@@ -139,17 +139,40 @@ def remap_text(s, remap):
     return re.sub(r"\b[0-9a-f]{7,40}\b", sub, s)
 
 
+ID = r"\b(?:T\d{2,}|R\d+)[a-z]?\b"   # session-local work ids (T513, R16a), not trackable issues
+MARK = "\x00"
+
+
+def strip_ids(s):
+    """Drop T###/R## work ids from commit text, then tidy the punctuation they leave behind."""
+    s = re.sub(r"\b(after|like|beside|before|than|since|from)\s+" + ID, r"\1 an earlier fix", s)
+    s = re.sub(ID + r"(?:\s*-\s*" + ID + r")?", MARK, s)
+    # every tidy rule is anchored on a removed id, so code text like `make()` is never touched
+    for pat, rep in [(MARK + r"\s*\(" + MARK + r"\)", MARK),        # T521 (R7)
+                     (r"(^|[.;]\s+)" + MARK + r":\s*", r"\1"),       # leading "T513: "
+                     (r"\s+as\s+" + MARK, ""),                       # filed as R22
+                     (MARK + r"(?:'s)?\s*,\s*", ""), (r",\s*" + MARK, ""),
+                     (r"\s+(?:and|or)\s+" + MARK, ""), (MARK + r"\s+(?:and|or)\s+", ""),
+                     (r"\s*\(" + MARK + r"(?:\s+\w+)?\)", ""),       # (R16a), (R20 narrowed)
+                     (r"\(" + MARK + r"(?:'s)?\s*", "("),
+                     (r"\s*" + MARK + r"(?:'s)?\s*(?=[),;:])", ""),
+                     (r"(\s?)" + MARK + r"(?:'s)?(\s?)", lambda m: " " if m.group(1) and m.group(2) else "")]:
+        s = re.sub(pat, rep, s, flags=re.M)
+    return s.strip()
+
+
 def message(title, commits, remap, reword=None):
     if len(commits) == 1 and title == out("log", "-1", "--format=%s", commits[0]).strip():
-        # an earlier headline kept as its own group: message verbatim
-        return remap_text(out("log", "-1", "--format=%B", commits[0]).rstrip(), remap) + "\n"
-    lines = [title, ""]
+        # an earlier headline kept as its own group: message verbatim, minus work ids
+        body = out("log", "-1", "--format=%B", commits[0]).rstrip().splitlines()
+        return "\n".join(strip_ids(remap_text(l, remap)) for l in body) + "\n"
+    lines = [strip_ids(title), ""]
     for c in commits:
         body = next((v for k, v in (reword or {}).items() if c.startswith(k)), None) \
             or out("log", "-1", "--format=%B", c)
         body = " ".join(l.strip() for l in body.splitlines()
                         if l.strip() and not l.startswith("Co-Authored-By:"))
-        lines.append("- %s (was %s)" % (remap_text(body, remap), c[:8]))
+        lines.append("- %s (was %s)" % (strip_ids(remap_text(body, remap)), c[:8]))
     return "\n".join(lines) + "\n\n" + TRAILER + "\n"
 
 

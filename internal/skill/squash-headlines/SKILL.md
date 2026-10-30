@@ -87,7 +87,7 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
      `--date` order) or every ~20-40 commits, always right after a landing's queue commit. Each run
      keeps its own code + queue commits, so it replays with no conflicts at all. Only the
      trailing queue commits after the last landing form the `bookkeeping` group. Headline:
-     `<2-3 dominant topics>, fix box <date> (<T-range>): <key items>`. Do not collapse to one
+     `<2-3 dominant topics>, fix box <date>: <key items>`. Do not collapse to one
      catch-all code commit: 2026-10-12 a topical plan scattered to 13-17 parts, the
      catch-all came out as 2 commits (too coarse), and 7 chronological chunks + bookkeeping
      came out clean.
@@ -124,3 +124,7 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
 - Commit messages: the headline goes on the subject line; each old commit becomes one bullet
   (full old message, Co-Authored-By trailers dropped), followed by one trailer. Headlines
   follow the repo's style: a summary clause, a colon, then the key items.
+- No work ids. `T###` / `R##` (T513, R16a) are session-local labels, not trackable issues:
+  never put them in a headline; name the behaviour instead. The tool also strips them from
+  titles and bullets (`strip_ids` in `squash.py`), tidying the punctuation left behind; old
+  hashes in each bullet's `(was <hash>)` stay the way back to the original text.
