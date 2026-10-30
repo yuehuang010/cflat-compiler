@@ -1826,8 +1826,247 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
     return true;
 }
 
+bool LLVMBackend::BeginFileScopeExpectations(
+    const std::vector<CFlatParser::ExternalDeclarationContext*>& declarations, size_t scopeDepth)
+{
+    if (scopeDepth == SIZE_MAX)
+    {
+        size_t count = 0;
+        std::vector<antlr4::tree::ParseTree*> pending(
+            declarations.begin(), declarations.end());
+        while (!pending.empty())
+        {
+            auto* node = pending.back();
+            pending.pop_back();
+            if (auto* decl = dynamic_cast<CFlatParser::ExternalDeclarationContext*>(node))
+            {
+                auto* expectDecl = decl->expectErrorDeclaration();
+                auto* literal = expectDecl ? expectDecl->StringLiteral() : nullptr;
+                auto* token = literal ? literal->getSymbol() : nullptr;
+                if (token != nullptr && token->getTokenIndex() != INVALID_INDEX)
+                    ++count;
+                if (expectDecl)
+                    for (auto* nested : expectDecl->externalDeclaration())
+                        pending.push_back(nested);
+                if (auto* ns = decl->namespaceDefinition())
+                    for (auto* nested : ns->externalDeclaration())
+                        pending.push_back(nested);
+                if (auto* ifConst = decl->ifConstDeclaration())
+                    pending.push_back(ifConst);
+            }
+            else if (auto* ifConst = dynamic_cast<CFlatParser::IfConstDeclarationContext*>(node))
+            {
+                for (auto* block : ifConst->ifConstBlock())
+                    for (auto* nested : block->externalDeclaration())
+                        pending.push_back(nested);
+                if (auto* elseIf = ifConst->ifConstDeclaration())
+                    pending.push_back(elseIf);
+            }
+        }
+        fileScopeExpectationTotal_ += count;
+        fileScopeExpectationRemaining_ += count;
+    }
+
+    FileScopeExpectationFrame frame;
+    for (auto* decl : declarations)
+    {
+        auto* expectDecl = decl->expectErrorDeclaration();
+        auto* literal = expectDecl ? expectDecl->StringLiteral() : nullptr;
+        auto* token = literal ? literal->getSymbol() : nullptr;
+        if (expectDecl == nullptr || !expectDecl->externalDeclaration().empty()
+            || token == nullptr || token->getTokenIndex() == INVALID_INDEX)
+            continue;
+        frame.Messages.push_back(DequoteStringLiteral(literal->getText()));
+        frame.Declarations.push_back(decl);
+    }
+    if (frame.Messages.empty()) return false;
+
+    frame.Matched.resize(frame.Messages.size(), false);
+    frame.UsesExpectScope = scopeDepth != SIZE_MAX;
+    frame.ScopeDepth = scopeDepth;
+    frame.ParentExpected = expectedError;
+    frame.ParentFileScopeExpected = fileScopeExpectedError_;
+    frame.ParentDepth = expectedErrorScopeDepth;
+    frame.ParentFunction = expectedErrorScopeFunction_;
+    frame.ParentScope = activeExpectScope_;
+    frame.ParentPosition = activeExpectPosition_;
+    frame.ActiveIndex = 0;
+    fileScopeExpectationFrames_.push_back(std::move(frame));
+    if (fileScopeExpectationFrames_.back().UsesExpectScope)
+    {
+        expectedError = fileScopeExpectationFrames_.back().Messages.front();
+        fileScopeExpectationFrames_.back().ActiveScope =
+            ArmExpectScope(expectedError, scopeDepth);
+    }
+    else
+    {
+        fileScopeExpectedError_ = fileScopeExpectationFrames_.back().Messages.front();
+        expectedError = fileScopeExpectedError_;
+        expectedErrorScopeDepth = SIZE_MAX;
+        expectedErrorScopeFunction_ = nullptr;
+        activeExpectScope_ = 0;
+        activeExpectPosition_ = { 0, expectedError, sourceFileName, currentLine, currentColumn };
+    }
+    return true;
+}
+
+bool LLVMBackend::AdvanceFileScopeExpectation(
+    const CFlatParser::ExternalDeclarationContext* declaration)
+{
+    if (fileScopeExpectationFrames_.empty()) return false;
+    auto& frame = fileScopeExpectationFrames_.back();
+    if (frame.SeenDeclarations >= frame.Declarations.size()
+        || frame.Declarations[frame.SeenDeclarations] != declaration)
+        return false;
+    if (frame.SeenDeclarations == 0)
+    {
+        frame.SeenDeclarations = 1;
+        return true;
+    }
+    const size_t next = frame.SeenDeclarations;
+    const size_t previous = next - 1;
+    if (previous < frame.Matched.size() && !frame.Matched[previous])
+        FailMissingFileScopeExpectation(frame.Messages[previous]);
+    if (next >= frame.Messages.size()) return true;
+
+    frame.SeenDeclarations = next + 1;
+    frame.ActiveIndex = next;
+    if (frame.UsesExpectScope)
+    {
+        expectedError = frame.Messages[next];
+        frame.ActiveScope = ArmExpectScope(expectedError, frame.ScopeDepth);
+    }
+    else
+    {
+        fileScopeExpectedError_ = frame.Messages[next];
+        expectedError = fileScopeExpectedError_;
+        expectedErrorScopeDepth = SIZE_MAX;
+        expectedErrorScopeFunction_ = nullptr;
+        activeExpectScope_ = 0;
+        activeExpectPosition_ = { 0, expectedError, sourceFileName, currentLine, currentColumn };
+    }
+    return true;
+}
+
+bool LLVMBackend::IsActiveFileScopeExpectation() const
+{
+    if (fileScopeExpectationFrames_.empty()) return false;
+    const auto& frame = fileScopeExpectationFrames_.back();
+    return frame.ActiveIndex < frame.Messages.size()
+        && expectedError == frame.Messages[frame.ActiveIndex]
+        && (frame.UsesExpectScope ? activeExpectScope_ == frame.ActiveScope
+                                  : activeExpectScope_ == 0
+                                      && fileScopeExpectedError_ == expectedError);
+}
+
+void LLVMBackend::MarkFileScopeExpectationMatched()
+{
+    if (!IsActiveFileScopeExpectation()) return;
+    auto& frame = fileScopeExpectationFrames_.back();
+    if (!frame.Matched[frame.ActiveIndex] && fileScopeExpectationRemaining_ > 0)
+        --fileScopeExpectationRemaining_;
+    frame.Matched[frame.ActiveIndex] = true;
+}
+
+void LLVMBackend::MarkFileScopeExpectationProcessed()
+{
+    if (fileScopeExpectationRemaining_ > 0)
+        --fileScopeExpectationRemaining_;
+}
+
+bool LLVMBackend::HandleFileScopeExpectationMatch()
+{
+    if (!IsActiveFileScopeExpectation()) return false;
+    auto& frame = fileScopeExpectationFrames_.back();
+    if (!frame.Matched[frame.ActiveIndex]) return false;
+    if (frame.UsesExpectScope)
+    {
+        const size_t scope = frame.ActiveScope;
+        RestoreExpectScope(scope);
+        frame.ActiveScope = 0;
+        expectedError.clear();
+        expectedErrorScopeDepth = SIZE_MAX;
+        expectedErrorScopeFunction_ = nullptr;
+        activeExpectScope_ = 0;
+        activeExpectPosition_ = {};
+    }
+    else
+        RestoreFileScopeExpectedError();
+    if (ShouldFinishFileScopeExpectations())
+    {
+        CompleteFileScopeExpectations();
+        throw ExpectedErrorReceived{};
+    }
+    return true;
+}
+
+bool LLVMBackend::ShouldFinishFileScopeExpectations() const
+{
+    return !processingImports_ && fileScopeExpectationTotal_ != 0
+        && fileScopeExpectationRemaining_ == 0;
+}
+
+void LLVMBackend::CompleteFileScopeExpectations()
+{
+    while (!fileScopeExpectationFrames_.empty())
+        PopFileScopeExpectations();
+}
+
+void LLVMBackend::PopFileScopeExpectations()
+{
+    if (fileScopeExpectationFrames_.empty()) return;
+    if (fileScopeExpectationFrames_.back().UsesExpectScope
+        && fileScopeExpectationFrames_.back().ActiveScope != 0)
+        RestoreExpectScope(fileScopeExpectationFrames_.back().ActiveScope);
+    const auto frame = std::move(fileScopeExpectationFrames_.back());
+    fileScopeExpectationFrames_.pop_back();
+    expectedError = frame.ParentExpected;
+    fileScopeExpectedError_ = frame.ParentFileScopeExpected;
+    expectedErrorScopeDepth = frame.ParentDepth;
+    expectedErrorScopeFunction_ = frame.ParentFunction;
+    activeExpectScope_ = frame.ParentScope;
+    activeExpectPosition_ = frame.ParentPosition;
+}
+
+[[noreturn]] void LLVMBackend::FailMissingFileScopeExpectation(const std::string& message)
+{
+    std::cout << std::format("FAIL: expected error '{}' did not occur\n", message);
+    expectedError.clear();
+    fileScopeExpectedError_.clear();
+    expectedErrorScopeDepth = SIZE_MAX;
+    expectedErrorScopeFunction_ = nullptr;
+    activeExpectScope_ = 0;
+    FailCompilation("expected error did not occur");
+}
+
+void LLVMBackend::EndFileScopeExpectations(bool allowDeferred)
+{
+    if (fileScopeExpectationFrames_.empty()) return;
+    auto& frame = fileScopeExpectationFrames_.back();
+    if (allowDeferred && frame.UsesExpectScope
+        && frame.ActiveIndex < frame.Matched.size()
+        && !frame.Matched[frame.ActiveIndex]
+        && frame.ActiveScope != 0 && DeferExpectationVerdict())
+    {
+        frame.Matched[frame.ActiveIndex] = true;
+        frame.ActiveScope = 0;
+    }
+    std::string missing;
+    for (size_t i = 0; i < frame.Matched.size(); ++i)
+        if (!frame.Matched[i])
+        {
+            missing = frame.Messages[i];
+            break;
+        }
+    PopFileScopeExpectations();
+    if (!missing.empty()) FailMissingFileScopeExpectation(missing);
+}
+
 bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverride)
 {
+    fileScopeExpectationTotal_ = 0;
+    fileScopeExpectationRemaining_ = 0;
+    processingImports_ = false;
     // --check: parse and codegen for diagnostics only, emitting no outputs.
     bool checkOnly = args.hasFlag("check");
     cxxDemandLinks_ = !checkOnly && !batchMode_;
@@ -2304,33 +2543,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             return false;
         }
 
-        // Arm a file-scope bare-semicolon `expect_error("...");` BEFORE imports run, so a
-        // diagnostic raised during ProcessImports (e.g. the orphan-header error) is matched
-        // rather than aborting the compile. Only the bare form (no inner declarations) is
-        // handled here; the scoped-block form is processed by the listener walk as before.
-        // First writer wins - a file declares at most one such expectation.
+        // Arm the first bare file-scope expectation before imports so import-time diagnostics
+        // can match. Later arms are activated in source order after each previous arm matches.
         if (auto* tu = computeUnit->translationUnit())
-        {
-            for (auto* decl : tu->externalDeclaration())
-            {
-                auto* ee = decl->expectErrorDeclaration();
-                auto* literal = ee ? ee->StringLiteral() : nullptr;
-                auto* literalToken = literal ? literal->getSymbol() : nullptr;
-                if (ee && ee->externalDeclaration().empty() && literalToken != nullptr
-                    && literalToken->getTokenIndex() != INVALID_INDEX)
-                {
-                    std::string raw = literal->getText();
-                    fileScopeExpectedError_ = DequoteStringLiteral(raw);
-                    expectedError = fileScopeExpectedError_;
-                    expectedErrorScopeDepth = SIZE_MAX;
-                    break;
-                }
-            }
-        }
+            BeginFileScopeExpectations(tu->externalDeclaration());
 
-        // ProcessImports / ForwardRefScan / the code-gen walk can all raise the armed
-        // file-scope expectation. ExpectedErrorReceived is thrown only on a match (PASS already
-        // printed by LogError), so catching it here and returning success is correct.
+        // Import matches are caught at each import boundary so later declarations still run.
+        // This outer catch handles a match from the scan or module-finalization passes.
         try
         {
 
@@ -2338,117 +2557,132 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
         // Process all top-level imports before scanning the main file so that
         // imported symbols are available to ForwardRefScanner.
+        processingImports_ = true;
         {
             llvm::TimeTraceScope importsScope("ProcessImports", sourceFileName);
             if (auto* tu = computeUnit->translationUnit()) {
                 for (auto* decl : tu->externalDeclaration()) {
-                    if (auto* imp = decl->importDeclaration()) {
-                        // Point diagnostics at this import statement. A not-found error is raised
-                        // before any real file is opened (there is no readable file behind it, e.g.
-                        // a winmd), so without this it would report (0,0) instead of the import line.
-                        SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
-                        if (auto error = ValidateImportLeadingMarker(imp); !error.empty()) {
-                            LogError(error);
-                            return false;
-                        }
-                        if (auto error = ValidateImportSoftKeywords(imp); !error.empty()) {
-                            LogError(error);
-                            return false;
-                        }
-                        if (isolatedPolicy_ && IsIsolatedNativeImport(imp))
-                        {
-                            LogError(std::format("policy-restricted-language: native interop imports "
-                                                 "are not allowed in isolated mode (policy '{}')",
-                                                 isolatedPolicy_->path));
-                            return false;
-                        }
-                        // `import { "a", "b" };` / `import cpp { "a", "b" };` - a group of
-                        // >1 imports. Header entries share one TU.
-                        auto groupedImports = ImportFilenames(imp);
-                        // `import framework "X";` / `import framework { ... };` - record each
-                        // framework for the Mach-O link. Dispatched before the importGroup
-                        // routing since it reuses importGroup for its name list.
-                        if (IsFrameworkImport(imp))
-                        {
-                            for (const auto& fw : groupedImports)
-                                if (!AddFrameworkImport(fw)) return false;
-                            continue;
-                        }
-                        // A `framework "X"` clause on a header/package/group import (S3): link the
-                        // framework in addition to binding the header. Standalone form handled above.
-                        for (const auto& fw : DequoteFrameworkClauses(imp))
-                            if (!AddFrameworkImport(fw)) return false;
-                        // `import package-nuget importGroup from "id[/version]";` - dispatch on the
-                        // keyword BEFORE any importGroup-based routing (package-nuget now also
-                        // carries an importGroup, but a multi-entry nuget group is ONE package TU,
-                        // not several plain imports). Skips the regular import dedup/parse machinery.
-                        if (IsPackageNugetImport(imp))
-                        {
-                            std::string packageSpec = DequoteFromClause(imp);
-                            if (verbose) std::cout << std::format("[verbose] nuget import (group of {}) from {}\n", groupedImports.size(), packageSpec);
-                            if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp), DequotePriClause(imp)))
+                    try
+                    {
+                        if (auto* imp = decl->importDeclaration()) {
+                            // Point diagnostics at this import statement. A not-found error is raised
+                            // before any real file is opened (there is no readable file behind it, e.g.
+                            // a winmd), so without this it would report (0,0) instead of the import line.
+                            SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                            if (auto error = ValidateImportLeadingMarker(imp); !error.empty()) {
+                                LogError(error);
                                 return false;
-                            continue;
-                        }
-                        if (groupedImports.size() > 1)
-                        {
-                            if (verbose) std::cout << std::format("[verbose] import requested (group of {})\n", groupedImports.size());
-                            if (!CompileImportGroup(filename, groupedImports, DequoteLibClauses(imp),
-                                                    DequoteDefineClauses(imp), IsCppImport(imp)))
-                                return false;
-                            continue;
-                        }
-                        std::string importFilename = groupedImports[0];
-                        // `import package-vcpkg "header" from "port";` - dispatch to the
-                        // vcpkg resolver and skip the regular import dedup/parse machinery.
-                        if (IsPackageVcpkgImport(imp))
-                        {
-                            std::string portSpec = DequoteFromClause(imp);
-                            if (verbose) std::cout << std::format("[verbose] vcpkg import: {} from {}\n", importFilename, portSpec);
-                            if (!CompileVcpkgImport(RootVcpkgImportPath(filename), importFilename, portSpec, DequoteDefineClauses(imp)))
-                                return false;
-                            continue;
-                        }
-                        std::string ns = ImportNamespace(imp);
-                        bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
-                        std::string alias = isProgram ? ImportProgramAlias(imp) : "";
-                        std::string impExt = LowerExtension(importFilename);
-                        bool isCProgram = isProgram && impExt == ".c";
-                        bool isCppImport = IsCppImport(imp);
-                        std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
-                        std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
-                        if (verbose) std::cout << std::format("[verbose] import requested: {}{}\n", importFilename, ns.empty() ? "" : " as " + ns);
-                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport))
-                            return false;
-
-                        if (isProgram)
-                        {
-                            if (isCProgram)
-                            {
-                                // CompileCFile already created __imported_main_<alias> and set programTable.
-                                if (!programTable[alias].MainFunction)
-                                {
-                                    LogError(std::format("import program '{}': C file '{}' has no externally-linkable 'main'", alias, importFilename));
-                                    return false;
-                                }
                             }
-                            else
+                            if (auto error = ValidateImportSoftKeywords(imp); !error.empty()) {
+                                LogError(error);
+                                return false;
+                            }
+                            if (isolatedPolicy_ && IsIsolatedNativeImport(imp))
                             {
-                                // For 'import program "file.cb" as Name', rename @main to __imported_main_Name
-                                auto* mainFn = module->getFunction("main");
-                                if (!mainFn)
-                                {
-                                    LogError(std::format("import program '{}': '{}' has no 'main' function", alias, importFilename));
+                                LogError(std::format("policy-restricted-language: native interop imports "
+                                                     "are not allowed in isolated mode (policy '{}')",
+                                                     isolatedPolicy_->path));
+                                return false;
+                            }
+                            // `import { "a", "b" };` / `import cpp { "a", "b" };` - a group of
+                            // >1 imports. Header entries share one TU.
+                            auto groupedImports = ImportFilenames(imp);
+                            // `import framework "X";` / `import framework { ... };` - record each
+                            // framework for the Mach-O link. Dispatched before the importGroup
+                            // routing since it reuses importGroup for its name list.
+                            if (IsFrameworkImport(imp))
+                            {
+                                for (const auto& fw : groupedImports)
+                                    if (!AddFrameworkImport(fw)) return false;
+                                continue;
+                            }
+                            // A `framework "X"` clause on a header/package/group import (S3): link the
+                            // framework in addition to binding the header. Standalone form handled above.
+                            for (const auto& fw : DequoteFrameworkClauses(imp))
+                                if (!AddFrameworkImport(fw)) return false;
+                            // `import package-nuget importGroup from "id[/version]";` - dispatch on the
+                            // keyword BEFORE any importGroup-based routing (package-nuget now also
+                            // carries an importGroup, but a multi-entry nuget group is ONE package TU,
+                            // not several plain imports). Skips the regular import dedup/parse machinery.
+                            if (IsPackageNugetImport(imp))
+                            {
+                                std::string packageSpec = DequoteFromClause(imp);
+                                if (verbose) std::cout << std::format("[verbose] nuget import (group of {}) from {}\n", groupedImports.size(), packageSpec);
+                                if (!CompileNugetImport(groupedImports, packageSpec, DequoteDefineClauses(imp), DequotePriClause(imp)))
                                     return false;
+                                continue;
+                            }
+                            if (groupedImports.size() > 1)
+                            {
+                                if (verbose) std::cout << std::format("[verbose] import requested (group of {})\n", groupedImports.size());
+                                if (!CompileImportGroup(filename, groupedImports, DequoteLibClauses(imp),
+                                                        DequoteDefineClauses(imp), IsCppImport(imp)))
+                                    return false;
+                                continue;
+                            }
+                            std::string importFilename = groupedImports[0];
+                            // `import package-vcpkg "header" from "port";` - dispatch to the
+                            // vcpkg resolver and skip the regular import dedup/parse machinery.
+                            if (IsPackageVcpkgImport(imp))
+                            {
+                                std::string portSpec = DequoteFromClause(imp);
+                                if (verbose) std::cout << std::format("[verbose] vcpkg import: {} from {}\n", importFilename, portSpec);
+                                if (!CompileVcpkgImport(RootVcpkgImportPath(filename), importFilename, portSpec, DequoteDefineClauses(imp)))
+                                    return false;
+                                continue;
+                            }
+                            std::string ns = ImportNamespace(imp);
+                            bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
+                            std::string alias = isProgram ? ImportProgramAlias(imp) : "";
+                            std::string impExt = LowerExtension(importFilename);
+                            bool isCProgram = isProgram && impExt == ".c";
+                            bool isCppImport = IsCppImport(imp);
+                            std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
+                            std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
+                            if (verbose) std::cout << std::format("[verbose] import requested: {}{}\n", importFilename, ns.empty() ? "" : " as " + ns);
+                            if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport))
+                                return false;
+
+                            if (isProgram)
+                            {
+                                if (isCProgram)
+                                {
+                                    // CompileCFile already created __imported_main_<alias> and set programTable.
+                                    if (!programTable[alias].MainFunction)
+                                    {
+                                        LogError(std::format("import program '{}': C file '{}' has no externally-linkable 'main'", alias, importFilename));
+                                        return false;
+                                    }
                                 }
-                                mainFn->setName("__imported_main_" + alias);
-                                programTable[alias].IsImportedProgram = true;
-                                programTable[alias].MainFunction = mainFn;
+                                else
+                                {
+                                    // For 'import program "file.cb" as Name', rename @main to __imported_main_Name
+                                    auto* mainFn = module->getFunction("main");
+                                    if (!mainFn)
+                                    {
+                                        LogError(std::format("import program '{}': '{}' has no 'main' function", alias, importFilename));
+                                        return false;
+                                    }
+                                    mainFn->setName("__imported_main_" + alias);
+                                    programTable[alias].IsImportedProgram = true;
+                                    programTable[alias].MainFunction = mainFn;
+                                }
                             }
                         }
                     }
+                    catch (const ExpectedErrorReceived&)
+                    {
+                        if (!HandleFileScopeExpectationMatch())
+                            throw;
+                    }
                 }
             }
+        }
+        processingImports_ = false;
+        if (ShouldFinishFileScopeExpectations())
+        {
+            CompleteFileScopeExpectations();
+            return true;
         }
 
         // Pre-scan: register all function signatures and struct type shells so
@@ -2515,6 +2749,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
             NoCurrentFunctionScope noCurrent(this);
             SettledInterfaceInstancesScope settled(this);
+            ResolveFunctionPointerTargetSets();
             ResolveDeferredExpectationVerdicts();
         }
 
@@ -2562,8 +2797,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
         catch (const ExpectedErrorReceived&)
         {
-            // A file-scope expectation matched somewhere in imports / scan / walk. The PASS
-            // line is already printed; settle every deferred scoped verdict before success.
+            // An import/scan-level match cannot resume the listener walk; still verify every
+            // arm in this translation unit before reporting success.
             try
             {
                 NoCurrentFunctionScope noCurrent(this);
@@ -2571,16 +2806,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 ResolveDeferredExpectationVerdicts(true);
             }
             catch (const CompilerAbortException&) { return false; }
+            EndFileScopeExpectations();
             return true;
         }
 
-        // The armed file-scope expectation never fired (had it fired, the catch above would
-        // have returned). That is the did-not-occur failure for this negative test.
-        if (!fileScopeExpectedError_.empty())
-        {
-            std::cout << std::format("FAIL: expected error '{}' did not occur\n", fileScopeExpectedError_);
-            FailCompilation("expected error did not occur");
-        }
+        EndFileScopeExpectations();
     }
 
     // Define the `application` constants before optimization so a folded Application.name()
@@ -3740,53 +3970,69 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     currentSourceFilePath_ = canonicalStr;
     currentSourceIsCore_ = isCoreImport;
     compilingExplicitCoreFile_ = explicitCoreImport;
-    ValidateIsolatedParseTree(computeUnit);
-    // Files that follow this import are not scanned yet, so no interface-implementor claim made
-    // while codegen'ing it can be proven complete (see InterfaceImplementorSetIsUncertain).
-    ImportedFileCompileScope importDepthScope(this);
-
-    // Forward-ref scan the imported file
+    bool fileScopeExpectationsOpened = computeUnit->translationUnit() != nullptr
+        && BeginFileScopeExpectations(computeUnit->translationUnit()->externalDeclaration());
+    try
     {
-        llvm::TimeTraceScope scanScope("ForwardRefScan", importFilename);
-        if (verbose) std::cout << std::format("[verbose]   forward-ref scan: {}\n", importFilename);
-        ForwardRefScanner scanner(this);
-        scanner.SetTokens(tokensPtr);
-        scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
-        // Pre-declare opaque types for all generic instantiations found in the file
-        // (including inside function/program bodies) before scanning declarations.
-        // Without this pass, program definitions that pre-declare run(Name*, list$string)
-        // fail because the opaque shell for list$string hasn't been created yet.
-        // Generic interface templates first (see the main-file scan for why).
-        if (auto* tu = computeUnit->translationUnit())
+        ValidateIsolatedParseTree(computeUnit);
+        // Files that follow this import are not scanned yet, so no interface-implementor claim made
+        // while codegen'ing it can be proven complete (see InterfaceImplementorSetIsUncertain).
+        ImportedFileCompileScope importDepthScope(this);
+
+        // Forward-ref scan the imported file
         {
-            scanner.SeedConstIntGlobals(tu);
-            scanner.SeedConstFloatingGlobals(tu);
-            scanner.ScanGenericInterfaceTemplateNames(tu);
-            scanner.PreRegisterCppStructNames(tu);
-            // Type aliases first (see the main-file scan for why).
-            scanner.PreRegisterRenameAliases(tu);
-            for (auto* decl : tu->externalDeclaration())
-                scanner.ScanGenericTypeUses(decl);
-            for (auto* decl : tu->externalDeclaration())
-                scanner.ScanExternalDeclaration(decl);
-            scanner.RefreshProvisionalAggregateAliases();
-            scanner.PrepareWinrtClasses(tu);
-            scanner.FinalizeViewFieldMoveInference();
+            llvm::TimeTraceScope scanScope("ForwardRefScan", importFilename);
+            if (verbose) std::cout << std::format("[verbose]   forward-ref scan: {}\n", importFilename);
+            ForwardRefScanner scanner(this);
+            scanner.SetTokens(tokensPtr);
+            scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
+            // Pre-declare opaque types for all generic instantiations found in the file
+            // (including inside function/program bodies) before scanning declarations.
+            // Without this pass, program definitions that pre-declare run(Name*, list$string)
+            // fail because the opaque shell for list$string hasn't been created yet.
+            // Generic interface templates first (see the main-file scan for why).
+            if (auto* tu = computeUnit->translationUnit())
+            {
+                scanner.SeedConstIntGlobals(tu);
+                scanner.SeedConstFloatingGlobals(tu);
+                scanner.ScanGenericInterfaceTemplateNames(tu);
+                scanner.PreRegisterCppStructNames(tu);
+                // Type aliases first (see the main-file scan for why).
+                scanner.PreRegisterRenameAliases(tu);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.ScanGenericTypeUses(decl);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.ScanExternalDeclaration(decl);
+                scanner.RefreshProvisionalAggregateAliases();
+                scanner.PrepareWinrtClasses(tu);
+                scanner.FinalizeViewFieldMoveInference();
+            }
+        }
+
+        // Code-gen walk the imported file
+        if (verbose) std::cout << std::format("[verbose]   code-gen walk: {}\n", importFilename);
+        {
+            llvm::TimeTraceScope codegenScope("CodeGeneration", importFilename);
+            auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
+            antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
+            {
+                NoCurrentFunctionScope noCurrent(this);
+                myListener->EmitPendingGlobalCxxConstructions(
+                    myListener->ResolvePendingGlobalDefaultConstructions());
+            }
         }
     }
-
-    // Code-gen walk the imported file
-    if (verbose) std::cout << std::format("[verbose]   code-gen walk: {}\n", importFilename);
+    catch (const ExpectedErrorReceived&)
     {
-        llvm::TimeTraceScope codegenScope("CodeGeneration", importFilename);
-        auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
-        antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
-        {
-            NoCurrentFunctionScope noCurrent(this);
-            myListener->EmitPendingGlobalCxxConstructions(
-                myListener->ResolvePendingGlobalDefaultConstructions());
-        }
+        if (fileScopeExpectationsOpened) EndFileScopeExpectations();
+        throw;
     }
+    catch (...)
+    {
+        if (fileScopeExpectationsOpened) PopFileScopeExpectations();
+        throw;
+    }
+    if (fileScopeExpectationsOpened) EndFileScopeExpectations();
     if (isCoreImport)
         for (auto& function : module->functions())
             if (!function.isDeclaration()) isolatedCoreFunctions_.insert(function.getName().str());
@@ -4778,6 +5024,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             {
                 NoCurrentFunctionScope noCurrent(this);
                 SettledInterfaceInstancesScope settled(this);
+                ResolveFunctionPointerTargetSets();
                 ResolveDeferredExpectationVerdicts();
             }
             // #8 on const receivers, as in Compile: every body is emitted now.
@@ -4891,6 +5138,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingReceiverText_.clear();
     pendingCallReceiver_.reset();
     pendingConstReceiverCalls_.clear();
+    deferredFunctionPointerTargetCalls_.clear();
     deferredExpectations_.clear();
     expectErrorStack_.clear();
     activeExpectScope_ = 0;
@@ -5284,6 +5532,7 @@ void LLVMBackend::ResetForReanalysis()
     expectedErrorScopeFunction_ = nullptr;
     expectErrorStack_.clear();
     fileScopeExpectedError_.clear();
+    fileScopeExpectationFrames_.clear();
     currentFunction = nullptr;
     activeGenericEnumSpecialization_.clear();
     activeLocalEnumFunction_.clear();

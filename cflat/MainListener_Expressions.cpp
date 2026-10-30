@@ -1454,12 +1454,8 @@ static bool IsClosureValueHelperCall(const llvm::Value* value, std::string_view 
         const auto* call = llvm::dyn_cast<llvm::CallBase>(value);
         const llvm::Function* callee = call == nullptr ? nullptr : call->getCalledFunction();
         if (callee == nullptr || call->arg_size() != 1) return false;
-        // Exact helper name or a numeric ".N" rename; a user `_closure_fat_ptr` namespace must not match.
-        llvm::StringRef name = callee->getName();
         const std::string base = "__closure_fat_ptr." + std::string(kind);
-        if (!name.consume_front(base)) return false;
-        if (name.empty()) return true;
-        return name.consume_front(".") && !name.empty() && name.find_first_not_of("0123456789") == llvm::StringRef::npos;
+        return IsClosureHelperName(callee->getName(), base);
     }
 
 // A struct passed in its C ABI form: a whole-size non-pointer load (`i64`, `[2 x i64]`) of a struct
@@ -4211,9 +4207,18 @@ bool MainListener::IsDeclaredPointerSubscriptString(
         if (stringType == nullptr || value->getType() != stringType) return false;
 
         auto* postfix = tryGetPostfixExpression(expression);
+        // R21: `Ns.g[i]` - a `.` member path ahead of the subscript; only a global slot decides it.
+        const size_t memberPathChildren = postfix != nullptr && postfix->children.size() > 4
+            ? postfix->children.size() - 4 : 0;
+        bool memberPathOnly = memberPathChildren > 0 && memberPathChildren % 2 == 0
+            && postfix->memberNameToken().size() == memberPathChildren / 2
+            && postfix->genericTypeParameters().empty();
+        for (size_t i = 1; memberPathOnly && i <= memberPathChildren; i += 2)
+            memberPathOnly = postfix->children[i]->getText() == ".";
         if (postfix == nullptr || postfix->LeftBracket().size() != 1
             || postfix->RightBracket().size() != 1
-            || postfix->expression().size() != 1 || postfix->children.size() != 4
+            || postfix->expression().size() != 1
+            || (postfix->children.size() != 4 && !memberPathOnly)
             || postfix->primaryExpression() == nullptr
             || postfix->children.front() != postfix->primaryExpression()
             || postfix->children.back() != postfix->RightBracket().back())
@@ -4243,6 +4248,9 @@ bool MainListener::IsDeclaredPointerSubscriptString(
             return unaryBase == nullptr || isBareBasePostfix(unaryBase);
         };
         if (!isBareBasePrimary(postfix->primaryExpression())) return false;
+        if (memberPathOnly && postfix->primaryExpression()->Identifier() == nullptr
+            && postfix->primaryExpression()->genericIdentifier() == nullptr)
+            return false;
 
         auto* basePrimary = postfix->primaryExpression();
         bool parenthesizedPointerDeref = false;
@@ -4469,6 +4477,25 @@ bool MainListener::IsDeclaredPointerSubscriptString(
             || (pointerBinding != nullptr && pointerBinding->AllocatedByRawNewArray);
         // `(*pp)[i]` through a single referred local slot: adopt only a proven raw-new element.
         if (holderDecides) return !holderProvenRawNew;
+        // R21 (ruling 2026-10-27): a base loaded from a global, field or closure-capture slot has no
+        // compile-time provenance, so the read copies (C++ `std::string t = g[0]`).
+        auto* slotGep = llvm::dyn_cast<llvm::GEPOperator>(pointerSlot);
+        // A pointer-typed global, not a struct global whose field-zero GEP folded to the global.
+        auto* slotGlobal = llvm::dyn_cast<llvm::GlobalVariable>(pointerSlot->stripPointerCasts());
+        const bool globalSlot = slotGlobal != nullptr && slotGlobal->getValueType()->isPointerTy();
+        const bool fieldSlot = slotGep != nullptr && slotGep->getSourceElementType()->isStructTy();
+        if (pointerLoad != nullptr && pointerBinding == nullptr && !parenthesizedPointerDeref
+            && pointerLoad->getType()->isPointerTy() && (globalSlot || (fieldSlot && !memberPathOnly))
+            && (rawArrayTarget == nullptr || !rawArrayTarget->IsArrayView))
+        {
+            // A container's `_data[i]` in a generic instance over string keeps its bit-move: the
+            // container consumes the read (swap, return), so a copy would leak the element.
+            bool genericOverString = false;
+            for (const auto& [param, argument] : activeTypeSubstitutions)
+                genericOverString = genericOverString || argument == "string";
+            if (globalSlot || !genericOverString) return true;
+        }
+        if (memberPathOnly) return false;
         // An unproven `(*pp)[i]` can be borrowed; its copy sites apply owned-array exceptions.
         return !rawNewArrayTarget && (pointerBindingProvesLocalElement || parenthesizedPointerDeref);
     }
@@ -4729,6 +4756,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 FlexibleArrayKeepScope keep(flexibleArrayKeep_, DirectOperandPostfixes(unaryCtx));
                 return ParseUnaryExpression(unaryCtx);
             }();
+            const llvm::GlobalVariable* enumMemberGlobal = nullptr;
+            if (compiler->IsEnumMemberStorage(namedVar.Storage, &enumMemberGlobal))
+                LogErrorContext(unaryCtx, std::format("cannot assign to enum member '{}'",
+                    EnumMemberDiagnosticName(namedVar, unaryCtx, enumMemberGlobal)));
             if (operatorText != "=" && !namedVar.TypeAndValue.Pointer
                 && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName))
             {
@@ -10194,6 +10225,23 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 right = compiler->EmitOwnedStringDeepCopy(right);
             }
 
+            const bool rhsBorrowsOwnedString = NamedVarIsString(rightNV)
+                && !rightNV.TypeAndValue.IsMove
+                && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
+                    || rightNV.RootIsBorrowedThisField || rightNV.BorrowsOwnedString);
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && NamedVarIsString(namedVar) && namedVar.FieldName.empty()
+                && !namedVar.TypeAndValue.Pointer
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && rhsBorrowsOwnedString
+                && !rightNV.TypeAndValue.IsAlias && !rightNV.IsAliasBorrow)
+            {
+                // Keep assignment's established borrow semantics, but clear the copied owned bit
+                // so a later rebind's string destructor cannot free the source field's buffer.
+                right = compiler->ClearStringOwnedBit(right);
+            }
+
             // Drop the old owned string in a local or mutable closure slot before rebinding it.
             // The string dtor checks the owned bit, so a borrowed or empty value is a safe no-op.
             // Self-assign is guarded by destination != rightNV.Storage.
@@ -10581,6 +10629,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 bool rhsBorrowsField = NamedVarIsString(rightNV)
                     && !rightNV.TypeAndValue.IsMove
                     && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
+                        || rightNV.RootIsBorrowedThisField
                         || rightNV.BorrowsOwnedString);
                 if (rhsBorrowsField || coalesceResume == nullptr)
                     compiler->SetVariableBorrowsOwnedString(namedVar.CallerName, rhsBorrowsField);
@@ -24984,6 +25033,10 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
 
             if (opText == "&")
             {
+                const llvm::GlobalVariable* enumMemberGlobal = nullptr;
+                if (compiler->IsEnumMemberStorage(namedVar.Storage, &enumMemberGlobal))
+                    LogErrorContext(ctx, std::format("cannot take the address of enum member '{}'",
+                        EnumMemberDiagnosticName(namedVar, castExpCtx, enumMemberGlobal)));
                 if (namedVar.TypeAndValue.IsArrayView)
                     LogErrorContext(ctx, std::format(
                         "cannot take the address of array-view '{}'; use '&{}[0]' to get the element address",
@@ -34856,6 +34909,10 @@ void MainListener::NormalizeCxxReferenceOperand(
 void MainListener::PrepareAliasCallResult(
         antlr4::ParserRuleContext* ctx,
         LLVMBackend::NamedVariable& result, bool markRvalue) {
+        // Provenance identifies a value that is itself a field. A method or operator result is
+        // derived from its receiver, even when the receiver was an implicit-this field.
+        result.RootIsBorrowedThisField = false;
+        result.ThisFieldPath.clear();
         result.IsTopLevelConst = result.TypeAndValue.IsCxxConstValueReturn;
         if (markRvalue && result.Primary != nullptr && !result.TypeAndValue.IsAlias)
             result.IsRvalue = true;

@@ -11,6 +11,31 @@ list<B*> g_items = default;
 void putGlobal(B* p) { g_items.add(p); }
 struct LateS { int k = 0; void Set(int v) { k = v; } };
 
+// R16: an explicit container-pointer destination maps to the caller's argument through every
+// helper level, so a caller-local or global container refuses the owning local at any depth.
+void depth2(list<B*>* l, B* p) { l->add(p); }
+void depth1(list<B*>* l, B* p) { depth2(l, p); }
+void depth0(list<B*>* l, B* p) { depth1(l, p); }
+void swapped2(B* p, int k, list<B*>* l) { l->add(p); }
+void swapped1(list<B*>* l, B* p) { swapped2(p, 0, l); }
+struct ListHolder { list<B*> l; };
+void viaField(ListHolder* h, B* p) { depth2(&h->l, p); }
+void viaLocalSource(list<B*>* l, B* p) { B* q = p; depth2(l, q); }
+void genDepth2<T>(list<T*>* l, T* p) { l->add(p); }
+void genDepth1<T>(list<T*>* l, T* p) { genDepth2<T>(l, p); }
+class Stasher { int k = 0; void stash(list<B*>* l, B* p) { depth2(l, p); } };
+class OwnBag { list<B*> items; void putOther(list<B*>* other, B* p) { depth2(other, p); } };
+void mutualA(list<B*>* l, B* p, int n);
+void mutualB(list<B*>* l, B* p, int n) { if (n == 0) { l->add(p); return; } mutualA(l, p, n - 1); }
+void mutualA(list<B*>* l, B* p, int n) { mutualB(l, p, n); }
+void viaGlobalMid(B* p) { depth2(&g_items, p); }
+void addThenTake(list<B*>* l, B* p) { l->add(p); l->take(0); }
+void addThenTake1(list<B*>* l, B* p) { addThenTake(l, p); }
+// Default arguments add a generated forwarding body per level; the chain must still map.
+void dfLeaf(list<B*>* l, B* p, int k = 0) { l->add(p); }
+void dfMid(list<B*>* l, B* p, int k = 0) { dfLeaf(l, p); }
+void dfTop(list<B*>* l, B* p, int k = 0) { dfMid(l, p); }
+
 extern int main()
 {
     expect_error("'n' still owns the object it was given") {
@@ -57,10 +82,112 @@ extern int main()
         B* n = new B();
         lateStore(n);
     }
+
+    expect_error("call to 'depth1': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        depth1(&l, n);
+        delete n;
+    }
+
+    expect_error("call to 'depth0': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        depth0(&l, n);
+    }
+
+    expect_error("call to 'swapped1': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        swapped1(&l, n);
+    }
+
+    expect_error("call to 'viaField': 'n' still owns the object it was given") {
+        B* n = new B();
+        ListHolder h;
+        viaField(&h, n);
+    }
+
+    expect_error("call to 'viaLocalSource': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        viaLocalSource(&l, n);
+    }
+
+    expect_error("call to 'genDepth1<B>': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        genDepth1<B>(&l, n);
+    }
+
+    expect_error("call to 'stash': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        Stasher s;
+        s.stash(&l, n);
+    }
+
+    expect_error("call to 'putOther': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        OwnBag b;
+        b.putOther(&l, n);
+    }
+
+    expect_error("call to 'mutualA': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        mutualA(&l, n, 2);
+    }
+
+    expect_error("call to 'depth1': 'n' still owns the object it was given") {
+        B* n = new B();
+        depth1(&g_items, n);
+    }
+
+    expect_error("call to 'viaGlobalMid': 'n' still owns the object it was given") {
+        B* n = new B();
+        viaGlobalMid(n);
+    }
+
+    expect_error("call through function pointer 'f': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        function<void(list<B*>*, B*)> f = depth1;
+        f(&l, n);
+    }
+
+    expect_error("call to 'lateDepth1': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        lateDepth1(&l, n);
+    }
+
+    // Flow-insensitive like the one-level `addThenTake(&l, n)`, which master already refuses.
+    expect_error("call to 'addThenTake1': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        addThenTake1(&l, n);
+    }
+
+    expect_error("call to 'dfMid': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        dfMid(&l, n);
+        delete n;
+    }
+
+    expect_error("call to 'dfTop': 'n' still owns the object it was given") {
+        B* n = new B();
+        list<B*> l;
+        dfTop(&l, n);
+    }
     return 0;
 }
 
 void lateStore2(B* p) { g_items.add(p); }
+void lateDepth2(list<B*>* l, B* p) { l->add(p); }
+void lateDepth1(list<B*>* l, B* p) { lateDepth2(l, p); }
 void lateStore1(B* p) { lateStore2(p); }
 void lateStore(B* p) { g_items.add(p); }
 void lateRead(B* p) { printf("%d\n", p->v); }

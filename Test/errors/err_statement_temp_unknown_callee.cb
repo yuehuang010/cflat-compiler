@@ -1,0 +1,119 @@
+import "../library/cinterop.c";
+
+int t521ErrorTempDtors = 0;
+struct T521ErrorTemp
+{
+    int value = 0;
+    T521ErrorTemp(int v) { value = v; }
+    ~T521ErrorTemp() { t521ErrorTempDtors = t521ErrorTempDtors + 1; }
+};
+
+int t521ErrorZero = 0;
+struct T521ErrorWrap { int* p = nullptr; int value = 0; };
+T521ErrorWrap t521ErrorWrapLate(int* p)
+{
+    T521ErrorWrap result;
+    *p = 18;
+    result.p = p;
+    result.value = 18;
+    return result;
+}
+function<T521ErrorWrap(int*)> g_t521ErrorWrapFn = t521ErrorWrapLate;
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectCKeep()
+    {
+        cflat521_keep(&(new T521ErrorTemp(1))->value);
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectCRead()
+    {
+        cflat521_read(&(new T521ErrorTemp(2))->value);
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectUnknownFunctionValue(function<void(int*)> reader, bool choose)
+    {
+        T521ErrorTemp* empty = nullptr;
+        reader(&(empty ?? (choose ? new T521ErrorTemp(3) : new T521ErrorTemp(4)))->value);
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectCFunctionPointer()
+    {
+        cflat521_read_fn(&(new T521ErrorTemp(5))->value);
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    int* t521RejectCPassReturn()
+    {
+        return cflat521_pass(&(new T521ErrorTemp(6))->value);
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    int* t521RejectCReadReturnOther()
+    {
+        int* result = cflat521_read_return_other(&(new T521ErrorTemp(7))->value);
+        return result;
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectDiscardedCPass()
+    {
+        cflat521_pass(&(new T521ErrorTemp(8))->value);
+    }
+}
+
+// The struct return carries the pointer in its first field; the indirect target is unprovable.
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    T521ErrorWrap t521RejectIndirectAggregate(int choose)
+    {
+        return g_t521ErrorWrapFn(choose > 0
+            ? &(new T521ErrorTemp(9))->value : &t521ErrorZero);
+    }
+}
+
+int t521R4Dtors = 0;
+int* t521R4Kept = nullptr;
+struct T521R4Temp
+{
+    int value = 0;
+    T521R4Temp(int v) { value = v; }
+    ~T521R4Temp() { t521R4Dtors = t521R4Dtors + 1; }
+};
+void t521R4NoopRead(int* p) { int value = *p; }
+void t521R4GlobalKeeper(int* p) { t521R4Kept = p; }
+void t521R4LocalKeeper(int* p) { t521R4Kept = p; }
+function<void(int*)> g_t521R4LaterFn = t521R4NoopRead;
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    // The caller is emitted first; the later store adds an unproven keeper target.
+    void t521R4RejectGlobalLaterStore()
+    {
+        g_t521R4LaterFn(&(new T521R4Temp(10))->value);
+    }
+    void t521R4StoreGlobalLater()
+    {
+        g_t521R4LaterFn = t521R4GlobalKeeper;
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    // The loop back-edge can reach the call after f is rebound to the keeper.
+    void t521R4RejectLocalLoopStore()
+    {
+        function<void(int*)> f = t521R4NoopRead;
+        for (int i = 0; i < 2; i++)
+        {
+            f(&(new T521R4Temp(11 + i))->value);
+            f = t521R4LocalKeeper;
+        }
+    }
+}

@@ -1,4 +1,9 @@
 
+import "library/cinterop.c";
+
+extern short cbf_ext_def_ret(int value) { return (short)value; }
+extern u8 cbf_ext_def_retu(int value) { return (u8)value; }
+
 extern int printf(const char* argv, ...);
 extern void* malloc(i64 size);
 extern void free(void* ptr);
@@ -8,6 +13,29 @@ extern int toupper(int c);
 extern int abs(int n);
 
 bool printOnPass = false;
+
+int t521TempDtors = 0;
+struct T521Temp
+{
+    int value = 0;
+    T521Temp(int v) { value = v; }
+    ~T521Temp() { t521TempDtors = t521TempDtors + 1; }
+};
+
+int t521TargetValue = 0;
+int t521TargetSelected = 0;
+void t521GlobalReadTarget(int* p) { t521TargetValue = *p; t521TargetSelected = 1; }
+void t521LocalReadTargetA(int* p) { t521TargetValue = *p; t521TargetSelected = 2; }
+void t521LocalReadTargetB(int* p) { t521TargetValue = *p; t521TargetSelected = 3; }
+function<void(int*)> g_t521ReadTarget = t521GlobalReadTarget;
+int t521R5TargetValue = 0;
+int t521R5TargetSelected = 0;
+void t521R5ReaderA(int* p) { t521R5TargetValue = *p; t521R5TargetSelected = 1; }
+void t521R5ReaderB(int* p) { t521R5TargetValue = *p + 1; t521R5TargetSelected = 2; }
+function<void(int*)> g_t521R5Before = t521R5ReaderA;
+function<void(int*)> g_t521R5After = t521R5ReaderA;
+void t521R5BeforeSetB() { g_t521R5Before = t521R5ReaderB; }
+void t521R5BeforeSetA() { g_t521R5Before = t521R5ReaderA; }
 
 bool Test(const char* testName, long long actual, long long expected)
 {
@@ -68,6 +96,92 @@ bool Test(const char* testName, bool actual, bool expected)
     printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
     return false;
 }
+
+bool testT521FunctionPointerTargetSets()
+{
+    bool result = true;
+    t521TempDtors = 0;
+    t521R5TargetValue = 0;
+    t521R5TargetSelected = 0;
+    t521R5BeforeSetB();
+    g_t521R5Before(&(new T521Temp(51))->value);
+    t521R5BeforeSetA();
+    result &= Test("funcptr_global_before_value", t521R5TargetValue, 52);
+    result &= Test("funcptr_global_before_target", t521R5TargetSelected, 2);
+    result &= Test("funcptr_global_before_dtor", t521TempDtors, 1);
+
+    t521TempDtors = 0;
+    t521R5TargetValue = 0;
+    t521R5TargetSelected = 0;
+    t521R5AfterSetB();
+    g_t521R5After(&(new T521Temp(61))->value);
+    t521R5AfterSetA();
+    result &= Test("funcptr_global_after_value", t521R5TargetValue, 62);
+    result &= Test("funcptr_global_after_target", t521R5TargetSelected, 2);
+    result &= Test("funcptr_global_after_dtor", t521TempDtors, 1);
+
+    t521TempDtors = 0;
+    t521R5TargetValue = 0;
+    t521R5TargetSelected = 0;
+    function<void(int*)> branchFn = t521R5ReaderA;
+    int choose = 1;
+    if (choose > 0) branchFn = t521R5ReaderB;
+    branchFn(&(new T521Temp(71))->value);
+    result &= Test("funcptr_local_ifelse_value", t521R5TargetValue, 72);
+    result &= Test("funcptr_local_ifelse_target", t521R5TargetSelected, 2);
+    result &= Test("funcptr_local_ifelse_dtor", t521TempDtors, 1);
+
+    t521TempDtors = 0;
+    t521TargetValue = 0;
+    t521TargetSelected = 0;
+    g_t521ReadTarget(&(new T521Temp(51))->value);
+    result &= Test("funcptr_global_once_value", t521TargetValue, 51);
+    result &= Test("funcptr_global_once_target", t521TargetSelected, 1);
+    result &= Test("funcptr_global_once_dtor", t521TempDtors, 1);
+
+    t521TempDtors = 0;
+    t521TargetValue = 0;
+    t521TargetSelected = 0;
+    function<void(int*)> f = t521LocalReadTargetA;
+    for (int i = 0; i < 2; i++)
+    {
+        f(&(new T521Temp(60 + i))->value);
+        f = t521LocalReadTargetB;
+    }
+    result &= Test("funcptr_local_targets_value", t521TargetValue, 61);
+    result &= Test("funcptr_local_targets_selected", t521TargetSelected, 3);
+    result &= Test("funcptr_local_targets_dtors", t521TempDtors, 2);
+    return result;
+}
+
+void t521R5AfterSetB() { g_t521R5After = t521R5ReaderB; }
+void t521R5AfterSetA() { g_t521R5After = t521R5ReaderA; }
+
+bool testT521StatementTempCalls()
+{
+    t521TempDtors = 0;
+    {
+        T521Temp local = T521Temp(41);
+        cflat521_keep(&local.value);
+        if (cflat521_get() != &local.value || *cflat521_get() != 41
+            || t521TempDtors != 0) return false;
+    }
+    if (t521TempDtors != 1) return false;
+
+    t521TempDtors = 0;
+    {
+        T521Temp local = T521Temp(42);
+        if (cflat521_read(&local.value) != 42 || cflat521_read_fn(&local.value) != 42
+            || t521TempDtors != 0) return false;
+    }
+    if (t521TempDtors != 1) return false;
+
+    t521TempDtors = 0;
+    int value = t521CflatReadOnly(&(new T521Temp(43))->value);
+    return value == 43 && t521TempDtors == 1;
+}
+
+int t521CflatReadOnly(int* value) { return *value; }
 
 int fooInt = 0;
 double fooDouble;
@@ -884,6 +998,8 @@ extern int main(int argc, char** argv)
     testEmptyFunction();
     testEmptyIfStatement();
     testPointers();
+    result &= Test("statement_temp_call_ownership", testT521StatementTempCalls(), true);
+    result &= Test("function_pointer_target_sets", testT521FunctionPointerTargetSets(), true);
     result &= Test("testConditional", testConditional(), 11);
     result &= Test("testIfElseStatement", testIfElseStatement(), 11);
     result &= Test("myWhileLoopNotEnter", myWhileLoopNotEnter(), 0);

@@ -3652,3 +3652,44 @@ silent UAF never acceptable). Per-item detail and probes (scratch/rulings1024/) 
 - FYI items (T426 .borrow reading, T447 alias gap, alias-return item 3 hold, reverse member destruction, T443 part 2) stand as ruled on 2026-10-24.
 - Second round, same day (scan of remaining "needs ruling" files): `p2/iface-return-dangle-via-calls-aggregates-and-rebinds` (R17): Rust lifetime elision - a non-owning call result borrows from every pointer argument + receiver unless the callee summary proves fresh/global/param N; heap aggregate carrying a frame alias is refused the same way. `p3/self-pointer-struct-return-not-in-place`: C++ guaranteed elision - every ctor- or dtor-bearing native struct is returned via sret and `new`-constructed in place; plan first. `p3/returned-pointer-from-call-result-field-temp-dangles` item 1: REFUSE a temp-field pointer passed to a callee that may store it in an outliving arm (mixed-select legs -> err_, both-local stays). `p3/cpp-header-unreferenced-global-initializers-skipped`: follow clang, run every harvested header global's dynamic initializer, budget-gated.
 
+
+## Rulings 2026-10-27: main-session sweep of the box-4 leftovers (maintainer may veto any line)
+Ruled from existing direction (bucket table 2026-10-21, "refuse first, refine later", C/C++ meaning where CFlat has no
+safety reason to differ, Rust elision precedent of T522, a frozen accept-set changes only by deliberate ruling).
+Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintainer_questions_2026-10-27.md.
+- R7 `p2/statement-temp-escapes-via-out-param-or-global` (T521): CONVERT the accepted leg Test/test_collection_leaks.cb:1021
+  (`rkIndCallI`: `&(new PtrLeak())->v` into a `function<>` callee) to an err_ leg with the T521 r2 text "cannot pass an
+  owning statement temporary to a callee whose retention cannot be proven". Same policy as T522: unprovable callee
+  (C, `function<>`, fn pointer) fails closed; the escape is the one-line rebind the message names. Condition: the
+  refusal fires on that leg ONLY - every other test_collection_leaks leg and the suite stay green, and the C-callee
+  UAF + fn<> leak shapes become located errors (p2 -> closed by bucket rule B). Unparked for Luna.
+- R16 `p2/delete-borrow-via-named-local`: CONVERT the accepted leg Test/test_list_ownership.cb helperDepth1 ->
+  helperDepth2 ("two-level helper stores"). Measured on master: the ONE-level shape `helperStores(&l, p)` and the
+  global shapes are already refused with "'p' still owns the object it was given ... stored element would dangle"
+  (scratch/rulings_1027/r16_a..d.cb); the two-level explicit-pointer shape is the only accepted one and only because
+  T507 froze it. Consistency wins: the fix propagates "param N stored into param M's container" through the chain
+  using the T522 summary, and the leg becomes an err_ leg (the `helperStoresMove` / `unique T*` spellings next to it
+  are the accepted replacements). No delete-time rule changes. Unparked.
+- R21 `p2/string-copy-through-pointer-subscript`: NO runtime provenance. A `string` read through a `string*` subscript
+  whose slot provenance is not proven at compile time (global base, implicit-this / `this->` field base, unproven
+  `(*pp)[i]`) COPIES, as `std::string t = g[0]` does in C++ and as Rust refuses the move. Adoption stays an
+  optimization for the proven raw-new shapes T413 already accepts. The leak this leaves in raw-new cases (p02, p04)
+  is the raw `delete[]` of a `string*` array skipping element destructors, which is the real defect there and belongs to
+  the raw-array desugar direction (2026-09-03), not to this row; file it as p3 at landing. Changed alloc/free counts
+  (p08) are expected and the expectation is updated. Confirm before unparking (design line; see the veto list).
+- Enum members are writable (`Band.High = 5`, `Band.High++`, `&Band.High` all compile and change the runtime value):
+  a bug, p3 (safe but wrong; no idiomatic program assigns to an enumerator). An enumerator is an rvalue constant as in
+  C/C++: refuse assignment, increment and address-of with a located error. Filed p3/enum-member-assignable.
+- A SECOND bare file-scope `expect_error(...)` is never verified: the first arm is checked, a later arm whose message
+  never appears still exits 0 (scratch/rulings_1027/two_expect_b.cb). Parser-level arms are unaffected (the
+  reserved-word fixture still fails on a bogus message). No in-tree fixture is vacuous today; the hole bites the next
+  one. p3, harness: every bare file-scope arm is verified when the next arm is set or at module end. Filed
+  p3/expect-error-second-bare-file-scope-arm-unverified.
+- trivial_abi by-value double destroy ("1702 2" vs clang "1702 12"): NOT reproduced on master 8ef3d45a9 in six shapes
+  (scoped local, unscoped, read-after-call, by-value param forward, `move x`, copied local; JIT and AOT all match
+  clang; scratch/rulings_1027/ta*.cb). The r6 repro left with the t518 worktree. Not filed until a repro exists.
+- LLVMBackend_CInterop.cpp:3288 matches `__closure_fat_ptr.dtor` by prefix: tighten to the T529 exact-name + numeric
+  `.N` rule by sharing IsClosureHelperName (move it to a header). p3, one change, no new test file; a leg in an existing
+  closure fixture with a user `_closure_fat_ptr` namespace covers it. Filed p3/closure-dtor-prefix-match-in-cinterop.
+- 2026-10-27 maintainer: "Confirm all" - every line above stands as ruled, R21 included (copy on unproven read, no
+  runtime provenance). R7, R16 and R21 are unparked; the veto list is closed.

@@ -19,6 +19,24 @@ static CFlatParser::PostfixExpressionContext* DirectPostfixArgument(
     return nullptr;
 }
 
+static bool IsCompileTimeMutationExpression(antlr4::tree::ParseTree* node)
+{
+    for (; node; node = node->parent)
+    {
+        if (dynamic_cast<CFlatParser::ConstantExpressionContext*>(node)) return true;
+        auto* expression = dynamic_cast<CFlatParser::ExpressionContext*>(node);
+        if (!expression) continue;
+        auto* parent = dynamic_cast<antlr4::RuleContext*>(expression->parent);
+        if (auto* selection = dynamic_cast<CFlatParser::SelectionStatementContext*>(parent))
+            if (selection->Const()) return true;
+        if (dynamic_cast<CFlatParser::IfConstDeclarationContext*>(parent)
+            || dynamic_cast<CFlatParser::IfConstMemberContext*>(parent)
+            || dynamic_cast<CFlatParser::IfConstInterfaceMemberContext*>(parent))
+            return true;
+    }
+    return false;
+}
+
 struct DirectViewCallArgumentScope
 {
     const CFlatParser::PostfixExpressionContext*& slot;
@@ -737,15 +755,6 @@ static bool LocalPointerVariableValues(const llvm::AllocaInst* variable,
 
 // Closure copy and destroy helpers never keep the fat pointer: copy returns a fresh owned one,
 // which the caller tracks as a pass-through.
-// Exact name or a numeric ".N" rename (__closure_fat_ptr.copy.2); a user `_closure_fat_ptr` namespace
-// mangles to `__closure_fat_ptr.copyX$...` and must not match.
-static bool IsClosureHelperName(llvm::StringRef name, llvm::StringRef base)
-{
-    if (!name.consume_front(base)) return false;
-    if (name.empty()) return true;
-    return name.consume_front(".") && !name.empty() && name.find_first_not_of("0123456789") == llvm::StringRef::npos;
-}
-
 static bool IsClosureRuntimeHelper(const llvm::Function* function)
 {
     const llvm::StringRef name = function->getName();
@@ -4013,6 +4022,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     }
                     case CFlatParser::PlusPlus:
                     {
+                        llvm::Value* enumMemberStorage = namedVar.Storage != nullptr
+                            ? namedVar.Storage : parenthesizedPostfixStorage;
+                        const llvm::GlobalVariable* enumMemberGlobal = nullptr;
+                        if (Compiler(ctx)->IsEnumMemberStorage(enumMemberStorage, &enumMemberGlobal)
+                            && !IsCompileTimeMutationExpression(ctx))
+                            LogErrorContext(ctx, std::format("cannot assign to enum member '{}'",
+                                EnumMemberDiagnosticName(namedVar, ctx, enumMemberGlobal)));
                         if (ApplyStructPostfixOperator("operator++"))
                             break;
                         if (namedVar.IsCxxMacroGlobal || namedVar.IsCxxMacroJoin)
@@ -4091,6 +4107,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     }
                     case CFlatParser::MinusMinus:
                     {
+                        llvm::Value* enumMemberStorage = namedVar.Storage != nullptr
+                            ? namedVar.Storage : parenthesizedPostfixStorage;
+                        const llvm::GlobalVariable* enumMemberGlobal = nullptr;
+                        if (Compiler(ctx)->IsEnumMemberStorage(enumMemberStorage, &enumMemberGlobal)
+                            && !IsCompileTimeMutationExpression(ctx))
+                            LogErrorContext(ctx, std::format("cannot assign to enum member '{}'",
+                                EnumMemberDiagnosticName(namedVar, ctx, enumMemberGlobal)));
                         if (ApplyStructPostfixOperator("operator--"))
                             break;
                         if (namedVar.IsCxxMacroGlobal || namedVar.IsCxxMacroJoin)
@@ -9458,8 +9481,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     std::move(Compiler(ctx)->moveTransferConsumedTemps_);
                                 Compiler(ctx)->moveTransferConsumedTemps_.clear();
                                 callArgumentPostfix.Flush();
+                                const llvm::Function* retentionTarget =
+                                    Compiler(ctx)->FunctionPointerTargetFromStorage(namedVar.Storage);
                                 auto result = Compiler(ctx)->CreateIndirectCall(
-                                    funcPtrTV, funcPtr, callArgs, &argNVs, &rawArrayCounts);
+                                    funcPtrTV, funcPtr, callArgs, &argNVs, &rawArrayCounts,
+                                    retentionTarget, funcPtrTV.IsThinFnPtr(), namedVar.Storage);
                                 RecordPendingCallResult(callParen, result);
                                 // The result keeps the function type's return pointee const.
                                 if (result != nullptr && result->getType()->isPointerTy()

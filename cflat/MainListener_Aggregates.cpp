@@ -1051,6 +1051,16 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         {
             structName = baseName;
         }
+        // Mid-definition marker: nested flushes below must not drain a pointer-only record that
+        // names this struct, since its destructor and methods are not registered yet.
+        struct BeingDefinedScope
+        {
+            std::unordered_set<std::string>& names;
+            std::string name;
+            bool owned;
+            ~BeingDefinedScope() { if (owned) names.erase(name); }
+        } beingDefined{ compiler->gts.structsBeingDefined, structName,
+            compiler->gts.structsBeingDefined.insert(structName).second };
         if (compiler->TrackAggregateDefinitionSite(structName, DefinitionSiteText(compiler, ctx),
                 ctx->genericTypeParameters() != nullptr))
             LogErrorContext(ctx, std::format("redefinition of '{}'", baseName));
@@ -5009,6 +5019,16 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         {
             structName = baseName;
         }
+        // Mid-definition marker, as in ParseStructDefinition: nested flushes must not drain a
+        // pointer-only record that names this class while its body is still being parsed.
+        struct BeingDefinedScope
+        {
+            std::unordered_set<std::string>& names;
+            std::string name;
+            bool owned;
+            ~BeingDefinedScope() { if (owned) names.erase(name); }
+        } beingDefined{ compiler->gts.structsBeingDefined, structName,
+            compiler->gts.structsBeingDefined.insert(structName).second };
         if (compiler->TrackAggregateDefinitionSite(structName, DefinitionSiteText(compiler, ctx),
                 ctx->genericTypeParameters() != nullptr))
             LogErrorContext(ctx, std::format("redefinition of '{}'", baseName));

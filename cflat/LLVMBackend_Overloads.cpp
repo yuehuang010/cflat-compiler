@@ -10694,7 +10694,13 @@ void LLVMBackend::RejectOwningLocalIntoBorrowingHelper(const std::string& functi
                     ? activeExpectScope_ : 0 });
             return;
         }
-        if (!sinkSummary.ReachesSink()) return;
+        if (!sinkSummary.ReachesSink())
+        {
+            if (sinkSummary.BudgetExhausted)
+                ReportBorrowingHelperDepthLimit(SpellFunctionSymbol(*this, functionName),
+                    callee.Parameters[paramIndex].VariableName, arg.CallerName);
+            return;
+        }
         LogErrorMessage(
             "call to '{}': '{}' still owns the object it was given, and the helper parameter '{}' "
             "stores it into a container that only BORROWS its elements and never frees them, so "

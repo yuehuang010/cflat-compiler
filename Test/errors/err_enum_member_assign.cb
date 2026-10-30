@@ -1,0 +1,164 @@
+import "manifest.cb";
+import "c_keyword_typedefs.h";
+import cpp "cpp_interop_scoped_enum.h";
+
+enum Band : int { Low = 1, High = 2 };
+namespace ns { enum Band : int { High = 3 }; }
+using BandAlias = Band;
+
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignPlain() { Band.High = 5; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignMultiply() { Band.High *= 2; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignDivide() { Band.High /= 2; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignModulo() { Band.High %= 2; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignAdd() { Band.High += 2; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignSubtract() { Band.High -= 2; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignLeftShift() { Band.High <<= 1; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignRightShift() { Band.High >>= 1; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignAnd() { Band.High &= 1; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignXor() { Band.High ^= 1; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignOr() { Band.High |= 1; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumAssignCoalesce() { Band.High ??= 1; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumIncrement() { Band.High++; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumParenthesizedIncrement() { (Band.High)++; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumDecrement() { Band.High--; return 0; }
+}
+expect_error("cannot take the address of enum member 'Band.High'") {
+    int enumAddress() { int* value = &Band.High; return 0; }
+}
+expect_error("cannot take the address of enum member 'Band.High'") {
+    int enumParenthesizedAddress() { int* value = &(Band.High); return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumParenthesizedAssign() { (Band.High) = 5; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumLargerExpression() { int result = (Band.High = 5) + 3; return result; }
+}
+expect_error("cannot take the address of enum member 'Band.High'") {
+    int enumPointerArgument() { return enumReadPointer(&Band.High); }
+    int enumReadPointer(int* value) { return *value; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumGlobalInitializer = (Band.High = 5);
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumGenericWrite<T>(T value) { Band.High = (int)value; return 0; }
+    int enumGenericCall() { return enumGenericWrite<int>(1); }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumLambdaWrite() {
+        function<int()> write = () => { Band.High = 5; return 0; };
+        return write();
+    }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    struct EnumWriteMethod { int write() { Band.High = 5; return 0; } };
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumIfConstWrite() {
+        if const (Band.High == 2) { Band.High = 5; }
+        return 0;
+    }
+}
+expect_error("cannot assign to enum member 'ns.Band.High'") {
+    int enumNamespaceWrite() { ns.Band.High = 5; return 0; }
+}
+expect_error("cannot assign to enum member 'BandAlias.High'") {
+    int enumAliasWrite() { BandAlias.High = 5; return 0; }
+}
+expect_error("cannot assign to enum member 'global::Band.High'") {
+    int enumGlobalScopeWrite() { global::Band.High = 5; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumLocalShadowWrite() {
+        enum Band : int { High = 3 };
+        Band.High = 5;
+        return 0;
+    }
+}
+expect_error("cannot assign to enum member 'ExecutionLevel.requireAdministrator'") {
+    int enumImportedCflatWrite() { ExecutionLevel.requireAdministrator = 5; return 0; }
+}
+expect_error("cannot assign to enum member 'KW_BA'") {
+    int enumImportedCWrite() { KW_BA = 5; return 0; }
+}
+expect_error("cannot take the address of enum member 'KW_BA'") {
+    int enumImportedCAddress() { i64* value = &KW_BA; return 0; }
+}
+expect_error("cannot assign to enum member 'KW_BA'") {
+    int enumImportedCIncrement() { KW_BA--; return 0; }
+}
+expect_error("cannot assign to enum member 'cppi_scope.A.x'") {
+    int enumImportedCppWrite() { cppi_scope.A.x = cppi_scope.A.x; return 0; }
+}
+expect_error("cannot take the address of enum member 'cppi_scope.A.x'") {
+    int enumImportedCppAddress() { cppi_scope.A* value = &cppi_scope.A.x; return 0; }
+}
+expect_error("cannot assign to enum member 'cppi_scope.A.x'") {
+    int enumImportedCppIncrement() { cppi_scope.A.x++; return 0; }
+}
+expect_error("cannot assign to enum member 'cppi_scope.A.x'") {
+    int enumImportedCppDecrement() { cppi_scope.A.x--; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumTernaryAssign() { bool f = true; (f ? Band.High : Band.Low) = 9; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumTernaryCompoundAssign() { bool f = true; (f ? Band.High : Band.Low) += 4; return 0; }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumTernaryIncrement() { bool f = true; (f ? Band.High : Band.Low)++; return 0; }
+}
+expect_error("cannot take the address of enum member 'Band.High'") {
+    int enumTernaryAddress() {
+        bool f = true;
+        int* value = &(f ? Band.High : Band.Low);
+        *value = 8;
+        return 0;
+    }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumNestedTernaryAssign() {
+        bool f = true, g = true;
+        (f ? (g ? Band.High : Band.Low) : Band.Low) = 9;
+        return 0;
+    }
+}
+expect_error("cannot assign to enum member 'Band.High'") {
+    int enumMixedTernaryAssign() {
+        bool f = true;
+        int localInt = 4;
+        (f ? localInt : Band.High) = 9;
+        return 0;
+    }
+}
+

@@ -467,6 +467,173 @@ int t413ReadCalleeBorrow()
     string t = (*pp)[0];
     return t.length();
 }
+// R21 (ruling 2026-10-27): a string read through a string* subscript whose base slot is a global,
+// an implicit-this field or a closure capture has no proven provenance, so it copies.
+string* r21G = nullptr;
+static string* r21StaticG = nullptr;
+namespace R21Ns { string* g = nullptr; }
+int r21Pick = 1;
+int r21ReadGlobal() { string s = t413MakeString(); r21G = &s; string t = r21G[0]; return t.length(); }
+void r21SetRawUncalled() { r21G = new string[2]; }
+int r21ReadGlobalRawSetterUncalled()
+{
+    string s = t413MakeString();
+    r21G = &s;
+    string t = r21G[0];
+    return t.length();
+}
+int r21ReadGlobalSelected()
+{
+    string a = t413MakeString();
+    string b = t413MakeString();
+    r21G = r21Pick != 0 ? &a : &b;
+    string t = r21G[0];
+    return t.length();
+}
+void r21Rebind(string* p) { r21G = p; }
+int r21ReadGlobalCalleeRebind() { string s = t413MakeString(); r21Rebind(&s); string t = r21G[0]; return t.length(); }
+int r21ReadStaticGlobal() { string s = t413MakeString(); r21StaticG = &s; string t = r21StaticG[0]; return t.length(); }
+int r21ReadNsGlobal() { string s = t413MakeString(); R21Ns.g = &s; string t = R21Ns.g[0]; return t.length(); }
+int r21ReadParenGlobal() { string s = t413MakeString(); r21G = &s; string t = (r21G)[0]; return t.length(); }
+int r21ReadGlobalIndex1()
+{
+    string[2] items = default;
+    items[0] = t413MakeString();
+    items[1] = t413MakeString();
+    r21G = &items[0];
+    string t = r21G[1];
+    return t.length();
+}
+int r21ReadGlobalAuto() { string s = t413MakeString(); r21G = &s; auto t = r21G[0]; return t.length(); }
+int r21AssignGlobal()
+{
+    string s = t413MakeString();
+    r21G = &s;
+    string t = "old".copy();
+    t = r21G[0];
+    return t.length();
+}
+int r21AssignNsGlobal()
+{
+    string s = t413MakeString();
+    R21Ns.g = &s;
+    string t = "old".copy();
+    t = R21Ns.g[0];
+    return t.length();
+}
+struct R21Named { string name = default; };
+int r21GlobalIntoField() { string s = t413MakeString(); r21G = &s; R21Named n = default; n.name = r21G[0]; return n.name.length(); }
+int r21NsGlobalIntoField() { string s = t413MakeString(); R21Ns.g = &s; R21Named n = default; n.name = R21Ns.g[0]; return n.name.length(); }
+int r21GenericReadGlobal<T>(T unused) { string t = r21G[0]; return t.length(); }
+int r21ReadGlobalInGeneric() { string s = t413MakeString(); r21G = &s; return r21GenericReadGlobal<int>(1); }
+struct R21Holder
+{
+    string* gq = default;
+    int readImplicit() { string t = gq[0]; return t.length(); }
+    int readThis() { string t = this->gq[0]; return t.length(); }
+    int assignImplicit() { string t = "old".copy(); t = gq[0]; return t.length(); }
+};
+int r21ReadImplicitThis() { string s = t413MakeString(); R21Holder h = default; h.gq = &s; return h.readImplicit(); }
+int r21ReadExplicitThis() { string s = t413MakeString(); R21Holder h = default; h.gq = &s; return h.readThis(); }
+int r21AssignImplicitThis() { string s = t413MakeString(); R21Holder h = default; h.gq = &s; return h.assignImplicit(); }
+struct R21GenericHolder<T> { string* gq = default; T tag = default; int read() { string t = gq[0]; return t.length(); } };
+int r21ReadGenericHolder() { string s = t413MakeString(); R21GenericHolder<int> h = default; h.gq = &s; return h.read(); }
+int r21ReadCapture()
+{
+    string s = t413MakeString();
+    string* p = &s;
+    Lambda<int()> f = () => { string t = p[0]; return t.length(); };
+    return f();
+}
+bool r21Clean(function<int()> body, u64 allocations)
+{
+    u64 before = HeapAudit.reportLeaks();
+    t392AuditAllocations = 0; t392AuditFrees = 0;
+    __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+    int value = body();
+    __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+    return HeapAudit.reportLeaks() == before && value == 46
+        && t392AuditAllocations == allocations && t392AuditFrees == allocations;
+}
+
+string r22MakeString() { return "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy(); }
+int r22Length(string value) { return value.length(); }
+struct R22Inner { string value = default; };
+struct R22Box
+{
+    string name = default;
+    string other = default;
+    string storage = default;
+    string? nullable = nullptr;
+    R22Inner inner = default;
+    list<string> values = default;
+    int readImplicit() { string t = name; return t.length() + name.length(); }
+    int readAuto() { auto t = name; return t.length() + name.length(); }
+    int assignImplicit() { string t = "old".copy(); t = name; return t.length() + name.length(); }
+    int argImplicit() { return r22Length(name) + name.length(); }
+    string returnImplicit() { return name; }
+    int braceImplicit() { R22Inner t = { value = name }; return t.value.length() + name.length(); }
+    int addImplicit() { values.add(name); return values[0].length() + name.length(); }
+    int ternaryImplicit() { string other = "other".copy(); string t = true ? name : other; return t.length() + name.length(); }
+    int plusImplicit() { string t = name + "x"; return t.length() + name.length(); }
+    int explicitThis() { string t = this->name; return t.length() + name.length(); }
+    int explicitAssign() { string t = "old".copy(); t = this->name; return t.length() + name.length(); }
+    int implicitFieldReassign() { string t = default; t = name; t = "q".copy(); return t.length() + name.length(); }
+    int explicitFieldReassign() { string t = default; t = this->name; t = "q".copy(); return t.length() + this->name.length(); }
+    int fieldStoreImplicit() { other = name; return other.length() + name.length(); }
+    int fieldStoreExplicit() { other = this->name; return other.length() + name.length(); }
+    int lambdaImplicit() { Lambda<int()> f = () => { string t = name; return t.length(); }; return f() + name.length(); }
+    int copyInner() { R22Inner t = inner; return t.value.length() + inner.value.length(); }
+    int copyList() { list<string> t = values; return t.count() + values.count() * 10; }
+    int indexImplicit() { string t = values[0]; return t.length(); }
+    int indexAssignImplicit() { string t = "o".copy(); t = values[0]; return t.length(); }
+    int derefNullable() { string t = *nullable; return t.length() + storage.length(); }
+    int localShadow() { string name = r22MakeString(); string t = name; return t.length(); }
+    int parameterShadow(string name) { string t = name; return t.length(); }
+};
+struct R22Generic<T> { T name = default; int read() { string t = name; return t.length() + name.length(); } };
+
+int r22DeclCase() { R22Box h = default; h.name = r22MakeString(); return h.readImplicit(); }
+int r22AutoCase() { R22Box h = default; h.name = r22MakeString(); return h.readAuto(); }
+int r22AssignCase() { R22Box h = default; h.name = r22MakeString(); return h.assignImplicit(); }
+int r22ArgCase() { R22Box h = default; h.name = r22MakeString(); return h.argImplicit(); }
+int r22ReturnCase() { R22Box h = default; h.name = r22MakeString(); string t = h.returnImplicit(); return t.length() + h.name.length(); }
+int r22BraceCase() { R22Box h = default; h.name = r22MakeString(); return h.braceImplicit(); }
+int r22AddCase() { R22Box h = default; h.name = r22MakeString(); return h.addImplicit(); }
+int r22TernaryCase() { R22Box h = default; h.name = r22MakeString(); return h.ternaryImplicit(); }
+int r22PlusCase() { R22Box h = default; h.name = r22MakeString(); return h.plusImplicit(); }
+int r22LambdaCase() { R22Box h = default; h.name = r22MakeString(); return h.lambdaImplicit(); }
+int r22ExplicitCase() { R22Box h = default; h.name = r22MakeString(); return h.explicitThis(); }
+int r22ExplicitAssignCase() { R22Box h = default; h.name = r22MakeString(); return h.explicitAssign(); }
+int r22FieldStoreCase() { R22Box h = default; h.name = r22MakeString(); return h.fieldStoreImplicit(); }
+int r22FieldStoreExplicitCase() { R22Box h = default; h.name = r22MakeString(); return h.fieldStoreExplicit(); }
+int r22ExternalFieldCase() { R22Box h = default; h.name = r22MakeString(); string t = h.name; return t.length() + h.name.length(); }
+int r22ExternalAssignCase() { R22Box h = default; h.name = r22MakeString(); string t = "old".copy(); t = h.name; return t.length() + h.name.length(); }
+int r22ImplicitFieldReassignCase() { R22Box h = default; h.name = r22MakeString(); return h.implicitFieldReassign(); }
+int r22ExplicitFieldReassignCase() { R22Box h = default; h.name = r22MakeString(); return h.explicitFieldReassign(); }
+int r22ExternalFieldReassignCase() { R22Box h = default; h.name = r22MakeString(); string t = default; t = h.name; t = "q".copy(); return t.length() + h.name.length(); }
+int r22InnerCase() { R22Box h = default; h.inner.value = r22MakeString(); return h.copyInner(); }
+int r22ListCase() { R22Box h = default; h.values.add(r22MakeString()); return h.copyList(); }
+int r22ListIndexDeclCase() { R22Box h = default; h.values.add(r22MakeString()); return h.indexImplicit(); }
+int r22ListIndexAssignCase() { R22Box h = default; h.values.add(r22MakeString()); return h.indexAssignImplicit(); }
+int r22NullableCase() { R22Box h = default; h.storage = r22MakeString(); h.nullable = &h.storage; return h.derefNullable(); }
+int r22ValueReceiverCase() { R22Box h = default; h.name = r22MakeString(); return h.readImplicit(); }
+int r22PointerReceiverCase() { R22Box h = default; h.name = r22MakeString(); R22Box* p = &h; return p->readImplicit(); }
+int r22GenericCase() { R22Generic<string> h = default; h.name = r22MakeString(); return h.read(); }
+int r22LocalShadowCase() { R22Box h = default; h.name = r22MakeString(); return h.localShadow(); }
+int r22ParameterShadowCase() { R22Box h = default; h.name = r22MakeString(); return h.parameterShadow(r22MakeString()); }
+
+bool r22Clean(function<int()> body, int expectedValue, u64 allocations)
+{
+    u64 before = HeapAudit.reportLeaks();
+    t392AuditAllocations = 0; t392AuditFrees = 0;
+    __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+    int value = body();
+    __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+    return HeapAudit.reportLeaks() == before && value == expectedValue
+        && t392AuditAllocations == allocations && t392AuditFrees == allocations;
+}
+
 void* t359SelfAssignBuffer = nullptr;
 u64 t359SelfAssignAllocations = 0;
 u64 t359SelfAssignFrees = 0;
@@ -1013,12 +1180,6 @@ int g_rkIZero = 0;
 // T237: the arms are interior pointers (&(new PtrLeak())->v) so the arm temp is a pointer temp the
 // return flush frees. v is the first field, so (PtrLeak*) of the arm is the object to delete.
 // (An object-pointer arm is not freed by the return flush on any build: no leg for it.)
-// Indirect (function<>) callee, struct result: the ABI coerces it to {i64, i64}, which hides the
-// pointer from the return walk, so the arm must be kept for the caller.
-struct RkWrapI { int* p = nullptr; int k = 0; };
-RkWrapI rkWrapLateI(int* p) { RkWrapI r; *p = 18; r.p = p; r.k = 18; return r; }
-function<RkWrapI(int*)> g_rkWrapFn = rkWrapLateI;
-RkWrapI rkIndCallI(int c) { return g_rkWrapFn(c > 0 ? &(new PtrLeak())->v : &g_rkIZero); }
 // The callee is defined BEFORE its caller and parks the argument in a global it returns.
 int* g_rkEarlyI = nullptr;
 int* rkGlobEarlyI(int* p) { g_rkEarlyI = p; *p = 41; return g_rkEarlyI; }
@@ -2157,6 +2318,59 @@ extern int main()
             && t392AuditAllocations == 2u && t392AuditFrees == 2u;
         total++; passed += Test("t413_raw_new_name_collision_no_copy", clean, true);
     }
+    // R21: each read copies; pre-fix each adopted the element and double-freed (rc 133).
+    // Allocation count = sources + one copy (+1 for "old" in assignment legs).
+    total++; passed += Test("r21_global_copy", r21Clean(r21ReadGlobal, 2u), true);
+    total++; passed += Test("r21_global_raw_setter_uncalled_copy", r21Clean(r21ReadGlobalRawSetterUncalled, 2u), true);
+    total++; passed += Test("r21_global_selected_copy", r21Clean(r21ReadGlobalSelected, 3u), true);
+    total++; passed += Test("r21_global_callee_rebind_copy", r21Clean(r21ReadGlobalCalleeRebind, 2u), true);
+    total++; passed += Test("r21_static_global_copy", r21Clean(r21ReadStaticGlobal, 2u), true);
+    total++; passed += Test("r21_ns_global_copy", r21Clean(r21ReadNsGlobal, 2u), true);
+    total++; passed += Test("r21_paren_global_copy", r21Clean(r21ReadParenGlobal, 2u), true);
+    total++; passed += Test("r21_global_index1_copy", r21Clean(r21ReadGlobalIndex1, 3u), true);
+    total++; passed += Test("r21_global_auto_copy", r21Clean(r21ReadGlobalAuto, 2u), true);
+    total++; passed += Test("r21_assign_global_copy", r21Clean(r21AssignGlobal, 3u), true);
+    total++; passed += Test("r21_assign_ns_global_copy", r21Clean(r21AssignNsGlobal, 3u), true);
+    total++; passed += Test("r21_global_into_field_copy", r21Clean(r21GlobalIntoField, 2u), true);
+    total++; passed += Test("r21_ns_global_into_field_copy", r21Clean(r21NsGlobalIntoField, 2u), true);
+    total++; passed += Test("r21_global_in_generic_copy", r21Clean(r21ReadGlobalInGeneric, 2u), true);
+    total++; passed += Test("r21_implicit_this_copy", r21Clean(r21ReadImplicitThis, 2u), true);
+    total++; passed += Test("r21_assign_implicit_this_copy", r21Clean(r21AssignImplicitThis, 3u), true);
+    total++; passed += Test("r21_generic_holder_concrete_copy", r21Clean(r21ReadGenericHolder, 2u), true);
+    total++; passed += Test("r21_capture_copy", r21Clean(r21ReadCapture, 3u), true);
+    // Accept: `this->gq[0]` already copied on master (field-path borrow taint); must stay a copy.
+    total++; passed += Test("r21_explicit_this_copy", r21Clean(r21ReadExplicitThis, 2u), true);
+    // R22: bare reads must retain the field provenance used by explicit member access.
+    total++; passed += Test("r22_implicit_declaration_copy", r22Clean(r22DeclCase, 92, 2u), true);
+    total++; passed += Test("r22_implicit_auto_copy", r22Clean(r22AutoCase, 92, 2u), true);
+    total++; passed += Test("r22_implicit_assignment_borrow", r22Clean(r22AssignCase, 92, 2u), true);
+    total++; passed += Test("r22_implicit_list_index_declaration", r22Clean(r22ListIndexDeclCase, 46, 2u), true);
+    total++; passed += Test("r22_implicit_list_index_assignment", r22Clean(r22ListIndexAssignCase, 46, 3u), true);
+    total++; passed += Test("r22_reassign_implicit_field", r22Clean(r22ImplicitFieldReassignCase, 47, 2u), true);
+    total++; passed += Test("r22_reassign_explicit_this_field", r22Clean(r22ExplicitFieldReassignCase, 47, 2u), true);
+    total++; passed += Test("r22_reassign_external_field", r22Clean(r22ExternalFieldReassignCase, 47, 2u), true);
+    total++; passed += Test("r22_value_receiver_copy", r22Clean(r22ValueReceiverCase, 92, 2u), true);
+    total++; passed += Test("r22_pointer_receiver_copy", r22Clean(r22PointerReceiverCase, 92, 2u), true);
+    total++; passed += Test("r22_generic_string_field_copy", r22Clean(r22GenericCase, 92, 2u), true);
+    total++; passed += Test("r22_lambda_implicit_this_copy", r22Clean(r22LambdaCase, 92, 3u), true);
+    // Accept-set: existing spellings and adjacent consumers keep their independently measured values/counts.
+    total++; passed += Test("r22_explicit_this_accept", r22Clean(r22ExplicitCase, 92, 2u), true);
+    total++; passed += Test("r22_explicit_this_assignment_accept", r22Clean(r22ExplicitAssignCase, 92, 2u), true);
+    total++; passed += Test("r22_field_store_implicit_accept", r22Clean(r22FieldStoreCase, 92, 2u), true);
+    total++; passed += Test("r22_field_store_explicit_accept", r22Clean(r22FieldStoreExplicitCase, 92, 2u), true);
+    total++; passed += Test("r22_external_field_accept", r22Clean(r22ExternalFieldCase, 92, 2u), true);
+    total++; passed += Test("r22_external_field_assignment_accept", r22Clean(r22ExternalAssignCase, 92, 2u), true);
+    total++; passed += Test("r22_by_value_argument_accept", r22Clean(r22ArgCase, 92, 1u), true);
+    total++; passed += Test("r22_return_field_accept", r22Clean(r22ReturnCase, 92, 1u), true);
+    total++; passed += Test("r22_brace_field_accept", r22Clean(r22BraceCase, 92, 2u), true);
+    total++; passed += Test("r22_list_add_field_accept", r22Clean(r22AddCase, 92, 2u), true);
+    total++; passed += Test("r22_ternary_field_accept", r22Clean(r22TernaryCase, 92, 3u), true);
+    total++; passed += Test("r22_compound_plus_accept", r22Clean(r22PlusCase, 93, 2u), true);
+    total++; passed += Test("r22_nested_struct_field_accept", r22Clean(r22InnerCase, 92, 2u), true);
+    total++; passed += Test("r22_list_string_field_accept", r22Clean(r22ListCase, 11, 2u), true);
+    total++; passed += Test("r22_nullable_pointer_deref_accept", r22Clean(r22NullableCase, 92, 2u), true);
+    total++; passed += Test("r22_local_shadow_accept", r22Clean(r22LocalShadowCase, 46, 3u), true);
+    total++; passed += Test("r22_parameter_shadow_accept", r22Clean(r22ParameterShadowCase, 46, 3u), true);
     {
         u64 before = HeapAudit.reportLeaks();
         int dtorBefore = t352UniqueDtor;
@@ -6318,15 +6532,6 @@ extern int main()
         total++; passed += Test("mutual-recursive later callee: not freed early", g_shapeDtor, 0);
         delete mut;
         total++; passed += Test("mutual-recursive later callee: freed once by caller", g_shapeDtor, 1);
-
-        // T237: indirect callee with a struct result. The caller frees the arm object once.
-        g_shapeDtor = 0;
-        RkWrapI wrapped = rkIndCallI(1);
-        total++; passed += Test("indirect struct callee: value", *wrapped.p, 18);
-        total++; passed += Test("indirect struct callee: not freed early", g_shapeDtor, 0);
-        PtrLeak* wrappedObj = (PtrLeak*)wrapped.p;
-        delete wrappedObj;
-        total++; passed += Test("indirect struct callee: freed once by caller", g_shapeDtor, 1);
 
         // T237: the callee is defined before the caller and returns the arm through a global.
         g_shapeDtor = 0;

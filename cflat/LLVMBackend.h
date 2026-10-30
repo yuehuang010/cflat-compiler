@@ -88,6 +88,7 @@ inline const char* CxxCompactIntegerSpellingToCflat(std::string_view compact)
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <llvm/ADT/DenseSet.h>   // llvm::DenseSet (identity-keyed value ledgers)
+#include <llvm/ADT/StringRef.h>
 #include <llvm/IR/CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
 #include <llvm/Analysis/TargetLibraryInfo.h>  // stdio-safe TLI for ELF codegen (no chk->plain fold)
 #include <llvm/IR/IRBuilder.h>
@@ -150,6 +151,15 @@ void NormalizeForInitTree(CFlatParser& parser, antlr4::tree::ParseTree* root);
 #include "NugetResolver.h"
 #include "LlvmHelpers.h"
 #include "AppResources.h"
+
+// Exact closure helper name or an LLVM numeric rename such as `.1`.
+inline bool IsClosureHelperName(llvm::StringRef name, llvm::StringRef base)
+{
+    if (!name.consume_front(base)) return false;
+    if (name.empty()) return true;
+    return name.consume_front(".") && !name.empty()
+        && name.find_first_not_of("0123456789") == llvm::StringRef::npos;
+}
 
 struct ExpectedErrorReceived {};
 
@@ -311,6 +321,9 @@ struct GenericTemplateState
     std::unordered_set<std::string>                                             instantiatedGenericFunctions;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
     std::vector<PendingInstantiation>                                           pendingInstantiations;
+    // Struct instantiations whose ParseStructDefinition is on the stack. A pointer-only record
+    // naming one waits: its dtor/methods are not registered until that body finishes.
+    std::unordered_set<std::string>                                             structsBeingDefined;
     // Set by the active MainListener: drains a waiting pointer-only instance on its first by-value
     // layout lookup (GetType). Null outside a listener's walk.
     std::function<void(const std::string&)>                                     drainWaitingInstance;
@@ -2632,14 +2645,21 @@ public:
     // Third cycle guard, for ParameterMayReachReturn. Same reason: a key left by either escape
     // walk must never terminate the return walk, which asks a different question again.
     std::set<std::pair<const llvm::Function*, unsigned>> mayReachReturnInProgress_;
+    // Helper-call budget for the borrowing-container summary. Memo + cycle guard already bound
+    // the walk; past this depth the summary fails closed, so keep it far above real chains.
+    static constexpr int kMaxBorrowingSinkDepth = 64;
     // Per-(function, parameter) summary for borrowing-container sinks. Destinations are globals
-    // or caller-supplied method receivers, with the shortest helper-call distance to the sink.
+    // or caller-supplied pointer arguments (receiver or explicit), with the shortest helper-call
+    // distance to the sink.
     struct BorrowingContainerSinkSummary
     {
         std::optional<unsigned> GlobalDepth;
         std::map<unsigned, unsigned> ArgumentDepths;
         bool UnmappedOutlivingDestination = false;
         bool UnresolvedCallee = false;
+        // The helper-call depth budget ran out: not a proven sink, but the caller fails closed
+        // with a separate analysis-limit diagnostic.
+        bool BudgetExhausted = false;
         bool ReachesSink() const
         {
             return GlobalDepth.has_value() || !ArgumentDepths.empty()
@@ -5200,13 +5220,46 @@ private:
     bool suppressErrors_ = false;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
     llvm::Function* expectedErrorScopeFunction_ = nullptr;
-    // Armed before ProcessImports so import-time errors can match. An unmatched expectation
-    // at end of compilation is a did-not-occur failure.
+    // Active file-scope arm; the frame stack retains every arm until its translation unit ends.
     std::string fileScopeExpectedError_;
+    struct FileScopeExpectationFrame
+    {
+        std::vector<std::string> Messages;
+        std::vector<bool> Matched;
+        std::vector<const CFlatParser::ExternalDeclarationContext*> Declarations;
+        size_t SeenDeclarations = 0;
+        size_t ActiveIndex = SIZE_MAX;
+        bool UsesExpectScope = false;
+        size_t ScopeDepth = SIZE_MAX;
+        size_t ActiveScope = 0;
+        std::string ParentExpected;
+        std::string ParentFileScopeExpected;
+        size_t ParentDepth = SIZE_MAX;
+        llvm::Function* ParentFunction = nullptr;
+        size_t ParentScope = 0;
+        DeferredExpectation ParentPosition;
+    };
+    std::vector<FileScopeExpectationFrame> fileScopeExpectationFrames_;
+    size_t fileScopeExpectationTotal_ = 0;
+    size_t fileScopeExpectationRemaining_ = 0;
+    bool processingImports_ = false;
     std::vector<ExpectErrorScopeState> expectErrorStack_;
 
     // Restore the module-level bare expectation after module-end deferred diagnostics.
     void RestoreFileScopeExpectedError();
+    bool BeginFileScopeExpectations(
+        const std::vector<CFlatParser::ExternalDeclarationContext*>& declarations,
+        size_t scopeDepth = SIZE_MAX);
+    bool ShouldFinishFileScopeExpectations() const;
+    void CompleteFileScopeExpectations();
+    bool AdvanceFileScopeExpectation(const CFlatParser::ExternalDeclarationContext* declaration);
+    bool IsActiveFileScopeExpectation() const;
+    bool HandleFileScopeExpectationMatch();
+    void MarkFileScopeExpectationMatched();
+    void MarkFileScopeExpectationProcessed();
+    void EndFileScopeExpectations(bool allowDeferred = false);
+    void PopFileScopeExpectations();
+    [[noreturn]] void FailMissingFileScopeExpectation(const std::string& message);
 
     // Compile-time macros (constant throughout compilation, set early)
     struct CompileTimeMacro
@@ -5647,6 +5700,11 @@ private:
     // True when `value` is a still-unadopted owning-POINTER temp: an owning-RETURN call result or
     // a raw `new` result. Exactly the set RegisterOwnedPtrTemp accepts.
     bool IsOwningPtrTempValue(llvm::Value* value) const;
+    bool ValueContainsOwningPtrTemp(llvm::Value* value) const;
+    void CheckUnprovenOwningPtrTempArgs(const llvm::Function* target,
+                                       llvm::ArrayRef<llvm::Value*> args,
+                                       const std::vector<TypeAndValue>& params,
+                                       bool forceUnknown);
 
     /*
      * Register every owning-pointer ARGUMENT of the just-emitted call whose matching parameter
@@ -5657,7 +5715,8 @@ private:
     void RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult, bool calleeIsCxx = false);
     // A `?:` / `??` arm `new` ledgered while the argument was parsed stays unfreed when the callee
     // keeps the joined argument (or has no body to prove it), same as a bare `new` argument.
-    void DropRetainedJoinArmPtrTemps(llvm::Value* callResult);
+    void DropRetainedJoinArmPtrTemps(llvm::Value* callResult,
+                                     const llvm::Function* retentionTarget = nullptr);
     // Pre-call form for a direct C++ call, so a landing pad of that very call already frees
     // the gated temp on unwind. False (nothing registered) when the callee does not qualify.
     bool RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* callee,
@@ -5926,7 +5985,7 @@ private:
                                  ReturnReachLeaves* leaves = nullptr);
 
     // True only when a bare pointer parameter reaches a borrowing-container sink through defined
-    // helpers and the destination is a global or method receiver. Unknown answers are false.
+    // helpers and the destination is a global or a caller argument. Unknown answers are false.
     bool ParameterMayReachBorrowingContainerSink(const llvm::Function* fn, unsigned argIndex,
                                                  int depth = 0);
     BorrowingContainerSinkSummary BorrowingContainerSinkSummaryForParameter(
@@ -5939,6 +5998,12 @@ private:
         int depth = 0, const llvm::DominatorTree* dominatorTree = nullptr) const;
     const llvm::Function* FunctionPointerTargetFromLocal(const llvm::Value* storage,
         int depth = 0, const llvm::DominatorTree* dominatorTree = nullptr) const;
+    const llvm::Function* FunctionPointerTargetFromStorage(const llvm::Value* storage) const;
+    std::vector<const llvm::Function*> FunctionPointerTargetsFromStorage(
+        const llvm::Value* storage, bool& complete) const;
+    const llvm::Function* FunctionPointerNonRetainingTargetFromStorage(
+        const llvm::Value* storage, llvm::ArrayRef<llvm::Value*> args,
+        const std::vector<TypeAndValue>& params, const std::vector<bool>& owningTempArgs);
     bool FunctionPointerLocalHasSingleNamedTarget(const llvm::Function* caller,
         const llvm::Value* storage, const llvm::Function* target,
         const llvm::DominatorTree& dominatorTree) const;
@@ -6075,6 +6140,8 @@ private:
     bool OwningLocalBorrowingHelperRefuses(
         const OwningLocalBorrowingHelperArg& entry, const llvm::DominatorTree* dominatorTree);
     void ReportOwningLocalBorrowingHelperRefusal(const OwningLocalBorrowingHelperArg& entry);
+    void ReportBorrowingHelperDepthLimit(const std::string& functionName,
+        const std::string& parameterName, const std::string& argumentName);
 
     void RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry, const std::string& destKind);
 
@@ -10002,7 +10069,10 @@ public:
     llvm::Value* CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
                                     std::vector<llvm::Value*> args,
                                     const std::vector<NamedVariable>* argNVs = nullptr,
-                                    const std::vector<llvm::Value*>* rawArrayCounts = nullptr);
+                                    const std::vector<llvm::Value*>* rawArrayCounts = nullptr,
+                                    const llvm::Function* retentionTarget = nullptr,
+                                    bool checkUnknownTempLifetime = false,
+                                    const llvm::Value* targetStorage = nullptr);
 
     bool TryAdoptAliasReturnStringTemp(llvm::Value*& result, const TypeAndValue& returnType,
         bool returnsOwned, bool returnsAlias, const std::vector<TypeAndValue>& params,
@@ -12997,6 +13067,21 @@ public:
         bool AppendsCause = false;
     };
     std::vector<PendingConstReceiverCall> pendingConstReceiverCalls_;
+    // Rechecked after the module walk so later stores to the same resolved storage are visible.
+    struct DeferredFunctionPointerTargetCall
+    {
+        const llvm::Value* Storage = nullptr;
+        const llvm::Function* InitialTarget = nullptr;
+        std::vector<llvm::Value*> Args;
+        std::vector<TypeAndValue> Params;
+        std::vector<bool> OwningTempArgs;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        size_t Owner = 0;
+        bool Refuse = false;
+    };
+    std::vector<DeferredFunctionPointerTargetCall> deferredFunctionPointerTargetCalls_;
     std::vector<DeferredExpectation> deferredExpectations_;
     size_t activeExpectScope_ = 0;
     size_t expectScopeCounter_ = 0;
@@ -13043,6 +13128,7 @@ public:
     // Its scope ended without an error: true (and disarmed) when pending #8 entries decide it.
     bool DeferExpectationVerdict();
     void ResolveDeferredExpectationVerdicts(bool aborted = false);
+    void ResolveFunctionPointerTargetSets();
     void DiscardExpectScopeEntries(size_t scope)
     {
         if (scope == 0) return;
@@ -13050,6 +13136,8 @@ public:
         std::erase_if(thisClosureCopySites_, [&](const auto& e) { return e.Owner == scope; });
         std::erase_if(owningLocalBorrowingHelperArgs_, [&](const auto& e) { return e.Owner == scope; });
         std::erase_if(deferredRawPointerCalleeStores_,
+                      [&](const auto& e) { return e.Owner == scope; });
+        std::erase_if(deferredFunctionPointerTargetCalls_,
                       [&](const auto& e) { return e.Owner == scope; });
     }
 
@@ -13439,6 +13527,55 @@ public:
     {
         auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
         return gv != nullptr && importedEnumeratorGlobals_.count(std::string(gv->getName())) != 0;
+    }
+    // Find a member through lvalue PHIs/selects and the slot ledger used by `??` joins.
+    const llvm::GlobalVariable* FindEnumMemberStorage(const llvm::Value* storage) const
+    {
+        std::unordered_set<const llvm::Value*> visited;
+        auto find = [&](auto&& self, const llvm::Value* value, unsigned depth)
+            -> const llvm::GlobalVariable* {
+            if (value == nullptr || depth > 8) return nullptr;
+            if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value))
+                return IsImportedEnumeratorStorage(global) || global->hasMetadata("cflat.enum_member")
+                    ? global : nullptr;
+            auto* phi = llvm::dyn_cast<llvm::PHINode>(value);
+            auto* select = llvm::dyn_cast<llvm::SelectInst>(value);
+            const NullCoalesceJoin* coalesce = nullptr;
+            if (phi == nullptr && select == nullptr)
+            {
+                if (!llvm::isa<llvm::LoadInst>(value) || !value->getType()->isPointerTy()) return nullptr;
+                coalesce = FindNullCoalesceJoin(value);
+                if (coalesce == nullptr) return nullptr;
+            }
+            if (!visited.insert(value).second) return nullptr;
+            const llvm::GlobalVariable* member = nullptr;
+            if (phi != nullptr)
+            {
+                for (const llvm::Value* incoming : phi->incoming_values())
+                    if ((member = self(self, incoming, depth + 1)) != nullptr) break;
+            }
+            else if (select != nullptr)
+            {
+                member = self(self, select->getTrueValue(), depth + 1);
+                if (member == nullptr) member = self(self, select->getFalseValue(), depth + 1);
+            }
+            else
+            {
+                for (const auto& arm : coalesce->Arms)
+                    if ((member = self(self, arm.Value, depth + 1)) != nullptr) break;
+            }
+            visited.erase(value);
+            return member;
+        };
+        return find(find, storage, 0);
+    }
+    // CFlat enum members and imported C/C++ enumerators are constants, not writable objects.
+    bool IsEnumMemberStorage(const llvm::Value* storage,
+                             const llvm::GlobalVariable** foundMember = nullptr) const
+    {
+        const auto* member = FindEnumMemberStorage(storage);
+        if (foundMember != nullptr) *foundMember = member;
+        return member != nullptr;
     }
     // True while an array dimension is folded. A C macro or an unscoped imported enumerator is a
     // constant only there (clang: `int a[DIMQ]`); general constant tracking never sees them, so

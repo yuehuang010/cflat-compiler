@@ -4283,12 +4283,13 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
             // form is armed here because its members are processed under the namespace scope.
             if (expectErrDecl->externalDeclaration().empty())
             {
-                // A namespace has no function scope-exit handler, so remember its bare form
-                // and let ParseNamespaceDefinition report a missing error after its members.
-                if (!namespaceName.empty())
+                if (!compilerLLVM->AdvanceFileScopeExpectation(ctx))
                 {
-                    std::string rawText = expectErrDecl->StringLiteral()->getText();
-                    compilerLLVM->ArmExpectScope(ProcessRawText(rawText), compilerLLVM->stackNamedVariable.size());
+                    if (!namespaceName.empty())
+                    {
+                        std::string rawText = expectErrDecl->StringLiteral()->getText();
+                        compilerLLVM->ArmExpectScope(ProcessRawText(rawText), compilerLLVM->stackNamedVariable.size());
+                    }
                 }
             }
             else
@@ -4399,6 +4400,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     else
                         compilerLLVM->FailCompilation("expected error did not occur");
                 }
+                compilerLLVM->MarkFileScopeExpectationProcessed();
             }
         }
 
@@ -4761,11 +4763,24 @@ void MainListener::ParseNamespaceDefinition(CFlatParser::NamespaceDefinitionCont
         // Member declarations (extern signatures, struct fields) may reference sibling
         // types unqualified - make the namespace visible to GetType while parsing them.
         LLVMBackend::NamespaceScope nsScope(compiler, namespaceName);
+        bool namespaceExpectationsOpened = compilerLLVM->BeginFileScopeExpectations(
+            ctx->externalDeclaration(), compilerLLVM->stackNamedVariable.size());
         for (auto* extDecl : ctx->externalDeclaration())
-            ParseExternalDeclaration(extDecl, namespaceName);
+        {
+            try
+            {
+                ParseExternalDeclaration(extDecl, namespaceName);
+            }
+            catch (const ExpectedErrorReceived&)
+            {
+                if (!compilerLLVM->HandleFileScopeExpectationMatch())
+                    throw;
+            }
+        }
 
-        // A bare namespace expectation has no enclosing function to check its scope exit.
-        if (!compilerLLVM->expectedError.empty()
+        if (namespaceExpectationsOpened)
+            compilerLLVM->EndFileScopeExpectations(true);
+        else if (!compilerLLVM->expectedError.empty()
             && compilerLLVM->expectedErrorScopeDepth != SIZE_MAX
             && !compilerLLVM->DeferExpectationVerdict())
         {
@@ -4792,7 +4807,15 @@ void MainListener::enterExternalDeclaration(CFlatParser::ExternalDeclarationCont
         if (dynamic_cast<CFlatParser::ExpectErrorDeclarationContext*>(ctx->parent))
             return;
 
-        ParseExternalDeclaration(ctx);
+        try
+        {
+            ParseExternalDeclaration(ctx);
+        }
+        catch (const ExpectedErrorReceived&)
+        {
+            if (!compilerLLVM->HandleFileScopeExpectationMatch())
+                throw;
+        }
     }
 
 void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, const std::string& namespaceName, const std::string& nameOverride, std::optional<std::string> bodyNamespace) {
@@ -5315,19 +5338,23 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             }
             catch (const ExpectedErrorReceived&)
             {
-                // Handle only if the expect_error was set at this function's entry depth
-                // (bare-semicolon form inside this function body).
-                // File-scope scoped-block form sets expectedErrorScopeDepth = SIZE_MAX - re-throw.
-                if (!compilerLLVM->expectedError.empty() &&
-                    compilerLLVM->expectedErrorScopeDepth == funcDepth &&
-                    compilerLLVM->ActiveExpectScopeOwnsFunction(fn))
+                // A function-scope arm belongs to this function; a file-scope arm also
+                // recovers here so the listener can continue to later declarations.
+                bool functionScopeExpectation = !compilerLLVM->expectedError.empty()
+                    && compilerLLVM->expectedErrorScopeDepth == funcDepth
+                    && compilerLLVM->ActiveExpectScopeOwnsFunction(fn);
+                bool fileScopeExpectation = compilerLLVM->IsActiveFileScopeExpectation();
+                if (functionScopeExpectation || fileScopeExpectation)
                 {
                     RestoreExpectErrorRecoveryState(recoveryMark, fn);
                     // The rest of the body never ran; defensive no-op while the grammar puts no
                     // classDefinition in a function body (see the file-scope catch for the real case).
                     ForgetIfConstGuardedImpls(compilerLLVM, blockItemList);
                     compilerLLVM->AbortFunctionBlocks(funcDepth - 1, fn);
-                    compilerLLVM->RestoreExpectScope(compilerLLVM->activeExpectScope_);
+                    if (fileScopeExpectation)
+                        compilerLLVM->HandleFileScopeExpectationMatch();
+                    else
+                        compilerLLVM->RestoreExpectScope(compilerLLVM->activeExpectScope_);
                     compiler->ClearCurrentSubprogram();
                     // The body was aborted mid-way: its CFG is partial, so its null-state log
                     // must be dropped rather than analyzed by the end-of-module sweep.
@@ -10432,6 +10459,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcBorrowsOwnedString = NamedVarIsString(rightNV)
                                     && !rightNV.TypeAndValue.IsMove
                                     && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
+                                        || rightNV.RootIsBorrowedThisField
                                         || rightNV.BorrowsOwnedString
                                         || srcIsClosureStringCapture);
                                 srcIsOwningArrayStringElem =

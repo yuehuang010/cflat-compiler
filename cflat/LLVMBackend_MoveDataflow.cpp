@@ -3698,7 +3698,10 @@ bool LLVMBackend::DeferExpectationVerdict()
                             [&](const auto& e) { return e.Owner == scope; })
             && std::none_of(deferredRawPointerCalleeStores_.begin(),
                             deferredRawPointerCalleeStores_.end(),
-                            [&](const auto& e) { return e.Owner == scope && e.Refuse; })))
+                            [&](const auto& e) { return e.Owner == scope && e.Refuse; })
+            && std::none_of(deferredFunctionPointerTargetCalls_.begin(),
+                            deferredFunctionPointerTargetCalls_.end(),
+                            [&](const auto& e) { return e.Owner == scope; })))
         return false;
     deferredExpectations_.push_back(activeExpectPosition_);
     RestoreExpectScope(scope);
@@ -3714,13 +3717,15 @@ void LLVMBackend::ResolveDeferredExpectationVerdicts(bool aborted)
     helperCalls.swap(owningLocalBorrowingHelperArgs_);
     std::vector<ThisClosureCopySite> closureSites;
     closureSites.swap(thisClosureCopySites_);
+    std::vector<DeferredFunctionPointerTargetCall> functionPointerCalls;
+    functionPointerCalls.swap(deferredFunctionPointerTargetCalls_);
     std::vector<DeferredExpectation> expectations;
     expectations.swap(deferredExpectations_);
 
     std::unordered_set<size_t> deferredScopes;
     for (const auto& expectation : expectations) deferredScopes.insert(expectation.Scope);
 
-    enum class Kind { ConstReceiver, Helper, Closure, RawStore };
+    enum class Kind { ConstReceiver, Helper, Closure, RawStore, FunctionPointer };
     struct Candidate
     {
         Kind Type;
@@ -3772,6 +3777,12 @@ void LLVMBackend::ResolveDeferredExpectationVerdicts(bool aborted)
             if (entry.Owner == expectation.Scope && entry.Refuse
                 && entry.Verdict == RawPointerStoreVerdict::Stores)
                 candidates.push_back({ Kind::RawStore, i, entry.File, entry.Line, entry.Column });
+        }
+        for (size_t i = 0; i < functionPointerCalls.size(); ++i)
+        {
+            const auto& entry = functionPointerCalls[i];
+            if (entry.Owner == expectation.Scope && entry.Refuse)
+                candidates.push_back({ Kind::FunctionPointer, i, entry.File, entry.Line, entry.Column });
         }
         std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b)
         {
@@ -3825,6 +3836,17 @@ void LLVMBackend::ResolveDeferredExpectationVerdicts(bool aborted)
                 });
                 answered = true;
             }
+            else if (candidate.Type == Kind::FunctionPointer)
+            {
+                const auto& entry = functionPointerCalls[candidate.Index];
+                reportExpected(expectation.Expected, entry.File, entry.Line, entry.Column, [&]()
+                {
+                    LogError("cannot pass an owning statement temporary to a callee whose retention "
+                             "cannot be proven; bind the temporary to a local or move it into an "
+                             "owning sink first");
+                });
+                answered = true;
+            }
             else
             {
                 const auto& site = closureSites[candidate.Index];
@@ -3858,6 +3880,9 @@ void LLVMBackend::ResolveDeferredExpectationVerdicts(bool aborted)
         if (!deferredScopes.contains(site.Owner)) thisClosureCopySites_.push_back(std::move(site));
     std::erase_if(deferredRawPointerCalleeStores_,
                   [&](const auto& e) { return deferredScopes.contains(e.Owner); });
+    for (const auto& entry : functionPointerCalls)
+        if (deferredScopes.count(entry.Owner) == 0)
+            deferredFunctionPointerTargetCalls_.push_back(entry);
 }
 
 // `aborted`: an expected error ended the walk early. Only the deferred expectations are settled
@@ -3867,6 +3892,8 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
     if (!aborted) ResolveRawPointerCalleeStoreVerdicts();
     std::vector<PendingConstReceiverCall> pending;
     pending.swap(pendingConstReceiverCalls_);
+    std::vector<DeferredFunctionPointerTargetCall> functionPointerCalls;
+    functionPointerCalls.swap(deferredFunctionPointerTargetCalls_);
     std::vector<DeferredExpectation> expectations;
     expectations.swap(deferredExpectations_);
     // Deferred expectations first, in source order: each is answered by the first refusal it
@@ -3957,6 +3984,14 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
             continue;
         ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
         LogError(DeferredCalleeStoreMessage(entry));
+    }
+    for (const auto& entry : functionPointerCalls)
+    {
+        if (deferredScopes.count(entry.Owner) != 0 || !entry.Refuse) continue;
+        ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+        LogError("cannot pass an owning statement temporary to a callee whose retention "
+                 "cannot be proven; bind the temporary to a local or move it into an "
+                 "owning sink first");
     }
     std::vector<ThisClosureCopySite> sites;
     sites.swap(thisClosureCopySites_);

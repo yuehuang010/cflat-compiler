@@ -10,6 +10,11 @@
 // mark). Only the plain zero-implementor wording may be used.
 //
 // The check fires at FINALIZATION, so this needs the bare-semicolon file-scope expect_error.
+expect_error("Undefined variable expect2FirstBareArm");
+int expect2FirstBareFunction() { return expect2FirstBareArm; }
+expect_error("Undefined variable expect2SecondBareArm");
+int expect2SecondBareFunction() { return expect2SecondBareArm; }
+
 expect_error("cannot convert to interface 'IGenBody' - no class implements it");
 
 interface IGenBody { int gb(); };

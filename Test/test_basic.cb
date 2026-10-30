@@ -54,6 +54,8 @@ bool testBuiltinIdentifiers()
 
 int[4] t6PointerGlobal = { 10, 20, 30, 40 };
 enum T114Bound : int { T114Two = 2 };
+enum EnumTernaryAccept : int { AcceptA = 1, AcceptB = 2 };
+struct TernaryHolder { int a = default; int b = default; };
 const int T114ConstBound = 2;
 const int T114ShadowBound = 9;
 const float T118ConstFloat = 1.0f;
@@ -418,6 +420,17 @@ namespace EnumNs { enum Facing : int { Back = -7, Fwd = 7 }; }
 using FacingAlias = EnumNs.Facing;
 
 struct EnumHolder { WideU8 band = default; int amount = default; };
+struct TEnumMemberDefault { MyEnum value = MyEnum.E_THREE; };
+MyEnum tEnumAcceptGlobal = MyEnum.E_ONE;
+const int tEnumAcceptConst = 29;
+int[MyEnum.E_TWO] tEnumAcceptArray = default;
+int tEnumAcceptByValue(MyEnum value) { return (int)value + 10; }
+int tEnumAcceptGeneric<T>(T value) { return (int)value; }
+int tEnumAcceptIfConst()
+{
+    if const (MyEnum.E_TWO == 2) { return 17; }
+    else { return -1; }
+}
 
 struct EnumBox<T> { T value = default; };
 
@@ -762,6 +775,30 @@ int t115GenericEnumCaller()
 bool testEnum()
 {
     bool result = true;
+    result &= Test("enum_member_comparison", MyEnum.E_ONE < MyEnum.E_TWO, true);
+    int tEnumMemberSwitch = 0;
+    switch (MyEnum.E_TWO)
+    {
+        case MyEnum.E_TWO: tEnumMemberSwitch = 23; break;
+        default: tEnumMemberSwitch = -1; break;
+    }
+    result &= Test("enum_member_case_label", tEnumMemberSwitch, 23);
+    result &= Test("enum_member_array_size", (int)sizeof(tEnumAcceptArray), 8);
+    result &= Test("enum_member_int_cast", (int)MyEnum.E_THREE, 5);
+    result &= Test("enum_member_by_value", tEnumAcceptByValue(MyEnum.E_TWO), 12);
+    result &= Test("enum_member_generic_argument", tEnumAcceptGeneric<MyEnum>(MyEnum.E_THREE), 5);
+    result &= Test("enum_member_if_const", tEnumAcceptIfConst(), 17);
+    result &= Test("enum_member_const_like_global", tEnumAcceptConst, 29);
+    MyEnum tEnumMutable = MyEnum.E_ONE;
+    tEnumMutable = MyEnum.E_THREE;
+    tEnumMutable++;
+    result &= Test("enum_variable_assign_increment_neighbor", (int)tEnumMutable, 6);
+    tEnumAcceptGlobal = MyEnum.E_TWO;
+    result &= Test("enum_global_assign_neighbor", (int)tEnumAcceptGlobal, 2);
+    TEnumMemberDefault tEnumDefault = default;
+    result &= Test("enum_member_field_default", (int)tEnumDefault.value, 5);
+    tEnumDefault.value = MyEnum.E_ONE;
+    result &= Test("enum_field_assign_neighbor", (int)tEnumDefault.value, 1);
     result &= Test("enum_E_ONE", MyEnum.E_ONE, 1);
     result &= Test("enum_E_TWO", MyEnum.E_TWO, 2);
     result &= Test("enum_E_THREE", MyEnum.E_THREE, 5);
@@ -6469,6 +6506,31 @@ extern int main()
     total++; passed += testAssertReturnBlock()           ? 1 : 0;
     total++; passed += testExplicitIntTypes()            ? 1 : 0;
     total++; passed += testEnum()                        ? 1 : 0;
+    {
+        bool choose = true;
+        int a = 3, b = 5;
+        (choose ? a : b) = 7;
+        (!choose ? a : b)++;
+        total++; passed += Test("enum_ternary_local_lvalue", a * 10 + b, 76) ? 1 : 0;
+
+        TernaryHolder h = default;
+        h.a = 2; h.b = 4;
+        (choose ? h.a : h.b) = 6;
+        (!choose ? h.a : h.b)++;
+        total++; passed += Test("enum_ternary_field_lvalue", h.a * 10 + h.b, 65) ? 1 : 0;
+
+        EnumTernaryAccept x = EnumTernaryAccept.AcceptA;
+        EnumTernaryAccept y = EnumTernaryAccept.AcceptB;
+        (choose ? x : y) = EnumTernaryAccept.AcceptB;
+        (!choose ? x : y)++;
+        total++; passed += Test("enum_ternary_enum_variable_lvalue", (int)x * 10 + (int)y, 23) ? 1 : 0;
+
+        int coalesceTarget = 3;
+        int* empty = nullptr;
+        int* fallback = &coalesceTarget;
+        *(empty ?? fallback) = 8;
+        total++; passed += Test("enum_coalesce_local_pointer_lvalue", coalesceTarget, 8) ? 1 : 0;
+    }
     total++; passed += testT379LocalEnums()               ? 1 : 0;
     total++; passed += testNegativeGlobalInit()          ? 1 : 0;
     total++; passed += testConstGlobalIsNotAMacro()      ? 1 : 0;

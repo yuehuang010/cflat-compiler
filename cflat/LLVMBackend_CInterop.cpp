@@ -3251,6 +3251,12 @@ bool LLVMBackend::ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const
 {
         auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(slot);
         if (alloca == nullptr) return false;
+        auto isClosureEnvNew = [&](const llvm::Function* function) {
+            if (auto helpers = functionTable.find("__closure_env_new"); helpers != functionTable.end())
+                for (const auto& symbol : helpers->second)
+                    if (symbol.Function == function) return true;
+            return module->getFunction("__closure_env_new") == function;
+        };
         // A fat value {code, env}: env null, or a fresh env built with a null cleanup function.
         auto trivialFat = [&](llvm::Value* fat) {
             while (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(fat))
@@ -3259,10 +3265,10 @@ bool LLVMBackend::ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const
                 {
                     llvm::Value* env = insert->getInsertedValueOperand();
                     if (llvm::isa<llvm::ConstantPointerNull>(env)) return true;
-                    // __closure_env_new(size, cleanup), under its mangled name.
+                    // A fresh environment with no cleanup function has only trivial captures.
                     auto* call = llvm::dyn_cast<llvm::CallInst>(env);
                     return call != nullptr && call->getCalledFunction() != nullptr
-                        && call->getCalledFunction()->getName().contains("__closure_env_new")
+                        && isClosureEnvNew(call->getCalledFunction())
                         && call->arg_size() == 2
                         && llvm::isa<llvm::ConstantPointerNull>(call->getArgOperand(1));
                 }
@@ -3285,7 +3291,7 @@ bool LLVMBackend::ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const
             // The scope-exit / unwind destructor only reads the slot.
             if (auto* call = llvm::dyn_cast<llvm::CallInst>(user);
                 call != nullptr && call->getCalledFunction() != nullptr
-                && call->getCalledFunction()->getName().starts_with("__closure_fat_ptr.dtor"))
+                && IsClosureHelperName(call->getCalledFunction()->getName(), "__closure_fat_ptr.dtor"))
                 continue;
             auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
             if (store == nullptr || store->getPointerOperand() != alloca

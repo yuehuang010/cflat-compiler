@@ -1228,6 +1228,9 @@ bool MainListener::PendingWaitsOnStructBody(const GenericTemplateState::PendingI
             return false;
         for (const auto& arg : pending.typeArgs)
         {
+            // Its body is still being parsed (a nested flush inside it): fields exist, but the
+            // destructor and methods do not, so a pointer-only user of it must wait.
+            if (c.gts.structsBeingDefined.count(arg) != 0) return true;
             bool cflatBodyCanComplete = c.gts.scannedTypeNames.count(arg) != 0
                 && c.gts.scannedInterfaceNames.count(arg) == 0;
             if (!cflatBodyCanComplete)

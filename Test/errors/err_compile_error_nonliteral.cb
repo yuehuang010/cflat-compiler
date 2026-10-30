@@ -13,3 +13,12 @@ extern int main()
     b.f();
     return 0;
 }
+
+namespace Expect2LateNamespace {
+    expect_error("Undefined variable expect2NamespaceMissing");
+    int expect2NamespaceProbe() { return expect2NamespaceMissing; }
+}
+
+expect_error("Undefined variable expect2ScopedMissing") {
+    int expect2ScopedProbe() { return expect2ScopedMissing; }
+}

@@ -1,5 +1,6 @@
 import "list.cb";
 import "dictionary.cb";
+import cpp "functional";
 
 // Returning a lambda that reference-captures a local struct must fail with a
 // bond escape error - the lambda would outlive the captured stack variable.
@@ -674,5 +675,32 @@ void t529R4EscapeHelperLookalike() {
         T529R3Holder holder;
         Lambda<int()> closure = () => { return owner->value; };
         t529R4StoreHolderAndLookalike(&holder, closure);
+    }
+}
+
+Lambda<int()> clpfxCtorGlobal = default;
+namespace _closure_fat_ptr {
+    void dtorClpfx(Lambda<int()> value) { clpfxCtorGlobal = value; }
+}
+expect_error("the constructor of 'ClpfxCtorValue' returns the object by value") {
+    struct ClpfxCtorValue {
+        int value = default;
+        ClpfxCtorValue(int initial) {
+            this.value = initial;
+            Lambda<int()> local = () => { return this.value; };
+            _closure_fat_ptr.dtorClpfx(local);
+        }
+    };
+}
+
+namespace _closure_fat_ptr {
+    void dtorClpfxCInterop(alias Lambda<int(int)> slot) { }
+}
+expect_error("a closure that may own non-trivial captures") {
+    int clpfxCInteropImpostor() {
+        Lambda<int(int)> f = (int x) => x + 40;
+        _closure_fat_ptr.dtorClpfxCInterop(f);
+        std.function<int(int)> copied = f;
+        return copied(2);
     }
 }

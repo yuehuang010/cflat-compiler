@@ -57,29 +57,10 @@ Rows are grouped by the KIND of fix, which decides the mode and the reviewer's f
 A **run** is one worktree + one branch. Issues that share a function go in the same run (never two
 concurrent runs on the same function). Run ids are new for this regroup; old ids are retired.
 
-## Next timebox: ship gate (p1 + p2), rebuilt 2026-10-25 (box 4)
+## Ship gate (p1 + p2)
 
-p1 count: zero. Every p2 below is fixed or refused with a located error (bucket rule B). Rows name every issue file
-they close. Rulings 2026-10-25 (lessons digest "Rulings 2026-10-25") are folded in; no row waits on a ruling.
-
-Tiers: Luna default; Haiku high after a Luna fail; Opus after Haiku. "Win gate" = C++/ABI-touching, needs the Windows box.
-Ruling refs: L = fix-issue-lessons.md "Rulings 2026-10-21/22: open-question sweep"; B = "Ruling 2026-10-21: issue bucket meanings" (p2 = fix or located error).
-
-| Id | Item (bucket/stem) | What is wrong (<= 15 words) | Fix (<= 20 words, cite ruling if any) | Area | Size | Tier | Win |
-|---|---|---|---|---|---|---|---|
-| R7 | p2/statement-temp-escapes-via-out-param-or-global | C-callee keeps freed temp (UAF); indirect fn<> read-only callee leaks | Join refusal landed (T410). C callee = conservative keeper (extern C follows CFlat rules); fn<> unknown callee same | statement-temp release, C callee policy | M | Luna | yes |
-| R16 | p2/delete-borrow-via-named-local | Borrow reaches container via helper chain with explicit pointer-param destination | Interprocedural callee summary "param N stored into param M container"; share with R17 summary. Parked fix/t396-viewalias | callee summaries, MemoryOutlivesCall walk | L | Opus | no |
-| R21 | p2/string-copy-through-pointer-subscript | Global / implicit-this `string*` subscript copy double-frees | Implicit-this: byte-offset field proof. Global: runtime provenance design (compile-time flag rejected) | string copy, pointer-slot proof | M | Opus | no |
-
-### Conflict map (never concurrent)
-- R13: C++ call args, CInterop - one at a time with R7 (R12 2fa93ab1b, R14 17250e7a7 landed).
-- R16, R17, R20, R21: MainListener_Expressions provenance / view state; R16 and R17 share the callee summary.
-
-### Waves (max 3 implementers on the Mac)
-- Wave 2: R17 (Opus), R7
-- Wave 3: R16 (after R17 summary), R20
-- Wave 4: R13 design, R21
-Windows gate: R7, R13 land after the Windows box passes. Run the Windows gate on the master tip once per box.
+Empty since box 5 (2026-10-27): p1 = 0, p2 = 0 after R16 (ef53fe523). Last rows landed: R21, R22, R7 (T521), R16, and
+p2 generic-unique-arg-pointer-spelling (19c6c56ec). Run the Windows gate on the master tip once per box.
 
 ## In flight
 

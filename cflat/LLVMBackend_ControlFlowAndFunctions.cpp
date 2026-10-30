@@ -652,13 +652,59 @@ static bool IndirectArgIsUnsigned(const std::vector<LLVMBackend::NamedVariable>*
 llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
                                              std::vector<llvm::Value*> args,
                                              const std::vector<NamedVariable>* argNVs,
-                                             const std::vector<llvm::Value*>* rawArrayCounts)
+                                             const std::vector<llvm::Value*>* rawArrayCounts,
+                                             const llvm::Function* retentionTarget,
+                                             bool checkUnknownTempLifetime,
+                                             const llvm::Value* targetStorage)
 {
         auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         lastCxxRetTemp_ = nullptr;
         lastCxxRetValue_ = nullptr;
         lastLoweredRetTemp_ = nullptr;
         lastLoweredRetValue_ = nullptr;
+        const llvm::Function* ownershipTarget = nullptr;
+        if (checkUnknownTempLifetime)
+        {
+            std::vector<TypeAndValue> params;
+            params.reserve(funcPtrType.FuncPtrParams.size());
+            for (size_t i = 0; i < funcPtrType.FuncPtrParams.size(); ++i)
+                params.push_back(FuncPtrParamAsTypeAndValue(funcPtrType.FuncPtrParams[i], i));
+            bool needsTargetSetProof = false;
+            std::vector<bool> owningTempArgs(args.size(), false);
+            for (size_t i = 0; i < args.size() && i < params.size(); ++i)
+            {
+                const TypeAndValue& param = params[i];
+                const bool owningSink = param.IsMove || param.IsUnique || param.IsInterfaceSink
+                    || (OwningSinkConsumesConcrete(param)
+                        && (param.Pointer || IsOwningValueOrClosureType(param.TypeName)));
+                owningTempArgs[i] = args[i] != nullptr && args[i]->getType()->isPointerTy()
+                    && ValueContainsOwningPtrTemp(args[i]);
+                if (owningTempArgs[i] && !owningSink)
+                    needsTargetSetProof = true;
+            }
+            if (targetStorage != nullptr && needsTargetSetProof && retentionTarget == nullptr)
+                retentionTarget = FunctionPointerNonRetainingTargetFromStorage(
+                    targetStorage, args, params, owningTempArgs);
+            CheckUnprovenOwningPtrTempArgs(retentionTarget, args, params, false);
+            if (targetStorage != nullptr && needsTargetSetProof)
+            {
+                DeferredFunctionPointerTargetCall pending;
+                pending.Storage = targetStorage;
+                pending.InitialTarget = retentionTarget;
+                pending.Args = args;
+                pending.Params = std::move(params);
+                pending.OwningTempArgs = std::move(owningTempArgs);
+                pending.File = sourceFileName;
+                pending.Line = currentLine;
+                pending.Column = currentColumn;
+                if (!expectedError.empty() && expectedError != fileScopeExpectedError_)
+                    pending.Owner = activeExpectScope_;
+                deferredFunctionPointerTargetCalls_.push_back(std::move(pending));
+            }
+            if (retentionTarget != nullptr && !retentionTarget->isDeclaration()
+                && FunctionBodyIsComplete(retentionTarget))
+                ownershipTarget = retentionTarget;
+        }
         if (argNVs != nullptr)
         {
             TypeAndValue indirectReturn;
@@ -967,7 +1013,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 cFnTy = llvm::FunctionType::get(cFnTy->getReturnType(), loweredTys, variadicSig);
                 abiArgs = std::move(loweredArgs);
             }
-            PreserveRetainedJoinArmTempsBeforeCall(nullptr, abiArgs);
+            PreserveRetainedJoinArmTempsBeforeCall(ownershipTarget, abiArgs);
             auto* result = CreateCallOrInvoke(cFnTy, fnPtr, abiArgs, /*mayUnwind=*/true);
             markBorrowedPointerReturn(result, retTV);
             // thin function<> = bare C pointer: the callee may be clang -O2 C code (see the helper).
@@ -997,7 +1043,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 else ApplyNarrowIntExtCallAttrs(callBase, extParams);
             }
             // No body to prove the callee borrows: keep `?:` / `??` arm temps it may retain.
-            DropRetainedJoinArmPtrTemps(result);
+            DropRetainedJoinArmPtrTemps(result, ownershipTarget);
             if (cxxSretRecipe.hasLowering)
                 ApplyAbiCallAttributes(result, cxxSretRecipe);
             llvm::Value* value = nullptr;
@@ -1123,10 +1169,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         }
 
         lastCallReturnType = retTV;
-        PreserveRetainedJoinArmTempsBeforeCall(nullptr, fullArgs);
+        PreserveRetainedJoinArmTempsBeforeCall(ownershipTarget, fullArgs);
         auto* result = CreateCallOrInvoke(invokerTy, fnPtr, fullArgs, /*mayUnwind=*/true);
         markBorrowedPointerReturn(result, retTV);
-        DropRetainedJoinArmPtrTemps(result);
+        DropRetainedJoinArmPtrTemps(result, ownershipTarget);
         if (cxxSretRecipe.hasLowering)
             ApplyAbiCallAttributes(result, cxxSretRecipe);
         llvm::Value* value = cxxSretReturn

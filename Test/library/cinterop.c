@@ -137,6 +137,15 @@ int c_negate(int x)       { return -x; }
 
 #include "c_macro_helpers.h"
 
+/* T521: C stores a pointer so CFlat must reject a statement-temp argument. */
+static int* cflat521_kept;
+void cflat521_keep(int* value) { cflat521_kept = value; }
+int* cflat521_get(void) { return cflat521_kept; }
+int cflat521_read(int* value) { return *value; }
+int (*cflat521_read_fn)(int*) = cflat521_read;
+int* cflat521_pass(int* value) { return value; }
+int* cflat521_read_return_other(int* value) { static int other; other = *value; return &other; }
+
 int cbf_flex_int_size(void) { return (int)sizeof(struct CBF_FlexInt); }
 int cbf_flex_int_offset(void) { return (int)offsetof(struct CBF_FlexInt, data); }
 int cbf_flex_zero_size(void) { return (int)sizeof(struct CBF_ZeroInt); }

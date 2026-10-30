@@ -133,6 +133,49 @@ inline CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
     return nullptr;
 }
 
+inline std::string EnumMemberSourceSpelling(antlr4::tree::ParseTree* node)
+{
+    while (node != nullptr)
+    {
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            auto* primary = postfix->primaryExpression();
+            size_t childCount = postfix->children.size();
+            while (childCount > 1 && (postfix->children[childCount - 1]->getText() == "++"
+                                      || postfix->children[childCount - 1]->getText() == "--"))
+                --childCount;
+            if (childCount == 1 && primary != nullptr && primary->expression() != nullptr)
+            {
+                node = primary->expression();
+                continue;
+            }
+            std::string spelling;
+            for (size_t i = 0; i < childCount; ++i) spelling += postfix->children[i]->getText();
+            return spelling;
+        }
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->expression() != nullptr)
+        {
+            node = primary->expression();
+            continue;
+        }
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (rule == nullptr) return node->getText();
+        if (rule->children.size() != 1) return {};
+        node = rule->children[0];
+    }
+    return {};
+}
+
+inline std::string EnumMemberDiagnosticName(const LLVMBackend::NamedVariable& member,
+                                            antlr4::tree::ParseTree* expression,
+                                            const llvm::GlobalVariable* foundMember = nullptr)
+{
+    const std::string sourceName = EnumMemberSourceSpelling(expression);
+    if (!sourceName.empty()) return sourceName;
+    return foundMember != nullptr ? foundMember->getName().str() : member.TypeAndValue.VariableName;
+}
+
 inline antlr4::tree::TerminalNode* BareIdentifierInExpression(
     antlr4::tree::ParseTree* expression)
 {
