@@ -59,20 +59,20 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 ## Ship gate (p1 + p2)
 
-Empty since box 5 (2026-10-27): p1 = 0, p2 = 0 after R16 (ef53fe523). Last rows landed: R21, R22, R7 (T521), R16, and
-p2 generic-unique-arg-pointer-spelling (19c6c56ec). Run the Windows gate on the master tip once per box.
+Empty since box 5 (2026-10-27): p1 = 0, p2 = 0 after R16 (05a00f1af). Last rows landed: R21, R22, R7 (T521), R16, and
+p2 generic-unique-arg-pointer-spelling (05a00f1af). Run the Windows gate on the master tip once per box.
 
 ## In flight
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| P3 | - | p3/moved-from-struct-leftovers-after-t490 | filed 2026-10-24; local field move landed MVFIELD (aea8e89da); open: T418 C++ param `_ = move` (immediate release + disarm), heap-field `move p->inn`, raw-pointer-field scope ruling question |
-| P3 | - | p3/nested-function-type-parameter-not-compared | filed T427 review: function-type component of a function type not compared |
-| P3 | - | p3/interface-call-overload-ranking-and-conversion | landed IFACEOVL (83fea586e - see issue); residue: unrelated-pointer fall-through, const receiver overloads, first-not-ambiguous picks (pre-existing) |
-| P3 | - | p3/call-name-shadowing-leftovers-after-t484 | implicit-this member template landed SHADOW (a3158cb58), static + viability MTPL (128ea6b82), nested outer static template NEST (2d2e922ad), generic outer NEST2 (24e3ec23a), defaults + inner-hides-outer NEST3 (30e9629ad), bare defaulted instance call NEST4 (6923945d8); outer U in member templates + sibling nested static + N.O<T>.run() NEST5 (a509d073c); 3 sections NEED RULING: qualified int -> double at calls (q08), field-default member lookup, self-initializer read; interface default via interface var + static-caller text NEST6 (31519d3b3); by-value outer layout NESTVAL (2e6b647bf) |
+| P3 | - | p3/moved-from-struct-leftovers-after-t490 | filed 2026-10-24; local field move landed MVFIELD (af5834ad3); RULED 2026-10-29: T418 = callee destroys by-value params always (CFlat ABI), heap-field `move p->inn` = zero-fill + skip dtor on all-zero; raw-pointer-field scope RULED 2026-10-29 (T490 covers every plain struct, drop the exclusion) |
+| P3 | - | p3/nested-function-type-parameter-not-compared | filed T427 review; FNABI RULED 2026-10-29 option (b): pointees follow the ABI-class rule, retarget fix/fnabi (worktree cflat-fix-fnabi) |
+| P3 | - | p3/interface-call-overload-ranking-and-conversion | landed IFACEOVL (483f3b83d - see issue); residue: unrelated-pointer fall-through, const receiver overloads (RULED 2026-10-29: C++ const viability on both paths), first-not-ambiguous picks (pre-existing) |
+| P3 | - | p3/call-name-shadowing-leftovers-after-t484 | implicit-this member template landed SHADOW (af5834ad3), static + viability MTPL (af5834ad3), nested outer static template NEST (1cc0ed5d2), generic outer NEST2 (1cc0ed5d2), defaults + inner-hides-outer NEST3 (1cc0ed5d2), bare defaulted instance call NEST4 (1cc0ed5d2); outer U in member templates + sibling nested static + N.O<T>.run() NEST5 (ef83ffa02); RULED 2026-10-29: q08 section closed (stands refused), field-default = C++ member lookup (earlier fields visible), self-initializer read = located error (leg -> err_); interface default via interface var + static-caller text NEST6 (ef83ffa02); by-value outer layout NESTVAL (ef83ffa02) |
 | P3 | - | p3/ctor-lambda-this-closure-relocation | T515 residue: by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
 | P3 | - | p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
-| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | decl / return / single-argument sink landed MIXCOND (237dbf3cc); multi-arg last-argument + nested decl + F1 producer lifetime MIXCOND2 (0870063c4); open: operators, overloaded callee, defaulted/named/not-last args, by-value param return arm, B dtor order (C++ row) |
+| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | decl / return / single-argument sink landed MIXCOND (af5834ad3); multi-arg last-argument + nested decl + F1 producer lifetime MIXCOND2 (483f3b83d); open: operators, overloaded callee, defaulted/named/not-last args, by-value param return arm, B dtor order (C++ row) |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
 
@@ -92,8 +92,8 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | global/function name collisions, anonymous/inline-namespace enums, comma, `auto&&`, deref macros, C errno/INT_MAX; T98 reviews 1-2, pre-existing |
 | - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | unnamed-enum source picks int ctor; non-const trivially-copyable lvalue copy-init skips U&& template (T54 review, pre-existing) |
 | - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | extra move vs clang elision; the old p2 by-value-temporary-extra-moves file was gone, re-pointed 2026-10-15 (T229) |
-| - | p3/cpp-reference-member-leftovers-after-t47 | ref members | designated init + literal/prvalue lifetime landed REFMEM (791f1281e), base/member-aggregate positional REFBASE (d4999d9da); fn-ref member + nullptr brace element REFFN (ec5f57a0e); refused contexts REFCTX (ce8ff8163), temp dtor order landed DTORORD (b4466d12f) + alias temp lifetime ALIASTMP (8ad5ea039); residue: unwind leak / extra copy / wrapper path, opaque-fn alias refusal needs ruling, elided-range prvalue/array residue, `&f` element needs ruling, REFCTX raw-pointer/self-field refusal residue |
-| - | p3/function-ptr-c-abi-leftovers-after-t77 | function<> C ABI | narrow callback return landed FPABI (70c49a598); open: extern `move T*` count lost (needs ruling: refuse vs counted entry) |
+| - | p3/cpp-reference-member-leftovers-after-t47 | ref members | designated init + literal/prvalue lifetime landed REFMEM (1cc0ed5d2), base/member-aggregate positional REFBASE (ef83ffa02); fn-ref member + nullptr brace element REFFN (ef83ffa02); refused contexts REFCTX (483f3b83d), temp dtor order landed DTORORD (483f3b83d) + alias temp lifetime ALIASTMP (483f3b83d); residue: unwind leak / extra copy / wrapper path, opaque-fn alias refusal RULED 2026-10-29 (stays refused, lifetimebound optional), elided-range prvalue/array residue, `&f` element RULED 2026-10-29 (accepted, WAI), REFCTX raw-pointer/self-field refusal residue |
+| - | p3/function-ptr-c-abi-leftovers-after-t77 | function<> C ABI | narrow callback return landed FPABI (1cc0ed5d2); open: extern `move T*` count lost (RULED 2026-10-29: refuse - function<> binding mismatch + array-provenance call refusal) |
 | - | p3/cpp-ctor-template-viability-not-clang-selected | C++ ctor narrowing | template constraints / failed deduction not seen; validate clang-selected ctor (T78 reviews 2-5) |
 | - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | `auto x = 1e3 + 1; fwd(x)` float / refused, `auto x = l + 1` long long; T58 review 5, pre-existing |
 | - | p3/simd-float-postfix-increment-generic-message | simd<float,4>++ | generic lane-count error; decide lane-wise or specific refusal; T71 review 1 |
@@ -183,7 +183,7 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
 | N41 | p3/cpp-variadic-alias-template-refused | in-repo `template<auto... I> using A = S<I...>` refused (alias machinery has no pack support) (ST4, pre-existing) | NEW 2026-10-01 |
-| N42 | p3/cpp-header-unreferenced-global-initializers-skipped | landed HDRGLOB (d13af01d8); if-const imported-const order IFCORDER (f2cbf5171); residue: root-const / qualified-const `if const` order, non-inline extern destructible shared global, same guard macro in two files | p3 |
+| N42 | p3/cpp-header-unreferenced-global-initializers-skipped | landed HDRGLOB (483f3b83d); if-const imported-const order IFCORDER (483f3b83d); residue: root-const / qualified-const `if const` order, non-inline extern destructible shared global, same guard macro in two files | p3 |
 | N47 | p3/cpp-constant-fold-and-const-static-twin-leftovers | constexpr-call initializer refused by the fold guard; const receiver + static twin overload refused (ST4 re-review leftovers) | NEW 2026-10-01 |
 | N52 | p3/cpp-range-for-member-name-lookup-and-count-probe | range-for member lookup misses enum/nested-type begin/end (accepts invalid); count/get clients pay a failed ADL probe; ST6 follow-up | NEW 2026-10-01 |
 | N58 | p3/cpp-struct-identity-underscore-namespace | [cpp] identity: ns_ namespace decode, global name collision, CRTP base reading a derived field (master too); N51 follow-up | NEW 2026-10-01 |
@@ -204,7 +204,7 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
 | p3/cpp-pointer-depth-and-array-pointer-param-gaps | (C++ interop) | non-null int** accepted into C++ int***; member/static array-pointer params refuse valid args |
 | p3/float-literal-plus-variable-computed-in-float | (C++ interop) | `i + 1.0` / `f + 1.0` typed float (clang double); check CFlat literal rule first |
-| p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (1bb1f5139); NEEDS RULING: exact generic vs widened concrete picks on compiling programs; leftovers: strlit vs char*, named-arg inference, generic-only const pointee return, UFCS free generic |
+| p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (ef83ffa02); RULED 2026-10-29: exact generic beats widened concrete (C++/C#), nullptr ambiguous, void* pick is a bug; leftovers: strlit vs char*, named-arg inference, generic-only const pointee return, UFCS free generic |
 | p3/member-type-path-remaining-gaps | (none) | `Outer<int>.Inner<long>.type`, closure-alias members, CFlat static data members, C++ statics as value template args (T37 follow-up) |
 
 ### Ruled 2026-10-01 - ready to schedule (rulings recorded in each issue file)
@@ -231,7 +231,7 @@ The A-H sections above stay the per-issue record; schedule from this table.
 | 1 | DIAG-TEXT | M/L | p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | shared KIND only (relayed clang / refusal text); no shared function (u) - may split into 2 runs | F1 | yes |
 | 3 | NULLCTOR | M/H | p3/cpp-null-macro-and-nullptr-spellings-refused | C++ ctor null-constant selection: scalar-reference mirror (CInterop ~15375), SelectCxxConstructorListed (~26846), RequestCxxBraceConstructor | NULLPTR-T, CTOR-VIABILITY, PTRRANK, CTOR-BRACE, CONSTMACRO | no |
 | 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | CheckCxxNamespaceConflicts + struct identity canonicalization (CInterop) | - | yes, careful on identity |
-| 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7 | items 1-2 (volatile operand, const prvalue into free C&&) + OPBIN residue; items 3-5 landed OPBIN (3a13c8ea9) | D2/D3 operator dispatch, CONVOP | yes |
+| 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7 | items 1-2 (volatile operand, const prvalue into free C&&) + OPBIN residue; items 3-5 landed OPBIN (ef83ffa02) | D2/D3 operator dispatch, CONVOP | yes |
 | 6 | MOVEPARAM | M/H | - (p2 file closed by T529) | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
 | 8 | PTRRANK | M/H | p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg (CInterop), TryBinaryOperatorOverload (supersedes old B3 row) | T89 in flight (same predicate) - after it lands | no |
 | 9 | FIELDCTOR | M/M | p3/cpp-class-field-default-construction-leftovers-after-v20 | field initializer lowering, MainListener_Aggregates.cpp (u) | - | yes |

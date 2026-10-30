@@ -1,6 +1,6 @@
 # Mixed-class C++ conditional residue after MIXCOND2
 
-MIXCOND (237dbf3cc) landed decl / sret / single-argument sink; MIXCOND2 (0870063c4) landed the last argument of a
+MIXCOND (af5834ad3) landed decl / sret / single-argument sink; MIXCOND2 (483f3b83d) landed the last argument of a
 multi-argument CFlat, C++ or method call (earlier arguments converted as the regular call path converts them), a nested
 conditional declaration arm, and the F1 blocker (a CFlat-produced prvalue arm now lives in the caller's full-expression
 ledger). Both ABIs verified (MS: a reference-taking callee leaves B to the wrapper temporary; a by-value one destroys it

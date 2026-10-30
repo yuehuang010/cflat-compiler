@@ -18,7 +18,7 @@ receiver. Items 1-2 are open; items 3-7 are pre-existing binary/compound/rewrite
    `-mkc()` with `const C mkc()` -> CFlat runs the free (2); clang: no viable operator. 3 global cells; the namespaced
    variant was not checked.
 
-Items 3-5 (compound member-vs-free ranking, `<=>` tie text, template free with a double operand) landed OPBIN (3a13c8ea9); items 6-7
+Items 3-5 (compound member-vs-free ranking, `<=>` tie text, template free with a double operand) landed OPBIN (ef83ffa02); items 6-7
 already matched clang on master (refused ambiguous, verified by the OPBIN reviews). Pre-existing residue from the OPBIN reviews:
 - A const receiver with both `operator+=(K&, int)` and `template<class T> operator+=(T&, int)`: clang picks the template (21); CFlat
   refuses ("rejected because the operand is const"), and the message leaks the internal `__cxx_free.` prefix.

@@ -1,6 +1,10 @@
 # Function pointer ABI-class pointee crossings remain open
 
-**NEEDS RULING (box 5, 2026-10-27, FNABI r1 parked):** an exact-pointee rule (clang: `u32*` vs `int*`, LP64 `long*` vs
+**RULED 2026-10-29 (maintainer): option (b).** Pointees follow the T427 ABI-class rule like by-value components: signedness-only
+pointee crossings stay accepted (char*/u8*, u32*/int*); width or type-identity crossings refuse (LP64 long* vs i64*, double* vs
+float*). The pinned char*/u8* leg stays; fix/fnabi (option (a)) is retargeted to (b).
+
+**Original question (box 5, 2026-10-27, FNABI r1 parked):** an exact-pointee rule (clang: `u32*` vs `int*`, LP64 `long*` vs
 `i64*`, `char*` vs `u8*` are distinct) breaks the pinned leg Test/test_function_ptr.cb ~3629
 `function<int(char*)> gcp = onCharPtrSigned; spellCallU8Ptr(gcp)` ("Signedness-only crossings - the isolated axis",
 together with by-value u32/int and u64/i64 legs). doc/LANGUAGE.md says function-type identity is exact, as in C.

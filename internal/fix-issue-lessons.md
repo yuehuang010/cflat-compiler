@@ -3685,7 +3685,7 @@ Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintaine
   reserved-word fixture still fails on a bogus message). No in-tree fixture is vacuous today; the hole bites the next
   one. p3, harness: every bare file-scope arm is verified when the next arm is set or at module end. Filed
   p3/expect-error-second-bare-file-scope-arm-unverified.
-- trivial_abi by-value double destroy ("1702 2" vs clang "1702 12"): NOT reproduced on master 8ef3d45a9 in six shapes
+- trivial_abi by-value double destroy ("1702 2" vs clang "1702 12"): NOT reproduced on master cb5c3eb6e in six shapes
   (scoped local, unscoped, read-after-call, by-value param forward, `move x`, copied local; JIT and AOT all match
   clang; scratch/rulings_1027/ta*.cb). The r6 repro left with the t518 worktree. Not filed until a repro exists.
 - LLVMBackend_CInterop.cpp:3288 matches `__closure_fat_ptr.dtor` by prefix: tighten to the T529 exact-name + numeric

@@ -1,6 +1,6 @@
 # Generic overload vs concrete overloads: needs-ruling picks and leftovers after GENOVL
 
-GENOVL (1bb1f5139) lets a generic candidate join a native overload set with concrete overloads when no concrete candidate
+GENOVL (ef83ffa02) lets a generic candidate join a native overload set with concrete overloads when no concrete candidate
 resolves the call on its own, so every call master REFUSED and clang accepts now picks as clang (pointer, value, pair,
 namespace, both declaration orders). Matrix and probes: scratch/repro_keep/genovl/ (genovl_report.md, genovl_review1.md,
 review1/cases/).
@@ -14,6 +14,8 @@ review1/cases/).
 - int -> bool, a long/double tie, variadic: CFlat 2, clang 9.
 Question: should an exact generic beat a concrete candidate reached by a widening conversion (C++ rule), changing these
 compiling programs?
+RULED 2026-10-29 (maintainer): YES - follow C++ and C#: identity beats widening, an exact generic wins; `nullptr` is
+ambiguous as in clang; the `void*` -> f(float*) pick is a bug. Every cell above follows clang.
 
 ## Leftovers (no ruling needed; clang accepts, CFlat refuses)
 

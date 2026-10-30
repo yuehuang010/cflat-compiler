@@ -9,7 +9,8 @@ Three related cases remain; all need a ruling.
 
 ## Qualified static method with int-to-double argument conversion
 
-NEEDS RULING: CFlat call arguments never accept int -> double (q08 680d9e8a); accepting it is a call-conversion surface change, not a lookup fix.
+RULED 2026-10-29 (main session, from precedent; maintainer may veto): STANDS as refused (q08 680d9e8a + 2026-09-30 "C++ call args keep CFlat's strict conversions"). Working as
+intended; this section is closed. The spelling is an explicit `(double)x` cast.
 
 Repro: `scratch/t504/qualified_static_overload.cb` and
 `scratch/t504/qualified_static_unique_int.cb`.
@@ -22,6 +23,11 @@ Fix direction: support the standard int-to-double conversion in this qualified o
 namespace variable is not the cause: removing it leaves the same candidate and diagnostic.
 
 ## Field default calls its own field name
+
+RULED 2026-10-29 (main session, from precedent; maintainer may veto; C++ member-initializer lookup; same ruling as cpp-class-field-default-construction-leftovers-after-v20
+item 4): a field initializer sees the struct's members and members hide outer names, so `int gv = gv(1);` is the
+non-callable-name error. An EARLIER field is readable (`int b = a + 1;`, declaration-order initialization); the field itself
+or a LATER field in its own initializer is a located use-before-initialization error.
 
 Repro: `scratch/t511/field_default_self_call.cb`.
 
@@ -38,6 +44,11 @@ routing the field through the function-body pending-local scope.
 
 ## Non-call self-initializer read
 
+RULED 2026-10-29 (main session, from precedent; maintainer may veto): the local is in scope from its point of declaration for every lookup (T511 did calls). `int x = x;` is
+a located error ("'x' is read in its own initializer"); the outer global is never the referent. The pinned leg
+`t504ReadSelfInitializer` (value 9) becomes an err_ leg. Rust's outer-binding reading is NOT adopted: C/C++ scoping was
+already chosen for calls.
+
 Repro: `Test/test_basic.cb::t504ReadSelfInitializer`.
 
 Observed: CFlat reads the global `t504SelfReadGlobal` and returns 9. In C++20 the local is in scope
@@ -50,6 +61,6 @@ the newly declared local for non-call reads.
 Fix direction: handle the local's point of declaration in ordinary expression lookup as well as
 call lookup, with a defined diagnostic or initialization rule.
 
-The generic-outer leftovers are all closed: NEST (2d2e922ad), NEST2 (24e3ec23a), NEST3 (30e9629ad), NEST5 (a509d073c),
-NEST6 (31519d3b3) and NESTVAL (2e6b647bf, nested member bodies using the enclosing aggregate by value). Only the sections
+The generic-outer leftovers are all closed: NEST (1cc0ed5d2), NEST2 (1cc0ed5d2), NEST3 (1cc0ed5d2), NEST5 (ef83ffa02),
+NEST6 (ef83ffa02) and NESTVAL (ef83ffa02, nested member bodies using the enclosing aggregate by value). Only the sections
 above that need a ruling remain.
