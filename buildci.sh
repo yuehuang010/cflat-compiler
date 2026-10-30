@@ -10,7 +10,7 @@
 #   6. BUILD vscode-extension (vscode-extension/build.sh)
 #   7. PACKAGE              (package_release.sh -> out/cflat-macos-arm64-v<ver>.tar.gz)
 #
-# --nightly: LIBS runs tiers 1-3 (adds Eigen and libtorch, ~6 min at -j3 on a warm
+# --nightly: LIBS runs tiers 1-3 (adds libtorch, ~6 min at -j3 on a warm
 # out/libs-cache) instead of tier 1 only. Every other stage is unchanged.
 #
 # A failed BUILD (stage 1) aborts; test/package failures are counted and CI

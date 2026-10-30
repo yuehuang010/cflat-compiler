@@ -57,6 +57,6 @@ When a fix lands for a disabled case, remove its `DISABLED` marker in the same c
 
 | Tier | Cadence | Libraries |
 | --- | --- | --- |
-| 1 | Smoke: required before landing, runs in `buildci.sh` / `buildci.bat`; not in the dev loop | std (C++11-C++20 feature sets, `std_<SS>_<topic>`), json, fmt, simdjson, and the Windows-only vcpkg libraries curl, openblas, sdl3, sqlite3, zlib |
-| 2 | On request (`-t 2`) and nightly (`buildci.sh --nightly`) | eigen, std_full (every C++11-C++20 header and API family, `std_full_<SS>_<topic>`) |
+| 1 | Smoke: required before landing, runs in `buildci.sh` / `buildci.bat`; not in the dev loop | std (C++11-C++20 feature sets, `std_<SS>_<topic>`), json, fmt, simdjson, eigen, std_full (every C++11-C++20 header and API family, `std_full_<SS>_<topic>`), and the Windows-only vcpkg libraries curl, openblas, sdl3, sqlite3, zlib |
+| 2 | On request (`-t 2`) and nightly (`buildci.sh --nightly`) | none at present |
 | 3 | On request (`-t 3`); giant, minutes per case | torch |

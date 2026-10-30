@@ -15,8 +15,7 @@ Green on the rebased branch, run by the main session before `git merge --ff-only
 ./cmake_build.sh release && x64/Release/cflat --init-local
 bash test.sh Release -j 4          # 0 failed
 bash test_example.sh               # 0 failed
-./test_libs.sh -j 2                # tier 1: 0 FAIL
-./test_libs.sh -t 2 -j 1           # tier 2 (eigen): 0 FAIL; an XPASS means a DISABLED marker comes off in the same commit
+./test_libs.sh -j 2                # tier 1 (incl. eigen, std_full): 0 FAIL; an XPASS means a DISABLED marker comes off in the same commit
 ./test_libs.sh -t 3 -j 1 torch     # torch 11/0 - required for any change under cflat/*CInterop*, *Overloads*, C++ call/ctor/operator paths
 ```
 

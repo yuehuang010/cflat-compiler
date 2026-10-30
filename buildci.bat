@@ -4,7 +4,7 @@ setlocal EnableDelayedExpansion
 set START_TIME=%TIME%
 set /a OVERALL_ERRORS=0
 
-REM --nightly: LIBS runs tiers 1-3 (adds Eigen and libtorch) instead of tier 1 only.
+REM --nightly: LIBS runs tiers 1-3 (adds libtorch) instead of tier 1 only.
 set LIBS_TIER=1
 if /I "%~1"=="--nightly" set LIBS_TIER=3
 
