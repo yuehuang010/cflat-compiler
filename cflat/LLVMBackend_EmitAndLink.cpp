@@ -2999,21 +2999,70 @@ bool LLVMBackend::EmitCxxDemandCompanions()
     for (const auto& [key, use] : cxxDemandGroups_) keys.insert(key);
     for (const auto& [key, group] : cxxIncrementalGroups_)
         if (group != nullptr && group->DemandChunks() > 0) keys.insert(key);
+    std::vector<std::string> orderedKeys(keys.begin(), keys.end());
+    const bool hasDynamicInitializers = std::any_of(
+        cxxDemandGroups_.begin(), cxxDemandGroups_.end(), [](const auto& item) {
+            return !item.second.dynamicInitializerSymbols.empty();
+        });
+    auto importOrder = [&](const std::string& key) {
+        cflat_cinterop::CxxImportOrder order;
+        if (auto use = cxxDemandGroups_.find(key); use != cxxDemandGroups_.end()
+            && !use->second.importOrder.empty())
+            order = use->second.importOrder;
+        if (auto request = cxxDemandRequestGroups_.find(key);
+            request != cxxDemandRequestGroups_.end()
+            && request->second.primary < cxxImportGroups_.size())
+        {
+            const auto& requestOrder = cxxImportGroups_[request->second.primary].importOrder;
+            if (order.empty() || requestOrder < order) order = requestOrder;
+        }
+        if (order.empty())
+            order = { static_cast<uint64_t>(-1) };
+        return order;
+    };
+    if (hasDynamicInitializers)
+        std::stable_sort(orderedKeys.begin(), orderedKeys.end(), [&](const auto& a, const auto& b) {
+            const auto aOrder = importOrder(a);
+            const auto bOrder = importOrder(b);
+            return aOrder != bOrder ? aOrder < bOrder : a < b;
+        });
     // use_empty() asserts on a lazily-loaded core; the link materializes it next anyway.
     MaterializeCoreIfLazy();
     const std::vector<std::string> demand = CxxProgramDemand();
     const std::string cacheDir = noCache_ ? std::string{} : GetCHeaderCacheDir();
-    for (const std::string& key : keys)
+    for (const std::string& key : orderedKeys)
     {
         const auto useIt = cxxDemandGroups_.find(key);
         const auto groupIt = cxxIncrementalGroups_.find(key);
         CxxIncrementalGroup* group = groupIt != cxxIncrementalGroups_.end()
             ? groupIt->second.get() : nullptr;
         const bool served = useIt != cxxDemandGroups_.end() && useIt->second.served;
+        std::vector<const cflat_cinterop::RawDynamicInitializer*> ownedInitializers;
+        if (useIt != cxxDemandGroups_.end())
+            for (const auto& initializer : useIt->second.dynamicInitializerSymbols)
+            {
+                const std::string identity = initializer.identity.empty()
+                    ? initializer.symbol : initializer.identity;
+                const auto owner = cxxDynamicInitializerOwners_.find(identity);
+                if (owner != cxxDynamicInitializerOwners_.end()
+                    && owner->second.groupKey == key)
+                    ownedInitializers.push_back(&initializer);
+            }
         const bool demanded = (useIt != cxxDemandGroups_.end() && useIt->second.demand)
+            || !ownedInitializers.empty()
             || (group != nullptr && group->DemandChunks() > 0);
         if (!demanded) continue;
         bool live = group != nullptr && !served;
+        std::vector<std::string> groupDemand = demand;
+        if (!ownedInitializers.empty())
+        {
+            std::unordered_set<std::string> names(groupDemand.begin(), groupDemand.end());
+            for (const auto* initializer : ownedInitializers)
+            {
+                if (names.insert(initializer->symbol).second)
+                    groupDemand.push_back(initializer->symbol);
+            }
+        }
 
         uint64_t companionKey = 14695981039346656037ULL;
         auto mix = [&](const std::string& text) {
@@ -3039,8 +3088,19 @@ bool LLVMBackend::EmitCxxDemandCompanions()
         for (const std::string& define : cDefines_) mix("D" + define);
         mix(key);
         if (useIt != cxxDemandGroups_.end())
+        {
             for (uint64_t hash : useIt->second.hashes) mix(std::to_string(hash));
-        for (const std::string& name : demand) mix(name);
+            for (const auto& initializer : useIt->second.dynamicInitializerSymbols)
+            {
+                const std::string identity = initializer.identity.empty()
+                    ? initializer.symbol : initializer.identity;
+                mix(identity);
+                const auto owner = cxxDynamicInitializerOwners_.find(identity);
+                mix(owner == cxxDynamicInitializerOwners_.end()
+                    ? std::string("<no-owner>") : owner->second.groupKey);
+            }
+        }
+        for (const std::string& name : groupDemand) mix(name);
         uint64_t groupHash = 14695981039346656037ULL;
         for (unsigned char byte : key)
         {
@@ -3144,7 +3204,7 @@ bool LLVMBackend::EmitCxxDemandCompanions()
         if (!recoverLookupTaint(group->TakeLookupTaintedBodyKeys())) return false;
         // Nothing recorded: the empty companion is still cached so a warm run finds it.
         if (group->DemandChunks() > 0
-            && !group->EmitDemandCompanion(demand, bitcode, stats, error, context.get(),
+            && !group->EmitDemandCompanion(groupDemand, bitcode, stats, error, context.get(),
                                            &companionModule))
         {
             std::vector<std::string> tainted = group->TakeLookupTaintedBodyKeys();
@@ -3160,7 +3220,7 @@ bool LLVMBackend::EmitCxxDemandCompanions()
             companionModule.reset();
             stats = cflat_cinterop::CxxDemandStats();
             if (group->DemandChunks() > 0
-                && !group->EmitDemandCompanion(demand, bitcode, stats, error, context.get(),
+                && !group->EmitDemandCompanion(groupDemand, bitcode, stats, error, context.get(),
                                                &companionModule))
             {
                 // In place, nothing is replayed, so no key can remain: a real body failure.
@@ -3173,7 +3233,7 @@ bool LLVMBackend::EmitCxxDemandCompanions()
         if (verbose)
             std::cout << std::format("[verbose] C++ demand companion: {} of {} program "
                                      "symbol(s) demanded, {} definition(s), {} unresolved, "
-                                     "{} bytes\n", stats.demanded, demand.size(),
+                                     "{} bytes\n", stats.demanded, groupDemand.size(),
                                      stats.definitions, stats.unresolved, bitcode.size());
         if (!companionPath.empty() && !runMode_ && !batchMode_ && symbolSink_ == nullptr)
         {

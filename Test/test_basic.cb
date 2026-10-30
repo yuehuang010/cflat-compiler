@@ -6452,6 +6452,25 @@ bool testCSpellingsAndCharTypes()
     return result;
 }
 
+int aliasTempCflatDtorOrder = 0;
+struct AliasTempCflat
+{
+    int value = 0;
+    AliasTempCflat(int v) { value = v; }
+    ~AliasTempCflat() { aliasTempCflatDtorOrder = aliasTempCflatDtorOrder * 10 + value; }
+};
+int testAliasTempCflatLifetime()
+{
+    aliasTempCflatDtorOrder = 0;
+    int value = 0;
+    {
+        alias AliasTempCflat r = AliasTempCflat(7);
+        aliasTempCflatDtorOrder = aliasTempCflatDtorOrder * 10 + 8;
+        value = r.value;
+    }
+    return value * 100 + aliasTempCflatDtorOrder;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -6494,6 +6513,7 @@ extern int main()
     total++; passed += testNestedNamespace()             ? 1 : 0;
     total++; passed += testNestedUsing()                 ? 1 : 0;
     total++; passed += testAliasAndStaticResolution() ? 1 : 0;
+    total++; passed += Test("cflat_alias_temp_lifetime", testAliasTempCflatLifetime(), 787) ? 1 : 0;
     total++; passed += testCSpellingsAndCharTypes()      ? 1 : 0;
     total++; passed += testLocalUsing()                  ? 1 : 0;
     total++; passed += testLocalUsingScoped()            ? 1 : 0;

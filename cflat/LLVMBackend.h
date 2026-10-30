@@ -1853,6 +1853,9 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // Ledger end index for this call argument, used to order caller-owned parameter temps.
+        size_t OwnedStructTempEnd = 0;
+        bool HasOwnedStructTempRange = false;
         // Address-of a proven pointer lvalue yields a C++ pointer prvalue (`&p`). Transient.
         bool IsCxxAddressOfPointerValue = false;
         // CFlat brace arguments load from their construction slot instead of a call instruction.
@@ -3512,7 +3515,14 @@ private:
     // so the later destructor runs ONLY when the arm ran - a user dtor body is not null-safe.
     // ArrayCount (C++ brace-list backing only): Alloca is an entry `TypeName[ArrayCount]` whose
     // elements are destroyed in reverse; see RegisterOwnedBraceListTemp.
-    struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; llvm::Value* LiveFlag = nullptr; uint64_t ArrayCount = 0; };
+    struct PendingOwnedStructTemp
+    {
+        llvm::Value* Alloca;
+        std::string TypeName;
+        llvm::BasicBlock* Block;
+        llvm::Value* LiveFlag = nullptr;
+        uint64_t ArrayCount = 0;
+    };
     std::vector<PendingOwnedStructTemp> pendingOwnedStructTemps;
     std::vector<llvm::Value*> cxxDefaultTernaryStorageJoins_;
     // Receiver temps of the alias declarator in progress (see MarkAliasDeclTemps). They stay on the
@@ -4303,6 +4313,7 @@ private:
      */
     struct CxxImportGroup
     {
+        cflat_cinterop::CxxImportOrder importOrder;
         std::vector<std::string> headers;
         std::vector<std::string> defines;
         std::unordered_set<std::string> namespaces;
@@ -4325,6 +4336,7 @@ private:
         mutable size_t closureHashFiles = static_cast<size_t>(-1);
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
+    cflat_cinterop::CxxImportOrder currentCxxImportOrderPath_;
     // Header guard verdicts are reused across constructor requests within one analysis.
     std::unordered_map<std::string, bool> cxxHeaderGuardCache_;
     /*
@@ -4360,6 +4372,9 @@ private:
     struct CxxDemandGroupUse
     {
         std::set<uint64_t> hashes;   // content hash x full cache key of every entry noted
+        std::vector<cflat_cinterop::RawDynamicInitializer> dynamicInitializerSymbols;
+        std::unordered_set<std::string> dynamicInitializerSeen;
+        cflat_cinterop::CxxImportOrder importOrder;
         std::vector<cflat_cinterop::ExtractResult::DemandReplayChunk> replayChunks;
         std::vector<std::string> noDeferBodyKeys;
         std::vector<std::string> pendingLookupTaintBodyKeys;
@@ -4369,6 +4384,7 @@ private:
         bool forceEagerBodies = false;
     };
     std::map<std::string, CxxDemandGroupUse> cxxDemandGroups_;
+    cflat_cinterop::DynamicInitializerOwnerMap cxxDynamicInitializerOwners_;
     std::unordered_map<std::string, CxxRequestGroup> cxxDemandRequestGroups_;
     std::unordered_set<std::string> cxxDemandLiveKeys_;   // entries this compile stored
     std::string pendingCxxDemandGroupKey_;                 // set by a recorded header harvest
@@ -4389,6 +4405,8 @@ private:
     // companion never outlives the inputs of any entry it was generated beside.
     void NoteCxxDemandEntry(const std::string& groupKey, uint64_t hash, uint64_t entryKey,
                             bool served, bool demand = true);
+    void NoteCxxDynamicInitializers(
+        const std::vector<cflat_cinterop::RawDynamicInitializer>& initializers);
     void NoteCxxDemandReplayChunk(
         const CxxRequestGroup& group,
         const cflat_cinterop::ExtractResult::DemandReplayChunk& chunk);
@@ -5072,6 +5090,7 @@ private:
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
         std::vector<CGlobalEntry> globals;
+        std::vector<cflat_cinterop::RawDynamicInitializer> cxxDynamicInitializerSymbols;
         // typedef-name -> tag aliases (MSG -> tagMSG). Cached so disk-cache hits replay them.
         std::vector<std::pair<std::string, std::string>> recordAliases;
         std::vector<CTypeAliasEntry> typeAliases;
@@ -5132,6 +5151,7 @@ private:
              + entry.classTemplateSpecializations.size()
              + entry.cxxGroupNamespaces.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
+             + entry.cxxDynamicInitializerSymbols.size()
              + entry.recordAliases.size() + entry.typeAliases.size()
              + entry.usingDirectives.size() + entry.namespaceAliases.size()
              + entry.classUsings.size()
@@ -5308,6 +5328,9 @@ private:
 
     // Fold-only view of file-scope `const` integer globals (see SetConstGlobalInt).
     std::unordered_map<std::string, int64_t> constGlobalInts_;
+    // Import discovery records decisions so later passes select the same file-scope arm.
+    std::unordered_map<const CFlatParser::IfConstDeclarationContext*, int>
+        sourceOrderedIfConstDecisions_;
     // Names of file-scope `const` floating globals used to re-admit imported declarations.
     std::set<std::string> constGlobalFPs_;
     // A -D define from the command line. Parsed once at arg time; re-applied by
@@ -6413,6 +6436,8 @@ private:
     void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName);
     // Same, destroyed only when the i1 at `liveFlag` is set (a conditionally constructed temp).
     void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName, llvm::Value* liveFlag);
+    void RegisterOwnedCxxParamTempAt(llvm::Value* alloca, const std::string& typeName, size_t index);
+    void DestroyMovedCxxArgSourceTemp(llvm::Value* source, llvm::Value* destination);
     /*
      * T518: whether the IR emitted after `anchor` (in `block`; nullptr = from its start) up to the
      * insert point may WRITE the object at `storage`: a store into it, an escape of its address, or
@@ -6521,6 +6546,9 @@ private:
     OwnedTempMark MarkOwnedTemps() const;
     // True when `alloca` is an owned struct temp registered at or after `mark`.
     bool IsOwnedStructTempSince(const OwnedTempMark& mark, llvm::Value* alloca) const;
+    bool AddressDerivesFromOwnedStructTempSince(const OwnedTempMark& mark,
+                                                 llvm::Value* address) const;
+    bool ExtendCxxStructTempsToScopeSince(const OwnedTempMark& mark, llvm::Value* address);
     // True when `storage` is a field address inside a struct temp still on the owned-temp list.
     bool IsFieldOfOwnedStructTemp(const llvm::Value* storage) const;
     void HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::Value* address,
@@ -8043,7 +8071,8 @@ private:
                              std::vector<std::string>* outVariableTemplateNames = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outClassUsings = nullptr,
                              std::vector<std::string>* outClassTemplateSpecializations = nullptr,
-                             std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates = nullptr);
+                             std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates = nullptr,
+                             std::vector<cflat_cinterop::RawDynamicInitializer>* outDynamicInitializers = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -8533,6 +8562,26 @@ public:
         AliasScopeGuard& operator=(const AliasScopeGuard&) = delete;
     private:
         LLVMBackend* compiler_;
+    };
+
+    class CxxImportOrderGuard
+    {
+    public:
+        CxxImportOrderGuard(LLVMBackend* compiler,
+                            const cflat_cinterop::CxxImportOrder& order)
+            : compiler_(compiler), saved_(compiler_->currentCxxImportOrderPath_)
+        {
+            compiler_->currentCxxImportOrderPath_ = order;
+        }
+        ~CxxImportOrderGuard()
+        {
+            compiler_->currentCxxImportOrderPath_ = std::move(saved_);
+        }
+        CxxImportOrderGuard(const CxxImportOrderGuard&) = delete;
+        CxxImportOrderGuard& operator=(const CxxImportOrderGuard&) = delete;
+    private:
+        LLVMBackend* compiler_;
+        cflat_cinterop::CxxImportOrder saved_;
     };
 
     // Canonical interface lookup. Callers must not choose between a bare key and a qualified key
@@ -11114,7 +11163,11 @@ public:
                             const CxxTernaryVerdict& verdict, bool discardResult,
                             llvm::Value* resultSlot = nullptr,
                             llvm::Value* callSink = nullptr,
-                            const std::string& callReturnSpelling = {});
+                            const std::string& callReturnSpelling = {},
+                            std::vector<llvm::Value*>* callerOwnedProducerSlots = nullptr,
+                            bool callerOwnedProducerAllowed = false,
+                            llvm::Value* callSinkEnvironment = nullptr,
+                            bool callSinkTakesReference = false);
     // clang's std::is_convertible<S&&, P*> for a class xvalue at a P* parameter; cached per pair.
     bool HasImplicitClassPointerConversion(const std::string& sourceType,
                                            const std::string& pointeeType, bool pointeeConst);
@@ -11509,6 +11562,8 @@ public:
     std::string ResolveCxxBaseRecordName(const cflat_cinterop::RawCxxBase& base) const;
     // An unqualified identifier spelling no CFlat type maps: a global-namespace C++ class.
     bool IsUnmappedGlobalCxxClassSpelling(const std::string& spelling);
+    // A global template-id spelling of a known C++ class template that no CFlat generic owns.
+    bool IsCxxGlobalClassTemplateSpecializationSpelling(const std::string& spelling) const;
     // Re-entry guard for retrying a specialization's refused signature after registration.
     std::set<std::string> cxxRefusedMemberRebindInFlight_;
     // Re-entry guard for the inherited-member rebind above (a diamond can reach one base twice).
@@ -12836,6 +12891,10 @@ public:
      */
     void SetConstGlobalInt(const std::string& name, int64_t value);
     bool TryGetConstGlobalInt(const std::string& name, int64_t& out) const;
+    void SetSourceOrderedIfConstDecision(
+        const CFlatParser::IfConstDeclarationContext* ctx, int decision);
+    std::optional<int> GetSourceOrderedIfConstDecision(
+        const CFlatParser::IfConstDeclarationContext* ctx) const;
     void SetConstGlobalFP(const std::string& name);
     bool IsConstGlobalFP(const std::string& name) const;
 
@@ -13969,7 +14028,7 @@ public:
 
     bool CheckGrammar(const std::string& filename);
 
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cppMode = false);
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cppMode = false, const cflat_cinterop::CxxImportOrder& importOrder = {});
 
     bool ResolveImportPath(const std::string& importingFilePath, const std::string& importFilename,
                            std::string& outCanonical, bool quiet = false);
@@ -13978,7 +14037,10 @@ public:
                             const std::vector<std::string>& entries,
                             const std::vector<std::string>& groupLibs,
                             const std::vector<std::string>& groupDefines,
-                            bool cppMode = false);
+                            bool cppMode = false,
+                            const cflat_cinterop::CxxImportOrder& importOrder = {});
+
+    cflat_cinterop::CxxImportOrder CxxImportOrderAt(uint64_t sourceOffset) const;
 
     static std::string ResolveCLinkLib(const std::string& lib, const std::string& importingFilePath);
 
@@ -14144,7 +14206,11 @@ public:
     // 297: closureKeptParams follows glvalue init lists and skips unevaluated operands (T525 r6).
     // 298: a sizeof/alignof of a variably modified type is evaluated for closureKeptParams (T525 r7).
     // 299: C++ constructor template parameter-pack metadata round-trips in the header cache (AMP2 r2).
-    static constexpr int kCHeaderCacheVersion = 299;
+    // 300: C++ header initializer symbols and declaration order round-trip in the header cache.
+    // 301: zero-initialized scalars are excluded from the dynamic initializer list.
+    // 302: dynamic initializer ownership is shared across import groups.
+    // 303: initializer cache entries carry internal-linkage file identity and import order.
+    static constexpr int kCHeaderCacheVersion = 304;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

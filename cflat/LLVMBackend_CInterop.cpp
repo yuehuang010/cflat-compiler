@@ -6060,7 +6060,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<std::string>* outVariableTemplateNames,
                              std::vector<std::pair<std::string, std::string>>* outClassUsings,
                              std::vector<std::string>* outClassTemplateSpecializations,
-                             std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates)
+                             std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates,
+                             std::vector<cflat_cinterop::RawDynamicInitializer>* outDynamicInitializers)
 {
         if (headerPaths.empty()) return false;
         if (outHeaderFailure) *outHeaderFailure = false;
@@ -6275,6 +6276,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             if (verbose) std::cout << std::format("[verbose]   C header extraction failed: {}\n", err);
             return false;
         }
+        if (outDynamicInitializers != nullptr)
+            *outDynamicInitializers = raw.cxxDynamicInitializerSymbols;
         SetCInteropTargetFacts(raw);
         if (outIncludes) *outIncludes = raw.includedFiles;
         const bool captureClosure = cxxMode && activeCxxRequestGroup_ != nullptr
@@ -7703,9 +7706,37 @@ void LLVMBackend::NoteCxxDemandEntry(const std::string& groupKey, uint64_t hash,
 {
         if (groupKey.empty()) return;
         CxxDemandGroupUse& use = cxxDemandGroups_[groupKey];
+        if (activeCxxRequestGroup_ != nullptr
+            && activeCxxRequestGroup_->primary < cxxImportGroups_.size())
+        {
+            const auto& order = cxxImportGroups_[activeCxxRequestGroup_->primary].importOrder;
+            if (use.importOrder.empty() || order < use.importOrder) use.importOrder = order;
+        }
         use.hashes.insert(HashWrapperKey(std::format("{:016x}:{:016x}", hash, entryKey)));
         use.served = use.served || served;
         use.demand = use.demand || demand;
+}
+
+void LLVMBackend::NoteCxxDynamicInitializers(
+    const std::vector<cflat_cinterop::RawDynamicInitializer>& initializers)
+{
+        if (activeCxxRequestGroup_ == nullptr || initializers.empty()) return;
+        const std::string groupKey = CxxIncrementalGroupKey(*activeCxxRequestGroup_);
+        auto& use = cxxDemandGroups_[groupKey];
+        cflat_cinterop::CxxImportOrder importOrder = activeCxxRequestGroup_->primary < cxxImportGroups_.size()
+            ? cxxImportGroups_[activeCxxRequestGroup_->primary].importOrder
+            : cflat_cinterop::CxxImportOrder{ static_cast<uint64_t>(-1) };
+        if (use.importOrder.empty() || importOrder < use.importOrder) use.importOrder = importOrder;
+        for (const auto& initializer : initializers)
+        {
+            if (initializer.symbol.empty()) continue;
+            const std::string identity = initializer.identity.empty()
+                ? initializer.symbol : initializer.identity;
+            cflat_cinterop::NoteDynamicInitializerOccurrence(
+                cxxDynamicInitializerOwners_, identity, groupKey);
+            if (use.dynamicInitializerSeen.insert(identity).second)
+                use.dynamicInitializerSymbols.push_back(initializer);
+        }
 }
 
 void LLVMBackend::NoteCxxDemandReplayChunk(const CxxRequestGroup& group,
@@ -7714,6 +7745,11 @@ void LLVMBackend::NoteCxxDemandReplayChunk(const CxxRequestGroup& group,
         const std::string key = CxxIncrementalGroupKey(group);
         cxxDemandRequestGroups_[key] = group;
         auto& use = cxxDemandGroups_[key];
+        if (group.primary < cxxImportGroups_.size())
+        {
+            const auto& order = cxxImportGroups_[group.primary].importOrder;
+            if (use.importOrder.empty() || order < use.importOrder) use.importOrder = order;
+        }
         for (const std::string& bodyKey : chunk.noDeferBodyKeys)
             if (std::find(use.noDeferBodyKeys.begin(), use.noDeferBodyKeys.end(), bodyKey)
                 == use.noDeferBodyKeys.end())
@@ -8068,8 +8104,16 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
 {
         std::string key = CxxIncrementalGroupKey(group);
         cxxDemandRequestGroups_[key] = group;
+        const cflat_cinterop::CxxImportOrder importOrder = group.primary < cxxImportGroups_.size()
+            ? cxxImportGroups_[group.primary].importOrder
+            : cflat_cinterop::CxxImportOrder{ static_cast<uint64_t>(-1) };
         auto found = cxxIncrementalGroups_.find(key);
-        if (found != cxxIncrementalGroups_.end()) return found->second.get();
+        if (found != cxxIncrementalGroups_.end())
+        {
+            found->second->SetDynamicInitializerOwners(&cxxDynamicInitializerOwners_,
+                importOrder);
+            return found->second.get();
+        }
 
         const std::string source = initialSource.empty()
             ? BuildCxxRequestIncludes(group) : initialSource;
@@ -8083,6 +8127,8 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
             cxxDemandGroups_.contains(key) && cxxDemandGroups_[key].forceEagerBodies);
         if (!created) return nullptr;
         CxxIncrementalGroup* result = created.get();
+        result->SetDynamicInitializerOwners(&cxxDynamicInitializerOwners_,
+            importOrder);
         result->RememberPrefixSource(BuildCxxRequestIncludes(group));
         cxxIncrementalGroups_.emplace(std::move(key), std::move(created));
         const std::string groupKey = CxxIncrementalGroupKey(group);
@@ -9314,13 +9360,31 @@ void LLVMBackend::StoreCxxTypeRequestCache(const CxxRequestGroup& group,
  * the header disk cache hashes. A second import of the same headers with the same defines is the
  * same group, so a repeated import does not split the request cache.
  */
+cflat_cinterop::CxxImportOrder LLVMBackend::CxxImportOrderAt(uint64_t sourceOffset) const
+{
+        auto order = currentCxxImportOrderPath_;
+        order.push_back(sourceOffset);
+        return order;
+}
+
 size_t LLVMBackend::FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
                                             const std::vector<std::string>& defines)
 {
         for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
             if (cxxImportGroups_[i].headers == headers && cxxImportGroups_[i].defines == defines)
+            {
+                const auto& order = currentCxxImportOrderPath_.empty()
+                    ? cflat_cinterop::CxxImportOrder{ static_cast<uint64_t>(-1) }
+                    : currentCxxImportOrderPath_;
+                if (cxxImportGroups_[i].importOrder.empty()
+                    || order < cxxImportGroups_[i].importOrder)
+                    cxxImportGroups_[i].importOrder = order;
                 return i;
+            }
         CxxImportGroup group;
+        group.importOrder = currentCxxImportOrderPath_.empty()
+            ? cflat_cinterop::CxxImportOrder{ static_cast<uint64_t>(-1) }
+            : currentCxxImportOrderPath_;
         group.headers = headers;
         group.defines = defines;
         cxxImportGroups_.push_back(std::move(group));
@@ -27314,6 +27378,18 @@ bool LLVMBackend::IsUnmappedGlobalCxxClassSpelling(const std::string& spelling)
             && dataStructures.find(spelling) == dataStructures.end();
 }
 
+bool LLVMBackend::IsCxxGlobalClassTemplateSpecializationSpelling(
+        const std::string& spelling) const
+{
+        if (spelling.find("::") != std::string::npos) return false;
+        const size_t templateOpen = spelling.find('<');
+        if (templateOpen == std::string::npos) return false;
+        const std::string base = spelling.substr(0, templateOpen);
+        // A CFlat generic of the same name owns the spelling; never map a C++ layout onto it.
+        return HasCxxClassTemplate(base) && !AnyGenericTypeTemplateNamed(base)
+            && dataStructures.find(spelling) == dataStructures.end();
+}
+
 bool LLVMBackend::CxxRefusedMemberSignatureKnown(const CRecordEntry& record,
                                                  const std::string& memberName) const
 {
@@ -27331,7 +27407,8 @@ bool LLVMBackend::CxxRefusedMemberSignatureKnown(const CRecordEntry& record,
                     && (spelling.find('<') == std::string::npos
                         || spelling.starts_with("__cflat_user::")
                         || spelling.starts_with("const __cflat_user::"));
-                if (spelling.find("::") == std::string::npos
+                if ((spelling.find("::") == std::string::npos
+                     && !IsCxxGlobalClassTemplateSpecializationSpelling(spelling))
                     || generatedUserRecord
                     || spelling.find("type-parameter-") != std::string::npos)
                     continue;
@@ -27497,7 +27574,8 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                     for (const std::string& raw : spellings)
                     {
                         const std::string spelling = CxxMemberValueSpelling(raw);
-                        if (spelling.find("::") == std::string::npos
+                        if ((spelling.find("::") == std::string::npos
+                             && !IsCxxGlobalClassTemplateSpecializationSpelling(spelling))
                             || spelling.find('<') == std::string::npos)
                             continue;
                         if (spelling.find("__cflat_user::") != std::string::npos
@@ -27586,7 +27664,8 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                 // A global-namespace class (MSVC's ::type_info behind `using ::type_info;` in std)
                 // is spelled unqualified; request it like a qualified one.
                 if (spelling.find("::") == std::string::npos
-                    && !IsUnmappedGlobalCxxClassSpelling(spelling))
+                    && !IsUnmappedGlobalCxxClassSpelling(spelling)
+                    && !IsCxxGlobalClassTemplateSpecializationSpelling(spelling))
                     return;
                 if (spelling.find("__cflat_user::") != std::string::npos
                     && GeneratedCxxPrefixForSpelling(spelling).empty())
@@ -29717,6 +29796,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<CMacroEntry> hitMacros;
         std::vector<CFunctionMacroEntry> hitFuncMacros;
         std::vector<CGlobalEntry> hitGlobals;
+        std::vector<cflat_cinterop::RawDynamicInitializer> hitDynamicInitializers;
         std::vector<std::pair<std::string, std::string>> hitAliases;
         std::vector<CTypeAliasEntry> hitTypeAliases;
         std::vector<std::pair<std::string, std::string>> hitUsingDirectives;
@@ -29751,6 +29831,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     TouchCFileSigEntry(cacheKey, entry);
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
+                    hitDynamicInitializers = entry.cxxDynamicInitializerSymbols;
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
                     hitUsingDirectives = entry.usingDirectives;
@@ -29776,6 +29857,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     TouchCFileSigEntry(cacheKey, entry);
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
+                    hitDynamicInitializers = entry.cxxDynamicInitializerSymbols;
                     hitAliases = entry.recordAliases; hit = true;
                     hitTypeAliases = entry.typeAliases;
                     hitUsingDirectives = entry.usingDirectives;
@@ -29796,6 +29878,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         if (hit)
         {
+            if (cppMode) NoteCxxDynamicInitializers(hitDynamicInitializers);
             for (const auto& classTemplate : hitClassTemplates)
                 cxxClassTemplateParameters_[classTemplate.name] = classTemplate;
             if (!cppMode && std::ranges::any_of(hitSigs, [](const CSigEntry& sig) { return sig.isInline; }))
@@ -29918,6 +30001,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             {
                 NoteCxxDemandEntry(diskEntry.cxxDemandGroupKey, diskEntry.hash, demandEntryKey,
                                    /*served*/ true);
+                if (cppMode)
+                    NoteCxxDynamicInitializers(diskEntry.cxxDynamicInitializerSymbols);
                 if (!diskEntry.cxxDemandGroupKey.empty() && activeCxxRequestGroup_ != nullptr)
                     NoteCxxDemandReplayChunk(*activeCxxRequestGroup_,
                                              diskEntry.cxxDemandReplayChunk);
@@ -30048,6 +30133,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<std::pair<std::string, std::string>> namespaceAliases;
         std::vector<std::pair<std::string, std::string>> classUsings;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> functionPointerAbis;
+        std::vector<cflat_cinterop::RawDynamicInitializer> dynamicInitializers;
         uint64_t longDoubleWidth = 0;
         bool longDoubleIsIEEEDouble = false;
         std::string targetTriple;
@@ -30085,7 +30171,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates,
                                      &usingDirectives, &namespaceAliases, &classTemplateNames,
                                      &variableTemplateNames,
-                                     &classUsings, &classTemplateSpecializations, &classTemplates))
+                                     &classUsings, &classTemplateSpecializations, &classTemplates,
+                                     &dynamicInitializers))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg, cppMode);
@@ -30099,6 +30186,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 }
                 return false;
             }
+            if (cppMode) NoteCxxDynamicInitializers(dynamicInitializers);
             // C inline demand inputs, computed once per group (never per signature, never C++:
             // C++ inline bodies come from the companion module).
             if (!cppMode && std::ranges::any_of(sigs, [](const CSigEntry& sig) { return sig.isInline; }))
@@ -30161,6 +30249,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.namespaceAliases = namespaceAliases;
             entry.classUsings = classUsings;
             entry.functionPointerAbis = functionPointerAbis;
+            entry.cxxDynamicInitializerSymbols = dynamicInitializers;
             entry.cxxBitcode = cxxBitcode;
             entry.cxxDemandGroupKey = std::move(pendingCxxDemandGroupKey_);
             pendingCxxDemandGroupKey_.clear();
@@ -30820,6 +30909,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
          * call, so it joins the end-of-statement owned-temp list.
          */
         std::vector<llvm::Value*> indirectArgAddrs;
+        size_t insertedCxxParamTemps = 0;
         if (recipe.hasLowering && callArgVars != nullptr)
             for (size_t i = 1; i < recipe.paramSlots.size() && i < st.params.size(); ++i)
             {
@@ -30855,7 +30945,16 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                                 "into a by-value constructor parameter", {},
                                                 CxxConstReceiverKind((*callArgVars)[argIndex]) != 0))
                     continue;
-                if (!IsCxxParamDestroyedInCallee(pn)) RegisterOwnedStructTemp(temp, pn);
+                if (!IsCxxParamDestroyedInCallee(pn))
+                {
+                    size_t index = pendingOwnedStructTemps.size();
+                    if ((*callArgVars)[argIndex].HasOwnedStructTempRange)
+                        index = (*callArgVars)[argIndex].OwnedStructTempEnd + insertedCxxParamTemps;
+                    RegisterOwnedCxxParamTempAt(temp, pn, index);
+                    ++insertedCxxParamTemps;
+                }
+                if (useMove && (*callArgVars)[argIndex].IsRvalue)
+                    DestroyMovedCxxArgSourceTemp((*callArgVars)[argIndex].Storage, temp);
                 if ((*callArgVars)[argIndex].CxxParamLastUse
                     && !(*callArgVars)[argIndex].IsElementAccess
                     && (*callArgVars)[argIndex].FieldName.empty())
@@ -33320,7 +33419,11 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
                                      CxxArmCategory falseCategory, bool armIsTrue,
                                      const CxxTernaryVerdict& verdict, bool discardResult,
                                      llvm::Value* resultSlot, llvm::Value* callSink,
-                                     const std::string& callReturnSpelling)
+                                     const std::string& callReturnSpelling,
+                                     std::vector<llvm::Value*>* callerOwnedProducerSlots,
+                                     bool callerOwnedProducerAllowed,
+                                     llvm::Value* callSinkEnvironment,
+                                     bool callSinkTakesReference)
 {
         using Kind = CxxTernaryVerdict::Kind;
         if (callSink != nullptr && (resultSlot != nullptr || callReturnSpelling.empty()))
@@ -33383,6 +33486,11 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             return true;
         };
         if (!collectSlots(collectSlots, arm.Storage)) producerSlots.clear();
+        if (callerOwnedProducerAllowed)
+            if (auto* direct = llvm::dyn_cast_or_null<llvm::AllocaInst>(arm.Storage);
+                direct != nullptr
+                && std::find(producerSlots.begin(), producerSlots.end(), direct) == producerSlots.end())
+                producerSlots.push_back(direct);
         auto isStorageJoin = [&](llvm::User* user) {
             return std::find(storageJoins.begin(), storageJoins.end(), user) != storageJoins.end();
         };
@@ -33446,8 +33554,14 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             }
             if (!indirect) producers.clear();
         }
+        const bool callerOwnedProducer = callerOwnedProducerAllowed && !producerSlots.empty()
+            && (resultSlot != nullptr || callSink != nullptr) && armIsPrvalue && !refResult
+            && armName != resultName;
+        if (callerOwnedProducer && callerOwnedProducerSlots != nullptr)
+            for (llvm::AllocaInst* slot : producerSlots)
+                callerOwnedProducerSlots->push_back(slot);
         // A discarded result is the whole full-expression in clang: temporaries die in its order.
-        const bool thunkArm = !producers.empty();
+        const bool thunkArm = !producers.empty() && !callerOwnedProducer;
         const bool discardInClang = thunkArm && discardResult;
         // The never-taken arm is a null dereference: a constant condition never evaluates it.
         // Lvalue arms stay lvalues; xvalue and (modelled) prvalue arms are rvalue-reference casts.
@@ -33464,7 +33578,9 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             + (armIsTrue ? "t" : "f") + CxxArmCategoryTag(armCategory) + "|"
             + CxxArmCategoryTag(otherCategory)
             + (refResult ? "r" : "v") + (thunkArm ? "k" : "") + (discardInClang ? "d" : "")
-            + (callSink != nullptr ? "|call|" + callReturnSpelling : std::string())
+            + (callSink != nullptr ? "|call|" + callReturnSpelling
+                + (callSinkEnvironment != nullptr ? "|env" : "")
+                + (callSinkTakesReference ? "|ref" : "") : std::string())
             + "|" + conditional;
         const std::string wrapperName = std::format("__cflat_ternary_arm_{:016x}",
             HashWrapperKey(wrapperKey));
@@ -33473,22 +33589,29 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
         const std::string armParams = thunkArm ? std::string("void * p0, void * p1")
                                                : armCv + " * p0";
         std::string source;
-        if (callSink != nullptr && IsCxxParamDestroyedInCallee(resultName))
+        const bool callSinkHasEnvironment = callSink != nullptr && callSinkEnvironment != nullptr;
+        const std::string sinkParams = callSinkHasEnvironment
+            ? "void * sink, void * call_env, " : "void * sink, ";
+        const std::string sinkEnvironmentArg = callSinkHasEnvironment ? ", call_env" : "";
+        // A sink taking a reference never destroys B: the wrapper's temporary does, after the call.
+        if (callSink != nullptr && !callSinkTakesReference && IsCxxParamDestroyedInCallee(resultName))
         {
             // MS ABI: callee destroys the by-value parameter; B lives in caller-owned storage.
             // One full-expression keeps the converted-from arm alive through the call.
             const std::string callback = "reinterpret_cast<" + callReturnSpelling + " (*)("
-                + resultSpelling + " &&)>(sink)(static_cast<" + resultSpelling + " &&>(*new (storage) "
-                + resultSpelling + "(" + conditional + ")))";
-            source = prologue + callReturnSpelling + " " + wrapperName + "(void * sink, "
+                + resultSpelling + " &&" + (callSinkHasEnvironment ? ", void *" : std::string())
+                + ")>(sink)(static_cast<" + resultSpelling + " &&>(*new (storage) "
+                + resultSpelling + "(" + conditional + "))" + sinkEnvironmentArg + ")";
+            source = prologue + callReturnSpelling + " " + wrapperName + "(" + sinkParams
                 + armParams + ") { alignas(" + resultSpelling + ") unsigned char storage[sizeof("
                 + resultSpelling + ")]; return " + callback + "; }\n";
         }
         else if (callSink != nullptr)
         {
             const std::string callback = "reinterpret_cast<" + callReturnSpelling + " (*)("
-                + resultSpelling + " &&)>(sink)(" + conditional + ")";
-            source = prologue + callReturnSpelling + " " + wrapperName + "(void * sink, "
+                + resultSpelling + " &&" + (callSinkHasEnvironment ? ", void *" : std::string())
+                + ")>(sink)(" + conditional + sinkEnvironmentArg + ")";
+            source = prologue + callReturnSpelling + " " + wrapperName + "(" + sinkParams
                 + armParams + ") { return " + callback + "; }\n";
         }
         else if (refResult && resultSlot == nullptr)
@@ -33616,8 +33739,12 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             {
                 if (callSink != nullptr)
                 {
+                    std::vector<llvm::Value*> wrapperArgs{ callSink };
+                    if (callSinkHasEnvironment) wrapperArgs.push_back(callSinkEnvironment);
+                    wrapperArgs.push_back(thunk);
+                    wrapperArgs.push_back(env);
                     arm.Primary = CreateCallOrInvoke(function->getFunctionType(), function,
-                        { callSink, thunk, env }, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
+                        wrapperArgs, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
                     arm.Storage = nullptr;
                     arm.BaseType = arm.Primary != nullptr ? arm.Primary->getType() : nullptr;
                     return arm.Primary != nullptr;
@@ -33644,8 +33771,11 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             }
             if (callSink != nullptr)
             {
+                std::vector<llvm::Value*> wrapperArgs{ callSink };
+                if (callSinkHasEnvironment) wrapperArgs.push_back(callSinkEnvironment);
+                wrapperArgs.push_back(storage);
                 arm.Primary = CreateCallOrInvoke(function->getFunctionType(), function,
-                    { callSink, storage }, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
+                    wrapperArgs, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
                 arm.Storage = nullptr;
                 arm.BaseType = arm.Primary != nullptr ? arm.Primary->getType() : nullptr;
                 return arm.Primary != nullptr;

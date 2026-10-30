@@ -515,6 +515,21 @@ namespace cflat_cinterop
                 if (go.getComdat() == old) go.setComdat(renamed);
         }
 
+        void RewriteNonOwnerInternalAliases(
+            llvm::Module& mod,
+            const std::unordered_map<std::string, std::string>& aliases)
+        {
+            for (const auto& [symbol, ownerAlias] : aliases)
+            {
+                llvm::GlobalVariable* gv = mod.getGlobalVariable(symbol, true);
+                if (gv == nullptr) continue;
+                gv->setInitializer(nullptr);
+                RenamePerGroupGlobal(gv, ownerAlias);
+                gv->setLinkage(llvm::GlobalValue::ExternalLinkage);
+                gv->setVisibility(llvm::GlobalValue::DefaultVisibility);
+            }
+        }
+
         // A bindable entry for an internal function: the body and its in-module callers keep the
         // internal copy, so this companion's static is never merged with another module's.
         void AddStaticInlineProgramThunk(llvm::Module& mod, llvm::Function* fn,
@@ -1573,6 +1588,47 @@ namespace cflat_cinterop
             return os.str().str();
         }
 
+        bool HasCxxDynamicInitializer(ASTContext& ctx, const VarDecl* definition)
+        {
+            if (definition == nullptr || definition->isInvalidDecl()
+                || definition->getType()->isDependentType()
+                || definition->getDeclContext()->isDependentContext()
+                || definition->getTSCSpec() != TSCS_unspecified
+                || definition->hasConstantInitialization())
+                return false;
+            if (definition->getInit() == nullptr)
+            {
+                QualType objectType = definition->getType();
+                while (const ArrayType* array = ctx.getAsArrayType(objectType))
+                    objectType = array->getElementType();
+                const CXXRecordDecl* record = objectType->getAsCXXRecordDecl();
+                if (record == nullptr || record->hasTrivialDefaultConstructor()) return false;
+            }
+            return true;
+        }
+
+        std::string CxxDynamicInitializerIdentity(ASTContext& ctx, const VarDecl* definition,
+                                                   const std::string& symbol)
+        {
+            if (definition->hasExternalFormalLinkage()
+                && definition->getStorageClass() != SC_Static)
+                return symbol;
+            SourceManager& sm = ctx.getSourceManager();
+            SourceLocation loc = sm.getExpansionLoc(definition->getLocation());
+            if (loc.isInvalid() || !loc.isFileID())
+                loc = sm.getSpellingLoc(definition->getLocation());
+            if (loc.isInvalid() || !loc.isFileID())
+                return std::format("I0::{}", CxxLinkageName(ctx, definition));
+            std::string file = sm.getFilename(loc).str();
+            if (auto fileEntry = sm.getFileEntryRefForID(sm.getFileID(loc)))
+            {
+                const llvm::StringRef realPath = fileEntry->getFileEntry().tryGetRealPathName();
+                if (!realPath.empty()) file = realPath.str();
+            }
+            const std::string linkage = CxxLinkageName(ctx, definition);
+            return std::format("I{}:{}:{}:{}", file.size(), file, sm.getFileOffset(loc), linkage);
+        }
+
         int MapAccess(AccessSpecifier a)
         {
             if (a == AS_private)   return AccessPrivate;
@@ -2275,6 +2331,71 @@ namespace cflat_cinterop
             const Stmt* skippedBody = nullptr;
 
             DeclVisitor(ASTContext& c, ExtractState& s) : ctx(c), sm(c.getSourceManager()), st(s) {}
+
+            bool HasDynamicInitializer(const VarDecl* definition) const
+            {
+                return HasCxxDynamicInitializer(ctx, definition);
+            }
+
+            bool NoteDynamicInitializer(const VarDecl* definition,
+                                        const std::string& symbol)
+            {
+                auto* plan = st.req.demandPlan;
+                if (plan == nullptr || symbol.empty() || !HasDynamicInitializer(definition))
+                    return false;
+                const std::string identity =
+                    CxxDynamicInitializerIdentity(ctx, definition, symbol);
+                if (plan->dynamicInitializerCandidateSeen.insert(identity).second)
+                    plan->dynamicInitializerCandidates.push_back({ symbol, identity });
+                if (plan->dynamicInitializerOwners != nullptr)
+                {
+                    NoteDynamicInitializerOccurrence(*plan->dynamicInitializerOwners, identity,
+                        st.req.cxxImportGroupKey);
+                    auto owner = plan->dynamicInitializerOwners->find(identity);
+                    if (owner->second.groupKey != st.req.cxxImportGroupKey) return false;
+                }
+                if (definition->hasExternalFormalLinkage()
+                    && definition->getStorageClass() != SC_Static
+                    && std::find(plan->weakPromoteSymbols.begin(),
+                                 plan->weakPromoteSymbols.end(), symbol)
+                        == plan->weakPromoteSymbols.end())
+                    plan->weakPromoteSymbols.push_back(symbol);
+                if (plan->dynamicInitializerSeen.insert(symbol).second)
+                    plan->dynamicInitializerSymbols.push_back(symbol);
+                return true;
+            }
+
+            bool RecordDynamicInitializerDefinition(const VarDecl* definition,
+                                                   const std::string& symbol)
+            {
+                if (!st.req.RecordsDefinitionDemand()
+                    || !NoteDynamicInitializer(definition, symbol))
+                    return false;
+                if (std::find(st.varEmitWork.begin(), st.varEmitWork.end(), definition)
+                    == st.varEmitWork.end())
+                    st.varEmitWork.push_back(definition);
+                return true;
+            }
+
+            bool RecordInternalDynamicInitializerDefinition(const VarDecl* definition)
+            {
+                if (definition == nullptr) return false;
+                const std::string originalLinkage = CxxLinkageName(ctx, definition);
+                const std::string groupLinkage =
+                    StaticCxxGlobalAlias(st.req.cxxImportGroupKey, originalLinkage);
+                if (!RecordDynamicInitializerDefinition(definition, groupLinkage)) return false;
+                if (st.req.demandPlan != nullptr)
+                    st.req.demandPlan->renamed[groupLinkage] = originalLinkage;
+                if (std::find(st.out.weakPromoteSymbols.begin(),
+                              st.out.weakPromoteSymbols.end(), originalLinkage)
+                    == st.out.weakPromoteSymbols.end())
+                    st.out.weakPromoteSymbols.push_back(originalLinkage);
+                if (std::find(st.out.weakPromotePerGroupSymbols.begin(),
+                              st.out.weakPromotePerGroupSymbols.end(), originalLinkage)
+                    == st.out.weakPromotePerGroupSymbols.end())
+                    st.out.weakPromotePerGroupSymbols.push_back(originalLinkage);
+                return true;
+            }
 
             // Harvested API data comes from declarations, not function statements.
             bool shouldWalkTypesOfTypeLocs() const { return false; }
@@ -4175,6 +4296,9 @@ namespace cflat_cinterop
                     const VarDecl* definition = vd->getDefinition();
                     const bool isImplicitTemplateMember =
                         vd->getTemplateSpecializationKind() == clang::TSK_ImplicitInstantiation;
+                    const bool isExplicitTemplateMember = definition != nullptr
+                        && definition->getTemplateSpecializationKind()
+                            == clang::TSK_ExplicitInstantiationDefinition;
                     // An out-of-line `inline int C::k = 17;` marks only the DEFINITION inline; the
                     // in-class declaration reached here is not.
                     const bool isInlineVar =
@@ -4207,17 +4331,38 @@ namespace cflat_cinterop
                                       << vd->getQualifiedNameAsString()
                                       << " not bound: " << why << "\n";
                     };
+                    if (!emitLocal && definition != nullptr
+                        && (isExplicitTemplateMember
+                            || definition->getTemplateSpecializationKind()
+                                == clang::TSK_Undeclared)
+                        && st.req.RecordsDefinitionDemand())
+                    {
+                        std::string definitionFile;
+                        int definitionLine = 1, definitionCol = 0;
+                        if (LocOfRaw(definition, definitionFile, definitionLine, definitionCol)
+                            && st.InScope(definitionFile))
+                            RecordDynamicInitializerDefinition(
+                                definition, CxxLinkageName(ctx, definition));
+                    }
                     if (!emitLocal && (vd->isConstexpr() || isInlineVar))
                     { skipStaticVar("inline or constexpr storage is emitted per TU"); continue; }
                     if (!emitLocal && vd->hasInit())
                     { skipStaticVar("its initializer lives in the header, so it has no library symbol"); continue; }
-                    if (emitLocal && st.req.RecordsDefinitionDemand())
-                        st.varEmitWork.push_back(definition);
                     RawCxxStaticVar sv;
                     sv.name = vd->getNameAsString();
                     sv.ctype = CanonicalSpelling(ctx, vd->getType());
                     sv.access = MapAccess(vd->getAccess());
                     sv.linkageName = CxxLinkageName(ctx, vd);
+                    if (emitLocal)
+                    {
+                        const bool dynamicInitializer = HasDynamicInitializer(definition);
+                        const bool ownsInitializer = !dynamicInitializer
+                            || NoteDynamicInitializer(definition, sv.linkageName);
+                        if (st.req.RecordsDefinitionDemand() && ownsInitializer)
+                            st.varEmitWork.push_back(definition);
+                        else if (!st.req.RecordsDefinitionDemand())
+                            NoteDynamicInitializer(definition, sv.linkageName);
+                    }
                     rememberInitializerFailure(sv);
                     LocOfRaw(vd, sv.file, sv.line, sv.col);
                     rec.staticVars.push_back(std::move(sv));
@@ -4510,7 +4655,24 @@ namespace cflat_cinterop
                 }
                 else if (st.req.cxxMode && !rec.name.empty())
                 {
-                    if (rd->isInAnonymousNamespace()) return;
+                    if (rd->isInAnonymousNamespace())
+                    {
+                        if (auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
+                            for (Decl* member : cxx->decls())
+                                if (auto* vd = llvm::dyn_cast<VarDecl>(member);
+                                    vd != nullptr && vd->isStaticDataMember())
+                                {
+                                    const VarDecl* definition = vd->getDefinition();
+                                    std::string definitionFile;
+                                    int definitionLine = 1, definitionCol = 0;
+                                    if (definition != nullptr
+                                        && LocOfRaw(definition, definitionFile,
+                                                    definitionLine, definitionCol)
+                                        && st.InScope(definitionFile))
+                                        RecordInternalDynamicInitializerDefinition(definition);
+                                }
+                        return;
+                    }
                     if (const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
                     {
                         if (const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(cxx);
@@ -5506,6 +5668,24 @@ namespace cflat_cinterop
 
                 std::string file; int line = 1, col = 0;
                 if (!LocOf(vd, file, line, col)) return true;
+                if (auto* specialization = llvm::dyn_cast<VarTemplateSpecializationDecl>(vd);
+                    specialization != nullptr
+                    && specialization->getTemplateSpecializationKind()
+                        == clang::TSK_ExplicitInstantiationDefinition)
+                {
+                    const VarDecl* definition = specialization->getDefinition();
+                    if (definition == nullptr && specialization->isThisDeclarationADefinition())
+                        definition = specialization;
+                    if (definition != nullptr)
+                    {
+                        if (!definition->hasExternalFormalLinkage()
+                            || definition->getStorageClass() == SC_Static)
+                            RecordInternalDynamicInitializerDefinition(definition);
+                        else
+                            RecordDynamicInitializerDefinition(
+                                definition, CxxLinkageName(ctx, definition));
+                    }
+                }
                 const std::string qualified = CxxQualifiedName(vd);
                 auto skipVar = [&](const char* why) {
                     if (st.req.verbose)
@@ -5513,7 +5693,12 @@ namespace cflat_cinterop
                                   << " not bound: " << why << "\n";
                 };
                 if (!IsValidDottedName(qualified))
-                { skipVar("name is not a valid CFlat qualified name"); return true; }
+                {
+                    if (vd->isInAnonymousNamespace())
+                        RecordInternalDynamicInitializerDefinition(vd->getDefinition());
+                    skipVar("name is not a valid CFlat qualified name");
+                    return true;
+                }
                 // A variable template's pattern (or a specialization of it) is no object of its
                 // own name; `ns.v<T>` binds the specialization on use (decltype request).
                 if (vd->getDescribedVarTemplate() != nullptr
@@ -5577,14 +5762,13 @@ namespace cflat_cinterop
                                   || st.req.assumeInlineDefinitions;
                 if (headerOnly)
                 {
-                    if (def == nullptr || init == nullptr)
+                    if (def == nullptr || (init == nullptr && def->hasConstantInitialization()))
                     { skipVar("no definition to emit and no library symbol to bind"); return true; }
                     if (!canEmit)
                     { skipVar("its initializer lives in the header, so it has no library symbol"); return true; }
                     if (def->getType()->isDependentType()
                         || def->getDeclContext()->isDependentContext())
                     { skipVar("its type or initializer is dependent"); return true; }
-                    if (st.req.RecordsDefinitionDemand()) st.varEmitWork.push_back(def);
                     const std::string originalLinkage = CxxLinkageName(ctx, vd);
                     const bool internalStorage = !vd->hasExternalFormalLinkage()
                         || vd->getStorageClass() == SC_Static;
@@ -5607,6 +5791,13 @@ namespace cflat_cinterop
                                 key = (key ^ c) * 1099511628211ULL;
                             g.constInitHash = key == 0 ? 1 : key;
                         }
+                    if (st.req.RecordsDefinitionDemand())
+                    {
+                        const bool dynamicInitializer = HasDynamicInitializer(def);
+                        const bool ownsInitializer = !dynamicInitializer
+                            || NoteDynamicInitializer(def, g.linkageName);
+                        if (ownsInitializer) st.varEmitWork.push_back(def);
+                    }
                     // An internal-linkage definition is invisible outside the companion module.
                     if (internalStorage)
                     {
@@ -5621,6 +5812,8 @@ namespace cflat_cinterop
                     if (st.req.definitionsOnly && def == nullptr) return true;
                     g.linkageName = CxxLinkageName(ctx, vd);
                 }
+                if (!headerOnly || !st.req.RecordsDefinitionDemand())
+                    NoteDynamicInitializer(def, g.linkageName);
                 st.out.globals.push_back(std::move(g));
                 return true;
             }
@@ -5662,6 +5855,28 @@ namespace cflat_cinterop
             // constant-folded initializer give the macro's natural type and value.
             bool VisitVarDecl(VarDecl* vd)
             {
+                if (vd->isStaticDataMember()
+                    && vd->getTemplateSpecializationKind()
+                        == clang::TSK_ExplicitInstantiationDefinition)
+                {
+                    const VarDecl* definition = vd->getDefinition();
+                    if (definition == nullptr && vd->isThisDeclarationADefinition())
+                        definition = vd;
+                    std::string definitionFile;
+                    int definitionLine = 1, definitionCol = 0;
+                    if (definition != nullptr
+                        && LocOfRaw(definition, definitionFile, definitionLine, definitionCol)
+                        && st.InScope(definitionFile))
+                    {
+                        if (!definition->hasExternalFormalLinkage()
+                            || definition->getStorageClass() == SC_Static)
+                            RecordInternalDynamicInitializerDefinition(definition);
+                        else
+                            RecordDynamicInitializerDefinition(
+                                definition, CxxLinkageName(ctx, definition));
+                    }
+                    return true;
+                }
                 const IdentifierInfo* ii = vd->getIdentifier();
                 if (!ii) return true;
                 StringRef nm = ii->getName();
@@ -7165,6 +7380,58 @@ namespace cflat_cinterop
                     }
                     return;
                 }
+                if (auto* vd = llvm::dyn_cast<VarDecl>(d);
+                    vd != nullptr && plan != nullptr
+                    && plan->dynamicInitializerOwners != nullptr)
+                {
+                    VarDecl* definition = vd->getDefinition();
+                    if (definition == nullptr && vd->isThisDeclarationADefinition())
+                        definition = vd;
+                    // Same filter as the plan: only owned candidates are mangled here.
+                    if (definition != nullptr && HasCxxDynamicInitializer(ctx, definition))
+                    {
+                        const std::string linkage = CxxLinkageName(ctx, definition);
+                        const std::string identity =
+                            CxxDynamicInitializerIdentity(ctx, definition, linkage);
+                        auto owner = plan->dynamicInitializerOwners->find(identity);
+                        if (owner != plan->dynamicInitializerOwners->end())
+                        {
+                            // A stripped global with a destructor still registers it (MS ABI crashes
+                            // on the missing init); leave those to clang's guarded emission.
+                            if (owner->second.groupKey == st.req.cxxImportGroupKey
+                                || definition->needsDestruction(ctx) != QualType::DK_none)
+                            {
+                                hand(d);
+                                return;
+                            }
+                            const bool internalLinkage =
+                                !definition->hasExternalFormalLinkage()
+                                || definition->getStorageClass() == SC_Static;
+                            definition->setInit(nullptr);
+                            if (internalLinkage)
+                            {
+                                plan->nonOwnerInternalAliases[linkage] =
+                                    StaticCxxGlobalAlias(owner->second.groupKey, linkage);
+                            }
+                            if (!internalLinkage)
+                            {
+                                // An inline variable must still have a definition in each
+                                // translation unit that odr-uses it. Its weak ODR symbol is
+                                // merged by the linker; stripping its initializer here makes
+                                // Clang reject otherwise unrelated template instantiations.
+                                if (!definition->isInline())
+                                {
+                                    definition->setInit(nullptr);
+                                    definition->setStorageClass(SC_Extern);
+                                }
+                                if (std::find(plan->weakPromoteSymbols.begin(),
+                                              plan->weakPromoteSymbols.end(), linkage)
+                                    == plan->weakPromoteSymbols.end())
+                                    plan->weakPromoteSymbols.push_back(linkage);
+                            }
+                        }
+                    }
+                }
                 hand(d);
             };
 
@@ -7731,9 +7998,10 @@ namespace cflat_cinterop
             llvm::Module* mod = cg.GetModule();
             if (mod == nullptr) return;   // CodeGen error: nothing is bound to a local definition
 
-            // An internal-linkage namespace constant (`constexpr Color kRed{1,0,0};`) exists in
-            // no library and is invisible across modules; weak_odr makes the emitted storage
-            // bindable and still merges if two companion modules carry it.
+            if (plan != nullptr)
+                RewriteNonOwnerInternalAliases(*mod, plan->nonOwnerInternalAliases);
+
+            // Promote header definitions with shared storage so duplicate import groups merge.
             for (const std::string& sym : st.out.weakPromoteSymbols)
             {
                 llvm::GlobalVariable* gv = mod->getGlobalVariable(sym, /*AllowInternal*/ true);
@@ -7741,11 +8009,9 @@ namespace cflat_cinterop
                 const bool perGroup = std::find(st.out.weakPromotePerGroupSymbols.begin(),
                               st.out.weakPromotePerGroupSymbols.end(), sym)
                     != st.out.weakPromotePerGroupSymbols.end();
-                if (!gv->hasLocalLinkage() && !perGroup) continue;
                 if (perGroup)
                     RenamePerGroupGlobal(gv, StaticCxxGlobalAlias(st.req.cxxImportGroupKey, sym));
-                if (gv->hasLocalLinkage())
-                    gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+                gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
                 gv->setVisibility(llvm::GlobalValue::DefaultVisibility);
             }
             for (const auto& [mangled, programName] : st.out.localInlineAliases)
@@ -8659,19 +8925,41 @@ namespace cflat_cinterop
         splitPlan();
 
         std::set<std::string> want;
+        std::vector<std::string> wantOrder;
         std::unordered_map<std::string, std::string> restore;   // emitted -> program name
-        for (const std::string& programName : demand)
-        {
+        auto demandName = [&](const std::string& programName) {
             std::string name = programName;
             if (auto it = plan.renamed.find(programName); it != plan.renamed.end())
             {
                 name = it->second;
                 restore[name] = programName;
             }
-            if (plan.bound.count(name) != 0 || held.count(name) != 0
-                || plan.vtables.count(name) != 0)
-                want.insert(name);
+            return name;
+        };
+        auto knownDemand = [&](const std::string& name) {
+            return plan.bound.count(name) != 0 || held.count(name) != 0
+                || plan.vtables.count(name) != 0;
+        };
+        std::vector<std::string> orderedInitializers;
+        std::unordered_set<std::string> initializerSet;
+        for (const std::string& programName : plan.dynamicInitializerSymbols)
+        {
+            const std::string name = demandName(programName);
+            if (knownDemand(name) && initializerSet.insert(name).second)
+                orderedInitializers.push_back(name);
         }
+        for (const std::string& programName : demand)
+        {
+            const std::string name = demandName(programName);
+            if (knownDemand(name) && initializerSet.count(name) == 0
+                && want.insert(name).second)
+                wantOrder.push_back(name);
+        }
+        for (const std::string& name : orderedInitializers)
+            if (want.insert(name).second) wantOrder.push_back(name);
+        auto addClosureWant = [&](const std::string& name) {
+            if (want.insert(name).second) wantOrder.push_back(name);
+        };
         stats.demanded = (unsigned)want.size();
         if (want.empty()) return true;
 
@@ -8683,7 +8971,7 @@ namespace cflat_cinterop
             std::string bodyDiagnostic;
             std::string vtableDiagnostic;
             std::vector<const FunctionDecl*> roots;
-            for (const std::string& name : want)
+            for (const std::string& name : wantOrder)
             {
                 if (auto it = held.find(name); it != held.end())
                     roots.push_back(llvm::dyn_cast<FunctionDecl>(it->second.getDecl()));
@@ -8837,7 +9125,7 @@ namespace cflat_cinterop
                 llvm::TimeTraceScope handScope("CxxDemandHand", std::to_string(lazy.size()));
                 for (Decl* d : lazy) cg->HandleTopLevelDecl(DeclGroupRef(d));
             }
-            for (const std::string& name : want)
+            for (const std::string& name : wantOrder)
             {
                 if (auto it = held.find(name); it != held.end())
                 {
@@ -8868,8 +9156,11 @@ namespace cflat_cinterop
             bool grew = false;
             for (const llvm::GlobalValue& gv : mod->global_values())
                 if (gv.isDeclaration() && gv.hasName() && held.count(gv.getName().str()) != 0
-                    && want.insert(gv.getName().str()).second)
+                    && want.count(gv.getName().str()) == 0)
+                {
+                    addClosureWant(gv.getName().str());
                     grew = true;
+                }
             if (grew) continue;
             /*
              * ODR-use closure, as clang++ would finish the TU: a used function the module only
@@ -8916,7 +9207,7 @@ namespace cflat_cinterop
                     if (plan.declSeen.count(body) == 0 && plan.declSeen.count(fd) == 0)
                     {
                         plan.Add(body);
-                        want.insert(name);
+                        addClosureWant(name);
                         grew = true;
                     }
                     else if (materialized || splitDone < plan.decls.size())
@@ -8954,6 +9245,8 @@ namespace cflat_cinterop
             }
             if (grew) continue;
 
+            RewriteNonOwnerInternalAliases(*mod, plan.nonOwnerInternalAliases);
+
             for (const std::string& sym : plan.weakPromoteSymbols)
             {
                 llvm::GlobalVariable* gv = mod->getGlobalVariable(sym, /*AllowInternal*/ true);
@@ -8961,11 +9254,9 @@ namespace cflat_cinterop
                 const bool perGroup = std::find(plan.weakPromotePerGroupSymbols.begin(),
                               plan.weakPromotePerGroupSymbols.end(), sym)
                     != plan.weakPromotePerGroupSymbols.end();
-                if (!gv->hasLocalLinkage() && !perGroup) continue;
                 if (perGroup)
                     RenamePerGroupGlobal(gv, StaticCxxGlobalAlias(plan.cxxImportGroupKey, sym));
-                if (gv->hasLocalLinkage())
-                    gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+                gv->setLinkage(llvm::GlobalValue::WeakODRLinkage);
                 gv->setVisibility(llvm::GlobalValue::DefaultVisibility);
             }
             for (const llvm::GlobalValue& gv : mod->global_values())

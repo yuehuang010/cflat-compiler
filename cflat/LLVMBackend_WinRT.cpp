@@ -4768,6 +4768,15 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
             return true;
         };
 
+        NamedVariable receiverArg;
+        receiverArg.TypeAndValue.TypeName = ifaceName;
+        receiverArg.TypeAndValue.Pointer = true;
+        receiverArg.TypeAndValue.IsInterface = true;
+        receiverArg.TypeAndValue.IsInterfacePointer = true;
+        receiverArg.TypeAndValue.VariableName = "this";
+        receiverArg.IsThisReceiver = true;
+        TypeAndValue receiverParam = receiverArg.TypeAndValue;
+
         size_t inheritedCount = 0;
         if (auto parents = interfaceParents.find(ResolveInterfaceName(ifaceName));
             parents != interfaceParents.end())
@@ -4824,15 +4833,19 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
             if (method.Parameters.size() == args.size())
             {
                 exactSlots.push_back(idx);
-                std::vector<NamedVariable> matched = args.empty()
-                    ? args : MatchFunction(args, method.Parameters, false, true);
-                if (!args.empty() && matched.empty()) continue;
+                std::vector<NamedVariable> candidateArgs{ receiverArg };
+                candidateArgs.insert(candidateArgs.end(), args.begin(), args.end());
+                std::vector<TypeAndValue> methodParams{ receiverParam };
+                methodParams.insert(methodParams.end(), method.Parameters.begin(), method.Parameters.end());
+                std::vector<NamedVariable> matched = MatchFunction(candidateArgs, methodParams, false, true);
+                if (matched.empty()) continue;
 
                 FunctionSymbol sym;
                 sym.UniqueName = std::to_string(idx);
                 sym.SourceName = displayIface + "." + methodName;
                 sym.ReturnType = method.ReturnType;
-                sym.Parameters = method.Parameters;
+                sym.Parameters = std::move(methodParams);
+                sym.IsMethod = true;
                 candidates.emplace_back(std::move(matched), std::move(sym));
                 continue;
             }
@@ -4849,15 +4862,19 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
 
                 std::vector<TypeAndValue> helperParams(helper.Parameters.begin() + 1,
                                                        helper.Parameters.end());
-                std::vector<NamedVariable> matched = args.empty()
-                    ? args : MatchFunction(args, helperParams, false, true);
-                if (!args.empty() && matched.empty()) continue;
+                std::vector<NamedVariable> candidateArgs{ receiverArg };
+                candidateArgs.insert(candidateArgs.end(), args.begin(), args.end());
+                std::vector<TypeAndValue> candidateParams{ receiverParam };
+                candidateParams.insert(candidateParams.end(), helperParams.begin(), helperParams.end());
+                std::vector<NamedVariable> matched = MatchFunction(candidateArgs, candidateParams, false, true);
+                if (matched.empty()) continue;
 
                 FunctionSymbol sym;
                 sym.UniqueName = std::to_string(idx);
                 sym.SourceName = displayIface + "." + methodName;
                 sym.ReturnType = method.ReturnType;
-                sym.Parameters = std::move(helperParams);
+                sym.Parameters = std::move(candidateParams);
+                sym.IsMethod = true;
                 candidates.emplace_back(std::move(matched), std::move(sym));
             }
         }
@@ -4877,7 +4894,8 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                 if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
                                                           methods[idx].Parameters))
                     return -1;
-                return idx;
+                LogError(std::format("no overload of '{}' matches the given arguments.", methodName));
+                return -1;
             }
 
             std::sort(availableArities.begin(), availableArities.end());
@@ -4947,16 +4965,124 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
             return -1;
         }
 
-        int selectedIdx = winner.UniqueName.empty()
-            ? std::stoi(candidates.front().second.UniqueName) : std::stoi(winner.UniqueName);
+        if (winner.UniqueName.empty())
+        {
+            if (fallbackDefaultSlot >= 0)
+                return -1;
+            if (!exactSlots.empty())
+            {
+                const int firstSlot = candidates.empty()
+                    ? exactSlots.front() : std::stoi(candidates.front().second.UniqueName);
+                const auto& firstMethod = methods[firstSlot];
+                std::vector<NamedVariable> diagnosticArgs = args;
+                if (!candidates.empty() && !candidates.front().first.empty())
+                {
+                    diagnosticArgs = candidates.front().first;
+                    diagnosticArgs.erase(diagnosticArgs.begin());
+                }
+                if (!candidates.empty())
+                {
+                    if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, diagnosticArgs,
+                                                              firstMethod.Parameters))
+                        return -1;
+                    for (size_t i = 0; i < diagnosticArgs.size()
+                         && i < firstMethod.Parameters.size(); ++i)
+                    {
+                        if (RejectFuncPtrShapeMismatch(diagnosticArgs[i], firstMethod.Parameters[i])
+                            || RejectCodeValueIntoDataParam(diagnosticArgs[i], firstMethod.Parameters[i],
+                                                           ifaceName, methodName))
+                            return -1;
+                        const auto& arg = diagnosticArgs[i];
+                        const auto& param = firstMethod.Parameters[i];
+                        auto* paramType = GetType(param);
+                        if (ClassifyScalarArgConversion(arg, param) == ScalarArgConversion::Narrow
+                            && arg.BaseType != nullptr && arg.BaseType->isIntegerTy()
+                            && paramType != nullptr && paramType->isIntegerTy())
+                        {
+                            const std::string parameter = param.VariableName.empty()
+                                ? std::format("parameter {}", i)
+                                : std::format("parameter '{}'", param.VariableName);
+                            const std::string target = SpellType(*this, param);
+                            const std::string what = parameter + " of '" + displayIface + "."
+                                + methodName + "'";
+                            LogErrorMessage(
+                                "cannot pass a {}-bit integer to {}: implicit integer narrowing "
+                                "to '{}' is not allowed at a call argument - cast it explicitly "
+                                "with '({})'",
+                                { std::to_string(arg.BaseType->getIntegerBitWidth()), what,
+                                  target, target });
+                        }
+                    }
+                }
+                const bool unrankedObjectPointers = !args.empty()
+                    && std::all_of(args.begin(), args.end(), [&](const NamedVariable& arg) {
+                        return arg.TypeAndValue.Pointer && !arg.TypeAndValue.TypeName.empty()
+                            && IsDataStructure(arg.TypeAndValue.TypeName);
+                    })
+                    && std::all_of(byName.begin(), byName.end(), [&](int idx) {
+                        const auto& params = methods[idx].Parameters;
+                        return params.size() == args.size()
+                            && std::all_of(params.begin(), params.end(), [&](const TypeAndValue& param) {
+                                return param.Pointer && !param.TypeName.empty()
+                                    && IsDataStructure(param.TypeName);
+                            });
+                    });
+                if (unrankedObjectPointers)
+                {
+                    matchedArgs = std::move(diagnosticArgs);
+                    return firstSlot;
+                }
+                // Keep exact/widening scalar calls whose conversion is lowered but not ranked.
+                bool safelyLowerableScalars = diagnosticArgs.size() == firstMethod.Parameters.size();
+                for (size_t i = 0; safelyLowerableScalars && i < diagnosticArgs.size(); ++i)
+                {
+                    const auto conversion = ClassifyScalarArgConversion(
+                        diagnosticArgs[i], firstMethod.Parameters[i]);
+                    safelyLowerableScalars = conversion == ScalarArgConversion::Exact
+                        || conversion == ScalarArgConversion::Widen;
+                    if (safelyLowerableScalars && diagnosticArgs[i].BaseType != nullptr
+                        && diagnosticArgs[i].BaseType->isFloatingPointTy())
+                    {
+                        auto* targetType = GetType(firstMethod.Parameters[i]);
+                        if (targetType != nullptr && targetType->isFloatingPointTy()
+                            && diagnosticArgs[i].BaseType->getPrimitiveSizeInBits().getFixedValue()
+                                > targetType->getPrimitiveSizeInBits().getFixedValue())
+                            safelyLowerableScalars = false;
+                    }
+                }
+                if (safelyLowerableScalars)
+                {
+                    matchedArgs = std::move(diagnosticArgs);
+                    return firstSlot;
+                }
+            }
+            LogError(std::format("no overload of '{}' matches the given arguments.", methodName));
+            return -1;
+        }
+
+        int selectedIdx = std::stoi(winner.UniqueName);
         if (!scored.empty())
+        {
             matchedArgs = scored;
+            matchedArgs.erase(matchedArgs.begin());
+        }
         else if (!candidates.front().first.empty())
+        {
             matchedArgs = candidates.front().first;
+            matchedArgs.erase(matchedArgs.begin());
+        }
 
         const InterfaceMethod& selected = methods[selectedIdx];
+        std::vector<NamedVariable> diagnosticArgs = args;
+        for (const auto& candidate : candidates)
+            if (candidate.second.UniqueName == std::to_string(selectedIdx))
+            {
+                diagnosticArgs = candidate.first;
+                if (!diagnosticArgs.empty()) diagnosticArgs.erase(diagnosticArgs.begin());
+                break;
+            }
         if (args.size() == selected.Parameters.size()
-            && DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
+            && DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, diagnosticArgs,
                                                      selected.Parameters))
             return -1;
         return selectedIdx;
@@ -5011,6 +5137,31 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             return CreateOverloadedFunctionCall(wrapperMethod.DefaultWrapperName, helperArgs,
                                                 false, displayMethod);
         };
+        if (userReceiver != nullptr)
+        {
+            std::string constObject, constReason;
+            if (ConstReceiverReason(*userReceiver, constObject, constReason))
+            {
+                std::vector<int> bindableSlots;
+                for (int i = 0; i < static_cast<int>(ifaceMethods->size()); ++i)
+                {
+                    const auto& method = (*ifaceMethods)[i];
+                    if (method.Name != methodName || method.Parameters.size() != extraArgNVs.size())
+                        continue;
+                    auto bound = MatchFunction(extraArgNVs, method.Parameters, false, true);
+                    if (bound.size() == extraArgNVs.size()) bindableSlots.push_back(i);
+                }
+                if (bindableSlots.size() == 1 && !(*ifaceMethods)[bindableSlots.front()].IsConst)
+                {
+                    const auto& method = (*ifaceMethods)[bindableSlots.front()];
+                    auto bound = MatchFunction(extraArgNVs, method.Parameters, false, true);
+                    if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, bound,
+                                                              method.Parameters))
+                        return nullptr;
+                    RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName);
+                }
+            }
+        }
         std::vector<NamedVariable> callArgNVs;
         int fallbackDefaultSlot = -1;
         int methodIdx = ResolveInterfaceMethodSlot(ifaceName, methodName, *ifaceMethods,

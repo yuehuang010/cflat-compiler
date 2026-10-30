@@ -2,6 +2,10 @@
 // an owning `unique C*` return, a reference into a frame-local receiver, and a private base.
 import cpp "cpp_interop_basic.h";
 import cpp "cpp_interop_refgate.h";
+import cpp "cpp_interop_ref_member.h";
+import cpp "cpp_interop_refctx_global.h";
+
+int g = 5;
 
 expect_error("cannot return borrowed value 'cppi.ref_cell' as 'std.unique_ptr<cppi.RefCell>'") {
     unique cppi.RefCell* RrOwned() { return cppi.ref_cell(); }
@@ -41,6 +45,104 @@ expect_error("its argument #0 in 'cpprefgate.local_ref(cpprefgate.local_ref(loca
     cpprefgate.C* RgFrameNested() {
         cpprefgate.C local = { v = 61 };
         return cpprefgate.local_ref(cpprefgate.local_ref(local));
+    }
+}
+
+expect_error("cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnShadowLocal() {
+        int g = 7;
+        return { r = g, v = 1, d = 0.0 };
+    }
+}
+expect_error("cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnShadowParameter(int g) {
+        return { g, 1, 0.0 };
+    }
+}
+expect_error("cannot bind to a local or temporary value") {
+    struct RefctxReturnLocalField { int g = default; };
+    cppref.BraceRefInner RefctxReturnLocalFieldValue() {
+        RefctxReturnLocalField h = default;
+        h.g = 8;
+        return { r = h.g, v = 1, d = 0.0 };
+    }
+}
+expect_error("cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnTernary(bool c) {
+        int local = 7;
+        return { r = c ? g : local, v = 1, d = 0.0 };
+    }
+}
+expect_error("cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnInnerAlias(alias int p) {
+        int local = 7;
+        { alias int p = local; return { r = p, v = 1, d = 0.0 }; }
+    }
+}
+expect_error("lifetime cannot be proven to outlive the function") {
+    cppref.BraceRefInner RefctxReturnPointerDeref(int* p) {
+        return { r = *p, v = 1, d = 0.0 };
+    }
+}
+
+expect_error("cannot bind to a non-program-lifetime source");
+cpprefctxg.CR RefctxGlobalAggregateTemporary = { p = cpprefctxg.mkp(), k = 1 };
+
+expect_error("field default: reference member 'r' must bind to program-lifetime storage") {
+    struct RefctxSelfRefDefault {
+        int v = 5;
+        cppref.BraceRefInner item = { r = v, v = 1, d = 0.0 };
+    };
+    int RefctxSelfRefDefaultProbe() {
+        RefctxSelfRefDefault value = default;
+        value.v = 9;
+        return value.item.r;
+    }
+}
+expect_error("field default: reference member 'r' must bind to program-lifetime storage") {
+    struct RefctxSelfRefReturn {
+        int v = 5;
+        cppref.BraceRefInner item = { r = v, v = 1, d = 0.0 };
+    };
+    RefctxSelfRefReturn RefctxSelfRefReturnProbe() {
+        RefctxSelfRefReturn value = default;
+        value.v = 8;
+        return value;
+    }
+}
+
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnLocalDesignated() {
+        int value = 31;
+        return { r = value, v = 1, d = 0.0 };
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnLocalPositional() {
+        int value = 32;
+        return { value, 1, 0.0 };
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceConstRef': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceConstRef RefctxReturnConstLocalDesignated() {
+        int value = 33;
+        return { r = value };
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceConstRef': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceConstRef RefctxReturnConstLocalPositional() {
+        int value = 34;
+        return { value };
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRvalRef': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRvalRef RefctxReturnRvalTemporaryDesignated() {
+        return { r = 35 };
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRvalRef': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRvalRef RefctxReturnRvalTemporaryPositional() {
+        return { 36 };
     }
 }
 

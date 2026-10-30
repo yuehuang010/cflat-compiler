@@ -1204,6 +1204,7 @@ namespace cppi
         explicit TrackedHolder(int v) noexcept : t(v) {}
         Tracked& get() noexcept { return t; }
         const Tracked& cget() const noexcept { return t; }
+        TrackedHolder& self() noexcept { return *this; }
     };
     // A MUTABLE class reference return. A CFlat pointer local binds to the REFERENT, so a write
     // through that pointer is visible to the next call - a copy would hide it.
@@ -2702,6 +2703,120 @@ struct OpfreeRoundFreeBoxRef
 { int value; explicit OpfreeRoundFreeBoxRef(int x) : value(x) {} };
 inline OpfreeRoundBox<int>& operator*=(OpfreeRoundFreeBoxRef& a, int x)
 { static OpfreeRoundBox<int> r(0, 54); a.value *= x; r.value = a.value; return r; }
+template<class T> struct OpfreeRoundMemberResult
+{
+    T value; int marker;
+    explicit OpfreeRoundMemberResult(T x = 0, int m = 55) : value(x), marker(m) {}
+    int get() const { return (int)value; }
+    int kind() const { return marker; }
+};
+template<class T> struct OpfreeRoundTemplateMemberRef
+{
+    T value; int calls;
+    explicit OpfreeRoundTemplateMemberRef(T x) : value(x), calls(0) {}
+    OpfreeRoundTemplateMemberRef& operator+=(int x)
+    { value += (T)x; ++calls; return *this; }
+};
+struct OpfreeRoundMemberBoxRef
+{
+    int value;
+    explicit OpfreeRoundMemberBoxRef(int x) : value(x) {}
+    OpfreeRoundMemberResult<int>& operator+=(int x)
+    { static OpfreeRoundMemberResult<int> r(0, 55); value += x; r.value = value; return r; }
+};
+struct OpfreeRoundGlobalAmbigMul { int value; };
+inline long operator*(const OpfreeRoundGlobalAmbigMul& a, long) { return a.value + 1; }
+inline unsigned long operator*(const OpfreeRoundGlobalAmbigMul& a, unsigned long)
+{ return a.value + 2; }
+struct OpfreeRoundOtherRef
+{
+    int value;
+    int calls;
+    explicit OpfreeRoundOtherRef(int x) : value(x), calls(0) {}
+    int get() const { return value; }
+    void bump() { value += 100; }
+};
+inline OpfreeRoundOtherRef& opfreeRoundOtherRef()
+{ static OpfreeRoundOtherRef result(0); return result; }
+inline OpfreeRoundOtherRef& operator+=(OpfreeRoundOtherRef& a, int x)
+{
+    ++a.calls;
+    a.value += x;
+    opfreeRoundOtherRef().value = a.value + 1000;
+    return opfreeRoundOtherRef();
+}
+struct OpfreeRoundValue
+{
+    int value;
+    int calls;
+    explicit OpfreeRoundValue(int x) : value(x), calls(0) {}
+    void bump() { value += 100; }
+    OpfreeRoundValue operator*=(int x) { ++calls; value *= x; return *this; }
+};
+struct OpfreeRoundVoid
+{
+    int value;
+    int calls;
+    explicit OpfreeRoundVoid(int x) : value(x), calls(0) {}
+    void operator+=(int x) { ++calls; value += x; }
+};
+struct OpfreeRoundConstRef
+{
+    int value;
+    int calls;
+    explicit OpfreeRoundConstRef(int x) : value(x), calls(0) {}
+    int get() const { return value; }
+    void bump() { value += 100; }
+};
+inline const OpfreeRoundConstRef& operator+=(OpfreeRoundConstRef& a, int x)
+{
+    static OpfreeRoundConstRef result(0);
+    ++a.calls;
+    a.value += x;
+    result.value = a.value;
+    return result;
+}
+struct OpfreeRoundSameMember
+{
+    int value;
+    int calls;
+    explicit OpfreeRoundSameMember(int x) : value(x), calls(0) {}
+    int get() const { return value; }
+    void bump() { value += 100; }
+    OpfreeRoundSameMember& operator*=(int x) { ++calls; value *= x; return *this; }
+};
+struct OpfreeRoundSameFree
+{
+    int value;
+    int calls;
+    explicit OpfreeRoundSameFree(int x) : value(x), calls(0) {}
+    int get() const { return value; }
+    void bump() { value += 100; }
+};
+inline OpfreeRoundSameFree& operator+=(OpfreeRoundSameFree& a, int x)
+{ ++a.calls; a.value += x; return a; }
+namespace cppi_opfree_refalias_ns
+{
+    struct MemberRef
+    {
+        int value;
+        int calls;
+        explicit MemberRef(int x) : value(x), calls(0) {}
+        int get() const { return value; }
+        void bump() { value += 100; }
+        MemberRef& operator*=(int x) { ++calls; value *= x; return *this; }
+    };
+    struct FreeRef
+    {
+        int value;
+        int calls;
+        explicit FreeRef(int x) : value(x), calls(0) {}
+        int get() const { return value; }
+        void bump() { value += 100; }
+    };
+    inline FreeRef& operator+=(FreeRef& a, int x)
+    { ++a.calls; a.value += x; return a; }
+}
 
 namespace cppi_opfree_ns
 {

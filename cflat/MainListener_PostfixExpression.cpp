@@ -1598,6 +1598,62 @@ static bool FunctionArgumentMayBeReturned(const llvm::Function* function, size_t
     return false;
 }
 
+bool MainListener::AliasResultMayBorrowOwnedTemp(
+    LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv,
+    const LLVMBackend::OwnedTempMark& mark)
+{
+    if (compiler == nullptr || nv.Storage == nullptr) return false;
+
+    std::vector<llvm::Value*> pending{ nv.Storage };
+    std::unordered_set<llvm::Value*> visited;
+    while (!pending.empty())
+    {
+        llvm::Value* value = pending.back();
+        pending.pop_back();
+        if (!visited.insert(value).second) continue;
+        if (auto* call = llvm::dyn_cast<llvm::CallBase>(value))
+        {
+            const llvm::Function* callee = DirectCallee(call);
+            for (unsigned i = 0; i < call->arg_size(); ++i)
+            {
+                if (!FunctionArgumentMayBeReturned(callee, i)) continue;
+                if (compiler->AddressDerivesFromOwnedStructTempSince(mark, call->getArgOperand(i)))
+                    return true;
+                pending.push_back(call->getArgOperand(i));  // chained calls: `C(1).self().self()`
+            }
+            continue;
+        }
+        if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+        {
+            pending.push_back(gep->getPointerOperand());
+            continue;
+        }
+        if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+        {
+            pending.push_back(select->getTrueValue());
+            pending.push_back(select->getFalseValue());
+            continue;
+        }
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (llvm::Value* incoming : phi->incoming_values()) pending.push_back(incoming);
+            continue;
+        }
+        if (auto* instruction = llvm::dyn_cast<llvm::Instruction>(value))
+            switch (instruction->getOpcode())
+            {
+            case llvm::Instruction::BitCast:
+            case llvm::Instruction::AddrSpaceCast:
+            case llvm::Instruction::Freeze:
+                pending.push_back(instruction->getOperand(0));
+                break;
+            default:
+                break;
+            }
+    }
+    return false;
+}
+
 // The soft `alias` specifier of a declaration (the same spelling test as ParseDeclarationSpecifiers).
 static bool DeclarationSpecifiersHaveAlias(CFlatParser::DeclarationSpecifiersContext* specs)
 {
@@ -10457,12 +10513,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                *Compiler(ctx)->context, "string"))
                                         Compiler(ctx)->RegisterOwnedStringTemp(argValue);
                                     LLVMBackend::NamedVariable argVar;
+                                    argVar.OriginalArgumentType = argNV.TypeAndValue;
+                                    argVar.HasOriginalArgumentType = true;
+                                    argVar.IsTopLevelConst = argNV.IsTopLevelConst;
                                     // Named-argument binding uses the INTERFACE's declared parameter
                                     // names, not the implementor's - matches virtual dispatch.
-                                    if (argName)
-                                        argVar.TypeAndValue.VariableName = argName->getText();
+                                    argVar.TypeAndValue.VariableName = argName
+                                        ? argName->getText() : std::string();
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+                                    // Same literal identity rule as a direct-class call.
+                                    argVar.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
+                                        namedArgument->assignmentExpression()->getText(),
+                                        &argVar.LiteralIdentitySuffixed);
+                                    argVar.LiteralSigned = LLVMBackend::LiteralTextHasSign(
+                                        namedArgument->assignmentExpression()->getText());
                                     argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
                                     argVar.IsCxxNullIntegerMacro = argNV.IsCxxNullIntegerMacro;
                                     argVar.IsCxxMacroJoin = argNV.IsCxxMacroJoin;
@@ -10525,6 +10590,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The POSITIVE depth is the argument-side proof the depth gates
                                     // read; dropped here every argument looks depth-unrecorded.
                                     argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
+                                    const std::string sourceEnum = argNV.InferSourceTypeName.empty()
+                                        ? std::string()
+                                        : Compiler(ctx)->ResolveEnumTypeName(argNV.InferSourceTypeName);
+                                    argVar.InferSourceTypeName = !sourceEnum.empty()
+                                        && (Compiler(ctx)->IsCxxForeignNamespace(sourceEnum)
+                                            || Compiler(ctx)->IsCxxForeignTypeRegistered(sourceEnum))
+                                        ? sourceEnum
+                                        : argNV.TypeAndValue.TypeName.empty()
+                                            ? argNV.InferSourceTypeName
+                                            : argNV.TypeAndValue.TypeName;
                                     if (argNV.IsCxxAddressOfPointerValue)
                                     {
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
@@ -10586,6 +10661,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Preserve unsigned-integer TypeName so Upconvert (LowerByValueArg)
                                     // chooses ZExt over SExt - without it a u8 200 arrives as -56.
                                     argVar.TypeAndValue.EnumBacking = argNV.TypeAndValue.EnumBacking;
+                                    if (argNV.TypeAndValue.IsScopedEnum
+                                        || Compiler(ctx)->IsScopedEnumTypeName(
+                                            argNV.TypeAndValue.TypeName))
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                        argVar.TypeAndValue.IsScopedEnum = true;
+                                    }
                                     // An enum keeps its identity whatever its backing sign (MSVC
                                     // fixes every unscoped C++ enum to int) for the enum-mismatch rule.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1
@@ -11040,6 +11122,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     Compiler(ctx)->TryBindCxxFunction(functionName);
                                 // Look up the function signature to set lambdaExpectedType for lambda arguments.
                                 const LLVMBackend::FunctionSymbol* funcSym = nullptr;
+                                const std::vector<LLVMBackend::FunctionSymbol>* funcSymFamily = nullptr;
                                 {
                                     auto it = Compiler(ctx)->functionTable.find(functionName);
                                     bool lexicalScopeFunction = false;
@@ -11112,6 +11195,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             }
                                             if (!funcSym) funcSym = typeMatch ? typeMatch : &it->second.front();
                                         }
+                                        if (funcSym != nullptr) funcSymFamily = &it->second;
                                     }
                                 }
                                 const bool selectedImplicitMethod = implicitCallReceiver.GetValue() != nullptr
@@ -11122,6 +11206,32 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 size_t paramOffset = arguments.empty()
                                     ? (selectedImplicitMethod ? 1 : 0)
                                     : 1; // offset for an already assembled receiver
+                                bool uniqueCxxCandidateForArity = true;
+                                if (funcSym != nullptr && funcSym->IsCxx)
+                                {
+                                    const size_t wantedParams = paramOffset + namedArgCtx.size();
+                                    size_t candidateCount = 0;
+                                    auto candidates = Compiler(ctx)->functionTable.find(functionName);
+                                    if (candidates != Compiler(ctx)->functionTable.end())
+                                        for (const auto& candidate : candidates->second)
+                                        {
+                                            if (!candidate.IsCxx) continue;
+                                            const size_t fixedParams = candidate.Parameters.size();
+                                            if (wantedParams > fixedParams && !candidate.Variadic)
+                                                continue;
+                                            bool defaultsCoverOmitted = true;
+                                            for (size_t i = wantedParams;
+                                                i < fixedParams; ++i)
+                                                if (i >= candidate.DefaultArguments.size()
+                                                    || candidate.DefaultArguments[i].kind.empty())
+                                                {
+                                                    defaultsCoverOmitted = false;
+                                                    break;
+                                                }
+                                            if (defaultsCoverOmitted) ++candidateCount;
+                                        }
+                                    uniqueCxxCandidateForArity = candidateCount == 1;
+                                }
 
                                 // A named argument makes the call-site index diverge from the declared
                                 // one, so map through the same binder MatchFunction uses.
@@ -11188,6 +11298,48 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // value are intentionally absent from functionTable. Do not ask
                                         // the CFlat field-initializer resolver to diagnose those braces.
                                         std::string structType;
+                                        const auto* braceParam = funcSym != nullptr
+                                            && (!funcSym->IsCxx || uniqueCxxCandidateForArity)
+                                            && declaredIdx[argIdx] >= 0
+                                            && declaredIdx[argIdx] < (int64_t)funcSym->Parameters.size()
+                                            ? &funcSym->Parameters[declaredIdx[argIdx]] : nullptr;
+                                        if (braceParam != nullptr
+                                            && namedArgument->initializerList() != nullptr
+                                            && !namedArgument->initializerList()->fieldInit().empty()
+                                            && (!braceParam->Pointer || braceParam->IsAlias
+                                                || braceParam->IsRvalueRef || braceParam->CxxConstRef())
+                                            && !braceParam->ElemPointer
+                                            && !braceParam->IsArrayView
+                                            && braceParam->ConstArraySize == 0
+                                            && braceParam->ConstInnerDimensions.empty()
+                                            && Compiler(ctx)->IsForeignCxxAggregateClass(braceParam->TypeName)
+                                            && HasForeignCxxAggregateReferenceMember(
+                                                braceParam->TypeName, namedArgument))
+                                        {
+                                            const std::string braceType =
+                                                Compiler(ctx)->ResolveTypeAlias(braceParam->TypeName);
+                                            auto* braceStruct = Compiler(ctx)->GetDataStructure(braceType).StructType;
+                                            if (braceStruct != nullptr)
+                                            {
+                                                auto* braceSlot = Compiler(ctx)->CreateAlloca(braceStruct);
+                                                if (TryEmitForeignCxxAggregateBraceInit(
+                                                        braceType, namedArgument->initializerList(),
+                                                        namedArgument, braceSlot, true))
+                                                {
+                                                    LLVMBackend::NamedVariable argVar;
+                                                    argVar.Primary = Compiler(ctx)->builder->CreateLoad(
+                                                        braceStruct, braceSlot, "cxx.brace.argument");
+                                                    argVar.Storage = braceSlot;
+                                                    argVar.BaseType = braceStruct;
+                                                    argVar.TypeAndValue.TypeName = braceType;
+                                                    argVar.TypeAndValue.VariableName = namedParam;
+                                                    argVar.IsRvalue = true;
+                                                    argVar.IsCxxPrvalueTemp = true;
+                                                    arguments.emplace_back(std::move(argVar));
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         // C++ brace arguments are resolved by the generated wrapper; keep them out of
                                         // CFlat's field-initializer resolver, whose record-overload scan can be ambiguous.
                                         if (funcSym != nullptr && !funcSym->IsCxx)
@@ -11634,16 +11786,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     // r5: a one-parameter default-argument wrapper forwards a copy to a longer overload.
                                     bool ternaryLongerOverload = false;
-                                    if (funcSym != nullptr)
-                                    {
-                                        auto sameName = Compiler(ctx)->functionTable.find(functionName);
-                                        if (sameName != Compiler(ctx)->functionTable.end())
-                                            for (const auto& cand : sameName->second)
-                                                if (!cand.IsMethod && cand.Parameters.size() > funcSym->Parameters.size())
-                                                    ternaryLongerOverload = true;
-                                    }
+                                    if (funcSym != nullptr && funcSymFamily != nullptr)
+                                        for (const auto& candidate : *funcSymFamily)
+                                            if (!candidate.IsMethod
+                                                && candidate.Parameters.size() > funcSym->Parameters.size())
+                                                ternaryLongerOverload = true;
                                     llvm::Function* ternaryCallSink = nullptr;
                                     LLVMBackend::TypeAndValue ternaryCallSinkReturnType;
+                                    llvm::Value* ternaryCallSinkEnvironment = nullptr;
+                                    bool ternaryCallSinkTakesReference = false;
                                     if (funcSym != nullptr && !funcSym->IsCxx && !funcSym->IsMethod
                                         && funcSym->Function != nullptr && !funcSym->Variadic
                                         && namedArgCtx.size() == 1 && argIdx == 0
@@ -11670,8 +11821,168 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         ternaryCallSink = funcSym->Function;
                                         ternaryCallSinkReturnType = funcSym->ReturnType;
                                     }
+                                    auto* conditionalArgument = argumentExpression != nullptr
+                                        && argumentExpression->assignmentOperator() == nullptr
+                                        ? argumentExpression->conditionalExpression() : nullptr;
+                                    const bool isConditionalArgument = conditionalArgument != nullptr
+                                        && conditionalArgument->Question() != nullptr;
+                                    if (ternaryCallSink == nullptr && isConditionalArgument
+                                        && funcSym != nullptr && funcSym->Function != nullptr
+                                        && !funcSym->Variadic && argIdx + 1 == namedArgCtx.size()
+                                        && !ternaryLongerOverload
+                                        && !CallUnderOperatorAncestor(ctx)
+                                        && declaredIdx[argIdx] >= 0
+                                        && static_cast<size_t>(declaredIdx[argIdx])
+                                            < funcSym->Parameters.size()
+                                        && std::none_of(namedArgCtx.begin(), namedArgCtx.end(),
+                                            [](const auto& item) { return item->Identifier() != nullptr; })
+                                        && Compiler(ctx)->IsForeignNontrivialCxxClass(
+                                            Compiler(ctx)->ResolveTypeAlias(argExpectedDest.TypeName)))
+                                    {
+                                        const size_t parameterIndex = static_cast<size_t>(declaredIdx[argIdx]);
+                                        const auto& targetParam = funcSym->Parameters[parameterIndex];
+                                        const std::string targetClass = Compiler(ctx)->ResolveTypeAlias(
+                                            targetParam.TypeName);
+                                        const bool cflatByValue = !funcSym->IsCxx && !targetParam.Pointer
+                                            && !targetParam.IsAlias && !targetParam.IsRvalueRef;
+                                        const bool cxxReference = funcSym->IsCxx
+                                            && Compiler(ctx)->IsCxxReferenceParameter(*funcSym, parameterIndex);
+                                        const bool cxxByValue = funcSym->IsCxx && !cxxReference
+                                            && !targetParam.Pointer && !targetParam.IsAlias
+                                            && !targetParam.IsRvalueRef;
+                                        const size_t callArgCount = arguments.size() + 1;
+                                        bool uniqueArity = false;
+                                        bool foundFunctionFamily = false;
+                                        std::vector<llvm::Function*> sameArityFunctions;
+                                        for (const auto& [familyName, family] : Compiler(ctx)->functionTable)
+                                        {
+                                            (void)familyName;
+                                            if (std::none_of(family.begin(), family.end(),
+                                                [&](const auto& candidate) {
+                                                    return candidate.Function == funcSym->Function;
+                                                }))
+                                                continue;
+                                            foundFunctionFamily = true;
+                                            for (const auto& candidate : family)
+                                                if (candidate.Function != nullptr
+                                                    && candidate.Function->arg_size() == callArgCount
+                                                    && candidate.Parameters.size() == funcSym->Parameters.size()
+                                                    && candidate.IsMethod == funcSym->IsMethod)
+                                                    if (std::find(sameArityFunctions.begin(),
+                                                        sameArityFunctions.end(), candidate.Function)
+                                                        == sameArityFunctions.end())
+                                                        sameArityFunctions.push_back(candidate.Function);
+                                        }
+                                        uniqueArity = !foundFunctionFamily || sameArityFunctions.size() == 1;
+                                        llvm::Function* target = funcSym->Function;
+                                        llvm::Type* targetReturn = target->getReturnType();
+                                        const bool scalarReturn = targetReturn->isVoidTy()
+                                            || !targetReturn->isAggregateType();
+                                        const bool expectedClassMatches = targetClass
+                                            == Compiler(ctx)->ResolveTypeAlias(argExpectedDest.TypeName);
+                                        if ((cflatByValue || cxxReference || cxxByValue) && uniqueArity
+                                            && expectedClassMatches && scalarReturn
+                                            && funcSym->Parameters.size() == callArgCount
+                                            && target->arg_size() == callArgCount
+                                            && target->getFunctionType()->getParamType(callArgCount - 1)
+                                                ->isPointerTy())
+                                        {
+                                            LLVMBackend::NamedVariable deferredArgument;
+                                            deferredArgument.TypeAndValue = funcSym->Parameters.back();
+                                            deferredArgument.BaseType = Compiler(ctx)->GetType(
+                                                deferredArgument.TypeAndValue);
+                                            deferredArgument.Primary = llvm::UndefValue::get(
+                                                deferredArgument.BaseType);
+                                            deferredArgument.IsRvalue = true;
+                                            std::vector<LLVMBackend::NamedVariable> matchArguments = arguments;
+                                            matchArguments.push_back(deferredArgument);
+                                            auto matchedArguments = Compiler(ctx)->MatchFunction(
+                                                matchArguments, funcSym->Parameters, funcSym->Variadic, true,
+                                                &funcSym->DefaultArguments);
+                                            bool capturesMatch = matchedArguments.size() == matchArguments.size();
+                                            if (capturesMatch)
+                                            {
+                                                std::vector<std::pair<
+                                                    std::vector<LLVMBackend::NamedVariable>,
+                                                    LLVMBackend::FunctionSymbol>> candidate = {
+                                                        { std::move(matchedArguments), *funcSym } };
+                                                capturesMatch = Compiler(ctx)->ComputeOverloadFunction(
+                                                    candidate).second.Function == target;
+                                            }
+                                            std::vector<llvm::Value*> captured;
+                                            std::vector<llvm::Type*> captureTypes;
+                                            for (size_t i = 0; capturesMatch && i < arguments.size(); ++i)
+                                            {
+                                                llvm::Value* value = arguments[i].GetValue();
+                                                if (value == nullptr)
+                                                    value = LoadNamedVariable(arguments[i]);
+                                                llvm::Type* expected = target->getFunctionType()->getParamType(i);
+                                                if (value != nullptr)
+                                                    value = Compiler(ctx)->LowerByValueArg(value,
+                                                        funcSym->Parameters[i], arguments[i]);
+                                                if (value == nullptr || value->getType() != expected
+                                                    || !value->getType()->isFirstClassType())
+                                                {
+                                                    capturesMatch = false;
+                                                    break;
+                                                }
+                                                captured.push_back(value);
+                                                captureTypes.push_back(value->getType());
+                                            }
+                                            if (capturesMatch)
+                                            {
+                                                llvm::Value* environment =
+                                                    llvm::ConstantPointerNull::get(Compiler(ctx)->builder->getPtrTy());
+                                                llvm::StructType* environmentType = nullptr;
+                                                if (!captureTypes.empty())
+                                                {
+                                                    environmentType = llvm::StructType::get(
+                                                        *Compiler(ctx)->context, captureTypes);
+                                                    environment = Compiler(ctx)->AllocaAtEntry(
+                                                        environmentType, nullptr, "cxx.ternary.call.env");
+                                                    for (size_t i = 0; i < captured.size(); ++i)
+                                                        Compiler(ctx)->builder->CreateStore(captured[i],
+                                                            Compiler(ctx)->builder->CreateStructGEP(
+                                                                environmentType, environment,
+                                                                static_cast<unsigned>(i)));
+                                                }
+                                                auto* callbackType = llvm::FunctionType::get(targetReturn,
+                                                    { Compiler(ctx)->builder->getPtrTy(),
+                                                      Compiler(ctx)->builder->getPtrTy() }, false);
+                                                auto* callback = llvm::Function::Create(callbackType,
+                                                    llvm::GlobalValue::InternalLinkage,
+                                                    "__cflat_ternary_call", Compiler(ctx)->module.get());
+                                                auto* callbackEntry = llvm::BasicBlock::Create(
+                                                    *Compiler(ctx)->context, "entry", callback);
+                                                llvm::IRBuilder<> callbackBuilder(callbackEntry);
+                                                std::vector<llvm::Value*> callValues;
+                                                for (size_t i = 0; i < captured.size(); ++i)
+                                                    callValues.push_back(callbackBuilder.CreateLoad(
+                                                        captureTypes[i], callbackBuilder.CreateStructGEP(
+                                                            environmentType, callback->getArg(1),
+                                                            static_cast<unsigned>(i))));
+                                                callValues.push_back(callback->getArg(0));
+                                                auto* forwarded = callbackBuilder.CreateCall(
+                                                    target->getFunctionType(), target, callValues);
+                                                forwarded->setAttributes(target->getAttributes());
+                                                forwarded->setCallingConv(target->getCallingConv());
+                                                if (targetReturn->isVoidTy()) callbackBuilder.CreateRetVoid();
+                                                else callbackBuilder.CreateRet(forwarded);
+                                                ternaryCallSink = callback;
+                                                ternaryCallSinkEnvironment = environment;
+                                                ternaryCallSinkTakesReference =
+                                                    Compiler(ctx)->IsCxxReferenceParameter(*funcSym,
+                                                        funcSym->Parameters.size() - 1);
+                                                ternaryCallSinkReturnType = funcSym->ReturnType;
+                                            }
+                                        }
+                                    }
                                     llvm::SaveAndRestore<llvm::Function*> ternaryCallSinkScope(
                                         cxxTernaryCallSink_, ternaryCallSink);
+                                    llvm::SaveAndRestore<llvm::Value*> ternaryCallSinkEnvironmentScope(
+                                        cxxTernaryCallSinkEnvironment_, ternaryCallSinkEnvironment);
+                                    llvm::SaveAndRestore<bool> ternaryCallSinkTakesReferenceScope(
+                                        cxxTernaryCallSinkTakesReference_, ternaryCallSinkTakesReference);
                                     llvm::SaveAndRestore<LLVMBackend::TypeAndValue>
                                         ternaryCallSinkReturnTypeScope(
                                             cxxTernaryCallSinkReturnType_,
@@ -12637,6 +12948,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         Compiler(ctx)->RegisterOwnedStringTemp(argValue);
 
                                     argVar.CastOccurrenceId = thisCastOcc;
+                                    argVar.OwnedStructTempEnd = Compiler(ctx)->pendingOwnedStructTemps.size();
+                                    argVar.HasOwnedStructTempRange = true;
                                     // Canonical lock path of the argument as written, so a lock(a.mtx)
                                     // clause keys on 'o.inner.mtx' for bump(&o.inner, ...).
                                     argVar.CallerLockPath = LockPathForOperandText(

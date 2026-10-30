@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -26,6 +27,9 @@ public:
     void RememberPrefixSource(const std::string& source);
     bool HasDemandChunkSource(const std::string& source) const;
     bool HasDemandHeaderHarvest() const;
+    void SetDynamicInitializerOwners(
+        cflat_cinterop::DynamicInitializerOwnerMap* owners,
+        const cflat_cinterop::CxxImportOrder& importOrder);
     bool HarvestHeader(const cflat_cinterop::ExtractRequest& req,
                        cflat_cinterop::ExtractResult& out,
                        std::string& error);

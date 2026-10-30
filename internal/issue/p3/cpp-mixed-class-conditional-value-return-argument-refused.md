@@ -1,31 +1,23 @@
-# Mixed-class C++ conditional used as a value, return or argument is refused (clang accepts)
+# Mixed-class C++ conditional residue after MIXCOND2
 
-Status (r5): accepted only as the sole argument of a single-parameter CFlat callee (the sink; same-arity
-CFlat overloads such as tq(PB) + tq(int) are fine, but any same-name free overload with MORE parameters
-refuses it), or as a decl/sret value with no conversion of a by-value parameter arm. Everything else
-is refused with master's "ternary branches have incompatible types" or "cannot return C++ class".
+MIXCOND (237dbf3cc) landed decl / sret / single-argument sink; MIXCOND2 (0870063c4) landed the last argument of a
+multi-argument CFlat, C++ or method call (earlier arguments converted as the regular call path converts them), a nested
+conditional declaration arm, and the F1 blocker (a CFlat-produced prvalue arm now lives in the caller's full-expression
+ledger). Both ABIs verified (MS: a reference-taking callee leaves B to the wrapper temporary; a by-value one destroys it
+in the callee). Repros scratch/repro_keep/mixcond2/, clang++ -std=c++20 oracle.
 
 ## Still refused (clang accepts)
-- Non-sink call args: `take2(1, k ? mkA(11) : mkB())` (c05); method/C++ callee args (c06, c15).
-- Operand of a binary/unary/cast op: `take(k ? mkA(11) : mkB()) * 2 + ...` (c24, c37).
-- Sink with a dangling view: `take2(1, k ? mkAV(11) : mkV())` (c30, c31).
-- Defaulted trailing parameter (sink would forward a copy): `tq(k ? mkA(11) : mkNB())` (S2).
-- Nested decl: `PB b = k ? mkA(11) : (j ? mkA(12) : mkB());` (c14).
-- Overloaded callee: `ov(k ? mkA(11) : mkB())` with two overloads (c07).
-- Return of a converting by-value parameter lvalue arm: `return k ? a : mkNB();` (S3, c25). Local lvalue arm (c34) stays accepted; matches clang.
+- Operand of a binary/unary/cast op: `take(k ? mkA(11) : mkB()) * 2` (c24, c37).
+- Overloaded callee with one-argument candidates: `ov(k ? mkA(11) : mkB())` with two overloads (c07).
+- Defaulted trailing parameter (S2); a conditional not in the last argument position; named arguments; an earlier
+  argument that is a C++ class temporary or a long/double-to-narrower conversion.
+- Return of a converting by-value parameter lvalue arm: `return k ? a : mkNB();` (S3, c25).
 
-## MS sink lifetime (S1): fixed in wrapper text, Windows not run
-The MS callee-destroy wrapper builds B by placement new inside the sink call's single
-full-expression, so the converted-from arm lives through the call. Checked (clang MSVC target):
--fsyntax-only, and IR (one B dtor, in the callee; both A dtors after the indirect sink call).
-Legs V13-V15 use one value on both ABIs.
-
-## F1 blocker: thunk-arm temp lifetime
-A prvalue arm A from a CFlat function is a wrapper-local temp in `__cflat_ternary_arm_*`, destroyed
-at wrapper end. The owned-temp ledger cannot hoist it, so B(A) reads a dead A. clang keeps A to the end of the full expression. Const-ref A needs per-kind ctor selection.
+## Destructor order (values match clang)
+The converted B dies when the callee returns inside the arm wrapper, not at the end of the caller's full expression:
+`t2(t1(k ? cmkA(11) : mkB()), mkB())` gives 167574 vs clang 165774 (pre-existing on the single-argument path), and the
+nested `t2(t2(1, k ? ...), k ? ...)` cell gives 167574 / 57167 vs clang 165774 / 516747.
 
 ## Fix direction
-(a) Caller-owned producer storage: emit B's converting ctor from CFlat with a pointer to a
-caller-owned A, so the temp outlives the wrapper.
-(b) Multi-arg sink with captured args (r2 idea), then drop the operator and overload refusals.
-Check ctor/dtor sequences against clang++ on both ABIs (MSVC destroys by-value params in callee).
+B in caller-owned storage registered on the full-expression ledger (like the producer A), so the wrapper only constructs
+it; then the operator/overload refusals can route through the same callback.

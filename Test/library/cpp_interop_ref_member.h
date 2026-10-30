@@ -49,6 +49,35 @@ struct PtrRef {
 // Aggregate-only reference members for designated and positional brace initialization.
 struct BraceConstRef { const int& r; };
 struct BraceRvalRef { int&& r; };
+inline int refctxCallKind = 0;
+inline const int* refctxLastConstReferent = nullptr;
+inline void refctx_reset_call() {
+    refctxCallKind = 0;
+    refctxLastConstReferent = nullptr;
+}
+inline int refctx_call_kind() { return refctxCallKind; }
+inline int refctx_last_const_referent() {
+    return refctxLastConstReferent == nullptr ? -1 : *refctxLastConstReferent;
+}
+inline int refctx_const_byval(BraceConstRef value) {
+    refctxCallKind = 1;
+    refctxLastConstReferent = &value.r;
+    return value.r;
+}
+inline int refctx_const_byconst(const BraceConstRef& value) {
+    refctxCallKind = 2;
+    refctxLastConstReferent = &value.r;
+    return value.r;
+}
+inline int refctx_rval_byval(BraceRvalRef value) {
+    refctxCallKind = 3;
+    value.r = 9;
+    return value.r;
+}
+inline int refctx_rval_byconst(const BraceRvalRef& value) {
+    refctxCallKind = 4;
+    return value.r;
+}
 struct FunctionRef {
     int (&f)(int);
     int v;
@@ -96,6 +125,8 @@ inline int refmem_lifetime_copy_count() { return refmemLifetimeCopies; }
 inline int refmem_lifetime_move_count() { return refmemLifetimeMoves; }
 inline int refmem_lifetime_dtor_count() { return refmemLifetimeDtors; }
 struct BraceRefInner { int& r; int v; double d; };
+inline int refctx_mut_byval(BraceRefInner value) { refctxCallKind = 5; value.r = 9; return value.v; }
+inline int refctx_mut_byconst(const BraceRefInner& value) { refctxCallKind = 6; return value.r + value.v; }
 struct BraceRefOuter { BraceRefInner m; int k; };
 struct BraceRefDeep { BraceRefOuter o; };
 struct BraceAggNestedRefBase { BraceRefOuter nested; int baseTail; };

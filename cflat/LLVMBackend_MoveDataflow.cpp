@@ -1345,6 +1345,20 @@ void LLVMBackend::SetConstGlobalInt(const std::string& name, int64_t value)
         constGlobalInts_[name] = value;
     }
 
+void LLVMBackend::SetSourceOrderedIfConstDecision(
+    const CFlatParser::IfConstDeclarationContext* ctx, int decision)
+{
+        if (ctx != nullptr) sourceOrderedIfConstDecisions_[ctx] = decision;
+    }
+
+std::optional<int> LLVMBackend::GetSourceOrderedIfConstDecision(
+    const CFlatParser::IfConstDeclarationContext* ctx) const
+{
+        auto it = sourceOrderedIfConstDecisions_.find(ctx);
+        if (it == sourceOrderedIfConstDecisions_.end()) return std::nullopt;
+        return it->second;
+    }
+
 bool LLVMBackend::TryGetConstGlobalInt(const std::string& name, int64_t& out) const
 {
         auto it = constGlobalInts_.find(name);

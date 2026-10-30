@@ -1,0 +1,1 @@
+const int HDRGLOB_R9_ENABLED = 1;

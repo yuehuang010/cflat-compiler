@@ -2027,6 +2027,14 @@ CxxIncrementalGroup::CxxIncrementalGroup(std::unique_ptr<Impl> impl)
 
 CxxIncrementalGroup::~CxxIncrementalGroup() = default;
 
+void CxxIncrementalGroup::SetDynamicInitializerOwners(
+    cflat_cinterop::DynamicInitializerOwnerMap* owners,
+    const cflat_cinterop::CxxImportOrder& importOrder)
+{
+    impl_->plan.dynamicInitializerOwners = owners;
+    impl_->plan.cxxImportGroupOrder = importOrder;
+}
+
 std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         const std::vector<std::string>& args, const std::string& headerSource,
         bool verbose, std::string& error, bool tolerateDiagnostics,
@@ -2421,7 +2429,11 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
         effective, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
         impl_->headerRoot, {}, impl_->headerModule, out, error, true);
-    if (harvested && effective.demandPlan != nullptr) out.demandRecorded = true;
+    if (harvested && effective.demandPlan != nullptr)
+    {
+        out.demandRecorded = true;
+        out.cxxDynamicInitializerSymbols = impl_->plan.dynamicInitializerCandidates;
+    }
     if (harvested && out.demandRecorded) impl_->demandHeaderHarvested = true;
     out.includedFiles = impl_->includedFiles;
     return harvested;

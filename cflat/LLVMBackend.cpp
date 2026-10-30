@@ -2062,10 +2062,159 @@ void LLVMBackend::EndFileScopeExpectations(bool allowDeferred)
     if (!missing.empty()) FailMissingFileScopeExpectation(missing);
 }
 
+namespace {
+
+struct SourceOrderedImport
+{
+    CFlatParser::ImportDeclarationContext* declaration = nullptr;
+    std::string namespaceName;
+};
+
+class SourceOrderedImportCursor
+{
+public:
+    SourceOrderedImportCursor(
+        LLVMBackend* compiler,
+        const std::vector<CFlatParser::ExternalDeclarationContext*>& declarations)
+        : compiler_(compiler)
+    {
+        frames_.push_back({ declarations, 0, false, false, compiler_->GetCurrentNamespace() });
+    }
+
+    std::optional<SourceOrderedImport> Next()
+    {
+        while (!frames_.empty())
+        {
+            auto& frame = frames_.back();
+            if (frame.nextIndex >= frame.declarations.size())
+            {
+                frames_.pop_back();
+                continue;
+            }
+
+            auto* external = frame.declarations[frame.nextIndex++];
+            if (auto* import = external->importDeclaration())
+            {
+                // Plain namespace imports retain their existing late-processing path.
+                if ((!frame.inNamespace && !frame.inSelectedIfConst)
+                    || (frame.inSelectedIfConst && IsCppImport(import)))
+                    return SourceOrderedImport{ import, frame.namespaceName };
+                continue;
+            }
+
+            if (auto* declaration = external->declaration())
+            {
+                RememberPriorConstNames(declaration, frame.namespaceName);
+                continue;
+            }
+
+            if (auto* ns = external->namespaceDefinition())
+            {
+                std::string nestedName = frame.namespaceName;
+                for (auto* id : ns->Identifier())
+                    nestedName += (nestedName.empty() ? "" : ".") + id->getText();
+                frames_.push_back({ ns->externalDeclaration(), 0, true,
+                                    frame.inSelectedIfConst, std::move(nestedName) });
+                continue;
+            }
+
+            if (auto* ifConst = external->ifConstDeclaration())
+                PushSelectedIfConst(ifConst, frame.inNamespace, frame.namespaceName);
+        }
+
+        return std::nullopt;
+    }
+
+private:
+    struct Frame
+    {
+        std::vector<CFlatParser::ExternalDeclarationContext*> declarations;
+        size_t nextIndex = 0;
+        bool inNamespace = false;
+        bool inSelectedIfConst = false;
+        std::string namespaceName;
+    };
+
+    void RememberPriorConstNames(CFlatParser::DeclarationContext* declaration,
+                                 const std::string& namespaceName)
+    {
+        auto* specs = declaration->declarationSpecifiers();
+        auto* list = declaration->initDeclaratorList();
+        if (specs == nullptr || list == nullptr) return;
+        bool isConst = false;
+        for (auto* spec : specs->declarationSpecifier())
+            isConst = isConst || spec->typeQualifier() != nullptr;
+        if (!isConst) return;
+
+        for (auto* init : list->initDeclarator())
+        {
+            auto* declarator = init->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            auto* identifier = LexicalDirectDeclaratorIdentifier(direct);
+            if (identifier == nullptr) continue;
+            const std::string name = identifier->getText();
+            priorConstNames_.insert(namespaceName.empty() ? name : namespaceName + "." + name);
+        }
+    }
+
+    bool ReferencesPriorConst(antlr4::tree::ParseTree* node,
+                              const std::string& namespaceName) const
+    {
+        if (node == nullptr) return false;
+        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+        {
+            if (terminal->getSymbol()->getType() != CFlatParser::Identifier) return false;
+            const std::string name = terminal->getText();
+            for (std::string scope = namespaceName; !scope.empty(); )
+            {
+                if (priorConstNames_.count(scope + "." + name) != 0) return true;
+                auto separator = scope.rfind('.');
+                scope = separator == std::string::npos ? std::string{} : scope.substr(0, separator);
+            }
+            return priorConstNames_.count(name) != 0;
+        }
+        for (auto* child : node->children)
+            if (ReferencesPriorConst(child, namespaceName)) return true;
+        return false;
+    }
+
+    void PushSelectedIfConst(CFlatParser::IfConstDeclarationContext* ifConst,
+                             bool inNamespace, const std::string& namespaceName)
+    {
+        // A preceding root const is not seeded until after imports. Keep this arm late so the
+        // early walk cannot select against a same-named imported constant instead.
+        if (ReferencesPriorConst(ifConst->expression(), namespaceName)) return;
+        auto decision = FoldCompileTimeInt(compiler_, ifConst->expression());
+        if (!decision) return;
+
+        const int selected = *decision != 0 ? 1 : 0;
+        compiler_->SetSourceOrderedIfConstDecision(ifConst, selected);
+        auto blocks = ifConst->ifConstBlock();
+        if (selected != 0)
+        {
+            if (!blocks.empty())
+                frames_.push_back({ blocks[0]->externalDeclaration(), 0, inNamespace,
+                                    true, namespaceName });
+        }
+        else if (auto* elseIf = ifConst->ifConstDeclaration())
+            PushSelectedIfConst(elseIf, inNamespace, namespaceName);
+        else if (blocks.size() > 1)
+            frames_.push_back({ blocks[1]->externalDeclaration(), 0, inNamespace,
+                                true, namespaceName });
+    }
+
+    LLVMBackend* compiler_ = nullptr;
+    std::vector<Frame> frames_;
+    std::unordered_set<std::string> priorConstNames_;
+};
+
+} // namespace
+
 bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverride)
 {
     fileScopeExpectationTotal_ = 0;
     fileScopeExpectationRemaining_ = 0;
+    sourceOrderedIfConstDecisions_.clear();
     processingImports_ = false;
     // --check: parse and codegen for diagnostics only, emitting no outputs.
     bool checkOnly = args.hasFlag("check");
@@ -2561,10 +2710,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
             llvm::TimeTraceScope importsScope("ProcessImports", sourceFileName);
             if (auto* tu = computeUnit->translationUnit()) {
-                for (auto* decl : tu->externalDeclaration()) {
+                SourceOrderedImportCursor imports(this, tu->externalDeclaration());
+                while (true) {
+                    auto importSite = imports.Next();
+                    if (!importSite) break;
+                    LLVMBackend::NamespaceScope namespaceScope(this, importSite->namespaceName);
                     try
                     {
-                        if (auto* imp = decl->importDeclaration()) {
+                            auto* imp = importSite->declaration;
                             // Point diagnostics at this import statement. A not-found error is raised
                             // before any real file is opened (there is no readable file behind it, e.g.
                             // a winmd), so without this it would report (0,0) instead of the import line.
@@ -2616,7 +2769,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                             {
                                 if (verbose) std::cout << std::format("[verbose] import requested (group of {})\n", groupedImports.size());
                                 if (!CompileImportGroup(filename, groupedImports, DequoteLibClauses(imp),
-                                                        DequoteDefineClauses(imp), IsCppImport(imp)))
+                                                        DequoteDefineClauses(imp), IsCppImport(imp),
+                                                        CxxImportOrderAt(imp->getStart()->getStartIndex())))
                                     return false;
                                 continue;
                             }
@@ -2640,7 +2794,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                             std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                             std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
                             if (verbose) std::cout << std::format("[verbose] import requested: {}{}\n", importFilename, ns.empty() ? "" : " as " + ns);
-                            if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport))
+                            if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport,
+                                                     CxxImportOrderAt(imp->getStart()->getStartIndex())))
                                 return false;
 
                             if (isProgram)
@@ -2668,7 +2823,6 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                                     programTable[alias].MainFunction = mainFn;
                                 }
                             }
-                        }
                     }
                     catch (const ExpectedErrorReceived&)
                     {
@@ -3617,12 +3771,15 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
                                      const std::vector<std::string>& entries,
                                      const std::vector<std::string>& groupLibs,
                                      const std::vector<std::string>& groupDefines,
-                                     bool cppMode)
+                                     bool cppMode,
+                                     const cflat_cinterop::CxxImportOrder& importOrder)
 {
+    CxxImportOrderGuard orderGuard(this, importOrder);
     std::vector<std::string> headerCanonicals;
     bool anyNewHeader = false;
-    for (const auto& entry : entries)
+    for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex)
     {
+        const auto& entry = entries[entryIndex];
         std::string ext = LowerExtension(entry);
         // `import cpp { ... }`: every entry that is not a C/C++ source file is a header,
         // whatever its extension.
@@ -3635,7 +3792,9 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
         if (!isHeader)
         {
             // .cb / .c entries are independent - route each like a plain `import "x";`.
-            if (!CompileImportedFile(importingFilePath, entry, {}, {}, {}, {}, cppMode))
+            auto entryOrder = importOrder;
+            entryOrder.push_back(entryIndex);
+            if (!CompileImportedFile(importingFilePath, entry, {}, {}, {}, {}, cppMode, entryOrder))
                 return false;
             continue;
         }
@@ -3679,8 +3838,9 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
     return ok;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cppMode)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cppMode, const cflat_cinterop::CxxImportOrder& importOrder)
 {
+    CxxImportOrderGuard orderGuard(this, importOrder);
     if (isolatedPolicy_)
     {
         auto ext = LowerExtension(importFilename);
@@ -3878,10 +4038,13 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     // Recursively process nested imports before scanning this file's declarations
     if (auto* tu = computeUnit->translationUnit())
     {
-        for (auto* decl : tu->externalDeclaration())
+        SourceOrderedImportCursor imports(this, tu->externalDeclaration());
+        while (true)
         {
-            if (auto* imp = decl->importDeclaration())
-            {
+                auto importSite = imports.Next();
+                if (!importSite) break;
+                LLVMBackend::NamespaceScope namespaceScope(this, importSite->namespaceName);
+                auto* imp = importSite->declaration;
                 SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
                 if (auto error = ValidateImportLeadingMarker(imp); !error.empty()) {
                     LogError(error);
@@ -3925,7 +4088,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 {
                     if (verbose) std::cout << std::format("[verbose]   nested import (group of {})\n", groupedImports.size());
                     if (!CompileImportGroup(canonicalStr, groupedImports, DequoteLibClauses(imp),
-                                            DequoteDefineClauses(imp), IsCppImport(imp)))
+                                            DequoteDefineClauses(imp), IsCppImport(imp),
+                                            CxxImportOrderAt(imp->getStart()->getStartIndex())))
                         return false;
                     continue;
                 }
@@ -3943,9 +4107,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
                 if (verbose) std::cout << std::format("[verbose]   nested import: {}{}\n", nested, nestedNs.empty() ? "" : " as " + nestedNs);
                 if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLibs, nestedDefines,
-                                         IsCppImport(imp)))
+                                         IsCppImport(imp),
+                                         CxxImportOrderAt(imp->getStart()->getStartIndex())))
                     return false;
-            }
         }
     }
 
@@ -4936,7 +5100,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     if (groupedImports.size() > 1)
                     {
                         if (!CompileImportGroup(filePath, groupedImports, DequoteLibClauses(imp),
-                                                DequoteDefineClauses(imp), IsCppImport(imp)))
+                                                DequoteDefineClauses(imp), IsCppImport(imp),
+                                                CxxImportOrderAt(imp->getStart()->getStartIndex())))
                             return false;
                         continue;
                     }
@@ -4956,7 +5121,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     bool isCppImport = IsCppImport(imp);
                     std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                     std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
-                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport))
+                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, isCppImport,
+                                             CxxImportOrderAt(imp->getStart()->getStartIndex())))
                         return false;
 
                     // Mirror Compile()'s 'import program "file.cb" as Name' handling:
@@ -5166,11 +5332,13 @@ void LLVMBackend::ResetForReanalysis()
     cppInteropUsed_ = false;
     cxxProgramEhGuardAttempted_ = false;
     cxxImportGroups_.clear();
+    currentCxxImportOrderPath_.clear();
     cxxHeaderGuardCache_.clear();
     tuParseCounts_.clear();
     cInlineBodyRequests_.clear();
     cxxIncrementalGroups_.clear();
     cxxDemandGroups_.clear();
+    cxxDynamicInitializerOwners_.clear();
     cxxBodyChecks_.clear();
     cxxConstructorBodyRefusals_.clear();
     cxxVerdictFileMemo_.clear();
@@ -5522,6 +5690,7 @@ void LLVMBackend::ResetForReanalysis()
     returnBlockTable.clear();
     compileTimeMacros.clear();
     constGlobalInts_.clear();
+    sourceOrderedIfConstDecisions_.clear();
     constGlobalFPs_.clear();
     stringLiteralLenByPtr.clear();
     stringLiteralGlobals_.clear();

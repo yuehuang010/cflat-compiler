@@ -513,3 +513,33 @@ struct T513V11View
     int get() const noexcept { return p ? *p : 20; }
 };
 inline T513V11View t513V11MakeNull() noexcept { return T513V11View(); }
+inline int t513V11CppTake2(int x, T513V11View value) { return x + value.get(); }
+
+// MIXCOND2: a converting reference ctor observes its producer through multi-argument calls.
+inline int t513M2Sequence = 0;
+inline void t513M2Reset() { t513M2Sequence = 0; }
+inline int t513M2Stats() noexcept { return t513M2Sequence; }
+struct T513M2A
+{
+    int value;
+    explicit T513M2A(int n) : value(n) { t513M2Sequence = t513M2Sequence * 10 + 1; }
+    ~T513M2A() { t513M2Sequence = t513M2Sequence * 10 + 4; value = -999; }
+};
+struct T513M2B
+{
+    const T513M2A* source;
+    int fallback;
+    T513M2B() : source(nullptr), fallback(20) { t513M2Sequence = t513M2Sequence * 10 + 5; }
+    T513M2B(const T513M2A& value) : source(&value), fallback(0) {
+        t513M2Sequence = t513M2Sequence * 10 + 6;
+    }
+    ~T513M2B() { t513M2Sequence = t513M2Sequence * 10 + 7; }
+    int get() const { return source != nullptr ? source->value : fallback; }
+};
+inline T513M2A t513M2MakeA(int n) { return T513M2A(n); }
+inline T513M2B t513M2MakeB() { return T513M2B(); }
+inline int t513M2CppTake2(int x, const T513M2B& value) { return x + value.get(); }
+struct T513M2Host
+{
+    int take2(int x, const T513M2B& value) { return x + value.get(); }
+};

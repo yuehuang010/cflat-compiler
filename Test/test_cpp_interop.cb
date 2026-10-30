@@ -228,6 +228,32 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp {"library/cpp_hdrglob_a.hpp", "library/cpp_hdrglob_b.hpp"};
+import cpp "library/cpp_hdrglob_r3_a.hpp";
+import cpp "library/cpp_hdrglob_r3_b.hpp";
+import cpp "library/cpp_hdrglob_r5_path_a.hpp";
+import cpp "library/cpp_hdrglob_r5_path_b.hpp";
+if const (__POSIX__ || __WINDOWS__) { import cpp "library/cpp_hdrglob_r6_static_z.hpp"; }
+import cpp "library/cpp_hdrglob_r6_static_y.hpp";
+if const (__POSIX__ || __WINDOWS__) { import cpp "library/cpp_hdrglob_r6_inline_z.hpp"; }
+import cpp "library/cpp_hdrglob_r6_inline_y.hpp";
+if const (0) { import cpp "library/cpp_hdrglob_r7_dead.hpp"; }
+if const (__POSIX__ || __WINDOWS__) { import cpp "library/cpp_hdrglob_r7_static_z.hpp"; }
+import cpp "library/cpp_hdrglob_r7_static_y.hpp";
+if const (__POSIX__ || __WINDOWS__) { import cpp "library/cpp_hdrglob_r7_inline_z.hpp"; }
+import cpp "library/cpp_hdrglob_r7_inline_y.hpp";
+import "library/cpp_hdrglob_r9_flag.cb";
+if const (HDRGLOB_R9_ENABLED == 1) { import cpp "library/cpp_hdrglob_r9_z.hpp"; }
+import cpp "library/cpp_hdrglob_r9_y.hpp";
+import cpp "library/cpp_hdrglob_r5_order_x.hpp";
+if const (__MACOS__) {
+    import cpp "library/cpp_hdrglob_r5_order_z.hpp";
+} else {
+    import cpp "library/cpp_hdrglob_r5_order_z.hpp";
+}
+import cpp "library/cpp_hdrglob_r5_order_y.hpp";
+import cpp "library/cpp_hdrglob_r3_order_y.hpp";
+import cpp "library/cpp_hdrglob_r3_order_x.hpp";
 import cpp "library/cpp_t497_compound.hpp";
 import cpp "library/t414_fnmove.hpp";
 import cpp "library/cpp_t322_constretcv.hpp";
@@ -238,6 +264,7 @@ import "library/cpp_t103_nullctor_c.h";
 import cpp "library/cpp_t103_nullctor.hpp";
 import cpp "library/cpp_t110_varlink.hpp";
 import cpp "library/cpp_interop_t74.h";
+import cpp "library/cpp_dtorord.hpp";
 import cpp "library/t70_xvalue_overloads.h";
 import cpp "library/cpp_t105_conversion_operators.hpp";
 import cpp "library/cpp_t97_fieldctor.h";
@@ -345,6 +372,7 @@ void CxxDerefPointer(cpp_derefcopy.Cursor16* value, int x) { **value = x; **valu
 // C++ REFERENCE data members - an alias of the referent (M97/M98), never reseatable.
 import cpp "library/cpp_interop_ref_member.h";
 import cpp "library/cpp_interop_ref_alias.h";
+import cpp "library/cpp_interop_refctx_overload.h";
 import cpp "library/cpp_t495_amppick.hpp";
 import cpp "library/cpp_interop_field.h";
 int RefFnCflat(int x) { return x + 3000; }
@@ -1467,6 +1495,211 @@ int CppTemporaryRefCases()
     ExFieldHolder refField = default;
     if (cppref.take_ref(refField.ex) != 6 || refField.ex.v != 6)             return 3395;
     if (cppref.take_ref(cppref.ref_ex()) != 71 || cppref.ref_ex().v != 71)  return 3396;
+    return 0;
+}
+
+struct DtorOrdF {
+    int v = 0;
+    DtorOrdF(int x) { v = x; }
+    ~DtorOrdF() { cppdtorord.mark(v); }
+};
+int DtorOrdAdd(DtorOrdF f, int a, int b) { return f.v + a + b; }
+int DtorOrdReturn() { return cppdtorord.C(1).v; }
+int DtorOrdAliasEarlyReturn()
+{
+    alias cppdtorord.C r = cppdtorord.C(4);
+    cppdtorord.mark(8);
+    return r.v;
+}
+int CppDtorOrderCases()
+{
+    cppdtorord.reset();
+    int two = cppdtorord.pick(cppdtorord.C(1), cppdtorord.C(2));
+    if (two != 12 || cppdtorord.order() != 21 || cppdtorord.routes() != 113) return 3610;
+
+    cppdtorord.reset();
+    int three = cppdtorord.pick(cppdtorord.C(1), cppdtorord.C(2), cppdtorord.C(3));
+    if (three != 123 || cppdtorord.order() != 321 || cppdtorord.routes() != 1114) return 3611;
+
+    cppdtorord.reset();
+    int nested = cppdtorord.f(cppdtorord.g(1), cppdtorord.C(2));
+    if (nested != 12 || cppdtorord.order() != 21 || cppdtorord.routes() != 5116) return 3612;
+
+    cppdtorord.reset();
+    int byRef = cppdtorord.take_ref(cppdtorord.C(1));
+    if (byRef != 1 || cppdtorord.order() != 1 || cppdtorord.routes() != 17) return 3613;
+    cppdtorord.reset();
+    int byValue = cppdtorord.take_value(cppdtorord.C(1));
+    if (byValue != 1 || cppdtorord.order() != 1 || cppdtorord.routes() != 20) return 3614;
+
+    cppdtorord.reset();
+    int binary = cppdtorord.C(1) + cppdtorord.C(2);
+    if (binary != 3 || cppdtorord.order() != 21 || cppdtorord.routes() != 121) return 3615;
+
+    cppdtorord.reset();
+    int condition = 0;
+    if (cppdtorord.C(1)) condition = 1;
+    if (condition != 1 || cppdtorord.order() != 1 || cppdtorord.routes() != 18) return 3616;
+    cppdtorord.reset();
+    int returned = DtorOrdReturn();
+    if (returned != 1 || cppdtorord.order() != 1 || cppdtorord.routes() != 1) return 3617;
+    cppdtorord.reset();
+    int initialized = cppdtorord.C(1).v;
+    if (initialized != 1 || cppdtorord.order() != 1 || cppdtorord.routes() != 1) return 3618;
+
+    cppdtorord.reset();
+    int member = cppdtorord.C(1).member(cppdtorord.C(2));
+    if (member != 12 || cppdtorord.order() != 21 || cppdtorord.routes() != 119) return 3619;
+
+    cppdtorord.reset();
+    int refValue = 0;
+    {
+        alias cppdtorord.C r = cppdtorord.C(1);
+        refValue = r.v;
+    }
+    if (refValue != 1 || cppdtorord.order() != 1 || cppdtorord.routes() != 1) return 3620;
+
+    cppdtorord.reset();
+    int mixed = DtorOrdAdd(DtorOrdF(7), cppdtorord.C(1).v, cppdtorord.C(2).v);
+    if (mixed != 10 || cppdtorord.order() != 217 || cppdtorord.routes() != 11) return 3621;
+
+    cppdtorord.C lvalue = cppdtorord.C(1);
+    cppdtorord.reset();
+    int lvalueByValue = cppdtorord.take_value(lvalue)
+        + cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+    cppdtorord.mark(8);
+    if (lvalueByValue != 24 || cppdtorord.order() != 3218
+        || cppdtorord.routes() != 30113) return 3622;
+
+    cppdtorord.reset();
+    int lvalueLast = cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3))
+        + cppdtorord.take_value(lvalue);
+    cppdtorord.mark(8);
+    if (lvalueLast != 24 || cppdtorord.order() != 1328
+        || cppdtorord.routes() != 11330) return 3623;
+
+    cppdtorord.C conditionalX = cppdtorord.C(1);
+    cppdtorord.C conditionalY = cppdtorord.C(2);
+    bool conditionalPick = true;
+    cppdtorord.reset();
+    int conditionalByValue = cppdtorord.take_value(conditionalPick ? conditionalX : conditionalY)
+        + cppdtorord.pick(cppdtorord.C(3), cppdtorord.C(4));
+    cppdtorord.mark(8);
+    if (conditionalByValue != 35 || cppdtorord.order() != 4318
+        || cppdtorord.routes() != 30113) return 3624;
+
+    cppdtorord.reset();
+    int aliasOrderValue = 0;
+    {
+        alias cppdtorord.C r = cppdtorord.C(1);
+        cppdtorord.mark(8);
+        int q = cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+        cppdtorord.mark(7);
+        aliasOrderValue = r.v + q;
+    }
+    if (aliasOrderValue != 24 || cppdtorord.order() != 83271
+        || cppdtorord.routes() != 1113) return 3625;
+
+    cppdtorord.reset();
+    int makeAliasValue = 0;
+    {
+        alias cppdtorord.C r = cppdtorord.g(4);
+        cppdtorord.mark(8);
+        makeAliasValue = r.v;
+        cppdtorord.mark(7);
+    }
+    if (makeAliasValue != 4 || cppdtorord.order() != 874
+        || cppdtorord.routes() != 51) return 3626;
+
+    cppdtorord.reset();
+    int conditionalAliasValue = 0;
+    {
+        alias cppdtorord.C r = true ? cppdtorord.C(1) : cppdtorord.C(2);
+        cppdtorord.mark(8);
+        conditionalAliasValue = r.v;
+        cppdtorord.mark(7);
+    }
+    if (conditionalAliasValue != 1 || cppdtorord.order() != 871
+        || cppdtorord.routes() != 1) return 3627;
+
+    cppdtorord.reset();
+    int aliasLoopI = 0;
+    int aliasLoopValue = 0;
+    while (aliasLoopI < 2)
+    {
+        alias cppdtorord.C r = cppdtorord.C(aliasLoopI + 1);
+        cppdtorord.mark(8);
+        aliasLoopValue = aliasLoopValue * 10 + r.v;
+        aliasLoopI++;
+    }
+    if (aliasLoopValue != 12 || cppdtorord.order() != 8182
+        || cppdtorord.routes() != 11) return 3628;
+
+    cppdtorord.reset();
+    int aliasScopeOrderValue = 0;
+    {
+        alias cppdtorord.C r = cppdtorord.C(1);
+        cppdtorord.mark(8);
+        cppdtorord.C other = cppdtorord.C(2);
+        cppdtorord.mark(9);
+        aliasScopeOrderValue = r.v + other.v;
+    }
+    if (aliasScopeOrderValue != 3 || cppdtorord.order() != 8921
+        || cppdtorord.routes() != 11) return 3629;
+
+    cppdtorord.reset();
+    int aliasNestedValue = 0;
+    {
+        alias cppdtorord.C r = cppdtorord.C(1);
+        cppdtorord.mark(8);
+        { cppdtorord.mark(9); aliasNestedValue = r.v; }
+    }
+    cppdtorord.mark(7);
+    if (aliasNestedValue != 1 || cppdtorord.order() != 8917
+        || cppdtorord.routes() != 1) return 3630;
+
+    cppdtorord.reset();
+    int aliasEarlyValue = DtorOrdAliasEarlyReturn();
+    if (aliasEarlyValue != 4 || cppdtorord.order() != 84
+        || cppdtorord.routes() != 1) return 3631;
+
+    cppdtorord.reset();
+    int aliasContinueI = 0;
+    int aliasContinueValue = 0;
+    while (aliasContinueI < 2)
+    {
+        alias cppdtorord.C r = cppdtorord.C(aliasContinueI + 1);
+        cppdtorord.mark(8);
+        aliasContinueValue += r.v;
+        aliasContinueI++;
+        continue;
+    }
+    if (aliasContinueValue != 3 || cppdtorord.order() != 8182
+        || cppdtorord.routes() != 11) return 3632;
+
+    cppdtorord.reset();
+    int aliasBreakValue = 0;
+    while (true)
+    {
+        alias cppdtorord.C r = cppdtorord.C(3);
+        cppdtorord.mark(8);
+        aliasBreakValue = r.v;
+        break;
+    }
+    if (aliasBreakValue != 3 || cppdtorord.order() != 83
+        || cppdtorord.routes() != 1) return 3633;
+
+    cppdtorord.C aliasSource = cppdtorord.C(5);
+    cppdtorord.reset();
+    int aliasLvalueValue = 0;
+    {
+        alias cppdtorord.C r = aliasSource;
+        cppdtorord.mark(8);
+        aliasLvalueValue = r.v;
+    }
+    cppdtorord.mark(7);
+    if (aliasLvalueValue != 5 || cppdtorord.order() != 87
+        || cppdtorord.routes() != 0) return 3634;
     return 0;
 }
 
@@ -2987,6 +3220,110 @@ int T513V14Probe(bool k, int input)
     T513V14Take(k ? t513V10MakeA(input) : t513V10MakeB());
     return t513V14Value * 10000 + t513V10Stats();
 }
+int T513V16Take2(int x, T513V10B value) { return x + value.value; }
+int T513V16Probe(bool k, int input)
+{
+    t513V10Reset();
+    int value = T513V16Take2(1, k ? t513V10MakeA(input) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+int t513M2BoolArgCalls = 0;
+int T513M2BoolArgSide(int value)
+{
+    t513M2BoolArgCalls++;
+    return value;
+}
+int T513M2BoolArgTake(bool enabled, T513V10B value)
+{
+    return (enabled ? 1000 : 0) + value.value;
+}
+int T513M2BoolArgProbe(bool k, int input)
+{
+    t513V10Reset();
+    t513M2BoolArgCalls = 0;
+    int value = T513M2BoolArgTake(T513M2BoolArgSide(2),
+        k ? t513V10MakeA(input) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+int T513M2WidePrefixTake(long a, double d, T513V10B value)
+{
+    return (int)(a * 10 + d * 4) * 100 + value.value;
+}
+int T513M2WidePrefixProbe(bool k, int input)
+{
+    t513V10Reset();
+    int value = T513M2WidePrefixTake(5, 2.5,
+        k ? t513V10MakeA(input) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+int t513V16VoidValue = 0;
+void T513V16VoidTake2(int x, T513V10B value) { t513V16VoidValue = x + value.value; }
+int T513V16VoidProbe(bool k, int input)
+{
+    t513V10Reset();
+    T513V16VoidTake2(1, k ? t513V10MakeA(input) : t513V10MakeB());
+    return t513V16VoidValue * 10000 + t513V10Stats();
+}
+
+T513M2A t513M2CflatMakeA(int input) { return T513M2A(input); }
+T513M2B t513M2CflatMakeB() { return T513M2B(); }
+int t513M2CflatTake2(int x, T513M2B value) { return x + value.get(); }
+int T513M2C05Probe(bool k, int input)
+{
+    t513M2Reset();
+    int value = t513M2CflatTake2(1,
+        k ? t513M2CflatMakeA(input) : t513M2CflatMakeB());
+    return value * 10000 + t513M2Stats();
+}
+int T513M2C06Probe(bool k, int input)
+{
+    t513M2Reset();
+    T513M2Host host = default;
+    int value = host.take2(1, k ? t513M2CflatMakeA(input) : t513M2CflatMakeB());
+    return value * 10000 + t513M2Stats();
+}
+int T513M2C15Probe(bool k, int input)
+{
+    t513M2Reset();
+    int value = t513M2CppTake2(1,
+        k ? t513M2CflatMakeA(input) : t513M2CflatMakeB());
+    return value * 10000 + t513M2Stats();
+}
+// After the reference-callee wrappers: a by-value CFlat callee must not reuse their wrapper (MS double destroy).
+int T513M2C05AfterRefProbe(bool k, int input)
+{
+    t513M2Reset();
+    int value = t513M2CflatTake2(1, k ? t513M2CflatMakeA(input) : t513M2CflatMakeB());
+    return value * 10000 + t513M2Stats();
+}
+T513V10A t513V10CflatMakeA(int input) { return T513V10A(input); }
+T513V10B t513V10CflatMakeB() { return T513V10B(20); }
+int T513M2C14Probe(bool k, bool j)
+{
+    t513V10Reset();
+    int value = 0;
+    {
+        T513V10B result = k ? t513V10CflatMakeA(11)
+            : (j ? t513V10CflatMakeA(12) : t513V10CflatMakeB());
+        value = result.value;
+    }
+    return value * 10000 + t513V10Stats();
+}
+int T513M2ViewTake2(int x, T513V11View value) { return x + value.get(); }
+int T513M2ViewCflatProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513M2ViewTake2(1,
+        k ? t513V10CflatMakeA(11) : t513V11MakeNull());
+    return value * 10000 + t513V10Stats();
+}
+int T513M2ViewCppProbe(bool k)
+{
+    t513V10Reset();
+    int value = t513V11CppTake2(1,
+        k ? t513V10CflatMakeA(11) : t513V11MakeNull());
+    return value * 10000 + t513V10Stats();
+}
 
 int t47RefmemChurn(int a)
 {
@@ -2996,6 +3333,68 @@ int t47RefmemChurn(int a)
 }
 
 using T47RefMemConstAlias = cppref.BraceConstRef;
+
+int refctxCflatByval(cppref.BraceRefInner value)
+{
+    value.r = 10;
+    return value.v;
+}
+int refctxCflatConstAlias(alias (const cppref.BraceRefInner) value)
+{
+    value.r = 11;
+    return value.v;
+}
+struct RefctxAliasFieldOwner { int k = default; int g = default; };
+struct RefctxAliasMethodOwner
+{
+    int unused = default;
+    cppref.BraceRefInner pick(int a, alias int p) { return { r = p, v = a, d = 0.0 }; }
+};
+cppref.BraceRefInner refctxReturnAliasField(alias RefctxAliasFieldOwner value)
+{
+    return { r = value.g, v = 1, d = 0.0 };
+}
+cppref.BraceRefInner refctxReturnAliasNamed(alias int value)
+{
+    return { r = value, v = 6, d = 0.0 };
+}
+cppref.BraceRefInner refctxReturnAliasPositional(alias int value)
+{
+    return { value, 7, 0.0 };
+}
+cppref.BraceRvalRef refctxReturnRvalAliasNamed(alias int value)
+{
+    return { r = move value };
+}
+cppref.BraceRvalRef refctxReturnRvalAliasPositional(alias int value)
+{
+    return { move value };
+}
+
+int refctxGlobalRefSource = 40;
+int refctxGlobalConstSource = 41;
+cppref.BraceRefInner refctxGlobalRefNamed = {
+    r = refctxGlobalRefSource, v = 1, d = 0.0 };
+cppref.BraceConstRef refctxGlobalConstPositional = { refctxGlobalConstSource };
+cppref.BraceRvalRef refctxGlobalRvalPrvalue = { 42 };
+int refctxFieldDefaultSource = 43;
+int refctxFieldBraceSource = 44;
+struct RefctxFieldDefaultNamed
+{
+    cppref.BraceRefInner item = { r = refctxFieldDefaultSource, v = 2, d = 0.0 };
+};
+struct RefctxFieldDefaultPositional
+{
+    cppref.BraceRefInner item = { refctxFieldDefaultSource, 3, 0.0 };
+};
+struct RefctxFieldBrace
+{
+    cppref.BraceConstRef item;
+};
+struct RefctxArray
+{
+    cppref.BraceRefInner[2] items;
+};
 
 int t47RefmemEarlyReturn()
 {
@@ -3007,6 +3406,79 @@ int t47RefmemEarlyReturn()
 
 extern int main()
 {
+    // Header dynamic initializers run once in declaration order, including unused globals.
+    if (hdrglob.counter_now() != 7 || hdrglob.sequence_now() != 1234567) return 52801;
+    if (hdrglob.referenced_now() != 40) return 52802;
+    if (hdrglob.constexpr_value != 41 || hdrglob.constant_value != 42) return 52804;
+    int hdrglobR2Anonymous = hdrglob.anonymous_referenced_now();
+    int hdrglobR2Static = hdrglob.out_of_line_static_referenced_now();
+    int hdrglobR2Variable = hdrglob.explicit_variable_referenced_now();
+    int hdrglobR2Member = hdrglob.explicit_static_referenced_now();
+    // Referenced and unused definitions must each initialize once, in clang's order.
+    if (hdrglob.new_initializer_count_now() != 8
+        || hdrglob.new_initializer_sequence_now() != 56781234) return 52805;
+    if (hdrglobR2Anonymous != 2 || hdrglobR2Static != 4
+        || hdrglobR2Variable != 5 || hdrglobR2Member != 7) return 52806;
+    if (hdrglob.new_initializer_count_now() != 8
+        || hdrglob.new_initializer_sequence_now() != 56781234) return 52807;
+    if (hdrglob_r3.plain_count() != 1 || hdrglob_r3.out_of_line_count() != 1
+        || hdrglob_r3.anonymous_count() != 1 || hdrglob_r3.static_count() != 1
+        || hdrglob_r3.anonymous_member_count() != 1
+        || hdrglob_r3.explicit_member_count() != 1) return 52808;
+    if (hdrglob_r3.plain_ptr_a() != hdrglob_r3.plain_ptr_b()
+        || hdrglob_r3.out_of_line_ptr_a() != hdrglob_r3.out_of_line_ptr_b()) return 52809;
+    if (hdrglob_r3.anonymous_ptr_a() != hdrglob_r3.anonymous_ptr_b()
+        || hdrglob_r3.static_ptr_a() != hdrglob_r3.static_ptr_b()) return 52810;
+    if (hdrglob_r3.same_name_count() != 2
+        || hdrglob_r3.same_named_static_a() != 3
+        || hdrglob_r3.same_named_static_b() != 4
+        || hdrglob_r3.same_named_static_ptr_a() == hdrglob_r3.same_named_static_ptr_b()) return 52811;
+    if (hdrglob_r3.shared_static_count() != 1
+        || hdrglob_r3.shared_static_ptr_a() != hdrglob_r3.shared_static_ptr_b()
+        || *hdrglob_r3.shared_static_ptr_a() != 8) return 52813;
+    if (hdrglob_r3.shared_anonymous_count() != 1
+        || hdrglob_r3.shared_anonymous_ptr_a() != hdrglob_r3.shared_anonymous_ptr_b()
+        || *hdrglob_r3.shared_anonymous_ptr_a() != 6) return 52814;
+    if (hdrglob_r3.shared_anonymous_member_count() != 1
+        || hdrglob_r3.shared_anonymous_member_ptr_a() != hdrglob_r3.shared_anonymous_member_ptr_b()
+        || *hdrglob_r3.shared_anonymous_member_ptr_a() != 7) return 52815;
+    if (hdrglob_r5_path.count() != 1 || hdrglob_r5_path.ptr_a() != hdrglob_r5_path.ptr_b()
+        || *hdrglob_r5_path.ptr_a() != 3) return 52816;
+    if (hdrglob_r5_order.sequence_now() != 132) return 52817;
+    int hdrglobR6StaticSequence = hdrglob_r6_static.sequence_now();
+    int hdrglobR6StaticBefore = *hdrglob_r6_static.sy() == 3
+        && *hdrglob_r6_static.sz() == 3 ? 1 : 0;
+    *hdrglob_r6_static.sz() = 9;
+    int hdrglobR6StaticAfter = *hdrglob_r6_static.sy() == 9
+        && *hdrglob_r6_static.sz() == 9 ? 1 : 0;
+    if (hdrglobR6StaticSequence != 35 || hdrglobR6StaticBefore != 1
+        || hdrglobR6StaticAfter != 1) return 52818;
+    int hdrglobR6InlineSequence = hdrglob_r6_inline.sequence_now();
+    int hdrglobR6InlineBefore = *hdrglob_r6_inline.sy() == 3
+        && *hdrglob_r6_inline.sz() == 3 ? 1 : 0;
+    *hdrglob_r6_inline.sz() = 9;
+    int hdrglobR6InlineAfter = *hdrglob_r6_inline.sy() == 9
+        && *hdrglob_r6_inline.sz() == 9 ? 1 : 0;
+    if (hdrglobR6InlineSequence != 35 || hdrglobR6InlineBefore != 1
+        || hdrglobR6InlineAfter != 1) return 52820;
+    if const (__POSIX__ || __WINDOWS__) {
+        int hdrglobR7StaticBefore = *hdrglob_r7_static.sy() == 3
+            && *hdrglob_r7_static.sz() == 3 ? 1 : 0;
+        *hdrglob_r7_static.sz() = 9;
+        int hdrglobR7StaticAfter = *hdrglob_r7_static.sy() == 9
+            && *hdrglob_r7_static.sz() == 9 ? 1 : 0;
+        int hdrglobR7InlineBefore = *hdrglob_r7_inline.sy() == 3
+            && *hdrglob_r7_inline.sz() == 3 ? 1 : 0;
+        *hdrglob_r7_inline.sz() = 9;
+        int hdrglobR7InlineAfter = *hdrglob_r7_inline.sy() == 9
+            && *hdrglob_r7_inline.sz() == 9 ? 1 : 0;
+        if (hdrglob_r7.sequence_now() != 324324 || hdrglobR7StaticBefore != 1
+            || hdrglobR7StaticAfter != 1 || hdrglobR7InlineBefore != 1
+            || hdrglobR7InlineAfter != 1) return 52822;
+    }
+    if (hdrglob_r9.sequence_now() != 324 || *hdrglob_r9.sz() != 3) return 52823;
+    if (hdrglob_r3_order.sequence_now() != 356412) return 52812;
+
     // FPABI r3: C++ function-pointer parameters require C ABI entries for thin CFlat callbacks.
     int fpabiR3Input = 0x14001;
     int fpabiR3Named = cppbv.fpabiR3CallShort(fpabiR3H, fpabiR3Input);
@@ -4592,6 +5064,31 @@ extern int main()
     // r5 (S1): the view sink keeps A alive through the call on both ABIs (clang: 11/1674).
     if (T513V15Probe(true, 11) != 111674) return 95181;
     if (T513V15Probe(false, 11) != 200057) return 95182;
+    // MIXCOND2: two-argument CFlat and C++ calls keep the converting source alive through the call.
+    if (T513V16Probe(true, 11) != t513V12TrueExpected + 10000) return 95183;
+    if (T513V16Probe(false, 11) != 210057) return 95184;
+    if (T513V16VoidProbe(true, 11) != t513V12TrueExpected + 10000) return 95198;
+    if (T513V16VoidProbe(false, 11) != 210057) return 95199;
+    if (T513M2BoolArgProbe(true, 11) != t513V12TrueExpected + 10000000
+        || t513M2BoolArgCalls != 1) return 95200;
+    if (T513M2BoolArgProbe(false, 11) != 10200057 || t513M2BoolArgCalls != 1) return 95201;
+    if (T513M2WidePrefixProbe(true, 11)
+        != 6111 * 10000 + t513V12TrueExpected - 1110000) return 95202;
+    if (T513M2WidePrefixProbe(false, 11) != 6020 * 10000 + 57) return 95203;
+    if (T513M2C05Probe(true, 11) != 121674) return 95185;
+    if (T513M2C05Probe(false, 11) != 210057) return 95186;
+    if (T513M2C06Probe(true, 11) != 121674) return 95187;
+    if (T513M2C06Probe(false, 11) != 210057) return 95188;
+    if (T513M2C05AfterRefProbe(true, 11) != 121674) return 95204;
+    if (T513M2C15Probe(true, 11) != 121674) return 95189;
+    if (T513M2C15Probe(false, 11) != 210057) return 95190;
+    if (T513M2C14Probe(true, false) != 1111647) return 95191;
+    if (T513M2C14Probe(false, true) != 1121647) return 95192;
+    if (T513M2C14Probe(false, false) != 200057) return 95193;
+    if (T513M2ViewCflatProbe(true) != 121674) return 95194;
+    if (T513M2ViewCflatProbe(false) != 210057) return 95195;
+    if (T513M2ViewCppProbe(true) != 121674) return 95196;
+    if (T513M2ViewCppProbe(false) != 210057) return 95197;
     t226s.reset();
     if (T233LocalDerivedTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93018;
     t226s.reset();
@@ -9186,6 +9683,146 @@ extern int main()
     if (t47RefmemChurn(100) != 107 || t47DirectRvalPos.r != 5) return 47718;
     T47RefMemConstAlias t47LiteralAlias = { r = 5 };
     if (t47RefmemChurn(100) != 107 || t47LiteralAlias.r != 5) return 47719;
+
+    // REFCTX accept-set: positional reference-member call arguments retain their callee and referent.
+    cppref.refctx_reset_call();
+    int refctxConstValue = 21;
+    int refctxConstByval = cppref.refctx_const_byval({ refctxConstValue });
+    if (refctxConstByval != 21 || cppref.refctx_call_kind() != 1) return 47901;
+    refctxConstValue = 22;
+    if (cppref.refctx_last_const_referent() != 22) return 47902;
+    cppref.refctx_reset_call();
+    int refctxConstByconst = cppref.refctx_const_byconst({ refctxConstValue });
+    if (refctxConstByconst != 22 || cppref.refctx_call_kind() != 2) return 47903;
+    refctxConstValue = 23;
+    if (cppref.refctx_last_const_referent() != 23) return 47904;
+    cppref.refctx_reset_call();
+    int refctxRvalByval = cppref.refctx_rval_byval({ 5 });
+    if (refctxRvalByval != 9 || cppref.refctx_call_kind() != 3) return 47905;
+    cppref.refctx_reset_call();
+    int refctxRvalByconst = cppref.refctx_rval_byconst({ 6 });
+    if (refctxRvalByconst != 6 || cppref.refctx_call_kind() != 4) return 47906;
+
+    int refctxMutSourceDesignated = 31;
+    cppref.refctx_reset_call();
+    int refctxMutByvalDesignated = cppref.refctx_mut_byval(
+        { r = refctxMutSourceDesignated, v = 7, d = 0.0 });
+    if (refctxMutByvalDesignated != 7 || cppref.refctx_call_kind() != 5
+        || refctxMutSourceDesignated != 9) return 47907;
+    int refctxMutSourcePositional = 32;
+    cppref.refctx_reset_call();
+    int refctxMutByvalPositional = cppref.refctx_mut_byval(
+        { refctxMutSourcePositional, 8, 0.0 });
+    if (refctxMutByvalPositional != 8 || cppref.refctx_call_kind() != 5
+        || refctxMutSourcePositional != 9) return 47908;
+    int refctxMutConstSource = 12;
+    cppref.refctx_reset_call();
+    int refctxMutByconst = cppref.refctx_mut_byconst(
+        { r = refctxMutConstSource, v = 3, d = 0.0 });
+    if (refctxMutByconst != 15 || cppref.refctx_call_kind() != 6) return 47909;
+
+    int refctxConstDesignatedSource = 24;
+    cppref.refctx_reset_call();
+    int refctxConstByvalDesignated = cppref.refctx_const_byval(
+        { r = refctxConstDesignatedSource });
+    if (refctxConstByvalDesignated != 24 || cppref.refctx_call_kind() != 1)
+        return 47910;
+    refctxConstDesignatedSource = 25;
+    if (cppref.refctx_last_const_referent() != 25) return 47911;
+    cppref.refctx_reset_call();
+    int refctxConstByconstDesignated = cppref.refctx_const_byconst(
+        { r = refctxConstDesignatedSource });
+    if (refctxConstByconstDesignated != 25 || cppref.refctx_call_kind() != 2)
+        return 47912;
+    refctxConstDesignatedSource = 26;
+    if (cppref.refctx_last_const_referent() != 26) return 47913;
+
+    // REFCTX r2 c02: a one-field brace argument selects A over the B overload, as in clang.
+    if (cpprefctx.ov({ 5 }) != 1) return 47930;
+
+    RefctxAliasFieldOwner refctxAliasFieldOwner = default;
+    refctxAliasFieldOwner.g = 8;
+    cppref.BraceRefInner refctxAliasField = refctxReturnAliasField(refctxAliasFieldOwner);
+    refctxAliasFieldOwner.g = 9;
+    if (refctxAliasField.r != 9) return 47931;
+    RefctxAliasMethodOwner refctxAliasMethodOwner = default;
+    int refctxAliasMethodSource = 6;
+    cppref.BraceRefInner refctxAliasMethod = refctxAliasMethodOwner.pick(2, refctxAliasMethodSource);
+    refctxAliasMethodSource = 7;
+    if (refctxAliasMethod.r != 7 || refctxAliasMethod.v != 2) return 47932;
+
+    int refctxCflatByvalSource = 4;
+    int refctxCflatByvalResult = refctxCflatByval(
+        { r = refctxCflatByvalSource, v = 2, d = 0.0 });
+    if (refctxCflatByvalResult != 2 || refctxCflatByvalSource != 10) return 47914;
+    refctxCflatByvalSource = 5;
+    refctxCflatByvalResult = refctxCflatByval(
+        { refctxCflatByvalSource, 3, 0.0 });
+    if (refctxCflatByvalResult != 3 || refctxCflatByvalSource != 10) return 47915;
+    int refctxCflatConstSource = 6;
+    int refctxCflatConstResult = refctxCflatConstAlias(
+        { r = refctxCflatConstSource, v = 4, d = 0.0 });
+    if (refctxCflatConstResult != 4 || refctxCflatConstSource != 11) return 47916;
+    refctxCflatConstSource = 7;
+    refctxCflatConstResult = refctxCflatConstAlias(
+        { refctxCflatConstSource, 5, 0.0 });
+    if (refctxCflatConstResult != 5 || refctxCflatConstSource != 11) return 47917;
+
+    int refctxReturnNamedSource = 33;
+    cppref.BraceRefInner refctxReturnNamed =
+        refctxReturnAliasNamed(refctxReturnNamedSource);
+    refctxReturnNamed.r = 34;
+    if (refctxReturnNamedSource != 34 || refctxReturnNamed.v != 6) return 47918;
+    int refctxReturnPositionalSource = 35;
+    cppref.BraceRefInner refctxReturnPositional =
+        refctxReturnAliasPositional(refctxReturnPositionalSource);
+    refctxReturnPositional.r = 36;
+    if (refctxReturnPositionalSource != 36 || refctxReturnPositional.v != 7)
+        return 47919;
+    int refctxReturnRvalNamedSource = 37;
+    cppref.BraceRvalRef refctxReturnRvalNamed =
+        refctxReturnRvalAliasNamed(refctxReturnRvalNamedSource);
+    refctxReturnRvalNamed.r = 38;
+    if (refctxReturnRvalNamedSource != 38) return 47920;
+    int refctxReturnRvalPositionalSource = 39;
+    cppref.BraceRvalRef refctxReturnRvalPositional =
+        refctxReturnRvalAliasPositional(refctxReturnRvalPositionalSource);
+    refctxReturnRvalPositional.r = 40;
+    if (refctxReturnRvalPositionalSource != 40) return 47921;
+
+    refctxGlobalRefNamed.r = 45;
+    if (refctxGlobalRefSource != 45 || refctxGlobalRefNamed.v != 1) return 47922;
+    refctxGlobalConstSource = 46;
+    if (refctxGlobalConstPositional.r != 46) return 47923;
+    if (t47RefmemChurn(100) != 107 || refctxGlobalRvalPrvalue.r != 42)
+        return 47924;
+
+    RefctxFieldDefaultNamed refctxDefaultNamed = default;
+    refctxDefaultNamed.item.r = 47;
+    if (refctxFieldDefaultSource != 47 || refctxDefaultNamed.item.v != 2)
+        return 47925;
+    RefctxFieldDefaultPositional refctxDefaultPositional = default;
+    refctxDefaultPositional.item.r = 48;
+    if (refctxFieldDefaultSource != 48 || refctxDefaultPositional.item.v != 3)
+        return 47926;
+    RefctxFieldBrace refctxFieldValue = {
+        item = { refctxFieldBraceSource } };
+    refctxFieldBraceSource = 49;
+    if (refctxFieldValue.item.r != 49) return 47927;
+
+    int refctxArrayX = 50;
+    int refctxArrayY = 51;
+    RefctxArray refctxArrayNamed = { items = {
+        { r = refctxArrayX, v = 4, d = 0.0 },
+        { r = refctxArrayY, v = 5, d = 0.0 } } };
+    refctxArrayNamed.items[0].r = 52;
+    if (refctxArrayX != 52 || refctxArrayNamed.items[1].r != 51
+        || refctxArrayNamed.items[1].v != 5) return 47928;
+    RefctxArray refctxArrayPositional = { items = {
+        { refctxArrayX, 6, 0.0 }, { refctxArrayY, 7, 0.0 } } };
+    refctxArrayPositional.items[1].r = 53;
+    if (refctxArrayY != 53 || refctxArrayPositional.items[0].r != 52
+        || refctxArrayPositional.items[0].v != 6) return 47929;
 
     // T47 r2 F2: `move x` is an xvalue when bound to an int&& reference member.
     int t47RvalX = 5;
@@ -14063,6 +14700,8 @@ extern int main()
     }
     int refResult = CppTemporaryRefCases();
     if (refResult != 0) return refResult;
+    int dtorOrderResult = CppDtorOrderCases();
+    if (dtorOrderResult != 0) return dtorOrderResult;
 
     // Character literal identity crosses each C++ overload boundary as char.
     std.string literalBase = std.string("hi");
@@ -14939,6 +15578,16 @@ extern int main()
         if (value != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
             || cppas.Life.moves != 1 || cppas.Life.dtors != 2
             || cppas.Life.last_dtor != expected) return 3572;
+    }
+
+    // DTORORD: a nested conditional moved into a by-value param destroys its arm temp before the param.
+    for (int i = 0; i < 3; i++)
+    {
+        cppas.Life.reset();
+        int value = cppas.read_life(i != 2 ? (i == 0 ? cppas.Life(41) : cppas.Life(43)) : cppas.Life(42));
+        int expected = i == 0 ? 41 : (i == 1 ? 43 : 42);
+        if (value != expected || cppas.Life.moves != 1 || cppas.Life.dtors != 2
+            || cppas.Life.last_dtor != expected) return 35721;
     }
 
     for (int i = 0; i < 2; i++)
@@ -17286,6 +17935,18 @@ extern int main()
     if ((opfreeFreeRef += 3).get() != 8 || opfreeFreeRef.value != 8) return 7576;
     OpfreeRoundFreeBoxRef opfreeFreeBoxRef = OpfreeRoundFreeBoxRef(5);
     if ((opfreeFreeBoxRef *= 3).get() != 15 || opfreeFreeBoxRef.value != 15) return 7577;
+    OpfreeRoundMemberBoxRef opfreeGlobalMemberBoxRef = OpfreeRoundMemberBoxRef(5);
+    if ((opfreeGlobalMemberBoxRef += 3).kind() != 55 || opfreeGlobalMemberBoxRef.value != 8)
+        return 7597;
+    if ((opfreeGlobalMemberBoxRef += 1).get() != 9 || opfreeGlobalMemberBoxRef.value != 9)
+        return 7598;
+    OpfreeRoundTemplateMemberRef<int> opfreeTemplateMemberRef =
+        OpfreeRoundTemplateMemberRef<int>(5);
+    if ((opfreeTemplateMemberRef += 3).value != 8 || opfreeTemplateMemberRef.calls != 1)
+        return 7599;
+    (opfreeTemplateMemberRef += 2) += 1;
+    if (opfreeTemplateMemberRef.value != 11 || opfreeTemplateMemberRef.calls != 3)
+        return 7600;
     cppi_opfree_ns.MemberRef opfreeNsMemberRef = cppi_opfree_ns.MemberRef(5);
     if ((opfreeNsMemberRef *= 3).get() != 15 || opfreeNsMemberRef.value != 15) return 7578;
     cppi_opfree_ns.FreeRef opfreeNsFreeRef = cppi_opfree_ns.FreeRef(5);
@@ -17294,6 +17955,47 @@ extern int main()
     if ((opfreeNsMemberBoxRef += 3).get() != 8 || opfreeNsMemberBoxRef.value != 8) return 7580;
     cppi_opfree_ns.FreeBoxRef opfreeNsFreeBoxRef = cppi_opfree_ns.FreeBoxRef(5);
     if ((opfreeNsFreeBoxRef *= 3).get() != 15 || opfreeNsFreeBoxRef.value != 15) return 7581;
+    // Same-type lvalue-reference results keep the returned object across scopes and chains.
+    OpfreeRoundSameMember opfreeSameMember = OpfreeRoundSameMember(5);
+    (opfreeSameMember *= 3).bump();
+    if (opfreeSameMember.value != 115 || opfreeSameMember.calls != 1) return 7584;
+    OpfreeRoundSameFree opfreeSameFree = OpfreeRoundSameFree(5);
+    (opfreeSameFree += 3).bump();
+    if (opfreeSameFree.value != 108 || opfreeSameFree.calls != 1) return 7585;
+    OpfreeRoundSameMember opfreeChainMember = OpfreeRoundSameMember(5);
+    (opfreeChainMember *= 2) *= 3;
+    if (opfreeChainMember.value != 30 || opfreeChainMember.calls != 2) return 7586;
+    OpfreeRoundSameFree opfreeChainFree = OpfreeRoundSameFree(5);
+    (opfreeChainFree += 2) += 3;
+    if (opfreeChainFree.value != 10 || opfreeChainFree.calls != 2) return 7587;
+    cppi_opfree_refalias_ns.MemberRef opfreeNsSameMember = cppi_opfree_refalias_ns.MemberRef(5);
+    (opfreeNsSameMember *= 3).bump();
+    if (opfreeNsSameMember.value != 115 || opfreeNsSameMember.calls != 1) return 7588;
+    cppi_opfree_refalias_ns.FreeRef opfreeNsSameFree = cppi_opfree_refalias_ns.FreeRef(5);
+    (opfreeNsSameFree += 3).bump();
+    if (opfreeNsSameFree.value != 108 || opfreeNsSameFree.calls != 1) return 7589;
+    cppi_opfree_refalias_ns.MemberRef opfreeNsChainMember = cppi_opfree_refalias_ns.MemberRef(5);
+    (opfreeNsChainMember *= 2) *= 3;
+    if (opfreeNsChainMember.value != 30 || opfreeNsChainMember.calls != 2) return 7590;
+    cppi_opfree_refalias_ns.FreeRef opfreeNsChainFree = cppi_opfree_refalias_ns.FreeRef(5);
+    (opfreeNsChainFree += 2) += 3;
+    if (opfreeNsChainFree.value != 10 || opfreeNsChainFree.calls != 2) return 7591;
+    OpfreeRoundOtherRef opfreeOther = OpfreeRoundOtherRef(5);
+    if ((opfreeOther += 3).get() != 1008 || opfreeOther.value != 8 || opfreeOther.calls != 1)
+        return 7592;
+    (opfreeOther += 1).bump();
+    if (opfreeRoundOtherRef().get() != 1109 || opfreeOther.value != 9 || opfreeOther.calls != 2)
+        return 7593;
+    OpfreeRoundValue opfreeByValue = OpfreeRoundValue(5);
+    (opfreeByValue *= 3).bump();
+    if (opfreeByValue.value != 15 || opfreeByValue.calls != 1) return 7594;
+    OpfreeRoundVoid opfreeVoid = OpfreeRoundVoid(5);
+    opfreeVoid += 3;
+    if (opfreeVoid.value != 8 || opfreeVoid.calls != 1) return 7595;
+    OpfreeRoundConstRef opfreeConstRef = OpfreeRoundConstRef(5);
+    if ((opfreeConstRef += 3).get() != 8 || opfreeConstRef.value != 8 || opfreeConstRef.calls != 1)
+        return 7596;
+    expect_error("non-const member 'bump'") { (opfreeConstRef += 1).bump(); }
     cppi_opfree_ns.ConvertA opfreeConvertA = cppi_opfree_ns.ConvertA(5);
     cppi_opfree_ns.ConvertW opfreeConvertCopy = opfreeConvertA * 3.0;
     if (opfreeConvertCopy.get() != 18) return 7582;

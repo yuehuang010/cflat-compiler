@@ -39,6 +39,29 @@ namespace llvm
 
 namespace cflat_cinterop
 {
+    struct RawDynamicInitializer
+    {
+        std::string symbol;
+        std::string identity;
+    };
+
+    using CxxImportOrder = std::vector<uint64_t>;
+
+    struct DynamicInitializerOwner
+    {
+        std::string groupKey;
+    };
+
+    using DynamicInitializerOwnerMap =
+        std::unordered_map<std::string, DynamicInitializerOwner>;
+
+    inline void NoteDynamicInitializerOccurrence(DynamicInitializerOwnerMap& owners,
+                                                 const std::string& identity,
+                                                 const std::string& groupKey)
+    {
+        owners.try_emplace(identity, DynamicInitializerOwner{ groupKey });
+    }
+
     // Tail of the refusal for a C++ variable read by value whose initializer is not a constant
     // initialization: folding would skip the initializer, and no live binding exists on this path.
     inline constexpr const char* kCxxNotConstantVariableRefusal =
@@ -669,9 +692,19 @@ namespace cflat_cinterop
         std::unordered_map<std::string, void*> bound;
         // Records whose vtable a request would have emitted, by vtable symbol name.
         std::unordered_map<std::string, const clang::CXXRecordDecl*> vtables;
+        // Header globals whose dynamic initializers Clang must emit, in declaration order.
+        std::vector<std::string> dynamicInitializerSymbols;
+        std::unordered_set<std::string> dynamicInitializerSeen;
+        // Every candidate is cached so a later import order can choose its own earliest owner.
+        std::vector<RawDynamicInitializer> dynamicInitializerCandidates;
+        std::unordered_set<std::string> dynamicInitializerCandidateSeen;
+        // Program-wide owners keep one header definition when import groups share a linkage name.
+        DynamicInitializerOwnerMap* dynamicInitializerOwners = nullptr;
         std::vector<std::string> weakPromoteSymbols;
         std::vector<std::string> weakPromotePerGroupSymbols;
+        std::unordered_map<std::string, std::string> nonOwnerInternalAliases;
         std::string cxxImportGroupKey;
+        CxxImportOrder cxxImportGroupOrder;
         // Retry-renamed generated wrappers: program-visible name -> name clang emits.
         std::unordered_map<std::string, std::string> renamed;
         unsigned recordedChunks = 0;
@@ -869,6 +902,9 @@ namespace cflat_cinterop
         // when nothing needed emitting. Plain bytes, so it round-trips through the disk cache.
         std::string bitcode;
         unsigned emittedDefinitions = 0;   // number of definitions in `bitcode`, for -v
+        // Dynamic header globals, in declaration order; persisted so warm cache hits can key and
+        // order the same startup work without reparsing the header.
+        std::vector<RawDynamicInitializer> cxxDynamicInitializerSymbols;
         // Definitions were recorded into a group demand plan instead of emitted into `bitcode`.
         bool demandRecorded = false;
         struct DemandReplayChunk

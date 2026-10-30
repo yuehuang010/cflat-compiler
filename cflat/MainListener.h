@@ -7406,6 +7406,8 @@ private:
         // A constant initializer naming a thread_local's address (`S* p = &s`) is not a link-time
         // constant; the global starts zero and this value is stored at its turn in the init order.
         llvm::Constant* StoreValue = nullptr;
+        // Nonempty C++ aggregate brace lists are built in the ordered module initializer.
+        CFlatParser::InitializerListContext* BraceInitializer = nullptr;
         // Declaration order across BOTH queues (native and C++), so one module initializer runs
         // the constructions in the order the globals were declared.
         size_t Sequence = 0;
@@ -7954,6 +7956,8 @@ private:
     bool inCxxCallArgument_ = false;
     LLVMBackend::TypeAndValue cxxCallArgumentExpectedType_;
     llvm::Function* cxxTernaryCallSink_ = nullptr;
+    llvm::Value* cxxTernaryCallSinkEnvironment_ = nullptr;
+    bool cxxTernaryCallSinkTakesReference_ = false;
     LLVMBackend::TypeAndValue cxxTernaryCallSinkReturnType_;
     llvm::Value* cxxTernaryCallResult_ = nullptr;
     LLVMBackend::TypeAndValue cxxTernaryCallResultType_;
@@ -8962,6 +8966,16 @@ public:
      * a T lvalue (copy constructor), `move <T lvalue>` (move constructor, source consumed), and
      * a call returning T by value (constructed straight into the slot through the sret pointer).
      */
+    bool HasForeignCxxAggregateReferenceMember(const std::string& ownerTypeName,
+        antlr4::ParserRuleContext* context);
+    bool TryEmitForeignCxxAggregateBraceInit(const std::string& typeName,
+        CFlatParser::InitializerListContext* list,
+        antlr4::ParserRuleContext* errorContext,
+        llvm::Value* slotValue,
+        bool copyListInit,
+        bool rejectEscapingReferences = false,
+        llvm::GlobalVariable* referenceLifetimeOwner = nullptr,
+        bool rejectFrameBoundReferences = false);
     bool TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext* initDeclarator,
                                    CFlatParser::DirectDeclaratorContext* direct,
                                    const LLVMBackend::DeclTypeAndValue& declType,
@@ -9443,6 +9457,9 @@ public:
      */
     static void ApplyCallResultBorrowProvenance(LLVMBackend* compiler,
                                                 LLVMBackend::NamedVariable& nv);
+    static bool AliasResultMayBorrowOwnedTemp(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv,
+        const LLVMBackend::OwnedTempMark& mark);
 
     /*
      * The ADOPTING sites (owning-local store, `move` argument) additionally require the borrow to
@@ -11019,7 +11036,8 @@ public:
         const std::string& structName,
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list,
-        llvm::Value** outSlot = nullptr);
+        llvm::Value** outSlot = nullptr,
+        bool rejectFrameBoundReferences = false);
 
     // Per-slot value-init of an array whose element type owns a resource: construct each slot
     // independently and re-apply the named overrides there, instead of splatting one seed.
@@ -11132,7 +11150,8 @@ public:
         llvm::Value* elemPtr,
         llvm::StructType* elemStructTy,
         const std::string& elemTypeName,
-        CFlatParser::FieldInitContext* fi);
+        CFlatParser::FieldInitContext* fi,
+        bool rejectFrameBoundReferences = false);
 
     // Coerce a parsed element value to the container's `string` element type.
     // Mirrors EmitFieldInitializer's string handling: a char* string-literal constant is
@@ -11176,7 +11195,8 @@ public:
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* initList,
         llvm::Value* arrAlloc,
-        bool updateExistingElements = false);
+        bool updateExistingElements = false,
+        bool rejectFrameBoundReferences = false);
 
     // Name the initializer for a diagnostic hint: "a", "h.d", or a neutral placeholder.
     static std::string DescribeInitializerPath(const std::string& callerName,

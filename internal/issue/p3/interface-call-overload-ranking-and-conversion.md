@@ -1,21 +1,13 @@
-# Overload calls through an interface variable rank and convert differently from direct calls
+# Interface-call overload residue after IFACEOVL
 
-Filed 2026-10-29 from the NEST6 review 2 (Opus). The behaviour is the same on master before and after NEST6, which
-did not touch it. The direct-class calls already match clang. Repros and the probe script are in
-scratch/repro_keep/nest6/ (rev_nest6_opus_repro/, rev_nest6_opus_probe.sh, nest6_review2.md).
+IFACEOVL (83fea586e) landed: interface method calls rank overloads exactly as a direct class call (literal kinds, widths,
+pointers, named/defaulted args, returned interfaces, `?.`, generic interfaces). Remaining (repros
+scratch/repro_keep/ifaceovl/; direct = the same call on a class receiver):
 
-## Repro shapes (`I p = c;`, c is a class implementing I)
-
-- `I { int f(int); int f(char); int f(float); int f(double); }`: `p.f(1)` picks f(char) and `p.f(1.5)` picks
-  f(float). The direct class call and clang pick f(int) and f(double).
-- `I { int f(long); int f(short); }`: `p.f(1)` picks f(short). The direct class call picks f(long). clang says the
-  call is ambiguous.
-- A non-convertible argument gives "module verification failed" (an LLVM verifier abort) instead of a LogError.
-  Cases: `f(int)` given 1.5, `f(float)` given a double, `f(int)` given a struct, and named `z: &q` to an S param.
-- `g(int x, int* z)` given `"str"` is accepted. The direct call refuses it.
-
-## Fix direction
-
-Route interface-variable overload resolution through the same ranking and conversion checks as the direct class
-call (the NEST6 tiedOut path in LLVMBackend_Overloads.cpp is the shared entry). Report a bad conversion with
-LogError before the IR is emitted.
+- Unrelated object pointer accepted: an `Rt*` argument to an interface with `{f(Pt*), f(Qt*)}` calls `f(Pt*)`; the
+  direct class refuses (master too). The no-winner fall-through in ResolveInterfaceMethodSlot (LLVMBackend_WinRT.cpp)
+  returns the first candidate; it must require an exact or derived pointee.
+- Const receiver with overloads `I{f(int); f(double) const}`, `x.f(1)` on a const receiver: interface refuses the
+  non-const f(int), direct `const C*` calls it (1), clang picks f(double) const (2). Needs one rule for both paths.
+- Pre-existing on both paths (clang: ambiguous): `nullptr` to `{f(Pt*), f(Qt*)}` and `int -3` to `{f(u32), f(double)}`
+  pick the first; a `Col : u8` enum argument to `{f(u8), f(Col)}` picks f(u8); `-(1)` picks u8, `(1.0)` picks float.

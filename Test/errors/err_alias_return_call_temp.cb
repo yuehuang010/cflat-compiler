@@ -134,6 +134,38 @@ expect_error("borrows frame-local storage") {
     alias int t408NestedUnique() { T408NestU h; h.u = new T408Node(); return h.inner().get()->value; }
 }
 
+expect_error("cannot bind an alias to a reference that may refer to a temporary") {
+    int tAliasTempReferenceResult()
+    {
+        alias cppi.Tracked value = cppi.TrackedHolder(7).get();
+        return value.payload;
+    }
+}
+
+expect_error("cannot bind an alias to a reference that may refer to a temporary") {
+    int tAliasTempChainedReference()
+    {
+        alias cppi.Tracked value = cppi.TrackedHolder(8).self().get();
+        return value.payload;
+    }
+}
+
+expect_error("cannot bind an alias to a reference that may refer to a temporary") {
+    int tAliasTempReferenceMember()
+    {
+        alias int payload = cppi.TrackedHolder(9).get().payload;
+        return payload;
+    }
+}
+
+expect_error("Undefined variable aliastmpMissingAfterAlias.") {
+    int tAliasTempFollowingError()
+    {
+        alias cppi.Tracked value = cppi.Tracked(7);
+        return aliastmpMissingAfterAlias;
+    }
+}
+
 extern int main()
 {
     return 0;

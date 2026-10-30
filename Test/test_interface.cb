@@ -2701,6 +2701,82 @@ class OvChild : IOvChild
     int mix(int a, int b) { return a * b; }
 };
 
+interface IOvlRank
+{
+    int f(int a);
+    int f(char a);
+    int f(float a);
+    int f(double a);
+};
+class OvlRank : IOvlRank
+{
+    int f(int a) { return 11; }
+    int f(char a) { return 12; }
+    int f(float a) { return 13; }
+    int f(double a) { return 14; }
+};
+
+interface IOvlWidth
+{
+    int f(bool a);
+    int f(u8 a);
+    int f(i8 a);
+};
+class OvlWidth : IOvlWidth
+{
+    int f(bool a) { return 11; }
+    int f(u8 a) { return 12; }
+    int f(i8 a) { return 13; }
+};
+
+interface IOvlTie { int f(long a); int f(short a); };
+class OvlTie : IOvlTie
+{
+    int f(long a) { return 1; }
+    int f(short a) { return 2; }
+};
+
+interface IOvlPointer { int f(int* a); int f(char* a); };
+class OvlPointer : IOvlPointer
+{
+    int f(int* a) { return 11; }
+    int f(char* a) { return 12; }
+};
+
+interface IOvlNamed { int g(int x, int y); int g(int x, long z); };
+class OvlNamed : IOvlNamed
+{
+    int g(int x, int y) { return 100 + x * 10 + y; }
+    int g(int x, long z) { return 200 + x * 10 + (int)z; }
+};
+
+interface IOvlDefault<T> { int h(T a); int h(int a, int b = 2); };
+class OvlDefault : IOvlDefault<long>
+{
+    int h(long a) { return 11; }
+    int h(int a, int b = 2) { return 20 + b; }
+};
+
+interface IOvlGeneric<T> { T f(T a); int f(int a, T b); };
+class OvlGenericLong : IOvlGeneric<long>
+{
+    long f(long a) { return a + 1; }
+    int f(int a, long b) { return a + 50; }
+};
+class OvlGenericDouble : IOvlGeneric<double>
+{
+    double f(double a) { return a * 2.0; }
+    int f(int a, double b) { return a + 70; }
+};
+
+interface IOvlReturn { int f(int a); int f(long a); };
+class OvlReturn : IOvlReturn
+{
+    int f(int a) { return 11; }
+    int f(long a) { return 12; }
+};
+IOvlReturn getOvlReturn(IOvlReturn value) { return value; }
+
 bool testInterfaceOverloadDispatch()
 {
     bool result = true;
@@ -2726,6 +2802,95 @@ bool testInterfaceOverloadDispatch()
     IOvArity? na = oa;
     result &= Test("iface_ov_nullcond_1", na?.go(7), 107);
     result &= Test("iface_ov_nullcond_2", na?.go(7, 3), 21);
+
+    // Freeze concrete-class overload picks and require the interface path to match them.
+    // Before the fix, the interface int literal chose char and the i8/char* cases chose siblings.
+    OvlRank rank;
+    IOvlRank rankIface = rank;
+    result &= Test("iface_ov_rank_concrete_int", rank.f(1), 11);
+    result &= Test("iface_ov_rank_int", rankIface.f(1), 11);
+    result &= Test("iface_ov_rank_concrete_char", rank.f('x'), 12);
+    result &= Test("iface_ov_rank_char", rankIface.f('x'), 12);
+    result &= Test("iface_ov_rank_concrete_float_suffix", rank.f(1.5f), 13);
+    result &= Test("iface_ov_rank_float_suffix", rankIface.f(1.5f), 13);
+    result &= Test("iface_ov_rank_concrete_float_literal", rank.f(1.5), 13);
+    result &= Test("iface_ov_rank_float_literal", rankIface.f(1.5), 13);
+    result &= Test("iface_ov_rank_concrete_double", rank.f(0.1), 14);
+    result &= Test("iface_ov_rank_double", rankIface.f(0.1), 14);
+
+    OvlWidth width;
+    IOvlWidth widthIface = width;
+    bool boolValue = true;
+    u8 unsigned8Value = 3;
+    i8 signed8Value = 4;
+    result &= Test("iface_ov_width_concrete_bool", width.f(boolValue), 11);
+    result &= Test("iface_ov_width_bool", widthIface.f(boolValue), 11);
+    result &= Test("iface_ov_width_concrete_u8", width.f(unsigned8Value), 12);
+    result &= Test("iface_ov_width_u8", widthIface.f(unsigned8Value), 12);
+    result &= Test("iface_ov_width_concrete_i8", width.f(signed8Value), 13);
+    result &= Test("iface_ov_width_i8", widthIface.f(signed8Value), 13);
+
+    OvlTie tie;
+    IOvlTie tieIface = tie;
+    // long is 32-bit on Windows, where f(1) over {long, short} is ambiguous on both paths (as clang).
+    if const (!__WINDOWS__)
+    {
+        result &= Test("iface_ov_tie_concrete_long", tie.f(1), 1);
+        result &= Test("iface_ov_tie_long", tieIface.f(1), 1);
+    }
+
+    OvlPointer pointers;
+    IOvlPointer pointerIface = pointers;
+    int intPointee = 0;
+    char charPointee = 'x';
+    result &= Test("iface_ov_pointer_concrete_int", pointers.f(&intPointee), 11);
+    result &= Test("iface_ov_pointer_int", pointerIface.f(&intPointee), 11);
+    result &= Test("iface_ov_pointer_concrete_char", pointers.f(&charPointee), 12);
+    result &= Test("iface_ov_pointer_char", pointerIface.f(&charPointee), 12);
+    result &= Test("iface_ov_pointer_concrete_null", pointers.f(nullptr), 11);
+    result &= Test("iface_ov_pointer_null", pointerIface.f(nullptr), 11);
+
+    OvlNamed named;
+    IOvlNamed namedIface = named;
+    long namedLong = 7;
+    result &= Test("iface_ov_named_concrete_reorder", named.g(y: 3, x: 2), 123);
+    result &= Test("iface_ov_named_reorder", namedIface.g(y: 3, x: 2), 123);
+    result &= Test("iface_ov_named_concrete_long", named.g(z: namedLong, x: 1), 217);
+    result &= Test("iface_ov_named_long", namedIface.g(z: namedLong, x: 1), 217);
+
+    OvlDefault defaultImpl;
+    IOvlDefault<long> defaultIface = defaultImpl;
+    long defaultLong = 4;
+    result &= Test("iface_ov_default_concrete_literal", defaultImpl.h(1), 22);
+    result &= Test("iface_ov_default_literal", defaultIface.h(1), 22);
+    result &= Test("iface_ov_default_concrete_long", defaultImpl.h(defaultLong), 11);
+    result &= Test("iface_ov_default_long", defaultIface.h(defaultLong), 11);
+
+    OvlGenericLong genericLong;
+    IOvlGeneric<long> genericLongIface = genericLong;
+    OvlGenericDouble genericDouble;
+    IOvlGeneric<double> genericDoubleIface = genericDouble;
+    double genericDoubleArg = 3.0;
+    result &= Test("iface_ov_generic_long_concrete", genericLong.f(4), 5);
+    result &= Test("iface_ov_generic_long", genericLongIface.f(4), 5);
+    result &= Test("iface_ov_generic_long_pair_concrete", genericLong.f(1, 2), 51);
+    result &= Test("iface_ov_generic_long_pair", genericLongIface.f(1, 2), 51);
+    result &= Test("iface_ov_generic_double_concrete", (int)(genericDouble.f(1.5) * 10.0), 30);
+    result &= Test("iface_ov_generic_double", (int)(genericDoubleIface.f(1.5) * 10.0), 30);
+    result &= Test("iface_ov_generic_double_pair_concrete", genericDouble.f(2, genericDoubleArg), 72);
+    result &= Test("iface_ov_generic_double_pair", genericDoubleIface.f(2, genericDoubleArg), 72);
+
+    OvlReturn returnImpl;
+    IOvlReturn returnIface = returnImpl;
+    OvlReturn? concreteNullable = &returnImpl;
+    IOvlReturn? interfaceNullable = &returnImpl;
+    IOvlReturn? nullInterface = nullptr;
+    result &= Test("iface_ov_return_concrete", returnImpl.f(1), 11);
+    result &= Test("iface_ov_return_local", returnIface.f(1), 11);
+    result &= Test("iface_ov_return_call", getOvlReturn(returnIface).f(1), 11);
+    result &= Test("iface_ov_return_concrete_safe", concreteNullable?.f(1), 11);
+    result &= Test("iface_ov_return_interface_safe", interfaceNullable?.f(1), 11);
+    result &= Test("iface_ov_return_null_safe", nullInterface?.f(1), 0);
 
     return result;
 }

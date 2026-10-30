@@ -1381,10 +1381,19 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 && returnData.StructType != nullptr && !returnData.IsUnion
                 && !compiler->IsCxxRecord(resolvedTypeName)
                 && !compiler->IsForeignNontrivialCxxClass(resolvedTypeName);
-            if (!cflatRecordReturn || (cxxSretReturn && cxxSretDest == nullptr))
+            const bool cxxReferenceAggregateReturn = !compiler->currentFunctionReturnTV.Pointer
+                && !compiler->currentFunctionReturnTV.ElemPointer
+                && !compiler->currentFunctionReturnTV.IsAlias
+                && !compiler->currentFunctionReturnTV.IsArrayView
+                && compiler->currentFunctionReturnTV.ConstArraySize == 0
+                && compiler->currentFunctionReturnTV.ConstInnerDimensions.empty()
+                && compiler->IsForeignCxxAggregateClass(resolvedTypeName)
+                && HasForeignCxxAggregateReferenceMember(resolvedTypeName, errCtx);
+            if ((!cflatRecordReturn && !cxxReferenceAggregateReturn)
+                || (cxxSretReturn && cxxSretDest == nullptr))
             {
                 LogErrorContext(errCtx,
-                    "a return brace initializer requires a CFlat struct return");
+                    "a return brace initializer requires a struct or C++ aggregate return");
                 return;
             }
             llvm::Type* returnType = compiler->GetType(compiler->currentFunctionReturnTV);
@@ -1401,6 +1410,25 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 compiler->builder->CreateStore(llvm::Constant::getNullValue(returnType), returnDest);
             }
             auto* fieldList = braceInitializer->initializerList();
+            if (cxxReferenceAggregateReturn)
+            {
+                if (!TryEmitForeignCxxAggregateBraceInit(
+                        resolvedTypeName, fieldList, errCtx, returnDest, true, true))
+                    return;
+                if (cxxSretReturn)
+                    cflatReturnBraceConstructed = true;
+                else
+                {
+                    returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
+                    returnNV.BaseType = returnType;
+                    returnNV.Primary = compiler->builder->CreateLoad(
+                        returnType, returnDest, "return.brace.value");
+                    returnNV.IsRvalue = true;
+                    returnNV.IsCxxPrvalueTemp = true;
+                }
+            }
+            else
+            {
             // Movable structs follow the declaration path (source-order field evaluation).
             const bool forceFresh = cxxSretReturn || compiler->IsImmovableCFlatStruct(resolvedTypeName);
             if (!EmitFreshBraceInitializeAggregate(returnDest, resolvedTypeName, fieldList, forceFresh))
@@ -1435,6 +1463,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 returnNV.IsRvalue = true;
                 returnNV.IsOwning = compiler->IsOwningValueType(resolvedTypeName);
                 if (returnNV.IsOwning) compiler->lastOwningResult = true;
+            }
             }
         }
         const bool cxxReturnTernary = cxxSretReturn && assignExpr != nullptr
@@ -2271,7 +2300,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 value = value->stripPointerCasts();
                 if (!visitedAliasRoots.insert(value).second) return false;
 
-                if (PointsIntoStackFrame(value))
+                llvm::Value* storageRoot = value;
+                while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storageRoot))
+                    storageRoot = gep->getPointerOperand()->stripPointerCasts();
+                const bool isJoinRoot = llvm::isa<llvm::PHINode>(storageRoot)
+                    || llvm::isa<llvm::SelectInst>(storageRoot);
+                if (!isJoinRoot && PointsIntoStackFrame(value))
                 {
                     llvm::Value* root = value;
                     while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(root))

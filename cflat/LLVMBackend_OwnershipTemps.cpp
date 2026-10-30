@@ -7346,6 +7346,71 @@ void LLVMBackend::RegisterOwnedStructTemp(llvm::Value* alloca, const std::string
         pendingOwnedStructTemps.push_back({ alloca, typeName, builder->GetInsertBlock(), liveFlag });
     }
 
+void LLVMBackend::RegisterOwnedCxxParamTempAt(llvm::Value* alloca, const std::string& typeName,
+                                              size_t index)
+{
+        if (alloca == nullptr || typeName.empty()) return;
+        index = std::min(index, pendingOwnedStructTemps.size());
+        pendingOwnedStructTemps.insert(pendingOwnedStructTemps.begin() + static_cast<long>(index),
+            { alloca, typeName, builder->GetInsertBlock() });
+    }
+
+void LLVMBackend::DestroyMovedCxxArgSourceTemp(llvm::Value* source, llvm::Value* destination)
+{
+        if (source == nullptr || destination == nullptr || source == destination) return;
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(source))
+        {
+            std::vector<size_t> sourceSlots;
+            std::string typeName;
+            std::vector<llvm::PHINode*> visited;
+            // Nested conditionals: walk PHI-of-PHI down to the leaf ledger slots.
+            std::function<bool(llvm::PHINode*)> collectLeaves = [&](llvm::PHINode* node) -> bool {
+                if (node->getNumIncomingValues() == 0) return false;
+                if (std::find(visited.begin(), visited.end(), node) != visited.end()) return true;
+                visited.push_back(node);
+                for (unsigned i = 0; i < node->getNumIncomingValues(); ++i)
+                {
+                    llvm::Value* incoming = node->getIncomingValue(i);
+                    if (auto* inner = llvm::dyn_cast<llvm::PHINode>(incoming))
+                    {
+                        if (!collectLeaves(inner)) return false;
+                        continue;
+                    }
+                    auto it = std::find_if(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                        [&](const PendingOwnedStructTemp& temp) {
+                            return temp.Alloca == incoming && temp.Alloca != nullptr
+                                && temp.ArrayCount == 0 && IsCxxRecord(temp.TypeName);
+                        });
+                    if (it == pendingOwnedStructTemps.end()) return false;
+                    if (typeName.empty()) typeName = it->TypeName;
+                    else if (typeName != it->TypeName) return false;
+                    sourceSlots.push_back(static_cast<size_t>(it - pendingOwnedStructTemps.begin()));
+                }
+                return true;
+            };
+            const bool allIncomingAreOwnedTemps = collectLeaves(phi);
+            if (allIncomingAreOwnedTemps)
+            {
+                PendingOwnedStructTemp movedSource{ source, typeName, builder->GetInsertBlock() };
+                EmitOwnedStructTempFree(movedSource);
+                for (size_t slot : sourceSlots) pendingOwnedStructTemps[slot].Alloca = nullptr;
+                return;
+            }
+        }
+        auto it = std::find_if(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+            [&](const PendingOwnedStructTemp& temp) {
+                return temp.Alloca == source && temp.Alloca != nullptr && temp.ArrayCount == 0
+                    && IsCxxRecord(temp.TypeName);
+            });
+        if (it == pendingOwnedStructTemps.end()) return;
+        std::optional<llvm::DominatorTree> domTree;
+        if (!OwnedTempDominatesHere(it->Block, builder->GetInsertBlock(), domTree)) return;
+        const auto temp = *it;
+        EmitOwnedStructTempFree(temp);
+        if (temp.LiveFlag != nullptr) builder->CreateStore(builder->getFalse(), temp.LiveFlag);
+        it->Alloca = nullptr;
+    }
+
 void LLVMBackend::RegisterOwnedBraceListTemp(llvm::Value* array, const std::string& typeName,
                                              uint64_t count)
 {
@@ -7353,13 +7418,14 @@ void LLVMBackend::RegisterOwnedBraceListTemp(llvm::Value* array, const std::stri
         pendingOwnedStructTemps.push_back({ array, typeName, builder->GetInsertBlock(), nullptr, count });
     }
 
-// Brace lists die in reverse creation order: permute them among their own ledger slots only.
-template <class Temp>
-static void ReverseBraceListTemps(std::vector<Temp>& temps, size_t from)
+// Full-expression C++ class temps, including by-value parameter slots, die in reverse order.
+// CFlat temps retain their ledger order.
+template <class Temp, class IsCxxTemp>
+static void ReverseCxxStructTemps(std::vector<Temp>& temps, size_t from, IsCxxTemp isCxxTemp)
 {
         std::vector<size_t> slots;
         for (size_t i = from; i < temps.size(); ++i)
-            if (temps[i].ArrayCount != 0) slots.push_back(i);
+            if (isCxxTemp(temps[i])) slots.push_back(i);
         for (size_t a = 0, b = slots.size(); a + 1 < b; ++a, --b)
             std::swap(temps[slots[a]], temps[slots[b - 1]]);
     }
@@ -7596,7 +7662,9 @@ void LLVMBackend::FlushOwnedStructTemps()
 
         auto temps = std::move(pendingOwnedStructTemps);
         pendingOwnedStructTemps.clear();
-        ReverseBraceListTemps(temps, 0);
+        ReverseCxxStructTemps(temps, 0, [&](const PendingOwnedStructTemp& temp) {
+            return IsCxxRecord(temp.TypeName);
+        });
         // ONE pass in ledger order. A guarded free opens blocks, so the insert block is re-read
         // per temp and the dominator tree is dropped after one - batching the guarded temps last
         // instead would silently reverse two temps' destruction order within a statement.
@@ -7768,6 +7836,48 @@ LLVMBackend::OwnedTempMark LLVMBackend::MarkOwnedTemps() const
 {
         return { pendingOwnedStringTemps.size(), pendingOwnedClosureTemps.size(),
                  pendingOwnedStructTemps.size(), pendingOwnedPtrTemps.size(), ownedNewTemps_.size() };
+    }
+
+bool LLVMBackend::AddressDerivesFromOwnedStructTempSince(const OwnedTempMark& mark,
+                                                          llvm::Value* address) const
+{
+        if (address == nullptr) return false;
+        for (size_t i = mark.Structs; i < pendingOwnedStructTemps.size(); ++i)
+        {
+            const auto& temp = pendingOwnedStructTemps[i];
+            if (temp.Alloca == nullptr || !IsCxxRecord(temp.TypeName)) continue;
+            if (AddressDerivesFromTemp(address, true,
+                    [&](llvm::Value* base) { return base == temp.Alloca; }, FindJoinOf, this))
+                return true;
+        }
+        return false;
+    }
+
+bool LLVMBackend::ExtendCxxStructTempsToScopeSince(const OwnedTempMark& mark,
+                                                    llvm::Value* address)
+{
+        if (address == nullptr) return false;
+        std::vector<llvm::Value*> slots;
+        for (size_t i = mark.Structs; i < pendingOwnedStructTemps.size(); ++i)
+        {
+            const auto& temp = pendingOwnedStructTemps[i];
+            if (temp.Alloca == nullptr || !IsCxxRecord(temp.TypeName)) continue;
+            if (AddressDerivesFromTemp(address, true,
+                    [&](llvm::Value* base) { return base == temp.Alloca; }, FindJoinOf, this))
+                slots.push_back(temp.Alloca);
+        }
+        bool extended = false;
+        for (llvm::Value* slot : slots)
+        {
+            auto it = std::find_if(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                [&](const PendingOwnedStructTemp& temp) { return temp.Alloca == slot; });
+            if (it == pendingOwnedStructTemps.end()) continue;
+            const PendingOwnedStructTemp temp = *it;
+            if (!ExtendOwnedStructTempToScope(temp)) continue;
+            it->Alloca = nullptr;
+            extended = true;
+        }
+        return extended;
     }
 
 void LLVMBackend::HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::Value* address,
@@ -8006,10 +8116,12 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
                 if (!OwnedTempDominatesHere(bb, curBlock, domTree)) continue;
                 EmitOwnedClosureTempFree(value);
             }
-            ReverseBraceListTemps(pendingOwnedStructTemps, mark.Structs);
-            // Ledger order, guarded and unguarded alike. A guarded free opens blocks, so the
-            // insert block is re-read per temp and the cached tree dropped after one; batching
-            // the guarded ones last instead would reverse two temps' destruction order.
+            ReverseCxxStructTemps(pendingOwnedStructTemps, mark.Structs,
+                [&](const PendingOwnedStructTemp& temp) {
+                    return IsCxxRecord(temp.TypeName);
+                });
+            // C++ temps are reversed in place among their ledger slots; CFlat temps retain their
+            // relative order. A guarded free opens blocks, so re-read the insert block per temp.
             for (size_t i = mark.Structs; live && i < pendingOwnedStructTemps.size(); ++i)
             {
                 auto& t = pendingOwnedStructTemps[i];
@@ -9505,10 +9617,15 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
         llvm::BasicBlock* cleanupExitBB = builder->GetInsertBlock();
         if (ownFrame)
         {
-            // Then the statement's temps still OWNED at the invoke: in FlushOwnedStructTemps'
-            // ledger order, and never an argument this call hands to a sink parameter.
+            // Then the statement's temps still OWNED at the invoke, in the same order as the
+            // normal flush; never include an argument this call hands to a sink parameter.
             auto* invokeBlock = invoke->getParent();
-            for (const auto& t : pendingOwnedStructTemps)
+            auto unwindStructTemps = pendingOwnedStructTemps;
+            ReverseCxxStructTemps(unwindStructTemps, 0,
+                [&](const PendingOwnedStructTemp& temp) {
+                    return IsCxxRecord(temp.TypeName);
+                });
+            for (const auto& t : unwindStructTemps)
             {
                 std::optional<llvm::DominatorTree> domTree;
                 if (t.Alloca == nullptr || !IsInsertBlockLive()) continue;

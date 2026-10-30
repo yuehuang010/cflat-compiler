@@ -2062,6 +2062,8 @@ int ForwardRefScanner::ScannerDecideIfConst(CFlatParser::ExpressionContext* expr
 void ForwardRefScanner::CollectGenericTemplateDeclsIfConst(CFlatParser::IfConstDeclarationContext* ctx, bool certain,
                                             bool ifConstUnfoldable, const std::string& ns) {
         int decision = ScannerDecideIfConst(ctx->expression());
+        if (auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ctx))
+            decision = *recorded;
         auto ifBlocks = ctx->ifConstBlock();
         if (ifBlocks.empty()) return;
         if (decision < 0)

@@ -184,15 +184,21 @@ expect_error("cannot initialize C++ class 'T513R7LB' from this expression") {
     }
 }
 
-// T513 r4: a mixed-class ?: as a non-leading call argument is refused (only the single-parameter sink lowers).
+// MIXCOND2: overloads and operator ancestors still refuse a mixed-class call argument.
 expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
-    int t513V10Take2(int x, T513V10B b) { return x + b.value; }
-    int t513V10Arg2(bool k) { return t513V10Take2(1, k ? t513V10MakeA(11) : t513V10MakeB()); }
+    int t513V10Overloaded(T513V10B b) { return b.value; }
+    int t513V10Overloaded(T513V10B b, int extra) { return b.value + extra; }
+    int t513V10OverloadedCall(bool k) { return t513V10Overloaded(k ? t513V10MakeA(11) : t513V10MakeB()); }
 }
 
 expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
-    void t513V10Keep(int x, T513V10B b) { }
-    void t513V10Arg2Void(bool k) { t513V10Keep(2, k ? t513V10MakeA(11) : t513V10MakeB()); }
+    int t513V10BinarySink(T513V10B b) { return b.value + 100; }
+    int t513V10BinaryCall(bool k) { return t513V10BinarySink(k ? t513V10MakeA(11) : t513V10MakeB()) * 2; }
+}
+
+expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
+    int t513V10UnarySink(T513V10B b) { return b.value + 100; }
+    int t513V10UnaryCall(bool k) { return -t513V10UnarySink(k ? t513V10MakeA(11) : t513V10MakeB()); }
 }
 
 // T513 r5 (S2): a defaulted trailing parameter is a longer overload; the sink must not forward a copy.
@@ -204,6 +210,30 @@ expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'
 // T513 r5 (S3): a by-value parameter lvalue arm that converts is refused in return position.
 expect_error("cannot return C++ class 'T513V10B' from this conditional expression") {
     T513V10B t513V10ReturnParam(bool k, T513V10A a) { return k ? a : t513V10MakeB(); }
+}
+
+// MIXCOND2 r2: prefix arguments with a narrowing conversion refuse the conditional sink.
+expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
+    int t513M2LongCall(int x, T513V10B value) { return x + value.value; }
+    int t513M2LongArg(bool k) {
+        i64 wide = 5000000001;
+        return t513M2LongCall(wide, k ? t513V10MakeA(11) : t513V10MakeB());
+    }
+}
+
+expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
+    int t513M2CharCall(char x, T513V10B value) { return x + value.value; }
+    int t513M2CharArg(bool k) {
+        return t513M2CharCall(3 - 10, k ? t513V10MakeA(11) : t513V10MakeB());
+    }
+}
+
+expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
+    int t513M2PointerCall(int* p, T513V10B value) { return *p + value.value; }
+    int t513M2PointerArg(bool k) {
+        double d = 2.0;
+        return t513M2PointerCall(&d, k ? t513V10MakeA(11) : t513V10MakeB());
+    }
 }
 
 extern int main() { return 0; }

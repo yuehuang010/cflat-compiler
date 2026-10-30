@@ -66,14 +66,13 @@ p2 generic-unique-arg-pointer-spelling (19c6c56ec). Run the Windows gate on the 
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| P3 | - | p3/cpp-pointer-return-unrequested-specialization-not-retried | global free specialization operators + base free operators + different-type reference results landed OPFREE (f13122adf); open: same-type T& compound result is a copy, global member specialization-ref operator refused, internal name in ambiguity text; RULED 2026-10-24: no `a @= b` -> `a = a @ b` fallback (C++ row) |
 | P3 | - | p3/moved-from-struct-leftovers-after-t490 | filed 2026-10-24; local field move landed MVFIELD (aea8e89da); open: T418 C++ param `_ = move` (immediate release + disarm), heap-field `move p->inn`, raw-pointer-field scope ruling question |
 | P3 | - | p3/nested-function-type-parameter-not-compared | filed T427 review: function-type component of a function type not compared |
-| P3 | - | p3/interface-call-overload-ranking-and-conversion | calls through an interface variable rank literal args differently from direct calls (char/float picks, long/short tie), verifier abort on bad conversions, "str" accepted into int*; pre-existing, found in NEST6 review |
+| P3 | - | p3/interface-call-overload-ranking-and-conversion | landed IFACEOVL (83fea586e - see issue); residue: unrelated-pointer fall-through, const receiver overloads, first-not-ambiguous picks (pre-existing) |
 | P3 | - | p3/call-name-shadowing-leftovers-after-t484 | implicit-this member template landed SHADOW (a3158cb58), static + viability MTPL (128ea6b82), nested outer static template NEST (2d2e922ad), generic outer NEST2 (24e3ec23a), defaults + inner-hides-outer NEST3 (30e9629ad), bare defaulted instance call NEST4 (6923945d8); outer U in member templates + sibling nested static + N.O<T>.run() NEST5 (a509d073c); 3 sections NEED RULING: qualified int -> double at calls (q08), field-default member lookup, self-initializer read; interface default via interface var + static-caller text NEST6 (31519d3b3); by-value outer layout NESTVAL (2e6b647bf) |
 | P3 | - | p3/ctor-lambda-this-closure-relocation | T515 residue: by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
 | P3 | - | p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
-| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | decl / return / single-argument sink landed MIXCOND (237dbf3cc); open: multi-argument and non-sink call args (arm temp must live to full-expression end), overload, nested ternary, by-value param arm (C++ row) |
+| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | decl / return / single-argument sink landed MIXCOND (237dbf3cc); multi-arg last-argument + nested decl + F1 producer lifetime MIXCOND2 (0870063c4); open: operators, overloaded callee, defaulted/named/not-last args, by-value param return arm, B dtor order (C++ row) |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
 
@@ -93,7 +92,7 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | global/function name collisions, anonymous/inline-namespace enums, comma, `auto&&`, deref macros, C errno/INT_MAX; T98 reviews 1-2, pre-existing |
 | - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | unnamed-enum source picks int ctor; non-const trivially-copyable lvalue copy-init skips U&& template (T54 review, pre-existing) |
 | - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | extra move vs clang elision; the old p2 by-value-temporary-extra-moves file was gone, re-pointed 2026-10-15 (T229) |
-| - | p3/cpp-reference-member-leftovers-after-t47 | ref members | designated init + literal/prvalue lifetime landed REFMEM (791f1281e), base/member-aggregate positional REFBASE (d4999d9da); fn-ref member + nullptr brace element REFFN (ec5f57a0e); open: refused contexts, call-arg temp dtor order (DTORORD in flight), elided-range prvalue/array residue, `&f` element needs ruling |
+| - | p3/cpp-reference-member-leftovers-after-t47 | ref members | designated init + literal/prvalue lifetime landed REFMEM (791f1281e), base/member-aggregate positional REFBASE (d4999d9da); fn-ref member + nullptr brace element REFFN (ec5f57a0e); refused contexts REFCTX (ce8ff8163), temp dtor order landed DTORORD (b4466d12f) + alias temp lifetime ALIASTMP (8ad5ea039); residue: unwind leak / extra copy / wrapper path, opaque-fn alias refusal needs ruling, elided-range prvalue/array residue, `&f` element needs ruling, REFCTX raw-pointer/self-field refusal residue |
 | - | p3/function-ptr-c-abi-leftovers-after-t77 | function<> C ABI | narrow callback return landed FPABI (70c49a598); open: extern `move T*` count lost (needs ruling: refuse vs counted entry) |
 | - | p3/cpp-ctor-template-viability-not-clang-selected | C++ ctor narrowing | template constraints / failed deduction not seen; validate clang-selected ctor (T78 reviews 2-5) |
 | - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | `auto x = 1e3 + 1; fwd(x)` float / refused, `auto x = l + 1` long long; T58 review 5, pre-existing |
@@ -175,7 +174,6 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | N13 | p3/cpp-ctor-expression-position-const-ref-copies-lvalue | C++ ctor in expression position - remaining `const T&` copies and enum `T&&` refusal | NEW 2026-09-29 |
 | N14 | p3/cpp-ctor-ranking-leftovers | P3 C++ constructor ranking leftovers after C6 round 2 | NEW 2026-09-29 |
 | N15 | p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | C++ header default-wrapper batch chunk stores a stripped prefix (latent replay failure) | NEW 2026-09-29 |
-| N18 | p3/cpp-pointer-return-unrequested-specialization-not-retried | Remaining C++ free-operator and converting-constructor retry gaps | NEW 2026-09-29 |
 | N22 | p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | C++ template constructor deduction - enum lvalue and arithmetic rvalue deduce the wrong T | NEW 2026-09-29 |
 | N23 | p3/cpp-unary-operator-leftovers-after-d7 | Unary operator leftovers after D7+C3 | NEW 2026-09-29 |
 | N24 | p3/cpp-unrequested-specialization-pointer-eager-request | Bucket: p3 (C++ interop compile time; left by D6, fix/unrequested-spec-pointer-retry, 2026-09-29) | NEW 2026-09-29 |
@@ -185,7 +183,7 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
 | N41 | p3/cpp-variadic-alias-template-refused | in-repo `template<auto... I> using A = S<I...>` refused (alias machinery has no pack support) (ST4, pre-existing) | NEW 2026-10-01 |
-| N42 | p3/cpp-header-unreferenced-global-initializers-skipped | unreferenced C++ header inline globals never run their dynamic initializer (referenced ones + .cpp sources fixed/fine, T44) | RULED 2026-10-25: follow clang, run every harvested header global initializer, budget-gated; p3 |
+| N42 | p3/cpp-header-unreferenced-global-initializers-skipped | landed HDRGLOB (d13af01d8); if-const imported-const order IFCORDER (f2cbf5171); residue: root-const / qualified-const `if const` order, non-inline extern destructible shared global, same guard macro in two files | p3 |
 | N47 | p3/cpp-constant-fold-and-const-static-twin-leftovers | constexpr-call initializer refused by the fold guard; const receiver + static twin overload refused (ST4 re-review leftovers) | NEW 2026-10-01 |
 | N52 | p3/cpp-range-for-member-name-lookup-and-count-probe | range-for member lookup misses enum/nested-type begin/end (accepts invalid); count/get clients pay a failed ADL probe; ST6 follow-up | NEW 2026-10-01 |
 | N58 | p3/cpp-struct-identity-underscore-namespace | [cpp] identity: ns_ namespace decode, global name collision, CRTP base reading a derived field (master too); N51 follow-up | NEW 2026-10-01 |

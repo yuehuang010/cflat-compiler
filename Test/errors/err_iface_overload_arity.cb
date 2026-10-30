@@ -43,6 +43,22 @@ class HelperNamedImpl : IHelperNamed
     int h(int a, int b, int c) { return a + b + c; }
 };
 
+struct IOvlBadValue { int value = 0; };
+interface IOvlBadNumericInt { int f(int a); };
+class OvlBadNumericInt : IOvlBadNumericInt { int f(int a) { return a; } };
+interface IOvlBadNumericFloat { int f(float a); };
+class OvlBadNumericFloat : IOvlBadNumericFloat { int f(float a) { return 1; } };
+interface IOvlBadStruct { int f(int a); };
+class OvlBadStruct : IOvlBadStruct { int f(int a) { return a; } };
+interface IOvlBadNamed { int g(int x, IOvlBadValue z); };
+class OvlBadNamed : IOvlBadNamed { int g(int x, IOvlBadValue z) { return x; } };
+interface IOvlBadString { int g(int x, int y); int g(int x, int* z); };
+class OvlBadString : IOvlBadString
+{
+    int g(int x, int y) { return 1; }
+    int g(int x, int* z) { return 2; }
+};
+
 extern int main()
 {
     OvA o;
@@ -77,6 +93,42 @@ extern int main()
     }
     expect_error("IHelperNamed.h(IHelperNamed, int, int, int)") {
         int badNamed = helperNamedIface.h(1, c: 7);
+    }
+
+    OvlBadNumericInt badNumericIntImpl = default;
+    IOvlBadNumericInt badNumericIntIface = badNumericIntImpl;
+    expect_error("no overload of 'f' matches the given arguments") {
+        int badNumericInt = badNumericIntIface.f(1.5);
+    }
+
+    OvlBadNumericFloat badNumericFloatImpl = default;
+    IOvlBadNumericFloat badNumericFloatIface = badNumericFloatImpl;
+    double wideFloat = 0.1;
+    expect_error("no overload of 'f' matches the given arguments") {
+        int badNumericFloat = badNumericFloatIface.f(wideFloat);
+    }
+
+    OvlBadStruct badStructImpl = default;
+    IOvlBadStruct badStructIface = badStructImpl;
+    IOvlBadValue badStructValue = default;
+    expect_error("no overload of 'f' matches the given arguments") {
+        int badStruct = badStructIface.f(badStructValue);
+    }
+
+    OvlBadNamed badNamedImpl = default;
+    IOvlBadNamed badNamedIface = badNamedImpl;
+    int badNamedPointer = 0;
+    expect_error("no overload of 'g' matches the given arguments") {
+        int badNamedArg = badNamedIface.g(z: &badNamedPointer, x: 1);
+    }
+
+    OvlBadString badStringImpl = default;
+    IOvlBadString badStringIface = badStringImpl;
+    expect_error("no overload of 'g' matches the given arguments") {
+        int badStringArg = badStringIface.g(1, "str");
+    }
+    expect_error("no overload of 'g' matches the given arguments") {
+        int badNamedStringArg = badStringIface.g(z: "str", x: 1);
     }
 
     return 0;

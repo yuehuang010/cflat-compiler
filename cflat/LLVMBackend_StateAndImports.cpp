@@ -3750,6 +3750,11 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m, files));
             if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m, files));
             if (j.contains("globals"))    for (const auto& g : j["globals"])    entry.globals.push_back(GlobalFromJson(g));
+            if (j.contains("cxxDynamicInitializers"))
+                for (const auto& initializer : j["cxxDynamicInitializers"])
+                    entry.cxxDynamicInitializerSymbols.push_back({
+                        initializer.value("symbol", std::string{}),
+                        initializer.value("identity", std::string{}) });
             if (j.contains("recordAliases"))
                 for (const auto& a : j["recordAliases"])
                     entry.recordAliases.emplace_back(a.value("a", std::string{}), a.value("t", std::string{}));
@@ -4213,6 +4218,14 @@ void LLVMBackend::WriteCHeaderDiskCache(
         nlohmann::json globals = nlohmann::json::array();
         for (const auto& g : entry.globals) globals.push_back(GlobalToJson(g));
         j["globals"] = std::move(globals);
+        if (!entry.cxxDynamicInitializerSymbols.empty())
+        {
+            nlohmann::json initializers = nlohmann::json::array();
+            for (const auto& initializer : entry.cxxDynamicInitializerSymbols)
+                initializers.push_back({ { "symbol", initializer.symbol },
+                                         { "identity", initializer.identity } });
+            j["cxxDynamicInitializers"] = std::move(initializers);
+        }
         nlohmann::json recordAliases = nlohmann::json::array();
         for (const auto& a : entry.recordAliases)
             recordAliases.push_back({{"a", a.first}, {"t", a.second}});

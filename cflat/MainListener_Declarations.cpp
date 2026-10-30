@@ -3328,6 +3328,13 @@ void MainListener::EmitPendingGlobalCxxConstructions(
             }
             if (item.Global == nullptr || item.Global->isDeclaration()) return;
             const std::string& typeName = item.TypeValue.TypeName;
+            if (item.BraceInitializer != nullptr)
+            {
+                TryEmitForeignCxxAggregateBraceInit(
+                    typeName, item.BraceInitializer, item.Context, item.Global, item.CopyListInit,
+                    false, item.Global);
+                return;
+            }
             if (!compiler->IsCxxRecord(typeName))
             {
                 EmitGlobalCxxFieldDefaultConstruction(
@@ -4625,6 +4632,15 @@ const std::vector<CFlatParser::InterfaceMemberContext*>& MainListener::ResolveIn
 void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContext* ctx, const std::string& namespaceName) {
         auto expression = ctx->expression();
         int decision = DecideIfConstCondition(expression);
+        if (auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ctx))
+        {
+            if (decision != *recorded)
+            {
+                LogErrorContext(ctx, "internal: if const arm selection changed between passes");
+                return;
+            }
+            decision = *recorded;
+        }
         if (decision < 0)
         {
             LogErrorContext(ctx, "'if const' condition must be a compile-time constant expression");
@@ -4749,7 +4765,9 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                     bool grpIsCpp = imp->children.size() >= 2
                                  && imp->children[1]->getText() == "cpp";
                     Compiler()->CompileImportGroup(Compiler()->currentSourceFilePath_, entries,
-                                                   grpLibs, grpDefines, grpIsCpp);
+                                                   grpLibs, grpDefines, grpIsCpp,
+                                                   Compiler()->CxxImportOrderAt(
+                                                       imp->getStart()->getStartIndex()));
                     continue;
                 }
                 std::string importFilename = importFilenames[0];
@@ -4791,7 +4809,9 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                 // `import cpp "..."` inside an if-const branch selects C++ mode, same as at file scope.
                 bool isCppImport = imp->children.size() >= 2 && imp->children[1]->getText() == "cpp";
                 Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "",
-                                                explicitLibs, extraDefines, isCppImport);
+                                                explicitLibs, extraDefines, isCppImport,
+                                                Compiler()->CxxImportOrderAt(
+                                                    imp->getStart()->getStartIndex()));
             }
         }
 
@@ -5788,26 +5808,52 @@ void MainListener::ValidateAllocAlignField(const LLVMBackend::DeclTypeAndValue& 
 // fields, or of an element of a local array. Globals, heap results and loads root elsewhere.
 bool MainListener::PointsIntoStackFrame(llvm::Value* value)
 {
-        if (value == nullptr || !value->getType()->isPointerTy()) return false;
-        value = value->stripPointerCasts();
-        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
-            value = gep->getPointerOperand()->stripPointerCasts();
-        return llvm::isa<llvm::AllocaInst>(value);
+        std::unordered_set<llvm::Value*> visited;
+        std::function<bool(llvm::Value*)> pointsIntoFrame = [&](llvm::Value* pointer) -> bool {
+            if (pointer == nullptr || !pointer->getType()->isPointerTy()) return false;
+            pointer = pointer->stripPointerCasts();
+            if (!visited.insert(pointer).second) return false;
+            if (llvm::isa<llvm::AllocaInst>(pointer)) return true;
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(pointer))
+                return pointsIntoFrame(gep->getPointerOperand());
+            if (auto* select = llvm::dyn_cast<llvm::SelectInst>(pointer))
+                return pointsIntoFrame(select->getTrueValue())
+                    || pointsIntoFrame(select->getFalseValue());
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(pointer))
+                for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+                    if (pointsIntoFrame(phi->getIncomingValue(i))) return true;
+            return false;
+        };
+        return pointsIntoFrame(value);
     }
 
 bool MainListener::IsProgramLifetimeStorage(
         const LLVMBackend::NamedVariable& nv) const {
         if (nv.IsStaticLocal) return true;
-        llvm::Value* storage = nv.Storage;
-        for (int depth = 0; storage != nullptr && depth < 64; ++depth)
-        {
+        std::unordered_map<llvm::Value*, bool> memo;
+        std::unordered_set<llvm::Value*> active;
+        std::function<bool(llvm::Value*)> isGlobalStorage = [&](llvm::Value* storage) -> bool {
+            if (storage == nullptr || !storage->getType()->isPointerTy()) return false;
             storage = storage->stripPointerCasts();
-            if (llvm::isa<llvm::GlobalVariable>(storage)) return true;
-            auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storage);
-            if (gep == nullptr) return false;
-            storage = gep->getPointerOperand();
-        }
-        return false;
+            if (auto found = memo.find(storage); found != memo.end()) return found->second;
+            if (!active.insert(storage).second) return false;
+            bool isGlobal = llvm::isa<llvm::GlobalVariable>(storage);
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storage))
+                isGlobal = isGlobalStorage(gep->getPointerOperand());
+            else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(storage))
+                isGlobal = isGlobalStorage(select->getTrueValue())
+                    && isGlobalStorage(select->getFalseValue());
+            else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(storage))
+            {
+                isGlobal = phi->getNumIncomingValues() != 0;
+                for (unsigned i = 0; isGlobal && i < phi->getNumIncomingValues(); ++i)
+                    isGlobal = isGlobalStorage(phi->getIncomingValue(i));
+            }
+            active.erase(storage);
+            memo.emplace(storage, isGlobal);
+            return isGlobal;
+        };
+        return isGlobalStorage(nv.Storage);
     }
 
 void MainListener::RejectLambdaReferenceCaptureEscape(
@@ -6260,227 +6306,42 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
         return nullptr;
     }
 
-bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext* initDeclarator,
-                                             CFlatParser::DirectDeclaratorContext* direct,
-                                             const LLVMBackend::DeclTypeAndValue& declType,
-                                             const std::string& name, size_t line,
-                                             std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList)
+bool MainListener::HasForeignCxxAggregateReferenceMember(
+        const std::string& ownerTypeName,
+        antlr4::ParserRuleContext* context)
 {
-        auto* compiler = Compiler(direct);
-        const std::string typeName = declType.TypeName;
-        const bool hasCxxConstructors = compiler->IsForeignCxxClassWithConstructors(typeName);
-        auto* initializer = initDeclarator->initializer();
-        // Redundant parentheses take the bare initializer's route (in-place elision).
-        auto* assign = CastCallInitializer(UnwrapInitializerParens(
-            initializer != nullptr ? initializer->assignmentExpression() : nullptr));
-        auto* declarationBraceList = initDeclarator->initializerList();
-        if (declarationBraceList == nullptr && initializer != nullptr
-            && initializer->LeftBrace() != nullptr)
-            declarationBraceList = initializer->initializerList();
-        const bool emptyBraceDeclaration =
-            (initDeclarator->LeftBrace() != nullptr
-                && (declarationBraceList == nullptr || declarationBraceList->fieldInit().empty()))
-            || (initializer != nullptr && initializer->LeftBrace() != nullptr
-                && (initializer->initializerList() == nullptr
-                    || initializer->initializerList()->fieldInit().empty()));
-        const bool hasNonemptyDeclarationBrace = declarationBraceList != nullptr
-            && !declarationBraceList->fieldInit().empty();
-        if (!hasCxxConstructors
-            && !(compiler->IsCxxRecord(typeName) && hasNonemptyDeclarationBrace))
-            return false;
-        // `alias T x = ref()` borrows the callee's object: no slot, no constructor, no destructor.
-        if (declType.IsAlias) return false;
-        if (declType.Pointer || declType.ConstArraySize > 0 || !declType.ConstInnerDimensions.empty()
-            || declType.IsArrayView || declType.IsInterface || declType.ArraySize != nullptr)
-            return false;   // pointers and arrays of the class keep the ordinary path
-        if (compiler->RejectUnsupportedCxxLayout(typeName)) return true;
-        if (compiler->RejectAbstractCxxClass(typeName, "declare a local of")) return true;
-
-        // A std.function's signature reaches a lambda in its initializer or constructor
-        // argument, as a function<> declarator's does (`std.function<int(int)> f = (int x) => x;`).
-        LambdaExpectedTypeRestoreGuard stdFunctionLambdaRestore(&lambdaExpectedType);
-        if (const auto* signature = compiler->StdFunctionClosureSignature(typeName))
-            lambdaExpectedType = *signature;
-
-        const auto declarationBraceFields = hasNonemptyDeclarationBrace
-            ? declarationBraceList->fieldInit()
-            : std::vector<CFlatParser::FieldInitContext*>{};
-        const bool hasCxxFieldDesignators = hasNonemptyDeclarationBrace
-            && std::any_of(declarationBraceFields.begin(), declarationBraceFields.end(),
-                [](auto* field) { return field->Identifier() != nullptr; });
-        const bool hasKeyedInitializers = hasNonemptyDeclarationBrace
-            && std::any_of(declarationBraceFields.begin(), declarationBraceFields.end(),
-                [](auto* field) { return field->Colon() != nullptr; });
-        auto cxxAggregateHasReferenceMember = [&](auto&& self, const std::string& ownerTypeName) -> bool {
-            if (!compiler->IsForeignCxxAggregateClass(ownerTypeName)) return false;
-            const auto record = compiler->GetDataStructure(ownerTypeName);
-            for (const auto& field : record.StructFields)
-            {
-                std::string spelling;
-                bool isReference = false;
-                if (compiler->CxxRecordFieldTypeSpelling(
-                        ownerTypeName, field.VariableName, spelling, &isReference)
-                    && isReference)
-                    return true;
-                const std::string fieldTypeName = compiler->ResolveTypeAlias(field.TypeName);
-                if (!field.Pointer && !field.ElemPointer
-                    && compiler->IsForeignCxxAggregateClass(fieldTypeName)
-                    && self(self, fieldTypeName))
-                    return true;
-            }
-            return false;
-        };
-        const bool hasCxxReferenceMember = hasCxxFieldDesignators
-            && cxxAggregateHasReferenceMember(cxxAggregateHasReferenceMember, typeName);
-        if (hasKeyedInitializers || (hasCxxFieldDesignators
-            && !hasCxxReferenceMember))
-            return false;
-        // Depending on the initializer alternative selected by ANTLR, `default` may be exposed
-        // as the rule token or as a single assignment-expression child.
-        bool isDefaultForm = initializer != nullptr
-            && (initializer->Default() != nullptr
-                || IsDefaultOnlyExpression(initializer->assignmentExpression(), false));
-        if (emptyBraceDeclaration) isDefaultForm = true;
-        auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
-        auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
-
-        // A trivial record can skip construction only when its default constructor is public.
-        auto* directCall = assign != nullptr ? SolePostfixExpression(assign) : nullptr;
-        const std::string directCallText = directCall != nullptr
-            ? directCall->getText() : std::string();
-        const bool directCallReturn = !directCallText.empty()
-            && directCallText.back() == ')'
-            && std::count(directCallText.begin(), directCallText.end(), '(') == 1;
-        if (ctorArgs == nullptr && moveExpr == nullptr
-            && !compiler->IsForeignNontrivialCxxClass(typeName)
-            && !(directCallReturn
-                 && compiler->IsForeignNontrivialCxxReturnClass(typeName)))
+        auto* compiler = Compiler(context);
+        if (!compiler->IsForeignCxxAggregateClass(ownerTypeName)) return false;
+        const auto record = compiler->GetDataStructure(ownerTypeName);
+        for (const auto& field : record.StructFields)
         {
-            const auto* trivial = compiler->GetCxxClassInfo(typeName);
-            const bool fullyTrivial = trivial != nullptr && trivial->hasTrivialDefaultCtor
-                && trivial->hasTrivialCopyCtor && trivial->hasTrivialDtor
-                && !trivial->hasDeletedDefaultCtor
-                && !compiler->HasNonPublicCxxDefaultCtor(typeName);
-            // Only a non-explicit converting ctor (template or one-parameter) can turn an
-            // expression initializer into a construction, decided on the evaluated value below.
-            bool convertingCtor = trivial != nullptr && trivial->hasCtorTemplate;
-            if (trivial != nullptr)
-                for (const auto& ctor : trivial->constructors)
-                {
-                    // One argument: params[0] is 'this'; trailing params need a default.
-                    bool oneArgument = ctor.params.size() >= 2;
-                    for (size_t n = 2; oneArgument && n < ctor.params.size(); ++n)
-                        oneArgument = n < ctor.defaultArgs.size()
-                            && !ctor.defaultArgs[n].kind.empty();
-                    if (oneArgument && !ctor.isExplicit && !ctor.isDeleted
-                        && !ctor.isCopyCtor && !ctor.isMoveCtor && !ctor.isDefaultCtor)
-                        convertingCtor = true;
-                }
-            if ((fullyTrivial && (initializer == nullptr || isDefaultForm)
-                 && !hasNonemptyDeclarationBrace)
-                || (initializer != nullptr && !isDefaultForm
-                    && (assign == nullptr || !convertingCtor) && !hasNonemptyDeclarationBrace))
-                return false;
-        }
-
-        auto badInit = [&](antlr4::ParserRuleContext* where) {
-            LogErrorContext(where, std::format(
-                "cannot initialize C++ class '{}' from this expression; use '{}(args)', "
-                "'= default', a '{}' lvalue, or 'move <{}> lvalue'",
-                compiler->DisplayCxxClassName(typeName),
-                compiler->DisplayCxxClassName(typeName),
-                compiler->DisplayCxxClassName(typeName),
-                compiler->DisplayCxxClassName(typeName)));
-        };
-        // Item 3 of the std.move ruling: a `U&&` result that cannot build T names the reference.
-        auto badRvalueRefInit = [&](antlr4::ParserRuleContext* where,
-                                    const LLVMBackend::NamedVariable& source) {
-            LLVMBackend::TypeAndValue referent = source.TypeAndValue;
-            referent.IsRvalueRef = false;
-            if (referent.Pointer && !referent.ElemPointer) referent.Pointer = false;
-            else if (referent.ElemPointer) referent.ElemPointer = false;
-            LogErrorContext(where, std::format(
-                "cannot initialize C++ class '{}' from the rvalue reference '{}&&' this call "
-                "returns; only a '{}&&' result move-constructs it - use '{}(args)' or "
-                "'move <{}> lvalue'",
-                compiler->DisplayCxxClassName(typeName), SpellDiagnosticType(*compiler, referent),
-                compiler->DisplayCxxClassName(typeName), compiler->DisplayCxxClassName(typeName),
-                compiler->DisplayCxxClassName(typeName)));
-        };
-        if (initializer != nullptr && assign == nullptr && !isDefaultForm
-            && !hasNonemptyDeclarationBrace)
-        {
-            badInit(initializer);
-            return true;
-        }
-
-        // The slot is allocated BEFORE anything is evaluated: every form below constructs into it.
-        LLVMBackend::DeclTypeAndValue slotType = declType;
-        slotType.VariableName = name;
-        if (compiler->stackNamedVariable.back().namedVariable.count(name))
-            LogErrorContext(direct, std::format(
-                "redeclaration of '{}' in the same scope; use a different name or assign to the "
-                "existing variable", name));
-        llvm::Value* slotValue = compiler->CreateLocalVariable(slotType, nullptr, nullptr, line,
-                                                               slotType.UserAlignValue);
-        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
-        allocList.push_back(std::pair(name, slot));
-        if (slotValue == nullptr) return true;
-        // The slot is under construction: a const local is still writable by its constructor.
-        LLVMBackend::ConstructingScope constructingSlot(compiler, slotValue);
-        // Plan converting-constructors.md point 1: `T t = u;` is `T t = T(u);` - the converting
-        // constructor builds straight into the slot. False leaves the caller's refusal.
-        auto convertInto = [&](LLVMBackend::NamedVariable source) {
-            // This declaration path does not otherwise attach literal identity to the source.
-            if (source.LiteralIdentity.empty() && assign != nullptr)
-            {
-                bool suffixedLiteral = false;
-                const std::string identity = LLVMBackend::LiteralIdentityForOverload(
-                    assign->getText(), &suffixedLiteral);
-                if (!identity.empty())
-                {
-                    source.LiteralIdentity = identity;
-                    source.LiteralIdentitySuffixed = suffixedLiteral;
-                    source.LiteralSigned = LLVMBackend::LiteralTextHasSign(assign->getText());
-                }
-            }
-            std::string refusal;
-            compiler->SetCurrentDebugLocation(line);
-            switch (compiler->ConvertThroughCxxConvertingCtor(source, typeName, slot, refusal,
-                                                              /*directInit*/ false,
-                                                              /*allowScalarNarrowing*/ true))
-            {
-            case LLVMBackend::CxxConvertingCtorResult::Converted:
+            std::string spelling;
+            bool isReference = false;
+            if (compiler->CxxRecordFieldTypeSpelling(
+                    ownerTypeName, field.VariableName, spelling, &isReference)
+                && isReference)
                 return true;
-            case LLVMBackend::CxxConvertingCtorResult::Refused:
-                LogErrorContext(assign, std::format(
-                    "cannot initialize C++ class '{}' from this expression; {}",
-                    compiler->DisplayCxxClassName(typeName), refusal));
+            const std::string fieldTypeName = compiler->ResolveTypeAlias(field.TypeName);
+            if (!field.Pointer && !field.ElemPointer
+                && compiler->IsForeignCxxAggregateClass(fieldTypeName)
+                && HasForeignCxxAggregateReferenceMember(fieldTypeName, context))
                 return true;
-            default:
-                return false;
-            }
-        };
-
-        // Nontrivial classes must have a callable destructor; trivial classes need no cleanup.
-        if (compiler->IsForeignNontrivialCxxClass(typeName)
-            && !compiler->HasTrivialCxxDtor(typeName)
-            && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
-        {
-            compiler->TryBindRefusedCxxMember(typeName, "__dtor");
-            if (compiler->GetOrCreateCxxClassDestructor(typeName) != nullptr)
-                goto cxx_dtor_ready;
-            LogErrorContext(direct, std::format(
-                "cannot declare a local of C++ class '{}': it has no destructor cflat can call "
-                "(the destructor is implicit or defined inline in the header) - hold it through a "
-                "pointer instead", compiler->DisplayCxxClassName(typeName)));
-            return true;
         }
-cxx_dtor_ready:
+        return false;
+}
 
-        // A direct declaration brace list lives on InitDeclarator, not Initializer. Route it
-        // through clang's brace-constructor selector instead of treating it as default-init.
-        if (declarationBraceList != nullptr && !declarationBraceList->fieldInit().empty())
+bool MainListener::TryEmitForeignCxxAggregateBraceInit(
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* list,
+        antlr4::ParserRuleContext* errorContext,
+        llvm::Value* slotValue,
+        bool copyListInit,
+        bool rejectEscapingReferences,
+        llvm::GlobalVariable* referenceLifetimeOwner,
+        bool rejectFrameBoundReferences)
+{
+        auto* compiler = Compiler(errorContext);
+        if (list != nullptr && !list->fieldInit().empty())
         {
             BranchPostfixScope braceElementPostfix(this);
             std::vector<LLVMBackend::NamedVariable> braceElements;
@@ -6640,8 +6501,7 @@ cxx_dtor_ready:
                         [&](auto* field) {
                             return field->Colon() != nullptr
                                 || (field->Identifier() != nullptr
-                                    && !cxxAggregateHasReferenceMember(
-                                        cxxAggregateHasReferenceMember, ownerTypeName));
+                                    && !HasForeignCxxAggregateReferenceMember(ownerTypeName, errorContext));
                         });
                     if (unsupported != fields.end())
                     {
@@ -6801,7 +6661,7 @@ cxx_dtor_ready:
                     if (topLevel && (IsDefaultOnlyExpression(expression)
                         || HasDefaultOnlyTernaryArm(expression)))
                         compiler->GetUniqueCxxConstructorValueParameter(typeName, braceElements.size(),
-                            declarationBraceList->fieldInit().size(), argExpected);
+                            list->fieldInit().size(), argExpected);
                     const bool deferredDefault = topLevel && IsDefaultOnlyExpression(expression)
                         && !argExpected.TypeName.empty() && !argExpected.Pointer
                         && !argExpected.IsAlias && !argExpected.IsRvalueRef;
@@ -6845,6 +6705,100 @@ cxx_dtor_ready:
                         }
                         NormalizeCxxRvalueReferenceArgument(expression, elementNV);
                     }
+                    if (rejectFrameBoundReferences && targetIsReference
+                        && !IsProgramLifetimeStorage(elementNV))
+                    {
+                        const std::string fieldName = targetField != nullptr
+                            ? targetField->VariableName
+                            : targetBaseType.empty() ? std::string("<base>") : targetBaseType;
+                        LogErrorContext(element, std::format(
+                            "cannot initialize C++ aggregate '{}' field default: reference member "
+                            "'{}' must bind to program-lifetime storage because a CFlat value can "
+                            "move and leave a frame reference dangling",
+                            SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }),
+                            fieldName));
+                    }
+                    if (rejectEscapingReferences && targetIsReference)
+                    {
+                        auto* currentFunction = compiler->builder->GetInsertBlock() != nullptr
+                            ? compiler->builder->GetInsertBlock()->getParent() : nullptr;
+                        const auto* currentSymbol = currentFunction != nullptr
+                            ? compiler->FindSymbolForFunction(currentFunction) : nullptr;
+                        const auto thisReceiver = compiler->GetThisPointer();
+                        llvm::Value* thisReceiverStorage = thisReceiver.Primary != nullptr
+                            ? thisReceiver.Primary : thisReceiver.Storage;
+                        std::unordered_set<llvm::Value*> storageLifetimeActive;
+                        std::function<bool(llvm::Value*, bool)> storageOutlivesFunction;
+                        storageOutlivesFunction = [&](llvm::Value* storage,
+                                                      bool allowAliasParameter) -> bool {
+                            if (storage == nullptr || !storage->getType()->isPointerTy())
+                                return false;
+                            storage = storage->stripPointerCasts();
+                            if (!storageLifetimeActive.insert(storage).second) return false;
+                            bool outlives = false;
+                            if (thisReceiver.IsThisReceiver && thisReceiverStorage != nullptr
+                                && llvm::isa<llvm::LoadInst>(storage)
+                                && llvm::cast<llvm::LoadInst>(storage)->getPointerOperand()
+                                    ->stripPointerCasts()
+                                    == thisReceiverStorage->stripPointerCasts())
+                                outlives = true;
+                            else if (llvm::isa<llvm::GlobalVariable>(storage))
+                                outlives = true;
+                            else if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storage))
+                                outlives = storageOutlivesFunction(
+                                    gep->getPointerOperand(), allowAliasParameter);
+                            else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(storage))
+                                outlives = storageOutlivesFunction(
+                                    select->getTrueValue(), allowAliasParameter)
+                                    && storageOutlivesFunction(
+                                        select->getFalseValue(), allowAliasParameter);
+                            else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(storage))
+                            {
+                                outlives = phi->getNumIncomingValues() != 0;
+                                for (unsigned i = 0; outlives && i < phi->getNumIncomingValues(); ++i)
+                                    outlives = storageOutlivesFunction(
+                                        phi->getIncomingValue(i), allowAliasParameter);
+                            }
+                            else if (auto* argument = llvm::dyn_cast<llvm::Argument>(storage))
+                            {
+                                const bool receiver = currentSymbol != nullptr
+                                    && currentSymbol->IsMethod && argument->getArgNo() == 0;
+                                // Resolve by storage: method receivers and sret shift argument numbers.
+                                const auto* parameterNV = compiler->FindVariableByStorage(argument);
+                                const bool borrowedAlias = allowAliasParameter && !receiver
+                                    && parameterNV != nullptr
+                                    && parameterNV->TypeAndValue.IsAlias
+                                    && !parameterNV->TypeAndValue.Pointer;
+                                outlives = receiver || borrowedAlias;
+                            }
+                            storageLifetimeActive.erase(storage);
+                            return outlives;
+                        };
+                        const bool localOrTemporary = elementNV.IsRvalue
+                            || elementNV.Storage == nullptr
+                            || PointsIntoStackFrame(elementNV.Storage);
+                        const bool stableStorage = IsProgramLifetimeStorage(elementNV)
+                            || (!localOrTemporary
+                                && storageOutlivesFunction(elementNV.Storage, true));
+                        if (!stableStorage)
+                        {
+                            const std::string fieldName = targetField != nullptr
+                                ? targetField->VariableName
+                                : targetBaseType.empty() ? std::string("<base>") : targetBaseType;
+                            const std::string aggregateType = SpellType(*compiler,
+                                LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                            if (localOrTemporary)
+                                LogErrorContext(element, std::format(
+                                    "cannot return C++ aggregate '{}': reference member '{}' cannot "
+                                    "bind to a local or temporary value",
+                                    aggregateType, fieldName));
+                            else
+                                LogErrorContext(element, std::format(
+                                    "cannot return C++ aggregate '{}': reference member '{}' has "
+                                    "storage whose lifetime cannot be proven to outlive the function",
+                                    aggregateType, fieldName));
+                        }
+                    }
                     llvm::Value* elementValue = elementNV.Primary
                         ? elementNV.Primary : LoadNamedVariable(elementNV);
                     if (elementValue == nullptr && !deferredDefault)
@@ -6860,6 +6814,53 @@ cxx_dtor_ready:
                                 expression->getText(), &suffixedLiteral);
                         TypeUntypedCtorArg(elementNV.TypeAndValue, elementValue,
                             suffixedLiteral ? elementNV.LiteralIdentity : std::string());
+                    }
+                    if (referenceLifetimeOwner != nullptr && targetIsReference
+                        && !deferredDefault && !elementNV.TypeAndValue.IsAlias)
+                    {
+                        const bool sourceIsGlobal = IsProgramLifetimeStorage(elementNV);
+                        auto* referentType = compiler->GetType(elementNV.TypeAndValue);
+                        const bool scalarReferent = referentType != nullptr
+                            && (referentType->isIntegerTy() || referentType->isFloatingPointTy()
+                                || referentType->isPointerTy());
+                        const bool temporarySource = elementNV.IsRvalue
+                            || elementNV.Storage == nullptr
+                            || PointsIntoStackFrame(elementNV.Storage);
+                        if (!sourceIsGlobal && scalarReferent && temporarySource)
+                        {
+                            std::string storageName = "__cflat_refctx_global_reference_temp";
+                            for (size_t suffix = 0;
+                                compiler->module->getNamedValue(storageName) != nullptr; ++suffix)
+                                storageName = std::format(
+                                    "__cflat_refctx_global_reference_temp_{}", suffix + 1);
+                            auto* persistent = new llvm::GlobalVariable(
+                                *compiler->module, referentType, false,
+                                llvm::GlobalValue::InternalLinkage,
+                                llvm::Constant::getNullValue(referentType), storageName,
+                                nullptr, referenceLifetimeOwner->isThreadLocal()
+                                    ? referenceLifetimeOwner->getThreadLocalMode()
+                                    : llvm::GlobalVariable::NotThreadLocal);
+                            const bool sourceUnsigned =
+                                elementNV.TypeAndValue.IsUnsignedInteger() != -1;
+                            compiler->CreateAssignment(elementValue, persistent, sourceUnsigned,
+                                referentType, sourceUnsigned);
+                            elementValue = compiler->builder->CreateLoad(
+                                referentType, persistent, "refctx.global.reference.temp");
+                            elementNV.Storage = persistent;
+                            elementNV.IsCxxPrvalueTemp = false;
+                        }
+                        else if (!sourceIsGlobal)
+                        {
+                            const std::string fieldName = targetField != nullptr
+                                ? targetField->VariableName
+                                : targetBaseType.empty() ? std::string("<base>") : targetBaseType;
+                            LogErrorContext(element, std::format(
+                                "cannot initialize global C++ aggregate '{}': reference member '{}' "
+                                "cannot bind to a non-program-lifetime source because its storage "
+                                "cannot preserve that source's lifetime",
+                                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }),
+                                fieldName));
+                        }
                     }
                     elementNV.Primary = elementValue;
                     elementNV.TypeAndValue.VariableName.clear();
@@ -6896,7 +6897,7 @@ cxx_dtor_ready:
                 }
             };
             const size_t braceReferenceTempMark = compiler->MarkAliasDeclTemps();
-            appendFields(appendFields, declarationBraceList->fieldInit(), braceExpression, true,
+            appendFields(appendFields, list->fieldInit(), braceExpression, true,
                          typeName);
             braceExpression += "}";
             if (!valid) return true;
@@ -6905,7 +6906,7 @@ cxx_dtor_ready:
             std::vector<size_t> forwardedBraceElements;
             if (!compiler->RequestCxxDirectBraceConstructor(
                     typeName, braceElements, braceExpression,
-                    initializer != nullptr && initializer->LeftBrace() != nullptr,
+                    copyListInit,
                     wrapperName, constructorError, true, &forwardedBraceElements,
                     &braceElementTargetTypes))
             {
@@ -6913,7 +6914,7 @@ cxx_dtor_ready:
                     constructorError = std::format(
                         "C++ class '{}' has no constructor accepting this brace list",
                         compiler->DisplayCxxClassName(typeName));
-                LogErrorContext(direct, constructorError);
+                LogErrorContext(errorContext, constructorError);
                 return true;
             }
             LLVMBackend::NamedVariable self;
@@ -6930,10 +6931,218 @@ cxx_dtor_ready:
             // Settle before wrapper-call flushing so the reference-bound prvalue uses the
             // same scope cleanup as a reference local.
             compiler->SettleAliasDeclTemps(braceReferenceTempMark, true);
-            compiler->SetCurrentDebugLocation(line);
+            compiler->SetCurrentDebugLocation(errorContext->getStart()->getLine());
             compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
             return true;
         }
+
+        return false;
+}
+
+bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext* initDeclarator,
+                                             CFlatParser::DirectDeclaratorContext* direct,
+                                             const LLVMBackend::DeclTypeAndValue& declType,
+                                             const std::string& name, size_t line,
+                                             std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList)
+{
+        auto* compiler = Compiler(direct);
+        const std::string typeName = declType.TypeName;
+        const bool hasCxxConstructors = compiler->IsForeignCxxClassWithConstructors(typeName);
+        auto* initializer = initDeclarator->initializer();
+        // Redundant parentheses take the bare initializer's route (in-place elision).
+        auto* assign = CastCallInitializer(UnwrapInitializerParens(
+            initializer != nullptr ? initializer->assignmentExpression() : nullptr));
+        auto* declarationBraceList = initDeclarator->initializerList();
+        if (declarationBraceList == nullptr && initializer != nullptr
+            && initializer->LeftBrace() != nullptr)
+            declarationBraceList = initializer->initializerList();
+        const bool emptyBraceDeclaration =
+            (initDeclarator->LeftBrace() != nullptr
+                && (declarationBraceList == nullptr || declarationBraceList->fieldInit().empty()))
+            || (initializer != nullptr && initializer->LeftBrace() != nullptr
+                && (initializer->initializerList() == nullptr
+                    || initializer->initializerList()->fieldInit().empty()));
+        const bool hasNonemptyDeclarationBrace = declarationBraceList != nullptr
+            && !declarationBraceList->fieldInit().empty();
+        if (!hasCxxConstructors
+            && !(compiler->IsCxxRecord(typeName) && hasNonemptyDeclarationBrace))
+            return false;
+        // `alias T x = ref()` borrows the callee's object: no slot, no constructor, no destructor.
+        if (declType.IsAlias) return false;
+        if (declType.Pointer || declType.ConstArraySize > 0 || !declType.ConstInnerDimensions.empty()
+            || declType.IsArrayView || declType.IsInterface || declType.ArraySize != nullptr)
+            return false;   // pointers and arrays of the class keep the ordinary path
+        if (compiler->RejectUnsupportedCxxLayout(typeName)) return true;
+        if (compiler->RejectAbstractCxxClass(typeName, "declare a local of")) return true;
+
+        // A std.function's signature reaches a lambda in its initializer or constructor
+        // argument, as a function<> declarator's does (`std.function<int(int)> f = (int x) => x;`).
+        LambdaExpectedTypeRestoreGuard stdFunctionLambdaRestore(&lambdaExpectedType);
+        if (const auto* signature = compiler->StdFunctionClosureSignature(typeName))
+            lambdaExpectedType = *signature;
+
+        const auto declarationBraceFields = hasNonemptyDeclarationBrace
+            ? declarationBraceList->fieldInit()
+            : std::vector<CFlatParser::FieldInitContext*>{};
+        const bool hasCxxFieldDesignators = hasNonemptyDeclarationBrace
+            && std::any_of(declarationBraceFields.begin(), declarationBraceFields.end(),
+                [](auto* field) { return field->Identifier() != nullptr; });
+        const bool hasKeyedInitializers = hasNonemptyDeclarationBrace
+            && std::any_of(declarationBraceFields.begin(), declarationBraceFields.end(),
+                [](auto* field) { return field->Colon() != nullptr; });
+        const bool hasCxxReferenceMember = hasCxxFieldDesignators
+            && HasForeignCxxAggregateReferenceMember(typeName, direct);
+        if (hasKeyedInitializers || (hasCxxFieldDesignators
+            && !hasCxxReferenceMember))
+            return false;
+        // Depending on the initializer alternative selected by ANTLR, `default` may be exposed
+        // as the rule token or as a single assignment-expression child.
+        bool isDefaultForm = initializer != nullptr
+            && (initializer->Default() != nullptr
+                || IsDefaultOnlyExpression(initializer->assignmentExpression(), false));
+        if (emptyBraceDeclaration) isDefaultForm = true;
+        auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
+        auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
+
+        // A trivial record can skip construction only when its default constructor is public.
+        auto* directCall = assign != nullptr ? SolePostfixExpression(assign) : nullptr;
+        const std::string directCallText = directCall != nullptr
+            ? directCall->getText() : std::string();
+        const bool directCallReturn = !directCallText.empty()
+            && directCallText.back() == ')'
+            && std::count(directCallText.begin(), directCallText.end(), '(') == 1;
+        if (ctorArgs == nullptr && moveExpr == nullptr
+            && !compiler->IsForeignNontrivialCxxClass(typeName)
+            && !(directCallReturn
+                 && compiler->IsForeignNontrivialCxxReturnClass(typeName)))
+        {
+            const auto* trivial = compiler->GetCxxClassInfo(typeName);
+            const bool fullyTrivial = trivial != nullptr && trivial->hasTrivialDefaultCtor
+                && trivial->hasTrivialCopyCtor && trivial->hasTrivialDtor
+                && !trivial->hasDeletedDefaultCtor
+                && !compiler->HasNonPublicCxxDefaultCtor(typeName);
+            // Only a non-explicit converting ctor (template or one-parameter) can turn an
+            // expression initializer into a construction, decided on the evaluated value below.
+            bool convertingCtor = trivial != nullptr && trivial->hasCtorTemplate;
+            if (trivial != nullptr)
+                for (const auto& ctor : trivial->constructors)
+                {
+                    // One argument: params[0] is 'this'; trailing params need a default.
+                    bool oneArgument = ctor.params.size() >= 2;
+                    for (size_t n = 2; oneArgument && n < ctor.params.size(); ++n)
+                        oneArgument = n < ctor.defaultArgs.size()
+                            && !ctor.defaultArgs[n].kind.empty();
+                    if (oneArgument && !ctor.isExplicit && !ctor.isDeleted
+                        && !ctor.isCopyCtor && !ctor.isMoveCtor && !ctor.isDefaultCtor)
+                        convertingCtor = true;
+                }
+            if ((fullyTrivial && (initializer == nullptr || isDefaultForm)
+                 && !hasNonemptyDeclarationBrace)
+                || (initializer != nullptr && !isDefaultForm
+                    && (assign == nullptr || !convertingCtor) && !hasNonemptyDeclarationBrace))
+                return false;
+        }
+
+        auto badInit = [&](antlr4::ParserRuleContext* where) {
+            LogErrorContext(where, std::format(
+                "cannot initialize C++ class '{}' from this expression; use '{}(args)', "
+                "'= default', a '{}' lvalue, or 'move <{}> lvalue'",
+                compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName)));
+        };
+        // Item 3 of the std.move ruling: a `U&&` result that cannot build T names the reference.
+        auto badRvalueRefInit = [&](antlr4::ParserRuleContext* where,
+                                    const LLVMBackend::NamedVariable& source) {
+            LLVMBackend::TypeAndValue referent = source.TypeAndValue;
+            referent.IsRvalueRef = false;
+            if (referent.Pointer && !referent.ElemPointer) referent.Pointer = false;
+            else if (referent.ElemPointer) referent.ElemPointer = false;
+            LogErrorContext(where, std::format(
+                "cannot initialize C++ class '{}' from the rvalue reference '{}&&' this call "
+                "returns; only a '{}&&' result move-constructs it - use '{}(args)' or "
+                "'move <{}> lvalue'",
+                compiler->DisplayCxxClassName(typeName), SpellDiagnosticType(*compiler, referent),
+                compiler->DisplayCxxClassName(typeName), compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName)));
+        };
+        if (initializer != nullptr && assign == nullptr && !isDefaultForm
+            && !hasNonemptyDeclarationBrace)
+        {
+            badInit(initializer);
+            return true;
+        }
+
+        // The slot is allocated BEFORE anything is evaluated: every form below constructs into it.
+        LLVMBackend::DeclTypeAndValue slotType = declType;
+        slotType.VariableName = name;
+        if (compiler->stackNamedVariable.back().namedVariable.count(name))
+            LogErrorContext(direct, std::format(
+                "redeclaration of '{}' in the same scope; use a different name or assign to the "
+                "existing variable", name));
+        llvm::Value* slotValue = compiler->CreateLocalVariable(slotType, nullptr, nullptr, line,
+                                                               slotType.UserAlignValue);
+        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
+        allocList.push_back(std::pair(name, slot));
+        if (slotValue == nullptr) return true;
+        // The slot is under construction: a const local is still writable by its constructor.
+        LLVMBackend::ConstructingScope constructingSlot(compiler, slotValue);
+        // Plan converting-constructors.md point 1: `T t = u;` is `T t = T(u);` - the converting
+        // constructor builds straight into the slot. False leaves the caller's refusal.
+        auto convertInto = [&](LLVMBackend::NamedVariable source) {
+            // This declaration path does not otherwise attach literal identity to the source.
+            if (source.LiteralIdentity.empty() && assign != nullptr)
+            {
+                bool suffixedLiteral = false;
+                const std::string identity = LLVMBackend::LiteralIdentityForOverload(
+                    assign->getText(), &suffixedLiteral);
+                if (!identity.empty())
+                {
+                    source.LiteralIdentity = identity;
+                    source.LiteralIdentitySuffixed = suffixedLiteral;
+                    source.LiteralSigned = LLVMBackend::LiteralTextHasSign(assign->getText());
+                }
+            }
+            std::string refusal;
+            compiler->SetCurrentDebugLocation(line);
+            switch (compiler->ConvertThroughCxxConvertingCtor(source, typeName, slot, refusal,
+                                                              /*directInit*/ false,
+                                                              /*allowScalarNarrowing*/ true))
+            {
+            case LLVMBackend::CxxConvertingCtorResult::Converted:
+                return true;
+            case LLVMBackend::CxxConvertingCtorResult::Refused:
+                LogErrorContext(assign, std::format(
+                    "cannot initialize C++ class '{}' from this expression; {}",
+                    compiler->DisplayCxxClassName(typeName), refusal));
+                return true;
+            default:
+                return false;
+            }
+        };
+
+        // Nontrivial classes must have a callable destructor; trivial classes need no cleanup.
+        if (compiler->IsForeignNontrivialCxxClass(typeName)
+            && !compiler->HasTrivialCxxDtor(typeName)
+            && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
+        {
+            compiler->TryBindRefusedCxxMember(typeName, "__dtor");
+            if (compiler->GetOrCreateCxxClassDestructor(typeName) != nullptr)
+                goto cxx_dtor_ready;
+            LogErrorContext(direct, std::format(
+                "cannot declare a local of C++ class '{}': it has no destructor cflat can call "
+                "(the destructor is implicit or defined inline in the header) - hold it through a "
+                "pointer instead", compiler->DisplayCxxClassName(typeName)));
+            return true;
+        }
+cxx_dtor_ready:
+
+        // Direct-list initialization uses the shared reference-aware C++ aggregate wrapper.
+        if (declarationBraceList != nullptr && !declarationBraceList->fieldInit().empty())
+            return TryEmitForeignCxxAggregateBraceInit(
+                typeName, declarationBraceList, direct, slotValue,
+                initializer != nullptr && initializer->LeftBrace() != nullptr);
 
         // R5: `unique T* p = <raw T*>` (the keyword's std::unique_ptr<T>) adopts the pointer
         // through unique_ptr(pointer); false leaves the ordinary refusal to the caller.
@@ -9380,6 +9589,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 llvm::Value* aliasStorage = nullptr;
                 std::string aliasSourceName; // root variable an `alias` local binds to
                 bool bindAliasReference = false;
+                bool aliasSourceIsAlias = false;
                 // True when the initializer borrows an element the owning container frees
                 // (`B* g = l.get(0)` on a `list<unique B*>`). A later `delete g` double-frees.
                 bool srcBorrowsOwnedElement = false;
@@ -9647,6 +9857,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 aliasStorage = rightNV.Storage;
                                 aliasSourceName = rightNV.CallerName;
                                 bindAliasReference = true;
+                                aliasSourceIsAlias = rightNV.TypeAndValue.IsAlias;
                             }
                             // Interface decl-init is its OWN branch, so the escape gate in the
                             // else below never sees `IShape s = makeIBox().t;` (it dangled).
@@ -10071,6 +10282,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         rightNV.TypeAndValue.TypeName)
                                     && compiler->IsOwnedTempValue(rightNV))
                                     srcCxxRetTemp = rightNV.Storage;
+                                if (!global_scope && typeAndValue.IsAlias
+                                    && !rightNV.TypeAndValue.IsAlias && rightNV.IsRvalue
+                                    && !rightNV.TypeAndValue.Pointer && rightNV.Storage != nullptr
+                                    && llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                                    && compiler->IsForeignNontrivialCxxClass(
+                                        rightNV.TypeAndValue.TypeName)
+                                    && !compiler->IsOwnedTempValue(rightNV))
+                                    compiler->RegisterOwnedStructTemp(
+                                        rightNV.Storage, rightNV.TypeAndValue.TypeName);
                                 ApplyCallResultBorrowProvenance(compiler, rightNV);
                                 // `static T g = move x;` (same class) move-constructs from x's storage, as clang
                                 // does. A bare name is consumed and must be live; `move *p` consumes the object.
@@ -10280,9 +10500,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && rightNV.Storage != nullptr
                                     && typeAndValue.IsAlias)
                                 {
+                                    if (AliasResultMayBorrowOwnedTemp(compiler, rightNV, ownedTemps.mark))
+                                        LogErrorContext(direct,
+                                            "cannot bind an alias to a reference that may refer to a temporary; bind the temporary to a local first");
                                     aliasStorage = rightNV.Storage;
                                     aliasSourceName = rightNV.CallerName;
                                     bindAliasReference = true;
+                                    aliasSourceIsAlias = rightNV.TypeAndValue.IsAlias;
                                     // A C++ derived lvalue bound to a base alias: adjust the
                                     // address (clang's conversion for a virtual route).
                                     if (!rightNV.TypeAndValue.Pointer
@@ -11913,7 +12137,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             || MangledBase(scalarTypeName) == "dictionary";
                         bool scalarIsAggregate =
                             compiler->GetDataStructure(scalarTypeName).StructType != nullptr;
-                        if (!scalarElements.empty() && scalarIsAggregate)
+                        const bool cxxReferenceAggregate = !typeAndValue.Pointer
+                            && !typeAndValue.ElemPointer && !typeAndValue.IsArrayView
+                            && compiler->IsForeignCxxAggregateClass(scalarTypeName)
+                            && HasForeignCxxAggregateReferenceMember(scalarTypeName, direct);
+                        if (!scalarElements.empty() && scalarIsAggregate && !cxxReferenceAggregate)
                         {
                             bool hasPositional = false;
                             for (auto* fi : scalarElements)
@@ -11945,7 +12173,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     "at global scope; assign fields individually after declaration, or use "
                                     "'= default' to zero-initialize", kindWord, scalarTypeSpelling));
                         }
-                        else if (!scalarElements.empty() && !isContainerType)
+                        else if (!scalarElements.empty() && !isContainerType
+                            && !cxxReferenceAggregate)
                         {
                             /*
                              * The type is neither an aggregate nor a container, so the branch above
@@ -12041,6 +12270,26 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
                         typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly,
                         srcIsUnsigned);
+                    auto* globalBraceList = initializer != nullptr
+                        ? initializer->initializerList() : barebraceList;
+                    const bool globalReferenceBraceInitializer = !externDeclOnly
+                        && global != nullptr && !global->isDeclaration()
+                        && !typeAndValue.Pointer && !typeAndValue.ElemPointer
+                        && !typeAndValue.IsArrayView && !typeAndValue.IsAlias
+                        && typeAndValue.ConstArraySize == 0
+                        && typeAndValue.ConstInnerDimensions.empty()
+                        && globalBraceList != nullptr && !globalBraceList->fieldInit().empty()
+                        && compiler->IsForeignCxxAggregateClass(typeAndValue.TypeName)
+                        && HasForeignCxxAggregateReferenceMember(typeAndValue.TypeName, direct);
+                    if (globalReferenceBraceInitializer)
+                    {
+                        global->setInitializer(llvm::Constant::getNullValue(global->getValueType()));
+                        QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_,
+                            {global, typeAndValue, direct});
+                        pendingGlobalCxxConstructions_.back().BraceInitializer = globalBraceList;
+                        pendingGlobalCxxConstructions_.back().CopyListInit = initializer != nullptr
+                            && initializer->LeftBrace() != nullptr;
+                    }
                     const bool nativeStructDefault = global_scope && explicitZeroDefault
                         && !externDeclOnly && global != nullptr && !global->isDeclaration()
                         && !typeAndValue.Pointer && !typeAndValue.IsArrayView
@@ -12108,7 +12357,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (!externDeclOnly && !typeAndValue.Pointer && !typeAndValue.IsArrayView
                         && !typeAndValue.IsInterface && !typeAndValue.IsAlias
                         && global != nullptr && !global->isDeclaration()
-                        && compiler->CxxElementNeedsDefaultConstruction(typeAndValue.TypeName))
+                        && compiler->CxxElementNeedsDefaultConstruction(typeAndValue.TypeName)
+                        && !globalReferenceBraceInitializer)
                     {
                         // The module initializer runs on ONE thread, so a 'thread_local' object
                         // would be constructed only in the launching thread and zeroed in others.
@@ -12260,11 +12510,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && !compiler->NeedsCxxLoweringType(typeAndValue.TypeName);
                     const bool loweredSretResult = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
+                        && !typeAndValue.IsAlias
                         && (!srcCxxRetTempFromDefault || nativeDefaultCtorResult)
                         && (srcInferredTypeName == typeAndValue.TypeName || nativeDefaultCtorResult)
                         && srcCxxRetTemp == compiler->lastLoweredInPlaceRetTemp_;
                     const bool elideCxxReturn = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
+                        && !typeAndValue.IsAlias
                         && !initializerHasTopLevelMove
                         && (srcInferredTypeName == typeAndValue.TypeName
                             || srcCxxRetTempFromDefault)
@@ -12417,6 +12669,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     // at the statement end as before.
                     compiler->SettleAliasDeclTemps(aliasTemps.mark,
                         bindAliasReference || typeAndValue.Pointer);
+                    if (bindAliasReference && !aliasSourceIsAlias && !typeAndValue.Pointer)
+                        compiler->ExtendCxxStructTempsToScopeSince(
+                            ownedTemps.mark, aliasStorage);
                     // A mutable alias bound to a whole const object (#16); `const alias T` may bind it.
                     if (bindAliasReference && aliasStorage != nullptr && !typeAndValue.Pointer
                         && !typeAndValue.IsConstObject())

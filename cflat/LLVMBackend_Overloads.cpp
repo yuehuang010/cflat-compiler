@@ -5443,6 +5443,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (IsCoreUniqueType(functionName))
                 shownFunctionName = SpellType(*this, TypeAndValue{ .TypeName = functionName });
         }
+        constexpr std::string_view globalOperatorAlias = "__cxx_free.";
+        if (shownFunctionName.starts_with(globalOperatorAlias)
+            && shownFunctionName.substr(globalOperatorAlias.size()).starts_with("operator"))
+            shownFunctionName.erase(0, globalOperatorAlias.size());
 
         // Implicit `copy()` synthesis: a value type with no copy() of its own gets a memberwise
         // one generated on demand (the "every value type has an implicit copy() if undefined"
@@ -9096,6 +9100,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             });
         if (candidate.Recipe.hasLowering && (candidate.IsCxx || cxxClassReturn || cxxClassParam))
         {
+            size_t insertedCxxParamTemps = 0;
             for (size_t i = 0; i < candidate.Recipe.paramSlots.size()
                             && i < candidate.Parameters.size(); ++i)
             {
@@ -9255,7 +9260,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                        "into a by-value parameter",
                                                        CxxConstReceiverKind(matched[i]) != 0)) continue;
                 if (cxxObject && !calleeDestroysCxxParam)
-                    RegisterOwnedStructTemp(temp, pn);
+                {
+                    size_t index = pendingOwnedStructTemps.size();
+                    if (matched[i].HasOwnedStructTempRange)
+                        index = matched[i].OwnedStructTempEnd + insertedCxxParamTemps;
+                    RegisterOwnedCxxParamTempAt(temp, pn, index);
+                    ++insertedCxxParamTemps;
+                }
+                if (useMove && matched[i].IsRvalue)
+                    DestroyMovedCxxArgSourceTemp(matched[i].Storage, temp);
                 cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
                 cxxIndirectArgAddrs[i] = temp;
                 if (matched[i].CxxParamLastUse && !cflatHolder && !matched[i].IsElementAccess

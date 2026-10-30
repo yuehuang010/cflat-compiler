@@ -15,10 +15,23 @@ clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch
    function, no runtime risk); clang refuses both because `&f` is a pointer prvalue. Pre-existing (master refuses too, clang
    accepts): a function template specialization `q.tf<int>` and a ternary `c ? f : g` element. Repros
    scratch/repro_keep/reffn/.
-3. Refused contexts (clear diagnostics; clang accepts): designated C++ aggregate with reference members as a global, as
-   `return { r = x }`, as a call argument `f({ r = x })`, as a CFlat struct field initializer; named fields inside array
-   elements (`{ a = { { r = x, v = 1 }, ... } }`). A bare `nullptr` element in a C++ brace list landed REFFN.
-4. Call-argument C++ temporaries are destroyed in construction order; clang destroys them in reverse:
-   `int z = pick(C(1), C(2)).v;` -> order 12, clang 21.
+3. Refused contexts landed REFCTX (ce8ff8163): global, `return { r = x }`, call argument, CFlat struct field, array
+   element names. Residue (conservative refusals, clang accepts; repros scratch/repro_keep/refctx/): return binding to
+   `*p` or `hp.g` through a raw pointer parameter (pointee lifetime untracked), a global binding `{ p = *gptr }`, a
+   global whose referent is a non-scalar temporary (clang 73), a field default binding another field of the frame
+   (clang 9). Pre-existing: a named local aggregate returned (r12) and a nested explicit brace field (f04) escape the
+   return gate; a lambda returning the aggregate lacks return-type inference (r13).
+4. Full-expression temp destruction order landed DTORORD (b4466d12f). Pre-existing residue found by its reviews (master
+   behaves the same; repros scratch/repro_keep/dtorord/):
+   - Alias of a temporary landed ALIASTMP (8ad5ea039): the temp is extended to scope end; an alias of a reference that may
+     come from a temporary is refused. NEEDS RULING: the refusal is conservative for opaque C++ functions - `alias r =
+     pickref(C(2), 0)` returning a reference to a global is valid in clang (7) but refused; options: honour clang's
+     `lifetimebound`, or inspect the inline body. Pre-existing: `alias r = *C(6).ptr();` (raw-pointer provenance) dangles.
+     Repros scratch/repro_keep/aliastmp/.
+   - A by-value copy of an lvalue is never destroyed when a later constructor in the same call throws (thrlv: 3210,
+     clang 13210).
+   - A conditional prvalue into a by-value param makes an extra moved copy clang elides (condbv 131, clang 31).
+   - A by-value param that goes through the generated C++ wrapper (`bv1(C(1)) + ref2(C(2), C(3))`) is destroyed inside
+     the call (132, clang 321).
+   - A conditional mixing a prvalue and an lvalue arm (`c ? D(1) : y`) is refused; clang accepts.
 
-Fix direction: item 4 in the full-expression temp ledger flush order.
