@@ -1,26 +1,17 @@
-# P3: Remaining C++ free-operator and converting-constructor retry gaps
+# P3: C++ compound-operator result leftovers after OPFREE
 
-This file now tracks only the D3 review findings not fixed in D6. The original pointer-return
-method and `operator->` retry gap is fixed in D6 by requesting an opaque pointer's unrequested
-class-template pointee when that member is projected on use. Pointer-returning member `operator*=`
-expressions now preserve their declared pointer result type. See `scratch/d6_matrix.md` and
-`scratch/briefs/d6_report.md` for measured probes and legs.
+OPFREE (f13122adf) fixed the global free operator returning a class-template specialization, base-declared free operators on a
+derived receiver, and different-type reference results of compound assignment (alias of the returned object). Finding 4 (copy-init
+through a converting constructor) did not reproduce; master already matched clang. Queue ruling 2026-10-24 stands: no
+`a = a @ b` fallback on C++ classes. Probes and oracles: scratch/repro_keep/opfree/. clang++ -std=c++20 is the oracle.
 
-## Remaining findings
+## Remaining (pre-existing; master behaves the same)
 
-- A global-namespace class with a free operator returning a class-template specialization is still
-  refused for both `*=` and binary `*`. D6 probes `global_compound.cb` and `c_GB.cb` still fail on
-  the post-fix compiler with the same errors as master. The issue is in global free-operator lookup
-  and binding, outside the member-signature lazy retry path.
-- A free operator declared on a base class was reported refused for a derived receiver, including
-  a plain-return control on master. The copied D3 fixture's analogous specialization-return and
-  plain-return compound operators (`base_free_compound.cb`, `c_KD2.cb`) both pass on master and
-  post-fix; the exact failing D3 spelling still needs a focused repro before changing overload
-  candidate selection.
-- A free or member compound-assignment expression such as `(a *= x).get()` can use the wrong
-  declared result type for reference returns. D6 fixed pointer-return member `operator*=` result
-  propagation (leg 7562), but `ok_Aexpr.cb` and `ns_free_compound.cb` still fail for reference
-  result types. This expression-result path needs separate review.
-- `op3.W d = a * 3.0` still reports the incorrect `cannot cast an aggregate value` diagnostic while
-  explicit `op3.W(a * 3.0)` succeeds. D6 measured the pair in `op3_convert.cb` and `op3_direct.cb`;
-  aggregate converting-constructor resolution is a separate path.
+- A SAME-type reference result is a copy, not an alias: member `M& operator*=(int)` or free `F& operator+=(F&, int)` with
+  `(a *= 3).bump()` mutates a copy (CFlat 1, clang 0); chained `(a *= 2) *= 3` and an operator returning a reference to a
+  DIFFERENT object of the same type (`(a += 3).get()` reads `a`) behave the same. Cause: the alias branch in
+  MainListener_Expressions.cpp (~8610) only fires when the result type differs from the destination type; same-type results
+  re-read the destination.
+- A global MEMBER compound operator returning a specialization reference (`GB<int>& GB<int>::operator+=(int)`) is still refused
+  by the member-signature eligibility gate.
+- The ambiguity diagnostic for global free operators prints the internal name `__cxx_free.operator*`.

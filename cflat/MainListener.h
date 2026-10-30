@@ -7561,6 +7561,8 @@ private:
     std::unordered_map<std::string, std::vector<std::string>>&                  genericStructTypeParams;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericStructValueParams;
     std::unordered_set<std::string>&                                            instantiatedGenerics;
+    std::unordered_map<std::string, std::vector<CFlatParser::FunctionDefinitionContext*>>
+        failedAggregateMethodBodies_;
     // Constraints: templateName -> { typeParamName -> [requiredInterface, ...] }
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericStructConstraints;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericClassConstraints;
@@ -7586,10 +7588,12 @@ private:
         CFlatParser::DestructorDefinitionContext* destructor = nullptr;
         std::string ownerName;
         std::string templateName;
+        std::string declaringNamespace;
         std::string nameOverride;
         bool suppliesNoArgCtor = false;
         size_t cppCtorIndex = SIZE_MAX;
         bool hasExplicitNoArgCtor = false;
+        bool waitForEnclosingLayout = false;
         TypeSubstitutionMap typeSubstitutions;
         std::unordered_map<std::string, std::string> valueSubstitutions;
         std::unordered_map<std::string, std::vector<std::string>> packSubstitutions;
@@ -7600,8 +7604,8 @@ private:
         antlr4::ParserRuleContext* aggregate, const std::string& ownerName,
         DeferredGenericMemberKind kind, const std::string& nameOverride = {},
         bool suppliesNoArgCtor = false, size_t cppCtorIndex = SIZE_MAX,
-        bool hasExplicitNoArgCtor = false);
-    void ProcessDeferredGenericMemberBodies();
+        bool hasExplicitNoArgCtor = false, bool waitForEnclosingLayout = false);
+    void ProcessDeferredGenericMemberBodies(size_t first = 0, bool enclosingLayoutReady = false);
 
     // True while monomorphizing a generic template body. The body's tokens come from the
     // template's own file (e.g. core/list.cb), but currentSourceFilePath_ is the use-site
@@ -8427,6 +8431,9 @@ public:
     // Owner struct of a generic template keyed "Owner.method", or "" when the template is a
     // free function or a static member (a static has no receiver, so it stays free-shaped).
     std::string GenericMethodOwner(const std::string& baseName, CFlatParser::FunctionDefinitionContext* tmplCtx);
+    // Declaring aggregate of a generic member template, including static templates.
+    std::string GenericMemberTemplateOwner(const std::string& baseName,
+        CFlatParser::FunctionDefinitionContext* tmplCtx);
 
     // Template key for a generic method called on a receiver ("Holder" + "get" -> "Holder.get"),
     // or "" when the receiver's type declares no such template.
@@ -8810,6 +8817,11 @@ public:
         bool varargs,
         size_t line,
         bool isMethod = false);
+
+    std::string InterfaceDefaultWrapperFunctionName(
+        const std::string& interfaceName, const std::string& methodName) const;
+    void GenerateInterfaceDefaultParamOverloads(
+        const std::string& interfaceName, CFlatParser::InterfaceMethodContext* method);
 
     // Tri-state evaluate an `if const` condition for the active instantiation WITHOUT emitting
     // code: 1 (taken), 0 (not taken), -1 (not a compile-time constant / cannot decide). A valid
@@ -10665,7 +10677,8 @@ public:
         // operand's own cv as a call argument is. Every C++-reachable caller passes both.
         int lhsObjectCv = 0, int rhsObjectCv = 0,
         // An alias-returned native struct is already an addressable receiver, not a value to copy.
-        bool lhsIsAlias = false);
+        bool lhsIsAlias = false,
+        bool refuseConstWriteOnNoViable = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

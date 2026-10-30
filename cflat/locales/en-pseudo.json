@@ -20,6 +20,11 @@
       "'alignas(0, 32)'",
       "64"
     ],
+    "ambiguouscalltoarg0a...parametertypeyoumean5f78cd7f67640af3": [
+      "IOvDefaultAmbiguous",
+      "h",
+      "IOvDefaultAmbiguous.h(int), IOvDefaultAmbiguous.h(int, int)"
+    ],
     "ambiguouscalltoarg0n...achelperthatpicksone1dc49999f19f6b0a": [
       "cpppa.rk_qn",
       "cpppa.rk_qn(cpppa.RkW*), cpppa.rk_qn(const cpppa.RkW*)"
@@ -1967,6 +1972,7 @@
     "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": "'alignas' is not supported on a 'new T[n]' stored into 'array<T>': the array frees its buffer through the plain deallocator",
     "alignmentmismatchini...ntthevaluealreadyhas5a4ed9c3ad1bf980": "alignment mismatch initializing '{0}': the declared type allocates at {1}, but the value was allocated {2}. Allocate the value with the matching 'alignas(0, {3})' clause, or declare the receiver with the alignment the value already has.",
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
+    "ambiguouscalltoarg0a...parametertypeyoumean5f78cd7f67640af3": "ambiguous call to '{0}.{1}': no candidate ranks better than the others: {2}. Cast the argument to the parameter type you mean.",
     "ambiguouscalltoarg0n...achelperthatpicksone1dc49999f19f6b0a": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. They differ only in const, which a CFlat argument does not carry; call it through a C++ helper that picks one.",
     "ambiguouscalltoarg0n...parametertypeyoumean6524b093d1fa9da7": "ambiguous call to '{0}': no candidate ranks better than the others: {1}. Cast the argument to the parameter type you mean.",
     "ambiguousoverloadofa...chesfunctiontypearg11fa395df3076d85e": "ambiguous overload of '{0}' matches function type '{1}'",

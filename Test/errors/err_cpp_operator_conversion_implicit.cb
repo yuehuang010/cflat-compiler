@@ -56,5 +56,9 @@ extern int main()
         cppas.ObRankFloatInt q = default;
         int v = obRankLongOrDouble(q);
     }
+    expect_error("declared explicit, so it is not offered as an implicit conversion") {
+        cppi_opfree_ns.ConvertA a = cppi_opfree_ns.ConvertA(5);
+        cppi_opfree_ns.ConvertExplicitW w = a * 3.0;
+    }
     return 0;
 }

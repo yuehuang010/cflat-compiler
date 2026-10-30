@@ -4748,41 +4748,146 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
 
 int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const std::string& methodName,
         const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
-        std::vector<NamedVariable>& matchedArgs)
+        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot)
 {
         matchedArgs = args;
+        fallbackDefaultSlot = -1;
         const std::string displayIface = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
+        auto sameParameterShape = [](const TypeAndValue& left, const TypeAndValue& right) {
+            return left.TypeName == right.TypeName && left.Pointer == right.Pointer
+                && left.ElemPointer == right.ElemPointer && left.PointerDepth == right.PointerDepth
+                && left.ConstMask == right.ConstMask && left.IsAlias == right.IsAlias
+                && left.IsRvalueRef == right.IsRvalueRef && left.IsMove == right.IsMove
+                && left.IsArrayView == right.IsArrayView && left.IsInterface == right.IsInterface
+                && left.IsFunctionPointer == right.IsFunctionPointer;
+        };
+        auto sameMethodSignature = [&](const InterfaceMethod& left, const InterfaceMethod& right) {
+            if (left.Parameters.size() != right.Parameters.size()) return false;
+            for (size_t i = 0; i < left.Parameters.size(); ++i)
+                if (!sameParameterShape(left.Parameters[i], right.Parameters[i])) return false;
+            return true;
+        };
 
+        size_t inheritedCount = 0;
+        if (auto parents = interfaceParents.find(ResolveInterfaceName(ifaceName));
+            parents != interfaceParents.end())
+            for (const auto& parentName : parents->second)
+                if (const auto* parentMethods = FindInterface(parentName))
+                    inheritedCount += parentMethods->size();
+
+        std::vector<int> allByName;
+        std::vector<int> ownByName;
+        for (int i = 0; i < static_cast<int>(methods.size()); ++i)
+            if (methods[i].Name == methodName)
+            {
+                allByName.push_back(i);
+                if (static_cast<size_t>(i) >= inheritedCount)
+                    ownByName.push_back(i);
+            }
         std::vector<int> byName;
-        for (int i = 0; i < (int)methods.size(); i++)
-            if (methods[i].Name == methodName) byName.push_back(i);
-
+        for (int inheritedIdx : allByName)
+        {
+            const bool redeclared = static_cast<size_t>(inheritedIdx) < inheritedCount
+                && std::any_of(ownByName.begin(), ownByName.end(), [&](int ownIdx) {
+                    return sameMethodSignature(methods[inheritedIdx], methods[ownIdx]);
+                });
+            if (!redeclared) byName.push_back(inheritedIdx);
+        }
         if (byName.empty())
         {
             LogErrorMessage("interface '{}' has no method '{}'", { displayIface, methodName });
             return -1;
         }
 
-        // A variadic interface method is rejected at its declaration (no vtable lowering exists
-        // for '...'), so every slot here has a fixed parameter list and arity is exact.
-        std::vector<int> byArity;
+        auto helperSet = [&](const InterfaceMethod& method) -> const std::vector<FunctionSymbol>* {
+            if (method.DefaultWrapperName.empty()) return nullptr;
+            auto it = functionTable.find(method.DefaultWrapperName);
+            return it == functionTable.end() ? nullptr : &it->second;
+        };
+        auto helperMatchesMethod = [&](const FunctionSymbol& helper, const InterfaceMethod& method) {
+            if (helper.IsMethod || helper.Parameters.empty()
+                || helper.Parameters.size() > method.Parameters.size() + 1)
+                return false;
+            for (size_t i = 1; i < helper.Parameters.size(); ++i)
+                if (!sameParameterShape(helper.Parameters[i], method.Parameters[i - 1]))
+                    return false;
+            return true;
+        };
+
+        std::vector<size_t> availableArities;
+        std::vector<int> exactSlots;
+        std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates;
         for (int idx : byName)
-            if (methods[idx].Parameters.size() == args.size()) byArity.push_back(idx);
-
-        if (byArity.empty())
         {
-            // Distinct arities only: same-arity overloads differ by TYPE, and listing "1 or 1"
-            // would read as nonsense. Sorted so the list is stable across declaration order.
-            std::vector<size_t> arities;
-            for (int idx : byName) arities.push_back(methods[idx].Parameters.size());
-            std::sort(arities.begin(), arities.end());
-            arities.erase(std::unique(arities.begin(), arities.end()), arities.end());
-
-            std::string expected;
-            for (size_t i = 0; i < arities.size(); i++)
+            const InterfaceMethod& method = methods[idx];
+            availableArities.push_back(method.Parameters.size());
+            if (method.Parameters.size() == args.size())
             {
-                if (i > 0) expected += (i + 1 == arities.size()) ? " or " : ", ";
-                expected += std::to_string(arities[i]);
+                exactSlots.push_back(idx);
+                std::vector<NamedVariable> matched = args.empty()
+                    ? args : MatchFunction(args, method.Parameters, false, true);
+                if (!args.empty() && matched.empty()) continue;
+
+                FunctionSymbol sym;
+                sym.UniqueName = std::to_string(idx);
+                sym.SourceName = displayIface + "." + methodName;
+                sym.ReturnType = method.ReturnType;
+                sym.Parameters = method.Parameters;
+                candidates.emplace_back(std::move(matched), std::move(sym));
+                continue;
+            }
+
+            const auto* helpers = helperSet(method);
+            if (helpers == nullptr || args.size() >= method.Parameters.size()) continue;
+            for (const FunctionSymbol& helper : *helpers)
+            {
+                if (!helperMatchesMethod(helper, method)) continue;
+                const size_t helperArity = helper.Parameters.size() - 1;
+                availableArities.push_back(helperArity);
+                if (helperArity != args.size()) continue;
+                if (fallbackDefaultSlot < 0) fallbackDefaultSlot = idx;
+
+                std::vector<TypeAndValue> helperParams(helper.Parameters.begin() + 1,
+                                                       helper.Parameters.end());
+                std::vector<NamedVariable> matched = args.empty()
+                    ? args : MatchFunction(args, helperParams, false, true);
+                if (!args.empty() && matched.empty()) continue;
+
+                FunctionSymbol sym;
+                sym.UniqueName = std::to_string(idx);
+                sym.SourceName = displayIface + "." + methodName;
+                sym.ReturnType = method.ReturnType;
+                sym.Parameters = std::move(helperParams);
+                candidates.emplace_back(std::move(matched), std::move(sym));
+            }
+        }
+
+        if (candidates.empty())
+        {
+            if (fallbackDefaultSlot >= 0)
+                return -1;
+            if (!exactSlots.empty())
+            {
+                const int idx = exactSlots.front();
+                if (!args.empty())
+                {
+                    auto matched = MatchFunction(args, methods[idx].Parameters);
+                    if (!matched.empty()) matchedArgs = matched;
+                }
+                if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
+                                                          methods[idx].Parameters))
+                    return -1;
+                return idx;
+            }
+
+            std::sort(availableArities.begin(), availableArities.end());
+            availableArities.erase(std::unique(availableArities.begin(), availableArities.end()),
+                                   availableArities.end());
+            std::string expected;
+            for (size_t i = 0; i < availableArities.size(); ++i)
+            {
+                if (i > 0) expected += (i + 1 == availableArities.size()) ? " or " : ", ";
+                expected += std::to_string(availableArities[i]);
             }
             LogErrorMessage(
                 "no overload of interface method '{}.{}' takes {} argument(s); expected {}",
@@ -4790,88 +4895,71 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
             return -1;
         }
 
-        if (byArity.size() == 1)
+        std::vector<FunctionSymbol> tiedCandidates;
+        const auto& [scored, winner] = ComputeOverloadFunction(candidates, &tiedCandidates);
+        std::vector<int> ambiguousSlots;
+        for (const auto& tied : tiedCandidates)
         {
-            // Route a single match through MatchFunction anyway so a named argument
-            // (`f(count: n)`) still lands in its declared slot.
-            if (!args.empty())
+            const int idx = std::stoi(tied.UniqueName);
+            if (std::find(ambiguousSlots.begin(), ambiguousSlots.end(), idx) == ambiguousSlots.end())
+                ambiguousSlots.push_back(idx);
+        }
+        const int winnerIdx = winner.UniqueName.empty() ? -1 : std::stoi(winner.UniqueName);
+        for (size_t i = 0; winnerIdx >= 0 && i < candidates.size(); ++i)
+            for (size_t j = i + 1; j < candidates.size(); ++j)
             {
-                auto matched = MatchFunction(args, methods[byArity[0]].Parameters);
-                if (!matched.empty()) matchedArgs = matched;
+                const int leftIdx = std::stoi(candidates[i].second.UniqueName);
+                const int rightIdx = std::stoi(candidates[j].second.UniqueName);
+                if (winnerIdx != leftIdx && winnerIdx != rightIdx) continue;
+                if (methods[leftIdx].Parameters.size() == args.size()
+                    && methods[rightIdx].Parameters.size() == args.size())
+                    continue;
+                bool sameCallTypes = true;
+                for (size_t argIdx = 0; argIdx < args.size(); ++argIdx)
+                    if (!sameParameterShape(methods[leftIdx].Parameters[argIdx],
+                                            methods[rightIdx].Parameters[argIdx]))
+                    {
+                        sameCallTypes = false;
+                        break;
+                    }
+                if (!sameCallTypes) continue;
+                for (int idx : { leftIdx, rightIdx })
+                    if (std::find(ambiguousSlots.begin(), ambiguousSlots.end(), idx)
+                        == ambiguousSlots.end())
+                        ambiguousSlots.push_back(idx);
             }
-            // The lone slot was taken on ARITY alone, so an `int` reached a closure slot and
-            // was called. Reject only a PROVABLE mismatch (LogError does not return).
-            if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
-                    methods[byArity[0]].Parameters))
-                return -1;
-            return byArity[0];
-        }
 
-        std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates;
-        for (int idx : byArity)
+        if (!ambiguousSlots.empty())
         {
-            std::vector<NamedVariable> matched;
-            if (!args.empty())
+            std::string candidateList;
+            for (int idx : ambiguousSlots)
             {
-                matched = MatchFunction(args, methods[idx].Parameters, false, true);
-                if (matched.empty()) continue;
+                std::string params;
+                for (const auto& param : methods[idx].Parameters)
+                    params += (params.empty() ? "" : ", ") + SpellType(*this, param);
+                candidateList += (candidateList.empty() ? "" : ", ")
+                    + displayIface + "." + methodName + "(" + params + ")";
             }
-            FunctionSymbol sym;
-            sym.UniqueName = std::to_string(idx);   // slot index carrier; also the "matched" marker
-            sym.ReturnType = methods[idx].ReturnType;
-            sym.Parameters = methods[idx].Parameters;
-            candidates.emplace_back(matched, sym);
-        }
-
-        const auto& [scored, winner] = ComputeOverloadFunction(candidates);
-        if (!winner.UniqueName.empty())
-        {
-            if (!scored.empty()) matchedArgs = scored;
-            return std::stoi(winner.UniqueName);
-        }
-
-        // Same arity, no type winner: keep the historical first-slot pick rather than reject a
-        // program the scorer cannot rank (an unresolved generic argument lands here).
-        int fallbackIdx = byArity[0];
-        if (!args.empty())
-        {
-            // Nothing scored, so re-run only candidates whose parameter names bind. A different
-            // slot may fail on names while the slot the caller meant fails on types; replaying the
-            // first slot unconditionally would report the wrong cause. An all-positional call
-            // binds every slot by construction.
-            std::vector<std::string> argumentNames;
-            argumentNames.reserve(args.size());
-            for (const auto& arg : args)
-                argumentNames.push_back(arg.TypeAndValue.VariableName);
-            bool replayedNameMatch = false;
-            bool permutedMatchedArgs = false;
-            for (int idx : byArity)
-            {
-                auto binding = ComputeArgumentPositions(argumentNames, methods[idx].Parameters, false);
-                if (!binding.Ok) continue;
-                replayedNameMatch = true;
-                if (!permutedMatchedArgs)
-                    fallbackIdx = idx;
-                MatchFunction(args, methods[idx].Parameters, false, false);
-                if (!permutedMatchedArgs)
-                {
-                    matchedArgs = MatchFunction(args, methods[idx].Parameters);
-                    permutedMatchedArgs = true;
-                }
-            }
-            if (!replayedNameMatch)
-                MatchFunction(args, methods[byArity[0]].Parameters, false, false);
-
-            // The fallback slot still needs its permutation - matchedArgs is raw call order,
-            // so without this a reordered named call would bind its arguments backwards. The
-            // first name-valid slot is the one the replay just established as intended.
-        }
-        // Same provable-mismatch gate as the lone-slot arm above: without it, adding a second
-        // same-arity overload turns that arm's clean error back into a silent miscompile.
-        if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
-                methods[fallbackIdx].Parameters))
+            LogErrorMessage(
+                "ambiguous call to '{}.{}': no candidate ranks better than the others: {}. "
+                "Cast the argument to the parameter type you mean.",
+                { displayIface, methodName, candidateList });
             return -1;
-        return fallbackIdx;
+        }
+
+        int selectedIdx = winner.UniqueName.empty()
+            ? std::stoi(candidates.front().second.UniqueName) : std::stoi(winner.UniqueName);
+        if (!scored.empty())
+            matchedArgs = scored;
+        else if (!candidates.front().first.empty())
+            matchedArgs = candidates.front().first;
+
+        const InterfaceMethod& selected = methods[selectedIdx];
+        if (args.size() == selected.Parameters.size()
+            && DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
+                                                     selected.Parameters))
+            return -1;
+        return selectedIdx;
     }
 
 llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
@@ -4901,12 +4989,41 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             return nullptr;
         }
 
+        const std::string displayMethod = SpellType(*this, TypeAndValue{ .TypeName = ifaceName })
+            + "." + methodName;
+        auto callDefaultWrapper = [&](const InterfaceMethod& wrapperMethod) {
+            NamedVariable ifaceArg = userReceiver != nullptr ? *userReceiver : NamedVariable{};
+            ifaceArg.TypeAndValue.TypeName = ifaceName;
+            ifaceArg.TypeAndValue.Pointer = false;
+            ifaceArg.TypeAndValue.ElemPointer = false;
+            ifaceArg.TypeAndValue.IsInterface = true;
+            ifaceArg.TypeAndValue.IsInterfacePointer = false;
+            ifaceArg.TypeAndValue.VariableName.clear();
+            ifaceArg.IsThisReceiver = true;
+            ifaceArg.Primary = builder->CreateLoad(fatTy, ifacePtr, "iface_default_receiver");
+            ifaceArg.BaseType = fatTy;
+            ifaceArg.Storage = ifacePtr;
+
+            std::vector<NamedVariable> helperArgs;
+            helperArgs.reserve(extraArgNVs.size() + 1);
+            helperArgs.push_back(std::move(ifaceArg));
+            helperArgs.insert(helperArgs.end(), extraArgNVs.begin(), extraArgNVs.end());
+            return CreateOverloadedFunctionCall(wrapperMethod.DefaultWrapperName, helperArgs,
+                                                false, displayMethod);
+        };
         std::vector<NamedVariable> callArgNVs;
+        int fallbackDefaultSlot = -1;
         int methodIdx = ResolveInterfaceMethodSlot(ifaceName, methodName, *ifaceMethods,
-                                                   extraArgNVs, callArgNVs);
+                                                   extraArgNVs, callArgNVs, fallbackDefaultSlot);
         if (methodIdx < 0)
+        {
+            if (fallbackDefaultSlot >= 0)
+                return callDefaultWrapper((*ifaceMethods)[fallbackDefaultSlot]);
             return nullptr;
+        }
         const InterfaceMethod* methodInfo = &(*ifaceMethods)[methodIdx];
+        if (extraArgNVs.size() < methodInfo->Parameters.size())
+            return callDefaultWrapper(*methodInfo);
         if (userReceiver != nullptr && !methodInfo->IsConst)
             RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName);
 

@@ -3245,6 +3245,41 @@ struct LitOverloadHolder
 };
 T litListFirst<T>(list<T> values) { return values.get(0); }
 
+struct GenOvlA { int value = default; };
+int genOvlPtrGenericFirst<T>(T* value) { return 9; }
+int genOvlPtrGenericFirst(double* value) { return 2; }
+int genOvlPtrGenericFirst(float* value) { return 3; }
+int genOvlPtrConcreteFirst(double* value) { return 2; }
+int genOvlPtrConcreteFirst(float* value) { return 3; }
+int genOvlPtrConcreteFirst<T>(T* value) { return 9; }
+int genOvlValueGenericFirst<T>(T value) { return 9; }
+int genOvlValueGenericFirst(int value) { return 1; }
+int genOvlValueGenericFirst(long value) { return 2; }
+int genOvlValueConcreteFirst(int value) { return 1; }
+int genOvlValueConcreteFirst(long value) { return 2; }
+int genOvlValueConcreteFirst<T>(T value) { return 9; }
+int genOvlPairGenericFirst<T, U>(T first, U second) { return 9; }
+int genOvlPairGenericFirst(int first, double second) { return 1; }
+int genOvlPairGenericFirst(long first, long second) { return 2; }
+int genOvlPairConcreteFirst(int first, double second) { return 1; }
+int genOvlPairConcreteFirst(long first, long second) { return 2; }
+int genOvlPairConcreteFirst<T, U>(T first, U second) { return 9; }
+namespace GenOvlPtrGenericFirst
+{
+    int select<T>(T* value) { return 9; }
+    int select(double* value) { return 2; }
+    int select(float* value) { return 3; }
+}
+namespace GenOvlPtrConcreteFirst
+{
+    int select(double* value) { return 2; }
+    int select(float* value) { return 3; }
+    int select<T>(T* value) { return 9; }
+}
+struct GenOvlTakeConcrete { int value = default; };
+int take(GenOvlTakeConcrete value) { return value.value; }
+int take<T>(list<T>* values, int index) { return values->get(index).value; }
+
 bool testGenericArgInference()
 {
     bool result = true;
@@ -3297,6 +3332,42 @@ bool testGenericArgInference()
     litValues.add(9);
     result &= Test("lit_list_param_sz", (int)sizeof(litListFirst(litValues)) * 100
         + litListFirst(litValues), 409);
+
+    int genOvlInt = 7;
+    int* genOvlIntPtr = &genOvlInt;
+    GenOvlA genOvlObject = default;
+    GenOvlA* genOvlStructPtr = &genOvlObject;
+    u8 genOvlByte = 7;
+    u8* genOvlBytePtr = &genOvlByte;
+    const int* genOvlConstPtr = &genOvlInt;
+    int[] genOvlArrayView = { 7, 8 };
+    result &= Test("genovl_ptr_generic_first_int", genOvlPtrGenericFirst(genOvlIntPtr), 9);
+    result &= Test("genovl_ptr_generic_first_struct", genOvlPtrGenericFirst(genOvlStructPtr), 9);
+    result &= Test("genovl_ptr_generic_first_u8", genOvlPtrGenericFirst(genOvlBytePtr), 9);
+    result &= Test("genovl_ptr_generic_first_const", genOvlPtrGenericFirst(genOvlConstPtr), 9);
+    result &= Test("genovl_ptr_generic_first_view", genOvlPtrGenericFirst(genOvlArrayView), 9);
+    result &= Test("genovl_ptr_concrete_first_int", genOvlPtrConcreteFirst(genOvlIntPtr), 9);
+    result &= Test("genovl_ptr_concrete_first_struct", genOvlPtrConcreteFirst(genOvlStructPtr), 9);
+    result &= Test("genovl_ptr_concrete_first_u8", genOvlPtrConcreteFirst(genOvlBytePtr), 9);
+    result &= Test("genovl_ptr_concrete_first_const", genOvlPtrConcreteFirst(genOvlConstPtr), 9);
+    result &= Test("genovl_ptr_concrete_first_view", genOvlPtrConcreteFirst(genOvlArrayView), 9);
+    double genOvlDouble = 7.5;
+    result &= Test("genovl_value_generic_first_double", genOvlValueGenericFirst(genOvlDouble), 9);
+    result &= Test("genovl_value_concrete_first_double", genOvlValueConcreteFirst(genOvlDouble), 9);
+    int genOvlPairInt = 7;
+    double genOvlPairDouble = 7.5;
+    result &= Test("genovl_pair_generic_first_double_int",
+        genOvlPairGenericFirst(genOvlPairDouble, genOvlPairInt), 9);
+    result &= Test("genovl_pair_concrete_first_double_int",
+        genOvlPairConcreteFirst(genOvlPairDouble, genOvlPairInt), 9);
+    result &= Test("genovl_namespace_generic_first",
+        GenOvlPtrGenericFirst.select(genOvlIntPtr), 9);
+    result &= Test("genovl_namespace_concrete_first",
+        GenOvlPtrConcreteFirst.select(genOvlIntPtr), 9);
+    list<int> genOvlTakeList = default;
+    genOvlTakeList.add(43);
+    result &= Test("genovl_member_skips_same_named_free_generic",
+        genOvlTakeList.take(0), 43);
     return result;
 }
 

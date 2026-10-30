@@ -4685,6 +4685,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     interfaceVar = {};
                                     break;
                                 }
+                                if (followedByGenericTypeParameters && !isFileAlias
+                                    && (genericStructTemplates.count(qualifiedName) != 0
+                                        || genericClassTemplates.count(qualifiedName) != 0))
+                                {
+                                    primaryIdentifier = memberName;
+                                    namedVar = {};
+                                    structVar = {};
+                                    interfaceVar = {};
+                                    break;
+                                }
                                 // A bound C++ OBJECT can never take template arguments: the grammar
                                 // read a '<' comparison as a generic parameter list.
                                 if (followedByGenericTypeParameters
@@ -6125,6 +6135,43 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     dynamic_cast<antlr4::ParserRuleContext*>(parseTree));
                                 namesEnclosingMethod = HasCFlatMemberMethod(owner, idName);
                             }
+                            std::string lexicalAggregateType;
+                            if (prevPrimary->genericIdentifier()->genericTypeParameters() == nullptr
+                                && followedByDot && !aliasNameIsVariable && !localTypeMember)
+                            {
+                                const std::string genericFunctionName =
+                                    Compiler(ctx)->ResolveGenericFunctionBase(qualifiedName);
+                                const bool namesFunction = Compiler(ctx)->GetFunction(qualifiedName) != nullptr
+                                    || Compiler(ctx)->GetFunction(idName) != nullptr
+                                    || Compiler(ctx)->GetReturnBlock(qualifiedName) != nullptr
+                                    || Compiler(ctx)->GetReturnBlock(idName) != nullptr
+                                    || genericFunctionTemplates.count(genericFunctionName) != 0
+                                    || Compiler(ctx)->HasCxxFunctionTemplate(qualifiedName)
+                                    || Compiler(ctx)->HasCxxFunctionTemplate(idName)
+                                    || Compiler(ctx)->IsCxxFunctionMacro(idName);
+                                if (!namesFunction)
+                                {
+                                    const auto thisVar = Compiler(ctx)->GetThisPointer();
+                                    std::string scope = !thisVar.TypeAndValue.TypeName.empty()
+                                        ? thisVar.TypeAndValue.TypeName
+                                        : !structScopeStack.empty() ? structScopeStack.back()
+                                        : EnclosingAggregateScopeFromContext(Compiler(ctx), parseTree);
+                                    std::unordered_set<std::string> visited;
+                                    while (!scope.empty() && visited.insert(scope).second)
+                                    {
+                                        const std::string candidate = scope + "." + idName;
+                                        if (Compiler(ctx)->IsDataStructure(candidate))
+                                        {
+                                            lexicalAggregateType = candidate;
+                                            break;
+                                        }
+                                        auto parent = aggregateParentScopes_.find(scope);
+                                        if (parent == aggregateParentScopes_.end() || parent->second == scope)
+                                            break;
+                                        scope = parent->second;
+                                    }
+                                }
+                            }
                             if (!namesEnclosingMethod
                                 && (Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
                                 && (!nameIsVariable || localTypeMember) && !defaultedCxxBaseAlias)
@@ -6135,8 +6182,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 structVar = {};
                             }
                             else if (prevPrimary->genericIdentifier()->genericTypeParameters() == nullptr
-                                     && Compiler(ctx)->IsDataStructure(
-                                         Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText()))
+                                     && (Compiler(ctx)->IsDataStructure(qualifiedName)
+                                         || !lexicalAggregateType.empty())
                                      && !namesEnclosingMethod
                                      && (localTypeMember
                                          || (Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
@@ -6145,7 +6192,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 // Type name used as qualifier for static method access: ClassName.Method()
                                 // Constructor calls (ClassName()) still work because functionName = "ClassName".
-                                namespaceContext = Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText());
+                                namespaceContext = lexicalAggregateType.empty()
+                                    ? qualifiedName : lexicalAggregateType;
                                 namedVar = {};
                                 structVar = {};
                             }
@@ -7021,6 +7069,69 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         auto resolveCxxTypeArg = [&](CFlatParser::TypeParameterEntryContext* entry) {
                             return ResolveTypeArgEntry(entry);
                         };
+                        auto* compiler = Compiler(ctx);
+                        auto genericAggregateBase = [&](const std::string& spelling)
+                        {
+                            const auto scopes = EnclosingAggregateScopesForCall(compiler, genParams);
+                            const std::string base = ResolveGenericTemplateBaseAtScope(
+                                compiler, spelling, scopes, genParams, spelling);
+                            return genericStructTemplates.count(base) != 0
+                                || genericClassTemplates.count(base) != 0 ? base : std::string{};
+                        };
+                        std::string nativeGenericAggregate;
+                        auto hasReceiverValue = [](const LLVMBackend::NamedVariable& value) {
+                            return value.Storage != nullptr || value.Primary != nullptr
+                                || value.BitfieldStorage != nullptr
+                                || !value.TypeAndValue.TypeName.empty()
+                                || !value.TypeAndValue.VariableName.empty()
+                                || value.TypeAndValue.IsInterface;
+                        };
+                        const bool noReceiverValue = !hasReceiverValue(namedVar)
+                            && !hasReceiverValue(structVar) && !hasReceiverValue(interfaceVar);
+                        const bool cflatAggregateQualifier = !namespaceContext.empty()
+                            && compiler->IsDataStructure(namespaceContext)
+                            && !compiler->IsCxxRecord(namespaceContext);
+                        const bool cflatNamespaceQualifier = !namespaceContext.empty()
+                            && compiler->IsNamespace(namespaceContext)
+                            && !compiler->IsCxxNamespace(namespaceContext);
+                        if (noReceiverValue && cflatAggregateQualifier)
+                        {
+                            nativeGenericAggregate = genericAggregateBase(
+                                namespaceContext + "." + primaryIdentifier);
+                            if (nativeGenericAggregate.empty())
+                                nativeGenericAggregate = genericAggregateBase(primaryIdentifier);
+                        }
+                        else if (noReceiverValue && cflatNamespaceQualifier)
+                        {
+                            nativeGenericAggregate = genericAggregateBase(
+                                namespaceContext + "." + primaryIdentifier);
+                            if (nativeGenericAggregate.empty())
+                                nativeGenericAggregate = genericAggregateBase(primaryIdentifier);
+                        }
+                        if (!nativeGenericAggregate.empty())
+                        {
+                            std::vector<std::string> typeArgs;
+                            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                                typeArgs.push_back(resolveCxxTypeArg(entry));
+                            ResolveEnumTypeArguments(typeArgs);
+                            const std::string mangled =
+                                MangleGenericInstance(*compiler, nativeGenericAggregate, typeArgs);
+                            const bool processedLocalEnum = QueueAndProcessLocalEnumInstantiation(
+                                genParams, nativeGenericAggregate, typeArgs, mangled, genParams);
+                            if (!processedLocalEnum)
+                            {
+                                QueueGenericInstantiation(
+                                    nativeGenericAggregate, typeArgs, mangled, genParams);
+                                LLVMBackend::BuilderStateGuard savedState(compiler);
+                                ProcessPendingInstantiations();
+                            }
+                            namespaceContext = mangled;
+                            primaryIdentifier = mangled;
+                            namedVar = {};
+                            structVar = {};
+                            interfaceVar = {};
+                            break;
+                        }
                         // Resolve a qualified C++ class-template constructor before generic dispatch.
                         if (Compiler(ctx)->IsStdFunctionSpecialization(primaryIdentifier))
                         {
@@ -13805,6 +13916,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string resolvedFuncName = functionName;
                                 // Bare spelling inside a namespace reaches that namespace's key first.
                                 std::string gfName = Compiler(primaryCtx)->ResolveGenericFunctionBase(functionName);
+                                std::string joinedGenericFunctionName;
                                 std::string structTypeName = structVar.TypeAndValue.TypeName;
                                 if (structTypeName.empty() && structVar.BaseType)
                                 {
@@ -13995,6 +14107,67 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (bareImplicitCall && implicitCallReceiver.GetValue() == nullptr
                                     && !staticMethod)
                                     implicitReceiverGenericMethod = false;
+                                bool genericInferenceAllowed = false;
+                                bool genericCanJoinConcreteOverloads = false;
+                                if ((!isPostfixMemberCall || !receiverHasViablePlainMethod)
+                                    && genericFunctionTemplates.count(gfName) != 0)
+                                {
+                                    auto* compiler = Compiler(primaryCtx);
+                                    if (compiler->GetFunction(functionName) == nullptr)
+                                        genericInferenceAllowed = true;
+                                    else
+                                    {
+                                        auto overloads = compiler->functionTable.find(
+                                            compiler->ResolveQualifiedName(functionName));
+                                        bool hasNativeFreeOverload = false;
+                                        bool hasCxxFreeOverload = false;
+                                        if (overloads != compiler->functionTable.end())
+                                            for (const auto& candidate : overloads->second)
+                                            {
+                                                if (candidate.IsMethod) continue;
+                                                if (candidate.IsCxx)
+                                                    hasCxxFreeOverload = true;
+                                                else
+                                                    hasNativeFreeOverload = true;
+                                            }
+                                        if (hasNativeFreeOverload && !hasCxxFreeOverload)
+                                        {
+                                            std::vector<std::string> argumentNames;
+                                            argumentNames.reserve(arguments.size());
+                                            for (const auto& argument : arguments)
+                                                argumentNames.push_back(argument.TypeAndValue.VariableName);
+                                            std::vector<std::pair<std::vector<LLVMBackend::NamedVariable>,
+                                                LLVMBackend::FunctionSymbol>> concreteCandidates;
+                                            for (const auto& candidate : overloads->second)
+                                            {
+                                                if (candidate.IsMethod || candidate.IsCxx) continue;
+                                                const auto binding = LLVMBackend::ComputeArgumentPositions(
+                                                    argumentNames, candidate.Parameters,
+                                                    candidate.Variadic, 0, &candidate.DefaultArguments);
+                                                if (!binding.Ok) continue;
+                                                auto matched = compiler->MatchFunction(arguments,
+                                                    candidate.Parameters, candidate.Variadic, true,
+                                                    &candidate.DefaultArguments);
+                                                if (matched.size() == arguments.size())
+                                                    concreteCandidates.emplace_back(
+                                                        std::move(matched), candidate);
+                                            }
+                                            bool concreteCallResolves = false;
+                                            if (!concreteCandidates.empty())
+                                            {
+                                                std::vector<LLVMBackend::FunctionSymbol> tied;
+                                                LLVMBackend::CxxPreferredOverload preferred;
+                                                const auto selection = compiler->ComputeOverloadFunction(
+                                                    concreteCandidates, &tied, &preferred);
+                                                concreteCallResolves = selection.second.Function != nullptr
+                                                    && tied.empty() && !preferred.set;
+                                            }
+                                            genericInferenceAllowed = !concreteCallResolves;
+                                            genericCanJoinConcreteOverloads = genericInferenceAllowed;
+                                        }
+                                    }
+                                }
+                                bool attemptedFreeGenericInference = false;
                                 const bool hasExplicitReceiverGenericMethod = !methodTemplate.empty()
                                     && !implicitReceiverGenericMethod
                                     && !receiverHasViablePlainMethod
@@ -14020,9 +14193,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         implicitReceiverMethodInstantiated = !staticMethod;
                                     }
                                 }
-                                else if (!Compiler(primaryCtx)->GetFunction(functionName)
-                                    && genericFunctionTemplates.count(gfName))
+                                else if (genericInferenceAllowed)
                                 {
+                                    attemptedFreeGenericInference = true;
                                     for (const auto& iface : Compiler(primaryCtx)->GetStructInterfaces(structTypeName))
                                     {
                                         auto inst = InferAndInstantiateGenericFunction(gfName, iface);
@@ -14061,6 +14234,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && implicitCallReceiver.GetValue() == nullptr
                                     && receiverHasViablePlainMethod)
                                     resolvedFuncName = qualifiedMethodName;
+                                if (attemptedFreeGenericInference && genericCanJoinConcreteOverloads
+                                    && resolvedFuncName != functionName)
+                                {
+                                    joinedGenericFunctionName = resolvedFuncName;
+                                    resolvedFuncName = functionName;
+                                }
                                 if (implicitReceiverMethodInstantiated)
                                 {
                                     arguments.insert(arguments.begin(), implicitCallReceiver);
@@ -14075,19 +14254,53 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         ? std::optional<LLVMBackend::NamedVariable>(structVar)
                                         : std::nullopt;
                                 braceArgumentUnwind.Release();
+                                auto createResolvedCall = [&]() {
+                                    std::optional<LLVMBackend::FunctionSymbol> joinedCandidate;
+                                    if (!joinedGenericFunctionName.empty())
+                                    {
+                                        auto* compiler = Compiler(primaryCtx);
+                                        auto instantiated = compiler->functionTable.find(
+                                            joinedGenericFunctionName);
+                                        if (instantiated == compiler->functionTable.end())
+                                            instantiated = compiler->functionTable.find(
+                                                compiler->ResolveQualifiedName(joinedGenericFunctionName));
+                                        if (instantiated != compiler->functionTable.end())
+                                        {
+                                            auto symbol = std::find_if(instantiated->second.begin(),
+                                                instantiated->second.end(), [&](const auto& candidate) {
+                                                    return candidate.Function != nullptr
+                                                        && !candidate.IsMethod && !candidate.IsCxx
+                                                        && candidate.UniqueName == joinedGenericFunctionName;
+                                                });
+                                            if (symbol == instantiated->second.end())
+                                                symbol = std::find_if(instantiated->second.begin(),
+                                                    instantiated->second.end(), [](const auto& candidate) {
+                                                        return candidate.Function != nullptr
+                                                            && !candidate.IsMethod && !candidate.IsCxx;
+                                                    });
+                                            if (symbol != instantiated->second.end())
+                                            {
+                                                joinedCandidate = *symbol;
+                                                joinedCandidate->SourceName = gfName;
+                                            }
+                                        }
+                                    }
+                                    return Compiler(primaryCtx)->CreateOverloadedFunctionCall(
+                                        resolvedFuncName, arguments, globalScopeCall, callDisplayName,
+                                        cxxMemberReceiverType(),
+                                        isPostfixMemberCall && !isStaticTemplateThroughObject
+                                            && !callHasCxxBraceArguments,
+                                        enclosingFunctionName, false, nullptr,
+                                        implicitCallReceiver.GetValue() != nullptr
+                                            ? &implicitCallReceiver : nullptr,
+                                        lexicalAggregateScopes,
+                                        joinedCandidate.has_value() ? &*joinedCandidate : nullptr);
+                                };
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
                                         lastMemberReceiverPath)
                                     ? nullptr
-                                    : Compiler(primaryCtx)->CreateOverloadedFunctionCall(
-                                    resolvedFuncName, arguments, globalScopeCall, callDisplayName,
-                                    cxxMemberReceiverType(),
-                                    isPostfixMemberCall && !isStaticTemplateThroughObject
-                                        && !callHasCxxBraceArguments,
-                                    enclosingFunctionName, false, nullptr,
-                                    implicitCallReceiver.GetValue() != nullptr
-                                        ? &implicitCallReceiver : nullptr,
-                                    lexicalAggregateScopes);
+                                    : createResolvedCall();
                                 RecordPendingCallResult(callParen, namedVar.Primary);
                                 markDataMutParamOwning(structVar, namedVar.Primary);
                                 globalScopeCall = false;
@@ -17518,8 +17731,9 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         baseName = ResolveGenericTemplateBaseAtScope(
                             compiler, baseName, enclosingScope, typeSpec, spelledBase);
                         if (baseName.empty()) continue;
-                        if (insideScopedExpectation && isCflatTemplate(Compiler(typeSpec), baseName))
-                            continue;  // Drain this CFlat body while the scoped expectation is armed.
+                        if ((insideScopedExpectation || afterBareExpectation)
+                            && isCflatTemplate(Compiler(typeSpec), baseName))
+                            continue;  // Let the source-order declaration drain this body under its expectation.
                         if (GenericArgumentsNeedFunctionLocalEnumDeferral(
                                 genParams, localEnumNames, Compiler(typeSpec),
                                 &Compiler(typeSpec)->gts.scannedNonLocalEnumNames,

@@ -1,0 +1,7 @@
+expect_error("incomplete") {
+    struct NestValFieldOuter {
+        int value = 7;
+        struct I { NestValFieldOuter outer; };
+    };
+}
+extern int main() { return 0; }

@@ -774,6 +774,23 @@ bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* mem
                 if (isOpaqueTypeSpecifier(specifier)) return true;
             return false;
         };
+        auto isOpaqueGenericType = [&](std::string spelledBase,
+                                       CFlatParser::GenericTypeParametersContext* params,
+                                       CFlatParser::TypeSpecifierContext* useSite)
+        {
+            if (params == nullptr || params->typeParameterList() == nullptr) return false;
+            std::vector<std::string> args;
+            for (auto* entry : params->typeParameterList()->typeParameterEntry())
+                args.push_back(ResolveTypeArgEntry(entry));
+            const std::string templateBase = ResolveGenericTemplateSpellingAtScope(
+                compiler, spelledBase, args, EnclosingAggregateScopesFromContext(compiler, useSite),
+                useSite, spelledBase, false);
+            compiler->CompleteCxxTemplateTypeArgs(templateBase, args);
+            const std::string typeName = MangleGenericInstance(*compiler, templateBase, args);
+            auto found = compiler->dataStructures.find(typeName);
+            return found != compiler->dataStructures.end() && found->second.StructType != nullptr
+                && found->second.StructType->isOpaque();
+        };
         isOpaqueTypeSpecifier = [&](CFlatParser::TypeSpecifierContext* typeSpecifier)
         {
             if (typeSpecifier == nullptr) return false;
@@ -790,7 +807,7 @@ bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* mem
                                 || entry->arrayTypeSuffix() != nullptr) continue;
                             if (isOpaqueTypeSpecifier(entry->typeSpecifier())) return true;
                         }
-                    return false;
+                    return isOpaqueGenericType(generic->Identifier()->getText(), args, typeSpecifier);
                 }
                 return generic->Identifier() != nullptr
                     && isOpaqueName(generic->Identifier()->getText());
@@ -807,7 +824,11 @@ bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* mem
                                 || entry->arrayTypeSuffix() != nullptr) continue;
                             if (isOpaqueTypeSpecifier(entry->typeSpecifier())) return true;
                         }
-                    return false;
+                    std::string base = qualified->Identifier() == nullptr
+                        ? std::string{} : qualified->Identifier()->getText();
+                    for (auto* member : qualified->memberNameToken())
+                        base += "." + member->getText();
+                    return isOpaqueGenericType(std::move(base), args, typeSpecifier);
                 }
                 return isOpaqueName(qualified->getText());
             }
@@ -902,7 +923,8 @@ bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* mem
 void MainListener::DeferGenericMemberBody(antlr4::ParserRuleContext* member,
     antlr4::ParserRuleContext* aggregate, const std::string& ownerName,
     DeferredGenericMemberKind kind, const std::string& nameOverride,
-    bool suppliesNoArgCtor, size_t cppCtorIndex, bool hasExplicitNoArgCtor)
+    bool suppliesNoArgCtor, size_t cppCtorIndex, bool hasExplicitNoArgCtor,
+    bool waitForEnclosingLayout)
 {
         std::string templateName;
         if (auto* structCtx = dynamic_cast<CFlatParser::StructDefinitionContext*>(aggregate))
@@ -911,29 +933,47 @@ void MainListener::DeferGenericMemberBody(antlr4::ParserRuleContext* member,
         if (auto* classCtx = dynamic_cast<CFlatParser::ClassDefinitionContext*>(aggregate))
             for (const auto& [name, ctx] : genericClassTemplates)
                 if (ctx == classCtx) { templateName = name; break; }
-        if (templateName.empty()) return;
+        auto* compiler = Compiler(aggregate);
         DeferredGenericMemberBody deferred;
         deferred.kind = kind;
         deferred.function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(member);
         deferred.destructor = dynamic_cast<CFlatParser::DestructorDefinitionContext*>(member);
         deferred.ownerName = ownerName;
         deferred.templateName = templateName;
+        deferred.declaringNamespace = templateName.empty()
+            ? compiler->GetCurrentNamespace() : DeclaringNamespaceOf(compiler, templateName);
         deferred.nameOverride = nameOverride;
         deferred.suppliesNoArgCtor = suppliesNoArgCtor;
         deferred.cppCtorIndex = cppCtorIndex;
         deferred.hasExplicitNoArgCtor = hasExplicitNoArgCtor;
+        deferred.waitForEnclosingLayout = waitForEnclosingLayout;
         deferred.typeSubstitutions = activeTypeSubstitutions;
         deferred.valueSubstitutions = activeValueSubstitutions;
         deferred.packSubstitutions = activePackSubstitutions;
         deferredGenericMemberBodies_.push_back(std::move(deferred));
 }
 
-void MainListener::ProcessDeferredGenericMemberBodies()
+void MainListener::ProcessDeferredGenericMemberBodies(size_t first, bool enclosingLayoutReady)
 {
-        size_t next = 0;
-        while (next < deferredGenericMemberBodies_.size())
+        std::vector<DeferredGenericMemberBody> pending;
+        auto extractPending = [&]()
         {
-            auto deferred = deferredGenericMemberBodies_[next++];
+            for (size_t i = first; i < deferredGenericMemberBodies_.size();)
+            {
+                if (enclosingLayoutReady && !deferredGenericMemberBodies_[i].waitForEnclosingLayout)
+                {
+                    ++i;
+                    continue;
+                }
+                pending.push_back(std::move(deferredGenericMemberBodies_[i]));
+                deferredGenericMemberBodies_.erase(deferredGenericMemberBodies_.begin() + i);
+            }
+        };
+        extractPending();
+        size_t next = 0;
+        while (next < pending.size())
+        {
+            auto deferred = std::move(pending[next++]);
             auto savedTypes = activeTypeSubstitutions;
             auto savedValues = activeValueSubstitutions;
             auto savedPacks = activePackSubstitutions;
@@ -960,7 +1000,7 @@ void MainListener::ProcessDeferredGenericMemberBodies()
             GenericValueMacroScope valueMacros(compilerLLVM);
             for (const auto& [name, value] : activeValueSubstitutions)
                 valueMacros.Bind(name, ParseValueArg(value));
-            TemplateNamespaceScope namespaceScope(compilerLLVM, deferred.templateName);
+            LLVMBackend::NamespaceScope namespaceScope(compilerLLVM, deferred.declaringNamespace);
             LLVMBackend::AliasScopeGuard aliasScope(compilerLLVM, deferred.ownerName);
             struct RestoreMemberContext
             {
@@ -979,6 +1019,9 @@ void MainListener::ProcessDeferredGenericMemberBodies()
                     globalScope = wasGlobal;
                 }
             } memberContext(structScopeStack, global_scope, deferred.ownerName);
+            antlr4::ParserRuleContext* deferredMember = deferred.function != nullptr
+                ? static_cast<antlr4::ParserRuleContext*>(deferred.function)
+                : static_cast<antlr4::ParserRuleContext*>(deferred.destructor);
             if (deferred.kind == DeferredGenericMemberKind::Constructor)
                 ParseConstructorDefinition(deferred.function, deferred.ownerName,
                     deferred.suppliesNoArgCtor, deferred.cppCtorIndex,
@@ -989,8 +1032,8 @@ void MainListener::ProcessDeferredGenericMemberBodies()
                 ParseFunctionDefinition(deferred.function, deferred.ownerName);
             else
                 ParseFunctionDefinition(deferred.function, {}, {}, deferred.nameOverride);
+            extractPending();
         }
-        deferredGenericMemberBodies_.clear();
 }
 
 void MainListener::exitTranslationUnit(CFlatParser::TranslationUnitContext*)
@@ -1073,6 +1116,7 @@ void MainListener::RecheckPendingNontrivialCxxUnionMembers(const std::string& co
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
+        const size_t deferredBodiesAtEntry = deferredGenericMemberBodies_.size();
         auto decl = ctx->directDeclarator();
         std::string baseName = decl->getText();
         std::string structName;
@@ -1103,6 +1147,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         };
         const bool predeclareConcreteMembers = !nameOverride.empty()
             || hasInstantiatedGenericAncestor(namespaceName);
+        const auto enclosingData = compiler->dataStructures.find(namespaceName);
+        const bool deferNestedBodiesForIncompleteParent = HasEnclosingAggregateContext(ctx)
+            && enclosingData != compiler->dataStructures.end()
+            && enclosingData->second.StructType != nullptr
+            && enclosingData->second.StructType->isOpaque();
         // Mid-definition marker: nested flushes below must not drain a pointer-only record that
         // names this struct, since its destructor and methods are not registered yet.
         struct BeingDefinedScope
@@ -1529,6 +1578,38 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     declList.push_back(f);
                 }
             }
+        }
+
+        auto incompleteEnclosingFieldType = [&](const LLVMBackend::DeclTypeAndValue& field) {
+            if (!HasEnclosingAggregateContext(ctx)) return std::string{};
+            auto* incomplete = compiler->FindIncompleteByValueAggregate(field, {}, false);
+            if (incomplete == nullptr) return std::string{};
+            std::string enclosingName = namespaceName;
+            std::unordered_set<std::string> visited;
+            while (!enclosingName.empty() && visited.insert(enclosingName).second
+                && aggregateDefinitionContexts_.contains(enclosingName))
+            {
+                auto data = compiler->dataStructures.find(enclosingName);
+                if (data != compiler->dataStructures.end()
+                    && data->second.StructType == incomplete)
+                    return enclosingName;
+                auto parent = aggregateParentScopes_.find(enclosingName);
+                if (parent == aggregateParentScopes_.end()
+                    || !aggregateDefinitionContexts_.contains(parent->second)) break;
+                enclosingName = parent->second;
+            }
+            return std::string{};
+        };
+        for (const auto& field : declList)
+        {
+            const std::string enclosingName = incompleteEnclosingFieldType(field);
+            if (enclosingName.empty()) continue;
+            const std::string enclosingType = SpellType(*compiler,
+                LLVMBackend::TypeAndValue{ .TypeName = enclosingName });
+            LogErrorContext(ctx, std::format(
+                "nested field '{}' stores enclosing aggregate '{}' by value while it is incomplete; "
+                "this can form a by-value cycle if the enclosing aggregate also stores this nested type. "
+                "Use a pointer instead.", field.VariableName, enclosingType));
         }
 
         if (compiler->IsVerbose())
@@ -2764,10 +2845,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     bool suppliesNoArgCtor = !isUnion && !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
                     const size_t ctorIndex = isCppStruct ? cppCtorIndex++ : SIZE_MAX;
-                    if (!nameOverride.empty() && needsDeferredMemberBody(func))
+                    if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                        || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Constructor, {}, suppliesNoArgCtor,
-                            ctorIndex, hasExplicitNoArgCtor);
+                            ctorIndex, hasExplicitNoArgCtor, deferNestedBodiesForIncompleteParent);
                     else
                         ParseConstructorDefinition(func, structName, suppliesNoArgCtor,
                             ctorIndex, hasExplicitNoArgCtor);
@@ -2781,12 +2863,14 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 {
                     continue;
                 }
-                else if (!nameOverride.empty() && needsDeferredMemberBody(func))
+                else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                    || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                     DeferGenericMemberBody(func, ctx, structName,
                         DeferredGenericMemberKind::Function,
                         (funcName == "operator new" || funcName == "operator delete"
                          || funcName == "operator bool" || isFunctionStatic(func))
-                            ? structName + "." + funcName : std::string{});
+                            ? structName + "." + funcName : std::string{}, false, SIZE_MAX, false,
+                        deferNestedBodiesForIncompleteParent);
                 else if (funcName == "operator new" || funcName == "operator delete"
                          || funcName == "operator bool" || isFunctionStatic(func))
                 {
@@ -2810,9 +2894,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
                         Compiler(func)->LogError(std::format(
                             "constructor '{}' is not allowed inside a lock field group", baseName));
-                    else if (!nameOverride.empty() && needsDeferredMemberBody(func))
+                    else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                        || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
-                            DeferredGenericMemberKind::Function);
+                            DeferredGenericMemberKind::Function, {}, false, SIZE_MAX, false,
+                            deferNestedBodiesForIncompleteParent);
                     else
                         ParseFunctionDefinition(func, structName);
                 }
@@ -2880,9 +2966,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
-                if (!nameOverride.empty() && needsDeferredMemberBody(dtor))
+                if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(dtor))
+                    || (!nameOverride.empty() && needsDeferredMemberBody(dtor)))
                     DeferGenericMemberBody(dtor, ctx, structName,
-                        DeferredGenericMemberKind::Destructor);
+                        DeferredGenericMemberKind::Destructor, {}, false, SIZE_MAX, false,
+                        deferNestedBodiesForIncompleteParent);
                 else
                     ParseDestructorDefinition(dtor, structName);
             }
@@ -2921,6 +3009,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // ProcessPendingInstantiations();
 
         structScopeStack.pop_back();
+        if (!deferNestedBodiesForIncompleteParent)
+            ProcessDeferredGenericMemberBodies(deferredBodiesAtEntry, true);
     }
 
 void MainListener::EmitUnionDefaultConstructorBody(
@@ -5087,6 +5177,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
 void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
+        const size_t deferredBodiesAtEntry = deferredGenericMemberBodies_.size();
         auto decl = ctx->directDeclarator();
         std::string baseName = decl->getText();
         std::string structName;
@@ -5117,6 +5208,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         };
         const bool predeclareConcreteMembers = !nameOverride.empty()
             || hasInstantiatedGenericAncestor(namespaceName);
+        const auto enclosingData = compiler->dataStructures.find(namespaceName);
+        const bool deferNestedBodiesForIncompleteParent = HasEnclosingAggregateContext(ctx)
+            && enclosingData != compiler->dataStructures.end()
+            && enclosingData->second.StructType != nullptr
+            && enclosingData->second.StructType->isOpaque();
         // Mid-definition marker, as in ParseStructDefinition: nested flushes must not drain a
         // pointer-only record that names this class while its body is still being parsed.
         struct BeingDefinedScope
@@ -5444,6 +5540,38 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             }
         }
 
+        auto incompleteEnclosingFieldType = [&](const LLVMBackend::DeclTypeAndValue& field) {
+            if (!HasEnclosingAggregateContext(ctx)) return std::string{};
+            auto* incomplete = compiler->FindIncompleteByValueAggregate(field, {}, false);
+            if (incomplete == nullptr) return std::string{};
+            std::string enclosingName = namespaceName;
+            std::unordered_set<std::string> visited;
+            while (!enclosingName.empty() && visited.insert(enclosingName).second
+                && aggregateDefinitionContexts_.contains(enclosingName))
+            {
+                auto data = compiler->dataStructures.find(enclosingName);
+                if (data != compiler->dataStructures.end()
+                    && data->second.StructType == incomplete)
+                    return enclosingName;
+                auto parent = aggregateParentScopes_.find(enclosingName);
+                if (parent == aggregateParentScopes_.end()
+                    || !aggregateDefinitionContexts_.contains(parent->second)) break;
+                enclosingName = parent->second;
+            }
+            return std::string{};
+        };
+        for (const auto& field : declList)
+        {
+            const std::string enclosingName = incompleteEnclosingFieldType(field);
+            if (enclosingName.empty()) continue;
+            const std::string enclosingType = SpellType(*compiler,
+                LLVMBackend::TypeAndValue{ .TypeName = enclosingName });
+            LogErrorContext(ctx, std::format(
+                "nested field '{}' stores enclosing aggregate '{}' by value while it is incomplete; "
+                "this can form a by-value cycle if the enclosing aggregate also stores this nested type. "
+                "Use a pointer instead.", field.VariableName, enclosingType));
+        }
+
         // Prepend the COM header fields (vtable pointer @0, refcount @1) so the user fields
         // follow. `new` wires lpVtbl/refcount after the constructor; both are zero meanwhile.
         if (isWinrt)
@@ -5705,10 +5833,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.
                     bool suppliesNoArgCtor = !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
-                    if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                    if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                        || (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Constructor, {}, suppliesNoArgCtor,
-                            SIZE_MAX, hasExplicitNoArgCtor);
+                            SIZE_MAX, hasExplicitNoArgCtor, deferNestedBodiesForIncompleteParent);
                     else
                         ParseConstructorDefinition(func, structName, suppliesNoArgCtor, SIZE_MAX,
                                                    hasExplicitNoArgCtor);
@@ -5722,11 +5851,13 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 {
                     continue;
                 }
-                else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                    || (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func)))
                     DeferGenericMemberBody(func, ctx, structName,
                         DeferredGenericMemberKind::Function,
                         (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
-                            ? structName + "." + funcName : std::string{});
+                            ? structName + "." + funcName : std::string{}, false, SIZE_MAX, false,
+                        deferNestedBodiesForIncompleteParent);
                 else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
                 {
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
@@ -5749,9 +5880,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
                         Compiler(func)->LogError(std::format(
                             "constructor '{}' is not allowed inside a lock field group", baseName));
-                    else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                    else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                        || (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
-                            DeferredGenericMemberKind::Function);
+                            DeferredGenericMemberKind::Function, {}, false, SIZE_MAX, false,
+                            deferNestedBodiesForIncompleteParent);
                     else
                         ParseFunctionDefinition(func, structName);
                 }
@@ -5764,9 +5897,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
-                if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(dtor))
+                if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(dtor))
+                    || (!nameOverride.empty() && GenericMemberNeedsDeferredBody(dtor)))
                     DeferGenericMemberBody(dtor, ctx, structName,
-                        DeferredGenericMemberKind::Destructor);
+                        DeferredGenericMemberKind::Destructor, {}, false, SIZE_MAX, false,
+                        deferNestedBodiesForIncompleteParent);
                 else
                     ParseDestructorDefinition(dtor, structName);
             }
@@ -5789,6 +5924,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // ProcessPendingInstantiations();
 
         structScopeStack.pop_back();
+        if (!deferNestedBodiesForIncompleteParent)
+            ProcessDeferredGenericMemberBodies(deferredBodiesAtEntry, true);
     }
 
 std::vector<std::string> MainListener::ParseGenericTypeParameters(

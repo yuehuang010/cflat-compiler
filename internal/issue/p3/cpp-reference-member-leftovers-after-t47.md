@@ -5,20 +5,20 @@ lifetime extension, `{ r = move x }`, and nested aggregates landed in REFMEM (79
 (T104) and const C& result ranking already matched clang on master. All below are pre-existing (master behaves the same);
 clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch/repro_keep/t47/.
 
-1. Wrong code: a reference member in a BASE class, positional init: `struct B { int& r; }; struct D : B { int v; };`
-   `D d = { { x }, 5 }` does not make d.r alias x (master and REFMEM exit 1, clang 0).
-   Attempt REFBASE (branch fix/refbase, b1f84a38e, parked 2026-10-28; review in its worktree scratch/briefs/refbase_review1.md)
-   fixed single/multi/nested bases but regressed an empty base clause `{ { }, x, 5 }` (`{}` parses without initializerList(),
-   so it is not seen as a base -> dangling ref) and mapped derived fields as elementIndex - baseCount, wrong when a later base
-   is brace-elided. Next: one flattened-field cursor (braced base clause advances by the base's flattened field count, elided
-   clause by 1) and detect a braced clause by its `{` token.
-2. A function-reference member is refused: "'__c_fn_ptr' has no C++ spelling" (the wrapper parameter spelling for function
-   references exists but is unreachable).
+1. Positional base/member-aggregate reference members landed REFBASE (d4999d9da). Pre-existing residue found by its reviews
+   (master behaves the same): a C++ class prvalue element (`T(3)`) into an aggregate member inside an elided range makes an
+   extra copy + destroy (CFlat 127458969, clang 1274569); a converting element into a class-type member inside an elided range
+   runs the ctor after later elements (12345769, clang 12374569); an array of aggregates with reference members loses the alias,
+   elided and fully braced (exit 3, clang 0). Repros in the REFBASE review files (scratch/repro_keep/refbase/).
+2. Function-reference members landed REFFN (ec5f57a0e): a named function or an existing C++ function reference binds, a
+   function-pointer value is refused. NEEDS RULING: `{ &f, 5 }` and `{ (function<int(int)>)f, 5 }` are accepted (the same
+   function, no runtime risk); clang refuses both because `&f` is a pointer prvalue. Pre-existing (master refuses too, clang
+   accepts): a function template specialization `q.tf<int>` and a ternary `c ? f : g` element. Repros
+   scratch/repro_keep/reffn/.
 3. Refused contexts (clear diagnostics; clang accepts): designated C++ aggregate with reference members as a global, as
    `return { r = x }`, as a call argument `f({ r = x })`, as a CFlat struct field initializer; named fields inside array
-   elements (`{ a = { { r = x, v = 1 }, ... } }`); a bare `nullptr` element ("brace-list element type '' has no C++ spelling").
+   elements (`{ a = { { r = x, v = 1 }, ... } }`). A bare `nullptr` element in a C++ brace list landed REFFN.
 4. Call-argument C++ temporaries are destroyed in construction order; clang destroys them in reverse:
    `int z = pick(C(1), C(2)).v;` -> order 12, clang 21.
 
-Fix direction: item 1 in the positional brace wrapper's base-subobject lowering (reference target metadata for base fields);
-item 4 in the full-expression temp ledger flush order.
+Fix direction: item 4 in the full-expression temp ledger flush order.

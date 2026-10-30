@@ -50,3 +50,11 @@ expect_error("no overload of 'gv' matches the given arguments") {
         };
     };
 }
+
+expect_error("call to non-static member function 'm' without an object argument") {
+    struct T471StaticDefaultInstanceCall
+    {
+        int m(int k = 7) { return k; }
+        static int g() { return m(); }
+    };
+}

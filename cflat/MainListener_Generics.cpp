@@ -188,6 +188,7 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
         ResolvedInterfaceMembersScope memberScope(resolvedInterfaceMembers_, (const void*)ctx);
 
         std::vector<LLVMBackend::InterfaceMethod> methods;
+        std::vector<CFlatParser::InterfaceMethodContext*> defaultMethods;
         auto implementationUsesCoreUnique = [&](const std::string& methodName, size_t paramIndex) {
             auto functionIt = compilerLLVM->functionTable.find(methodName);
             if (functionIt == compilerLLVM->functionTable.end()) return false;
@@ -231,22 +232,28 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
                     tv.IsMove = true;
                 }
                 m.Parameters.push_back(tv);
+                if (p.DefaultValue != nullptr)
+                    m.DefaultWrapperName = InterfaceDefaultWrapperFunctionName(mangledName, m.Name);
             }
+            if (!m.DefaultWrapperName.empty()) defaultMethods.push_back(method);
             methods.push_back(std::move(m));
         }
 
         auto fields = ParseInterfaceFields(ctx);
+        Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods, fields);
+        for (auto* method : defaultMethods)
+            GenerateInterfaceDefaultParamOverloads(mangledName, method);
+
         activeTypeSubstitutions = savedSubst;
         activeValueSubstitutions = savedValueSubst;
         activePackSubstitutions = savedPackSubst;
         valueMacros.Restore();
-        Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods, fields);
     }
 
-std::string MainListener::GenericMethodOwner(const std::string& baseName, CFlatParser::FunctionDefinitionContext* tmplCtx) {
+std::string MainListener::GenericMemberTemplateOwner(
+        const std::string& baseName, CFlatParser::FunctionDefinitionContext* tmplCtx) {
         size_t dot = baseName.rfind('.');
-        if (dot == std::string::npos || tmplCtx == nullptr || isFunctionStatic(tmplCtx))
-            return {};
+        if (dot == std::string::npos || tmplCtx == nullptr) return {};
         std::string owner = baseName.substr(0, dot);
         // Struct nesting and namespace nesting share ONE dotted key space, so the prefix alone
         // cannot say which this is. The RECORDED declaring namespace can: when it equals the
@@ -255,6 +262,12 @@ std::string MainListener::GenericMethodOwner(const std::string& baseName, CFlatP
             return {};
         return Compiler()->IsDataStructure(owner) ? owner : std::string{};
     }
+
+std::string MainListener::GenericMethodOwner(
+        const std::string& baseName, CFlatParser::FunctionDefinitionContext* tmplCtx) {
+        if (tmplCtx == nullptr || isFunctionStatic(tmplCtx)) return {};
+        return GenericMemberTemplateOwner(baseName, tmplCtx);
+}
 
 std::string MainListener::GenericMethodTemplateKey(const std::string& receiverType, const std::string& methodName) {
         if (receiverType.empty() || methodName.empty())
@@ -358,9 +371,58 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         auto savedValueSubst = activeValueSubstitutions;
         auto savedPackSubst = activePackSubstitutions;
         GenericValueMacroScope valueMacros(compilerLLVM);
+        const std::string genericMemberOwner = GenericMemberTemplateOwner(baseName, tmplCtx);
+        for (std::string owner = genericMemberOwner; !owner.empty(); )
+        {
+            auto instance = compilerLLVM->gts.genericAggregateInstances.find(owner);
+            if (instance != compilerLLVM->gts.genericAggregateInstances.end())
+            {
+                auto ownerParams = genericStructTypeParams.find(instance->second.templateName);
+                if (ownerParams != genericStructTypeParams.end())
+                {
+                    const auto& ownerValueParams =
+                        genericStructValueParams[instance->second.templateName];
+                    for (size_t i = 0; i < ownerParams->second.size(); ++i)
+                        if (i < instance->second.typeArgs.size()
+                            && (i >= ownerValueParams.size() || ownerValueParams[i].empty()))
+                            activeTypeSubstitutions.Bind(
+                                ownerParams->second[i], instance->second.typeArgs[i]);
+                }
+            }
+            else
+            {
+                const std::string ownerBase(MangledBase(owner));
+                auto ownerParams = genericStructTypeParams.find(ownerBase);
+                if (ownerParams != genericStructTypeParams.end())
+                {
+                    std::vector<std::string> ownerArgs;
+                    ownerArgs.reserve(ownerParams->second.size());
+                    for (size_t i = 0; i < ownerParams->second.size(); ++i)
+                        ownerArgs.push_back(MangledGenericArgument(*compilerLLVM, owner, i));
+                    if (std::none_of(ownerArgs.begin(), ownerArgs.end(),
+                            [](const std::string& arg) { return arg.empty(); })
+                        && MangleGenericInstance(*compilerLLVM, ownerBase, ownerArgs) == owner)
+                    {
+                        const auto& ownerValueParams = genericStructValueParams[ownerBase];
+                        for (size_t i = 0; i < ownerParams->second.size(); ++i)
+                            if (i >= ownerValueParams.size() || ownerValueParams[i].empty())
+                                activeTypeSubstitutions.Bind(ownerParams->second[i], ownerArgs[i]);
+                    }
+                }
+            }
+            auto parent = aggregateParentScopes_.find(owner);
+            if (parent == aggregateParentScopes_.end() || parent->second == owner) break;
+            owner = parent->second;
+        }
         const auto& valueParams = genericFunctionValueParams[baseName];
         if (!ValidateGenericArgumentKinds(baseName, typeParams, valueParams, typeArgs))
+        {
+            activeTypeSubstitutions = savedSubst;
+            activeValueSubstitutions = savedValueSubst;
+            activePackSubstitutions = savedPackSubst;
+            valueMacros.Restore();
             return {};
+        }
         // Same shadow rule as the struct drain: this instantiation OWNS its parameter names.
         for (const auto& tp : typeParams)
         {
@@ -815,6 +877,16 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                             const uint8_t levels = compilerLLVM->StoredConstLevels(
                                 compilerLLVM->ArgumentPointerValue(args[i]), constName);
                             if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
+                        }
+                        // `T*` drops one pointer level, but T can itself be a const base type.
+                        else if (paramStars > 0 && paramStars <= 8 && argStars == 0)
+                        {
+                            std::string constName;
+                            const uint8_t levels = compilerLLVM->StoredConstLevels(
+                                compilerLLVM->ArgumentPointerValue(args[i]), constName);
+                            const uint8_t baseConstBit = static_cast<uint8_t>(1u << (paramStars - 1));
+                            if ((levels & baseConstBit) != 0)
+                                argType = "(const " + argType + ")";
                         }
                     }
                 }
@@ -1567,13 +1639,27 @@ void MainListener::ProcessPendingInstantiations() {
                 continue;
             }
 
+            compilerLLVM->gts.genericAggregateInstances[pending.mangledName] = {
+                pending.templateName, pending.typeArgs };
+
             try
             {
                 TemplateNamespaceScope nsScope(compilerLLVM, pending.templateName);
                 if (auto parent = aggregateParentScopes_.find(pending.templateName);
                     parent != aggregateParentScopes_.end())
                     aggregateParentScopes_[pending.mangledName] = parent->second;
-                if (isStruct)
+                auto failedBodies = failedAggregateMethodBodies_.find(pending.mangledName);
+                if (failedBodies != failedAggregateMethodBodies_.end())
+                {
+                    while (!failedBodies->second.empty())
+                    {
+                        auto* method = failedBodies->second.front();
+                        ParseFunctionDefinition(method, pending.mangledName);
+                        failedBodies->second.erase(failedBodies->second.begin());
+                    }
+                    failedAggregateMethodBodies_.erase(failedBodies);
+                }
+                else if (isStruct)
                     ParseStructDefinition(structCtx, pending.mangledName);
                 else
                     ParseClassDefinition(classCtx, pending.mangledName);
@@ -1581,6 +1667,13 @@ void MainListener::ProcessPendingInstantiations() {
             catch (const ExpectedErrorReceived&)
             {
                 instantiatedGenerics.erase(pending.mangledName);
+                auto partial = compilerLLVM->dataStructures.find(pending.mangledName);
+                if (partial == compilerLLVM->dataStructures.end()
+                    || partial->second.StructType == nullptr || partial->second.StructType->isOpaque())
+                {
+                    compilerLLVM->gts.genericAggregateInstances.erase(pending.mangledName);
+                    failedAggregateMethodBodies_.erase(pending.mangledName);
+                }
                 activeTypeSubstitutions = savedSubst;
                 activeValueSubstitutions = savedValueSubst;
                 activePackSubstitutions = savedPackSubst;

@@ -34,6 +34,18 @@ static bool IsCallArgumentContaining(
     return false;
 }
 
+static std::vector<std::string> CxxFreeOperatorSources(const std::string& className,
+                                                        const std::string& operatorName)
+{
+    const std::string base = className.substr(0, className.find('$'));
+    const size_t dot = base.rfind('.');
+    std::vector<std::string> sources;
+    if (dot != std::string::npos)
+        sources.push_back(base.substr(0, dot) + "." + operatorName);
+    sources.push_back(operatorName);
+    return sources;
+}
+
 // Name a direct call with a borrowed parameter return, keeping proven owning arguments accepted.
 std::string MainListener::BorrowedParameterCallName(
     const LLVMBackend::NamedVariable& source, llvm::Value* value)
@@ -4875,6 +4887,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             } selfAssignPathRestore{thisFieldAssignDestPath_, thisFieldAssignDestPath_};
             thisFieldAssignDestPath_ = operatorText == "=" ? ThisFieldSlotKey(namedVar) : std::string();
             bool constCxxCompoundCandidate = false;
+            bool constCxxCompoundFreeCandidate = false;
             if (operatorText != "=" && !namedVar.TypeAndValue.Pointer
                 && !namedVar.TypeAndValue.IsArrayView
                 && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName)
@@ -4891,6 +4904,78 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 && !member.isDeleted && member.bindRefusal.empty()
                                 && member.access == cflat_cinterop::AccessPublic;
                         });
+                if (!constCxxCompoundCandidate)
+                {
+                    const std::string operatorName = "operator" + operatorText;
+                    const auto sources = CxxFreeOperatorSources(
+                        namedVar.TypeAndValue.TypeName, operatorName);
+                    for (const std::string& source : sources)
+                    {
+                        if (compiler->HasCxxFunctionTemplateForRecordArgument(
+                                source, namedVar.TypeAndValue.TypeName, 2))
+                        {
+                            constCxxCompoundCandidate = true;
+                            constCxxCompoundFreeCandidate = true;
+                            break;
+                        }
+                        compiler->TryBindCxxFunction(source);
+                        auto freeCandidateBindsConstReceiver = [&](const auto& candidate) {
+                            if (auto signatures = compiler->cxxFunctionSignatures_.find(
+                                    candidate.SourceName);
+                                signatures != compiler->cxxFunctionSignatures_.end())
+                                for (const auto& signature : signatures->second)
+                                    if (signature.linkageName == candidate.UniqueName
+                                        && !signature.paramSpellings.empty())
+                                    {
+                                        const std::string& spelling = signature.paramSpellings[0];
+                                        if (spelling.find('&') == std::string::npos) return true;
+                                        bool constParameter = false;
+                                        for (size_t pos = 0;
+                                             (pos = spelling.find("const", pos)) != std::string::npos; )
+                                        {
+                                            const size_t end = pos + 5;
+                                            const bool leftBoundary = pos == 0
+                                                || std::isspace(static_cast<unsigned char>(spelling[pos - 1]));
+                                            const bool rightBoundary = end == spelling.size()
+                                                || std::isspace(static_cast<unsigned char>(spelling[end]));
+                                            if (leftBoundary && rightBoundary)
+                                            {
+                                                constParameter = true;
+                                                break;
+                                            }
+                                            pos = end;
+                                        }
+                                        return constParameter
+                                            && (spelling.find("&&") == std::string::npos
+                                                || namedVar.IsRvalue);
+                                    }
+                            const auto& parameter = candidate.Parameters[0];
+                            if (parameter.IsRvalueRef)
+                                return parameter.CxxConstRef() && namedVar.IsRvalue;
+                            return !parameter.IsAlias || parameter.CxxConstRef();
+                        };
+                        const std::string lookup = source == operatorName
+                            ? "__cxx_free." + operatorName : source;
+                        if (auto it = compiler->functionTable.find(lookup);
+                            it != compiler->functionTable.end())
+                            for (const auto& candidate : it->second)
+                                if (candidate.IsCxx && !candidate.IsMethod
+                                    && candidate.SourceName == source
+                                    && candidate.Parameters.size() == 2
+                                    && freeCandidateBindsConstReceiver(candidate)
+                                    && (candidate.Parameters[0].TypeName
+                                            == namedVar.TypeAndValue.TypeName
+                                        || compiler->IsCxxBaseOf(
+                                            candidate.Parameters[0].TypeName,
+                                            namedVar.TypeAndValue.TypeName)))
+                                {
+                                    constCxxCompoundCandidate = true;
+                                    constCxxCompoundFreeCandidate = true;
+                                    break;
+                                }
+                        if (constCxxCompoundCandidate) break;
+                    }
+                }
             }
             // A struct with a const field has no assignment (C++ deletes it): only construction
             // sets it. Init, copy/move construction and by-value passing stay legal.
@@ -8360,7 +8445,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 namedVar.TypeAndValue.IsCxxNullptrT,
                                 rightNV.TypeAndValue.IsCxxNullptrT, namedVar.IsRvalue, false,
                                 compiler->CxxOperandObjectCv(namedVar),
-                                compiler->CxxOperandObjectCv(rightNV));
+                                compiler->CxxOperandObjectCv(rightNV), false,
+                                constCxxCompoundFreeCandidate);
                     };
                     auto isCxxClassValue = [&](llvm::Value* value) {
                         auto* st = value != nullptr
@@ -8491,6 +8577,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         right = overload;
                         usedCompoundOverload = true;
                     }
+                    else if (constCxxCompoundFreeCandidate
+                        && RefuseConstWrite(unaryCtx, namedVar, destination, "modify", "assign to"))
+                    {
+                        return nullptr;
+                    }
                     else if (!binaryOp.empty() && left != nullptr
                              && (left->getType()->isStructTy() || cxxClassRight))
                     {
@@ -8516,6 +8607,31 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     || namedVar.TypeAndValue.Pointer || destination == nullptr)
                     return stored;
                 const auto& opResultType = compiler->lastCallReturnType;
+                if (right != nullptr && right->getType()->isPointerTy()
+                    && opResultType.IsAlias && !opResultType.IsRvalueRef
+                    && !opResultType.TypeName.empty()
+                    && opResultType.TypeName != namedVar.TypeAndValue.TypeName
+                    && compiler->IsCxxRecord(opResultType.TypeName))
+                {
+                    auto valueType = opResultType;
+                    valueType.Pointer = false;
+                    valueType.PointerDepth = 0;
+                    valueType.ElemPointer = false;
+                    auto* llvmValueType = compiler->GetType(valueType);
+                    if (llvmValueType != nullptr && llvmValueType->isStructTy())
+                    {
+                        auto* resultValue = compiler->CreateLoad(llvmValueType, right);
+                        assignmentResult->TypeAndValue = opResultType;
+                        assignmentResult->Primary = resultValue;
+                        assignmentResult->Storage = right;
+                        assignmentResult->BaseType = llvmValueType;
+                        assignmentResult->CallerName.clear();
+                        assignmentResult->FieldName.clear();
+                        assignmentResult->MovePathKey.clear();
+                        assignmentResult->MovePathHasDynamicIndex = false;
+                        return resultValue;
+                    }
+                }
                 if (right != nullptr && right->getType()->isPointerTy()
                     && opResultType.Pointer && !opResultType.IsAlias
                     && !opResultType.TypeName.empty()
@@ -20935,7 +21051,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         const std::string& rhsArithIdentity,
         bool rhsExplicitMove, bool lhsExplicitMove,
         bool lhsCxxNullptrT, bool rhsCxxNullptrT, bool lhsMaterializedPrvalue,
-        bool lhsCxxPointeeConst, int lhsObjectCv, int rhsObjectCv, bool lhsIsAlias) {
+        bool lhsCxxPointeeConst, int lhsObjectCv, int rhsObjectCv, bool lhsIsAlias,
+        bool refuseConstWriteOnNoViable) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
         // An ADL request for this expression was ambiguous and refused: nested rewrites stay silent.
@@ -21231,7 +21348,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         operands.push_back(rule);
             return operands;
         };
-        auto tryFreeOperator = [&](bool adlOnly = false, bool clangDecides = false) -> llvm::Value* {
+        auto tryFreeOperator = [&](bool adlOnly = false, bool clangDecides = false,
+                                   bool memberFreeRanking = false) -> llvm::Value* {
             if (ctx != nullptr && ctx == cxxAdlAmbiguousCtx_) return nullptr;
             llvm::Value* freeLhsStorage = lhsIsRvalue ? nullptr : lhsStorage;
             llvm::Value* freeRhsStorage = rhsIsRvalue ? nullptr : rhsStorage;
@@ -21496,7 +21614,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (adlResult == nullptr && adlClangAmbiguous && ctx != nullptr)
                 {
                     cxxAdlAmbiguousCtx_ = ctx;
-                    LogErrorContext(ctx, adlClangRefusal);
+                    if (memberFreeRanking)
+                        LogErrorContext(ctx, std::format(
+                            "ambiguous C++ binary operator '{}': a member and a free overload are both viable and rank equally",
+                            opName));
+                    else
+                        LogErrorContext(ctx, adlClangRefusal);
                 }
                 return adlResult;
             }
@@ -22197,6 +22320,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     [&](const auto& compound) { return compound.first == candidate; });
         };
         auto relayCxxCompoundRefusal = [&]() -> llvm::Value* {
+            // Const-write bypass: hand every no-viable path back to RefuseConstWrite.
+            if (refuseConstWriteOnNoViable) return nullptr;
             std::string diagnostic = adlClangRefusal;
             if (diagnostic.empty())
                 diagnostic = std::format("clang: no viable overloaded '{}'", "operator" + op);
@@ -22226,12 +22351,72 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             // A scalar-left equality needs C++20's reversed candidates in the same set.
             if (op == "==" && !isCxxRecordValue(lvalue) && isCxxRecordValue(rvalue))
                 return tryFreeOperator(true, true);
-            if (isCxxCompoundOperator(op) && isCxxRecordValue(lvalue))
+            auto hasMemberCandidate = [&](const std::string& className,
+                                          const std::string& operatorName) {
+                compiler->EnsureCxxMemberProjected(className, operatorName);
+                if (auto it = compiler->functionTable.find(operatorName);
+                    it != compiler->functionTable.end())
+                    for (const auto& candidate : it->second)
+                        if (candidate.IsCxx && isMemberCandidate(candidate)
+                            && candidate.Parameters.size() == 2
+                            && candidate.Parameters[0].TypeName == className)
+                            return true;
+                return false;
+            };
+            auto hasFreeTemplateCandidate = [&](const std::string& className,
+                                                const std::string& operatorName) {
+                for (const std::string& source : CxxFreeOperatorSources(className, operatorName))
+                    if (compiler->HasCxxFunctionTemplate(source)) return true;
+                return false;
+            };
+            auto hasFreeCandidate = [&](const std::string& className,
+                                        const std::string& operatorName) {
+                for (const std::string& source : CxxFreeOperatorSources(className, operatorName))
+                {
+                    compiler->TryBindCxxFunction(source);
+                    const std::string lookup = source == operatorName
+                        ? "__cxx_free." + operatorName : source;
+                    if (auto it = compiler->functionTable.find(lookup);
+                        it != compiler->functionTable.end())
+                        for (const auto& candidate : it->second)
+                            if (isFreeCxxCandidate(candidate)
+                                && candidate.SourceName == source
+                                && candidate.Parameters.size() == 2
+                                && candidate.Parameters[0].TypeName == className)
+                                return true;
+                }
+                return false;
+            };
+            // An unregistered free function template must rank beside a member. When both are
+            // present, clang resolves the complete candidate set; the registered set is incomplete.
+            if (isCxxRecordValue(lvalue) && !isCxxCompoundOperator(op))
+            {
+                const std::string leftName =
+                    llvm::cast<llvm::StructType>(lvalue->getType())->getName().str();
+                const std::string operatorName = "operator" + op;
+                if (hasFreeTemplateCandidate(leftName, operatorName)
+                    && hasMemberCandidate(leftName, operatorName))
+                {
+                    const bool hasExactFree = hasFreeCandidate(leftName, operatorName);
+                    adlClangRefusal.clear();
+                    if (llvm::Value* resolved = tryFreeOperator(true, true, hasExactFree)) return resolved;
+                    if (adlClangAmbiguous) return nullptr;
+                    if (!adlClangRefusal.empty())
+                    {
+                        LogErrorContext(ctx, adlClangRefusal);
+                        return nullptr;
+                    }
+                }
+            }
+            if (isCxxCompoundOperator(op) && isCxxRecordValue(lvalue) && !lhsIsRvalue)
             {
                 const std::string opName = "operator" + op;
                 const std::string leftName =
                     llvm::cast<llvm::StructType>(lvalue->getType())->getName().str();
-                compiler->EnsureCxxMemberProjected(leftName, opName);
+                if (hasMemberCandidate(leftName, opName)
+                    && (hasFreeCandidate(leftName, opName)
+                        || hasFreeTemplateCandidate(leftName, opName)))
+                    if (llvm::Value* resolved = tryFreeOperator(true, true, true)) return resolved;
                 bool inheritedMember = false;
                 if (auto it = compiler->functionTable.find(opName);
                     it != compiler->functionTable.end())
@@ -22270,7 +22455,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 ? llvm::cast<llvm::StructType>(rvalue->getType())->getName().str() : std::string();
             if (hasCxxMemberOperator(leftName, "operator<=>")
                 || hasCxxMemberOperator(rightName, "operator<=>"))
-                return tryFreeOperator(true, true);
+                return tryFreeOperator(true, true, true);
             return nullptr;
         };
 
@@ -23063,6 +23248,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             if (isCxxCompoundOperator(op) && viable.empty())
             {
                 if (llvm::Value* freeResult = tryFreeOperator()) return freeResult;
+                if (refuseConstWriteOnNoViable) return nullptr;
                 if (cxxCompoundBinaryFallbackMayBind())
                 {
                     adlClangRefusal.clear();

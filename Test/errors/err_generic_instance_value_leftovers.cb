@@ -55,3 +55,12 @@ expect_error("generic method 'm'") {
         }
     };
 }
+
+struct EivBareBadMethod<T> { int bad() { return eivBareMethodUndefinedName; } };
+int eivBareMethod()
+{
+    expect_error("Undefined variable eivBareMethodUndefinedName");
+    EivBareBadMethod<int> value = default;
+    int result = value.bad();
+    return 0;
+}

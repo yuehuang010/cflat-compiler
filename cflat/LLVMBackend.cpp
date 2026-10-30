@@ -7928,6 +7928,7 @@ static llvm::json::Object SerializeIfaceMethod(const IM& m)
     for (auto& p : m.Parameters) ps.push_back(SerializeTav(p));
     o["ps"] = std::move(ps);
     if (m.IsConst) o["c"] = true;
+    if (!m.DefaultWrapperName.empty()) o["dw"] = m.DefaultWrapperName;
     return o;
 }
 
@@ -7940,6 +7941,7 @@ static IM DeserializeIfaceMethod(const llvm::json::Object& o)
         for (auto& elem : *ps)
             if (auto* po = elem.getAsObject()) m.Parameters.push_back(DeserializeTav(*po));
     if (auto c = o.getBoolean("c")) m.IsConst = *c;
+    if (auto dw = o.getString("dw")) m.DefaultWrapperName = dw->str();
     return m;
 }
 
@@ -8083,8 +8085,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
     // const floating global admission names; v13 stores function origin metadata; v16 adds
     // const interface methods; v17 function-type pointee const masks; v18 C/C++ pointee, reference
-    // and field const folded into ConstMask; v22 borrowed pointer-return summaries and provenance.
-    root["version"]   = 22;
+    // and field const folded into ConstMask; v22 borrowed pointer-return summaries and provenance;
+    // v23 generic aggregate instances retain their template key and resolved arguments.
+    root["version"]   = 23;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
     if (CacheBuildStampEnabled()) root["cstamp"] = CompilerBuildStamp();
@@ -8499,6 +8502,20 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         for (auto& s : gts.instantiatedGenericFunctions) arr.push_back(s);
         root["instantiated_generic_functions"] = std::move(arr);
     }
+    {
+        llvm::json::Array arr;
+        for (const auto& [name, instance] : gts.genericAggregateInstances)
+        {
+            llvm::json::Object record;
+            record["name"] = name;
+            record["template"] = instance.templateName;
+            llvm::json::Array args;
+            for (const auto& arg : instance.typeArgs) args.push_back(arg);
+            record["args"] = std::move(args);
+            arr.push_back(std::move(record));
+        }
+        root["generic_aggregate_instances"] = std::move(arr);
+    }
     } // end CoreCacheJsonBuild scope
 
     // Write JSON.
@@ -8575,7 +8592,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 22) return false;
+    if (!ver || *ver != 23) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
     if (CacheBuildStampEnabled())
@@ -9150,6 +9167,20 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* arr = root->getArray("instantiated_generic_functions"))
         for (auto& elem : *arr)
             if (auto v = elem.getAsString()) gts.instantiatedGenericFunctions.insert(v->str());
+    if (auto* arr = root->getArray("generic_aggregate_instances"))
+        for (auto& elem : *arr)
+            if (auto* record = elem.getAsObject())
+            {
+                auto name = record->getString("name");
+                auto templateName = record->getString("template");
+                auto* args = record->getArray("args");
+                if (!name || !templateName || args == nullptr) continue;
+                GenericTemplateState::GenericAggregateInstance instance;
+                instance.templateName = templateName->str();
+                for (auto& arg : *args)
+                    if (auto value = arg.getAsString()) instance.typeArgs.push_back(value->str());
+                gts.genericAggregateInstances[name->str()] = std::move(instance);
+            }
     } // end CoreDes:Instantiated
 
     // Mark lazy-registered functions as done if they were deserialized from the cache.

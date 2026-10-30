@@ -1,0 +1,10 @@
+import cpp "cpp_interop_ref_member.h";
+
+extern int main()
+{
+    expect_error("cannot bind a C++ function reference to a function pointer value") {
+        function<int(int)> p = (int x) => { return x + 1; };
+        cppref.FunctionRef value = { p, 5 };
+    }
+    return 0;
+}

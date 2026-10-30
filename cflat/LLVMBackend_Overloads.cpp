@@ -5386,7 +5386,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         bool postfixMemberCall, const std::string& enclosingFunctionName,
         bool allowOperatorAliasReturnStringTemp, llvm::Value* operatorReceiverStorage,
         const NamedVariable* implicitReceiver,
-        const std::vector<std::string>& lexicalAggregateScopes)
+        const std::vector<std::string>& lexicalAggregateScopes,
+        const FunctionSymbol* additionalCandidate)
 {
         std::vector<NamedVariable> arguments(inputArguments);
         // These describe only the call being lowered. Clear them before overload probing so a
@@ -5795,6 +5796,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     || (receiverHasCxxMember && !CxxUniquePtrPointee(receiverType).empty())))
                 candidateSet = &receiverMemberCandidates;
         }
+        std::vector<FunctionSymbol> joinedCandidateSet;
+        if (additionalCandidate != nullptr
+            && std::none_of(candidateSet->begin(), candidateSet->end(), [&](const auto& candidate) {
+                return candidate.UniqueName == additionalCandidate->UniqueName;
+            }))
+        {
+            joinedCandidateSet = *candidateSet;
+            joinedCandidateSet.push_back(*additionalCandidate);
+            candidateSet = &joinedCandidateSet;
+        }
         std::vector<FunctionSymbol> cxxOperatorCandidates;
         // Free C++ operators dropped because a const receiver cannot bind their non-const `T&`
         // parameter: kept for the no-overload diagnostic, which names them and the const reason.
@@ -5976,7 +5987,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     {
                         std::vector<NamedVariable> rest(arguments.begin() + 1, arguments.end());
                         return CreateOverloadedFunctionCall(staticName, rest, forceRoot, displayName,
-                                                            {}, false, enclosingFunctionName);
+                                                            {}, false, enclosingFunctionName,
+                                                            false, nullptr, nullptr, {});
                     }
                 }
             }
@@ -6291,8 +6303,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             if (c.Variadic)
                 paramList += paramList.empty() ? "..." : ", ...";
-            const std::string name = StripCxxConstTwin(
-                c.SourceName.empty() ? shownFunctionName : c.SourceName);
+            const std::string name = displayName.empty()
+                ? StripCxxConstTwin(c.SourceName.empty() ? shownFunctionName : c.SourceName)
+                : displayName;
             return std::format("{}({})", name, paramList);
         };
 
@@ -6861,7 +6874,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const bool objectlessInstanceCall = resolvedCandidate.empty()
                 && implicitReceiver == nullptr && !lexicalAggregateScopes.empty()
                 && !candidates.empty()
-                && std::all_of(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+                && std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) {
                     return candidate.IsMethod && !candidate.Parameters.empty()
                         && candidate.Parameters.size() == arguments.size() + 1
                         && std::any_of(lexicalAggregateScopes.begin(), lexicalAggregateScopes.end(),
@@ -6950,11 +6963,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 std::string name;
                 if (arg.TypeAndValue.VariableName.empty())
                 {
-                    bool isThis = i == 0 && !candidates.empty() &&
+                    bool isThis = arg.IsThisReceiver || (i == 0 && !candidates.empty() &&
                                   !candidates[0].Parameters.empty() &&
                                   (candidates[0].Parameters[0].VariableName.ends_with("__")
                                    || (candidates[0].IsCxx && candidates[0].IsMethod
-                                       && candidates[0].Parameters[0].VariableName == "this"));
+                                       && candidates[0].Parameters[0].VariableName == "this")));
                     name = isThis ? "<this>" : "<unnamed>";
                 }
                 else
@@ -7046,8 +7059,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (p.IsMove) paramList += "move ";
                     paramList += parameterType;
                 }
-                const std::string candidateName = StripCxxConstTwin(
-                    c.SourceName.empty() ? shownFunctionName : c.SourceName);
+                const std::string candidateName = displayName.empty()
+                    ? StripCxxConstTwin(c.SourceName.empty() ? shownFunctionName : c.SourceName)
+                    : displayName;
                 msg += std::format("    {}({})\n", candidateName, paramList);
             }
 

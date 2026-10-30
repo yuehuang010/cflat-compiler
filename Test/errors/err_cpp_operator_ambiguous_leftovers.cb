@@ -1,0 +1,23 @@
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_operator_const_bypass.h";
+
+extern int main()
+{
+    t280.CompoundTie value = default;
+    expect_error("ambiguous C++ binary operator 'operator+=': a member and a free overload are both viable and rank equally") {
+        value += 1;
+    }
+    expect_error("cannot assign to 'opbin_const_ref(k)': it is reached through a C++ const reference result or const pointer result, so it is read-only. Copy it into a local and modify that instead.") {
+        OpbinConstK k = default;
+        opbin_const_ref(k) += 1;
+    }
+    expect_error("cannot assign to 'opbin_const_u_ref(u)': it is reached through a C++ const reference result or const pointer result, so it is read-only. Copy it into a local and modify that instead.") {
+        OpbinConstU u = default;
+        opbin_const_u_ref(u) += 1;
+    }
+    expect_error("cannot assign to 'opbin_const_kd_ref(d)': it is reached through a C++ const reference result or const pointer result, so it is read-only. Copy it into a local and modify that instead.") {
+        OpbinConstKD d = default;
+        opbin_const_kd_ref(d) += 1;
+    }
+    return 0;
+}

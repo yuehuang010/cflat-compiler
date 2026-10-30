@@ -215,6 +215,12 @@ struct GenericTemplateState
     };
     ActiveInstantiationOrigin activeInstantiationOrigin;
 
+    struct GenericAggregateInstance
+    {
+        std::string templateName;
+        std::vector<std::string> typeArgs;
+    };
+
     std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>      genericStructTemplates;
     // Non-generic struct/class method bodies by type name then method name (every overload),
     // recorded by the pre-pass so copy-on-entry can classify a user method that mutates a field.
@@ -228,6 +234,8 @@ struct GenericTemplateState
     // Parallel again: the DEFAULT of a trailing value parameter, already folded to its decimal
     // spelling. Empty means "no default". Only trailing value parameters may carry one.
     std::unordered_map<std::string, std::vector<std::string>>                   genericStructValueDefaults;
+    // Concrete struct/class name -> the template key and resolved arguments used to register it.
+    std::unordered_map<std::string, GenericAggregateInstance>                    genericAggregateInstances;
     std::unordered_set<std::string>                                             instantiatedGenerics;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericStructConstraints;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericClassConstraints;
@@ -2501,6 +2509,7 @@ public:
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters; // excludes the implicit 'this' pointer
         bool IsConst = false;                 // `int get() const;`: callable on a const receiver
+        std::string DefaultWrapperName;       // hidden overload set for calls that omit trailing defaults
     };
 
     struct WideIntegerConstant
@@ -7284,6 +7293,9 @@ private:
         const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
         const std::string& fileForLsp);
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
+    bool HasCxxFunctionTemplateForRecordArgument(const std::string& qualifiedName,
+                                                 const std::string& recordType,
+                                                 size_t arity) const;
     bool HasArityViableCxxFunctionTemplate(const std::string& functionName,
                                            const std::string& ownerType,
                                            size_t arity) const;
@@ -7444,6 +7456,11 @@ private:
                                     const std::string& fieldName,
                                     std::string& spelling,
                                     bool* isReference = nullptr) const;
+    size_t CxxAggregateBaseCount(const std::string& typeName) const;
+    std::string CxxAggregateBaseTypeAt(const std::string& typeName, size_t index) const;
+    size_t CxxAggregateBaseFieldCountAt(const std::string& typeName, size_t index) const;
+    std::string CxxAggregateFlattenedFieldNameAt(const std::string& typeName,
+                                                 size_t index) const;
     // copyInit: the wrapper copy-initializes (`T t = arg;`), so an explicit constructor is
     // never a candidate - the form every IMPLICIT conversion site must use.
     // Converts each scalar argument of a generated constructor thunk call into the thunk's own
@@ -9682,16 +9699,15 @@ public:
         const std::vector<TypeAndValue>& params);
 
     /*
-     * Pick the vtable slot for an interface method call by FULL SIGNATURE. Slots are gathered by
-     * name, filtered by arity, then ranked with the same scorer the direct-call path uses
-     * (ComputeOverloadFunction), so `io.go(a)` and `io.go(a, b)` reach different slots.
-     * GetOrCreateVTable already populates each slot from the matching implementor overload, so
-     * only the call site needed the signature match. Returns the slot index, or -1 after an error.
-     * matchedArgs receives the arguments reordered against the winning slot's parameters.
+     * Pick the vtable slot for an interface call by visible overload and conversion rank. A
+     * shortened default-wrapper candidate competes with exact slots in the same scoring pass.
+     * Returns the slot index, or -1 after an error/deferred helper call. matchedArgs receives the
+     * arguments reordered against the winning slot's parameters; fallbackDefaultSlot names a
+     * default helper to use when its overload set must produce the argument diagnostic.
      */
     int ResolveInterfaceMethodSlot(const std::string& ifaceName, const std::string& methodName,
         const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
-        std::vector<NamedVariable>& matchedArgs);
+        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot);
 
     // receiver: the user's receiver expression, judged for #8 (a const one needs a const method).
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
@@ -12240,7 +12256,8 @@ public:
                                               bool allowOperatorAliasReturnStringTemp = false,
                                               llvm::Value* operatorReceiverStorage = nullptr,
                                               const NamedVariable* implicitReceiver = nullptr,
-                                              const std::vector<std::string>& lexicalAggregateScopes = {});
+                                              const std::vector<std::string>& lexicalAggregateScopes = {},
+                                              const FunctionSymbol* additionalCandidate = nullptr);
 
     llvm::Function* GetFunction(const std::string& functionName);
 

@@ -13,6 +13,36 @@ class OvA : IOvA
     int go(int a, int b) { return a * b; }
 };
 
+interface IOvDefaultAmbiguous
+{
+    int h(int a);
+    int h(int a, int b = 2);
+};
+class OvDefaultAmbiguous : IOvDefaultAmbiguous
+{
+    int h(int a) { return a; }
+    int h(int a, int b) { return a + b; }
+};
+
+interface IHiddenDefaultBase { int h(int a, int b = 13); };
+interface IHiddenDefault : IHiddenDefaultBase { int h(int a, int b); };
+class HiddenDefaultImpl : IHiddenDefault
+{
+    int h(int a, int b) { return a + b; }
+};
+
+interface IHelperBadType { int h(int* a, int b = 13); };
+class HelperBadTypeImpl : IHelperBadType
+{
+    int h(int* a, int b) { return b; }
+};
+
+interface IHelperNamed { int h(int a, int b = 13, int c = 4); };
+class HelperNamedImpl : IHelperNamed
+{
+    int h(int a, int b, int c) { return a + b + c; }
+};
+
 extern int main()
 {
     OvA o;
@@ -20,6 +50,33 @@ extern int main()
 
     expect_error("no overload of interface method 'IOvA.go' takes 3 argument(s); expected 1 or 2") {
         int tooMany = io.go(1, 2, 3);
+    }
+
+    OvDefaultAmbiguous ambiguousImpl = default;
+    IOvDefaultAmbiguous ambiguousIface = ambiguousImpl;
+    expect_error("ambiguous call to 'IOvDefaultAmbiguous.h'") {
+        int ambiguous = ambiguousIface.h(1);
+    }
+
+    HiddenDefaultImpl hiddenDefaultImpl = default;
+    IHiddenDefault hiddenDefaultIface = hiddenDefaultImpl;
+    expect_error("no overload of interface method 'IHiddenDefault.h' takes 1 argument(s); expected 2") {
+        int hiddenDefault = hiddenDefaultIface.h(1);
+    }
+
+    HelperBadTypeImpl helperBadTypeImpl = default;
+    IHelperBadType helperBadTypeIface = helperBadTypeImpl;
+    expect_error("cannot pass parameter 'a' of 'IHelperBadType.h'") {
+        int badType = helperBadTypeIface.h(5);
+    }
+
+    HelperNamedImpl helperNamedImpl = default;
+    IHelperNamed helperNamedIface = helperNamedImpl;
+    expect_error("no overload of 'IHelperNamed.h' matches") {
+        int badNamed = helperNamedIface.h(1, c: 7);
+    }
+    expect_error("IHelperNamed.h(IHelperNamed, int, int, int)") {
+        int badNamed = helperNamedIface.h(1, c: 7);
     }
 
     return 0;

@@ -91,6 +91,7 @@ int gavBareOuter<T>()
 
 struct GavScopedBadMethod<T> { int bad() { return gavMethodUndefinedName; } };
 struct GavUniqueBadMethod<T> { int bad() { return gavMethodUndefinedName; } };
+struct GavRetryBadMethod<T> { int bad() { return gavRetryMethodUndefinedName; } };
 
 int gavMethodScoped()
 {
@@ -131,6 +132,15 @@ extern int main()
     int gavBareResult = gavBareOuter<int>();
     gavMethodScoped();
     gavMethodUnique();
+    // T354: the same failed specialization must report its body error on a later request.
+    expect_error("Undefined variable gavRetryMethodUndefinedName") {
+        GavRetryBadMethod<int> first = default;
+        int firstValue = first.bad();
+    }
+    expect_error("Undefined variable gavRetryMethodUndefinedName") {
+        GavRetryBadMethod<int> second = default;
+        int secondValue = second.bad();
+    }
     // The instantiation moved this function's locals aside; recovery must put them back.
     return gavLocal - 7;
 }

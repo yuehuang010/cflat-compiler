@@ -347,6 +347,7 @@ import cpp "library/cpp_interop_ref_member.h";
 import cpp "library/cpp_interop_ref_alias.h";
 import cpp "library/cpp_t495_amppick.hpp";
 import cpp "library/cpp_interop_field.h";
+int RefFnCflat(int x) { return x + 3000; }
 // Array elements of a C++ class.
 import cpp "library/cpp_interop_arrayelem.h";
 import "library/cpp_interop_globals.cb";
@@ -3377,6 +3378,26 @@ extern int main()
     if (t280Bv + 1 != 2) return 27517;
     t280.ByValLongDer t280Bl = default;
     if (t280Bl + 1 != 2) return 27518;
+    // OPBIN compound assignment: clang rejects the mutable-lvalue tie and selects viable frees otherwise.
+    t280.CompoundFree t280Compound = default;
+    t280Compound += 1;
+    if (t280.getCompoundChoice() != 1) return 28001;
+    t280.compoundFreeConst(t280Compound) += 1;
+    if (t280.getCompoundChoice() != 2) return 28002;
+    t280.compoundFreeMake() += 1;
+    if (t280.getCompoundChoice() != 2) return 28003;
+    t280.compoundFreeConstMake() += 1;
+    if (t280.getCompoundChoice() != 2) return 28004;
+    // OPBIN template/member ranking: exact member for int, free template for wider/floating RHS.
+    t280.TfWithMember t280Tf = default;
+    if (t280Tf + 1 != 11) return 28005;
+    i64 t280Wide = 1;
+    if (t280Tf + t280Wide != 21 || t280Tf + 1.5 != 21) return 28006;
+    if (t280.tfWithMemberMake() + 1.5 != 11) return 28007;
+    t280.TfWithConstMember t280TfConst = default;
+    if (t280TfConst + 1 != 21) return 28008;
+    if (t280.tfWithConstMemberRef(t280TfConst) + 1.5 != 11
+        || t280.tfWithConstMemberMake() + 1.5 != 11) return 28009;
     // T307: binary member/free ranking across inherited bases and cv qualifications.
     // Distinct member/free return tags make each ranking decision observable.
     t307.I1A t307_item1_nearer_free = default;
@@ -9040,6 +9061,61 @@ extern int main()
     cppi.Pair t47PlainDesignated = { a = 2, b = 3 };
     if (t47PlainDesignated.a * 10 + t47PlainDesignated.b != 23) return 47701;
 
+    // REFFN: all aggregate forms carry the selected free function into a C++ function reference.
+    cppref.FunctionRef reffnCflatPos = { RefFnCflat, 5 };
+    if (reffnCflatPos.call(4) != 3004 || reffnCflatPos.v != 5) return 47801;
+    cppref.FunctionRef reffnCflatNamed = { f = RefFnCflat, v = 5 };
+    if (reffnCflatNamed.call(4) != 3004 || reffnCflatNamed.v != 5) return 47802;
+    cppref.FunctionRef reffnCflatDirect { RefFnCflat, 5 };
+    if (reffnCflatDirect.call(4) != 3004 || reffnCflatDirect.v != 5) return 47803;
+    cppref.FunctionRef reffnCPos = { cppref.ref_member_c_fn, 5 };
+    if (reffnCPos.call(4) != 2004 || reffnCPos.v != 5) return 47804;
+    cppref.FunctionRef reffnCNamed = { f = cppref.ref_member_c_fn, v = 5 };
+    if (reffnCNamed.call(4) != 2004 || reffnCNamed.v != 5) return 47805;
+    cppref.FunctionRef reffnCDirect { cppref.ref_member_c_fn, 5 };
+    if (reffnCDirect.call(4) != 2004 || reffnCDirect.v != 5) return 47806;
+    cppref.FunctionRef reffnCppPos = { cppref.ref_member_cpp_fn, 5 };
+    if (reffnCppPos.call(4) != 1004 || reffnCppPos.v != 5) return 47807;
+    cppref.FunctionRef reffnCppNamed = { f = cppref.ref_member_cpp_fn, v = 5 };
+    if (reffnCppNamed.call(4) != 1004 || reffnCppNamed.v != 5) return 47808;
+    cppref.FunctionRef reffnCppDirect { cppref.ref_member_cpp_fn, 5 };
+    if (reffnCppDirect.call(4) != 1004 || reffnCppDirect.v != 5) return 47809;
+
+    // REFFN: bare nullptr is emitted in the C++ list so clang applies the target field type.
+    cppref.TextPointerAgg reffnNullPlain = { "ab", nullptr, 65, 2 };
+    if (cppref.read_text(reffnNullPlain) != 174
+        || cppref.null_pick(reffnNullPlain.raw) != 11) return 47810;
+    int reffnNullRefValue = 9;
+    cppref.RefTextPointerAgg reffnNullRef = { reffnNullRefValue, "ab", nullptr, 65 };
+    if (reffnNullRef.ref != 9 || reffnNullRef.raw != nullptr
+        || cppref.null_pick(reffnNullRef.raw) != 11) return 47811;
+    cppref.NestedPointerAgg reffnNullNested = { { "ab", nullptr, 65, 2 }, 4 };
+    if (cppref.read_nested(reffnNullNested) != 178) return 47812;
+    cppref.PointerAgg reffnNullPointer = { nullptr, 7 };
+    if (reffnNullPointer.p != nullptr || reffnNullPointer.value != 7
+        || cppref.pointer_pick(reffnNullPointer.p) != 51) return 47813;
+    cppref.FunctionPointerAgg reffnNullFunction = { nullptr, 8 };
+    if (reffnNullFunction.f != nullptr || reffnNullFunction.value != 8
+        || cppref.function_pick(reffnNullFunction.f) != 31) return 47814;
+    cppref.NullptrAgg reffnNullptrT = { nullptr, 8 };
+    if (reffnNullptrT.p != nullptr || reffnNullptrT.value != 8
+        || cppref.null_pick(reffnNullptrT.p) != 22) return 47815;
+    cppref.PointerAgg reffnNullCast = { (int*)nullptr, 7 };
+    if (reffnNullCast.p != nullptr || cppref.pointer_pick(reffnNullCast.p) != 51)
+        return 47817;
+    cppref.PointerAgg reffnNullZero = { 0, 7 };
+    if (reffnNullZero.p != nullptr || cppref.pointer_pick(reffnNullZero.p) != 51)
+        return 47818;
+    // REFFN: an existing C++ function reference (variable or call result) binds through to the member.
+    cppref.FunctionRef reffnRefVarPos = { cppref.ref_member_fn_ref, 5 };
+    if (reffnRefVarPos.call(4) != 1004 || reffnRefVarPos.v != 5) return 47819;
+    cppref.FunctionRef reffnRefVarDirect { cppref.ref_member_fn_ref, 6 };
+    if (reffnRefVarDirect.call(5) != 1005 || reffnRefVarDirect.v != 6) return 47820;
+    cppref.FunctionRef reffnRefCall = { cppref.ref_member_fn_ref_get(), 7 };
+    if (reffnRefCall.call(6) != 1006 || reffnRefCall.v != 7) return 47821;
+    cppref.FunctionRefDerived reffnRefBase = { { cppref.ref_member_fn_ref, 8 }, 9 };
+    if (reffnRefBase.call(7) != 1007 || reffnRefBase.v != 8 || reffnRefBase.w != 9) return 47822;
+
     // T47: scalar references bind to the original lvalue in named and positional brace forms.
     int t47NamedRefValue = 7;
     cppi.ReferenceField t47NamedRef = { value = t47NamedRefValue };
@@ -9198,6 +9274,102 @@ extern int main()
         || cppref.refmem_lifetime_ctor_count() != 1 || cppref.refmem_lifetime_copy_count() != 0
         || cppref.refmem_lifetime_move_count() != 0)
         return 47728;
+
+    // T47 base-subobject positional braces keep base references bound to caller storage.
+    int refbaseCopyX = 31;
+    cppref.BraceAggRefDerived refbaseCopy = { { refbaseCopyX }, 4 };
+    if (refbaseCopy.r != 31 || refbaseCopy.v != 4) return 47729;
+    refbaseCopy.r = 32;
+    if (refbaseCopyX != 32) return 47730;
+
+    int refbaseDirectX = 33;
+    cppref.BraceAggRefDerived refbaseDirect { { refbaseDirectX }, 5 };
+    refbaseDirect.r = 34;
+    if (refbaseDirectX != 34 || refbaseDirect.v != 5) return 47731;
+
+    cppref.BraceAggConstRefDerived refbaseLiteral = { { 35 }, 6 };
+    t47RefmemChurn(100);
+    if (refbaseLiteral.r != 35 || refbaseLiteral.v != 6) return 47732;
+
+    int refbaseDeepX = 37;
+    cppref.BraceAggRefDeep refbaseDeep = { { { refbaseDeepX }, 8 }, 9 };
+    if (refbaseDeep.r != 37 || refbaseDeep.m != 8 || refbaseDeep.d != 9) return 47733;
+    refbaseDeep.r = 38;
+    if (refbaseDeepX != 38) return 47734;
+
+    int refbaseMixedX = 39;
+    cppref.BraceAggMixedDerived refbaseMixed = { { refbaseMixedX, 10 }, 11 };
+    if (refbaseMixed.r != 39 || refbaseMixed.b != 10 || refbaseMixed.d != 11)
+        return 47735;
+    refbaseMixed.r = 40;
+    if (refbaseMixedX != 40 || refbaseMixed.b != 10 || refbaseMixed.d != 11)
+        return 47736;
+
+    // T47 empty and brace-elided bases keep flattened reference fields aligned.
+    int refbaseEmptyX = 41;
+    cppref.BraceAggEmptyDerived refbaseEmpty = { { }, refbaseEmptyX, 42 };
+    if (refbaseEmpty.r != 41 || refbaseEmpty.v != 42) return 47737;
+    refbaseEmpty.r = 43;
+    if (refbaseEmptyX != 43) return 47738;
+
+    int refbaseD12X = 44;
+    int refbaseD12Y = 45;
+    cppref.BraceAggD12 refbaseD12 = { { refbaseD12X }, 46, 47, refbaseD12Y };
+    if (refbaseD12.r != 44 || refbaseD12.a != 46 || refbaseD12.b != 47
+        || refbaseD12.s != 45)
+        return 47739;
+    refbaseD12.r = 48;
+    refbaseD12.s = 49;
+    if (refbaseD12X != 48 || refbaseD12Y != 49) return 47740;
+
+    int refbaseDMX = 50;
+    int refbaseDMY = 51;
+    cppref.BraceAggDM refbaseDM = { { refbaseDMX, 52 }, refbaseDMY, 53 };
+    if (refbaseDM.r != 50 || refbaseDM.a != 52 || refbaseDM.s != 51
+        || refbaseDM.v != 53)
+        return 47741;
+    refbaseDM.r = 54;
+    refbaseDM.s = 55;
+    if (refbaseDMX != 54 || refbaseDMY != 55) return 47742;
+
+    int refbaseNestedX = 56;
+    cppref.BraceAggNestedRefDerived refbaseNested = {
+        { refbaseNestedX, 57, 58.5, 59, 60 }, 61 };
+    if (refbaseNested.nested.m.r != 56 || refbaseNested.nested.m.v != 57
+        || refbaseNested.nested.m.d != 58.5 || refbaseNested.nested.k != 59
+        || refbaseNested.baseTail != 60 || refbaseNested.derivedTail != 61)
+        return 47743;
+    refbaseNested.nested.m.r = 62;
+    if (refbaseNestedX != 62) return 47744;
+
+    int refbaseNestedElidedX = 63;
+    cppref.BraceAggNestedRefDerived refbaseNestedElided = {
+        refbaseNestedElidedX, 64, 65.5, 66, 67, 68 };
+    if (refbaseNestedElided.nested.m.r != 63 || refbaseNestedElided.nested.m.v != 64
+        || refbaseNestedElided.nested.m.d != 65.5 || refbaseNestedElided.nested.k != 66
+        || refbaseNestedElided.baseTail != 67 || refbaseNestedElided.derivedTail != 68)
+        return 47745;
+    refbaseNestedElided.nested.m.r = 69;
+    if (refbaseNestedElidedX != 69) return 47746;
+
+    cppref.reset_refbase_order();
+    cppref.BraceOrderOuter refbaseOrder = {
+        cppref.refbase_order_value(1), { cppref.refbase_order_value(2) },
+        cppref.refbase_order_value(3), cppref.refbase_order_value(4) };
+    if (cppref.refbase_order() != 1234 || refbaseOrder.inner.first != 1
+        || refbaseOrder.inner.nested.value != 2 || refbaseOrder.inner.last != 3
+        || refbaseOrder.tail != 4)
+        return 47749;
+
+    cppref.BraceAggNestedPair refbaseObjectPair = { 70, 71 };
+    int refbaseObjectX = 72;
+    cppref.BraceAggObjectDerived refbaseObject = {
+        { 73, refbaseObjectPair, refbaseObjectX }, 74 };
+    if (refbaseObject.inner.x != 73 || refbaseObject.inner.pair.a != 70
+        || refbaseObject.inner.pair.b != 71 || refbaseObject.tail != 74)
+        return 47747;
+    refbaseObject.r = 75;
+    if (refbaseObjectX != 75) return 47748;
 
     int refmemX = 5;
     cppref.RefHolder refmemH = cppref.make_ref(&refmemX);      // by-value return of the record
@@ -17084,6 +17256,51 @@ extern int main()
     if (arrowOwner.get() != 17.0) return 7561;
     cppi_retryptr.CompoundOwner compoundOwner = cppi_retryptr.CompoundOwner(5.0);
     if ((compoundOwner *= 3.0).get() != 15.0 || compoundOwner.v != 15.0) return 7562;
+    OpfreeRoundG opfreeGlobal = OpfreeRoundG(5);
+    if ((opfreeGlobal * 3).get() != 15 || (opfreeGlobal * 3).kind() != 101) return 7563;
+    OpfreeRoundG opfreeGlobalAssign = OpfreeRoundG(5);
+    if ((opfreeGlobalAssign *= 3).get() != 15 || opfreeGlobalAssign.get() != 15) return 7564;
+    cppi_opfree_ns.G opfreeNamespaced = cppi_opfree_ns.G(5);
+    if ((opfreeNamespaced * 3).get() != 15 || (opfreeNamespaced * 3).kind() != 102) return 7565;
+    cppi_opfree_ns.G opfreeNamespacedAssign = cppi_opfree_ns.G(5);
+    if ((opfreeNamespacedAssign *= 3).get() != 15 || opfreeNamespacedAssign.get() != 15) return 7566;
+    OpfreeRoundDerivedPlainMul opfreeBasePlain = OpfreeRoundDerivedPlainMul(5);
+    if ((opfreeBasePlain * 3).get() != 15 || (opfreeBasePlain * 3).kind() != 31) return 7567;
+    OpfreeRoundDerivedSpecMul opfreeBaseSpec = OpfreeRoundDerivedSpecMul(5);
+    if ((opfreeBaseSpec * 3).get() != 15 || (opfreeBaseSpec * 3).kind() != 32) return 7568;
+    OpfreeRoundDerivedPlainAssign opfreeBasePlainAssign = OpfreeRoundDerivedPlainAssign(5);
+    if ((opfreeBasePlainAssign *= 3).get() != 15) return 7569;
+    OpfreeRoundDerivedSpecAssign opfreeBaseSpecAssign = OpfreeRoundDerivedSpecAssign(5);
+    if ((opfreeBaseSpecAssign *= 3).get() != 15 || opfreeBaseSpecAssign.value != 5) return 7570;
+    cppi_opfree_ns.DerivedPlainMul opfreeNsBasePlain = cppi_opfree_ns.DerivedPlainMul(5);
+    if ((opfreeNsBasePlain * 3).get() != 15 || (opfreeNsBasePlain * 3).kind() != 41) return 7571;
+    cppi_opfree_ns.DerivedSpecMul opfreeNsBaseSpec = cppi_opfree_ns.DerivedSpecMul(5);
+    if ((opfreeNsBaseSpec * 3).get() != 15 || (opfreeNsBaseSpec * 3).kind() != 42) return 7572;
+    cppi_opfree_ns.DerivedPlainAssign opfreeNsBasePlainAssign = cppi_opfree_ns.DerivedPlainAssign(5);
+    if ((opfreeNsBasePlainAssign *= 3).get() != 15) return 7573;
+    cppi_opfree_ns.DerivedSpecAssign opfreeNsBaseSpecAssign = cppi_opfree_ns.DerivedSpecAssign(5);
+    if ((opfreeNsBaseSpecAssign *= 3).get() != 15 || opfreeNsBaseSpecAssign.value != 5) return 7574;
+    OpfreeRoundMemberRef opfreeMemberRef = OpfreeRoundMemberRef(5);
+    if ((opfreeMemberRef *= 3).get() != 15 || opfreeMemberRef.value != 15) return 7575;
+    OpfreeRoundFreeRef opfreeFreeRef = OpfreeRoundFreeRef(5);
+    if ((opfreeFreeRef += 3).get() != 8 || opfreeFreeRef.value != 8) return 7576;
+    OpfreeRoundFreeBoxRef opfreeFreeBoxRef = OpfreeRoundFreeBoxRef(5);
+    if ((opfreeFreeBoxRef *= 3).get() != 15 || opfreeFreeBoxRef.value != 15) return 7577;
+    cppi_opfree_ns.MemberRef opfreeNsMemberRef = cppi_opfree_ns.MemberRef(5);
+    if ((opfreeNsMemberRef *= 3).get() != 15 || opfreeNsMemberRef.value != 15) return 7578;
+    cppi_opfree_ns.FreeRef opfreeNsFreeRef = cppi_opfree_ns.FreeRef(5);
+    if ((opfreeNsFreeRef += 3).get() != 8 || opfreeNsFreeRef.value != 8) return 7579;
+    cppi_opfree_ns.MemberBoxRef opfreeNsMemberBoxRef = cppi_opfree_ns.MemberBoxRef(5);
+    if ((opfreeNsMemberBoxRef += 3).get() != 8 || opfreeNsMemberBoxRef.value != 8) return 7580;
+    cppi_opfree_ns.FreeBoxRef opfreeNsFreeBoxRef = cppi_opfree_ns.FreeBoxRef(5);
+    if ((opfreeNsFreeBoxRef *= 3).get() != 15 || opfreeNsFreeBoxRef.value != 15) return 7581;
+    cppi_opfree_ns.ConvertA opfreeConvertA = cppi_opfree_ns.ConvertA(5);
+    cppi_opfree_ns.ConvertW opfreeConvertCopy = opfreeConvertA * 3.0;
+    if (opfreeConvertCopy.get() != 18) return 7582;
+    cppi_opfree_ns.ConvertW opfreeConvertDirect = cppi_opfree_ns.ConvertW(opfreeConvertA * 3.0);
+    cppi_opfree_ns.ConvertExplicitW opfreeExplicitDirect =
+        cppi_opfree_ns.ConvertExplicitW(opfreeConvertA * 3.0);
+    if (opfreeConvertDirect.get() != 18 || opfreeExplicitDirect.get() != 19) return 7583;
     // `c op= move d` binds the rvalue-reference parameter to the moved value, spec or plain return
     // (the source is dead after `move`; the callee stealing from it is oracle-checked in scratch, not readable here).
     cppi_opspec.OsMv osMc = cppi_opspec.OsMv(1.0);

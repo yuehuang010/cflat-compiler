@@ -1176,13 +1176,13 @@ bool SplitConstTypeArgument(std::string_view arg, std::string& plain, int& const
         constDepth = depth;
         return true;
     }
-    // A view's `[]` is one level like a star: "(const int)[]" = "int[]" with element const.
+    // A view counts like a star; a naked const base lets T* deduce T = const E.
     const bool view = rest.ends_with("[]");
     if (view) rest.remove_suffix(2);
     size_t outer = 0;
     while (outer < rest.size() && rest[rest.size() - 1 - outer] == '*') ++outer;
     std::string_view word = rest.substr(0, rest.size() - outer);
-    if ((outer == 0 && !view) || !word.starts_with("(const ") || !word.ends_with(")")) return false;
+    if (!word.starts_with("(const ") || !word.ends_with(")")) return false;
     word = word.substr(7, word.size() - 8);
     size_t inner = 0;
     while (inner < word.size() && word[word.size() - 1 - inner] == '*') ++inner;

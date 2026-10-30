@@ -2640,6 +2640,140 @@ namespace cppi_retryptr
         }
     };
 }
+
+template <class T> struct OpfreeRoundBox
+{
+    T value;
+    int marker;
+    OpfreeRoundBox(T x, int tag = 0) : value(x), marker(tag) {}
+    int get() const { return (int)value; }
+    int kind() const { return marker; }
+};
+struct OpfreeRoundG
+{
+    int value;
+    explicit OpfreeRoundG(int x) : value(x) {}
+    int get() const { return value; }
+};
+inline OpfreeRoundBox<int> operator*(const OpfreeRoundG& a, int x)
+{ return OpfreeRoundBox<int>(a.value * x, 101); }
+inline OpfreeRoundG& operator*=(OpfreeRoundG& a, int x)
+{ a.value *= x; return a; }
+
+struct OpfreeRoundPlain { int value; int get() const { return value; } int kind() const { return 31; } };
+struct OpfreeRoundBasePlainMul { int value; explicit OpfreeRoundBasePlainMul(int x) : value(x) {} };
+struct OpfreeRoundDerivedPlainMul : OpfreeRoundBasePlainMul
+{ explicit OpfreeRoundDerivedPlainMul(int x) : OpfreeRoundBasePlainMul(x) {} };
+inline OpfreeRoundPlain operator*(const OpfreeRoundBasePlainMul& a, int x)
+{ return {a.value * x}; }
+struct OpfreeRoundBaseSpecMul { int value; explicit OpfreeRoundBaseSpecMul(int x) : value(x) {} };
+struct OpfreeRoundDerivedSpecMul : OpfreeRoundBaseSpecMul
+{ explicit OpfreeRoundDerivedSpecMul(int x) : OpfreeRoundBaseSpecMul(x) {} };
+inline OpfreeRoundBox<int> operator*(const OpfreeRoundBaseSpecMul& a, int x)
+{ return OpfreeRoundBox<int>(a.value * x, 32); }
+struct OpfreeRoundBasePlainAssign
+{ int value; explicit OpfreeRoundBasePlainAssign(int x) : value(x) {} int get() const { return value; } };
+struct OpfreeRoundDerivedPlainAssign : OpfreeRoundBasePlainAssign
+{ explicit OpfreeRoundDerivedPlainAssign(int x) : OpfreeRoundBasePlainAssign(x) {} };
+inline OpfreeRoundBasePlainAssign& operator*=(OpfreeRoundBasePlainAssign& a, int x)
+{ a.value *= x; return a; }
+struct OpfreeRoundBaseSpecAssign { int value; explicit OpfreeRoundBaseSpecAssign(int x) : value(x) {} };
+struct OpfreeRoundDerivedSpecAssign : OpfreeRoundBaseSpecAssign
+{ explicit OpfreeRoundDerivedSpecAssign(int x) : OpfreeRoundBaseSpecAssign(x) {} };
+inline OpfreeRoundBox<int>& operator*=(OpfreeRoundBaseSpecAssign& a, int x)
+{ static OpfreeRoundBox<int> r(0, 33); r.value = a.value * x; return r; }
+
+struct OpfreeRoundMemberRef
+{
+    int value;
+    explicit OpfreeRoundMemberRef(int x) : value(x) {}
+    int get() const { return value; }
+    OpfreeRoundMemberRef& operator*=(int x) { value *= x; return *this; }
+};
+struct OpfreeRoundFreeRef
+{
+    int value;
+    explicit OpfreeRoundFreeRef(int x) : value(x) {}
+    int get() const { return value; }
+};
+inline OpfreeRoundFreeRef& operator+=(OpfreeRoundFreeRef& a, int x)
+{ a.value += x; return a; }
+struct OpfreeRoundFreeBoxRef
+{ int value; explicit OpfreeRoundFreeBoxRef(int x) : value(x) {} };
+inline OpfreeRoundBox<int>& operator*=(OpfreeRoundFreeBoxRef& a, int x)
+{ static OpfreeRoundBox<int> r(0, 54); a.value *= x; r.value = a.value; return r; }
+
+namespace cppi_opfree_ns
+{
+    template <class T> struct Box
+    {
+        T value;
+        int marker;
+        Box(T x, int tag = 0) : value(x), marker(tag) {}
+        int get() const { return (int)value; }
+        int kind() const { return marker; }
+    };
+    struct G { int value; explicit G(int x) : value(x) {} int get() const { return value; } };
+    inline Box<int> operator*(const G& a, int x) { return Box<int>(a.value * x, 102); }
+    inline G& operator*=(G& a, int x) { a.value *= x; return a; }
+    struct Plain { int value; int get() const { return value; } int kind() const { return 41; } };
+    struct BasePlainMul { int value; explicit BasePlainMul(int x) : value(x) {} };
+    struct DerivedPlainMul : BasePlainMul { explicit DerivedPlainMul(int x) : BasePlainMul(x) {} };
+    inline Plain operator*(const BasePlainMul& a, int x) { return {a.value * x}; }
+    struct BaseSpecMul { int value; explicit BaseSpecMul(int x) : value(x) {} };
+    struct DerivedSpecMul : BaseSpecMul { explicit DerivedSpecMul(int x) : BaseSpecMul(x) {} };
+    inline Box<int> operator*(const BaseSpecMul& a, int x) { return Box<int>(a.value * x, 42); }
+    struct BasePlainAssign { int value; explicit BasePlainAssign(int x) : value(x) {} int get() const { return value; } };
+    struct DerivedPlainAssign : BasePlainAssign { explicit DerivedPlainAssign(int x) : BasePlainAssign(x) {} };
+    inline BasePlainAssign& operator*=(BasePlainAssign& a, int x) { a.value *= x; return a; }
+    struct BaseSpecAssign { int value; explicit BaseSpecAssign(int x) : value(x) {} };
+    struct DerivedSpecAssign : BaseSpecAssign { explicit DerivedSpecAssign(int x) : BaseSpecAssign(x) {} };
+    inline Box<int>& operator*=(BaseSpecAssign& a, int x)
+    { static Box<int> r(0, 43); r.value = a.value * x; return r; }
+    struct MemberRef
+    {
+        int value;
+        explicit MemberRef(int x) : value(x) {}
+        int get() const { return value; }
+        MemberRef& operator*=(int x) { value *= x; return *this; }
+    };
+    struct FreeRef { int value; explicit FreeRef(int x) : value(x) {} int get() const { return value; } };
+    inline FreeRef& operator+=(FreeRef& a, int x) { a.value += x; return a; }
+    struct MemberBoxRef
+    {
+        int value;
+        explicit MemberBoxRef(int x) : value(x) {}
+        Box<int>& operator+=(int x)
+        { static Box<int> r(0, 53); value += x; r.value = value; return r; }
+    };
+    struct FreeBoxRef { int value; explicit FreeBoxRef(int x) : value(x) {} };
+    inline Box<int>& operator*=(FreeBoxRef& a, int x)
+    { static Box<int> r(0, 58); a.value *= x; r.value = a.value; return r; }
+    struct ConvertA { int value; explicit ConvertA(int x) : value(x) {} };
+    struct ConvertR
+    {
+        int value;
+        explicit ConvertR(int x) : value(x) {}
+        ConvertR(const ConvertR& r) : value(r.value) {}
+        ~ConvertR() {}
+    };
+    inline ConvertR operator*(const ConvertA& a, double x)
+    { return ConvertR(a.value * (int)x); }
+    struct ConvertW
+    {
+        int value;
+        ConvertW(const ConvertR& r) : value(r.value + 3) {}
+        ~ConvertW() {}
+        int get() const { return value; }
+    };
+    struct ConvertExplicitW
+    {
+        int value;
+        explicit ConvertExplicitW(const ConvertR& r) : value(r.value + 4) {}
+        ~ConvertExplicitW() {}
+        int get() const { return value; }
+    };
+}
 // Explicit `move` of a NON-trivial class into a `T&&` / by-value operator parameter (legs 31700+).
 namespace cppi_opmv
 {
@@ -2967,6 +3101,26 @@ inline int operator+(ByValDer, int) { return 2; }
 struct ByValLongBase { int operator+(long) { return 1; } };
 struct ByValLongDer : ByValLongBase {};
 inline int operator+(ByValLongDer, int) { return 2; }
+
+// OPBIN: compound member/free ranking and template free/member ranking.
+inline int compoundChoice = 0;
+inline int getCompoundChoice() { return compoundChoice; }
+struct CompoundTie { int operator+=(int) { return 1; } };
+inline int operator+=(CompoundTie&, int) { return 2; }
+struct CompoundFree { int operator+=(int) & { compoundChoice = 1; return 1; } };
+inline int operator+=(const CompoundFree&, int) { compoundChoice = 2; return 2; }
+inline int operator+=(CompoundFree&&, int) { compoundChoice = 2; return 2; }
+inline const CompoundFree& compoundFreeConst(CompoundFree& value) { return value; }
+inline CompoundFree compoundFreeMake() { return {}; }
+inline const CompoundFree compoundFreeConstMake() { return {}; }
+
+struct TfWithMember { int operator+(int) { return 11; } };
+template<class T> inline int operator+(TfWithMember&, T) { return 21; }
+inline TfWithMember tfWithMemberMake() { return {}; }
+struct TfWithConstMember { int operator+(int) const { return 11; } };
+template<class T> inline int operator+(TfWithConstMember&, T) { return 21; }
+inline const TfWithConstMember& tfWithConstMemberRef(TfWithConstMember& value) { return value; }
+inline TfWithConstMember tfWithConstMemberMake() { return {}; }
 }
 
 // T291: a reversed `<=>` relation (`5 > x` as `0 > (x <=> 5)`) reads the mirrored ordering range

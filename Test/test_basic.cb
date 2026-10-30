@@ -10225,6 +10225,248 @@ class NestGenericClassOuterUsesULambda<U>
         }
     };
 };
+struct Nest5MemberTemplate<U>
+{
+    static int get<T>(T value) { return (int)sizeof(U) * 10 + (int)sizeof(T); }
+    int getInstance<T>(T value) { return (int)sizeof(U) * 10 + (int)sizeof(T); }
+};
+
+// NESTVAL accept-set: nested static calls keep working on both sides of field order.
+struct NestValAcceptPlainAfter
+{
+    int value = 7;
+    static int tag() { return 20; }
+    struct I { static int run() { return NestValAcceptPlainAfter.tag() + 1; } };
+};
+struct NestValAcceptPlainBefore
+{
+    struct I { static int run() { return NestValAcceptPlainBefore.tag() + 2; } };
+    int value = 7;
+    static int tag() { return 20; }
+};
+struct NestValAcceptGenericAfter<T>
+{
+    T marker = default;
+    int value = 7;
+    static int tag() { return 20 + (int)sizeof(T) * 10; }
+    struct I { static int run() { return NestValAcceptGenericAfter<T>.tag() + 3; } };
+};
+struct NestValAcceptGenericBefore<T>
+{
+    struct I { static int run() { return NestValAcceptGenericBefore<T>.tag() + 4; } };
+    T marker = default;
+    int value = 7;
+    static int tag() { return 20 + (int)sizeof(T) * 10; }
+};
+struct NestValAcceptClassNeighbor
+{
+    int value = 7;
+    static int tag() { return 20; }
+    class I { static int run() { return NestValAcceptClassNeighbor.tag() + 5; } };
+};
+union NestValAcceptUnionNeighbor
+{
+    int value = 7;
+    static int tag() { return 20; }
+    struct I { static int run() { return NestValAcceptUnionNeighbor.tag() + 6; } };
+};
+struct NestValPointerFieldOuter
+{
+    int value = 7;
+    struct I
+    {
+        NestValPointerFieldOuter* owner = nullptr;
+        int read() { return owner == nullptr ? 7 : 8; }
+    };
+};
+struct NestValPlainAfter
+{
+    int value = 7;
+    static int pick(int value) { return 20 + value; }
+    static int pick(double value) { return 99; }
+    int hit(int value) { return 30 + value; }
+    int hit(double value) { return 199; }
+    struct I
+    {
+        static NestValPlainAfter make() { return { value = 41 }; }
+        static int read(NestValPlainAfter value) { return value.value; }
+        static int run()
+        {
+            NestValPlainAfter local = default;
+            NestValPlainAfter returned = make();
+            int passed = read(local);
+            return local.value + returned.value + passed + (int)sizeof(NestValPlainAfter)
+                + NestValPlainAfter.pick(1) + local.hit(1);
+        }
+    };
+};
+struct NestValPlainBefore
+{
+    struct I
+    {
+        static NestValPlainBefore make() { return { value = 41 }; }
+        static int read(NestValPlainBefore value) { return value.value; }
+        static int run()
+        {
+            NestValPlainBefore local = default;
+            NestValPlainBefore returned = make();
+            int passed = read(local);
+            return local.value + returned.value + passed + (int)sizeof(NestValPlainBefore)
+                + NestValPlainBefore.pick(1) + local.hit(1);
+        }
+    };
+    int value = 7;
+    static int pick(int value) { return 20 + value; }
+    static int pick(double value) { return 99; }
+    int hit(int value) { return 30 + value; }
+    int hit(double value) { return 199; }
+};
+struct NestValGenericAfter<T>
+{
+    T marker = default;
+    int value = 7;
+    static int pick(int value) { return 20 + value; }
+    static int pick(double value) { return 99; }
+    int hit(int value) { return 30 + value; }
+    int hit(double value) { return 199; }
+    struct I
+    {
+        static NestValGenericAfter<T> make() { return { value = 41 }; }
+        static int read(NestValGenericAfter<T> value) { return value.value; }
+        static int run()
+        {
+            NestValGenericAfter<T> local = default;
+            NestValGenericAfter<T> returned = make();
+            int passed = read(local);
+            return local.value + returned.value + passed + (int)sizeof(NestValGenericAfter<T>)
+                + NestValGenericAfter<T>.pick(1) + local.hit(1);
+        }
+    };
+};
+struct NestValGenericBefore<T>
+{
+    struct I
+    {
+        static NestValGenericBefore<T> make() { return { value = 41 }; }
+        static int read(NestValGenericBefore<T> value) { return value.value; }
+        static int run()
+        {
+            NestValGenericBefore<T> local = default;
+            NestValGenericBefore<T> returned = make();
+            int passed = read(local);
+            return local.value + returned.value + passed + (int)sizeof(NestValGenericBefore<T>)
+                + NestValGenericBefore<T>.pick(1) + local.hit(1);
+        }
+    };
+    T marker = default;
+    int value = 7;
+    static int pick(int value) { return 20 + value; }
+    static int pick(double value) { return 99; }
+    int hit(int value) { return 30 + value; }
+    int hit(double value) { return 199; }
+};
+struct NestValClassOuter
+{
+    int value = 7;
+    static int pick(int x) { return 20 + x; }
+    int hit(int x) { return 30 + x; }
+    class I
+    {
+        NestValClassOuter make() { return { value = 41 }; }
+        int read(NestValClassOuter value) { return value.value; }
+        int run()
+        {
+            NestValClassOuter local = default;
+            NestValClassOuter returned = make();
+            return local.value + returned.value + read(local) + (int)sizeof(NestValClassOuter)
+                + NestValClassOuter.pick(1) + local.hit(1);
+        }
+    };
+};
+union NestValUnionOuter
+{
+    int value = 7;
+    static int pick(int x) { return 20 + x; }
+    int hit(int x) { return 30 + x; }
+    struct I
+    {
+        NestValUnionOuter make() { NestValUnionOuter result = default; result.value = 41; return result; }
+        int read(NestValUnionOuter value) { return value.value; }
+        int run()
+        {
+            NestValUnionOuter local = default;
+            NestValUnionOuter returned = make();
+            return local.value + returned.value + read(local) + (int)sizeof(NestValUnionOuter)
+                + NestValUnionOuter.pick(1) + local.hit(1);
+        }
+    };
+};
+struct Nest5PlainMemberTemplate
+{
+    static int get<T>(T value) { return 30 + (int)sizeof(T); }
+};
+struct Nest5SiblingGeneric<U>
+{
+    struct I { static int go() { return (int)sizeof(U) * 10; } };
+    struct M
+    {
+        static int callStatic() { return I.go() + 1; }
+        int callInstance() { return I.go() + 2; }
+    };
+    static int callInstance() { M m = default; return m.callInstance(); }
+};
+struct Nest5SiblingPlain
+{
+    struct I { static int go() { return 30; } };
+    struct M
+    {
+        static int callStatic() { return I.go() + 1; }
+        int callInstance() { return I.go() + 2; }
+    };
+    static int callInstance() { M m = default; return m.callInstance(); }
+};
+namespace Nest5QualifiedNS
+{
+    struct O<U> { static int run() { return 40 + (int)sizeof(U); } };
+    struct Plain { static int run() { return 30; } };
+    struct wrap<U> { static int run() { return 50 + (int)sizeof(U); } };
+};
+struct wrap<U> { static int run() { return 90; } };
+struct Nest5Round2Receiver
+{
+    int wrap<T>(T value) { return (int)sizeof(T) * 10 + 3; }
+    int pick<T>(T value) { return (int)sizeof(T) * 10 + 3; }
+    int implicitCall() { return wrap<double>(1.0); }
+    int explicitCall() { return this.wrap<double>(1.0); }
+};
+struct Nest5Round2Envelope { Nest5Round2Receiver field = default; };
+Nest5Round2Receiver nest5Round2MakeReceiver() { return default; }
+int nest5Round2Parameter(Nest5Round2Receiver value)
+{
+    return value.wrap<double>(1.0);
+}
+struct Nest5Round2GenericReceiver<U>
+{
+    int wrap<T>(T value)
+    {
+        return (int)sizeof(U) * 100 + (int)sizeof(T) * 10 + 5;
+    }
+    int pick<T>(T value)
+    {
+        return (int)sizeof(U) * 100 + (int)sizeof(T) * 10 + 5;
+    }
+};
+struct Nest5Round2NestedOwner<U>
+{
+    struct B<V>
+    {
+        static int get<T>(T value)
+        {
+            return (int)sizeof(U) * 100 + (int)sizeof(V) * 10 + (int)sizeof(T);
+        }
+    };
+    static int call() { return B<char>.get<int>(1); }
+};
 struct MtplGenericMemberOverload
 {
     int gv(double value) { return 2; }
@@ -10242,6 +10484,85 @@ bool mtplDoubleOnlyCallRemainsRejected()
     expect_error("no overload of 'gv' matches the given arguments") { h.gv(2); }
     return true;
 }
+
+interface Nest6DefaultInterface { int h(int a, int b = 13); };
+class Nest6DefaultImpl : Nest6DefaultInterface
+{
+    int h(int a, int b = 2) { return a * 100 + b; }
+};
+int nest6InterfaceParam(Nest6DefaultInterface p) { return p.h(1); }
+
+interface Nest6GenericDefaultInterface<T> { int h(int a, int b = 13); };
+class Nest6GenericDefaultImpl<T> : Nest6GenericDefaultInterface<T>
+{
+    int h(int a, int b = 2) { return a * 100 + b; }
+};
+
+interface Nest6TwoDefaultsInterface { int h(int a, int b = 2, int c = 3); };
+class Nest6TwoDefaultsImpl : Nest6TwoDefaultsInterface
+{
+    int h(int a, int b = 4, int c = 5) { return a * 100 + b * 10 + c; }
+};
+
+interface Nest6AllDefaultsInterface { int h(int a = 11, int b = 12); };
+class Nest6AllDefaultsImpl : Nest6AllDefaultsInterface
+{
+    int h(int a = 41, int b = 42) { return a + b; }
+};
+
+interface Nest6DerivedDefaultBaseInterface { int h(int a, int b = 13); };
+interface Nest6DerivedDefaultInterface : Nest6DerivedDefaultBaseInterface
+{
+    int h(int a, int b = 77);
+};
+class Nest6DerivedDefaultImpl : Nest6DerivedDefaultInterface
+{
+    int h(int a, int b) { return a * 100 + b; }
+};
+
+interface Nest6DefaultOverloadInterface
+{
+    int h(int a, int b = 2);
+    int h(double a);
+};
+class Nest6DefaultOverloadImpl : Nest6DefaultOverloadInterface
+{
+    int h(int a, int b = 2) { return 10 + b; }
+    int h(double a) { return 99; }
+};
+
+interface Nest6TwoDefaultOverloadsInterface
+{
+    int h(int a, int b = 2);
+    int h(double a, double b, int c = 5);
+};
+class Nest6TwoDefaultOverloadsImpl : Nest6TwoDefaultOverloadsInterface
+{
+    int h(int a, int b) { return 10 + b; }
+    int h(double a, double b, int c) { return 30 + c; }
+};
+
+interface Nest6LiteralDefaultInterface
+{
+    int h(long a);
+    int h(int a, int b = 2);
+};
+class Nest6LiteralDefaultImpl : Nest6LiteralDefaultInterface
+{
+    int h(long a) { return 1; }
+    int h(int a, int b) { return 10 + b; }
+};
+
+interface Nest6GenericLiteralDefaultInterface<T>
+{
+    int h(T a);
+    int h(int a, int b = 2);
+};
+class Nest6GenericLiteralDefaultImpl<T> : Nest6GenericLiteralDefaultInterface<T>
+{
+    int h(T a) { return 1; }
+    int h(int a, int b) { return 10 + b; }
+};
 
 bool testT471BareCalls()
 {
@@ -10347,10 +10668,140 @@ bool testT471BareCalls()
     result &= Test("nest4 member default hides same-name free function", nest4MemberWins.bareCall(), 13);
     Nest4LambdaDefault nest4Lambda = default;
     result &= Test("nest4 lambda captures implicit this for default call", nest4Lambda.lambdaCall(), 13);
+    Nest6DefaultImpl nest6Default = default;
+    Nest6DefaultInterface nest6Iface = nest6Default;
+    result &= Test("nest6 interface default on variable", nest6Iface.h(1), 113);
+    result &= Test("nest6 interface default on parameter", nest6InterfaceParam(nest6Default), 113);
+    result &= Test("nest6 implementation keeps its own direct default", nest6Default.h(1), 102);
+    Nest6GenericDefaultImpl<int> nest6GenericDefault = default;
+    Nest6GenericDefaultInterface<int> nest6GenericIface = nest6GenericDefault;
+    result &= Test("nest6 generic interface default", nest6GenericIface.h(1), 113);
+    Nest6TwoDefaultsImpl nest6TwoDefaults = default;
+    Nest6TwoDefaultsInterface nest6TwoIface = nest6TwoDefaults;
+    result &= Test("nest6 interface supplies two defaults", nest6TwoIface.h(1), 123);
+    Nest6AllDefaultsImpl nest6AllDefaults = default;
+    Nest6AllDefaultsInterface nest6AllIface = nest6AllDefaults;
+    result &= Test("nest6 interface supplies all defaults", nest6AllIface.h(), 23);
+    Nest6DerivedDefaultImpl nest6DerivedDefault = default;
+    Nest6DerivedDefaultInterface nest6DerivedIface = nest6DerivedDefault;
+    Nest6DerivedDefaultBaseInterface nest6BaseIface = nest6DerivedDefault;
+    result &= Test("nest6 derived interface redeclaration supplies its own default",
+        nest6DerivedIface.h(1), 177);
+    result &= Test("nest6 base interface retains its declared default",
+        nest6BaseIface.h(1), 113);
+    Nest6DefaultOverloadImpl nest6DefaultOverload = default;
+    Nest6DefaultOverloadInterface nest6DefaultOverloadIface = nest6DefaultOverload;
+    result &= Test("nest6 defaulted interface overload ranks with exact overload",
+        nest6DefaultOverloadIface.h(1), 12);
+    result &= Test("nest6 direct overload ranking remains unchanged",
+        nest6DefaultOverload.h(1), 12);
+    Nest6TwoDefaultOverloadsImpl nest6TwoDefaultOverloads = default;
+    Nest6TwoDefaultOverloadsInterface nest6TwoDefaultOverloadsIface = nest6TwoDefaultOverloads;
+    result &= Test("nest6 shorter default overload wins over int conversion",
+        nest6TwoDefaultOverloadsIface.h(1.5, 2.5), 35);
+    result &= Test("nest6 overload defaults use distinct effective arities",
+        nest6TwoDefaultOverloadsIface.h(1), 12);
+    Nest6LiteralDefaultImpl nest6LiteralDefault = default;
+    Nest6LiteralDefaultInterface nest6LiteralDefaultIface = nest6LiteralDefault;
+    result &= Test("nest6 interface literal prefers defaulted int overload",
+        nest6LiteralDefaultIface.h(1), 12);
+    Nest6GenericLiteralDefaultImpl<long> nest6GenericLiteralDefault = default;
+    Nest6GenericLiteralDefaultInterface<long> nest6GenericLiteralDefaultIface =
+        nest6GenericLiteralDefault;
+    result &= Test("nest6 generic interface literal prefers defaulted int overload",
+        nest6GenericLiteralDefaultIface.h(1), 12);
     result &= Test("nest generic class outer template uses current instantiation",
         NestGenericClassOuterUsesU<i64>.I.call() + NestGenericClassOuterUsesU<char>.I.call(), 96);
     result &= Test("nest generic class outer template through lambda uses current instantiation",
         NestGenericClassOuterUsesULambda<i64>.I.call() + NestGenericClassOuterUsesULambda<char>.I.call(), 96);
+    result &= Test("nestval accept-set plain outer field before nested type",
+        NestValAcceptPlainAfter.I.run(), 21);
+    result &= Test("nestval accept-set plain outer field after nested type",
+        NestValAcceptPlainBefore.I.run(), 22);
+    result &= Test("nestval accept-set generic outer field before nested type",
+        NestValAcceptGenericAfter<long>.I.run(), 20 + (int)sizeof(long) * 10 + 3);
+    result &= Test("nestval accept-set generic outer field after nested type",
+        NestValAcceptGenericBefore<long>.I.run(), 20 + (int)sizeof(long) * 10 + 4);
+    result &= Test("nestval accept-set nested class static call", NestValAcceptClassNeighbor.I.run(), 25);
+    result &= Test("nestval accept-set nested union static call", NestValAcceptUnionNeighbor.I.run(), 26);
+    NestValPointerFieldOuter.I nestValPointerField = default;
+    result &= Test("nestval accept-set enclosing pointer field remains legal",
+        nestValPointerField.read(), 7);
+    result &= Test("nestval plain outer body after its fields by value",
+        NestValPlainAfter.I.run(), 111);
+    result &= Test("nestval plain outer body before its fields by value",
+        NestValPlainBefore.I.run(), 111);
+    result &= Test("nestval generic outer body after its fields by value",
+        NestValGenericAfter<long>.I.run(), 107 + (int)sizeof(NestValGenericAfter<long>));
+    result &= Test("nestval generic outer body before its fields by value",
+        NestValGenericBefore<long>.I.run(), 107 + (int)sizeof(NestValGenericBefore<long>));
+    NestValClassOuter.I nestValClass = default;
+    result &= Test("nestval nested class method uses enclosing struct by value",
+        nestValClass.run(), 111);
+    NestValUnionOuter.I nestValUnion = default;
+    result &= Test("nestval nested struct in union method uses enclosing union by value",
+        nestValUnion.run(), 111);
+    Nest5MemberTemplate<char> nest5MemberChar = default;
+    result &= Test("nest5 outer U in explicit static member template",
+        Nest5MemberTemplate<i64>.get<char>(0), 81);
+    result &= Test("nest5 distinct outer U in static member template",
+        Nest5MemberTemplate<char>.get<char>(0), 11);
+    result &= Test("nest5 outer U in inferred static member template",
+        Nest5MemberTemplate<i64>.get(0), 84);
+    result &= Test("nest5 outer U in explicit instance member template",
+        nest5MemberChar.getInstance<i64>(0), 18);
+    result &= Test("nest5 outer U in inferred instance member template",
+        nest5MemberChar.getInstance(0), 14);
+    result &= Test("nest5 non-generic outer explicit member template",
+        Nest5PlainMemberTemplate.get<char>(0), 31);
+    result &= Test("nest5 non-generic outer inferred member template",
+        Nest5PlainMemberTemplate.get(0), 34);
+    result &= Test("nest5 generic sibling static caller for i64",
+        Nest5SiblingGeneric<i64>.M.callStatic(), 81);
+    result &= Test("nest5 generic sibling static caller for char",
+        Nest5SiblingGeneric<char>.M.callStatic(), 11);
+    result &= Test("nest5 generic sibling instance caller for i64",
+        Nest5SiblingGeneric<i64>.callInstance(), 82);
+    result &= Test("nest5 generic sibling instance caller for char",
+        Nest5SiblingGeneric<char>.callInstance(), 12);
+    result &= Test("nest5 non-generic sibling static caller",
+        Nest5SiblingPlain.M.callStatic(), 31);
+    result &= Test("nest5 non-generic sibling instance caller",
+        Nest5SiblingPlain.callInstance(), 32);
+    result &= Test("nest5 namespace-qualified generic static for i64",
+        Nest5QualifiedNS.O<i64>.run(), 48);
+    result &= Test("nest5 namespace-qualified generic static for char",
+        Nest5QualifiedNS.O<char>.run(), 41);
+    result &= Test("nest5 namespace-qualified non-generic static",
+        Nest5QualifiedNS.Plain.run(), 30);
+    result &= Test("nest5 namespace-qualified generic beats same-named global",
+        Nest5QualifiedNS.wrap<double>.run(), 58);
+    Nest5Round2Receiver nest5Round2Local = default;
+    result &= Test("nest5 member template local receiver collision",
+        nest5Round2Local.wrap<double>(1.0), 83);
+    result &= Test("nest5 member template unique-name receiver control",
+        nest5Round2Local.pick<double>(1.0), 83);
+    result &= Test("nest5 member template parameter receiver collision",
+        nest5Round2Parameter(default), 83);
+    Nest5Round2Receiver* nest5Round2Pointer = &nest5Round2Local;
+    result &= Test("nest5 member template pointer receiver collision",
+        nest5Round2Pointer.wrap<double>(1.0), 83);
+    Nest5Round2Envelope nest5Round2Envelope = default;
+    result &= Test("nest5 member template field receiver collision",
+        nest5Round2Envelope.field.wrap<double>(1.0), 83);
+    result &= Test("nest5 member template implicit this receiver collision",
+        nest5Round2Local.implicitCall(), 83);
+    result &= Test("nest5 member template explicit this receiver collision",
+        nest5Round2Local.explicitCall(), 83);
+    Nest5Round2GenericReceiver<i64> nest5Round2Generic = default;
+    result &= Test("nest5 member template generic receiver collision",
+        nest5Round2Generic.wrap<char>('a'), 815);
+    result &= Test("nest5 member template unique-name generic receiver control",
+        nest5Round2Generic.pick<char>('a'), 815);
+    result &= Test("nest5 member template call result receiver collision",
+        nest5Round2MakeReceiver().wrap<double>(1.0), 83);
+    result &= Test("nest5 nested generic owner binds outer inner and method arguments",
+        Nest5Round2NestedOwner<double>.call(), 814);
     result &= Test("nest inner plain method hides outer template",
         NestRound1NS.Outer.InnerPlain.call(), 203);
     result &= Test("nest inner template hides outer template",

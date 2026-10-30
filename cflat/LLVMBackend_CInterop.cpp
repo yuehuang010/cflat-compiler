@@ -5075,7 +5075,15 @@ int LLVMBackend::ClassifyCxxSignatureSpelling(const std::string& spelling,
         const std::string foreignLookupSpelling = named;
         if (CxxSpellingIsBareNullptrT(named)) return 0;   // a builtin: the mapper answers it
         named = CanonicalizeCxxUniquePtrSpelling(named);
-        if (named.find("::") == std::string::npos) return 0;
+        if (named.find("::") == std::string::npos)
+        {
+            const size_t globalTemplateOpen = named.find('<');
+            if (globalTemplateOpen == std::string::npos
+                || !HasCxxClassTemplate(named.substr(0, globalTemplateOpen)))
+                return 0;
+            identity = CanonicalCxxForeignIdentity(named);
+            return identity.empty() ? 3 : 2;
+        }
         if (named.find('<') == std::string::npos)
         {
             // Only a plain qualified class name can be a typedef of a specialization worth a
@@ -9455,6 +9463,83 @@ bool LLVMBackend::HasCxxFunctionTemplate(const std::string& qualifiedName) const
         return dot != std::string::npos
             && !ResolveCxxFunctionTemplateName(qualifiedName.substr(0, dot),
                                                qualifiedName.substr(dot + 1)).empty();
+}
+
+bool LLVMBackend::HasCxxFunctionTemplateForRecordArgument(
+        const std::string& qualifiedName, const std::string& recordType, size_t arity) const
+{
+        std::string resolvedName = qualifiedName;
+        auto templates = cxxFunctionTemplates_.find(resolvedName);
+        if (templates == cxxFunctionTemplates_.end())
+        {
+            const size_t dot = qualifiedName.rfind('.');
+            if (dot == std::string::npos) return false;
+            resolvedName = ResolveCxxFunctionTemplateName(
+                qualifiedName.substr(0, dot), qualifiedName.substr(dot + 1));
+            templates = cxxFunctionTemplates_.find(resolvedName);
+            if (templates == cxxFunctionTemplates_.end()) return false;
+        }
+
+        auto stripSpecialization = [](const std::string& type) {
+            const size_t separator = type.find('$');
+            return type.substr(0, separator);
+        };
+        const std::string recordBase = stripSpecialization(recordType);
+        static const std::set<std::string> builtins = {
+            "void", "bool", "char", "wchar", "c8", "c16", "c32", "short", "u16",
+            "int", "u32", "long", "ulong", "i64", "u64", "float", "double",
+            "longdouble", "i8", "u8"
+        };
+        for (const auto& candidate : templates->second)
+        {
+            if (candidate.kind != cflat_cinterop::RawFunctionTemplate::Free
+                || arity < candidate.minArity || arity > candidate.maxArity
+                || candidate.parameterTypes.empty())
+                continue;
+
+            std::string parameterType = candidate.parameterTypes.front();
+            if (parameterType.find('*') != std::string::npos) continue;
+            for (const char* tag : { "class ", "struct ", "union " })
+                if (parameterType.starts_with(tag))
+                {
+                    parameterType.erase(0, std::strlen(tag));
+                    break;
+                }
+            for (const char* qualifier : { "const", "volatile" })
+                for (size_t pos = 0; (pos = parameterType.find(qualifier, pos)) != std::string::npos; )
+                {
+                    const size_t end = pos + std::strlen(qualifier);
+                    const bool leftBoundary = pos == 0
+                        || std::isspace(static_cast<unsigned char>(parameterType[pos - 1]));
+                    const bool rightBoundary = end == parameterType.size()
+                        || std::isspace(static_cast<unsigned char>(parameterType[end]));
+                    if (leftBoundary && rightBoundary) parameterType.erase(pos, end - pos);
+                    else pos = end;
+                }
+            parameterType.erase(std::remove(parameterType.begin(), parameterType.end(), '&'),
+                                parameterType.end());
+            const size_t first = parameterType.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) continue;
+            parameterType.erase(0, first);
+            const size_t last = parameterType.find_last_not_of(" \t\r\n");
+            parameterType.erase(last + 1);
+
+            const std::string parameterIdentity = CanonicalCxxForeignIdentity(parameterType);
+            if (parameterIdentity == recordType || parameterIdentity == recordBase
+                || IsCxxBaseOf(parameterIdentity, recordType))
+                return true;
+
+            const bool simpleTypeName = !parameterType.empty()
+                && std::all_of(parameterType.begin(), parameterType.end(), [](unsigned char c) {
+                    return std::isalnum(c) || c == '_';
+                });
+            if (candidate.typeParameterCount != 0 && simpleTypeName
+                && !builtins.count(parameterIdentity)
+                && !IsCxxRecord(parameterIdentity)
+                && !IsCxxForeignTypeRegistered(parameterIdentity))
+                return true;
+        }
+        return false;
 }
 
 bool LLVMBackend::HasArityViableCxxFunctionTemplate(
@@ -17475,6 +17560,32 @@ static bool CxxBraceFieldIsReference(const std::string& spelling)
         return false;
 }
 
+static bool CxxBraceFieldIsFunctionReference(const std::string& spelling)
+{
+        for (size_t open = 0; open < spelling.size(); ++open)
+        {
+            if (spelling[open] != '(') continue;
+            int depth = 1;
+            size_t close = open + 1;
+            for (; close < spelling.size() && depth != 0; ++close)
+            {
+                if (spelling[close] == '(') ++depth;
+                else if (spelling[close] == ')') --depth;
+            }
+            if (depth != 0) break;
+            --close;
+            const size_t suffix = close + 1;
+            if (suffix < spelling.size() && spelling[suffix] == '(')
+            {
+                const std::string_view declarator(spelling.data() + open + 1, close - open - 1);
+                return declarator.find('&') != std::string_view::npos
+                    && declarator.find('*') == std::string_view::npos;
+            }
+            open = close;
+        }
+        return false;
+}
+
 static bool CxxBraceFieldIsRvalueReference(const std::string& spelling)
 {
         const size_t last = spelling.find_last_not_of(" \t\r\n");
@@ -17555,6 +17666,46 @@ bool LLVMBackend::CxxRecordFieldTypeSpelling(const std::string& typeName,
         return !spelling.empty();
 }
 
+size_t LLVMBackend::CxxAggregateBaseCount(const std::string& typeName) const
+{
+        const std::string resolvedType = ResolveTypeAlias(typeName);
+        auto record = cxxRecordEntries_.find(resolvedType);
+        return record == cxxRecordEntries_.end() ? 0 : record->second.bases.size();
+}
+
+std::string LLVMBackend::CxxAggregateBaseTypeAt(const std::string& typeName, size_t index) const
+{
+        const std::string resolvedType = ResolveTypeAlias(typeName);
+        auto record = cxxRecordEntries_.find(resolvedType);
+        if (record == cxxRecordEntries_.end() || index >= record->second.bases.size())
+            return {};
+        const auto& base = record->second.bases[index];
+        if (base.access != cflat_cinterop::AccessPublic || base.isVirtual) return {};
+        return ResolveCxxBaseRecordName(base);
+}
+
+size_t LLVMBackend::CxxAggregateBaseFieldCountAt(const std::string& typeName,
+                                                  size_t index) const
+{
+        const std::string resolvedType = ResolveTypeAlias(typeName);
+        auto record = cxxRecordEntries_.find(resolvedType);
+        if (record == cxxRecordEntries_.end() || index >= record->second.bases.size()) return 0;
+        const auto& base = record->second.bases[index];
+        if (base.access != cflat_cinterop::AccessPublic || base.isVirtual) return 0;
+        const std::string baseType = ResolveCxxBaseRecordName(base);
+        auto baseRecord = cxxRecordEntries_.find(baseType);
+        return baseRecord == cxxRecordEntries_.end() ? 0 : baseRecord->second.fields.size();
+}
+
+std::string LLVMBackend::CxxAggregateFlattenedFieldNameAt(const std::string& typeName,
+                                                          size_t index) const
+{
+        const std::string resolvedType = ResolveTypeAlias(typeName);
+        auto record = cxxRecordEntries_.find(resolvedType);
+        if (record == cxxRecordEntries_.end() || index >= record->second.fields.size()) return {};
+        return record->second.fields[index].name;
+}
+
 bool LLVMBackend::RequestCxxDirectBraceConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& elements,
         const std::string& initializerList, bool copyListInit, std::string& wrapperName,
@@ -17606,21 +17757,31 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         std::vector<std::string> parameterTypes{ ownerSpelling + " *" };
         std::vector<std::string> elementParameters(elements.size());
         std::vector<size_t> elementParameterTypes(elements.size(), 0);
+        std::vector<bool> elementIsFunctionReference(elements.size(), false);
         std::string init = initializerList;
         size_t nextParameter = 1;
+        auto isBareNullptrLiteral = [](const NamedVariable& element) {
+            const auto& type = element.TypeAndValue;
+            return type.TypeName.empty() && !type.Pointer && !type.IsCxxNullptrT
+                && !type.IsFunctionPointer && element.LiteralIdentity.empty()
+                && element.Storage == nullptr
+                && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(element.Primary);
+        };
         for (size_t i = 0; i < elements.size(); ++i)
         {
             std::string spelling;
             const auto& type = elements[i].TypeAndValue;
-            if (type.TypeName.empty() || !CxxSpellingForCflatType(type.TypeName, spelling))
-            {
-                error = std::format("C++ brace-list element type '{}' has no C++ spelling",
-                                    type.TypeName);
-                return false;
-            }
-            if (type.Pointer && spelling.find('*') == std::string::npos) spelling += " *";
+            const std::string targetType = elementTargetTypes != nullptr
+                && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
             if (elements[i].IsDefaultArgument)
             {
+                if (type.TypeName.empty() || !CxxSpellingForCflatType(type.TypeName, spelling))
+                {
+                    error = std::format("C++ brace-list element type '{}' has no C++ spelling",
+                                        type.TypeName);
+                    return false;
+                }
+                if (type.Pointer && spelling.find('*') == std::string::npos) spelling += " *";
                 if (type.Pointer || type.IsAlias || type.IsRvalueRef
                     || !IsCxxRecord(type.TypeName))
                 {
@@ -17637,11 +17798,50 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 }
                 continue;
             }
-            const std::string targetType = elementTargetTypes != nullptr
-                && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
-            if (CxxBraceFieldIsReference(targetType))
+            if (isBareNullptrLiteral(elements[i]))
             {
-                spelling = targetType;
+                const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
+                size_t at = 0;
+                while ((at = init.find(marker, at)) != std::string::npos)
+                {
+                    init.replace(at, marker.size(), "nullptr");
+                    at += sizeof("nullptr") - 1;
+                }
+                continue;
+            }
+            const bool targetIsReference = CxxBraceFieldIsReference(targetType);
+            if (targetIsReference)
+            {
+                elementIsFunctionReference[i] = CxxBraceFieldIsFunctionReference(targetType);
+                if (elementIsFunctionReference[i]
+                    && !CxxThinFunctionPointerSpelling(type, spelling))
+                {
+                    // An existing C++ function reference (no CFlat spelling): bind by reference, clang checks it.
+                    elementIsFunctionReference[i] = false;
+                    spelling = targetType;
+                }
+                else if (elementIsFunctionReference[i])
+                {
+                    if (!IsCxxFunctionDesignatorArgument(elements[i])
+                        || elements[i].Storage != nullptr)
+                    {
+                        error = "cannot bind a C++ function reference to a function pointer value; use a named function";
+                        return false;
+                    }
+                }
+                else
+                    spelling = targetType;
+            }
+            else if (type.TypeName.empty() || !CxxSpellingForCflatType(type.TypeName, spelling))
+            {
+                error = std::format("C++ brace-list element type '{}' has no C++ spelling",
+                                    type.TypeName);
+                return false;
+            }
+            if (!targetIsReference && type.Pointer && spelling.find('*') == std::string::npos)
+                spelling += " *";
+            if (targetIsReference)
+            {
                 elementParameters[i] = "p" + std::to_string(nextParameter++);
                 elementParameterTypes[i] = parameterTypes.size();
                 parameterTypes.push_back(std::move(spelling));
@@ -17672,7 +17872,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         }
         for (size_t i = 0; i < elements.size(); ++i)
         {
-            if (elements[i].IsDefaultArgument) continue;
+            if (elements[i].IsDefaultArgument || isBareNullptrLiteral(elements[i])) continue;
             const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
             const std::string& param = elementParameters[i];
             const std::string targetType = elementTargetTypes != nullptr
@@ -17680,7 +17880,9 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             if (CxxBraceFieldIsReference(targetType))
             {
                 std::string replacement = param;
-                if (CxxBraceFieldIsRvalueReference(targetType))
+                if (elementIsFunctionReference[i])
+                    replacement = "(*" + param + ")";
+                else if (CxxBraceFieldIsRvalueReference(targetType))
                 {
                     const size_t last = targetType.find_last_not_of(" \t\r\n");
                     const size_t first = last != std::string::npos && last > 0
@@ -23268,6 +23470,11 @@ void LLVMBackend::EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& 
                 else if (templateDepth == 0) topLevel += ch;
             }
             const bool pointerSpelling = topLevel.find('*') != std::string::npos;
+            const bool referenceToTemplateSpecialization = templateClose != std::string::npos
+                && spelling.find('<') != std::string::npos
+                && topLevel.find('&') != std::string::npos
+                && topLevel.find("&&") == std::string::npos
+                && pointerCvRefSuffixOnly();
             bool hasPointerRefTemplateArgument = false;
             std::vector<bool> nestedTemplateInArgument;
             for (char ch : spelling)
@@ -23331,6 +23538,7 @@ void LLVMBackend::EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& 
                                    && mappedAsOpaquePointer))
                 && !memberFilter.empty() && !stdFunctionIdentity
                 && (byValueTemplate
+                    || (allowPointerRequest && referenceToTemplateSpecialization)
                     || (spelling.find('*') == std::string::npos
                         && spelling.find('&') == std::string::npos)
                     || pointerToTemplateSpecialization))
@@ -24288,16 +24496,6 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 fields.reserve(r.fields.size());
                 for (const auto& f : r.fields)
                 {
-                    if (r.isCxx && f.ctype.find("::*") != std::string::npos)
-                    {
-                        r.layoutRefusal = std::format(
-                            "field '{}' of '{}' is a pointer to member; member-pointer fields are not supported (an ordinary pointer is not equivalent)",
-                            f.name, r.name);
-                        badFieldName = f.name;
-                        badFieldType = f.ctype;
-                        ok = false;
-                        break;
-                    }
                     TypeAndValue tv;
                 // Strip fixed-array dims before mapping: the shared mapper decays `[N]` to a
                 // pointer (right for params, wrong for fields), so peel them here first.
@@ -24313,6 +24511,16 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 // address comes from the clang offset map, with no record storage.
                 if (f.isZeroSize && !arrDims.empty() && arrDims.front() == 0)
                     arrDims.front() = 1;
+                if (r.isCxx && f.ctype.find("::*") != std::string::npos)
+                {
+                    r.layoutRefusal = std::format(
+                        "field '{}' of '{}' is a pointer to member; member-pointer fields are not supported (an ordinary pointer is not equivalent)",
+                        f.name, r.name);
+                    badFieldName = f.name;
+                    badFieldType = f.ctype;
+                    ok = false;
+                    break;
+                }
                 if (!MapCTypeToTypeAndValue(elemSpelling, tv, r.isCxx))
                 {
                     // A C++ field whose TYPE has no CFlat mapping yet (a class-template

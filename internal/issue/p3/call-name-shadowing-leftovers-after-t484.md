@@ -5,7 +5,7 @@ including lambda bodies lexically nested in that local's initializer. A generic 
 instantiated during the initializer remains outside that lexical scope. Regression legs are in
 `Test/test_basic.cb` and `Test/errors/err_noncallable_name_shadows_function.cb`.
 
-Three related cases remain (need a ruling), plus a generic-outer leftovers section at the end (no ruling needed).
+Three related cases remain; all need a ruling.
 
 ## Qualified static method with int-to-double argument conversion
 
@@ -50,18 +50,6 @@ the newly declared local for non-call reads.
 Fix direction: handle the local's point of declaration in ordinary expression lookup as well as
 call lookup, with a defined diagnostic or initialization rule.
 
-## Generic outer leftovers after NEST3 (no ruling needed)
-
-NEST (2d2e922ad), NEST2 (24e3ec23a) and NEST3 (30e9629ad) cover bare calls from nested structs, field defaults and lambdas
-to a generic outer's static members, defaulted generic methods, and inner-hides-outer under a generic. Still failing the
-same way on master (clang++ -std=c++20 accepts each):
-
-- A member template inside a generic that uses the outer `U`: "cannot find the type 'U'".
-- Calling a sibling nested type's static (`I.go()` from a method of sibling `M`) inside a generic: "Undefined variable".
-- Qualified call through a namespace to a generic's static (`N.O<long>.run()`): "Undefined variable".
-- A defaulted INTERFACE method called through an interface variable with the argument omitted (`IH p = c; p.h(1);`):
-  "no version of 'IH.h' takes 1 argument(s)" (clang uses the base default, 13). NEST4 (6923945d8) fixed the bare implicit-this form.
-- A bare call to a defaulted instance method from a STATIC method is refused (correct) but with "no overload ... [0] i8 <this>"
-  instead of the "non-static member function without an object argument" text the non-defaulted form gets.
-- Using the outer aggregate by value from a nested body (`O<long>` / `O` incomplete): layout ordering, generic and not.
-- The generic redefinition diagnostic prints `G<long.h>` instead of the qualified method name.
+The generic-outer leftovers are all closed: NEST (2d2e922ad), NEST2 (24e3ec23a), NEST3 (30e9629ad), NEST5 (a509d073c),
+NEST6 (31519d3b3) and NESTVAL (2e6b647bf, nested member bodies using the enclosing aggregate by value). Only the sections
+above that need a ruling remain.

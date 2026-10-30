@@ -3803,6 +3803,7 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
         ResolvedInterfaceMembersScope memberScope(resolvedInterfaceMembers_, (const void*)ctx);
 
         std::vector<LLVMBackend::InterfaceMethod> methods;
+        std::vector<CFlatParser::InterfaceMethodContext*> defaultMethods;
         for (auto method : InterfaceMethods(ctx))
         {
             if (RejectVariadicInterfaceMethod(name, method)) continue;
@@ -3823,12 +3824,85 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
             {
                 LLVMBackend::TypeAndValue tv = p;
                 m.Parameters.push_back(tv);
+                if (p.DefaultValue != nullptr)
+                    m.DefaultWrapperName = InterfaceDefaultWrapperFunctionName(name, m.Name);
             }
+            if (!m.DefaultWrapperName.empty()) defaultMethods.push_back(method);
             methods.push_back(std::move(m));
         }
 
         Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods, ParseInterfaceFields(ctx),
                                                  DefinitionSiteText(Compiler(ctx), ctx));
+        for (auto* method : defaultMethods)
+            GenerateInterfaceDefaultParamOverloads(name, method);
+    }
+
+std::string MainListener::InterfaceDefaultWrapperFunctionName(
+        const std::string& interfaceName, const std::string& methodName) const
+{
+        return std::format("__cflat_iface_default_{}_{}_{}", interfaceName.size(),
+                           interfaceName, methodName);
+    }
+
+void MainListener::GenerateInterfaceDefaultParamOverloads(
+        const std::string& interfaceName, CFlatParser::InterfaceMethodContext* method)
+{
+        if (method == nullptr) return;
+        auto* compiler = Compiler(method);
+        const std::string methodName = getInterfaceMethodName(method);
+        auto returnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+        auto methodParams = ParseParameterTypeList(method->parameterTypeList());
+        if (std::none_of(methodParams.begin(), methodParams.end(), [](const auto& p) {
+                return p.DefaultValue != nullptr;
+            }))
+            return;
+
+        LLVMBackend::DeclTypeAndValue ifaceParam;
+        ifaceParam.TypeName = interfaceName;
+        ifaceParam.VariableName = "__cflat_iface";
+        ifaceParam.IsInterface = true;
+        if (method->trailingConst() != nullptr) ifaceParam.ConstMask = 1;
+
+        std::vector<LLVMBackend::DeclTypeAndValue> declParams;
+        declParams.reserve(methodParams.size() + 1);
+        declParams.push_back(ifaceParam);
+        declParams.insert(declParams.end(), methodParams.begin(), methodParams.end());
+
+        std::vector<LLVMBackend::TypeAndValue> params;
+        params.reserve(declParams.size());
+        for (const auto& param : declParams) params.push_back(param);
+
+        const std::string helperName = InterfaceDefaultWrapperFunctionName(interfaceName, methodName);
+        const size_t line = method->getStart()->getLine();
+        auto* fn = compiler->CreateFunctionDefinition(helperName, returnType, params,
+                                                       false, false, line);
+        compiler->InitializeBlock(&fn->front(), false);
+        auto ifaceArg = compiler->GetFunctionArgument(ifaceParam.VariableName);
+        ifaceArg.TypeAndValue.VariableName.clear();
+
+        std::vector<LLVMBackend::NamedVariable> callArgs;
+        callArgs.reserve(methodParams.size());
+        for (const auto& param : methodParams)
+        {
+            auto arg = compiler->GetFunctionArgument(param.VariableName);
+            arg.TypeAndValue.VariableName.clear();
+            if (param.IsMove) arg.IsExplicitMove = true;
+            callArgs.push_back(arg);
+        }
+
+        llvm::Value* ifaceStorage = ifaceArg.Storage;
+        if (ifaceStorage == nullptr && ifaceArg.Primary != nullptr)
+        {
+            ifaceStorage = compiler->CreateAlloca(compiler->GetFatPtrType());
+            compiler->CreateAssignment(ifaceArg.Primary, ifaceStorage);
+        }
+        auto* result = compiler->CallInterfaceMethod(ifaceStorage, interfaceName, methodName,
+                                                     callArgs, nullptr, &ifaceArg);
+        compiler->CreateReturnCall(result);
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
+
+        GenerateDefaultParamOverloads(helperName, returnType, declParams, false, line);
     }
 
 bool MainListener::RejectVariadicInterfaceMethod(const std::string& ifaceName,
@@ -5369,6 +5443,14 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                 }
                 else
                 {
+                    if (!structName.empty()
+                        && compilerLLVM->gts.genericAggregateInstances.count(structName) != 0)
+                    {
+                        auto& failedBodies = failedAggregateMethodBodies_[structName];
+                        if (std::find(failedBodies.begin(), failedBodies.end(), func)
+                            == failedBodies.end())
+                            failedBodies.push_back(func);
+                    }
                     throw;
                 }
             }
@@ -6403,8 +6485,151 @@ cxx_dtor_ready:
             BranchPostfixScope braceElementPostfix(this);
             std::vector<LLVMBackend::NamedVariable> braceElements;
             std::vector<std::string> braceElementTargetTypes;
+            std::unordered_map<CFlatParser::FieldInitContext*, LLVMBackend::NamedVariable>
+                prefetchedBraceElements;
             std::string braceExpression = "{";
             bool valid = true;
+            auto prefetchBraceElement = [&](CFlatParser::FieldInitContext* element)
+                -> LLVMBackend::NamedVariable* {
+                auto prefetched = prefetchedBraceElements.find(element);
+                if (prefetched != prefetchedBraceElements.end()) return &prefetched->second;
+                if (element->assignmentExpression().size() != 1) return nullptr;
+                auto* expression = element->assignmentExpression(0);
+                if (IsDefaultOnlyExpression(expression)
+                    || HasDefaultOnlyTernaryArm(expression))
+                    return nullptr;
+                LLVMBackend::NamedVariable candidate;
+                {
+                    CallArgumentScope callArgumentScope(
+                        inCallArgument_, ternaryCallArgumentDepth_);
+                    CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
+                    CxxCallArgumentExpectedTypeScope cxxArgumentExpected(
+                        cxxCallArgumentExpectedType_, LLVMBackend::TypeAndValue{});
+                    CxxCallArgumentParseStateScope argumentState(compiler);
+                    candidate = ParseAssignmentExpressionNamed(expression);
+                    llvm::Value* retTemp = compiler->lastCxxRetTemp_;
+                    llvm::Value* retValue = compiler->lastCxxRetValue_;
+                    if (retTemp != nullptr
+                        && (candidate.Storage == retTemp || candidate.Primary == retValue))
+                    {
+                        candidate.Storage = retTemp;
+                        candidate.IsRvalue = true;
+                        candidate.IsCxxPrvalueTemp = !candidate.IsExplicitMove;
+                    }
+                }
+                return &prefetchedBraceElements.emplace(element, std::move(candidate)).first->second;
+            };
+            auto prefetchBraceLeaves = [&](auto&& self,
+                CFlatParser::FieldInitContext* element) -> void {
+                if (element->initializerList() != nullptr)
+                {
+                    for (auto* child : element->initializerList()->fieldInit())
+                        self(self, child);
+                }
+                else if (element->LeftBrace() == nullptr)
+                    prefetchBraceElement(element);
+            };
+            auto prefetchBraceElementInOrder = [&](
+                const std::vector<CFlatParser::FieldInitContext*>& fields,
+                size_t firstElement, size_t elementIndex) {
+                for (size_t i = firstElement; i < elementIndex; ++i)
+                    prefetchBraceLeaves(prefetchBraceLeaves, fields[i]);
+                return prefetchBraceElement(fields[elementIndex]);
+            };
+            auto countElidedAggregateElements = [&](auto&& self,
+                const std::string& ownerTypeName,
+                const std::vector<CFlatParser::FieldInitContext*>& fields,
+                size_t firstElement) -> size_t {
+                size_t consumed = 0;
+                size_t fieldCursor = 0;
+                const size_t baseCount = compiler->CxxAggregateBaseCount(ownerTypeName);
+                for (size_t baseIndex = 0; baseIndex < baseCount; ++baseIndex)
+                {
+                    const size_t baseFieldCount = compiler->CxxAggregateBaseFieldCountAt(
+                        ownerTypeName, baseIndex);
+                    if (baseFieldCount == 0)
+                    {
+                        if (firstElement + consumed < fields.size()
+                            && fields[firstElement + consumed]->LeftBrace() != nullptr)
+                            ++consumed;
+                        continue;
+                    }
+                    if (firstElement + consumed >= fields.size()) break;
+                    auto* element = fields[firstElement + consumed];
+                    if (element->LeftBrace() != nullptr)
+                    {
+                        ++consumed;
+                    }
+                    else
+                    {
+                        auto* candidate = prefetchBraceElementInOrder(
+                            fields, firstElement, firstElement + consumed);
+                        const bool defaultElement = element->assignmentExpression().size() == 1
+                            && (IsDefaultOnlyExpression(element->assignmentExpression(0))
+                                || HasDefaultOnlyTernaryArm(
+                                    element->assignmentExpression(0)));
+                        if (defaultElement || (candidate != nullptr
+                            && compiler->IsCxxRecord(compiler->ResolveTypeAlias(
+                                candidate->TypeAndValue.TypeName))))
+                        {
+                            ++consumed;
+                            fieldCursor += baseFieldCount;
+                            continue;
+                        }
+                        const std::string baseType = compiler->CxxAggregateBaseTypeAt(
+                            ownerTypeName, baseIndex);
+                        if (baseType.empty()) return 0;
+                        const size_t baseElements = self(self, baseType, fields,
+                            firstElement + consumed);
+                        if (baseElements == 0) return 0;
+                        consumed += baseElements;
+                    }
+                    fieldCursor += baseFieldCount;
+                }
+
+                const auto ownerData = compiler->GetDataStructure(ownerTypeName);
+                while (true)
+                {
+                    const std::string fieldName = compiler->CxxAggregateFlattenedFieldNameAt(
+                        ownerTypeName, fieldCursor);
+                    if (fieldName.empty() || firstElement + consumed >= fields.size()) break;
+                    auto field = std::find_if(ownerData.StructFields.begin(),
+                        ownerData.StructFields.end(), [&](const auto& value) {
+                            return value.VariableName == fieldName;
+                        });
+                    auto* element = fields[firstElement + consumed];
+                    if (field != ownerData.StructFields.end()
+                        && element->LeftBrace() == nullptr
+                        && !field->Pointer && !field->ElemPointer
+                        && field->ConstArraySize <= 0 && field->ConstInnerDimensions.empty())
+                    {
+                        const std::string fieldType = compiler->ResolveTypeAlias(field->TypeName);
+                        if (compiler->IsForeignCxxAggregateClass(fieldType))
+                        {
+                            auto* candidate = prefetchBraceElementInOrder(
+                                fields, firstElement, firstElement + consumed);
+                            const bool defaultElement = element->assignmentExpression().size() == 1
+                                && (IsDefaultOnlyExpression(element->assignmentExpression(0))
+                                    || HasDefaultOnlyTernaryArm(
+                                        element->assignmentExpression(0)));
+                            if (!defaultElement && (candidate == nullptr
+                                || !compiler->IsCxxRecord(compiler->ResolveTypeAlias(
+                                    candidate->TypeAndValue.TypeName))))
+                            {
+                                const size_t nestedElements = self(self, fieldType, fields,
+                                    firstElement + consumed);
+                                if (nestedElements == 0) return 0;
+                                consumed += nestedElements;
+                                ++fieldCursor;
+                                continue;
+                            }
+                        }
+                    }
+                    ++consumed;
+                    ++fieldCursor;
+                }
+                return consumed;
+            };
             auto appendFields = [&](auto&& self,
                                     const std::vector<CFlatParser::FieldInitContext*>& fields,
                                     std::string& out, bool topLevel,
@@ -6427,12 +6652,16 @@ cxx_dtor_ready:
                     }
                 }
                 const auto ownerData = compiler->GetDataStructure(ownerTypeName);
-                size_t positionalFieldIndex = 0;
+                size_t positionalFieldCursor = 0;
+                size_t positionalBaseIndex = 0;
+                size_t positionalBaseFieldStart = 0;
+                const size_t baseCount = compiler->CxxAggregateBaseCount(ownerTypeName);
                 for (size_t i = 0; i < fields.size() && valid; ++i)
                 {
                     auto* element = fields[i];
                     if (i != 0) out += ", ";
                     const LLVMBackend::DeclTypeAndValue* targetField = nullptr;
+                    std::string targetBaseType;
                     std::string targetSpelling;
                     bool targetIsReference = false;
                     if (element->Identifier() != nullptr)
@@ -6444,8 +6673,94 @@ cxx_dtor_ready:
                         if (field != ownerData.StructFields.end()) targetField = &*field;
                         out += "." + element->Identifier()->getText() + " = ";
                     }
-                    else if (positionalFieldIndex < ownerData.StructFields.size())
-                        targetField = &ownerData.StructFields[positionalFieldIndex++];
+                    else
+                    {
+                        const bool elementIsBraced = element->LeftBrace() != nullptr;
+                        bool isBaseInitializer = false;
+                        while (positionalBaseIndex < baseCount)
+                        {
+                            const size_t baseFieldCount = compiler->CxxAggregateBaseFieldCountAt(
+                                ownerTypeName, positionalBaseIndex);
+                            if (baseFieldCount == 0)
+                            {
+                                if (elementIsBraced)
+                                {
+                                    isBaseInitializer = true;
+                                    break;
+                                }
+                                ++positionalBaseIndex;
+                                continue;
+                            }
+                            if (positionalFieldCursor
+                                >= positionalBaseFieldStart + baseFieldCount)
+                            {
+                                positionalBaseFieldStart += baseFieldCount;
+                                ++positionalBaseIndex;
+                                continue;
+                            }
+                            isBaseInitializer = elementIsBraced
+                                && positionalFieldCursor == positionalBaseFieldStart;
+                            break;
+                        }
+                        if (isBaseInitializer)
+                        {
+                            targetBaseType = compiler->CxxAggregateBaseTypeAt(
+                                ownerTypeName, positionalBaseIndex);
+                            const size_t baseFieldCount = compiler->CxxAggregateBaseFieldCountAt(
+                                ownerTypeName, positionalBaseIndex);
+                            positionalFieldCursor += baseFieldCount;
+                            positionalBaseFieldStart += baseFieldCount;
+                            ++positionalBaseIndex;
+                        }
+                        else
+                        {
+                            const std::string fieldName = compiler->CxxAggregateFlattenedFieldNameAt(
+                                ownerTypeName, positionalFieldCursor);
+                            auto field = std::find_if(ownerData.StructFields.begin(),
+                                ownerData.StructFields.end(), [&](const auto& value) {
+                                    return value.VariableName == fieldName;
+                                });
+                            if (!fieldName.empty() && field != ownerData.StructFields.end())
+                                targetField = &*field;
+                            ++positionalFieldCursor;
+                        }
+                    }
+                    if (element->LeftBrace() == nullptr && targetBaseType.empty()
+                        && targetField != nullptr
+                        && !targetField->Pointer && !targetField->ElemPointer
+                        && targetField->ConstArraySize <= 0
+                        && targetField->ConstInnerDimensions.empty())
+                    {
+                        const std::string fieldType = compiler->ResolveTypeAlias(
+                            targetField->TypeName);
+                        if (compiler->IsForeignCxxAggregateClass(fieldType))
+                        {
+                            auto* expression = element->assignmentExpression().size() == 1
+                                ? element->assignmentExpression(0) : nullptr;
+                            if (expression != nullptr
+                                && !IsDefaultOnlyExpression(expression)
+                                && !HasDefaultOnlyTernaryArm(expression))
+                            {
+                                auto* candidate = prefetchBraceElement(element);
+                                if (candidate != nullptr
+                                    && !compiler->IsCxxRecord(compiler->ResolveTypeAlias(
+                                        candidate->TypeAndValue.TypeName)))
+                                {
+                                    const size_t elidedCount = countElidedAggregateElements(
+                                        countElidedAggregateElements, fieldType, fields, i);
+                                    if (elidedCount > 0 && elidedCount <= fields.size() - i)
+                                    {
+                                        std::vector<CFlatParser::FieldInitContext*> nestedFields(
+                                            fields.begin() + static_cast<std::ptrdiff_t>(i),
+                                            fields.begin() + static_cast<std::ptrdiff_t>(i + elidedCount));
+                                        self(self, nestedFields, out, false, fieldType);
+                                        i += elidedCount - 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (targetField != nullptr)
                         compiler->CxxRecordFieldTypeSpelling(
                             ownerTypeName, targetField->VariableName, targetSpelling,
@@ -6460,8 +6775,9 @@ cxx_dtor_ready:
                     if (element->initializerList() != nullptr)
                     {
                         out += "{";
-                        const std::string nestedType = targetField != nullptr
-                            ? targetField->TypeName : std::string();
+                        const std::string nestedType = !targetBaseType.empty()
+                            ? targetBaseType : targetField != nullptr
+                                ? targetField->TypeName : std::string();
                         self(self, element->initializerList()->fieldInit(), out, false,
                              nestedType);
                         out += "}";
@@ -6504,20 +6820,29 @@ cxx_dtor_ready:
                     {
                         CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
                         CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
-                        elementNV = [&] {
-                            CxxCallArgumentParseStateScope argumentState(compiler);
-                            auto parsed = ParseAssignmentExpressionNamed(expression);
-                            llvm::Value* retTemp = compiler->lastCxxRetTemp_;
-                            llvm::Value* retValue = compiler->lastCxxRetValue_;
-                            if (retTemp != nullptr
-                                && (parsed.Storage == retTemp || parsed.Primary == retValue))
-                            {
-                                parsed.Storage = retTemp;
-                                parsed.IsRvalue = true;
-                                parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
-                            }
-                            return parsed;
-                        }();
+                        auto prefetched = prefetchedBraceElements.find(element);
+                        if (prefetched != prefetchedBraceElements.end())
+                        {
+                            elementNV = std::move(prefetched->second);
+                            prefetchedBraceElements.erase(prefetched);
+                        }
+                        else
+                        {
+                            elementNV = [&] {
+                                CxxCallArgumentParseStateScope argumentState(compiler);
+                                auto parsed = ParseAssignmentExpressionNamed(expression);
+                                llvm::Value* retTemp = compiler->lastCxxRetTemp_;
+                                llvm::Value* retValue = compiler->lastCxxRetValue_;
+                                if (retTemp != nullptr
+                                    && (parsed.Storage == retTemp || parsed.Primary == retValue))
+                                {
+                                    parsed.Storage = retTemp;
+                                    parsed.IsRvalue = true;
+                                    parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
+                                }
+                                return parsed;
+                            }();
+                        }
                         NormalizeCxxRvalueReferenceArgument(expression, elementNV);
                     }
                     llvm::Value* elementValue = elementNV.Primary

@@ -18,22 +18,11 @@ receiver. Items 1-2 are open; items 3-7 are pre-existing binary/compound/rewrite
    `-mkc()` with `const C mkc()` -> CFlat runs the free (2); clang: no viable operator. 3 global cells; the namespaced
    variant was not checked.
 
-3. PRE-EXISTING (T280 round 2, found by the review, not fixed): compound assignment ranking. A member and a free
-   `operator+=` on one lvalue are not ranked: `x += 1` with member `operator+=(int)` vs free `operator+=(S&, int)`
-   gives 1 | 1 | ambiguous (clang); `cbConst(x) += 1` gives ERR | ERR | 2; `ccMk() += 1` (prvalue) gives ERR | ERR | 2.
-   Cells: ca_lv, cc_lv, cb_clv, cc_pr in scratch/rev_t280/repro/. The T280 gate is `plainBinaryOperator`, which
-   excludes `=` and the compound forms, so the compound path still uses master ranking.
-
-4. PRE-EXISTING (T280 round 2): `<=>` rewrite tie. `x < 1` with a member and a free `operator<=>` on one lvalue
-   gives 11 | 11 | ambiguous (clang). Cell: sp3_lt_lv.
-
-5. PRE-EXISTING (T280 round 2): template free `operator+(Tf&, T)` with a double right operand. `x + 1.5` gives
-   ERR | ERR | 21 (clang). Cell: tf_dbl_then_int.
-
-6. PRE-EXISTING (T280 round 2): base member vs `GB&` free on a derived lvalue. `GD x; x + 1` with member
-   `operator+(int)` in `GB` and free `operator+(GB&, int)` gives 1 | 1 | ambiguous (clang). Cell: gd_lv.
-
-7. PRE-EXISTING (T280 round 3): owner-typed free on an inherited member. `struct B { int operator+(int) }; struct A : B {};
-   inline int operator+(B&, int)`, `A a; a + 1` gives 1 | 1 | ambiguous (clang). The binary ranking pass filters
-   out frees whose first parameter is not the receiver class (MainListener_Expressions.cpp, candidate loop), so
-   this tie is not handled; owner ties are NOT handled by T280. Cell: owner.cb (owner.h).
+Items 3-5 (compound member-vs-free ranking, `<=>` tie text, template free with a double operand) landed OPBIN (3a13c8ea9); items 6-7
+already matched clang on master (refused ambiguous, verified by the OPBIN reviews). Pre-existing residue from the OPBIN reviews:
+- A const receiver with both `operator+=(K&, int)` and `template<class T> operator+=(T&, int)`: clang picks the template (21); CFlat
+  refuses ("rejected because the operand is const"), and the message leaks the internal `__cxx_free.` prefix.
+- A template parameter named like an unrelated record (`struct Z; template<class Z> int operator+=(Z&, int)`) on a const receiver:
+  refused, clang 61.
+- `struct Tf { int operator+(int); }; x + 1.5` with only the member (or an unrelated namespaced operator+ template): refused with
+  "cannot pass parameter 'b' of 'operator+' of type 'char*' from 'float'"; clang 11.
