@@ -3146,6 +3146,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
             for (const auto& t : r.ctorTemplates)
             {
                 nlohmann::json tj = {{"h", t.head}, {"pt", t.paramTypes}, {"df", t.defaulted}};
+                if (t.hasParameterPack) tj["hp"] = true;
                 if (t.variadic) tj["va"] = true;
                 if (t.isDeleted) tj["dl"] = true;
                 if (t.isExplicit) tj["ex"] = true;
@@ -3266,6 +3267,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
             ct.head = t.value("h", std::string{});
             ct.paramTypes = t["pt"].to_string_vector();
             for (uint64_t value : t["df"].to_u64_vector()) ct.defaulted.push_back(value != 0 ? 1 : 0);
+            ct.hasParameterPack = t.value("hp", false);
             ct.variadic = t.value("va", false);
             ct.isDeleted = t.value("dl", false);
             ct.isExplicit = t.value("ex", false);

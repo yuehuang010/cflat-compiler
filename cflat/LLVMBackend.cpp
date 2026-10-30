@@ -5195,6 +5195,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionParameterSpellingsByLinkage_.clear();
     cxxTopLevelConstTypeAliases_.clear();
     cxxDefaultWrapperRequests_.clear();
+    cxxVariadicCtorRequestsInProgress_.clear();
     cxxRvalueRefBindVerdicts_.clear();
     cxxFunctionBindAttempts_.clear();
     cxxLazyStdFunctionMemberBinds_.clear();

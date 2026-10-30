@@ -330,6 +330,7 @@ namespace cflat_cinterop
         std::string head;                  // "template <class T, unsigned long N>"
         std::vector<std::string> paramTypes;
         std::vector<uint8_t> defaulted;    // aligned with paramTypes
+        bool hasParameterPack = false;
         bool variadic = false;
         bool isDeleted = false;
         bool isExplicit = false;
@@ -914,7 +915,7 @@ namespace cflat_cinterop
         unsigned prereqErrors = 0;
         std::string firstPrereqError;            // formatted text of the first such error
         std::string firstError;                  // first clang error, including wrapper requests
-        // firstError is "no viable operator" / "invalid operands" raised AT the request's own
+        // firstError is "no matching function" / "no viable operator" / "invalid operands" at the request's own
         // expression (main file / interpreter input), not inside a header or an instantiated body.
         bool firstErrorNoViableAtRequest = false;
         // A requested template specialization whose completion failed. This is separate from

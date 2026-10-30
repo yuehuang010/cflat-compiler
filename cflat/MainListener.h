@@ -7961,6 +7961,11 @@ private:
     const CFlatParser::PostfixExpressionContext* directViewCallArgument_ = nullptr;
     bool inCxxCallArgument_ = false;
     LLVMBackend::TypeAndValue cxxCallArgumentExpectedType_;
+    llvm::Function* cxxTernaryCallSink_ = nullptr;
+    LLVMBackend::TypeAndValue cxxTernaryCallSinkReturnType_;
+    llvm::Value* cxxTernaryCallResult_ = nullptr;
+    LLVMBackend::TypeAndValue cxxTernaryCallResultType_;
+    bool cxxTernaryCallConsumed_ = false;
     CFlatParser::AssignmentExpressionContext* cxxDirectConstructionArgument_ = nullptr;
     LLVMBackend::TypeAndValue cxxDirectConstructionTargetType_;
     bool cxxDirectConstructionCanDefer_ = true;
@@ -9121,6 +9126,12 @@ public:
 
     bool IsOwningTempRawPointerFieldEscape(const LLVMBackend::NamedVariable& nv) const;
 
+    void GuardOwningTempRawPointerFieldIntoUnique(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& destinationType,
+        antlr4::ParserRuleContext* ctx,
+        const std::string& calleeName);
+
     void GuardRawPointerIntoOwningTempField(
         const LLVMBackend::NamedVariable& source,
         const LLVMBackend::TypeAndValue& destinationType,
@@ -9356,6 +9367,12 @@ public:
     llvm::Value* EmitCopyableOwnerCopy(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* right,
+        antlr4::ParserRuleContext* ctx);
+
+    // Turn a null-conditional owning read into an independent by-value result. Pointer-borrow
+    // call arguments keep the original field address and are materialized by their selected sink.
+    void MaterializeNullConditionalOwningValue(
+        LLVMBackend::NamedVariable& value,
         antlr4::ParserRuleContext* ctx);
 
     // The copy-vs-move classification shared by the decl-init, reassign, and deref assignment paths.

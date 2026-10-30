@@ -472,3 +472,44 @@ struct T513R10ThrowB
 };
 inline T513R10ThrowB t513R10MakeThrowB() noexcept { return T513R10ThrowB(); }
 inline int t513R10Guarded(int (*f)(int), int x) { try { return f(x); } catch (int e) { return -e; } }
+
+// T513 value sinks: digits record the A conversion, B construction, and destruction order.
+inline int t513V10Sequence = 0;
+inline void t513V10Reset() { t513V10Sequence = 0; }
+inline int t513V10Stats() noexcept { return t513V10Sequence; }
+struct T513V10A
+{
+    int value;
+    T513V10A(int v) noexcept : value(v) { t513V10Sequence = t513V10Sequence * 10 + 1; }
+    T513V10A(const T513V10A& other) noexcept : value(other.value) {
+        t513V10Sequence = t513V10Sequence * 10 + 2;
+    }
+    T513V10A(T513V10A&& other) noexcept : value(other.value) {
+        t513V10Sequence = t513V10Sequence * 10 + 3;
+    }
+    ~T513V10A() noexcept { t513V10Sequence = t513V10Sequence * 10 + 4; }
+};
+struct T513V10B
+{
+    int value;
+    T513V10B(int v = 20) noexcept : value(v) {
+        t513V10Sequence = t513V10Sequence * 10 + 5;
+    }
+    T513V10B(T513V10A a) noexcept : value(a.value + 100) {
+        t513V10Sequence = t513V10Sequence * 10 + 6;
+    }
+    ~T513V10B() noexcept { t513V10Sequence = t513V10Sequence * 10 + 7; }
+};
+inline T513V10A t513V10MakeA(int v) noexcept { return T513V10A(v); }
+inline T513V10B t513V10MakeB() noexcept { return T513V10B(20); }
+// T513 r5: a view over the converted-from A; the sink must keep A alive through the call.
+struct T513V11View
+{
+    const int* p;
+    T513V11View() noexcept : p(nullptr) { t513V10Sequence = t513V10Sequence * 10 + 5; }
+    T513V11View(const T513V10A& a) noexcept : p(&a.value) { t513V10Sequence = t513V10Sequence * 10 + 6; }
+    T513V11View(const T513V11View& o) noexcept : p(o.p) { t513V10Sequence = t513V10Sequence * 10 + 8; }
+    ~T513V11View() noexcept { t513V10Sequence = t513V10Sequence * 10 + 7; }
+    int get() const noexcept { return p ? *p : 20; }
+};
+inline T513V11View t513V11MakeNull() noexcept { return T513V11View(); }

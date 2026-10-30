@@ -1,4 +1,5 @@
 import cpp "cpp_interop_basic.h";
+import cpp "cpp_t495_amppick.hpp";
 
 expect_error("cannot pass C++ const pointer argument 1 ('p')") {
     int passConstParameter(const cppi.CrReceiverValue* p) {
@@ -78,6 +79,11 @@ extern int main()
     }
     expect_error("cannot assign the address of a const C++ object to field 'p'") {
         RefusedBraceHolder braced = { p = &cppi.crConst };
+    }
+    int amp2Value = 4;
+    amp2r3.H constSlot = amp2r3.make_h(&amp2Value);
+    expect_error("cannot pass C++ const pointer argument 1") {
+        amp2r3.free_const_pointer(&constSlot.fp);
     }
     return 0;
 }

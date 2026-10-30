@@ -1799,7 +1799,9 @@ namespace cflat_cinterop
                 if (firstError.empty())
                 {
                     firstError = msg.str().str();
-                    firstErrorNoViableAtRequest = (info.getID() == diag::err_ovl_no_viable_oper
+                    firstErrorNoViableAtRequest = (info.getID() == diag::err_ovl_no_viable_function_in_call
+                            || info.getID() == diag::err_ovl_no_viable_function_in_init
+                            || info.getID() == diag::err_ovl_no_viable_oper
                             || info.getID() == diag::err_typecheck_invalid_operands)
                         && info.hasSourceManager() && info.getLocation().isValid()
                         && info.getSourceManager().isInMainFile(
@@ -3586,6 +3588,7 @@ namespace cflat_cinterop
                         if (!paramType->isDependentType()) paramType = paramType.getCanonicalType();
                         ct.paramTypes.push_back(paramType.getAsString(pp));
                         ct.defaulted.push_back(p->hasDefaultArg() ? 1 : 0);
+                        ct.hasParameterPack = ct.hasParameterPack || p->isParameterPack();
                     }
                     ct.variadic = ctor->isVariadic();
                     ct.isDeleted = ctor->isDeleted();

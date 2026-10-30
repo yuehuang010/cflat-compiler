@@ -1,9 +1,29 @@
+import "unique.cb";
+
 struct ForwardErrorThing { int value = 0; };
+
+struct ForwardUniqueErrorThing
+{
+    int get(int n) { return n + 40; }
+    int reset(int n) { return n + 50; }
+};
 
 struct ForwardErrorPtr
 {
     ForwardErrorThing* raw = nullptr;
     ForwardErrorThing* operator->() { return raw; }
+};
+
+struct StaticForwardPointee
+{
+    int st() { return 2; }
+};
+
+struct StaticForwardBox
+{
+    StaticForwardPointee* raw = nullptr;
+    static int st() { return 1; }
+    StaticForwardPointee* operator->() { return raw; }
 };
 
 struct NoIncrementError { int value = 0; };
@@ -14,6 +34,17 @@ extern int main()
     expect_error("Unknown identifier 'nothere'") {
         int missing = p.nothere;
     }
+
+    unique<ForwardUniqueErrorThing> u =
+        unique<ForwardUniqueErrorThing>(new ForwardUniqueErrorThing());
+    expect_error("no overload of 'get' matches") { int dotGet = u.get(2); }
+    expect_error("no overload of 'get' matches") { int arrowGet = u->get(2); }
+    expect_error("no overload of 'reset' matches") { u.reset(9); }
+
+    StaticForwardBox sb = default;
+    sb.raw = new StaticForwardPointee();
+    expect_error("no overload of 'st' matches") { int dotStatic = sb.st(); }
+    expect_error("no overload of 'st' matches") { int arrowStatic = sb->st(); }
 
     NoIncrementError x;
     expect_error("struct 'NoIncrementError' has no 'operator++'; define 'void operator++()' on it or use a scalar") {

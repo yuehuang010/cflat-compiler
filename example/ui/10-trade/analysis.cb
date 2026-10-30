@@ -515,7 +515,7 @@ void writeCorrelationMatrix(stringbuilder* sb, string dataDir, string primary)
         int d = 0;
         while (d < dates.count())
         {
-            v->add(byDate.get(i)->get(dates.get(d)));
+            v->add((*byDate.get(i)).get(dates.get(d)));
             d++;
         }
         series.add(v);

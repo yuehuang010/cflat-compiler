@@ -494,13 +494,43 @@ bool MainListener::CanFreshBraceInitializeAggregate(
         [](auto* fi) { return fi != nullptr && fi->Identifier() != nullptr; });
     if (!hasNamedField) return false;
     auto* compiler = Compiler(list);
+    auto data = compiler->GetDataStructure(typeName);
+    if (data.StructType == nullptr || data.IsUnion) return false;
+    auto isDirectMoveValue = [](antlr4::tree::ParseTree* node) {
+        while (node != nullptr)
+        {
+            if (dynamic_cast<CFlatParser::MoveExpressionContext*>(node) != nullptr)
+                return true;
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (rule == nullptr || rule->children.size() != 1) return false;
+            node = rule->children[0];
+        }
+        return false;
+    };
+    const bool hasDropBearingOverride = std::any_of(fieldInits.begin(), fieldInits.end(),
+        [&](auto* fi) {
+            if (fi == nullptr || fi->Identifier() == nullptr
+                || fi->assignmentExpression().empty())
+                return false;
+            auto* initExpr = fi->assignmentExpression()[0];
+            if (!isDirectMoveValue(initExpr))
+                return false;
+            const std::string fieldName = fi->Identifier()->getText();
+            auto field = std::find_if(data.StructFields.begin(), data.StructFields.end(),
+                [&](const auto& value) { return value.VariableName == fieldName; });
+            return field != data.StructFields.end() && !field->Pointer && !field->ElemPointer
+                && !field->IsUnique && !compiler->IsCoreUniqueType(field->TypeName)
+                && !field->IsAlias && !field->IsArrayView && !field->IsFunctionPointer
+                && field->ConstArraySize == 0 && field->ConstInnerDimensions.empty()
+                && !compiler->IsCxxRecord(field->TypeName)
+                && !compiler->HasForeignNontrivialCxxField(field->TypeName)
+                && compiler->HasNonTrivialDestructor(field->TypeName);
+        });
     if ((explicitNoArgConstructors_.count(typeName) != 0
             && !compiler->IsImmovableCFlatStruct(typeName))
         || compiler->IsCxxRecord(typeName)
-        || compiler->GetFunction(typeName) == nullptr)
+        || (compiler->GetFunction(typeName) == nullptr && !hasDropBearingOverride))
         return false;
-    auto data = compiler->GetDataStructure(typeName);
-    if (data.StructType == nullptr || data.IsUnion) return false;
     auto containsCtorArrayOverride = [&](auto&& self, const std::string& targetType,
                                          CFlatParser::InitializerListContext* targetList,
                                          unsigned depth) -> bool {
@@ -557,7 +587,8 @@ bool MainListener::CanFreshBraceInitializeAggregate(
             && fi->initializerList() == nullptr && fi->assignmentExpression().empty(); });
     const bool immovableCtor = explicitNoArgConstructors_.count(typeName) != 0
         && compiler->IsImmovableCFlatStruct(typeName);
-    if (!force && !hasEmptyFieldBrace && !hasCtorArrayOverride && !immovableCtor
+    if (!force && !hasEmptyFieldBrace && !hasCtorArrayOverride && !hasDropBearingOverride
+        && !immovableCtor
         && !compiler->IsImmovableCFlatStruct(typeName)
         && !compiler->HasForeignNontrivialCxxField(typeName)) return false;
     return true;

@@ -5638,9 +5638,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         const bool receiverHasCxxMember = (postfixMemberCall || !cxxMemberReceiver.empty())
             && !receiverType.empty()
             && CxxClassHasMemberNamed(receiverType, bareMemberName);
+        const bool receiverHasCflatArrowMember = postfixMemberCall
+            && !receiverType.empty() && !bareMemberName.empty()
+            && !IsCxxRecord(receiverType)
+            && HasArrowOverloadFor(receiverType)
+            && TypeHasMember(receiverType, bareMemberName);
         auto originalFuncSym = functionTable.find(functionName);
         auto funcSym = originalFuncSym;
         std::vector<FunctionSymbol> receiverMemberCandidates;
+        std::vector<FunctionSymbol> receiverCflatOwnCandidates;
         std::vector<FunctionSymbol> lexicalMethodCandidates;
         std::vector<FunctionSymbol> lexicalAggregateCandidates;
         const auto bareMemberSet = functionTable.find(bareMemberName);
@@ -5691,12 +5697,23 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         {
             for (const auto& candidate : bareMemberSet->second)
             {
-                if (!candidate.IsMethod || candidate.Parameters.empty()) continue;
+                if (candidate.Parameters.empty()) continue;
                 const std::string& ownerType = candidate.Parameters.front().TypeName;
-                if (ownerType == receiverType
-                    || (candidate.IsCxx && !receiverType.empty()
-                        && IsCxxBaseOf(ownerType, receiverType)))
-                    receiverMemberCandidates.push_back(candidate);
+                if (candidate.IsMethod)
+                {
+                    if (ownerType == receiverType
+                        || (candidate.IsCxx && !receiverType.empty()
+                            && IsCxxBaseOf(ownerType, receiverType)))
+                        receiverMemberCandidates.push_back(candidate);
+                    if (!candidate.IsCxx && ownerType == receiverType)
+                        receiverCflatOwnCandidates.push_back(candidate);
+                }
+                else if (!candidate.IsMethod && !candidate.IsCxx
+                    && !candidate.UniqueName.starts_with("__cflat_tpl_")
+                    && !candidate.UniqueName.starts_with("__cflat_free_")
+                    && !candidate.Parameters.empty()
+                    && candidate.Parameters.front().TypeName == receiverType)
+                    receiverCflatOwnCandidates.push_back(candidate);
             }
             if (receiverHasCxxMember && !receiverMemberCandidates.empty())
                 funcSym = bareMemberSet;
@@ -5768,9 +5785,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             && !candidate.Parameters.empty()
                             && candidate.Parameters.front().TypeName == receiverType;
                     });
-            // A unique_ptr receiver borrows to its pointee, so a bound same-named pointee method
-            // would also fit `this`; the receiver's own member wins, like clang (T46).
-            if (!receiverMemberCandidates.empty()
+            // CFlat arrow wrappers keep own methods and receiver-first free functions.
+            if (receiverHasCflatArrowMember)
+                candidateSet = &receiverCflatOwnCandidates;
+            // C++ unique_ptr and other C++ records keep their existing own-member resolution.
+            else if (!receiverMemberCandidates.empty()
                 && (currentFreeFunctionIsCandidate || enclosingFreeFunctionIsCandidate
                     || (receiverHasCxxMember && receiverFirstFreeFunctionIsCandidate)
                     || (receiverHasCxxMember && !CxxUniquePtrPointee(receiverType).empty())))
@@ -5897,6 +5916,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             candidateSet = &defaultCandidates;
         }
         const auto& candidates = *candidateSet;
+        auto hasImplicitIntegerPointerArg = [&](const FunctionSymbol& candidate,
+                                               const std::vector<NamedVariable>& callArgs) {
+            if (candidate.IsCxx) return false;
+            for (size_t i = 0; i < callArgs.size() && i < candidate.Parameters.size(); ++i)
+            {
+                const auto& arg = callArgs[i];
+                const auto& from = arg.HasOriginalArgumentType
+                    ? arg.OriginalArgumentType : arg.TypeAndValue;
+                if (IsImplicitIntegerPointeePointerConversion(from, candidate.Parameters[i]))
+                    return true;
+            }
+            return false;
+        };
 
         /*
          * `obj.f(args)` where the C++ class declares f both static and non-static: C++ selects
@@ -5965,6 +5997,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             std::vector<NamedVariable> candidateArguments = arguments;
             if (usesImplicitReceiver(candidate))
                 candidateArguments.insert(candidateArguments.begin(), *implicitReceiver);
+            if (receiverHasCflatArrowMember
+                && hasImplicitIntegerPointerArg(candidate, candidateArguments))
+                continue;
             if (candidate.Variadic)
             {
                 // Route through MatchFunction so named fixed params are reordered correctly.
@@ -6050,48 +6085,65 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     && arg.TypeAndValue.IsProvenDoublePointer();
             }))
         {
-            std::vector<NamedVariable> slotArguments = arguments;
-            bool slotShapeAvailable = false;
-            for (NamedVariable& arg : slotArguments)
-            {
-                if (!arg.IsCxxAddressOfPointerValue || arg.Storage != nullptr
-                    || !arg.TypeAndValue.IsProvenDoublePointer() || arg.Primary == nullptr
-                    || !arg.Primary->getType()->isPointerTy())
-                    continue;
-                arg.TypeAndValue.ElemPointer = false;
-                arg.TypeAndValue.PointerDepth = 1;
-                arg.Storage = arg.Primary;
-                arg.Primary = nullptr;
-                arg.BaseType = GetType(arg.TypeAndValue);
-                arg.IsRvalue = false;
-                slotShapeAvailable = true;
-            }
             std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> slotCandidates;
-            if (slotShapeAvailable)
-                for (const FunctionSymbol& slotCandidate : candidates)
+            std::vector<std::vector<NamedVariable>> slotCallArguments;
+            for (const FunctionSymbol& slotCandidate : candidates)
+            {
+                if (!slotCandidate.IsCxx) continue;
+                std::vector<NamedVariable> candidateArguments = arguments;
+                const bool hasImplicitReceiver = usesImplicitReceiver(slotCandidate);
+                if (hasImplicitReceiver)
+                    candidateArguments.insert(candidateArguments.begin(), *implicitReceiver);
+                std::vector<std::string> argumentNames;
+                argumentNames.reserve(candidateArguments.size());
+                for (const NamedVariable& arg : candidateArguments)
+                    argumentNames.push_back(arg.TypeAndValue.VariableName);
+                const ArgumentBinding binding = ComputeArgumentPositions(
+                    argumentNames, slotCandidate.Parameters, slotCandidate.Variadic, 0,
+                    &slotCandidate.DefaultArguments);
+                if (!binding.Ok) continue;
+                bool hasSlotArgument = false;
+                for (size_t i = 0; i < candidateArguments.size(); ++i)
                 {
-                    if (!slotCandidate.IsCxx) continue;
-                    auto slotMatchedArgs = MatchFunction(slotArguments, slotCandidate.Parameters,
-                        slotCandidate.Variadic, true, &slotCandidate.DefaultArguments);
-                    if (slotMatchedArgs.empty()) continue;
-                    bool hasSlotArgument = false;
-                    bool onlyReferenceSlots = true;
-                    for (size_t i = 0; i < slotMatchedArgs.size()
-                         && i < slotCandidate.Parameters.size(); ++i)
+                    NamedVariable& arg = candidateArguments[i];
+                    if (!arg.IsCxxAddressOfPointerValue || arg.Storage != nullptr
+                        || !arg.TypeAndValue.IsProvenDoublePointer() || arg.Primary == nullptr
+                        || !arg.Primary->getType()->isPointerTy() || binding.PosMap[i] < 0
+                        || static_cast<size_t>(binding.PosMap[i]) >= slotCandidate.Parameters.size())
+                        continue;
+                    const TypeAndValue& param = slotCandidate.Parameters[binding.PosMap[i]];
+                    if (arg.IsCxxConstPointerSlot()
+                        && param.IsCxxRefToPointer && !param.CxxConstRef() && !param.IsRvalueRef
+                        && param.TypeName == arg.TypeAndValue.TypeName)
                     {
-                        const auto& arg = slotMatchedArgs[i];
-                        if (!arg.IsCxxAddressOfPointerValue) continue;
-                        hasSlotArgument = true;
-                        const auto& param = slotCandidate.Parameters[i];
-                        onlyReferenceSlots = onlyReferenceSlots && param.IsCxxRefToPointer
-                            && !param.CxxConstRef() && !param.IsRvalueRef
-                            && param.TypeName == arg.TypeAndValue.TypeName;
+                        const std::string sourceName = !arg.CallerName.empty()
+                            ? arg.CallerName : arg.TypeAndValue.VariableName;
+                        LogError(CxxConstPointerArgumentError(i + 1, sourceName,
+                                                              param.VariableName));
                     }
-                    if (!hasSlotArgument || !onlyReferenceSlots) continue;
-                    for (NamedVariable& arg : slotMatchedArgs)
-                        if (arg.IsCxxAddressOfPointerValue) arg.IsCxxAddressOfPointerValue = false;
-                    slotCandidates.emplace_back(std::move(slotMatchedArgs), slotCandidate);
+                    if (!param.IsCxxRefToPointer || param.CxxConstRef() || param.IsRvalueRef
+                        || param.TypeName != arg.TypeAndValue.TypeName)
+                        continue;
+                    if (arg.IsCxxConstPointerSlot()) continue;
+                    arg.TypeAndValue.ElemPointer = false;
+                    arg.TypeAndValue.PointerDepth = 1;
+                    arg.Storage = arg.Primary;
+                    arg.Primary = nullptr;
+                    arg.BaseType = GetType(arg.TypeAndValue);
+                    arg.IsRvalue = false;
+                    arg.IsCxxAddressOfPointerValue = false;
+                    hasSlotArgument = true;
                 }
+                if (!hasSlotArgument) continue;
+                auto slotMatchedArgs = MatchFunction(candidateArguments,
+                    slotCandidate.Parameters, slotCandidate.Variadic, true,
+                    &slotCandidate.DefaultArguments);
+                if (slotMatchedArgs.empty()) continue;
+                std::vector<NamedVariable> callArguments = candidateArguments;
+                if (hasImplicitReceiver) callArguments.erase(callArguments.begin());
+                slotCallArguments.push_back(std::move(callArguments));
+                slotCandidates.emplace_back(std::move(slotMatchedArgs), slotCandidate);
+            }
             if (!slotCandidates.empty())
             {
                 std::vector<FunctionSymbol> slotTied;
@@ -6100,9 +6152,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     slotCandidates, &slotTied, &slotPreferred);
                 if (slotCandidate.Function != nullptr && slotTied.empty() && !slotPreferred.set)
                 {
-                    for (NamedVariable& arg : slotArguments)
-                        if (arg.IsCxxAddressOfPointerValue) arg.IsCxxAddressOfPointerValue = false;
-                    arguments = std::move(slotArguments);
+                    for (size_t i = 0; i < slotCandidates.size(); ++i)
+                        if (slotCandidates[i].second.UniqueName == slotCandidate.UniqueName)
+                        {
+                            arguments = std::move(slotCallArguments[i]);
+                            break;
+                        }
                     resolvedCandidate = std::move(slotCandidates);
                     matched = std::move(slotMatched);
                     candidate = std::move(slotCandidate);
@@ -6644,23 +6699,24 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     }
                 }
             }
-            for (const auto& c : candidates)
-            {
-                if (c.IsCxx || c.Parameters.size() != arguments.size()) continue;
-                if (!std::all_of(arguments.begin(), arguments.end(), [](const auto& arg) {
-                        return arg.TypeAndValue.VariableName.empty();
-                    }))
-                    continue;
-                for (size_t i = 0; i < arguments.size(); ++i)
-                    if (IsImplicitPrimitiveToPointer(c.Parameters[i], arguments[i], arguments[i].Primary))
-                    {
-                        LogError(DescribeImplicitPrimitiveToPointer(
-                            c.Parameters[i], arguments[i], arguments[i].Primary, "pass",
-                            std::format("parameter '{}' of '{}'", c.Parameters[i].VariableName,
-                                        shownFunctionName)));
-                        return nullptr;
-                    }
-            }
+            if (!receiverHasCflatArrowMember)
+                for (const auto& c : candidates)
+                {
+                    if (c.IsCxx || c.Parameters.size() != arguments.size()) continue;
+                    if (!std::all_of(arguments.begin(), arguments.end(), [](const auto& arg) {
+                            return arg.TypeAndValue.VariableName.empty();
+                        }))
+                        continue;
+                    for (size_t i = 0; i < arguments.size(); ++i)
+                        if (IsImplicitPrimitiveToPointer(c.Parameters[i], arguments[i], arguments[i].Primary))
+                        {
+                            LogError(DescribeImplicitPrimitiveToPointer(
+                                c.Parameters[i], arguments[i], arguments[i].Primary, "pass",
+                                std::format("parameter '{}' of '{}'", c.Parameters[i].VariableName,
+                                            shownFunctionName)));
+                            return nullptr;
+                        }
+                }
 
             // A copy-deleted lvalue whose const T& overload clang refused to instantiate: the
             // call needed the copy. Offer 'move x' only when an rvalue overload is bound.
@@ -8161,10 +8217,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             llvm::cast<llvm::PointerType>(pointerType)));
                     }
                 }
-                else if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr
+                else if (!arg.TypeAndValue.Pointer
+                    && (arg.Storage != nullptr || arg.NullConditionalBorrowStorage != nullptr)
                     && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
                 {
-                    llvm::Value* address = arg.Storage;
+                    llvm::Value* address = LowerPointerParamArg(arg,
+                        !inVariadicRange && !(candidate.IsMethod && argIndex == 0));
                     if (!candParamItr->IsAlias && !candParamItr->IsCxxRefToPointer
                         && !candParamItr->CxxConstRef() && !candParamItr->IsRvalueRef
                         && IsCxxRecord(candParamItr->TypeName)
@@ -8182,39 +8240,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 else if (!arg.TypeAndValue.Pointer && arg.Storage == nullptr
                          && arg.Primary != nullptr && arg.Primary->getType()->isStructTy())
                 {
-                    // By-value struct parameter passed to a pointer parameter (e.g. args.count()
-                    // where args is a list<T> value param). Materialize on the stack first.
-                    auto* tempAlloca = AllocaAtEntry(arg.Primary->getType(), nullptr);
-                    builder->CreateStore(arg.Primary, tempAlloca);
-                    argList.push_back(tempAlloca);
+                    argList.push_back(LowerPointerParamArg(arg, false));
                 }
                 else
                 {
-                    // arg is a pointer type; Storage may be an alloca holding the pointer
-                    // (promoted param). Load through it to get the actual pointer value.
-                    llvm::Value* pointerValue = nullptr;
-                    if (arg.Primary == nullptr && arg.Storage != nullptr
-                        && llvm::isa<llvm::AllocaInst>(arg.Storage))
-                        pointerValue = LoadArgStorage(arg);
-                    else
-                        pointerValue = arg.GetValue();
-                    argList.push_back(pointerValue);
+                    argList.push_back(LowerPointerParamArg(arg, false));
                 }
 
                 // A `move` parameter is checked while the argument's origin is still visible.
                 llvm::Value* loweredArg = argList.back();
-                if (candParamItr->IsMove
-                    && IsProvableNonHeapAddress(loweredArg))
-                {
-                    const std::string qualifier = candParamItr->IsMove ? "'move'" : "unique";
-                    LogErrorMessage(
-                        "call to '{}': cannot pass the address of a stack or global value to {} "
-                        "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
-                        "but neither is heap-allocated and freeing it is undefined. Use '{}' to "
-                        "allocate on the heap, or drop '{}' if the callee only borrows.",
-                        { diagnosticFunctionName, qualifier, candParamItr->VariableName, "new", "new" });
+                if (candParamItr->IsMove && RejectMoveParamFromNonHeapAddress(
+                        diagnosticFunctionName, candParamItr->VariableName, loweredArg))
                     return nullptr;
-                }
                 }
             }
             else if (!inVariadicRange && candParamItr->IsFunctionPointer
@@ -8388,6 +8425,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             else if (!inVariadicRange && ParameterIsAliasByPointer(*candParamItr))
             {
+                const llvm::Value* ownerStorage = arg.FieldDropOwnerStorage != nullptr
+                    ? arg.FieldDropOwnerStorage : arg.Storage;
+                const std::string ownerName = !arg.FieldPathRoot.empty() ? arg.FieldPathRoot
+                    : !arg.CallerName.empty() ? arg.CallerName
+                    : FindVariableNameByStorage(ownerStorage);
+                const auto* ownerBinding = FindVariableByStorage(ownerStorage);
+                const TypeAndValue& ownerType = ownerBinding != nullptr
+                    ? ownerBinding->TypeAndValue : arg.TypeAndValue;
+                const bool cflatAggregate = !ownerType.Pointer
+                    && IsDataStructure(ownerType.TypeName) && !IsCxxRecord(ownerType.TypeName);
+                if (!candidate.IsCxx && cflatAggregate && !ownerName.empty())
+                    MarkVariableFieldStorageEscaped(ownerName);
                 // The callee may re-initialize any field under the aliased argument path.
                 if (const std::string& path = arg.FieldPathText.empty() ? arg.CallerName : arg.FieldPathText;
                     !path.empty())
@@ -9271,6 +9320,37 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 receiverStorage = matched[0].Storage;
             if (receiverStorage != nullptr)
                 DisarmNonLocalViewFieldsForEscape(receiverStorage, true);
+        }
+        if (candidate.IsMethod && !candidate.IsCxx && !arguments.empty())
+        {
+            const auto& receiver = arguments.front();
+            bool receiverRewritesTrackedStorage = receiver.FieldName.empty() || receiverMayHandOut;
+            if (!receiverRewritesTrackedStorage && receiver.FieldDropOwnerStorage != nullptr
+                && !receiver.OwningStructName.empty())
+            {
+                const auto* root = FindVariableByStorage(receiver.FieldDropOwnerStorage);
+                const auto* fieldOwnerType = GetType(
+                    TypeAndValue{ .TypeName = receiver.OwningStructName });
+                receiverRewritesTrackedStorage = root != nullptr && root->BaseType == fieldOwnerType;
+            }
+            if (receiverRewritesTrackedStorage)
+            {
+                const std::string ownerName = receiver.FieldPathRoot.empty()
+                    ? receiver.CallerName : receiver.FieldPathRoot;
+                // The method mutates the owner or may retain a pointer into its storage.
+                MarkVariableFieldStorageEscaped(ownerName);
+            }
+            else if (!receiver.FieldPathText.empty())
+            {
+                // A deeper receiver (`w.n.bi.reinit()`) may re-init a moved field below it.
+                const std::string ownerName = receiver.FieldPathRoot.empty()
+                    ? receiver.CallerName : receiver.FieldPathRoot;
+                const std::string prefix = ownerName + ".";
+                if (receiver.FieldPathText.starts_with(prefix))
+                    MarkReceiverPathEscaped(ownerName, receiver.FieldPathText.substr(prefix.size()));
+                else
+                    MarkVariableFieldStorageEscaped(ownerName);
+            }
         }
 
         llvm::Value* cxxVirtualCallee = nullptr;
@@ -11073,6 +11153,9 @@ void LLVMBackend::MarkVariableUnmoved(const std::string& name)
                     it->second.IsMoved = false;
                     it->second.PointeeMove = false;
                     it->second.PointeeMoveBlock = nullptr;
+                    if (builder != nullptr)
+                        for (const auto& entry : it->second.FieldDropFlags)
+                            builder->CreateStore(builder->getInt1(true), entry.second);
                     return;
                 }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
@@ -11080,6 +11163,9 @@ void LLVMBackend::MarkVariableUnmoved(const std::string& name)
                     it->second.IsMoved = false;
                     it->second.PointeeMove = false;
                     it->second.PointeeMoveBlock = nullptr;
+                    if (builder != nullptr)
+                        for (const auto& entry : it->second.FieldDropFlags)
+                            builder->CreateStore(builder->getInt1(true), entry.second);
                     return;
                 }
         }
@@ -11164,6 +11250,7 @@ void LLVMBackend::MarkVariableAddressEscaped(const std::string& name)
 {
         if (name.empty()) return;
         RecordNullEscape(name);
+        MarkVariableFieldStorageEscaped(name);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
@@ -11182,6 +11269,85 @@ void LLVMBackend::MarkVariableAddressEscaped(const std::string& name)
                 it->second.ExplicitNullBlock = nullptr;
                 it->second.PointeeMove = false;
                 it->second.PointeeMoveBlock = nullptr;
+                return;
+            }
+        }
+    }
+
+// True when `ancestor` is `path` itself or one of its ancestors ("n.bi" covers "n.bi.inn").
+static bool FieldPathIsAncestorOrSelf(const std::string& ancestor, const std::string& path)
+{
+        return !ancestor.empty() && (path == ancestor || path.starts_with(ancestor + "."));
+}
+
+// A method receiver at or above a moved field can re-init that field through `this`. Latch the
+// escape when such a move is seen; a receiver strictly inside the moved field does not latch.
+static void LatchEscapeForMovedField(LLVMBackend::NamedVariable& namedVar, const std::string& field)
+{
+        if (namedVar.FieldDropStorageEscaped) return;
+        for (const auto& receiverPath : namedVar.EscapeReceiverPaths)
+            if (FieldPathIsAncestorOrSelf(receiverPath, field))
+            {
+                namedVar.FieldDropStorageEscaped = true;
+                return;
+            }
+}
+
+void LLVMBackend::MarkReceiverPathEscaped(const std::string& name, const std::string& path)
+{
+        if (name.empty() || path.empty()) return;
+        // Indexed paths are not tracked by flag key: fall back to the whole-binding latch.
+        if (path.find('[') != std::string::npos)
+        {
+            MarkVariableFieldStorageEscaped(name);
+            return;
+        }
+        NamedVariable* binding = nullptr;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+            {
+                binding = &it->second;
+                break;
+            }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                binding = &it->second;
+                break;
+            }
+        }
+        if (binding == nullptr) return;
+        // A flag that already exists is judged now; a flag created by a later move is judged there.
+        for (const auto& [field, _] : binding->FieldDropFlags)
+            if (FieldPathIsAncestorOrSelf(path, field))
+            {
+                MarkVariableFieldStorageEscaped(name);
+                return;
+            }
+        if (std::ranges::find(binding->EscapeReceiverPaths, path) == binding->EscapeReceiverPaths.end())
+            binding->EscapeReceiverPaths.push_back(path);
+}
+
+void LLVMBackend::MarkVariableFieldStorageEscaped(const std::string& name)
+{
+        if (name.empty()) return;
+        auto mark = [&](NamedVariable& namedVar) {
+            namedVar.FieldDropStorageEscaped = true;
+            if (namedVar.FieldDropFlags.empty() || builder == nullptr) return;
+            // An escaped owner can have any flagged field rebuilt through an alias.
+            for (const auto& [_, flag] : namedVar.FieldDropFlags)
+                builder->CreateStore(builder->getInt1(true), flag);
+        };
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+            {
+                mark(it->second);
+                return;
+            }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                mark(it->second);
                 return;
             }
         }
@@ -11271,22 +11437,65 @@ std::string LLVMBackend::FieldMoveKey(const NamedVariable& nv)
         return nv.FieldName;
     }
 
-void LLVMBackend::MarkVariableFieldMoved(const std::string& name, const std::string& field)
+void LLVMBackend::MarkVariableFieldMoved(const std::string& name, const std::string& field,
+                                         bool runtimeOnly)
 {
         if (name.empty() || field.empty()) return;
-        RecordMoveKillField(name, field);
+        if (!runtimeOnly) RecordMoveKillField(name, field);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                    {
-                        movedf::MarkFieldPathMoved(it->second.MovedFields, field);
-                        MarkNonLocalViewFieldMoved(it->second.Storage, field);
-                        return;
-                    }
-            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                SetFieldDropFlagsLive(it->second, field, true, false);
+                LatchEscapeForMovedField(it->second, field);
+                // Keep a moved field destructible when an alias may have rebuilt it.
+                if (it->second.FieldDropStorageEscaped)
+                    SetFieldDropFlagsLive(it->second, field, false, true);
+                if (!runtimeOnly)
                 {
                     movedf::MarkFieldPathMoved(it->second.MovedFields, field);
                     MarkNonLocalViewFieldMoved(it->second.Storage, field);
+                }
+                return;
+            }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                SetFieldDropFlagsLive(it->second, field, true, false);
+                LatchEscapeForMovedField(it->second, field);
+                if (it->second.FieldDropStorageEscaped)
+                    SetFieldDropFlagsLive(it->second, field, false, true);
+                if (!runtimeOnly)
+                {
+                    movedf::MarkFieldPathMoved(it->second.MovedFields, field);
+                    MarkNonLocalViewFieldMoved(it->second.Storage, field);
+                }
+                return;
+            }
+        }
+    }
+
+void LLVMBackend::MarkStorageFieldMovedForDrop(llvm::Value* rootStorage,
+                                               const std::string& field)
+{
+        if (rootStorage == nullptr || field.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            for (auto& entry : frame.namedVariable)
+                if (entry.second.Storage == rootStorage || entry.second.Primary == rootStorage)
+                {
+                    SetFieldDropFlagsLive(entry.second, field, true, false);
+                    LatchEscapeForMovedField(entry.second, field);
+                    if (entry.second.FieldDropStorageEscaped)
+                        SetFieldDropFlagsLive(entry.second, field, false, true);
+                    return;
+                }
+            for (auto& entry : frame.functionArgument)
+                if (entry.second.Storage == rootStorage || entry.second.Primary == rootStorage)
+                {
+                    SetFieldDropFlagsLive(entry.second, field, true, false);
+                    LatchEscapeForMovedField(entry.second, field);
+                    if (entry.second.FieldDropStorageEscaped)
+                        SetFieldDropFlagsLive(entry.second, field, false, true);
                     return;
                 }
         }
@@ -11299,9 +11508,17 @@ void LLVMBackend::MarkVariableFieldUnmoved(const std::string& name, const std::s
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { movedf::ReviveFieldPath(it->second.MovedFields, field); return; }
+                {
+                    movedf::ReviveFieldPath(it->second.MovedFields, field);
+                    SetFieldDropFlagsLive(it->second, field, false, true);
+                    return;
+                }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { movedf::ReviveFieldPath(it->second.MovedFields, field); return; }
+                {
+                    movedf::ReviveFieldPath(it->second.MovedFields, field);
+                    SetFieldDropFlagsLive(it->second, field, false, true);
+                    return;
+                }
         }
     }
 

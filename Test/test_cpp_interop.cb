@@ -2234,6 +2234,107 @@ int t508HeapNew(int x) {
     delete v;
     return r;
 }
+struct T470FlatCTZU { t470.Counted c; t470.TC t; int z = 0; T470FlatCTZU() { z = 3; } };
+struct T470FlatTCZU { t470.TC t; t470.Counted c; int z = 0; T470FlatTCZU() { z = 3; } };
+struct T470FlatTZCU { t470.TC t; int z = 0; t470.Counted c; T470FlatTZCU() { z = 3; } };
+struct T470FlatCTZN { t470.Counted c; t470.TC t; int z = 3; };
+struct T470FlatTCZN { t470.TC t; t470.Counted c; int z = 3; };
+struct T470FlatTZCN { t470.TC t; int z = 3; t470.Counted c; };
+struct T470TagMove { t470.Counted c; t470.TC t; int z = 3; };
+
+int t470MoveFlat<T>(int mode) {
+    t470.Counted cc = default; cc.value = 11;
+    t470.TC s = default; s.value = 8;
+    t470.set_throw(mode / 2);
+    if (mode % 2 == 0) {
+        T value = { c = move cc, t = s };
+        if (value.c.value != 11 || value.t.value != 8 || value.z != 3) return 211;
+    } else {
+        T* value = new T { c = move cc, t = s };
+        int bad = value->c.value != 11 || value->t.value != 8 || value->z != 3;
+        delete value;
+        if (bad) return 212;
+    }
+    t470.set_throw(0);
+    return 1183;
+}
+int t470MoveHost<T>(int throwCopy) {
+    t470.Counted cc = default; cc.value = 11;
+    t470.TC s = default; s.value = 8;
+    t470.set_throw(throwCopy);
+    T value = { c = move cc, t = s };
+    t470.set_throw(0);
+    if (value.c.value != 11 || value.t.value != 8 || value.z != 3) return 213;
+    return 1183;
+}
+int t470MoveFlatCTZU(int mode) { return t470MoveFlat<T470FlatCTZU>(mode); }
+int t470MoveFlatTCZU(int mode) { return t470MoveFlat<T470FlatTCZU>(mode); }
+int t470MoveFlatTZCU(int mode) { return t470MoveFlat<T470FlatTZCU>(mode); }
+int t470MoveFlatCTZN(int mode) { return t470MoveFlat<T470FlatCTZN>(mode); }
+int t470MoveFlatTCZN(int mode) { return t470MoveFlat<T470FlatTCZN>(mode); }
+int t470MoveFlatTZCN(int mode) { return t470MoveFlat<T470FlatTZCN>(mode); }
+int t470MoveHostCTZU(int mode) { return t470MoveHost<t470.BraceHost_CTZ_U>(mode); }
+int t470MoveHostTCZU(int mode) { return t470MoveHost<t470.BraceHost_TCZ_U>(mode); }
+int t470MoveHostTZCU(int mode) { return t470MoveHost<t470.BraceHost_TZC_U>(mode); }
+int t470MoveHostCTZN(int mode) { return t470MoveHost<t470.BraceHost_CTZ_N>(mode); }
+int t470MoveHostTCZN(int mode) { return t470MoveHost<t470.BraceHost_TCZ_N>(mode); }
+int t470MoveHostTZCN(int mode) { return t470MoveHost<t470.BraceHost_TZC_N>(mode); }
+int t470TagMove(int throwCopy) {
+    t470.Counted cc = default; cc.value = 11;
+    t470.TC s = default; s.value = 8;
+    t470.set_throw(throwCopy);
+    T470TagMove* value = <T470TagMove c={move cc} t={s} />;
+    t470.set_throw(0);
+    int result = value->c.value * 100 + value->t.value * 10 + value->z;
+    delete value;
+    return result;
+}
+int t470ConstructAtMove(int unused) {
+    t470.Counted* slot = (t470.Counted*)malloc((i64)sizeof(t470.Counted));
+    {
+        t470.Counted cc = default; cc.value = 11;
+        construct_at(slot, move cc);
+    }
+    int result = slot->value;
+    t470.destroyCounted(slot);
+    free(slot);
+    return result;
+}
+int t470FixedArrayMove(int unused) {
+    t470.Counted cc = default; cc.value = 11;
+    t470.Counted[1] values = { move cc };
+    return values[0].value;
+}
+int t470DeclFromArrayMove(int unused) {
+    t470.Counted[1] source = { t470.Counted() };
+    t470.Counted moved = move source[0];
+    return moved.value;
+}
+int t470PositionalHostMove(int unused) {
+    t470.Counted cc = default; cc.value = 11;
+    t470.TC s = default; s.value = 8;
+    t470.BraceHost_CTZ_N value = { move cc, s, 3 };
+    return value.c.value * 100 + value.t.value * 10 + value.z;
+}
+int t470NamedCopy(int unused) {
+    t470.Counted cc = default; cc.value = 11;
+    t470.TC s = default; s.value = 8;
+    T470FlatCTZN value = { c = cc, t = s };
+    return value.c.value * 100 + value.t.value * 10 + value.z;
+}
+int t470NamedTemp(int unused) {
+    t470.TC s = default; s.value = 8;
+    T470FlatCTZN value = { c = t470.Counted(), t = s };
+    return value.c.value * 100 + value.t.value * 10 + value.z;
+}
+int t470CheckMove(t470.Callback callback, int mode, int expected) {
+    t470.reset();
+    int got = t470.guarded(callback, mode);
+    t470.set_throw(0);
+    if (got != expected || t470.live() != 0 || t470.countedLive() != 0 || t470.tcLive() != 0
+        || t470.ctors() + t470.copies() + t470.moves() != t470.dtors()) return 1;
+    return 0;
+}
 // T313: the element block of a tag form (or `new T{...}`) whose attribute throws is freed once,
 // through the operator new/delete pair it came from: the user pair when the struct declares one.
 int t313UnNew = 0;
@@ -2807,6 +2908,71 @@ int T513R10ThrowCtor(int x)
     bool c = true;
     c ? T513R10ThrowA(x) : t513R10MakeThrowB();
     return 0;
+}
+
+// T513 v10: the declaration sink constructs the selected common-type result in its slot.
+int T513V10DeclProbe(bool k, int input)
+{
+    t513V10Reset();
+    int value = 0;
+    {
+        T513V10B result = k ? t513V10MakeA(input) : t513V10MakeB();
+        value = result.value;
+    }
+    return value * 10000 + t513V10Stats();
+}
+
+// T513 v11: return uses the function's sret slot for the same common-type result.
+T513V10B T513V11Return(bool k, int input)
+{
+    return k ? t513V10MakeA(input) : t513V10MakeB();
+}
+int T513V11Probe(bool k, int input)
+{
+    t513V10Reset();
+    int value = 0;
+    {
+        T513V10B result = T513V11Return(k, input);
+        value = result.value;
+    }
+    return value * 10000 + t513V10Stats();
+}
+
+// T513 v12: a by-value call argument is built in the call's argument temp.
+int T513V12Take(T513V10B value) { return value.value; }
+int T513V12Probe(bool k, int input)
+{
+    t513V10Reset();
+    int value = T513V12Take(k ? t513V10MakeA(input) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+
+// T513 v13: a free function named like core list's take() takes the mixed-ternary argument.
+int take(T513V10B value) { return value.value; }
+int T513V13Probe(bool k, int input)
+{
+    t513V10Reset();
+    int value = take(k ? t513V10MakeA(input) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+
+// T513 r5: a view callee; the mixed-ternary arm A must outlive the sink call.
+int T513V15Take(T513V11View v) { return v.get(); }
+int T513V15Probe(bool k, int input)
+{
+    t513V10Reset();
+    int value = T513V15Take(k ? t513V10MakeA(input) : t513V11MakeNull());
+    return value * 10000 + t513V10Stats();
+}
+
+// T513 v14: a void by-value callee takes the mixed-ternary argument.
+int t513V14Value = 0;
+void T513V14Take(T513V10B value) { t513V14Value = value.value; }
+int T513V14Probe(bool k, int input)
+{
+    t513V10Reset();
+    T513V14Take(k ? t513V10MakeA(input) : t513V10MakeB());
+    return t513V14Value * 10000 + t513V10Stats();
 }
 
 extern int main()
@@ -4288,6 +4454,26 @@ extern int main()
     if (t513R10Guarded(T513R10ThrowReverse, 7) != -7 || t513R10Living() != 0 || t513R10Deaths() != 1) return 95169;
     t513ResetR10();
     if (t513R10Guarded(T513R10ThrowCtor, 7) != -7 || t513R10Living() != 0 || t513R10Deaths() != 1) return 95170;
+    // T513 v10-v12: value and ctor/dtor sequence match clang++ for both selected arms.
+    if (T513V10DeclProbe(true, 11) != 1111647) return 95171;
+    if (T513V10DeclProbe(false, 11) != 200057) return 95172;
+    if (T513V11Probe(true, 11) != 1111647) return 95173;
+    if (T513V11Probe(false, 11) != 200057) return 95174;
+    // MSVC destroys the by-value A parameter inside B(A), before B's call-argument destruction.
+    int t513V12TrueExpected = 1111674;
+    if const (__WINDOWS__) { t513V12TrueExpected = 1111647; }
+    if (T513V12Probe(true, 11) != t513V12TrueExpected) return 95175;
+    if (T513V12Probe(false, 11) != 200057) return 95176;
+    // By-value B(A): MSVC destroys A inside B(A), so A dies before the callee's B (clang-cl 1647).
+    int t513V13TrueExpected = 1111674;
+    if const (__WINDOWS__) { t513V13TrueExpected = 1111647; }
+    if (T513V13Probe(true, 11) != t513V13TrueExpected) return 95177;
+    if (T513V13Probe(false, 11) != 200057) return 95178;
+    if (T513V14Probe(true, 11) != t513V13TrueExpected) return 95179;
+    if (T513V14Probe(false, 11) != 200057) return 95180;
+    // r5 (S1): the view sink keeps A alive through the call on both ABIs (clang: 11/1674).
+    if (T513V15Probe(true, 11) != 111674) return 95181;
+    if (T513V15Probe(false, 11) != 200057) return 95182;
     t226s.reset();
     if (T233LocalDerivedTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93018;
     t226s.reset();
@@ -9020,6 +9206,143 @@ extern int main()
     int t495MultiY = 9; int* t495MultiPtr = &t495MultiY;
     cppamp.Multi t495Multi = cppamp.Multi(&t495MultiPtr, 7);
     if (t495Multi.get() + (t495MultiPtr == nullptr ? 10 : 0) != cppamp.oracleMulti()) return 1948;
+
+    // AMP2: method template wrappers keep the address value's full pointer depth.
+    cppamp.Amp2MethodCases amp2Methods = default;
+    int amp2MethodIntValue = 4; int* amp2MethodIntPtr = &amp2MethodIntValue;
+    if (amp2Methods.urefInt(&amp2MethodIntPtr) != cppamp.oracleAmp2MethodURefInt()) return 1949;
+    if (amp2Methods.ustarInt(&amp2MethodIntPtr) != cppamp.oracleAmp2MethodUStarInt()) return 1950;
+    cppamp.Amp2Payload amp2MethodObject = default; amp2MethodObject.value = 4;
+    cppamp.Amp2Payload* amp2MethodClassPtr = &amp2MethodObject;
+    if (amp2Methods.urefClass(&amp2MethodClassPtr) != cppamp.oracleAmp2MethodURefClass()) return 1951;
+    if (amp2Methods.ustarClass(&amp2MethodClassPtr) != cppamp.oracleAmp2MethodUStarClass()) return 1952;
+
+    // Static method template wrappers use the same pointer-value reading.
+    int amp2StaticIntValue = 4; int* amp2StaticIntPtr = &amp2StaticIntValue;
+    if (cppamp.Amp2StaticCases.urefInt(&amp2StaticIntPtr) != cppamp.oracleAmp2StaticURefInt()) return 1953;
+    if (cppamp.Amp2StaticCases.ustarInt(&amp2StaticIntPtr) != cppamp.oracleAmp2StaticUStarInt()) return 1954;
+    cppamp.Amp2Payload amp2StaticObject = default; amp2StaticObject.value = 4;
+    cppamp.Amp2Payload* amp2StaticClassPtr = &amp2StaticObject;
+    if (cppamp.Amp2StaticCases.urefClass(&amp2StaticClassPtr) != cppamp.oracleAmp2StaticURefClass()) return 1955;
+    if (cppamp.Amp2StaticCases.ustarClass(&amp2StaticClassPtr) != cppamp.oracleAmp2StaticUStarClass()) return 1956;
+
+    // Templates with a required second parameter are not viable for this one-argument call.
+    int amp2CtorIntValue = 4; int* amp2CtorIntPtr = &amp2CtorIntValue;
+    auto amp2CtorUStarInt = cppamp.Amp2CtorUStarArityInt(&amp2CtorIntPtr);
+    if (amp2CtorUStarInt.selected + (amp2CtorIntPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2CtorUStarArityInt()) return 1957;
+    cppamp.Amp2Payload amp2CtorObject = default; amp2CtorObject.value = 4;
+    cppamp.Amp2Payload* amp2CtorClassPtr = &amp2CtorObject;
+    auto amp2CtorUStarClass = cppamp.Amp2CtorUStarArityClass(&amp2CtorClassPtr);
+    if (amp2CtorUStarClass.selected + (amp2CtorClassPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2CtorUStarArityClass()) return 1958;
+    int amp2CtorRefValue = 4; int* amp2CtorRefPtr = &amp2CtorRefValue;
+    auto amp2CtorURefInt = cppamp.Amp2CtorURefArityInt(&amp2CtorRefPtr);
+    if (amp2CtorURefInt.selected + (amp2CtorRefPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2CtorURefArityInt()) return 1959;
+    int amp2FreeIntValue = 4; int* amp2FreeIntPtr = &amp2FreeIntValue;
+    int amp2FreeUStarInt = cppamp.amp2FreeUStarArityInt(&amp2FreeIntPtr);
+    if (amp2FreeUStarInt + (amp2FreeIntPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2FreeUStarArityInt()) return 1960;
+    cppamp.Amp2Payload amp2FreeObject = default; amp2FreeObject.value = 4;
+    cppamp.Amp2Payload* amp2FreeClassPtr = &amp2FreeObject;
+    int amp2FreeUStarClass = cppamp.amp2FreeUStarArityClass(&amp2FreeClassPtr);
+    if (amp2FreeUStarClass + (amp2FreeClassPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2FreeUStarArityClass()) return 1961;
+    int amp2FreeRefValue = 4; int* amp2FreeRefPtr = &amp2FreeRefValue;
+    int amp2FreeURefInt = cppamp.amp2FreeURefArityInt(&amp2FreeRefPtr);
+    if (amp2FreeURefInt + (amp2FreeRefPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2FreeURefArityInt()) return 1962;
+
+    // Each argument keeps its own reading: the first binds the slot, the second stays T**.
+    int amp2CtorMixedA = 4; int amp2CtorMixedB = 7;
+    int* amp2CtorMixedPtr = &amp2CtorMixedA; int* amp2CtorMixedQ = &amp2CtorMixedB;
+    auto amp2CtorMixed = cppamp.Amp2CtorMixedInt(&amp2CtorMixedPtr, &amp2CtorMixedQ);
+    if (amp2CtorMixed.selected + (amp2CtorMixedPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2CtorMixedInt()) return 1963;
+    cppamp.Amp2Payload amp2CtorMixedAClass = default; amp2CtorMixedAClass.value = 4;
+    cppamp.Amp2Payload amp2CtorMixedBClass = default; amp2CtorMixedBClass.value = 7;
+    cppamp.Amp2Payload* amp2CtorMixedClassPtr = &amp2CtorMixedAClass;
+    cppamp.Amp2Payload* amp2CtorMixedClassQ = &amp2CtorMixedBClass;
+    auto amp2CtorMixedClass = cppamp.Amp2CtorMixedClass(&amp2CtorMixedClassPtr, &amp2CtorMixedClassQ);
+    if (amp2CtorMixedClass.selected + (amp2CtorMixedClassPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2CtorMixedClass()) return 1964;
+    int amp2MethodMixedA = 4; int amp2MethodMixedB = 7;
+    int* amp2MethodMixedPtr = &amp2MethodMixedA; int* amp2MethodMixedQ = &amp2MethodMixedB;
+    int amp2MethodMixed = amp2Methods.mixedInt(&amp2MethodMixedPtr, &amp2MethodMixedQ);
+    if (amp2MethodMixed + (amp2MethodMixedPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2MethodMixedInt()) return 1965;
+    cppamp.Amp2Payload amp2MethodMixedAClass = default; amp2MethodMixedAClass.value = 4;
+    cppamp.Amp2Payload amp2MethodMixedBClass = default; amp2MethodMixedBClass.value = 7;
+    cppamp.Amp2Payload* amp2MethodMixedClassPtr = &amp2MethodMixedAClass;
+    cppamp.Amp2Payload* amp2MethodMixedClassQ = &amp2MethodMixedBClass;
+    int amp2MethodMixedClass = amp2Methods.mixedClass(&amp2MethodMixedClassPtr, &amp2MethodMixedClassQ);
+    if (amp2MethodMixedClass + (amp2MethodMixedClassPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2MethodMixedClass()) return 1966;
+    int amp2StaticMixedA = 4; int amp2StaticMixedB = 7;
+    int* amp2StaticMixedPtr = &amp2StaticMixedA; int* amp2StaticMixedQ = &amp2StaticMixedB;
+    int amp2StaticMixed = cppamp.Amp2StaticCases.mixedInt(&amp2StaticMixedPtr, &amp2StaticMixedQ);
+    if (amp2StaticMixed + (amp2StaticMixedPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2StaticMixedInt()) return 1967;
+    cppamp.Amp2Payload amp2StaticMixedAClass = default; amp2StaticMixedAClass.value = 4;
+    cppamp.Amp2Payload amp2StaticMixedBClass = default; amp2StaticMixedBClass.value = 7;
+    cppamp.Amp2Payload* amp2StaticMixedClassPtr = &amp2StaticMixedAClass;
+    cppamp.Amp2Payload* amp2StaticMixedClassQ = &amp2StaticMixedBClass;
+    int amp2StaticMixedClass = cppamp.Amp2StaticCases.mixedClass(&amp2StaticMixedClassPtr, &amp2StaticMixedClassQ);
+    if (amp2StaticMixedClass + (amp2StaticMixedClassPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2StaticMixedClass()) return 1968;
+    int amp2FreeMixedA = 4; int amp2FreeMixedB = 7;
+    int* amp2FreeMixedPtr = &amp2FreeMixedA; int* amp2FreeMixedQ = &amp2FreeMixedB;
+    int amp2FreeMixed = cppamp.amp2FreeMixedInt(&amp2FreeMixedPtr, &amp2FreeMixedQ);
+    if (amp2FreeMixed + (amp2FreeMixedPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2FreeMixedInt()) return 1969;
+    cppamp.Amp2Payload amp2FreeMixedAClass = default; amp2FreeMixedAClass.value = 4;
+    cppamp.Amp2Payload amp2FreeMixedBClass = default; amp2FreeMixedBClass.value = 7;
+    cppamp.Amp2Payload* amp2FreeMixedClassPtr = &amp2FreeMixedAClass;
+    cppamp.Amp2Payload* amp2FreeMixedClassQ = &amp2FreeMixedBClass;
+    int amp2FreeMixedClass = cppamp.amp2FreeMixedClass(&amp2FreeMixedClassPtr, &amp2FreeMixedClassQ);
+    if (amp2FreeMixedClass + (amp2FreeMixedClassPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2FreeMixedClass()) return 1970;
+
+    // Parameter packs absorb zero or more trailing constructor arguments after the fixed prefix.
+    int amp2PackValue = 4; int* amp2PackPtr = &amp2PackValue;
+    auto amp2PackCtor = cppamp.Amp2CtorPack(&amp2PackPtr);
+    if (amp2PackCtor.selected + (amp2PackPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2CtorPack()) return 260001;
+
+    // A clang-rejected value template falls back to the non-template mutable pointer slot.
+    int amp2FreeFallbackValue = 4; int* amp2FreeFallbackPtr = &amp2FreeFallbackValue;
+    int amp2FreeURefFallback = cppamp.amp2FreeURefFallback(&amp2FreeFallbackPtr);
+    if (amp2FreeURefFallback + (amp2FreeFallbackPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2FreeURefFallback()) return 260002;
+    int amp2RequiresFreeValue = 4; int* amp2RequiresFreePtr = &amp2RequiresFreeValue;
+    int amp2RequiresFreeFallback = cppamp.amp2RequiresFreeFallback(&amp2RequiresFreePtr);
+    if (amp2RequiresFreeFallback + (amp2RequiresFreePtr == nullptr ? 10 : 0) != cppamp.oracleAmp2RequiresFreeFallback()) return 260003;
+    int amp2RequiresCtorValue = 4; int* amp2RequiresCtorPtr = &amp2RequiresCtorValue;
+    auto amp2RequiresCtor = cppamp.Amp2RequiresCtorFallback(&amp2RequiresCtorPtr);
+    if (amp2RequiresCtor.selected + (amp2RequiresCtorPtr == nullptr ? 10 : 0) != cppamp.oracleAmp2RequiresCtorFallback()) return 260004;
+
+    // Field address values keep the template pick; slot fallback writes through field storage.
+    int amp2FieldTemplateValue = 4;
+    cppamp.Amp2Field amp2FieldTemplate = default; amp2FieldTemplate.fp = &amp2FieldTemplateValue;
+    int amp2FieldTemplateResult = cppamp.amp2FieldTemplate(&amp2FieldTemplate.fp);
+    if (amp2FieldTemplateResult + (amp2FieldTemplate.fp == nullptr ? 10 : 0) != cppamp.oracleAmp2FieldTemplate()) return 260005;
+    int amp2FieldSlotValue = 4;
+    cppamp.Amp2Field amp2FieldSlot = default; amp2FieldSlot.fp = &amp2FieldSlotValue;
+    int amp2FieldSlotResult = cppamp.amp2FieldSlot(&amp2FieldSlot.fp);
+    if (amp2FieldSlotResult + (amp2FieldSlot.fp == nullptr ? 10 : 0) != cppamp.oracleAmp2FieldSlot()) return 260006;
+
+    // A request-site no-match can use the lvalue slot fallback even with another argument.
+    int amp2L10Value = 4; int* amp2L10Ptr = &amp2L10Value;
+    int amp2L10 = amp2r3.free_l10(&amp2L10Ptr, 2);
+    if (amp2L10 + (amp2L10Ptr == nullptr ? 10 : 0) != amp2r3.oracle_free_l10()) return 260007;
+
+    // Non-incremental clang retries must not recurse on an in-progress constructor shape.
+    int amp2R5TwoLeadValue = 4; int* amp2R5TwoLeadPtr = &amp2R5TwoLeadValue;
+    auto amp2R5TwoLead = cppamp.Amp2R5CtorTwoLead(&amp2R5TwoLeadPtr);
+    if (amp2R5TwoLead.selected + (amp2R5TwoLeadPtr == nullptr ? 10 : 0)
+        != cppamp.oracleAmp2R5CtorTwoLead()) return 260008;
+    int amp2R5RequiredMidValue = 4; int* amp2R5RequiredMidPtr = &amp2R5RequiredMidValue;
+    auto amp2R5RequiredMid = cppamp.Amp2R5CtorRequiredMid(&amp2R5RequiredMidPtr);
+    if (amp2R5RequiredMid.selected + (amp2R5RequiredMidPtr == nullptr ? 10 : 0)
+        != cppamp.oracleAmp2R5CtorRequiredMid()) return 260009;
+    int amp2R5PackLRefValue = 4; int* amp2R5PackLRefPtr = &amp2R5PackLRefValue;
+    auto amp2R5PackLRef = cppamp.Amp2R5CtorPackLRef(&amp2R5PackLRefPtr);
+    if (amp2R5PackLRef.selected + (amp2R5PackLRefPtr == nullptr ? 10 : 0)
+        != cppamp.oracleAmp2R5CtorPackLRef()) return 260010;
+    int amp2R5MultiValue = 4; int* amp2R5P = &amp2R5MultiValue;
+    int* amp2R5Q = &amp2R5MultiValue; int* amp2R5R = &amp2R5MultiValue;
+    int amp2R5A = cppamp.amp2R5FreeFallback(&amp2R5P);
+    int amp2R5B = cppamp.amp2R5FreeSuccess(&amp2R5Q);
+    auto amp2R5MultiCtor = cppamp.Amp2R5CtorMultiFallback(&amp2R5R);
+    int amp2R5Multi = amp2R5A + (amp2R5P == nullptr ? 10 : 0) + amp2R5B * 20
+        + (amp2R5Q != nullptr ? 0 : 100) + amp2R5MultiCtor.selected * 3
+        + (amp2R5R != nullptr ? 0 : 50);
+    if (amp2R5Multi != cppamp.oracleAmp2R5MultiFallbackSuccessFallback()) return 260011;
 
     // ---- a C++ field whose type is a CLASS ------------------------------------------------------
     // Pre-fix every leg below failed to COMPILE ("Undefined variable ..." / "no overload of
@@ -19415,6 +19738,30 @@ int LoweredUserDtorAssignLegs(int argc)
     t258A = t470.guarded(t470NestedReplace, 1);
     if (t258A != -7 || t470.copyAttempts() != 1 || t470.live() != 0 || t470.countedLive() != 0
         || t470.tcLive() != 0 || t470.ctors() + t470.copies() + t470.moves() != t470.dtors()) return 29612;
+    // T470: a moved-from C++ source remains alive and is destroyed after named-field construction.
+    t470.Callback[6] t470FlatMoveProbes = { t470MoveFlatCTZU, t470MoveFlatTCZU, t470MoveFlatTZCU,
+        t470MoveFlatCTZN, t470MoveFlatTCZN, t470MoveFlatTZCN };
+    for (int t470Type = 0; t470Type < 6; t470Type++) {
+        for (int t470Mode = 0; t470Mode < 4; t470Mode++) {
+            int t470Expected = t470Mode < 2 ? 1183 : -7;
+            if (t470CheckMove(t470FlatMoveProbes[t470Type], t470Mode, t470Expected) != 0)
+                return 29620 + t470Type * 4 + t470Mode;
+        }
+    }
+    t470.Callback[6] t470HostMoveProbes = { t470MoveHostCTZU, t470MoveHostTCZU, t470MoveHostTZCU,
+        t470MoveHostCTZN, t470MoveHostTCZN, t470MoveHostTZCN };
+    for (int t470Type = 0; t470Type < 6; t470Type++) {
+        if (t470CheckMove(t470HostMoveProbes[t470Type], 0, 1183) != 0) return 29650 + t470Type;
+        if (t470CheckMove(t470HostMoveProbes[t470Type], 1, -7) != 0) return 29660 + t470Type;
+    }
+    if (t470CheckMove(t470TagMove, 0, 1183) != 0) return 29670;
+    if (t470CheckMove(t470TagMove, 1, -7) != 0) return 29671;
+    if (t470CheckMove(t470ConstructAtMove, 0, 11) != 0) return 29672;
+    if (t470CheckMove(t470FixedArrayMove, 0, 11) != 0) return 29673;
+    if (t470CheckMove(t470DeclFromArrayMove, 0, 0) != 0) return 29674;
+    if (t470CheckMove(t470PositionalHostMove, 0, 1183) != 0) return 29675;
+    if (t470CheckMove(t470NamedCopy, 0, 1183) != 0) return 29676;
+    if (t470CheckMove(t470NamedTemp, 0, 83) != 0) return 29677;
     // T313: a tag-form block freed when an attribute throws (heap audit: no leak), then the user pair.
     HeapAudit.enable();
     int t313Base = (int)HeapAudit.reportLeaks();

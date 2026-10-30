@@ -13419,6 +13419,25 @@ bool MainListener::IsOwningTempRawPointerFieldEscape(
                     || compilerLLVM->JoinCarriesOwningTempRawPointerFieldAddress(nv.Primary)));
 }
 
+void MainListener::GuardOwningTempRawPointerFieldIntoUnique(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& destinationType,
+        antlr4::ParserRuleContext* ctx,
+        const std::string& calleeName) {
+        if (ctx == nullptr || compilerLLVM == nullptr
+            || !(destinationType.IsUnique
+                || (!destinationType.Pointer
+                    && compilerLLVM->IsCoreUniqueType(destinationType.TypeName)))
+            || !source.TypeAndValue.Pointer || source.TypeAndValue.IsUnique
+            || (!IsOwningTempRawPointerFieldEscape(source)
+                && compilerLLVM->FindOwningTempRawPointerFieldOwners(source.Primary).empty()))
+            return;
+        LogErrorContext(ctx, std::format(
+            "cannot pass a pointer borrowed from an owning temporary's field to unique parameter of '{}'; "
+            "bind the owner to a named local first",
+            calleeName));
+}
+
 void MainListener::GuardRawPointerIntoOwningTempField(
         const LLVMBackend::NamedVariable& source,
         const LLVMBackend::TypeAndValue& destinationType,

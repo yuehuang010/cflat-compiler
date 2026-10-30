@@ -13,8 +13,9 @@ T490 (2026-10-24) made a moved-from plain CFlat struct (user dtor, no owning fie
   The contract must be readable by every caller (part of the function TYPE / ABI), or callee-destroys only for functions
   never taken as a value. Conditional consumes (`if`, early return, loop, recursive: 20030 vs clang 20020) need the
   same contract plus the callee's conditional drop flag. Repros: scratch/repro_keep/t499/ (main checkout).
-- (master too) `take(move b.inn)` (moving a struct field out) destroys `inn` twice.
-- (master too) `Bx b = { inn = move a };` runs one extra dtor on an empty default value.
+- Local-field moves are fixed by the MVFIELD runtime field-drop tracking. The equivalent heap-field path
+  (`take(move p->inn)`) remains open: it still drops one extra moved-from value after three ownership-root
+  tracking attempts. Repro: `scratch/repro_keep/mvfield/field_matrix_noaudit.cb` (main checkout).
 - Scope: structs with a raw-pointer or `int[]` view field are excluded from T490 (cautious; C-style `~Buf(){ free(data); }`)
   and still get 2 dtor runs after a move. Ruling question: does "no owning fields" cover raw pointers?
 Repros: scratch/repro_keep/t490/ (main checkout).

@@ -168,3 +168,36 @@ extern int main()
 
 // Defined after its caller: the store verdict waits for the final IR.
 void t510r5Later(int* p) { t426Saved = p; }
+
+// A raw pointer read from a temporary owner cannot be adopted by a unique sink: the sink and
+// the temporary would both own the pointee. The callback and interface forms share that rule.
+void t510UniqueSink(unique int* p) { }
+
+expect_error("cannot pass a pointer borrowed from an owning temporary's field to unique parameter") {
+    void tempRawFieldIntoUniqueSink() { t510UniqueSink(t426Mk2().heap); }
+}
+
+int* t510UniqueSaved = nullptr;
+void t510UniqueSave(int* p) { t510UniqueSaved = p; }
+int t510UniqueCallbackSink(unique int* p)
+{
+    function<void(int*)> fp = t510UniqueSave;
+    fp(p);
+    return *p;
+}
+
+expect_error("cannot pass a pointer borrowed from an owning temporary's field to unique parameter") {
+    void tempRawFieldIntoUniqueCallbackSink() { t510UniqueCallbackSink(t426Mk2().heap); }
+}
+
+interface T510UniqueSink { void take(unique int* p); };
+class T510UniqueSinkImpl : T510UniqueSink { void take(unique int* p) { } };
+
+expect_error("cannot pass a pointer borrowed from an owning temporary's field to unique parameter") {
+    void tempRawFieldIntoUniqueInterfaceSink()
+    {
+        T510UniqueSinkImpl impl = default;
+        T510UniqueSink sink = impl;
+        sink.take(t426Mk2().heap);
+    }
+}

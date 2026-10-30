@@ -596,11 +596,11 @@ class ChartsApp : IComponent
         {
             double sum = 0.0;
             int i = 0;
-            while (i < n) { sum = sum + maps.get(s).get(common.get(i)); i++; }
+            while (i < n) { sum = sum + maps.get(s).get().get(common.get(i)); i++; }
             double mu = sum / (double)n;
             double ss = 0.0;
             i = 0;
-            while (i < n) { double d2 = maps.get(s).get(common.get(i)) - mu; ss = ss + d2 * d2; i++; }
+            while (i < n) { double d2 = maps.get(s).get().get(common.get(i)) - mu; ss = ss + d2 * d2; i++; }
             means.add(mu);
             sds.add(Math.sqrt(ss / (double)n));
             s++;
@@ -617,7 +617,7 @@ class ChartsApp : IComponent
                 while (i < n)
                 {
                     string dt = common.get(i);
-                    cov = cov + (maps.get(r).get(dt) - means.get(r)) * (maps.get(c).get(dt) - means.get(c));
+                    cov = cov + (maps.get(r).get().get(dt) - means.get(r)) * (maps.get(c).get().get(dt) - means.get(c));
                     i++;
                 }
                 cov = cov / (double)n;

@@ -5,6 +5,9 @@ interface INcW { int kind(); int tag; };
 class NcW : INcW { int pad = 7; int tag = 0; int kind() { return 1; } };
 struct NcS { int x = 0; };
 struct NcErr { int[1] arr = default; };
+struct NcOwningValue { unique int* item = nullptr; ~NcOwningValue() { } };
+struct NcOwningOuter { NcOwningValue mid = default; ~NcOwningOuter() { } };
+void ncConsumeOwningValue(move NcOwningValue value) { }
 
 extern int main()
 {
@@ -14,6 +17,8 @@ extern int main()
     NcS* sp = &sv;
     NcErr ev = default;
     NcErr* ep = &ev;
+    NcOwningOuter owningValue = default;
+    NcOwningOuter* owningValuePtr = &owningValue;
 
     expect_error("Left side of assignment is not an addressable lvalue") {
         iface?.tag = 9;
@@ -39,5 +44,14 @@ extern int main()
     // old leaked nc_null block, which only surfaced after compilation continued.
     expect_error("Undefined variable") { int r = ep?.arr[missingIndexA]; }
     expect_error("Undefined variable") { int r = ep?.arr[missingIndexB]; }
+    expect_error("cannot pass an owning struct read from a null-conditional '?.' access") {
+        ncConsumeOwningValue(owningValuePtr?.mid);
+    }
+    expect_error("cannot read owning struct 'NcOwningValue' by value from a null-conditional '?.' access") {
+        NcOwningValue copy = owningValuePtr?.mid;
+    }
+    expect_error("cannot read owning struct 'NcOwningValue' by value from a null-conditional '?.' access") {
+        Lambda<NcOwningValue()> returnCopy = () => { return owningValuePtr?.mid; };
+    }
     return 0;
 }

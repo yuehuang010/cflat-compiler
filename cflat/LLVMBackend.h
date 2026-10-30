@@ -1756,6 +1756,9 @@ public:
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
+        // Null-safe aggregate reads keep a conditional field address for borrow arguments.
+        llvm::Value* NullConditionalBorrowStorage = nullptr;
+        bool IsNullConditionalOwningValue = false;
         llvm::Value* MoveSourceStorage = nullptr; // Original slot for a detached moved value.
         // Element-field key of that slot when it has no storage (`move a.hs[0].f`).
         std::string MoveSourcePathKey;
@@ -1789,6 +1792,13 @@ public:
         // Runtime liveness for a foreign C++ value whose explicit release is conditional. The
         // static ExplicitlyMovedNull fact remains for same-block diagnostics and fast paths.
         llvm::Value* ConditionalDropFlag = nullptr;
+        // Runtime liveness for moved-out native value fields. Keys are paths below this binding.
+        std::unordered_map<std::string, llvm::Value*> FieldDropFlags;
+        // A field-drop-tracked binding escaped after at least one field move.
+        bool FieldDropStorageEscaped = false;
+        // Field paths below this binding whose method receiver may re-init fields through `this`.
+        // A later move of a path at or below one of them latches FieldDropStorageEscaped.
+        std::vector<std::string> EscapeReceiverPaths;
         size_t DeclarationScopeDepth = 0;
         llvm::BasicBlock* DeclarationBlock = nullptr;
         // compile-time: the DECLARED element type name of this call argument, kept even where the
@@ -2097,6 +2107,7 @@ public:
         // Root VARIABLE of a field path ("w" for `w.a.b`). TypeAndValue.ParentVariableName names
         // only the IMMEDIATE parent, which on a nested path is an intermediate field, not a variable.
         std::string FieldPathRoot;
+        llvm::Value* FieldDropOwnerStorage = nullptr;
         // Positive provenance is set only after lookup resolves a field against `this`.
         bool IsThisReceiver = false;
         bool RootIsBorrowedThisField = false;
@@ -2175,6 +2186,18 @@ public:
         bool TernaryTempAlreadyRegistered = false;
         // True only for a parenthesized produced rvalue whose recovery spill is not an lvalue.
         bool IsParenthesizedProducedTemp = false;
+
+        // True when this lvalue or `&` expression names a const pointer object slot.
+        bool IsCxxConstPointerSlot() const
+        {
+            const LLVMBackend::TypeAndValue& type = TypeAndValue;
+            if (IsCxxAddressOfPointerValue)
+            {
+                const int depth = type.ValuePointerDepth();
+                return depth >= 2 && ((type.ConstMask >> (depth - 1)) & 1u) != 0;
+            }
+            return type.Pointer && !type.ElemPointer && type.IsConstObject();
+        }
 
         llvm::Value* GetValue() const
         {
@@ -4799,6 +4822,8 @@ private:
         std::string error;
     };
     std::unordered_map<std::string, CxxDefaultWrapperRequest> cxxDefaultWrapperRequests_;
+    // Constructor ranking can re-enter clang for the same target and argument shape.
+    std::unordered_set<std::string> cxxVariadicCtorRequestsInProgress_;
     // `X&& r = source;` verdicts from clang, keyed "<source param spelling>|<X spelling>".
     std::unordered_map<std::string, std::pair<bool, std::string>> cxxRvalueRefBindVerdicts_;
     void RememberCxxDefaultWrapper(const std::string& owner, const std::string& linkage,
@@ -6686,6 +6711,26 @@ private:
     void EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Value* storage,
                                        llvm::Type* storageTy, llvm::Function* dtor,
                                        const std::string& typeName, bool reverse = false);
+    struct FullDestructorMember
+    {
+        unsigned Index = 0;
+        llvm::Function* Dtor = nullptr;
+        bool IsUniquePtr = false;
+        std::string TypeName;
+        uint64_t AllocAlign = 0;
+        bool IsUniqueArray = false;
+        bool IsIface = false;
+        bool IsUniqueIface = false;
+    };
+    // Shared field walk and classification for both full-destruction emitters.
+    std::vector<FullDestructorMember> CollectFullDestructorMembers(const std::string& typeName);
+    void EmitFullDestructorWithFieldDropFlags(const NamedVariable& namedVar,
+                                               llvm::Value* storage,
+                                               const std::string& typeName,
+                                               const std::string& pathPrefix = {});
+    void EnsureFieldDropFlag(NamedVariable& namedVar, const std::string& field);
+    void SetFieldDropFlagsLive(NamedVariable& namedVar, const std::string& field,
+                               bool ensureExact, bool live);
 
     // `unique T* field`: null-checked delete of the pointee. Emitted into the synthesized
     // .dtorfull wrapper at teardown, and (with `replacement` set) ahead of a reassignment store,
@@ -7237,6 +7282,9 @@ private:
         const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
         const std::string& fileForLsp);
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
+    bool HasArityViableCxxFunctionTemplate(const std::string& functionName,
+                                           const std::string& ownerType,
+                                           size_t arity) const;
     bool IsCxxFunctionTemplateParameterByValue(const std::string& functionName,
                                                const std::string& ownerType,
                                                size_t parameterIndex, size_t arity) const;
@@ -7401,7 +7449,8 @@ private:
                                        const std::vector<NamedVariable>& arguments,
                                        std::string& wrapperName,
                                        std::string& error,
-                                       bool copyInit = false);
+                                       bool copyInit = false,
+                                       bool* noViableCandidate = nullptr);
     bool RequestCxxOperatorArrow(const std::string& typeName, std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase);
     void CollectCxxTypeOwnerGroups(const std::string& cflatTypeName,
@@ -9563,6 +9612,10 @@ public:
     // call can arrive here with such a parameter.
     llvm::Value* LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg);
 
+    // Lower a plain pointer parameter from a pointer value, addressable value, or struct temporary.
+    // Shared by direct calls and calls through function values so implicit borrows cannot drift.
+    llvm::Value* LowerPointerParamArg(const NamedVariable& arg, bool markAggregateEscape);
+
     // Address handed to a non-pointer `alias T` parameter: the caller's own slot when the
     // shapes match exactly, otherwise a materialized temp (a converted value has no slot).
     llvm::Value* LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param,
@@ -9998,6 +10051,8 @@ public:
      * Named for what it proves ("non-heap"), not "stack": a global is exactly as un-free()-able.
      */
     static bool IsProvableNonHeapAddress(llvm::Value* value);
+    bool RejectMoveParamFromNonHeapAddress(const std::string& functionName,
+                                           const std::string& paramName, llvm::Value* value);
     // The same proof for a NAMED source: its Primary when it has one, else a fixed array's storage
     // (an array name decays to its element pointer without a Primary value of its own).
     static bool IsProvableNonHeapAddressSource(const NamedVariable& source);
@@ -11033,7 +11088,10 @@ public:
     bool LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& trueArm,
                             CxxArmCategory trueCategory, const TypeAndValue& falseArm,
                             CxxArmCategory falseCategory, bool armIsTrue,
-                            const CxxTernaryVerdict& verdict, bool discardResult);
+                            const CxxTernaryVerdict& verdict, bool discardResult,
+                            llvm::Value* resultSlot = nullptr,
+                            llvm::Value* callSink = nullptr,
+                            const std::string& callReturnSpelling = {});
     // clang's std::is_convertible<S&&, P*> for a class xvalue at a P* parameter; cached per pair.
     bool HasImplicitClassPointerConversion(const std::string& sourceType,
                                            const std::string& pointeeType, bool pointeeConst);
@@ -12384,6 +12442,9 @@ public:
     // '&name' escaped the address - latch off the deref guard permanently (see AddressEscaped
     // on NamedVariable): the pointee may be rewritten through the escaped pointer from here on.
     void MarkVariableAddressEscaped(const std::string& name);
+    // A borrow may rebuild moved fields through its storage without changing null/move diagnostics.
+    void MarkVariableFieldStorageEscaped(const std::string& name);
+    void MarkReceiverPathEscaped(const std::string& name, const std::string& path);
 
     // The full explicit-move-null deref predicate: fires only for a DEREFERENCE in the SAME
     // block the move was recorded in (never across a branch/merge/loop back-edge - see
@@ -12409,7 +12470,9 @@ public:
     // Key of a field mark: the path below the root binding ('inner.p' for o.inner.p), so a nested
     // path never aliases a one-level field of the same leaf name. Falls back to the leaf name.
     static std::string FieldMoveKey(const NamedVariable& nv);
-    void MarkVariableFieldMoved(const std::string& name, const std::string& field);
+    void MarkVariableFieldMoved(const std::string& name, const std::string& field,
+                                bool runtimeOnly = false);
+    void MarkStorageFieldMovedForDrop(llvm::Value* rootStorage, const std::string& field);
 
     // Reassigning a field (`node->left = ...`) makes it live again.
     void MarkVariableFieldUnmoved(const std::string& name, const std::string& field);
@@ -14056,7 +14119,8 @@ public:
     // 296: closureKeptParams follows aliases through ?:, comma and casts, and fails closed (T525 r5).
     // 297: closureKeptParams follows glvalue init lists and skips unevaluated operands (T525 r6).
     // 298: a sizeof/alignof of a variably modified type is evaluated for closureKeptParams (T525 r7).
-    static constexpr int kCHeaderCacheVersion = 298;
+    // 299: C++ constructor template parameter-pack metadata round-trips in the header cache (AMP2 r2).
+    static constexpr int kCHeaderCacheVersion = 299;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

@@ -1,8 +1,17 @@
 // The nontrivial by-value slot must not make the following reference a value parameter.
 import cpp "t20_ref_param_slots.hpp";
+import cpp "cpp_t495_amppick.hpp";
 extern int main()
 {
     t20slot.H h = default;
+    int amp2Value = 4;
+    int* amp2Pointer = &amp2Value;
+    expect_error("is ambiguous") { amp2r3.free_ambiguous(&amp2Pointer); }
+    expect_error("call to deleted function") { amp2r3.free_deleted(&amp2Pointer); }
+    expect_error("static assertion failed") { amp2r3.free_body(&amp2Pointer); }
+    expect_error("no matching function for call to") {
+        int nested = amp2r3.free_nested_nomatch(&amp2Pointer);
+    }
     expect_error("a user-defined conversion cannot bind to the non-const reference parameter");
     h.refafter(t20slot.Big(1), 5);
     return 0;

@@ -38,6 +38,7 @@ struct Counted {
     }
     ~Counted() { ++dtor_count; --live_count; ++counted_dtors; --counted_live; }
 };
+inline void destroyCounted(Counted* value) { value->~Counted(); }
 
 struct TC {
     int value = 0;
@@ -52,6 +53,13 @@ struct TC {
     }
     ~TC() { ++dtor_count; --live_count; ++tc_dtors; --tc_live; }
 };
+
+struct BraceHost_CTZ_U { Counted c; TC t; int z; BraceHost_CTZ_U() : z(3) {} };
+struct BraceHost_TCZ_U { TC t; Counted c; int z; BraceHost_TCZ_U() : z(3) {} };
+struct BraceHost_TZC_U { TC t; int z; Counted c; BraceHost_TZC_U() : z(3) {} };
+struct BraceHost_CTZ_N { Counted c; TC t; int z = 3; };
+struct BraceHost_TCZ_N { TC t; Counted c; int z = 3; };
+struct BraceHost_TZC_N { TC t; int z = 3; Counted c; };
 
 inline int bval(int value) { if (value == 1) throw 7; return value; }
 using Callback = int (*)(int);

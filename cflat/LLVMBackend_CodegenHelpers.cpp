@@ -1167,6 +1167,136 @@ void LLVMBackend::EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Valu
             EmitFixedArrayElementWalk(b, storage, elemTy, n, callDtor);
     }
 
+std::vector<LLVMBackend::FullDestructorMember> LLVMBackend::CollectFullDestructorMembers(
+    const std::string& typeName)
+{
+        std::vector<FullDestructorMember> work;
+        auto dsIt = dataStructures.find(typeName);
+        if (dsIt == dataStructures.end() || dsIt->second.IsUnion) return work;
+
+        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
+        {
+            const auto& f = dsIt->second.StructFields[i];
+            if (f.IsAlias) continue;
+            if (f.IsUnique
+                && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
+                && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
+            {
+                work.push_back({ i, GetFullDestructorForDelete(f.TypeName), true,
+                                 f.TypeName, f.AllocAlignValue });
+                continue;
+            }
+            if (f.IsUnique
+                && f.IsFatInterfaceValue()
+                && !f.ElemPointer && !f.IsSimd && !f.IsBitfield && !f.IsPadding
+                && f.ConstArraySize == 0)
+            {
+                work.push_back({ i, nullptr, false, f.TypeName, 0, false, true, true });
+                continue;
+            }
+            if (f.IsUnique
+                && f.ConstArraySize > 0
+                && !f.ElemPointer && !f.IsArrayView && !f.IsSimd && !f.IsBitfield && !f.IsPadding
+                && f.ConstInnerDimensions.empty()
+                && (f.Pointer || f.IsFatInterfaceValue()))
+            {
+                work.push_back({ i, nullptr, false, f.TypeName, f.AllocAlignValue, true,
+                                 f.IsFatInterfaceValue() });
+                continue;
+            }
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
+                continue;
+            if (f.ConstArraySize > 0)
+            {
+                if (llvm::Function* elemDtor = GetOrCreateFullDestructor(f.TypeName))
+                    work.push_back({ i, elemDtor, false, f.TypeName, 0 });
+                continue;
+            }
+            if (llvm::Function* childDtor = GetOrCreateFullDestructor(f.TypeName))
+                work.push_back({ i, childDtor, false, f.TypeName, 0 });
+        }
+        return work;
+    }
+
+void LLVMBackend::EmitFullDestructorWithFieldDropFlags(const NamedVariable& namedVar,
+                                                        llvm::Value* storage,
+                                                        const std::string& typeName,
+                                                        const std::string& pathPrefix)
+{
+        auto data = GetDataStructure(typeName);
+        if (storage == nullptr || data.StructType == nullptr || data.IsUnion
+            || IsCxxRecord(typeName))
+        {
+            if (auto* dtor = GetOrCreateFullDestructor(typeName))
+                builder->CreateCall(dtor->getFunctionType(), dtor, { storage });
+            return;
+        }
+
+        if (data.Destructor != nullptr)
+            builder->CreateCall(data.Destructor->getFunctionType(), data.Destructor, { storage });
+
+        const auto memberWork = CollectFullDestructorMembers(typeName);
+        std::unordered_map<unsigned, const FullDestructorMember*> workByIndex;
+        for (const auto& work : memberWork) workByIndex.emplace(work.Index, &work);
+        auto emitFieldDestructor = [&](unsigned index, llvm::Value* fieldPtr, llvm::Type* fieldTy) {
+            auto it = workByIndex.find(index);
+            if (it == workByIndex.end()) return;
+            const auto& work = *it->second;
+            if (work.IsUniqueIface)
+                EmitUniqueInterfaceFieldRelease(*builder, fieldPtr, work.TypeName);
+            else if (work.IsUniqueArray)
+                EmitUniqueArrayFieldRelease(*builder, fieldPtr, fieldTy, work.TypeName,
+                                            work.IsIface, work.AllocAlign);
+            else if (work.IsUniquePtr)
+                EmitUniqueFieldDelete(*builder, fieldPtr, work.Dtor);
+            else
+                EmitFullDestructorOverStorage(*builder, fieldPtr, fieldTy, work.Dtor,
+                                               work.TypeName, true);
+        };
+
+        for (size_t offset = 0; offset < data.StructFields.size(); ++offset)
+        {
+            const unsigned index = static_cast<unsigned>(data.StructFields.size() - 1 - offset);
+            const auto& field = data.StructFields[index];
+            if (field.IsAlias) continue;
+            const unsigned element = CxxFieldElementIndex(data, index);
+            auto* fieldPtr = CreateCxxFieldGEP(data, storage, index, "drop.field");
+            auto* fieldTy = element == std::numeric_limits<unsigned>::max()
+                ? GetType(field) : data.StructType->getElementType(element);
+            const std::string fieldPath = pathPrefix.empty() ? field.VariableName
+                : pathPrefix + "." + field.VariableName;
+            const auto exact = namedVar.FieldDropFlags.find(fieldPath);
+            const std::string descendantPrefix = fieldPath + ".";
+            const bool hasDescendant = std::any_of(namedVar.FieldDropFlags.begin(),
+                namedVar.FieldDropFlags.end(), [&](const auto& entry) {
+                    return entry.first.compare(0, descendantPrefix.size(), descendantPrefix) == 0;
+                });
+            if (exact != namedVar.FieldDropFlags.end())
+            {
+                auto* function = builder->GetInsertBlock()->getParent();
+                auto* liveBlock = llvm::BasicBlock::Create(*context, "field.drop.live", function);
+                auto* afterBlock = llvm::BasicBlock::Create(*context, "field.drop.after", function);
+                auto* live = builder->CreateLoad(builder->getInt1Ty(), exact->second,
+                                                  "field.drop.livef");
+                builder->CreateCondBr(live, liveBlock, afterBlock);
+                builder->SetInsertPoint(liveBlock);
+                emitFieldDestructor(index, fieldPtr, fieldTy);
+                builder->CreateBr(afterBlock);
+                builder->SetInsertPoint(afterBlock);
+            }
+            else if (hasDescendant && !field.Pointer && !field.ElemPointer
+                && !field.IsArrayView && !field.IsUnique && field.ConstArraySize == 0)
+            {
+                EmitFullDestructorWithFieldDropFlags(namedVar, fieldPtr, field.TypeName,
+                                                      fieldPath);
+            }
+            else
+            {
+                emitFieldDestructor(index, fieldPtr, fieldTy);
+            }
+        }
+    }
+
 bool LLVMBackend::HasCxxClassMember(const std::string& typeName) const
 {
         std::unordered_set<std::string> seen;
@@ -1341,65 +1471,7 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
 
         llvm::Function* userDtor = membersOnly ? nullptr : dsIt->second.Destructor;
 
-        // Collect member fields that need destruction.
-        struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; bool IsUniqueArray = false; bool IsIface = false; bool IsUniqueIface = false; };
-        std::vector<MemberWork> work;
-        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
-        {
-            const auto& f = dsIt->second.StructFields[i];
-            // An alias field is a borrowed reference to storage owned elsewhere. It must
-            // never participate in the containing value's synthesized destruction.
-            if (f.IsAlias)
-                continue;
-            // A remaining builtin `unique T*` field owns the pointee. Core unique fields use the
-            // wrapper value's synthesized destructor instead.
-            if (f.IsUnique
-                && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
-                && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
-            {
-                work.push_back({ i, GetFullDestructorForDelete(f.TypeName), true, f.TypeName, f.AllocAlignValue });
-                continue;
-            }
-            // A remaining builtin scalar `unique IFace field` is a {i8*,i8*} fat pointer, so
-            // f.Pointer is false above. Route it to the fat-pointer-aware emitter (vtable dtor
-            // slot + operator delete).
-            if (f.IsUnique
-                && f.IsFatInterfaceValue()
-                && !f.ElemPointer && !f.IsSimd && !f.IsBitfield && !f.IsPadding
-                && f.ConstArraySize == 0)
-            {
-                work.push_back({ i, nullptr, false, f.TypeName, 0, false, true, true });
-                continue;
-            }
-            // A remaining builtin aligned `unique T* f[N]` / `unique IFace f[N]` owns every slot,
-            // so release element by element. Null slots are skipped by the scalar emitters.
-            if (f.IsUnique
-                && f.ConstArraySize > 0
-                && !f.ElemPointer && !f.IsArrayView && !f.IsSimd && !f.IsBitfield && !f.IsPadding
-                && f.ConstInnerDimensions.empty()
-                && (f.Pointer || f.IsFatInterfaceValue()))
-            {
-                bool iface = f.IsFatInterfaceValue();
-                work.push_back({ i, nullptr, false, f.TypeName, f.AllocAlignValue, true, iface });
-                continue;
-            }
-            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield || f.IsPadding)
-                continue;
-            // Owning fixed-array value field (`SBox items[3]`): the FULLY-LIVE contract requires
-            // every element be a live owned value, so destruct all N (EmitFullDestructorOverStorage
-            // below walks them). Pointer/view/simd/bitfield arrays never reach here - the field-shape
-            // skip above already caught them (e.g. btree_node's `children[17]` is a pointer array).
-            if (f.ConstArraySize > 0)
-            {
-                if (llvm::Function* elemDtor = GetOrCreateFullDestructor(f.TypeName))
-                    work.push_back({ i, elemDtor, false, f.TypeName, 0 });
-                continue;
-            }
-            // `string` members ARE destructed: the owned bit in _len tells the dtor whether to free.
-            // A borrowed string (literal/view; bit clear) is safely left alone by the dtor.
-            if (llvm::Function* childDtor = GetOrCreateFullDestructor(f.TypeName))
-                work.push_back({ i, childDtor, false, f.TypeName, 0 });
-        }
+        auto work = CollectFullDestructorMembers(typeName);
 
         fullDestructorInProgress_.erase(typeName);
 
@@ -2415,6 +2487,9 @@ bool LLVMBackend::TypeHasMember(const std::string& typeName, const std::string& 
             for (const auto& sym : fn->second)
                 if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName)
                     return true;
+        if (!IsCxxRecord(typeName)
+            && functionTable.find(typeName + "." + memberName) != functionTable.end())
+            return true;
         return GetWinrtSlot(typeName, memberName) != nullptr;
     }
 

@@ -2522,6 +2522,19 @@ bool LLVMBackend::IsProvableNonHeapAddress(llvm::Value* value)
         return llvm::isa<llvm::AllocaInst>(base) || llvm::isa<llvm::GlobalVariable>(base);
     }
 
+bool LLVMBackend::RejectMoveParamFromNonHeapAddress(const std::string& functionName,
+        const std::string& paramName, llvm::Value* value)
+{
+        if (!IsProvableNonHeapAddress(value)) return false;
+        LogErrorMessage(
+            "call to '{}': cannot pass the address of a stack or global value to {} "
+            "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
+            "but neither is heap-allocated and freeing it is undefined. Use '{}' to "
+            "allocate on the heap, or drop '{}' if the callee only borrows.",
+            { functionName, "'move'", paramName, "new", "new" });
+        return true;
+}
+
 llvm::Value* LLVMBackend::CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
 {
         if (left == nullptr)

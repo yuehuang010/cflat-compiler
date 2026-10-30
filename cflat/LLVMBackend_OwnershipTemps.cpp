@@ -788,6 +788,7 @@ std::vector<llvm::Value*> LLVMBackend::FindPendingStructTempOwnersOf(const llvm:
                 add(owner);
                 continue;
             }
+            for (llvm::Value* owner : FindOwningTempRawPointerFieldOwners(v)) add(owner);
             // A value spilled into a pending temp names it (`store %call, %owntemp`).
             for (const llvm::User* user : v->users())
                 if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
@@ -801,6 +802,13 @@ std::vector<llvm::Value*> LLVMBackend::FindPendingStructTempOwnersOf(const llvm:
                 pending.push_back(cast->getOperand(0));
             else if (const auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(v))
                 pending.push_back(extract->getAggregateOperand());
+            else if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(v))
+                for (const llvm::Value* incoming : phi->incoming_values()) pending.push_back(incoming);
+            else if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(v))
+            {
+                pending.push_back(select->getTrueValue());
+                pending.push_back(select->getFalseValue());
+            }
             else if (const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(v))
                 for (const llvm::User* user : slot->users())
                     if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
@@ -2839,6 +2847,11 @@ void LLVMBackend::EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::V
             builder->SetInsertPoint(doneBB);
             return;
         }
+        if (!namedVar.FieldDropFlags.empty() && !IsCxxRecord(typeName))
+        {
+            EmitFullDestructorWithFieldDropFlags(namedVar, ptrVal, typeName);
+            return;
+        }
         builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
     }
 
@@ -4590,11 +4603,7 @@ bool LLVMBackend::MemoryOutlivesCall(const llvm::Value* ptr, std::string& destKi
         return false;   // alloca, fresh allocation, unrecognized: no proof, so accept
     }
 
-/*
- * A join of addresses proves the store outlives the call only when EVERY arm proves it. One arm
- * naming a local is a path on which nothing escapes, so `c ? &loc : &g` stays accepted - that
- * accept is what forbids the ANY-arm rule the sibling join walks use on values.
- */
+/* A joined destination may outlive the call when any reachable arm names longer-lived memory. */
 bool LLVMBackend::JoinAddressOutlivesCall(const llvm::Instruction* join, std::string& destKind,
                                           int depth) const
 {
@@ -4610,22 +4619,33 @@ bool LLVMBackend::JoinAddressOutlivesCall(const llvm::Instruction* join, std::st
         }
         else if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(join))
             for (const llvm::Value* incoming : phi->incoming_values()) arms.push_back(incoming);
-        bool proven = !arms.empty();
+        bool proven = false;
         bool sameKind = true;
+        bool hasNonOutlivingArm = false;
         std::string firstKind;
         for (const llvm::Value* arm : arms)
         {
             std::string armKind;
-            if (!MemoryOutlivesCall(arm, armKind, depth + 1)) { proven = false; break; }
-            if (armKind.empty()) continue;                  // arm answered by the cycle guard
+            if (!MemoryOutlivesCall(arm, armKind, depth + 1))
+            {
+                hasNonOutlivingArm = true;
+                continue;
+            }
+            if (armKind.empty())
+            {
+                hasNonOutlivingArm = true;                  // no concrete proof for this arm
+                continue;
+            }
+            proven = true;
             if (firstKind.empty()) firstKind = armKind;
             else if (armKind != firstKind) sameKind = false;
         }
         joinAddressInProgress_.erase(join);
-        // No arm named a destination (every one was a back-edge): nothing true to report, so no
-        // proof rather than a diagnostic that cannot name where the pointer went.
         if (!proven || firstKind.empty()) return false;
-        destKind = sameKind ? firstKind : "memory that outlives the call on every arm of a join";
+        destKind = sameKind && !hasNonOutlivingArm ? firstKind
+            : !hasNonOutlivingArm
+                ? "memory that outlives the call on every arm of a join"
+                : "memory that may outlive the call on at least one arm of a join";
         return true;
     }
 
@@ -6012,6 +6032,15 @@ std::string LLVMBackend::DescribeCalleeParameter(const llvm::Function* fn, unsig
 void LLVMBackend::RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry,
                                                  const std::string& destKind)
 {
+        if (destKind == "memory that may outlive the call on at least one arm of a join")
+        {
+            LogError(std::format(
+                "call to '{}': borrow of a temporary's field may reach a longer-lived slot "
+                "through a join (field '{}'); bind the temporary to a named local owner and "
+                "pass that owner's field instead",
+                entry.CalleeName, entry.Access.empty() ? "pointer" : entry.Access));
+            return;
+        }
         std::string what = entry.Access.empty()
             ? std::string("a unique field of a temporary")
             : std::format("unique field '{}' of a temporary", entry.Access);
@@ -8287,6 +8316,82 @@ void LLVMBackend::EnsureConditionalDropFlag(NamedVariable& namedVar, bool initia
         if (savedBlock != nullptr) builder->SetInsertPoint(savedBlock, savedPoint);
     }
 
+void LLVMBackend::EnsureFieldDropFlag(NamedVariable& namedVar, const std::string& field)
+{
+        if (field.empty() || field.find('[') != std::string::npos
+            || namedVar.FieldDropFlags.contains(field) || namedVar.Storage == nullptr
+            || builder == nullptr || namedVar.IsStaticLocal || namedVar.IsRangeForBorrow
+            || namedVar.IsAliasBorrow || IsCxxRecord(namedVar.TypeAndValue.TypeName))
+            return;
+
+        std::string currentType = namedVar.TypeAndValue.TypeName;
+        size_t start = 0;
+        const auto root = GetDataStructure(currentType);
+        if (root.StructType == nullptr || root.IsUnion) return;
+        while (start < field.size())
+        {
+            const size_t dot = field.find('.', start);
+            const bool last = dot == std::string::npos;
+            const std::string component = field.substr(start,
+                last ? std::string::npos : dot - start);
+            const auto data = GetDataStructure(currentType);
+            auto member = std::find_if(data.StructFields.begin(), data.StructFields.end(),
+                [&](const auto& candidate) { return candidate.VariableName == component; });
+            if (data.StructType == nullptr || data.IsUnion || member == data.StructFields.end()
+                || member->IsAlias || member->IsArrayView || member->IsSimd
+                || member->IsBitfield || member->IsPadding || member->ConstArraySize != 0
+                || member->ConstInnerDimensions.size() != 0)
+                return;
+            if (last)
+            {
+                if (member->IsUnique || IsCoreUniqueType(member->TypeName)
+                    || member->Pointer || member->ElemPointer)
+                    return;
+                if (IsCxxRecord(member->TypeName)
+                    || HasForeignNontrivialCxxField(member->TypeName))
+                    return;
+                if (!IsCoreUniqueType(member->TypeName)
+                    && GetOrCreateFullDestructor(member->TypeName) == nullptr)
+                    return;
+                break;
+            }
+            if (member->Pointer || member->ElemPointer || member->IsUnique
+                || IsCxxRecord(member->TypeName)
+                || HasForeignNontrivialCxxField(member->TypeName))
+                return;
+            currentType = member->TypeName;
+            start = dot + 1;
+        }
+
+        auto* savedBlock = builder->GetInsertBlock();
+        auto savedPoint = builder->GetInsertPoint();
+        llvm::Value* flag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "field.dropflag");
+        namedVar.FieldDropFlags.emplace(field, flag);
+        auto* declarationBlock = namedVar.DeclarationBlock;
+        if (auto* terminator = declarationBlock != nullptr && declarationBlock != savedBlock
+                ? cflat_llvm::GetTerminatorOrNull(declarationBlock) : nullptr)
+            builder->SetInsertPoint(declarationBlock, terminator->getIterator());
+        else if (declarationBlock != nullptr && declarationBlock != savedBlock)
+            builder->SetInsertPoint(declarationBlock);
+        builder->CreateStore(builder->getInt1(true), flag);
+        if (savedBlock != nullptr) builder->SetInsertPoint(savedBlock, savedPoint);
+    }
+
+void LLVMBackend::SetFieldDropFlagsLive(NamedVariable& namedVar, const std::string& field,
+                                         bool ensureExact, bool live)
+{
+        if (ensureExact) EnsureFieldDropFlag(namedVar, field);
+        if (builder == nullptr) return;
+        const std::string prefix = field + ".";
+        for (const auto& [path, flag] : namedVar.FieldDropFlags)
+        {
+            if (path != field && path.compare(0, prefix.size(), prefix) != 0
+                && field.compare(0, (path + ".").size(), path + ".") != 0)
+                continue;
+            builder->CreateStore(builder->getInt1(live), flag);
+        }
+    }
+
 void LLVMBackend::RearmConditionalDropFlag(NamedVariable& namedVar)
 {
         if (namedVar.ConditionalDropFlag == nullptr || builder == nullptr) return;
@@ -8296,10 +8401,17 @@ void LLVMBackend::RearmConditionalDropFlag(NamedVariable& namedVar)
 void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, llvm::Function* dtor)
 {
         if (dtor == nullptr) return;
+        auto emitDestructor = [&]() {
+            if (!namedVar.FieldDropFlags.empty())
+                EmitFullDestructorWithFieldDropFlags(namedVar, namedVar.Storage,
+                                                      namedVar.TypeAndValue.TypeName);
+            else
+                EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
+                                              namedVar.TypeAndValue.TypeName, true);
+        };
         if (namedVar.ConditionalDropFlag == nullptr)
         {
-            EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
-                                          namedVar.TypeAndValue.TypeName, true);
+            emitDestructor();
             return;
         }
         auto* function = builder->GetInsertBlock()->getParent();
@@ -8309,8 +8421,7 @@ void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, l
                                          "cxx.drop.livef");
         builder->CreateCondBr(live, liveBlock, afterBlock);
         builder->SetInsertPoint(liveBlock);
-        EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
-                                      namedVar.TypeAndValue.TypeName, true);
+        emitDestructor();
         builder->CreateBr(afterBlock);
         builder->SetInsertPoint(afterBlock);
     }

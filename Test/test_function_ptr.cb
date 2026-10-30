@@ -23,6 +23,38 @@ int i1_global = 42;
 int i1_pick_pointer(int* p) { return 11; }
 int i1_pick_pointer(char* p) { return 22; }
 
+struct FnvbArgBox { int value = default; };
+using FnvbArgBoxPtr = FnvbArgBox*;
+int fnvbRead(FnvbArgBox* p) { return p->value; }
+int fnvbReadBorrowed(alias FnvbArgBox* p) { return p->value; }
+int fnvbReadAlias(FnvbArgBoxPtr p) { return p->value; }
+int fnvbGenericRead<T>(T* p) { return p->value; }
+int fnvbApply(function<int(FnvbArgBox*)> fn, FnvbArgBox box) { return fn(box); }
+int fnvbIncrement(int value) { return value + 1; }
+
+int fnvbPayloadLive = 0;
+struct FnvbPayload
+{
+    FnvbPayload() { fnvbPayloadLive++; }
+    ~FnvbPayload() { fnvbPayloadLive--; }
+};
+struct FnvbOwner
+{
+    int value = 0;
+    unique FnvbPayload* item = nullptr;
+    ~FnvbOwner() { }
+};
+FnvbOwner fnvbMakeOwner(int value)
+{
+    FnvbOwner result = default;
+    result.value = value;
+    result.item = new FnvbPayload();
+    return move result;
+}
+int fnvbTakeOwner(move FnvbOwner value) { return value.value; }
+struct FnvbMoveBox { FnvbOwner inn = default; FnvbOwner other = default; };
+void fnvbReinitialize(FnvbMoveBox* box) { box->inn = fnvbMakeOwner(3); }
+
 // ── Higher-order named helpers ────────────────────────────────────────────────
 
 int apply(Lambda<int(int, int)> f, int a, int b) { return f(a, b); }
@@ -127,6 +159,48 @@ bool testFunctionPointerAsArgument()
     result &= Test("predicate even",     applyPred(isEven, 8), true);
     result &= Test("predicate odd",      applyPred(isEven, 9), false);
 
+    return result;
+}
+
+bool testFunctionValueImplicitStructBorrow()
+{
+    bool result = true;
+    FnvbArgBox box = default;
+    box.value = 7;
+    result &= Test("fnvb direct struct borrow", fnvbRead(box), 7);
+
+    function<int(FnvbArgBox*)> fn = fnvbRead;
+    result &= Test("fnvb named function value borrow", fn(box), 7);
+    result &= Test("fnvb explicit pointer accept", fn(&box), 7);
+    function<int(FnvbArgBox*)> aliasParam = fnvbReadBorrowed;
+    result &= Test("fnvb alias pointer parameter borrow", aliasParam(box), 7);
+    result &= Test("fnvb function parameter borrow", fnvbApply(fnvbRead, box), 7);
+
+    int offset = 3;
+    Lambda<int(FnvbArgBox*)> closure = (FnvbArgBox* p) => { return p->value + offset; };
+    result &= Test("fnvb capturing lambda borrow", closure(box), 10);
+
+    function<int(FnvbArgBox*)> generic = fnvbGenericRead<FnvbArgBox>;
+    result &= Test("fnvb generic function value borrow", generic(box), 7);
+    function<int(FnvbArgBoxPtr)> aliased = fnvbReadAlias;
+    result &= Test("fnvb pointer alias borrow", aliased(box), 7);
+
+    function<int(int)> scalar = fnvbIncrement;
+    result &= Test("fnvb matching scalar callback accept", scalar(4), 5);
+
+    fnvbPayloadLive = 0;
+    {
+        FnvbMoveBox moved = default;
+        moved.inn = fnvbMakeOwner(1);
+        moved.other = fnvbMakeOwner(2);
+        result &= Test("fnvb moved field value", fnvbTakeOwner(move moved.inn), 1);
+        result &= Test("fnvb live count after move", fnvbPayloadLive, 1);
+        function<void(FnvbMoveBox*)> reinitialize = fnvbReinitialize;
+        reinitialize(moved);
+        result &= Test("fnvb reinitialized field value", moved.inn.value, 3);
+        result &= Test("fnvb live count after callback", fnvbPayloadLive, 2);
+    }
+    result &= Test("fnvb live count after scope", fnvbPayloadLive, 0);
     return result;
 }
 
@@ -7458,6 +7532,7 @@ extern int main(int argc, char** argv)
     total++; passed += testExplicitFunctionPointer()   ? 1 : 0;
     total++; passed += testBareFunctionPointer()       ? 1 : 0;
     total++; passed += testFunctionPointerAsArgument() ? 1 : 0;
+    total++; passed += testFunctionValueImplicitStructBorrow() ? 1 : 0;
     total++; passed += testFunctionPointerInLoop()     ? 1 : 0;
     total++; passed += testFunctionPointerCountIf()    ? 1 : 0;
     total++; passed += testVoidFunctionPointer()       ? 1 : 0;

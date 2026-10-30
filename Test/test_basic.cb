@@ -9884,6 +9884,32 @@ int t511LambdaLocalCallableShadowCall()
 }
 int t504SelfReadGlobal = 9;
 int t504ReadSelfInitializer() { int t504SelfReadGlobal = t504SelfReadGlobal; return t504SelfReadGlobal; }
+namespace T504GenericMemberUniqueNS
+{
+    struct Holder
+    {
+        T gv<T>(T value) { return value + 10; }
+        int call() { return gv(3); }
+    };
+};
+namespace T504GenericMemberRootShadowNS
+{
+    int gv(int value) { return value + 100; }
+    struct Holder
+    {
+        T gv<T>(T value) { return value + 10; }
+        int call() { return gv(3); }
+    };
+};
+namespace T504GenericMemberPlainOverloadNS
+{
+    struct Holder
+    {
+        int gv(int value) { return value + 100; }
+        T gv<T>(T value) { return value + 10; }
+        int call() { return gv(3); }
+    };
+};
 namespace T504NamespaceMethod
 {
     int gv = 5;
@@ -9893,6 +9919,73 @@ namespace T504StaticMethodNS
 {
     struct M { static int gv(int value) { return value + 30; } int call() { return gv(3); } };
 };
+namespace MtplStaticGenericNS
+{
+    struct H
+    {
+        static int gv<T>(T value) { return (int)value + 12; }
+        int call() { return gv(1); }
+    };
+    int qualifiedCall() { return H.gv(1); }
+};
+namespace MtplRound2NS
+{
+    struct StaticPlainInt
+    {
+        static int gv(int value) { return 2; }
+        static int gv<T>(T value) { return 1; }
+        int call() { return gv(3); }
+    };
+    struct StaticPlainArity
+    {
+        static int gv(int first, int second) { return 2; }
+        static int gv<T>(T value) { return 1; }
+        int call() { return gv(3, 4); }
+    };
+    struct StaticPlainDouble
+    {
+        static int gv(double value) { return 2; }
+        static int gv<T>(T value) { return 1; }
+        int call() { return gv(3.0); }
+    };
+    struct StaticTemplateCaller
+    {
+        static int gv<T>(T value) { return (int)value + 1; }
+        static int call() { return gv(3); }
+    };
+    struct StaticTemplateLambda
+    {
+        static int gv<T>(T value) { return (int)value + 1; }
+        int call()
+        {
+            function<int(int)> f = (int value) => { return gv(value); };
+            return f(3);
+        }
+    };
+    struct PlainArityBeforeTemplate
+    {
+        int gv(int first, int second) { return 2; }
+        int gv<T>(T value) { return 12; }
+        int call() { return gv(3); }
+    };
+};
+struct MtplGenericMemberOverload
+{
+    int gv(double value) { return 2; }
+    int gv<T>(T value) { return 1; }
+    int bareCall() { return gv(3); }
+    int thisCall() { return this.gv(3); }
+};
+struct MtplDoubleOnlyMember
+{
+    int gv(double value) { return 2; }
+};
+bool mtplDoubleOnlyCallRemainsRejected()
+{
+    MtplDoubleOnlyMember h = default;
+    expect_error("no overload of 'gv' matches the given arguments") { h.gv(2); }
+    return true;
+}
 
 bool testT471BareCalls()
 {
@@ -9907,6 +10000,42 @@ bool testT471BareCalls()
     result &= Test("t504 namespace variable yields to member", t504NamespaceValue.call(), 23);
     T504StaticMethodNS.M t504StaticNamespaceValue = default;
     result &= Test("t504 namespace static member call", t504StaticNamespaceValue.call(), 33);
+    T504GenericMemberUniqueNS.Holder t504GenericUnique = default;
+    result &= Test("t504 inferred unique member template", t504GenericUnique.call(), 13);
+    T504GenericMemberRootShadowNS.Holder t504GenericShadow = default;
+    result &= Test("t504 member template beats outer gv", t504GenericShadow.call(), 13);
+    T504GenericMemberPlainOverloadNS.Holder t504GenericPlain = default;
+    result &= Test("t504 plain member overload beats template", t504GenericPlain.call(), 103);
+    MtplStaticGenericNS.H mtplStatic = default;
+    result &= Test("mtpl static generic bare member call", mtplStatic.call(), 13);
+    result &= Test("mtpl static generic qualified member call",
+        MtplStaticGenericNS.qualifiedCall(), 13);
+    MtplRound2NS.StaticPlainInt mtplStaticPlainInt = default;
+    result &= Test("mtpl static plain int beats static template",
+        mtplStaticPlainInt.call(), 2);
+    MtplRound2NS.StaticPlainArity mtplStaticPlainArity = default;
+    result &= Test("mtpl static plain arity beats static template",
+        mtplStaticPlainArity.call(), 2);
+    MtplRound2NS.StaticPlainDouble mtplStaticPlainDouble = default;
+    result &= Test("mtpl static plain double beats static template",
+        mtplStaticPlainDouble.call(), 2);
+    result &= Test("mtpl static template bare from static method",
+        MtplRound2NS.StaticTemplateCaller.call(), 4);
+    MtplRound2NS.StaticTemplateLambda mtplStaticLambda = default;
+    result &= Test("mtpl static template bare inside lambda",
+        mtplStaticLambda.call(), 4);
+    MtplRound2NS.PlainArityBeforeTemplate mtplPlainArity = default;
+    result &= Test("mtpl arity mismatch plain does not hide template",
+        mtplPlainArity.call(), 12);
+    MtplGenericMemberOverload mtplGeneric = default;
+    result &= Test("mtpl generic beats nonviable plain overload bare",
+        mtplGeneric.bareCall(), 1);
+    result &= Test("mtpl generic beats nonviable plain overload this",
+        mtplGeneric.thisCall(), 1);
+    result &= Test("mtpl generic beats nonviable plain overload receiver",
+        mtplGeneric.gv(3), 1);
+    result &= Test("mtpl int to double call remains rejected",
+        mtplDoubleOnlyCallRemainsRejected(), true);
     result &= Test("t484 generic no shadow", t484GenericNoShadow(3), 13);
     result &= Test("t484 non-generic no shadow", t484PlainNoShadow(3), 23);
     result &= Test("t484 qualified call with root name", T484CallNS.id(3), 33);

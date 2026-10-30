@@ -9457,6 +9457,25 @@ bool LLVMBackend::HasCxxFunctionTemplate(const std::string& qualifiedName) const
                                                qualifiedName.substr(dot + 1)).empty();
 }
 
+bool LLVMBackend::HasArityViableCxxFunctionTemplate(
+        const std::string& functionName, const std::string& ownerType, size_t arity) const
+{
+        const std::string resolved = ownerType.empty()
+            ? functionName : ResolveCxxFunctionTemplateName(ownerType, functionName);
+        auto templates = cxxFunctionTemplates_.find(resolved);
+        if (templates == cxxFunctionTemplates_.end()) return false;
+        return std::any_of(templates->second.begin(), templates->second.end(),
+            [&](const cflat_cinterop::RawFunctionTemplate& candidate) {
+                const bool kindMatches = ownerType.empty()
+                    ? candidate.kind == cflat_cinterop::RawFunctionTemplate::Free
+                        || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember
+                    : candidate.kind == cflat_cinterop::RawFunctionTemplate::InstanceMember
+                        || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember;
+                return kindMatches && arity >= candidate.minArity
+                    && arity <= candidate.maxArity;
+            });
+}
+
 bool LLVMBackend::IsCxxFunctionTemplateParameterByValue(const std::string& functionName,
                                                         const std::string& ownerType,
                                                         size_t parameterIndex,
@@ -12135,6 +12154,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
 {
         error.clear();
         lastCxxRequestClangRejected_ = false;
+        lastCxxRequestNoViableAtRequest_ = false;
         registeredName.clear();
         const bool hasDirectConstructionArgument = std::any_of(
             arguments.begin(), arguments.end(), [](const auto& argument) {
@@ -12227,7 +12247,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             if (pointer)
             {
                 type += "*";
-                if (arg.TypeAndValue.ElemPointer) type += "*";
+                if (arg.TypeAndValue.ElemPointer
+                    || (arg.IsCxxAddressOfPointerValue
+                        && arg.TypeAndValue.PointerDepth >= 2))
+                    type += "*";
             }
             if (IsCxxFixedArrayArgument(arg))
             {
@@ -13434,6 +13457,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         if (!wrapped)
         {
             lastCxxRequestClangRejected_ = true;
+            lastCxxRequestNoViableAtRequest_ = lastCxxWrapperNoViableAtRequest_;
             // Clang's own errors and notes for this failure; the move probe below overwrites them.
             const std::string wrapperCause = lastCxxWrapperCause_ + "\n" + wrapperError;
             // A refused non-template overload taking the element by const reference (assign,
@@ -17817,11 +17841,68 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
             {
                 if (addressValue)
                 {
-                    bool hasTemplate = listed->hasCtorTemplate;
-                    if (auto raw = cxxRecordEntries_.find(typeName);
-                        raw != cxxRecordEntries_.end())
-                        hasTemplate = hasTemplate || !raw->second.ctorTemplates.empty();
-                    if (hasTemplate) return true;
+                    auto raw = cxxRecordEntries_.find(typeName);
+                    if (raw != cxxRecordEntries_.end()
+                        && !raw->second.ctorTemplates.empty())
+                    {
+                        for (const cflat_cinterop::RawCxxCtorTemplate& ctorTemplate
+                             : raw->second.ctorTemplates)
+                        {
+                            const size_t arity = argVars->size();
+                            size_t packIndex = ctorTemplate.paramTypes.size();
+                            if (ctorTemplate.hasParameterPack)
+                                for (size_t i = 0; i < ctorTemplate.paramTypes.size(); ++i)
+                                    if (ctorTemplate.paramTypes[i].ends_with("..."))
+                                    { packIndex = i; break; }
+                            const bool trailingPack = ctorTemplate.hasParameterPack
+                                && packIndex + 1 == ctorTemplate.paramTypes.size();
+                            const size_t fixedCount = ctorTemplate.hasParameterPack
+                                && packIndex < ctorTemplate.paramTypes.size()
+                                ? ctorTemplate.paramTypes.size() - 1
+                                : ctorTemplate.paramTypes.size();
+                            size_t required = fixedCount;
+                            for (size_t i = 0; i < fixedCount; ++i)
+                                if (i < ctorTemplate.defaulted.size() && ctorTemplate.defaulted[i])
+                                { required = i; break; }
+                            bool viable = arity >= required
+                                && (trailingPack || ctorTemplate.variadic || arity <= fixedCount);
+                            for (size_t i = arity; viable
+                                 && i < fixedCount; ++i)
+                                viable = i < ctorTemplate.defaulted.size()
+                                    && ctorTemplate.defaulted[i] != 0;
+                            bool acceptsAddressValue = true;
+                            for (size_t i = 0; i < argVars->size(); ++i)
+                            {
+                                if (!(*argVars)[i].IsCxxAddressOfPointerValue
+                                    || (*argVars)[i].Storage != nullptr)
+                                    continue;
+                                if (i >= ctorTemplate.paramTypes.size())
+                                {
+                                    if (!ctorTemplate.variadic && !ctorTemplate.hasParameterPack)
+                                        acceptsAddressValue = false;
+                                    continue;
+                                }
+                                const size_t parameterIndex = trailingPack && i >= packIndex
+                                    ? packIndex : i;
+                                const std::string& param = ctorTemplate.paramTypes[parameterIndex];
+                                const size_t ref = param.find('&');
+                                size_t afterRef = ref == std::string::npos ? ref : ref + 1;
+                                while (afterRef != std::string::npos && afterRef < param.size()
+                                       && std::isspace(static_cast<unsigned char>(param[afterRef])))
+                                    ++afterRef;
+                                if (ref != std::string::npos
+                                    && (afterRef == param.size() || param[afterRef] != '&')
+                                    && param.find("const") == std::string::npos)
+                                    acceptsAddressValue = false;
+                            }
+                            if (viable && acceptsAddressValue) return true;
+                        }
+                    }
+                    else if (listed->hasCtorTemplate)
+                    {
+                        // The template's arity is unavailable, so keep clang as the oracle.
+                        return true;
+                    }
                     auto* self = const_cast<LLVMBackend*>(this);
                     for (const CxxClassInfo::Structor& ctor : listed->constructors)
                     {
@@ -18141,11 +18222,15 @@ static bool CtorMayBindScalarByReference(const std::vector<cflat_cinterop::RawCx
         // Arity viability: a candidate takes this call's argument count when it declares enough
         // parameters without defaults, and either no more than it declares or a trailing `...`.
         // `defaulted` is the parameter list's default flags; `first` is the parameters before it.
-        const auto viable = [argCount](size_t paramCount, const auto& defaulted, bool variadic) {
-            size_t required = paramCount;
-            for (size_t i = 0; i < paramCount; ++i)
+        const auto viable = [argCount](size_t paramCount, const auto& defaulted,
+                                       bool variadic, bool hasParameterPack) {
+            const size_t fixedCount = hasParameterPack && paramCount > 0
+                ? paramCount - 1 : paramCount;
+            size_t required = fixedCount;
+            for (size_t i = 0; i < fixedCount; ++i)
                 if (i < defaulted.size() && defaulted[i]) { required = i; break; }
-            return argCount >= required && (variadic || argCount <= paramCount);
+            return argCount >= required
+                && (hasParameterPack || variadic || argCount <= fixedCount);
         };
         // A template's parameter list has no `this` entry; a binding by reference keeps the slot.
         // A parameter pack ("A &...") absorbs any count, so positions at or past it take its spelling.
@@ -18155,9 +18240,10 @@ static bool CtorMayBindScalarByReference(const std::vector<cflat_cinterop::RawCx
             size_t pack = params.size();
             for (size_t i = 0; i < params.size(); ++i)
                 if (params[i].ends_with("...")) { pack = i; break; }
-            if (pack == params.size())
+            if (!ctorTemplate.hasParameterPack || pack == params.size())
             {
-                if (position < params.size() && viable(params.size(), ctorTemplate.defaulted, ctorTemplate.variadic)
+                if (position < params.size() && viable(params.size(), ctorTemplate.defaulted,
+                        ctorTemplate.variadic, false)
                     && params[position].ends_with("&")) return true;
                 continue;
             }
@@ -18168,7 +18254,8 @@ static bool CtorMayBindScalarByReference(const std::vector<cflat_cinterop::RawCx
                     if (params[i].find('&') != std::string::npos) return true;
                 continue;
             }
-            if (!viable(pack, ctorTemplate.defaulted, true)) continue;
+            if (!viable(params.size(), ctorTemplate.defaulted, ctorTemplate.variadic,
+                        ctorTemplate.hasParameterPack)) continue;
             std::string spelling = params[position < pack ? position : pack];
             if (spelling.ends_with("...")) spelling.resize(spelling.size() - 3);
             while (!spelling.empty() && spelling.back() == ' ') spelling.pop_back();
@@ -18182,7 +18269,7 @@ static bool CtorMayBindScalarByReference(const std::vector<cflat_cinterop::RawCx
             std::vector<bool> defaulted;
             for (size_t i = 1; i < member.paramTypes.size(); ++i)
                 defaulted.push_back(i < member.defaultArgs.size() && !member.defaultArgs[i].kind.empty());
-            if (!viable(member.paramTypes.size() - 1, defaulted, member.variadic)) continue;
+            if (!viable(member.paramTypes.size() - 1, defaulted, member.variadic, false)) continue;
             const std::string& parameter = member.paramTypes[position + 1];
             if (parameter.ends_with("...")) continue;
             if (parameter.ends_with("&")) return true;
@@ -18192,10 +18279,72 @@ static bool CtorMayBindScalarByReference(const std::vector<cflat_cinterop::RawCx
 
 bool LLVMBackend::RequestCxxVariadicConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& arguments,
-        std::string& wrapperName, std::string& error, bool copyInit)
+        std::string& wrapperName, std::string& error, bool copyInit,
+        bool* noViableCandidate)
 {
+        if (noViableCandidate != nullptr) *noViableCandidate = false;
         error.clear();
         wrapperName.clear();
+
+        // An implicit conversion can recurse through overload ranking back into the same ctor
+        // request. Direct-init and copy-init share this key: only one may resolve at a time.
+        std::string shapeKey;
+        auto appendKeyString = [&](std::string_view value) {
+            shapeKey += std::to_string(value.size());
+            shapeKey += ':';
+            shapeKey.append(value);
+            shapeKey += ';';
+        };
+        auto appendKeyInt = [&](int value) {
+            shapeKey += std::to_string(value);
+            shapeKey += ';';
+        };
+        appendKeyString(typeName);
+        appendKeyInt(static_cast<int>(arguments.size()));
+        for (const NamedVariable& arg : arguments)
+        {
+            const TypeAndValue& type = arg.TypeAndValue;
+            appendKeyString(type.TypeName);
+            appendKeyString(arg.InferSourceTypeName);
+            appendKeyString(arg.LiteralIdentity);
+            appendKeyString(arg.CxxArithIdentity);
+            appendKeyInt(type.Pointer);
+            appendKeyInt(type.ElemPointer);
+            appendKeyInt(type.PointerDepth);
+            appendKeyInt(type.IsAlias);
+            appendKeyInt(type.IsRvalueRef);
+            appendKeyInt(type.IsCxxRefToPointer);
+            appendKeyInt(type.ConstMask);
+            appendKeyInt(type.CxxRefLevel);
+            appendKeyInt(type.IsFunctionPointer);
+            appendKeyInt(type.IsArrayView);
+            appendKeyInt(type.IsInterface);
+            appendKeyInt(arg.IsCxxAddressOfPointerValue);
+            appendKeyInt(arg.IsTopLevelConst);
+            appendKeyInt(arg.IsRvalue);
+            appendKeyInt(arg.CxxLvalueKind);
+            appendKeyInt(arg.Storage != nullptr);
+            appendKeyInt(arg.BaseType == nullptr ? -1 : static_cast<int>(arg.BaseType->getTypeID()));
+            appendKeyInt(arg.BaseType != nullptr && arg.BaseType->isIntegerTy()
+                ? static_cast<int>(arg.BaseType->getIntegerBitWidth()) : 0);
+            if (const auto* structure = llvm::dyn_cast_or_null<llvm::StructType>(arg.BaseType))
+                appendKeyString(structure->getName().str());
+            else
+                appendKeyString({});
+        }
+        if (!cxxVariadicCtorRequestsInProgress_.insert(shapeKey).second)
+        {
+            // Re-entry cycle: report no cause so the outer request does not quote a stale one.
+            lastCxxWrapperCause_.clear();
+            lastCxxWrapperNoViableAtRequest_ = false;
+            return false;
+        }
+        struct RequestGuard
+        {
+            std::unordered_set<std::string>& requests;
+            std::string key;
+            ~RequestGuard() { requests.erase(key); }
+        } requestGuard{ cxxVariadicCtorRequestsInProgress_, std::move(shapeKey) };
 
         // A using-declaration can inherit a constructor template without putting a concrete
         // constructor in the derived record's member list. Look through public bases for the
@@ -18870,6 +19019,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
         if (!requested)
         {
+            if (noViableCandidate != nullptr)
+                *noViableCandidate = lastCxxWrapperNoViableAtRequest_;
             // Clang selected a constructor whose body failed to instantiate: its refusal stands.
             if (wrapperError.starts_with("clang: "))
             {
@@ -23884,9 +24035,14 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         }
                         tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
                         tv.IsZeroLengthArrayMember = tv.IsFlexibleArrayMember && zeroLengthArray;
-                        MarkCxxDeclaredConstField(tv, r.isCxx && f.isConst);
                         tv.IsCxxMutableField = f.isMutable;
                         MarkCxxReferenceField(f.ctype, tv, r.isCxx);
+                        // C++ field pointers have a known one-level shape even though the shared
+                        // type mapper leaves their ordinary value depth unrecorded.
+                        if (r.isCxx && tv.Pointer && !tv.ElemPointer
+                            && !tv.IsFunctionPointer && !tv.IsCxxRef())
+                            tv.PointerDepth = 1;
+                        MarkCxxDeclaredConstField(tv, r.isCxx && f.isConst && !f.isMutable);
                         static_cast<TypeAndValue&>(d) = tv;
                         d.VariableName = f.name;
                         if (f.isBitfield)
@@ -24032,6 +24188,10 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 }
                 tv.IsCxxMutableField = f.isMutable;
                 MarkCxxReferenceField(f.ctype, tv, r.isCxx);
+                // Keep a pointer field's known one-level shape when taking its address.
+                if (r.isCxx && tv.Pointer && !tv.ElemPointer
+                    && !tv.IsFunctionPointer && !tv.IsCxxRef())
+                    tv.PointerDepth = 1;
                 // `const char* p`: the pointee stays const for C++ overload choice; a class-typed
                 // const field makes its object read-only to the C++ receiver checks.
                 if (r.isCxx && tv.Pointer && !tv.IsFunctionPointer)
@@ -30093,6 +30253,13 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
             if (callArgVars != nullptr && i < callArgVars->size() && param != nullptr)
             {
                 const NamedVariable& source = (*callArgVars)[i];
+                if (param->IsCxxRefToPointer && !param->CxxConstRef() && !param->IsRvalueRef
+                    && source.IsCxxConstPointerSlot())
+                    LogError("cannot pass C++ const pointer argument");
+                if (param->IsCxxRefToPointer && source.TypeAndValue.Pointer
+                    && source.Storage != nullptr && source.BaseType == GetType(*param)
+                    && !source.IsRvalue)
+                    a = source.Storage;
                 if (param->IsFunctionPointer && param->Pointer && !param->ElemPointer
                     && (param->IsAlias || param->IsRvalueRef || param->CxxConstRef()))
                 {
@@ -32793,9 +32960,13 @@ LLVMBackend::CxxTernaryVerdict LLVMBackend::ClassifyCxxTernary(const TypeAndValu
 bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& trueArm,
                                      CxxArmCategory trueCategory, const TypeAndValue& falseArm,
                                      CxxArmCategory falseCategory, bool armIsTrue,
-                                     const CxxTernaryVerdict& verdict, bool discardResult)
+                                     const CxxTernaryVerdict& verdict, bool discardResult,
+                                     llvm::Value* resultSlot, llvm::Value* callSink,
+                                     const std::string& callReturnSpelling)
 {
         using Kind = CxxTernaryVerdict::Kind;
+        if (callSink != nullptr && (resultSlot != nullptr || callReturnSpelling.empty()))
+            return false;
         const TypeAndValue& armType = armIsTrue ? trueArm : falseArm;
         const TypeAndValue& otherType = armIsTrue ? falseArm : trueArm;
         const CxxArmCategory armCategory = armIsTrue ? trueCategory : falseCategory;
@@ -32806,7 +32977,9 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
         const std::string otherName = ResolveTypeAlias(otherType.TypeName);
         const std::string resultName = ResolveTypeAlias(
             verdict.resultIsTrue ? trueArm.TypeName : falseArm.TypeName);
-        if (armName == resultName && (refResult || armIsPrvalue)) return true;
+        if (resultSlot == nullptr && callSink == nullptr && armName == resultName
+            && (refResult || armIsPrvalue))
+            return true;
         std::string armSpelling;
         std::string otherSpelling;
         std::string resultSpelling;
@@ -32933,6 +33106,7 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             + (armIsTrue ? "t" : "f") + CxxArmCategoryTag(armCategory) + "|"
             + CxxArmCategoryTag(otherCategory)
             + (refResult ? "r" : "v") + (thunkArm ? "k" : "") + (discardInClang ? "d" : "")
+            + (callSink != nullptr ? "|call|" + callReturnSpelling : std::string())
             + "|" + conditional;
         const std::string wrapperName = std::format("__cflat_ternary_arm_{:016x}",
             HashWrapperKey(wrapperKey));
@@ -32941,7 +33115,25 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
         const std::string armParams = thunkArm ? std::string("void * p0, void * p1")
                                                : armCv + " * p0";
         std::string source;
-        if (refResult)
+        if (callSink != nullptr && IsCxxParamDestroyedInCallee(resultName))
+        {
+            // MS ABI: callee destroys the by-value parameter; B lives in caller-owned storage.
+            // One full-expression keeps the converted-from arm alive through the call.
+            const std::string callback = "reinterpret_cast<" + callReturnSpelling + " (*)("
+                + resultSpelling + " &&)>(sink)(static_cast<" + resultSpelling + " &&>(*new (storage) "
+                + resultSpelling + "(" + conditional + ")))";
+            source = prologue + callReturnSpelling + " " + wrapperName + "(void * sink, "
+                + armParams + ") { alignas(" + resultSpelling + ") unsigned char storage[sizeof("
+                + resultSpelling + ")]; return " + callback + "; }\n";
+        }
+        else if (callSink != nullptr)
+        {
+            const std::string callback = "reinterpret_cast<" + callReturnSpelling + " (*)("
+                + resultSpelling + " &&)>(sink)(" + conditional + ")";
+            source = prologue + callReturnSpelling + " " + wrapperName + "(void * sink, "
+                + armParams + ") { return " + callback + "; }\n";
+        }
+        else if (refResult && resultSlot == nullptr)
             source = prologue + resultSpelling + " * " + wrapperName + "(" + armCv + " * p0) { "
                 "static_assert(std::is_reference_v<decltype(" + conditional + ")>, \"\"); "
                 "auto &&r = " + conditional + "; return const_cast<" + resultSpelling
@@ -33064,9 +33256,17 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             }
             else
             {
-                llvm::Value* slot = CreateAlloca(resultObject);
+                if (callSink != nullptr)
+                {
+                    arm.Primary = CreateCallOrInvoke(function->getFunctionType(), function,
+                        { callSink, thunk, env }, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
+                    arm.Storage = nullptr;
+                    arm.BaseType = arm.Primary != nullptr ? arm.Primary->getType() : nullptr;
+                    return arm.Primary != nullptr;
+                }
+                llvm::Value* slot = resultSlot != nullptr ? resultSlot : CreateAlloca(resultObject);
                 CreateCallOrInvoke(function->getFunctionType(), function, { slot, thunk, env }, true);
-                if (IsForeignNontrivialCxxClass(resultName))
+                if (resultSlot == nullptr && IsForeignNontrivialCxxClass(resultName))
                     RegisterOwnedStructTemp(slot, resultName);
                 arm.Storage = slot;
                 arm.Primary = CreateLoad(resultObject, slot);
@@ -33084,7 +33284,15 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
                 if (value == nullptr) return false;
                 builder->CreateStore(value, storage);
             }
-            if (refResult)
+            if (callSink != nullptr)
+            {
+                arm.Primary = CreateCallOrInvoke(function->getFunctionType(), function,
+                    { callSink, storage }, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
+                arm.Storage = nullptr;
+                arm.BaseType = arm.Primary != nullptr ? arm.Primary->getType() : nullptr;
+                return arm.Primary != nullptr;
+            }
+            if (refResult && resultSlot == nullptr)
             {
                 llvm::Value* pointer = CreateCallOrInvoke(function->getFunctionType(), function,
                     { storage }, true, "cxx.ternary.ref");
@@ -33093,9 +33301,9 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             }
             else
             {
-                llvm::Value* slot = CreateAlloca(resultObject);
+                llvm::Value* slot = resultSlot != nullptr ? resultSlot : CreateAlloca(resultObject);
                 CreateCallOrInvoke(function->getFunctionType(), function, { slot, storage }, true);
-                if (IsForeignNontrivialCxxClass(resultName))
+                if (resultSlot == nullptr && IsForeignNontrivialCxxClass(resultName))
                     RegisterOwnedStructTemp(slot, resultName);
                 arm.Storage = slot;
                 arm.Primary = CreateLoad(resultObject, slot);
@@ -33104,7 +33312,7 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
         arm.BaseType = resultObject;
         arm.TypeAndValue = TypeAndValue{};
         arm.TypeAndValue.TypeName = resultName;
-        arm.IsRvalue = !refResult;
+        arm.IsRvalue = resultSlot != nullptr || !refResult;
         return true;
 }
 

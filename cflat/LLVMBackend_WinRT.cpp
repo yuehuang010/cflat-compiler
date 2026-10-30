@@ -3551,6 +3551,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             }
             std::string sourceName = args[i].CallerName;
             const std::string movePath = FieldMoveKey(args[i]);
+            const std::string fieldRootName = sourceName.empty()
+                ? !args[i].FieldPathRoot.empty() ? args[i].FieldPathRoot
+                    : args[i].TypeAndValue.ParentVariableName
+                : sourceName;
             const bool wholeBindingSource = !args[i].IsElementAccess
                 && args[i].FieldName.empty() && args[i].OwningStructName.empty();
             if (sourceName.empty() && movePath.empty())
@@ -3980,7 +3984,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
                 // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
                 // Moving a FIELD (`node->left`) marks only that field, not the whole base variable.
-                if (!args[i].DeferMovedMark && !sourceName.empty() && srcStorage != nullptr &&
+                if (!args[i].DeferMovedMark && !fieldRootName.empty() && srcStorage != nullptr &&
                     !isInterfaceBorrow && srcBaseTy != nullptr)
                 {
                     bool isPtr = llvm::isa<llvm::PointerType>(srcBaseTy);
@@ -3991,8 +3995,12 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         if (explicitFunctionMove)
                             continue;
                         if (isFieldAccess)
-                            MarkVariableFieldMoved(sourceName, movePath);
-                        else if (wholeBindingSource)
+                        {
+                            MarkVariableFieldMoved(fieldRootName, movePath,
+                                                   sourceName.empty());
+                            MarkStorageFieldMovedForDrop(args[i].FieldDropOwnerStorage, movePath);
+                        }
+                        else if (wholeBindingSource && !sourceName.empty())
                             MarkVariableMoved(sourceName, isPointeeMove(args[i]));
                     }
                 }
@@ -4371,6 +4379,33 @@ llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const Type
 
 llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg)
 {
+        if (arg.IsNullConditionalOwningValue && !param.Pointer && !param.IsAlias
+            && (param.IsMove || OwningSinkConsumesConcrete(param)))
+        {
+            if (!IsCopyableType(arg.TypeAndValue.TypeName)
+                || IsLoweredCFlatOnlyStruct(arg.TypeAndValue.TypeName))
+                LogError(
+                    "cannot pass an owning struct read from a null-conditional '?.' access to a "
+                    "consuming parameter; use an explicit null check and move or copy the field");
+            NamedVariable source;
+            source.Primary = value;
+            source.BaseType = value != nullptr ? value->getType() : nullptr;
+            source.TypeAndValue.TypeName = arg.TypeAndValue.TypeName;
+            value = CreateOverloadedFunctionCall("copy", { source });
+            if (value == nullptr)
+                LogError(
+                    "cannot safely copy an owning struct from a null-conditional '?.' access");
+        }
+        if ((param.Pointer || ParameterIsAliasByPointer(param))
+            && !arg.TypeAndValue.Pointer && !arg.CallerName.empty()
+            && IsDataStructure(arg.TypeAndValue.TypeName)
+            && !IsCxxRecord(arg.TypeAndValue.TypeName))
+        {
+            // A pointer/reference borrow can rebuild fields through callee storage.
+            const std::string ownerName = arg.FieldPathRoot.empty()
+                ? arg.CallerName : arg.FieldPathRoot;
+            MarkVariableFieldStorageEscaped(ownerName);
+        }
         // Encoded closure param (list<function<...>>::add's `T value`, a substituted generic field).
         // The encoded element has the SAME machine repr as the spelling it encodes - bare code
         // pointer (thin) or fat struct - so convert exactly as an IsFunctionPointer param would.
@@ -4502,6 +4537,39 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
         }
 
         return value;
+    }
+
+llvm::Value* LLVMBackend::LowerPointerParamArg(const NamedVariable& arg, bool markAggregateEscape)
+{
+        if (!arg.TypeAndValue.Pointer
+            && (arg.Storage != nullptr || arg.NullConditionalBorrowStorage != nullptr)
+            && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
+        {
+            if (markAggregateEscape && IsDataStructure(arg.TypeAndValue.TypeName)
+                && !IsCxxRecord(arg.TypeAndValue.TypeName))
+            {
+                const std::string ownerName = !arg.FieldPathRoot.empty()
+                    ? arg.FieldPathRoot : arg.CallerName;
+                if (!ownerName.empty())
+                    MarkVariableFieldStorageEscaped(ownerName);
+            }
+            // `p?.f`: borrow the field in place (null-or-field-address), never a temporary copy.
+            return arg.NullConditionalBorrowStorage != nullptr ? arg.NullConditionalBorrowStorage : arg.Storage;
+        }
+
+        if (!arg.TypeAndValue.Pointer && arg.Storage == nullptr
+            && arg.Primary != nullptr && arg.Primary->getType()->isStructTy())
+        {
+            auto* temporary = AllocaAtEntry(arg.Primary->getType(), nullptr);
+            builder->CreateStore(arg.Primary, temporary);
+            return temporary;
+        }
+
+        if (arg.Primary == nullptr && arg.Storage != nullptr
+            && llvm::isa<llvm::AllocaInst>(arg.Storage))
+            return LoadArgStorage(arg);
+
+        return arg.GetValue();
     }
 
 bool LLVMBackend::ArgumentProvablyMismatchesParameter(const NamedVariable& arg, const TypeAndValue& param) const

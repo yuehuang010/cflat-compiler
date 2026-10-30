@@ -223,3 +223,39 @@ expect_error("cannot bind function 't512GetWide'") {
 expect_error("cannot bind function 't512GetThin'") {
     struct T512ThinReturnField { function<Lambda<int(int)>()> get = t512GetThin; };
 }
+
+expect_error("cannot pass argument of type 'int' to parameter of type 'FnvbErrorBox*' through a function value") {
+    struct FnvbErrorBox { int value = default; };
+    int fnvbErrorRead(FnvbErrorBox* box) { return box->value; }
+    int fnvbErrorCall() { function<int(FnvbErrorBox*)> fn = fnvbErrorRead; return fn(5); }
+}
+
+expect_error("cannot pass the address of a stack or global value to 'move' parameter") {
+    struct FnvbMoveErrorBox { int value = default; };
+    int fnvbMoveErrorTarget(move FnvbMoveErrorBox* p) { return 23; }
+    void fnvbMoveErrorCall() {
+        FnvbMoveErrorBox b = default;
+        function<int(move FnvbMoveErrorBox*)> fn = fnvbMoveErrorTarget;
+        fn(b);
+    }
+}
+
+expect_error("cannot pass parameter 'p' of 'fnvbScalarErrorTarget' of type 'int*' from a value of type 'int'") {
+    int fnvbScalarErrorTarget(int* p) { return *p; }
+    void fnvbScalarErrorCall() {
+        int v = 12;
+        function<int(int*)> fn = fnvbScalarErrorTarget;
+        fn(v);
+    }
+}
+
+expect_error("cannot pass parameter 'p' of 'fnvbScalarFieldErrorTarget' of type 'int*' from a value of type 'int'") {
+    struct FnvbScalarFieldErrorOwner { int y = default; };
+    int fnvbScalarFieldErrorTarget(int* p) { return *p; }
+    void fnvbScalarFieldErrorCall() {
+        FnvbScalarFieldErrorOwner o = default;
+        o.y = 12;
+        function<int(int*)> fn = fnvbScalarFieldErrorTarget;
+        fn(o.y);
+    }
+}

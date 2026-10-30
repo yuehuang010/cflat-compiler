@@ -12862,8 +12862,8 @@ int recursiveReadResourceId(Resource* r, int d) { if (d > 0) { return recursiveR
 void printResourcePointer(Resource* r) { snprintf(nullptr, 0, "%p", r); }
 Resource* passthruResource(Resource* r) { return r; }
 void keepResourceGlobal(Resource* r) { gKeptResource = r; }
-// The ACCEPT twins of the joined-destination rule. A store through `c ? &a : &b` is proof only
-// when EVERY arm outlives the call, so one local arm - or two - must keep compiling.
+// Mixed joins with an outliving arm are refusals in err_unique_borrow_into_field.cb.
+// The both-local join below remains accepted because neither arm outlives the call.
 struct ResourceCell { Resource* v = nullptr; };
 Resource* gKeptResource2 = nullptr;
 int selLocalArmRead(Resource* r, int c)
@@ -12963,6 +12963,15 @@ MoveBox<unique SelfResource*> makeSelfBox()
     b.t = new SelfResource();
     b.t->id = 45;
     return b;
+}
+
+Resource* ret510UnknownSaved = nullptr;
+void ret510UnknownSave(Resource* r) { ret510UnknownSaved = r; }
+int ret510UnknownIndirectRead(Resource* r)
+{
+    function<void(Resource*)> fp = ret510UnknownSave;
+    fp(r);
+    return r->id;
 }
 
 int testTempUniqueFieldBorrowAccepts()
@@ -13443,20 +13452,18 @@ int testTempUniqueFieldBorrowAccepts()
     }
     passed += Test("temp_uniq_accept_late_passthru_of_plain_ptr_freed_once", dtorCount, 1);
 
-    // The ACCEPT SET of the joined-destination rule, frozen before that rule was written. Each
-    // callee stores through a select whose arms are NOT all outliving memory, so no proof.
+    // Item 3's indirect callee is Unknown, so the selected call temporary must stay alive.
     dtorCount = 0;
-    passed += Test("temp_uniq_accept_join_dest_local_arm",
-                   selLocalArmRead(makeMoveBox().t, 1), 44);
-    passed += Test("temp_uniq_accept_join_dest_local_arm_freed_once", dtorCount, 1);
+    ret510UnknownSaved = nullptr;
+    passed += Test("ret510_ternary_unknown_value",
+                   ret510UnknownIndirectRead((dtorCount == 0 ? makeMoveBox() : makeMoveBox()).t), 44);
+    passed += Test("ret510_ternary_unknown_saved", ret510UnknownSaved == nullptr ? 0 : 1, 1);
+    passed += Test("ret510_ternary_unknown_owner_kept", dtorCount, 0);
+
     dtorCount = 0;
     passed += Test("temp_uniq_accept_join_dest_both_local_arms",
                    selBothLocalArmsRead(makeMoveBox().t, 1), 44);
     passed += Test("temp_uniq_accept_join_dest_both_local_arms_freed_once", dtorCount, 1);
-    dtorCount = 0;
-    passed += Test("temp_uniq_accept_join_dest_fresh_arm",
-                   selFreshArmRead(makeMoveBox().t, 1), 44);
-    passed += Test("temp_uniq_accept_join_dest_fresh_arm_freed_once", dtorCount, 1);
 
     // The MAY-return walk's own accept set, frozen before the walk was written. Each callee below
     // is a shape whose RESULT does not derive from the temp-field argument, so binding it to a
@@ -16771,6 +16778,31 @@ T499Plain t499MakePlain(int value)
     return move result;
 }
 struct T490PlainBox { T490Plain value; };
+struct T490PlainOuter
+{
+    T490Plain inn;
+    T490Plain other;
+    ~T490PlainOuter() { }
+};
+struct T490PlainInnerOuter
+{
+    T490Plain inn;
+    T490Plain other;
+    ~T490PlainInnerOuter() { }
+};
+struct T490PlainNested
+{
+    T490PlainInnerOuter inner;
+    T490Plain other;
+    ~T490PlainNested() { }
+};
+T490Plain t490ReturnOuterField()
+{
+    T490PlainOuter value = default;
+    value.inn.value = 31;
+    value.other.value = 32;
+    return move value.inn;
+}
 int t490RunPlainBranch(bool shouldMove, int value)
 {
     T490Plain local = default;
@@ -16799,6 +16831,75 @@ struct T490Owner
     ~T490Owner() { t490OwnerDtors++; }
 };
 void t490TakeOwner(move T490Owner value) { }
+
+int t490FieldOwnerDtors = 0;
+int t490FieldPayloadDtors = 0;
+struct T490FieldPayload { ~T490FieldPayload() { t490FieldPayloadDtors++; } };
+struct T490FieldStringOwner
+{
+    int value = 0;
+    string text = default;
+    ~T490FieldStringOwner() { t490FieldOwnerDtors++; }
+};
+struct T490FieldStringOuter
+{
+    T490FieldStringOwner inn;
+    T490FieldStringOwner other;
+    ~T490FieldStringOuter() { }
+};
+struct T490FieldListOwner
+{
+    int value = 0;
+    list<unique T490FieldPayload*> items = default;
+    ~T490FieldListOwner() { t490FieldOwnerDtors++; }
+};
+struct T490FieldListOuter
+{
+    T490FieldListOwner inn;
+    T490FieldListOwner other;
+    ~T490FieldListOuter() { }
+};
+struct T490FieldUniqueOwner
+{
+    int value = 0;
+    unique T490FieldPayload* item = nullptr;
+    ~T490FieldUniqueOwner() { t490FieldOwnerDtors++; }
+};
+struct T490FieldUniqueOuter
+{
+    T490FieldUniqueOwner inn;
+    T490FieldUniqueOwner other;
+    ~T490FieldUniqueOuter() { }
+};
+int t490TakeFieldString(move T490FieldStringOwner value) { return value.value; }
+int t490TakeFieldList(move T490FieldListOwner value) { return value.value; }
+int t490TakeFieldUnique(move T490FieldUniqueOwner value) { return value.value; }
+
+int t490BraceCtorCount = 0;
+int t490BraceDtorCount = 0;
+int t490BraceOrder = 0;
+struct T490BraceLeaf
+{
+    int value = 0;
+    T490BraceLeaf() { t490BraceCtorCount++; }
+    T490BraceLeaf(int value) { this.value = value; t490BraceCtorCount++; }
+    ~T490BraceLeaf()
+    {
+        t490BraceDtorCount++;
+        t490BraceOrder = t490BraceOrder * 10 + value + 1;
+    }
+};
+struct T490BraceBox
+{
+    T490BraceLeaf inn = default;
+    T490BraceLeaf other = default;
+    ~T490BraceBox() { }
+};
+T490BraceLeaf t490MakeBraceLeaf(int value)
+{
+    T490BraceLeaf result = T490BraceLeaf(value);
+    return move result;
+}
 
 int t523P2ACtor = 0;
 int t523P2ADtor = 0;
@@ -16916,6 +17017,115 @@ int testT523ByrefClosureRebind()
     passed += Test("t523_nested_param_no_leak", (i64)HeapAudit.reportLeaks() - base, (i64)0);
     return passed;
 }
+
+int t490EscapedPayloadLive = 0;
+int t490NullableCopyCount = 0;
+struct T490EscapedPayload
+{
+    T490EscapedPayload() { t490EscapedPayloadLive++; }
+    ~T490EscapedPayload() { t490EscapedPayloadLive--; }
+};
+struct T490EscapedOwner
+{
+    int value = 0;
+    unique T490EscapedPayload* item = nullptr;
+    ~T490EscapedOwner() { }
+};
+T490EscapedOwner t490MakeEscapedOwner(int value)
+{
+    T490EscapedOwner result = default;
+    result.value = value;
+    result.item = new T490EscapedPayload();
+    return move result;
+}
+struct T490NullableCopyOwner
+{
+    int value = 0;
+    unique T490EscapedPayload* item = nullptr;
+    ~T490NullableCopyOwner() { }
+    T490NullableCopyOwner copy()
+    {
+        t490NullableCopyCount++;
+        T490NullableCopyOwner result = default;
+        result.value = value;
+        if (item != nullptr) result.item = new T490EscapedPayload();
+        return move result;
+    }
+};
+T490NullableCopyOwner t490MakeNullableCopyOwner(int value)
+{
+    T490NullableCopyOwner result = default;
+    result.value = value;
+    result.item = new T490EscapedPayload();
+    return move result;
+}
+int t490TakeNullableCopyOwner(move T490NullableCopyOwner value) { return value.value; }
+int t490ReadNullableCopyOwner(T490NullableCopyOwner value) { return value.value; }
+struct T490NullableCopyOuter
+{
+    T490NullableCopyOwner mid = default;
+    ~T490NullableCopyOuter() { }
+};
+struct T490NullableCopyHolder
+{
+    T490NullableCopyOwner item = default;
+    ~T490NullableCopyHolder() { }
+};
+T490NullableCopyOwner t490NullableCopyReturn(T490NullableCopyOuter* owner)
+{
+    return owner?.mid;
+}
+T490NullableCopyOwner t490NullableCopyReturnParen(T490NullableCopyOuter* owner)
+{
+    return (owner?.mid);
+}
+void t490SetNullableCopyOwner(T490NullableCopyOwner* out, T490NullableCopyOuter* owner)
+{
+    *out = owner?.mid;
+}
+void t490SetNullableCopyOwnerParen(T490NullableCopyOwner* out, T490NullableCopyOuter* owner)
+{
+    *out = (owner?.mid);
+}
+T t490NullableCopyGenericReturn<T>(T490NullableCopyOuter* owner)
+{
+    return owner?.mid;
+}
+int t490TakeEscapedOwner(move T490EscapedOwner value) { return value.value; }
+struct T490EscapedOuter
+{
+    T490EscapedOwner inn = default;
+    T490EscapedOwner other = default;
+    ~T490EscapedOuter() { }
+    void reinit(int value) { this.inn = t490MakeEscapedOwner(value); }
+};
+void t490FillEscapedOuter(T490EscapedOuter* owner, int value)
+{
+    owner->inn = t490MakeEscapedOwner(value);
+}
+void t490SaveEscapedOuter(T490EscapedOuter** slot, T490EscapedOuter* owner)
+{
+    *slot = owner;
+}
+struct T490EscapedNest { T490EscapedOuter bi = default; };
+struct T490EscapedRoot { T490EscapedNest n = default; };
+struct T490NullableOuter { T490EscapedOuter mid = default; ~T490NullableOuter() { } };
+struct T490NullableLeaf { int value = 0; int Read() { return value; } };
+struct T490NullableLink { T490NullableLeaf* leaf = nullptr; };
+struct T490NullableNode { T490NullableLink* next = nullptr; int scalar = 31; };
+T490EscapedOuter* t490NullableSaved = nullptr;
+int t490NullableSelection = 0;
+void t490SaveNullableMid(T490EscapedOuter* value)
+{
+    t490NullableSaved = value;
+    t490NullableSelection = 1;
+}
+void t490SaveNullableMid(int value)
+{
+    t490NullableSelection = value == 0 ? 2 : 3;
+}
+int t490NullableReadScalar(T490NullableNode* value) { return value?.scalar ?? -1; }
+int t490NullableReadChain(T490NullableNode* value) { return value?.next?.leaf?.Read() ?? -1; }
 
 extern int main()
 {
@@ -17406,7 +17616,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 135;
+    total += 134;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
@@ -17860,6 +18070,7 @@ extern int main()
     total += 15;
 
     passed += testT364NativeOperatorReturnFacts();
+    total += 93; // mvfield legs, including NULLARG round 3
     passed += testT523ByrefClosureRebind();
     total += 15;
     total += 3; // T499 branch, loop and for-increment reassign legs
@@ -19360,7 +19571,7 @@ unique<T480Res> t480Mk() { return unique<T480Res>(new T480Res()); }
 T480Res t480Mk2() { return T480Res(); }
 int t480Use(int* p) { return *p; }
 void t480CallArgs() { for (int i = 0; i < 10; i = i + 1) { int a = t480Use(t480Mk()->heap); if (gT480Dtors != 2 * i + 1) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + a; int b = t480Use((t480Mk())->heap); if (gT480Dtors != 2 * i + 2) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + b; } }
-void t480IndexMethod() { for (int i = 0; i < 10; i = i + 1) { int a = t480Mk()->heap[0]; if (gT480Dtors != 2 * i + 1) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + a; int b = t480Mk()->get(); if (gT480Dtors != 2 * i + 2) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + b; } }
+void t480IndexMethod() { for (int i = 0; i < 10; i = i + 1) { int a = t480Mk()->heap[0]; if (gT480Dtors != 2 * i + 1) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + a; int b = t480Mk().get().get(); if (gT480Dtors != 2 * i + 2) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + b; } }
 void t480ByValue() { for (int i = 0; i < 10; i = i + 1) { int v = t480Use(t480Mk2().heap); if (gT480Dtors != i + 1) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + v; } }
 
 // T482: pointer arithmetic and ternary argument reads keep the owning temp through the full expression.
@@ -23789,6 +24000,312 @@ int testT364NativeOperatorReturnFacts()
     t499Value = 0;
     { T499Plain local = default; local.value = 5; t499Value = t499TakePlain(move local); for (int i = 0; i < 3; local = t499MakePlain(i)) { i++; } }
     passed += Test("t499_for_increment_reassign_value_trace", t499Value * 10000 + t499PlainTrace, 56234);
+
+    t490PlainDtors = 0;
+    { T490PlainOuter box = default; box.inn.value = 41; box.other.value = 42; t490Value = t490TakePlain(move box.inn); }
+    passed += Test("mvfield_param_value", t490Value, 41);
+    passed += Test("mvfield_param_drop_count", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    { T490PlainOuter box = default; box.inn.value = 43; box.other.value = 44; T490Plain local = move box.inn; t490Value = local.value; }
+    passed += Test("mvfield_local_value", t490Value, 43);
+    passed += Test("mvfield_local_drop_count", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    { T490Plain local = t490ReturnOuterField(); t490Value = local.value; }
+    passed += Test("mvfield_return_value", t490Value, 31);
+    passed += Test("mvfield_return_drop_count", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    { T490Plain target = default; target.value = 45; T490PlainOuter box = default; box.inn.value = 46; box.other.value = 47; target = move box.inn; t490Value = target.value; }
+    passed += Test("mvfield_assign_value", t490Value, 46);
+    passed += Test("mvfield_assign_drop_count", t490PlainDtors, 3);
+
+    t490PlainDtors = 0;
+    { T490PlainNested box = default; box.inner.inn.value = 48; box.inner.other.value = 49; box.other.value = 50; t490Value = t490TakePlain(move box.inner.inn); }
+    passed += Test("mvfield_nested_value", t490Value, 48);
+    passed += Test("mvfield_nested_drop_count", t490PlainDtors, 3);
+
+    t490PlainDtors = 0;
+    { T490PlainOuter box = default; box.inn.value = 51; box.other.value = 52; t490Value = 0; if (false) { t490Value = t490TakePlain(move box.inn); } }
+    passed += Test("mvfield_conditional_skip_count", t490PlainDtors, 2);
+    t490PlainDtors = 0;
+    { T490PlainOuter box = default; box.inn.value = 53; box.other.value = 54; t490Value = 0; if (true) { t490Value = t490TakePlain(move box.inn); } }
+    passed += Test("mvfield_conditional_value", t490Value, 53);
+    passed += Test("mvfield_conditional_drop_count", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    { T490PlainOuter box = default; box.inn.value = 55; box.other.value = 56; int i = 0; while (i < 0) { t490Value = t490TakePlain(move box.inn); break; } }
+    passed += Test("mvfield_loop_skip_count", t490PlainDtors, 2);
+    t490PlainDtors = 0;
+    { T490PlainOuter box = default; box.inn.value = 57; box.other.value = 58; int i = 0; while (i < 1) { t490Value = t490TakePlain(move box.inn); break; } }
+    passed += Test("mvfield_loop_value", t490Value, 57);
+    passed += Test("mvfield_loop_drop_count", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    { T490PlainOuter box = default; box.inn.value = 59; box.other.value = 60; t490TakePlain(move box.inn); t490Value = box.inn.value; }
+    passed += Test("mvfield_read_default_value", t490Value, 0);
+    passed += Test("mvfield_read_drop_count", t490PlainDtors, 2);
+
+    t490FieldOwnerDtors = 0;
+    i64 mvfieldStringBase = (i64)HeapAudit.reportLeaks();
+    { T490FieldStringOuter box = default; box.inn.value = 61; box.inn.text = "" + "moved"; box.other.value = 62; box.other.text = "" + "kept"; t490Value = t490TakeFieldString(move box.inn); }
+    passed += Test("mvfield_string_value", t490Value, 61);
+    passed += Test("mvfield_string_owner_dtors", t490FieldOwnerDtors, 2);
+    passed += Test("mvfield_string_no_leak", (i64)HeapAudit.reportLeaks() - mvfieldStringBase, 0);
+
+    t490FieldOwnerDtors = 0;
+    t490FieldPayloadDtors = 0;
+    { T490FieldListOuter box = default; box.inn.value = 63; box.inn.items.add(new T490FieldPayload()); box.other.value = 64; box.other.items.add(new T490FieldPayload()); t490Value = t490TakeFieldList(move box.inn); }
+    passed += Test("mvfield_list_value", t490Value, 63);
+    passed += Test("mvfield_list_owner_dtors", t490FieldOwnerDtors, 2);
+    passed += Test("mvfield_list_payload_dtors", t490FieldPayloadDtors, 2);
+
+    t490FieldOwnerDtors = 0;
+    t490FieldPayloadDtors = 0;
+    { T490FieldUniqueOuter box = default; box.inn.value = 65; box.inn.item = new T490FieldPayload(); box.other.value = 66; box.other.item = new T490FieldPayload(); t490Value = t490TakeFieldUnique(move box.inn); }
+    passed += Test("mvfield_unique_value", t490Value, 65);
+    passed += Test("mvfield_unique_owner_dtors", t490FieldOwnerDtors, 2);
+    passed += Test("mvfield_unique_payload_dtors", t490FieldPayloadDtors, 2);
+
+    // Each case transfers the original owner, then installs a new payload through an escaped
+    // path; the live delta proves the field destructor freed that replacement at scope exit.
+    i64 mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(71); box.other = t490MakeEscapedOwner(72); t490Value = t490TakeEscapedOwner(move box.inn); box.reinit(73); }
+    passed += Test("mvfield_escape_method_value", t490Value, 71);
+    passed += Test("mvfield_escape_method_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(74); box.other = t490MakeEscapedOwner(75); t490Value = t490TakeEscapedOwner(move box.inn); t490FillEscapedOuter(&box, 76); }
+    passed += Test("mvfield_escape_borrow_value", t490Value, 74);
+    passed += Test("mvfield_escape_borrow_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(77); box.other = t490MakeEscapedOwner(78); t490Value = t490TakeEscapedOwner(move box.inn); T490EscapedOuter* alias = &box; alias->inn = t490MakeEscapedOwner(79); }
+    passed += Test("mvfield_escape_alias_value", t490Value, 77);
+    passed += Test("mvfield_escape_alias_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    bool mvfieldEscapeCondition = true;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(80); box.other = t490MakeEscapedOwner(81); t490Value = t490TakeEscapedOwner(move box.inn); if (mvfieldEscapeCondition) { box.reinit(82); } }
+    passed += Test("mvfield_escape_conditional_value", t490Value, 80);
+    passed += Test("mvfield_escape_conditional_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(83); box.other = t490MakeEscapedOwner(84); T490EscapedOuter* alias = &box; t490Value = t490TakeEscapedOwner(move box.inn); alias->inn = t490MakeEscapedOwner(85); }
+    passed += Test("mvfield_escape_before_move_owner_value", t490Value, 83);
+    passed += Test("mvfield_escape_before_move_owner_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(86); box.other = t490MakeEscapedOwner(87); T490EscapedOwner* field = &box.inn; t490Value = t490TakeEscapedOwner(move box.inn); *field = t490MakeEscapedOwner(88); }
+    passed += Test("mvfield_escape_before_move_field_value", t490Value, 86);
+    passed += Test("mvfield_escape_before_move_field_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(89); box.other = t490MakeEscapedOwner(90); T490EscapedOuter* alias = &box; t490Value = t490TakeEscapedOwner(move box.inn); t490FillEscapedOuter(alias, 91); }
+    passed += Test("mvfield_escape_before_move_borrow_value", t490Value, 89);
+    passed += Test("mvfield_escape_before_move_borrow_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedOuter box = default; box.inn = t490MakeEscapedOwner(92); box.other = t490MakeEscapedOwner(93); T490EscapedOuter* alias = nullptr; t490SaveEscapedOuter(&alias, box); t490Value = t490TakeEscapedOwner(move box.inn); alias->inn = t490MakeEscapedOwner(94); }
+    passed += Test("mvfield_escape_before_move_cflat_borrow_value", t490Value, 92);
+    passed += Test("mvfield_escape_before_move_cflat_borrow_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedRoot w = default; w.n.bi.inn = t490MakeEscapedOwner(95); w.n.bi.other = t490MakeEscapedOwner(96); t490Value = t490TakeEscapedOwner(move w.n.bi.inn); w.n.bi.reinit(97); }
+    passed += Test("mvfield_escape_nested_receiver_value", t490Value, 95);
+    passed += Test("mvfield_escape_nested_receiver_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490EscapedRoot w = default; w.n.bi.inn = t490MakeEscapedOwner(98); w.n.bi.other = t490MakeEscapedOwner(99); w.n.bi.reinit(100); t490Value = t490TakeEscapedOwner(move w.n.bi.inn); }
+    passed += Test("mvfield_escape_nested_before_move_value", t490Value, 100);
+    passed += Test("mvfield_escape_nested_before_move_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    t490NullableSaved = nullptr;
+    t490NullableSelection = 0;
+    { T490NullableOuter box = default; T490NullableOuter* pb = &box; box.mid.inn = t490MakeEscapedOwner(101); box.mid.other = t490MakeEscapedOwner(102); t490SaveNullableMid(pb?.mid); t490Value = t490TakeEscapedOwner(move box.mid.inn); t490NullableSaved->inn = t490MakeEscapedOwner(103); }
+    passed += Test("mvfield_nullable_escape_before_move_value", t490Value, 101);
+    passed += Test("mvfield_nullable_escape_before_move_overload", t490NullableSelection, 1);
+    passed += Test("mvfield_nullable_escape_before_move_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    t490NullableSaved = nullptr;
+    t490NullableSelection = 0;
+    { T490NullableOuter box = default; T490NullableOuter* pb = &box; box.mid.inn = t490MakeEscapedOwner(101); box.mid.other = t490MakeEscapedOwner(102); t490SaveNullableMid((pb?.mid)); t490Value = t490TakeEscapedOwner(move box.mid.inn); t490NullableSaved->inn = t490MakeEscapedOwner(103); }
+    passed += Test("mvfield_nullable_paren_escape_before_move_value", t490Value, 101);
+    passed += Test("mvfield_nullable_paren_escape_before_move_overload", t490NullableSelection, 1);
+    passed += Test("mvfield_nullable_paren_escape_before_move_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    t490NullableSaved = nullptr;
+    t490NullableSelection = 0;
+    { T490NullableOuter box = default; T490NullableOuter* pb = &box; box.mid.inn = t490MakeEscapedOwner(104); box.mid.other = t490MakeEscapedOwner(105); t490Value = t490TakeEscapedOwner(move box.mid.inn); t490SaveNullableMid(pb?.mid); t490NullableSaved->inn = t490MakeEscapedOwner(106); }
+    passed += Test("mvfield_nullable_escape_after_move_value", t490Value, 104);
+    passed += Test("mvfield_nullable_escape_after_move_overload", t490NullableSelection, 1);
+    passed += Test("mvfield_nullable_escape_after_move_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    t490NullableSaved = nullptr;
+    t490NullableSelection = 0;
+    T490NullableOuter* nullNullableOuter = nullptr;
+    t490SaveNullableMid(nullNullableOuter?.mid);
+    passed += Test("mvfield_nullable_null_overload", t490NullableSelection, 1);
+    passed += Test("mvfield_nullable_null_pointer", t490NullableSaved == nullptr ? 1 : 0, 1);
+
+    T490NullableNode scalarNullable = default;
+    T490NullableNode* scalarNullablePtr = &scalarNullable;
+    passed += Test("mvfield_nullable_scalar", t490NullableReadScalar(scalarNullablePtr), 31);
+
+    T490NullableLeaf chainNullableLeaf = default;
+    chainNullableLeaf.value = 47;
+    T490NullableLink chainNullableLink = default;
+    chainNullableLink.leaf = &chainNullableLeaf;
+    T490NullableNode chainNullable = default;
+    chainNullable.next = &chainNullableLink;
+    T490NullableNode* chainNullablePtr = &chainNullable;
+    T490NullableNode* nullChainNullablePtr = nullptr;
+    passed += Test("mvfield_nullable_chain", t490NullableReadChain(chainNullablePtr), 47);
+    passed += Test("mvfield_nullable_chain_null", t490NullableReadChain(nullChainNullablePtr), -1);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableOuter box = default; T490NullableOuter* pb = &box; box.mid.inn = t490MakeEscapedOwner(107); box.mid.other = t490MakeEscapedOwner(108); t490Value = t490TakeEscapedOwner(move pb->mid.inn); }
+    passed += Test("mvfield_nullable_direct_move_value", t490Value, 107);
+    passed += Test("mvfield_nullable_direct_move_live", (i64)t490EscapedPayloadLive - mvfieldEscapeBase, (i64)0);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = box.mid; t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_direct_decl", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = pb?.mid; t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_decl_present", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter* pb = nullptr; T490NullableCopyOwner copy = pb?.mid; t490Value = copy.value == 0 && copy.item == nullptr ? 1 : 0; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_decl_null", t490Value * 100 + (int)live * 10 + (int)after, 100);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(8); T490NullableCopyOwner copy = default; copy = pb?.mid; t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_assign_present", t490Value * 100 + (int)live * 10 + (int)after, 820);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter* pb = nullptr; T490NullableCopyOwner copy = t490MakeNullableCopyOwner(8); copy = pb?.mid; t490Value = copy.value == 0 && copy.item == nullptr ? 1 : 0; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_assign_null", t490Value * 100 + (int)live * 10 + (int)after, 100);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = t490NullableCopyReturn(pb); t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_return_present", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter* pb = nullptr; T490NullableCopyOwner copy = t490NullableCopyReturn(pb); t490Value = copy.value == 0 && copy.item == nullptr ? 1 : 0; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_return_null", t490Value * 100 + (int)live * 10 + (int)after, 100);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); t490Value = t490TakeNullableCopyOwner(pb?.mid); live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_sink_present", t490Value * 100 + (int)live * 10 + (int)after, 710);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter* pb = nullptr; t490Value = t490TakeNullableCopyOwner(pb?.mid); live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_sink_null", (t490Value == 0 ? 1 : 0) * 100 + (int)live * 10 + (int)after, 100);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); t490Value = t490ReadNullableCopyOwner(pb?.mid); live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_borrow_value", t490Value * 100 + (int)live * 10 + (int)after, 710);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = true ? pb?.mid : box.mid.copy(); t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_ternary", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyHolder holder = { item = pb?.mid }; t490Value = holder.item.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_brace_field", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner[1] items = { pb?.mid }; t490Value = items[0].value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_array_element", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = t490NullableCopyGenericReturn<T490NullableCopyOwner>(pb); t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_generic_return", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner captured = pb?.mid; Lambda<int()> getter = () => { return captured.value; }; t490Value = getter(); live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_lambda_capture", t490Value * 100 + (int)live * 10 + (int)after, 720);
+
+    t490NullableCopyCount = 0;
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = default; t490SetNullableCopyOwner(&copy, pb); t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_outparam_store", t490Value * 1000 + t490NullableCopyCount * 100 + (int)live * 10 + (int)after, 7120);
+
+    t490NullableCopyCount = 0;
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = default; T490NullableCopyOwner* q = &copy; *q = pb?.mid; t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_deref_store", t490Value * 1000 + t490NullableCopyCount * 100 + (int)live * 10 + (int)after, 7120);
+
+    t490NullableCopyCount = 0;
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); t490Value = t490TakeNullableCopyOwner((pb?.mid)); live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_sink_paren", t490Value * 1000 + t490NullableCopyCount * 100 + (int)live * 10 + (int)after, 7110);
+
+    t490NullableCopyCount = 0;
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = (pb?.mid); t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_decl_paren", t490Value * 1000 + t490NullableCopyCount * 100 + (int)live * 10 + (int)after, 7120);
+
+    t490NullableCopyCount = 0;
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = t490NullableCopyReturnParen(pb); t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_return_paren", t490Value * 1000 + t490NullableCopyCount * 100 + (int)live * 10 + (int)after, 7120);
+
+    t490NullableCopyCount = 0;
+    mvfieldEscapeBase = (i64)t490EscapedPayloadLive;
+    { T490NullableCopyOuter box = default; T490NullableCopyOuter* pb = &box; box.mid = t490MakeNullableCopyOwner(7); T490NullableCopyOwner copy = default; t490SetNullableCopyOwnerParen(&copy, pb); t490Value = copy.value; live = (i64)t490EscapedPayloadLive - mvfieldEscapeBase; }
+    after = (i64)t490EscapedPayloadLive - mvfieldEscapeBase;
+    passed += Test("mvfield_nullable_owner_outparam_paren", t490Value * 1000 + t490NullableCopyCount * 100 + (int)live * 10 + (int)after, 7120);
+
+    t490BraceCtorCount = 0;
+    t490BraceDtorCount = 0;
+    t490BraceOrder = 0;
+    { T490BraceLeaf value = T490BraceLeaf(1); { T490BraceBox box = { inn = move value }; t490Value = box.inn.value * 10 + box.other.value; } }
+    passed += Test("mvfield_brace_move_value", t490Value, 10);
+    passed += Test("mvfield_brace_move_ctor_count", t490BraceCtorCount, 2);
+    passed += Test("mvfield_brace_move_dtor_count", t490BraceDtorCount, 2);
+
+    t490BraceCtorCount = 0;
+    t490BraceDtorCount = 0;
+    t490BraceOrder = 0;
+    { T490BraceLeaf value = T490BraceLeaf(2); { T490BraceBox box = { inn = value }; t490Value = box.inn.value * 10 + box.other.value; } }
+    passed += Test("mvfield_brace_copy_value", t490Value, 20);
+    passed += Test("mvfield_brace_copy_ctor_count", t490BraceCtorCount, 3);
+    passed += Test("mvfield_brace_copy_dtor_count", t490BraceDtorCount, 4);
+
+    t490BraceCtorCount = 0;
+    t490BraceDtorCount = 0;
+    t490BraceOrder = 0;
+    { T490BraceBox box = { inn = t490MakeBraceLeaf(3) }; t490Value = box.inn.value * 10 + box.other.value; }
+    passed += Test("mvfield_brace_temp_value", t490Value, 30);
+    passed += Test("mvfield_brace_temp_ctor_count", t490BraceCtorCount, 3);
+    passed += Test("mvfield_brace_temp_dtor_count", t490BraceDtorCount, 3);
 
     expect_error("use of moved variable 'local'") {
         T490Plain local = default;

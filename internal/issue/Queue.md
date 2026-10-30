@@ -66,17 +66,13 @@ p2 generic-unique-arg-pointer-spelling (19c6c56ec). Run the Windows gate on the 
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| P3 | - | p3/cpp-ctor-address-of-pointer-spelling-vs-clang | RULED 2026-10-24: `&p` = T** value when any candidate accepts it; slot binding fallback only (C++ row) |
 | P3 | - | p3/cpp-pointer-return-unrequested-specialization-not-retried | RULED 2026-10-24: no `a @= b` -> `a = a @ b` fallback on C++ classes (C++ row) |
-| P3 | - | p3/named-brace-init-partial-unwind (item 1) | RULED 2026-10-24: keep refusal, reword diagnostic only |
-| P3 | - | p3/moved-from-struct-leftovers-after-t490 | filed 2026-10-24: reassign-after-move extra dtor, T418 C++ param `_ = move` (immediate release + disarm), field move, raw-pointer-field scope ruling question |
+| P3 | - | p3/moved-from-struct-leftovers-after-t490 | filed 2026-10-24; local field move landed MVFIELD (aea8e89da); open: T418 C++ param `_ = move` (immediate release + disarm), heap-field `move p->inn`, raw-pointer-field scope ruling question |
 | P3 | - | p3/nested-function-type-parameter-not-compared | filed T427 review: function-type component of a function type not compared |
-| P3 | - | p3/call-name-shadowing-leftovers-after-t484 | filed T484 review |
-| P3 | - | p3/returned-pointer-from-call-result-field-temp-dangles | T510 residue: RULED 2026-10-25 item 1 REFUSE (mixed-select legs -> err_); raw temp field into unique int* param double free, ternary owner, accepted leaks |
+| P3 | - | p3/call-name-shadowing-leftovers-after-t484 | implicit-this member template landed SHADOW (a3158cb58), static + viability MTPL (128ea6b82); 3 sections NEED RULING: qualified int -> double at calls (q08), field-default member lookup, self-initializer read; plus outer static template from nested struct (no ruling needed) |
 | P3 | - | p3/ctor-lambda-this-closure-relocation | T515 residue: by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
 | P3 | - | p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
-| P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | RULED 2026-10-25: own-first strict hiding, `.` == `->`, drop the shape fallback (see issue head) (T438) |
-| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | T513 residue (v10-v12): value / return / argument mixed-class `?:` refused, clang converts to the common type (C++ row) |
+| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | decl / return / single-argument sink landed MIXCOND (237dbf3cc); open: multi-argument and non-sink call args (arm temp must live to full-expression end), overload, nested ternary, by-value param arm (C++ row) |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
 
@@ -266,7 +262,6 @@ A3's "after A1" condition is met (A1 landed 2026-09-29).
 
 | Issue | Question |
 |-------|----------|
-| p3/cflat-unique-dot-dispatches-to-pointee-member | `.` on CFlat unique<T>: prefer unique's own members (like C++ smart pointers after T46) or keep forwarding? RULED 2026-10-21 (see lessons digest). |
 | p4/string-functional-construction-spelling | p4: RULED 2026-10-21 - string(ptr) and string(ptr, len) borrow (see lessons digest) |
 
 ### Conflict map (never concurrent)

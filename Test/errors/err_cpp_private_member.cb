@@ -1,6 +1,7 @@
 // A private field of an imported C++ class is laid out (the record's size depends on it) but must
 // not be nameable from CFlat. The diagnostic says "is private", not "has no field named".
 import cpp "cpp_interop_basic.h";
+import cpp "cpp_t495_amppick.hpp";
 
 extern int main()
 {
@@ -30,6 +31,16 @@ extern int main()
     }
     expect_error("member 'K' of C++ class 'cppi_inh.DataViaPrivateBase' is inaccessible: 'cppi_inh.DataGrand' is a private base of 'cppi_inh.DataViaPrivateBase'") {
         int leak = cppi_inh.DataViaPrivateBase.K;
+    }
+    int value = 4;
+    int* p = &value;
+    amp2r3.MethodDeleted m = default;
+    expect_error("call to deleted member function 'f'") {
+        m.f(&p);
+    }
+    amp2r3.MethodNestedNomatch nestedMethod = default;
+    expect_error("no instantiation of C++ function template") {
+        int nested = nestedMethod.f(&p);
     }
     return 0;
 }

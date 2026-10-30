@@ -3415,9 +3415,9 @@ bool testListOfListPtr()
     ll.add(b);
 
     result &= Test("ptr count", ll.count(),         2);
-    result &= Test("ptr a[0]",  ll.get(0).get(0),  10);
-    result &= Test("ptr a[2]",  ll.get(0).get(2),  30);
-    result &= Test("ptr b[1]",  ll.get(1).get(1),  50);
+    result &= Test("ptr a[0]",  (*ll.get(0)).get(0),  10);
+    result &= Test("ptr a[2]",  (*ll.get(0)).get(2),  30);
+    result &= Test("ptr b[1]",  (*ll.get(1)).get(1),  50);
     return result;
 }
 
@@ -3437,6 +3437,111 @@ bool testDictOfListPtr()
     result &= Test("dict value count", got.count(),  2);
     result &= Test("dict value[0]",    got.get(0), 100);
     result &= Test("dict value[1]",    got.get(1), 200);
+    return result;
+}
+
+struct T438bPointee
+{
+    int _p = 22;
+    int collision = 22;
+    bool valid() { return false; }
+    int get(int n) { return n + 40; }
+    int only() { return 31; }
+};
+
+struct T438bBox
+{
+    T438bPointee* raw = nullptr;
+    int collision = 11;
+    int get() { return 11; }
+    T438bPointee* operator->() { return raw; }
+};
+
+// Freeze the T438 accept-set before the receiver-name guard: explicit pointee access,
+// unique members and fields, missing-name forwarding, and user Box access all stay live.
+bool testT438bDispatchAcceptSet()
+{
+    bool result = true;
+    unique<T438bPointee> u = unique<T438bPointee>(new T438bPointee());
+    result &= Test("t438b explicit pointee call", (*u).get(2), 42);
+    result &= Test("t438b unique get dot", u.get() != nullptr, true);
+    result &= Test("t438b unique get arrow", u->get() != nullptr, true);
+    result &= Test("t438b unique field dot", u._p != nullptr, true);
+    result &= Test("t438b unique field arrow", u->_p != nullptr, true);
+    result &= Test("t438b unique forwards dot", u.only(), 31);
+    result &= Test("t438b unique forwards arrow", u->only(), 31);
+
+    T438bBox b = default;
+    b.raw = new T438bPointee();
+    result &= Test("t438b Box own method dot", b.get(), 11);
+    result &= Test("t438b Box own method arrow", b->get(), 11);
+    result &= Test("t438b Box own field dot", b.collision, 11);
+    result &= Test("t438b Box own field arrow", b->collision, 11);
+    result &= Test("t438b Box forwards dot", b.only(), 31);
+    result &= Test("t438b Box forwards arrow", b->only(), 31);
+    T438bPointee* raw = b.raw;
+    b.raw = nullptr;
+    delete raw;
+    return result;
+}
+
+// Same-name unique methods must hide the pointee name for each member-access spelling.
+bool testT438bOwnFirstRegressions()
+{
+    bool result = true;
+    unique<T438bPointee> u = unique<T438bPointee>(new T438bPointee());
+    unique<T438bPointee>* pu = &u;
+    result &= Test("t438b unique valid dot own", u.valid(), true);
+    result &= Test("t438b unique valid arrow own", u->valid(), true);
+    result &= Test("t438b unique valid parenthesized own", (u).valid(), true);
+    result &= Test("t438b unique valid pointer receiver own", pu->valid(), true);
+    result &= Test("t438b unique valid null-conditional own", u?.valid(), true);
+    return result;
+}
+
+struct T438bUfcsPointee
+{
+    int get(int n) { return n + 40; }
+};
+
+struct T438bUfcsOnly
+{
+    T438bUfcsPointee* raw = nullptr;
+    T438bUfcsPointee* operator->() { return raw; }
+};
+
+struct T438bUfcsBox
+{
+    T438bUfcsPointee* raw = nullptr;
+    int get() { return 11; }
+    T438bUfcsPointee* operator->() { return raw; }
+};
+
+struct T438bPlainReceiver {};
+
+int get(T438bUfcsOnly* b, int n) { return 77; }
+int get(T438bUfcsBox* b, int n) { return 77; }
+int get(T438bPlainReceiver* b, int n) { return 77; }
+
+bool testT438bReceiverFirstFreeFunctions()
+{
+    bool result = true;
+    T438bUfcsOnly only = default;
+    only.raw = new T438bUfcsPointee();
+    result &= Test("t438b arrow wrapper receiver-first free", only.get(2), 77);
+
+    T438bUfcsBox box = default;
+    box.raw = new T438bUfcsPointee();
+    result &= Test("t438b own method plus receiver-first free", box.get(2), 77);
+    T438bPlainReceiver plain = default;
+    result &= Test("t438b plain receiver-first free control", plain.get(2), 77);
+
+    T438bUfcsPointee* onlyRaw = only.raw;
+    only.raw = nullptr;
+    delete onlyRaw;
+    T438bUfcsPointee* boxRaw = box.raw;
+    box.raw = nullptr;
+    delete boxRaw;
     return result;
 }
 
@@ -6838,6 +6943,9 @@ extern int main()
     total++; passed += testListOfListOfListByValue()     ? 1 : 0;
     total++; passed += testListOfListPtr()               ? 1 : 0;
     total++; passed += testDictOfListPtr()               ? 1 : 0;
+    total++; passed += testT438bDispatchAcceptSet()      ? 1 : 0;
+    total++; passed += testT438bOwnFirstRegressions()   ? 1 : 0;
+    total++; passed += testT438bReceiverFirstFreeFunctions() ? 1 : 0;
     total++; passed += testAutoReturn()                  ? 1 : 0;
     total++; passed += testSortInt()                     ? 1 : 0;
     total++; passed += testSortFloat()                   ? 1 : 0;

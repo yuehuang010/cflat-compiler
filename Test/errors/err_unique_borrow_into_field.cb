@@ -468,3 +468,53 @@ extern int main()
     bi.t = new Circle();
     return 0;
 }
+
+// The 2026-10-25 ruling rejects a temporary-field borrow when ANY destination arm can outlive
+// the call. These are the moved local/global and fresh/global legs plus heap and out-parameter
+// siblings; the both-local positive remains in Test/test_move.cb.
+void t510JoinLocalGlobal(Node* n, int c)
+{
+    Node* local = nullptr;
+    Node** q = c > 0 ? &local : &gStore;
+    *q = n;
+}
+
+expect_error("borrow of a temporary's field may reach a longer-lived slot") {
+    void temp_uniq_accept_join_dest_local_arm() { t510JoinLocalGlobal(makeBox().t, 1); }
+}
+
+struct T510JoinHeapCell { Node* p = nullptr; };
+T510JoinHeapCell* t510JoinHeap = nullptr;
+void t510JoinHeapGlobal(Node* n, int c)
+{
+    Node* local = nullptr;
+    Node** q = c > 0 ? &local : &t510JoinHeap->p;
+    *q = n;
+}
+
+expect_error("borrow of a temporary's field may reach a longer-lived slot") {
+    void tempFieldJoinHeapArm() { t510JoinHeapGlobal(makeBox().t, 1); }
+}
+
+void t510JoinOut(Node* n, int c, Node** out)
+{
+    Node* local = nullptr;
+    Node** q = c > 0 ? &local : out;
+    *q = n;
+}
+
+expect_error("borrow of a temporary's field may reach a longer-lived slot") {
+    void tempFieldJoinOutParamArm() { Node* out = nullptr; t510JoinOut(makeBox().t, 1, &out); }
+}
+
+void t510JoinFreshGlobal(Node* n, int c)
+{
+    T510JoinHeapCell* fresh = new T510JoinHeapCell();
+    Node** q = c > 0 ? &fresh->p : &gStore;
+    *q = n;
+    delete fresh;
+}
+
+expect_error("borrow of a temporary's field may reach a longer-lived slot") {
+    void temp_uniq_accept_join_dest_fresh_arm() { t510JoinFreshGlobal(makeBox().t, 1); }
+}

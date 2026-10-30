@@ -243,7 +243,7 @@ namespace
         unsigned errors = 0;
         std::string firstError;
         std::string lastError;   // the newest error's text
-        // firstError is a no-viable-operator / invalid-operands error AT an interpreter input
+        // firstError is a no-matching-call / no-viable-operator / invalid-operands error AT an input
         // line (the request's own expression), not inside a header or an instantiated body.
         bool firstErrorNoViableAtInput = false;
         // First error naming a not-yet-defined CFlat record: no retry can complete that record.
@@ -303,7 +303,9 @@ namespace
                 if (firstError.empty())
                 {
                     firstError = std::move(message);
-                    if ((info.getID() == clang::diag::err_ovl_no_viable_oper
+                    if ((info.getID() == clang::diag::err_ovl_no_viable_function_in_call
+                         || info.getID() == clang::diag::err_ovl_no_viable_function_in_init
+                         || info.getID() == clang::diag::err_ovl_no_viable_oper
                          || info.getID() == clang::diag::err_typecheck_invalid_operands)
                         && info.getLocation().isValid() && info.hasSourceManager())
                     {

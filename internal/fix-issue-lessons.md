@@ -3693,3 +3693,10 @@ Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintaine
   closure fixture with a user `_closure_fat_ptr` namespace covers it. Filed p3/closure-dtor-prefix-match-in-cinterop.
 - 2026-10-27 maintainer: "Confirm all" - every line above stands as ruled, R21 included (copy on unproven read, no
   runtime provenance). R7, R16 and R21 are unparked; the veto list is closed.
+
+## Design record 2026-10-28: call-temp field keep-alive leaks are accepted (T510 / RET510 / RET510c)
+
+- A raw pointer read from an owning call temporary's field and passed to a callee the store walk cannot classify
+  (Unknown: indirect callee, bound exhausted, address escape, integer cast, local container add, heap object freed in
+  the callee) keeps the temporary alive and leaks it by design (d=0 where clang destroys at full-expression end).
+  Proving None there would need container-aware summaries; do not re-file. Ternary-of-temps owners follow the same rule.

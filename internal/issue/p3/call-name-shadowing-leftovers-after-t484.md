@@ -5,25 +5,11 @@ including lambda bodies lexically nested in that local's initializer. A generic 
 instantiated during the initializer remains outside that lexical scope. Regression legs are in
 `Test/test_basic.cb` and `Test/errors/err_noncallable_name_shadows_function.cb`.
 
-Four related cases remain.
-
-## Implicit-this generic member template call
-
-Repro: `scratch/t504/generic_method_inferred_root_shadow.cb` and
-`scratch/t504/generic_method_inferred_unique.cb`.
-
-Observed: C++20 accepts both and returns 13 through `Holder::gv<int>`. The worktree still
-reports unknown/undefined `gv`; the master executable failed the same way before edits.
-
-Root cause: generic member templates are stored separately from ordinary function overloads, and
-the bare-call path does not finish template inference and receiver binding before ordinary name
-resolution. An attempted local dispatch reached the instantiated candidate but the call builder
-received only the implicit receiver and no explicit argument, so it still reported no overload.
-
-Fix direction: resolve the enclosing generic member template before outer-name fallback, then pass
-the receiver and explicit arguments through the same successful member-call binding path.
+Four related cases remain (the last needs no ruling).
 
 ## Qualified static method with int-to-double argument conversion
+
+NEEDS RULING: CFlat call arguments never accept int -> double (q08 680d9e8a); accepting it is a call-conversion surface change, not a lookup fix.
 
 Repro: `scratch/t504/qualified_static_overload.cb` and
 `scratch/t504/qualified_static_unique_int.cb`.
@@ -63,3 +49,18 @@ the newly declared local for non-call reads.
 
 Fix direction: handle the local's point of declaration in ordinary expression lookup as well as
 call lookup, with a defined diagnostic or initialization rule.
+
+## Outer static member template called bare from a nested struct
+
+MTPL (128ea6b82) resolves a bare call to a static member template from the owner's instance
+methods, static methods and lambdas, but owner lookup checks only the innermost lexical aggregate
+(`lexicalAggregateScopes.front()`, MainListener_PostfixExpression.cpp ~13600 and ~16044).
+
+```cflat
+struct O { static int gv<T>(T v) { return (int)v + 1; } struct I { static int call() { return gv(3); } }; };
+int main() { return O.I.call(); }
+```
+
+Observed: "Undefined variable gv". Clang returns 4; an outer static PLAIN method in the same
+position already works. Fix direction: walk outward through the lexical aggregate scopes until a
+static member template of that name is found (inner names still hide outer ones).
