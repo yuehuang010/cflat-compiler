@@ -7305,6 +7305,7 @@ struct T472ConstAliasCopy
 };
 
 Resource[] t472FallbackView = default;
+Resource[] t516ShadowBorrowedSource = default;
 
 Resource[] t472ReturnTernaryView(bool choose)
 {
@@ -7325,6 +7326,228 @@ T387FieldHolder t472MakeFieldHolder(int id)
 void t472PutBorrowed(T387ElemHolder* p, Resource[] value)
 {
     p->hs[0].view = value;
+}
+
+int t516ReadField(T387FieldHolder* p) { return p->view[0].id; }
+
+int t516MoveOwnedFirst(T387ElemHolder* p)
+{
+    int selected = p->hs[0].view[0].id;
+    t377MoveViewSink(move p->hs[0].view);
+    return selected;
+}
+
+void t516MoveFirst(T387ElemHolder* p)
+{
+    t377MoveViewSink(move p->hs[0].view);
+}
+
+int t516ReadBorrowedView(Resource[] source)
+{
+    T387FieldHolder h = default;
+    h.view = source;
+    return t516ReadField(&h);
+}
+
+int t516MoveOwnedWithBorrowedSibling(Resource[] source)
+{
+    T387ElemHolder a = default;
+    a.hs[0].view = new Resource[1];
+    a.hs[0].view[0].id = 943;
+    a.hs[1].view = source;
+    int selected = a.hs[1].view[0].id;
+    t516MoveFirst(&a);
+    return selected;
+}
+
+int t516ShadowPointerParam(T387ElemHolder* p)
+{
+    T387ElemHolder z = default;
+    z.hs[0].view = new Resource[1];
+    z.hs[0].view[0].id = 945;
+    int selected = z.hs[0].view[0].id;
+    {
+        T387ElemHolder* p = &z;
+        t377MoveViewSink(move p->hs[0].view);
+    }
+    return selected;
+}
+
+int t516MoveRetargetedPointer(Resource[] source)
+{
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 946;
+    T387ElemHolder* q = &a;
+    T387ElemHolder** qq = &q;
+    *qq = &b;
+    int selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+int t516MoveFromOwnedPointerCandidates(bool chooseA)
+{
+    T387ElemHolder a = default;
+    a.hs[0].view = new Resource[1];
+    a.hs[0].view[0].id = 947;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 948;
+    T387ElemHolder* q = chooseA ? &a : &b;
+    int selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+int t516MoveFromNullOwnedPointerCandidate(bool chooseNull)
+{
+    T387ElemHolder a = default;
+    a.hs[0].view = new Resource[1];
+    a.hs[0].view[0].id = 949;
+    T387ElemHolder* q = chooseNull ? nullptr : &a;
+    int selected = 0;
+    if (q != nullptr)
+    {
+        selected = q->hs[0].view[0].id;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+    return selected;
+}
+
+struct T516R3MethodHolder
+{
+    T387FieldHolder hs[2];
+    int take2()
+    {
+        int selected = hs[0].view[0].id;
+        t377MoveViewSink(move hs[0].view);
+        return selected;
+    }
+    int takeLocal()
+    {
+        T387FieldHolder hs = default;
+        hs.view = new Resource[1];
+        hs.view[0].id = 951;
+        int selected = hs.view[0].id;
+        t377MoveViewSink(move hs.view);
+        return selected;
+    }
+    int takeParam(T387ElemHolder* hs)
+    {
+        return t516MoveOwnedFirst(hs);
+    }
+};
+
+int t516R3MethodOwned()
+{
+    T516R3MethodHolder a = default;
+    a.hs[0].view = new Resource[1];
+    a.hs[0].view[0].id = 950;
+    return a.take2();
+}
+
+int t516R3MethodParamShadow()
+{
+    Resource[] borrowed = new Resource[2];
+    borrowed[0].id = 951;
+    T516R3MethodHolder a = default;
+    a.hs[0].view = borrowed;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 952;
+    return a.takeParam(&b);
+}
+
+int t516R3MethodLocalShadow()
+{
+    Resource[] borrowed = new Resource[2];
+    borrowed[0].id = 957;
+    T516R3MethodHolder a = default;
+    a.hs[0].view = borrowed;
+    return a.takeLocal();
+}
+
+int t516R3ForwardCallee(T387ElemHolder* p);
+
+int t516R3ForwardCaller(T387ElemHolder* p)
+{
+    return t516R3ForwardCallee(p);
+}
+
+int t516R3ForwardCallee(T387ElemHolder* p)
+{
+    int selected = p->hs[0].view[0].id;
+    t377MoveViewSink(move p->hs[0].view);
+    return selected;
+}
+
+int t516R3ArityCallee(T387ElemHolder* p, int k);
+
+int t516R3ArityCaller(T387ElemHolder* p)
+{
+    return t516R3ArityCallee(p, 0);
+}
+
+int t516R3ArityCallee(T387ElemHolder* p, int k)
+{
+    int selected = p->hs[0].view[0].id + k;
+    t377MoveViewSink(move p->hs[0].view);
+    return selected;
+}
+
+int t516R3LastStore(Resource[] source)
+{
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 953;
+    T387ElemHolder* q = &a;
+    q = &b;
+    int selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+// Last store in the declaring block narrows a pointer whose use sits in a nested block.
+int t516R4InnerBlockLastStore(Resource[] source)
+{
+    int selected = -1;
+    {
+        T387ElemHolder a = default;
+        a.hs[0].view = source;
+        T387ElemHolder b = default;
+        b.hs[0].view = new Resource[1];
+        b.hs[0].view[0].id = 961;
+        T387ElemHolder* q = &a;
+        q = &b;
+        if (selected < 0)
+        {
+            selected = q->hs[0].view[0].id;
+            t377MoveViewSink(move q->hs[0].view);
+        }
+    }
+    return selected;
+}
+
+int t516R4NestedUseLastStore(Resource[] source)
+{
+    int selected = -1;
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 962;
+    T387ElemHolder* q = &a;
+    q = &b;
+    {
+        selected = q->hs[0].view[0].id;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+    return selected;
 }
 
 class T387ImplicitHolder
@@ -8022,6 +8245,414 @@ int checkT387NestedLoopOuterDecl(bool arm)
     return passed;
 }
 
+int checkT516OwnedHelperSink()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        T387ElemHolder a = default;
+        a.hs[0].view = new Resource[1];
+        a.hs[0].view[0].id = 941;
+        selected = t516MoveOwnedFirst(&a);
+    }
+    passed += Test("t516_owned_helper_sink_value", selected, 941);
+    passed += Test("t516_owned_helper_sink_dtors", dtorCount, 1);
+    passed += Test("t516_owned_helper_sink_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516ReadOnlyBorrowedField()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 942;
+        selected = t516ReadBorrowedView(source);
+    }
+    passed += Test("t516_read_only_borrowed_value", selected, 942);
+    passed += Test("t516_read_only_borrowed_dtors", dtorCount, 2);
+    passed += Test("t516_read_only_borrowed_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516BorrowedSiblingUntouched()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 944;
+        selected = t516MoveOwnedWithBorrowedSibling(source);
+    }
+    passed += Test("t516_borrowed_sibling_value", selected, 944);
+    passed += Test("t516_borrowed_sibling_dtors", dtorCount, 3);
+    passed += Test("t516_borrowed_sibling_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516ShadowPointerParam(bool useBorrowed)
+{
+    int passed = 0;
+    int selected = -1;
+    t516ShadowBorrowedSource = new Resource[2];
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        T387ElemHolder a = default;
+        a.hs[0].view = useBorrowed ? t516ShadowBorrowedSource : new Resource[1];
+        selected = t516ShadowPointerParam(&a);
+    }
+    passed += Test("t516_shadow_pointer_value", selected, 945);
+    passed += Test("t516_shadow_pointer_dtors", dtorCount, 1);
+    passed += Test("t516_shadow_pointer_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516MoveRetargetedPointer()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 946;
+        selected = t516MoveRetargetedPointer(source);
+    }
+    passed += Test("t516_retargeted_pointer_value", selected, 946);
+    passed += Test("t516_retargeted_pointer_dtors", dtorCount, 3);
+    passed += Test("t516_retargeted_pointer_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516OwnedPointerCandidates(bool chooseA)
+{
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int selected = t516MoveFromOwnedPointerCandidates(chooseA);
+    passed += Test(chooseA ? "t516_owned_pointer_candidates_a_value"
+                           : "t516_owned_pointer_candidates_b_value",
+        selected, chooseA ? 947 : 948);
+    passed += Test(chooseA ? "t516_owned_pointer_candidates_a_dtors"
+                           : "t516_owned_pointer_candidates_b_dtors", dtorCount, 1);
+    passed += Test(chooseA ? "t516_owned_pointer_candidates_a_leaks"
+                           : "t516_owned_pointer_candidates_b_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516NullOwnedPointerCandidate(bool chooseNull)
+{
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int selected = t516MoveFromNullOwnedPointerCandidate(chooseNull);
+    passed += Test(chooseNull ? "t516_null_pointer_candidate_null_value"
+                              : "t516_null_pointer_candidate_owned_value",
+        selected, chooseNull ? 0 : 949);
+    passed += Test(chooseNull ? "t516_null_pointer_candidate_null_dtors"
+                              : "t516_null_pointer_candidate_owned_dtors",
+        dtorCount, chooseNull ? 0 : 1);
+    passed += Test(chooseNull ? "t516_null_pointer_candidate_null_leaks"
+                              : "t516_null_pointer_candidate_owned_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516R3AcceptSet()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    selected = t516R3MethodOwned();
+    passed += Test("t516_r3_implicit_this_owned_value", selected, 950);
+    passed += Test("t516_r3_implicit_this_owned_dtors", dtorCount, 1);
+    passed += Test("t516_r3_implicit_this_owned_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    selected = t516R3MethodLocalShadow();
+    passed += Test("t516_r3_this_field_local_shadow_value", selected, 951);
+    passed += Test("t516_r3_this_field_local_shadow_dtors", dtorCount, 3);
+    passed += Test("t516_r3_this_field_local_shadow_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    selected = t516R3MethodParamShadow();
+    passed += Test("t516_r3_this_field_param_shadow_value", selected, 952);
+    passed += Test("t516_r3_this_field_param_shadow_dtors", dtorCount, 3);
+    passed += Test("t516_r3_this_field_param_shadow_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    T387ElemHolder forward = default;
+    forward.hs[0].view = new Resource[1];
+    forward.hs[0].view[0].id = 954;
+    selected = t516R3ForwardCaller(&forward);
+    passed += Test("t516_r3_forward_chain_owned_value", selected, 954);
+    passed += Test("t516_r3_forward_chain_owned_dtors", dtorCount, 1);
+    passed += Test("t516_r3_forward_chain_owned_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    T387ElemHolder arity = default;
+    arity.hs[0].view = new Resource[1];
+    arity.hs[0].view[0].id = 955;
+    selected = t516R3ArityCaller(&arity);
+    passed += Test("t516_r3_arity_chain_owned_value", selected, 955);
+    passed += Test("t516_r3_arity_chain_owned_dtors", dtorCount, 1);
+    passed += Test("t516_r3_arity_chain_owned_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 956;
+        selected = t516R3LastStore(source);
+    }
+    passed += Test("t516_r3_last_store_owned_value", selected, 953);
+    passed += Test("t516_r3_last_store_owned_dtors", dtorCount, 3);
+    passed += Test("t516_r3_last_store_owned_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT516R4AcceptSet()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 961;
+        selected = t516R4InnerBlockLastStore(source);
+    }
+    passed += Test("t516_r4_inner_block_last_store_value", selected, 961);
+    passed += Test("t516_r4_inner_block_last_store_dtors", dtorCount, 3);
+    passed += Test("t516_r4_inner_block_last_store_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 962;
+        selected = t516R4NestedUseLastStore(source);
+    }
+    passed += Test("t516_r4_nested_use_last_store_value", selected, 962);
+    passed += Test("t516_r4_nested_use_last_store_dtors", dtorCount, 3);
+    passed += Test("t516_r4_nested_use_last_store_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+// An identity store (`q = q + 0`) keeps the last real store as the candidate source.
+int t516R5IdentityLastStore(Resource[] source)
+{
+    int selected = -1;
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 971;
+    T387ElemHolder* q = &a;
+    q = &b;
+    q = q + 0;
+    selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+// A plain nested block runs unconditionally, so its store narrows the pointer.
+int t516R5NestedPlainStore(Resource[] source)
+{
+    int selected = -1;
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 972;
+    T387ElemHolder* q = &a;
+    {
+        q = &b;
+    }
+    selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+// An alias copied through a declaration is tracked; its store to the slot is a candidate.
+int t516R5AliasCopyStore(Resource[] source)
+{
+    int selected = -1;
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 973;
+    T387ElemHolder* q = &a;
+    T387ElemHolder** x = &q;
+    T387ElemHolder** y = x;
+    *y = &b;
+    selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+// A block-local alias named like a parameter resolves to its own declaration only.
+int t516R5ParamNameAlias(Resource[] source, int x)
+{
+    int selected = -1;
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 974;
+    T387ElemHolder* q = &a;
+    {
+        T387ElemHolder** x = &q;
+        *x = &b;
+    }
+    selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+int checkT516R5AcceptSet()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 971;
+        selected = t516R5IdentityLastStore(source);
+    }
+    passed += Test("t516_r5_identity_last_store_value", selected, 971);
+    passed += Test("t516_r5_identity_last_store_dtors", dtorCount, 3);
+    passed += Test("t516_r5_identity_last_store_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 972;
+        selected = t516R5NestedPlainStore(source);
+    }
+    passed += Test("t516_r5_nested_plain_store_value", selected, 972);
+    passed += Test("t516_r5_nested_plain_store_dtors", dtorCount, 3);
+    passed += Test("t516_r5_nested_plain_store_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 973;
+        selected = t516R5AliasCopyStore(source);
+    }
+    passed += Test("t516_r5_alias_copy_store_value", selected, 973);
+    passed += Test("t516_r5_alias_copy_store_dtors", dtorCount, 3);
+    passed += Test("t516_r5_alias_copy_store_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        source[0].id = 974;
+        selected = t516R5ParamNameAlias(source, 0);
+    }
+    passed += Test("t516_r5_param_name_alias_value", selected, 974);
+    passed += Test("t516_r5_param_name_alias_dtors", dtorCount, 3);
+    passed += Test("t516_r5_param_name_alias_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+// A counted for with constant bounds runs its body once, so the store dominates the use.
+int t516R6CountedLoopStore(Resource[] source)
+{
+    int selected = -1;
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 975;
+    T387ElemHolder* q = &a;
+    for (int i = 0; i < 1; i++)
+    {
+        q = &b;
+    }
+    selected = q->hs[0].view[0].id;
+    t377MoveViewSink(move q->hs[0].view);
+    return selected;
+}
+
+// Every root the helper argument can hold is owned once q is retargeted to b.
+int t516R7HelperOwned(Resource[] source)
+{
+    T387ElemHolder a = default;
+    a.hs[0].view = source;
+    T387ElemHolder b = default;
+    b.hs[0].view = new Resource[1];
+    b.hs[0].view[0].id = 976;
+    T387ElemHolder* q = &a;
+    q = &b;
+    int selected = q->hs[0].view[0].id;
+    t516MoveFirst(q);
+    return selected;
+}
+
+int checkT516R6AcceptSet()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        selected = t516R6CountedLoopStore(source);
+    }
+    passed += Test("t516_r6_counted_loop_store_value", selected, 975);
+    passed += Test("t516_r6_counted_loop_store_dtors", dtorCount, 3);
+    passed += Test("t516_r6_counted_loop_store_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    dtorCount = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] source = new Resource[2];
+        selected = t516R7HelperOwned(source);
+    }
+    passed += Test("t516_r7_helper_owned_value", selected, 976);
+    passed += Test("t516_r7_helper_owned_dtors", dtorCount, 3);
+    passed += Test("t516_r7_helper_owned_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
 // A same-named local in an inner scope must not inherit the outer element's borrow state.
 int checkT387ScopeShadowKey(bool arm)
 {
@@ -8298,6 +8929,21 @@ int testT387ReviewAcceptSet()
     passed += checkT387NestedLoopOuterDecl(false);
     passed += checkT387NestedLoopOuterDecl(true);
     passed += checkT472EscapingViews();
+    passed += checkT516OwnedHelperSink();
+    passed += checkT516ReadOnlyBorrowedField();
+    passed += checkT516BorrowedSiblingUntouched();
+    passed += checkT516ShadowPointerParam(true);
+    delete[2] t516ShadowBorrowedSource;
+    t516ShadowBorrowedSource = default;
+    passed += checkT516MoveRetargetedPointer();
+    passed += checkT516OwnedPointerCandidates(true);
+    passed += checkT516OwnedPointerCandidates(false);
+    passed += checkT516NullOwnedPointerCandidate(true);
+    passed += checkT516NullOwnedPointerCandidate(false);
+    passed += checkT516R3AcceptSet();
+    passed += checkT516R4AcceptSet();
+    passed += checkT516R5AcceptSet();
+    passed += checkT516R6AcceptSet();
     return passed;
 }
 
@@ -14077,6 +14723,100 @@ int uqStaticLocalId()
     return s->id;
 }
 
+struct T524NullPtrHolder { unique Resource* p = nullptr; };
+struct T524NullValueHolder { unique<Resource> u = nullptr; };
+unique Resource* t524NullPtrBare;
+unique Resource* t524NullPtrDefault = default;
+unique<Resource> t524NullValueBare;
+unique<Resource> t524NullValueDefault = default;
+T524NullPtrHolder t524NullPtrHolderBare;
+T524NullPtrHolder t524NullPtrHolderDefault = default;
+T524NullPtrHolder t524NullPtrHolderBrace = {};
+T524NullValueHolder t524NullValueHolderBare;
+T524NullValueHolder t524NullValueHolderDefault = default;
+T524NullValueHolder t524NullValueHolderBrace = {};
+// T524 round 5: a pure free-function call with a parameter folds (its parameter spills are frame-local).
+int t524Pick(int x) { return 41; }
+struct T524PickHolder { int x = t524Pick(2); };
+T524PickHolder t524PickHolder;
+// T527: an enum member is a compile-time constant in a global field default (and an expression over it).
+enum T527Band : i32 { T527Low = 0, T527High = 2 };
+struct T527Score { i32 value = 0; i32 band = T527Band.T527High; i32 next = T527Band.T527High + 1; };
+T527Score t527Score = default;
+
+unique<Resource> t524MakeNullOwner(int id)
+{
+    unique<Resource> owner = unique<Resource>(new Resource());
+    owner->id = id;
+    return owner;
+}
+
+int testT524NullOwningGlobalDefaults()
+{
+    int passed = 0;
+    bool allNull = t524NullPtrBare == nullptr && t524NullPtrDefault == nullptr
+        && t524NullValueBare == nullptr && t524NullValueDefault == nullptr
+        && t524NullPtrHolderBare.p == nullptr && t524NullPtrHolderDefault.p == nullptr
+        && t524NullPtrHolderBrace.p == nullptr && t524NullValueHolderBare.u == nullptr
+        && t524NullValueHolderDefault.u == nullptr && t524NullValueHolderBrace.u == nullptr;
+    passed += Test("t524_null_owning_globals_initially_empty", allNull, true);
+    passed += Test("t524_pure_pick_global_default_folds", t524PickHolder.x, 41);
+    passed += Test("t527_enum_member_global_default_folds", t527Score.band, 2);
+    passed += Test("t527_enum_member_expr_global_default_folds", t527Score.next, 3);
+
+    dtorCount = 0;
+    t524NullPtrBare = new Resource();
+    t524NullPtrBare->id = 31;
+    {
+        unique Resource* owner = move t524NullPtrBare;
+        passed += Test("t524_null_ptr_global_move_value_and_source", owner->id == 31
+            && t524NullPtrBare == nullptr, true);
+    }
+    passed += Test("t524_null_ptr_global_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    t524NullValueBare = t524MakeNullOwner(32);
+    {
+        unique<Resource> owner = move t524NullValueBare;
+        passed += Test("t524_null_unique_global_move_value_and_source", owner->id == 32
+            && t524NullValueBare == nullptr, true);
+    }
+    passed += Test("t524_null_unique_global_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    t524NullPtrHolderBare.p = new Resource(); t524NullPtrHolderBare.p->id = 41;
+    t524NullPtrHolderDefault.p = new Resource(); t524NullPtrHolderDefault.p->id = 42;
+    t524NullPtrHolderBrace.p = new Resource(); t524NullPtrHolderBrace.p->id = 43;
+    {
+        unique Resource* a = move t524NullPtrHolderBare.p;
+        unique Resource* b = move t524NullPtrHolderDefault.p;
+        unique Resource* c = move t524NullPtrHolderBrace.p;
+        passed += Test("t524_null_ptr_field_global_move_values_and_sources",
+            a->id == 41 && b->id == 42 && c->id == 43
+                && t524NullPtrHolderBare.p == nullptr
+                && t524NullPtrHolderDefault.p == nullptr
+                && t524NullPtrHolderBrace.p == nullptr, true);
+    }
+    passed += Test("t524_null_ptr_field_global_freed_once_each", dtorCount, 3);
+
+    dtorCount = 0;
+    t524NullValueHolderBare.u = t524MakeNullOwner(51);
+    t524NullValueHolderDefault.u = t524MakeNullOwner(52);
+    t524NullValueHolderBrace.u = t524MakeNullOwner(53);
+    {
+        unique<Resource> a = move t524NullValueHolderBare.u;
+        unique<Resource> b = move t524NullValueHolderDefault.u;
+        unique<Resource> c = move t524NullValueHolderBrace.u;
+        passed += Test("t524_null_unique_field_global_move_values_and_sources",
+            a->id == 51 && b->id == 52 && c->id == 53
+                && t524NullValueHolderBare.u == nullptr
+                && t524NullValueHolderDefault.u == nullptr
+                && t524NullValueHolderBrace.u == nullptr, true);
+    }
+    passed += Test("t524_null_unique_field_global_freed_once_each", dtorCount, 3);
+    return passed;
+}
+
 int testUniqueGlobalStorage()
 {
     int passed = 0;
@@ -14321,6 +15061,14 @@ void borrowLibraryUnique(Resource* value)
     int id = value->id;
 }
 
+struct T519UniqueHolder { unique Resource* value = default; };
+void t519AdoptUniqueField(T519UniqueHolder* holder, move Resource* value)
+{
+    value->id = 519;
+    holder.value = value;
+}
+void t519CountedMovePointerSink(move Resource* value) { }
+
 int testLibraryUnique()
 {
     int passed = 0;
@@ -14511,6 +15259,19 @@ int testLibraryUnique()
     }
     passed += Test("library_unique_iface_list_final_a_dtor", libraryUniqueADtor, 2);
     passed += Test("library_unique_iface_list_final_b_dtor", libraryUniqueBDtor, 1);
+
+    dtorCount = 0;
+    {
+        T519UniqueHolder holder = default;
+        t519AdoptUniqueField(&holder, new Resource());
+        passed += Test("t519_scalar_new_to_unique_field_value", holder.value->id, 519);
+        passed += Test("t519_scalar_new_to_unique_field_live", dtorCount, 0);
+    }
+    passed += Test("t519_scalar_new_to_unique_field_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    t519CountedMovePointerSink(new Resource[3]);
+    passed += Test("t519_array_to_nonadopting_move_pointer_dtor", dtorCount, 3);
 
     return passed;
 }
@@ -16039,11 +16800,127 @@ struct T490Owner
 };
 void t490TakeOwner(move T490Owner value) { }
 
+int t523P2ACtor = 0;
+int t523P2ADtor = 0;
+struct T523P2ALeaf
+{
+    int value = default;
+    T523P2ALeaf() { t523P2ACtor++; }
+    ~T523P2ALeaf() { t523P2ADtor++; }
+};
+struct T523P2AOwner
+{
+    unique<T523P2ALeaf> leaf = default;
+    T523P2AOwner copy()
+    {
+        T523P2AOwner result = default;
+        result.leaf = unique<T523P2ALeaf>(new T523P2ALeaf());
+        result.leaf->value = leaf->value;
+        return move result;
+    }
+};
+struct T523P2AHolder { T523P2AOwner owner = default; };
+T523P2AOwner t523P2AMake(int value)
+{
+    T523P2AOwner result = default;
+    result.leaf = unique<T523P2ALeaf>(new T523P2ALeaf());
+    result.leaf->value = value;
+    return move result;
+}
+void t523P2ARewriteParam(T523P2AOwner owner)
+{
+    Lambda<void()> rewrite = () => { owner = t523P2AMake(2); };
+    rewrite();
+}
+void t523P2ARewriteNested(T523P2AOwner owner)
+{
+    Lambda<void()> outer = () => {
+        Lambda<void()> inner = () => { owner = t523P2AMake(2); };
+        inner();
+    };
+    outer();
+}
+int testT523ByrefClosureRebind()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 base = (i64)HeapAudit.reportLeaks();
+    int value = 0;
+    int liveDtor = 0;
+
+    t523P2ACtor = 0; t523P2ADtor = 0;
+    base = (i64)HeapAudit.reportLeaks();
+    {
+        T523P2AOwner owner = t523P2AMake(1);
+        Lambda<void()> rewrite = () => {
+            owner = t523P2AMake(2);
+            owner = t523P2AMake(3);
+        };
+        rewrite();
+        value = owner.leaf->value;
+        liveDtor = t523P2ADtor;
+    }
+    passed += Test("t523_byref_local_value", value, 3);
+    passed += Test("t523_byref_local_lifecycle", t523P2ACtor * 100 + liveDtor * 10 + t523P2ADtor, 323);
+    passed += Test("t523_byref_local_no_leak", (i64)HeapAudit.reportLeaks() - base, (i64)0);
+
+    t523P2ACtor = 0; t523P2ADtor = 0;
+    base = (i64)HeapAudit.reportLeaks();
+    {
+        T523P2AOwner owner = t523P2AMake(1);
+        owner = t523P2AMake(2);
+        owner = t523P2AMake(3);
+        value = owner.leaf->value;
+        liveDtor = t523P2ADtor;
+    }
+    passed += Test("t523_direct_local_value", value, 3);
+    passed += Test("t523_direct_local_lifecycle", t523P2ACtor * 100 + liveDtor * 10 + t523P2ADtor, 323);
+    passed += Test("t523_direct_local_no_leak", (i64)HeapAudit.reportLeaks() - base, (i64)0);
+
+    t523P2ACtor = 0; t523P2ADtor = 0;
+    base = (i64)HeapAudit.reportLeaks();
+    {
+        T523P2AOwner original = t523P2AMake(1);
+        t523P2ARewriteParam(original);
+        value = original.leaf->value;
+        liveDtor = t523P2ADtor;
+    }
+    passed += Test("t523_param_lambda_source_value", value, 1);
+    passed += Test("t523_param_lambda_lifecycle", t523P2ACtor * 100 + liveDtor * 10 + t523P2ADtor, 323);
+    passed += Test("t523_param_lambda_no_leak", (i64)HeapAudit.reportLeaks() - base, (i64)0);
+
+    t523P2ACtor = 0; t523P2ADtor = 0;
+    base = (i64)HeapAudit.reportLeaks();
+    {
+        T523P2AHolder holder = default;
+        holder.owner = t523P2AMake(1);
+        Lambda<void()> rewrite = () => { holder.owner = t523P2AMake(2); };
+        rewrite();
+        value = holder.owner.leaf->value;
+        liveDtor = t523P2ADtor;
+    }
+    passed += Test("t523_captured_field_value", value, 2);
+    passed += Test("t523_captured_field_lifecycle", t523P2ACtor * 100 + liveDtor * 10 + t523P2ADtor, 212);
+    passed += Test("t523_captured_field_no_leak", (i64)HeapAudit.reportLeaks() - base, (i64)0);
+
+    t523P2ACtor = 0; t523P2ADtor = 0;
+    base = (i64)HeapAudit.reportLeaks();
+    {
+        T523P2AOwner original = t523P2AMake(1);
+        t523P2ARewriteNested(original);
+        value = original.leaf->value;
+        liveDtor = t523P2ADtor;
+    }
+    passed += Test("t523_nested_param_source_value", value, 1);
+    passed += Test("t523_nested_param_lifecycle", t523P2ACtor * 100 + liveDtor * 10 + t523P2ADtor, 323);
+    passed += Test("t523_nested_param_no_leak", (i64)HeapAudit.reportLeaks() - base, (i64)0);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
     int total  = 0;
-
     total += 12;
     passed += testT488MemberDestructionOrder();
     total += 8;
@@ -16599,6 +17476,9 @@ extern int main()
     passed += testUniqueGlobalStorage();
     total += 16;
 
+    passed += testT524NullOwningGlobalDefaults();
+    total += 12;
+
     passed += testCastBorrowsOwningPointer();
     total += 7;
 
@@ -16610,6 +17490,7 @@ extern int main()
 
     passed += testLibraryUnique();
     total += 49;
+    total += 4;
 
     passed += testDesugaredUniquePointerForms();
     total += 43;
@@ -16979,6 +17860,8 @@ extern int main()
     total += 15;
 
     passed += testT364NativeOperatorReturnFacts();
+    passed += testT523ByrefClosureRebind();
+    total += 15;
     total += 3; // T499 branch, loop and for-increment reassign legs
     total += 3;
     total += 18;
@@ -16999,7 +17882,9 @@ extern int main()
     total += 24;
 
     passed += testT387ReviewAcceptSet();
-    total += 58;
+    total += 85;
+    total += 18; // T516 round3 accept-set legs
+    total += 18;
     total += 7;
     total += 12;
     total += 4;
@@ -17275,6 +18160,7 @@ extern int main()
     passed += Test("t505_scalar_mixed_join_call_dtor", dtorCount, 1);
     total += 6;
     total += 26;
+    total += 6;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

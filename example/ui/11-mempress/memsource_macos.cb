@@ -384,7 +384,18 @@ class AppIconBuffer
     }
 };
 
-dictionary<string, unique AppIconBuffer*> _appIconCache = default;
+dictionary<string, unique AppIconBuffer*>* _appIconCache = nullptr;
+
+void initMacAppIconCache()
+{
+    _appIconCache = new dictionary<string, unique AppIconBuffer*>();
+}
+
+void destroyMacAppIconCache()
+{
+    if (_appIconCache != nullptr) delete _appIconCache;
+    _appIconCache = nullptr;
+}
 
 // CGRect decomposes to 4 doubles on arm64, so CGContextDrawImage takes scalars.
 import framework "CoreGraphics";
@@ -605,13 +616,14 @@ AppIconBuffer* _readMacAppIcon(string bundlePath)
 ListRowIcon memSourceAppIcon(AppEntry* app)
 {
     if (app == nullptr || app->exePath.isEmpty() || app->key.isEmpty()) return noListIcon();
+    if (_appIconCache == nullptr) return noListIcon();
     if (!_macIconInit() || _macIconClass("NSWorkspace") == nullptr) return noListIcon();
 
     string cacheKey = app->key.copy();
-    if (!_appIconCache.contains(cacheKey))
-        _appIconCache.set(cacheKey, _readMacAppIcon(cacheKey));
+    if (!_appIconCache->contains(cacheKey))
+        _appIconCache->set(cacheKey, _readMacAppIcon(cacheKey));
 
-    AppIconBuffer* cached = _appIconCache.get(cacheKey);
+    AppIconBuffer* cached = _appIconCache->get(cacheKey);
     if (cached == nullptr || cached->pixels == nullptr || cached->pxW <= 0 || cached->pxH <= 0)
         return noListIcon();
     return listIcon(cached->key.data(), (u64)cached->pixels, cached->pxW, cached->pxH);

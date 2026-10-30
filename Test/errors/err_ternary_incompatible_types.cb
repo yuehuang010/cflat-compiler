@@ -6,6 +6,80 @@
 // branches (e.g. char* literal vs string, or int vs float) are coerced and
 // compile fine; only a true mismatch errors here.
 import "string.cb";
+import cpp "../library/cpp_interop_ternaryref.h";
+
+struct T513VarA { int value = 1; };
+struct T513VarB { int value = 2; };
+
+expect_error("ternary branches have incompatible types 'T513VarA' and 'T513VarB'") {
+    int t513DiscardedStructVariables(bool c) {
+        T513VarA a = default;
+        T513VarB b = default;
+        c ? a : b;
+        return 0;
+    }
+}
+
+expect_error("ternary branches have incompatible types 'T513VarA' and 'T513VarB'") {
+    int t513ValueStructVariables(bool c) {
+        T513VarA a = default;
+        T513VarB b = default;
+        T513VarA result = c ? a : b;
+        return result.value;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513CppA' from this expression; use 'T513CppA(args)', '= default', a 'T513CppA' lvalue, or 'move <T513CppA> lvalue'") {
+    int t513ValueCppClasses(bool c) {
+        T513CppA result = c ? t513MakeA() : t513MakeB();
+        return result.value;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513CppA' from this expression; use 'T513CppA(args)', '= default', a 'T513CppA' lvalue, or 'move <T513CppA> lvalue'") {
+    int t513DiscardedCppClasses(bool c) {
+        c ? t513MakeA() : t513MakeB();
+        return 0;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513CppA' from this expression; use 'T513CppA(args)', '= default', a 'T513CppA' lvalue, or 'move <T513CppA> lvalue'") {
+    int t513BareUnrelatedIntCtor(bool c) {
+        c ? t513MakeA() : t513MakeE();
+        return 0;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513CppA' from this expression; use 'T513CppA(args)', '= default', a 'T513CppA' lvalue, or 'move <T513CppA> lvalue'") {
+    int t513ValueUnrelatedIntCtor(bool c) {
+        T513CppA result = c ? t513MakeA() : t513MakeE();
+        return result.value;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513CppA' from this expression; use 'T513CppA(args)', '= default', a 'T513CppA' lvalue, or 'move <T513CppA> lvalue'") {
+    int t513VariablesUnrelatedIntCtor(bool c) {
+        T513CppA a = default;
+        T513CppE e = default;
+        c ? a : e;
+        return 0;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513CppOp' from this expression; use 'T513CppOp(args)', '= default', a 'T513CppOp' lvalue, or 'move <T513CppOp> lvalue'") {
+    int t513UnrelatedClassConversionOperator(bool c) {
+        c ? t513MakeOp() : t513MakeB();
+        return 0;
+    }
+}
+
+// A discarded conditional still requires the same common type as a value conditional.
+expect_error("ternary branches have incompatible types") {
+    void t513DiscardedIntString(bool c) {
+        string value = "abc";
+        c ? 5 : value;
+    }
+}
 
 expect_error("ternary branches have incompatible types") {
     int bad() {
@@ -62,6 +136,44 @@ expect_error("ternary branches have incompatible types") {
     int genericArmVsInt(int k) {
         int x = k ? tiGen<int> : 2;
         return x;
+    }
+}
+
+// T513 r5: both directions viable (A(const B&) and a deducible B(const U&) ctor): clang refuses as ambiguous.
+expect_error("ternary branches have ambiguous C++ conversions between 'T513R5AmbA' and 'T513R5AmbB'") {
+    int t513R5Ambiguous(bool c) {
+        c ? t513R5MakeAmbA() : t513R5MakeAmbB();
+        return 0;
+    }
+}
+
+// T513 r6: clang refuses a const prvalue or const lvalue arm that the only converting constructor cannot take.
+expect_error("cannot initialize C++ class 'T513R6CK' from this expression") {
+    int t513R6ConstPrvalue(bool c) {
+        c ? t513R6MakeCK() : t513R6MakeCB();
+        return 0;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513R6CK' from this expression") {
+    int t513R6ConstLvalue(bool c) {
+        c ? t513R6CkRef() : t513R6MakeCL();
+        return 0;
+    }
+}
+
+// T513 r7: a trivial prvalue arm cannot bind B(A&) (clang: incompatible operand types), in both orders.
+expect_error("cannot initialize C++ class 'T513R7TA' from this expression") {
+    int t513R7PrvalueToLref(bool c) {
+        c ? t513R7MakeTA() : t513R7MakeLB();
+        return 0;
+    }
+}
+
+expect_error("cannot initialize C++ class 'T513R7LB' from this expression") {
+    int t513R7PrvalueToLrefReversed(bool c) {
+        c ? t513R7MakeLB() : t513R7MakeTA();
+        return 0;
     }
 }
 

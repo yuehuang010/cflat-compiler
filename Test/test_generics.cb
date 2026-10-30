@@ -6297,7 +6297,6 @@ struct T368CtorBodyLater<T> {
         value = seed + p.value;
     }
 };
-T368CtorBodyLater<int> t368CtorBodyLater;
 // The local alias is declared before its by-value use and must resolve without registration.
 struct T368LocalUsingLater<T> {
     int read() {
@@ -6331,7 +6330,6 @@ struct T368DtorBodyLater<T> {
         t368DeferredDtorEvents = t368DeferredDtorEvents * 10 + 4;
     }
 };
-T368DtorBodyLater<int> t368DtorBodyLater;
 struct T368DtorLaterPayload {
     int value = 0;
     ~T368DtorLaterPayload() {
@@ -6376,11 +6374,10 @@ struct T368LifecycleControl<T> {
         t368LifecycleEvents = t368LifecycleEvents * 10 + 4;
     }
 };
-T368LifecycleControl<int> t368LifecycleControl = default;
-
 bool testGenericLaterRecords()
 {
     bool result = true;
+    T368CtorBodyLater<int> t368CtorBodyLater;
     T368LaterPayload input;
     input.value = 151;
     t368MemberLater.field.value = 139;

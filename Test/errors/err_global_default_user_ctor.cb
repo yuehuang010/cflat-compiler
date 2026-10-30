@@ -1,0 +1,9 @@
+// T524: a user-written default constructor body cannot run for a native global.
+struct GSeedUserCtor { int a = 95; GSeedUserCtor() { a = 96; } };
+expect_error("must be constructed in main or made foldable");
+GSeedUserCtor gSeedUserCtor;
+
+extern int main()
+{
+    return gSeedUserCtor.a;
+}

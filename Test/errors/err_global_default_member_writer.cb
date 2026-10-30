@@ -1,0 +1,11 @@
+// T524: a field default that calls a member method writing a global is not foldable, so the
+// native global is refused (ruling 2026-10-25: construct in main or make it foldable).
+int gT524Calls = 0;
+struct T524Writer { int x = 0; int get() { gT524Calls = 41; return 41; } int y = get(); };
+expect_error("must be constructed in main or made foldable");
+T524Writer gT524Writer;
+
+extern int main()
+{
+    return gT524Writer.y;
+}

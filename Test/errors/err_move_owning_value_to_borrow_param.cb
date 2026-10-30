@@ -9,7 +9,7 @@ import "string.cb";
 struct P { int v = 0; };
 struct Holder { unique P* slot = nullptr; int k = 0; };
 
-Holder g_sink = default;
+Holder g_sink;
 
 // Owning struct (synth dtor) moved into a plain borrow param - the case this fix added.
 expect_error("transfers nothing") {

@@ -1216,8 +1216,14 @@ std::string MainListener::ReturnUpcastStructName(const LLVMBackend::NamedVariabl
         return {};
     }
 
+// T522: a frame verdict from provenance the model cannot follow names no local.
 void MainListener::LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, const std::string& structName,
-                                  const std::string& ifaceName) {
+                                  const std::string& ifaceName, bool unproven) {
+        if (unproven)
+        {
+            LogErrorContext(ctx, UnprovenInterfaceReturnText(*Compiler(ctx), ifaceName));
+            return;
+        }
         if (structName.empty())
         {
             LogErrorContext(ctx, std::format("cannot return a local value as interface '{}' - "
@@ -1233,6 +1239,32 @@ void MainListener::LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, cons
             "allocate on the heap ('new {}') and return the pointer",
             SpellType(*Compiler(ctx), structType), SpellType(*Compiler(ctx), interfaceType),
             SpellType(*Compiler(ctx), structType)));
+    }
+
+// T522: the texts a deferred interface-return borrow reports (same wording as the immediate checks).
+static std::pair<std::string, std::string> DeferredInterfaceReturnTexts(LLVMBackend& compiler,
+        const std::string& structName, const std::string& ifaceName)
+{
+        LLVMBackend::TypeAndValue interfaceType{ .TypeName = ifaceName };
+        std::string frame;
+        if (structName.empty())
+            frame = std::format("cannot return a local value as interface '{}' - "
+                "the interface fat pointer would dangle once this function returns; "
+                "allocate the object on the heap and return the pointer", SpellType(compiler, interfaceType));
+        else
+        {
+            LLVMBackend::TypeAndValue structType{ .TypeName = structName };
+            frame = std::format("cannot return local value '{}' as interface '{}' - "
+                "the interface fat pointer would dangle once this function returns; "
+                "allocate on the heap ('new {}') and return the pointer",
+                SpellType(compiler, structType), SpellType(compiler, interfaceType), SpellType(compiler, structType));
+        }
+        std::string alias = std::format(
+            "cannot return a borrow of a local owner as interface '{}' - the "
+            "owning local is freed when this function returns and a borrow "
+            "cannot outlive its owner; return the owning local itself "
+            "('return t;' from a 'move' function) or a heap object", SpellType(compiler, interfaceType));
+        return { std::move(frame), std::move(alias) };
     }
 
 /*
@@ -3628,10 +3660,74 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
                     if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
                             load->getPointerOperand()->stripPointerCasts()))
+                    {
+                        // T522: classify interface call results feeding the slot (through slot
+                        // copies) now, while the owning locals they may borrow are in scope.
+                        std::vector<llvm::AllocaInst*> slots{ slot };
+                        std::unordered_set<const llvm::Value*> seenSlots{ slot };
+                        for (size_t i = 0; i < slots.size() && i < 32; ++i)
+                            for (llvm::User* user : slots[i]->users())
+                            {
+                                auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                                if (store == nullptr || store->getPointerOperand()->stripPointerCasts() != slots[i])
+                                    continue;
+                                llvm::Value* stored = store->getValueOperand();
+                                if (llvm::isa<llvm::CallBase>(stored) && stored->getType() == compiler->GetFatPtrType())
+                                {
+                                    std::vector<LLVMBackend::DeferredCallBorrow> deferred;
+                                    const int borrowKind = CallResultFrameBorrowKind(
+                                        stored, compiler, compiler->currentFunction, &deferred);
+                                    compiler->fatCallBorrowKinds_[stored] = borrowKind;
+                                    if (borrowKind == 0 && !deferred.empty())
+                                    {
+                                        auto [frame, alias] = DeferredInterfaceReturnTexts(
+                                            *compiler, std::string(), compiler->currentFunctionReturnTypeName);
+                                        compiler->RecordDeferredReturnBorrow(std::move(deferred), std::move(frame),
+                                            std::move(alias), errCtx->getStart()->getLine(),
+                                            errCtx->getStart()->getCharPositionInLine(),
+                                            UnprovenInterfaceReturnText(*compiler, compiler->currentFunctionReturnTypeName));
+                                    }
+                                }
+                                else if (auto* copied = llvm::dyn_cast<llvm::LoadInst>(stored))
+                                    if (auto* from = llvm::dyn_cast<llvm::AllocaInst>(
+                                            copied->getPointerOperand()->stripPointerCasts());
+                                        from != nullptr && seenSlots.insert(from).second)
+                                        slots.push_back(from);
+                            }
                         compiler->RecordPendingReturnDangleCheck(
                             slot, load, static_cast<int>(errCtx->getStart()->getLine()),
                             static_cast<int>(errCtx->getStart()->getCharPositionInLine()),
                             compiler->currentFunctionReturnTypeName);
+                    }
+        }
+        // T522: an interface produced by a non-'move' call borrows that call's pointer arguments.
+        if (right != nullptr && returnedFatFrameSlot == nullptr && llvm::isa<llvm::CallBase>(right)
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType() == compiler->GetFatPtrType()
+            && right->getType() == compiler->GetFatPtrType())
+        {
+            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+            std::vector<LLVMBackend::DeferredCallBorrow> deferred;
+            PointerValueRootKind rootKind = PointerRootKindDeferring(right, compiler, deferred);
+            const bool unproven = TakeUnprovenPointerRoot();
+            if (rootKind != PointerValueRootKind::FrameLocal && rootKind != PointerValueRootKind::AliasOfOwnedLocal
+                && !deferred.empty())
+            {
+                auto [frame, alias] = DeferredInterfaceReturnTexts(
+                    *compiler, BoxedStructNameOfFatValue(right, compiler), ifaceName);
+                compiler->RecordDeferredReturnBorrow(std::move(deferred), std::move(frame), std::move(alias),
+                    errCtx->getStart()->getLine(), errCtx->getStart()->getCharPositionInLine(),
+                    UnprovenInterfaceReturnText(*compiler, ifaceName));
+            }
+            if (rootKind == PointerValueRootKind::FrameLocal)
+                LogInterfaceReturnDangle(errCtx, BoxedStructNameOfFatValue(right, compiler), ifaceName, unproven);
+            else if (rootKind == PointerValueRootKind::AliasOfOwnedLocal)
+                LogErrorContext(errCtx, std::format(
+                    "cannot return a borrow of a local owner as interface '{}' - the "
+                    "owning local is freed when this function returns and a borrow "
+                    "cannot outlive its owner; return the owning local itself "
+                    "('return t;' from a 'move' function) or a heap object",
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
         }
         if (auto* fatTy = compiler->GetFatPtrType();
             right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
@@ -3674,7 +3770,18 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     // provable roots refuse; an undecided root is accepted as before.
                     if (right->getType()->isPointerTy() && !llvm::isa<llvm::Constant>(right))
                     {
-                        PointerValueRootKind rootKind = PointerRootKind(right, compiler);
+                        std::vector<LLVMBackend::DeferredCallBorrow> deferred;
+                        PointerValueRootKind rootKind = PointerRootKindDeferring(right, compiler, deferred);
+                        const bool unproven = TakeUnprovenPointerRoot();
+                        if (rootKind != PointerValueRootKind::FrameLocal
+                            && rootKind != PointerValueRootKind::AliasOfOwnedLocal && !deferred.empty())
+                        {
+                            auto [frame, alias] = DeferredInterfaceReturnTexts(*compiler, structName, ifaceName);
+                            compiler->RecordDeferredReturnBorrow(std::move(deferred), std::move(frame),
+                                std::move(alias), errCtx->getStart()->getLine(),
+                                errCtx->getStart()->getCharPositionInLine(),
+                                UnprovenInterfaceReturnText(*compiler, ifaceName));
+                        }
                         // `&hp->first` folds to `hp` in IR (field 0): a member address of an owning local
                         // is still a borrow of it. `&t[0]` is not a member access and stays a move.
                         auto addressOfMemberShape = [&]() {
@@ -3727,7 +3834,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                         if (rootKind == PointerValueRootKind::OwnedLocal && addressOfMemberShape())
                             rootKind = PointerValueRootKind::AliasOfOwnedLocal;
                         if (rootKind == PointerValueRootKind::FrameLocal)
-                            LogInterfaceReturnDangle(errCtx, structName, ifaceName);
+                            LogInterfaceReturnDangle(errCtx, structName, ifaceName, unproven);
                         else if (rootKind == PointerValueRootKind::AliasOfOwnedLocal)
                             LogErrorContext(errCtx, std::format(
                                 "cannot return a borrow of a local owner as interface '{}' - the "

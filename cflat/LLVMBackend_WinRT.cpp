@@ -1,5 +1,6 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
+#include <limits>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Instructions.h>
@@ -1761,42 +1762,862 @@ bool LLVMBackend::JoinArmsStillKeepOwner(const NamedVariable& nv, int depth) con
         return true;
 }
 
+struct NonLocalViewStoragePath
+{
+    const llvm::Value* Root = nullptr;
+    std::vector<const llvm::Value*> Indices;
+};
+
+static bool PointerSlotHasEscaped(const llvm::AllocaInst* slot)
+{
+    if (slot == nullptr) return true;
+    for (const auto* user : slot->users())
+    {
+        if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+        {
+            if (load->getPointerOperand()->stripPointerCasts() == slot) continue;
+            return true;
+        }
+        if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+        {
+            if (store->getPointerOperand()->stripPointerCasts() == slot) continue;
+            return true;
+        }
+        if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            if (const llvm::Function* callee = call->getCalledFunction(); callee != nullptr)
+            {
+                const auto name = callee->getName();
+                if (name.starts_with("llvm.dbg.") || name.starts_with("llvm.lifetime.")) continue;
+            }
+        return true;
+    }
+    return false;
+}
+
+static bool NonLocalFieldPathMatches(const std::string& pattern, const std::string& value)
+{
+    size_t p = 0;
+    size_t v = 0;
+    while (p < pattern.size() && v < value.size())
+    {
+        if (p + 2 < pattern.size() && pattern[p] == '['
+            && pattern[p + 1] == '*' && pattern[p + 2] == ']')
+        {
+            if (value[v] != '[') return false;
+            const size_t close = value.find(']', v + 1);
+            if (close == std::string::npos || close == v + 1) return false;
+            p += 3;
+            v = close + 1;
+            continue;
+        }
+        if (pattern[p++] != value[v++]) return false;
+    }
+    return p == pattern.size() && v == value.size();
+}
+
+static bool NonLocalFieldPathsAlias(const std::string& left, const std::string& right)
+{
+    return left == right || NonLocalFieldPathMatches(left, right)
+        || NonLocalFieldPathMatches(right, left);
+}
+
+static bool SameProvenNonLocalViewPath(const NonLocalViewStoragePath& left,
+        const NonLocalViewStoragePath& right);
+
+static bool CollectNonLocalViewStorageCandidates(const llvm::Value* value,
+        const llvm::Function* function, std::unordered_set<const llvm::Value*>& active,
+        std::vector<NonLocalViewStoragePath>& candidates, unsigned depth = 0)
+{
+    if (value == nullptr || depth > 32) return false;
+    value = value->stripPointerCasts();
+    if (llvm::isa<llvm::ConstantPointerNull>(value)) return true;
+    if (!active.insert(value).second) return false;
+    bool resolved = true;
+    if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+    {
+        std::vector<NonLocalViewStoragePath> bases;
+        resolved = CollectNonLocalViewStorageCandidates(gep->getPointerOperand(), function,
+            active, bases, depth + 1);
+        if (resolved)
+        {
+            for (auto& path : bases)
+                for (auto index = gep->idx_begin(); index != gep->idx_end(); ++index)
+                    path.Indices.push_back(index->get());
+            candidates.insert(candidates.end(), bases.begin(), bases.end());
+        }
+    }
+    else if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+    {
+        const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
+            load->getPointerOperand()->stripPointerCasts());
+        if (function == nullptr || slot == nullptr || !slot->getAllocatedType()->isPointerTy()
+            || PointerSlotHasEscaped(slot))
+            resolved = false;
+        else
+        {
+            bool foundStore = false;
+            for (const auto& block : *function)
+                for (const auto& instruction : block)
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+                        store != nullptr
+                        && store->getPointerOperand()->stripPointerCasts() == slot)
+                    {
+                        foundStore = true;
+                        if (!CollectNonLocalViewStorageCandidates(store->getValueOperand(), function,
+                                active, candidates, depth + 1))
+                            resolved = false;
+                        if (!resolved || candidates.size() > 8) break;
+                    }
+            if (!foundStore) resolved = false;
+        }
+    }
+    else if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+    {
+        for (const auto& incoming : phi->incoming_values())
+        {
+            if (!CollectNonLocalViewStorageCandidates(incoming.get(), function, active,
+                    candidates, depth + 1) || candidates.size() > 8)
+            {
+                resolved = false;
+                break;
+            }
+        }
+    }
+    else if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+    {
+        resolved = CollectNonLocalViewStorageCandidates(select->getTrueValue(), function,
+                active, candidates, depth + 1)
+            && CollectNonLocalViewStorageCandidates(select->getFalseValue(), function,
+                active, candidates, depth + 1)
+            && candidates.size() <= 8;
+    }
+    else if (llvm::isa<llvm::AllocaInst>(value))
+        candidates.push_back({ value, {} });
+    else
+        resolved = false;
+    active.erase(value);
+    return resolved;
+}
+
+static void DeduplicateNonLocalViewStorageCandidates(
+        std::vector<NonLocalViewStoragePath>& candidates)
+{
+    std::vector<NonLocalViewStoragePath> unique;
+    for (auto& candidate : candidates)
+        if (std::none_of(unique.begin(), unique.end(), [&](const auto& prior) {
+                return SameProvenNonLocalViewPath(prior, candidate);
+            }))
+            unique.push_back(std::move(candidate));
+    candidates = std::move(unique);
+}
+
+static bool SourceViewFieldRootAndPath(antlr4::tree::ParseTree* source,
+        std::string& rootName, std::string& fieldPath)
+{
+    CFlatParser::MoveExpressionContext* move = nullptr;
+    unsigned moveCount = 0;
+    auto findMove = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (node != source
+            && (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr
+                || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node) != nullptr)) return;
+        if (auto* found = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+        {
+            ++moveCount;
+            if (moveCount > 1) { move = nullptr; return; }
+            move = found;
+            return;
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    findMove(findMove, source);
+    if (moveCount != 1 || move == nullptr || move->unaryExpression() == nullptr) return false;
+    auto* postfix = SolePostfixExpressionShape(move->unaryExpression());
+    auto* primary = postfix != nullptr ? postfix->primaryExpression() : nullptr;
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    if (postfix == nullptr || primary == nullptr || primary->children.size() != 1
+        || generic == nullptr || generic->genericTypeParameters() != nullptr
+        || generic->Identifier() == nullptr)
+        return false;
+    rootName = generic->Identifier()->getText();
+    bool sawArrow = false;
+    for (size_t i = 1; i < postfix->children.size();)
+    {
+        auto* token = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+        if (token == nullptr) return false;
+        const size_t tokenType = token->getSymbol()->getType();
+        if (tokenType == CFlatParser::Arrow || tokenType == CFlatParser::Dot)
+        {
+            if (i + 1 >= postfix->children.size()) return false;
+            auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i + 1]);
+            if (member == nullptr) return false;
+            if (tokenType == CFlatParser::Arrow)
+            {
+                if (sawArrow || !fieldPath.empty()) return false;
+                sawArrow = true;
+                fieldPath = member->getText();
+            }
+            else
+            {
+                if (!sawArrow) return false;
+                fieldPath += "." + member->getText();
+            }
+            i += 2;
+            continue;
+        }
+        if (tokenType == CFlatParser::LeftBracket)
+        {
+            if (!sawArrow || i + 2 >= postfix->children.size()) return false;
+            auto* expression = dynamic_cast<CFlatParser::ExpressionContext*>(postfix->children[i + 1]);
+            auto* close = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i + 2]);
+            auto* indexPostfix = SolePostfixExpressionShape(expression);
+            auto* indexPrimary = indexPostfix != nullptr
+                ? indexPostfix->primaryExpression() : nullptr;
+            auto* literal = indexPrimary != nullptr ? indexPrimary->Constant() : nullptr;
+            if (indexPostfix == nullptr || close == nullptr
+                || close->getSymbol()->getType() != CFlatParser::RightBracket)
+                return false;
+            bool constantIndex = false;
+            if (indexPostfix->children.size() == 1 && indexPrimary != nullptr
+                && indexPrimary->children.size() == 1 && literal != nullptr)
+            {
+                const std::string digits = literal->getText();
+                uint64_t index = 0;
+                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), index);
+                if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size())
+                {
+                    fieldPath += "[" + std::to_string(index) + "]";
+                    constantIndex = true;
+                }
+            }
+            if (!constantIndex) fieldPath += "[*]";
+            i += 3;
+            continue;
+        }
+        return false;
+    }
+    return sawArrow && !fieldPath.empty();
+}
+
+static bool CollectSourcePointerRootNames(antlr4::tree::ParseTree* value,
+        std::vector<std::string>& names)
+{
+    if (value == nullptr) return false;
+    if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(value))
+    {
+        if (assignment->assignmentOperator() != nullptr) return false;
+        return CollectSourcePointerRootNames(assignment->conditionalExpression(), names);
+    }
+    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(value))
+    {
+        if (conditional->expression() != nullptr && conditional->conditionalExpression() != nullptr)
+            return CollectSourcePointerRootNames(conditional->expression(), names)
+                && CollectSourcePointerRootNames(conditional->conditionalExpression(), names);
+        if (conditional->QuestionQuestion() != nullptr) return false;
+    }
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(value))
+    {
+        // This is reached only for a well-typed pointer initializer/store; a bare constant there
+        // is a null pointer constant, so it contributes no local root candidate.
+        if (primary->Constant() != nullptr) return true;
+        return false;
+    }
+    if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(value))
+    {
+        if (unary->unaryOperator() != nullptr)
+        {
+            if (unary->unaryOperator()->getText() != "&") return false;
+            const std::string name = SimpleIdentifierExpressionName(unary->castExpression());
+            if (name.empty()) return false;
+            names.push_back(name);
+            return names.size() <= 8;
+        }
+    }
+    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(value);
+    if (rule != nullptr && rule->children.size() == 1)
+        return CollectSourcePointerRootNames(rule->children.front(), names);
+    return false;
+}
+
+// Plain decimal literal text (no leading zero, no suffix) that fits int, or nullopt.
+static std::optional<long long> CountedLoopLiteralValue(const std::string& text)
+{
+    if (text.empty() || text.size() > 10 || (text.size() > 1 && text[0] == '0')) return std::nullopt;
+    for (char c : text)
+        if (c < '0' || c > '9') return std::nullopt;
+    const long long value = std::stoll(text);
+    if (value > std::numeric_limits<int>::max()) return std::nullopt;
+    return value;
+}
+
+// True when a break, continue, return or label starts before token anywhere under root.
+static bool JumpOrLabelStartsBefore(antlr4::tree::ParseTree* root, size_t token)
+{
+    if (root == nullptr) return false;
+    if (dynamic_cast<CFlatParser::JumpStatementContext*>(root) != nullptr
+        || dynamic_cast<CFlatParser::LabeledStatementContext*>(root) != nullptr)
+    {
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(root);
+        if (ctx != nullptr && ctx->getStart() != nullptr
+            && ctx->getStart()->getTokenIndex() < token)
+            return true;
+    }
+    for (auto* child : root->children)
+        if (JumpOrLabelStartsBefore(child, token)) return true;
+    return false;
+}
+
+// `for (int NAME = N; NAME OP M; NAME++ or NAME += K)` with integer literals, OP one of
+// <, <=, != and the first test true for N: the body runs at least once.
+static bool CountedForRunsBodyOnce(CFlatParser::IterationStatementContext* loop)
+{
+    auto* condition = loop->forCondition();
+    if (condition == nullptr || condition->forDeclaration() == nullptr
+        || condition->assignmentExpression() == nullptr || condition->forExpression() == nullptr)
+        return false;
+    auto* list = condition->forDeclaration()->initDeclaratorList();
+    if (list == nullptr || list->initDeclarator().size() != 1) return false;
+    // Only a plain int loop variable holds every accepted literal unchanged.
+    if (condition->forDeclaration()->declarationSpecifiers() == nullptr
+        || condition->forDeclaration()->declarationSpecifiers()->getText() != "int") return false;
+    auto* init = list->initDeclarator(0);
+    auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+    if (direct == nullptr || direct->Identifier() == nullptr
+        || init->initializer() == nullptr
+        || init->initializer()->assignmentExpression() == nullptr)
+        return false;
+    const std::string name = direct->Identifier()->getText();
+    const auto start = CountedLoopLiteralValue(init->initializer()->assignmentExpression()->getText());
+    const std::string test = condition->assignmentExpression()->getText();
+    const std::string step = condition->forExpression()->getText();
+    if (!start.has_value() || test.compare(0, name.size(), name) != 0) return false;
+    bool stepOk = step == name + "++";
+    if (!stepOk && step.compare(0, name.size() + 2, name + "+=") == 0)
+        stepOk = CountedLoopLiteralValue(step.substr(name.size() + 2)).has_value();
+    if (!stepOk) return false;
+    const std::string rest = test.substr(name.size());
+    for (const std::string op : {"<=", "!=", "<"})
+    {
+        if (rest.compare(0, op.size(), op) != 0) continue;
+        const auto bound = CountedLoopLiteralValue(rest.substr(op.size()));
+        if (!bound.has_value()) return false;
+        if (op == "<=") return *start <= *bound;
+        if (op == "!=") return *start != *bound;
+        return *start < *bound;
+    }
+    return false;
+}
+
+// True when child is the body of a counted for that runs at least once, and no break,
+// continue, return or label starts before node inside that body.
+static bool IsRunOnceCountedForBody(CFlatParser::IterationStatementContext* loop,
+        antlr4::tree::ParseTree* child, antlr4::tree::ParseTree* node)
+{
+    if (child == nullptr || child != loop->statement()) return false;
+    auto* nodeContext = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    if (nodeContext == nullptr || nodeContext->getStart() == nullptr) return false;
+    return CountedForRunsBodyOnce(loop)
+        && !JumpOrLabelStartsBefore(loop->statement(), nodeContext->getStart()->getTokenIndex());
+}
+
+// True when node runs directly in block: no nested block, branch, loop, label, ?:, && or ||
+// between them, so every path through block after node passes through node.
+// A counted for body that always runs once (see CountedForRunsBodyOnce) does not break this.
+static bool IsStraightLineInBlock(antlr4::tree::ParseTree* node,
+        CFlatParser::CompoundStatementContext* block)
+{
+    if (node == nullptr || block == nullptr) return false;
+    antlr4::tree::ParseTree* child = nullptr;
+    for (auto* parent = node; parent != nullptr; child = parent, parent = parent->parent)
+    {
+        if (parent == block) return true;
+        // A plain nested block runs unconditionally; branch and loop bodies are caught below.
+        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::SelectionStatementContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::LabeledStatementContext*>(parent) != nullptr)
+            return false;
+        if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent);
+            loop != nullptr && !IsRunOnceCountedForBody(loop, child, node))
+            return false;
+        if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent);
+            conditional != nullptr && conditional->children.size() > 1)
+            return false;
+        if (auto* logicalAnd = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(parent);
+            logicalAnd != nullptr && logicalAnd->inclusiveOrExpression().size() > 1)
+            return false;
+        if (auto* logicalOr = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(parent);
+            logicalOr != nullptr && logicalOr->logicalAndExpression().size() > 1)
+            return false;
+    }
+    return false;
+}
+
+// A use inside block (any depth of nested statements) that is not in a lambda body, which
+// runs later on its own schedule.
+static bool IsNestedInBlockWithoutLambda(antlr4::tree::ParseTree* node,
+        CFlatParser::CompoundStatementContext* block)
+{
+    if (node == nullptr || block == nullptr) return false;
+    for (auto* parent = node; parent != nullptr; parent = parent->parent)
+    {
+        if (parent == block) return true;
+        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr) return false;
+    }
+    return false;
+}
+
+static bool IsAncestorOf(const antlr4::tree::ParseTree* ancestor, const antlr4::tree::ParseTree* node)
+{
+    for (auto* parent = node; parent != nullptr; parent = parent->parent)
+        if (parent == ancestor) return true;
+    return false;
+}
+
+// A store after the use reaches it again only through an enclosing loop that holds both but not
+// the declaration (each iteration re-declares the pointer otherwise).
+static bool StoreReachesUseThroughLoop(const antlr4::tree::ParseTree* store,
+        const antlr4::tree::ParseTree* use, const antlr4::tree::ParseTree* init)
+{
+    for (auto* loop = store->parent; loop != nullptr; loop = loop->parent)
+        if (dynamic_cast<const CFlatParser::IterationStatementContext*>(loop) != nullptr
+            && IsAncestorOf(loop, use) && !IsAncestorOf(loop, init))
+            return true;
+    return false;
+}
+
+// `q`, `q + 0`, `q - 0`: the value and the candidate roots of q are unchanged.
+static bool IsIdentityPointerValue(const std::string& text, const std::string& slotName)
+{
+    return text == slotName || text == slotName + "+0" || text == slotName + "-0";
+}
+
+static antlr4::tree::TerminalNode* FirstIdentifierTerminal(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return nullptr;
+    if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+        return terminal->getSymbol()->getType() == CFlatParser::Identifier ? terminal : nullptr;
+    for (auto* child : node->children)
+        if (auto* found = FirstIdentifierTerminal(child)) return found;
+    return nullptr;
+}
+
+static bool IsMemberNameTerminal(const antlr4::tree::ParseTree* terminal)
+{
+    for (auto* parent = terminal->parent; parent != nullptr; parent = parent->parent)
+    {
+        if (dynamic_cast<const CFlatParser::MemberNameTokenContext*>(parent) != nullptr) return true;
+        if (dynamic_cast<const CFlatParser::CompoundStatementContext*>(parent) != nullptr) return false;
+    }
+    return false;
+}
+
+// A declaration is visible in its nearest compound or iteration statement.
+static antlr4::tree::ParseTree* DeclarationScopeNode(antlr4::tree::ParseTree* declaration)
+{
+    for (auto* parent = declaration->parent; parent != nullptr; parent = parent->parent)
+        if (dynamic_cast<CFlatParser::CompoundStatementContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::IterationStatementContext*>(parent) != nullptr)
+            return parent;
+    return nullptr;
+}
+
+// True when the reference names the alias binding: it follows the alias inside the alias scope
+// and no other declaration of the name visible at the reference shadows it.
+static bool ReferenceSeesAlias(antlr4::tree::TerminalNode* reference,
+        CFlatParser::InitDeclaratorContext* alias, antlr4::tree::ParseTree* aliasScope,
+        const std::vector<CFlatParser::InitDeclaratorContext*>& sameName)
+{
+    const size_t referenceToken = static_cast<size_t>(reference->getSymbol()->getTokenIndex());
+    const size_t aliasToken = static_cast<size_t>(alias->getStart()->getTokenIndex());
+    if (referenceToken <= aliasToken || !IsAncestorOf(aliasScope, reference)) return false;
+    for (auto* other : sameName)
+    {
+        if (other == alias) continue;
+        auto* scope = DeclarationScopeNode(other);
+        const size_t otherToken = static_cast<size_t>(other->getStart()->getTokenIndex());
+        if (scope == nullptr || otherToken >= referenceToken || !IsAncestorOf(scope, reference))
+            continue;
+        if (scope == aliasScope)
+        {
+            if (otherToken > aliasToken) return false;
+        }
+        else if (IsAncestorOf(aliasScope, scope))
+            return false;
+    }
+    return true;
+}
+
+// Writes that reach an escaped pointer slot through a local alias `T** x = &slot;`. Accepted only
+// for a closed alias: every reference that resolves to the alias is a plain `*x = value;` target,
+// no lambda is present, and the alias is not a parameter-shadowing redeclaration.
+static std::optional<std::vector<CFlatParser::AssignmentExpressionContext*>> CollectIndirectSlotStores(
+        CFlatParser::FunctionDefinitionContext* function, const std::string& slotName)
+{
+    const std::string addressText = "&" + slotName;
+    std::vector<CFlatParser::InitDeclaratorContext*> initDecls;
+    std::vector<CFlatParser::InitDeclaratorContext*> aliasDecls;
+    std::vector<CFlatParser::AssignmentExpressionContext*> assignments;
+    std::vector<CFlatParser::UnaryExpressionContext*> stars;
+    std::vector<antlr4::tree::TerminalNode*> identifiers;
+    std::set<const antlr4::tree::ParseTree*> declIdentifiers;
+    size_t addressCount = 0;
+    bool hasLambda = false;
+    auto walk = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+        {
+            if (terminal->getSymbol()->getType() == CFlatParser::Identifier)
+                identifiers.push_back(terminal);
+            return;
+        }
+        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr) hasLambda = true;
+        if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
+        {
+            initDecls.push_back(init);
+            auto* declarator = init->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            if (direct != nullptr && direct->Identifier() != nullptr)
+                declIdentifiers.insert(direct->Identifier());
+            auto* initializer = init->initializer();
+            if (direct != nullptr && direct->Identifier() != nullptr && initializer != nullptr
+                && initializer->assignmentExpression() != nullptr
+                && initializer->assignmentExpression()->getText() == addressText)
+                aliasDecls.push_back(init);
+        }
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+            assignments.push_back(assignment);
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+        {
+            const std::string text = unary->getText();
+            if (text == addressText) ++addressCount;
+            if (!text.empty() && text[0] == '*') stars.push_back(unary);
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    walk(walk, function);
+    if (hasLambda || aliasDecls.empty() || addressCount != aliasDecls.size()) return std::nullopt;
+
+    // A declaration copying an alias (`T** y = x;`) is an alias too. Its initializer reference is
+    // the copy itself, so it does not count as a use of x.
+    std::set<const antlr4::tree::ParseTree*> copyTerminals;
+    std::set<std::string> aliasNames;
+    for (auto* alias : aliasDecls)
+        aliasNames.insert(alias->declarator()->directDeclarator()->Identifier()->getText());
+    for (bool grown = true; grown;)
+    {
+        grown = false;
+        for (auto* init : initDecls)
+        {
+            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+            auto* initializer = init->initializer();
+            if (direct == nullptr || direct->Identifier() == nullptr || initializer == nullptr
+                || initializer->assignmentExpression() == nullptr) continue;
+            const std::string name = direct->Identifier()->getText();
+            auto* copied = FirstIdentifierTerminal(initializer->assignmentExpression());
+            if (copied == nullptr || aliasNames.count(copied->getText()) == 0
+                || aliasNames.count(name) != 0
+                || initializer->assignmentExpression()->getText() != copied->getText()) continue;
+            // The copied name must resolve to an alias binding, not a same-named shadow.
+            bool seesAlias = false;
+            for (auto* alias : aliasDecls)
+            {
+                const std::string aliasName = alias->declarator()->directDeclarator()->Identifier()->getText();
+                if (aliasName != copied->getText()) continue;
+                std::vector<CFlatParser::InitDeclaratorContext*> sameName;
+                for (auto* decl : initDecls)
+                    if (decl->declarator()->directDeclarator()->Identifier()->getText() == aliasName)
+                        sameName.push_back(decl);
+                auto* scope = DeclarationScopeNode(alias);
+                if (scope != nullptr && ReferenceSeesAlias(copied, alias, scope, sameName))
+                    seesAlias = true;
+            }
+            if (!seesAlias) continue;
+            aliasDecls.push_back(init);
+            aliasNames.insert(name);
+            copyTerminals.insert(copied);
+            grown = true;
+        }
+    }
+
+    std::vector<CFlatParser::AssignmentExpressionContext*> aliasStores;
+    for (auto* alias : aliasDecls)
+    {
+        const std::string name = alias->declarator()->directDeclarator()->Identifier()->getText();
+        auto* scope = DeclarationScopeNode(alias);
+        if (dynamic_cast<CFlatParser::CompoundStatementContext*>(scope) == nullptr) return std::nullopt;
+        if (scope == function->compoundStatement())
+            for (auto* terminal : identifiers)
+                if (terminal->getText() == name && !IsAncestorOf(function->compoundStatement(), terminal))
+                    return std::nullopt;
+        std::vector<CFlatParser::InitDeclaratorContext*> sameName;
+        for (auto* decl : initDecls)
+            if (decl->declarator()->directDeclarator()->Identifier()->getText() == name)
+                sameName.push_back(decl);
+        auto resolves = [&](antlr4::tree::TerminalNode* terminal) {
+            return terminal->getText() == name && declIdentifiers.count(terminal) == 0
+                && copyTerminals.count(terminal) == 0 && !IsMemberNameTerminal(terminal)
+                && ReferenceSeesAlias(terminal, alias, scope, sameName);
+        };
+        size_t references = 0;
+        for (auto* terminal : identifiers)
+            if (resolves(terminal)) ++references;
+        size_t resolvedStars = 0;
+        for (auto* star : stars)
+        {
+            auto* terminal = FirstIdentifierTerminal(star);
+            if (star->getText() == "*" + name && terminal != nullptr && resolves(terminal))
+                ++resolvedStars;
+        }
+        std::vector<CFlatParser::AssignmentExpressionContext*> plain;
+        for (auto* assignment : assignments)
+        {
+            if (assignment->unaryExpression() == nullptr) continue;
+            auto* terminal = FirstIdentifierTerminal(assignment->unaryExpression());
+            if (assignment->unaryExpression()->getText() != "*" + name
+                || terminal == nullptr || !resolves(terminal)) continue;
+            if (assignment->assignmentOperator() == nullptr
+                || assignment->assignmentOperator()->getText() != "=") return std::nullopt;
+            plain.push_back(assignment);
+        }
+        if (resolvedStars != plain.size() || references != plain.size()) return std::nullopt;
+        aliasStores.insert(aliasStores.end(), plain.begin(), plain.end());
+    }
+    return aliasStores;
+}
+
+static std::optional<std::vector<const llvm::Value*>> CollectSourcePointerRootCandidates(
+        const LLVMBackend* compiler, const LLVMBackend::NamedVariable& arg,
+        const std::string& rootName)
+{
+    if (compiler == nullptr || rootName.empty() || arg.SourceExpressionContext == nullptr)
+        return std::nullopt;
+    const auto rootRef = compiler->FindVariableStorageForViewAnalysis(rootName);
+    const auto* pointerSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(rootRef.Storage);
+    if (pointerSlot == nullptr || !pointerSlot->getAllocatedType()->isPointerTy())
+        return std::nullopt;
+    const bool slotEscaped = PointerSlotHasEscaped(pointerSlot);
+
+    auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(
+        arg.SourceExpressionContext);
+    for (auto* parent = arg.SourceExpressionContext->parent;
+         function == nullptr && parent != nullptr; parent = parent->parent)
+        function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent);
+    if (function == nullptr || function->compoundStatement() == nullptr) return std::nullopt;
+    const size_t useToken = static_cast<size_t>(arg.SourceExpressionContext->getStart()->getTokenIndex());
+    std::vector<CFlatParser::InitDeclaratorContext*> declarations;
+    std::vector<CFlatParser::AssignmentExpressionContext*> stores;
+    std::vector<size_t> labelTokens;
+    bool unsafeStore = false;
+    auto scan = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (node != function->compoundStatement()
+            && (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr
+                || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node) != nullptr)) return;
+        if (auto* label = dynamic_cast<CFlatParser::LabeledStatementContext*>(node))
+            labelTokens.push_back(static_cast<size_t>(label->getStart()->getTokenIndex()));
+        if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
+        {
+            auto* declarator = init->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            if (direct != nullptr && direct->Identifier() != nullptr
+                && direct->Identifier()->getText() == rootName)
+                declarations.push_back(init);
+        }
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            if (assignment->unaryExpression() != nullptr
+                && SimpleIdentifierExpressionName(assignment->unaryExpression()) == rootName
+                && assignment->assignmentOperator() != nullptr)
+            {
+                if (assignment->assignmentOperator()->getText() != "=") unsafeStore = true;
+                stores.push_back(assignment);
+            }
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    scan(scan, function->compoundStatement());
+    if (slotEscaped)
+    {
+        auto aliasStores = CollectIndirectSlotStores(function, rootName);
+        if (!aliasStores.has_value()) return std::nullopt;
+        stores.insert(stores.end(), aliasStores->begin(), aliasStores->end());
+        std::sort(stores.begin(), stores.end(), [](auto* left, auto* right) {
+            return left->getStart()->getTokenIndex() < right->getStart()->getTokenIndex();
+        });
+    }
+    // An identity store (`q = q + 0`) keeps the value, so it is not a candidate source.
+    stores.erase(std::remove_if(stores.begin(), stores.end(), [&](auto* store) {
+        return store->assignmentExpression() != nullptr
+            && IsIdentityPointerValue(store->assignmentExpression()->getText(), rootName);
+    }), stores.end());
+    if (unsafeStore || declarations.size() != 1) return std::nullopt;
+    auto* init = declarations.front();
+    if (static_cast<size_t>(init->getStart()->getTokenIndex()) >= useToken) return std::nullopt;
+    for (auto* store : stores)
+        if (static_cast<size_t>(store->getStart()->getTokenIndex()) > useToken
+            && StoreReachesUseThroughLoop(store, arg.SourceExpressionContext, init))
+            return std::nullopt;
+    auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(init->parent);
+    for (auto* parent = init->parent; declaration == nullptr && parent != nullptr;
+         parent = parent->parent)
+        declaration = dynamic_cast<CFlatParser::DeclarationContext*>(parent);
+    auto* specs = declaration != nullptr ? declaration->declarationSpecifiers() : nullptr;
+    bool pointerType = false;
+    if (specs != nullptr)
+        for (auto* spec : specs->declarationSpecifier())
+            pointerType = pointerType || (spec->typeSpecifier() != nullptr && spec->pointer() != nullptr);
+    auto* initializer = init->initializer();
+    if (!pointerType || initializer == nullptr || initializer->assignmentExpression() == nullptr)
+        return std::nullopt;
+
+    // The declaring block is the nearest compound statement above the declaration. The last
+    // store must run unconditionally in it, and no label may sit between init and use (a case
+    // label could be jumped to past the store).
+    CFlatParser::CompoundStatementContext* declBlock = nullptr;
+    for (auto* parent = init->parent; declBlock == nullptr && parent != nullptr; parent = parent->parent)
+        declBlock = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
+    const size_t initToken = static_cast<size_t>(init->getStart()->getTokenIndex());
+    const bool labelBetween = std::any_of(labelTokens.begin(), labelTokens.end(),
+        [&](size_t token) { return token > initToken && token < useToken; });
+    // Stores after the use cannot reach it (checked above), so the last store is the last one
+    // textually before it. A store textually before the declaration writes another variable.
+    CFlatParser::AssignmentExpressionContext* lastStore = nullptr;
+    for (auto* store : stores)
+        if (static_cast<size_t>(store->getStart()->getTokenIndex()) < useToken) lastStore = store;
+    const bool storeAfterInit = lastStore != nullptr
+        && static_cast<size_t>(lastStore->getStart()->getTokenIndex()) > initToken;
+    const bool lastStoreDominatesUse = !labelBetween
+        && IsStraightLineInBlock(init, declBlock)
+        && IsNestedInBlockWithoutLambda(arg.SourceExpressionContext, declBlock)
+        && (!storeAfterInit || IsStraightLineInBlock(lastStore, declBlock));
+
+    std::vector<std::string> rootNames;
+    auto appendRoots = [&](antlr4::tree::ParseTree* source) {
+        if (!CollectSourcePointerRootNames(source, rootNames)) return false;
+        return rootNames.size() <= 8;
+    };
+    if (lastStoreDominatesUse)
+    {
+        if (!appendRoots(storeAfterInit
+                ? lastStore->assignmentExpression()
+                : initializer->assignmentExpression()))
+            return std::nullopt;
+    }
+    else
+    {
+        if (!appendRoots(initializer->assignmentExpression())) return std::nullopt;
+        for (auto* store : stores)
+            if (!appendRoots(store->assignmentExpression())) return std::nullopt;
+    }
+
+    std::vector<const llvm::Value*> roots;
+    for (const auto& name : rootNames)
+    {
+        const auto candidateRef = compiler->FindVariableStorageForViewAnalysis(name);
+        const auto* candidate = llvm::dyn_cast_or_null<llvm::AllocaInst>(candidateRef.Storage);
+        if (candidate == nullptr || !candidate->getAllocatedType()->isStructTy())
+            return std::nullopt;
+        if (std::find(roots.begin(), roots.end(), candidate) == roots.end())
+            roots.push_back(candidate);
+    }
+    return roots;
+}
+
+static bool SameProvenNonLocalViewPath(const NonLocalViewStoragePath& left,
+        const NonLocalViewStoragePath& right)
+{
+    if (left.Root != right.Root || left.Indices.size() != right.Indices.size()) return false;
+    for (size_t i = 0; i < left.Indices.size(); ++i)
+    {
+        if (left.Indices[i] == right.Indices[i]) continue;
+        const auto* leftConstant = llvm::dyn_cast<llvm::ConstantInt>(left.Indices[i]);
+        const auto* rightConstant = llvm::dyn_cast<llvm::ConstantInt>(right.Indices[i]);
+        if (leftConstant == nullptr || rightConstant == nullptr
+            || leftConstant->getValue() != rightConstant->getValue()) return false;
+    }
+    return true;
+}
+
+static bool NormalizeNonLocalViewStorage(const llvm::Value* value,
+        const llvm::Function* function, std::unordered_set<const llvm::Value*>& active,
+        NonLocalViewStoragePath& path, unsigned depth = 0)
+{
+    if (value == nullptr || depth > 32) return false;
+    value = value->stripPointerCasts();
+    if (!active.insert(value).second)
+    {
+        path.Root = value;
+        path.Indices.clear();
+        return true;
+    }
+    bool resolved = true;
+    if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+    {
+        resolved = NormalizeNonLocalViewStorage(gep->getPointerOperand(), function,
+            active, path, depth + 1);
+        if (resolved)
+            for (auto index = gep->idx_begin(); index != gep->idx_end(); ++index)
+                path.Indices.push_back(index->get());
+    }
+    else if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+    {
+        const llvm::Value* slot = load->getPointerOperand()->stripPointerCasts();
+        const auto* localPointer = llvm::dyn_cast<llvm::AllocaInst>(slot);
+        if (function != nullptr && localPointer != nullptr
+            && localPointer->getAllocatedType()->isPointerTy()
+            && !PointerSlotHasEscaped(localPointer))
+        {
+            bool foundStore = false;
+            bool everyStoreAgrees = true;
+            NonLocalViewStoragePath storedPath;
+            for (const auto& block : *function)
+                for (const auto& instruction : block)
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+                        store != nullptr && store->getPointerOperand()->stripPointerCasts() == slot)
+                    {
+                        NonLocalViewStoragePath candidate;
+                        std::unordered_set<const llvm::Value*> nestedActive = active;
+                        if (!NormalizeNonLocalViewStorage(store->getValueOperand(), function,
+                                nestedActive, candidate, depth + 1))
+                        {
+                            everyStoreAgrees = false;
+                            break;
+                        }
+                        if (!foundStore) storedPath = std::move(candidate);
+                        else if (!SameProvenNonLocalViewPath(storedPath, candidate))
+                            everyStoreAgrees = false;
+                        foundStore = true;
+                    }
+            if (foundStore && everyStoreAgrees) path = std::move(storedPath);
+            else
+            {
+                path.Root = slot;
+                path.Indices.clear();
+            }
+        }
+        else
+            resolved = NormalizeNonLocalViewStorage(slot, function, active, path, depth + 1);
+    }
+    else
+        path.Root = value;
+    active.erase(value);
+    return resolved;
+}
+
 bool LLVMBackend::SameNonLocalViewStorage(const llvm::Value* left,
         const llvm::Value* right) const
 {
         if (left == right) return true;
         if (left == nullptr || right == nullptr) return false;
-        struct StoragePath
-        {
-            const llvm::Value* Root = nullptr;
-            std::vector<const llvm::Value*> Indices;
-        };
-        auto normalize = [](const llvm::Value* value) {
-            StoragePath path;
-            while (value != nullptr)
-            {
-                value = value->stripPointerCasts();
-                if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
-                {
-                    value = load->getPointerOperand();
-                    continue;
-                }
-                if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
-                {
-                    std::vector<const llvm::Value*> segment;
-                    for (auto index = gep->idx_begin(); index != gep->idx_end(); ++index)
-                        segment.push_back(*index);
-                    path.Indices.insert(path.Indices.begin(), segment.begin(), segment.end());
-                    value = gep->getPointerOperand();
-                    continue;
-                }
-                break;
-            }
-            path.Root = value != nullptr ? value->stripPointerCasts() : value;
-            return path;
-        };
-        const StoragePath leftPath = normalize(left);
-        const StoragePath rightPath = normalize(right);
+        const llvm::Function* function = builder != nullptr && builder->GetInsertBlock() != nullptr
+            ? builder->GetInsertBlock()->getParent() : currentFunction;
+        NonLocalViewStoragePath leftPath;
+        NonLocalViewStoragePath rightPath;
+        std::unordered_set<const llvm::Value*> leftActive;
+        std::unordered_set<const llvm::Value*> rightActive;
+        if (!NormalizeNonLocalViewStorage(left, function, leftActive, leftPath)
+            || !NormalizeNonLocalViewStorage(right, function, rightActive, rightPath))
+            return false;
         if (leftPath.Root != rightPath.Root
             || leftPath.Indices.size() != rightPath.Indices.size())
             return false;
@@ -1935,7 +2756,44 @@ std::string LLVMBackend::NonLocalElementPathKey(const NamedVariable& nv) const
         if (!nv.MovePathHasDynamicIndex && nv.MovePathKey.find('[') == std::string::npos)
             return {};
         // Key the root by its resolved binding: same-named locals in nested scopes are distinct.
-        const llvm::Value* rootStorage = FindVariableStorage(nv.FieldPathRoot).Storage;
+    const llvm::Value* rootStorage = FindVariableStorage(nv.FieldPathRoot).Storage;
+    const auto* function = builder != nullptr && builder->GetInsertBlock() != nullptr
+        ? builder->GetInsertBlock()->getParent() : currentFunction;
+    const auto* pointerSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(rootStorage);
+    if (function != nullptr && pointerSlot != nullptr && !PointerSlotHasEscaped(pointerSlot)
+        && pointerSlot->getAllocatedType()->isPointerTy())
+    {
+        const llvm::Value* resolvedRoot = nullptr;
+        bool foundStore = false;
+        bool everyStoreAgrees = true;
+        for (const auto& block : *function)
+            for (const auto& instruction : block)
+                if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+                    store != nullptr
+                    && store->getPointerOperand()->stripPointerCasts() == pointerSlot)
+                {
+                    NonLocalViewStoragePath target;
+                    std::unordered_set<const llvm::Value*> active;
+                    if (!NormalizeNonLocalViewStorage(store->getValueOperand(), function,
+                            active, target)
+                        || !llvm::isa_and_nonnull<llvm::AllocaInst>(target.Root))
+                    {
+                        everyStoreAgrees = false;
+                        break;
+                    }
+                    for (const auto* index : target.Indices)
+                    {
+                        const auto* constant = llvm::dyn_cast<llvm::ConstantInt>(index);
+                        if (constant == nullptr || !constant->isZero())
+                            everyStoreAgrees = false;
+                    }
+                    if (!everyStoreAgrees) break;
+                    if (resolvedRoot == nullptr) resolvedRoot = target.Root;
+                    else if (resolvedRoot != target.Root) everyStoreAgrees = false;
+                    foundStore = true;
+                }
+        if (foundStore && everyStoreAgrees) rootStorage = resolvedRoot;
+    }
         const std::string root = rootStorage != nullptr
             ? std::to_string(reinterpret_cast<uintptr_t>(rootStorage))
             : "name:" + nv.FieldPathRoot;
@@ -2129,17 +2987,132 @@ std::optional<bool> LLVMBackend::NonLocalViewMayBeBorrowed(const llvm::Value* st
             || builder == nullptr || builder->GetInsertBlock() == nullptr)
             return std::nullopt;
         const auto* function = builder->GetInsertBlock()->getParent();
+        std::vector<NonLocalViewStoragePath> candidates;
+        std::unordered_set<const llvm::Value*> active;
+        const bool provenCandidates = storage != nullptr
+            && CollectNonLocalViewStorageCandidates(storage, function, active, candidates);
+        if (provenCandidates) DeduplicateNonLocalViewStorageCandidates(candidates);
         // A dynamic index may name any aliased element: every candidate counts, and one
         // may-borrowed candidate outweighs any number of owned ones.
         std::optional<bool> result;
         for (const auto& state : nonLocalViewOwnershipStates_)
         {
             if (state.Function != function) continue;
-            const bool sameSlot = storage != nullptr
-                && SameNonLocalViewStorage(state.Storage, storage);
+            bool sameSlot = storage != nullptr && SameNonLocalViewStorage(state.Storage, storage);
+            if (!sameSlot && provenCandidates)
+            {
+                NonLocalViewStoragePath statePath;
+                std::unordered_set<const llvm::Value*> stateActive;
+                if (NormalizeNonLocalViewStorage(state.Storage, function, stateActive, statePath))
+                    sameSlot = std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+                        return SameProvenNonLocalViewPath(candidate, statePath);
+                    });
+            }
             const bool samePath = !pathKey.empty() && !state.PathKey.empty()
                 && NonLocalPathKeysAlias(state.PathKey, pathKey);
             if (!sameSlot && !samePath) continue;
+            if (state.MayBeBorrowed) return true;
+            result = false;
+        }
+        return result;
+}
+
+std::optional<bool> LLVMBackend::NonLocalViewFieldMayBeBorrowed(
+        const llvm::Value* rootStorage, const std::string& fieldPath) const
+{
+        if (rootStorage == nullptr || fieldPath.empty()
+            || builder == nullptr || builder->GetInsertBlock() == nullptr)
+            return std::nullopt;
+        const auto* function = builder->GetInsertBlock()->getParent();
+        std::vector<NonLocalViewStoragePath> roots;
+        std::unordered_set<const llvm::Value*> active;
+        if (!CollectNonLocalViewStorageCandidates(rootStorage, function, active, roots))
+            return std::nullopt;
+        DeduplicateNonLocalViewStorageCandidates(roots);
+        if (roots.empty() || std::any_of(roots.begin(), roots.end(), [](const auto& root) {
+                return root.Root == nullptr || !root.Indices.empty()
+                    || !llvm::isa<llvm::AllocaInst>(root.Root);
+            })) return std::nullopt;
+        std::optional<bool> result;
+        for (const auto& state : nonLocalViewOwnershipStates_)
+        {
+            if (state.Function != function
+                || !NonLocalFieldPathMatches(fieldPath, state.FieldMovePath)
+                || std::none_of(roots.begin(), roots.end(), [&](const auto& root) {
+                    return state.RootStorage == root.Root;
+                }))
+                continue;
+            if (state.MayBeBorrowed) return true;
+            result = false;
+        }
+        return result;
+}
+
+std::optional<bool> LLVMBackend::NonLocalViewFieldCandidatesMayBeBorrowed(
+        const std::vector<const llvm::Value*>& rootStorages,
+        const std::string& fieldPath) const
+{
+        if (rootStorages.empty() || fieldPath.empty()
+            || builder == nullptr || builder->GetInsertBlock() == nullptr)
+            return std::nullopt;
+        const auto* function = builder->GetInsertBlock()->getParent();
+        std::optional<bool> result;
+        for (const auto& state : nonLocalViewOwnershipStates_)
+        {
+            if (state.Function != function
+                || !NonLocalFieldPathMatches(fieldPath, state.FieldMovePath)
+                || std::find(rootStorages.begin(), rootStorages.end(), state.RootStorage)
+                    == rootStorages.end())
+                continue;
+            if (state.MayBeBorrowed) return true;
+            result = false;
+        }
+        return result;
+}
+
+std::optional<bool> LLVMBackend::NonLocalViewFieldAnyRootMayBeBorrowed(
+        const std::string& fieldPath) const
+{
+        if (fieldPath.empty() || builder == nullptr || builder->GetInsertBlock() == nullptr)
+            return std::nullopt;
+        const auto* function = builder->GetInsertBlock()->getParent();
+        std::optional<bool> result;
+        for (const auto& state : nonLocalViewOwnershipStates_)
+        {
+            if (state.Function != function
+                || !NonLocalFieldPathMatches(fieldPath, state.FieldMovePath))
+                continue;
+            if (state.MayBeBorrowed) return true;
+            result = false;
+        }
+        return result;
+}
+
+std::optional<bool> LLVMBackend::NonLocalViewFieldStorageMayBeBorrowed(
+        const llvm::Value* fieldStorage, const std::string& fieldPath) const
+{
+        if (fieldStorage == nullptr || fieldPath.empty()
+            || builder == nullptr || builder->GetInsertBlock() == nullptr)
+            return std::nullopt;
+        const auto* function = builder->GetInsertBlock()->getParent();
+        std::vector<NonLocalViewStoragePath> fieldAddressPaths;
+        std::unordered_set<const llvm::Value*> active;
+        if (!CollectNonLocalViewStorageCandidates(fieldStorage, function, active, fieldAddressPaths))
+            return std::nullopt;
+        DeduplicateNonLocalViewStorageCandidates(fieldAddressPaths);
+        if (fieldAddressPaths.empty() || std::any_of(fieldAddressPaths.begin(), fieldAddressPaths.end(),
+                [](const auto& path) {
+                    return path.Root == nullptr || !llvm::isa<llvm::AllocaInst>(path.Root);
+                })) return std::nullopt;
+        std::optional<bool> result;
+        for (const auto& state : nonLocalViewOwnershipStates_)
+        {
+            if (state.Function != function
+                || !NonLocalFieldPathMatches(fieldPath, state.FieldMovePath)
+                || std::none_of(fieldAddressPaths.begin(), fieldAddressPaths.end(), [&](const auto& path) {
+                    return state.RootStorage == path.Root;
+                }))
+                continue;
             if (state.MayBeBorrowed) return true;
             result = false;
         }
@@ -2224,17 +3197,43 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
 {
         // The argument NV is rebuilt by the expression walk, so the borrow bits live on the
         // binding itself - ask the live variable, not the copy. Unknown provenance ACCEPTS.
-        const bool storageIsLocalSlot = arg.Storage != nullptr
-            && llvm::isa<llvm::AllocaInst>(arg.Storage);
-        const NamedVariable* live = FindVariableByStorage(arg.Storage);
+        const llvm::Value* moveSourceStorage = arg.MoveSourceStorage != nullptr
+            ? arg.MoveSourceStorage : arg.Storage;
+        const bool storageIsLocalSlot = moveSourceStorage != nullptr
+            && llvm::isa<llvm::AllocaInst>(moveSourceStorage);
+        const NamedVariable* live = FindVariableByStorage(moveSourceStorage);
         const bool allJoinArmsKeepOwner = live != nullptr && !live->IsOwning
             && JoinArmsStillKeepOwner(*live) && !live->JoinKeepsOwnerSource.empty();
 
         // Non-local views have no runtime own flag; preserve the last assignment's proof instead.
+        const auto nonLocalFieldMayBeBorrowed = arg.TypeAndValue.IsArrayView
+            ? NonLocalViewFieldStorageMayBeBorrowed(moveSourceStorage,
+                arg.MoveSourceFieldPath.empty() ? FieldMoveKey(arg) : arg.MoveSourceFieldPath)
+            : std::optional<bool>{};
+        std::string sourceRootName;
+        std::string sourceFieldPath;
+        const bool hasSourceFieldPath = arg.TypeAndValue.IsArrayView
+            && SourceViewFieldRootAndPath(arg.SourceExpressionContext,
+                sourceRootName, sourceFieldPath);
+        const auto sourceRootCandidates = hasSourceFieldPath
+            ? CollectSourcePointerRootCandidates(this, arg, sourceRootName)
+            : std::optional<std::vector<const llvm::Value*>>{};
+        const std::string candidateFieldPath = hasSourceFieldPath ? sourceFieldPath
+            : (!arg.MoveSourceFieldPath.empty() ? arg.MoveSourceFieldPath
+                : (!arg.MovePathKey.empty() ? arg.MovePathKey : FieldMoveKey(arg)));
+        // Undecidable provenance may reach any root: refuse when any mixed root of this function
+        // has the moved path. Only a fully decided candidate set narrows the check.
+        const auto sourceRootCandidatesMayBeBorrowed = sourceRootCandidates.has_value()
+            ? NonLocalViewFieldCandidatesMayBeBorrowed(*sourceRootCandidates, candidateFieldPath)
+            : (hasSourceFieldPath
+                ? NonLocalViewFieldAnyRootMayBeBorrowed(candidateFieldPath)
+                : std::optional<bool>{});
         const bool nonLocalMayBeBorrowed = !storageIsLocalSlot
             && arg.TypeAndValue.IsArrayView
-            && NonLocalViewMayBeBorrowed(arg.Storage, arg.MoveSourcePathKey.empty()
+            && NonLocalViewMayBeBorrowed(moveSourceStorage, arg.MoveSourcePathKey.empty()
                 ? NonLocalElementPathKey(arg) : arg.MoveSourcePathKey).value_or(false);
+        const bool nonLocalFieldMayBeBorrowedValue = nonLocalFieldMayBeBorrowed.value_or(false);
+        const bool candidateFieldMayBeBorrowedValue = sourceRootCandidatesMayBeBorrowed.value_or(false);
         const bool localMayBeBorrowed = live != nullptr
             && (live->OwnFlagMayBeFalse || allJoinArmsKeepOwner);
         auto makeDiagnostic = [&]() {
@@ -2249,7 +3248,9 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                 sourceName.empty() ? SpellType(*this, arg.TypeAndValue) : sourceName,
                 paramName, SpellFunctionSymbol(*this, functionName));
         };
-        if (arg.TypeAndValue.IsArrayView && (localMayBeBorrowed || nonLocalMayBeBorrowed))
+        if (arg.TypeAndValue.IsArrayView
+            && (localMayBeBorrowed || nonLocalMayBeBorrowed || nonLocalFieldMayBeBorrowedValue
+                || candidateFieldMayBeBorrowedValue))
         {
             LogError(makeDiagnostic());
             return;
@@ -2258,7 +3259,7 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
         {
             const std::string rootName = !arg.FieldPathRoot.empty()
                 ? arg.FieldPathRoot : arg.CallerName;
-            const llvm::Value* scopeStorage = arg.Storage;
+            const llvm::Value* scopeStorage = moveSourceStorage;
             if (!rootName.empty())
                 if (auto* resolved = FindVariableStorage(rootName).Storage) scopeStorage = resolved;
 
@@ -2281,7 +3282,7 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                 const std::string diagnostic = makeDiagnostic();
                 for (auto& frame : ownFlagLoopReownSnapshots_)
                     if (isGlobal || scopeIndex < frame.scopeDepth)
-                        frame.moveSinkViews.push_back({ arg.Storage, pathKey, diagnostic,
+                        frame.moveSinkViews.push_back({ moveSourceStorage, pathKey, diagnostic,
                             sourceFileName, currentLine, currentColumn });
             }
         }
@@ -2326,6 +3327,46 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                 arg.CallerName.empty() ? FindVariableNameByStorage(arg.Storage) : arg.CallerName,
                 copy.OwningLocalOrigin, paramName, SpellFunctionSymbol(*this, functionName),
                 copy.OwningLocalStorage);
+}
+
+void LLVMBackend::DiagnoseBorrowedViewFieldMoveArg(const std::string& functionName,
+        const std::string& paramName, const NamedVariable& arg,
+        const std::vector<std::string>& fieldPaths, bool isMethodReceiver)
+{
+        if ((!arg.TypeAndValue.Pointer && !arg.TypeAndValue.ElemPointer)
+            && !isMethodReceiver) return;
+        if (fieldPaths.empty()) return;
+        const llvm::Value* rootStorage = arg.Primary != nullptr
+            && arg.Primary->getType()->isPointerTy() ? arg.Primary : arg.Storage;
+        if (rootStorage == nullptr || !rootStorage->getType()->isPointerTy()) return;
+        // A summarized helper may move through any root the pointer argument can hold, so the
+        // candidate roots of a plain pointer identifier are checked as well.
+        const std::string argName = arg.SourceExpressionContext != nullptr
+            ? std::string(SimpleIdentifierExpressionName(arg.SourceExpressionContext)) : std::string{};
+        const auto argRoots = !argName.empty()
+            ? CollectSourcePointerRootCandidates(this, arg, argName)
+            : std::optional<std::vector<const llvm::Value*>>{};
+        for (const auto& fieldPath : fieldPaths)
+        {
+            const bool candidateBorrowed = !argName.empty() && (argRoots.has_value()
+                ? NonLocalViewFieldCandidatesMayBeBorrowed(*argRoots, fieldPath)
+                : NonLocalViewFieldAnyRootMayBeBorrowed(fieldPath)).value_or(false);
+            // Decided candidates are exact; the every-stored-value fallback is for undecided ones.
+            const bool storageBorrowed = !argRoots.has_value()
+                && NonLocalViewFieldMayBeBorrowed(rootStorage, fieldPath).value_or(false);
+            if (!candidateBorrowed && !storageBorrowed) continue;
+            const std::string sourceName = !arg.CallerName.empty()
+                ? arg.CallerName
+                : (!arg.FieldPathText.empty() ? arg.FieldPathText
+                    : FindVariableNameByStorage(arg.Storage));
+            LogError(std::format(
+                "cannot call '{}' through '{}' for parameter '{}' - array view field '{}': the view "
+                "may be borrowed on a runtime path, so the callee's move sink could free storage the "
+                "real owner still holds. Reassign the field from an owned source before calling.",
+                SpellFunctionSymbol(*this, functionName), sourceName.empty() ? "<pointer>" : sourceName,
+                paramName, fieldPath));
+            return;
+        }
 }
 
 std::string LLVMBackend::ImplicitOutlivingOwnerConsumeError(const NamedVariable& srcNV,

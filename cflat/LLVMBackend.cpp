@@ -2480,6 +2480,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                     scanner.ScanExternalDeclaration(decl);
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
+                scanner.FinalizeViewFieldMoveInference();
             }
         }
 
@@ -3770,6 +3771,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 scanner.ScanExternalDeclaration(decl);
             scanner.RefreshProvisionalAggregateAliases();
             scanner.PrepareWinrtClasses(tu);
+            scanner.FinalizeViewFieldMoveInference();
         }
     }
 
@@ -4751,6 +4753,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     scanner.ScanExternalDeclaration(decl);
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
+                scanner.FinalizeViewFieldMoveInference();
             }
         }
 
@@ -4864,10 +4867,21 @@ void LLVMBackend::ResetForReanalysis()
     ownFlagControlKind_.clear();
     nextOwnFlagControlFrameId_ = 1;
     ownFlagDefinitelyReowned_.clear();
+    // Struct-walk facts describe the source being re-analysed: a constructor removed since the
+    // last walk must not keep its struct out of the declared-shape default.
+    walkedStructDefinitions_.clear();
+    userNoArgCtorTypes_.clear();
     loopIterationAssigned_.clear();
     ownFlagLoopReownSnapshots_.clear();
     ownReleaseGates_.clear();
     receiverScanFacts_.clear();
+    returnBorrowMemo_.clear();
+    returnBorrowInProgress_.clear();
+    returnBorrowApprox_.clear();
+    returnBorrowProvisional_ = false;
+    returnBorrowApproxChanged_ = false;
+    returnBorrowIterations_ = 0;
+    fatCallBorrowKinds_.clear();
     readOnlyMethodMemo_.clear();
     readOnlyCauseMemo_.clear();
     receiverCallResolution_.clear();
@@ -4875,6 +4889,7 @@ void LLVMBackend::ResetForReanalysis()
     receiverBodyStack_.clear();
     pendingCallSite_ = nullptr;
     pendingReceiverText_.clear();
+    pendingCallReceiver_.reset();
     pendingConstReceiverCalls_.clear();
     deferredExpectations_.clear();
     expectErrorStack_.clear();
@@ -4882,6 +4897,11 @@ void LLVMBackend::ResetForReanalysis()
     fallbackOwnerGates_.clear();
     cxxThisEscapeGates_.clear();
     deferredCallReleaseGates_.clear();
+    uniqueAdoptionForwardEdges_.clear();
+    uniqueAdoptionArrayCalls_.clear();
+    uniqueAdoptedParameterFacts_.clear();
+    uniqueAdoptionFactInsertions_.clear();
+    uniqueAdoptionSummaryInsertions_.clear();
     deferredReturnKeepGates_.clear();
     returnOperandFunction_ = nullptr;
     ownAdoptGates_.clear();
@@ -4919,6 +4939,8 @@ void LLVMBackend::ResetForReanalysis()
     cxxDemandReplayed_ = false;
     activeCxxRequestGroup_ = nullptr;
     cxxTemplateOwnerGroup_.clear();
+    cxxFreeWrapperGroups_.clear();
+    cxxDirectCalleeGetters_.clear();
     cxxFunctionTemplates_.clear();
     cxxFunctionTemplateOwnerGroup_.clear();
     cxxFunctionSignatures_.clear();
@@ -5090,6 +5112,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxGroupStatics_.clear();
     cxxImplicitConversionRefusal_.clear();
     cxxXvaluePointerConversions_.clear();
+    cxxTernaryVerdicts_.clear();
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
     cxxTriviallyRelocatableRecords_.clear();
@@ -7216,6 +7239,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsInterfacePointer)     o["ifp"] = true;
     if (s.IsNullable)             o["nl"]  = true;
     if (s.IsMove)                 o["mv"]  = true;
+    if (s.IsUniqueAdoptedParam)   o["uap"] = true;
     if (s.IsAdopt)                o["ad"]  = true;
     if (s.IsAlias)                o["al"]  = true;
     if (s.IsRvalueRef)             o["rr"]  = true;
@@ -7230,6 +7254,12 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsConsumeInferredSink)  o["cis"] = true;
     if (s.IsReturnInferredSink)  o["ris"] = true;
     if (s.IsWriteInferredSink)  o["wis"] = true;
+    if (!s.ViewFieldMovePaths.empty())
+    {
+        llvm::json::Array paths;
+        for (const auto& path : s.ViewFieldMovePaths) paths.push_back(path);
+        o["vfmp"] = std::move(paths);
+    }
     if (s.IsBorrowOfAliasElement) o["bae"] = true;
     if (s.IsBond)                 o["bd"]  = true;
     if (s.IsUnique)               o["uq"]  = true;
@@ -7317,6 +7347,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("ifp"))s.IsInterfacePointer = *v;
     if (auto v = o.getBoolean("nl")) s.IsNullable = *v;
     if (auto v = o.getBoolean("mv")) s.IsMove = *v;
+    if (auto v = o.getBoolean("uap")) s.IsUniqueAdoptedParam = *v;
     if (auto v = o.getBoolean("ad")) s.IsAdopt = *v;
     if (auto v = o.getBoolean("al")) s.IsAlias = *v;
     if (auto v = o.getBoolean("rr")) s.IsRvalueRef = *v;
@@ -7331,6 +7362,10 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
     if (auto v = o.getBoolean("ris")) s.IsReturnInferredSink = *v;
     if (auto v = o.getBoolean("wis")) s.IsWriteInferredSink = *v;
+    if (auto* paths = o.getArray("vfmp"))
+        for (const auto& path : *paths)
+            if (auto value = path.getAsString())
+                s.ViewFieldMovePaths.push_back(value->str());
     if (auto v = o.getBoolean("bae")) s.IsBorrowOfAliasElement = *v;
     if (auto v = o.getBoolean("bd")) s.IsBond = *v;
     if (auto v = o.getBoolean("uq")) s.IsUnique = *v;

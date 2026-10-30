@@ -1632,7 +1632,36 @@ llvm::Value* LLVMBackend::BareFunctionToThinValue(llvm::Value* val, const TypeAn
         return MakeThinFnPtrValue(fn, FuncPtrSigOfSymbol(*symbol));
 }
 
-llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV)
+bool LLVMBackend::CxxCallableNeedsRawArrayCountAdapter(
+    const TypeAndValue& source, const TypeAndValue& target) const
+{
+        if (source.FuncPtrVariadic != target.FuncPtrVariadic) return false;
+        std::vector<FuncPtrComponent> sourceComponents, targetComponents;
+        if (!FuncPtrSignatureOf(source, sourceComponents)
+            || !FuncPtrSignatureOf(target, targetComponents)
+            || sourceComponents.size() != targetComponents.size())
+            return false;
+        for (size_t i = 0; i < sourceComponents.size(); ++i)
+            if (!sourceComponents[i].Known || !targetComponents[i].Known
+                || ComponentsProvablyDiffer(sourceComponents[i], targetComponents[i]))
+                return false;
+
+        TypeAndValue sourceRet, targetRet;
+        std::vector<TypeAndValue> sourceParams, targetParams;
+        UnpackFuncPtrSignature(source, sourceRet, sourceParams);
+        UnpackFuncPtrSignature(target, targetRet, targetParams);
+        if (sourceParams.size() != targetParams.size()) return false;
+        bool needsAdapter = ReturnCarriesRawArrayCount(sourceRet)
+            != ReturnCarriesRawArrayCount(targetRet);
+        for (size_t i = 0; i < sourceParams.size(); ++i)
+            needsAdapter = needsAdapter
+                || ParameterCarriesRawArrayCount(sourceParams[i])
+                    != ParameterCarriesRawArrayCount(targetParams[i]);
+        return needsAdapter;
+}
+
+llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV,
+                                             bool cxxCallable)
 {
         if (auto* function = llvm::dyn_cast_or_null<llvm::Function>(fn))
             RecordAliasReturnAddressUse(function);
@@ -1643,6 +1672,30 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
             UnpackFuncPtrSignature(fpTV, ret, params);
             auto planIt = cxxFunctionPointerAbiPlans_.find(FunctionPointerAbiKey(ret, params));
             const auto* symbol = FindSymbolForFunction(original);
+            const TypeAndValue sourceSig = symbol != nullptr
+                ? FuncPtrSigOfSymbol(*symbol) : TypeAndValue{};
+            const bool needsRawCountAdapter = cxxCallable && symbol != nullptr
+                && !symbol->External
+                && CxxCallableNeedsRawArrayCountAdapter(sourceSig, fpTV);
+            auto buildRawCountAdapter = [&](const AbiRecipe& targetRecipe) -> llvm::Value* {
+                if (!needsRawCountAdapter) return nullptr;
+                if (targetRecipe.paramSlots.size() != params.size()
+                    || targetRecipe.retCountParam)
+                    return nullptr;
+                for (const auto& slot : targetRecipe.paramSlots)
+                    if (slot.countAfter || slot.kind == AbiSlot::Ignore)
+                        return nullptr;
+                TypeAndValue sourceRet;
+                std::vector<TypeAndValue> sourceParams;
+                UnpackFuncPtrSignature(sourceSig, sourceRet, sourceParams);
+                CxxFunctionPointerAbiPlan adapterPlan{
+                    sourceRet, sourceParams, targetRecipe
+                };
+                auto* adapter = GetOrCreateReverseAbiFunctionThunk(original, adapterPlan);
+                return adapter != nullptr
+                    ? builder->CreateBitCast(adapter, BuildThinFnPtrType(fpTV), "thinfn")
+                    : nullptr;
+            };
             if (planIt != cxxFunctionPointerAbiPlans_.end())
             {
                 const auto& plan = planIt->second;
@@ -1674,6 +1727,12 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
                                  "C++ signature; this callback shape is not supported");
                         return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
                     }
+                if (needsRawCountAdapter)
+                {
+                    if (auto* adapter = buildRawCountAdapter(plan.recipe)) return adapter;
+                    LogError("cannot adapt this CFlat ownership-count callback to the C++ callable ABI");
+                    return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                }
                 if (plan.recipe.hasLowering)
                 {
                     if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
@@ -1707,6 +1766,13 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
                             return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
                         }
                     }
+                }
+                if (needsRawCountAdapter)
+                {
+                    AbiRecipe cxxRecipe = ComputeAbiRecipe(ret, params);
+                    if (auto* adapter = buildRawCountAdapter(cxxRecipe)) return adapter;
+                    LogError("cannot adapt this CFlat ownership-count callback to the C++ callable ABI");
+                    return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
                 }
                 // Every call through a thin function<> uses the C ABI of its signature. An extern
                 // definition already has that lowering, so its address is stored as is; a

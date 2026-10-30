@@ -957,6 +957,7 @@ void MainListener::ProcessDeferredGenericMemberBodies()
 void MainListener::exitTranslationUnit(CFlatParser::TranslationUnitContext*)
 {
         ProcessDeferredGenericMemberBodies();
+        compilerLLVM->ResolveUniqueAdoptionFacts();
 }
 
 std::string MainListener::FindNontrivialCxxTypeForUnionMember(
@@ -1612,6 +1613,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             return false;
         }();
         bool hasExplicitNoArgCtor = !isUnion && (hasBareNoArgCtor || hasAllDefaultedCtor);
+        if (!isCppStruct) compiler->NoteStructDefinitionWalked(structName, hasExplicitNoArgCtor);
         if (hasExplicitNoArgCtor && !isCppStruct)
             explicitNoArgConstructors_.insert(structName);
         bool baseHasDefaultCtor = cppBaseName.empty();
@@ -5349,6 +5351,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             return false;
         }();
         bool hasExplicitNoArgCtor = hasBareNoArgCtor || hasAllDefaultedCtor;
+        compiler->NoteStructDefinitionWalked(structName, hasExplicitNoArgCtor);
         if (hasExplicitNoArgCtor)
             explicitNoArgConstructors_.insert(structName);
 

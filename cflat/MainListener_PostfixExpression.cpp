@@ -606,12 +606,18 @@ struct StoreWalkResult
 {
     StoreVerdict verdict = StoreVerdict::None;
     std::set<ParamStore> paramStores;
+    std::set<unsigned> externalParameters;
+    bool externalGlobal = false;
+    bool unknown = false;
 };
 
 struct StoreWalkContext
 {
     // The core deallocators: freeing a pointer never keeps it (their hooks are not walked).
     std::vector<const llvm::Function*> deallocators;
+    llvm::Type* closureFatPtrType = nullptr;
+    // Collect every sink instead of stopping at the first one (destination proof only).
+    bool collectAll = false;
     std::vector<StoreWalkKey> active;
     std::map<StoreWalkKey, StoreWalkResult> memo;
     size_t bodies = 0;
@@ -634,6 +640,8 @@ struct StoreWalk
     std::vector<const llvm::Value*> rescan;
     std::set<std::pair<const llvm::Value*, StorePath>> seenValues;
     std::set<ParamStore> paramStores;
+    std::set<unsigned> externalParameters;
+    bool externalGlobal = false;
     bool unknown = false;
 
     void track(const llvm::Value* value, StorePath rel);
@@ -646,6 +654,8 @@ struct StoreWalk
     bool scanValue(const TrackedValue& tracked);
     bool scanRoot(const llvm::Value* root);
     StoreVerdict run();
+    // A sink ends the walk, except in collectAll mode where the walk goes on past it.
+    bool stopAtSink() const { return !context.collectAll; }
 };
 
 void StoreWalk::track(const llvm::Value* value, StorePath rel)
@@ -675,8 +685,22 @@ bool StoreWalk::callee(const llvm::CallBase* call, const llvm::Function* nested,
     const StoreWalkResult result = CalleeStoresTracked(context, nested, argumentIndex,
                                                        std::move(values), std::move(seeds), depth + 1);
     if (result.verdict == StoreVerdict::Unknown) unknown = true;
-    if (result.verdict == StoreVerdict::Stores) return true;
-    for (const auto& [parameter, below] : result.paramStores)
+    if (result.externalGlobal)
+    {
+        if (!context.collectAll) return true;
+        externalGlobal = true;
+    }
+    if (context.collectAll && result.unknown) unknown = true;
+    if (result.verdict == StoreVerdict::Stores && !result.externalGlobal
+        && result.externalParameters.empty() && result.paramStores.empty())
+    {
+        if (!context.collectAll) return true;
+        unknown = true;
+    }
+    std::set<ParamStore> destinations = result.paramStores;
+    for (unsigned parameter : result.externalParameters)
+        destinations.insert({ parameter, StorePath{} });
+    for (const auto& [parameter, below] : destinations)
     {
         if (parameter >= call->arg_size())
         {
@@ -711,6 +735,23 @@ static bool LocalPointerVariableValues(const llvm::AllocaInst* variable,
     return true;
 }
 
+// Closure copy and destroy helpers never keep the fat pointer: copy returns a fresh owned one,
+// which the caller tracks as a pass-through.
+// Exact name or a numeric ".N" rename (__closure_fat_ptr.copy.2); a user `_closure_fat_ptr` namespace
+// mangles to `__closure_fat_ptr.copyX$...` and must not match.
+static bool IsClosureHelperName(llvm::StringRef name, llvm::StringRef base)
+{
+    if (!name.consume_front(base)) return false;
+    if (name.empty()) return true;
+    return name.consume_front(".") && !name.empty() && name.find_first_not_of("0123456789") == llvm::StringRef::npos;
+}
+
+static bool IsClosureRuntimeHelper(const llvm::Function* function)
+{
+    const llvm::StringRef name = function->getName();
+    return IsClosureHelperName(name, "__closure_fat_ptr.copy") || IsClosureHelperName(name, "__closure_fat_ptr.dtor");
+}
+
 // A tainted value stored at root/path. Proven outside: a global, storage reached through a global,
 // or the top call's own parameter. A nested callee's parameter is reported to its caller; a local
 // slot keeps the value; storage the walk cannot place (heap, a call result) is Unknown.
@@ -721,11 +762,23 @@ bool StoreWalk::storeAtRoot(const llvm::Value* root, StorePath path, bool exact,
         slot(root, std::move(path));
         return false;
     }
-    if (llvm::isa<llvm::GlobalValue>(root)) return true;
+    if (llvm::isa<llvm::GlobalValue>(root))
+    {
+        externalGlobal = true;
+        return stopAtSink();
+    }
     if (const auto* argument = llvm::dyn_cast<llvm::Argument>(root))
     {
-        if (argument->getParent() != function) return true;
-        if (depth == 0) return true;
+        if (argument->getParent() != function)
+        {
+            externalGlobal = true;
+            return stopAtSink();
+        }
+        if (depth == 0)
+        {
+            externalParameters.insert(argument->getArgNo());
+            return stopAtSink();
+        }
         paramStores.insert({ argument->getArgNo(), std::move(path) });
         return false;
     }
@@ -766,10 +819,17 @@ bool StoreWalk::storeAtRoot(const llvm::Value* root, StorePath path, bool exact,
                     && held.size() == 1)
                     base = held.front()->stripPointerCasts();
             }
-            if (llvm::isa<llvm::GlobalValue>(base)) return true;
+            if (llvm::isa<llvm::GlobalValue>(base))
+            {
+                externalGlobal = true;
+                return stopAtSink();
+            }
             if (const auto* argument = llvm::dyn_cast<llvm::Argument>(base);
                 argument != nullptr && argument->getParent() == function && depth == 0)
-                return true;
+            {
+                externalParameters.insert(argument->getArgNo());
+                return stopAtSink();
+            }
             unknown = true;
             return false;
         }
@@ -837,8 +897,13 @@ bool StoreWalk::scanValue(const TrackedValue& tracked)
                     continue;
                 }
                 if (nested->isDeclaration()) continue;
-                if (callee(call, nested, i, { tracked.rel }, {})) return true;
-                if (FunctionArgumentMayBeReturned(nested, i, 0)) track(call, tracked.rel);
+                const bool closureRuntime = context.collectAll && IsClosureRuntimeHelper(nested);
+                if (!closureRuntime && callee(call, nested, i, { tracked.rel }, {})) return true;
+                const bool closureValuePassThrough = context.closureFatPtrType != nullptr
+                    && call->getType() == context.closureFatPtrType
+                    && call->getArgOperand(i)->getType() == context.closureFatPtrType;
+                if (closureValuePassThrough || FunctionArgumentMayBeReturned(nested, i, 0))
+                    track(call, tracked.rel);
             }
             continue;
         }
@@ -993,7 +1058,8 @@ bool StoreWalk::scanRoot(const llvm::Value* root)
                         continue;
                     }
                     if (nested->isDeclaration()) continue;
-                    if (callee(call, nested, a, {}, seeds)) return true;
+                    const bool closureRuntime = context.collectAll && IsClosureRuntimeHelper(nested);
+                    if (!closureRuntime && callee(call, nested, a, {}, seeds)) return true;
                     // The returned parameter is the same address; a maybe-returned one is not followed.
                     if (ArgumentAlwaysReturned(nested, a))
                         addItem(call, item.path, item.exact, false);
@@ -1024,6 +1090,9 @@ StoreVerdict StoreWalk::run()
         work.pop_back();
         if (scanValue(tracked)) return StoreVerdict::Stores;
     }
+    // collectAll never returns early, so a sink found on the way is reported here.
+    if (context.collectAll && (externalGlobal || !paramStores.empty() || !externalParameters.empty()))
+        return StoreVerdict::Stores;
     return unknown ? StoreVerdict::Unknown : StoreVerdict::None;
 }
 
@@ -1062,7 +1131,8 @@ static StoreWalkResult CalleeStoresTracked(StoreWalkContext& context, const llvm
     const llvm::Argument* argument = callee->getArg(argumentIndex);
     for (const auto& rel : key.values) walk.track(argument, rel);
     for (const auto& path : key.slots) walk.slot(argument, path);
-    StoreWalkResult result{ walk.run(), std::move(walk.paramStores) };
+    StoreWalkResult result{ walk.run(), std::move(walk.paramStores),
+        std::move(walk.externalParameters), walk.externalGlobal, walk.unknown };
     context.active.pop_back();
     // A verdict that leaned on a walk still in progress is not final for other callers.
     if (result.verdict == StoreVerdict::Stores || context.cycles == cyclesBefore)
@@ -1132,10 +1202,51 @@ bool LLVMBackend::FunctionArgumentDefinitelyStoresOutsideCall(const llvm::Functi
     return ClassifyArgumentStoreOutsideCall(function, argumentIndex) == StoreVerdict::Stores;
 }
 
+std::vector<unsigned> LLVMBackend::FunctionArgumentStoreDestinations(
+        const llvm::Function* function, size_t argumentIndex)
+{
+    StoreWalkContext context;
+    context.closureFatPtrType = GetClosureFatPtrType();
+    const auto result = CalleeStoresTracked(context, function, argumentIndex, { StorePath{} }, {}, 0);
+    if (result.verdict != StoreVerdict::Stores || result.externalGlobal) return {};
+    std::vector<unsigned> destinations;
+    for (const auto& [parameter, path] : result.paramStores)
+        destinations.push_back(parameter);
+    destinations.insert(destinations.end(), result.externalParameters.begin(), result.externalParameters.end());
+    std::sort(destinations.begin(), destinations.end());
+    destinations.erase(std::unique(destinations.begin(), destinations.end()), destinations.end());
+    return destinations;
+}
+
+std::vector<unsigned> LLVMBackend::FunctionArgumentStoreSinks(
+        const llvm::Function* function, size_t argumentIndex, bool& nonParameterSink)
+{
+    StoreWalkContext context;
+    context.closureFatPtrType = GetClosureFatPtrType();
+    context.collectAll = true;
+    const auto result = CalleeStoresTracked(context, function, argumentIndex, { StorePath{} }, {}, 0);
+    // Anything the walk could not place (heap, unknown callee) is treated as a non-parameter sink.
+    nonParameterSink = result.externalGlobal || result.unknown
+        || result.verdict == StoreVerdict::Unknown;
+    if (result.verdict != StoreVerdict::Stores)
+    {
+        nonParameterSink = true;
+        return {};
+    }
+    std::vector<unsigned> destinations;
+    for (const auto& [parameter, path] : result.paramStores)
+        destinations.push_back(parameter);
+    destinations.insert(destinations.end(), result.externalParameters.begin(), result.externalParameters.end());
+    std::sort(destinations.begin(), destinations.end());
+    destinations.erase(std::unique(destinations.begin(), destinations.end()), destinations.end());
+    return destinations;
+}
+
 LLVMBackend::RawPointerStoreVerdict LLVMBackend::ClassifyArgumentStoreOutsideCall(
         const llvm::Function* function, size_t argumentIndex)
 {
     StoreWalkContext context;
+    context.closureFatPtrType = GetClosureFatPtrType();
     for (const char* name : { "operator delete", "__delete_aligned" })
         if (auto it = functionTable.find(name); it != functionTable.end())
             for (const auto& symbol : it->second)
@@ -2170,6 +2281,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             DiagnoseAssignmentArguments(argumentList);
         const size_t arrowTempMark = arrowOwnedTemps_.size();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        if (namedVar.Primary != nullptr
+            && namedVar.Primary->getType() == Compiler(ctx)->GetClosureFatPtrType()
+            && Compiler(ctx)->lastCallIsBonded)
+        {
+            namedVar.IsBonded = true;
+            namedVar.BondByAddress = Compiler(ctx)->lastCallBondByAddress;
+            namedVar.BondedSources = Compiler(ctx)->lastCallBondedSources;
+        }
         if (auto* resultCall = llvm::dyn_cast_or_null<llvm::CallBase>(namedVar.Primary);
             resultCall != nullptr && resultCall->getType()->isPointerTy())
         {
@@ -2840,6 +2959,8 @@ void MainListener::DiagnoseVoidResultConsumed(antlr4::ParserRuleContext* ctx,
         // Discard positions want exactly this result, and `return <call>;` is settled by
         // EmitReturnExpression (a void crossing out of a void function is legal) - both defer.
         if (use != ResultUse::Value || nv.TypeAndValue.Pointer) return;
+        for (const auto& leaf : discardedNestedArmLeaves_)
+            if (ctx->getSourceInterval().a == leaf.a && ctx->getSourceInterval().b == leaf.b) return;
         // Resolve through `using V = void;` - the spelling is aliasable, so matching the
         // literal "void" would leave the alias reaching the verifier.
         if (Compiler(ctx)->ResolveTypeAlias(nv.TypeAndValue.TypeName) != "void") return;
@@ -6105,6 +6226,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         if (prevPrimary->lambdaExpression() != nullptr)
                         {
                             namedVar.TypeAndValue = lastLambdaType;
+                            namedVar.IsBonded = Compiler(ctx)->lastCallIsBonded;
+                            namedVar.BondByAddress = Compiler(ctx)->lastCallBondByAddress;
+                            namedVar.BondedSources = Compiler(ctx)->lastCallBondedSources;
                             namedVar.LambdaCaptureNames = Compiler(ctx)->lastCallLambdaCaptureNames;
                             namedVar.LambdaReferenceCaptureNames =
                                 Compiler(ctx)->lastLambdaReferenceCaptureNames;
@@ -11105,9 +11229,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                      * unless the arm converts.
                                      */
                                     // The type `default` builds when argument `index` defers; empty when it cannot.
+                                    // T518: an unbound callee defers on the place type only behind a clang proof.
+                                    bool deferredPlaceGuard = false;
                                     auto deferredTypeFor = [&](size_t index, antlr4::ParserRuleContext* expression) {
                                         std::string placeType;
-                                        if (!IsCxxDeferrableDefaultTernary(expression, placeType)) return std::string();
+                                        if (!IsCxxDeferrableDefaultTernary(expression, placeType)
+                                            && (funcSym != nullptr
+                                                || !IsCxxDeferrableDefaultTernary(expression, placeType,
+                                                    /*allowCallArm*/ true)))
+                                            return std::string();
                                         std::string parameterType;
                                         bool parameterAgrees = true;
                                         auto fit = Compiler(ctx)->functionTable.find(functionName);
@@ -11128,7 +11258,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         const bool wrapperCallee = funcSym == nullptr
                                             || funcSym->UniqueName.starts_with("__cflat_free_");
                                         if (funcSym == nullptr)
-                                            return parameterType.empty() ? placeType : std::string();
+                                        {
+                                            if (!parameterType.empty()) return std::string();
+                                            if (index == argIdx) deferredPlaceGuard = true;
+                                            return placeType;
+                                        }
                                         if (parameterAgrees && !parameterType.empty()
                                             && Compiler(ctx)->IsForeignNontrivialCxxClass(parameterType)
                                             && (wrapperCallee || cxxNonTemplateMemberWrapper
@@ -11167,13 +11301,29 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (cxxStaticMemberWrapper && !deferredDefaultType.empty())
                                             cxxStaticDeferredCall = true;
                                     }
+                                    // T518: a `?:` of only `default` arms has no type, and an unbound callee no parameter yet.
+                                    if (deferredDefaultType.empty() && funcSym == nullptr && cxxFreeWrapper
+                                        && argumentExpression != nullptr && ternaryArgDest.TypeName.empty())
+                                    {
+                                        if (auto* conditional = CxxDefaultOnlyTernary(argumentExpression))
+                                        {
+                                            LogErrorContext(conditional, std::format(
+                                                "the '?:' argument {} of C++ '{}' has only 'default' arms, so it "
+                                                "has no type of its own, and the parameter type is not known "
+                                                "before the call; give an arm its type explicitly",
+                                                argIdx + 1, functionName));
+                                            cxxCallRefused = true;
+                                            return;
+                                        }
+                                    }
                                     auto argNV = ParseCallArgument([&] {
                                         auto* backend = Compiler(ctx);
                                         if (!deferredDefaultType.empty())
                                         {
                                             LLVMBackend::NamedVariable deferred;
                                             if (!BuildCxxDeferredDefaultTernary(
-                                                    argumentExpression, deferredDefaultType, deferred))
+                                                    argumentExpression, deferredDefaultType, deferred,
+                                                    deferredPlaceGuard))
                                                 return LLVMBackend::NamedVariable{};
                                             return deferred;
                                         }
@@ -11276,6 +11426,195 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
+                                    /*
+                                     * T518: an unbound C++ free wrapper copies a class lvalue argument only
+                                     * inside the wrapper, after every later argument ran; a later non-inert
+                                     * argument naming the same object is handled below.
+                                     */
+                                    if (cxxFreeWrapper && !cxxTemplateWrapper && !cxxConstructorCall
+                                        && (funcSym == nullptr || funcSym->UniqueName.starts_with("__cflat_free_"))
+                                        && !argNV.IsRvalue && !argNV.IsExplicitMove && argNV.Storage != nullptr
+                                        && !argNV.IsCxxDirectConstruction && argNV.CxxClosureSignature.empty()
+                                        && !argNV.TypeAndValue.Pointer && argNV.TypeAndValue.PointerDepth == 0
+                                        && !argNV.TypeAndValue.IsInterface
+                                        && Compiler(ctx)->IsCxxRecord(argNV.TypeAndValue.TypeName)
+                                        && std::none_of(namedArgCtx.begin(), namedArgCtx.end(),
+                                            [](auto* na) { return na->Identifier() != nullptr; }))
+                                    {
+                                        /*
+                                         * Whether C++ copies here is known only once clang selects the callee
+                                         * (CSigEntry::paramBindKinds after binding). The argument stays the same
+                                         * `T &` lvalue, so overload selection is unchanged. A trivially copyable
+                                         * class is snapshot bitwise here and named by the argument only for a
+                                         * by-value selection (the wrapper's own copy is unobservable). Any other
+                                         * class is copy-constructed here behind an i1 decision and a live flag;
+                                         * a by-value selection then calls the selected callee through its
+                                         * address with this copy as the parameter (SwitchCxxDirectByValueCall),
+                                         * so C++'s single copy happens in evaluation order.
+                                         */
+                                        size_t laterIndex = 0;
+                                        for (size_t later = argIdx + 1; later < namedArgCtx.size() && laterIndex == 0; ++later)
+                                            if (!IsCxxInertCallArgument(namedArgCtx[later]->assignmentExpression())
+                                                && BareIdentifierInExpression(namedArgCtx[later]->assignmentExpression()) == nullptr
+                                                && ArgumentNamesStorageRoot(namedArgCtx[later]->assignmentExpression(),
+                                                    argNV.Storage))
+                                                laterIndex = later + 1;
+                                        const bool laterMayWrite = laterIndex != 0;
+                                        auto* backend = Compiler(ctx);
+                                        const std::string typeName = argNV.TypeAndValue.TypeName;
+                                        if (laterMayWrite && !backend->IsCxxTriviallyCopyableRecord(typeName))
+                                        {
+                                            const auto* copyCtor = backend->FindCxxCopyCtor(typeName);
+                                            auto* builder = backend->builder.get();
+                                            auto* objectType = backend->GetType(LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                                            if (copyCtor != nullptr && !copyCtor->isDeleted && objectType != nullptr)
+                                            {
+                                                auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                                                    backend->AllocaAtEntry(objectType, nullptr, "cxx.arg.early.copy"));
+                                                auto* decide = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                                                    backend->AllocaAtEntry(builder->getInt1Ty(), nullptr, "cxx.arg.early.decide"));
+                                                auto* live = backend->AllocaAtEntry(builder->getInt1Ty(), nullptr, "cxx.arg.early.live");
+                                                if (slot == nullptr || decide == nullptr || live == nullptr)
+                                                {
+                                                    cxxCallRefused = true;
+                                                    return;
+                                                }
+                                                llvm::StoreInst* decision = nullptr;
+                                                {
+                                                    llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                                                    builder->SetInsertPoint(decide->getParent(), std::next(decide->getIterator()));
+                                                    decision = builder->CreateStore(builder->getInt1(false), decide);
+                                                }
+                                                // Copies `source` into the slot when the decision is set, then jumps to `resume`.
+                                                auto emitCopy = [&](llvm::Value* source, llvm::BasicBlock* resume) {
+                                                    builder->CreateStore(builder->getInt1(false), live);
+                                                    auto* copyBlock = backend->CreateBasicBlock("cxx.arg.early.copy.do");
+                                                    builder->CreateCondBr(
+                                                        builder->CreateLoad(builder->getInt1Ty(), decide, "cxx.arg.early.copy.now"),
+                                                        copyBlock, resume);
+                                                    backend->SwitchToBlock(copyBlock);
+                                                    if (!backend->EmitCxxCopyOrMoveConstruct(typeName, slot, source, false, "argument"))
+                                                        return false;
+                                                    builder->CreateStore(builder->getInt1(true), live);
+                                                    backend->CreateJump(resume);
+                                                    return true;
+                                                };
+                                                /*
+                                                 * A `c ? default : x` join whose default arm is an owned temp: clang
+                                                 * builds the parameter from the default arm directly, so only the
+                                                 * lvalue arms copy, each on its own edge, and the parameter is a join
+                                                 * of owned slots (the by-value path elides into either).
+                                                 */
+                                                auto isOwnedSlot = [&](llvm::Value* value) {
+                                                    auto* a = llvm::dyn_cast_or_null<llvm::AllocaInst>(value);
+                                                    return a != nullptr && a->getAllocatedType() == objectType
+                                                        && std::any_of(backend->pendingOwnedStructTemps.begin(),
+                                                            backend->pendingOwnedStructTemps.end(),
+                                                            [&](const auto& e) { return e.Alloca == a; });
+                                                };
+                                                auto* join = llvm::dyn_cast<llvm::PHINode>(argNV.Storage);
+                                                bool splitJoin = join != nullptr && join->getType()->isPointerTy();
+                                                if (splitJoin)
+                                                {
+                                                    bool anyOwned = false;
+                                                    for (unsigned in = 0; in < join->getNumIncomingValues(); ++in)
+                                                    {
+                                                        anyOwned = anyOwned || isOwnedSlot(join->getIncomingValue(in));
+                                                        auto* pred = join->getIncomingBlock(in);
+                                                        splitJoin = splitJoin && pred->getTerminator() != nullptr
+                                                            && llvm::isa<llvm::BranchInst>(pred->getTerminator());
+                                                    }
+                                                    splitJoin = splitJoin && anyOwned;
+                                                }
+                                                if (splitJoin)
+                                                {
+                                                    auto* current = builder->GetInsertBlock();
+                                                    auto* joinBlock = join->getParent();
+                                                    std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incoming;
+                                                    for (unsigned in = 0; in < join->getNumIncomingValues(); ++in)
+                                                        incoming.emplace_back(join->getIncomingValue(in), join->getIncomingBlock(in));
+                                                    std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> exactIncoming;
+                                                    for (const auto& [value, pred] : incoming)
+                                                    {
+                                                        auto* edge = backend->CreateBasicBlock("cxx.arg.early.edge");
+                                                        pred->getTerminator()->replaceSuccessorWith(joinBlock, edge);
+                                                        backend->SwitchToBlock(edge);
+                                                        llvm::BasicBlock* last = edge;
+                                                        if (isOwnedSlot(value))
+                                                        {
+                                                            builder->CreateStore(builder->getInt1(false), live);
+                                                            exactIncoming.emplace_back(value, edge);
+                                                        }
+                                                        else
+                                                        {
+                                                            auto* merge = backend->CreateBasicBlock("cxx.arg.early.edge.done");
+                                                            if (!emitCopy(value, merge))
+                                                            {
+                                                                cxxCallRefused = true;
+                                                                return;
+                                                            }
+                                                            backend->SwitchToBlock(merge);
+                                                            last = merge;
+                                                            exactIncoming.emplace_back(slot, merge);
+                                                        }
+                                                        builder->CreateBr(joinBlock);
+                                                        joinBlock->replacePhiUsesWith(pred, last);
+                                                    }
+                                                    llvm::PHINode* exact = nullptr;
+                                                    {
+                                                        llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                                                        builder->SetInsertPoint(joinBlock, joinBlock->getFirstNonPHIIt());
+                                                        exact = builder->CreatePHI(join->getType(),
+                                                            static_cast<unsigned>(exactIncoming.size()), "cxx.arg.early.join");
+                                                    }
+                                                    for (const auto& [value, block] : exactIncoming) exact->addIncoming(value, block);
+                                                    builder->SetInsertPoint(current);
+                                                    backend->RegisterCxxDefaultTernaryStorageJoin(exact);
+                                                    argNV.CxxEarlyCopyJoin = exact;
+                                                }
+                                                else
+                                                {
+                                                    auto* resumeBlock = backend->CreateBasicBlock("cxx.arg.early.copy.done");
+                                                    if (!emitCopy(argNV.Storage, resumeBlock))
+                                                    {
+                                                        cxxCallRefused = true;
+                                                        return;
+                                                    }
+                                                    backend->SwitchToBlock(resumeBlock);
+                                                }
+                                                backend->RegisterOwnedStructTemp(slot, typeName, live);
+                                                argNV.CxxEarlyCopyDecision = decision;
+                                                argNV.CxxEarlyCopySlot = slot;
+                                            }
+                                        }
+                                        else if (laterMayWrite)
+                                        {
+                                            auto* builder = backend->builder.get();
+                                            auto* objectType = backend->GetType(LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                                            auto* slot = objectType != nullptr
+                                                ? backend->AllocaAtEntry(objectType, nullptr, "cxx.arg.early.copy") : nullptr;
+                                            auto* decide = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                                                backend->AllocaAtEntry(builder->getInt1Ty(), nullptr, "cxx.arg.early.decide"));
+                                            if (slot == nullptr || decide == nullptr)
+                                            {
+                                                cxxCallRefused = true;
+                                                return;
+                                            }
+                                            llvm::StoreInst* decision = nullptr;
+                                            {
+                                                llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                                                builder->SetInsertPoint(decide->getParent(), std::next(decide->getIterator()));
+                                                decision = builder->CreateStore(builder->getInt1(false), decide);
+                                            }
+                                            const llvm::DataLayout& layout = backend->module->getDataLayout();
+                                            builder->CreateMemCpy(slot, layout.getABITypeAlign(objectType), argNV.Storage,
+                                                layout.getABITypeAlign(objectType), layout.getTypeAllocSize(objectType));
+                                            auto* copyNow = builder->CreateLoad(builder->getInt1Ty(), decide, "cxx.arg.early.copy.now");
+                                            argNV.Storage = builder->CreateSelect(copyNow, slot, argNV.Storage, "cxx.arg.early.place");
+                                            argNV.Primary = backend->CreateLoad(objectType, argNV.Storage);
+                                            argNV.CxxEarlyCopyDecision = decision;
+                                        }
+                                    }
                                     // T235: a C++ class prvalue before a direct construction keeps it out of
                                     // the wrapper, whose by-value param would move the prvalue (clang: 0).
                                     if (cxxDirectConstructionCallOrderSafe_ != nullptr && argNV.IsRvalue
@@ -11373,6 +11712,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CxxDirectConstructionArguments =
                                         argNV.CxxDirectConstructionArguments;
                                     argVar.CxxDeferredTernaryShape = argNV.CxxDeferredTernaryShape;
+                                    argVar.CxxEarlyCopyDecision = argNV.CxxEarlyCopyDecision;
+                                    argVar.CxxEarlyCopySlot = argNV.CxxEarlyCopySlot;
+                                    argVar.CxxEarlyCopyJoin = argNV.CxxEarlyCopyJoin;
 
                                     if (argName)
                                         argVar.TypeAndValue.VariableName = argName->getText();
@@ -12726,6 +13068,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgumentPostfix.Flush();
                                 Compiler(ctx)->pendingCallSite_ = callParen;
                                 Compiler(ctx)->pendingReceiverText_ = lastMemberReceiverPath;
+                                Compiler(ctx)->pendingCallReceiver_ =
+                                    isPostfixMemberCall && !isStaticTemplateThroughObject
+                                        ? std::optional<LLVMBackend::NamedVariable>(structVar)
+                                        : std::nullopt;
                                 braceArgumentUnwind.Release();
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
@@ -12745,6 +13091,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
                                 Compiler(ctx)->pendingReceiverText_.clear();
+                                Compiler(ctx)->pendingCallReceiver_.reset();
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
@@ -12856,6 +13203,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgumentPostfix.Flush();
                                 Compiler(ctx)->pendingCallSite_ = callParen;
                                 Compiler(ctx)->pendingReceiverText_ = lastMemberReceiverPath;
+                                Compiler(ctx)->pendingCallReceiver_ =
+                                    isPostfixMemberCall && !isStaticTemplateThroughObject
+                                        ? std::optional<LLVMBackend::NamedVariable>(structVar)
+                                        : std::nullopt;
                                 braceArgumentUnwind.Release();
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
@@ -12875,6 +13226,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
                                 Compiler(ctx)->pendingReceiverText_.clear();
+                                Compiler(ctx)->pendingCallReceiver_.reset();
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())

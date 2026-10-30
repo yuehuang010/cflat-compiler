@@ -1,0 +1,12 @@
+import cpp "list";
+
+struct T524ListNode { std.list<int> l = default; int tag = 0; };
+struct T524ListPair { T524ListNode[2] nodes = default; };
+
+expect_error("must be constructed in main or made foldable");
+T524ListPair t524GlobalListPair = default;
+
+extern int main()
+{
+    return 0;
+}

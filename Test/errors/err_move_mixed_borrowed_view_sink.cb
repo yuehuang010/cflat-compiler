@@ -352,3 +352,403 @@ expect_error("the view may be borrowed on a runtime path") {
         }
     }
 }
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedArrayElementFieldJoinSinkThroughPointerAlias(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[2] : w;
+        T387ArrayFieldHolder* q = &a;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedArrayElementFieldJoinSinkThroughForwardHelper(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[2] : w;
+        t516MoveViewFromPointer(&a);
+    }
+}
+
+void t516MoveViewFromPointer(T387ArrayFieldHolder* p)
+{
+    t377MoveViewSink(move p->hs[0].view);
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516ChainUse(T387ArrayFieldHolder* p)
+    {
+        t377MoveViewSink(move p->hs[0].view);
+    }
+    void t516ChainUse2(T387ArrayFieldHolder* p) { t516ChainUse(p); }
+    void t516ChainCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        t516ChainUse2(&a);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516ParamAlias( T387ArrayFieldHolder* p)
+    {
+        T387ArrayFieldHolder* r = p;
+        t377MoveViewSink(move r->hs[0].view);
+    }
+    void t516ParamAliasCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        t516ParamAlias(&a);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516DynamicIndex(T387ArrayFieldHolder* p, int i)
+    {
+        t377MoveViewSink(move p->hs[i].view);
+    }
+    void t516DynamicIndexCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        t516DynamicIndex(&a, 0);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    struct T516MethodHolder
+    {
+        T387FieldHolder hs[2];
+        void take() { t377MoveViewSink(move this->hs[0].view); }
+    };
+    void t516MethodCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T516MethodHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        a.take();
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516MixedTernaryRoots(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? w : new T377MoveView[1];
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = c ? &a : &b;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516MixedReassignedRoots(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? w : new T377MoveView[1];
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &b;
+        q = &a;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516MixedNullRoot(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder* q = c ? nullptr : &a;
+        if (q != nullptr) t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    struct T516ImplicitMethodHolder
+    {
+        T387FieldHolder hs[2];
+        void take2() { t377MoveViewSink(move hs[0].view); }
+    };
+    void t516ImplicitMethodCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T516ImplicitMethodHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        a.take2();
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516Forward2(T387ArrayFieldHolder* p);
+    void t516ForwardCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        t516Forward2(&a);
+    }
+    void t516Forward2(T387ArrayFieldHolder* p)
+    {
+        t516ForwardSink(p);
+    }
+    void t516ForwardSink(T387ArrayFieldHolder* p)
+    {
+        t377MoveViewSink(move p->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516TwoArgSink(T387ArrayFieldHolder* p, int k)
+    {
+        t377MoveViewSink(move p->hs[0].view);
+    }
+    void t516TwoArgForward(T387ArrayFieldHolder* p)
+    {
+        t516TwoArgSink(p, 0);
+    }
+    void t516TwoArgCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        t516TwoArgForward(&a);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516R4LoopCaller(bool c, int n)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        for (int i = 0; i < n; i++) { q = &b; }
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516R4AddrCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        T387ArrayFieldHolder** pp = &q;
+        q = &b;
+        *pp = &a;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516R4CopyCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* r = &a;
+        T387ArrayFieldHolder* q = &b;
+        q = r;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516R4ArityMove(T387ArrayFieldHolder* p, int k)
+    {
+        t377MoveViewSink(move p->hs[0].view);
+    }
+    void t516R4ArityMove(T387ArrayFieldHolder* p, double k)
+    {
+    }
+    void t516R4ArityForward(T387ArrayFieldHolder* p)
+    {
+        t516R4ArityMove(p, 1);
+    }
+    void t516R4ArityCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        t516R4ArityForward(&a);
+    }
+}
+
+expect_error("for parameter 'this'") {
+    struct T516R4ThisHolder
+    {
+        T387FieldHolder hs[2];
+        void take() { t377MoveViewSink(move hs[0].view); }
+    };
+    void t516R4ThisCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T516R4ThisHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        a.take();
+    }
+}
+
+expect_error("through 'q' for parameter 'p'") {
+    void t516R5HelperUse(T387ArrayFieldHolder* p) { t377MoveViewSink(move p->hs[0].view); }
+    void t516R5HelperSet(T387ArrayFieldHolder** x, T387ArrayFieldHolder* v) { *x = v; }
+    void t516R5HelperCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &b;
+        T387ArrayFieldHolder** x = &q;
+        t516R5HelperSet(x, &a);
+        t516R5HelperUse(q);
+    }
+}
+
+expect_error("through 'q' for parameter 'p'") {
+    void t516R5CopyUse(T387ArrayFieldHolder* p) { t377MoveViewSink(move p->hs[0].view); }
+    void t516R5CopyCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &b;
+        T387ArrayFieldHolder** x = &q;
+        T387ArrayFieldHolder** y = x;
+        *y = &a;
+        t516R5CopyUse(q);
+    }
+}
+
+expect_error("through 'q' for parameter 'p'") {
+    void t516R5LambdaUse(T387ArrayFieldHolder* p) { t377MoveViewSink(move p->hs[0].view); }
+    void t516R5LambdaCaller(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &b;
+        T387ArrayFieldHolder** x = &q;
+        Lambda<void()> g = () => { *x = &a; };
+        g();
+        t516R5LambdaUse(q);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void t516R6BreakBeforeStore(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        for (int i = 0; i < 1; i++)
+        {
+            if (c) break;
+            q = &b;
+        }
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void countedLoopNarrowChar(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        for (char i = 256; i != 0; i++) { q = &b; }
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void countedLoopNarrowInt(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        for (int i = 4294967296; i != 0; i++) { q = &b; }
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void countedLoopOctalBound(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        for (int i = 9; i < 010; i++) { q = &b; }
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void aliasCopyOfShadow(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        T387ArrayFieldHolder* r = &a;
+        T387ArrayFieldHolder** x = &q;
+        { T387ArrayFieldHolder** x = &r; T387ArrayFieldHolder** y = x; *y = &b; }
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void aliasCopyConditional(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[2];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[1] : w;
+        T387ArrayFieldHolder b = default;
+        b.hs[0].view = new T377MoveView[1];
+        T387ArrayFieldHolder* q = &a;
+        T387ArrayFieldHolder* r = &a;
+        T387ArrayFieldHolder** x = &q;
+        T387ArrayFieldHolder** y = x ? &r : &r;
+        *y = &b;
+        t377MoveViewSink(move q->hs[0].view);
+    }
+}

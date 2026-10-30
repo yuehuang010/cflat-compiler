@@ -35,7 +35,7 @@ UBox makeBorrowedDestinationBox()
     return b;
 }
 
-UBox gsink = default;
+UBox gsink;
 
 expect_error("cannot consume field 'Wrap.b' out of borrowed parameter 'w'") {
     int badDeclInit(Wrap w) { UBox o = w.b; return o.item->id; }

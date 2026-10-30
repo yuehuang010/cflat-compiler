@@ -82,7 +82,6 @@ struct FbList  { list<int> l = { 1, 2, 3 }; };             // container-typed fi
 int fbBumped = 0;
 int fbBump() { fbBumped = fbBumped + 1; return 41; }
 struct FbSide  { FbIn i = { x = fbBump(), y = 2 }; };      // the call must run exactly once
-FbEq fbGlobal = default;                                   // non-folding default runs in the module initializer
 
 // Nested named braces reuse the ordinary per-field emission path.
 struct NbiLeaf   { int x = 11; string label = default; };
@@ -595,10 +594,6 @@ extern int main()
     FbEq fbeZ = { z = 5 };
     total++; passed += Test("field brace default survives outer brace init",
                             fbeZ.i.x * 1000 + fbeZ.i.y + fbeZ.z, 1007);
-
-    // A global whose default does not fold runs its construction in the module initializer (T514).
-    total++; passed += Test("field brace default at global scope",
-                            fbGlobal.i.x * 1000 + fbGlobal.i.y, 1002);
 
     // ===== 'S[N] a = default;' runs the element's field initializers per element =====
     // Every leg in this block read 0 (or crashed) on the pre-fix binary.

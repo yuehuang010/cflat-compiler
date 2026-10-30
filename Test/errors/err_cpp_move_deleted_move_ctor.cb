@@ -55,6 +55,12 @@ extern int main()
         cppi.XvMultiMove b = cppi.XvMultiMove(9);
         b = move a;
     }
+    // T528: discarding a moved fixed-array element constructs through clang's pick, so the
+    // deleted move constructor is refused instead of silently copying.
+    expect_error("cannot move-construct C++ class 'cppi.XvNoMove' from 'move a[0]' (std::move of a 'cppi.XvNoMove'): clang: call to deleted constructor of 'cppi::XvNoMove'") {
+        cppi.XvNoMove[2] a = { cppi.XvNoMove(12), cppi.XvNoMove(13) };
+        _ = move a[0];
+    }
     // Controls: a move-only class moves; XvNoMove copies from a const source.
     cppi.XvMoveOnly m = cppi.XvMoveOnly(10);
     cppi.XvMoveOnly n = move m;

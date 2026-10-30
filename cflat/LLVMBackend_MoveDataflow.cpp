@@ -283,6 +283,26 @@ static bool RefineStoresByCorrelatedBranches(
         std::unordered_map<const llvm::Value*, unsigned> storeCountBySlot;
         auto storesToSlot = [&](const llvm::Value* alloca) {
             auto [it, inserted] = storeCountBySlot.emplace(alloca, 0);
+            // A slot whose address escapes (a call, a stored or derived pointer) may change under
+            // any instruction: never stable, whatever its direct store count.
+            if (inserted)
+                for (const llvm::User* user : alloca->users())
+                {
+                    if (llvm::isa<llvm::LoadInst>(user)) continue;
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getPointerOperand() == alloca
+                        && store->getValueOperand() != alloca)
+                        continue;
+                    if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(user);
+                        intrinsic != nullptr
+                        && (intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_declare
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_value
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end))
+                        continue;
+                    it->second = 2;
+                    return it->second;
+                }
             if (inserted)
                 for (const llvm::BasicBlock& basicBlock : *load->getFunction())
                     for (const llvm::Instruction& instruction : basicBlock)
@@ -345,6 +365,31 @@ static bool RefineStoresByCorrelatedBranches(
             branchFacts.push_back(fact);
             return true;
         };
+        // T522: a store's own block must be reachable from entry under the facts gathered below
+        // it (`if (k == 99) i = &loc; if (k == 99) i = &g;`). Simple paths suffice: a cycle only
+        // adds facts. Exhaustion answers reachable (conservative).
+        std::function<bool(llvm::BasicBlock*, std::unordered_set<const llvm::BasicBlock*>&)> reachable =
+            [&](llvm::BasicBlock* block, std::unordered_set<const llvm::BasicBlock*>& onPath) {
+                if (exhausted) return true;
+                if (++visitedNodes > kNodeBudget)
+                {
+                    exhausted = true;
+                    return true;
+                }
+                if (block == &block->getParent()->getEntryBlock()) return true;
+                if (!onPath.insert(block).second) return false;
+                bool any = false;
+                for (llvm::BasicBlock* predecessor : llvm::predecessors(block))
+                {
+                    auto* branch = llvm::dyn_cast<llvm::BranchInst>(predecessor->getTerminator());
+                    size_t factCount = branchFacts.size();
+                    if (addBranchFact(branch, block) && reachable(predecessor, onPath)) any = true;
+                    branchFacts.resize(factCount);
+                    if (any || exhausted) break;
+                }
+                onPath.erase(block);
+                return any || exhausted;
+            };
         std::function<void(llvm::BasicBlock*, llvm::Instruction*)> walk =
             [&](llvm::BasicBlock* block, llvm::Instruction* before) {
                 if (exhausted || block == nullptr) return;
@@ -362,7 +407,9 @@ static bool RefineStoresByCorrelatedBranches(
                     if (store == nullptr
                         || store->getPointerOperand()->stripPointerCasts() != slot)
                         continue;
-                    if (seenStores.insert(store).second) stores.push_back(store);
+                    std::unordered_set<const llvm::BasicBlock*> onPath;
+                    if (reachable(block, onPath) && seenStores.insert(store).second)
+                        stores.push_back(store);
                     path.erase(block);
                     return;
                 }
@@ -405,6 +452,8 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
         {
             if (!rec.Slot || !rec.ReturnedLoad) continue;
             bool aliasOfOwnedLocal = false;
+            bool frameBorrowViaCall = false;
+            bool unprovenViaCall = false;  // T522: the frame verdict came from unproven provenance
             bool sawNullReachingStore = false;
             std::string frameStorageClassName;
             std::unordered_set<const llvm::Value*> valuePath;
@@ -446,6 +495,18 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
                         valuePath.erase(value);
                         return;
                     }
+                    // T522: an interface produced by a non-'move' call borrows its pointer arguments.
+                    if (llvm::isa<llvm::CallBase>(value) && value->getType() == GetFatPtrType())
+                    {
+                        auto cached = fatCallBorrowKinds_.find(value);
+                        const int borrow = cached != fatCallBorrowKinds_.end() ? cached->second
+                            : CallResultFrameBorrowKind(const_cast<llvm::Value*>(value), this, F);
+                        aliasOfOwnedLocal = aliasOfOwnedLocal || borrow == 1;
+                        frameBorrowViaCall = frameBorrowViaCall || borrow == 2 || borrow == 3;
+                        unprovenViaCall = unprovenViaCall || borrow == 3;
+                        valuePath.erase(value);
+                        return;
+                    }
                     if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
                         load != nullptr && load->getType() == GetFatPtrType())
                     {
@@ -470,14 +531,20 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
                 if (!activeLoads.insert(load).second) return linear;
 
                 bool savedAlias = aliasOfOwnedLocal;
+                bool savedFrameCall = frameBorrowViaCall;
+                bool savedUnproven = unprovenViaCall;
                 std::string savedFrame = frameStorageClassName;
                 aliasOfOwnedLocal = false;
+                frameBorrowViaCall = false;
                 frameStorageClassName.clear();
                 valuePath.clear();
                 for (const llvm::StoreInst* store : linear)
                     inspectValue(store->getValueOperand(), 0);
-                bool hasDangerousStore = aliasOfOwnedLocal || !frameStorageClassName.empty();
+                bool hasDangerousStore = aliasOfOwnedLocal || frameBorrowViaCall
+                    || !frameStorageClassName.empty();
                 aliasOfOwnedLocal = savedAlias;
+                frameBorrowViaCall = savedFrameCall;
+                unprovenViaCall = savedUnproven;
                 frameStorageClassName = std::move(savedFrame);
                 valuePath.clear();
 
@@ -537,6 +604,18 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
                     "is freed when this function returns and a borrow cannot outlive its owner; "
                     "return the owning local itself ('return t;' from a 'move' function) or a heap "
                     "object", rec.InterfaceName));
+            }
+            if (frameBorrowViaCall && frameStorageClassName.empty() && unprovenViaCall)
+            {
+                SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+                LogError(UnprovenInterfaceReturnText(*this, rec.InterfaceName));
+            }
+            else if (frameBorrowViaCall && frameStorageClassName.empty())
+            {
+                SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+                LogError(std::format("cannot return a local value as interface '{}' - "
+                    "the interface fat pointer would dangle once this function returns; "
+                    "allocate the object on the heap and return the pointer", rec.InterfaceName));
             }
             if (!frameStorageClassName.empty())
             {
@@ -1234,7 +1313,7 @@ llvm::GlobalVariable* LLVMBackend::GetGlobalVariable(const std::string& name)
         return nullptr;
     }
 
-LLVMBackend::NamedVariable LLVMBackend::GetGlobalVariableNV(const std::string& name)
+LLVMBackend::NamedVariable LLVMBackend::GetGlobalVariableNV(const std::string& name) const
 {
         auto gIt = globalNamedVariable.find(name);
         if (gIt == globalNamedVariable.end())
@@ -2661,6 +2740,13 @@ bool LLVMBackend::IsOwningStructField(const std::string& structName, unsigned in
         return field.IsUnique || IsCoreUniqueType(field.TypeName);
     }
 
+std::string UnprovenInterfaceReturnText(const LLVMBackend& compiler, const std::string& ifaceName)
+{
+        return std::format("cannot prove the returned interface '{}' does not borrow from a local - its "
+            "provenance is beyond what the compiler tracks; return a heap object or a global, or shorten "
+            "the chain it flows through", SpellType(compiler, LLVMBackend::TypeAndValue{ .TypeName = ifaceName }));
+    }
+
 bool LLVMBackend::IsFunctionArgumentStorage(llvm::Value* storage) const
 {
         if (storage == nullptr) return false;
@@ -3735,7 +3821,7 @@ void LLVMBackend::ResolveDeferredExpectationVerdicts(bool aborted)
                 const auto& entry = deferredRawPointerCalleeStores_[candidate.Index];
                 reportExpected(expectation.Expected, entry.File, entry.Line, entry.Column, [&]()
                 {
-                    LogError(DescribeRawPointerCalleeStore(entry.ParamName));
+                    LogError(DeferredCalleeStoreMessage(entry));
                 });
                 answered = true;
             }
@@ -3834,7 +3920,7 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
             try
             {
                 ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
-                LogError(DescribeRawPointerCalleeStore(entry.ParamName));
+                LogError(DeferredCalleeStoreMessage(entry));
             }
             catch (const ExpectedErrorReceived&) {}
             RestoreFileScopeExpectedError();
@@ -3870,7 +3956,7 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
             || entry.Verdict != RawPointerStoreVerdict::Stores)
             continue;
         ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
-        LogError(DescribeRawPointerCalleeStore(entry.ParamName));
+        LogError(DeferredCalleeStoreMessage(entry));
     }
     std::vector<ThisClosureCopySite> sites;
     sites.swap(thisClosureCopySites_);

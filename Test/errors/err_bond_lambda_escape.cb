@@ -35,7 +35,186 @@ void escapeThroughIdentityStore() {
 extern int main() {
     _ = escapeThroughIdentityReturn();
     escapeThroughIdentityStore();
+    _ = t529EscapeIdentityReturn();
+    t529EscapeIdentityStore();
+    t529EscapeSetterReceiver();
+    t529EscapeSetterReceiverCounts();
+    t529EscapeSetterGlobal();
+    t529EscapeSetterPointer();
+    t529EscapeGlobalWithUnrelatedArgument();
+    t529EscapeThroughPointerReceiver();
+    t529EscapeTwoHopIdentity();
+    t529EscapeTernaryIdentity();
+    t529EscapeNestedReceiverCall();
+    t529R3EscapeReceiverAndGlobal();
+    t529R3EscapeParamAndGlobal();
+    t529R3RejectEarlierSameScopeDestination();
+    t529R4EscapeHelperLookalike();
     return 0;
+}
+
+// A by-reference capture of a unique pointee must stay bonded through a closure-valued identity call.
+struct T529IdentityRes { int value = default; };
+Lambda<int()> t529Identity(Lambda<int()> value) { return value; }
+Lambda<int()> t529Escaped = default;
+Lambda<int()> t529EscapeIdentityReturn() {
+    expect_error("bonded value whose source 'owner' is not a 'bond' parameter");
+    unique<T529IdentityRes> owner = unique<T529IdentityRes>(new T529IdentityRes());
+    owner->value = 23;
+    return t529Identity(() => { return owner->value; });
+}
+void t529EscapeIdentityStore() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    unique<T529IdentityRes> owner = unique<T529IdentityRes>(new T529IdentityRes());
+    owner->value = 23;
+    t529Escaped = t529Identity(() => { return owner->value; });
+}
+// A by-value closure parameter stored into a wider receiver escapes the owner's scope.
+struct T529SetterRes { int value = default; };
+struct T529SetterBox { Lambda<int()> value = default; void set(Lambda<int()> next) { value = next; } };
+void t529EscapeSetterReceiver() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    T529SetterBox box;
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        owner->value = 43;
+        box.set(() => { return owner->value; });
+    }
+}
+void t529EscapeSetterReceiverCounts() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    T529SetterBox box;
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        owner->value = 43;
+        box.set(() => { return owner->value; });
+    }
+}
+
+Lambda<int()> t529GlobalClosure = default;
+void t529StoreSetterGlobal(Lambda<int()> next) { t529GlobalClosure = next; }
+void t529EscapeSetterGlobal() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+    owner->value = 47;
+    t529StoreSetterGlobal(() => { return owner->value; });
+}
+
+struct T529SetterHolder { Lambda<int()> value = default; };
+void t529StoreSetterPointer(T529SetterHolder* destination, Lambda<int()> next) {
+    destination->value = next;
+}
+void t529EscapeSetterPointer() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    T529SetterHolder holder;
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        owner->value = 53;
+        t529StoreSetterPointer(&holder, () => { return owner->value; });
+    }
+}
+
+void t529StoreGlobalWithInt(int unrelated, Lambda<int()> next) {
+    t529GlobalClosure = next;
+}
+
+void t529EscapeGlobalWithUnrelatedArgument() {
+    expect_error("bonded value");
+    unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+    owner->value = 61;
+    int unrelated = 1;
+    t529StoreGlobalWithInt(unrelated, () => { return owner->value; });
+}
+
+void t529EscapeThroughPointerReceiver() {
+    expect_error("bonded value");
+    T529SetterBox box;
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        owner->value = 67;
+        T529SetterBox* pointer = &box;
+        pointer->set(() => { return owner->value; });
+    }
+}
+
+void t529EscapeTwoHopIdentity() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+    owner->value = 71;
+    t529Escaped = t529Identity(t529Identity(() => { return owner->value; }));
+}
+
+void t529EscapeTernaryIdentity() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+    owner->value = 73;
+    bool choose = true;
+    t529Escaped = choose
+        ? t529Identity(() => { return owner->value; })
+        : t529Identity(() => { return owner->value + 1; });
+}
+
+struct T529NestedMaker {
+    Lambda<int()> make(Lambda<int()> value) { return t529Identity(value); }
+};
+
+void t529EscapeNestedReceiverCall() {
+    expect_error("bonded value");
+    T529SetterBox box;
+    T529NestedMaker maker;
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        owner->value = 79;
+        box.set(maker.make(() => { return owner->value; }));
+    }
+}
+
+// Receiver stores the closure locally and also into a global: the global sink refuses.
+Lambda<int()> t529R3Global = default;
+struct T529R3ReceiverAndGlobal {
+    Lambda<int()> value = default;
+    void set(Lambda<int()> next) { value = next; t529R3Global = next; }
+};
+void t529R3EscapeReceiverAndGlobal() {
+    expect_error("bonded value");
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        T529R3ReceiverAndGlobal receiver;
+        Lambda<int()> closure = () => { return owner->value; };
+        receiver.set(closure);
+    }
+}
+
+// Parameter stores the closure in a holder and also into a global: the global sink refuses.
+struct T529R3Holder { Lambda<int()> value = default; };
+void t529R3StoreParamAndGlobal(T529R3Holder* holder, Lambda<int()> next) {
+    holder->value = next;
+    t529R3Global = next;
+}
+void t529R3EscapeParamAndGlobal() {
+    expect_error("bonded value");
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        T529R3Holder holder;
+        Lambda<int()> closure = () => { return owner->value; };
+        t529R3StoreParamAndGlobal(&holder, closure);
+    }
+}
+
+// The receiver is declared before the closure's source at the same depth; its destructor runs
+// after the source is gone, so the store refuses.
+int t529R3Seen = 0;
+struct T529R3DtorReceiver {
+    Lambda<int()> value = default;
+    void set(Lambda<int()> next) { value = next; }
+    ~T529R3DtorReceiver() { t529R3Seen = value(); }
+};
+void t529R3RejectEarlierSameScopeDestination() {
+    expect_error("bonded value");
+    T529R3DtorReceiver receiver;
+    unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+    Lambda<int()> closure = () => { return owner->value; };
+    receiver.set(closure);
 }
 
 // A list<T> is a non-pointer struct, so it reference-captures like the Counter above and the
@@ -477,4 +656,23 @@ BraceResultHolder returnBraceInitBondedField() {
     h.f = () => { xs.count(); };
     BraceResultHolder r = {f = h.f};
     return r;
+}
+
+// A user `_closure_fat_ptr` namespace mangles like the closure runtime helpers; its global store
+// must still count as a sink.
+namespace _closure_fat_ptr {
+    void copyT529(Lambda<int()> n) { t529R3Global = n; }
+}
+void t529R4StoreHolderAndLookalike(T529R3Holder* holder, Lambda<int()> next) {
+    holder->value = next;
+    _closure_fat_ptr.copyT529(next);
+}
+void t529R4EscapeHelperLookalike() {
+    expect_error("bonded value");
+    {
+        unique<T529SetterRes> owner = unique<T529SetterRes>(new T529SetterRes());
+        T529R3Holder holder;
+        Lambda<int()> closure = () => { return owner->value; };
+        t529R4StoreHolderAndLookalike(&holder, closure);
+    }
 }

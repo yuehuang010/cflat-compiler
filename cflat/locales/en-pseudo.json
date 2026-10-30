@@ -150,6 +150,7 @@
       "cpppoly.Shape",
       "cpppoly.Tagged"
     ],
+    "bondedvaluecannotbes...mewouldbeuntrackablef73fc95d4ef9df74": [],
     "callthroughfunctionp...ainerselementuniquetfb2c6f922712c5d0": [
       "f",
       "n",
@@ -2021,6 +2022,7 @@
     "baseinitializerargum...parametersorliterals4e1fed190568eb69": "base initializer arguments must be constructor parameters or literals",
     "baseinitializerisonlyvalidinacppstruct": "base initializer is only valid in a [cpp] struct",
     "baseinitializernames...utthebaseclassisarg1cd645a82a4640656": "base initializer names '{0}' but the base class is '{1}'",
+    "bondedvaluecannotbes...mewouldbeuntrackablef73fc95d4ef9df74": "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable",
     "builtinssourcenotfoundarg0": "builtins source not found: '{0}'.",
     "callthroughafunction...sitetopassthepointee5550b0e566872e76": "call through a function value: cannot pass a pointer as argument {0} - that parameter is a by-value slot and there is no implicit dereference. Write '*' at the call site to pass the pointee.",
     "callthroughfunctionp...ainerselementuniquetfb2c6f922712c5d0": "call through function pointer '{0}': '{1}' still owns the object it was given, and the target stores this argument into a container that only BORROWS its elements and never frees them, so the stored element would dangle. Transfer the object with '{2}(move {3})', or declare the container's element 'unique T*'.",

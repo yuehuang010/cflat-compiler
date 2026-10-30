@@ -57,73 +57,45 @@ Rows are grouped by the KIND of fix, which decides the mode and the reviewer's f
 A **run** is one worktree + one branch. Issues that share a function go in the same run (never two
 concurrent runs on the same function). Run ids are new for this regroup; old ids are retired.
 
-## Next timebox: ship gate (p1 + p2), built 2026-10-22
+## Next timebox: ship gate (p1 + p2), rebuilt 2026-10-25 (box 4)
 
-Land all runs below in the next timebox. p1 first (gate: zero). Rows name every issue file they close.
-R5 `&v` on a view: refusal is the safe default under the bucket rule; no explicit ruling on `&v` meaning yet.
+p1 count: zero. Every p2 below is fixed or refused with a located error (bucket rule B). Rows name every issue file
+they close. Rulings 2026-10-25 (lessons digest "Rulings 2026-10-25") are folded in; no row waits on a ruling.
 
 Tiers: Luna default; Haiku high after a Luna fail; Opus after Haiku. "Win gate" = C++/ABI-touching, needs the Windows box.
 Ruling refs: L = fix-issue-lessons.md "Rulings 2026-10-21/22: open-question sweep"; B = "Ruling 2026-10-21: issue bucket meanings" (p2 = fix or located error).
 
 | Id | Item (bucket/stem) | What is wrong (<= 15 words) | Fix (<= 20 words, cite ruling if any) | Area | Size | Tier | Win |
 |---|---|---|---|---|---|---|---|
-| R7 | p2/statement-temp-escapes-via-out-param-or-global | void*/unrelated pointer joins accepted; C-callee keeps freed temp (use-after-free) | Join refusal landed (T410). Left: C-callee/indirect-fn policy | pointer join conversion, statement-temp release (MainListener_Expressions), C callee policy | M | Luna | yes |
-| R9 | p2/unique-field-heap-array-through-move-param | `new T[n]` reaches `move T*`/unique field, freed as one object | RULED 2026-10-25, hold lifted: option 1 - callee-side "adopted into unique<T>" param fact, call-site refusal on precise array provenance; `move T*` keeps the hidden count; also `m = new R()` on a move param releases the old value (see issue head) | param sink check, new T[n] typing (MainListener_Expressions, LLVMBackend) | M | Luna (spike gate) | no |
-| R12 | p2/cpp-ternary-default-arm-unbound-callee-wrong-arm | Bulk landed (T418 default/local leaves, T420 field/move leaves). Left: conversion arm into first unbound wrapper call (unknown signature); call arm; (default) parens; ctor const& | See issue "Still wrong"; extend deferral to move/field leaves, register wrapper param type before arg parse | MainListener_PostfixExpression.cpp, ParseTernaryBranches, C++ call-arg state | L | Opus | yes |
-| R13 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | (a),(b) landed (T417). Left: R3 arr slot reuse `_ = move arr[0]; arr[0] = b` | (c) R3 element state (needs design). ruled: DESTROY+REBUILD stays | lowered C++ field machinery | M | Opus (after design) | yes |
-| R14 | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame | fn-ptr var or closure forwarded to C++ T&& dangles in wrapper frame | Blob-record family landed (T419: std-owner rule, MSVC shared_ptr). Left: see issue (std::function(std::ref(f)), caller-frame materialization, BorrowDtor/Mixed blind spots) | C++ wrapper/forwarding (CInterop, LLVMBackend_Overloads) | L | Opus | yes |
-| R16 | p2/delete-borrow-via-named-local + p2/view-mixed-join-sunk-through-pointer-param-alias | Owner/borrow reaches sink via helper chain or ptr param; double free / UAF | One interprocedural callee summary ("param stored into borrowing container / sinks view field"); path-sensitive provenance. Parked fix/t396-viewalias; not same-function guard (digest) | callee summaries, MemoryOutlivesCall walk, T387 view state | L | Opus | no |
-| R17 | p2/iface-return-dangle-via-calls-aggregates-and-rebinds | Returned interface boxes pointer from local via call/heap/indirect write | RULED 2026-10-25: Rust lifetime elision - call result borrows from every pointer arg + receiver unless callee summary proves fresh/global/param N; heap aggregate alias refused the same way (see issue head) | provenance through memory; PointerValueRoot | L | Opus | no |
+| R7 | p2/statement-temp-escapes-via-out-param-or-global | C-callee keeps freed temp (UAF); indirect fn<> read-only callee leaks | Join refusal landed (T410). C callee = conservative keeper (extern C follows CFlat rules); fn<> unknown callee same | statement-temp release, C callee policy | M | Luna | yes |
+| R16 | p2/delete-borrow-via-named-local | Borrow reaches container via helper chain with explicit pointer-param destination | Interprocedural callee summary "param N stored into param M container"; share with R17 summary. Parked fix/t396-viewalias | callee summaries, MemoryOutlivesCall walk | L | Opus | no |
+| R21 | p2/string-copy-through-pointer-subscript | Global / implicit-this `string*` subscript copy double-frees | Implicit-this: byte-offset field proof. Global: runtime provenance design (compile-time flag rejected) | string copy, pointer-slot proof | M | Opus | no |
 
 ### Conflict map (never concurrent)
-- R1, R6, R14: function-value / callable binding (ParseTernaryBranches + function<> sinks). R6 before R14.
-- R6, R7, R11, R12, R13, R14: C++ call args, LLVMBackend_Overloads, CInterop. R11 -> R12; R13 not with R6/R14.
-- R3, R9, R10: param consume/ownership checks (WinRT call-site + move sink rules).
-- R4, R15: alias-return gate / alias closure ABI. R4 first.
-- R5, R8, R9, R16, R17: MainListener_Expressions provenance / view state; R16 after R5 and R8 (same T382/T387 keys).
-- R2 with R15, R1: lambda capture and copy paths.
+- R13: C++ call args, CInterop - one at a time with R7 (R12 2fa93ab1b, R14 17250e7a7 landed).
+- R16, R17, R20, R21: MainListener_Expressions provenance / view state; R16 and R17 share the callee summary.
 
-### Parallel waves (max 3 implementers)
-- Wave 1: R1, R2 (long, Opus), R3
-- Wave 2: R4, R5, R6
-- Wave 3: R7, R8, R10 (R10 sub-run a/b only)
-- Wave 4: R9, R11, R13
-- Wave 5: R12, R15, R16
-- Wave 6: R14 (R17 only after a ruling)
-Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 is the long pole; start it in wave 1 and let waves 2-3 refill the other 2 slots as they finish.
-
-### Not ready
-- R17 iface-return-dangle: RULED 2026-10-25 (elision rule, see issue head); heap-aggregate alias and indirect-write sub-items tried 3x by Luna - Opus.
-- p2/string-copy-through-pointer-subscript global-pointer and implicit-this parts: need a runtime provenance design or ruling (compile-time global flag depended on emission order); Luna failed 3 attempts.
-- R13(c) R3 `_ = move arr[0]; arr[0] = b`: element state not static; needs design.
-- R10(d) conditional moved-source read: path-sensitive moved-state design, no plan yet.
-- R16 and R17 share one needed plan: callee provenance summaries (no internal/plan entry exists); R16 may start only as design spike. T396 refusal of `if (owned) sink(move p->f)` is kept (L).
-- R5: no explicit ruling on `&v` meaning (element address vs refusal); refusal is the safe default under B, flag to maintainer in the brief.
-
+### Waves (max 3 implementers on the Mac)
+- Wave 2: R17 (Opus), R7
+- Wave 3: R16 (after R17 summary), R20
+- Wave 4: R13 design, R21
+Windows gate: R7, R13 land after the Windows box passes. Run the Windows gate on the master tip once per box.
 
 ## In flight
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| P3 | - | p3/cpp-unique-field-move-from-field-refused | RULED 2026-10-24: accept field-path move source `h.w = move g.w` (C++ row: Windows gate) |
 | P3 | - | p3/cpp-ctor-address-of-pointer-spelling-vs-clang | RULED 2026-10-24: `&p` = T** value when any candidate accepts it; slot binding fallback only (C++ row) |
-| P3 | - | p3/cpp-ctor-ranking-leftovers (item 3) | RULED 2026-10-24: no float->int at C++ ctor args in any form incl. reference params (C++ row) |
 | P3 | - | p3/cpp-pointer-return-unrequested-specialization-not-retried | RULED 2026-10-24: no `a @= b` -> `a = a @ b` fallback on C++ classes (C++ row) |
 | P3 | - | p3/named-brace-init-partial-unwind (item 1) | RULED 2026-10-24: keep refusal, reword diagnostic only |
-| P2 | - | p2/unique-array-element-assign-borrow-double-free | filed T486 review 2026-10-24: unique array-element store has no borrow check (double free); route through T486 check |
 | P3 | - | p3/moved-from-struct-leftovers-after-t490 | filed 2026-10-24: reassign-after-move extra dtor, T418 C++ param `_ = move` (immediate release + disarm), field move, raw-pointer-field scope ruling question |
-| P3 | - | p3/local-fixed-array-elements-destroyed-forward | filed T488 review: local `T[3]` dtors forward, C++ reverse; reuse T488 helper |
 | P3 | - | p3/nested-function-type-parameter-not-compared | filed T427 review: function-type component of a function type not compared |
 | P3 | - | p3/call-name-shadowing-leftovers-after-t484 | filed T484 review |
-| P3 | - | p3/function-pointer-double-pointer-address-of-named-function-accepted | filed T478 |
-| P3 | - | p3/nested-type-lookup-leftovers-after-t481 | filed T481 |
 | P3 | - | p3/returned-pointer-from-call-result-field-temp-dangles | T510 residue: RULED 2026-10-25 item 1 REFUSE (mixed-select legs -> err_); raw temp field into unique int* param double free, ternary owner, accepted leaks |
 | P3 | - | p3/ctor-lambda-this-closure-relocation | T515 residue: by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
 | P3 | - | p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
-| P3 | - | p3/crossed-address-of-state-leaks-call-temporary | T485 leftovers: C2 non-storing callee leak, two-owner pointer difference, pre-existing store3 EARLY FREE |
-| P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | RULED 2026-10-25: native globals Rust-strict, C++ per clang; land r2 + rewrite the 3 sites (see issue head) |
 | P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | RULED 2026-10-25: own-first strict hiding, `.` == `->`, drop the shape fallback (see issue head) (T438) |
-| R16 (parked) | fix/t396-viewalias | p2/view-mixed-join-sunk-through-pointer-param-alias | Sol r2b: 4 INCOMPLETE, needs path-sensitive provenance |
+| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | T513 residue (v10-v12): value / return / argument mixed-class `?:` refused, clang converts to the common type (C++ row) |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
 
@@ -281,11 +253,10 @@ The A-H sections above stay the per-issue record; schedule from this table.
 | # | Run | C/R | Issues | Shared site / root cause | Not concurrent with | Cheap |
 |---|-----|-----|--------|--------------------------|---------------------|-------|
 | 1 | DIAG-TEXT | M/L | p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | shared KIND only (relayed clang / refusal text); no shared function (u) - may split into 2 runs | F1 | yes |
-| 2 | STATIC-INIT | M/M | p3/global-default-spelling-zeroes-without-the-note | MainListener_Declarations.cpp static/global init arms (EmitCxxStructorCall ~6475, GenerateDefaultValue global arm ~1620) | - | yes |
 | 3 | NULLCTOR | M/H | p3/cpp-null-macro-and-nullptr-spellings-refused | C++ ctor null-constant selection: scalar-reference mirror (CInterop ~15375), SelectCxxConstructorListed (~26846), RequestCxxBraceConstructor | NULLPTR-T, CTOR-VIABILITY, PTRRANK, CTOR-BRACE, CONSTMACRO | no |
 | 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | CheckCxxNamespaceConflicts + struct identity canonicalization (CInterop) | - | yes, careful on identity |
 | 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7 | unary `*` in ParseUnaryExpression (MainListener_PostfixExpression.cpp) | D2/D3 operator dispatch, CONVOP | yes |
-| 6 | MOVEPARAM | M/H | p2/byvalue-param-owning-leftovers-after-b13, p2/unique-field-heap-array-through-move-param | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
+| 6 | MOVEPARAM | M/H | - (p2 file closed by T529) | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
 | 8 | PTRRANK | M/H | p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg (CInterop), TryBinaryOperatorOverload (supersedes old B3 row) | T89 in flight (same predicate) - after it lands | no |
 | 9 | FIELDCTOR | M/M | p3/cpp-class-field-default-construction-leftovers-after-v20 | field initializer lowering, MainListener_Aggregates.cpp (u) | - | yes |
 | 10 | CLIBNAME | M/M | p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | RULING first (nobuiltin on CFlat bodies) | after ruling RULED 2026-10-21: nobuiltin on CFlat bodies (see lessons digest). |
@@ -293,7 +264,7 @@ The A-H sections above stay the per-issue record; schedule from this table.
 | 15 | ASSIGN | M/H | p3/cpp-assign-operator-route-leftovers, p3/cpp-assignment-result-leftovers-after-b9, p3/cpp-nested-member-class-free-return-and-call-result-assign | C++ assignment route + class-result receivers (u) | T92 in flight (operator=(T)) | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | REFBIND pair, CTOR-VIABILITY | no |
 | 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-viability-not-clang-selected, p3/cpp-ctor-ranking-leftovers, p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM | no |
-| 20 | FNWRAP | L/H | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame, p3/cpp-capturing-closure-to-std-function | wrapper-frame slot for fnptr/closure into C++ T&& (RequestCxxFunctionTemplate) | ELIDE (P2 plan) | no |
+| 20 | FNWRAP | L/H | p3/cpp-forwarded-closure-refusals-after-t525, p3/cpp-capturing-closure-to-std-function | wrapper-frame slot for fnptr/closure into C++ T&& (RequestCxxFunctionTemplate) | ELIDE (P2 plan) | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, TOPSTMT | no |
 | 25 | CONSTTWIN | M/H | p3/cpp-const-twin-overloads-collapse, p3/cpp-constrained-twin-default-argument-ranking | RegisterCxxClassMembers (~22175) dedupe keeps the non-const twin | CONSTPOINTEE pair | no |
 | 26 | SRCTYPE | L/H | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls, p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | source type not propagated into C++ call construction (CxxArithIdentity) | T92 in flight - after it lands | no |

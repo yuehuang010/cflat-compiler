@@ -1,0 +1,975 @@
+// Interface return of a non-owning call result or a slot written indirectly (T522, Rust lifetime
+// elision): a call result borrows every pointer argument and the receiver unless the callee summary
+// narrows it (a global, a fresh 'move' result, one forwarded parameter). A frame alias stored into
+// a heap object, written through a derived address, or handed to a call that may write it carries
+// the frame borrow. Accepted controls live in test_interface.cb (testInterfaceReturnCallBorrowAcceptSet).
+import "unique.cb";
+import "list.cb";
+import "function.cb";
+interface IThing { int value(); };
+
+class Thing : IThing
+{
+    int n = 0;
+    int value() { return n; }
+};
+
+struct T522Holder { Thing* p = default; void noop() { } Thing* getP() { return p; } };
+struct T522Passer { int z = 0; Thing* pass(Thing* p) { return p; } };
+T522Passer t522Passer = default;
+T522Holder* t522GlobalHolder = nullptr;
+Thing* t522Global = nullptr;
+Thing* t522Idt(Thing* p) { return p; }
+Thing* t522Forward(Thing* p) { return t522Idt(p); }
+Thing* t522ForwardLater(Thing* p);
+Thing* t522Pick(Thing* a, Thing* b) { if (a == nullptr) return b; return a; }
+Thing* t522Rec(Thing* p, int k) { if (k == 0) return p; return t522Rec(p, k - 1); }
+T* t522Gid<T>(T* p) { return p; }
+IThing t522Wrap(Thing* p) { return p; }
+void t522Touch(T522Holder* h) { }
+void t522SetSlot(Thing** pp, Thing* x) { *pp = x; }
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522IdentityOfOwner()
+    {
+        Thing* t = new Thing();
+        return t522Idt(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522UniqueGet()
+    {
+        unique<Thing> u = new Thing();
+        return u.get();
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522UniqueGetAlias()
+    {
+        unique<Thing> u = new Thing();
+        Thing* b = u.get();
+        return b;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522LambdaCapture()
+    {
+        Thing* t = new Thing();
+        Lambda<Thing*()> l = () => { return t; };
+        return l();
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522ForwardingCall()
+    {
+        Thing* t = new Thing();
+        return t522Forward(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522ForwardingCallDefinedLater()
+    {
+        Thing* t = new Thing();
+        return t522ForwardLater(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522FunctionPointer()
+    {
+        Thing* t = new Thing();
+        function<Thing*(Thing*)> fp = t522Idt;
+        return fp(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522EitherArgument()
+    {
+        Thing* t = new Thing();
+        return t522Pick(t, t522Global);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522Recursive()
+    {
+        Thing* t = new Thing();
+        return t522Rec(t, 2);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522GenericIdentity()
+    {
+        Thing* t = new Thing();
+        return t522Gid<Thing>(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522MethodArgument()
+    {
+        Thing* t = new Thing();
+        return t522Passer.pass(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522AliasOfCall()
+    {
+        Thing* t = new Thing();
+        Thing* b = t522Idt(t);
+        return b;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522CallIntoStructField()
+    {
+        Thing* t = new Thing();
+        T522Holder h = default;
+        h.p = t522Idt(t);
+        return h.p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522InterfaceCall()
+    {
+        Thing* t = new Thing();
+        return t522Wrap(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522InterfaceCallLocal()
+    {
+        Thing* t = new Thing();
+        IThing i = t522Wrap(t);
+        return i;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522InterfaceLocalOfCall()
+    {
+        Thing* t = new Thing();
+        IThing i = t522Idt(t);
+        return i;
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522FrameArgument()
+    {
+        Thing loc = default;
+        return t522Idt(&loc);
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522InterfaceCallLocalFrame()
+    {
+        Thing loc = default;
+        IThing i = t522Wrap(&loc);
+        return i;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522HeapHolderSlot()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        T522Holder* h = new T522Holder();
+        h->p = alias;
+        return h->p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522HeapHolderGetter()
+    {
+        Thing* t = new Thing();
+        T522Holder* h = new T522Holder();
+        h->p = t;
+        return h->getP();
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522ArraySlotZero()
+    {
+        Thing* t = new Thing();
+        Thing* b = t;
+        Thing*[3] ps = default;
+        ps[0] = b;
+        return ps[0];
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522StoreThroughFieldAddress()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        T522Holder h = default;
+        Thing** pp = &h.p;
+        *pp = alias;
+        return h.p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522MethodOnHolder()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        T522Holder h = default;
+        h.p = alias;
+        h.noop();
+        return h.p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522HolderAddressToCall()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        T522Holder h = default;
+        h.p = alias;
+        t522Touch(&h);
+        return h.p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522HolderAddressToGlobal()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        T522Holder h = default;
+        h.p = alias;
+        t522GlobalHolder = &h;
+        return h.p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522VariableIndexStore()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        Thing*[3] s = default;
+        int j = 0;
+        s[j] = alias;
+        return s[0];
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522ElementAddressBesideAlias()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        Thing*[3] s = default;
+        s[1] = alias;
+        Thing** z = &s[0];
+        return s[1];
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522SlotSetByCall()
+    {
+        Thing* t = new Thing();
+        Thing* q = t522Global;
+        t522SetSlot(&q, t);
+        return q;
+    }
+}
+
+struct T522Chain { T522Holder* h = default; };
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522HeapChainSlot()
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        T522Chain* c = new T522Chain();
+        c->h = new T522Holder();
+        c->h->p = alias;
+        return c->h->p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522ParameterObjectSlot(T522Holder* h)
+    {
+        Thing* t = new Thing();
+        Thing* alias = t;
+        h->p = alias;
+        return h->p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    class T522Self
+    {
+        Thing* p = default;
+        IThing keepAlias()
+        {
+            Thing* t = new Thing();
+            Thing* alias = t;
+            p = alias;
+            return p;
+        }
+    };
+}
+
+// Round 2: a correlated branch whose condition storage escapes may change between the tests.
+void t522Zero(int* p) { *p = 0; }
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522BranchConditionCallWrite(int k)
+    {
+        Thing x = default;
+        IThing i = t522Global;
+        if (k == 99) i = &x;
+        t522Zero(&k);
+        if (k == 99) i = t522Global;
+        return i;
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522BranchConditionAliasWrite(int k)
+    {
+        Thing x = default;
+        IThing i = t522Global;
+        int* kp = &k;
+        if (k == 99) i = &x;
+        *kp = 0;
+        if (k == 99) i = t522Global;
+        return i;
+    }
+}
+
+// Indirect calls returning an interface borrow their arguments / captures too.
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522IndirectInterfaceResult()
+    {
+        Thing* t = new Thing();
+        function<IThing(Thing*)> fp = t522Wrap;
+        return fp(t);
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522ClosureInterfaceResult()
+    {
+        Thing* t = new Thing();
+        Lambda<IThing()> l = () => { return t; };
+        return l();
+    }
+}
+
+// An interface-returning callee defined below: decided once its body is emitted.
+IThing t522WrapLater(Thing* p);
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t522InterfaceForwardLater()
+    {
+        Thing* t = new Thing();
+        return t522WrapLater(t);
+    }
+}
+
+IThing t522WrapLater(Thing* p) { return p; }
+
+// Round 3: element and copied holders keep the frame borrow of what they hold; a nested later
+// call counts when the outer summary keeps its argument; mutual recursion forwarding a parameter.
+Thing* t522HolderField(T522Holder* h) { return h->p; }
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522ArrayHolderLocal()
+    {
+        Thing x = default;
+        T522Holder[2] a = default;
+        a[1].p = &x;
+        return t522HolderField(&a[1]);
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522CopiedHolderLocal()
+    {
+        Thing x = default;
+        T522Holder a = default;
+        a.p = &x;
+        T522Holder b = a;
+        return t522HolderField(&b);
+    }
+}
+
+Thing* t522SlotForwardLater(Thing* p);
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522SlotForwardThroughLaterCall()
+    {
+        Thing x = default;
+        return t522SlotForwardLater(&x);
+    }
+}
+
+Thing* t522KeepLater(Thing* p);
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522NestedLaterKept()
+    {
+        Thing x = default;
+        return t522KeepLater(t522KeepLater(&x));
+    }
+}
+
+Thing* t522MutualA(Thing* p, int k);
+Thing* t522MutualB(Thing* p, int k);
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522MutualForward()
+    {
+        Thing x = default;
+        return t522MutualA(&x, 2);
+    }
+}
+
+// Round 4: a struct relayed through a call or reassigned after the copy, a variable index that may
+// select the local, a struct argument lent to an unknown callee, a callee that writes through its
+// parameter before reading it, and a read past the pointed-to object.
+T522Holder t522RelayHolder(T522Holder h) { return h; }
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522RelayedHolderLocal()
+    {
+        Thing x = default;
+        T522Holder a = default;
+        a.p = &x;
+        T522Holder b = t522RelayHolder(a);
+        return t522HolderField(&b);
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522CopyReassignedLocal()
+    {
+        Thing x = default;
+        T522Holder a = default;
+        a.p = t522Global;
+        T522Holder b = a;
+        b.p = &x;
+        return t522HolderField(&b);
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522VariableElementMixed(int k)
+    {
+        Thing x = default;
+        T522Holder[2] a = default;
+        a[0].p = t522Global;
+        a[1].p = &x;
+        return t522HolderField(&a[k]);
+    }
+}
+
+IThing t522FromHolder(T522Holder a) { T522Holder b = a; return t522HolderField(&b); }
+expect_error("as interface 'IThing'") {
+    IThing t522HolderArgumentLocal()
+    {
+        Thing x = default;
+        T522Holder a = default;
+        a.p = &x;
+        return t522FromHolder(a);
+    }
+}
+
+Thing* t522WriteThenRead(T522Holder* h, Thing* q) { h->p = q; return h->p; }
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522CalleeWritesHolder()
+    {
+        Thing x = default;
+        T522Holder h = default;
+        h.p = t522Global;
+        return t522WriteThenRead(&h, &x);
+    }
+}
+
+Thing* t522SecondHolderField(T522Holder* h) { return h[1].p; }
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522ReadPastObject()
+    {
+        Thing x = default;
+        T522Holder[2] a = default;
+        a[0].p = t522Global;
+        a[1].p = &x;
+        return t522SecondHolderField(&a[0]);
+    }
+}
+
+Thing* t522SlotForwardLater(Thing* p) { Thing* q = p; return t522Idt(q); }
+Thing* t522KeepLater(Thing* p) { return t522Idt(p); }
+Thing* t522MutualA(Thing* p, int k) { if (k == 0) return p; return t522MutualB(p, k - 1); }
+Thing* t522MutualB(Thing* p, int k) { if (k == 0) return p; return t522MutualA(p, k - 1); }
+
+Thing* t522ForwardLater(Thing* p) { return t522Idt(p); }
+
+// Round 5 type narrowing keeps an argument whose type reaches an implementer of the returned
+// interface: a local struct holding a pointer to one (or an interface field), through an unknown
+// recursive summary and through a function<>.
+interface IT522Tree { int value(); list<IT522Tree>* t522Kids(); };
+class T522Tree : IT522Tree
+{
+    int n = 0;
+    list<IT522Tree>* ks = nullptr;
+    int value() { return n; }
+    list<IT522Tree>* t522Kids() { return ks; }
+};
+struct T522TreeBox { T522Tree* p = default; };
+struct T522TreeSlot { IT522Tree i = default; };
+expect_error("cannot return a local value as interface 'IT522Tree'") {
+    IT522Tree t522FindByBox(IT522Tree node, T522TreeBox b, int d)
+    {
+        if (d == 0) return b.p;
+        list<IT522Tree>* kids = node.t522Kids();
+        if (kids != nullptr)
+        {
+            int i = 0;
+            while (i < kids.count())
+            {
+                IT522Tree c = kids.get(i);
+                T522Tree local = default;
+                T522TreeBox nb = default;
+                nb.p = &local;
+                IT522Tree r = t522FindByBox(c, nb, d - 1);
+                if (r != nullptr) return r;
+                i++;
+            }
+        }
+        return nullptr;
+    }
+}
+
+expect_error("cannot return a local value as interface 'IT522Tree'") {
+    IT522Tree t522FindBySlot(IT522Tree node, T522TreeSlot b, int d)
+    {
+        if (d == 0) return b.i;
+        list<IT522Tree>* kids = node.t522Kids();
+        if (kids != nullptr)
+        {
+            int i = 0;
+            while (i < kids.count())
+            {
+                IT522Tree c = kids.get(i);
+                T522Tree local = default;
+                T522TreeSlot nb = default;
+                nb.i = &local;
+                IT522Tree r = t522FindBySlot(c, nb, d - 1);
+                if (r != nullptr) return r;
+                i++;
+            }
+        }
+        return nullptr;
+    }
+}
+
+IT522Tree t522BoxPick(IT522Tree node, T522TreeBox b) { if (b.p != nullptr) return b.p; return node; }
+expect_error("cannot return a local value as interface 'IT522Tree'") {
+    IT522Tree t522BoxThroughFunction(IT522Tree node)
+    {
+        T522Tree local = default;
+        T522TreeBox nb = default;
+        nb.p = &local;
+        function<IT522Tree(IT522Tree, T522TreeBox)> f = t522BoxPick;
+        return f(node, nb);
+    }
+}
+
+// Round 6: a closure lends what its environment captured - as a call argument (indirect and
+// recursive callees), and an interface-typed capture; a struct result of an indirect call whose
+// struct argument travels in its C ABI form holds what that argument held.
+IThing t522PickLambda(Lambda<IThing()> l) { return l(); }
+IThing t522RecLambda(Lambda<IThing()> l, int n) { if (n > 0) return t522RecLambda(l, n - 1); return l(); }
+T522Holder t522Relay(T522Holder a) { return a; }
+Thing* t522HolderPOf(T522Holder* h) { return h->p; }
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522ClosureArgumentLocal()
+    {
+        Thing x = default;
+        Thing* h = &x;
+        Lambda<IThing()> l = () => { return h; };
+        function<IThing(Lambda<IThing()>)> fp = t522PickLambda;
+        return fp(l);
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522ClosureArgumentRecursive()
+    {
+        Thing x = default;
+        Thing* h = &x;
+        Lambda<IThing()> l = () => { return h; };
+        return t522RecLambda(l, 1);
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522ClosureInterfaceCapture()
+    {
+        Thing x = default;
+        IThing h = &x;
+        Lambda<IThing()> l = () => { return h; };
+        return l();
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522IndirectRelayLocal()
+    {
+        Thing x = default;
+        T522Holder a = default;
+        a.p = &x;
+        function<T522Holder(T522Holder)> fp = t522Relay;
+        T522Holder b = fp(a);
+        return t522HolderPOf(&b);
+    }
+}
+
+// Round 7: a closure capturing a closure over a local lends the inner closure's captures.
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522NestedClosureLocal()
+    {
+        Thing x = default;
+        Thing* h = &x;
+        Lambda<IThing()> inner = () => { return h; };
+        Lambda<IThing()> outer = () => { return inner(); };
+        return outer();
+    }
+}
+
+// Round 8: calling a copy of a closure over a local (also after the source is reassigned), and an
+// sret struct result of an indirect call whose C-ABI-form argument held a local.
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522ClosureCopyLocal()
+    {
+        Thing x = default;
+        Thing* px = &x;
+        Lambda<IThing()> a = () => { return px; };
+        Lambda<IThing()> b = a;
+        return b();
+    }
+}
+
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522ClosureCopySourceReassignedLocal()
+    {
+        Thing x = default;
+        Thing* px = &x;
+        Thing* pg = t522Global;
+        Lambda<IThing()> a = () => { return px; };
+        Lambda<IThing()> b = a;
+        a = () => { return pg; };
+        return b();
+    }
+}
+
+struct T522Big { Thing* p = default; long a = default; long b = default; };
+T522Big t522WrapHolder(T522Holder h) { T522Big r = default; r.p = h.p; return r; }
+Thing* t522BigP(T522Big* b) { return b->p; }
+expect_error("as interface 'IThing' - the interface fat pointer would dangle once this function returns") {
+    IThing t522SretCoercedLocal()
+    {
+        Thing x = default;
+        T522Holder a = default;
+        a.p = &x;
+        function<T522Big(T522Holder)> fp = t522WrapHolder;
+        T522Big b = fp(a);
+        return t522BigP(&b);
+    }
+}
+
+// Round 9: a provenance walk that runs out of its step budget (each of 128 arguments re-walks the
+// previous call, three levels) proves nothing and is refused, never accepted.
+Thing* t522Wide(Thing* a0, Thing* a1, Thing* a2, Thing* a3, Thing* a4, Thing* a5, Thing* a6, Thing* a7, Thing* a8, Thing* a9, Thing* a10, Thing* a11, Thing* a12, Thing* a13, Thing* a14, Thing* a15, Thing* a16, Thing* a17, Thing* a18, Thing* a19, Thing* a20, Thing* a21, Thing* a22, Thing* a23, Thing* a24, Thing* a25, Thing* a26, Thing* a27, Thing* a28, Thing* a29, Thing* a30, Thing* a31, Thing* a32, Thing* a33, Thing* a34, Thing* a35, Thing* a36, Thing* a37, Thing* a38, Thing* a39, Thing* a40, Thing* a41, Thing* a42, Thing* a43, Thing* a44, Thing* a45, Thing* a46, Thing* a47, Thing* a48, Thing* a49, Thing* a50, Thing* a51, Thing* a52, Thing* a53, Thing* a54, Thing* a55, Thing* a56, Thing* a57, Thing* a58, Thing* a59, Thing* a60, Thing* a61, Thing* a62, Thing* a63, Thing* a64, Thing* a65, Thing* a66, Thing* a67, Thing* a68, Thing* a69, Thing* a70, Thing* a71, Thing* a72, Thing* a73, Thing* a74, Thing* a75, Thing* a76, Thing* a77, Thing* a78, Thing* a79, Thing* a80, Thing* a81, Thing* a82, Thing* a83, Thing* a84, Thing* a85, Thing* a86, Thing* a87, Thing* a88, Thing* a89, Thing* a90, Thing* a91, Thing* a92, Thing* a93, Thing* a94, Thing* a95, Thing* a96, Thing* a97, Thing* a98, Thing* a99, Thing* a100, Thing* a101, Thing* a102, Thing* a103, Thing* a104, Thing* a105, Thing* a106, Thing* a107, Thing* a108, Thing* a109, Thing* a110, Thing* a111, Thing* a112, Thing* a113, Thing* a114, Thing* a115, Thing* a116, Thing* a117, Thing* a118, Thing* a119, Thing* a120, Thing* a121, Thing* a122, Thing* a123, Thing* a124, Thing* a125, Thing* a126, Thing* a127) { if (a0 != nullptr) return a0; if (a1 != nullptr) return a1; if (a2 != nullptr) return a2; if (a3 != nullptr) return a3; if (a4 != nullptr) return a4; if (a5 != nullptr) return a5; if (a6 != nullptr) return a6; if (a7 != nullptr) return a7; if (a8 != nullptr) return a8; if (a9 != nullptr) return a9; if (a10 != nullptr) return a10; if (a11 != nullptr) return a11; if (a12 != nullptr) return a12; if (a13 != nullptr) return a13; if (a14 != nullptr) return a14; if (a15 != nullptr) return a15; if (a16 != nullptr) return a16; if (a17 != nullptr) return a17; if (a18 != nullptr) return a18; if (a19 != nullptr) return a19; if (a20 != nullptr) return a20; if (a21 != nullptr) return a21; if (a22 != nullptr) return a22; if (a23 != nullptr) return a23; if (a24 != nullptr) return a24; if (a25 != nullptr) return a25; if (a26 != nullptr) return a26; if (a27 != nullptr) return a27; if (a28 != nullptr) return a28; if (a29 != nullptr) return a29; if (a30 != nullptr) return a30; if (a31 != nullptr) return a31; if (a32 != nullptr) return a32; if (a33 != nullptr) return a33; if (a34 != nullptr) return a34; if (a35 != nullptr) return a35; if (a36 != nullptr) return a36; if (a37 != nullptr) return a37; if (a38 != nullptr) return a38; if (a39 != nullptr) return a39; if (a40 != nullptr) return a40; if (a41 != nullptr) return a41; if (a42 != nullptr) return a42; if (a43 != nullptr) return a43; if (a44 != nullptr) return a44; if (a45 != nullptr) return a45; if (a46 != nullptr) return a46; if (a47 != nullptr) return a47; if (a48 != nullptr) return a48; if (a49 != nullptr) return a49; if (a50 != nullptr) return a50; if (a51 != nullptr) return a51; if (a52 != nullptr) return a52; if (a53 != nullptr) return a53; if (a54 != nullptr) return a54; if (a55 != nullptr) return a55; if (a56 != nullptr) return a56; if (a57 != nullptr) return a57; if (a58 != nullptr) return a58; if (a59 != nullptr) return a59; if (a60 != nullptr) return a60; if (a61 != nullptr) return a61; if (a62 != nullptr) return a62; if (a63 != nullptr) return a63; if (a64 != nullptr) return a64; if (a65 != nullptr) return a65; if (a66 != nullptr) return a66; if (a67 != nullptr) return a67; if (a68 != nullptr) return a68; if (a69 != nullptr) return a69; if (a70 != nullptr) return a70; if (a71 != nullptr) return a71; if (a72 != nullptr) return a72; if (a73 != nullptr) return a73; if (a74 != nullptr) return a74; if (a75 != nullptr) return a75; if (a76 != nullptr) return a76; if (a77 != nullptr) return a77; if (a78 != nullptr) return a78; if (a79 != nullptr) return a79; if (a80 != nullptr) return a80; if (a81 != nullptr) return a81; if (a82 != nullptr) return a82; if (a83 != nullptr) return a83; if (a84 != nullptr) return a84; if (a85 != nullptr) return a85; if (a86 != nullptr) return a86; if (a87 != nullptr) return a87; if (a88 != nullptr) return a88; if (a89 != nullptr) return a89; if (a90 != nullptr) return a90; if (a91 != nullptr) return a91; if (a92 != nullptr) return a92; if (a93 != nullptr) return a93; if (a94 != nullptr) return a94; if (a95 != nullptr) return a95; if (a96 != nullptr) return a96; if (a97 != nullptr) return a97; if (a98 != nullptr) return a98; if (a99 != nullptr) return a99; if (a100 != nullptr) return a100; if (a101 != nullptr) return a101; if (a102 != nullptr) return a102; if (a103 != nullptr) return a103; if (a104 != nullptr) return a104; if (a105 != nullptr) return a105; if (a106 != nullptr) return a106; if (a107 != nullptr) return a107; if (a108 != nullptr) return a108; if (a109 != nullptr) return a109; if (a110 != nullptr) return a110; if (a111 != nullptr) return a111; if (a112 != nullptr) return a112; if (a113 != nullptr) return a113; if (a114 != nullptr) return a114; if (a115 != nullptr) return a115; if (a116 != nullptr) return a116; if (a117 != nullptr) return a117; if (a118 != nullptr) return a118; if (a119 != nullptr) return a119; if (a120 != nullptr) return a120; if (a121 != nullptr) return a121; if (a122 != nullptr) return a122; if (a123 != nullptr) return a123; if (a124 != nullptr) return a124; if (a125 != nullptr) return a125; if (a126 != nullptr) return a126; return a127; }
+expect_error("cannot prove the returned interface 'IThing' does not borrow from a local") {
+    IThing t522BudgetChain(Thing* p0)
+    {
+        Thing* p1 = t522Wide(p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0, p0);
+        Thing* p2 = t522Wide(p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1, p1);
+        Thing* p3 = t522Wide(p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2, p2);
+        return p3;
+    }
+}
+
+// Round 9/10: a relay chain far deeper than the walk's depth cap (200 hops) over a local owner
+// proves nothing past the cap and is refused, not accepted.
+expect_error("cannot prove the returned interface 'IThing' does not borrow from a local") {
+    IThing t522DepthChain()
+    {
+        Thing* p0 = new Thing();
+        Thing* p1 = t522Pick(p0, p0);
+        Thing* p2 = t522Pick(p1, p1);
+        Thing* p3 = t522Pick(p2, p2);
+        Thing* p4 = t522Pick(p3, p3);
+        Thing* p5 = t522Pick(p4, p4);
+        Thing* p6 = t522Pick(p5, p5);
+        Thing* p7 = t522Pick(p6, p6);
+        Thing* p8 = t522Pick(p7, p7);
+        Thing* p9 = t522Pick(p8, p8);
+        Thing* p10 = t522Pick(p9, p9);
+        Thing* p11 = t522Pick(p10, p10);
+        Thing* p12 = t522Pick(p11, p11);
+        Thing* p13 = t522Pick(p12, p12);
+        Thing* p14 = t522Pick(p13, p13);
+        Thing* p15 = t522Pick(p14, p14);
+        Thing* p16 = t522Pick(p15, p15);
+        Thing* p17 = t522Pick(p16, p16);
+        Thing* p18 = t522Pick(p17, p17);
+        Thing* p19 = t522Pick(p18, p18);
+        Thing* p20 = t522Pick(p19, p19);
+        Thing* p21 = t522Pick(p20, p20);
+        Thing* p22 = t522Pick(p21, p21);
+        Thing* p23 = t522Pick(p22, p22);
+        Thing* p24 = t522Pick(p23, p23);
+        Thing* p25 = t522Pick(p24, p24);
+        Thing* p26 = t522Pick(p25, p25);
+        Thing* p27 = t522Pick(p26, p26);
+        Thing* p28 = t522Pick(p27, p27);
+        Thing* p29 = t522Pick(p28, p28);
+        Thing* p30 = t522Pick(p29, p29);
+        Thing* p31 = t522Pick(p30, p30);
+        Thing* p32 = t522Pick(p31, p31);
+        Thing* p33 = t522Pick(p32, p32);
+        Thing* p34 = t522Pick(p33, p33);
+        Thing* p35 = t522Pick(p34, p34);
+        Thing* p36 = t522Pick(p35, p35);
+        Thing* p37 = t522Pick(p36, p36);
+        Thing* p38 = t522Pick(p37, p37);
+        Thing* p39 = t522Pick(p38, p38);
+        Thing* p40 = t522Pick(p39, p39);
+        Thing* p41 = t522Pick(p40, p40);
+        Thing* p42 = t522Pick(p41, p41);
+        Thing* p43 = t522Pick(p42, p42);
+        Thing* p44 = t522Pick(p43, p43);
+        Thing* p45 = t522Pick(p44, p44);
+        Thing* p46 = t522Pick(p45, p45);
+        Thing* p47 = t522Pick(p46, p46);
+        Thing* p48 = t522Pick(p47, p47);
+        Thing* p49 = t522Pick(p48, p48);
+        Thing* p50 = t522Pick(p49, p49);
+        Thing* p51 = t522Pick(p50, p50);
+        Thing* p52 = t522Pick(p51, p51);
+        Thing* p53 = t522Pick(p52, p52);
+        Thing* p54 = t522Pick(p53, p53);
+        Thing* p55 = t522Pick(p54, p54);
+        Thing* p56 = t522Pick(p55, p55);
+        Thing* p57 = t522Pick(p56, p56);
+        Thing* p58 = t522Pick(p57, p57);
+        Thing* p59 = t522Pick(p58, p58);
+        Thing* p60 = t522Pick(p59, p59);
+        Thing* p61 = t522Pick(p60, p60);
+        Thing* p62 = t522Pick(p61, p61);
+        Thing* p63 = t522Pick(p62, p62);
+        Thing* p64 = t522Pick(p63, p63);
+        Thing* p65 = t522Pick(p64, p64);
+        Thing* p66 = t522Pick(p65, p65);
+        Thing* p67 = t522Pick(p66, p66);
+        Thing* p68 = t522Pick(p67, p67);
+        Thing* p69 = t522Pick(p68, p68);
+        Thing* p70 = t522Pick(p69, p69);
+        Thing* p71 = t522Pick(p70, p70);
+        Thing* p72 = t522Pick(p71, p71);
+        Thing* p73 = t522Pick(p72, p72);
+        Thing* p74 = t522Pick(p73, p73);
+        Thing* p75 = t522Pick(p74, p74);
+        Thing* p76 = t522Pick(p75, p75);
+        Thing* p77 = t522Pick(p76, p76);
+        Thing* p78 = t522Pick(p77, p77);
+        Thing* p79 = t522Pick(p78, p78);
+        Thing* p80 = t522Pick(p79, p79);
+        Thing* p81 = t522Pick(p80, p80);
+        Thing* p82 = t522Pick(p81, p81);
+        Thing* p83 = t522Pick(p82, p82);
+        Thing* p84 = t522Pick(p83, p83);
+        Thing* p85 = t522Pick(p84, p84);
+        Thing* p86 = t522Pick(p85, p85);
+        Thing* p87 = t522Pick(p86, p86);
+        Thing* p88 = t522Pick(p87, p87);
+        Thing* p89 = t522Pick(p88, p88);
+        Thing* p90 = t522Pick(p89, p89);
+        Thing* p91 = t522Pick(p90, p90);
+        Thing* p92 = t522Pick(p91, p91);
+        Thing* p93 = t522Pick(p92, p92);
+        Thing* p94 = t522Pick(p93, p93);
+        Thing* p95 = t522Pick(p94, p94);
+        Thing* p96 = t522Pick(p95, p95);
+        Thing* p97 = t522Pick(p96, p96);
+        Thing* p98 = t522Pick(p97, p97);
+        Thing* p99 = t522Pick(p98, p98);
+        Thing* p100 = t522Pick(p99, p99);
+        Thing* p101 = t522Pick(p100, p100);
+        Thing* p102 = t522Pick(p101, p101);
+        Thing* p103 = t522Pick(p102, p102);
+        Thing* p104 = t522Pick(p103, p103);
+        Thing* p105 = t522Pick(p104, p104);
+        Thing* p106 = t522Pick(p105, p105);
+        Thing* p107 = t522Pick(p106, p106);
+        Thing* p108 = t522Pick(p107, p107);
+        Thing* p109 = t522Pick(p108, p108);
+        Thing* p110 = t522Pick(p109, p109);
+        Thing* p111 = t522Pick(p110, p110);
+        Thing* p112 = t522Pick(p111, p111);
+        Thing* p113 = t522Pick(p112, p112);
+        Thing* p114 = t522Pick(p113, p113);
+        Thing* p115 = t522Pick(p114, p114);
+        Thing* p116 = t522Pick(p115, p115);
+        Thing* p117 = t522Pick(p116, p116);
+        Thing* p118 = t522Pick(p117, p117);
+        Thing* p119 = t522Pick(p118, p118);
+        Thing* p120 = t522Pick(p119, p119);
+        Thing* p121 = t522Pick(p120, p120);
+        Thing* p122 = t522Pick(p121, p121);
+        Thing* p123 = t522Pick(p122, p122);
+        Thing* p124 = t522Pick(p123, p123);
+        Thing* p125 = t522Pick(p124, p124);
+        Thing* p126 = t522Pick(p125, p125);
+        Thing* p127 = t522Pick(p126, p126);
+        Thing* p128 = t522Pick(p127, p127);
+        Thing* p129 = t522Pick(p128, p128);
+        Thing* p130 = t522Pick(p129, p129);
+        Thing* p131 = t522Pick(p130, p130);
+        Thing* p132 = t522Pick(p131, p131);
+        Thing* p133 = t522Pick(p132, p132);
+        Thing* p134 = t522Pick(p133, p133);
+        Thing* p135 = t522Pick(p134, p134);
+        Thing* p136 = t522Pick(p135, p135);
+        Thing* p137 = t522Pick(p136, p136);
+        Thing* p138 = t522Pick(p137, p137);
+        Thing* p139 = t522Pick(p138, p138);
+        Thing* p140 = t522Pick(p139, p139);
+        Thing* p141 = t522Pick(p140, p140);
+        Thing* p142 = t522Pick(p141, p141);
+        Thing* p143 = t522Pick(p142, p142);
+        Thing* p144 = t522Pick(p143, p143);
+        Thing* p145 = t522Pick(p144, p144);
+        Thing* p146 = t522Pick(p145, p145);
+        Thing* p147 = t522Pick(p146, p146);
+        Thing* p148 = t522Pick(p147, p147);
+        Thing* p149 = t522Pick(p148, p148);
+        Thing* p150 = t522Pick(p149, p149);
+        Thing* p151 = t522Pick(p150, p150);
+        Thing* p152 = t522Pick(p151, p151);
+        Thing* p153 = t522Pick(p152, p152);
+        Thing* p154 = t522Pick(p153, p153);
+        Thing* p155 = t522Pick(p154, p154);
+        Thing* p156 = t522Pick(p155, p155);
+        Thing* p157 = t522Pick(p156, p156);
+        Thing* p158 = t522Pick(p157, p157);
+        Thing* p159 = t522Pick(p158, p158);
+        Thing* p160 = t522Pick(p159, p159);
+        Thing* p161 = t522Pick(p160, p160);
+        Thing* p162 = t522Pick(p161, p161);
+        Thing* p163 = t522Pick(p162, p162);
+        Thing* p164 = t522Pick(p163, p163);
+        Thing* p165 = t522Pick(p164, p164);
+        Thing* p166 = t522Pick(p165, p165);
+        Thing* p167 = t522Pick(p166, p166);
+        Thing* p168 = t522Pick(p167, p167);
+        Thing* p169 = t522Pick(p168, p168);
+        Thing* p170 = t522Pick(p169, p169);
+        Thing* p171 = t522Pick(p170, p170);
+        Thing* p172 = t522Pick(p171, p171);
+        Thing* p173 = t522Pick(p172, p172);
+        Thing* p174 = t522Pick(p173, p173);
+        Thing* p175 = t522Pick(p174, p174);
+        Thing* p176 = t522Pick(p175, p175);
+        Thing* p177 = t522Pick(p176, p176);
+        Thing* p178 = t522Pick(p177, p177);
+        Thing* p179 = t522Pick(p178, p178);
+        Thing* p180 = t522Pick(p179, p179);
+        Thing* p181 = t522Pick(p180, p180);
+        Thing* p182 = t522Pick(p181, p181);
+        Thing* p183 = t522Pick(p182, p182);
+        Thing* p184 = t522Pick(p183, p183);
+        Thing* p185 = t522Pick(p184, p184);
+        Thing* p186 = t522Pick(p185, p185);
+        Thing* p187 = t522Pick(p186, p186);
+        Thing* p188 = t522Pick(p187, p187);
+        Thing* p189 = t522Pick(p188, p188);
+        Thing* p190 = t522Pick(p189, p189);
+        Thing* p191 = t522Pick(p190, p190);
+        Thing* p192 = t522Pick(p191, p191);
+        Thing* p193 = t522Pick(p192, p192);
+        Thing* p194 = t522Pick(p193, p193);
+        Thing* p195 = t522Pick(p194, p194);
+        Thing* p196 = t522Pick(p195, p195);
+        Thing* p197 = t522Pick(p196, p196);
+        Thing* p198 = t522Pick(p197, p197);
+        Thing* p199 = t522Pick(p198, p198);
+        Thing* p200 = t522Pick(p199, p199);
+        return p200;
+    }
+}
+
+// Round 10: a lambda's environment is caller memory, but the body's own write of a frame address
+// into a capture (`px = &y;`) before reading it back is a local, as for a pointer parameter.
+Thing t522EnvGlobal = default;
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t522EnvWriteLocal()
+    {
+        Thing* px = &t522EnvGlobal;
+        Lambda<IThing()> l = () => { Thing y = default; px = &y; return px; };
+        return l();
+    }
+}
+
+// Round 11: a second capture puts `px` at a non-zero field of the environment; the env never owns
+// a pointer capture, so the body's `px = &y;` still decides (a read of another capture first, or
+// a store under a branch on a capture).
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t522EnvTwoCaptureLocal()
+    {
+        Thing* px = &t522EnvGlobal;
+        int k = 1;
+        Lambda<IThing()> l = () => { Thing y = default; int z = k; px = &y; if (z > 5) return &t522EnvGlobal; return px; };
+        return l();
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t522EnvBranchStoreLocal()
+    {
+        Thing* px = &t522EnvGlobal;
+        int k = 1;
+        Lambda<IThing()> l = () => { Thing y = default; if (k == 1) px = &y; return px; };
+        return l();
+    }
+}
+
+// Round 12: a by-value struct through a function<> thunk is passed as a hidden pointer to a copy;
+// the copy is not the borrow, but a frame address its field holds still is.
+struct T522WideHold { int a = 1; int b = 2; int c = 3; int d = 4; int e = 5; Thing* p = default; };
+IThing t522HoldWideThing(T522WideHold w) { return w.p; }
+expect_error("cannot return a local value as interface 'IThing'") {
+    IThing t522FunctionWideHeldLocal()
+    {
+        Thing loc = default;
+        T522WideHold w = default;
+        w.p = &loc;
+        function<IThing(T522WideHold)> f = t522HoldWideThing;
+        return f(w);
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

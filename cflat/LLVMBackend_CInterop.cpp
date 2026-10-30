@@ -1807,9 +1807,12 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         bool functionPointerLvalueRef = false;
         bool functionPointerRvalueRef = false;
         bool functionPointerConst = false;
+        int angleDepth = 0;   // a `(*)` inside template arguments is not this type's declarator
         for (size_t i = 0; i + 2 < s.size(); ++i)
         {
-            if (s[i] != '(') continue;
+            if (s[i] == '<') ++angleDepth;
+            else if (s[i] == '>' && angleDepth > 0) --angleDepth;
+            if (s[i] != '(' || angleDepth != 0) continue;
             bool candidateLvalueRef = false;
             bool candidateRvalueRef = false;
             bool candidateConst = false;
@@ -2839,6 +2842,11 @@ bool LLVMBackend::CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::
             if (!params.empty()) params += ", ";
             params += one;
         }
+        if (type.FuncPtrVariadic)
+        {
+            if (!params.empty()) params += ", ";
+            params += "...";
+        }
         out = "__typeof__(" + ret + " (*)(" + params + "))";
         return true;
 }
@@ -2992,8 +3000,15 @@ bool LLVMBackend::LowerNonCapturingClosureForCxx(NamedVariable& arg, const TypeA
                     thin = *target;
                     thin.TypeName = "__c_fn_ptr";
                 }
+                else if (fnSym != nullptr
+                    && CxxCallableNeedsRawArrayCountAdapter(
+                        FuncPtrSigOfSymbol(*fnSym), *target))
+                {
+                    thin = *target;
+                    thin.TypeName = "__c_fn_ptr";
+                }
             }
-            arg.Primary = MakeThinFnPtrValue(fn, thin);
+            arg.Primary = MakeThinFnPtrValue(fn, thin, target != nullptr);
             arg.BaseType = arg.Primary->getType();
             arg.TypeAndValue = thin;
             arg.IsRvalue = true;
@@ -3156,23 +3171,20 @@ const char* LLVMBackend::CxxClosureWrapperPreamble()
         return "extern \"C\" void* __cflat_closure_env_copy(void*);\n"
                "extern \"C\" void* __cflat_closure_env_move(void**);\n"
                "extern \"C\" void __cflat_closure_env_destroy(void*);\n"
-               "template <class T> T& __cflat_lvalue(T&& t) noexcept { return t; }\n"
                "template <class P> class __cflat_closure;\n"
                "template <class R, class... A> class __cflat_closure<R (*)(A...)> {\n"
-               "    void* code_; void* env_; bool owns_;\n"
+               "    // Same layout as the CFlat closure pair {code, env}: a CFlat closure variable IS this\n"
+               "    // object, so `F &` binds the caller's own slot. Ownership is the env's tag bit.\n"
+               "    void* code_; void* env_;\n"
                "public:\n"
-               "    __cflat_closure(void* fat, bool owns) noexcept : code_(static_cast<void**>(fat)[0]),\n"
-               "        env_(static_cast<void**>(fat)[1]), owns_(owns) {}\n"
+               "    explicit __cflat_closure(void* fat) noexcept : code_(static_cast<void**>(fat)[0]),\n"
+               "        env_(static_cast<void**>(fat)[1]) {}\n"
                "    __cflat_closure(const __cflat_closure& o) : code_(o.code_),\n"
-               "        env_(o.env_ != nullptr ? __cflat_closure_env_copy(o.env_) : nullptr), owns_(true) {}\n"
-               "    // A lent (non-owning) closure never moves out as a borrow: C++ may store the\n"
-               "    // result past the CFlat owner, so moving a lent closure clones its env. An owned\n"
-               "    // one is moved like a C++ lambda: see __cflat_closure_env_move.\n"
-               "    __cflat_closure(__cflat_closure&& o) : code_(o.code_), env_(o.env_), owns_(true) {\n"
-               "        if (env_ == nullptr) return;\n"
-               "        env_ = o.owns_ ? __cflat_closure_env_move(&o.env_) : __cflat_closure_env_copy(env_); }\n"
+               "        env_(o.env_ != nullptr ? __cflat_closure_env_copy(o.env_) : nullptr) {}\n"
+               "    __cflat_closure(__cflat_closure&& o) : code_(o.code_), env_(o.env_) {\n"
+               "        if (env_ != nullptr) env_ = __cflat_closure_env_move(&o.env_); }\n"
                "    __cflat_closure& operator=(const __cflat_closure&) = delete;\n"
-               "    ~__cflat_closure() { if (owns_ && env_ != nullptr) __cflat_closure_env_destroy(env_); }\n"
+               "    ~__cflat_closure() { if (env_ != nullptr) __cflat_closure_env_destroy(env_); }\n"
                "    R operator()(A... a) const {\n"
                "        void* env = reinterpret_cast<void*>(\n"
                "            reinterpret_cast<__UINTPTR_TYPE__>(env_) & ~static_cast<__UINTPTR_TYPE__>(1));\n"
@@ -3184,10 +3196,55 @@ const char* LLVMBackend::CxxClosureWrapperPreamble()
 std::string LLVMBackend::CxxClosureCallArgument(const NamedVariable& arg, const std::string& param)
 {
         if (arg.CxxClosureSignature.empty()) return {};
-        const std::string object = "__cflat_closure<" + arg.CxxClosureSignature + ">(" + param
-            + (arg.CxxClosureBorrowed ? ", false)" : ", true)");
-        // The borrowing object is an lvalue for the call's full expression.
-        return arg.CxxClosureBorrowed ? "__cflat_lvalue(" + object + ")" : object;
+        const std::string type = "__cflat_closure<" + arg.CxxClosureSignature + ">";
+        // A closure variable is passed as its own slot (an lvalue of the caller's frame, as in C++);
+        // a temporary is moved into the owning prvalue the wrapper builds.
+        if (arg.CxxClosureBorrowed) return "(*static_cast<" + type + " *>(" + param + "))";
+        return type + "(" + param + ")";
+}
+
+// A wrapper result spelled as a reference or pointer to the generated closure object itself.
+static bool IsCxxClosureReferenceResult(std::string spelling)
+{
+        while (spelling.starts_with("const ") || spelling.starts_with("volatile "))
+            spelling.erase(0, spelling.find(' ') + 1);
+        while (!spelling.empty() && std::isspace((unsigned char)spelling.back())) spelling.pop_back();
+        return spelling.starts_with("__cflat_closure<")
+            && (spelling.ends_with('&') || spelling.ends_with('*'));
+}
+
+static std::string CxxClosureReferenceResultRefusal(const std::string& callee)
+{
+        return std::format("C++ '{}' returns a reference to the CFlat closure it was given; CFlat cannot "
+                           "use that reference as a value - call the closure inside C++ or return it "
+                           "by value", callee);
+}
+
+void LLVMBackend::MarkCxxClosureLentByReference(const NamedVariable& arg, const std::string& callee)
+{
+        auto* reference = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(arg.Primary);
+        if (reference == nullptr || reference->getMetadata("cflat.cxx.closure.ref") == nullptr) return;
+        if (NamedVariable* variable = FindStackVariableByStorage(reference->getPointerOperand()))
+            if (variable->CxxClosureLentTo.empty()) variable->CxxClosureLentTo = callee;
+}
+
+void LLVMBackend::MarkKeptCxxClosureArguments(const std::vector<NamedVariable>& arguments,
+                                              const CSigEntry& bound, const std::string& callee)
+{
+        if (bound.ret.IsFunctionPointer || !(bound.ret.Pointer || bound.ret.IsAlias || IsCxxRecord(bound.ret.TypeName)))
+            return;   // a scalar result keeps nothing
+        bool layoutKeeps = false;
+        if (!bound.ret.Pointer && IsCxxRecord(bound.ret.TypeName))
+        {
+            EnsureCxxRecordProjected(bound.ret.TypeName, false);
+            layoutKeeps = CxxRecordStoresForwardedClosureReference(bound.ret.TypeName,
+                bound.retSpelling.find("__cflat_closure<") != std::string::npos);
+        }
+        for (const NamedVariable& argument : arguments)
+            if (argument.CxxClosureBorrowed
+                && (layoutKeeps || (!argument.CxxClosureParam.empty()
+                    && bound.closureKeptParams.find("," + argument.CxxClosureParam + ",") != std::string::npos)))
+                MarkCxxClosureLentByReference(argument, callee);
 }
 
 bool LLVMBackend::ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const
@@ -3221,6 +3278,10 @@ bool LLVMBackend::ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const
         for (llvm::User* user : alloca->users())
         {
             if (llvm::isa<llvm::LoadInst>(user)) continue;
+            // The slot handed to a C++ wrapper as the closure object: C++ cannot assign it.
+            if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+                gep != nullptr && gep->getMetadata("cflat.cxx.closure.ref") != nullptr)
+                continue;
             // The scope-exit / unwind destructor only reads the slot.
             if (auto* call = llvm::dyn_cast<llvm::CallInst>(user);
                 call != nullptr && call->getCalledFunction() != nullptr
@@ -3426,8 +3487,13 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
                     "a closure that may own non-trivial captures cannot be copied into C++ '{}' "
                     "implicitly; pass 'move {}' to hand it over", target,
                     arg.CallerName.empty() ? std::string("<closure>") : arg.CallerName);
-            // The pair is re-read into a temp: the variable's own slot is only ever loaded.
-            fat = CreateLoad(GetClosureFatPtrType(), arg.Storage);
+            // The variable's own slot is the C++ closure object (same layout): C++ binds `F &` to
+            // it as clang binds the caller's lambda. The marked GEP is a reference, not a store.
+            auto* reference = llvm::GetElementPtrInst::CreateInBounds(
+                builder->getInt8Ty(), arg.Storage, { builder->getInt64(0) }, "cxx_closure_ref");
+            builder->Insert(reference);
+            reference->setMetadata("cflat.cxx.closure.ref", llvm::MDNode::get(*context, {}));
+            slot = reference;
         }
         else
         {
@@ -3441,6 +3507,7 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
             if (explicitMove && arg.Storage != nullptr && arg.Storage->getType()->isPointerTy())
                 builder->CreateStore(llvm::ConstantAggregateZero::get(GetClosureFatPtrType()), arg.Storage);
         }
+        if (slot == nullptr)
         {
             llvm::AllocaInst* temp = AllocaAtEntry(GetClosureFatPtrType(), nullptr, "cxx_closure");
             builder->CreateStore(fat, temp);
@@ -3452,9 +3519,10 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
         wrapped.BaseType = slot->getType();
         wrapped.TypeAndValue.TypeName = "void";
         wrapped.TypeAndValue.Pointer = true;
-        wrapped.IsRvalue = true;
+        wrapped.IsRvalue = !named;   // a closure variable crosses as the lvalue it is
         wrapped.CxxClosureSignature = signature;
         wrapped.CxxClosureBorrowed = named;
+        wrapped.CxxClosureDisplay = "Lambda<" + FuncPtrSpellingOf(thin) + ">";
         arg = std::move(wrapped);
         return {};
 }
@@ -4234,6 +4302,11 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.braceListElementSpellings = r.braceListElementTypes;
         e.calleeIdentity = r.calleeIdentity;
         e.paramBindKinds = r.paramBindKinds;
+        e.conditionalArgumentKinds = r.conditionalArgumentKinds;
+        e.closureKeptParams = r.closureKeptParams;
+        e.selectedCalleeType = r.selectedCalleeType;
+        e.selectedCalleeTemplateArgs = r.selectedCalleeTemplateArgs;
+        e.selectedCalleeDefaults = r.selectedCalleeDefaults;
         e.retSpelling = r.retType;
         e.defaultArgs = r.defaultArgs;
         e.name     = r.name;
@@ -4496,6 +4569,11 @@ void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
             raw.braceListElementTypes = cached.braceListElementSpellings;
             raw.calleeIdentity = cached.calleeIdentity;
             raw.paramBindKinds = cached.paramBindKinds;
+            raw.conditionalArgumentKinds = cached.conditionalArgumentKinds;
+            raw.closureKeptParams = cached.closureKeptParams;
+            raw.selectedCalleeType = cached.selectedCalleeType;
+            raw.selectedCalleeTemplateArgs = cached.selectedCalleeTemplateArgs;
+            raw.selectedCalleeDefaults = cached.selectedCalleeDefaults;
             raw.paramNames = cached.paramNames;
             raw.defaultArgs = cached.defaultArgs;
             raw.variadic = cached.variadic;
@@ -12174,8 +12252,11 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             return CxxSpellingForCflatType(type, spelling);
         };
         auto displayTypeOf = [&](const NamedVariable& arg) {
+            if (!arg.CxxClosureDisplay.empty()) return arg.CxxClosureDisplay;
+            if (arg.TypeAndValue.IsFunctionPointer && arg.TypeAndValue.IsThinFnPtr())
+                return "function<" + FuncPtrSpellingOf(arg.TypeAndValue) + ">";
             std::string type = cflatTypeOf(arg);
-            return type.empty() ? std::string("<unknown>") : type;
+            return type.empty() ? std::string("<no C++ spelling>") : type;
         };
         auto braceForArgument = [&](size_t index) -> const CxxBraceArgument* {
             for (const auto& brace : braceArguments)
@@ -12730,7 +12811,9 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             const bool decayedArray = IsCxxFixedArrayArgument(arg);
             const bool classArgument = !arg.TypeAndValue.Pointer && !decayedArray
                 && IsCxxRecord(arg.TypeAndValue.TypeName);
-            const bool provenLvalue = decayedArray ? false
+            // A wrapped CFlat closure variable is its own caller-frame slot: an lvalue.
+            const bool provenLvalue = !arg.CxxClosureSignature.empty() ? arg.CxxClosureBorrowed
+                : decayedArray ? false
                 : classArgument ? !IsCxxRvalueReferenceArgument(arg) : IsProvenCxxScalarLvalue(arg);
             // Any reference (`const T&` included) binds the CALLER's object: a returned
             // reference then aliases it, never a wrapper copy.
@@ -12869,8 +12952,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             {
                 // A CFlat closure: F deduces to the owning __cflat_closure<> prvalue.
                 parameterSpellings.push_back("void *");
-                callArguments.push_back(CxxClosureCallArgument(
-                    arg, "p" + std::to_string(flatParameterIndex++)));
+                arg.CxxClosureParam = "p" + std::to_string(flatParameterIndex++);
+                callArguments.push_back(CxxClosureCallArgument(arg, arg.CxxClosureParam));
                 closureArgument = true;
                 continue;
             }
@@ -13269,6 +13352,12 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         bool wrapped = RequestGeneratedCxxWrapper(group, makeWrapperInput(wrapperName, callArguments),
                                                   wrapperName, "TPL", bound, wrapperError,
                                                   incompleteTypes.empty(), allowIncremental);
+        if (closureArgument && wrapped && IsCxxClosureReferenceResult(bound.retSpelling))
+        {
+            error = CxxClosureReferenceResultRefusal(lookupName);
+            return false;
+        }
+        if (closureArgument && wrapped) MarkKeptCxxClosureArguments(arguments, bound, lookupName);
         if (closureArgument && wrapped && !bound.ret.Pointer && !bound.ret.IsFunctionPointer
             && IsCxxRecord(bound.ret.TypeName))
         {
@@ -13276,7 +13365,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             bool closureForwarded = false;
             for (size_t i = 0; i < arguments.size(); ++i)
             {
-                if (arguments[i].CxxClosureSignature.empty()) continue;
+                // A closure variable crosses as its own caller-frame slot: a kept reference is fine.
+                if (arguments[i].CxxClosureSignature.empty() || arguments[i].CxxClosureBorrowed) continue;
                 size_t parameterIndex = i - functionArgumentOffset;
                 if (i < functionArgumentOffset) continue;
                 if (selected->hasParameterPack && !selected->parameterTypes.empty()
@@ -13636,6 +13726,182 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                          const std::vector<std::pair<size_t, size_t>>& braceGroups,
                                          const std::string& memberOwnerType)
 {
+        lastCxxFreeWrapperLinkage_.clear();
+        if (!RequestCxxFreeFunctionImpl(functionName, explicitArgs, arguments, registeredName, error,
+                                        infixOperator, infixLhsName, infixRhsName, adlCall,
+                                        braceGroups, memberOwnerType))
+            return false;
+        if (!infixOperator.empty() || adlCall || !braceGroups.empty() || !memberOwnerType.empty())
+            return true;
+        return SwitchCxxDirectByValueCall(functionName, arguments, registeredName, error);
+}
+
+/*
+ * T518: C++ copy-initializes a by-value class parameter at its argument's own position, before
+ * the later arguments run. Through the generated wrapper (`T &pN` parameters) that copy would be
+ * made inside the wrapper, after every argument. So a non-trivially-copyable class lvalue that a
+ * later argument names is copy-constructed at its position behind a decision (the call site, see
+ * CxxEarlyCopySlot), and when clang's selected callee takes it by value the call bypasses the
+ * wrapper: the selected callee is called through its address (a generated getter), on the
+ * by-value C++ ABI path, with that copy as the owned prvalue parameter - one copy, in order.
+ */
+bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
+                                             std::vector<NamedVariable>& arguments,
+                                             std::string& registeredName, std::string& error)
+{
+        if (lastCxxFreeWrapperLinkage_.empty()
+            || std::none_of(arguments.begin(), arguments.end(),
+                            [](const NamedVariable& a) { return a.CxxEarlyCopySlot != nullptr; }))
+            return true;
+        const std::string linkage = lastCxxFreeWrapperLinkage_;
+        const CSigEntry* wrapperSig = nullptr;
+        for (const std::string& key : { linkage, registeredName })
+            if (auto sigs = cxxFunctionSignatures_.find(key);
+                wrapperSig == nullptr && sigs != cxxFunctionSignatures_.end())
+                for (auto sig = sigs->second.rbegin(); sig != sigs->second.rend(); ++sig)
+                    if (sig->linkageName == linkage)
+                    {
+                        wrapperSig = &*sig;
+                        break;
+                    }
+        if (wrapperSig == nullptr) return true;
+        const std::string bindKinds = wrapperSig->paramBindKinds;
+        const std::string calleeType = wrapperSig->selectedCalleeType;
+        const std::string calleeTemplateArgs = wrapperSig->selectedCalleeTemplateArgs;
+        const std::vector<cflat_cinterop::RawDefaultArg> calleeDefaults = wrapperSig->selectedCalleeDefaults;
+        // A deferred `?:` / construction argument is flattened into several wrapper parameters.
+        auto leaves = [](auto&& self, const NamedVariable& value) -> size_t {
+            if (!value.IsCxxDirectConstruction) return 1;
+            size_t count = 0;
+            for (const NamedVariable& child : value.CxxDirectConstructionArguments) count += self(self, child);
+            return count;
+        };
+        std::vector<size_t> byValue;
+        bool wrapperBuilt = false;
+        size_t flat = 0;
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            const size_t index = flat;
+            flat += leaves(leaves, arguments[i]);
+            wrapperBuilt = wrapperBuilt || arguments[i].IsCxxDirectConstruction;
+            if (arguments[i].CxxEarlyCopySlot != nullptr && index < bindKinds.size() && bindKinds[index] == 'v')
+                byValue.push_back(i);
+        }
+        auto clearMarkers = [&] {
+            for (NamedVariable& a : arguments)
+            {
+                a.CxxEarlyCopySlot = nullptr;
+                a.CxxEarlyCopyJoin = nullptr;
+                a.CxxEarlyCopyDecision = nullptr;
+            }
+        };
+        if (byValue.empty())
+        {
+            // Reference selections keep the object; the copies stay unconstructed.
+            for (NamedVariable& a : arguments)
+                if (a.CxxEarlyCopySlot != nullptr)
+                {
+                    a.CxxEarlyCopySlot = nullptr;
+                    a.CxxEarlyCopyJoin = nullptr;
+                    a.CxxEarlyCopyDecision = nullptr;
+                }
+            return true;
+        }
+        const size_t first = byValue.front();
+        auto refuse = [&](const std::string& reason) {
+            error = std::format("argument {} of C++ '{}' initializes a by-value '{}' parameter, which C++ "
+                                "copies before the later arguments run; this call cannot make that copy "
+                                "in place because {}, so copy it into a local first and pass that",
+                                first + 1, functionName, arguments[first].TypeAndValue.TypeName, reason);
+            clearMarkers();
+            return false;
+        };
+        if (wrapperBuilt)
+            return refuse("another argument is a '?:' or construction that only the call's wrapper can build");
+        if (calleeType.empty())
+            return refuse("the selected callee is not a plain function whose address can be taken");
+        if (calleeDefaults.size() < arguments.size())
+            return refuse("the selected callee is variadic");
+        for (size_t k = arguments.size(); k < calleeDefaults.size(); ++k)
+            if (calleeDefaults[k].kind.empty() || calleeDefaults[k].kind == "nonconst"
+                || calleeDefaults[k].kind == "unsupported")
+                return refuse(std::format("default argument {} of the selected callee is not a constant", k + 1));
+        auto owner = cxxFreeWrapperGroups_.find(linkage);
+        if (owner == cxxFreeWrapperGroups_.end())
+            return refuse("the call's C++ import group is not known");
+        std::string cxxBase = functionName;
+        for (size_t pos = 0; (pos = cxxBase.find('.', pos)) != std::string::npos; pos += 2)
+            cxxBase.replace(pos, 1, "::");
+        const std::string name = std::format("__cflat_byval_{:016x}", HashWrapperKey(
+            std::format("{}{}|{}|{}", cxxBase, calleeTemplateArgs, calleeType, owner->second.first)));
+        const std::string getter = name + "_fp";
+        bool known = false;
+        if (auto fit = functionTable.find(name); fit != functionTable.end())
+            for (const auto& symbol : fit->second)
+                known = known || (symbol.External && symbol.UniqueName == name);
+        if (!known)
+        {
+            CxxRequestGroup group = MakeCxxRequestGroup(owner->second.first, owner->second.second);
+            if (group.headers.empty()) return refuse("the call's C++ import group is not known");
+            CxxRequestGroupScope groupScope(*this, &group);
+            const std::string source = "using " + name + "_t = " + calleeType + ";\n"
+                + "extern \"C\" " + name + "_t " + name + ";\n"
+                + "extern \"C\" __attribute__((weak)) void* " + getter + "() { return reinterpret_cast<void*>("
+                + "static_cast<" + name + "_t*>(&" + cxxBase + calleeTemplateArgs + ")); }\n";
+            CSigEntry direct;
+            std::string requestError;
+            if (!RequestGeneratedCxxWrapper(group, source, name, "BYVAL", direct, requestError))
+            {
+                const std::string cause = CxxFirstDiagnosticLine(lastCxxWrapperCause_);
+                return refuse("the selected callee's address cannot be taken"
+                              + (cause.empty() ? std::string() : " (clang: " + cause + ")"));
+            }
+            direct.defaultArgs = calleeDefaults;
+            direct.name = name;
+            RegisterCSignatures({ direct }, group.headers.front());
+            known = false;
+            if (auto fit = functionTable.find(name); fit != functionTable.end())
+                for (const auto& symbol : fit->second)
+                    known = known || (symbol.External && symbol.UniqueName == name);
+            if (!known) return refuse("the selected callee could not be registered");
+        }
+        cxxDirectCalleeGetters_[name] = getter;
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            NamedVariable& a = arguments[i];
+            const bool direct = std::find(byValue.begin(), byValue.end(), i) != byValue.end();
+            if (a.CxxEarlyCopyDecision != nullptr)
+                a.CxxEarlyCopyDecision->setOperand(0, builder->getInt1(
+                    direct || (a.CxxEarlyCopySlot == nullptr && i < bindKinds.size() && bindKinds[i] == 'v')));
+            if (direct)
+            {
+                // The early copy is the by-value parameter: an owned prvalue the call elides into.
+                llvm::AllocaInst* slot = a.CxxEarlyCopySlot;
+                a.Storage = a.CxxEarlyCopyJoin != nullptr ? static_cast<llvm::Value*>(a.CxxEarlyCopyJoin) : slot;
+                a.BaseType = slot->getAllocatedType();
+                a.Primary = builder->CreateLoad(slot->getAllocatedType(), a.Storage);
+                a.IsRvalue = true;
+                a.IsCxxPrvalueTemp = true;
+                a.TypeAndValue.VariableName.clear();
+            }
+        }
+        clearMarkers();
+        registeredName = name;
+        return true;
+}
+
+bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
+                                             const std::vector<std::string>& explicitArgs,
+                                             std::vector<NamedVariable>& arguments,
+                                             std::string& registeredName,
+                                             std::string& error,
+                                             const std::string& infixOperator,
+                                             const std::string& infixLhsName,
+                                             const std::string& infixRhsName,
+                                             bool adlCall,
+                                             const std::vector<std::pair<size_t, size_t>>& braceGroups,
+                                             const std::string& memberOwnerType)
+{
         const bool memberCall = !memberOwnerType.empty();
         const std::string memberName = memberCall
             ? functionName.substr(functionName.rfind('.') == std::string::npos
@@ -13834,6 +14100,10 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         // (call argument index, C++ literal spelling) for the literal retry below.
         std::vector<std::pair<size_t, std::string>> literalCallArguments;
         bool hasDeferredMoveLeaf = false;
+        // T518: argument `index` must bind a parameter of class `spelling` (by value or reference).
+        struct DeferredPlaceGuard { size_t index; std::string spelling; std::string cflatType; };
+        std::vector<DeferredPlaceGuard> deferredPlaceGuards;
+        size_t currentArgumentIndex = 0;
         auto appendDirectConstruction = [&](NamedVariable& construction,
                                              auto&& self,
                                              std::string& expression) -> bool {
@@ -13852,7 +14122,12 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 {
                     const NamedVariable& child = construction.CxxDirectConstructionArguments[c];
                     std::string spelling = "int";
-                    if (c != 0)
+                    if (c != 0 && IsCxxFunctionDesignatorArgument(child))
+                    {
+                        // T518: a call arm's CFlat function, called only in its selected arm.
+                        if (!CxxThinFunctionPointerSpelling(child.TypeAndValue, spelling)) return false;
+                    }
+                    else if (c != 0)
                     {
                         if (!CxxSpellingForCflatType(child.TypeAndValue.TypeName, spelling)) return false;
                         // A const local stays const: `CV(const CV&)` over `CV(CV&)`, and a distinct wrapper key.
@@ -13869,12 +14144,29 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                     ++at;
                     if (at < shape.size() && shape[at] == 'S') { expression += childNames.front(); ++at; continue; }
                     if (at < shape.size() && shape[at] == 'D') { expression += defaultSpelling + "()"; ++at; continue; }
+                    // T518: the callee is unbound, so clang must prove the parameter is `default`'s class.
+                    if (at < shape.size() && shape[at] == 'G')
+                    {
+                        deferredPlaceGuards.push_back({ currentArgumentIndex, defaultSpelling,
+                            construction.CxxDirectConstructionType });
+                        ++at;
+                        continue;
+                    }
+                    const bool callLeaf = at < shape.size() && shape[at] == 'F';
+                    if (callLeaf) ++at;
                     const bool movedLeaf = at < shape.size() && shape[at] == 'M';
                     if (movedLeaf) ++at;
                     size_t end = at;
                     while (end < shape.size() && std::isdigit(static_cast<unsigned char>(shape[end]))) ++end;
                     const size_t child = static_cast<size_t>(std::stoul(shape.substr(at, end - at)));
                     if (child >= childNames.size()) return false;
+                    if (callLeaf)
+                    {
+                        if (movedLeaf) return false;
+                        expression += childNames[child] + "()";
+                        at = end;
+                        continue;
+                    }
                     if (movedLeaf)
                     {
                         if (construction.CxxDirectConstructionArguments[child].Storage == nullptr)
@@ -14117,6 +14409,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             NamedVariable& arg = arguments[i];
+            currentArgumentIndex = i;
             const size_t parameterIndex = parameterSpellings.size();
             TypeAndValue type = argumentType(arg);
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -14155,8 +14448,8 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             {
                 // A CFlat closure: the wrapper builds the owning __cflat_closure<> prvalue.
                 parameterSpellings.push_back("void *");
-                callArguments.push_back(CxxClosureCallArgument(arg,
-                    "p" + std::to_string(parameterIndex)));
+                arg.CxxClosureParam = "p" + std::to_string(parameterIndex);
+                callArguments.push_back(CxxClosureCallArgument(arg, arg.CxxClosureParam));
                 continue;
             }
             // The null type needs no header: C++ deduces std::nullptr_t from this spelling.
@@ -14475,6 +14768,15 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         for (const std::string& explicitArg : explicitArgs)
             if (!explicitArg.starts_with("#")) collectTypeDependencies(explicitArg);
 
+        // T518: the place guard re-forms a plain free call only; other call forms refuse.
+        std::string placeGuardError;
+        if (!deferredPlaceGuards.empty()
+            && (memberCall || infix || adlCall || !braceGroups.empty() || !explicitArgs.empty()))
+        {
+            error = std::format("a '?:' argument of C++ '{}' cannot be checked against its parameter "
+                                "type in this call form", functionName);
+            return false;
+        }
         const std::string cxxBase = [&] {
             if (memberCall)
                 return CxxNameFromCflat(memberOwnerType) + "::" + memberName;
@@ -14492,7 +14794,10 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         };
         auto makeWrapper = [&](const std::vector<std::string>& calls, bool literal) {
             const std::string target = makeTarget(calls);
-            const uint64_t hash = HashWrapperKey(functionName + target
+            std::string guardKey;
+            for (const DeferredPlaceGuard& guard : deferredPlaceGuards)
+                guardKey += std::format("|place{}{}", guard.index, guard.spelling);
+            const uint64_t hash = HashWrapperKey(functionName + target + guardKey
                                                  + std::format("|{}", parameterSpellings.size())
                                                  + (braceGroups.empty() ? "" : "|list-probe")
                                                  + [&] {
@@ -14572,9 +14877,38 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 narrowingCheck = " using " + probe + "_t = decltype(" + probe + "(" + probeArguments
                     + "));";
             }
+            /*
+             * T518: an unbound callee's parameter is only known here. The probe re-forms the call with
+             * the `?:` replaced by a proxy whose only conversion yields a P prvalue: the overload clang
+             * selects (templates and default arguments included) must take P there - by value or by a
+             * reference a prvalue binds. A parameter of another class would need a second user-defined
+             * conversion, so the probe, and the wrapper with it, does not compile.
+             */
+            std::string placeCheck;
+            for (const DeferredPlaceGuard& guard : deferredPlaceGuards)
+            {
+                if (guard.index >= calls.size()) continue;
+                const std::string probe = wrapper.name + "_place" + std::to_string(guard.index);
+                std::vector<std::string> probeCalls = calls;
+                probeCalls[guard.index] = "Z()";
+                std::string templateParameters = "class Z";
+                std::string probeParameters = "Z";
+                std::string probeArguments = probe + "_proxy()";
+                for (size_t i = 0; i < parameterSpellings.size(); ++i)
+                {
+                    const std::string index = std::to_string(i);
+                    templateParameters += ", class A" + index;
+                    probeParameters += ", A" + index + " && p" + index;
+                    probeArguments += ", static_cast<decltype(p" + index + ") &&>(p" + index + ")";
+                }
+                wrapper.source += "struct " + probe + "_proxy { operator " + guard.spelling + "() const; };\n";
+                wrapper.source += "template <" + templateParameters + "> auto " + probe + "("
+                    + probeParameters + ") -> decltype(" + makeTarget(probeCalls) + ");\n";
+                placeCheck += " using " + probe + "_t = decltype(" + probe + "(" + probeArguments + "));";
+            }
             wrapper.source += "extern \"C\" __attribute__((weak)) decltype(auto) " + wrapper.name + "("
                 + parameters + ") noexcept(noexcept(" + call + ")) { return " + call + ";"
-                + narrowingCheck + " }\n";
+                + narrowingCheck + placeCheck + " }\n";
             if (hasDeferredMoveLeaf) wrapper.source.insert(0, "#include <utility>\n");
             return wrapper;
         };
@@ -14715,6 +15049,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                     if (symbol.External && symbol.UniqueName == wrapper.name)
                     {
                         registeredName = wrapper.bindName;
+                        lastCxxFreeWrapperLinkage_ = wrapper.name;
                         return true;
                     }
 
@@ -14821,14 +15156,44 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                         lastErrorScopeScore = scopeScore;
                         if (lastError.find("_list_narrowing") != std::string::npos)
                             lastError = "a brace-list element narrows in list-initialization";
+                        for (const DeferredPlaceGuard& guard : deferredPlaceGuards)
+                            if (lastError.find(wrapper.name + "_place" + std::to_string(guard.index))
+                                != std::string::npos)
+                                placeGuardError = std::format("'default' in the '?:' argument {} of C++ '{}' takes "
+                                        "the class of its other arm ('{}'), but the '{}' overload clang "
+                                        "selects does not take that class there; the parameter is not known "
+                                        "before the call, so give 'default' its type explicitly",
+                                        guard.index + 1, functionName, guard.cflatType, functionName);
                         lastCxxRequestClangRejected_ = true;
                         lastCxxRequestNoViableAtRequest_ = lastCxxWrapperNoViableAtRequest_;
                     }
                     continue;
                 }
+                // T518: the selected callee's parameter must be `default`'s class, not a conversion target.
+                for (const DeferredPlaceGuard& guard : deferredPlaceGuards)
+                    if (guard.index >= bound.conditionalArgumentKinds.size()
+                        || bound.conditionalArgumentKinds[guard.index] != '=')
+                    {
+                        error = std::format("'default' in the '?:' argument {} of C++ '{}' takes the class of "
+                                            "its other arm ('{}'), but the '{}' overload clang selects does not "
+                                            "take that class there; the parameter is not known before the call, "
+                                            "so give 'default' its type explicitly",
+                                            guard.index + 1, functionName, guard.cflatType, functionName);
+                        return false;
+                    }
+                if (IsCxxClosureReferenceResult(bound.retSpelling)
+                    && std::any_of(arguments.begin(), arguments.end(), [](const NamedVariable& argument) {
+                           return !argument.CxxClosureSignature.empty();
+                       }))
+                {
+                    error = CxxClosureReferenceResultRefusal(functionName);
+                    return false;
+                }
+                MarkKeptCxxClosureArguments(arguments, bound, functionName);
                 const bool hasClosureArgument = std::any_of(arguments.begin(), arguments.end(),
                     [](const NamedVariable& argument) {
-                        return !argument.CxxClosureSignature.empty();
+                        // A closure variable is its own caller-frame slot; only a temporary dangles.
+                        return !argument.CxxClosureSignature.empty() && !argument.CxxClosureBorrowed;
                     });
                 if (hasClosureArgument && HasCxxForwardingReferenceTemplate(functionName)
                     && !bound.ret.Pointer && !bound.ret.IsFunctionPointer
@@ -14872,6 +15237,8 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                     {
                         StageCxxOperatorScalarArguments(arguments, retarget);
                         registeredName = retargeted.bindName;
+                        lastCxxFreeWrapperLinkage_ = retargeted.name;
+                        cxxFreeWrapperGroups_[retargeted.name] = { group.primary, group.dependencyGroups };
                         return true;
                     }
                     CSigEntry retargetBound;
@@ -14924,6 +15291,9 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                 if (symbol.External && symbol.UniqueName == literalRetargeted.name)
                                 {
                                     registeredName = literalRetargeted.bindName;
+                                    lastCxxFreeWrapperLinkage_ = literalRetargeted.name;
+                                    cxxFreeWrapperGroups_[literalRetargeted.name] =
+                                        { group.primary, group.dependencyGroups };
                                     return true;
                                 }
                 }
@@ -15014,6 +15384,8 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                         if (symbol.External && symbol.UniqueName == chosen.name)
                         {
                             registeredName = chosen.bindName;
+                            lastCxxFreeWrapperLinkage_ = chosen.name;
+                            cxxFreeWrapperGroups_[chosen.name] = { group.primary, group.dependencyGroups };
                             if (!infix && !adlCall)
                                 cxxTemplateOwnerGroup_[cxxBase] = primary;
                             return true;
@@ -15035,6 +15407,11 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             // `offsetof(S, m)`: a function-like macro whose arguments are no values.
             error = std::format("C++ macro '{}' cannot be called with these arguments", functionName);
             if (!lastError.empty()) error += " (clang: " + lastError + ")";
+            return false;
+        }
+        if (!placeGuardError.empty())
+        {
+            error = placeGuardError;
             return false;
         }
         // clang found the name but could not bind it (a nested ctor or call argument refused):
@@ -18671,6 +19048,11 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             raw.braceListElementTypes = stored.braceListElementSpellings;
             raw.calleeIdentity = stored.calleeIdentity;
             raw.paramBindKinds = stored.paramBindKinds;
+            raw.conditionalArgumentKinds = stored.conditionalArgumentKinds;
+            raw.closureKeptParams = stored.closureKeptParams;
+            raw.selectedCalleeType = stored.selectedCalleeType;
+            raw.selectedCalleeTemplateArgs = stored.selectedCalleeTemplateArgs;
+            raw.selectedCalleeDefaults = stored.selectedCalleeDefaults;
             for (const TypeAndValue& param : stored.params)
                 raw.paramNames.push_back(param.VariableName);
             raw.defaultArgs = stored.defaultArgs;
@@ -32054,8 +32436,10 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         const bool operatorOnly = ctor == nullptr && !slicesToBase && !argType.Pointer
             && (param.IsRvalueRef || param.CxxConstRef()) && IsCxxRecord(argType.TypeName)
             && HasImplicitClassConversionOperator(argType.TypeName);
-        const bool wrapped = info != nullptr
-            && (operatorBindsBetter || classTemplateConversion || operatorOnly || zeroTie
+        // A slice with no listed constructor is the implicit base copy: clang's wrapper builds it.
+        const bool sliceByWrapper = slicesToBase && ctor == nullptr;
+        const bool wrapped = (sliceByWrapper || info != nullptr)
+            && (sliceByWrapper || operatorBindsBetter || classTemplateConversion || operatorOnly || zeroTie
                 || ((ctor == nullptr || clangResolves)
                     && (info->constructors.empty()
                         || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))
@@ -32281,6 +32665,441 @@ bool LLVMBackend::HasCxxImplicitConvertingCtor(const std::string& targetType)
             if (oneArgument) return true;
         }
         return false;
+}
+
+/*
+ * Whether a conditional arm's referent (or object) is const, read from its C++ shape.
+ */
+static bool CxxTernaryArmConst(const LLVMBackend::TypeAndValue& arm)
+{
+        // A call result returned `const T` by value is a const prvalue, not a const object.
+        return arm.IsCxxRef() ? arm.CxxConstRef() : arm.IsConstObject() || arm.IsCxxConstValueReturn;
+}
+
+/*
+ * clang's verdict on `c ? A : B` for two C++ class arms. The arms are spelled with their exact cv
+ * and category: an lvalue `*p`, an xvalue `static_cast<T &&>(*p)`, or for a prvalue arm a call to a
+ * declared-only function (only decltype sees it, so no copy is modelled). Each probe is a wrapper
+ * request; a failing one is a clang answer. Ill-formed and ambiguous conditionals are refusals.
+ */
+static const char* CxxArmCategoryTag(LLVMBackend::CxxArmCategory category)
+{
+        using Category = LLVMBackend::CxxArmCategory;
+        return category == Category::Prvalue ? "prvalue"
+            : category == Category::Xvalue ? "xvalue" : "lvalue";
+}
+
+LLVMBackend::CxxTernaryVerdict LLVMBackend::ClassifyCxxTernary(const TypeAndValue& trueArm,
+                                                               CxxArmCategory trueCategory,
+                                                               const TypeAndValue& falseArm,
+                                                               CxxArmCategory falseCategory)
+{
+        const bool trueIsPrvalue = trueCategory == CxxArmCategory::Prvalue;
+        const bool falseIsPrvalue = falseCategory == CxxArmCategory::Prvalue;
+        CxxTernaryVerdict verdict;
+        if (trueArm.Pointer || falseArm.Pointer || trueArm.IsArrayView || falseArm.IsArrayView
+            || trueArm.IsInterface || falseArm.IsInterface || trueArm.IsUnique || falseArm.IsUnique)
+            return verdict;
+        const std::string trueName = ResolveTypeAlias(trueArm.TypeName);
+        const std::string falseName = ResolveTypeAlias(falseArm.TypeName);
+        if (trueName.empty() || falseName.empty() || trueName == falseName
+            || !IsCxxRecord(trueName) || !IsCxxRecord(falseName))
+            return verdict;
+        const bool trueConst = CxxTernaryArmConst(trueArm);
+        const bool falseConst = CxxTernaryArmConst(falseArm);
+        const std::string key = trueName + (trueConst ? "|const|" : "||")
+            + CxxArmCategoryTag(trueCategory) + "|" + falseName + (falseConst ? "|const|" : "||")
+            + CxxArmCategoryTag(falseCategory);
+        if (auto known = cxxTernaryVerdicts_.find(key); known != cxxTernaryVerdicts_.end())
+            return known->second;
+        std::string trueSpelling;
+        std::string falseSpelling;
+        auto trueOwner = cxxTypeOwnerGroup_.find(trueName);
+        auto falseOwner = cxxTypeOwnerGroup_.find(falseName);
+        if (!CxxSpellingForCflatType(trueName, trueSpelling)
+            || !CxxSpellingForCflatType(falseName, falseSpelling)
+            || trueOwner == cxxTypeOwnerGroup_.end() || falseOwner == cxxTypeOwnerGroup_.end())
+            return verdict;
+        CxxRequestGroup group = MakeCxxClassRequestGroup(trueOwner->second, trueName,
+                                                         { falseOwner->second });
+        if (group.headers.empty()) return verdict;
+        const std::string trueCv = (trueConst ? "const " : "") + trueSpelling;
+        const std::string falseCv = (falseConst ? "const " : "") + falseSpelling;
+        // Declared names are per pair: every probe of one TU shares the declarations' scope.
+        const uint64_t pairHash = HashWrapperKey(key);
+        const std::string trueCall = std::format("__cflat_ternary_pv_t_{:016x}", pairHash);
+        const std::string falseCall = std::format("__cflat_ternary_pv_f_{:016x}", pairHash);
+        std::string decls;
+        if (trueIsPrvalue) decls += trueCv + " " + trueCall + "(); ";
+        if (falseIsPrvalue) decls += falseCv + " " + falseCall + "(); ";
+        // An xvalue arm is the caller's object cast to an rvalue reference, never a temporary.
+        auto armExpr = [](CxxArmCategory category, const std::string& call,
+                          const std::string& cv, const char* object) {
+            if (category == CxxArmCategory::Prvalue) return call + "()";
+            if (category == CxxArmCategory::Xvalue)
+                return "static_cast<" + cv + " &&>(" + object + ")";
+            return std::string(object);
+        };
+        const std::string trueExpr = armExpr(trueCategory, trueCall, trueCv, "*p0");
+        const std::string falseExpr = armExpr(falseCategory, falseCall, falseCv, "*p1");
+        const std::string conditional = "true ? " + trueExpr + " : " + falseExpr;
+        std::string lastError;
+        auto probe = [&](const std::string& tag, const std::string& check) {
+            const std::string name = std::format("__cflat_ternary_{}_{:016x}", tag,
+                HashWrapperKey(key + "|" + tag));
+            const std::string source = "#include <type_traits>\n"
+                "extern \"C\" __attribute__((weak)) void " + name + "(" + trueCv + " * p0, "
+                + falseCv + " * p1) { " + decls + "using R = decltype(" + conditional + "); "
+                + check + " }\n";
+            CxxRequestGroupScope groupScope(*this, &group);
+            CSigEntry ignored;
+            std::string error;
+            const bool accepted = RequestGeneratedCxxWrapper(group, source, name,
+                "TERNARY_PROBE", ignored, error);
+            if (!accepted) lastError = error;
+            return accepted;
+        };
+        using Kind = CxxTernaryVerdict::Kind;
+        if (!probe("valid", ""))
+            verdict.kind = lastError.find("ambiguous") != std::string::npos
+                ? Kind::Ambiguous : Kind::Ill;
+        else if (probe("lref", "static_assert(std::is_lvalue_reference_v<R>, \"\");"))
+            verdict.kind = Kind::LvalueRef;
+        else if (probe("xref", "static_assert(std::is_rvalue_reference_v<R>, \"\");"))
+            verdict.kind = Kind::XvalueRef;
+        else
+            verdict.kind = Kind::Prvalue;
+        if (verdict.kind == Kind::LvalueRef || verdict.kind == Kind::XvalueRef
+            || verdict.kind == Kind::Prvalue)
+            verdict.resultIsTrue = probe("true_result", "static_assert(std::is_same_v<"
+                "std::remove_cvref_t<R>, " + trueSpelling + ">, \"\");");
+        cxxTernaryVerdicts_[key] = verdict;
+        return verdict;
+}
+
+/*
+ * Lowers one arm of a classified `c ? A : B` to the result type. The wrapper evaluates the real
+ * conditional with this arm taken and the other arm in the dead branch of a constant condition, so
+ * clang emits exactly the binding, conversion or copy. A reference result hands back the referent's
+ * address; a prvalue result is constructed into a new temp. An arm already of the result type is
+ * left alone unless it must be copied into a prvalue.
+ */
+bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& trueArm,
+                                     CxxArmCategory trueCategory, const TypeAndValue& falseArm,
+                                     CxxArmCategory falseCategory, bool armIsTrue,
+                                     const CxxTernaryVerdict& verdict, bool discardResult)
+{
+        using Kind = CxxTernaryVerdict::Kind;
+        const TypeAndValue& armType = armIsTrue ? trueArm : falseArm;
+        const TypeAndValue& otherType = armIsTrue ? falseArm : trueArm;
+        const CxxArmCategory armCategory = armIsTrue ? trueCategory : falseCategory;
+        const CxxArmCategory otherCategory = armIsTrue ? falseCategory : trueCategory;
+        const bool armIsPrvalue = armCategory == CxxArmCategory::Prvalue;
+        const bool refResult = verdict.kind == Kind::LvalueRef || verdict.kind == Kind::XvalueRef;
+        const std::string armName = ResolveTypeAlias(armType.TypeName);
+        const std::string otherName = ResolveTypeAlias(otherType.TypeName);
+        const std::string resultName = ResolveTypeAlias(
+            verdict.resultIsTrue ? trueArm.TypeName : falseArm.TypeName);
+        if (armName == resultName && (refResult || armIsPrvalue)) return true;
+        std::string armSpelling;
+        std::string otherSpelling;
+        std::string resultSpelling;
+        if (!CxxSpellingForCflatType(armName, armSpelling)
+            || !CxxSpellingForCflatType(otherName, otherSpelling)
+            || !CxxSpellingForCflatType(resultName, resultSpelling))
+            return false;
+        auto armOwner = cxxTypeOwnerGroup_.find(armName);
+        auto otherOwner = cxxTypeOwnerGroup_.find(otherName);
+        auto resultOwner = cxxTypeOwnerGroup_.find(resultName);
+        if (armOwner == cxxTypeOwnerGroup_.end() || otherOwner == cxxTypeOwnerGroup_.end()
+            || resultOwner == cxxTypeOwnerGroup_.end())
+            return false;
+        const std::string armCv = (CxxTernaryArmConst(armType) ? "const " : "") + armSpelling;
+        const std::string otherCv = (CxxTernaryArmConst(otherType) ? "const " : "") + otherSpelling;
+        /*
+         * A prvalue arm converted into a prvalue result keeps guaranteed elision: when its producer
+         * is one call returning into the arm's slot (sret), that call moves into a thunk and clang
+         * calls the thunk inside the conversion, so the produced object is the converted parameter.
+         */
+        // Every writer of the arm slot: one per path of a nested `?:` arm, each an sret call or an
+        // initializer taking the slot once (a constructor expression) with its result unused.
+        struct Producer { llvm::CallBase* call; unsigned slotArg; bool sret; };
+        std::vector<Producer> producers;
+        // A nested arm whose paths built into different slots joins them with a storage PHI.
+        // Deeper nesting joins those PHIs again; every leaf slot is collected through them.
+        std::vector<llvm::AllocaInst*> producerSlots;
+        std::vector<llvm::PHINode*> storageJoins;
+        auto collectSlots = [&](auto&& self, llvm::Value* value) -> bool {
+            if (auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(value))
+            {
+                if (std::find(producerSlots.begin(), producerSlots.end(), slot) == producerSlots.end())
+                    producerSlots.push_back(slot);
+                return true;
+            }
+            auto* join = llvm::dyn_cast_or_null<llvm::PHINode>(value);
+            if (join == nullptr || !join->getType()->isPointerTy()) return false;
+            if (std::find(storageJoins.begin(), storageJoins.end(), join) != storageJoins.end())
+                return true;
+            storageJoins.push_back(join);
+            for (llvm::Value* incoming : join->incoming_values())
+                if (!self(self, incoming)) return false;
+            return true;
+        };
+        if (!collectSlots(collectSlots, arm.Storage)) producerSlots.clear();
+        auto isStorageJoin = [&](llvm::User* user) {
+            return std::find(storageJoins.begin(), storageJoins.end(), user) != storageJoins.end();
+        };
+        if (armIsPrvalue && !refResult)
+            for (llvm::AllocaInst* slot : producerSlots)
+            {
+                bool clean = true;
+                for (llvm::User* user : slot->users())
+                {
+                    if (llvm::isa<llvm::LoadInst>(user) || isStorageJoin(user)) continue;
+                    // A nested arm's join zero-fills the shared slot before either path runs.
+                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getPointerOperand() == slot
+                        && llvm::isa<llvm::Constant>(store->getValueOperand()))
+                        continue;
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                    if (call == nullptr || call->getFunction() != builder->GetInsertBlock()->getParent())
+                    {
+                        clean = false;
+                        break;
+                    }
+                    if (call->isLifetimeStartOrEnd()) continue;
+                    unsigned uses = 0;
+                    for (unsigned n = 0; n < call->arg_size(); ++n)
+                    {
+                        if (call->getArgOperand(n) != slot) continue;
+                        const bool sret = call->paramHasAttr(n, llvm::Attribute::StructRet);
+                        if (++uses > 1 || (!sret && !call->use_empty())) clean = false;
+                        else producers.push_back({ call, n, sret });
+                    }
+                    if (uses == 0) clean = false;
+                }
+                if (!clean)
+                {
+                    producers.clear();
+                    break;
+                }
+            }
+        bool needsReturnProbe = false;
+        for (const Producer& producer : producers) needsReturnProbe |= !producer.sret;
+        // An initializer producer becomes `A f(void *)`; only valid when clang returns A indirectly.
+        if (needsReturnProbe)
+        {
+            const std::string probeName = std::format("__cflat_ternary_retabi_{:016x}",
+                HashWrapperKey(armCv + "|ternary-return-abi"));
+            const std::string probeSource = "extern \"C\" __attribute__((weak)) " + armCv + " "
+                + probeName + "(void * p0) { return reinterpret_cast<" + armCv
+                + " (*)(void *)>(p0)(nullptr); }\n";
+            CxxRequestGroup probeGroup = MakeCxxClassRequestGroup(armOwner->second, armName);
+            CSigEntry probeSignature;
+            std::string probeError;
+            bool indirect = false;
+            if (!probeGroup.headers.empty())
+            {
+                CxxRequestGroupScope probeScope(*this, &probeGroup);
+                indirect = RequestGeneratedCxxWrapper(probeGroup, probeSource, probeName,
+                        "TERNARY_RETURN_ABI", probeSignature, probeError)
+                    && probeSignature.abi.valid
+                    && probeSignature.abi.ret.kind == cflat_cinterop::RawAbiSlot::Indirect
+                    && !probeSignature.abi.ret.sretAfterThis;
+            }
+            if (!indirect) producers.clear();
+        }
+        // A discarded result is the whole full-expression in clang: temporaries die in its order.
+        const bool thunkArm = !producers.empty();
+        const bool discardInClang = thunkArm && discardResult;
+        // The never-taken arm is a null dereference: a constant condition never evaluates it.
+        // Lvalue arms stay lvalues; xvalue and (modelled) prvalue arms are rvalue-reference casts.
+        const std::string taken = thunkArm
+            ? "reinterpret_cast<" + armCv + " (*)(void *)>(p0)(p1)"
+            : armCategory != CxxArmCategory::Lvalue
+            ? "static_cast<" + armCv + " &&>(*p0)" : std::string("*p0");
+        const std::string other = otherCategory != CxxArmCategory::Lvalue
+            ? "static_cast<" + otherCv + " &&>(*(" + otherCv + " *)nullptr)"
+            : "*(" + otherCv + " *)nullptr";
+        const std::string conditional = std::string("(") + (armIsTrue ? "true" : "false") + " ? "
+            + (armIsTrue ? taken : other) + " : " + (armIsTrue ? other : taken) + ")";
+        const std::string wrapperKey = resultSpelling + "|" + armCv + "|" + otherCv + "|"
+            + (armIsTrue ? "t" : "f") + CxxArmCategoryTag(armCategory) + "|"
+            + CxxArmCategoryTag(otherCategory)
+            + (refResult ? "r" : "v") + (thunkArm ? "k" : "") + (discardInClang ? "d" : "")
+            + "|" + conditional;
+        const std::string wrapperName = std::format("__cflat_ternary_arm_{:016x}",
+            HashWrapperKey(wrapperKey));
+        const std::string prologue = "#include <new>\n#include <type_traits>\n"
+            "extern \"C\" __attribute__((weak)) ";
+        const std::string armParams = thunkArm ? std::string("void * p0, void * p1")
+                                               : armCv + " * p0";
+        std::string source;
+        if (refResult)
+            source = prologue + resultSpelling + " * " + wrapperName + "(" + armCv + " * p0) { "
+                "static_assert(std::is_reference_v<decltype(" + conditional + ")>, \"\"); "
+                "auto &&r = " + conditional + "; return const_cast<" + resultSpelling
+                + " *>(&r); }\n";
+        else if (discardInClang)
+            source = prologue + "void " + wrapperName + "(" + armParams + ") { (void)"
+                + conditional + "; }\n";
+        else
+            source = prologue + "void " + wrapperName + "(" + resultSpelling + " * self, "
+                + armParams + ") { ::new (static_cast<void *>(self)) " + resultSpelling + "("
+                + conditional + "); }\n";
+        CxxRequestGroup group = MakeCxxClassRequestGroup(resultOwner->second, resultName,
+            { armOwner->second, otherOwner->second });
+        if (group.headers.empty()) return false;
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry signature;
+        std::string error;
+        if (!RequestGeneratedCxxWrapper(group, source, wrapperName, "TERNARY_ARM",
+                                        signature, error))
+            return false;
+        signature.name = wrapperName;
+        RegisterCSignatures({ signature }, group.headers.front());
+        llvm::Function* function = GetFunction(wrapperName);
+        if (function == nullptr) return false;
+        llvm::Type* resultObject = GetType(TypeAndValue{ .TypeName = resultName });
+        if (thunkArm)
+        {
+            /*
+             * Each producer's other operands (and an indirect callee) are stored into the env at the
+             * producer's own position, with a path selector when there are several; the thunk
+             * rebuilds the selected call with its sret parameter as the destination.
+             */
+            const bool selected = producers.size() > 1;
+            std::vector<llvm::Type*> fieldTypes;
+            if (selected) fieldTypes.push_back(builder->getInt32Ty());
+            struct Captured { std::vector<llvm::Value*> values; unsigned first; bool direct; };
+            std::vector<Captured> captures;
+            for (const Producer& producer : producers)
+            {
+                Captured captured{ {}, static_cast<unsigned>(fieldTypes.size()),
+                                   llvm::isa<llvm::Function>(producer.call->getCalledOperand()) };
+                for (unsigned n = 0; n < producer.call->arg_size(); ++n)
+                    if (n != producer.slotArg) captured.values.push_back(producer.call->getArgOperand(n));
+                if (!captured.direct) captured.values.push_back(producer.call->getCalledOperand());
+                for (llvm::Value* value : captured.values) fieldTypes.push_back(value->getType());
+                captures.push_back(std::move(captured));
+            }
+            auto* envType = llvm::StructType::get(*context, fieldTypes);
+            llvm::Value* env = llvm::ConstantPointerNull::get(builder->getPtrTy());
+            if (!fieldTypes.empty())
+            {
+                env = AllocaAtEntry(envType, nullptr, "cxx.ternary.env");
+                for (size_t p = 0; p < producers.size(); ++p)
+                {
+                    llvm::IRBuilder<> at(producers[p].call);
+                    if (selected)
+                        at.CreateStore(at.getInt32(static_cast<uint32_t>(p)),
+                                       at.CreateStructGEP(envType, env, 0));
+                    for (unsigned n = 0; n < captures[p].values.size(); ++n)
+                        at.CreateStore(captures[p].values[n],
+                                       at.CreateStructGEP(envType, env, captures[p].first + n));
+                }
+            }
+            auto* thunkType = llvm::FunctionType::get(builder->getVoidTy(),
+                { builder->getPtrTy(), builder->getPtrTy() }, false);
+            auto* thunk = llvm::Function::Create(thunkType, llvm::GlobalValue::InternalLinkage,
+                "__cflat_ternary_thunk", module.get());
+            if (llvm::Type* armObject = GetType(TypeAndValue{ .TypeName = armName }))
+            {
+                thunk->addParamAttr(0, llvm::Attribute::getWithStructRetType(*context, armObject));
+                thunk->addParamAttr(0, llvm::Attribute::NoAlias);
+            }
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
+            auto* done = llvm::BasicBlock::Create(*context, "done", thunk);
+            llvm::IRBuilder<>(done).CreateRetVoid();
+            llvm::IRBuilder<> head(entry);
+            llvm::SwitchInst* select = nullptr;
+            if (selected)
+                select = head.CreateSwitch(head.CreateLoad(head.getInt32Ty(),
+                    head.CreateStructGEP(envType, thunk->getArg(1), 0)), done,
+                    static_cast<unsigned>(producers.size()));
+            for (size_t p = 0; p < producers.size(); ++p)
+            {
+                llvm::CallBase* original = producers[p].call;
+                auto* block = selected ? llvm::BasicBlock::Create(*context, "path", thunk) : entry;
+                if (selected) select->addCase(head.getInt32(static_cast<uint32_t>(p)), block);
+                llvm::IRBuilder<> body(block);
+                std::vector<llvm::Value*> loaded;
+                for (unsigned n = 0; n < captures[p].values.size(); ++n)
+                    loaded.push_back(body.CreateLoad(fieldTypes[captures[p].first + n],
+                        body.CreateStructGEP(envType, thunk->getArg(1), captures[p].first + n)));
+                std::vector<llvm::Value*> args;
+                for (unsigned n = 0, next = 0; n < original->arg_size(); ++n)
+                    args.push_back(n == producers[p].slotArg ? thunk->getArg(0) : loaded[next++]);
+                llvm::CallInst* rebuilt = body.CreateCall(original->getFunctionType(),
+                    captures[p].direct ? original->getCalledOperand() : loaded.back(), args);
+                rebuilt->setAttributes(original->getAttributes());
+                rebuilt->setCallingConv(original->getCallingConv());
+                body.CreateBr(done);
+            }
+            // The produced object now lives and dies in clang's conversion, not in the arm's slot.
+            for (llvm::AllocaInst* slot : producerSlots) ReleaseOwnedStructTempInPlace(slot);
+            for (const Producer& producer : producers)
+            {
+                // An invoke leaves its block by its normal edge; the call now runs in the thunk.
+                if (auto* invoke = llvm::dyn_cast<llvm::InvokeInst>(producer.call))
+                {
+                    invoke->getUnwindDest()->removePredecessor(invoke->getParent());
+                    llvm::BranchInst::Create(invoke->getNormalDest(), invoke->getIterator());
+                }
+                producer.call->eraseFromParent();
+            }
+            // The wrapper (and the producer it now runs) may throw: unwind through this frame's cleanups.
+            if (discardInClang)
+            {
+                CreateCallOrInvoke(function->getFunctionType(), function, { thunk, env }, true);
+                llvm::Value* slot = AllocaAtEntry(resultObject, nullptr, "cxx.ternary.discard");
+                arm.Storage = slot;
+                arm.Primary = llvm::Constant::getNullValue(resultObject);
+            }
+            else
+            {
+                llvm::Value* slot = CreateAlloca(resultObject);
+                CreateCallOrInvoke(function->getFunctionType(), function, { slot, thunk, env }, true);
+                if (IsForeignNontrivialCxxClass(resultName))
+                    RegisterOwnedStructTemp(slot, resultName);
+                arm.Storage = slot;
+                arm.Primary = CreateLoad(resultObject, slot);
+            }
+        }
+        else
+        {
+            llvm::Value* storage = arm.Storage;
+            if (storage == nullptr)
+            {
+                llvm::Type* valueType = arm.BaseType != nullptr ? arm.BaseType : GetType(armType);
+                if (valueType == nullptr || !valueType->isSized()) return false;
+                storage = AllocaAtEntry(valueType, nullptr, "cxx.ternary.arm");
+                llvm::Value* value = arm.Primary != nullptr ? arm.Primary : LoadArgStorage(arm);
+                if (value == nullptr) return false;
+                builder->CreateStore(value, storage);
+            }
+            if (refResult)
+            {
+                llvm::Value* pointer = CreateCallOrInvoke(function->getFunctionType(), function,
+                    { storage }, true, "cxx.ternary.ref");
+                arm.Storage = pointer;
+                arm.Primary = CreateLoad(resultObject, pointer);
+            }
+            else
+            {
+                llvm::Value* slot = CreateAlloca(resultObject);
+                CreateCallOrInvoke(function->getFunctionType(), function, { slot, storage }, true);
+                if (IsForeignNontrivialCxxClass(resultName))
+                    RegisterOwnedStructTemp(slot, resultName);
+                arm.Storage = slot;
+                arm.Primary = CreateLoad(resultObject, slot);
+        }
+        }
+        arm.BaseType = resultObject;
+        arm.TypeAndValue = TypeAndValue{};
+        arm.TypeAndValue.TypeName = resultName;
+        arm.IsRvalue = !refResult;
+        return true;
 }
 
 /*

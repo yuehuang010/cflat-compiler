@@ -2343,11 +2343,7 @@ struct T514R5Brace
     T514R5Pt m { v = rd() };
 };
 struct T514R5Const { int b = 41; };
-T514R5Member t514R5Global = default;
-T514R5Member t514R5GlobalBrace = {};
-T514R5Brace t514R5Field = default;
 T514R5Const t514R5ConstGlobal = default;
-T514R5Member[2] t514R5Arr = default;
 
 // r7: a thread_local whose default does not fold is constructed per thread on first use.
 struct T514R7Explicit { int a = 7; int b = a + 34; T514R7Explicit() {} };
@@ -2374,7 +2370,6 @@ thread_local T514R5Member[2] t514R7Arr = default;
 int t514R9Count = 0;
 int t514R9Next() { t514R9Count += 1; return t514R9Count; }
 struct T514R9Seq { int v = t514R9Next(); };
-T514R9Seq t514R9Plain = default;
 thread_local T514R9Seq t514R9Tl = default;
 T514R9Seq*[2] t514R9Addrs = {&t514R9Tl, &t514R9Tl};
 int t514R9Rd();
@@ -2424,6 +2419,10 @@ move T514R3Payload* t514R3MakeOwnedZero()
 bool testT514R3FieldDefaultsAndOwnedSlots()
 {
     bool result = true;
+    T514R5Member t514R5Global = default;
+    T514R5Member t514R5GlobalBrace = {};
+    T514R5Brace t514R5Field = default;
+    T514R5Member[2] t514R5Arr = default;
     T514R3StaticFirst first = default;
     result &= Test("t514r3 static member hides free function", first.f(40), 41);
     T514R3StaticLate late = default;
@@ -2495,15 +2494,15 @@ bool testT514R3FieldDefaultsAndOwnedSlots()
     delete capturedResult;
     result &= Test("t514r3 captured owned lambda destructor", t514R3DtorCount, 1);
 
-    result &= Test("t514r5 global member default reads member", t514R5Global.b, 41);
-    result &= Test("t514r5 global member default method call", t514R5Global.c, 41);
-    result &= Test("t514r5 global brace member default", t514R5GlobalBrace.b, 41);
-    result &= Test("t514r5 global brace field default", t514R5Field.p.v + t514R5Field.q.v, 82);
-    result &= Test("t514r5 global brace method field default", t514R5Field.m.v, 41);
+    result &= Test("t514r5 local member default reads member", t514R5Global.b, 41);
+    result &= Test("t514r5 local member default method call", t514R5Global.c, 41);
+    result &= Test("t514r5 local brace member default", t514R5GlobalBrace.b, 41);
+    result &= Test("t514r5 local brace field default", t514R5Field.p.v + t514R5Field.q.v, 82);
+    result &= Test("t514r5 local brace method field default", t514R5Field.m.v, 41);
     result &= Test("t514r5 global constant default", t514R5ConstGlobal.b, 41);
-    result &= Test("t514r5 global array member default", t514R5Arr[1].c, 41);
+    result &= Test("t514r5 local array member default", t514R5Arr[1].c, 41);
     t514R5Global.a = 10;
-    result &= Test("t514r5 global member write persists", t514R5Global.a + t514R5Global.b, 51);
+    result &= Test("t514r5 local member write persists", t514R5Global.a + t514R5Global.b, 51);
 
     result &= Test("t514r7 thread_local member default", t514R7Member.b + t514R7Member.c, 82);
     result &= Test("t514r7 thread_local explicit ctor member default", t514R7Explicit.b, 41);
@@ -2516,7 +2515,8 @@ bool testT514R3FieldDefaultsAndOwnedSlots()
     t514R7Seed = 30;
     result &= Test("t514r7 thread_local dynamic default built once before first use", t514R7DynamicTl.b, 41);
     int callsBefore = t514R7Calls;
-    result &= Test("t514r9 address array after earlier plain global", t514R9Plain.v * 10 + t514R9Addrs[0].v, 12);
+    T514R9Seq t514R9Plain = default;
+    result &= Test("t514r9 address array after local default", t514R9Plain.v * 10 + t514R9Addrs[0].v, 21);
     result &= Test("t514r9 thread_local address array under the module guard", t514R9RecTl.b, 11);
     result &= Test("t514r9 thread_local address array stored", t514R9RecAddrs[1] == &t514R9RecTl ? 41 : 0, 41);
     int secondFirst = t514R8Second.v;
@@ -2960,6 +2960,9 @@ bool testTernaryClosureFieldJoin()
 struct BondedFieldBox { Lambda<int()> f = default; Lambda<int()> g = default; };
 struct BondedFieldOuter { BondedFieldBox box = default; };
 struct BondedVoidFieldBox { Lambda<void()> f = default; };
+struct T529BondedRes { int value = default; int* drops = default; ~T529BondedRes() { if (drops != nullptr) *drops = *drops + 1; } };
+struct T529BondedSetter { Lambda<int()> value = default; void set(Lambda<int()> next) { value = next; } };
+Lambda<int()> t529BondedIdentity(Lambda<int()> value) { return value; }
 
 // A callee that only INVOKES the closure keeps the bond inside the caller's frame, so passing
 // an extracted bonded field to it stays legal (the reject side is err_bond_lambda_escape.cb).
@@ -2971,6 +2974,45 @@ class InvokeBondedOnly : IInvokeBonded { int run(Lambda<int()> f) { return f(); 
 bool testBondedClosureFieldLifetime()
 {
     bool result = true;
+
+    {
+        int drops = 0;
+        int value = 0;
+        {
+            unique<T529BondedRes> owner = unique<T529BondedRes>(new T529BondedRes());
+            owner->value = 23; owner->drops = &drops;
+            Lambda<int()> local = t529BondedIdentity(() => { return owner->value; });
+            value = local();
+        }
+        result &= Test("bonded identity within source scope", value, 23);
+        result &= Test("bonded identity source destroyed once", drops, 1);
+    }
+    {
+        int drops = 0;
+        int value = 0;
+        {
+            unique<T529BondedRes> owner = unique<T529BondedRes>(new T529BondedRes());
+            owner->value = 37; owner->drops = &drops;
+            list<Lambda<int()>> values = default;
+            values.add(() => { return owner->value; });
+            value = values.get(0)();
+        }
+        result &= Test("bonded literal list add within source scope", value, 37);
+        result &= Test("bonded literal list add source destroyed once", drops, 1);
+    }
+    {
+        int drops = 0;
+        int value = 0;
+        {
+            unique<T529BondedRes> owner = unique<T529BondedRes>(new T529BondedRes());
+            owner->value = 43; owner->drops = &drops;
+            T529BondedSetter box;
+            box.set(() => { return owner->value; });
+            value = box.value();
+        }
+        result &= Test("bonded setter within source scope", value, 43);
+        result &= Test("bonded setter source destroyed once", drops, 1);
+    }
 
     {
         Counter c = default; c.value = 31;

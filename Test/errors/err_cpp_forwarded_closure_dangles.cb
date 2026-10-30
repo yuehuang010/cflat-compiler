@@ -2,87 +2,112 @@ import cpp "cpp_t28_fwdref.hpp";
 extern int main()
 {
     int k = 4;
+    // T525: a closure VARIABLE crosses as its own caller-frame slot, so results that keep a reference
+    // to it are value legs in test_cpp_interop.cb. A moved closure is a temporary: a result keeping a
+    // reference to it would outlive it, so those stay refused (layout facts, T419).
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m1 = (int v) => v * k;
+        std.cflat_t28.fwd(move m1);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m2 = (int v) => v * k;
+        t28.fwd1(move m2);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m3 = (int v) => v * k;
+        t28.holdptr(move m3);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m4 = (int v) => v * k;
+        t28.holdpriv(move m4);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m5 = (int v) => v * k;
+        t28.holdtup(move m5);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m6 = (int v) => v * k;
+        t28.holddeep(move m6);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m7 = (int v) => v * k;
+        t28.holddtorborrow(move m7);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        Lambda<int(int)> m8 = (int v) => v * k;
+        t28.holdcref(move m8);
+    }
+    // A variable bound by reference to C++ whose class result may keep it: `move` would null it.
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m10 = (int v) => v * k;
+        auto h10 = t28.holdfwd(m10);
+        Lambda<int(int)> g10 = move m10;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m11 = (int v) => v * k;
+        auto h11 = std.cflat_t28.fwd(m11);
+        Lambda<int(int)> g11 = move m11;
+    }
+    // r2: clang's view of the selected callee (std::ref, an address, a reference member), not only
+    // the result layout - std::function and a private F* behind a user destructor hide it there.
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m12 = (int v) => v * k;
+        auto h12 = t525.holdfnref(m12);
+        Lambda<int(int)> g12 = move m12;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m13 = (int v) => v * k;
+        auto h13 = t525.holdborrowdtor(m13);
+        Lambda<int(int)> g13 = move m13;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m14 = (int v) => v * k;
+        auto h14 = t525.holdmixed(m14);
+        Lambda<int(int)> g14 = move m14;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m15 = (int v) => v * k;
+        auto h15 = t28.holdtup(m15);
+        Lambda<int(int)> g15 = move m15;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m16 = (int v) => v * k;
+        auto h16 = t525.holdopaque(m16);
+        Lambda<int(int)> g16 = move m16;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m17 = (int v) => v * k;
+        auto h17 = t525.holdconstref(m17);
+        Lambda<int(int)> g17 = move m17;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m18 = (int v) => v * k;
+        auto h18 = t525.holdcondref(m18);
+        Lambda<int(int)> g18 = move m18;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m19 = (int v) => v * k;
+        auto h19 = t525.holdbraceref(m19);
+        Lambda<int(int)> g19 = move m19;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m20 = (int v) => v * k;
+        auto h20 = t525.holdbracelist(m20);
+        Lambda<int(int)> g20 = move m20;
+    }
+    expect_error("whose result may keep that reference, and 'move' leaves the closure null") {
+        Lambda<int(int)> m21 = (int v) => v * k;
+        auto h21 = t525.holdvla(m21);
+        Lambda<int(int)> g21 = move m21;
+    }
+    // A result that IS a reference to the closure has no CFlat value form.
     Lambda<int(int)> f = (int v) => v * k;
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdfwd(f);
+    expect_error("returns a reference to the CFlat closure it was given") {
+        t525.pass(f);
     }
-    expect_error("caller-owned C++ closure slot") {
-        t28.closureFactory.holdfwd(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdptr(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdcref(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdpriv(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdtup(f);
-    }
-    auto byValue = t28.hold(f);
-    if (byValue.run(5) != 20) return 1;
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdfwd(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.closureFactory.holdfwd(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdptr(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdcref(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.fwd1(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        std.cflat_t28.fwd(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        std.cflat_t28.fwd(move f);
-    }
-    // T419: opaque-blob results (no public field) holding F* / F& through private members.
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdpriv(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdnest(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdtup(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdoptrw(f);
-    }
-    // T419 r3: no depth, width or fact-count cutoff hides the borrowed F*.
-    expect_error("caller-owned C++ closure slot") {
-        t28.holddeep(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdwide(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdcrowd(f);
-    }
-    // T419 r4: an owner beside a borrowed sibling sharing the same base does not hide the borrow.
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdboxpair(f);
-    }
-    // T419 r5: only std owning templates exempt a visible T*; a user destructor does not.
-    expect_error("caller-owned C++ closure slot") {
-        t28.holdownedbox(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holddtorborrow(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holddtorderived(f);
-    }
-    expect_error("caller-owned C++ closure slot") {
-        t28.holddtorouter(f);
+    expect_error("returns a reference to the CFlat closure it was given") {
+        Lambda<int(int)> m9 = (int v) => v * k;
+        t525.pass(move m9);
     }
     return 0;
 }

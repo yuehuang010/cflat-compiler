@@ -5,7 +5,7 @@
 // literal-`move` container path the other noncopyable err tests exercise.
 class Res { int id = default; };
 class Holder { unique Res* r = default; };
-Holder g_slot = default;
+Holder g_slot;
 void store(Holder h) { g_slot = h; }
 // `return w` and a store INTO the whole parameter (`w += k`, `w = v`) consume it the same way:
 // master bit-copied or overwrote the borrowed value and the caller freed it again (rc 133).

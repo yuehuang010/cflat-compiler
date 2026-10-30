@@ -1,0 +1,11 @@
+// T524: a non-folding native global default is refused.
+// Spelling 1 of 3: bare declaration. Siblings: err_global_default_eq_default.cb, err_global_default_empty_brace.cb.
+const char* gRefPtr = "rt";
+struct RefStr { string s = gRefPtr; int n = 1; };
+expect_error("must be constructed in main or made foldable");
+RefStr gRefBare;
+
+extern int main()
+{
+    return gRefBare.n;
+}

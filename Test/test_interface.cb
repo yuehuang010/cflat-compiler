@@ -7,6 +7,7 @@ import "library/gi_collide_iface.cb";
 import "library/gi_collide_struct.cb";
 import "function.cb";
 import "diagnostic/heap_audit.cb";
+import "unique.cb";
 
 // === Interfaces ===
 
@@ -5503,6 +5504,371 @@ bool testInterfaceFieldZeroOwnerReturn()
     return ok;
 }
 
+// T522 (lifetime elision): a non-owning call result borrows only what the callee summary allows -
+// a global, a fresh 'move' result, the parameter it forwards, or what a slot address holds. Every
+// shape below is accepted; the refusals live in errors/err_iface_return_call_borrow.cb.
+Square* t522Idt(Square* p) { return p; }
+Square* t522GlobalOf(Square* x) { return &t91GArr[1]; }
+Square* t522GlobalSquare = nullptr;
+Square* t522GlobalLater(Square* x);
+Square* t522ForwardGlobal(Square* x) { return t522GlobalOf(x); }
+move Square* t522Fresh(Square* seed) { Square* s = new Square(); s->s = seed->s + 1; return s; }
+IShape t522GlobalThroughCall() { Square* t = new Square(); return t522GlobalOf(t); }
+IShape t522GlobalThroughLaterCall() { Square* t = new Square(); return t522GlobalLater(t); }
+IShape t522GlobalThroughForward() { Square* t = new Square(); return t522ForwardGlobal(t); }
+move IShape t522FreshThroughCall() { Square* t = new Square(); t->s = 2; return t522Fresh(t); }
+IShape t522ParamThroughCall(Square* p) { return t522Idt(p); }
+struct T522Pass { int z = 0; Square* pass(Square* p) { return p; } };
+IShape t522ParamThroughLocalMethod(Square* p) { T522Pass ps = default; return ps.pass(p); }
+IShape t522UniqueParamGet(unique<Square>* u) { return u->get(); }
+class T522UniqueOwner { unique<Square> u = default; IShape get() { return u.get(); } };
+IShape t522ReadThroughSlot(Square** pp) { Square* b = *pp; return b; }
+IShape t522DerefOfLocalSlot() { Square* q = &t91GArr[0]; return t522ReadThroughSlot(&q); }
+IShape t522WrapParam(Square* p) { return p; }
+IShape t522WrapThroughCall(Square* p) { return t522WrapParam(p); }
+IShape t522CorrelatedRebind(int k)
+{
+    Square loc = default;
+    IShape i = &t91GArr[1];
+    if (k == 99) i = &loc;
+    if (k == 99) i = &t91GArr[1];
+    return i;
+}
+void t522SetSlot(Square** pp, Square* x) { *pp = x; }
+IShape t522SlotSetByCall() { Square* q = nullptr; t522SetSlot(&q, &t91GArr[0]); return q; }
+IShape t522HeapHolderGlobal() { T198PointerHolder* h = new T198PointerHolder(); h->p = &t91GArr[0]; return h->p; }
+void t522Touch(T198PointerHolder* h) { }
+IShape t522TouchedHolderGlobal() { T198PointerHolder h = default; h.p = &t91GArr[0]; t522Touch(&h); return h.p; }
+Square* t522GlobalLater(Square* x) { return t522GlobalSquare; }
+// Round 2: later-defined callees are summarized once every body exists (definition order is
+// irrelevant); constant interface results, pointer fields read through a local aggregate, and
+// indirect interface results borrowing only globals stay accepted.
+Square* t522IdOfGlobalLater(Square* x);
+Square* t522ArrayElementLater(Square* x);
+IShape t522FatGlobalLater(Square* x);
+IShape t522FatGlobal(Square* x) { return &t91GArr[1]; }
+IShape t522IdOfGlobalThroughLaterCall() { Square q = default; return t522IdOfGlobalLater(&q); }
+IShape t522ArrayElementThroughLaterCall() { Square q = default; return t522ArrayElementLater(&q); }
+IShape t522FatGlobalThroughCall() { Square q = default; return t522FatGlobal(&q); }
+IShape t522FatGlobalThroughLaterCall() { Square q = default; return t522FatGlobalLater(&q); }
+Square* t522FieldOf(T198PointerHolder* h) { return h->p; }
+IShape t522FieldGlobalThroughCall() { T198PointerHolder h = default; h.p = &t91GArr[0]; return t522FieldOf(&h); }
+IShape t522IndirectGlobal() { function<IShape(Square*)> fp = t522WrapParam; return fp(&t91GArr[1]); }
+IShape t522ClosureGlobal() { Square* t = &t91GArr[1]; Lambda<IShape()> l = () => { return t; }; return l(); }
+Square* t522IdOfGlobalLater(Square* x) { return t522Idt(&t91GArr[1]); }
+Square* t522ArrayElementLater(Square* x) { return &t91GArr[1]; }
+IShape t522FatGlobalLater(Square* x) { return &t91GArr[1]; }
+// Round 3: element / copied holders, nested later calls whose outer callee drops the argument,
+// and mutually recursive helpers that only return a global.
+IShape t522ArrayHolderGlobal() { T198PointerHolder[2] a = default; a[1].p = &t91GArr[0]; return t522FieldOf(&a[1]); }
+IShape t522CopiedHolderGlobal() { T198PointerHolder a = default; a.p = &t91GArr[0]; T198PointerHolder b = a; return t522FieldOf(&b); }
+IShape t522AssignedHolderGlobal()
+{
+    T198PointerHolder a = default;
+    a.p = &t91GArr[0];
+    T198PointerHolder b = default;
+    b = a;
+    return t522FieldOf(&b);
+}
+Square* t522DropsArgumentLater(Square* x);
+Square* t522KeepsArgumentLater(Square* x);
+IShape t522NestedLaterDropped() { Square q = default; return t522DropsArgumentLater(t522KeepsArgumentLater(&q)); }
+Square* t522MutualA(Square* p, int k);
+Square* t522MutualB(Square* p, int k);
+IShape t522MutualGlobal() { Square q = default; return t522MutualA(&q, 3); }
+Square* t522DropsArgumentLater(Square* x) { return t522Idt(&t91GArr[1]); }
+Square* t522KeepsArgumentLater(Square* x) { return t522Idt(x); }
+Square* t522MutualA(Square* p, int k) { if (k == 0) return &t91GArr[1]; return t522MutualB(p, k - 1); }
+Square* t522MutualB(Square* p, int k) { if (k == 0) return &t91GArr[1]; return t522MutualA(p, k - 1); }
+// Round 4: holder fields as of the call - the selected element only, a copy's contents at the
+// copy, a struct relayed through a call, and a by-value parameter's fields (the caller's borrow).
+IShape t522ElementGlobalBesideLocal()
+{
+    Square x = default;
+    T198PointerHolder[2] a = default;
+    a[0].p = &t91GArr[0];
+    a[1].p = &x;
+    return t522FieldOf(&a[0]);
+}
+IShape t522CopyThenSourceWrite()
+{
+    Square x = default;
+    T198PointerHolder a = default;
+    a.p = &t91GArr[0];
+    T198PointerHolder b = a;
+    a.p = &x;
+    return t522FieldOf(&b);
+}
+IShape t522CopyThenReassignGlobal()
+{
+    T198PointerHolder a = default;
+    a.p = &t91GArr[1];
+    T198PointerHolder b = a;
+    b.p = &t91GArr[0];
+    return t522FieldOf(&b);
+}
+T198PointerHolder t522RelayHolder(T198PointerHolder h) { return h; }
+IShape t522RelayedHolderGlobal()
+{
+    T198PointerHolder a = default;
+    a.p = &t91GArr[0];
+    T198PointerHolder b = t522RelayHolder(a);
+    return t522FieldOf(&b);
+}
+IShape t522FromHolderParam(T198PointerHolder a) { T198PointerHolder b = a; return t522FieldOf(&b); }
+IShape t522HolderParamGlobal() { T198PointerHolder a = default; a.p = &t91GArr[0]; return t522FromHolderParam(a); }
+
+// Round 5 type narrowing: a call result of interface type borrows only arguments whose type can
+// reach an implementer. The cocoa.cb / term.cb findByKey shape recurses with a local string.
+interface IT522Node { int tag(); list<IT522Node>* t522Kids(); };
+class T522Node : IT522Node
+{
+    int t = 0;
+    list<IT522Node>* ks = nullptr;
+    int tag() { return t; }
+    list<IT522Node>* t522Kids() { return ks; }
+};
+string t522KeyOf(string path, int i) { if (i == 0) return "b"; return path; }
+IT522Node t522FindByKey(IT522Node node, string path, string want)
+{
+    if (path == want) return node;
+    list<IT522Node>* kids = node.t522Kids();
+    if (kids != nullptr)
+    {
+        int i = 0;
+        while (i < kids.count())
+        {
+            IT522Node c = kids.get(i);
+            string cp = t522KeyOf(path, i);
+            IT522Node r = t522FindByKey(c, cp, want);
+            if (r != nullptr) return r;
+            i++;
+        }
+    }
+    return nullptr;
+}
+IT522Node t522PickNode(IT522Node node, string s) { return node; }
+IT522Node t522NodeThroughFunction(IT522Node node)
+{
+    string local = t522KeyOf("x", 0);
+    function<IT522Node(IT522Node, string)> f = t522PickNode;
+    return f(node, local);
+}
+bool t522FindByKeyShape()
+{
+    T522Node* root = new T522Node();
+    root.t = 1;
+    T522Node* child = new T522Node();
+    child.t = 2;
+    root.ks = new list<IT522Node>();
+    root.ks.add(child);
+    IT522Node found = t522FindByKey(root, "a", "b");
+    return found != nullptr && found.tag() == 2 && t522NodeThroughFunction(root).tag() == 1;
+}
+
+// Round 6 global twins: closures over a global, an interface capture of a global, an indirect
+// struct relay of a global.
+IShape t522PickShapeLambda(Lambda<IShape()> l) { return l(); }
+IShape t522RecShapeLambda(Lambda<IShape()> l, int n) { if (n > 0) return t522RecShapeLambda(l, n - 1); return l(); }
+IShape t522ClosureArgumentGlobal()
+{
+    Square* h = t522GlobalSquare;
+    Lambda<IShape()> l = () => { return h; };
+    function<IShape(Lambda<IShape()>)> fp = t522PickShapeLambda;
+    return fp(l);
+}
+IShape t522ClosureRecursiveGlobal()
+{
+    Square* h = t522GlobalSquare;
+    Lambda<IShape()> l = () => { return h; };
+    return t522RecShapeLambda(l, 1);
+}
+IShape t522ClosureInterfaceCaptureGlobal()
+{
+    IShape h = t522GlobalSquare;
+    Lambda<IShape()> l = () => { return h; };
+    return l();
+}
+struct T522RelayBox { Square* p = default; };
+T522RelayBox t522RelayBox(T522RelayBox a) { return a; }
+Square* t522RelayBoxP(T522RelayBox* b) { return b->p; }
+IShape t522IndirectRelayGlobal()
+{
+    T522RelayBox a = default;
+    a.p = t522GlobalSquare;
+    function<T522RelayBox(T522RelayBox)> fp = t522RelayBox;
+    T522RelayBox b = fp(a);
+    return t522RelayBoxP(&b);
+}
+
+// Round 7 global shapes: a closure held in a struct passed by value (function<> and recursion),
+// a closure capturing a closure over a global, two indirect relays of a C-ABI-form struct.
+struct T522LambdaBox { Lambda<IShape()> l = default; };
+IShape t522LambdaBoxPick(T522LambdaBox b) { return b.l(); }
+IShape t522LambdaBoxRec(T522LambdaBox b, int n) { if (n > 0) return t522LambdaBoxRec(b, n - 1); return b.l(); }
+IShape t522LambdaBoxThroughFunctionGlobal()
+{
+    Square* h = t522GlobalSquare;
+    T522LambdaBox b = default;
+    b.l = () => { return h; };
+    function<IShape(T522LambdaBox)> fp = t522LambdaBoxPick;
+    return fp(b);
+}
+IShape t522LambdaBoxRecursiveGlobal()
+{
+    Square* h = t522GlobalSquare;
+    T522LambdaBox b = default;
+    b.l = () => { return h; };
+    return t522LambdaBoxRec(b, 1);
+}
+IShape t522NestedClosureGlobal()
+{
+    Square* h = t522GlobalSquare;
+    Lambda<IShape()> inner = () => { return h; };
+    Lambda<IShape()> outer = () => { return inner(); };
+    return outer();
+}
+IShape t522TwoHopRelayGlobal()
+{
+    T522RelayBox a = default;
+    a.p = t522GlobalSquare;
+    function<T522RelayBox(T522RelayBox)> fp = t522RelayBox;
+    function<T522RelayBox(T522RelayBox)> fq = t522RelayBox;
+    T522RelayBox b = fq(fp(a));
+    T522RelayBox m = fp(a);
+    T522RelayBox c = fp(m);
+    if (t522RelayBoxP(&c) != t522GlobalSquare) return nullptr;
+    return t522RelayBoxP(&b);
+}
+
+// Round 8 global twins: calling a copy of a closure (also after the source is reassigned to a
+// closure over a local), and an sret struct result of an indirect call with a C-ABI-form argument.
+IShape t522ClosureCopyGlobal()
+{
+    Square* pg = t522GlobalSquare;
+    Lambda<IShape()> a = () => { return pg; };
+    Lambda<IShape()> b = a;
+    return b();
+}
+IShape t522ClosureCopySourceReassignedGlobal()
+{
+    Square loc = default;
+    Square* px = &loc;
+    Square* pg = t522GlobalSquare;
+    Lambda<IShape()> a = () => { return pg; };
+    Lambda<IShape()> b = a;
+    a = () => { return px; };
+    return b();
+}
+struct T522BigBox { Square* p = default; long a = default; long b = default; };
+T522BigBox t522WrapBig(T522RelayBox h) { T522BigBox r = default; r.p = h.p; return r; }
+Square* t522BigBoxP(T522BigBox* b) { return b->p; }
+IShape t522SretCoercedGlobal()
+{
+    T522RelayBox a = default;
+    a.p = t522GlobalSquare;
+    function<T522BigBox(T522RelayBox)> fp = t522WrapBig;
+    T522BigBox b = fp(a);
+    return t522BigBoxP(&b);
+}
+
+// T522 round 10: deep relay and fluent chains over a global stay accepted (depth cap far above them).
+Square* t522Pk(Square* a, Square* b) { if (a == nullptr) return b; return a; }
+IShape t522RelayChain12Global()
+{
+    Square* p0 = t522GlobalSquare;
+    Square* p1 = t522Pk(p0, p0);
+    Square* p2 = t522Pk(p1, p1);
+    Square* p3 = t522Pk(p2, p2);
+    Square* p4 = t522Pk(p3, p3);
+    Square* p5 = t522Pk(p4, p4);
+    Square* p6 = t522Pk(p5, p5);
+    Square* p7 = t522Pk(p6, p6);
+    Square* p8 = t522Pk(p7, p7);
+    Square* p9 = t522Pk(p8, p8);
+    Square* p10 = t522Pk(p9, p9);
+    Square* p11 = t522Pk(p10, p10);
+    Square* p12 = t522Pk(p11, p11);
+    return p12;
+}
+class T522Fluent : IShape
+{
+    int s = 0;
+    T522Fluent* nx = default;
+    int area() { return s * s; }
+    T522Fluent* next() { return nx; }
+};
+T522Fluent t522FluentGlobal = default;
+IShape t522FluentChain10Global()
+{
+    t522FluentGlobal.s = 4;
+    t522FluentGlobal.nx = &t522FluentGlobal;
+    return t522FluentGlobal.next().next().next().next().next().next().next().next().next().next();
+}
+// T522 round 12: a struct passed by value through a function<> thunk travels as a hidden pointer
+// to a caller copy (Windows x64 byval; arm64 over 16 bytes): the struct's value, not a borrow of
+// the copy. Only what its fields hold can be borrowed.
+struct T522Wide { int a = 1; int b = 2; int c = 3; int d = 4; int e = 5; Square* sq = default; };
+IShape t522PickWide(IShape s, T522Wide w) { return s; }
+IShape t522HoldWide(T522Wide w) { return w.sq; }
+IShape t522FunctionWideStructGlobal()
+{
+    T522Wide local = default;
+    function<IShape(IShape, T522Wide)> f = t522PickWide;
+    return f(t522GlobalSquare, local);
+}
+IShape t522FunctionWideHeldGlobal()
+{
+    T522Wide local = default;
+    local.sq = t522GlobalSquare;
+    function<IShape(T522Wide)> f = t522HoldWide;
+    return f(local);
+}
+bool testInterfaceReturnCallBorrowAcceptSet()
+{
+    t91GArr[0].s = 5;
+    t91GArr[1].s = 4;
+    t522GlobalSquare = &t91GArr[1];
+    Square sq = default;
+    sq.s = 3;
+    unique<Square> u = new Square();
+    Square* up = u.get();
+    up->s = 6;
+    T522UniqueOwner owner = default;
+    owner.u = new Square();
+    Square* op = owner.u.get();
+    op->s = 7;
+    IShape fresh = t522FreshThroughCall();
+    int freshArea = fresh.area();
+    delete fresh;
+    bool ok = t522GlobalThroughCall().area() == 16 && t522GlobalThroughLaterCall().area() == 16
+        && t522GlobalThroughForward().area() == 16 && freshArea == 9
+        && t522ParamThroughCall(&sq).area() == 9 && t522ParamThroughLocalMethod(&sq).area() == 9
+        && t522UniqueParamGet(&u).area() == 36 && owner.get().area() == 49
+        && t522DerefOfLocalSlot().area() == 25 && t522WrapThroughCall(&sq).area() == 9
+        && t522CorrelatedRebind(99).area() == 16 && t522SlotSetByCall().area() == 25
+        && t522HeapHolderGlobal().area() == 25 && t522TouchedHolderGlobal().area() == 25
+        && t522IdOfGlobalThroughLaterCall().area() == 16 && t522ArrayElementThroughLaterCall().area() == 16
+        && t522FatGlobalThroughCall().area() == 16 && t522FatGlobalThroughLaterCall().area() == 16
+        && t522FieldGlobalThroughCall().area() == 25 && t522IndirectGlobal().area() == 16
+        && t522ClosureGlobal().area() == 16 && t522ArrayHolderGlobal().area() == 25
+        && t522CopiedHolderGlobal().area() == 25 && t522AssignedHolderGlobal().area() == 25
+        && t522NestedLaterDropped().area() == 16 && t522MutualGlobal().area() == 16
+        && t522ElementGlobalBesideLocal().area() == 25 && t522CopyThenSourceWrite().area() == 25
+        && t522CopyThenReassignGlobal().area() == 25 && t522RelayedHolderGlobal().area() == 25
+        && t522HolderParamGlobal().area() == 25 && t522FindByKeyShape()
+        && t522ClosureArgumentGlobal().area() == 16 && t522ClosureRecursiveGlobal().area() == 16
+        && t522ClosureInterfaceCaptureGlobal().area() == 16 && t522IndirectRelayGlobal().area() == 16
+        && t522LambdaBoxThroughFunctionGlobal().area() == 16 && t522LambdaBoxRecursiveGlobal().area() == 16
+        && t522NestedClosureGlobal().area() == 16 && t522TwoHopRelayGlobal().area() == 16
+        && t522ClosureCopyGlobal().area() == 16 && t522ClosureCopySourceReassignedGlobal().area() == 16
+        && t522SretCoercedGlobal().area() == 16 && t522RelayChain12Global().area() == 16
+        && t522FluentChain10Global().area() == 16 && t522FunctionWideStructGlobal().area() == 16
+        && t522FunctionWideHeldGlobal().area() == 16;
+    printf("%s: interface return call-borrow accept set\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // ---- auto copy of an interface value deduces the interface (t139) ----------------------
 interface IAutoCopy { int get(); void add(int d); };
 class AcImpl : IAutoCopy { int v = 0; int get() { return v; } void add(int d) { v = v + d; } };
@@ -5654,6 +6020,7 @@ extern int main()
     total++; passed += testPointerArithmeticIndirectBorrowReturns()    ? 1 : 0;
     total++; passed += testInterfaceReturnAcceptSet()                    ? 1 : 0;
     total++; passed += testInterfaceFieldZeroOwnerReturn()                 ? 1 : 0;
+    total++; passed += testInterfaceReturnCallBorrowAcceptSet()          ? 1 : 0;
 
     total++; passed += testAutoCopyInterface()                          ? 1 : 0;
 

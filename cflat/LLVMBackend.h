@@ -873,6 +873,8 @@ public:
         bool IsFatInterfaceValue() const { return IsInterface && !IsInterfacePointer && !IsArrayView; }
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
+        // Callee summary: this move pointer parameter is adopted by a unique<T> owner.
+        bool IsUniqueAdoptedParam = false;
         bool IsAdopt = false;    // parameter declared with 'adopt' - retires an owned interface box at the call site
         bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
         bool IsRvalueRef = false; // C++ T&& parameter: borrowed address, but only rvalues bind
@@ -915,6 +917,9 @@ public:
         // Set with IsConsumeInferredSink for a whole-name write, or alongside IsReturnInferredSink
         // when another consume path exists. It distinguishes return-only passthroughs.
         bool IsWriteInferredSink = false;
+        // CFlat pointer parameter paths the body moves out of. Direct callers use these paths
+        // to consult the caller's non-local view ownership state; indirect calls stay unknown.
+        std::vector<std::string> ViewFieldMovePaths;
         // Pure-borrow element (list<alias T*>) whose owner lives elsewhere; a later delete of a
         // local bound to this accessor result double-frees when the real owner releases it.
         bool IsBorrowOfAliasElement = false;
@@ -1398,6 +1403,7 @@ public:
         bool IsInterfacePointer = false;
         bool IsNullable = false;
         bool IsMove = false;
+        bool IsUniqueAdoptedParam = false;
         bool IsAdopt = false;
         bool IsAlias = false;
         bool IsRvalueRef = false;
@@ -1412,6 +1418,7 @@ public:
         bool IsConsumeInferredSink = false;
         bool IsReturnInferredSink = false;
         bool IsWriteInferredSink = false;
+        std::vector<std::string> ViewFieldMovePaths;
         bool IsBorrowOfAliasElement = false;
         bool IsBond = false;
         bool IsUnique = false;
@@ -1479,6 +1486,7 @@ public:
             s.IsInterfacePointer = t.IsInterfacePointer;
             s.IsNullable = t.IsNullable;
             s.IsMove = t.IsMove;
+            s.IsUniqueAdoptedParam = t.IsUniqueAdoptedParam;
             s.IsAdopt = t.IsAdopt;
             s.IsAlias = t.IsAlias;
             s.IsRvalueRef = t.IsRvalueRef;
@@ -1493,6 +1501,7 @@ public:
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
             s.IsReturnInferredSink = t.IsReturnInferredSink;
             s.IsWriteInferredSink = t.IsWriteInferredSink;
+            s.ViewFieldMovePaths = t.ViewFieldMovePaths;
             s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
             s.IsBond = t.IsBond;
             s.IsUnique = t.IsUnique;
@@ -1563,6 +1572,7 @@ public:
             t.IsInterfacePointer = IsInterfacePointer;
             t.IsNullable = IsNullable;
             t.IsMove = IsMove;
+            t.IsUniqueAdoptedParam = IsUniqueAdoptedParam;
             t.IsAdopt = IsAdopt;
             t.IsAlias = IsAlias;
             t.IsRvalueRef = IsRvalueRef;
@@ -1577,6 +1587,7 @@ public:
             t.IsConsumeInferredSink = IsConsumeInferredSink;
             t.IsReturnInferredSink = IsReturnInferredSink;
             t.IsWriteInferredSink = IsWriteInferredSink;
+            t.ViewFieldMovePaths = ViewFieldMovePaths;
             t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
             t.IsBond = IsBond;
             t.IsUnique = IsUnique;
@@ -1735,6 +1746,8 @@ public:
         llvm::Value* MoveSourceStorage = nullptr; // Original slot for a detached moved value.
         // Element-field key of that slot when it has no storage (`move a.hs[0].f`).
         std::string MoveSourcePathKey;
+        // Named field path retained by a detached move of a view field.
+        std::string MoveSourceFieldPath;
         // The declaration's top-level const, retained for C++ reference overload selection.
         bool IsTopLevelConst = false;
         // A const integer local with a constant initializer: folds like a file-scope const.
@@ -1824,6 +1837,15 @@ public:
         // T418: a `c ? default : local` argument evaluated inside the C++ wrapper; the shape spells
         // the conditional over the children (@S = selector, @D = default arm, @<n> = child n).
         std::string CxxDeferredTernaryShape;
+        // T518: an unbound C++ free wrapper's trivially copyable class lvalue argument snapshot at its
+        // own position, named only when clang's SELECTED callee takes it by value; this entry store
+        // of the i1 decision is set once the wrapper is bound (CSigEntry::paramBindKinds).
+        llvm::StoreInst* CxxEarlyCopyDecision = nullptr;
+        // T518: for a non-trivially-copyable class, the copy built at the argument's position (live
+        // only once the decision is set): the parameter of a by-value selection called by address.
+        llvm::AllocaInst* CxxEarlyCopySlot = nullptr;
+        // T518: for a `c ? default : x` argument, the join of the owned default temp and that copy.
+        llvm::PHINode* CxxEarlyCopyJoin = nullptr;
         // T142: the value of a `default` call argument. Overload ranking refuses it for reference and
         // move/owning-sink parameters (only a by-value parameter takes it).
         bool IsDefaultArgument = false;
@@ -1953,9 +1975,14 @@ public:
         // Set when a CFlat closure was handed to C++ as a `void*` to its {code, env} pair: the
         // `__typeof__(R (*)(A...))` signature the generated __cflat_closure<> wrapper takes.
         std::string CxxClosureSignature;
-        // A named closure crosses as an lvalue that borrows the variable (C++ copies it if it
-        // wants a copy); otherwise the C++ wrapper object owns the env.
+        // A named closure crosses as its own slot - the C++ closure object, an lvalue of the
+        // caller's frame (C++ copies it if it wants a copy); otherwise the wrapper owns the env.
         bool CxxClosureBorrowed = false;
+        std::string CxxClosureDisplay;   // the CFlat closure type, for diagnostics
+        std::string CxxClosureParam;     // its generated wrapper parameter ("pK")
+        // The C++ callee this closure VARIABLE was bound by reference to, with a result that may
+        // keep that reference: `move` would leave the reference calling a null closure.
+        std::string CxxClosureLentTo;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
         // Range-for variables borrow the current collection element. The slot is rebound for each
         // iteration, so it must never be treated as an owning value or a movable whole-local.
@@ -3075,11 +3102,40 @@ private:
     // also follows direct calls into CFlat bodies (cycle- and depth-bounded) and local slots.
     bool FunctionArgumentDefinitelyStoresOutsideCall(const llvm::Function* function,
             size_t argumentIndex, bool throughCalls);
+    std::vector<unsigned> FunctionArgumentStoreDestinations(const llvm::Function* function,
+            size_t argumentIndex);
+    // Every parameter sink for the destination proof. nonParameterSink is set for any other store
+    // (global, unmapped, unclassified), which the proof must refuse.
+    std::vector<unsigned> FunctionArgumentStoreSinks(const llvm::Function* function,
+            size_t argumentIndex, bool& nonParameterSink);
 
     // Three-valued answer of the through-calls walk: Unknown (a bound, an unfollowed use, an
     // indirect callee) is never a refusal; the owner is kept alive instead.
 public:
     enum class RawPointerStoreVerdict { None, Unknown, Stores };
+    /*
+     * T522: a call at an interface return whose callee's body is not emitted yet. ArgRoots[i][d]
+     * is the root (PointerValueRootKind as int) the result would borrow if the callee returns
+     * argument i read through d dereferences; decided once every body is emitted.
+     */
+    struct DeferredCallBorrow
+    {
+        // Tracked: an 'auto' return retype replaces the placeholder Function.
+        llvm::WeakTrackingVH Callee;
+        std::vector<std::array<int, 5>> ArgRoots;
+        // Deferred calls nested in argument i (`first(second(&x))`): they count only when this
+        // callee's summary selects argument i.
+        std::vector<std::vector<DeferredCallBorrow>> ArgChildren;
+        // The call result is the returned interface's object: an unknown summary counts only the
+        // arguments whose type (ArgTypes, ArgumentReachTypeKey) may reach an implementer.
+        bool NarrowByInterface = false;
+        std::vector<std::string> ArgTypes;
+    };
+    // T522 type narrowing: the LLVM struct name of a by-value struct argument, else "" (unknown).
+    std::string ArgumentReachTypeKey(const llvm::Value* argument) const;
+    // False only when no value of `typeName` can reach (by value, pointer, element, owner) an
+    // object of a type implementing `iface`; "" and anything opaque or foreign answer true.
+    bool TypeMayReachImplementer(const std::string& typeName, const std::string& iface) const;
 private:
     RawPointerStoreVerdict ClassifyArgumentStoreOutsideCall(const llvm::Function* function,
             size_t argumentIndex);
@@ -3102,6 +3158,14 @@ private:
         RawPointerStoreVerdict Verdict = RawPointerStoreVerdict::Unknown;
         // False where the call site reports its own diagnostic: only None opens the gate.
         bool Refuse = true;
+        // T522 deferred interface-return borrow (no gate): refused with FrameMessage (a frame
+        // borrow) or AliasMessage (a borrow of a local owner); the chosen text is ResolvedMessage.
+        std::vector<DeferredCallBorrow> Borrows;
+        std::string FrameMessage;
+        std::string AliasMessage;
+        std::string ResolvedMessage;
+        std::string InterfaceName;
+        std::string UnprovenMessage;  // root 4: provenance the model cannot follow
     };
     std::vector<DeferredRawPointerCalleeStore> deferredRawPointerCalleeStores_;
 
@@ -3553,6 +3617,43 @@ private:
     };
     std::vector<DeferredCallReleaseGate> deferredCallReleaseGates_;
     void ResolveDeferredCallReleaseGates();
+    struct UniqueAdoptionForwardEdge
+    {
+        llvm::Function* Caller = nullptr;
+        unsigned CallerParamIndex = 0;
+        llvm::Function* Callee = nullptr;
+        unsigned CalleeParamIndex = 0;
+    };
+    struct UniqueAdoptionArrayCall
+    {
+        llvm::Function* Callee = nullptr;
+        unsigned CalleeParamIndex = 0;
+        std::string ArgumentName;
+        std::string ParameterName;
+        std::string FunctionName;
+        antlr4::ParserRuleContext* Context = nullptr;
+        bool DirectUniqueAdoption = false;
+    };
+    struct UniqueAdoptionFactRef
+    {
+        llvm::Function* Function = nullptr;
+        unsigned ParamIndex = 0;
+    };
+    struct UniqueAdoptionRecoveryMark
+    {
+        size_t ForwardEdgeCount = 0;
+        size_t ArrayCallCount = 0;
+        size_t FactInsertionCount = 0;
+        size_t SummaryInsertionCount = 0;
+    };
+    std::vector<UniqueAdoptionForwardEdge> uniqueAdoptionForwardEdges_;
+    std::vector<UniqueAdoptionArrayCall> uniqueAdoptionArrayCalls_;
+    std::unordered_map<llvm::Function*, std::unordered_set<unsigned>> uniqueAdoptedParameterFacts_;
+    std::vector<UniqueAdoptionFactRef> uniqueAdoptionFactInsertions_;
+    std::vector<UniqueAdoptionFactRef> uniqueAdoptionSummaryInsertions_;
+    UniqueAdoptionRecoveryMark MarkUniqueAdoptionRecovery() const;
+    void RestoreUniqueAdoptionRecovery(const UniqueAdoptionRecoveryMark& mark);
+    void ResolveUniqueAdoptionFacts(size_t firstArrayCall = 0);
     // A callee edge the return-keep walk could not answer yet: `Callee` is the function's NAME
     // (Function objects are replaced by the link), empty for an indirect call (never answered).
     struct ReturnReachEdge
@@ -3689,6 +3790,11 @@ private:
     // owning local, bound to the sink. Called by the direct and the indirect call sites.
     void DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                                      const std::string& paramName, const NamedVariable& arg);
+    void DiagnoseBorrowedViewFieldMoveArg(const std::string& functionName,
+                                          const std::string& paramName,
+                                          const NamedVariable& arg,
+                                          const std::vector<std::string>& fieldPaths,
+                                          bool isMethodReceiver = false);
     void TrackNonLocalViewAssignment(llvm::Value* storage, llvm::Value* value,
                                      const llvm::Value* sourceStorage,
                                      bool sourceTransfersOwnership,
@@ -3701,6 +3807,15 @@ private:
     llvm::Value* RecomputeNonLocalViewFieldStorage(const NonLocalViewOwnershipState& state);
     std::optional<bool> NonLocalViewMayBeBorrowed(const llvm::Value* storage,
                                                   const std::string& pathKey = {}) const;
+    std::optional<bool> NonLocalViewFieldMayBeBorrowed(const llvm::Value* rootStorage,
+                                                       const std::string& fieldPath) const;
+    std::optional<bool> NonLocalViewFieldCandidatesMayBeBorrowed(
+        const std::vector<const llvm::Value*>& rootStorages,
+        const std::string& fieldPath) const;
+    // Undecidable provenance: any mixed root of the current function with this path counts.
+    std::optional<bool> NonLocalViewFieldAnyRootMayBeBorrowed(const std::string& fieldPath) const;
+    std::optional<bool> NonLocalViewFieldStorageMayBeBorrowed(const llvm::Value* fieldStorage,
+        const std::string& fieldPath) const;
     void MarkNonLocalViewFieldMoved(const llvm::Value* rootStorage,
                                     const std::string& fieldPath);
     void DropNonLocalViewFields(const NamedVariable& root);
@@ -3728,6 +3843,38 @@ private:
 
 public:
     bool FieldSatisfiesThreadDiscipline(const TypeAndValue& field) const;
+    // Every same-name, same-arity CFlat overload whose forwarded parameter matches. Overloads
+    // are not resolved yet, so the caller merges their moved paths (conservative union).
+    std::vector<const TypeAndValue*> FindCFlatViewFieldMoveParams(
+        const std::string& sourceName, const std::string& typeName,
+        size_t arity, size_t parameterIndex,
+        const std::string& parameterName = {}) const
+    {
+        std::vector<const TypeAndValue*> matches;
+        auto it = functionTable.find(sourceName);
+        if (it == functionTable.end()) return matches;
+        for (const auto& candidate : it->second)
+        {
+            if (candidate.IsCxx || candidate.IsMethod || !candidate.HasCFlatDefinition()
+                || candidate.Parameters.size() != arity)
+                continue;
+            size_t candidateIndex = parameterIndex;
+            if (!parameterName.empty())
+            {
+                auto named = std::find_if(candidate.Parameters.begin(), candidate.Parameters.end(),
+                    [&](const auto& param) { return param.VariableName == parameterName; });
+                if (named == candidate.Parameters.end()) continue;
+                candidateIndex = static_cast<size_t>(named - candidate.Parameters.begin());
+            }
+            if (candidateIndex < candidate.Parameters.size()
+                && candidate.Parameters[candidateIndex].Pointer
+                && candidate.Parameters[candidateIndex].TypeName == typeName)
+            {
+                matches.push_back(&candidate.Parameters[candidateIndex]);
+            }
+        }
+        return matches;
+    }
 
 private:
     std::unique_ptr<llvm::IRBuilder<>> builder;
@@ -4566,6 +4713,14 @@ private:
         std::string calleeIdentity;
         // RawSig::paramBindKinds of a generated wrapper (round-trips through the cache).
         std::string paramBindKinds;
+        // RawSig::conditionalArgumentKinds of a generated wrapper (round-trips through the cache).
+        std::string conditionalArgumentKinds;
+        // RawSig::closureKeptParams of a generated wrapper (round-trips through the cache).
+        std::string closureKeptParams;
+        // RawSig::selectedCalleeType / selectedCalleeDefaults of a generated wrapper (cached).
+        std::string selectedCalleeType;
+        std::string selectedCalleeTemplateArgs;
+        std::vector<cflat_cinterop::RawDefaultArg> selectedCalleeDefaults;
         std::string name;
         std::string linkageName; // C++ ABI symbol; empty for C
         TypeAndValue ret;
@@ -5310,6 +5465,10 @@ private:
 
     struct VarStorageRef { llvm::Value* Storage = nullptr; llvm::Type* BaseType = nullptr; };
     VarStorageRef FindVariableStorage(const std::string& name) const;
+public:
+    VarStorageRef FindVariableStorageForViewAnalysis(const std::string& name) const
+    { return FindVariableStorage(name); }
+private:
 
     // Return the live NamedVariable a name binds to (namedVariable then functionArgument, inner
     // scope first), or nullptr. The `drop` statement needs the same object scope-exit cleanup
@@ -6149,6 +6308,16 @@ private:
     // Register a by-value owning-struct temp (already spilled to `alloca`) for full destruction at
     // the end of the current full expression. The dtor takes a T*, so no spill is needed at flush.
     void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName);
+    // Same, destroyed only when the i1 at `liveFlag` is set (a conditionally constructed temp).
+    void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName, llvm::Value* liveFlag);
+    /*
+     * T518: whether the IR emitted after `anchor` (in `block`; nullptr = from its start) up to the
+     * insert point may WRITE the object at `storage`: a store into it, an escape of its address, or
+     * a call passing it where the callee may write (non-const C++ reference / pointer-to-non-const,
+     * non-const member, a CFlat pointer or reference parameter, a generated wrapper whose harvest
+     * says 'w', an indirect or unknown callee). Loads, const members, const references and
+     * by-value parameters are reads.
+     */
     /*
      * A C++ brace list's caller-frame backing array `typeName[count]` (an ENTRY alloca) as ONE
      * full-expression temporary: elements destroyed in reverse, lists in reverse creation order
@@ -6169,6 +6338,8 @@ private:
     bool IsAliasReturnResult(llvm::Value* value, std::string* callee = nullptr) const;
 
     void UnregisterOwnedStructTemp(llvm::Value* value);
+    // Drops the destruction obligation but leaves a null entry, so marks taken after it stay valid.
+    void ReleaseOwnedStructTempInPlace(llvm::Value* value);
 
     // `alias` declarations: the receiver temps an initializer took off the ledger (`alias int x =
     // mk()->v;`). Settled once per declarator: bound -> destroyed at the enclosing scope's end;
@@ -7071,6 +7242,27 @@ private:
                                 bool adlCall = false,
                                 const std::vector<std::pair<size_t, size_t>>& braceGroups = {},
                                 const std::string& memberOwnerType = {});
+    bool RequestCxxFreeFunctionImpl(const std::string& functionName,
+                                    const std::vector<std::string>& explicitArgs,
+                                    std::vector<NamedVariable>& arguments,
+                                    std::string& registeredName,
+                                    std::string& error,
+                                    const std::string& infixOperator,
+                                    const std::string& infixLhsName,
+                                    const std::string& infixRhsName,
+                                    bool adlCall,
+                                    const std::vector<std::pair<size_t, size_t>>& braceGroups,
+                                    const std::string& memberOwnerType);
+    // T518: after a free wrapper binds, call clang's selected callee by address when it takes an
+    // early-copied class argument by value (see the definition).
+    bool SwitchCxxDirectByValueCall(const std::string& functionName,
+                                    std::vector<NamedVariable>& arguments,
+                                    std::string& registeredName, std::string& error);
+    // T518: the free wrapper the newest successful RequestCxxFreeFunctionImpl bound (linkage name),
+    // each free wrapper's request group (primary, dependencies), and by-address callee getters.
+    std::string lastCxxFreeWrapperLinkage_;
+    std::unordered_map<std::string, std::pair<size_t, std::vector<size_t>>> cxxFreeWrapperGroups_;
+    std::unordered_map<std::string, std::string> cxxDirectCalleeGetters_;
     std::string CxxConstPointerArgumentError(size_t argumentIndex,
                                              const std::string& argumentName,
                                              const std::string& parameterName) const;
@@ -7426,6 +7618,12 @@ private:
     bool IsUnwrappedFatClosure(const NamedVariable& arg) const;
     // `__cflat_closure<SIG>(pN)` for a wrapped closure argument, empty otherwise.
     static std::string CxxClosureCallArgument(const NamedVariable& arg, const std::string& param);
+    // Records on the closure variable that a C++ result may keep a reference to its slot.
+    void MarkCxxClosureLentByReference(const NamedVariable& arg, const std::string& callee);
+    // Marks each closure-variable argument the bound wrapper's result keeps a reference to: the
+    // result's layout can hold F& / F* (T419 facts) or clang saw the callee keep the object.
+    void MarkKeptCxxClosureArguments(const std::vector<NamedVariable>& arguments, const CSigEntry& bound,
+                                     const std::string& callee);
     // The C++ definition of __cflat_closure<> (include-guarded), prepended to any wrapper source
     // that names it.
     static const char* CxxClosureWrapperPreamble();
@@ -8376,10 +8574,12 @@ public:
     llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV);
 
     // Wraps a named function in a {shim_i8ptr, null} closure fat struct value.
-    // Thin sibling of WrapBareValueAsFatStruct: a thin `function<T>` value is just the
-    // bare function pointer, bitcast to the declared thin signature R(*)(Args). No shim,
-    // no env, no fat struct. `fpTV` carries the target thin signature.
-    llvm::Value* MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV);
+    // Thin `function<T>` values use the declared signature; C++ callable bindings may need
+    // a reverse thunk for CFlat's hidden ownership-count slots. `fpTV` is the target signature.
+    llvm::Value* MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV,
+                                    bool cxxCallable = false);
+    bool CxxCallableNeedsRawArrayCountAdapter(const TypeAndValue& source,
+                                             const TypeAndValue& target) const;
     // A bare named function reaching a thin function<> slot through any producer door: converted
     // with the destination signature (thinTV) or, when null, the function's own signature. Any other
     // value is returned unchanged. Every thin store site routes through this, not MakeThinFnPtrValue.
@@ -10023,6 +10223,17 @@ public:
     std::string cxxImplicitConversionRefusal_;
     // HasImplicitClassPointerConversion answers, keyed "source|pointee|const".
     std::unordered_map<std::string, bool> cxxXvaluePointerConversions_;
+    // clang's verdict on `c ? A : B` for two C++ class arms (see ClassifyCxxTernary).
+    struct CxxTernaryVerdict
+    {
+        enum class Kind { Ill, Ambiguous, LvalueRef, XvalueRef, Prvalue };
+        Kind kind = Kind::Ill;
+        bool resultIsTrue = false; // the result is the true arm's class, else the false arm's
+    };
+    // Value category of one `?:` arm, read from the arm expression itself.
+    enum class CxxArmCategory { Lvalue, Xvalue, Prvalue };
+    // ClassifyCxxTernary verdicts, keyed by both arms' names, cv and category.
+    std::unordered_map<std::string, CxxTernaryVerdict> cxxTernaryVerdicts_;
     std::string cppStructAccessContext_;
 
     /*
@@ -10219,6 +10430,26 @@ public:
         return !t.IsCxxRef() && !t.Pointer && !t.IsCxxRefToPointer && (t.ConstMask & 1u) != 0
             && IsCxxRecord(t.TypeName);
     }
+    // Struct-walk bookkeeping for the declared-shape default fold. A struct restored from the core
+    // cache (or still a placeholder) has no field initializers recorded, so only a struct this
+    // compile walked, without a user-written no-arg constructor, has a default the shape decides.
+    void NoteStructDefinitionWalked(const std::string& typeName, bool userNoArgCtor)
+    {
+        walkedStructDefinitions_.insert(typeName);
+        if (userNoArgCtor) userNoArgCtorTypes_.insert(typeName);
+    }
+    bool StructDefaultsKnown(const std::string& typeName) const
+    {
+        if (builtinStructDefaults_.count(typeName) != 0) return true;
+        return walkedStructDefinitions_.count(typeName) != 0
+            && userNoArgCtorTypes_.count(typeName) == 0;
+    }
+    // Built-in structs whose fields carry no initializers (the compiler declares them, nothing to
+    // walk). Kept across ResetForReanalysis, unlike the walk facts above.
+    std::unordered_set<std::string> builtinStructDefaults_;
+    std::unordered_set<std::string> walkedStructDefinitions_;
+    std::unordered_set<std::string> userNoArgCtorTypes_;
+
     // T272: true when a CFlat struct declares no constructor that takes parameters (only the
     // synthesized no-arg one, or none): a constructor call with arguments can never bind to it.
     bool CFlatStructHasOnlyNoArgCtor(const std::string& typeName) const
@@ -10722,6 +10953,17 @@ public:
     bool HasImplicitClassConversionOperator(const std::string& sourceType);
     // A C++ record with a non-explicit constructor (or ctor template) callable with one argument.
     bool HasCxxImplicitConvertingCtor(const std::string& targetType);
+    // Asks clang about the actual conditional with each arm's exact cv and category (a prvalue
+    // arm is a declared-only call, so no copy is modelled). Cached per arm pair.
+    CxxTernaryVerdict ClassifyCxxTernary(const TypeAndValue& trueArm, CxxArmCategory trueCategory,
+                                         const TypeAndValue& falseArm, CxxArmCategory falseCategory);
+    // Lowers one arm of a classified conditional to the result: a reference result yields the
+    // arm's referent address (no copy), a prvalue result a new object built by clang. A discarded
+    // result of a thunked prvalue arm is evaluated whole by clang (no result object kept).
+    bool LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& trueArm,
+                            CxxArmCategory trueCategory, const TypeAndValue& falseArm,
+                            CxxArmCategory falseCategory, bool armIsTrue,
+                            const CxxTernaryVerdict& verdict, bool discardResult);
     // clang's std::is_convertible<S&&, P*> for a class xvalue at a P* parameter; cached per pair.
     bool HasImplicitClassPointerConversion(const std::string& sourceType,
                                            const std::string& pointeeType, bool pointeeConst);
@@ -12406,7 +12648,7 @@ public:
 
     llvm::GlobalVariable* GetGlobalVariable(const std::string& name);
 
-    NamedVariable GetGlobalVariableNV(const std::string& name);
+    NamedVariable GetGlobalVariableNV(const std::string& name) const;
 
     // Lazily create the live flag for a directly-bound nontrivial C++ class global. The flag is
     // absent for globals that are never explicitly released, preserving their original IR.
@@ -12723,6 +12965,7 @@ public:
     const void* pendingCallSite_ = nullptr;
     // Receiver spelling of that call ("w", "this.w", "h.s"), naming the object in #8; same lifetime.
     std::string pendingReceiverText_;
+    std::optional<NamedVariable> pendingCallReceiver_;
     void BeginReceiverBody(const std::string& uniqueName) { receiverBodyStack_.push_back(uniqueName); }
     void EndReceiverBody()
     {
@@ -12991,6 +13234,40 @@ public:
     bool IsOwningStructField(const std::string& structName, unsigned index) const;
     // The callee's own ReturnsOwned fact, public for provenance queries (see CalleeReturnsOwned).
     bool CalleeOwnsReturnFact(const llvm::Function* fn) const { return CalleeReturnsOwned(fn); }
+    /*
+     * T522 lifetime elision: what a non-owning pointer result of `fn` may borrow, as (argument
+     * index, dereference count) pairs: {1, 0} is argument 1 itself, {0, 1} a pointer read
+     * through argument 0 (`return *pp;`, `return this.p;`). False = unknown (every pointer
+     * argument, receiver included). Fresh, global and null returns borrow none. Decided from
+     * the emitted body (forwarding calls followed), else from the parse-tree summaries (global /
+     * single parameter), else unknown.
+     */
+    // `pending` (optional): set when the answer waits on a body not emitted yet (this callee or
+    // one it forwards through); such an answer is false and not memoized.
+    bool ReturnBorrowedArguments(const llvm::Function* fn, std::vector<std::pair<unsigned, unsigned>>& out,
+                                 bool* pending = nullptr);
+    // The named struct a single-level pointer parameter points at (null when not one).
+    llvm::Type* ParameterPointeeStructType(const llvm::Function* fn, unsigned argIndex) const;
+    // A struct value that may free what its fields point at (destructor or unique annotation).
+    bool StructValueMayOwnPointees(const std::string& typeName) { return IsOwningValueType(typeName); }
+    // Records the deferred borrows of one interface return (expect_error scope aware).
+    void RecordDeferredReturnBorrow(std::vector<DeferredCallBorrow> borrows, std::string frameMessage,
+                                    std::string aliasMessage, size_t line, size_t column,
+                                    std::string unprovenMessage = {});
+    // ResolvedMessage when set, else the raw-pointer store text.
+    std::string DeferredCalleeStoreMessage(const DeferredRawPointerCalleeStore& entry);
+    std::unordered_map<const llvm::Function*,
+                       std::pair<bool, std::vector<std::pair<unsigned, unsigned>>>> returnBorrowMemo_;
+    std::unordered_set<const llvm::Function*> returnBorrowInProgress_;
+    // Recursive groups: provisional answers per function until the outermost summary converges.
+    std::unordered_map<const llvm::Function*,
+                       std::pair<bool, std::vector<std::pair<unsigned, unsigned>>>> returnBorrowApprox_;
+    bool returnBorrowProvisional_ = false;
+    bool returnBorrowApproxChanged_ = false;
+    int returnBorrowIterations_ = 0;
+    // Interface call results stored into an interface local, classified at the `return` while the
+    // owners' scopes are live (CallResultFrameBorrowKind); read by RunInterfaceReturnDangleCheck.
+    std::unordered_map<const llvm::Value*, int> fatCallBorrowKinds_;
 
     // `returnedLocalStorage`, when provided, is the alloca of the named local being
     // returned (the return expression's NamedVariable.Storage). It lets the struct-return
@@ -13108,6 +13385,16 @@ public:
 
     std::string GetCurrentFunctionName() const;
     const FunctionSymbol* GetCurrentFunctionSymbol() const;
+    std::optional<unsigned> CurrentMoveParamIndex(const NamedVariable& source) const;
+    bool MarkCurrentMoveParamUniqueAdopted(const NamedVariable& source);
+    void RecordUniqueAdoptionForward(const NamedVariable& source, llvm::Function* callee,
+                                     unsigned calleeParamIndex, bool directUniqueAdoption);
+    void RecordUniqueAdoptionArrayCall(llvm::Function* callee, unsigned calleeParamIndex,
+                                       const NamedVariable& argument,
+                                       const std::string& parameterName,
+                                       const std::string& functionName,
+                                       bool directUniqueAdoption,
+                                       antlr4::ParserRuleContext* callContext);
 
     void RegisterReturnBlock(const std::string& name, CFlatParser::CompoundStatementContext* body, std::vector<DeclTypeAndValue> params, TypeAndValue returnType);
 
@@ -13625,7 +13912,14 @@ public:
     // 284: C++ alias-template parameter-pack flags are cached per parameter (T458 r2).
     // 285: unused. 286: [cpp] struct wrapper spellings use an injective CFlat-name
     // encoding (T464). 287: free operator built-in conversion candidates (T460).
-    static constexpr int kCHeaderCacheVersion = 287;
+    // 292: __cflat_closure<> has the CFlat closure pair layout {code, env} (T525).
+    // 293: generated wrappers cache closureKeptParams ("pckeep", T525 r2).
+    // 294: closureKeptParams treats opaque callees and the depth limit as kept (T525 r3).
+    // 295: a callee returning the closure by reference is an alias, not a keep (T525 r4).
+    // 296: closureKeptParams follows aliases through ?:, comma and casts, and fails closed (T525 r5).
+    // 297: closureKeptParams follows glvalue init lists and skips unevaluated operands (T525 r6).
+    // 298: a sizeof/alignof of a variably modified type is evaluated for closureKeptParams (T525 r7).
+    static constexpr int kCHeaderCacheVersion = 298;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by
@@ -14141,3 +14435,13 @@ inline void CompilerManager::DumpAllState() const
         compilers_[i]->DumpState();
     }
 }
+
+// T522: what a call RESULT borrows from this frame under lifetime elision: 0 nothing local,
+// 1 a local owner, 2 frame storage, 3 unproven provenance (refused with its own text). Defined
+// with PointerValueRoot (MainListener_Expressions.cpp).
+int CallResultFrameBorrowKind(llvm::Value* call, LLVMBackend* compiler, llvm::Function* fn,
+                              std::vector<LLVMBackend::DeferredCallBorrow>* deferred = nullptr);
+// T522: true (and cleared) when the last root query's frame verdict came from unproven provenance.
+bool TakeUnprovenPointerRoot();
+// The one "cannot prove the returned interface ..." text (T522), interface spelled via SpellType.
+std::string UnprovenInterfaceReturnText(const LLVMBackend& compiler, const std::string& ifaceName);

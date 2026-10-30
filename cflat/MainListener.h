@@ -5492,6 +5492,318 @@ inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
     return true;
 }
 
+inline std::string SimpleIdentifierExpressionName(antlr4::tree::ParseTree* expression)
+{
+    auto* postfix = SolePostfixExpressionShape(expression);
+    if (postfix == nullptr || postfix->children.size() != 1) return {};
+    auto* primary = postfix->primaryExpression();
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    if (primary == nullptr || primary->children.size() != 1 || generic == nullptr
+        || generic->genericTypeParameters() != nullptr || generic->Identifier() == nullptr)
+        return {};
+    return generic->Identifier()->getText();
+}
+
+inline bool NameIsImplicitThisField(antlr4::tree::ParseTree* bodyRoot,
+        const std::string& name)
+{
+    if (bodyRoot == nullptr || name.empty()) return false;
+    antlr4::tree::ParseTree* aggregate = nullptr;
+    for (auto* parent = bodyRoot; parent != nullptr; parent = parent->parent)
+        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) != nullptr)
+        {
+            aggregate = parent;
+            break;
+        }
+    if (aggregate == nullptr) return false;
+    bool found = false;
+    auto scan = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (found || node == nullptr) return;
+        if (node != aggregate
+            && (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)
+                || AsRuleCtx<CFlatParser::StructDefinitionContext>(node)
+                || AsRuleCtx<CFlatParser::ClassDefinitionContext>(node))) return;
+        if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+            if (auto* list = declaration->initDeclaratorList())
+                for (auto* init : list->initDeclarator())
+                {
+                    auto* declarator = init->declarator();
+                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                    if (direct != nullptr && direct->Identifier() != nullptr
+                        && direct->Identifier()->getText() == name)
+                    {
+                        found = true;
+                        return;
+                    }
+                }
+        for (auto* child : node->children) self(self, child);
+    };
+    scan(scan, aggregate);
+    return found;
+}
+
+inline bool ViewFieldAliasProvesParam(antlr4::tree::ParseTree* bodyRoot,
+        antlr4::tree::ParseTree* use, const std::string& aliasName,
+        const LLVMBackend::TypeAndValue& param,
+        const CFlatParser::LambdaExpressionContext* functionLambda)
+{
+    if (bodyRoot == nullptr || use == nullptr || aliasName.empty()
+        || aliasName == param.VariableName
+        || !NameShadowedByEnclosingLocal(use, aliasName, functionLambda))
+        return false;
+    const size_t useToken = static_cast<size_t>(use->getSourceInterval().a);
+    std::vector<CFlatParser::InitDeclaratorContext*> declarations;
+    auto collectDeclarations = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (node != bodyRoot
+            && (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)
+                || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node))) return;
+        if (auto* init = AsRuleCtx<CFlatParser::InitDeclaratorContext>(node))
+        {
+            auto* declarator = init->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            if (direct != nullptr && direct->Identifier() != nullptr
+                && direct->Identifier()->getText() == aliasName
+                && static_cast<size_t>(init->getStart()->getTokenIndex()) < useToken)
+                declarations.push_back(init);
+        }
+        for (auto* child : node->children) self(self, child);
+    };
+    collectDeclarations(collectDeclarations, bodyRoot);
+    if (declarations.size() != 1) return false;
+    auto* init = declarations.front();
+    auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(init->parent);
+    for (auto* parent = init->parent; declaration == nullptr && parent != nullptr;
+         parent = parent->parent)
+        declaration = dynamic_cast<CFlatParser::DeclarationContext*>(parent);
+    auto* specs = declaration != nullptr ? declaration->declarationSpecifiers() : nullptr;
+    bool pointerType = false;
+    if (specs != nullptr)
+        for (auto* spec : specs->declarationSpecifier())
+            pointerType = pointerType || (spec->typeSpecifier() != nullptr && spec->pointer() != nullptr);
+    auto* initializer = init->initializer();
+    auto* initialValue = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
+    if (!pointerType || SimpleIdentifierExpressionName(initialValue) != param.VariableName
+        || NameShadowedByEnclosingLocal(initialValue, param.VariableName, functionLambda))
+        return false;
+
+    bool everyStoreAgrees = true;
+    auto verifyStores = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (!everyStoreAgrees || node == nullptr) return;
+        if (node != bodyRoot
+            && (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)
+                || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node))) return;
+        if (auto* assignment = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
+        {
+            auto* lhs = assignment->unaryExpression();
+            if (lhs != nullptr && SimpleIdentifierExpressionName(lhs) == aliasName
+                && assignment->assignmentOperator() != nullptr)
+            {
+                auto* rhs = assignment->assignmentExpression();
+                if (assignment->assignmentOperator()->getText() != "="
+                    || SimpleIdentifierExpressionName(rhs) != param.VariableName
+                    || NameShadowedByEnclosingLocal(rhs, param.VariableName, functionLambda))
+                    everyStoreAgrees = false;
+            }
+        }
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+            if (unary->unaryOperator() != nullptr && unary->unaryOperator()->getText() == "&"
+                && SimpleIdentifierExpressionName(unary->castExpression()) == aliasName)
+                everyStoreAgrees = false;
+        for (auto* child : node->children) self(self, child);
+    };
+    verifyStores(verifyStores, bodyRoot);
+    return everyStoreAgrees;
+}
+
+inline std::string ViewFieldMovePath(CFlatParser::UnaryExpressionContext* source,
+        antlr4::tree::ParseTree* bodyRoot,
+        const LLVMBackend::TypeAndValue& param,
+        const std::vector<LLVMBackend::TypeAndValue>& allParams,
+        const CFlatParser::LambdaExpressionContext* functionLambda)
+{
+    if (source == nullptr || !param.Pointer || param.VariableName.empty()) return {};
+    auto* postfix = SolePostfixExpressionShape(source);
+    auto* primary = postfix != nullptr ? postfix->primaryExpression() : nullptr;
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    auto* root = generic != nullptr ? generic->Identifier() : nullptr;
+    if (primary == nullptr || primary->children.size() != 1 || generic == nullptr
+        || generic->genericTypeParameters() != nullptr || root == nullptr)
+        return {};
+    const std::string rootName = root->getText();
+    const bool isImplicitThisParam = param.VariableName == param.TypeName + "__";
+    const bool isImplicitThis = isImplicitThisParam && rootName == "this";
+    const bool isParam = rootName == param.VariableName
+        && !NameShadowedByEnclosingLocal(primary, param.VariableName, functionLambda);
+    const bool isParamAlias = rootName != param.VariableName
+        && ViewFieldAliasProvesParam(bodyRoot, primary, rootName, param, functionLambda);
+    const bool shadowsExplicitParam = std::any_of(allParams.begin(), allParams.end(),
+        [&](const auto& candidate) {
+            return candidate.VariableName == rootName
+                && candidate.VariableName != candidate.TypeName + "__";
+        });
+    const bool isImplicitThisField = isImplicitThisParam && rootName != "this"
+        && !shadowsExplicitParam
+        && !NameShadowedByEnclosingLocal(primary, rootName, functionLambda)
+        && NameIsImplicitThisField(bodyRoot, rootName);
+    if (!isImplicitThis && !isParam && !isParamAlias && !isImplicitThisField) return {};
+
+    std::string path = isImplicitThisField ? rootName : std::string{};
+    bool sawArrow = false;
+    for (size_t i = 1; i < postfix->children.size();)
+    {
+        auto* token = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+        if (token == nullptr) return {};
+        const size_t tokenType = token->getSymbol()->getType();
+        if (tokenType == CFlatParser::Arrow || tokenType == CFlatParser::Dot)
+        {
+            if (i + 1 >= postfix->children.size()) return {};
+            auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i + 1]);
+            if (member == nullptr || (i + 2 < postfix->children.size()
+                && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(postfix->children[i + 2]) != nullptr))
+                return {};
+            if (tokenType == CFlatParser::Arrow)
+            {
+                if (sawArrow || !path.empty()) return {};
+                sawArrow = true;
+                path = member->getText();
+            }
+            else
+            {
+                if (!sawArrow && !isImplicitThisField) return {};
+                path += "." + member->getText();
+            }
+            i += 2;
+            continue;
+        }
+        if (tokenType == CFlatParser::LeftBracket)
+        {
+            if ((!sawArrow && !isImplicitThisField) || i + 2 >= postfix->children.size()) return {};
+            auto* indexExpression = dynamic_cast<CFlatParser::ExpressionContext*>(postfix->children[i + 1]);
+            auto* close = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i + 2]);
+            auto* indexPostfix = SolePostfixExpressionShape(indexExpression);
+            auto* indexPrimary = indexPostfix != nullptr
+                ? indexPostfix->primaryExpression() : nullptr;
+            auto* literal = indexPrimary != nullptr ? indexPrimary->Constant() : nullptr;
+            if (indexPostfix == nullptr || close == nullptr
+                || close->getSymbol()->getType() != CFlatParser::RightBracket)
+                return {};
+            if (indexPostfix->children.size() == 1 && indexPrimary != nullptr
+                && indexPrimary->children.size() == 1 && literal != nullptr)
+            {
+                const std::string digits = literal->getText();
+                uint64_t index = 0;
+                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), index);
+                if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size())
+                    path += "[" + std::to_string(index) + "]";
+                else path += "[*]";
+            }
+            else path += "[*]";
+            i += 3;
+            continue;
+        }
+        return {};
+    }
+    return sawArrow || isImplicitThisField ? path : std::string{};
+}
+
+inline void InferViewFieldMovePaths(antlr4::tree::ParseTree* node,
+        antlr4::tree::ParseTree* bodyRoot,
+        const LLVMBackend* compiler,
+        std::vector<LLVMBackend::TypeAndValue>& allParams,
+        const IfConstEvaluator& evalIfConst = {},
+        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
+{
+    if (node == nullptr) return;
+    if (auto* selection = AsRuleCtx<CFlatParser::SelectionStatementContext>(node))
+    {
+        antlr4::tree::ParseTree* liveBranch = nullptr;
+        if (TryGetKnownIfConstBranch(selection, evalIfConst, liveBranch))
+        {
+            if (liveBranch != nullptr)
+                InferViewFieldMovePaths(liveBranch, bodyRoot, compiler, allParams,
+                                        evalIfConst, functionLambda);
+            return;
+        }
+    }
+    if (node != bodyRoot
+        && (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)
+            || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)))
+        return;
+    if (auto* move = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
+        for (auto& param : allParams)
+        {
+            const std::string path = ViewFieldMovePath(
+                move->unaryExpression(), bodyRoot, param, allParams, functionLambda);
+            if (!path.empty()
+                && std::find(param.ViewFieldMovePaths.begin(), param.ViewFieldMovePaths.end(), path)
+                    == param.ViewFieldMovePaths.end())
+                param.ViewFieldMovePaths.push_back(path);
+        }
+    if (compiler != nullptr)
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+            postfix != nullptr && postfix->children.size() == 4)
+        {
+            auto* primary = postfix->primaryExpression();
+            auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+            auto* name = generic != nullptr ? generic->Identifier() : nullptr;
+            auto* open = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[1]);
+            auto* args = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(postfix->children[2]);
+            auto* close = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[3]);
+            if (primary != nullptr && primary->children.size() == 1 && generic != nullptr
+                && generic->genericTypeParameters() == nullptr && name != nullptr
+                && open != nullptr && open->getSymbol()->getType() == CFlatParser::LeftParen
+                && args != nullptr && !args->argumentNamedExpression().empty()
+                && close != nullptr && close->getSymbol()->getType() == CFlatParser::RightParen)
+            {
+                const std::string calleeName = name->getText();
+                const bool shadowsParam = std::any_of(allParams.begin(), allParams.end(),
+                    [&](const auto& param) { return param.VariableName == calleeName; });
+                if (!shadowsParam
+                    && !NameShadowedByEnclosingLocal(primary, calleeName, functionLambda)
+                    && !NameIsImplicitThisField(bodyRoot, calleeName)
+                    && compiler->GetGlobalVariableNV(calleeName).Storage == nullptr)
+                {
+                    for (auto& callerParam : allParams)
+                    {
+                        if (!callerParam.Pointer || callerParam.VariableName.empty()) continue;
+                        for (size_t argumentIndex = 0;
+                             argumentIndex < args->argumentNamedExpression().size(); ++argumentIndex)
+                        {
+                            auto* argument = args->argumentNamedExpression(argumentIndex);
+                            if (argument == nullptr || argument->assignmentExpression() == nullptr)
+                                continue;
+                            auto* forwarded = argument->assignmentExpression();
+                            const std::string argName = SimpleIdentifierExpressionName(forwarded);
+                            const bool directParam = argName == callerParam.VariableName
+                                && !NameShadowedByEnclosingLocal(forwarded,
+                                    callerParam.VariableName, functionLambda);
+                            const bool localAlias = argName != callerParam.VariableName
+                                && ViewFieldAliasProvesParam(bodyRoot, forwarded, argName,
+                                    callerParam, functionLambda);
+                            if (!directParam && !localAlias) continue;
+                            const std::string namedParameter = argument->Identifier() != nullptr
+                                ? argument->Identifier()->getText() : std::string{};
+                            const auto calleeParams = compiler->FindCFlatViewFieldMoveParams(
+                                calleeName, callerParam.TypeName,
+                                args->argumentNamedExpression().size(), argumentIndex,
+                                namedParameter);
+                            for (const auto* calleeParam : calleeParams)
+                                for (const auto& path : calleeParam->ViewFieldMovePaths)
+                                    if (std::find(callerParam.ViewFieldMovePaths.begin(),
+                                                  callerParam.ViewFieldMovePaths.end(), path)
+                                        == callerParam.ViewFieldMovePaths.end())
+                                        callerParam.ViewFieldMovePaths.push_back(path);
+                        }
+                    }
+                }
+            }
+        }
+    for (auto* child : node->children)
+        InferViewFieldMovePaths(child, bodyRoot, compiler, allParams, evalIfConst, functionLambda);
+}
+
 // Owning-value move-sink inference: a plain by-value parameter is a synthesized sink (IsOwningSink)
 // so the caller's owning source is nulled at the call site. An unconditional top-level move consumes
 // any owner; stores and conditional moves remain structural until concrete copyability is known.
@@ -5505,6 +5817,9 @@ inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
                                      const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
 {
     if (body == nullptr) return;
+    if (std::any_of(allParams.begin(), allParams.end(), [](const auto& p) {
+            return p.Pointer && !p.VariableName.empty(); }))
+        InferViewFieldMovePaths(body, body, compiler, allParams, evalIfConst, functionLambda);
     // The scans only feed eligible parameters; a body with none (`main()`) skips them - their
     // shadowing checks are quadratic in the statement count of a large function.
     if (std::none_of(allParams.begin(), allParams.end(), [](const auto& p) {
@@ -6325,8 +6640,16 @@ inline std::string DescribeParameterTypes(const std::vector<LLVMBackend::TypeAnd
 class ForwardRefScanner
 {
 private:
+    struct ViewFieldMoveInferenceEntry
+    {
+        CFlatParser::FunctionDefinitionContext* Definition = nullptr;
+        std::string SourceName;
+        std::string UniqueName;
+        std::vector<LLVMBackend::TypeAndValue> Parameters;
+    };
     LLVMBackend* compilerLLVM;
     antlr4::BufferedTokenStream* tokens_ = nullptr;
+    std::vector<ViewFieldMoveInferenceEntry> viewFieldMoveInferenceEntries_;
     // The eager generic-use scan runs before scoped expect_error handlers are armed.
     unsigned genericTypeUseScanDepth_ = 0;
 
@@ -6665,6 +6988,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
 public:
     ForwardRefScanner(LLVMBackend* compiler);
     void SetTokens(antlr4::BufferedTokenStream* t);
+    void FinalizeViewFieldMoveInference();
 
     // Reject statically integral operands of pointer casts before code generation. The scanner
     // uses folded semantic constants and explicit scalar cast types, never source-text matching.
@@ -7947,6 +8271,16 @@ private:
     bool DefaultConstructionIsZero(const LLVMBackend::DeclTypeAndValue& typeValue);
     llvm::Constant* TryFoldGlobalDefaultConstruction(
         const LLVMBackend::DeclTypeAndValue& typeValue, FoldConstructedValueState& foldState);
+    // Declared-shape default of a value (a global or a native struct field); null when not foldable.
+    // expr is the field's `= <expr>` (null = default-constructed).
+    llvm::Constant* StructuralDefaultConstant(const LLVMBackend::DeclTypeAndValue& typeValue,
+        const std::string& ownerName, CFlatParser::AssignmentExpressionContext* expr,
+        FoldConstructedValueState& foldState, unsigned depth);
+    llvm::Constant* EvaluateFieldDefaultConstant(const std::string& ownerName,
+        const LLVMBackend::DeclTypeAndValue& typeValue, CFlatParser::AssignmentExpressionContext* expr,
+        FoldConstructedValueState& foldState);
+    bool FieldDefaultSpelling(const LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::AssignmentExpressionContext*& expr);
     llvm::Constant* SplatConstantOverFixedArray(llvm::Constant* elemConst, llvm::Type* arrType);
 
 public:
@@ -8416,7 +8750,7 @@ public:
     // An empty structName means the boxed class could not be pinned down - say nothing about it
     // rather than naming the wrong type and advising a 'new' that would not compile.
     void LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, const std::string& structName,
-                                  const std::string& ifaceName);
+                                  const std::string& ifaceName, bool unproven = false);
 
     // The shared `return <expr>;` lowering, used by the return statement and by an
     // expression-body lambda (`=> expr`, which is `=> { return expr; }`).
@@ -9458,6 +9792,9 @@ public:
     bool PointerArithmeticRootLeaks(llvm::Value* value, LLVMBackend* compiler);
     // Classifies the storage root of a pointer value (GEPs and casts stripped, aliases followed).
     PointerValueRootKind PointerRootKind(llvm::Value* value, LLVMBackend* compiler);
+    // T522 interface returns: later-defined callees are collected into `deferred`, not borrowed.
+    PointerValueRootKind PointerRootKindDeferring(llvm::Value* value, LLVMBackend* compiler,
+                                                  std::vector<LLVMBackend::DeferredCallBorrow>& deferred);
     bool PointerRootKindEveryArmLocal(llvm::Value* value, LLVMBackend* compiler,
                                       bool frameLocalContainer = false);
 
@@ -9684,7 +10021,9 @@ public:
     void PropagateTernaryViewElement(antlr4::ParserRuleContext* ctx,
                                      llvm::Value* trueValue, llvm::Value* trueStorage,
                                      llvm::Value* falseValue, llvm::Value* falseStorage,
-                                     llvm::Value* join, bool nullCoalesce = false);
+                                    llvm::Value* join, bool nullCoalesce = false,
+                                    const LLVMBackend::TypedValue* trueShape = nullptr,
+                                    const LLVMBackend::TypedValue* falseShape = nullptr);
 
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx,
                                            LLVMBackend::NamedVariable* assignmentResult = nullptr);
@@ -9725,6 +10064,11 @@ public:
                               bool trueIsUnsigned = false, bool falseIsUnsigned = false,
                               const std::string& interfaceDestination = {},
                               bool destinationPointer = false);
+    bool TernaryPointerJoinIsRejected(LLVMBackend* compiler,
+        const LLVMBackend::TypeAndValue& trueType, const LLVMBackend::TypeAndValue& falseType,
+        bool trueSimd, bool falseSimd, bool trueArrayView, bool falseArrayView,
+        bool trueNullArm, bool falseNullArm, const std::string& interfaceDestination,
+        bool destinationPointer);
     // A `?:` call argument over two different classes that BoxPointerJoinArgument did not box into
     // an interface goes in as a raw pointer: refused like clang's unrelated A*/B* join.
     void RefuseUnboxedClassJoinArgument(antlr4::ParserRuleContext* ctx, llvm::Value* argValue);
@@ -11125,6 +11469,11 @@ public:
     // A call whose return type is 'void' produces no consumable value: the direct path hands
     // back a void-typed CallInst that reaches the verifier as `void <badref>`. Reject at the
     // call, where the position is still known, rather than at each consumer.
+    // Leaf arms (parentheses stripped) of a nested `?:` parsed for its value under a discarded
+    // conditional: a void call there is still a discarded operand, not a consumed value.
+    std::vector<antlr4::misc::Interval> discardedNestedArmLeaves_;
+    // The nested `?:` arms themselves: two void branches there stay a discarded statement.
+    std::vector<antlr4::ParserRuleContext*> discardedNestedArms_;
     void DiagnoseVoidResultConsumed(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& nv,
                                     ResultUse use, const std::string& subject);
 
@@ -11257,15 +11606,24 @@ public:
     bool HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) const;
     // T418: the `?:` tree of a C++ call argument whose leaves are `default` or a live local of a
     // nontrivial C++ class; fills the place leaves' common type. False for any other shape.
-    bool IsCxxDeferrableDefaultTernary(antlr4::ParserRuleContext* ctx, std::string& placeType);
+    // T518: `allowCallArm` also admits a zero-argument CFlat call returning that class.
+    bool IsCxxDeferrableDefaultTernary(antlr4::ParserRuleContext* ctx, std::string& placeType,
+                                       bool allowCallArm = false);
+    bool ResolveCxxDeferredCallArm(antlr4::tree::ParseTree* node, LLVMBackend::NamedVariable& callable,
+                                   LLVMBackend::TypeAndValue& returnType);
     bool IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool condition = false);
+    // T518: whether `ctx` names a local or parameter whose storage is one of `storage`'s roots.
+    bool ArgumentNamesStorageRoot(antlr4::ParserRuleContext* ctx, llvm::Value* storage);
+    // T518: the `?:` of a call argument whose every leaf is `default`; nullptr otherwise.
+    antlr4::ParserRuleContext* CxxDefaultOnlyTernary(antlr4::ParserRuleContext* ctx);
     bool IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx);
     // T459: `c ? default : place` into a `const T&` class parameter joins a temporary of that class.
     LLVMBackend::NamedVariable ParseCxxConstRefTernaryTemp(CFlatParser::AssignmentExpressionContext* ctx,
         const LLVMBackend::TypeAndValue& dest);
     // T418: builds the deferred argument (selector + place leaves) for the C++ wrapper to evaluate.
+    // T518: `guardPlace` makes the wrapper prove (in clang) that the parameter is `defaultType`.
     bool BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx, const std::string& defaultType,
-        LLVMBackend::NamedVariable& out);
+        LLVMBackend::NamedVariable& out, bool guardPlace = false);
     // T142: types and owns a `default` call argument for the parameter it binds.
     void MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
         const LLVMBackend::TypeAndValue& dest, bool directLoweredSret = false);

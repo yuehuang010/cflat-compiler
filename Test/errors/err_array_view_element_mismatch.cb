@@ -55,6 +55,11 @@ expect_error("cannot join an array view of 'int' with an array view of 'u8' in a
     int[] avmJoinDisagree(int[] a, u8[] b, bool c) { int[] r = c ? a : b; return r; }
 }
 
+// A discarded view conditional still needs a shared element type.
+expect_error("cannot join an array view of 'int' with an array view of 'u8' in a '?:'") {
+    void avmDiscardJoinDisagree(int[] a, u8[] b, bool c) { c ? a : b; }
+}
+
 // A '?:' ARM that reads a struct FIELD names no local slot, so it used to stay unnamed, nothing
 // was stamped on the join and every door took its unnamed escape. A field's element lives on the
 // field's own declaration; these legs all compiled clean before that recovery existed.

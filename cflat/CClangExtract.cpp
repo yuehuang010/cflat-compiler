@@ -28,6 +28,7 @@
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/VTableBuilder.h"
 #include "clang/AST/BaseSubobject.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/TargetInfo.h"
@@ -75,6 +76,7 @@
 
 #include <map>
 #include <set>
+#include <functional>
 #include <array>
 #include <algorithm>
 #include <mutex>
@@ -622,6 +624,9 @@ namespace cflat_cinterop
             const Stmt* body = fd != nullptr ? fd->getBody() : nullptr;
             if (body == nullptr) return {};
             std::string kinds(fd->getNumParams(), '.');
+            // T518: a by-value class parameter's copy/move construction from the wrapper parameter
+            // is that parameter's own binding, not a reference binding of the constructor's.
+            llvm::SmallPtrSet<const CXXConstructExpr*, 4> parameterCopies;
             auto inspect = [&](const FunctionDecl* callee, const Expr* const* args, unsigned count,
                                unsigned skip) {
                 if (callee == nullptr) return;
@@ -630,10 +635,20 @@ namespace cflat_cinterop
                     if (i - skip >= callee->getNumParams() || args[i] == nullptr) break;
                     const Expr* e = args[i];
                     bool slot = false;
+                    const bool byValue = !callee->getParamDecl(i - skip)->getType()->isReferenceType();
+                    const CXXConstructExpr* parameterCopy = nullptr;
                     for (;;)
                     {
                         e = e->IgnoreParens();
                         if (const auto* cast = llvm::dyn_cast<CastExpr>(e)) { e = cast->getSubExpr(); continue; }
+                        if (const auto* bind = llvm::dyn_cast<CXXBindTemporaryExpr>(e);
+                            bind != nullptr && byValue && parameterCopy == nullptr)
+                            { e = bind->getSubExpr(); continue; }
+                        if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(e);
+                            construct != nullptr && byValue && parameterCopy == nullptr && !slot
+                            && construct->getNumArgs() >= 1
+                            && construct->getConstructor()->isCopyOrMoveConstructor())
+                            { parameterCopy = construct; e = construct->getArg(0); continue; }
                         if (const auto* temp = llvm::dyn_cast<MaterializeTemporaryExpr>(e))
                             { e = temp->getSubExpr(); continue; }
                         if (const auto* deref = llvm::dyn_cast<UnaryOperator>(e);
@@ -646,6 +661,7 @@ namespace cflat_cinterop
                     if (parm == nullptr || parm->getDeclContext() != fd) continue;
                     const unsigned index = parm->getFunctionScopeIndex();
                     if (index >= kinds.size()) continue;
+                    if (parameterCopy != nullptr) parameterCopies.insert(parameterCopy);
                     const bool reference = callee->getParamDecl(i - skip)->getType()->isReferenceType();
                     const char kind = slot ? (reference ? 'R' : 'V') : (reference ? 'r' : 'v');
                     if (kinds[index] == '.' || kind == 'r' || kind == 'R') kinds[index] = kind;
@@ -661,13 +677,417 @@ namespace cflat_cinterop
                 }
                 else if (const auto* call = llvm::dyn_cast<CallExpr>(s))
                     inspect(call->getDirectCallee(), call->getArgs(), call->getNumArgs(), 0);
-                else if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(s))
+                else if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(s);
+                         construct != nullptr && !parameterCopies.contains(construct))
                     inspect(construct->getConstructor(), construct->getArgs(), construct->getNumArgs(), 0);
                 for (const Stmt* child : s->children()) self(self, child);
             };
             visit(visit, body);
             if (kinds.find_first_not_of('.') == std::string::npos) return {};
             return kinds;
+        }
+
+        /*
+         * T518: per argument of the (last) direct call in a generated wrapper whose argument is a
+         * `?:` (under implicit casts, temporaries and a constructor of the parameter): '=' when the
+         * selected callee's parameter is the conditional's own class, by value or by reference, '!'
+         * when the conditional converts into another class, '.' otherwise. Empty when no `?:`.
+         */
+        std::string WrapperConditionalArgumentKinds(const FunctionDecl* fd)
+        {
+            const Stmt* body = fd != nullptr ? fd->getBody() : nullptr;
+            if (body == nullptr) return {};
+            std::string kinds;
+            auto inspect = [&](const FunctionDecl* callee, const Expr* const* args, unsigned count) {
+                if (callee == nullptr) return;
+                std::string out(count, '.');
+                bool any = false;
+                for (unsigned i = 0; i < count && i < callee->getNumParams(); ++i)
+                {
+                    const Expr* e = args[i];
+                    while (e != nullptr)
+                    {
+                        e = e->IgnoreParens();
+                        if (const auto* cast = llvm::dyn_cast<CastExpr>(e)) { e = cast->getSubExpr(); continue; }
+                        if (const auto* temp = llvm::dyn_cast<MaterializeTemporaryExpr>(e)) { e = temp->getSubExpr(); continue; }
+                        if (const auto* bind = llvm::dyn_cast<CXXBindTemporaryExpr>(e)) { e = bind->getSubExpr(); continue; }
+                        if (const auto* cleanups = llvm::dyn_cast<ExprWithCleanups>(e)) { e = cleanups->getSubExpr(); continue; }
+                        if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(e);
+                            construct != nullptr && construct->getNumArgs() >= 1)
+                            { e = construct->getArg(0); continue; }
+                        break;
+                    }
+                    const auto* conditional = llvm::dyn_cast_or_null<ConditionalOperator>(e);
+                    if (conditional == nullptr) continue;
+                    any = true;
+                    const QualType param = callee->getParamDecl(i)->getType().getNonReferenceType();
+                    const QualType arm = conditional->getType();
+                    out[i] = param->getCanonicalTypeUnqualified() == arm->getCanonicalTypeUnqualified() ? '=' : '!';
+                }
+                if (any && kinds.empty()) kinds = out;
+            };
+            auto visit = [&](auto&& self, const Stmt* s) -> void {
+                if (s == nullptr) return;
+                if (const auto* call = llvm::dyn_cast<CallExpr>(s);
+                    call != nullptr && !llvm::isa<CXXOperatorCallExpr>(call))
+                    inspect(call->getDirectCallee(), call->getArgs(), call->getNumArgs());
+                for (const Stmt* child : s->children()) self(self, child);
+            };
+            visit(visit, body);
+            return kinds;
+        }
+
+        /*
+         * T525: does `fn` keep a reference to the object its declaration `target` names (a reference
+         * parameter, or the wrapper's `*static_cast<__cflat_closure<...> *>(pK)` lvalue)? Positive
+         * evidence only: the object reaches std::ref / std::cref / std::reference_wrapper, has its
+         * address taken, initializes a reference member, a reference variable (followed as an alias)
+         * or a by-reference lambda capture, or is returned by reference. A reference parameter of a
+         * callee is followed into that callee's definition. A copy or move of the object, a call of
+         * it, or any use not listed is no evidence.
+         */
+        // Per (callee, parameter): 0 = in progress, 1 = not kept, 2 = kept, 3 = only returned by reference.
+        using ClosureKeepMemo = std::map<std::pair<const FunctionDecl*, const ParmVarDecl*>, int>;
+        static bool ClosureObjectKept(const FunctionDecl* fn, const std::function<bool(const Stmt*)>& isTarget,
+                                      int depth, ClosureKeepMemo& visited, bool* returned = nullptr);
+
+        static bool IsStdNamed(const NamedDecl* d, std::initializer_list<const char*> names)
+        {
+            if (d == nullptr || !d->getDeclContext()->isStdNamespace()) return false;
+            const IdentifierInfo* id = d->getIdentifier();
+            if (id == nullptr) return false;
+            for (const char* name : names)
+                if (id->getName() == name) return true;
+            return false;
+        }
+
+        // A parameter the walk cannot see into keeps the object unless it takes a copy.
+        static bool OpaqueParameterKeeps(QualType type)
+        {
+            return type.isNull() || type->isReferenceType() || type->isPointerType();
+        }
+
+        /*
+         * What `callee` does with the object passed as argument `index`: 1 = nothing kept, 2 = kept,
+         * 3 = not kept but returned by reference (the call result aliases the object, so the caller
+         * classifies its use of the result like a direct use). An unseen body keeps a reference.
+         */
+        static int ParameterKept(const FunctionDecl* callee, unsigned index, int depth,
+                                 ClosureKeepMemo& visited,
+                                 bool opaque = false)
+        {
+            if (callee == nullptr) return 2;
+            if (index >= callee->getNumParams())
+                return callee->isVariadic() ? 1 : 2;   // C variadic extras are copies
+            const FunctionDecl* def = callee->getDefinition();
+            // A library builtin with a visible body is walked like any callee. Clang folds the std
+            // reference-identity builtins without instantiating them: use their builtin semantics.
+            if (const unsigned id = callee->getBuiltinID(); id != 0 && (def == nullptr || def->getBody() == nullptr))
+                switch (id)
+                {
+                    case Builtin::BIas_const: case Builtin::BImove: case Builtin::BIforward:
+                    case Builtin::BImove_if_noexcept: case Builtin::BIforward_like:
+                        return 3;   // returns its argument by reference
+                    case Builtin::BIaddressof: case Builtin::BI__addressof: case Builtin::BI__builtin_addressof:
+                        return 2;
+                    default:
+                        return OpaqueParameterKeeps(callee->getParamDecl(index)->getType()) ? 2 : 1;
+                }
+            // No visible body (declared only, out of line), a virtual dispatch, or too deep: assume kept.
+            if (opaque || def == nullptr || def->getBody() == nullptr || depth <= 0)
+                return OpaqueParameterKeeps((def != nullptr ? def : callee)->getParamDecl(index)->getType()) ? 2 : 1;
+            const ParmVarDecl* param = def->getParamDecl(index);
+            if (!param->getType()->isReferenceType()) return 1;   // a copy: nothing kept
+            auto [slot, fresh] = visited.try_emplace({ def, param }, 0);
+            if (!fresh) return slot->second == 0 ? 3 : slot->second;   // recursion: the outer walk decides
+            std::set<const ValueDecl*> aliases{ param };
+            bool returned = false;
+            const bool kept = ClosureObjectKept(def, [&](const Stmt* s) {
+                const auto* ref = llvm::dyn_cast<DeclRefExpr>(s);
+                return ref != nullptr && aliases.count(ref->getDecl()) != 0;
+            }, depth, visited, &returned);
+            const int result = kept ? 2 : returned ? 3 : 1;
+            visited[{ def, param }] = result;
+            return result;
+        }
+
+        /*
+         * One use of the object (`stack.back()` is the target node): kept, not kept, or a new alias.
+         * Walks outward while the expression still denotes the object (an alias), then decides by the
+         * enclosing use. Fails closed: a node kind not handled below counts as kept.
+         */
+        static int ClassifyClosureUse(const std::vector<const Stmt*>& stack, const FunctionDecl* fn,
+                                      int depth, ClosureKeepMemo& visited,
+                                      const VarDecl*& alias, bool* returned, const FieldDecl* rootMember)
+        {
+            enum { No = 0, Yes = 1, Alias = 2 };
+            const Stmt* cur = stack.back();
+            // The result of a member call on the object: a reference result may be the object itself.
+            auto memberCallResult = [&](const CallExpr* call) {
+                return call->getCallReturnType(fn->getASTContext())->isReferenceType();
+            };
+            // Inside an unevaluated operand (sizeof, alignof, noexcept, unevaluated typeid) nothing is kept.
+            for (const Stmt* ancestor : stack)
+            {
+                // A sizeof/alignof of a variably modified type evaluates its array bounds.
+                if (const auto* trait = llvm::dyn_cast<UnaryExprOrTypeTraitExpr>(ancestor);
+                    trait != nullptr && !trait->getTypeOfArgument()->isVariablyModifiedType())
+                    return No;
+                if (llvm::isa<CXXNoexceptExpr>(ancestor))
+                    return No;
+                if (const auto* typeId = llvm::dyn_cast<CXXTypeidExpr>(ancestor); typeId != nullptr && !typeId->isPotentiallyEvaluated())
+                    return No;
+            }
+            for (size_t i = stack.size() - 1; i-- > 0;)
+            {
+                const Stmt* parent = stack[i];
+                // Still the object: parens, implicit conversions, temporaries, cleanups, default args.
+                if (llvm::isa<ParenExpr>(parent) || llvm::isa<ImplicitCastExpr>(parent)
+                    || llvm::isa<MaterializeTemporaryExpr>(parent) || llvm::isa<FullExpr>(parent)
+                    || llvm::isa<CXXBindTemporaryExpr>(parent) || llvm::isa<CXXDefaultArgExpr>(parent)
+                    || llvm::isa<CXXDefaultInitExpr>(parent))
+                { cur = parent; continue; }
+                if (const auto* cast = llvm::dyn_cast<ExplicitCastExpr>(parent))
+                {
+                    if (cast->getCastKind() == CK_ToVoid) return No;   // discarded
+                    if (cast->getCastKind() == CK_NoOp || cast->isGLValue()) { cur = parent; continue; }
+                    return Yes;
+                }
+                if (const auto* cond = llvm::dyn_cast<ConditionalOperator>(parent))
+                {
+                    if (cur == cond->getCond()) return No;   // a read
+                    cur = parent;
+                    continue;
+                }
+                if (llvm::isa<BinaryConditionalOperator>(parent)) { cur = parent; continue; }
+                if (const auto* bin = llvm::dyn_cast<BinaryOperator>(parent))
+                {
+                    if (bin->getOpcode() != BO_Comma) return Yes;
+                    if (cur == bin->getLHS()) return No;   // discarded
+                    cur = parent;
+                    continue;
+                }
+                if (const auto* u = llvm::dyn_cast<UnaryOperator>(parent))
+                {
+                    if (u->getOpcode() == UO_Extension) { cur = parent; continue; }
+                    return Yes;   // `&` and anything else
+                }
+                if (const auto* member = llvm::dyn_cast<MemberExpr>(parent))
+                {
+                    if (!llvm::isa<CXXMethodDecl>(member->getMemberDecl())) { cur = parent; continue; }   // a part of it
+                    const auto* call = i > 0 ? llvm::dyn_cast<CXXMemberCallExpr>(stack[i - 1]) : nullptr;
+                    if (call == nullptr || call->getCallee() != member) return Yes;
+                    if (!memberCallResult(call)) return No;   // the closure's own method, by-value result
+                    cur = call;
+                    --i;
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<CallExpr>(parent))
+                {
+                    const FunctionDecl* callee = call->getDirectCallee();
+                    unsigned j = 0;
+                    while (j < call->getNumArgs() && call->getArg(j) != cur) ++j;
+                    if (j == call->getNumArgs()) return Yes;   // not an argument: unknown use
+                    if (callee == nullptr)
+                    {
+                        // Through a function pointer: only the prototype is known.
+                        const FunctionProtoType* proto = nullptr;
+                        QualType t = call->getCallee()->getType();
+                        if (const auto* ptr = t->getAs<PointerType>()) t = ptr->getPointeeType();
+                        else if (const auto* ref = t->getAs<ReferenceType>()) t = ref->getPointeeType();
+                        proto = t->getAs<FunctionProtoType>();
+                        if (proto == nullptr) return Yes;
+                        if (j >= proto->getNumParams()) return proto->isVariadic() ? No : Yes;
+                        return OpaqueParameterKeeps(proto->getParamType(j)) ? Yes : No;
+                    }
+                    bool dispatch = false;
+                    if (const auto* method = llvm::dyn_cast<CXXMethodDecl>(callee); method != nullptr && method->isVirtual())
+                    {
+                        const auto* member = llvm::dyn_cast<MemberExpr>(call->getCallee()->IgnoreParenImpCasts());
+                        dispatch = member == nullptr || !member->hasQualifier();
+                        if (dispatch && (method->hasAttr<FinalAttr>() || method->getParent()->hasAttr<FinalAttr>()))
+                            dispatch = false;
+                    }
+                    if (llvm::isa<CXXOperatorCallExpr>(call) && llvm::isa<CXXMethodDecl>(callee))
+                    {
+                        if (j == 0)
+                        {
+                            // The object of the closure's own operator: only a reference result may alias it.
+                            if (!memberCallResult(call)) return No;
+                            cur = parent;
+                            continue;
+                        }
+                        --j;
+                    }
+                    if (IsStdNamed(callee, { "ref", "cref" })) return Yes;
+                    if (call->getNumArgs() == 1 && IsStdNamed(callee, { "forward", "move" }))
+                    { cur = parent; continue; }
+                    const int use = ParameterKept(callee, j, depth - 1, visited, dispatch);
+                    if (use == 3 && call->getCallReturnType(fn->getASTContext())->isReferenceType())
+                    { cur = parent; continue; }   // the result aliases the object: classify its use
+                    return use == 1 ? No : Yes;
+                }
+                if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(parent))
+                {
+                    const CXXRecordDecl* record = construct->getType()->getAsCXXRecordDecl();
+                    if (IsStdNamed(record, { "reference_wrapper" })) return Yes;
+                    const CXXConstructorDecl* ctor = construct->getConstructor();
+                    if (ctor == nullptr) return Yes;
+                    if (ctor->isCopyOrMoveConstructor()) return No;   // an independent copy
+                    unsigned j = 0;
+                    while (j < construct->getNumArgs() && construct->getArg(j) != cur) ++j;
+                    if (j == construct->getNumArgs()) return Yes;
+                    return ParameterKept(ctor, j, depth - 1, visited) == 1 ? No : Yes;
+                }
+                auto memberIsReference = [&](QualType aggregate, unsigned j) {
+                    const CXXRecordDecl* record = aggregate->getAsCXXRecordDecl();
+                    if (record == nullptr) return false;   // an array element is an object
+                    if (j < record->getNumBases()) return false;   // a base subobject is an object
+                    j -= record->getNumBases();
+                    for (const FieldDecl* field : record->fields())
+                        if (j-- == 0) return field->getType()->isReferenceType();
+                    return true;
+                };
+                if (const auto* list = llvm::dyn_cast<InitListExpr>(parent))
+                {
+                    // `F& r{g}` / `{g}` bound to a reference: a transparent or glvalue list IS the object.
+                    if (list->isTransparent() || list->isGLValue()) { cur = parent; continue; }
+                    for (unsigned j = 0; j < list->getNumInits(); ++j)
+                        if (list->getInit(j) == cur) return memberIsReference(list->getType(), j) ? Yes : No;
+                    return Yes;
+                }
+                if (const auto* list = llvm::dyn_cast<CXXParenListInitExpr>(parent))
+                {
+                    const auto inits = list->getInitExprs();
+                    for (unsigned j = 0; j < inits.size(); ++j)
+                        if (inits[j] == cur) return memberIsReference(list->getType(), j) ? Yes : No;
+                    return Yes;
+                }
+                if (const auto* decls = llvm::dyn_cast<DeclStmt>(parent))
+                {
+                    for (const Decl* d : decls->decls())
+                        if (const auto* var = llvm::dyn_cast<VarDecl>(d); var != nullptr && var->getInit() == cur)
+                        {
+                            if (!var->getType()->isReferenceType()) return No;   // a copy
+                            // Structured bindings and static references are not followed.
+                            if (llvm::isa<DecompositionDecl>(var) || var->hasGlobalStorage()) return Yes;
+                            alias = var;
+                            return Alias;
+                        }
+                    return Yes;
+                }
+                if (const auto* lambda = llvm::dyn_cast<LambdaExpr>(parent))
+                {
+                    auto capture = lambda->capture_begin();
+                    for (const Expr* init : lambda->capture_inits())
+                    {
+                        if (init == cur)
+                            return capture->getCaptureKind() == LCK_ByRef
+                                || (capture->capturesVariable() && capture->getCapturedVar() != nullptr
+                                    && capture->getCapturedVar()->getType()->isReferenceType()) ? Yes : No;
+                        ++capture;
+                    }
+                    return Yes;
+                }
+                if (llvm::isa<ReturnStmt>(parent))
+                {
+                    if (fn == nullptr || !fn->getReturnType()->isReferenceType()) return No;   // a copy
+                    if (returned == nullptr) return Yes;   // the wrapper itself returns the closure by reference
+                    *returned = true;   // a callee: its caller decides what the result does
+                    return No;
+                }
+                // A discarded-value statement (unevaluated operands are handled above).
+                if (llvm::isa<CompoundStmt>(parent)) return No;
+                return Yes;
+            }
+            // The root: a constructor's member initializer binds a reference member to the object.
+            return rootMember != nullptr && rootMember->getType()->isReferenceType() ? Yes : No;
+        }
+
+        static bool ClosureObjectKept(const FunctionDecl* fn, const std::function<bool(const Stmt*)>& isTarget,
+                                      int depth, ClosureKeepMemo& visited, bool* returned)
+        {
+            if (fn == nullptr) return false;
+            std::vector<const Stmt*> roots;
+            std::vector<const FieldDecl*> rootMembers;
+            if (const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(fn))
+                for (const CXXCtorInitializer* init : ctor->inits())
+                {
+                    if (!init->isWritten() || init->getInit() == nullptr) continue;
+                    // A reference member bound straight to the object keeps it.
+                    const Expr* e = init->getInit()->IgnoreParenImpCasts();
+                    while (const auto* call = llvm::dyn_cast<CallExpr>(e))
+                    {
+                        if (call->getNumArgs() != 1 || !IsStdNamed(call->getDirectCallee(), { "forward", "move" })) break;
+                        e = call->getArg(0)->IgnoreParenImpCasts();
+                    }
+                    if (const auto* cast = llvm::dyn_cast<ExplicitCastExpr>(e); cast != nullptr && cast->getCastKind() == CK_NoOp)
+                        e = cast->getSubExpr()->IgnoreParenImpCasts();
+                    if (init->getMember() != nullptr && init->getMember()->getType()->isReferenceType() && isTarget(e))
+                        return true;
+                    roots.push_back(init->getInit());
+                    rootMembers.push_back(init->getMember());
+                }
+            if (fn->getBody() != nullptr) { roots.push_back(fn->getBody()); rootMembers.push_back(nullptr); }
+            const FieldDecl* rootMember = nullptr;
+            bool kept = false;
+            std::vector<const Stmt*> stack;
+            std::vector<const VarDecl*> aliases;
+            auto walk = [&](auto&& self, const Stmt* s) -> void {
+                if (s == nullptr || kept) return;
+                stack.push_back(s);
+                if (isTarget(s))
+                {
+                    const VarDecl* alias = nullptr;
+                    const int use = ClassifyClosureUse(stack, fn, depth, visited, alias, returned, rootMember);
+                    if (use == 1) kept = true;
+                    else if (use == 2) aliases.push_back(alias);
+                }
+                else if (const auto* lambda = llvm::dyn_cast<LambdaExpr>(s))
+                {
+                    for (const Expr* init : lambda->capture_inits()) self(self, init);   // not the body
+                }
+                else
+                    for (const Stmt* child : s->children()) self(self, child);
+                stack.pop_back();
+            };
+            for (size_t r = 0; r < roots.size(); ++r) { rootMember = rootMembers[r]; walk(walk, roots[r]); }
+            if (kept) return true;
+            // A reference variable bound to the object is the object: follow its uses too.
+            for (size_t a = 0; a < aliases.size() && !kept; ++a)
+            {
+                const VarDecl* alias = aliases[a];
+                auto aliasTarget = [&](const Stmt* s) {
+                    const auto* ref = llvm::dyn_cast<DeclRefExpr>(s);
+                    return ref != nullptr && ref->getDecl() == alias;
+                };
+                if (ClosureObjectKept(fn, aliasTarget, depth, visited, returned)) return true;
+            }
+            return false;
+        }
+
+        // T525: ",pK," for each wrapper closure-slot parameter whose object the callee keeps.
+        std::string WrapperClosureKeptParams(const FunctionDecl* fd)
+        {
+            if (fd == nullptr || fd->getBody() == nullptr) return {};
+            std::string kept;
+            for (const ParmVarDecl* param : fd->parameters())
+            {
+                if (!param->getType()->isPointerType()) continue;
+                // The slot's use: `*static_cast<__cflat_closure<...> *>(pK)` (a closure lvalue).
+                auto slotUse = [&](const Stmt* s) {
+                    const auto* deref = llvm::dyn_cast<UnaryOperator>(s);
+                    if (deref == nullptr || deref->getOpcode() != UO_Deref) return false;
+                    const auto* record = deref->getType()->getAsCXXRecordDecl();
+                    if (record == nullptr || record->getName() != "__cflat_closure") return false;
+                    const auto* ref = llvm::dyn_cast<DeclRefExpr>(deref->getSubExpr()->IgnoreParenCasts());
+                    return ref != nullptr && ref->getDecl() == param;
+                };
+                ClosureKeepMemo visited;
+                if (ClosureObjectKept(fd, slotUse, 32, visited))
+                    kept += (kept.empty() ? "," : "") + param->getNameAsString() + ",";
+            }
+            return kept;
         }
 
         // The selected callee, exactly: qualified name, specialized type, and primary pattern.
@@ -2424,6 +2844,96 @@ namespace cflat_cinterop
                     sig.resultBorrowsBraceList = WrapperResultBorrowsBraceList(
                         ctx, fd, sig.braceListElementTypes);
                     sig.paramBindKinds = WrapperParameterBindKinds(fd);
+                    sig.conditionalArgumentKinds = WrapperConditionalArgumentKinds(fd);
+                    sig.closureKeptParams = WrapperClosureKeptParams(fd);
+                    /*
+                     * T518: the outermost free call's selected callee - its canonical function
+                     * type and default arguments - so a by-value class argument can be built at
+                     * its own position and the callee called through its address.
+                     */
+                    if (const Stmt* wrapperBody = fd->getBody())
+                    {
+                        const CallExpr* outer = nullptr;
+                        auto findCall = [&](auto&& self, const Stmt* s) -> void {
+                            if (s == nullptr || outer != nullptr) return;
+                            if (const auto* call = llvm::dyn_cast<CallExpr>(s))
+                            {
+                                outer = call;
+                                return;
+                            }
+                            for (const Stmt* child : s->children()) self(self, child);
+                        };
+                        findCall(findCall, wrapperBody);
+                        const FunctionDecl* callee = outer != nullptr && !llvm::isa<CXXMemberCallExpr>(outer)
+                                && !llvm::isa<CXXOperatorCallExpr>(outer) && !llvm::isa<UserDefinedLiteral>(outer)
+                            ? outer->getDirectCallee() : nullptr;
+                        if (callee != nullptr && callee->getBuiltinID() == 0
+                            && !llvm::isa<CXXMethodDecl>(callee))
+                        {
+                            /*
+                             * Source-valid C++ for the getter TU (which includes the same headers): an
+                             * anonymous namespace is an unwritten scope, so `edge6::Tag`, never the
+                             * diagnostic `edge6::(anonymous namespace)::Tag`.
+                             */
+                            PrintingPolicy policy(ctx.getLangOpts());
+                            policy.FullyQualifiedName = true;
+                            policy.SuppressScope = false;
+                            policy.SuppressUnwrittenScope = true;
+                            policy.AnonymousTagNameStyle = llvm::to_underlying(PrintingPolicy::AnonymousTagMode::Plain);
+                            policy.PrintAsCanonical = true;
+                            sig.selectedCalleeType = callee->getType().getCanonicalType().getAsString(policy);
+                            // The selected specialization's own arguments: the getter names exactly it.
+                            if (const TemplateArgumentList* targs = callee->getTemplateSpecializationArgs())
+                            {
+                                // A declaration argument (`&target`) prints its diagnostic qualified name
+                                // whatever the policy, so it is spelled from its scopes here.
+                                auto declSpelling = [&](const ValueDecl* vd) -> std::string {
+                                    std::string name = vd->getNameAsString();
+                                    for (const DeclContext* dc = vd->getDeclContext(); dc != nullptr; dc = dc->getParent())
+                                    {
+                                        if (dc->isTranslationUnit()) return "::" + name;
+                                        if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc))
+                                        {
+                                            if (!ns->isAnonymousNamespace()) name = ns->getNameAsString() + "::" + name;
+                                            continue;
+                                        }
+                                        if (const auto* rd = llvm::dyn_cast<RecordDecl>(dc))
+                                            return QualType(ctx.getCanonicalTagType(rd)).getAsString(policy) + "::" + name;
+                                        if (llvm::isa<LinkageSpecDecl>(dc)) continue;
+                                        return {};
+                                    }
+                                    return name;
+                                };
+                                std::string spelled;
+                                llvm::raw_string_ostream os(spelled);
+                                auto printArg = [&](auto&& self, const TemplateArgument& arg, bool& first) -> void {
+                                    if (arg.getKind() == TemplateArgument::Pack)
+                                    {
+                                        for (const TemplateArgument& element : arg.pack_elements()) self(self, element, first);
+                                        return;
+                                    }
+                                    if (!first) os << ", ";
+                                    first = false;
+                                    if (arg.getKind() == TemplateArgument::Declaration)
+                                        if (std::string decl = declSpelling(arg.getAsDecl()); !decl.empty())
+                                        {
+                                            if (!arg.getParamTypeForDecl()->isReferenceType()) os << "&";
+                                            os << decl;
+                                            return;
+                                        }
+                                    arg.print(policy, os, /*IncludeType*/ true);
+                                };
+                                bool first = true;
+                                os << "<";
+                                for (const TemplateArgument& arg : targs->asArray()) printArg(printArg, arg, first);
+                                os << ">";
+                                os.flush();
+                                sig.selectedCalleeTemplateArgs = spelled;
+                            }
+                            for (const ParmVarDecl* p : callee->parameters())
+                                sig.selectedCalleeDefaults.push_back(DefaultArgumentOf(p, ctx));
+                        }
+                    }
                 }
                 // An immediate ('consteval') function is evaluated by the C++ front end and gets
                 // no runtime symbol, so binding it would only fail at link time with a mangled name.

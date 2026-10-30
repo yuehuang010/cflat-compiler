@@ -5083,6 +5083,131 @@ int testApplication()
     return passed;
 }
 
+struct T513BareJoin { int value = 19; };
+int t513BareCallHits = 0;
+int t513BareCallF() { t513BareCallHits = t513BareCallHits + 1; return 1; }
+int t513BareCallG() { t513BareCallHits = t513BareCallHits + 10; return 2; }
+int t513BareFunctionA(int value) { return value + 3; }
+int t513BareFunctionB(int value) { return value + 4; }
+
+int testT513BareTernaryAcceptSet()
+{
+    int passed = 0;
+    bool c = false;
+    T513BareJoin a = default;
+    T513BareJoin b = default;
+    c ? &a : &b;
+    passed += Test("T513 bare compatible pointer arms preserve the selected object",
+        c ? a.value : b.value, 19);
+
+    T513BareJoin* owned = new T513BareJoin();
+    T513BareJoin local = default;
+    c = true;
+    c ? owned : &local;
+    passed += Test("T513 bare mixed owning and borrowed arms preserve the owner",
+        owned == nullptr ? -1 : owned->value, 19);
+    delete owned;
+
+    int x = 7;
+    c ? &x : nullptr;
+    int* localJoin = c ? &x : nullptr;
+    passed += Test("T513 bare frame-local nullish arms stay local and valid",
+        localJoin == &x ? x : -1, 7);
+
+    c ? t513BareFunctionA : t513BareFunctionB;
+    function<int(int)> fn = c ? t513BareFunctionA : t513BareFunctionB;
+    passed += Test("T513 bare compatible function-value arms remain callable", fn(5), 8);
+
+    t513BareCallHits = 0;
+    c = true;
+    c ? t513BareCallF() : t513BareCallG();
+    c = false;
+    c ? t513BareCallF() : t513BareCallG();
+    passed += Test("T513 calls in discarded arms execute only the selected call",
+        t513BareCallHits, 11);
+
+    int postX = 3;
+    int postY = 7;
+    c = true;
+    c ? postX++ : postY++;
+    c = false;
+    c ? postX++ : postY++;
+    passed += Test("T513 discarded postfix arms update only the selected variables",
+        postX * 10 + postY, 48);
+
+    int[2] values;
+    values[0] = 13;
+    values[1] = 29;
+    int[] left = values;
+    int[] right = values;
+    c ? left : right;
+    int[] viewJoin = c ? left : right;
+    passed += Test("T513 bare compatible array-view arms retain their element",
+        viewJoin[0] * 100 + viewJoin[1], 1329);
+    return passed;
+}
+
+int t513VoidArmHits = 0;
+int t513VoidArmValue() { t513VoidArmHits += 1; return 7; }
+void t513VoidArmVoid() { t513VoidArmHits += 10; }
+void t513VoidArmVoid2() { t513VoidArmHits += 100; }
+struct T513VoidArmMethods
+{
+    int Value() { t513VoidArmHits += 1; return 5; }
+    void Void() { t513VoidArmHits += 10; }
+};
+
+int testT513DiscardedVoidArms()
+{
+    int passed = 0;
+    bool c = true;
+    t513VoidArmHits = 0;
+    c ? t513VoidArmValue() : t513VoidArmVoid();
+    c = false;
+    c ? t513VoidArmValue() : t513VoidArmVoid();
+    passed += Test("T513 discarded int/void arms preserve selected call effects",
+        t513VoidArmHits, 11);
+
+    T513VoidArmMethods methods = default;
+    t513VoidArmHits = 0;
+    c = true;
+    c ? methods.Value() : methods.Void();
+    c = false;
+    c ? methods.Value() : methods.Void();
+    passed += Test("T513 discarded method/void arms preserve selected method effects",
+        t513VoidArmHits, 11);
+
+    bool inner = true;
+    t513VoidArmHits = 0;
+    c = true;
+    c ? (inner ? t513VoidArmValue() : t513VoidArmVoid()) : t513VoidArmVoid2();
+    inner = false;
+    c ? (inner ? t513VoidArmValue() : t513VoidArmVoid()) : t513VoidArmVoid2();
+    c = false;
+    c ? (inner ? t513VoidArmValue() : t513VoidArmVoid()) : t513VoidArmVoid2();
+    passed += Test("T513 nested discarded void arms preserve selected effects",
+        t513VoidArmHits, 111);
+
+    int value = 1;
+    t513VoidArmHits = 0;
+    c = true;
+    c ? t513VoidArmVoid() : &value;
+    c = false;
+    c ? t513VoidArmVoid() : &value;
+    passed += Test("T513 discarded void/pointer arms preserve selected effects",
+        t513VoidArmHits, 10);
+
+    int other = 2;
+    t513VoidArmHits = 0;
+    c = true;
+    c ? &value : (c ? &other : t513VoidArmVoid());
+    c = false;
+    c ? &value : (c ? &other : t513VoidArmVoid());
+    passed += Test("T513 nested discarded pointer/void arms preserve selected effects",
+        t513VoidArmHits, 10);
+    return passed;
+}
+
 // T141: a `?:` call argument joining pointers to ONE native class ranks as that class pointer
 // (clang's composite pointer type), so read(P*) wins over read(int*); a null arm adopts the class.
 int t141Tag = 0;
@@ -5220,6 +5345,8 @@ extern int main()
     r = testT75StringCasts();   passed += r; total += 4;
     r = testT141TernaryClassPointee(); passed += r; total += 6;
     r = testT147TernaryJoin();  passed += r; total += 3;
+    r = testT513BareTernaryAcceptSet(); passed += r; total += 7;
+    r = testT513DiscardedVoidArms(); passed += r; total += 5;
     r = testT323ImplicitCoreGlobal(); passed += r; total += 1;
 
     printf("\n%d / %d tests passed.\n", passed, total);

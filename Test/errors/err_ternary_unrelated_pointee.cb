@@ -63,6 +63,33 @@ expect_error("cannot join 'T141IA*' and 'T141IB*' in a '?:'") {
     int t141IfaceNested(int c, T141IA* a, T141IB* b) { T141IA* p = c > 0 ? (c < 0 ? a : b) : a; return p->v; }
 }
 
+// A discarded conditional still has to form one pointer type, including nested and loop forms.
+expect_error("cannot join 'T141A*' and 'T141B*' in a '?:'") {
+    void t513DiscardedPointerJoin(bool c, T141A* a, T141B* b) { c ? a : b; }
+}
+expect_error("cannot join 'T141A*' and 'T141B*' in a '?:'") {
+    void t513DiscardedAddressPointerJoin(bool c) {
+        T141A a = default;
+        T141B b = default;
+        c ? &a : &b;
+    }
+}
+expect_error("cannot join 'T141A*' and 'T141B*' in a '?:'") {
+    void t513DiscardedNestedPointerJoin(bool c, bool d, T141A* a, T141B* b) { c ? (d ? a : b) : a; }
+}
+expect_error("cannot join 'T141A*' and 'T141B*' in a '?:'") {
+    void t513DiscardedForIncrementJoin(bool c, T141A* a, T141B* b) {
+        for (int i = 0; i < 1; c ? a : b) { i++; }
+    }
+}
+expect_error("cannot join 'int*' and 'u8*' in a '?:'") {
+    void t513DiscardedFixedArrayJoin(bool c) {
+        int[2] ints;
+        u8[2] bytes;
+        c ? ints : bytes;
+    }
+}
+
 // A class pointer joined with a string literal (a char* arm): no common pointer type, even into void*.
 struct T147S { int v = 0; };
 expect_error("cannot join 'T147S*' and 'char*' in a '?:'") {

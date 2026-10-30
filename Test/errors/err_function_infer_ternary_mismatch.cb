@@ -13,6 +13,12 @@ struct T182Hold { function<int(int)> fn; };
 int t182Use(function<int(int)> g) { return g(1); }
 int t182Lo(int a) { return a; }
 int t182Hi(int a, int b) { return a + b; }
+
+// Discarding a function-value conditional does not make incompatible signatures compatible.
+expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") {
+    void t513DiscardedFunctionJoin(bool c) { c ? t176One : t176Many; }
+}
+
 // Int field arms shadow the same-named global functions: no function arm, so the bare 'function'
 // inference refuses the int join (not the globals' signatures).
 struct T182Bare {

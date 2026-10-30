@@ -865,8 +865,130 @@ void LLVMBackend::RecordDeferredRawPointerCalleeStore(const llvm::Function* call
         deferredRawPointerCalleeStores_.push_back(std::move(entry));
     }
 
+void LLVMBackend::RecordDeferredReturnBorrow(std::vector<DeferredCallBorrow> borrows, std::string frameMessage,
+                                             std::string aliasMessage, size_t line, size_t column,
+                                             std::string unprovenMessage)
+{
+        DeferredRawPointerCalleeStore entry;
+        entry.File = sourceFileName;
+        entry.Line = line;
+        entry.Column = column;
+        entry.Owner = activeExpectScope_;
+        entry.Borrows = std::move(borrows);
+        entry.FrameMessage = std::move(frameMessage);
+        entry.AliasMessage = std::move(aliasMessage);
+        entry.InterfaceName = currentFunctionReturnTypeName;
+        entry.UnprovenMessage = std::move(unprovenMessage);
+        deferredRawPointerCalleeStores_.push_back(std::move(entry));
+    }
+
+std::string LLVMBackend::ArgumentReachTypeKey(const llvm::Value* argument) const
+{
+        llvm::Type* passed = argument->getType();
+        // A struct passed in its C ABI form: a non-pointer load of a struct copy slot.
+        if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(argument); load != nullptr && !passed->isPointerTy())
+            if (const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand()->stripPointerCasts());
+                slot != nullptr && slot->getAllocatedType()->isStructTy()
+                && load->getModule()->getDataLayout().getTypeAllocSize(passed)
+                    == load->getModule()->getDataLayout().getTypeAllocSize(slot->getAllocatedType()))
+                passed = slot->getAllocatedType();
+        const auto* type = llvm::dyn_cast<llvm::StructType>(passed);
+        if (type == nullptr || !type->hasName() || type == GetFatPtrType()) return std::string();
+        return type->getName().str();
+    }
+
+bool LLVMBackend::TypeMayReachImplementer(const std::string& typeName, const std::string& iface) const
+{
+        static const std::set<std::string> scalars = {
+            "bool", "char", "uchar", "schar", "byte", "sbyte", "short", "ushort", "int", "uint", "long",
+            "ulong", "longlong", "ulonglong", "float", "double", "longdouble", "half", "int8", "int16",
+            "int32", "int64", "uint8", "uint16", "uint32", "uint64", "size_t", "wchar", "char16", "char32",
+            "i1", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "f16", "f32", "f64" };
+        auto derivesFrom = [&](const std::string& name) {
+            std::vector<std::string> work{ name };
+            std::set<std::string> seen;
+            while (!work.empty())
+            {
+                std::string next = std::move(work.back());
+                work.pop_back();
+                if (next == iface) return true;
+                if (!seen.insert(next).second) continue;
+                if (auto parents = interfaceParents.find(next); parents != interfaceParents.end())
+                    work.insert(work.end(), parents->second.begin(), parents->second.end());
+            }
+            return false;
+        };
+        std::set<std::string> visited;
+        std::function<bool(const std::string&)> reach = [&](const std::string& name) {
+            if (name.empty() || IsInterfaceType(name)) return true;
+            if (name.rfind("__", 0) == 0) return true;  // compiler-internal: closure / function fat pointers
+            if (cxxRecordEntries_.count(name) != 0 || pendingCxxRecordProjections_.count(name) != 0)
+                return true;  // a foreign C / C++ record
+            auto found = dataStructures.find(name);
+            if (found == dataStructures.end()) return scalars.count(name) == 0;  // generic, opaque, void
+            if (!visited.insert(name).second) return false;
+            const StructData& data = found->second;
+            if (data.StructType == nullptr || data.StructType->isOpaque() || data.IsUnion || data.CxxOffsetLayout)
+                return true;
+            if (data.VTables.count(iface) != 0) return true;
+            for (const std::string& implemented : data.Interfaces)
+                if (derivesFrom(implemented)) return true;
+            for (const auto& field : data.StructFields)
+                if (field.IsInterface || field.IsFunctionPointer || reach(field.TypeName)
+                    || ((field.Pointer || field.PointerDepth > 0) && (field.TypeName == "i8" || field.TypeName == "void")))
+                    return true;  // an untyped pointer may address anything
+            return false;
+        };
+        return reach(typeName);
+    }
+
+std::string LLVMBackend::DeferredCalleeStoreMessage(const DeferredRawPointerCalleeStore& entry)
+{
+        return entry.ResolvedMessage.empty() ? DescribeRawPointerCalleeStore(entry.ParamName) : entry.ResolvedMessage;
+    }
+
 void LLVMBackend::ResolveRawPointerCalleeStoreVerdicts()
 {
+        for (auto& entry : deferredRawPointerCalleeStores_)
+        {
+            if (entry.Resolved || entry.Borrows.empty()) continue;
+            // T522: every body is emitted now; the worst root among the arguments each callee's
+            // summary selects (all of them when unknown) decides. 2 = OwnedLocal..Alias, 3 = frame.
+            NoCurrentFunctionScope noCurrent(this);
+            // Compositional: an argument's nested deferred calls count only when the summary
+            // selects that argument (a pointer read through a nested result keeps it, conservatively).
+            std::function<int(const DeferredCallBorrow&)> contribution = [&](const DeferredCallBorrow& borrow) {
+                int result = 0;
+                std::vector<std::pair<unsigned, unsigned>> indexes;
+                const auto* callee = llvm::dyn_cast_or_null<llvm::Function>(static_cast<llvm::Value*>(borrow.Callee));
+                const bool known = callee != nullptr && ReturnBorrowedArguments(callee, indexes);
+                if (!known)
+                    for (unsigned i = 0; i < borrow.ArgRoots.size(); ++i)
+                    {
+                        // Type narrowing: an argument reaching no implementer of the returned interface
+                        // (now that every implementer is registered) cannot hold the returned object.
+                        if (borrow.NarrowByInterface && i < borrow.ArgTypes.size() && IsInterfaceType(entry.InterfaceName)
+                            && !TypeMayReachImplementer(borrow.ArgTypes[i], entry.InterfaceName))
+                            continue;
+                        indexes.push_back({ i, 0u });
+                    }
+                for (auto [index, derefs] : indexes)
+                {
+                    if (index >= borrow.ArgRoots.size()) continue;
+                    result = std::max(result, borrow.ArgRoots[index][std::min<unsigned>(derefs, 4u)]);
+                    if (index < borrow.ArgChildren.size())
+                        for (const auto& child : borrow.ArgChildren[index])
+                            result = std::max(result, contribution(child));
+                }
+                return result;
+            };
+            int worst = 0;
+            for (const auto& borrow : entry.Borrows) worst = std::max(worst, contribution(borrow));
+            entry.Resolved = true;
+            entry.Verdict = worst == 0 ? RawPointerStoreVerdict::None : RawPointerStoreVerdict::Stores;
+            entry.ResolvedMessage = worst == 2 ? entry.AliasMessage
+                : worst == 4 && !entry.UnprovenMessage.empty() ? entry.UnprovenMessage : entry.FrameMessage;
+        }
         for (auto& entry : deferredRawPointerCalleeStores_)
         {
             if (entry.Resolved) continue;
@@ -5612,6 +5734,405 @@ bool LLVMBackend::CalleeReturnsOwned(const llvm::Function* fn) const
         return sym != nullptr && sym->ReturnsOwned;
     }
 
+bool LLVMBackend::ReturnBorrowedArguments(const llvm::Function* fn,
+                                          std::vector<std::pair<unsigned, unsigned>>& out, bool* pending)
+{
+        out.clear();
+        if (pending != nullptr) *pending = false;
+        if (fn == nullptr) return false;
+        if (auto it = returnBorrowMemo_.find(fn); it != returnBorrowMemo_.end())
+        {
+            out = it->second.second;
+            return it->second.first;
+        }
+        const FunctionSymbol* sym = FindSymbolForFunction(fn);
+        if (sym == nullptr || sym->IsCxx || sym->Recipe.hasLowering) return false;
+        // Parse-tree facts: definition-order independent and round-tripped by the --init cache.
+        auto parseTreeAnswer = [&]() {
+            out.clear();
+            if (sym->ReturnsGlobalBorrow) return true;
+            if (sym->ReturnsSingleParameterIndex >= 0
+                && static_cast<size_t>(sym->ReturnsSingleParameterIndex) < fn->arg_size()
+                && sym->Parameters.size() == fn->arg_size())
+            {
+                out.push_back({ static_cast<unsigned>(sym->ReturnsSingleParameterIndex), 0u });
+                return true;
+            }
+            return false;
+        };
+        // Core bodies are only present on a cold cache: decide them from the cached facts alone.
+        const bool fatReturn = GetFatPtrType() != nullptr && fn->getReturnType() == GetFatPtrType();
+        bool complete = !fn->isDeclaration() && fn != currentFunction && !sym->IsCoreLibraryFunction
+            && (fn->getReturnType()->isPointerTy() || fatReturn);
+        if (complete)
+            for (const auto& block : *fn)
+                if (cflat_llvm::GetTerminatorOrNull(&block) == nullptr)
+                {
+                    complete = false;
+                    break;
+                }
+        if (complete && returnBorrowInProgress_.count(fn) != 0)
+        {
+            // Recursion: the current approximation (bottom = borrows nothing); the outermost
+            // summary iterates to a fixed point.
+            returnBorrowProvisional_ = true;
+            auto it = returnBorrowApprox_.find(fn);
+            if (it == returnBorrowApprox_.end()) return true;
+            out = it->second.second;
+            return it->second.first;
+        }
+        if (!complete || !returnBorrowInProgress_.insert(fn).second)
+        {
+            if (parseTreeAnswer()) return true;
+            // A CFlat body still to be emitted (defined later, or the one being emitted).
+            const bool later = !complete && !sym->IsCoreLibraryFunction
+                && (fn->getReturnType()->isPointerTy() || fatReturn);
+            if (later && pending != nullptr) *pending = true;
+            return false;
+        }
+        bool anyPending = false;
+        const bool enclosingProvisional = returnBorrowProvisional_;
+        returnBorrowProvisional_ = false;
+
+        std::set<std::pair<unsigned, unsigned>> borrowed;
+        bool known = true;
+        std::set<std::pair<const llvm::Value*, unsigned>> seen;
+        std::function<void(const llvm::Value*, int)> visitFat;
+        std::function<void(const llvm::Value*, int, unsigned)> visit =
+            [&](const llvm::Value* value, int depth, unsigned derefs) {
+            if (!known) return;
+            if (value == nullptr || depth > 16 || derefs > 4)
+            {
+                known = false;
+                return;
+            }
+            value = value->stripPointerCasts();
+            while (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                value = gep->getPointerOperand()->stripPointerCasts();
+            if (!seen.insert({ value, derefs }).second) return;
+            if (llvm::isa<llvm::Constant>(value)) return;  // null, a global, a function
+            if (const auto* argument = llvm::dyn_cast<llvm::Argument>(value))
+            {
+                borrowed.insert({ argument->getArgNo(), derefs });
+                return;
+            }
+            if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+            {
+                for (const llvm::Value* incoming : phi->incoming_values()) visit(incoming, depth + 1, derefs);
+                return;
+            }
+            if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+            {
+                visit(select->getTrueValue(), depth + 1, derefs);
+                visit(select->getFalseValue(), depth + 1, derefs);
+                return;
+            }
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(value))
+            {
+                const llvm::Function* callee = call->getCalledFunction();
+                if (callee != nullptr && callee->isIntrinsic())
+                {
+                    known = false;
+                    return;
+                }
+                if (callee != nullptr && CalleeReturnsOwned(callee)) return;
+                if (callee == nullptr && call->getMetadata("cflat.borrowed-pointer-return") == nullptr)
+                    return;
+                std::vector<std::pair<unsigned, unsigned>> forwarded;
+                bool calleePending = false;
+                const bool narrowedCall = callee != nullptr && ReturnBorrowedArguments(callee, forwarded, &calleePending);
+                if (calleePending) anyPending = true;
+                if (narrowedCall)
+                {
+                    for (auto [index, levels] : forwarded)
+                    {
+                        if (index >= call->arg_size())
+                        {
+                            known = false;
+                            return;
+                        }
+                        const llvm::Value* passed = call->getArgOperand(index);
+                        // An interface argument forwarded whole: its data half is what is borrowed.
+                        if (!passed->getType()->isPointerTy())
+                        {
+                            if (derefs + levels != 0) known = false;
+                            else visitFat(passed, depth + 1);
+                            if (!known) return;
+                            continue;
+                        }
+                        visit(passed, depth + 1, derefs + levels);
+                    }
+                    return;
+                }
+                for (const llvm::Value* argument : call->args())
+                    if (argument->getType()->isPointerTy()) visit(argument, depth + 1, 0);
+                return;
+            }
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+            {
+                const llvm::Value* address = load->getPointerOperand()->stripPointerCasts();
+                const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(address);
+                if (slot == nullptr || !slot->getAllocatedType()->isPointerTy())
+                {
+                    // A pointer read out of memory reached through a value: one more dereference.
+                    // Only within the pointed-to object: a read past it (`h[1].p`) is unknown.
+                    for (const llvm::Value* step = load->getPointerOperand()->stripPointerCasts();
+                         const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(step);
+                         step = gep->getPointerOperand()->stripPointerCasts())
+                    {
+                        const auto* first = gep->getNumIndices() == 0
+                            ? nullptr : llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()->get());
+                        if (first == nullptr || !first->isZero())
+                        {
+                            known = false;
+                            return;
+                        }
+                    }
+                    visit(address, depth + 1, derefs + 1);
+                    return;
+                }
+                bool anyStore = false;
+                for (const llvm::User* user : slot->users())
+                {
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                    {
+                        if (store->getPointerOperand()->stripPointerCasts() != slot)
+                        {
+                            known = false;
+                            return;
+                        }
+                        anyStore = true;
+                        visit(store->getValueOperand(), depth + 1, derefs);
+                        continue;
+                    }
+                    if (llvm::isa<llvm::LoadInst>(user)) continue;
+                    if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(user);
+                        intrinsic != nullptr
+                        && (intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_declare
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_value
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end))
+                        continue;
+                    known = false;
+                    return;
+                }
+                if (!anyStore) known = false;
+                return;
+            }
+            known = false;  // a frame address, an integer cast, an aggregate extract
+        };
+        /*
+         * The data half of an interface value: a constant `{vtable, @g}`, an insertvalue chain, a
+         * phi/select of those, a forwarding call, or a reload of a never-escaped local fat slot.
+         */
+        visitFat = [&](const llvm::Value* value, int depth) {
+            if (!known) return;
+            if (value == nullptr || depth > 16)
+            {
+                known = false;
+                return;
+            }
+            if (llvm::isa<llvm::UndefValue>(value) || llvm::isa<llvm::ConstantAggregateZero>(value)) return;
+            // An interface parameter returned as is: a borrow of that argument's object.
+            if (const auto* argument = llvm::dyn_cast<llvm::Argument>(value))
+            {
+                borrowed.insert({ argument->getArgNo(), 0u });
+                return;
+            }
+            if (const auto* constant = llvm::dyn_cast<llvm::Constant>(value))
+            {
+                if (const llvm::Constant* data = constant->getAggregateElement(1u))
+                    visit(data, depth + 1, 0);
+                return;
+            }
+            if (const auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value))
+            {
+                if (insert->getNumIndices() != 1)
+                {
+                    known = false;
+                    return;
+                }
+                if (insert->getIndices()[0] == 1) visit(insert->getInsertedValueOperand(), depth + 1, 0);
+                else visitFat(insert->getAggregateOperand(), depth + 1);
+                return;
+            }
+            if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+            {
+                for (const llvm::Value* incoming : phi->incoming_values()) visitFat(incoming, depth + 1);
+                return;
+            }
+            if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+            {
+                visitFat(select->getTrueValue(), depth + 1);
+                visitFat(select->getFalseValue(), depth + 1);
+                return;
+            }
+            if (llvm::isa<llvm::CallBase>(value))
+            {
+                visit(value, depth + 1, 0);
+                return;
+            }
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+            {
+                const llvm::Value* address = load->getPointerOperand()->stripPointerCasts();
+                const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(address);
+                if (slot == nullptr && !llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(address)))
+                {
+                    // An interface read out of memory reached through a value: its data word is one
+                    // dereference from that value, within the pointed-to object only.
+                    for (const llvm::Value* step = address; const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(step);
+                         step = gep->getPointerOperand()->stripPointerCasts())
+                    {
+                        const auto* first = gep->getNumIndices() == 0
+                            ? nullptr : llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()->get());
+                        if (first == nullptr || !first->isZero())
+                        {
+                            known = false;
+                            return;
+                        }
+                    }
+                    visit(address, depth + 1, 1);
+                    return;
+                }
+                if (slot == nullptr || slot->getAllocatedType() != value->getType())
+                {
+                    known = false;
+                    return;
+                }
+                bool anyStore = false;
+                for (const llvm::User* user : slot->users())
+                {
+                    if (llvm::isa<llvm::LoadInst>(user)) continue;
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getPointerOperand() == slot
+                        && store->getValueOperand() != slot)
+                    {
+                        anyStore = true;
+                        visitFat(store->getValueOperand(), depth + 1);
+                        continue;
+                    }
+                    // A half read in place (`node.kind()` loads the vtable / data words).
+                    if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+                        gep != nullptr && gep->getPointerOperand() == slot
+                        && std::all_of(gep->user_begin(), gep->user_end(),
+                                       [](const llvm::User* reader) { return llvm::isa<llvm::LoadInst>(reader); }))
+                        continue;
+                    if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(user);
+                        intrinsic != nullptr
+                        && (intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_declare
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_value
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end))
+                        continue;
+                    known = false;
+                    return;
+                }
+                if (!anyStore) known = false;
+                return;
+            }
+            known = false;
+        };
+        for (const auto& block : *fn)
+            if (const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(cflat_llvm::GetTerminatorOrNull(&block)))
+            {
+                const llvm::Value* returned = ret->getReturnValue();
+                // An interface result: what its data half borrows.
+                if (fatReturn)
+                {
+                    visitFat(returned, 0);
+                    continue;
+                }
+                visit(returned, 0, 0);
+            }
+        returnBorrowInProgress_.erase(fn);
+        const bool provisional = returnBorrowProvisional_;
+        returnBorrowProvisional_ = enclosingProvisional || provisional;
+        if (anyPending)
+        {
+            if (returnBorrowInProgress_.empty())
+            {
+                returnBorrowApprox_.clear();
+                returnBorrowIterations_ = 0;
+                returnBorrowApproxChanged_ = false;
+            }
+            if (parseTreeAnswer()) return true;
+            out.clear();
+            if (pending != nullptr) *pending = true;
+            return false;
+        }
+        // A read through an argument (`return h->p;`) names what the caller's memory held at the
+        // call only when the body writes no memory outside its own frame: a store through a
+        // parameter (`a->p = q; return a->p;`) or a call that may do so makes the answer unknown.
+        if (known && std::any_of(borrowed.begin(), borrowed.end(), [](const auto& entry) { return entry.second > 0; }))
+        {
+            auto frameOnly = [](const llvm::Value* address) {
+                return llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(address));
+            };
+            for (const auto& block : *fn)
+            {
+                for (const auto& instruction : block)
+                {
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction))
+                    {
+                        if (!frameOnly(store->getPointerOperand())) known = false;
+                    }
+                    else if (const auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+                    {
+                        if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(call))
+                        {
+                            const auto id = intrinsic->getIntrinsicID();
+                            if ((id == llvm::Intrinsic::memcpy || id == llvm::Intrinsic::memmove
+                                 || id == llvm::Intrinsic::memset)
+                                && !frameOnly(intrinsic->getArgOperand(0)))
+                                known = false;
+                            continue;
+                        }
+                        for (const llvm::Value* argument : call->args())
+                            if (!llvm::isa<llvm::Constant>(argument)
+                                && ((argument->getType()->isPointerTy() && !frameOnly(argument))
+                                    || argument->getType()->isAggregateType()))  // an interface's data word
+                                known = false;
+                    }
+                    if (!known) break;
+                }
+                if (!known) break;
+            }
+        }
+        if (known) out.assign(borrowed.begin(), borrowed.end());
+        else if (!parseTreeAnswer()) out.clear();
+        else known = true;
+        if (provisional)
+        {
+            std::pair<bool, std::vector<std::pair<unsigned, unsigned>>> now{ known, out };
+            auto it = returnBorrowApprox_.find(fn);
+            if (it == returnBorrowApprox_.end() || it->second != now)
+            {
+                returnBorrowApprox_[fn] = now;
+                returnBorrowApproxChanged_ = true;
+            }
+            if (!returnBorrowInProgress_.empty()) return known;  // an enclosing summary iterates
+            // Outermost of a recursive group: re-run until no approximation moves (monotone, so a
+            // small cap only guards pathological input; hitting it answers unknown).
+            returnBorrowProvisional_ = enclosingProvisional;
+            if (returnBorrowApproxChanged_ && returnBorrowIterations_ < 12)
+            {
+                returnBorrowApproxChanged_ = false;
+                ++returnBorrowIterations_;
+                return ReturnBorrowedArguments(fn, out, pending);
+            }
+            if (returnBorrowApproxChanged_)
+            {
+                known = false;
+                out.clear();
+            }
+            returnBorrowApprox_.clear();
+            returnBorrowIterations_ = 0;
+            returnBorrowApproxChanged_ = false;
+        }
+        returnBorrowMemo_[fn] = { known, out };
+        return known;
+    }
+
 bool LLVMBackend::ParameterIsMove(const llvm::Function* fn, unsigned argIndex) const
 {
         const FunctionSymbol* sym = FindSymbolForFunction(fn);
@@ -5629,6 +6150,30 @@ bool LLVMBackend::ParameterIsMove(const llvm::Function* fn, unsigned argIndex) c
             llvmIndex += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
         }
         return false;
+    }
+
+llvm::Type* LLVMBackend::ParameterPointeeStructType(const llvm::Function* fn, unsigned argIndex) const
+{
+        const FunctionSymbol* sym = FindSymbolForFunction(fn);
+        if (sym == nullptr || sym->Recipe.hasLowering || sym->IsCxx || ArgumentIsMethodReceiver(fn, argIndex))
+            return nullptr;
+        size_t expanded = 0;
+        for (const auto& param : sym->Parameters)
+            expanded += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+        unsigned llvmIndex = sym->IsMethod && fn->arg_size() == expanded + 1 ? 1u : 0u;
+        for (const auto& param : sym->Parameters)
+        {
+            if (llvmIndex == argIndex)
+            {
+                // A single-level pointer to a named struct: the callee reads one such object.
+                if (!param.Pointer || param.PointerDepth > 1 || ParameterCarriesRawArrayCount(param)
+                    || param.TypeName.empty())
+                    return nullptr;
+                return llvm::StructType::getTypeByName(*context, param.TypeName);
+            }
+            llvmIndex += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+        }
+        return nullptr;
     }
 
 bool LLVMBackend::TypeHoldsPointer(const llvm::Type* t) const
@@ -6373,6 +6918,13 @@ void LLVMBackend::RegisterOwnedStructTemp(llvm::Value* alloca, const std::string
         pendingOwnedStructTemps.push_back({ alloca, typeName, builder->GetInsertBlock() });
     }
 
+void LLVMBackend::RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName,
+                                          llvm::Value* liveFlag)
+{
+        if (alloca == nullptr || typeName.empty()) return;
+        pendingOwnedStructTemps.push_back({ alloca, typeName, builder->GetInsertBlock(), liveFlag });
+    }
+
 void LLVMBackend::RegisterOwnedBraceListTemp(llvm::Value* array, const std::string& typeName,
                                              uint64_t count)
 {
@@ -6545,6 +7097,13 @@ void LLVMBackend::UnregisterOwnedStructTemp(llvm::Value* value)
         if (value == nullptr) return;
         std::erase_if(pendingOwnedStructTemps,
             [&](const PendingOwnedStructTemp& e) { return e.Alloca == value; });
+    }
+
+void LLVMBackend::ReleaseOwnedStructTempInPlace(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        for (auto& e : pendingOwnedStructTemps)
+            if (e.Alloca == value) e.Alloca = nullptr;
     }
 
 size_t LLVMBackend::MarkAliasDeclTemps() const
@@ -6742,15 +7301,16 @@ bool LLVMBackend::AdoptTernaryArmStructTemps(llvm::PHINode* join)
         {
             bool found = false;
             for (size_t i = 0; i < pendingOwnedStructTemps.size() && !found; ++i)
-                for (auto* user : pendingOwnedStructTemps[i].Alloca->users())
-                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
-                        store != nullptr && store->getValueOperand() == incoming
-                        && store->getPointerOperand() == pendingOwnedStructTemps[i].Alloca)
-                    {
-                        armEntries.push_back(i);
-                        found = true;
-                        break;
-                    }
+                if (pendingOwnedStructTemps[i].Alloca != nullptr)  // released in place
+                    for (auto* user : pendingOwnedStructTemps[i].Alloca->users())
+                        if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                            store != nullptr && store->getValueOperand() == incoming
+                            && store->getPointerOperand() == pendingOwnedStructTemps[i].Alloca)
+                        {
+                            armEntries.push_back(i);
+                            found = true;
+                            break;
+                        }
             if (!found) return false;
         }
         std::sort(armEntries.begin(), armEntries.end());

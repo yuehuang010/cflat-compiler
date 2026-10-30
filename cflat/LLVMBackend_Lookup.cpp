@@ -747,6 +747,8 @@ bool LLVMBackend::IsCxxMacroGlobalName(const std::string& name)
 bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
 {
         if (arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr) return true;
+        // A wrapped CFlat closure: a variable crosses as its own slot, anything else as a temporary.
+        if (!arg.CxxClosureSignature.empty()) return !arg.CxxClosureBorrowed;
         // Rvalue-ness must be PROVEN. Without argument provenance nothing is proven, and an
         // argument that has addressable storage or came back as a reference is an lvalue.
         // An imported integer-zero macro expands to an integer literal prvalue in C++.

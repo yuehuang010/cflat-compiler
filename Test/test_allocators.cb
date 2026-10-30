@@ -840,7 +840,7 @@ class ProgramPayload : IMessage
     int _value = 0;
 };
 
-arena_channel<IMessage> g_ac_chan = default;
+arena_channel<IMessage>* g_ac_chan = nullptr;
 int g_chan_errors = 0;
 
 int producer(void* unused)
@@ -848,7 +848,7 @@ int producer(void* unused)
     int i = 0;
     while (i < 1000)
     {
-        page_arena<IMessage>* pa = g_ac_chan.acquire_arena();
+        page_arena<IMessage>* pa = g_ac_chan->acquire_arena();
 
         ChannelPayload* msg = (ChannelPayload*)pa->alloc(sizeof(ChannelPayload));
         msg->_value     = i;
@@ -863,10 +863,10 @@ int producer(void* unused)
             j = j + 1;
         }
 
-        g_ac_chan.send(pa);
+        g_ac_chan->send(pa);
         i = i + 1;
     }
-    g_ac_chan.send(nullptr);
+    g_ac_chan->send(nullptr);
     return 0;
 }
 
@@ -874,7 +874,7 @@ int consumer(void* unused)
 {
     while (true)
     {
-        page_arena<IMessage>* pa = g_ac_chan.recv();
+        page_arena<IMessage>* pa = g_ac_chan->recv();
         if (pa == nullptr) break;
 
         IMessage root = pa->_root;
@@ -893,14 +893,16 @@ int consumer(void* unused)
             j = j + 1;
         }
 
-        g_ac_chan.release_arena(pa);
+        g_ac_chan->release_arena(pa);
     }
     return 0;
 }
 
 bool testArenaChannel()
 {
-    g_ac_chan.init(128, 65536);
+    arena_channel<IMessage> channel = default;
+    g_ac_chan = &channel;
+    g_ac_chan->init(128, 65536);
 
     Thread prod = default;
     Thread cons = default;
@@ -911,11 +913,12 @@ bool testArenaChannel()
     prod.join();
     cons.join();
 
-    g_ac_chan.destroy();
+    g_ac_chan->destroy();
+    g_ac_chan = nullptr;
     return g_chan_errors == 0;
 }
 
-arena_channel<IMessage> g_ac_prog = default;
+arena_channel<IMessage>* g_ac_prog = nullptr;
 
 program ArenaConsumerGlobal
 {
@@ -925,13 +928,13 @@ program ArenaConsumerGlobal
     {
         while (true)
         {
-            page_arena<IMessage>* pa = g_ac_prog.recv();
+            page_arena<IMessage>* pa = g_ac_prog->recv();
             if (pa == nullptr) break;
 
             IMessage root = pa->_root;
             ProgramPayload* msg = root as ProgramPayload;
             total = total + msg->_value;
-            g_ac_prog.release_arena(pa);
+            g_ac_prog->release_arena(pa);
         }
         return total;
     }
@@ -939,7 +942,9 @@ program ArenaConsumerGlobal
 
 bool testArenaProgram()
 {
-    g_ac_prog.init(128, 65536);
+    arena_channel<IMessage> channel = default;
+    g_ac_prog = &channel;
+    g_ac_prog->init(128, 65536);
 
     ArenaConsumerGlobal w;
     list<string> args;
@@ -948,19 +953,20 @@ bool testArenaProgram()
     int i = 0;
     while (i < 100)
     {
-        page_arena<IMessage>* pa = g_ac_prog.acquire_arena();
+        page_arena<IMessage>* pa = g_ac_prog->acquire_arena();
 
         ProgramPayload* msg = (ProgramPayload*)pa->alloc(sizeof(ProgramPayload));
         msg->_value = i + 1;
         pa->_root   = msg;
 
-        g_ac_prog.send(pa);
+        g_ac_prog->send(pa);
         i = i + 1;
     }
-    g_ac_prog.send(nullptr);
+    g_ac_prog->send(nullptr);
 
     w.WaitForExit();
-    g_ac_prog.destroy();
+    g_ac_prog->destroy();
+    g_ac_prog = nullptr;
 
     return w.exitCode == 5050;
 }

@@ -1,0 +1,36 @@
+// T518: a `?:` argument of an unbound C++ free wrapper (anonymous-namespace t518) whose `default`
+// arm cannot be typed before the call is refused rather than given a guessed type.
+import cpp "../library/cpp_interop_lastuse.h";
+
+cpptw.Twin errT518RetTw() { return default; }
+
+extern int main(int argc, char** argv)
+{
+    bool c = argc > 1;
+    // A conversion arm: no single overload takes the arm's class, so `default` has no proven type.
+    expect_error("'default' in the '?:' argument 1 of C++ 't518.take' takes the class of its other arm") {
+        t420look.Look lk = default;
+        int a = t518.take(c ? default : lk);
+    }
+    // Only `default` arms: the conditional itself has no type.
+    expect_error("the '?:' argument 1 of C++ 't518.take' has only 'default' arms") {
+        int b = t518.take(c ? default : (default));
+    }
+    // The trailing bare `default` has no target, with or without the call arm beside it.
+    expect_error("'default' needs a known target type here") {
+        int d = t518.take2(c ? default : errT518RetTw(), default);
+    }
+    // The selected callee's parameter is another class reached through a template converting ctor.
+    expect_error("'default' in the '?:' argument 1 of C++ 't518.convert' takes the class of its other arm") {
+        t518.Arm arm = t518.Arm(7);
+        int e = t518.convert(c ? default : arm, 2);
+    }
+    // A non-trivially-copyable class into a by-value parameter that a later argument names is
+    // copy-constructed at its position and the selected callee called by address; a default
+    // argument that is not a constant cannot be supplied on that call, so it refuses.
+    expect_error("argument 1 of C++ 't518.dyndef' initializes a by-value 't418.Val' parameter") {
+        t418.Val v = t418.Val(7);
+        int f = t518.dyndef(v, t418.mutate(v));
+    }
+    return 0;
+}

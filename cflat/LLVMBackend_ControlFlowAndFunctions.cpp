@@ -754,7 +754,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             }
         };
         auto markBorrowedPointerReturn = [&](llvm::Value* result, const TypeAndValue& returnType) {
-            if (!returnType.Pointer || returnType.IsMove) return;
+            // T522: an interface result is a borrow too unless the signature says `move`.
+            const bool fatResult = result != nullptr && GetFatPtrType() != nullptr
+                && result->getType() == GetFatPtrType();
+            if ((!returnType.Pointer && !fatResult) || returnType.IsMove) return;
             if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(result))
                 call->setMetadata("cflat.borrowed-pointer-return", llvm::MDNode::get(*context, {}));
         };
@@ -1375,7 +1378,8 @@ std::string LLVMBackend::DescribeConditionType(llvm::Type* t) const
         }
         if (t->isArrayTy())  return "array";
         if (t->isVectorTy()) return "vector";
-        return "value";
+        if (t->isVoidTy()) return "void";
+        return "unknown";
     }
 
 llvm::CondBrInst* LLVMBackend::CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)

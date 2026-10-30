@@ -5398,6 +5398,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // The call site the postfix lowering named for THIS call (nested calls already ran).
         const void* receiverCallSite = std::exchange(pendingCallSite_, nullptr);
         const std::string receiverText = std::exchange(pendingReceiverText_, std::string());
+        const auto callReceiver = std::exchange(pendingCallReceiver_, std::nullopt);
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
         if (!forceRoot && dataStructures.count(functionName) != 0
             && (currentFunction == nullptr || currentFunction->getName() != functionName)
@@ -8558,6 +8559,69 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
 
         // Check: bonded value must not be passed to a move parameter (would transfer ownership out of scope).
+        auto bondedDestinationWithinSources = [&](size_t sourceIndex) {
+            if (candidate.Function == nullptr || sourceIndex >= candidate.Parameters.size()
+                || !matched[sourceIndex].FieldName.empty())
+                return false;
+            auto sourceLLVM = CFlatParameterLLVMIndex(candidate, (unsigned)sourceIndex);
+            if (!sourceLLVM.has_value()) return false;
+            bool nonParameterSink = false;
+            const auto sinks = FunctionArgumentStoreSinks(candidate.Function, *sourceLLVM,
+                                                          nonParameterSink);
+            if (sinks.empty() || nonParameterSink) return false;
+            bool foundSink = false;
+            for (unsigned sinkLLVM : sinks)
+            {
+                size_t sinkIndex = candidate.Parameters.size();
+                for (size_t j = 0; j < candidate.Parameters.size(); ++j)
+                    if (auto paramLLVM = CFlatParameterLLVMIndex(candidate, (unsigned)j);
+                        paramLLVM.has_value() && *paramLLVM == sinkLLVM)
+                    {
+                        sinkIndex = j;
+                        break;
+                    }
+                if (sinkIndex == candidate.Parameters.size()) return false;
+                const NamedVariable* destination = nullptr;
+                if (candidate.IsMethod && sinkIndex == 0 && callReceiver.has_value())
+                    destination = &*callReceiver;
+                else if (sinkIndex < matched.size())
+                    destination = &matched[sinkIndex];
+                if (destination == nullptr || destination->CallerName.empty()
+                    || !destination->FieldName.empty())
+                    return false;
+                const NamedVariable* destinationLocal = nullptr;
+                for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+                    if (auto it = frame.namedVariable.find(destination->CallerName);
+                        it != frame.namedVariable.end())
+                    {
+                        destinationLocal = &it->second;
+                        break;
+                    }
+                if (destinationLocal == nullptr || destinationLocal->TypeAndValue.Pointer
+                    || destinationLocal->TypeAndValue.ElemPointer
+                    || IsFunctionParameter(destination->CallerName)) return false;
+                const size_t destinationDepth = FindVariableScopeDepth(destination->CallerName);
+                if (destinationDepth == SIZE_MAX) return false;
+                for (const auto& source : matched[sourceIndex].BondedSources)
+                {
+                    const size_t sourceDepth = FindVariableScopeDepth(source);
+                    if (sourceDepth == SIZE_MAX || destinationDepth < sourceDepth)
+                        return false;
+                    // Same scope: locals die in reverse declaration order, so the destination
+                    // must be declared after the source.
+                    if (destinationDepth == sourceDepth)
+                    {
+                        const NamedVariable sourceLocal = GetScopedLocalOrArgument(source);
+                        if (sourceLocal.DeclSequence == 0 || destinationLocal->DeclSequence == 0
+                            || destinationLocal->DeclSequence <= sourceLocal.DeclSequence)
+                            return false;
+                    }
+                }
+                foundSink = true;
+            }
+            return foundSink;
+        };
+
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
             bool isCoreUniqueConstructor = i == 0 && IsCoreUniqueType(functionName);
@@ -8675,9 +8739,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         // type says the callee takes ownership.
                         || (!sinkParam.Pointer && IsCoreUniqueType(sinkParam.TypeName))
                         || foreignCxxPointerSink);
+                // The implicit receiver is stored as '<Type>__'; diagnostics name it 'this'.
+                const bool implicitThis = candidate.IsMethod && i == 0
+                    && sinkParam.VariableName == sinkParam.TypeName + "__";
+                const std::string sinkParamName = implicitThis ? "this" : sinkParam.VariableName;
                 if (paramIsSink)
                     DiagnoseBorrowedMoveSinkArg(diagnosticFunctionName,
-                        sinkParam.VariableName, matched[i]);
+                        sinkParamName, matched[i]);
+                if (!sinkParam.ViewFieldMovePaths.empty())
+                    DiagnoseBorrowedViewFieldMoveArg(diagnosticFunctionName,
+                        sinkParamName, matched[i], sinkParam.ViewFieldMovePaths,
+                        candidate.IsMethod && i == 0);
             }
 
             // [immovable]: a by-value or `move` parameter takes the value itself, so passing any
@@ -8693,19 +8765,72 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         "parameter of '{}' - the type is [immovable], so its value may not be transferred",
                         { p.VariableName, SpellDiagnosticType(*this, a.TypeAndValue), SpellFunctionSymbol(*this, diagnosticFunctionName) });
             }
-            if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
+            if (candidate.Parameters[i].IsMove && matched[i].IsBonded
+                && !bondedDestinationWithinSources(i))
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "move" });
+            if (candidate.Function != nullptr && matched[i].IsBonded
+                && !matched[i].BondedSources.empty())
+            {
+                const auto sourceLLVM = CFlatParameterLLVMIndex(candidate, (unsigned)i);
+                const bool stores = sourceLLVM.has_value()
+                    && FunctionArgumentDefinitelyStoresOutsideCall(candidate.Function,
+                                                                   *sourceLLVM, true);
+                const bool hasNamedStoreDestination = sourceLLVM.has_value()
+                    && !FunctionArgumentStoreDestinations(candidate.Function,
+                                                          *sourceLLVM).empty();
+                bool coreListMethod = false;
+                if (candidate.IsMethod && !candidate.Parameters.empty()
+                    && candidate.Parameters.front().Pointer)
+                {
+                    std::string_view base = MangledBase(candidate.Parameters.front().TypeName);
+                    if (size_t dot = base.rfind('.'); dot != std::string_view::npos)
+                        base.remove_prefix(dot + 1);
+                    coreListMethod = base == "list"
+                        && gts.coreGenericTemplates.count(
+                            std::string(MangledBase(candidate.Parameters.front().TypeName))) != 0;
+                }
+                if (stores && (matched[i].CallerName.empty() || candidate.IsMethod
+                        || hasNamedStoreDestination) && !coreListMethod
+                    && !bondedDestinationWithinSources(i))
+                    LogErrorMessage(
+                        "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable",
+                        {});
+            }
             if ((OwningSinkConsumesConcrete(candidate.Parameters[i])
                     || (candidate.Parameters[i].IsConsumeInferredSink
-                        && !candidate.Parameters[i].IsReturnInferredSink
-                        && !candidate.Parameters[i].IsWriteInferredSink))
-                && matched[i].IsBonded)
+                    && !candidate.Parameters[i].IsReturnInferredSink
+                    && !candidate.Parameters[i].IsWriteInferredSink))
+                && matched[i].IsBonded && !bondedDestinationWithinSources(i))
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "consuming" });
             // A core unique<T> wrapper owns one T, never a raw new T[n] allocation. The source
             // provenance is visible here before move transfer; unknown sources fail open.
             const auto& arg = matched[i];
+            const auto& adoptedParam = candidate.Parameters[i];
+            const bool coreUniqueReceiver = candidate.IsMethod
+                && !candidate.Parameters.empty()
+                && IsCoreUniqueType(candidate.Parameters.front().TypeName);
+            const bool directUniqueAdoption =
+                (i == 0 && IsCoreUniqueType(functionName))
+                || (coreUniqueReceiver && i > 0);
+            if (adoptedParam.IsMove && adoptedParam.Pointer
+                && !adoptedParam.ElemPointer && !adoptedParam.IsArrayView)
+            {
+                RecordUniqueAdoptionForward(arg, candidate.Function,
+                    static_cast<unsigned>(i), directUniqueAdoption);
+                if (directUniqueAdoption || adoptedParam.IsUniqueAdoptedParam)
+                    MarkCurrentMoveParamUniqueAdopted(arg);
+                if (HasRawNewArrayProvenance(arg)
+                    && (arg.SourceExpressionContext != nullptr || receiverCallSite != nullptr))
+                    RecordUniqueAdoptionArrayCall(candidate.Function,
+                        static_cast<unsigned>(i), arg, adoptedParam.VariableName,
+                        diagnosticFunctionName, directUniqueAdoption,
+                        receiverCallSite != nullptr
+                            ? static_cast<antlr4::ParserRuleContext*>(
+                                const_cast<void*>(receiverCallSite))
+                            : nullptr);
+            }
             if (!candidate.Parameters[i].Pointer
                 && IsCoreUniqueType(candidate.Parameters[i].TypeName)
                 && HasRawNewArrayProvenance(arg))
@@ -8840,6 +8965,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             bindKinds = sig->paramBindKinds;
                             break;
                         }
+            // T518: a trivially copyable early snapshot is the argument only for a by-value selection.
+            // (A non-trivially-copyable early copy is decided by SwitchCxxDirectByValueCall; unset
+            // here, it stays unconstructed.)
+            for (size_t i = 0; i < matched.size(); ++i)
+                if (llvm::StoreInst* decision = matched[i].CxxEarlyCopyDecision;
+                    decision != nullptr && matched[i].CxxEarlyCopySlot == nullptr)
+                    decision->setOperand(0, builder->getInt1(i < bindKinds.size() && bindKinds[i] == 'v'));
             slotBefore = matched;
             for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
             {
@@ -9212,6 +9344,36 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (cxxVirtualCallee != nullptr) argList[0] = adjustedThis;
             }
         }
+        /*
+         * A C++ class parameter the callee destroys (MSVC, [[clang::trivial_abi]]) passed in
+         * registers or coerced: an owned prvalue's destruction moves to the callee at the call, as
+         * the indirect path above does. Nothing that can unwind is emitted between here and the call.
+         */
+        if (candidate.IsCxx && candidate.Recipe.hasLowering)
+            for (size_t i = 0; i < candidate.Recipe.paramSlots.size() && i < candidate.Parameters.size()
+                            && i < matched.size(); ++i)
+            {
+                if (candidate.Recipe.paramSlots[i].kind == AbiSlot::ByVal) continue;
+                const TypeAndValue& param = candidate.Parameters[i];
+                // A reference parameter (`const X&`, `X&&`) is passed as an address, never handed over.
+                if (param.Pointer || param.PointerDepth != 0 || param.IsCxxRef() || param.IsRvalueRef
+                    || !IsForeignNontrivialCxxClass(param.TypeName)
+                    || !IsCxxParamDestroyedInCallee(param.TypeName))
+                    continue;
+                llvm::Type* classTy = GetType(TypeAndValue{ .TypeName = param.TypeName });
+                if (classTy == nullptr || !IsOwnedCxxPrvalueArgument(matched[i], classTy)) continue;
+                if (auto* storageJoin = llvm::dyn_cast_or_null<llvm::PHINode>(matched[i].Storage))
+                    for (unsigned arm = 0; arm < storageJoin->getNumIncomingValues(); ++arm)
+                        UnregisterOwnedStructTemp(storageJoin->getIncomingValue(arm));
+                else
+                    UnregisterOwnedStructTemp(matched[i].Storage);
+            }
+        // T518: a by-value selection called through the selected callee's address (its getter).
+        if (cxxVirtualCallee == nullptr && candidate.IsCxx)
+            if (auto getter = cxxDirectCalleeGetters_.find(candidate.UniqueName);
+                getter != cxxDirectCalleeGetters_.end())
+                cxxVirtualCallee = builder->CreateCall(module->getOrInsertFunction(
+                    getter->second, llvm::FunctionType::get(builder->getPtrTy(), false)), {}, "cxx.direct.callee");
 
         const bool calleeMayUnwind = CalleeMayUnwind(candidate);
         // Only this call's own invoke treats the sink arguments as handed over; an unwind out of
@@ -9520,8 +9682,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     const unsigned slotCount = useRecipeSlots
                         ? SlotLLVMParamCount(candidate.Recipe.paramSlots[i])
                         : (ParameterCarriesRawArrayCount(candidate.Parameters[i]) ? 2u : 1u);
+                    const bool closureResultBorrowsClosureArg =
+                        candidate.Function->getReturnType() == GetClosureFatPtrType()
+                        && i < argList.size() && argList[i] != nullptr
+                        && argList[i]->getType() == GetClosureFatPtrType();
                     if (matched[i].IsBonded && !matched[i].BondedSources.empty()
-                        && ParameterMayReachReturn(candidate.Function, llvmParamIndex))
+                        && (closureResultBorrowsClosureArg
+                            || ParameterMayReachReturn(candidate.Function, llvmParamIndex)))
                     {
                         lastCallIsBonded = true;
                         for (const auto& source : matched[i].BondedSources)
@@ -9531,6 +9698,28 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     }
                     llvmParamIndex += slotCount;
                 }
+            }
+        }
+
+        // A bonded closure passed by value cannot be kept by a callee whose parameter summary
+        // proves it stores the value beyond this call. Allow only destinations in the source scope.
+        if (candidate.Function != nullptr)
+        {
+            for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); ++i)
+            {
+                if (i >= argList.size() || argList[i] == nullptr
+                    || argList[i]->getType() != GetClosureFatPtrType()
+                    || !matched[i].IsBonded || matched[i].BondedSources.empty()) continue;
+                const auto argIndex = CFlatParameterLLVMIndex(candidate, (unsigned)i);
+                const bool stores = argIndex.has_value()
+                    && FunctionArgumentDefinitelyStoresOutsideCall(candidate.Function,
+                                                                   *argIndex, true);
+                if (!stores) continue;
+
+                if (!bondedDestinationWithinSources(i))
+                    LogErrorMessage(
+                        "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable",
+                        {});
             }
         }
 

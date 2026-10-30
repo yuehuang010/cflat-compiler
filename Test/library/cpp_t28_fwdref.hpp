@@ -5,6 +5,7 @@
 #include <vector>
 #include <optional>
 #include <tuple>
+#include <utility>
 // forward_as_tuple-shaped templates whose result refers to their arguments (t28): a string
 // literal or function name forwarded through a generated wrapper must not leave the reference
 // pointing into the wrapper's dead frame.
@@ -154,4 +155,53 @@ struct Mixed {
     template<class U> __attribute__((noinline)) const char* const* aw(const char* const& p, const U&) { std::cflat_t28::chosen = 1; return &p; }
     const char* const* aw(const char (&)[4], const int&) { std::cflat_t28::chosen = 2; return std::cflat_t28::other(); }
 };
+}
+// T525: results that keep a reference to a forwarded CFlat closure variable (the caller's own slot).
+namespace t525 {
+inline int dtors = 0;
+template<class F> std::function<int(int)> holdfnref(F&& f) { return std::function<int(int)>(std::ref(f)); }
+template<class F> std::function<int(int)> holdfncopy(F&& f) { return std::function<int(int)>(f); }
+template<class F> class BorrowDtor { F* p; public: BorrowDtor(F* q) : p(q) {} ~BorrowDtor() { ++dtors; } int run(int x) { return (*p)(x); } };
+template<class F> BorrowDtor<std::remove_reference_t<F>> holdborrowdtor(F&& f) { return BorrowDtor<std::remove_reference_t<F>>(&f); }
+template<class F> class Owner { F* p; public: Owner(const F& f) : p(new F(f)) {} Owner(const Owner& o) : p(new F(*o.p)) {} ~Owner() { ++dtors; delete p; } int run(int x) { return (*p)(x); } };
+template<class F> class Borrow { F* p; public: Borrow(F& f) : p(&f) {} int run(int x) { return (*p)(x); } };
+template<class F> class Mixed { Owner<F> o; Borrow<F> b; public: Mixed(F& f) : o(f), b(f) {} int run(int x) { return o.run(x) * 100 + b.run(x); } };
+template<class F> Mixed<std::remove_reference_t<F>> holdmixed(F&& f) { return Mixed<std::remove_reference_t<F>>(f); }
+struct NoOp { template<class T> void operator()(T*) const noexcept { ++dtors; } };
+template<class F> std::unique_ptr<std::remove_reference_t<F>, NoOp> holdnoop(F&& f) { return std::unique_ptr<std::remove_reference_t<F>, NoOp>(&f); }
+template<class T> int rununique(T& t) { return (*t)(5); }
+template<class F, class G> class Mixed2 : Borrow<G> { Owner<F> o; public: Mixed2(F& f, G& g) : Borrow<G>(g), o(f) {} int run(int x) { return o.run(x) + Borrow<G>::run(x); } };
+template<class F, class G> std::optional<Mixed2<std::remove_reference_t<F>, std::remove_reference_t<G>>> holdmixed2(F&& f, G&& g) { return Mixed2<std::remove_reference_t<F>, std::remove_reference_t<G>>(f, g); }
+template<class T> int runoptmixed(T& t) { return t->run(5); }
+template<class P, class F> class Decor { P p; F f; public: Decor(P q, const F& g) : p(q), f(g) {} Decor(const Decor& o) : p(o.p), f(o.f) {} ~Decor() { ++dtors; } int run(int x) { return p ? 0 : f(x); } };
+template<class F> Decor<int*, std::remove_reference_t<F>> holddecor(F&& f) { return Decor<int*, std::remove_reference_t<F>>(nullptr, f); }
+template<class F> int category(F&&) { return std::is_lvalue_reference_v<F> ? 1 : 2; }
+template<class F> F&& pass(F&& f) { return static_cast<F&&>(f); }
+template<class F> int call5(F&& f) { return f(5); }
+template<class F> const void* address(F& f) { return static_cast<const void*>(&f); }
+using Fp = int (*)(int);
+inline Fp& fwdfp(Fp& p) { return p; }
+inline int add2(int v) { return v + 2; }
+// Out-of-line keeper: declared only, so the walk cannot see whether it keeps f (T525 r3).
+struct OpaqueHandle { int id; };
+template<class F> OpaqueHandle opaquekeep(F& f);
+template<class F> OpaqueHandle holdopaque(F&& f) { return opaquekeep(f); }
+// A helper returning the closure by reference is an alias: a copy of it keeps nothing (T525 r4).
+template<class F> struct ConstCopy { F value; explicit ConstCopy(const F& f) : value(std::as_const(f)) {} int operator()(int x) const { return value(x); } };
+template<class F> std::function<int(int)> holdconstcopy(F&& f) { return std::function<int(int)>(ConstCopy<std::remove_reference_t<F>>(f)); }
+template<class F> std::function<int(int)> holdasconst(F&& f) { return std::function<int(int)>(std::as_const(f)); }
+template<class F> struct ConstRef { const F& value; explicit ConstRef(const F& f) : value(std::as_const(f)) {} int operator()(int x) const { return value(x); } };
+template<class F> std::function<int(int)> holdconstref(F&& f) { return std::function<int(int)>(ConstRef<std::remove_reference_t<F>>(f)); }
+// Both arms of a ?: alias the closure: a copy of the result keeps nothing, a reference member keeps f (T525 r5).
+template<class F> F& condid(F& f) { return f; }
+template<class F> std::function<int(int)> holdcondcopy(F&& f) { return std::function<int(int)>(true ? condid(f) : condid(f)); }
+template<class F> struct CondRef { F& f; int operator()(int x) const { return f(x); } };
+template<class F> std::function<int(int)> holdcondref(F&& f) { return std::function<int(int)>(CondRef<std::remove_reference_t<F>>{ true ? condid(f) : condid(f) }); }
+// A brace-bound reference is the closure itself; an unevaluated sizeof keeps nothing (T525 r6).
+template<class F> std::function<int(int)> holdbraceref(F&& g) { std::remove_reference_t<F>& r{ g }; return std::function<int(int)>(CondRef<std::remove_reference_t<F>>{ r }); }
+template<class F> std::function<int(int)> holdbracelist(F&& g) { return std::function<int(int)>(CondRef<std::remove_reference_t<F>>{ { g } }); }
+template<class F> std::function<int(int)> holdsizeof(F&& g) { (void)sizeof(CondRef<std::remove_reference_t<F>>{ g }); return std::function<int(int)>(g); }
+// sizeof of a VLA type evaluates its bound, so the stash runs and keeps &g (T525 r7).
+template<class F> int vlastash(F& g, F*& out) { out = &g; return 1; }
+template<class F> std::function<int(int)> holdvla(F&& g) { std::remove_reference_t<F>* p = nullptr; (void)sizeof(char[vlastash(g, p)]); return std::function<int(int)>([p](int x) { return (*p)(x); }); }
 }

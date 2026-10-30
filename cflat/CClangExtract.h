@@ -206,6 +206,20 @@ namespace cflat_cinterop
         // (WrapperParameterBindKinds): '.' unused, 'v'/'r' by value / reference, 'V'/'R' the same
         // for a pointer slot the wrapper dereferences (the callee reads the caller's storage).
         std::string paramBindKinds;
+        // Generated wrappers only (T518): per argument of the call the wrapper makes, '.' when it is
+        // not a `?:`, '=' when the selected callee's parameter is the conditional's own class (by
+        // value or reference), '!' when it is another class (WrapperConditionalArgumentKinds).
+        std::string conditionalArgumentKinds;
+        // Generated wrappers only (T525): ",pK," for each `void *` closure-slot parameter whose
+        // closure object the callee keeps by reference (std::ref, address, reference member or
+        // reference variable, a lambda by-reference capture), following reference parameters.
+        std::string closureKeptParams;
+        // Generated wrappers only (T518): the outermost free call's selected callee - canonical
+        // function type and its default arguments - for the by-address by-value call.
+        std::string selectedCalleeType;
+        // "<args>" when the selected callee is a function template specialization, else empty.
+        std::string selectedCalleeTemplateArgs;
+        std::vector<RawDefaultArg> selectedCalleeDefaults;
         bool variadic = false;
         bool isCxx = false;
         bool isInline = false;

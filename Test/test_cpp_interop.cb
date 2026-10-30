@@ -263,12 +263,7 @@ import cpp "compare";
 
 struct T74Wrap { cflat_t74.Track track; int z = 5; };
 struct T131PtrSlot { int* p; };
-T74Wrap[2] t74Global;
-T74Wrap[2][3] t74Grid;
 struct T74Nested { T74Wrap item; };
-T74Nested[2] t74Nested;
-T74Wrap t74Scalar;
-namespace T74Ns { T74Wrap[2] values; }
 cflat_t74.Probe[2] t74Direct;  // direct C++ array: exactly one ctor per element (clang: 2)
 int t74StaticLocalArray()
 {
@@ -1983,6 +1978,7 @@ struct T72FieldU10 { cppi.Tracked value = cppi.Tracked(cppi.Tracked(6).value());
 struct T72FieldU13 { cppi.Tracked value = cppi.make_tracked(cppi.Tracked(8).value()); T72FieldU13() { } };
 struct T72FieldN9 { cppi.Tracked value = cppi.Tracked(4).twice(); };
 struct T73Holder { cpp_t73.Mix mix; };
+thread_local T73Holder t73ThreadGlobal = default;
 struct T73ArrayHolder { cpp_t73.Mix items[2]; };
 struct T73Nested { T73Holder holder; };
 struct T134EmptyOnlyFieldHolder { t63.EmptyOnly value = {}; };
@@ -2022,13 +2018,10 @@ t135.DefList[2] t136GlobalDefArr = { {}, {} };
 // The outer `= {}` of an array: every element is value-initialized at startup as well.
 t135.T136List[2] t136GlobalOuter = {};
 t135.DefList[2] t136GlobalDefOuter = {};
-// T136 ORDER: C++ and CFlat globals are constructed in DECLARATION order by one initializer. A
-// native constructor global and a native array of `{}` both sit between two C++ globals.
+// T136 ORDER: foreign C++ globals keep clang declaration order. Native defaults are local.
 import cpp "library/cpp_t136_order.hpp";
 struct T136Ord { int v; T136Ord() { v = t136ord.mark(); } };
 t136ord.Stamp t136OrdBefore = default;
-T136Ord t136OrdOne;
-T136Ord[2] t136OrdArr = {};
 t136ord.Stamp t136OrdAfter = default;
 // T136: a list-only class array FIELD with an empty `= {}` brace: each element is value-initialized.
 struct T136FieldEmpty { t135.T136List[2] a = {}; int z; };
@@ -2066,8 +2059,8 @@ int t312Dt = 0;
 struct T312E { string s; int w = 0; T312E() { t312Ct = t312Ct + 1; } ~T312E() { t312Dt = t312Dt + 1; } };
 struct T312O { T312E[2] h; };
 struct T312O2 { T312O[2] a; };
-T312E t312Gx = default;
-struct T312FD { T312E[2] h = { t312Gx, t312Gx }; };
+T312E* t312Gx = nullptr;
+struct T312FD { T312E[2] h = { t312Gx[0], t312Gx[0] }; };
 struct T312RootFD { T312FD f; };
 int t468Alloc = 0;
 int t468Live = 0;
@@ -2450,7 +2443,6 @@ int T228ThrowWrapper(int x)
     T130ThrowHolder s = T228ThrowSibling(x);
     return s.t.get();
 }
-T73Holder t73Global = default;
 // T94 B: a [cpp] struct in a namespace whose name ends in '_'. Its generated identity must decode
 // back to ns_.Self, not ns._Self (clang++ oracle: 0).
 namespace t94u_ { [cpp] struct Self : std.enable_shared_from_this<Self> { int value = default; }; }
@@ -2794,6 +2786,29 @@ struct T440ForwardTrivialHolder { int value; };
     int useCompound(int rhs) { *this += rhs; return this.value; }
 };
 
+// T513 r10: a throwing producer moved into the conversion wrapper unwinds through these frames.
+int T513R10ThrowNested(int x)
+{
+    T513R10Guard g = default;
+    bool c = true;
+    c ? (c ? t513R10FailA(x) : t513R9MakeA(0)) : t513R9MakeB();
+    return 0;
+}
+int T513R10ThrowReverse(int x)
+{
+    T513R10Guard g = default;
+    bool c = true;
+    !c ? t513R9MakeB() : t513R10FailA(x);
+    return 0;
+}
+int T513R10ThrowCtor(int x)
+{
+    T513R10Guard g = default;
+    bool c = true;
+    c ? T513R10ThrowA(x) : t513R10MakeThrowB();
+    return 0;
+}
+
 extern int main()
 {
     T440TrivialCppUnion t440Trivial = { plain = { u = 47 } };
@@ -2920,9 +2935,11 @@ extern int main()
         || t136GlobalDefOuter[0].which != 0 || t136GlobalDefOuter[1].which != 0
         || t135.defListDefaultCount() != 4 || t135.defListListCount() != 0)
         return 9337;
-    // T136 ORDER: the constructions above ran in declaration order: 1, 2, then 3 and 4, then 5.
-    if (t136OrdBefore.n != 1 || t136OrdOne.v != 2 || t136OrdArr[0].v != 3
-        || t136OrdArr[1].v != 4 || t136OrdAfter.n != 5)
+    // C++ globals initialize before main; native objects construct here in main.
+    T136Ord t136OrdOne;
+    T136Ord[2] t136OrdArr = {};
+    if (t136OrdBefore.n != 1 || t136OrdAfter.n != 2 || t136OrdOne.v != 3
+        || t136OrdArr[0].v != 4 || t136OrdArr[1].v != 5)
         return 9348;
     // T103 accept set frozen before C++ constructor-selection changes.
     if (t103.only_int(0) != 11 || t103.only_pointer(0) != 22) return 10301;
@@ -4115,6 +4132,162 @@ extern int main()
     // T233: a derived or base prvalue arm of a ternary slices into a base local through B's move ctor.
     t226s.reset();
     if (T233LocalDerivedTern(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93017;
+    // T513: bare class-call joins run the selected implicit conversion and destroy the joined object.
+    t513ResetCtorStats();
+    bool t513Pick = true;
+    t513Pick ? t513MakeA() : t513MakeC();
+    if (t513CtorStats() != 1011) return 95131;
+    t513ResetOperatorStats();
+    t513Pick ? t513MakeOp() : t513MakeOpTarget();
+    if (t513OperatorStats() != 33) return 95132;
+    t513ResetBaseStats();
+    t513Pick ? t513MakeDerived() : t513MakeBase();
+    if (t513BaseStats() != 1211) return 95133;
+    // T513 r4: a base with implicit copy/move slices through clang's wrapper; related lvalues bind by reference.
+    t513ResetPlainDtors();
+    t513Pick ? t513MakePlainDerived() : t513MakePlainBase();
+    if (t513PlainStats() != 3) return 95134;
+    t513ResetPlainDtors();
+    t513Pick = false;
+    t513Pick ? t513MakePlainDerived() : t513MakePlainBase();
+    if (t513PlainStats() != 1) return 95135;
+    t513ResetPlainDtors();
+    t513Pick = true;
+    { T513PlainDerived pd; T513PlainBase pb; t513Pick ? pd : pb; }
+    if (t513PlainStats() != 3) return 95136;
+    // T513 r4: a converting constructor TEMPLATE joins like its declared converting ctor.
+    t513TmplCtors = 0;
+    t513Pick ? t513MakeA() : t513MakeTmpl();
+    if (t513TmplCtors != 1) return 95137;
+    t513Pick = false;
+    t513TmplCtors = 0;
+    t513Pick ? t513MakeA() : t513MakeTmpl();
+    if (t513TmplCtors != 0) return 95138;
+    // T513 r4: a related lvalue beside a derived prvalue joins as the base; the prvalue arm slices.
+    t513Pick = true;
+    t513ResetPlainDtors();
+    { T513PlainDerived pd; t513Pick ? pd : t513MakePlainBase(); }
+    if (t513PlainStats() != 3) return 95139;
+    t513ResetPlainDtors();
+    { T513PlainBase pb; t513Pick ? t513MakePlainDerived() : pb; }
+    if (t513PlainStats() != 4) return 95140;
+    // T513 r5: clang's conversion rules pick the direction: defaulted template, inherited template,
+    // A&& constructor, and an undeducible template (only the other direction converts).
+    t513Pick = true;
+    t513ResetR5();
+    t513Pick ? t513R5MakeDefA() : t513R5MakeDefB();
+    if (t513R5Stats() != 1101) return 95141;
+    t513ResetR5();
+    t513Pick ? t513R5MakeInhA() : t513R5MakeInhB();
+    if (t513R5Stats() != 1101) return 95142;
+    t513ResetR5();
+    t513Pick ? t513R5MakeRvA() : t513R5MakeRvB();
+    if (t513R5Stats() != 1101) return 95143;
+    t513Pick = false;
+    t513ResetR5();
+    t513Pick ? t513R5MakeUndA() : t513R5MakeUndB();
+    if (t513R5Stats() != 1011) return 95144;
+    // T513 r6: clang's conditional rules on the actual arms: derived prvalue over base, reference result
+    // (no copy), and a const prvalue arm that selects the B(const K&&) overload.
+    t513Pick = true;
+    t513ResetR6();
+    t513Pick ? t513R6MakeD() : t513R6MakeB();
+    if (t513R6Stats() != 10210) return 95145;
+    t513ResetR6();
+    t513Pick ? t513R6GetConv() : t513R6GetNoCopy();
+    if (t513R6Stats() != 10) return 95146;
+    t513ResetR6();
+    t513Pick ? t513R6MakeK() : t513R6MakeKB();
+    if (t513R6Stats() != 1101) return 95147;
+    // T513 r7: arm categories come from the arm expressions - a trivial prvalue or `move` local converts
+    // through B(A&&) into a B temporary (both orders); lvalue and xvalue arms bind the matching
+    // conversion operator straight into the XB&& result, with no move, copy or temporary.
+    t513ResetR7();
+    t513Pick ? t513R7MakeTA() : t513R7MakeB();
+    if (t513R7Stats() != 110) return 95148;
+    t513ResetR7();
+    !t513Pick ? t513R7MakeB() : t513R7MakeTA();
+    if (t513R7Stats() != 110) return 95149;
+    T513R7NA t513R7Na = default;
+    t513ResetR7();
+    t513Pick ? move t513R7Na : t513R7MakeB();
+    if (t513R7Stats() != 110) return 95150;
+    T513R7NA t513R7Na2 = default;
+    t513ResetR7();
+    !t513Pick ? t513R7MakeB() : move t513R7Na2;
+    if (t513R7Stats() != 110) return 95151;
+    T513R7XA t513R7Xa = default;
+    T513R7XB t513R7Xb = default;
+    t513ResetR7();
+    t513Pick ? t513R7Xa : move t513R7Xb;
+    if (t513R7Stats() != 10) return 95152;
+    T513R7XB t513R7Xb2 = default;
+    t513ResetR7();
+    !t513Pick ? move t513R7Xb2 : t513R7Xa;
+    if (t513R7Stats() != 10) return 95153;
+    T513R7XA t513R7Xa2 = default;
+    T513R7XB t513R7Xb3 = default;
+    t513ResetR7();
+    !t513Pick ? move t513R7Xb3 : move t513R7Xa2;
+    if (t513R7Stats() != 20) return 95154;
+    T513R7XA t513R7Xa3 = default;
+    T513R7XB t513R7Xb4 = default;
+    t513ResetR7();
+    t513Pick ? move t513R7Xb4 : move t513R7Xa3;
+    if (t513R7Stats() != 0) return 95155;
+    t513ResetR7();
+    t513Pick ? t513R7GetXA() : t513R7GetXB();
+    if (t513R7Stats() != 20) return 95156;
+    t513ResetR7();
+    !t513Pick ? t513R7GetXB() : t513R7GetXA();
+    if (t513R7Stats() != 20) return 95157;
+    // T513 r8: the producer call runs inside clang's conversion, so B(A) takes the produced A
+    // itself (no move) in both orders; its argument is still evaluated once, in the arm.
+    // B(A) by value: the Itanium ABI destroys the A parameter at full-expression end (B first),
+    // the MSVC ABI inside B's constructor (A first) - clang does the same per target.
+    int t513ParamSeq = 453;
+    if const (__WINDOWS__) { t513ParamSeq = 435; }
+    int t513R8Arg = 5;
+    t513ResetR8();
+    t513Pick ? t513R8MakeA(t513R8Arg++) : t513R8MakeB();
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 6) return 95158;
+    t513ResetR8();
+    !t513Pick ? t513R8MakeB() : t513R8MakeA(t513R8Arg++);
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 7) return 95159;
+    // T513 r9: a constructor expression and a nested `?:` arm are produced inside the conversion as
+    // well (both orders); a nested arm of void calls stays a discarded statement.
+    t513ResetR8();
+    t513Pick ? T513R9A(t513R8Arg++) : t513R9MakeB();
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 8) return 95160;
+    t513ResetR8();
+    !t513Pick ? t513R9MakeB() : T513R9A(t513R8Arg++);
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 9) return 95161;
+    t513ResetR8();
+    t513Pick ? (!t513Pick ? t513R9MakeA(t513R8Arg++) : T513R9A(t513R8Arg++)) : t513R9MakeB();
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 10) return 95162;
+    t513ResetR8();
+    !t513Pick ? t513R9MakeB() : (t513Pick ? t513R9MakeA(t513R8Arg++) : T513R9A(t513R8Arg++));
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 11) return 95163;
+    t513ResetR8();
+    t513Pick ? t513R9MakeA(t513R8Arg++) : (t513Pick ? t513R9MakeB() : t513R9MakeB());
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 12) return 95164;
+    t513ResetR8();
+    t513Pick ? (!t513Pick ? t513R9Mark(1) : t513R9Mark(2)) : t513R9Mark(3);
+    if (t513R8Stats() != 2) return 95165;
+    // T513 r10: a three-level nested arm keeps the selected producer at every depth (both outer
+    // orders); a producer that throws inside the conversion still destroys this frame's live guard.
+    t513ResetR8();
+    t513Pick ? (t513Pick ? (!t513Pick ? t513R9MakeA(t513R8Arg++) : T513R9A(t513R8Arg++)) : T513R9A(t513R8Arg++)) : t513R9MakeB();
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 13) return 95166;
+    t513ResetR8();
+    !t513Pick ? t513R9MakeB() : (t513Pick ? (t513Pick ? t513R9MakeA(t513R8Arg++) : T513R9A(t513R8Arg++)) : T513R9A(t513R8Arg++));
+    if (t513R8Stats() != t513ParamSeq || t513R8Arg != 14) return 95167;
+    t513ResetR10();
+    if (t513R10Guarded(T513R10ThrowNested, 7) != -7 || t513R10Living() != 0 || t513R10Deaths() != 1) return 95168;
+    t513ResetR10();
+    if (t513R10Guarded(T513R10ThrowReverse, 7) != -7 || t513R10Living() != 0 || t513R10Deaths() != 1) return 95169;
+    t513ResetR10();
+    if (t513R10Guarded(T513R10ThrowCtor, 7) != -7 || t513R10Living() != 0 || t513R10Deaths() != 1) return 95170;
     t226s.reset();
     if (T233LocalDerivedTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93018;
     t226s.reset();
@@ -5273,6 +5446,12 @@ extern int main()
     if (std.cflat_t28.call5(std.cflat_t28.fwd(move t56Fn)) != 6) return 56002;
     function<int(int)> t56Noncapturing = (int v) => v * 3;
     if (std.cflat_t28.call5(std.cflat_t28.fwd(t56Noncapturing)) != 15) return 56007;
+    // T525: a `(*)` inside template arguments is not the result's declarator (Decor<int *, int (*)(int)>).
+    if (t525.holddecor(t56Noncapturing).run(5) != 15) return 52514;
+    bool t525Pick = true;
+    if (t28.call5plain(t525Pick ? t56Noncapturing : nullptr) != 15) return 52515;
+    t525Pick = false;
+    if (t28.call5plain(t525Pick ? nullptr : t56Noncapturing) != 15) return 52516;
     bool t69Pick = true;
     if (t28.call5plain(t69Pick ? t56Fn : t56Noncapturing) != 6) return 69001;
     t69Pick = false;
@@ -5322,6 +5501,109 @@ extern int main()
         auto t419SharedConst = t28.holdsharedconst(t419Closure);
         t28.scribble();
         if (t28.runopt(t419SharedConst) != 20) return 41908;
+    }
+    {
+        // T525: a closure VARIABLE crosses as its own caller-frame slot (the C++ closure object), so
+        // a result keeping `F&` / `F*` / `std::ref(f)` calls the caller's closure, as clang does.
+        int t525Capture = 4;
+        Lambda<int(int)> t525F = (int v) => v * t525Capture;
+        if (std.cflat_t28.call5(std.cflat_t28.fwd(t525F)) != 20) return 52501;
+        if (t28.call5(t28.fwd1(t525F)) != 20) return 52502;
+        auto t525Fwd = t28.holdfwd(t525F);
+        auto t525Factory = t28.closureFactory.holdfwd(t525F);
+        auto t525Ptr = t28.holdptr(t525F);
+        auto t525Cref = t28.holdcref(t525F);
+        t28.scribble();
+        if (t525Fwd.run(5) != 20 || t525Factory.run(5) != 20 || t525Ptr.run(6) != 24
+            || t525Cref.run(5) != 20) return 52503;
+        auto t525Priv = t28.holdpriv(t525F);
+        auto t525Nest = t28.holdnest(t525F);
+        auto t525Tup = t28.holdtup(t525F);
+        auto t525OptRw = t28.holdoptrw(t525F);
+        t28.scribble();
+        if (t525Priv.run(5) != 20 || t525Nest.run(5) != 20 || t28.run0(t525Tup) != 20
+            || t28.runopt(t525OptRw) != 20) return 52504;
+        auto t525Deep = t28.holddeep(t525F);
+        auto t525Wide = t28.holdwide(t525F);
+        auto t525Crowd = t28.holdcrowd(t525F);
+        auto t525BoxPair = t28.holdboxpair(t525F);
+        t28.scribble();
+        if (t525Deep.run(5) != 20 || t525Wide.run(5) != 20 || t525Crowd.run(5) != 20
+            || t525BoxPair.run(5) != 20) return 52505;
+        auto t525OwnedBox = t28.holdownedbox(t525F);
+        auto t525DtorBorrow = t28.holddtorborrow(t525F);
+        auto t525DtorDerived = t28.holddtorderived(t525F);
+        auto t525DtorOuter = t28.holddtorouter(t525F);
+        t28.scribble();
+        if (t525OwnedBox.run(5) != 20 || t525DtorBorrow.run(5) != 20 || t525DtorDerived.run(5) != 20
+            || t525DtorOuter.run(5) != 20) return 52506;
+        // Type-erased and layout blind spots of the T419 rule: each now refers to the live variable.
+        auto t525FnRef = t525.holdfnref(t525F);
+        auto t525FnCopy = t525.holdfncopy(t525F);
+        t28.scribble();
+        if (t525FnRef(5) != 20 || t525FnCopy(5) != 20) return 52507;
+        t525.dtors = 0;
+        {
+            auto t525BorrowDtor = t525.holdborrowdtor(t525F);
+            auto t525Mixed = t525.holdmixed(t525F);
+            auto t525NoOp = t525.holdnoop(t525F);
+            t28.scribble();
+            if (t525BorrowDtor.run(5) != 20 || t525Mixed.run(5) != 2020
+                || t525.rununique(t525NoOp) != 20) return 52508;
+        }
+        if (t525.dtors != 3) return 52509;
+        Lambda<int(long long)> t525G = (long long v) => (int)(v + t525Capture + 3);
+        t525.dtors = 0;
+        {
+            auto t525Mixed2 = t525.holdmixed2(t525F, t525G);
+            auto t525Decor = t525.holddecor(t525F);
+            t28.scribble();
+            if (t525.runoptmixed(t525Mixed2) != 32 || t525Decor.run(5) != 20) return 52510;
+        }
+        if (t525.dtors != 3) return 52511;
+        // The slot is the variable: one object (same address), lvalue category, and a later
+        // assignment is what a kept reference sees.
+        if (t525.address(t525F) != t525.address(t525F) || t525.category(t525F) != 1) return 52512;
+        auto t525Kept = t28.holdfwd(t525F);
+        t525F = (int v) => v + 100;
+        t28.scribble();
+        if (t525Kept.run(5) != 105 || t525Fwd.run(5) != 105) return 52513;
+        // A copy (by-value parameter) or a scalar result keeps no reference: `move` stays legal.
+        Lambda<int(int)> t525ByValue = (int v) => v * t525Capture;
+        auto t525Hold = t28.hold(t525ByValue);
+        int t525Scalar = t28.call5plain(t525ByValue);
+        Lambda<int(int)> t525Moved = move t525ByValue;
+        if (t525Moved(5) != 20 || t525Hold.run(5) != 20 || t525Scalar != 20) return 52517;
+        // T525 r2: through `F&&`, a result that owns a COPY (vector<F>, std::function(f), a by-value
+        // member) keeps no reference either, so the source may still be moved afterwards.
+        Lambda<int(int)> t525CopySource = (int v) => v * t525Capture;
+        auto t525CopyVec = t28.holdvec(t525CopySource);
+        auto t525CopyFn = t525.holdfncopy(t525CopySource);
+        auto t525CopyDecor = t525.holddecor(t525CopySource);
+        auto t525CopyShared = t28.holdshared(t525CopySource);
+        Lambda<int(int)> t525CopyMoved = move t525CopySource;
+        t28.scribble();
+        if (t525CopyMoved(5) != 20 || t28.runat0(t525CopyVec) != 20 || t525CopyFn(5) != 20
+            || t525CopyDecor.run(5) != 20 || t28.runopt(t525CopyShared) != 20) return 52518;
+        // T525 r4: a copy made through a reference-returning helper (std::as_const) keeps nothing.
+        Lambda<int(int)> t525ConstSource = (int v) => v * t525Capture;
+        auto t525ConstCopy = t525.holdconstcopy(t525ConstSource);
+        auto t525AsConst = t525.holdasconst(t525ConstSource);
+        Lambda<int(int)> t525ConstMoved = move t525ConstSource;
+        t28.scribble();
+        if (t525ConstMoved(5) != 20 || t525ConstCopy(5) != 20 || t525AsConst(5) != 20) return 52519;
+        // T525 r5: a ?: whose arms alias the closure, copied into the result, keeps nothing either.
+        Lambda<int(int)> t525CondSource = (int v) => v * t525Capture;
+        auto t525CondCopy = t525.holdcondcopy(t525CondSource);
+        Lambda<int(int)> t525CondMoved = move t525CondSource;
+        t28.scribble();
+        if (t525CondMoved(5) != 20 || t525CondCopy(5) != 20) return 52520;
+        // T525 r6: a keeper named only inside sizeof is never built, so nothing is kept.
+        Lambda<int(int)> t525SizeofSource = (int v) => v * t525Capture;
+        auto t525SizeofCopy = t525.holdsizeof(t525SizeofSource);
+        Lambda<int(int)> t525SizeofMoved = move t525SizeofSource;
+        t28.scribble();
+        if (t525SizeofMoved(5) != 20 || t525SizeofCopy(5) != 20) return 52521;
     }
     if ((int)HeapAudit.reportLeaks() != t69HeapBase) return 69004;
     // A borrowed closure wrapper leaves the owning environment count unchanged.
@@ -9941,11 +10223,16 @@ extern int main()
     if (outerTransitive.inner.value != 29)                                      return 13814;
     if (outerDead.item.v != 24)                                                 return 13815;
 
-    // T74: uninitialized global arrays of CFlat structs construct each element before main.
+    // T74: native CFlat aggregates with C++ fields are explicitly constructed in main.
+    T74Wrap[2] t74Global = default;
+    T74Wrap[2][3] t74Grid = default;
+    T74Nested[2] t74Nested = default;
+    T74Wrap t74Scalar = default;
+    T74Wrap[2] t74NsValues = default;
     if (t74Global[1].z != 5 || t74Global[1].track.value != 37)                 return 7410;
     if (t74Grid[1][2].z != 5 || t74Grid[1][2].track.value != 37)               return 7411;
     if (t74Nested[1].item.z != 5 || t74Nested[1].item.track.value != 37)       return 7412;
-    if (T74Ns.values[1].track.value != 37 || t74Scalar.track.value != 37)       return 7413;
+    if (t74NsValues[1].track.value != 37 || t74Scalar.track.value != 37)       return 7413;
     if (cflat_t74.ctor_count() != 13 || cflat_t74.dtor_count() != 0)            return 7414;
     if (t74StaticLocalArray() != 375 || cflat_t74.ctor_count() != 15)           return 7415;
     if (cflat_t74.probe_ctor_count() != 2 || t74Direct[1].value != 41)         return 7416;
@@ -17645,6 +17932,95 @@ int T420R2Overload(bool c)
     t420r2overload.L2 lk = default; lk.field = 7;
     return t420r2overload.take(c ? default : lk);
 }
+// T518: through an unbound wrapper (t518 is anonymous-namespace), a call arm is produced inside the
+// C++ conditional, and a later argument that writes an earlier class argument runs after its copy.
+cpptw.Twin T518RetTw() { return default; }
+int T518CallArm(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { value = t518.take(c ? default : T518RetTw()); }
+    return T420Pack(value, baseLive);
+}
+int T518CallArmNested(bool c, bool d)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { value = t518.take(c ? default : (d ? T518RetTw() : default)); }
+    return T420Pack(value, baseLive);
+}
+// A reference parameter binds the caller's object, so it sees the later write (no early copy).
+int T518LaterRef() { t418.Val x = t418.Val(7); return t518.lref(x, t418.mutate(x)); }
+// The SELECTED overload decides: mixed(const Val&, int) wins for an int, so it sees the write.
+int T518Mixed() { t418.Val x = t418.Val(7); return t518.mixed(x, t418.mutate(x)); }
+// A trivially copyable class is snapshot at its argument; clang's selected callee decides by value.
+int T518Pod(bool c) { t518.Pod p = default; p.n = 7; return t518.pod(c ? default : p, t518.mutpod(p)); }
+int T518PodPlain() { t518.Pod p = default; p.n = 7; return t518.pod(p, t518.mutpod(p)); }
+int T518PodTmpl() { t518.Pod p = default; p.n = 7; return t518.podtmpl(p, t518.mutpod(p)); }
+int T518PodDef() { t518.Pod p = default; p.n = 7; return t518.poddef(p, t518.mutpod(p)); }
+int T518PodRef() { t518.Pod p = default; p.n = 7; return t518.podref(p, t518.mutpod(p)); }
+// A reference selection needs no copy constructor (NC's is deleted).
+int T518NcRef() { t518.NC x = t518.NC(7); return t518.ncref(x, t518.mutnc(x)); }
+// Later arguments that only READ a non-trivial by-value argument keep the wrapper's copy (exactly
+// one copy, master = clang): a const member, a field, a const-reference helper bound or wrapped.
+int T518IncConstMethod() { t518.Inc n = t518.Inc(7); return t518.inctake(n, n.get()); }
+int T518IncField() { t518.Inc n = t518.Inc(7); return t518.inctake(n, n.n); }
+int T518IncConstRef() { t518.Inc n = t518.Inc(7); return t518.inctake(n, t518.readinc(n)); }
+int T518IncWrapperRead() { t518.Inc n = t518.Inc(7); return t518.inctake(n, t518.incpeek(n)); }
+int T518IncLiteral() { t518.Inc n = t518.Inc(7); int y = 2; return t518.inctake(n, y); }
+// Later arguments that WRITE a non-trivial by-value argument: C++ copies it at its own position,
+// so CFlat copy-constructs it there and calls clang's selected callee by address (one copy).
+int T518WriteLater()
+{
+    t418.reset(); int value = 0;
+    { t418.Val v = t418.Val(7); value = t518.later(v, t418.mutate(v)); }
+    return T418Pack(value);
+}
+int T518WriteOver(bool c)
+{
+    t418.reset(); int value = 0;
+    { t418.Val v = t418.Val(7); value = t518.over(c ? default : v, t418.mutate(v)); }
+    return T418Pack(value);
+}
+int T518WriteTempl()
+{
+    t418.reset(); int value = 0;
+    { t418.Val v = t418.Val(7); value = t518.templ(v, t418.mutate(v)); }
+    return T418Pack(value);
+}
+int T518WriteDefargs()
+{
+    t418.reset(); int value = 0;
+    { t418.Val v = t418.Val(7); value = t518.defargs(v, t418.mutate(v)); }
+    return T418Pack(value);
+}
+int T518IncPtrWrite() { t518.Inc n = t518.Inc(7); return t518.inctake(n, t518.incptr(&n)); }
+int T518IncMemberWrite() { t518.Inc n = t518.Inc(7); return t518.inctake(n, n.bump()); }
+int T518IncWrapperWrite() { t518.Inc n = t518.Inc(7); return t518.inctake(n, t518.incbump(n)); }
+int T518IncConstCast() { t518.Inc n = t518.Inc(7); return t518.inctake(n, t518.inccast(n)); }
+int T518MutableWrite() { t518.Mu m = t518.Mu(7); return t518.mutake(m, m.poke()); }
+int T518ExplicitSpecialization() { t518.Inc n = t518.Inc(7); return t518.pick<t518.Inc>(n, t518.incbump(n)); }
+int T518AnonymousSpecialization()
+{
+    t518.Inc n = t518.Inc(7); t518.Inc m = t518.Inc(7);
+    return t518.tagged(n, t518.incbump(n)) * 10000 + t518.tagptr(m, t518.incbump(m));
+}
+int T518UndeducedSpecialization() { t518.Inc n = t518.Inc(7); return t518.unusedt<int>(n, t518.incbump(n)); }
+// value * 100 + copies * 10 + destructions, after the source's scope closed.
+int T518TrivialAbi8()
+{
+    t518.tareset(); int value = 0;
+    { t518.Ta8 x = default; value = t518.tatake8(x, t518.tamut8(x)); }
+    return value * 100 + t518.tastate();
+}
+int T518TrivialAbi16()
+{
+    t518.tareset(); int value = 0;
+    { t518.Ta16 x = default; value = t518.tatake16(x, t518.tamut16(x)); }
+    return value * 100 + t518.tastate();
+}
+// The place guard follows clang's selected candidate: overloads, templates, default arguments.
+int T518Guard(bool c) { t418.Val x = t418.Val(7); return t518.over(c ? default : x, 2); }
+int T518GuardTmpl(bool c) { t418.Val x = t418.Val(7); return t518.guardtmpl(c ? default : x, 2); }
+int T518GuardDef(bool c) { t418.Val x = t418.Val(7); return t518.guarddef(c ? default : x); }
 int LoweredUserDtorAssignLegs(int argc)
 {
     LdtHolder a; a.id = 1;
@@ -18160,8 +18536,10 @@ int LoweredUserDtorAssignLegs(int argc)
     if (t67Ordered[0] != 1 || t67Ordered[1] != 2 || t67Ordered[2] != 3
         || t67CallCount != 3) return 67015;
     // T73: clang's implicit non-trivial default constructor applies to CFlat fields too.
-    if (cpp_t73.ctor_count != 2 || t73Global.mix.first.value != 7
-        || t73Global.mix.second.value != 7) return 73001;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    if (t73ThreadGlobal.mix.first.value != 7 || t73ThreadGlobal.mix.second.value != 7
+        || cpp_t73.ctor_count != 2) return 73032;
+    if (t73ThreadGlobal.mix.first.value != 7 || cpp_t73.ctor_count != 2) return 73033;
     cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
     {
         cpp_t73.Mix t73Direct;
@@ -18501,6 +18879,8 @@ int LoweredUserDtorAssignLegs(int argc)
     if (t312Ct != 2 || t312Dt != 4) return 12936;
     // Guard (passes on master too): field default `E[2] h = { gx, gx }` copy-initializes from gx, no E()
     // runs and each copy is destroyed once, as in clang.
+    T312E t312DefaultValue = default;
+    t312Gx = &t312DefaultValue;
     t312Ct = 0; t312Dt = 0;
     {
         T312FD t312Fd;
@@ -18522,11 +18902,12 @@ int LoweredUserDtorAssignLegs(int argc)
     if (t312Ct != 1 || t312Dt != 2) return 46804;
     t312Ct = 0; t312Dt = 0;
     {
-        T312RootFD t468DefaultOverride = { f = { h = { t312Gx, t312Gx } } };
+        T312RootFD t468DefaultOverride = { f = { h = { t312Gx[0], t312Gx[0] } } };
         if (t468DefaultOverride.f.h[0].w != 0 || t468DefaultOverride.f.h[1].w != 0
             || t312Ct != 0 || t312Dt != 0) return 46805;
     }
     if (t312Ct != 0 || t312Dt != 2) return 46806;
+    t312Gx = nullptr;
     u64 t468HeapBase = HeapAudit.reportLeaks();
     t468Alloc = 0;
     {
@@ -19727,6 +20108,44 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T420R2LookSelf(true) != 104) return 42008;
     if (T420R2Overload(false) != 107) return 42009;
     if (T420R2Overload(true) != 104) return 42010;
+    if (T518CallArm(false) != 1000010) return 51801;
+    if (T518CallArm(true) != 1000010) return 51802;
+    if (T518CallArmNested(false, true) != 1000010) return 51803;
+    if (T518CallArmNested(true, true) != 1000010) return 51804;
+    if (T518LaterRef() != 902) return 51808;
+    if (T518Mixed() != 2902) return 51809;
+    if (T518Pod(false) != 1702) return 51810;
+    if (T518Pod(true) != 1002) return 51811;
+    if (T518PodPlain() != 1702) return 51812;
+    if (T518PodTmpl() != 1702) return 51813;
+    if (T518PodDef() != 1702) return 51805;
+    if (T518PodRef() != 2902) return 51806;
+    if (T518NcRef() != 2902) return 51807;
+    if (T518IncConstMethod() != 1802) return 51819;
+    if (T518IncField() != 1807) return 51820;
+    if (T518IncConstRef() != 1802) return 51821;
+    if (T518IncWrapperRead() != 1802) return 51822;
+    if (T518IncLiteral() != 1802) return 51823;
+    if (T518Guard(false) != 1702) return 51814;
+    if (T518Guard(true) != 1002) return 51815;
+    if (T518GuardTmpl(false) != 1702) return 51816;
+    if (T518GuardDef(false) != 1702) return 51817;
+    if (T518GuardDef(true) != 1002) return 51818;
+    if (T518WriteLater() != 70211020) return 51824;
+    if (T518WriteOver(false) != 170211020) return 51825;
+    if (T518WriteOver(true) != 100220020) return 51826;
+    if (T518WriteTempl() != 170211020) return 51827;
+    if (T518WriteDefargs() != 170211020) return 51828;
+    if (T518IncPtrWrite() != 1802) return 51829;
+    if (T518IncMemberWrite() != 1802) return 51830;
+    if (T518IncWrapperWrite() != 1802) return 51831;
+    if (T518IncConstCast() != 1802) return 51832;
+    if (T518MutableWrite() != 1702) return 51833;
+    if (T518ExplicitSpecialization() != 2802) return 51834;
+    if (T518UndeducedSpecialization() != 3802) return 51835;
+    if (T518TrivialAbi8() != 170212) return 51836;
+    if (T518TrivialAbi16() != 170212) return 51837;
+    if (T518AnonymousSpecialization() != 28053806) return 51838;
     return 0;
 }
 

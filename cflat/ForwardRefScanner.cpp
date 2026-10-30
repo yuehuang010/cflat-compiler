@@ -960,7 +960,10 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         if (returnType.external) returnType.IsAlias = false;
 
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
-        ApplyOwningSinkInference(compiler, func, allParams);
+        const IfConstEvaluator scannerIfConst = [this](CFlatParser::ExpressionContext* expr) {
+            return ScannerDecideIfConst(expr);
+        };
+        ApplyOwningSinkInference(compiler, func, allParams, scannerIfConst);
 
         bool returnsOwned = ComputeReturnsOwned(returnType, func, allParams);
         if (isMethod)
@@ -970,6 +973,16 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
             ? rawFuncName : std::string();
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs,
                                             returnsOwned, isMethod, returnType.CallConv, linkageName);
+        if (!returnType.external
+            && std::any_of(allParams.begin(), allParams.end(), [](const auto& param) {
+                return param.Pointer && !param.VariableName.empty();
+            }))
+            viewFieldMoveInferenceEntries_.push_back({
+                .Definition = func,
+                .SourceName = name,
+                .UniqueName = compiler->ComputeMangledName(name, returnType, allParams, varargs),
+                .Parameters = allParams,
+            });
         if (returnType.external)
             compiler->NoteCFlatExternBody(name, linkageName.empty() ? name : linkageName);
 
@@ -1000,9 +1013,6 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         if (!returnType.external && returnType.Pointer)
             if (auto it = compiler->functionTable.find(name); it != compiler->functionTable.end())
             {
-                const IfConstEvaluator scannerIfConst = [this](CFlatParser::ExpressionContext* expr) {
-                    return ScannerDecideIfConst(expr);
-                };
                 SetPointerBorrowReturnSummaries(it->second, allParams,
                     ReturnsOnlyModuleGlobals(func, allParams, scannerIfConst),
                     ReturnsParameterBorrow(func, allParams, scannerIfConst),
@@ -1327,6 +1337,47 @@ void ForwardRefScanner::RegisterRenameAlias(CFlatParser::UsingDeclarationContext
 ForwardRefScanner::ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
 
 void ForwardRefScanner::SetTokens(antlr4::BufferedTokenStream* t) { tokens_ = t; }
+
+void ForwardRefScanner::FinalizeViewFieldMoveInference()
+{
+    if (compilerLLVM == nullptr || viewFieldMoveInferenceEntries_.empty()) return;
+
+    auto publishSummary = [&](const ViewFieldMoveInferenceEntry& entry) {
+        auto functions = compilerLLVM->functionTable.find(entry.SourceName);
+        if (functions == compilerLLVM->functionTable.end()) return;
+        for (auto& function : functions->second)
+        {
+            if (function.UniqueName != entry.UniqueName
+                || function.Parameters.size() != entry.Parameters.size())
+                continue;
+            for (size_t i = 0; i < function.Parameters.size(); ++i)
+                function.Parameters[i].ViewFieldMovePaths = entry.Parameters[i].ViewFieldMovePaths;
+            return;
+        }
+    };
+
+    for (const auto& entry : viewFieldMoveInferenceEntries_) publishSummary(entry);
+    const IfConstEvaluator evalIfConst = [this](CFlatParser::ExpressionContext* expr) {
+        return ScannerDecideIfConst(expr);
+    };
+    for (size_t pass = 0; pass < viewFieldMoveInferenceEntries_.size(); ++pass)
+    {
+        bool changed = false;
+        for (auto& entry : viewFieldMoveInferenceEntries_)
+        {
+            size_t before = 0;
+            for (const auto& param : entry.Parameters) before += param.ViewFieldMovePaths.size();
+            auto* body = entry.Definition != nullptr
+                ? entry.Definition->compoundStatement() : nullptr;
+            InferViewFieldMovePaths(body, body, compilerLLVM, entry.Parameters, evalIfConst);
+            size_t after = 0;
+            for (const auto& param : entry.Parameters) after += param.ViewFieldMovePaths.size();
+            changed = changed || after != before;
+            publishSummary(entry);
+        }
+        if (!changed) break;
+    }
+}
 
 void ForwardRefScanner::SeedConstIntGlobals(CFlatParser::TranslationUnitContext* tu)
 {
@@ -1817,14 +1868,23 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
         if (ts == nullptr) return "void";
         if (ts->functionPointerSpecifier() != nullptr)
             return EncodeClosureScanner(ts->functionPointerSpecifier());
-        if (ts->genericIdentifier() != nullptr && ts->genericIdentifier()->genericTypeParameters() != nullptr)
+        std::string genericBase;
+        if (auto* genericParams = GenericSpecOf(ts, genericBase); genericParams != nullptr)
         {
-            std::string mangled = ts->genericIdentifier()->Identifier()->getText();
+            const std::string baseName = genericBase;
             std::vector<std::string> args;
-            for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                 args.push_back(ResolveForwardTypeArg(entry));
-            compilerLLVM->CompleteCxxTemplateTypeArgs(mangled, args);
-            return MangleGenericInstance(*compilerLLVM, mangled, args);
+            compilerLLVM->CompleteCxxTemplateTypeArgs(baseName, args);
+            std::string mangled = MangleGenericInstance(*compilerLLVM, baseName, args);
+            if (!compilerLLVM->AnyGenericTypeTemplateNamed(baseName)
+                && !compilerLLVM->IsKnownTypeName(mangled))
+            {
+                std::string cxxError;
+                if (compilerLLVM->TryRequestCxxType(baseName, args, mangled, cxxError))
+                    return compilerLLVM->ResolveTypeAlias(mangled);
+            }
+            return mangled;
         }
         if (auto* memberType = ts->memberTypeSpecifier(); memberType != nullptr)
             return compilerLLVM->ResolveTypeAlias(ResolveMemberTypeSpecifier(memberType));
@@ -1832,6 +1892,13 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
         std::string result = CanonicalTypeSpecifierText(ts, suffix, false, &error);
         if (HasPrimitiveTypeError(error))
             compilerLLVM->LogError(LocalizePrimitiveTypeError(compilerLLVM, error));
+        if (ts->qualifiedGenericIdentifier() != nullptr
+            && ts->qualifiedGenericIdentifier()->genericTypeParameters() == nullptr
+            && !compilerLLVM->IsKnownTypeName(result))
+        {
+            std::string cxxError;
+            compilerLLVM->TryRequestCxxType(result, {}, result, cxxError);
+        }
         return compilerLLVM->ResolveTypeAlias(result);
     }
 

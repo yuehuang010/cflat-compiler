@@ -759,6 +759,7 @@ void LLVMBackend::RegisterBuiltinClosure()
 
         dataStructures["__closure_fat_ptr"].StructType = closureTy;
         dataStructures["__closure_fat_ptr"].StructFields = { codeField, envField };
+        builtinStructDefaults_.insert("__closure_fat_ptr");
     }
 
 void LLVMBackend::EnsureClosureLifetimeRegistered()

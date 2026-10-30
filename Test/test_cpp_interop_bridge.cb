@@ -85,6 +85,7 @@
 import cpp "library/cpp_interop_sfinae.h";
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
+import cpp "library/cpp_interop_t520_callable.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
 import cpp "library/cpp_interop_poly.h";
@@ -1120,8 +1121,6 @@ struct BridgeT149Node { std.list<int> l = default; int tag = 0; };
 struct BridgeT149Arr2 { BridgeT149Node[2] arr = default; };
 struct BridgeT149Arr1 { BridgeT149Node[1] arr = default; };
 struct BridgeT149Outer { BridgeT149Arr2 inner = default; int k = 4; };
-BridgeT149Arr2 bridge_t149_global_arr2 = default;
-
 int bridge_t149_arr_field()
 {
     BridgeT149Arr2 x = default;
@@ -1129,12 +1128,6 @@ int bridge_t149_arr_field()
     BridgeT149Arr1 y = default; y.arr[0].l.push_back(5);
     BridgeT149Outer o = default; o.inner.arr[1].l.push_back(7); o.inner.arr[1].l.push_back(8);
     return x.arr[0].l.size() * 1000 + x.arr[1].l.size() * 100 + y.arr[0].l.size() * 10 + o.inner.arr[1].l.size();
-}
-
-int bridge_t149_arr_global()
-{
-    bridge_t149_global_arr2.arr[1].l.push_back(9);
-    return bridge_t149_global_arr2.arr[1].l.size() * 10 + bridge_t149_global_arr2.arr[0].l.size();
 }
 
 // T149 D5 r2: a user-written no-arg constructor seeds a C++-field array in place too (same rule
@@ -1166,6 +1159,107 @@ int bridge_t417_dict_twin()
     if (original != 41 || copied != 41 || cpptw.copy_count() == 0
         || cpptw.copy_assign_count() != 0 || cpptw.live_allocations() != 0) return 3;
     return 0;
+}
+
+// T528 (R3): `_ = move arr[i]` of an element holding C++ state move-constructs a temp and destroys
+// it, like clang's `{ T t = std::move(arr[i]); }`; the slot stays a valid moved-from object.
+// Its plain CFlat fields are nulled like every explicit move source (k == 0).
+struct BridgeT528Elem { cpptw.Twin w = cpptw.Twin(1); std.list<int> l = default; int k = 5; };
+struct BridgeT528Box { BridgeT528Elem[2] arr = default; int z = 1; };
+int bridge_t528_index = 1;
+
+int bridge_t528_discard_reassign()
+{
+    cpptw.reset_counts();
+    int result = 0;
+    {
+        BridgeT528Elem[2] arr = default;
+        arr[0].w.field = 2; arr[0].l.push_back(4);
+        BridgeT528Elem b = default; b.w.field = 3; b.l.push_back(3);
+        _ = move arr[0];
+        if (arr[0].l.size() != 0 || arr[0].w.value() != -1 || arr[0].k != 0) return 1;
+        arr[0] = b;
+        result = arr[0].l.front() * 10 + arr[0].w.value();
+    }
+    return result;
+}
+
+int bridge_t528_variable_index_twice()
+{
+    cpptw.reset_counts();
+    int result = 0;
+    {
+        BridgeT528Elem[2] arr = default;
+        arr[1].w.field = 2; arr[1].l.push_back(4);
+        _ = move arr[bridge_t528_index];
+        _ = move arr[bridge_t528_index];
+        result = (int)arr[1].l.size() * 10 + arr[0].w.value();
+    }
+    return result;
+}
+
+int bridge_t528_loop()
+{
+    cpptw.reset_counts();
+    int sum = 0;
+    {
+        BridgeT528Elem[3] arr = default;
+        BridgeT528Elem b = default; b.w.field = 3; b.l.push_back(3);
+        int i = 0;
+        while (i < 3) { _ = move arr[i]; arr[i] = b; i++; }
+        i = 0;
+        while (i < 3) { sum = sum + arr[i].l.front() + arr[i].w.value(); i++; }
+    }
+    return sum;
+}
+
+int bridge_t528_field_array()
+{
+    cpptw.reset_counts();
+    int result = 0;
+    {
+        BridgeT528Box o = default;
+        o.arr[0].w.field = 2; o.arr[0].l.push_back(4);
+        BridgeT528Elem b = default; b.w.field = 3; b.l.push_back(3);
+        _ = move o.arr[0];
+        if (o.arr[0].l.size() != 0 || o.arr[0].w.value() != -1) return 1;
+        o.arr[0] = b;
+        result = o.arr[0].l.front() * 10 + o.arr[0].w.value();
+    }
+    return result;
+}
+
+int bridge_t528_foreign_element()
+{
+    cpptw.Twin[2] arr = { cpptw.Twin(2), cpptw.Twin(4) };
+    cpptw.Twin b = cpptw.Twin(3);
+    cpptw.reset_counts();
+    _ = move arr[0];
+    if (arr[0].value() != -1) return 1;
+    _ = arr[1];
+    if (arr[1].value() != 4) return 2;
+    arr[0] = b;
+    return arr[0].value() * 10 + arr[1].value();
+}
+
+// T528 round 2: a const element discard copies (clang's pick for a const xvalue) and leaves the
+// element unchanged; a parenthesized `(move a[0])` is still the explicit move.
+int bridge_t528_const_element()
+{
+    const cpptw.Twin[2] a = { cpptw.Twin(2), cpptw.Twin(4) };
+    cpptw.reset_counts();
+    _ = move a[0];
+    return a[0].value() * 1000 + cpptw.copy_count() * 100 + cpptw.move_count() * 10
+        + cpptw.dtor_count();
+}
+
+int bridge_t528_paren_move()
+{
+    cpptw.Twin[2] a = { cpptw.Twin(2), cpptw.Twin(4) };
+    cpptw.reset_counts();
+    _ = (move a[0]);
+    return a[0].value() * 1000 + cpptw.copy_count() * 100 + cpptw.move_count() * 10
+        + cpptw.dtor_count();
 }
 
 int bridge_t417_dict_stdlist()
@@ -2635,6 +2729,62 @@ int cbCountedTwice(int x) { cbCallableCalls++; return x * 2; }
 // return, widened parameter.
 int cbIncInt(int x) { cbCallableCalls++; return x + 1; }
 int cbIncLong(long x) { cbCallableCalls++; return (int)x + 1; }
+int t520AssignSelected = 0;
+int t520AssignF1(int x) { t520AssignSelected = 1; return x + 1; }
+int t520AssignAdd3(int x) { t520AssignSelected = 3; return x + 3; }
+int t520VariadicSelected = 0;
+int t520Variadic(int first, ...) { t520VariadicSelected = 2; return first; }
+int t520MovePointerSelected = 0;
+int t520ConsumeTwinPointer(move cpptw.Twin* value)
+{
+    t520MovePointerSelected = 3;
+    int result = value->value();
+    delete value;
+    return result;
+}
+int t520VoidPayloadDestructions = 0;
+struct T520VoidPayload
+{
+    int value = 0;
+    T520VoidPayload(int v) { value = v; }
+    ~T520VoidPayload() { t520VoidPayloadDestructions++; }
+};
+move void* t520MakeVoidPayload()
+{
+    T520VoidPayload* value = new T520VoidPayload(29);
+    return (void*)value;
+}
+int t520StringSelected = 0;
+std.string t520MakeString()
+{
+    t520StringSelected = 5;
+    return std.string("t520");
+}
+using T520StringAlias = std.string;
+std.string t520MakeStringAlias()
+{
+    t520StringSelected = 7;
+    return std.string("alias");
+}
+int t520VectorSelected = 0;
+std.vector<int> t520MakeVector()
+{
+    t520VectorSelected = 6;
+    return std.vector<int>();
+}
+int t520FactorySelected = 0;
+int t520ConsumerSelected = 0;
+int t520UseTwinFactory(function<t520.TwinAlias()> make)
+{
+    t520.TwinAlias value = make();
+    t520ConsumerSelected = 7;
+    return value.value();
+}
+t520.TwinAlias t520MakeTwinAlias()
+{
+    t520FactorySelected = 6;
+    return cpptw.Twin(23);
+}
 // Explicit generic instantiations named as VALUES (`cbCountedTriple<int>`, `cbgen.quad<int>`).
 T cbCountedTriple<T>(T x) { cbCallableCalls++; return x * 3; }
 namespace cbgen { T quad<T>(T x) { return x * 4; } }
@@ -4025,20 +4175,12 @@ int bridge_move_ternary_cpp(bool choose)
 }
 
 struct GFieldOne { cppa.GTrk item = default; };
-GFieldOne gfieldOne = default;
 struct GFieldPair { cppa.GTrk first = default; int middle; cppa.GTrk last = default; };
-GFieldPair gfieldPair = default;
 struct GFieldInner { cppa.GTrk item = default; };
 struct GFieldOuter { int before; GFieldInner nested = default; int after; };
-GFieldOuter gfieldNested = default;
 struct GFieldArrayHolder { cppa.GTrk item = default; };
-GFieldArrayHolder[3] gfieldArrayHolders = default;
 struct GFieldCppArrayHolder { cppa.GTrk[2] items = default; };
-GFieldCppArrayHolder gfieldCppArray = default;
-GFieldOne gfieldEmptyBrace = {};
-GFieldOne gfieldBare;
 [cpp] struct GFieldBridgeHolder { cppa.GTrk item = default; };
-GFieldBridgeHolder gfieldBridge = default;
 
 int bridge_view_sum(int[] values)
 {
@@ -5040,6 +5182,62 @@ extern int main(int argc, char** argv)
     // ---- std::function from a plain CFlat function ----------------------------------------------
     std.function<int(int)> revF = std.function<int(int)>(cbTwice);
     if (revF(21) != 42)                             return 610;
+    t520AssignSelected = 0;
+    std.function<int(int)> t520Assigned = t520AssignF1;
+    t520Assigned = t520AssignAdd3;
+    bridge_check("T520 std.function assignment value", t520Assigned(4), 7);
+    bridge_check("T520 std.function assignment target", t520AssignSelected, 3);
+    t520VariadicSelected = 0;
+    bridge_check("T520 variadic callable value", t520.invoke_variadic(t520Variadic), 7);
+    bridge_check("T520 variadic callable target", t520VariadicSelected, 2);
+    cpptw.reset_counts();
+    t520MovePointerSelected = 0;
+    {
+        std.function<int(cpptw.Twin*)> t520MovePointerCallback = t520ConsumeTwinPointer;
+        move cpptw.Twin* t520MovePointerInput = new cpptw.Twin(19);
+        bridge_check("T520 move pointer callback value",
+            t520MovePointerCallback(move t520MovePointerInput), 19);
+    }
+    bridge_check("T520 move pointer callback target", t520MovePointerSelected, 3);
+    bridge_check("T520 move pointer callback destructor", cpptw.dtor_count(), 1);
+    bridge_check("T520 move pointer callback live", cpptw.live_allocations(), 0);
+    t520VoidPayloadDestructions = 0;
+    {
+        std.function<void*()> t520VoidCallback = t520MakeVoidPayload;
+        T520VoidPayload* t520VoidValue = (T520VoidPayload*)t520VoidCallback();
+        bridge_check("T520 owning void pointer callback value", t520VoidValue->value, 29);
+        delete t520VoidValue;
+    }
+    bridge_check("T520 owning void pointer callback destructor", t520VoidPayloadDestructions, 1);
+    t520StringSelected = 0;
+    {
+        Lambda<std.string()> t520StringCallback = t520MakeString;
+        std.string t520StringValue = t520StringCallback();
+        bridge_check("T520 direct std.string callback value", (int)t520StringValue.size(), 4);
+        bridge_check("T520 direct std.string callback target", t520StringSelected, 5);
+    }
+    t520VectorSelected = 0;
+    {
+        function<std.vector<int>()> t520VectorCallback = t520MakeVector;
+        std.vector<int> t520VectorValue = t520VectorCallback();
+        bridge_check("T520 direct std.vector callback value", (int)t520VectorValue.size(), 0);
+        bridge_check("T520 direct std.vector callback target", t520VectorSelected, 6);
+    }
+    t520StringSelected = 0;
+    {
+        Lambda<T520StringAlias()> t520StringAliasCallback = t520MakeStringAlias;
+        std.string t520StringAliasValue = t520StringAliasCallback();
+        bridge_check("T520 std.string alias callback value", (int)t520StringAliasValue.size(), 5);
+        bridge_check("T520 std.string alias callback target", t520StringSelected, 7);
+    }
+    t520FactorySelected = 0;
+    t520ConsumerSelected = 0;
+    {
+        function<t520.TwinAlias()> t520Factory = t520MakeTwinAlias;
+        bridge_check("T520 C++ typedef callback value", t520UseTwinFactory(t520Factory), 23);
+    }
+    bridge_check("T520 C++ typedef callback factory", t520FactorySelected, 6);
+    bridge_check("T520 C++ typedef callback consumer", t520ConsumerSelected, 7);
     if (cppi.apply_fn(revF, 5) != 10)               return 611;
     if (cppi.apply_fn(std.function<int(int)>(cbTwice), 5) != 10) return 612;
     std.function<int(int)> revFCopy = revF;
@@ -6461,6 +6659,29 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_check("bridge T417 dictionary Twin copy ctor and cleanup", bridge_t417_dict_twin(), 0);
     bridge_check("bridge T417 dictionary Twin live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T528 element discard then assign value", bridge_t528_discard_reassign(), 33);
+    bridge_check("bridge T528 element discard then assign C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge T528 element discard then assign C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("bridge T528 element discard then assign C++ live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T528 variable index discard twice value", bridge_t528_variable_index_twice(), 1);
+    bridge_check("bridge T528 variable index discard twice C++ move", cpptw.move_count(), 2);
+    bridge_check("bridge T528 variable index discard twice C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("bridge T528 variable index discard twice C++ live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T528 loop discard then assign value", bridge_t528_loop(), 18);
+    bridge_check("bridge T528 loop discard then assign C++ move", cpptw.move_count(), 3);
+    bridge_check("bridge T528 loop discard then assign C++ copy-assign", cpptw.copy_assign_count(), 3);
+    bridge_check("bridge T528 loop discard then assign C++ dtor", cpptw.dtor_count(), 7);
+    bridge_check("bridge T528 loop discard then assign C++ live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T528 field array discard then assign value", bridge_t528_field_array(), 33);
+    bridge_check("bridge T528 field array discard then assign C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge T528 field array discard then assign C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("bridge T528 field array discard then assign C++ live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T528 foreign element discard value", bridge_t528_foreign_element(), 34);
+    bridge_check("bridge T528 foreign element discard C++ move", cpptw.move_count(), 1);
+    bridge_check("bridge T528 foreign element discard C++ dtor", cpptw.dtor_count(), 4);
+    bridge_check("bridge T528 foreign element discard C++ copy-assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge T528 const element discard copies, element unchanged", bridge_t528_const_element(), 2101);
+    bridge_check("bridge T528 parenthesized element move discard", bridge_t528_paren_move(), -989);
     bridge_check("bridge T417 dictionary std.list independent copy", bridge_t417_dict_stdlist(), 0);
     bridge_check("bridge T417 core list C++ element copy", bridge_t417_list_twin_copy(), 0);
     bridge_check("bridge T417 core array C++ set copy constructor", bridge_t417_array_twin_set(), 0);
@@ -6505,7 +6726,6 @@ extern int main(int argc, char** argv)
     bridge_check("bridge T156 program field value", bridge_t156_program_fields(), 52105);
     bridge_check("bridge T156 program teardown", bridge_t156_program_teardown(), 7);
     bridge_check("bridge T149 fixed-array field value", bridge_t149_arr_field(), 2112);
-    bridge_check("bridge T149 fixed-array global value", bridge_t149_arr_global(), 10);
     bridge_check("bridge T149 user-ctor fixed-array field value", bridge_t149_user_ctor_arr(), 12);
     bridge_check("bridge T154 parameterized ctor array value", bridge_t154_param_ctor_arr(), 21);
     bridge_check("bridge T154 both ctors array value", bridge_t154_both_ctors_arr(), 21);
@@ -7416,8 +7636,18 @@ extern int main(int argc, char** argv)
 
     if (bridge_passed != bridge_checks) return 2000;
 
-    // ---- CFlat struct globals with C++ fields (2020-2039) ---------------------------
-    // Twelve GTrk fields across these globals must be constructed before main.
+    // ---- CFlat locals with C++ fields (2020-2039) ----------------------------------
+    // Native aggregates with non-folding C++ fields are constructed in main.
+    GFieldOne gfieldOne = default;
+    GFieldPair gfieldPair = default;
+    GFieldOuter gfieldNested = default;
+    GFieldArrayHolder[3] gfieldArrayHolders = default;
+    GFieldCppArrayHolder gfieldCppArray = default;
+    GFieldOne gfieldEmptyBrace = {};
+    GFieldOne gfieldBare;
+    GFieldBridgeHolder gfieldBridge = default;
+    GFieldOrderA gfieldOrderA = default;
+    GFieldOrderB gfieldOrderB = default;
     // One field: the pre-fix value was zero and no GTrk constructor had run.
     if (cppa.gctor_count() != 12 || gfieldOne.item.v != 7) return 2020;
     // Two fields around an int: both constructors and both field values are observable.

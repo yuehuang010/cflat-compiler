@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include "llvm/Analysis/ConstantFolding.h"
 
 LLVMBackend* MainListener::Compiler(antlr4::ParserRuleContext* ctx) {
         if (ctx)
@@ -1052,19 +1053,28 @@ std::string MainListener::ResolveSigComponentCodegen(
                 RejectFatClosurePointerArg(ts, inner->Function() != nullptr, ts->getText());
             return EncodeClosureCodegen(inner);
         }
-        if (ts->genericIdentifier() != nullptr && ts->genericIdentifier()->genericTypeParameters() != nullptr)
+        std::string genericBase;
+        if (auto* genericParams = GenericSpecOf(ts, genericBase); genericParams != nullptr)
         {
-            std::string baseName = ts->genericIdentifier()->Identifier()->getText();
+            const std::string baseName = genericBase;
             std::vector<std::string> innerArgs;
-            for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(entry));
             ResolveEnumTypeArguments(innerArgs);
             Compiler(ts)->CompleteCxxTemplateTypeArgs(baseName, innerArgs);
             std::string mangled = MangledGenericName(baseName, innerArgs);
+            if (!Compiler(ts)->AnyGenericTypeTemplateNamed(baseName)
+                && !Compiler(ts)->IsKnownTypeName(mangled))
+            {
+                std::string cxxError;
+                if (Compiler(ts)->TryRequestCxxType(baseName, innerArgs, mangled, cxxError))
+                    return Compiler(ts)->ResolveTypeAlias(mangled);
+                if (!cxxError.empty()) LogErrorContext(ts, cxxError);
+            }
             QueueGenericInstantiation(baseName, innerArgs, mangled, ts, outPointer);
             // A local-enum argument was deferred by the pre-scan; the signature needs the layout now.
             if (Compiler(ts)->AnyGenericTypeTemplateNamed(baseName))
-                QueueAndProcessLocalEnumInstantiation(ts->genericIdentifier()->genericTypeParameters(),
+                QueueAndProcessLocalEnumInstantiation(genericParams,
                     baseName, innerArgs, mangled, ts);
             return mangled;
         }
@@ -1085,6 +1095,21 @@ std::string MainListener::ResolveSigComponentCodegen(
             name = substIt->second;
             StripOwnershipQualifiers(name);  // resolve to the underlying type; not signature types
             while (!name.empty() && name.back() == '*') { name.pop_back(); outPointer = true; }
+        }
+        if (ts->qualifiedGenericIdentifier() != nullptr
+            && ts->qualifiedGenericIdentifier()->genericTypeParameters() == nullptr
+            && !Compiler(ts)->IsKnownTypeName(name))
+        {
+            std::string cxxError;
+            if (!Compiler(ts)->TryRequestCxxType(name, {}, name, cxxError)
+                && !cxxError.empty())
+                LogErrorContext(ts, cxxError);
+        }
+        if (ts->qualifiedGenericIdentifier() != nullptr
+            && ts->qualifiedGenericIdentifier()->genericTypeParameters() == nullptr)
+        {
+            const std::string resolved = Compiler(ts)->ResolveTypeAlias(name);
+            if (Compiler(ts)->IsCxxRecord(resolved)) return resolved;
         }
         return name;
     }
@@ -2442,6 +2467,15 @@ static bool MaterializeFoldCalleeIfLazy(llvm::Function* callee)
  * Conservative: an unresolvable callee, a declaration, or a recursive call all count as having
  * effects, so the fold declines and the caller emits real per-element construction.
  */
+static bool PointsIntoFrameSlot(const llvm::Value* ptr, const llvm::Function* fn)
+{
+    const llvm::Value* base = ptr->stripPointerCasts();
+    while (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
+        base = gep->getPointerOperand()->stripPointerCasts();
+    const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(base);
+    return slot != nullptr && slot->getFunction() == fn;
+}
+
 static bool CalleeHasSideEffectsSafe(
     llvm::Function* callee,
     llvm::DenseSet<llvm::Function*>& visiting,
@@ -2457,19 +2491,36 @@ static bool CalleeHasSideEffectsSafe(
     for (llvm::BasicBlock& bb : *callee)
         for (llvm::Instruction& inst : bb)
         {
-            if (auto* call = llvm::dyn_cast<llvm::CallBase>(&inst))
+            // Stores and block fills into the callee's own allocas die with the frame: not observable.
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&inst))
             {
-                if (CalleeHasSideEffectsSafe(call->getCalledFunction(), visiting, memo))
-                {
+                if (load->isVolatile() || load->isAtomic()) hasEffects = true;
+            }
+            else if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&inst))
+            {
+                if (store->isVolatile() || store->isAtomic()
+                    || !PointsIntoFrameSlot(store->getPointerOperand(), callee))
                     hasEffects = true;
-                    break;
-                }
             }
-            else if (inst.mayWriteToMemory())
+            else if (auto* call = llvm::dyn_cast<llvm::CallBase>(&inst))
             {
-                hasEffects = true;
-                break;
+                if (auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(call))
+                {
+                    if (intrinsic->isLifetimeStartOrEnd()) continue;
+                    const auto id = intrinsic->getIntrinsicID();
+                    if ((id == llvm::Intrinsic::memset || id == llvm::Intrinsic::memcpy
+                            || id == llvm::Intrinsic::memmove)
+                        && PointsIntoFrameSlot(call->getArgOperand(0), callee))
+                        continue;
+                    if (intrinsic->mayWriteToMemory() || intrinsic->mayHaveSideEffects())
+                        hasEffects = true;
+                }
+                else if (CalleeHasSideEffectsSafe(call->getCalledFunction(), visiting, memo))
+                    hasEffects = true;
             }
+            else if (inst.mayWriteToMemory() || inst.mayHaveSideEffects())
+                hasEffects = true;
+            if (hasEffects) break;
         }
     visiting.erase(callee);
     memo[callee] = hasEffects;
@@ -2678,6 +2729,37 @@ static llvm::Constant* FoldConstructedValueToConstantImpl(
         return folded;
     }
 
+    // An enum member is an immutable named constant (tagged at registration): its load is its value.
+    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+    {
+        auto* member = llvm::dyn_cast<llvm::GlobalVariable>(
+            load->getPointerOperand()->stripPointerCasts());
+        if (member == nullptr || !member->hasMetadata("cflat.enum_member") || !member->hasInitializer()
+            || member->getValueType() != load->getType())
+            return nullptr;
+        return llvm::dyn_cast<llvm::Constant>(member->getInitializer());
+    }
+    // Integer and floating arithmetic and casts fold when every operand folds (`Band.High + 1`).
+    if (auto* inst = llvm::dyn_cast<llvm::Instruction>(value);
+        inst != nullptr && !inst->mayReadOrWriteMemory() && !inst->mayHaveSideEffects()
+        && !llvm::isa<llvm::PHINode>(inst) && !llvm::isa<llvm::CallBase>(inst)
+        && (inst->getType()->isIntOrIntVectorTy() || inst->getType()->isFloatingPointTy()))
+    {
+        llvm::SmallVector<llvm::Constant*, 4> operands;
+        for (llvm::Use& use : inst->operands())
+        {
+            auto* folded = FoldConstructedValueToConstant(use.get(), frameArgs, frameMemo, state);
+            if (folded == nullptr) return nullptr;
+            operands.push_back(folded);
+        }
+        const llvm::DataLayout noLayout;
+        auto* result = llvm::ConstantFoldInstOperands(inst, operands, noLayout);
+        // Division by zero and similar undefined results are not values to replay.
+        if (result == nullptr || llvm::isa<llvm::PoisonValue>(result) || llvm::isa<llvm::UndefValue>(result))
+            return nullptr;
+        return result;
+    }
+
     return nullptr;
 }
 
@@ -2750,6 +2832,185 @@ bool MainListener::DefaultConstructionIsZero(const LLVMBackend::DeclTypeAndValue
         return zero;
     }
 
+/*
+ * Spelling of a native struct field's default: null when it is default-constructed (absent,
+ * `= default`, `{}`), else the `= <expr>` expression. False when the spelling is a brace list
+ * this predicate does not fold.
+ */
+bool MainListener::FieldDefaultSpelling(const LLVMBackend::DeclTypeAndValue& field,
+    CFlatParser::AssignmentExpressionContext*& expr)
+{
+        expr = nullptr;
+        if (field.BraceInitializer != nullptr || FieldDefaultBraceList(field) != nullptr) return false;
+        if (field.Initializer == nullptr || field.Initializer->Default() != nullptr) return true;
+        if (field.Initializer->assignmentExpression() != nullptr)
+        {
+            expr = field.Initializer->assignmentExpression();
+            return true;
+        }
+        return field.Initializer->LeftBrace() != nullptr
+            && field.Initializer->initializerList() == nullptr;
+}
+
+/*
+ * True when the emitted default initializer has no observable effect, by the same rule the folder
+ * applies to a called function: stores and block fills into the throwaway function's own slots are
+ * unobservable; any other write, a volatile or atomic access, or a callee with effects is not.
+ */
+static bool FieldDefaultEmitsNoEffects(llvm::Function* fn, FoldConstructedValueState& state)
+{
+    // The throwaway function is erased after this check: drop its memo entry so a reused address
+    // cannot answer for a different function later.
+    const bool effects = CalleeHasSideEffectsSafe(fn, state.EffectVisiting, state.EffectMemo);
+    state.EffectMemo.erase(fn);
+    return !effects;
+}
+
+/*
+ * The constant value of a field default (or a scalar global's `= <expr>`) that reads no member. The
+ * expression is emitted into a throwaway function and folded, so only a compile-time value survives.
+ * A default with an observable effect (`int x = (calls = 41)`) has no constant form: it is refused.
+ */
+llvm::Constant* MainListener::EvaluateFieldDefaultConstant(const std::string& ownerName,
+    const LLVMBackend::DeclTypeAndValue& typeValue, CFlatParser::AssignmentExpressionContext* expr,
+    FoldConstructedValueState& foldState)
+{
+        auto* compiler = Compiler();
+        const auto owner = compiler->GetDataStructure(ownerName);
+        // A default that names a member (field or method) runs against the object under construction:
+        // not a constant. A method call has no receiver in this throwaway frame, so it is refused here
+        // with the ruling diagnostic instead of the parser's "without an object argument" error.
+        if (FieldDefaultNamesMember(expr, [&](const std::string& name) {
+                const bool fieldName = std::any_of(owner.StructFields.begin(), owner.StructFields.end(),
+                    [&](const auto& field) { return field.VariableName == name; });
+                if (fieldName) return true;
+                for (const auto& [_, overloads] : compiler->functionTable)
+                    for (const auto& symbol : overloads)
+                        if (symbol.IsMethod && symbol.SourceName == name && !symbol.Parameters.empty()
+                            && symbol.Parameters.front().TypeName == ownerName
+                            && symbol.Parameters.front().Pointer)
+                            return true;
+                return false;
+            }))
+            return nullptr;
+
+        auto savedState = compiler->SaveBuilderState();
+        auto* tempFn = llvm::Function::Create(
+            llvm::FunctionType::get(compiler->builder->getVoidTy(), false),
+            llvm::Function::PrivateLinkage, "__global_field_default_tmp", compiler->module.get());
+        compiler->builder->SetInsertPoint(llvm::BasicBlock::Create(*compiler->context, "entry", tempFn));
+        llvm::Constant* folded = nullptr;
+        try
+        {
+            GlobalScopeGuard defaultCtorScope(global_scope);
+            llvm::Value* value = ParseFieldDefaultInitializer(ownerName, typeValue, expr);
+            llvm::DenseMap<const llvm::Value*, llvm::Constant*> noArgs;
+            llvm::DenseMap<const llvm::Value*, llvm::Constant*> rootMemo;
+            folded = FoldConstructedValueToConstant(value, noArgs, rootMemo, foldState);
+            if (!FieldDefaultEmitsNoEffects(tempFn, foldState)) folded = nullptr;
+        }
+        catch (...)
+        {
+            tempFn->eraseFromParent();
+            compiler->RestoreBuilderState(savedState);
+            throw;
+        }
+        tempFn->eraseFromParent();
+        compiler->RestoreBuilderState(savedState);
+
+        llvm::Type* target = compiler->GetType(typeValue);
+        if (folded == nullptr || target == nullptr) return nullptr;
+        if (folded->getType() == target) return folded;
+        // An integer literal stored into a narrower or wider integer field converts like the ctor does.
+        auto* source = llvm::dyn_cast<llvm::ConstantInt>(folded);
+        if (source != nullptr && target->isIntegerTy())
+            return llvm::ConstantInt::get(target,
+                source->getValue().sextOrTrunc(target->getIntegerBitWidth()));
+        return nullptr;
+}
+
+/*
+ * The default of one value, decided from its declared shape rather than the emitted IR. It is
+ * foldable (returned as a constant) when:
+ *   - a pointer (raw or owning) defaults to null (bare, `= default`, `= nullptr`);
+ *   - a core unique<T> defaults to null;
+ *   - a scalar defaults to zero or to a member-free constant expression;
+ *   - a fixed array's element is foldable;
+ *   - a native struct has no user-written no-arg constructor, no interface or union or C++ layout,
+ *     and every field is itself foldable (padding is zero).
+ * Anything else returns null and the global stays refused.
+ */
+llvm::Constant* MainListener::StructuralDefaultConstant(const LLVMBackend::DeclTypeAndValue& typeValue,
+    const std::string& ownerName, CFlatParser::AssignmentExpressionContext* expr,
+    FoldConstructedValueState& foldState, unsigned depth)
+{
+        auto* compiler = Compiler();
+        llvm::Type* type = compiler->GetType(typeValue);
+        if (depth > 32 || type == nullptr || typeValue.IsInterface || typeValue.IsArrayView
+            || typeValue.IsAlias || typeValue.IsSimd || typeValue.ElemPointer)
+            return nullptr;
+        const bool isNull = expr != nullptr && expr->getText() == "nullptr";
+
+        if (type->isPointerTy())
+        {
+            if (expr == nullptr || isNull) return llvm::Constant::getNullValue(type);
+            return EvaluateFieldDefaultConstant(ownerName, typeValue, expr, foldState);
+        }
+        if (type->isArrayTy())
+        {
+            // A multi-dimensional array's element is itself an array: refused, not folded.
+            if (expr != nullptr || typeValue.ConstArraySize == 0 || !typeValue.ConstInnerDimensions.empty())
+                return nullptr;
+            LLVMBackend::DeclTypeAndValue element = typeValue;
+            element.ConstArraySize = 0;
+            auto* arrayType = llvm::cast<llvm::ArrayType>(type);
+            auto* elementConst = StructuralDefaultConstant(element, ownerName, nullptr, foldState, depth + 1);
+            if (elementConst == nullptr || elementConst->getType() != arrayType->getElementType())
+                return nullptr;
+            if (elementConst->isNullValue()) return llvm::Constant::getNullValue(type);
+            return llvm::ConstantArray::get(arrayType,
+                std::vector<llvm::Constant*>(arrayType->getNumElements(), elementConst));
+        }
+        if (type->isStructTy())
+        {
+            if (compiler->IsCoreUniqueType(typeValue.TypeName))
+            {
+                // unique<T> owns nothing until assigned: only a null spelling folds.
+                if (expr == nullptr || isNull) return llvm::Constant::getNullValue(type);
+                return nullptr;
+            }
+            if (expr != nullptr) return nullptr;
+            const auto data = compiler->GetDataStructure(typeValue.TypeName);
+            if (data.StructType == nullptr || data.IsUnion || data.CxxOffsetLayout
+                || !data.Interfaces.empty() || compiler->IsCxxRecord(typeValue.TypeName)
+                || !compiler->StructDefaultsKnown(typeValue.TypeName))
+                return nullptr;
+            auto* structType = llvm::cast<llvm::StructType>(type);
+            if (data.StructFields.size() != structType->getNumElements()) return nullptr;
+            std::vector<llvm::Constant*> elements;
+            elements.reserve(data.StructFields.size());
+            for (size_t i = 0; i < data.StructFields.size(); ++i)
+            {
+                const auto& field = data.StructFields[i];
+                llvm::Type* elementType = structType->getElementType((unsigned)i);
+                if (field.IsPadding)
+                {
+                    elements.push_back(llvm::Constant::getNullValue(elementType));
+                    continue;
+                }
+                CFlatParser::AssignmentExpressionContext* fieldExpr = nullptr;
+                if (field.IsBitfield || !FieldDefaultSpelling(field, fieldExpr)) return nullptr;
+                auto* value = StructuralDefaultConstant(field, typeValue.TypeName, fieldExpr, foldState, depth + 1);
+                if (value == nullptr || value->getType() != elementType) return nullptr;
+                elements.push_back(value);
+            }
+            return llvm::ConstantStruct::get(structType, elements);
+        }
+        // Scalars: an absent or `= default` default is zero.
+        if (expr == nullptr) return llvm::Constant::getNullValue(type);
+        return EvaluateFieldDefaultConstant(ownerName, typeValue, expr, foldState);
+}
+
 llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(
     const LLVMBackend::DeclTypeAndValue& typeValue)
 {
@@ -2762,7 +3023,8 @@ llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(
 {
         auto* compiler = Compiler();
         if (compiler->GetDataStructure(typeValue.TypeName).StructType == nullptr) return nullptr;
-        if (compiler->GetFunction(typeValue.TypeName) == nullptr) return nullptr;
+        if (compiler->GetFunction(typeValue.TypeName) == nullptr)
+            return StructuralDefaultConstant(typeValue, typeValue.TypeName, nullptr, foldState, 0);
 
         auto savedState = compiler->SaveBuilderState();
         auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
@@ -2793,6 +3055,9 @@ llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(
 
         tempFn->eraseFromParent();
         compiler->RestoreBuilderState(savedState);
+        // A constructor fold that is missing or of the wrong shape falls back to the declared-shape default.
+        if (folded == nullptr || folded->getType() != compiler->GetType(typeValue))
+            folded = StructuralDefaultConstant(typeValue, typeValue.TypeName, nullptr, foldState, 0);
         // A fold that produced the wrong shape is not usable as this global's initializer.
         if (folded != nullptr && folded->getType() != compiler->GetType(typeValue)) return nullptr;
         return folded;
@@ -2835,11 +3100,13 @@ MainListener::ResolvePendingGlobalDefaultConstructions()
                     item.TypeValue.TypeName, &unavailableType))
             {
                 const auto* info = compilerLLVM->GetCxxClassInfo(unavailableType);
+                const char* fieldAdvice = compilerLLVM->IsCxxRecord(item.TypeValue.TypeName)
+                    ? "" : " - a global field of it cannot be constructed; hold it through a pointer instead";
                 LogErrorContext(item.Context, std::format(
-                    "C++ class '{}' has no default constructor cflat can call{}",
+                    "C++ class '{}' has no default constructor cflat can call{}{}",
                     compilerLLVM->DisplayCxxClassName(unavailableType),
                     info != nullptr && info->hasDeletedDefaultCtor
-                        ? " (it is deleted)" : ""));
+                        ? " (it is deleted)" : "", fieldAdvice));
             }
             // A direct C++ class element is constructed by pendingGlobalCxxConstructions_; queuing it
             // here too would run its default constructor twice per element.
@@ -2863,7 +3130,13 @@ MainListener::ResolvePendingGlobalDefaultConstructions()
                 item.Global->setInitializer(folded);
                 continue;
             }
-            // A fold-only retry (`= default` array) that does not fold keeps its zero constant.
+            if (!item.TypeValue.threadLocal)
+                LogErrorContext(item.Context, std::format(
+                    "native global '{}' of type '{}' has a default construction that could not be "
+                    "reduced to a compile-time constant; it must be constructed in main or made "
+                    "foldable",
+                    item.Global->getName().str(), item.TypeValue.TypeName));
+            // A fold-only TLS retry retains its pre-existing per-thread zero image.
             if (item.FoldOnly) continue;
             // A 'thread_local' joins the runtime list too; EmitPendingGlobalCxxConstructions builds
             // it per thread on first use. A zero-only construction keeps the zero image instead.
@@ -3004,10 +3277,8 @@ void MainListener::EmitPendingGlobalCxxConstructions(
         std::vector<PendingGlobalDefaultConstruction> nativeRuntime)
 {
         /*
-         * ONE module initializer for the native and the C++ runtime constructions, in declaration
-         * order (Sequence). Two initializers would run every native construction before every C++
-         * one, so `Stamp a; N[3] g = {};` built g first. A native construction that does not fold
-         * (a constructor body, an owning field) runs here as the local declarator would run it.
+         * Non-folding native globals are rejected. The remaining C++ globals use one ordered
+         * module initializer; native thread_local defaults use the lazy per-thread initializer below.
          */
         struct RuntimeConstruction
         {
@@ -3042,8 +3313,7 @@ void MainListener::EmitPendingGlobalCxxConstructions(
             }
             if (construction.Native)
             {
-                // A native global whose default construction did not fold: an array takes
-                // its per-element default init, a struct its CFlat default constructor.
+                // A non-folding native thread_local default builds once per thread on first use.
                 if (item.TypeValue.ConstArraySize > 0)
                 {
                     EmitFixedArrayDefaultInit(item.Global, item.TypeValue, item.Context, true);
@@ -3228,8 +3498,8 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
         if (!llvmType) return nullptr;
 
         // File scope has no element walk below: fold one element's default construction and
-        // replicate it, as the `S[N] g;` declarator arm does. An element that does not fold keeps
-        // the zero constant, the storage a non-folding global has always had.
+        // replicate it, as the `S[N] g;` declarator arm does. Non-folding native defaults are
+        // retried after declarations and then rejected (except thread_local defaults).
         if (!resolved.Pointer && llvmType->isArrayTy() && global_scope)
         {
             auto* element = llvmType;
@@ -3243,9 +3513,9 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
                 elemValue.ConstInnerDimensions.clear();
                 if (auto* elemConst = TryFoldGlobalDefaultConstruction(elemValue))
                     if (auto* splat = SplatConstantOverFixedArray(elemConst, llvmType)) return splat;
-                // Not foldable: the caller queues the element construction for the module initializer.
-                // A C++ field is built by the C++ queue instead (its own diagnostics), so no defer.
-                globalDefaultDeferred_ = !HasGlobalCxxFieldDefaultConstruction(elemValue);
+                // The caller retries the fold after declarations; native globals cannot run this
+                // default at module startup when the retry still fails.
+                globalDefaultDeferred_ = true;
             }
             return llvm::Constant::getNullValue(llvmType);
         }
@@ -3360,10 +3630,8 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
                 // At global scope the call is not an initializer; take its constant value if it has one.
                 if (auto* folded = TryFoldGlobalDefaultConstruction(resolved))
                     return folded;
-                // Not foldable (e.g. a member default reads another member): the caller must
-                // queue the construction for the module initializer, never keep this zero.
-                // A C++ field is built by the C++ queue instead (its own diagnostics), so no defer.
-                globalDefaultDeferred_ = !HasGlobalCxxFieldDefaultConstruction(resolved);
+                // A native global with a non-folding default is rejected after declarations.
+                globalDefaultDeferred_ = true;
             }
         }
 
@@ -4037,17 +4305,21 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     globalsBefore.insert(global.getName().str());
 
                 auto recoveryMark = MarkExpectErrorRecoveryState();
+                auto uniqueAdoptionMark = compilerLLVM->MarkUniqueAdoptionRecovery();
                 bool errorReceived = false;
                 try
                 {
                     for (auto* extDecl : expectErrDecl->externalDeclaration())
                         ParseExternalDeclaration(extDecl, namespaceName);
+                    // Resolve body summaries while this scoped expectation is still armed.
+                    compilerLLVM->ResolveUniqueAdoptionFacts(uniqueAdoptionMark.ArrayCallCount);
                 }
                 catch (const ExpectedErrorReceived&)
                 {
                     size_t caughtExpectScope = compilerLLVM->activeExpectScope_;
                     errorReceived = caughtExpectScope == expectScope;
                     RestoreExpectErrorRecoveryState(recoveryMark, nullptr);
+                    compilerLLVM->RestoreUniqueAdoptionRecovery(uniqueAdoptionMark);
                     // ForwardRefScanner may have queued generic work for this failed declaration
                     // before the scoped expectation ran. Let later source uses queue it again.
                     for (const auto& pending : pendingInstantiations)
@@ -4452,6 +4724,7 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
         scanner.SetTokens(GetTokens());
         for (auto* extDecl : branchDecls)
             scanner.ScanExternalDeclaration(extDecl, namespaceName);
+        scanner.FinalizeViewFieldMoveInference();
 
         // Second pass: generate code for the taken branch
         for (auto* extDecl : branchDecls)
@@ -11315,9 +11588,30 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     const size_t pendingConstructionsBefore = pendingGlobalDefaultConstructions_.size()
                         + pendingGlobalCxxConstructions_.size();
                     const size_t pendingDefaultBefore = pendingGlobalDefaultConstructions_.size();
+                    const bool explicitZeroDefault = initializer != nullptr
+                        && (initializer->Default() != nullptr
+                            || (initializer->LeftBrace() != nullptr
+                                && initializer->initializerList() == nullptr));
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
                         typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly,
                         srcIsUnsigned);
+                    const bool nativeStructDefault = global_scope && explicitZeroDefault
+                        && !externDeclOnly && global != nullptr && !global->isDeclaration()
+                        && !typeAndValue.Pointer && !typeAndValue.IsArrayView
+                        && !typeAndValue.IsInterface && !typeAndValue.IsAlias
+                        && !compiler->IsCxxRecord(typeAndValue.TypeName)
+                        && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr;
+                    if (nativeStructDefault && HasGlobalCxxFieldDefaultConstruction(typeAndValue))
+                    {
+                        if (typeAndValue.threadLocal)
+                        {
+                            pendingGlobalDefaultConstruction = false;
+                            QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_,
+                                {global, typeAndValue, direct});
+                        }
+                        else
+                            pendingGlobalDefaultConstruction = true;
+                    }
                     if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
                         && compiler->IsCxxRecord(typeAndValue.TypeName))
                         compiler->MarkCxxConstGlobal(global);
@@ -11334,7 +11628,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                     // `S[N] g = default;` / `= {}` of a CFlat struct array that is still zero here: the
                     // element's constructor may not be emitted yet (an unmaterialized generic), so the
-                    // fold is retried at module end. Fold-only: a failing retry keeps the zero constant.
+                    // fold is retried after declarations before deciding whether the default folds.
                     auto innermostIsStruct = [&]() {
                         auto* t = compiler->GetType(typeAndValue);
                         while (t != nullptr && t->isArrayTy()) t = t->getArrayElementType();
@@ -11389,17 +11683,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 emptyBraceToken && typeAndValue.ConstArraySize == 0, copyListInit, false});
                         }
                     }
-                    bool explicitZeroDefault = initializer != nullptr
-                        && (initializer->Default() != nullptr
-                            || (initializer->LeftBrace() != nullptr
-                                && initializer->initializerList() == nullptr));
-                    if (global_scope && explicitZeroDefault && !externDeclOnly
-                        && !typeAndValue.Pointer && !typeAndValue.IsArrayView
-                        && !typeAndValue.IsInterface && !typeAndValue.IsAlias
-                        && global != nullptr && !global->isDeclaration()
-                        && !compiler->IsCxxRecord(typeAndValue.TypeName)
-                        && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr)
-                        QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_, {global, typeAndValue, direct});
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
                         && typeAndValue.TypeName == "string" && initializer != nullptr
                         && initializer->assignmentExpression() != nullptr)
@@ -11411,8 +11694,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                     // A native const scalar / pointer / scalar-array global with a constant initializer
                     // and no module-init construction is read-only data.
-                    // `= default` on a native struct folds into the initializer; the queued C++-field
-                    // construction is dropped at emission when no field needs one.
+                    // Folded native defaults need no runtime construction; non-folding ones stay queued.
                     const bool foldedNativeDefault = explicitZeroDefault && !typeAndValue.Pointer
                         && pendingDefaultBefore == pendingGlobalDefaultConstructions_.size()
                         && pendingConstructionsBefore + 1 == pendingGlobalDefaultConstructions_.size()
@@ -13219,6 +13501,9 @@ void MainListener::RejectRawHeapArrayIntoUniqueField(
         const LLVMBackend::TypeAndValue& fieldType,
         const std::string& fieldName,
         antlr4::ParserRuleContext* ctx) {
+        if (compilerLLVM != nullptr && fieldType.ConstArraySize == 0
+            && IsOwningUniqueField(fieldType))
+            compilerLLVM->MarkCurrentMoveParamUniqueAdopted(source);
         if (!compilerLLVM->HasRawNewArrayProvenance(source)
             || fieldType.ConstArraySize != 0 || !IsOwningUniqueField(fieldType))
             return;
@@ -13239,6 +13524,8 @@ void MainListener::RejectRawHeapArrayIntoUniqueLocal(
                     && !localType.Pointer
                     && !compilerLLVM->IsInterfaceType(MangledGenericArgument(
                         *compilerLLVM, localType.TypeName))));
+        if (compilerLLVM != nullptr && localType.ConstArraySize == 0 && uniquePointer)
+            compilerLLVM->MarkCurrentMoveParamUniqueAdopted(source);
         // A counted call result (a `move` return) is not a raw local's `new T[n]` provenance.
         if (compilerLLVM == nullptr || !uniquePointer || localType.IsArrayView
             || !compilerLLVM->HasRawNewArrayProvenance(source)

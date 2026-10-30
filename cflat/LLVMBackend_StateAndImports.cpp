@@ -914,6 +914,211 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::GetCurrentFunctionSymbol() const
         return currentFunction == nullptr ? nullptr : GetFunctionSymbol(currentFunction);
 }
 
+std::optional<unsigned> LLVMBackend::CurrentMoveParamIndex(const NamedVariable& source) const
+{
+        if (currentFunction == nullptr || source.Storage == nullptr) return std::nullopt;
+        const FunctionSymbol* symbol = GetCurrentFunctionSymbol();
+        if (symbol == nullptr) return std::nullopt;
+
+        const StackState* functionScope = nullptr;
+        for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+            if (it->isFunction)
+            {
+                functionScope = &*it;
+                break;
+            }
+        if (functionScope == nullptr) return std::nullopt;
+
+        for (unsigned i = 0; i < symbol->Parameters.size(); ++i)
+        {
+            const TypeAndValue& param = symbol->Parameters[i];
+            if (!param.IsMove || !param.Pointer || param.ElemPointer || param.IsArrayView
+                || param.VariableName.empty())
+                continue;
+            auto arg = functionScope->functionArgument.find(param.VariableName);
+            if (arg != functionScope->functionArgument.end()
+                && arg->second.Storage == source.Storage)
+                return i;
+        }
+        return std::nullopt;
+}
+
+bool LLVMBackend::MarkCurrentMoveParamUniqueAdopted(const NamedVariable& source)
+{
+        auto index = CurrentMoveParamIndex(source);
+        if (!index || currentFunction == nullptr) return false;
+        if (uniqueAdoptedParameterFacts_[currentFunction].insert(*index).second)
+            uniqueAdoptionFactInsertions_.push_back({ currentFunction, *index });
+        return true;
+}
+
+void LLVMBackend::RecordUniqueAdoptionForward(const NamedVariable& source,
+        llvm::Function* callee, unsigned calleeParamIndex, bool directUniqueAdoption)
+{
+        auto callerIndex = CurrentMoveParamIndex(source);
+        if (callee == nullptr) return;
+        if (directUniqueAdoption)
+            if (uniqueAdoptedParameterFacts_[callee].insert(calleeParamIndex).second)
+                uniqueAdoptionFactInsertions_.push_back({ callee, calleeParamIndex });
+        if (!callerIndex || currentFunction == nullptr) return;
+        UniqueAdoptionForwardEdge edge{ currentFunction, *callerIndex, callee, calleeParamIndex };
+        if (std::find_if(uniqueAdoptionForwardEdges_.begin(), uniqueAdoptionForwardEdges_.end(),
+                [&](const UniqueAdoptionForwardEdge& existing) {
+                    return existing.Caller == edge.Caller
+                        && existing.CallerParamIndex == edge.CallerParamIndex
+                        && existing.Callee == edge.Callee
+                        && existing.CalleeParamIndex == edge.CalleeParamIndex;
+                }) == uniqueAdoptionForwardEdges_.end())
+            uniqueAdoptionForwardEdges_.push_back(edge);
+}
+
+void LLVMBackend::RecordUniqueAdoptionArrayCall(llvm::Function* callee,
+        unsigned calleeParamIndex, const NamedVariable& argument,
+        const std::string& parameterName, const std::string& functionName,
+        bool directUniqueAdoption, antlr4::ParserRuleContext* callContext)
+{
+        if (callee == nullptr) return;
+        antlr4::ParserRuleContext* context = argument.SourceExpressionContext != nullptr
+            ? argument.SourceExpressionContext : callContext;
+        // Source text with its original spacing ('new R[3]', not 'newR[3]').
+        auto sourceText = [](antlr4::ParserRuleContext* ctx) {
+            if (ctx->getStart() == nullptr || ctx->getStop() == nullptr) return ctx->getText();
+            return ctx->getStart()->getInputStream()->getText(antlr4::misc::Interval(
+                ctx->getStart()->getStartIndex(), ctx->getStop()->getStopIndex()));
+        };
+        const std::string argumentName = argument.SourceExpressionContext != nullptr
+            ? sourceText(argument.SourceExpressionContext)
+            : (!argument.CallerName.empty() ? argument.CallerName
+               : (!argument.TypeAndValue.VariableName.empty()
+                    ? argument.TypeAndValue.VariableName
+                    : (context != nullptr ? sourceText(context) : std::string("<expression>"))));
+        UniqueAdoptionArrayCall site{ callee, calleeParamIndex, argumentName,
+            parameterName, functionName, context,
+            directUniqueAdoption };
+        if (std::find_if(uniqueAdoptionArrayCalls_.begin(), uniqueAdoptionArrayCalls_.end(),
+                [&](const UniqueAdoptionArrayCall& existing) {
+                    return existing.Callee == site.Callee
+                        && existing.CalleeParamIndex == site.CalleeParamIndex
+                        && existing.Context == site.Context;
+                }) == uniqueAdoptionArrayCalls_.end())
+            uniqueAdoptionArrayCalls_.push_back(std::move(site));
+}
+
+LLVMBackend::UniqueAdoptionRecoveryMark LLVMBackend::MarkUniqueAdoptionRecovery() const
+{
+        return { uniqueAdoptionForwardEdges_.size(), uniqueAdoptionArrayCalls_.size(),
+            uniqueAdoptionFactInsertions_.size(), uniqueAdoptionSummaryInsertions_.size() };
+}
+
+void LLVMBackend::RestoreUniqueAdoptionRecovery(const UniqueAdoptionRecoveryMark& mark)
+{
+        uniqueAdoptionForwardEdges_.resize(mark.ForwardEdgeCount);
+        uniqueAdoptionArrayCalls_.resize(mark.ArrayCallCount);
+        auto mutableSymbol = [&](llvm::Function* function) -> FunctionSymbol* {
+            if (function == nullptr) return nullptr;
+            for (auto& [_, symbols] : functionTable)
+                for (auto& symbol : symbols)
+                    if (symbol.Function == function) return &symbol;
+            return nullptr;
+        };
+        for (size_t i = uniqueAdoptionSummaryInsertions_.size(); i > mark.SummaryInsertionCount; --i)
+        {
+            const auto& insertion = uniqueAdoptionSummaryInsertions_[i - 1];
+            if (FunctionSymbol* symbol = mutableSymbol(insertion.Function);
+                symbol != nullptr && insertion.ParamIndex < symbol->Parameters.size())
+                symbol->Parameters[insertion.ParamIndex].IsUniqueAdoptedParam = false;
+        }
+        uniqueAdoptionSummaryInsertions_.resize(mark.SummaryInsertionCount);
+        for (size_t i = uniqueAdoptionFactInsertions_.size(); i > mark.FactInsertionCount; --i)
+        {
+            const auto& insertion = uniqueAdoptionFactInsertions_[i - 1];
+            auto factIt = uniqueAdoptedParameterFacts_.find(insertion.Function);
+            if (factIt == uniqueAdoptedParameterFacts_.end()) continue;
+            factIt->second.erase(insertion.ParamIndex);
+            if (factIt->second.empty()) uniqueAdoptedParameterFacts_.erase(factIt);
+        }
+        uniqueAdoptionFactInsertions_.resize(mark.FactInsertionCount);
+}
+
+void LLVMBackend::ResolveUniqueAdoptionFacts(size_t firstArrayCall)
+{
+        auto mutableSymbol = [&](llvm::Function* function) -> FunctionSymbol* {
+            if (function == nullptr) return nullptr;
+            for (auto& [_, symbols] : functionTable)
+                for (auto& symbol : symbols)
+                    if (symbol.Function == function) return &symbol;
+            return nullptr;
+        };
+
+        for (const auto& [function, indices] : uniqueAdoptedParameterFacts_)
+            if (FunctionSymbol* symbol = mutableSymbol(function))
+                for (unsigned index : indices)
+                    if (index < symbol->Parameters.size())
+                    {
+                        auto& param = symbol->Parameters[index];
+                        if (!param.IsUniqueAdoptedParam)
+                        {
+                            param.IsUniqueAdoptedParam = true;
+                            uniqueAdoptionSummaryInsertions_.push_back({ function, index });
+                        }
+                    }
+
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (const auto& edge : uniqueAdoptionForwardEdges_)
+            {
+                FunctionSymbol* caller = mutableSymbol(edge.Caller);
+                const FunctionSymbol* callee = mutableSymbol(edge.Callee);
+                if (caller == nullptr || callee == nullptr
+                    || edge.CallerParamIndex >= caller->Parameters.size()
+                    || edge.CalleeParamIndex >= callee->Parameters.size()
+                    || !callee->Parameters[edge.CalleeParamIndex].IsUniqueAdoptedParam
+                    || caller->Parameters[edge.CallerParamIndex].IsUniqueAdoptedParam)
+                    continue;
+                caller->Parameters[edge.CallerParamIndex].IsUniqueAdoptedParam = true;
+                uniqueAdoptionSummaryInsertions_.push_back({ edge.Caller, edge.CallerParamIndex });
+                changed = true;
+            }
+        }
+
+        firstArrayCall = std::min(firstArrayCall, uniqueAdoptionArrayCalls_.size());
+        for (size_t i = firstArrayCall; i < uniqueAdoptionArrayCalls_.size();)
+        {
+            const auto& site = uniqueAdoptionArrayCalls_[i];
+            const FunctionSymbol* callee = mutableSymbol(site.Callee);
+            if (callee == nullptr || site.CalleeParamIndex >= callee->Parameters.size())
+            {
+                ++i;
+                continue;
+            }
+            const TypeAndValue& param = callee->Parameters[site.CalleeParamIndex];
+            if (!param.IsUniqueAdoptedParam && !site.DirectUniqueAdoption)
+            {
+                ++i;
+                continue;
+            }
+            const std::string message = std::format(
+                "cannot pass heap array argument '{}' to adopting parameter '{}' of '{}': "
+                "the array would be freed as one object",
+                site.ArgumentName, site.ParameterName, site.FunctionName);
+            auto* context = site.Context;
+            uniqueAdoptionArrayCalls_.erase(uniqueAdoptionArrayCalls_.begin() + i);
+            if (contextualErrorReporter && context != nullptr)
+            {
+                contextualErrorReporter(context, message);
+                continue;
+            }
+            if (context != nullptr && context->getStart() != nullptr)
+            {
+                SetSourceLocation(context->getStart()->getLine(),
+                    context->getStart()->getCharPositionInLine());
+            }
+            LogError(message);
+        }
+}
+
 std::string LLVMBackend::GetScopedCppEnumeratorHint(const std::string& name) const
 {
         auto it = scopedCppEnumeratorHints_.find(name);
@@ -1264,7 +1469,9 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
                 c = llvm::ConstantInt::get(*context, value.trunc(bits));
             else
                 c = CreateConstant(resolvedBacking, EnumWideToString(value));
-            CreateGlobalVariable(tv, c, false, 0, false, isUnsigned);
+            // Tagged so the constant folder reads the member as its value ("cflat.enum_member").
+            if (llvm::GlobalVariable* member = CreateGlobalVariable(tv, c, false, 0, false, isUnsigned))
+                member->setMetadata("cflat.enum_member", llvm::MDNode::get(*context, {}));
         }
         if (!registryName.empty()) enumDeclSites_[registryName].insert(site);
     }
@@ -2148,6 +2355,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsInterfacePointer) j["ifp"] = true;
         if (s.IsNullable)     j["nl"]  = true;
         if (s.IsMove)         j["mv"]  = true;
+        if (s.IsUniqueAdoptedParam) j["uap"] = true;
         if (s.IsAdopt)        j["ad"]  = true;
         if (s.IsAlias)        j["al"]  = true;
         if (s.IsRvalueRef)    j["rr"]  = true;
@@ -2162,6 +2370,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsConsumeInferredSink) j["cis"] = true;
         if (s.IsReturnInferredSink) j["ris"] = true;
         if (s.IsWriteInferredSink) j["wis"] = true;
+        if (!s.ViewFieldMovePaths.empty()) j["vfmp"] = s.ViewFieldMovePaths;
         if (s.IsBorrowOfAliasElement) j["bae"] = true;
         if (s.IsBond)          j["bd"] = true;
         if (s.IsUnique)        j["uq"] = true;
@@ -2229,6 +2438,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsInterfacePointer = j.value("ifp", false);
         s.IsNullable = j.value("nl", false);
         s.IsMove = j.value("mv", false);
+        s.IsUniqueAdoptedParam = j.value("uap", false);
         s.IsAdopt = j.value("ad", false);
         s.IsAlias = j.value("al", false);
         s.IsRvalueRef = j.value("rr", false);
@@ -2243,6 +2453,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsConsumeInferredSink = j.value("cis", false);
         s.IsReturnInferredSink = j.value("ris", false);
         s.IsWriteInferredSink = j.value("wis", false);
+        s.ViewFieldMovePaths = j["vfmp"].to_string_vector();
         s.IsBorrowOfAliasElement = j.value("bae", false);
         s.IsBond = j.value("bd", false);
         s.IsUnique = j.value("uq", false);
@@ -2397,6 +2608,16 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         if (!e.braceListElementSpellings.empty()) j["blel"] = e.braceListElementSpellings;
         if (!e.calleeIdentity.empty()) j["callee"] = e.calleeIdentity;
         if (!e.paramBindKinds.empty()) j["pbind"] = e.paramBindKinds;
+        if (!e.conditionalArgumentKinds.empty()) j["pcond"] = e.conditionalArgumentKinds;
+        if (!e.closureKeptParams.empty()) j["pckeep"] = e.closureKeptParams;
+        if (!e.selectedCalleeType.empty())
+        {
+            j["scty"] = e.selectedCalleeType;
+            if (!e.selectedCalleeTemplateArgs.empty()) j["scta"] = e.selectedCalleeTemplateArgs;
+            nlohmann::json scd = nlohmann::json::array();
+            for (const auto& d : e.selectedCalleeDefaults) scd.push_back({{"k", d.kind}, {"v", d.value}});
+            j["scd"] = std::move(scd);
+        }
         // paramNames repeats the names already serialized into "ps" for almost every C signature.
         // Compare against the SERIALIZED slot, so "pnq" means exactly what the reader rebuilds.
         bool namesMatchSlots = !e.paramNames.empty() && e.paramNames.size() == ps.size();
@@ -2457,6 +2678,13 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         if (j.contains("blel")) e.braceListElementSpellings = j["blel"].to_string_vector();
         e.calleeIdentity = j.value("callee", std::string());
         e.paramBindKinds = j.value("pbind", std::string());
+        e.conditionalArgumentKinds = j.value("pcond", std::string());
+        e.closureKeptParams = j.value("pckeep", std::string());
+        e.selectedCalleeType = j.value("scty", std::string());
+        e.selectedCalleeTemplateArgs = j.value("scta", std::string());
+        if (j.contains("scd"))
+            for (const auto& d : j["scd"])
+                e.selectedCalleeDefaults.push_back({ d.value("k", std::string{}), d.value("v", std::string{}) });
         if (j.value("pnq", false))
         {
             if (j.contains("ps"))

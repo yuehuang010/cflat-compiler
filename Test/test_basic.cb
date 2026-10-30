@@ -1541,7 +1541,6 @@ SeedInner gSeedBrace = {};
 GSeedTrunc gSeedTrunc;
 GSeedClass gSeedClass;
 GSeedNS.GSeedNsType gSeedNs;
-GSeedUserCtor gSeedUserCtor;
 
 // Global default-fold budget and source-order legs. Each global is paired with a local oracle.
 struct GSeedFoldD0 { int v = 100; };
@@ -1628,12 +1627,10 @@ bool testGlobalDefaultSeeding()
     result &= Test("gseed_ns_global_a", gSeedNs.a, 94);
 
     /*
-     * A user-written constructor BODY runs statements, so that construction does not fold to a
-     * constant initializer; it runs before main instead, and the global matches its local twin.
+     * A user-written constructor body cannot initialize a native global unless it folds.
      */
     GSeedUserCtor lUser;
     result &= Test("gseed_userctor_local_a", lUser.a, 96);
-    result &= Test("gseed_userctor_global_a", gSeedUserCtor.a, 96);
     return result;
 }
 

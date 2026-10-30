@@ -1,0 +1,78 @@
+import "unique.cb";
+
+expect_error("cannot pass heap array argument 'new T519Direct[3]' to adopting parameter 'value'") {
+    struct T519Direct { int value = 0; ~T519Direct() { } };
+    struct T519DirectHolder { unique T519Direct* value = default; };
+    void t519DirectStash(T519DirectHolder* holder, move T519Direct* value)
+    {
+        holder.value = value;
+    }
+    int t519DirectTrigger()
+    {
+        T519DirectHolder holder = default;
+        t519DirectStash(&holder, new T519Direct[3]);
+        return 0;
+    }
+}
+
+expect_error("cannot pass heap array argument 'new T519Forward[3]' to adopting parameter 'value'") {
+    struct T519Forward { int value = 0; ~T519Forward() { } };
+    struct T519ForwardHolder { unique T519Forward* value = default; };
+    void t519ForwardInner(T519ForwardHolder* holder, move T519Forward* value)
+    {
+        holder.value = value;
+    }
+    void t519ForwardOuter(T519ForwardHolder* holder, move T519Forward* value)
+    {
+        t519ForwardInner(holder, move value);
+    }
+    int t519ForwardTrigger()
+    {
+        T519ForwardHolder holder = default;
+        t519ForwardOuter(&holder, new T519Forward[3]);
+        return 0;
+    }
+}
+
+expect_error("cannot pass heap array argument 'new T519Unique[3]' to adopting parameter 'value'") {
+    struct T519Unique { int value = 0; ~T519Unique() { } };
+    void t519UniqueCtorAdopt(move T519Unique* value)
+    {
+        unique<T519Unique> owner = unique<T519Unique>(move value);
+    }
+    int t519UniqueCtorTrigger()
+    {
+        t519UniqueCtorAdopt(new T519Unique[3]);
+        return 0;
+    }
+}
+
+expect_error("cannot pass heap array argument 'new T519Reset[3]' to adopting parameter 'value'") {
+    struct T519Reset { int value = 0; ~T519Reset() { } };
+    void t519UniqueResetAdopt(move T519Reset* value)
+    {
+        unique<T519Reset> owner = default;
+        owner.reset(move value);
+    }
+    int t519UniqueResetTrigger()
+    {
+        t519UniqueResetAdopt(new T519Reset[3]);
+        return 0;
+    }
+}
+
+// Adoption is unsafe for trivial elements too: the array allocation still needs array delete.
+expect_error("cannot pass heap array argument 'new T519Trivial[3]' to adopting parameter 'value'") {
+    struct T519Trivial { int value = 0; };
+    struct T519TrivialHolder { unique T519Trivial* value = default; };
+    void t519TrivialStash(T519TrivialHolder* holder, move T519Trivial* value)
+    {
+        holder.value = value;
+    }
+    int t519TrivialTrigger()
+    {
+        T519TrivialHolder holder = default;
+        t519TrivialStash(&holder, new T519Trivial[3]);
+        return 0;
+    }
+}

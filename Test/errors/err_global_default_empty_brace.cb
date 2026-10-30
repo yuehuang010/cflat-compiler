@@ -1,0 +1,11 @@
+// T524: a non-folding native global default is refused.
+// Spelling 3 of 3: `= {}`. Siblings: err_global_default_not_constant.cb, err_global_default_eq_default.cb.
+const char* gRefPtr = "rt";
+struct RefStr { string s = gRefPtr; int n = 1; };
+expect_error("must be constructed in main or made foldable");
+RefStr gRefEmpty = {};
+
+extern int main()
+{
+    return gRefEmpty.n;
+}

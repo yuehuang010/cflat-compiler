@@ -27,7 +27,6 @@ i32 kSortMemory   = 1;
 i32 kSortPressure = 2;
 
 mutex     _resultLock       = default;
-AppSample _pendingSample    = default;
 bool      _pendingReady     = false;
 bool      _captureInFlight  = false;
 
@@ -36,6 +35,7 @@ MonitorApp* _appInstance = nullptr;
 
 class MonitorApp : IComponent
 {
+    AppSample _pendingSample = default;
     list<AppEntry> _all     = default;
     list<AppEntry> _visible = default;
     PressureScore  _pressure = default;
@@ -220,7 +220,7 @@ class MonitorApp : IComponent
         _captureInFlight = true;
         _resultLock.release();
 
-        if (!this._worker.start(_captureOnce, nullptr, 0))
+        if (!this._worker.start(_captureOnce, (void*)this, 0))
         {
             _resultLock.acquire();
             _captureInFlight = false;
@@ -313,23 +313,30 @@ class MonitorApp : IComponent
 void _drainSample()
 {
     _resultLock.acquire();
+    MonitorApp* app = _appInstance;
     bool ready = _pendingReady;
-    AppSample sample = move _pendingSample;
     _pendingReady = false;
+    if (!ready || app == nullptr)
+    {
+        _resultLock.release();
+        return;
+    }
+    AppSample sample = move app._pendingSample;
     _resultLock.release();
-    if (!ready || _appInstance == nullptr) return;
 
-    _appInstance.applySample(move sample);
+    app.applySample(move sample);
     _uiContext.invalidate();
 }
 
 int _captureOnce(void* argument)
 {
+    MonitorApp* app = (MonitorApp*)argument;
+    if (app == nullptr) return 0;
     MemSource source = default;
     AppSample sample = source.capture();
 
     _resultLock.acquire();
-    _pendingSample = move sample;
+    app._pendingSample = move sample;
     _pendingReady = true;
     _resultLock.release();
 

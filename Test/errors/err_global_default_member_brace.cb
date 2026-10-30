@@ -1,0 +1,10 @@
+// T524: a native global whose braced field default cannot fold must be refused.
+struct FbIn { int x; int y; };
+struct FbEq { FbIn i = { x = 1, y = 2 }; int z; };
+expect_error("must be constructed in main or made foldable");
+FbEq gFbEq = default;
+
+extern int main()
+{
+    return gFbEq.i.x + gFbEq.i.y;
+}

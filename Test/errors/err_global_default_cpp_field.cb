@@ -1,0 +1,9 @@
+expect_error("must be constructed in main or made foldable");
+import cpp "cpp_interop_basic.h";
+struct T73Holder { cpp_t73.Mix mix; };
+T73Holder t73Global = default;
+
+extern int main()
+{
+    return t73Global.mix.first.value;
+}

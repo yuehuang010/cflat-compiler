@@ -13,8 +13,9 @@ struct C02Stamp
 };
 struct C02Wrap { C02Stamp s = C02Stamp(4); int k = 0; };
 struct C02Box<T> { const T v = default; int n = 0; };
-C02Stamp C02G = default;
-namespace c02ns { C02Stamp NG = default; }
+// External storage keeps these analysis-only global targets out of default construction.
+extern C02Stamp C02G;
+namespace c02ns { extern C02Stamp NG; }
 
 extern int main()
 {

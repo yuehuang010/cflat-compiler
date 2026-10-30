@@ -6,7 +6,7 @@
 [immovable] struct Node { int x = 0; };
 struct Outer { Node n; int y = 0; };
 struct NodeContainer { Node value; };
-Node globalNode = default;
+Node globalNode;
 
 void takeValue(Node n) { }
 void takeMove(move Node n) { }
