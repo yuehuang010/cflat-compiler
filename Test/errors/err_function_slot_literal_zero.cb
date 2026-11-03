@@ -1,0 +1,136 @@
+import "../library/c_variadic_fnptr.h";
+
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroDeclaration() {
+        function<int(int)> fn = 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroAssignment() {
+        function<int(int)> fn = nullptr;
+        fn = 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    struct T185ZeroDefault { function<int(int)> fn = 0; };
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    struct T185ZeroBraceBox { function<int(int)> fn = default; };
+    int t185ZeroBrace() {
+        T185ZeroBraceBox box = { fn = 0 };
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    function<int(int)> t185ZeroReturn() { return 0; }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    struct T185ZeroGeneric<T> { T value = default; };
+    int t185ZeroGenericAssignment() {
+        T185ZeroGeneric<function<int(int)>> box;
+        box.value = 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroLambdaDeclaration() {
+        Lambda<int(int)> fn = 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroLambdaAssignment() {
+        Lambda<int(int)> fn = nullptr;
+        fn = 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    struct T185ZeroLambdaDefault { Lambda<int(int)> fn = 0; };
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    struct T185ZeroLambdaBraceBox { Lambda<int(int)> fn = default; };
+    int t185ZeroLambdaBrace() {
+        T185ZeroLambdaBraceBox box = { fn = 0 };
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroThinDeclaration() {
+        T311Bin fn = 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroThinAssignment() {
+        T311Bin fn = nullptr;
+        fn = 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    struct T185ZeroThinDefault { T311Bin fn = 0; };
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroThinBrace() {
+        T311Ops ops = { f = 0, k = 1 };
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    T311Bin t185ZeroThinReturn() { return 0; }
+}
+expect_error("integer constant zero is not a null spelling for a function slot 'f'") {
+    int t185ZeroFunctionDefault(function<int(int)> f = 0) { return 0; }
+    int t185CallFunctionDefault() { return t185ZeroFunctionDefault(); }
+}
+import cpp "../library/cpp_interop_fnptr.h";
+import cpp "../library/cpp_t48_nullptr.hpp";
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppOverloadedMfLiteralZero() { return cpi_t48.mf(0); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppOverloadedMfUnsignedLiteralZero() { return cpi_t48.mf(0UL); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppCallbackPresentLiteralZero() { return cppfnptr.callback_present(0); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppOverloadedLiteralZero() { return cpi_t48.fp(0); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppOverloadedLongLiteralZero() { return cpi_t48.fp(0L); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppFreeLiteralZero() { return cppfnptr.void_callback(0); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppFreeUnsignedLiteralZero() { return cppfnptr.void_callback(0UL); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppFree() { return cppfnptr.inline_callback(0, 1); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppMethod() {
+        cppfnptr.Sink sink = default;
+        return sink.member(0);
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppCtor() { cppfnptr.Sink sink = cppfnptr.Sink(0); return sink.value; }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppStdFunction() { return cppfnptr.std_function_present(0); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppMacro() { return cppfnptr.callback_present(CPPFN_ZERO); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppLongMacro() { return cppfnptr.callback_present(CPPFN_ZEROL); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot 'f'") {
+    int t185ZeroThinDefault(T311Bin f = 0) { return 0; }
+    int t185CallThinDefault() { return t185ZeroThinDefault(); }
+}

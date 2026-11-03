@@ -1,0 +1,2 @@
+expect_error("unknown type 'TListNever'");
+struct TListNeverHolder { list<TListNever> values = default; };

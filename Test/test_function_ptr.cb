@@ -6267,20 +6267,16 @@ bool testTernaryGenericFunctionArm()
 
 struct T185Box<T> { T v = default; };
 
-// T185: a function<> slot takes the values it may hold - a named function, nullptr, the zero null
-// literal, a function-pointer variable or field, a call result, and a ternary of those. Refusals of
+// T185: a function<> slot takes the values it may hold - a named function, nullptr,
+// a function-pointer variable or field, a call result, and a ternary of those. Refusals of
 // integers, structs and data pointers live in Test/errors/err_function_slot_nonfunction.cb.
 bool testFunctionSlotAccepts()
 {
     bool result = true;
     int k = 1;
-    function<int(int)> z = 0;
-    result &= Test("zero literal is the null function", z == nullptr, true);
     function<int(int)> n = nullptr;
     n = t182Sq;
     result &= Test("nullptr then assigned a function", n(5), 25);
-    n = 0;
-    result &= Test("zero literal assigned is null", n == nullptr, true);
     function<int(int)> kn = k ? t182Sq : nullptr;
     result &= Test("ternary with a nullptr arm", kn(5), 25);
     function<int(int)> kz = k ? nullptr : t182Tri;
@@ -6289,8 +6285,6 @@ bool testFunctionSlotAccepts()
     hold.fn = nullptr;
     hold.fn = t182Half;
     result &= Test("field assigned a function after nullptr", hold.fn(6), 3);
-    T182Hold held = { fn = 0 };
-    result &= Test("brace field zero is null", held.fn == nullptr, true);
     function<int(int)> fromField = hold.fn;
     result &= Test("function-pointer field into a slot", fromField(8), 4);
     function<int(int)> fromCall = t182GetTri();
@@ -6298,8 +6292,6 @@ bool testFunctionSlotAccepts()
     T185Box<function<int(int)>> bx;
     bx.v = t182Sq;
     result &= Test("generic field assigned a function", bx.v(3), 9);
-    bx.v = 0;
-    result &= Test("generic field zero is null", bx.v == nullptr, true);
     bx.v = nullptr;
     result &= Test("generic field nullptr", bx.v == nullptr, true);
     return result;

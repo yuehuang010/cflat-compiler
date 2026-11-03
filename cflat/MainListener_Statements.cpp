@@ -2236,6 +2236,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && !compiler->currentFunctionReturnTV.IsAlias
             && !compiler->ReturnCarriesRawArrayCount(compiler->currentFunctionReturnTV)
             && !compiler->IsCoreUniqueReleaseResult(returnNV.Primary)
+            && !returnNV.IsCoreUniqueRelease
             && (compiler->HasRawNewArrayProvenance(returnNV)
                 || compiler->FindRawArrayResult(returnNV.Primary) != nullptr))
         {
@@ -2434,10 +2435,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             if (compiler->ArrayViewElementMismatch(compiler->currentFunctionReturnTV,
                                                   returnNV.TypeAndValue,
                                                   retDestElement, retSrcElement))
-                LogErrorContext(errCtx, std::format(
+                LogErrorContext(errCtx, compiler->LocalizeMessage(
                     "cannot return an array view of '{}' from a function whose return element is "
                     "'{}' - a view indexes by its own element, so the elements must match",
-                    retSrcElement, retDestElement));
+                    { retSrcElement, retDestElement }));
         }
         // Return leg of the code-value store gate: `return w;` from a `Rec*`
         // function handed the caller a code address to write through.
@@ -2638,32 +2639,32 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 return sym != nullptr && !sym->IsCxx && !sym->ReturnType.Pointer
                     && (sym->ReturnType.IsAlias || sym->ReturnsAlias);
             };
-            std::function<void(llvm::Value*, const char*)> walkJoinArms;
-            walkJoinArms = [&](llvm::Value* value, const char* armJoin) {
+            std::function<void(llvm::Value*, const char*, bool)> walkJoinArms;
+            walkJoinArms = [&](llvm::Value* value, const char* armJoin, bool selectedArm) {
                 if (value == nullptr || frameLocalPointerReturn || cflatAliasJoinArm) return;
                 value = value->stripPointerCasts();
                 if (!visitedArms.insert(value).second) return;
                 if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
                 {
                     for (llvm::Value* incoming : phi->incoming_values())
-                        walkJoinArms(incoming, "?:");
+                        walkJoinArms(incoming, "?:", true);
                     return;
                 }
                 if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
                 {
-                    walkJoinArms(select->getTrueValue(), "?:");
-                    walkJoinArms(select->getFalseValue(), "?:");
+                    walkJoinArms(select->getTrueValue(), "?:", true);
+                    walkJoinArms(select->getFalseValue(), "?:", true);
                     return;
                 }
                 if (const auto* join = compiler->FindNullCoalesceJoin(value))
                 {
                     for (const auto& arm : join->Arms)
-                        walkJoinArms(arm.Value, "??");
+                        walkJoinArms(arm.Value, "??", true);
                     return;
                 }
                 if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
                 {
-                    walkJoinArms(gep->getPointerOperand(), armJoin);
+                    walkJoinArms(gep->getPointerOperand(), armJoin, false);
                     return;
                 }
                 frameLocalPointerReturn = PointsIntoStackFrame(value)
@@ -2672,17 +2673,37 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     if (auto* borrowedCall = llvm::dyn_cast<llvm::CallBase>(value);
                         borrowedCall != nullptr && borrowedCall->getType()->isPointerTy())
                     {
+                        bool borrowedResult = compiler->IsAliasValue(borrowedCall);
+                        if (!borrowedResult && borrowedCall->getCalledFunction() != nullptr)
+                        {
+                            std::vector<std::pair<unsigned, unsigned>> borrowedArguments;
+                            borrowedResult = compiler->ReturnBorrowedArguments(
+                                borrowedCall->getCalledFunction(), borrowedArguments);
+                        }
+                        // A statement-owned temporary root dangles whatever the callee summary says.
                         bool statementOwnedTempRoot = false;
-                        CallResultFrameBorrowKind(borrowedCall, compiler, currentFn, nullptr,
-                                                  &statementOwnedTempRoot);
+                        const int borrowKind = CallResultFrameBorrowKind(
+                            borrowedCall, compiler, currentFn, nullptr, &statementOwnedTempRoot);
                         frameLocalPointerReturn = statementOwnedTempRoot;
+                        if (borrowedResult && !frameLocalPointerReturn)
+                        {
+                            const auto* callee = borrowedCall->getCalledFunction();
+                            const auto* symbol = callee != nullptr
+                                ? compiler->FindSymbolForFunction(callee) : nullptr;
+                            const bool selectedBorrowCall = armJoin != nullptr && selectedArm
+                                && !isCflatAliasCall(value)
+                                && symbol != nullptr && !symbol->IsCxx
+                                && (borrowKind == 1 || borrowKind == 2);
+                            frameLocalPointerReturn = (armJoin == nullptr && (borrowKind == 1 || borrowKind == 2))
+                                || selectedBorrowCall;
+                        }
                     }
                 if (frameLocalPointerReturn && armJoin != nullptr)
                     frameLocalArmJoin = armJoin;
                 if (!frameLocalPointerReturn && armJoin != nullptr && isCflatAliasCall(value))
                     cflatAliasJoinArm = true;
             };
-            walkJoinArms(returnNV.Primary, nullptr);
+            walkJoinArms(returnNV.Primary, nullptr, false);
         }
         bool coreUniqueRawReturn = !aliasRefReturn && cxxRefReturnAddr == nullptr
             && compiler->IsCoreUniqueToRawPointer(returnNV, compiler->currentFunctionReturnTV);
@@ -6346,6 +6367,13 @@ void MainListener::GenerateDefaultParamOverloads(
                     defaultArg = defNV;
                     defaultVal = LoadNamedVariable(defNV);
                     defaultIsUnsigned = defNV.TypeAndValue.IsUnsignedInteger() != -1;
+                    if (params[i].IsFunctionPointer
+                        || compiler->GetEncodedClosureType(params[i].TypeName) != nullptr)
+                    {
+                        auto destination = defNV;
+                        destination.TypeAndValue.VariableName = params[i].VariableName;
+                        compiler->RejectLiteralZeroFunctionSlot(defaultVal, destination);
+                    }
                     RejectCodeValueIntoDataSlot(ae, defNV, params[i], "default-initialize",
                         std::format("parameter '{}' of", params[i].VariableName));
                     // Thin-function sibling of the gate above: a data pointer default for a

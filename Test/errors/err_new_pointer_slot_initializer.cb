@@ -1,0 +1,7 @@
+extern int main()
+{
+    expect_error("integer or other primitive") {
+        int value = 1;
+        int** slot = new int*(value);
+    }
+}

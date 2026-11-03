@@ -2675,6 +2675,38 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
         return tv;
     }
 
+bool ForwardRefScanner::RegisterGenericAlias(const std::string& alias,
+        CFlatParser::TypeSpecifierContext* typeSpec, const std::string& parsedSpelling,
+        const std::string& suffix, uint8_t constMask, bool genericDerived,
+        antlr4::ParserRuleContext* ctx, CFlatParser::GenericTypeParametersContext* genericCtx) {
+        std::string baseName;
+        auto* genParams = typeSpec != nullptr ? GenericSpecOf(typeSpec, baseName) : nullptr;
+        if (genParams == nullptr) return false;
+        auto* compiler = Compiler(ctx);
+        std::vector<std::string> args;
+        for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+            args.push_back(ResolveForwardTypeArg(entry));
+        std::string resolvedBase = ResolveGenericTemplateSpellingAtUse(
+            compiler, baseName, args, genericCtx != nullptr ? genericCtx : genParams, baseName, false);
+        compiler->CompleteCxxTemplateTypeArgs(resolvedBase, args);
+        std::string mangled = MangleGenericInstance(*compiler, resolvedBase, args);
+        if (compiler->IsGenericInterfaceTemplateName(resolvedBase))
+            compiler->gts.genericInterfaceInstances.insert(mangled);
+        else if (compiler->AnyGenericTypeTemplateNamed(resolvedBase))
+        {
+            compiler->CreateStructType(mangled, {});
+            LLVMBackend::TypeAndValue ret{ .TypeName = mangled };
+            compiler->CreateFunctionDeclaration(mangled, ret, {});
+        }
+        else
+        {
+            std::string cxxError;
+            compiler->TryRequestCxxType(resolvedBase, args, mangled, cxxError);
+        }
+        compiler->RegisterTypeAlias(alias, mangled + suffix, constMask, genericDerived);
+        return true;
+}
+
 void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx) {
         auto* compiler = Compiler(ctx);
 
@@ -2762,37 +2794,10 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         // The forward-ref pass is opportunistic: it never errors (templates may not be scanned
         // yet); ParseUsingDeclaration is authoritative and emits the diagnostics.
         std::string baseName;
-        if (auto* genParams = GenericSpecOf(typeSpec, baseName))
+        if (GenericSpecOf(typeSpec, baseName) != nullptr)
         {
-            std::vector<std::string> args;
-            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-            {
-                // Route every arg through ResolveForwardTypeArg so this shell matches ParseUsingDeclaration.
-                args.push_back(ResolveForwardTypeArg(entry));
-            }
-            std::string resolvedBaseName = ResolveGenericTemplateSpellingAtUse(
-                compiler, baseName, args, genParams, baseName, false);
-            compiler->CompleteCxxTemplateTypeArgs(resolvedBaseName, args);
-            std::string mangledName = MangleGenericInstance(*compiler, resolvedBaseName, args);
-            // A generic interface instantiation gets no struct shell / default ctor (see
-            // tryPreDeclare); the alias still names the mangled interface.
-            if (compiler->IsGenericInterfaceTemplateName(resolvedBaseName))
-                compiler->gts.genericInterfaceInstances.insert(mangledName);
-            else if (compiler->AnyGenericTypeTemplateNamed(resolvedBaseName))
-            {
-                compiler->CreateStructType(mangledName, {});
-                LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
-                compiler->CreateFunctionDeclaration(mangledName, returnType, {});
-            }
-            else
-            {
-                // A C++ specialization needs its foreign layout before a file-scope signature
-                // can use an alias declared later in the file. The main pass remains authoritative
-                // for diagnostics; this request is intentionally best effort.
-                std::string cxxError;
-                compiler->TryRequestCxxType(resolvedBaseName, args, mangledName, cxxError);
-            }
-            compiler->RegisterTypeAlias(alias, mangledName + suffix, targetConstMask, genericDerived);
+            RegisterGenericAlias(alias, typeSpec, target, suffix, targetConstMask,
+                genericDerived, ctx, GenericSpecOf(typeSpec, baseName));
             return;
         }
 
@@ -3165,6 +3170,70 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
             ScanGlobalLockGroup(lfg, namespaceName);
         else if (auto* decl = ctx->declaration())
         {
+            // A typedef declaration contributes a name to the type namespace before the
+            // code-generation pass visits later signatures and declarations.
+            auto* specs = decl->declarationSpecifiers();
+            bool isTypedef = false;
+            if (specs != nullptr)
+                for (auto* spec : specs->declarationSpecifier())
+                    if (auto* storage = spec->storageClassSpecifier();
+                        storage != nullptr && storage->Typedef() != nullptr)
+                        isTypedef = true;
+            if (isTypedef && decl->initDeclaratorList() != nullptr)
+            {
+                auto type = ParseDeclarationSpecifiers(specs);
+                std::string suffix = std::string(type.PointerDepth, '*');
+                std::string target = type.TypeName + suffix;
+                if (type.ArraySize != nullptr)
+                {
+                    suffix += "[" + type.ArraySize->getText() + "]";
+                    target += "[" + type.ArraySize->getText() + "]";
+                    for (auto* dim : type.ExtraArrayDims)
+                    {
+                        suffix += "[" + dim->getText() + "]";
+                        target += "[" + dim->getText() + "]";
+                    }
+                }
+                for (auto* item : decl->initDeclaratorList()->initDeclarator())
+                {
+                    auto* declarator = item->declarator();
+                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                    auto* id = LexicalDirectDeclaratorIdentifier(direct);
+                    if (item->initializer() != nullptr || item->initializerList() != nullptr)
+                        compilerLLVM->LogError("typedef declarations cannot have an initializer");
+                    if (direct != nullptr && direct->assignmentExpression() != nullptr)
+                        compilerLLVM->LogError(std::format(
+                            "C-style array declaration '{}[{}]' is not allowed; use '[{}] {}'",
+                            id != nullptr ? id->getText() : std::string("<anonymous>"),
+                            direct->assignmentExpression()->getText(),
+                            direct->assignmentExpression()->getText(),
+                            id != nullptr ? id->getText() : std::string("<anonymous>")));
+                    if (declarator != nullptr
+                        && (declarator->parameterTypeList() != nullptr
+                            || declarator->identifierList() != nullptr))
+                        compilerLLVM->LogError("typedef function declarators are not supported");
+                    if (id != nullptr)
+                    {
+                        std::string baseName;
+                        auto* lastSpec = LastDeclarationTypeSpecifier(specs->declarationSpecifier());
+                        auto* typeSpec = lastSpec != nullptr ? lastSpec->typeSpecifier() : nullptr;
+                        if (typeSpec != nullptr)
+                            if (auto* genParams = GenericSpecOf(typeSpec, baseName))
+                            {
+                                const std::string targetSpelling = typeSpec->getText();
+                                const bool genericDerived = scanTypeSubstitutions_.find(targetSpelling)
+                                        != scanTypeSubstitutions_.end()
+                                    || compilerLLVM->IsGenericDerivedTypeAlias(targetSpelling)
+                                    || compilerLLVM->IsGenericDerivedTypeAlias(
+                                        compilerLLVM->ResolveQualifiedName(targetSpelling));
+                                RegisterGenericAlias(id->getText(), typeSpec, target, suffix,
+                                    type.ConstMask, genericDerived, item, genParams);
+                                continue;
+                            }
+                        compilerLLVM->RegisterTypeAlias(id->getText(), target);
+                    }
+                }
+            }
             // Pre-register the enum so a signature (`int f(Dir d)`), a qualified spelling
             // (`Ns.Dir.Back`) and a member used before this declaration all resolve.
             if (auto* enumSpec = decl->enumSpecifier())

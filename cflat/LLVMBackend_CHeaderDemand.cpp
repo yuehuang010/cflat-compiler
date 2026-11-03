@@ -2191,8 +2191,10 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
         // is refused here rather than after the struct is defined.
         const bool evaluated = !cxxIncompleteArgumentSpelling_.empty();
         std::string src;
-        if (!rec.hasTrivialDtor && evaluated)
-            src = std::string(incrementalSource ? "__attribute__((used, noinline)) " : "")
+        // The one-shot fallback ODR-uses every nontrivial destructor; the default path (and its cache key) is master's.
+        const bool oneShotFallback = !UseCxxIncrementalRequests();
+        if (!rec.hasTrivialDtor && (evaluated || oneShotFallback))
+            src = std::string(incrementalSource || oneShotFallback ? "__attribute__((used, noinline)) " : "")
                 + "static void __cflat_use_dtor" + tagPrefix + "(" + marker
                 + "* p) { p->~" + marker + "(); }\n";
         else if (!rec.hasTrivialDtor)
@@ -2608,10 +2610,33 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
 {
         llvm::TimeTraceScope scope("RunCxxTypeRequests", group.label);
         cflat_cinterop::ExtractRequest req;
+        std::string completionSource;
+        if (!UseCxxIncrementalRequests())
+        {
+            for (const CxxRequestItem& item : items)
+            {
+                unsigned templateDepth = 0;
+                for (size_t i = 0; i + 1 < item.cxxSpelling.size(); ++i)
+                {
+                    if (item.cxxSpelling[i] == '<') ++templateDepth;
+                    else if (item.cxxSpelling[i] == '>' && templateDepth != 0) --templateDepth;
+                    else if (templateDepth == 0 && item.cxxSpelling[i] == ':'
+                             && item.cxxSpelling[i + 1] == ':')
+                    {
+                        const std::string owner = item.cxxSpelling.substr(0, i);
+                        if (owner.find('<') != std::string::npos)
+                        {
+                            completionSource += "static_assert(sizeof(" + owner + ") > 0);\n";
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         req.mainFileName = "cflat_cpp_request.cpp";
         req.cxxMode = true;
         req.cxxImportGroupKey = CxxIncrementalGroupKey(group);
-        req.source = BuildCxxRequestIncludes(group) + prefixSource
+        req.source = BuildCxxRequestIncludes(group) + prefixSource + completionSource
                    + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                    + extraSource;
         req.emitDefinitions = emitDefinitions;
@@ -2699,7 +2724,8 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         const std::string pch = EnsureCxxRequestPch(group, req.args);
         if (!pch.empty())
         {
-            req.source = prefixSource + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
+            req.source = prefixSource + completionSource
+                       + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                        + extraSource;
             req.args.push_back("-include-pch");
             req.args.push_back(pch);
@@ -2729,7 +2755,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             // makes every other request in the group re-parse the include prologue.
             llvm::TimeTraceScope retryScope("CxxRequestPchRetry", group.label);
             cflat_cinterop::ExtractRequest full = req;
-            full.source = BuildCxxRequestIncludes(group) + prefixSource
+            full.source = BuildCxxRequestIncludes(group) + prefixSource + completionSource
                         + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                         + extraSource;
             full.args.resize(full.args.size() - 2);

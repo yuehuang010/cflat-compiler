@@ -7822,13 +7822,14 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
             cxxMacroGlobalNames_.insert(m.name);
             // The set also tracks imported C pointer-valued NULL macros whose C++ expansion
             // is not preserved by the C-side value import.
-            static const std::set<std::string> kZeroMacroTypes = { "int", "u32", "long", "ulong", "i64", "u64" };
-            if (m.isIntegerLiteralZero && !m.isFloat && !m.isString && !m.isPointer && !m.isFuncPtr
-                && kZeroMacroTypes.count(tv.TypeName) != 0
-                && c != nullptr && c->getType()->isIntegerTy() && c->isNullValue())
+            if (m.isIntegerLiteralZero && c != nullptr && c->getType()->isIntegerTy()
+                && c->isNullValue())
                 cxxZeroIntegerMacroNames_.insert(m.name);
             else if (m.isIntegerLiteralZero && m.isPointer && c != nullptr && c->isNullValue())
                 cxxZeroIntegerMacroNames_.insert(m.name);
+            if (m.isIntegerLiteralZero && m.isIntegerLiteralToken && m.name != "NULL" && c != nullptr
+                && c->getType()->isIntegerTy() && c->isNullValue())
+                cxxLiteralZeroIntegerMacroNames_.insert(m.name);
             ++registered;
 
             if (auto* s = GetSymbolSink())

@@ -1,0 +1,24 @@
+expect_error("'++' is not allowed on a simd<bool, N> mask") {
+    void increment_bool_simd() {
+        simd<bool, 4> b = true;
+        b++;
+    }
+}
+
+expect_error("'--' is not allowed on a simd<bool, N> mask") {
+    void decrement_bool_simd() {
+        simd<bool, 4> b = true;
+        b--;
+    }
+}
+
+expect_error("'++' is not allowed on a simd<bool, N> mask") {
+    void increment_comparison_mask() {
+        simd<int, 4> a = 1;
+        simd<int, 4> c = 2;
+        simd<bool, 4> mask = a < c;
+        mask++;
+    }
+}
+
+extern int main() { return 0; }

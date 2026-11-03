@@ -451,6 +451,20 @@ void MainListener::MaterializeNullConditionalOwningValue(
         value.IsRvalue = true;
 }
 
+// The tuple literal of a cast chain that is ONLY that literal: no sizeof/unary operator, cast, or
+// postfix suffix. Anything else keeps ordinary evaluation, so sizeof, member and ++ apply as on master.
+static CFlatParser::TupleExpressionContext* BareTupleLiteralCast(CFlatParser::CastExpressionContext* cast)
+{
+    if (cast == nullptr || cast->children.size() != 1) return nullptr;
+    auto* unary = cast->unaryExpression();
+    if (unary == nullptr || unary->children.size() != 1) return nullptr;
+    auto* postfix = unary->postfixExpression();
+    if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
+    auto* primary = postfix->primaryExpression();
+    if (primary == nullptr || primary->children.size() != 1) return nullptr;
+    return primary->tupleExpression();
+}
+
 LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use) {
         // Snapshot and clear the owned-return flag so FinishAssignmentExpressionNamed
@@ -530,6 +544,10 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                                                     // and-expression level, below.
                                                     if (muls.size() == 1 && FindValueCastHazard(muls[0]) == nullptr)
                                                     {
+                                                        auto* cast = muls[0];
+                                                        if (auto* tuple = BareTupleLiteralCast(cast))
+                                                            return FinishAssignmentExpressionNamed(
+                                                                ParseTupleExpression(tuple), savedOwned);
                                                         // Pure single-child passthrough all the way down:
                                                         // this fast path IS the only shape where a bare
                                                         // return-block call reaches the inliner, so forward
@@ -563,6 +581,59 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
         {
             ParseAssignmentExpression(ctx);
             return {};
+        }
+        if (ctx->assignmentOperator() == nullptr)
+        {
+            auto* cond = ctx->conditionalExpression();
+            auto* ors = cond != nullptr ? cond->logicalOrExpression() : nullptr;
+            if (cond != nullptr && cond->Question() == nullptr && cond->QuestionQuestion() == nullptr
+                && ors != nullptr && ors->logicalAndExpression().size() == 1)
+            {
+                auto* andExpr = ors->logicalAndExpression(0);
+                if (andExpr->inclusiveOrExpression().size() == 1)
+                {
+                    auto* inclusive = andExpr->inclusiveOrExpression(0);
+                    if (inclusive->exclusiveOrExpression().size() == 1)
+                    {
+                        auto* exclusive = inclusive->exclusiveOrExpression(0);
+                        if (exclusive->andExpression().size() == 1)
+                        {
+                            auto* andBit = exclusive->andExpression(0);
+                            if (andBit->equalityExpression().size() == 1)
+                            {
+                                auto* equality = andBit->equalityExpression(0);
+                                if (equality->typeCheckExpression().size() == 1)
+                                {
+                                    auto* typeCheck = equality->typeCheckExpression(0);
+                                    if (typeCheck->Is().empty() && typeCheck->As().empty())
+                                    {
+                                        auto* relational = typeCheck->relationalExpression();
+                                        if (relational->shiftExpression().size() == 1)
+                                        {
+                                            auto* shift = relational->shiftExpression(0);
+                                            if (shift->additiveExpression().size() == 1)
+                                            {
+                                                auto* additive = shift->additiveExpression(0);
+                                                if (additive->multiplicativeExpression().size() == 1)
+                                                {
+                                                    auto* multiplicative = additive->multiplicativeExpression(0);
+                                                    if (multiplicative->castExpression().size() == 1)
+                                                    {
+                                                        auto* cast = multiplicative->castExpression(0);
+                                                        if (auto* tuple = BareTupleLiteralCast(cast))
+                                                            return FinishAssignmentExpressionNamed(
+                                                                ParseTupleExpression(tuple), savedOwned);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         // Fall back: call ParseConditionalExpression directly (when no assignment) so we can
         // recover the isUnsigned flag from TypedValue and synthesize the TypeName for Upconvert.
@@ -3742,15 +3813,15 @@ bool MainListener::RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx
         if (!Compiler()->ArrayViewElementMismatch(target, rhsNV.TypeAndValue, destElement, srcElement))
             return false;
         if (target.IsArrayView)
-            LogErrorContext(ctx, std::format(
+            LogErrorContext(ctx, Compiler()->LocalizeMessage(
                 "cannot bind an array view of '{}' to a destination of '{}' - a view indexes by its "
-                "own element, so the element types must match", srcElement, destElement));
+                "own element, so the element types must match", { srcElement, destElement }));
         else
             // Destination is a plain pointer (the one-way 'T[] -> T*' decay), not a view - a
             // depth change is proven broken, but wording must not imply the destination is one.
-            LogErrorContext(ctx, std::format(
+            LogErrorContext(ctx, Compiler()->LocalizeMessage(
                 "cannot bind an array view of '{}' to a plain pointer whose pointee is '{}' - only "
-                "a view whose element matches the pointee may decay to a pointer", srcElement, destElement));
+                "a view whose element matches the pointee may decay to a pointer", { srcElement, destElement }));
         return true;
     }
 
@@ -6509,8 +6580,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 return classAssignValue();
             }
             if (operatorText == "=")
+            {
+                RejectNewPointerSlotDepthMismatch(ctx, rightNV, namedVar.TypeAndValue);
                 compiler->RejectImplicitIntegerPointeePointerConversion(
                     rightNV.TypeAndValue, namedVar.TypeAndValue);
+            }
             arrayNewDesugarCtx = nullptr;
             // The observer conversion below unwraps an alias result whose element type is the
             // core unique wrapper. Preserve that source fact for the pointer-local ledger; the
@@ -7785,6 +7859,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(namedVar.TypeAndValue));
                 }
             }
+            if (operatorText == "=" && right && !namedVar.TypeAndValue.Pointer
+                && (namedVar.TypeAndValue.IsFunctionPointer
+                    || compiler->GetEncodedClosureType(namedVar.TypeAndValue.TypeName) != nullptr))
+                compiler->RejectLiteralZeroFunctionSlot(right, rightNV);
             // A thin function<T> destination fed a raw pointer not handled above (see
             // CheckThinFnPtrAssignProvenance's doc comment for why the FAT twin needs no gate here).
             if (operatorText == "=" && right && namedVar.TypeAndValue.IsFunctionPointer

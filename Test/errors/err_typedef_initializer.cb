@@ -1,0 +1,3 @@
+expect_error("typedef declarations cannot have an initializer") {
+    typedef int X = 5;
+}

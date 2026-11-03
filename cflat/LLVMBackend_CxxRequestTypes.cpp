@@ -3539,6 +3539,12 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                     && !generatedRequestMissing)
                     return failDeterministic(std::format("C++ type '{}' could not be parsed: {}",
                                             cxxSpelling, FirstCxxErrorLine(probe.firstError)));
+                // A one-shot request can harvest owner records with a requested scalar member
+                // typedef. Bind the marker before the record-only class request path.
+                if (!incrementalRequests && cxxSpelling.find(">::") != std::string::npos)
+                    for (const auto& t : probe.typedefs)
+                        if (t.name == "__cflat_req_0" && !t.underlying.empty())
+                            return bindScalarTypedef(t.underlying);
                 if (probe.records.empty())
                 {
                     if (generatedRequestMissing && !probe.firstError.empty())

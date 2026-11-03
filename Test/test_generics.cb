@@ -7550,6 +7550,23 @@ bool testT431SameLineAcceptSet()
     return result;
 }
 
+int TListLateDropCount = 0;
+struct TListLateHolder { list<TListLate> values = default; };
+struct TListLate { int value = default; ~TListLate() { TListLateDropCount++; } };
+
+bool testGenericFieldLaterList()
+{
+    TListLateDropCount = 0;
+    {
+        TListLateHolder holder = default;
+        TListLate value = default;
+        value.value = 42;
+        holder.values.add(value);
+        if (holder.values[0].value != 42) return false;
+    }
+    return TListLateDropCount == 2;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -7731,11 +7748,13 @@ extern int main()
     total++; passed += testT384TwoLevelNestedTemplates()                ? 1 : 0;
     total++; passed += testT465NestedTemplates()                        ? 1 : 0;
     total++; passed += testPointerOnlyLaterStruct()                  ? 1 : 0;
+    total++; passed += testGenericFieldLaterList()                    ? 1 : 0;
     total++; passed += testConstGenerics()                           ? 1 : 0;
     total++; passed += testConstGenericList()                        ? 1 : 0;
     total++; passed += testConstGenericAliasPack()                   ? 1 : 0;
     total++; passed += testMix5BareArrayDeduction()                  ? 1 : 0;
     total++; passed += testMix8TupleTemplates()                      ? 1 : 0;
+    total++; passed += testTupleLiteralElementConversions()           ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -7910,5 +7929,69 @@ bool testMix8TupleTemplates()
     result &= Test("mix8 nested tuple param names T", mix8Nest<int,int>(((1, 2), 3)), 6);
     (int,(int,int)) nested = mix8Mk2<int>(3);
     result &= Test("mix8 nested tuple return names T", nested.item_1.item_1, 3);
+    return result;
+}
+
+(i64, int) tupleLiteralWideningReturn() { return (3, 4); }
+int tupleLiteralWideningArgument((i64, int) value)
+{
+    return (int)value.item_0 + value.item_1;
+}
+int tupleLiteralFittingU8Argument((u8, int) value)
+{
+    return value.item_0 + value.item_1;
+}
+
+interface TupleLiteralInterface { int value((i64, int) pair); };
+class TupleLiteralInterfaceImpl : TupleLiteralInterface
+{
+    int value((i64, int) pair) { return (int)pair.item_0 + pair.item_1; }
+};
+
+int tupleLiteralExactOverload((i64, int) value) { return 2; }
+int tupleLiteralExactOverload((int, int) value) { return 1; }
+int tupleLiteralWideningOverloadA((i64, int) value) { return 1; }
+int tupleLiteralWideningOverloadA((double, int) value) { return 2; }
+int tupleLiteralWideningOverloadB((double, int) value) { return 2; }
+int tupleLiteralWideningOverloadB((i64, int) value) { return 1; }
+int tupleLiteralFunctionPointerTarget((i64, int) pair) { return (int)pair.item_0 + pair.item_1; }
+
+bool testTupleLiteralElementConversions()
+{
+    bool result = true;
+    (i64, int) wideInt = (3, 4);
+    result &= Test("tuple literal declaration i64", wideInt.item_0, 3);
+    result &= Test("tuple literal declaration i64 tail", wideInt.item_1, 4);
+
+    (double, int) wideDouble = (3, 4);
+    result &= Test("tuple literal declaration double", wideDouble.item_0 == 3.0, true);
+    result &= Test("tuple literal declaration double tail", wideDouble.item_1, 4);
+
+    (i64, int) assigned = default;
+    assigned = (3, 4);
+    result &= Test("tuple literal assignment i64", assigned.item_0, 3);
+    result &= Test("tuple literal assignment tail", assigned.item_1, 4);
+
+    (i64, int) returned = tupleLiteralWideningReturn();
+    result &= Test("tuple literal return i64", returned.item_0, 3);
+    result &= Test("tuple literal return tail", returned.item_1, 4);
+    result &= Test("tuple literal argument i64", tupleLiteralWideningArgument((3, 4)), 7);
+    result &= Test("tuple literal argument fitting u8", tupleLiteralFittingU8Argument((3, 4)), 7);
+    TupleLiteralInterface iface = new TupleLiteralInterfaceImpl();
+    result &= Test("tuple literal interface argument i64", iface.value((3, 4)), 7);
+    result &= Test("tuple literal overload exact beats first wider", tupleLiteralExactOverload((3, 4)), 1);
+    result &= Test("tuple literal widening overload i64 first", tupleLiteralWideningOverloadA((3, 4)), 1);
+    result &= Test("tuple literal widening overload double first", tupleLiteralWideningOverloadB((3, 4)), 1);
+    function<int((i64, int))> tupleFn = tupleLiteralFunctionPointerTarget;
+    result &= Test("tuple literal function pointer argument i64", tupleFn((3, 4)), 7);
+    (i64, int) tupleVariable = (3, 4);
+    result &= Test("same-type tuple variable function pointer argument", tupleFn(tupleVariable), 7);
+    result &= Test("tuple literal parenthesized argument i64", tupleLiteralWideningArgument(((3, 4))), 7);
+    int tupleLiteralSize = sizeof (3, 4);
+    result &= Test("sizeof tuple literal is its layout", tupleLiteralSize, 8);
+    int sideEffectCount = 0;
+    int sideEffectSize = sizeof (sideEffectCount++, 4);
+    result &= Test("sizeof tuple literal does not evaluate", sideEffectCount, 0);
+    result &= Test("sizeof tuple literal side-effect size", sideEffectSize, 8);
     return result;
 }

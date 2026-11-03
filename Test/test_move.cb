@@ -18445,7 +18445,7 @@ extern int main()
     passed += testMix9ReleaseReturn();
     passed += uqrawAcceptLegs();
     total += 11; // UQRAW accept-set legs (uqrawAcceptLegs)
-    total += 3; // release() results returned as bare pointers (heap-array gate)
+    total += 4; // release() results returned as bare pointers (heap-array gate)
     total += 97; // mvfield legs and four CALLEEREF accept-set legs
     passed += testT523ByrefClosureRebind();
     total += 15;
@@ -24746,6 +24746,17 @@ int testT364NativeOperatorReturnFacts()
 struct Mix9ReleaseBox { int id = 0; };
 struct Mix9Wrap<T> { T v; ~Mix9Wrap() { } };
 Mix9ReleaseBox* mix9ReleaseByValue(unique<Mix9ReleaseBox> owner) { return owner.release(); }
+move unique<Mix9ReleaseBox> mix9ReleaseMake(int value)
+{
+    Mix9ReleaseBox* raw = new Mix9ReleaseBox();
+    raw->id = value;
+    return unique<Mix9ReleaseBox>(raw);
+}
+Mix9ReleaseBox* mix9ReleaseViaLocal()
+{
+    Mix9ReleaseBox* raw = mix9ReleaseMake(37).release();
+    return raw;
+}
 struct Mix9ReleaseHolder { unique<Mix9ReleaseBox> box; };
 Mix9ReleaseBox* mix9ReleaseHeld(Mix9ReleaseHolder* h) { return h->box.release(); }
 Mix9Wrap<Mix9ReleaseBox>* mix9ReleaseWrap(unique<Mix9Wrap<Mix9ReleaseBox>> u) { return u.release(); }
@@ -24758,6 +24769,10 @@ int testMix9ReleaseReturn()
     Mix9ReleaseBox* byValue = mix9ReleaseByValue(move owner);
     passed += Test("mix9 release by-value return", byValue->id, 23);
     delete byValue;
+
+    Mix9ReleaseBox* viaLocal = mix9ReleaseViaLocal();
+    passed += Test("mix9 release through raw local return", viaLocal->id, 37);
+    delete viaLocal;
 
     Mix9ReleaseHolder* holder = new Mix9ReleaseHolder();
     holder->box = unique<Mix9ReleaseBox>(new Mix9ReleaseBox());

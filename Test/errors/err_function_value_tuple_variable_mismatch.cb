@@ -1,0 +1,41 @@
+int tupleMismatchTarget((i64, int) value) { return (int)value.item_0 + value.item_1; }
+using TupleMismatchFn = function<int((i64, int))>;
+struct TupleMismatchBox { function<int((i64, int))> fn = tupleMismatchTarget; };
+
+int tupleMismatchGeneric<T>(T fn)
+{
+    (int, int) value = (3, 4);
+    return fn(value);
+}
+
+extern int main()
+{
+    expect_error("a tuple value that is not a literal requires an exact tuple type") {
+        function<int((i64, int))> fn = tupleMismatchTarget;
+        (int, int) value = (3, 4);
+        fn(value);
+    }
+
+    expect_error("a tuple value that is not a literal requires an exact tuple type") {
+        TupleMismatchBox box;
+        (int, int) value = (3, 4);
+        box.fn(value);
+    }
+
+    expect_error("a tuple value that is not a literal requires an exact tuple type") {
+        Lambda<int((i64, int))> fn = tupleMismatchTarget;
+        (int, int) value = (3, 4);
+        fn(value);
+    }
+
+    expect_error("a tuple value that is not a literal requires an exact tuple type") {
+        TupleMismatchFn fn = tupleMismatchTarget;
+        (int, int) value = (3, 4);
+        fn(value);
+    }
+
+    expect_error("a tuple value that is not a literal requires an exact tuple type") {
+        TupleMismatchFn fn = tupleMismatchTarget;
+        tupleMismatchGeneric(fn);
+    }
+}

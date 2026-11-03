@@ -1,0 +1,8 @@
+extern int main()
+{
+    expect_error("pointer depths differ") {
+        int value = 1;
+        auto slot = new int*(&value);
+        int* bad = slot;
+    }
+}

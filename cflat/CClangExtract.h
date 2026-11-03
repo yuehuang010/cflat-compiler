@@ -618,6 +618,7 @@ namespace cflat_cinterop
         Kind kind = Skip;
         long long intValue = 0;
         bool isIntegerLiteralZero = false;
+        bool isIntegerLiteralToken = false;  // initializer is an integer literal token (not __null)
         double floatValue = 0.0;
         std::string stringValue;     // decoded characters (string kind)
         std::string naturalType;     // canonical type spelling of the folded expression

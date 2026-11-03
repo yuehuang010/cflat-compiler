@@ -790,15 +790,15 @@ void MainListener::PropagateTernaryViewElement(antlr4::ParserRuleContext* ctx,
         if (compilerLLVM->ArrayViewElementMismatch(trueType, falseType, trueElement, falseElement))
         {
             if (nullCoalesce)
-                LogErrorContext(ctx, std::format(
+                LogErrorContext(ctx, compilerLLVM->LocalizeMessage(
                     "cannot join an array view of '{}' with an array view of '{}' in a '??' - a "
                     "view indexes by its own element, so both arms must share it",
-                    trueElement, falseElement));
+                    { trueElement, falseElement }));
             else
-                LogErrorContext(ctx, std::format(
+                LogErrorContext(ctx, compilerLLVM->LocalizeMessage(
                     "cannot join an array view of '{}' with an array view of '{}' in a '?:' - a "
                     "view indexes by its own element, so both arms must share it",
-                    trueElement, falseElement));
+                    { trueElement, falseElement }));
             return;
         }
         LLVMBackend::TypeAndValue joinType;

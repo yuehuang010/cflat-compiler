@@ -4059,6 +4059,63 @@ bool LLVMBackend::ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedV
         return JoinDeliversDataValue(value, arg.CastOccurrenceId);
     }
 
+bool LLVMBackend::IsLiteralZeroIntegerToPointer(llvm::Value* value, const NamedVariable& arg) const
+{
+        if (value == nullptr) return false;
+        if (arg.IsCxxMacroGlobal)
+        {
+            llvm::Value* storage = value;
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                storage = load->getPointerOperand();
+            if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
+                global != nullptr)
+            {
+                if (global->hasInitializer() && global->getValueType()->isIntegerTy()
+                    && cxxLiteralZeroIntegerMacroNames_.count(global->getName().str()) != 0)
+                    if (auto* initial = llvm::dyn_cast<llvm::ConstantInt>(global->getInitializer());
+                        initial != nullptr && initial->isZero())
+                        return true;
+            }
+            if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+                constant != nullptr && constant->isZero()
+                    && cxxLiteralZeroIntegerMacroNames_.count(arg.CallerName) != 0)
+                return true;
+            // A null macro not spelled as an integer literal (NULL, also MSVC `#define NULL 0`) is a null spelling.
+            if (arg.IsCxxNullIntegerMacro) return false;
+        }
+        if (value->getType()->isIntegerTy())
+            if (auto* source = llvm::dyn_cast<llvm::ConstantInt>(value)) return source->isZero();
+        if (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsFunctionPointer) return false;
+
+        const bool integerSource = arg.TypeAndValue.IsInteger() >= 0
+            || arg.TypeAndValue.IsUnsignedInteger() >= 0 || arg.TypeAndValue.TypeName == "bool";
+        if (!integerSource) return false;
+        if (!value->getType()->isPointerTy()) return false;
+        if (llvm::isa<llvm::ConstantPointerNull>(value)) return true;
+
+        llvm::Value* integer = nullptr;
+        if (auto* expr = llvm::dyn_cast<llvm::ConstantExpr>(value);
+            expr != nullptr && expr->getOpcode() == llvm::Instruction::IntToPtr)
+            integer = expr->getOperand(0);
+        else if (auto* cast = llvm::dyn_cast<llvm::CastInst>(value);
+                 cast != nullptr && cast->getOpcode() == llvm::Instruction::IntToPtr)
+            integer = cast->getOperand(0);
+
+        auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(integer);
+        return constant != nullptr && constant->isZero();
+    }
+
+void LLVMBackend::RejectLiteralZeroFunctionSlot(llvm::Value* value, const NamedVariable& arg) const
+{
+        if (IsLiteralZeroIntegerToPointer(value, arg))
+        {
+            const std::string destination = arg.TypeAndValue.VariableName.empty()
+                ? "a function slot" : std::format("a function slot '{}'", arg.TypeAndValue.VariableName);
+            LogError(std::format(
+                "integer constant zero is not a null spelling for {}; use 'nullptr'", destination));
+        }
+    }
+
 std::string LLVMBackend::DescribeNonFunctionArgument(const NamedVariable& arg) const
 {
         const auto& tn = arg.TypeAndValue.TypeName;
@@ -4070,6 +4127,7 @@ std::string LLVMBackend::DescribeNonFunctionArgument(const NamedVariable& arg) c
 llvm::Value* LLVMBackend::WidenToClosureFatChecked(llvm::Value* val, const NamedVariable& arg,
         const std::string& paramName, const std::string& fieldDesc)
 {
+        RejectLiteralZeroFunctionSlot(val, arg);
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
             // A field STORE reaches the same gate as an argument pass; name the real
@@ -4091,6 +4149,7 @@ llvm::Value* LLVMBackend::WidenToClosureFatChecked(llvm::Value* val, const Named
 void LLVMBackend::CheckClosureReturnProvenance(llvm::Value* val, const NamedVariable& returnNV,
         bool thin) const
 {
+        RejectLiteralZeroFunctionSlot(val, returnNV);
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, returnNV))
         {
             if (thin)
@@ -4115,6 +4174,7 @@ void LLVMBackend::CheckClosureReturnProvenance(llvm::Value* val, const NamedVari
 void LLVMBackend::CheckThinFnPtrArgProvenance(llvm::Value* val, const NamedVariable& arg,
         const std::string& paramName) const
 {
+        RejectLiteralZeroFunctionSlot(val, arg);
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
             LogErrorMessage(
@@ -4130,6 +4190,7 @@ void LLVMBackend::CheckThinFnPtrArgProvenance(llvm::Value* val, const NamedVaria
 void LLVMBackend::CheckThinFnPtrAssignProvenance(llvm::Value* val, const NamedVariable& arg,
         const std::string& destDesc) const
 {
+        RejectLiteralZeroFunctionSlot(val, arg);
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
             LogErrorMessage(
@@ -4145,6 +4206,7 @@ void LLVMBackend::CheckThinFnPtrAssignProvenance(llvm::Value* val, const NamedVa
 void LLVMBackend::CheckFatClosureAssignProvenance(llvm::Value* val, const NamedVariable& arg,
         const std::string& destDesc) const
 {
+        RejectLiteralZeroFunctionSlot(val, arg);
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
             LogErrorMessage(
@@ -5419,8 +5481,9 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         callArgs.push_back(dataPtr);
         for (size_t i = 0; i < callArgNVs.size() && i < methodInfo->Parameters.size(); i++)
         {
-            const auto& nv = callArgNVs[i];
+            auto& nv = callArgNVs[i];
             const auto& param = methodInfo->Parameters[i];
+            ConvertTupleArgument(nv, param);
             const size_t firstCallArg = callArgs.size();
 
             const size_t recipeIndex = i + 1; // slot zero is the interface receiver

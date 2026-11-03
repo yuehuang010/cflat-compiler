@@ -2116,14 +2116,10 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   as such in the file. **When a wrapper restores an lvalue's address, check that the arms reading
   that address do not also need its TYPE** - a half-restored lvalue silently degrades to a temp
   instead of failing.
-  The same restore did NOT reach `(*p)++` / `((*p))++`, which still write the incremented value to
-  a temp and drop it - measured identical on both binaries (`deref_post=5`, want 6) while `(y)++`,
-  `(a[0])++`, `(*sp).n++` and `(t.n)++` are all correct. The comment at the
-  `namedVar.Storage = lastParenExprStorage;` site CLAIMED that case worked and was corrected rather
-  than the guard loosened; the gap is filed as
-  `p2/paren-deref-increment-is-a-silent-no-op.md` with its measurements, and both the broken and
-  the four working `++` spellings are pinned as `plv_*_increment*` legs so a fix there arrives with
-  its accept set already built.
+  The same restore did NOT reach `(*p)++` / `((*p))++` at the time (incremented value written to a
+  temp and dropped); the comment at the `namedVar.Storage = lastParenExprStorage;` site CLAIMED that
+  case worked and was corrected rather than the guard loosened. Fixed since by c999e4f3 (pinned by
+  `plv_paren_deref_increment`, Test/test_basic.cb); the p2 file is gone.
   Out of scope with reasons. FILED as `p1/alias-spelled-redundant-cast-defeats-owning-sink-inference.md`:
   an ALIAS-SPELLED redundant cast
   (`using UB = UBox; UBox o = (UB)p;`) still double-frees, because the syntactic peel compares
@@ -3700,3 +3696,10 @@ Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintaine
   (Unknown: indirect callee, bound exhausted, address escape, integer cast, local container add, heap object freed in
   the callee) keeps the temporary alive and leaks it by design (d=0 where clang destroys at full-expression end).
   Proving None there would need container-aware summaries; do not re-file. Ternary-of-temps owners follow the same rule.
+- `expect_error` matches the SOURCE-ENGLISH `LogError` format text, never catalog text (ruling 2026-10-31); the test.sh
+  pseudo-locale discovery pass depends on it. Write expectations from the format string (`unknown type '`), do not re-file.
+- A mixed owning/borrow `?:` join stays refused in every sink, argument position included (ruling 2026-10-31, from the
+  2026-09-03 join ruling): clang accepts by copying the borrowed arm; CFlat never inserts that copy. Escape: both arms owning,
+  or bind the join to a local. err_ternary_mixed_ownership.cb case (d) pins it; do not re-file.
+- An imported file cannot see the importer's declarations, earlier or later (ruling 2026-10-31: an import is a module, not a
+  textual include); "cannot find the type X" stands. C's `struct X;` forward declaration is not added. Do not re-file.

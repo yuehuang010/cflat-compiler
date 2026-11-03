@@ -105,7 +105,12 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
             loweredExtraArgs = extraArgs;
             for (size_t i = 0; i < loweredArgVars.size() && i + 1 < st.params.size(); ++i)
             {
-                if (!st.params[i + 1].IsFunctionPointer) continue;
+                if (!st.params[i + 1].IsFunctionPointer
+                    && !IsStdFunctionTypeName(st.params[i + 1].TypeName)
+                    && !IsStdFunctionSpecialization(st.params[i + 1].TypeName))
+                    continue;
+                if (loweredArgVars[i].Primary != nullptr)
+                    RejectLiteralZeroFunctionSlot(loweredArgVars[i].Primary, loweredArgVars[i]);
                 if (LowerNonCapturingClosureForCxx(loweredArgVars[i]))
                     loweredExtraArgs[i] = loweredArgVars[i].Primary;
                 // A function name passes the overload constructor selection matched, not the one

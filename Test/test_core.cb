@@ -179,6 +179,40 @@ int testArrayNewDesugar()
     passed += Test("T* from new int[n] stays a raw pointer", raw[4], 9);
     delete[_] raw;
 
+    auto autoPointerSlots = new int*[2];
+    passed += Test("auto from new pointer array deduces array<int*>", autoPointerSlots.count(), 2);
+    int autoPointerValue = 19;
+    autoPointerSlots.set(1, &autoPointerValue);
+    passed += Test("auto pointer array stores pointer elements", *autoPointerSlots.get(1), 19);
+
+    int*[] pointerSlots = new int*[2];
+    passed += Test("new pointer array zero-fills slots", pointerSlots[0] == nullptr, true);
+    int pointedValue = 17;
+    pointerSlots[1] = &pointedValue;
+    passed += Test("new pointer array stores pointers", *pointerSlots[1], 17);
+    delete[_] pointerSlots;
+
+    ArrElem structElement = default;
+    ArrElem*[] structPointerSlots = new ArrElem*[1];
+    passed += Test("new struct pointer array zero-fills slots", structPointerSlots[0] == nullptr, true);
+    structPointerSlots[0] = &structElement;
+    passed += Test("new struct pointer array stores pointers", structPointerSlots[0]->v, 5);
+    delete[_] structPointerSlots;
+
+    ArrElem** allocatedStructPointerSlot = new ArrElem*(&structElement);
+    passed += Test("new struct pointer slot initializes from argument", (*allocatedStructPointerSlot)->v, 5);
+    delete allocatedStructPointerSlot;
+
+    auto constPointerSlots = new int* const[2];
+    passed += Test("new const pointer slots zero-fill", constPointerSlots.count(), 2);
+
+    int* allocatedValue = new int;
+    *allocatedValue = 23;
+    int** allocatedPointerSlot = new int*(allocatedValue);
+    passed += Test("new pointer slot initializes from argument", **allocatedPointerSlot, 23);
+    delete allocatedPointerSlot;
+    delete allocatedValue;
+
     array<int> u = default;
     u.init_capacity(4);
     for (int i = 0; i < 4; i++) u.set(i, i * 2);
@@ -5363,7 +5397,7 @@ extern int main()
     int r;
 
     r = testArray();            passed += r; total += 27;
-    r = testArrayNewDesugar();  passed += r; total += 14;
+    r = testArrayNewDesugar();  passed += r; total += 23;
     // Two extra legs only exist under --sanitize=ownership (init_capacity poison fill).
     if const (__SANITIZE_OWNERSHIP__) total += 2;
     r = testMemberDtor();       passed += r; total += 8;

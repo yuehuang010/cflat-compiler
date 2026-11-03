@@ -1785,6 +1785,14 @@ CFlatParser::NewExpressionContext* RawNewArrayValueOf(antlr4::tree::ParseTree* n
     }
     return nullptr;
 }
+std::string MainListener::NewExpressionElementTypeName(CFlatParser::NewExpressionContext* ctx)
+{
+    if (ctx == nullptr) return {};
+    std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
+    if (ctx->pointer() != nullptr)
+        typeName.append(ctx->pointer()->Star().size(), '*');
+    return typeName;
+}
 bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node)
 {
     if (node == nullptr) return false;

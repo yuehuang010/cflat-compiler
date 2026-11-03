@@ -1,0 +1,54 @@
+import "unique.cb";
+
+struct ReturnCallBorrowOwnedRaw { int value = 0; ~ReturnCallBorrowOwnedRaw() { } };
+move unique<ReturnCallBorrowOwnedRaw> makeReturnCallBorrowOwnedRaw(int value)
+{
+    ReturnCallBorrowOwnedRaw* raw = new ReturnCallBorrowOwnedRaw();
+    raw->value = value;
+    return unique<ReturnCallBorrowOwnedRaw>(raw);
+}
+ReturnCallBorrowOwnedRaw* returnCallBorrowIdentity(ReturnCallBorrowOwnedRaw* value) { return value; }
+extern ReturnCallBorrowOwnedRaw* returnCallBorrowExtern(ReturnCallBorrowOwnedRaw* value);
+
+expect_error("cannot return the address") {
+    ReturnCallBorrowOwnedRaw* returnOwnedRawLocal()
+    {
+        ReturnCallBorrowOwnedRaw* value = new ReturnCallBorrowOwnedRaw();
+        return returnCallBorrowIdentity(value);
+    }
+}
+
+expect_error("cannot return the address") {
+    ReturnCallBorrowOwnedRaw* returnReleasedLocal()
+    {
+        ReturnCallBorrowOwnedRaw* value = makeReturnCallBorrowOwnedRaw(3).release();
+        return returnCallBorrowIdentity(value);
+    }
+}
+
+expect_error("cannot return the heap array") {
+    ReturnCallBorrowOwnedRaw* returnReleasedThenNewArray()
+    {
+        ReturnCallBorrowOwnedRaw* value = makeReturnCallBorrowOwnedRaw(3).release();
+        value = new ReturnCallBorrowOwnedRaw[3];
+        return value;
+    }
+}
+
+// A statement temporary reached through a borrowing call dangles in a '?:' arm and through a callee
+// with no borrow summary (an extern prototype).
+expect_error("cannot return the address") {
+    ReturnCallBorrowOwnedRaw* returnTemporaryInArm(ReturnCallBorrowOwnedRaw* other, int pick)
+    {
+        return pick ? returnCallBorrowIdentity(makeReturnCallBorrowOwnedRaw(3).get()) : other;
+    }
+}
+
+expect_error("cannot return the address") {
+    ReturnCallBorrowOwnedRaw* returnTemporaryThroughExtern()
+    {
+        return returnCallBorrowExtern(makeReturnCallBorrowOwnedRaw(3).get());
+    }
+}
+
+int main() { return 0; }

@@ -3219,13 +3219,27 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
 void LLVMBackend::RecordGenericTemplateOrigin(const std::string& name, const std::string& signature,
         size_t line, size_t column)
 {
-        // Templates of one name may differ in parameter types (an arity overload), so the slot is
-        // name plus signature; only the same signature is a redefinition.
+        // Keep the first origin for each template name. Until lookup stores overload sets, any
+        // later shape would otherwise replace it silently.
         const std::string key = name + "(" + signature + ")";
         FunctionBodyOrigin origin { SourceFileLeaf(sourceFileName), line, column, false, false };
         auto it = genericTemplateOrigin_.find(key);
         if (it != genericTemplateOrigin_.end())
+        {
             DiagnoseDuplicateBodyOrigin(name, key, it->second, line, column, false, false);
+            return;
+        }
+        const std::string prefix = name + "(";
+        for (const auto& [firstKey, first] : genericTemplateOrigin_)
+        {
+            if (!firstKey.starts_with(prefix)) continue;
+            const std::string currentFile = SourceFileLeaf(sourceFileName);
+            if (first.file == currentFile && first.line == line && first.column == column) return;
+            LogError(std::format("generic template overloading is not supported yet: redefinition of '{}' - "
+                "a template with a different parameter shape is already defined at {}({})",
+                SpellFunctionSymbol(*this, name), first.file, first.line));
+            return;
+        }
         genericTemplateOrigin_[key] = std::move(origin);
     }
 

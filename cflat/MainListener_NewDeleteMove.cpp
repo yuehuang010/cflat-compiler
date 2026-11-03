@@ -14,11 +14,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // inherit an enclosing initializer/return destination.
         DeclExpectedTypeScope newExpectedScope(&declExpectedType, {});
         DiagnoseAssignmentArguments(ctx->argumentExpressionList());
-        std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
+        std::string typeName = NewExpressionElementTypeName(ctx);
         bool isArray = ctx->assignmentExpression() != nullptr;
-        const auto spellNewType = [&]() {
-            return SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName });
-        };
 
         // If type substitution produced a pointer type (e.g. T=Employee*), strip the '*'
         // and treat as pointer-to-element so GetType resolves the base type correctly.
@@ -29,6 +26,19 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             typeName.pop_back();
             typeIsPtr = true;
             ++typeStars;
+        }
+        const auto spellNewType = [&]() {
+            return typeName + std::string(typeStars, '*');
+        };
+        const int spelledPointerStars = ctx->pointer() == nullptr
+            ? 0 : static_cast<int>(ctx->pointer()->Star().size());
+        // A written '*' over a substituted pointer type (T* with T=int*) counts the substituted stars too.
+        if (spelledPointerStars >= PointerDepthCap
+            || (spelledPointerStars > 0 && typeStars + 1 > PointerDepthCap))
+        {
+            LogErrorContext(ctx, PointerDepthCapMessage(
+                std::format("'new {}'", spellNewType()), typeStars + 1));
+            return {};
         }
 
         // `array<T> a = new T[n];` (and the assignment / return forms): the element count lives in
@@ -796,7 +806,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         newArrayScope.Release();
 
         // For non-array new of a class type: call constructor and store result
-        if (!isArray && compiler->GetFunction(typeName) && !freshBraceInit)
+        if (!isArray && !typeIsPtr && compiler->GetFunction(typeName) && !freshBraceInit)
         {
             // An unwind out of the arguments or the constructor frees the global-new block.
             LLVMBackend::UnwindPartialScope newBlockScope(*compiler);
@@ -910,8 +920,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
 
         // A non-class `new T(value)` has no constructor function to consume the argument. Keep
         // the C++ value-initialization meaning and use the ordinary assignment store conversion.
-        if (!isArray && compiler->GetFunction(typeName) == nullptr
-            && (typeIsPtr || !compiler->IsCxxRecord(typeName)))
+        if (!isArray && (typeIsPtr
+            || (compiler->GetFunction(typeName) == nullptr && !compiler->IsCxxRecord(typeName))))
         {
             auto* argList = ctx->argumentExpressionList();
             // `new T()` (and bare `new T`) value-initializes: the fresh heap slot reads zero.
@@ -938,6 +948,21 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 auto argNV = ParseAssignmentExpressionNamed(namedArg->assignmentExpression());
                 llvm::Value* argVal = argNV.Primary != nullptr
                     ? argNV.Primary : LoadNamedVariable(argNV);
+                LLVMBackend::TypeAndValue slotType{ .TypeName = typeName, .Pointer = typeIsPtr };
+                slotType.PointerDepth = typeStars;
+                if (argVal != nullptr)
+                {
+                    compiler->RejectImplicitIntegerPointeePointerConversion(
+                        argNV.TypeAndValue, slotType);
+                    if (RejectImplicitPrimitiveToPointer(
+                            namedArg, slotType, argNV, argVal, "initialize",
+                            std::format("the slot of 'new {}'", spellNewType()))
+                        || RejectImplicitPointerToNumber(
+                            namedArg, slotType, argNV, argVal, "initialize",
+                            std::format("the slot of 'new {}'", spellNewType()))
+                        || RejectConstDiscardingConversion(namedArg, argNV, argVal, slotType))
+                        return {};
+                }
                 if (argVal != nullptr)
                     compiler->CreateAssignment(
                         argVal, typedPtr, argNV.TypeAndValue.IsUnsignedInteger() != -1, elemType);
@@ -951,8 +976,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             // T=S*): 'typedPtr' then addresses a POINTER slot, not an 'S'.
             if (typeIsPtr)
                 // The element type IS 'typeName*' here; allocating one 'typeName' is the remedy.
-                LogPointerBraceInitReject(ctx, std::format("element of 'new {}*'", spellNewType()),
-                    spellNewType(), spellNewType() + "*", true);
+                LogPointerBraceInitReject(ctx, std::format("element of 'new {}'", spellNewType()),
+                    typeName, spellNewType(), true);
             if (freshBraceInit)
             {
                 LLVMBackend::UnwindPartialScope newBraceScope(*compiler);
@@ -999,7 +1024,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         result.TypeAndValue.IsArrayView = isArray;
         // A substituted POINTER element ('new T[n]' with T=S*) is an 'S*[]' view; without the
         // star the result read as an 'S[]' and bound anything an 'S[]' binds.
-        result.TypeAndValue.ElemPointer = isArray && typeIsPtr;
+        result.TypeAndValue.ElemPointer = typeIsPtr;
+        result.TypeAndValue.PointerDepth = typeStars + 1 <= PointerDepthCap
+            ? typeStars + 1 : 0;
         result.Primary = typedPtr;
         // `new T[n]` / `new T` with T bound to a pointee-const argument (`(const char)*`).
         if (int constDepth = SubstitutedConstDepth(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
@@ -2200,6 +2227,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.NullConditionalBorrowStorage = src.NullConditionalBorrowStorage;
         dst.AllocAlignment   = src.AllocAlignment;
         dst.AllocatedByRawNewArray = src.AllocatedByRawNewArray;
+        dst.IsCoreUniqueRelease = src.IsCoreUniqueRelease;
         dst.RawArrayLength = src.RawArrayLength;
         dst.RawArrayLengthStorage = src.RawArrayLengthStorage;
         dst.IsStaticLocal    = src.IsStaticLocal;

@@ -2317,6 +2317,14 @@ bool LLVMBackend::IsTopLevelStdFunctionSpelling(const std::string& spelling)
         return bare.rfind("std::function<", 0) == 0 && !bare.empty() && bare.back() == '>';
 }
 
+bool LLVMBackend::IsStdFunctionTypeName(const std::string& spelling)
+{
+        std::string cxxSpelling = spelling;
+        if (cxxSpelling.rfind("std.function<", 0) == 0)
+            cxxSpelling.replace(0, 12, "std::function");
+        return IsTopLevelStdFunctionSpelling(cxxSpelling);
+}
+
 /*
  * A `std::function<R(Args)>` spelling names the std.function specialization over the equivalent
  * CFlat closure type. Returns that specialization's CFlat name, or "" when the spelling is not a

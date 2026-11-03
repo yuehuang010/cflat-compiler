@@ -607,15 +607,34 @@ llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, 
         }
 
         llvm::Value* newValue = nullptr;
-        if (loadInst->getType()->isFloatingPointTy())
+        llvm::Type* arithmeticType = loadInst->getType();
+        llvm::FixedVectorType* vectorType = llvm::dyn_cast<llvm::FixedVectorType>(arithmeticType);
+        if (vectorType != nullptr)
+        {
+            arithmeticType = vectorType->getElementType();
+            if (arithmeticType->isIntegerTy(1))
+            {
+                LogError(amount < 0
+                             ? "'--' is not allowed on a simd<bool, N> mask"
+                             : "'++' is not allowed on a simd<bool, N> mask");
+                return nullptr;
+            }
+        }
+        if (arithmeticType->isFloatingPointTy())
         {
             const auto magnitude = amount < 0 ? -static_cast<int64_t>(amount) : amount;
-            auto* value = llvm::ConstantFP::get(loadInst->getType(), static_cast<double>(magnitude));
+            llvm::Constant* value = llvm::ConstantFP::get(arithmeticType, static_cast<double>(magnitude));
+            if (vectorType != nullptr)
+                value = llvm::cast<llvm::Constant>(builder->CreateVectorSplat(
+                    vectorType->getElementCount(), value));
             newValue = CreateOperation(amount < 0 ? Operation::Subtract : Operation::Add, loadInst, value);
         }
         else
         {
-            auto* value = llvm::ConstantInt::getSigned(loadInst->getType(), amount);
+            llvm::Constant* value = llvm::ConstantInt::getSigned(arithmeticType, amount);
+            if (vectorType != nullptr)
+                value = llvm::cast<llvm::Constant>(builder->CreateVectorSplat(
+                    vectorType->getElementCount(), value));
             newValue = CreateOperation(Operation::Add, loadInst, value);
         }
         return builder->CreateStore(newValue, destination);

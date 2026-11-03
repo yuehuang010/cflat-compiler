@@ -1,4 +1,4 @@
-# Array-view element gate: three diagnostic gaps
+# Array-view element gate: diagnostic gap (multi-candidate element hint)
 
 Bucket: batch mode (wording and one message-routing gap; no new rejection). Filed 2026-09-04
 from the q13/q15 reviews (d77dfdae, 5f693b7d).
@@ -26,13 +26,6 @@ from the q13/q15 reviews (d77dfdae, 5f693b7d).
    the re-modelling this item forbids. Direction now: the hint is sound only if the door gates
    run per candidate BEFORE the no-match dump (i.e. move the three view axes into the scorer
    as real refusals, which changes resolution and needs its own accept-set), or drop the hint.
-3. Two of the three gate strings go through `LogErrorContext(ctx, std::format(...))` and never
-   enter the localization catalog (same as the sibling raw-pointer-to-view gate); only the call
-   door's `LogErrorMessage` is catalogued. Decide whether these belong in the catalog.
 
 Deliberate, not a gap: `bool[]` <-> `u8[]` is rejected on i1-vs-i8 (zero users in the tree).
 
-RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31), item 3: YES, they belong in the catalog. Every user-facing
-diagnostic goes through a `LogError*` format string that the generator turns into `en-pseudo.json` (CLAUDE.md Localization); a
-`LogErrorContext(ctx, std::format(...))` with a pre-formatted string bypasses that by accident, not by design. Rewrite the three gate
-strings as `LogErrorContext` format strings with `{}` holes; the pseudo-locale discovery pass in test.sh then covers them.

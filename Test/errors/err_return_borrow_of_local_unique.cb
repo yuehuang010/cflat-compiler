@@ -1,0 +1,32 @@
+import "unique.cb";
+
+struct ReturnBorrowUnique { int value = 0; };
+unique ReturnBorrowUnique* makeUniquePointer()
+{
+    unique ReturnBorrowUnique* owner = new ReturnBorrowUnique();
+    return move owner;
+}
+move unique<ReturnBorrowUnique> makeUniqueValue()
+{
+    ReturnBorrowUnique* raw = new ReturnBorrowUnique();
+    return unique<ReturnBorrowUnique>(raw);
+}
+ReturnBorrowUnique* idReturnBorrow(ReturnBorrowUnique* value) { return value; }
+
+expect_error("cannot return the address") {
+    ReturnBorrowUnique* fromUniquePointer()
+    {
+        unique ReturnBorrowUnique* owner = makeUniquePointer();
+        return idReturnBorrow(owner);
+    }
+}
+
+expect_error("cannot return the address") {
+    ReturnBorrowUnique* fromUniqueValue()
+    {
+        unique<ReturnBorrowUnique> owner = makeUniqueValue();
+        return idReturnBorrow(owner.get());
+    }
+}
+
+int main() { return 0; }

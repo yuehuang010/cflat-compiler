@@ -1593,6 +1593,7 @@ void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value,
             if (it != frame.namedVariable.end())
             {
                 it->second.AllocatedByRawNewArray = value;
+                if (value) it->second.IsCoreUniqueRelease = false;
                 StoreRawArrayLength(it->second, rawArrayLength);
                 return;
             }
@@ -1600,6 +1601,7 @@ void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value,
             if (argIt != frame.functionArgument.end())
             {
                 argIt->second.AllocatedByRawNewArray = value;
+                if (value) argIt->second.IsCoreUniqueRelease = false;
                 StoreRawArrayLength(argIt->second, rawArrayLength);
                 return;
             }

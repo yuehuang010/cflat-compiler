@@ -1,0 +1,23 @@
+expect_error("redefinition of 'dupFree'") {
+    T dupFree<T>(T value) { return value; }
+    U dupFree<U>(U value) { return value + value; }
+}
+
+expect_error("redefinition of 'DupMember.f'") {
+    struct DupMember
+    {
+        T f<T>(T value) { return value; }
+        U f<U>(U value) { return value + value; }
+    };
+}
+
+struct DupList<T> { T value; };
+expect_error("redefinition of 'dupNested'") {
+    T dupNested<T>(DupList<T>* value) { return value->value; }
+    U dupNested<U>(DupList<U>* value) { return value->value; }
+}
+
+expect_error("generic template overloading is not supported yet") {
+    T diffShape<T>(T value) { return value; }
+    T diffShape<T>(T value, T other) { return value + other; }
+}

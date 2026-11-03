@@ -1,0 +1,15 @@
+import cpp "cpp_castglob.hpp";
+// A CFlat-declared C++ class global is a native global: any non-constant initializer is refused (T422).
+expect_error("initialize it in main or hold a pointer");
+castglob.Box gv = (castglob.Box)97;
+int gInit = 97;
+expect_error("initialize it in main or hold a pointer") {
+    castglob.Box gvCall = castglob.makeBox(97);
+}
+expect_error("initialize it in main or hold a pointer") {
+    castglob.Box gvCtor = castglob.Box(gInit);
+}
+expect_error("initialize it in main or hold a pointer") {
+    castglob.Box gvConvert = gInit;
+}
+extern int main() { return 0; }

@@ -1968,6 +1968,9 @@ public:
         // True when the source expression is a string literal. The lowered pointer may be wrapped
         // in a constant expression before overload matching, so LLVM identity alone is insufficient.
         bool IsStringLiteral = false;
+        // True only for values produced directly by ParseTupleExpression; used to gate call conversions.
+        bool IsTupleLiteral = false;
+        std::vector<NamedVariable> TupleLiteralElements;
         // compile-time: this POINTER binding was declared or assigned from an ADDRESS-OF value, so
         // it provably borrows - `&x` never yields an owner. Positive provenance recorded where the
         // binding is produced (never re-derived from IR); not part of the --init cache round-trip.
@@ -2204,6 +2207,8 @@ public:
         // nothing ever frees. Only such a base takes the raw-heap borrow arms; every other binding
         // (a decayed fixed array, a join, a parameter, an unknown source) keeps the plain store.
         bool AllocatedByRawNewArray = false;
+        // This pointer local came directly from core unique<T>::release().
+        bool IsCoreUniqueRelease = false;
         // Expression-local count produced by `new T[n]`. A bound local stores this immediately
         // in RawArrayLengthStorage so branch-local SSA never survives as binding metadata.
         llvm::Value* RawArrayLength = nullptr;
@@ -5050,6 +5055,8 @@ private:
         std::string aliasTarget;
         // The expanded macro expression is exactly an integer literal zero (parens allowed).
         bool isIntegerLiteralZero = false;
+        // The zero is spelled as an integer literal token, not __null or a pointer NULL.
+        bool isIntegerLiteralToken = false;
     };
     // Field types kept as raw C spellings so they can be re-resolved after all records in the
     // TU are registered (handles forward references between structs).
@@ -5236,6 +5243,7 @@ private:
     std::unordered_set<std::string> cxxMacroGlobalNames_;
     bool foldingArrayDim_ = false;   // see IsFoldingArrayDim (set only around a dimension fold)
     std::unordered_set<std::string> cxxZeroIntegerMacroNames_;
+    std::unordered_set<std::string> cxxLiteralZeroIntegerMacroNames_;
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
     // same header under different --c-include roots does not collide.
@@ -7796,6 +7804,7 @@ private:
     // True when the spelling IS a std::function (cv/reference decoration aside), not merely one
     // that contains a std::function somewhere inside it.
     static bool IsTopLevelStdFunctionSpelling(const std::string& spelling);
+    static bool IsStdFunctionTypeName(const std::string& spelling);
     // Maps a `std::function<R(Args)>` C++ spelling onto its std.function specialization and
     // requests it. "" when the spelling is not a TOP-LEVEL std::function.
     std::string StdFunctionSpecializationForSpelling(const std::string& spelling,
@@ -9733,6 +9742,8 @@ public:
     // allowlist here would false-reject every shape nobody enumerated, which this project ranks
     // as the worse failure; a missed diagnostic only restores the pre-existing behaviour.
     bool ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedVariable& arg) const;
+    bool IsLiteralZeroIntegerToPointer(llvm::Value* value, const NamedVariable& arg) const;
+    void RejectLiteralZeroFunctionSlot(llvm::Value* value, const NamedVariable& arg) const;
 
     // Name a data-pointer argument for the closure-parameter rejection. The interface argument
     // loop propagates shape flags but NOT TypeName, so this often has to stay generic - that is
@@ -12441,6 +12452,9 @@ public:
         std::vector<FunctionSymbol>* tiedOut = nullptr, CxxPreferredOverload* preferredOut = nullptr,
         bool* selectedPerfectOut = nullptr, bool reportNullPointerTemplateAmbiguity = false,
         bool rankEnumToIntegerAsConversion = false);
+    bool ConvertTupleArgument(NamedVariable& argument, const TypeAndValue& parameter);
+    std::optional<int> TupleLiteralElementCost(const NamedVariable& argument,
+                                               const TypeAndValue& parameter, bool cxx);
     std::vector<std::string> CxxClassConversionTies(const std::string& source,
                                                     const std::string& target) const;
     struct CxxClassConversionPair

@@ -298,6 +298,14 @@
       "int[]",
       "int"
     ],
+    "cannotbindanarrayvie...eemaydecaytoapointer2a051f8345ba8873": [
+      "int",
+      "int*"
+    ],
+    "cannotbindanarrayvie...lementtypesmustmatch3c93d43fe1f8dd3a": [
+      "AvmIface",
+      "int"
+    ],
     "cannotbindanowningca...rawpointerexplicitly97184b875fcd0fe7": [
       "q"
     ],
@@ -346,6 +354,10 @@
     ],
     "cannotcopyarg0unique...nethepointeeyourselfb6e9ff574f9a1595": [
       "unique<IShape>"
+    ],
+    "cannotjoinanarrayvie...obotharmsmustshareit3d3e026ed1b69627": [
+      "int",
+      "u8"
     ],
     "cannotmoveaborrowedp...ovefromtheowningslotf2bbb423758673ed": [],
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": [
@@ -465,6 +477,11 @@
       ".data()",
       "printf(\"%s\", s.data())"
     ],
+    "cannotpassatuplevalu...iresanexacttupletype9c6c9b3aa6368426": [
+      "tuple<int, int>",
+      "1",
+      "tuple<i64, int>"
+    ],
     "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": [
       "IBondedClosureStore",
       "put",
@@ -495,6 +512,10 @@
       "variables",
       "c0, c1, c2, c3, c4",
       "2"
+    ],
+    "cannotreturnanarrayv...theelementsmustmatch03392cfecad7b037": [
+      "AvmIface",
+      "int"
     ],
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": [
       "a 'void*' value",
@@ -827,6 +848,11 @@
       "move"
     ],
     "genericcppstructisnotsupportedyet": [],
+    "generictemplateoverl...adydefinedatarg1arg2c8cf5d18e33f4772": [
+      "diffShape",
+      "err_generic_template_redefinition.cb",
+      "21"
+    ],
     "hidesvirtualmethodarg0arg1addoverride": [
       "cpppoly.Shape",
       "area"
@@ -886,6 +912,10 @@
     "multiplebasesarenotsupportedyet": [],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
       "z"
+    ],
+    "nativeglobalarg0ofty...inmainorholdapointer292b5312827e6453": [
+      "gv",
+      "castglob.Box"
     ],
     "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": [
       "IClosureIntArg",
@@ -2071,6 +2101,8 @@
     "cannotassignarg0toar...thanexplicitcastarg4fac024c4cf80f689": "cannot assign {0} to '{1}' destination {2}: only a named function, a '{3}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{4}'.",
     "cannotassignarg0tocl...thanexplicitcastarg3b001825100666242": "cannot assign {0} to closure destination {1}: only a named function, a '{2}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotbindaarg0value...llonenotasinglevalue0596274fbb0f0913": "cannot bind a '{0}' value to array view '{1}' - a view indexes whole '{2}' elements, so its source must be an array view (or a null one), not a single value",
+    "cannotbindanarrayvie...eemaydecaytoapointer2a051f8345ba8873": "cannot bind an array view of '{0}' to a plain pointer whose pointee is '{1}' - only a view whose element matches the pointee may decay to a pointer",
+    "cannotbindanarrayvie...lementtypesmustmatch3c93d43fe1f8dd3a": "cannot bind an array view of '{0}' to a destination of '{1}' - a view indexes by its own element, so the element types must match",
     "cannotbindanowningca...rawpointerexplicitly97184b875fcd0fe7": "cannot bind an owning call result to raw pointer '{0}' - nothing frees it. Bind it to a 'unique' local, or call '.release()' to take the raw pointer explicitly",
     "cannotbraceinitializ...lonenotasingleobjectec2caca65ac1fee1": "cannot brace-initialize array-view field '{0}.{1}' ('{2}') from '{3}' - a view indexes whole '{4}' elements, so its source must be an array view of '{5}' (or a null one), not a single object",
     "cannotconvertarg0tob...implicitoperatorbool61d893b2ebf00f2d": "cannot convert '{0}' to 'bool': it is not a scalar and declares no implicit 'operator bool'",
@@ -2084,6 +2116,7 @@
     "cannotcopyarg0itsfie...ipinsteadofcopyingitc211031fc62a57d2": "cannot copy '{0}': its field '{1}.{2}' is 'unique', so it owns a raw pointer that has no generic deep-clone. A memberwise copy would share the pointer between two owners and double-free at teardown. Write a '{3}' method for '{4}' that clones the pointee itself, or '{5}' the value to transfer ownership instead of copying it.",
     "cannotcopyarg0itsfie...ipinsteadofcopyingitcc0e5e860001f897": "cannot copy '{0}': its field '{1}.{2}' is 'unique' (a unique<T> wrapper), so it owns a raw pointer that has no generic deep-clone. A memberwise copy would share the pointer between two owners and double-free at teardown. Write a '{3}' method for '{4}' that clones the pointee itself, or '{5}' the value to transfer ownership instead of copying it.",
     "cannotcopyarg0unique...nethepointeeyourselfb6e9ff574f9a1595": "cannot copy '{0}': unique<T> owns its pointee and has no deep-clone - 'move' it to transfer ownership, or clone the pointee yourself",
+    "cannotjoinanarrayvie...obotharmsmustshareit3d3e026ed1b69627": "cannot join an array view of '{0}' with an array view of '{1}' in a '?:' - a view indexes by its own element, so both arms must share it",
     "cannotlocatecflatbui...timedirectoryisunsetd6eb6b14f48bb579": "cannot locate cflat_builtins.c: runtime directory is unset.",
     "cannotlocatecrashhan...timedirectoryisunsetef91181cafe6b040": "cannot locate crash handler source: runtime directory is unset.",
     "cannotlowerdefaultar...rparameterarg0ofarg18db0b6145a9413b7": "cannot lower default argument for parameter '{0}' of '{1}'",
@@ -2108,6 +2141,7 @@
     "cannotpassarg0tothea...binditfirstarg9arg1069e931e3bcfc1bb6": "cannot pass '{0}' to the '{1}' parameter '{2}' of '{3}': a '{4}' is a {5} value, not a '{6}' - the callee would read the pair itself. Pass the buffer explicitly with '{7}'. An interpolated string literal is a '{8}': bind it first ({9}; {10}).",
     "cannotpassarg0tothea...erexplicitlywitharg685f9bb80ecf24438": "cannot pass '{0}' to the '{1}' parameter {2} through a function value: a '{3}' is a {4} value, not a '{5}'. Pass the buffer explicitly with '{6}'.",
     "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": "cannot pass '{0}' to the variadic '{1}' of '{2}': a variadic slot is untyped and a '{3}' is a {4} value, not a '{5}' - the length field would be read as the next argument. Pass the buffer explicitly with '{6}' (e.g. {7}).",
+    "cannotpassatuplevalu...iresanexacttupletype9c6c9b3aa6368426": "cannot pass a tuple value of type '{0}' to parameter {1} of a call through a function value with tuple type '{2}'; a tuple value that is not a literal requires an exact tuple type",
     "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": "cannot pass bonded value to interface method '{0}.{1}' parameter '{2}' - bonded values cannot be transferred out of their source's scope",
     "cannotpassowningheap...quetdoesnotownarrays57d0d857da621597": "cannot pass owning heap array '{0}' to parameter '{1}' of '{2}': unique<T> does not own arrays",
     "cannotpassthisexpressiontoarg0arg1": "cannot pass this expression to '{0}'; {1}",
@@ -2116,6 +2150,7 @@
     "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}, ... (and {4} more)]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": "cannot pass to C function-pointer parameter '{0}': this 'function<>' value may store captured state. A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",
     "cannotrepairtheexter...arationisalreadyused97e1fff5ca82f8ac": "cannot repair the extern '{0}' declaration after ABI lowering was selected: the old declaration is already used",
+    "cannotreturnanarrayv...theelementsmustmatch03392cfecad7b037": "cannot return an array view of '{0}' from a function whose return element is '{1}' - a view indexes by its own element, so the elements must match",
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": "cannot return {0} as a '{1}' value: only a named function, a '{2}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": "cannot return {0} as a closure: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",
     "cannotreturnborrowed...oramovereturningcallb3f87323df3d389a": "cannot return borrowed value '{0}' as '{1}'; the return type owns the pointee - use 'new', a move source, or a move-returning call",
@@ -2192,6 +2227,7 @@
     "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": "function '{0}' has no overload matching the '{1}' modifiers required by parameter '{2}' - '{3}' is part of the function-pointer type",
     "functionarg0isneverused": "function '{0}' is never used",
     "genericcppstructisnotsupportedyet": "generic [cpp] struct is not supported yet",
+    "generictemplateoverl...adydefinedatarg1arg2c8cf5d18e33f4772": "generic template overloading is not supported yet: redefinition of '{0}' - a template with a different parameter shape is already defined at {1}({2})",
     "getorcreateprogramvt...notimplementarg1arg27eb70aa4fbb83de6": "GetOrCreateProgramVTable: '{0}' does not implement '{1}::{2}'",
     "getorcreateprogramvt...unknowninterfacearg0e4dc00542011e2b1": "GetOrCreateProgramVTable: unknown interface '{0}'",
     "getorcreatevtablearg...notimplementarg1arg280f8d3de313016d6": "GetOrCreateVTable: '{0}' does not implement '{1}::{2}'",
@@ -2231,6 +2267,7 @@
     "movinganewarg0outofi...initializerorwithnewe436841fea1341f2": "moving a new '{0}' out of its temporary would leave its stored closure pointing at the temporary ('this' captured in {1}'s constructor); construct it in place (a declaration, a field or element initializer) or with 'new'",
     "multiplebasesarenotsupportedyet": "multiple bases are not supported yet",
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": "named argument '{0}' does not match any parameter",
+    "nativeglobalarg0ofty...inmainorholdapointer292b5312827e6453": "native global '{0}' of type '{1}' has an initializer that could not be reduced to a compile-time constant; initialize it in main or hold a pointer",
     "noarg0compilerdriver...dtolinktheexecutable11639c2d0b9f1811": "no {0} compiler driver found to link the executable.",
     "noarg0compilerdriver...pilenativesourcearg16740382ea0548b90": "no {0} compiler driver found - cannot compile native source '{1}'.",
     "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": "no method of '{0}.{1}' matches the given arguments{2}",

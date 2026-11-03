@@ -1835,6 +1835,7 @@ bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntr
         e = CMacroEntry();
         e.name = r.name; e.file = r.file; e.line = r.line ? r.line : 1; e.col = 0;
         e.isIntegerLiteralZero = r.isIntegerLiteralZero;
+        e.isIntegerLiteralToken = r.isIntegerLiteralToken;
         if (r.kind == K::Skip)
         {
             // Did not fold, but the body is one identifier: carry the spelling for the alias pass.

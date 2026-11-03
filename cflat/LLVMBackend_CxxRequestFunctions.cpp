@@ -553,6 +553,10 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
             return CxxSpellingForCflatType(type.TypeName, spelling) ? spelling : std::string();
         };
         auto isAllowedConversion = [&](const NamedVariable& arg, const std::string& raw) {
+            if (arg.TypeAndValue.TypeName.empty() && !arg.TypeAndValue.Pointer
+                && arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()
+                && IsTopLevelStdFunctionSpelling(raw))
+                return true;
             TypeAndValue source;
             const bool charPointer = [&] {
                 source = argumentType(arg);
@@ -779,6 +783,9 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
         auto actualArgument = [&](const NamedVariable& arg, size_t parameterIndex)
             -> std::optional<ActualArgument> {
             TypeAndValue type = argumentType(arg);
+            if (type.TypeName.empty() && !type.Pointer && arg.Primary != nullptr
+                && arg.Primary->getType()->isPointerTy())
+                return ActualArgument{ "std::nullptr_t", "p" + std::to_string(parameterIndex) };
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
             const bool stringLiteral = constant != nullptr && IsStringLiteralConstant(constant);
             if (stringLiteral || (type.Pointer && type.TypeName == "char"))
@@ -3475,6 +3482,8 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                                              const std::vector<std::pair<size_t, size_t>>& braceGroups,
                                              const std::string& memberOwnerType)
 {
+        static constexpr std::string_view kArrayReferenceParameterMarker =
+            "(&cflat_array_argument_marker)";
         const bool memberCall = !memberOwnerType.empty();
         const std::string memberName = memberCall
             ? functionName.substr(functionName.rfind('.') == std::string::npos
@@ -4076,6 +4085,39 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                                     functionName);
                 return false;
             }
+            if (IsCxxFixedArrayArgument(arg))
+            {
+                std::vector<uint64_t> dimensions;
+                if (arg.TypeAndValue.ConstArraySize != 0)
+                {
+                    dimensions.push_back(arg.TypeAndValue.ConstArraySize);
+                    dimensions.insert(dimensions.end(), arg.TypeAndValue.ConstInnerDimensions.begin(),
+                                      arg.TypeAndValue.ConstInnerDimensions.end());
+                }
+                else
+                {
+                    llvm::Type* arrayType = arg.BaseType;
+                    while (auto* array = llvm::dyn_cast_or_null<llvm::ArrayType>(arrayType))
+                    {
+                        dimensions.push_back(array->getNumElements());
+                        arrayType = array->getElementType();
+                    }
+                }
+                if (dimensions.empty() || !spelling.ends_with("*"))
+                {
+                    error = std::format("C++ free function '{}' has a fixed-array argument that cannot be spelled",
+                                        functionName);
+                    return false;
+                }
+                spelling.pop_back();
+                std::string parameter = spelling + " "
+                    + std::string(kArrayReferenceParameterMarker);
+                for (uint64_t dimension : dimensions)
+                    parameter += std::format("[{}]", dimension);
+                parameterSpellings.push_back(std::move(parameter));
+                callArguments.push_back("p" + std::to_string(parameterIndex));
+                continue;
+            }
             if (arg.IsCxxDirectConstruction)
             {
                 std::string construction;
@@ -4358,6 +4400,16 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                 result.replace(pos, 1, "::");
             return result;
         }();
+        auto namedParameter = [&](std::string spelling, const std::string& name) {
+            const size_t marker = spelling.find(kArrayReferenceParameterMarker);
+            if (marker != std::string::npos)
+            {
+                spelling.replace(marker, kArrayReferenceParameterMarker.size(),
+                                 "(&" + name + ")");
+                return spelling;
+            }
+            return spelling + " " + name;
+        };
         struct FreeWrapper
         {
             std::string name;
@@ -4394,7 +4446,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             for (size_t i = 0; i < parameterSpellings.size(); ++i)
             {
                 if (i != 0) parameters += ", ";
-                parameters += parameterSpellings[i] + " p" + std::to_string(i);
+                parameters += namedParameter(parameterSpellings[i], "p" + std::to_string(i));
             }
             std::string call = target;
             if (adlCall)
@@ -4528,7 +4580,8 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             std::string typedefs = "#include <initializer_list>\n#include <new>\n";
             std::string parameters;
             for (size_t i = 0; i < parameterSpellings.size(); ++i)
-                parameters += (i != 0 ? ", " : "") + parameterSpellings[i] + " p" + std::to_string(i);
+                parameters += (i != 0 ? ", " : "")
+                    + namedParameter(parameterSpellings[i], "p" + std::to_string(i));
             std::string body;
             std::vector<std::string> lists;
             for (size_t g = 0; g < braceGroups.size(); ++g)

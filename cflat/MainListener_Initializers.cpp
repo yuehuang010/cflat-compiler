@@ -1350,6 +1350,8 @@ bool MainListener::EmitOneFieldInit(
             const LLVMBackend::TypeAndValue* clo = fieldType.IsFunctionPointer
                 ? static_cast<const LLVMBackend::TypeAndValue*>(&fieldType)
                 : compiler->GetEncodedClosureType(fieldType.TypeName);
+            if (clo != nullptr)
+                compiler->RejectLiteralZeroFunctionSlot(val, rightNV);
             if (clo != nullptr && clo->IsThinFnPtr()
                 && val->getType() == compiler->GetClosureFatPtrType())
             {
@@ -1868,6 +1870,8 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         // function<> field fed a raw pointer (spelled or generic-encoded).
         const LLVMBackend::TypeAndValue* clo = field.IsFunctionPointer
             ? &field : compiler->GetEncodedClosureType(field.TypeName);
+        if (val && clo)
+            compiler->RejectLiteralZeroFunctionSlot(val, nv);
         if (val && clo && !field.Pointer && field.ConstArraySize == 0
             && val->getType()->isPointerTy() && !val->getType()->isStructTy())
         {
@@ -2511,6 +2515,22 @@ bool MainListener::RejectImplicitPrimitiveToPointer(
         LogErrorContext(ctx, compiler->DescribeImplicitPrimitiveToPointer(
             target, rhsNV, value, action, destination));
         return true;
+    }
+
+void MainListener::RejectNewPointerSlotDepthMismatch(
+    antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& sourceNV,
+    const LLVMBackend::TypeAndValue& target) {
+        const auto& source = sourceNV.TypeAndValue;
+        if (!source.Pointer || !source.ElemPointer || source.IsArrayView || !target.Pointer)
+            return;
+        auto* compiler = Compiler(ctx);
+        if (!sourceNV.IsOwning && !compiler->IsOwnedNewTemp(sourceNV.Primary)) return;
+        const int sourceDepth = source.PointerDepth > 0 ? source.PointerDepth : 2;
+        const int targetDepth = target.PointerDepth > 0 ? target.PointerDepth
+            : (target.ElemPointer ? 2 : 1);
+        if (sourceDepth == targetDepth || source.TypeName != target.TypeName) return;
+        LogErrorContext(ctx, std::format("cannot convert '{}' to '{}' implicitly: the pointer depths differ",
+            SpellType(*compiler, source), SpellType(*compiler, target)));
     }
 
 bool MainListener::RejectConstDiscardingConversion(
@@ -5710,7 +5730,7 @@ void MainListener::ArmArrayNewDesugar(antlr4::tree::ParseTree* rhs, const LLVMBa
         // a hidden count is the escape hatch and has to be spelled `T* p = new T[n];`.
         if (target.TypeName == "auto")
         {
-            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier(), ne->multiWordTypeSuffix());
+            std::string elem = NewExpressionElementTypeName(ne);
             std::string mangled = MangledGenericName("array", { elem });
             QueueGenericInstantiation("array", { elem }, mangled);
             arrayNewDesugarCtx = ne;

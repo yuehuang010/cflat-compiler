@@ -3308,6 +3308,7 @@ nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m, CCachePathTable* f
                             {"ln", m.line}, {"co", m.col}};
         PathToJson(j, m.file, files);
         if (m.isIntegerLiteralZero) j["ilz"] = true;
+        if (m.isIntegerLiteralToken) j["ilt"] = true;
         if (m.isPointer) j["isp"]  = true;
         if (!m.pointeeTypeName.empty()) j["pte"] = m.pointeeTypeName;
         // Store the float as its raw IEEE-754 bit pattern, not as a JSON number:
@@ -3335,6 +3336,7 @@ LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j, const CCache
         m.line      = j.value("ln",  1);
         m.col       = j.value("co",  0);
         m.isIntegerLiteralZero = j.value("ilz", false);
+        m.isIntegerLiteralToken = j.value("ilt", false);
         m.isPointer = j.value("isp", false);
         m.pointeeTypeName = j.value("pte", std::string{});
         m.isFloat   = j.value("isf", false);

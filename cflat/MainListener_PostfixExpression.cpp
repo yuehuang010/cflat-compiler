@@ -6523,6 +6523,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             lastParenExprCallerName.clear();
                             auto parenInnerNamed = lastParenExprNamed;
                             lastParenExprNamed = {};
+                            // Identity parentheses keep a tuple literal's provenance; a suffix drops it.
+                            if (prevPrimary->expression() != nullptr && childLimit == 1 && parenInnerNamed.IsTupleLiteral)
+                            {
+                                namedVar.IsTupleLiteral = true;
+                                namedVar.TupleLiteralElements = parenInnerNamed.TupleLiteralElements;
+                            }
                             // T250: `owner = (raw = new T())` carries the inner local slot out of the
                             // parens so an outer unique '=' consumes it as `owner = raw;` does.
                             if (prevPrimary->expression() != nullptr)
@@ -9833,6 +9839,32 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             return this->ParseAssignmentExpressionNamed(
                                                 namedArgument->assignmentExpression());
                                         });
+                                        // A tuple literal converts element-wise to the slot under the scalar call
+                                        // rule (as overload ranking checks it); a refused element is an error here.
+                                        if (argNV.IsTupleLiteral && argParamIndex < funcPtrTV.FuncPtrParams.size())
+                                        {
+                                            const auto elementCost = backend->TupleLiteralElementCost(
+                                                argNV, argExpectedDest, false);
+                                            if (elementCost && *elementCost < 0)
+                                                LogErrorContext(namedArgument, std::format(
+                                                    "cannot pass a tuple literal to parameter {} of a call through a function value: an element will not convert to '{}' on its own at a call argument; cast the element explicitly",
+                                                    argParamIndex + 1, SpellType(*backend, argExpectedDest)));
+                                            backend->ConvertTupleArgument(argNV, argExpectedDest);
+                                        }
+                                        else if (argParamIndex < funcPtrTV.FuncPtrParams.size())
+                                        {
+                                            const std::string sourceTupleName = backend->ResolveTypeAlias(
+                                                argNV.TypeAndValue.TypeName);
+                                            const std::string targetTupleName = backend->ResolveTypeAlias(
+                                                argExpectedDest.TypeName);
+                                            if (tupleTypeArgs.contains(sourceTupleName)
+                                                && tupleTypeArgs.contains(targetTupleName)
+                                                && sourceTupleName != targetTupleName)
+                                                LogErrorContext(namedArgument, backend->LocalizeMessage(
+                                                    "cannot pass a tuple value of type '{}' to parameter {} of a call through a function value with tuple type '{}'; a tuple value that is not a literal requires an exact tuple type",
+                                                    { SpellType(*backend, argNV.TypeAndValue), std::to_string(argParamIndex + 1),
+                                                      SpellType(*backend, argExpectedDest) }));
+                                        }
                                         GuardOwningTempRawPointerFieldIntoUnique(
                                             argNV, argExpectedDest, namedArgument, "function value");
                                         for (auto* owner : backend->FindOwningTempRawPointerFieldOwners(
@@ -10587,6 +10619,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.IsOwningStruct = argNV.IsOwningStruct;
                                     argVar.AllocatedByRawNewArray = argNV.AllocatedByRawNewArray;
+                                    argVar.IsCoreUniqueRelease = argNV.IsCoreUniqueRelease;
                                     argVar.RawArrayLength = argNV.RawArrayLength;
                                     argVar.RawArrayLengthStorage = argNV.RawArrayLengthStorage;
                                     // Explicit 'move' at the call site: drives move-overload selection
@@ -10614,6 +10647,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsStringLiteral = argNV.IsStringLiteral
                                         || (argText.size() >= 2 && argText.front() == '"'
                                             && argText.back() == '"');
+                                    // Tuple-literal provenance gates element-wise call conversion.
+                                    argVar.IsTupleLiteral = argNV.IsTupleLiteral;
+                                    argVar.TupleLiteralElements = argNV.TupleLiteralElements;
                                     // Propagate over-alignment so a `move` param that would inherit the block
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
@@ -12844,6 +12880,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.IsOwningStruct = argNV.IsOwningStruct;
                                     argVar.AllocatedByRawNewArray = argNV.AllocatedByRawNewArray;
+                                    argVar.IsCoreUniqueRelease = argNV.IsCoreUniqueRelease;
                                     argVar.RawArrayLength = argNV.RawArrayLength;
                                     argVar.RawArrayLengthStorage = argNV.RawArrayLengthStorage;
                                     // Explicit 'move' at the call site: drives move-overload selection
@@ -12862,6 +12899,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsStringLiteral = argNV.IsStringLiteral
                                         || (argText.size() >= 2 && argText.front() == '"'
                                             && argText.back() == '"');
+                                    // Tuple-literal provenance gates element-wise call conversion.
+                                    argVar.IsTupleLiteral = argNV.IsTupleLiteral;
+                                    argVar.TupleLiteralElements = argNV.TupleLiteralElements;
                                     // Propagate over-alignment so a `move` param that would inherit the block
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
@@ -16347,16 +16387,58 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         auto* compiler = Compiler(ctx);
         auto entries = ctx->tupleConstructEntry();
 
+        std::vector<LLVMBackend::DeclTypeAndValue> expectedFields;
+        const bool tupleIsCallArgument = inCallArgument_
+            && (IsDirectCallArgument(ctx) || IsCallArgumentThroughParens(ctx));
+        if (!tupleIsCallArgument && !declExpectedType.TypeName.empty() && !declExpectedType.Pointer
+            && !declExpectedType.IsArrayView
+            && MangledBase(compiler->ResolveTypeAlias(declExpectedType.TypeName)) == "tuple")
+        {
+            const std::string expectedName = compiler->ResolveTypeAlias(declExpectedType.TypeName);
+            if (compiler->GetDataStructure(expectedName).StructFields.empty())
+                EnsureTupleInstantiated(expectedName);
+            const auto& fields = compiler->GetDataStructure(expectedName).StructFields;
+            if (fields.size() == entries.size())
+                expectedFields = fields;
+        }
+
         // Evaluate each element and collect its type name
         std::vector<llvm::Value*> elemValues;
+        std::vector<LLVMBackend::NamedVariable> tupleLiteralElements;
         std::vector<std::string> typeArgs;
-        for (auto* entry : entries)
+        for (size_t i = 0; i < entries.size(); ++i)
         {
-            // The tuple is the destination expression; its enclosing type is not the type of
-            // any one element. Element-specific inference is not available here, so clear it.
-            DeclExpectedTypeScope elementExpectedScope(&declExpectedType, {});
+            auto* entry = entries[i];
+            // The expected tuple field is the context for this element; otherwise it is untyped.
+            DeclExpectedTypeScope elementExpectedScope(&declExpectedType,
+                expectedFields.empty() ? LLVMBackend::TypeAndValue{} : expectedFields[i], true);
             auto nv = ParseAssignmentExpressionNamed(entry->assignmentExpression());
             auto* loaded = LoadNamedVariable(nv);
+            // Record the source element as a scalar call argument would carry it (width from the value).
+            auto elementRecord = nv;
+            if (elementRecord.BaseType == nullptr && loaded != nullptr)
+                elementRecord.BaseType = loaded->getType();
+            tupleLiteralElements.push_back(std::move(elementRecord));
+            bool matchesExpectedTupleElement = false;
+
+            if (!expectedFields.empty() && loaded != nullptr)
+            {
+                const auto& expected = expectedFields[i];
+                auto* expectedType = compiler->GetType(expected);
+                matchesExpectedTupleElement = expectedType != nullptr
+                    && loaded->getType() == expectedType;
+                const bool numericConversion = expectedType != nullptr
+                    && (loaded->getType()->isIntegerTy() || loaded->getType()->isFloatingPointTy())
+                    && (expectedType->isIntegerTy() || expectedType->isFloatingPointTy());
+                if (!matchesExpectedTupleElement && numericConversion)
+                {
+                    LLVMBackend::NativeBraceScope braceScope(*compiler);
+                    loaded = compiler->ConvertScalarToType(loaded, expectedType,
+                        nv.TypeAndValue.IsUnsignedInteger() != -1,
+                        expected.IsUnsignedInteger() != -1);
+                    matchesExpectedTupleElement = true;
+                }
+            }
             elemValues.push_back(loaded);
 
             // Prefer TypeAndValue.TypeName (set for variables); fall back to LLVM type
@@ -16364,6 +16446,8 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             bool typeNameInferred = typeName.empty();
             if (typeName.empty() && loaded)
                 typeName = LLVMTypeToTypeName(loaded->getType(), nv.TypeAndValue.TypeName);
+            if (!expectedFields.empty() && matchesExpectedTupleElement)
+                typeName = expectedFields[i].TypeName;
             // C integer promotion: untyped small-integer literals widen to int (i32)
             if (typeNameInferred && (typeName == "i8" || typeName == "i16"))
             {
@@ -16429,6 +16513,8 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         result.Storage = alloca;
         result.Primary = compiler->builder->CreateLoad(structType, alloca);
         result.TypeAndValue = tupleType;
+        result.IsTupleLiteral = true;
+        result.TupleLiteralElements = std::move(tupleLiteralElements);
         return result;
     }
 
@@ -18502,8 +18588,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                             auto* init = initDecl->initializer();
                             auto* ne = init != nullptr ? AsDirectNew(init->assignmentExpression()) : nullptr;
                             if (ne == nullptr || ne->assignmentExpression() == nullptr) continue;
-                            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier(),
-                                ne->multiWordTypeSuffix());
+                            std::string elem = NewExpressionElementTypeName(ne);
                             QueueGenericInstantiation("array", { elem }, MangledGenericName("array", { elem }));
                         }
                     }

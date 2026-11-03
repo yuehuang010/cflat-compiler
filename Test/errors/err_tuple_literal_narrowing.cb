@@ -1,0 +1,42 @@
+void tupleNarrowingCall((int, int) value) {}
+void tupleDoubleCall((double, int) value) {}
+void tupleWideningCall((i64, int) value) {}
+int tupleFunctionU8((u8, int) value) { return (int)value.item_0; }
+int tupleFunctionInt((int, int) value) { return value.item_0; }
+
+extern int main()
+{
+    expect_error("implicit conversion from 'float' to 'int' loses the fractional part") {
+        (int, int) t = (3.5, 4);
+    }
+    (u8, int) fitting = (3, 4);
+    expect_error("integer constant 300 cannot be narrowed to type 'u8'") {
+        (u8, int) narrowed = (300, 4);
+    }
+    (int, int) tupleVariable = (3, 4);
+    expect_error("no overload of 'tupleWideningCall' matches the given arguments") {
+        tupleWideningCall(tupleVariable);
+    }
+    expect_error("no overload of 'tupleDoubleCall' matches the given arguments") {
+        tupleDoubleCall((3, 4));
+    }
+    expect_error("no overload of 'tupleWideningCall' matches the given arguments") {
+        tupleWideningCall((tupleVariable));
+    }
+    expect_error("'++' requires an addressable operand") {
+        (int, int) bumped = (3, 4)++;
+    }
+    expect_error("Undefined variable nonesuch") {
+        int member = (3, 4).nonesuch;
+    }
+    function<int((u8, int))> tupleFnU8 = tupleFunctionU8;
+    expect_error("cannot pass a tuple literal to parameter 1 of a call through a function value") {
+        tupleFnU8((300, 4));
+    }
+    i64 wide = 300;
+    function<int((int, int))> tupleFnInt = tupleFunctionInt;
+    expect_error("cannot pass a tuple literal to parameter 1 of a call through a function value") {
+        tupleFnInt((wide, 4));
+    }
+    return 0;
+}

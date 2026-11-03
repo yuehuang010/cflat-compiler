@@ -1,5 +1,8 @@
 #pragma once
 #include <functional>
+#define CPPFN_ZERO 0
+#define CPPFN_ZEROL 0L
+#define CPPFN_NULL __null
 namespace cppfnptr {
 using Cb = int (*)(int);
 typedef int (*CbAlias)(int);
@@ -20,4 +23,5 @@ struct Sink {
 };
 inline int inline_callback(int (*f)(int), int x) { return f ? f(x) : -1; }
 inline int std_function_callback(std::function<int(int)> f, int x) { return f(x); }
+inline int std_function_present(std::function<int(int)> f) { return f ? 1 : 0; }
 }

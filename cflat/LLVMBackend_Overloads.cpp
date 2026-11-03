@@ -1315,6 +1315,61 @@ int LLVMBackend::RankIntegerConversion(const std::string& argIdentity, const std
         return 1 + paramBits;
 }
 
+// Per-element scalar call viability and cost of a tuple literal against a tuple parameter.
+// nullopt: not a tuple-literal-to-tuple case. -1: refused. Otherwise the summed conversion cost.
+std::optional<int> LLVMBackend::TupleLiteralElementCost(const NamedVariable& argument,
+                                                        const TypeAndValue& parameter, bool cxx)
+{
+    if (argument.TypeAndValue.Pointer || parameter.Pointer || parameter.IsAlias
+        || parameter.IsRvalueRef || !argument.IsTupleLiteral)
+        return std::nullopt;
+    const std::string sourceName = ResolveTypeAlias(argument.TypeAndValue.TypeName);
+    const std::string targetName = ResolveTypeAlias(parameter.TypeName);
+    if (MangledBase(sourceName) != "tuple" || MangledBase(targetName) != "tuple")
+        return std::nullopt;
+    const auto source = dataStructures.find(sourceName);
+    const auto target = dataStructures.find(targetName);
+    if (source == dataStructures.end() || target == dataStructures.end()
+        || source->second.StructFields.size() != target->second.StructFields.size())
+        return -1;
+    int cost = 0;
+    for (size_t i = 0; i < source->second.StructFields.size(); ++i)
+    {
+        const auto& from = source->second.StructFields[i];
+        const auto& to = target->second.StructFields[i];
+        if (ResolveTypeAlias(from.TypeName) == ResolveTypeAlias(to.TypeName)
+            && from.Pointer == to.Pointer && from.ElemPointer == to.ElemPointer)
+            continue;
+        if (from.Pointer || to.Pointer || from.ElemPointer || to.ElemPointer)
+            return -1;
+        NamedVariable element;
+        if (i < argument.TupleLiteralElements.size())
+            element = argument.TupleLiteralElements[i];
+        else
+        {
+            element.TypeAndValue = from;
+            element.BaseType = GetType(from);
+        }
+        const ScalarArgConversion conversion = ClassifyScalarArgConversion(element, to);
+        // A native call refuses an integer element into a floating parameter (scalar rule).
+        if (conversion == ScalarArgConversion::Widen && !cxx
+            && CallArgumentIntegerBits(element) != -1 && FloatingBitsOfName(to.TypeName) != -1)
+            return -1;
+        if (conversion != ScalarArgConversion::Exact
+            && conversion != ScalarArgConversion::Widen
+            && conversion != ScalarArgConversion::PromotedNarrow)
+            return -1;
+        if (conversion == ScalarArgConversion::Widen)
+        {
+            if (from.IsInteger() != -1 && to.IsInteger() != -1)
+                cost += RankIntegerConversion(from.TypeName, to.TypeName, cxx);
+            else
+                cost += kIntegerConversionCost;
+        }
+    }
+    return cost;
+}
+
 /*
  * Ranks only what C++ ranks without further context: arithmetic to arithmetic (by value or
  * through a `const T&`), a class value to its own class, and a class value through a conversion
@@ -2649,6 +2704,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             }
             return false;
         };
+        auto tupleConversionCost = [&](const NamedVariable& argument,
+                                       const TypeAndValue& parameter,
+                                       bool cxx) -> std::optional<int> {
+            return TupleLiteralElementCost(argument, parameter, cxx);
+        };
 
         for (const auto& pair : candidates)
         {
@@ -2761,6 +2821,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const auto& arg : arguments)
             {
                 int result = -1;
+                int tupleCost = -1;
+                bool tuplePair = false;
                 bool coreUniqueAddressToRawSlot = false;
                 if (arg.IsDefaultArgument && candidateParamItr != candidate.Parameters.end()
                     && IsReferenceOrSinkParameter(*candidateParamItr))
@@ -3652,8 +3714,21 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                 // The one scalar table (rulings 2026-09-04, 2026-10-09): Narrow and EnumMismatch are
                 // refused; a C++ by-value parameter also takes Widen. Bool keeps its own arm.
-                const ScalarArgConversion scalarConv = ClassifyScalarArgConversion(arg,
-                    ScalarArgumentReferent(*candidateParamItr));
+                if (!arg.TypeAndValue.Pointer && !candidateParamItr->Pointer
+                    && !candidateParamItr->IsAlias && !candidateParamItr->IsRvalueRef
+                    && arg.IsTupleLiteral
+                    && MangledBase(ResolveTypeAlias(arg.TypeAndValue.TypeName)) == "tuple"
+                    && MangledBase(ResolveTypeAlias(candidateParamItr->TypeName)) == "tuple")
+                {
+                    const auto tupleCostResult = tupleConversionCost(arg, *candidateParamItr,
+                        candidate.IsCxx);
+                    tuplePair = true;
+                    tupleCost = tupleCostResult.value_or(-1);
+                    result = tupleCost < 0 ? -1 : tupleCost == 0 ? 0 : 1;
+                }
+                const ScalarArgConversion scalarConv = tuplePair
+                    ? ScalarArgConversion::NotScalar
+                    : ClassifyScalarArgConversion(arg, ScalarArgumentReferent(*candidateParamItr));
                 // An int built from narrow operands binds the narrow parameter as a conversion (C 6.3.1.3):
                 // viable, ranked below an exact int overload by RankIntegerConversion.
                 if (result < 0 && scalarConv == ScalarArgConversion::PromotedNarrow)
@@ -3775,6 +3850,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // Integer identity ranking (ruling 2026-09-10): only an identity-exact integer is a
                 // perfect match. Never widens the viable set - it re-ranks what already binds.
                 int integerCost = -1;
+                if (tuplePair && tupleCost >= 0)
+                    integerCost = tupleCost;
                 if (result >= 0)
                 {
                     // LLVM opaque pointers erase primitive pointee types. Preserve that identity
@@ -5579,6 +5656,62 @@ std::string LLVMBackend::CxxConstPointerArgumentError(
             "parameter{}: it points to a const C++ object, so the parameter could write through "
             "read-only storage",
             argumentIndex, argumentName, parameter);
+}
+
+bool LLVMBackend::ConvertTupleArgument(NamedVariable& argument, const TypeAndValue& parameter)
+{
+        if (argument.TypeAndValue.Pointer || parameter.Pointer || parameter.IsAlias
+            || parameter.IsRvalueRef || !argument.IsTupleLiteral)
+            return false;
+        const std::string sourceName = ResolveTypeAlias(argument.TypeAndValue.TypeName);
+        const std::string targetName = ResolveTypeAlias(parameter.TypeName);
+        if (sourceName == targetName || MangledBase(sourceName) != "tuple"
+            || MangledBase(targetName) != "tuple")
+            return false;
+        auto source = dataStructures.find(sourceName);
+        auto target = dataStructures.find(targetName);
+        if (source == dataStructures.end() || target == dataStructures.end()
+            || source->second.StructFields.size() != target->second.StructFields.size())
+            return false;
+        auto* sourceType = source->second.StructType;
+        auto* targetType = target->second.StructType;
+        if (sourceType == nullptr || targetType == nullptr) return false;
+        llvm::Value* sourceStorage = argument.Storage;
+        if (sourceStorage == nullptr)
+        {
+            sourceStorage = CreateAlloca(sourceType);
+            builder->CreateStore(argument.Primary, sourceStorage);
+        }
+        auto* targetStorage = CreateAlloca(targetType);
+        for (size_t i = 0; i < source->second.StructFields.size(); ++i)
+        {
+            const auto& from = source->second.StructFields[i];
+            const auto& to = target->second.StructFields[i];
+            auto* fromType = GetType(from);
+            auto* toType = GetType(to);
+            if (fromType == nullptr || toType == nullptr) return false;
+            auto* sourceField = CreateStructGEP(sourceType, sourceStorage,
+                static_cast<unsigned>(i));
+            llvm::Value* value = builder->CreateLoad(fromType, sourceField);
+            if (fromType != toType)
+            {
+                if (from.Pointer || to.Pointer || from.ElemPointer || to.ElemPointer
+                    || !(fromType->isIntegerTy() || fromType->isFloatingPointTy())
+                    || !(toType->isIntegerTy() || toType->isFloatingPointTy()))
+                    return false;
+                value = ConvertScalarToType(value, toType,
+                    from.IsUnsignedInteger() != -1, to.IsUnsignedInteger() != -1);
+            }
+            auto* targetField = CreateStructGEP(targetType, targetStorage,
+                static_cast<unsigned>(i));
+            builder->CreateStore(value, targetField);
+        }
+        argument.Storage = targetStorage;
+        argument.Primary = builder->CreateLoad(targetType, targetStorage);
+        argument.BaseType = targetType;
+        argument.TypeAndValue = TypeAndValue{ .TypeName = targetName };
+        argument.IsRvalue = true;
+        return true;
 }
 
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& inputArguments, bool forceRoot,
@@ -7708,6 +7841,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
         {
             const auto& param = candidate.Parameters[i];
+            if (candidate.IsCxx && matched[i].Primary != nullptr
+                && (param.IsFunctionPointer
+                    || (!param.Pointer && (IsStdFunctionTypeName(param.TypeName)
+                                           || IsStdFunctionSpecialization(param.TypeName)))))
+                RejectLiteralZeroFunctionSlot(matched[i].Primary, matched[i]);
             auto& arg = matched[i];
             if (candidate.IsCxx || !param.IsArrayView || param.IsMove || param.IsUnique
                 || param.IsOwningSink || !IsCxxContiguousViewSource(arg, param))
@@ -8775,6 +8913,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
                 if (!inVariadicRange)
                 {
+                    if (ConvertTupleArgument(arg, *candParamItr))
+                        value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
                     if (IsRawPointerToCoreUnique(arg, *candParamItr))
                         value = CreateCoreUniqueFromRawPointerCall(arg, *candParamItr);
                     else

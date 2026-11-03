@@ -6382,7 +6382,10 @@ namespace cflat_cinterop
                 }
 
                 if (const auto* integer = llvm::dyn_cast<IntegerLiteral>(init->IgnoreParenImpCasts()))
+                {
                     m.isIntegerLiteralZero = integer->getValue().isZero();
+                    m.isIntegerLiteralToken = true;
+                }
                 else
                     // C's null-constant test also takes integer constant expressions ('\0', 1-1,
                     // ((int)0)); C++ takes only __null and a pointer-typed NULL like ((void*)0).

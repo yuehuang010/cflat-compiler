@@ -1038,8 +1038,8 @@ destructorDefinition
     ;
 
 newExpression
-    : New typeSpecifier multiWordTypeSuffix? ('(' argumentExpressionList ')')?
-    | New typeSpecifier multiWordTypeSuffix? '[' assignmentExpression ']' alignmentSpecifier?
+    : New typeSpecifier multiWordTypeSuffix? pointer? ('(' argumentExpressionList ')')?
+    | New typeSpecifier multiWordTypeSuffix? pointer? '[' assignmentExpression ']' alignmentSpecifier?
     | New typeSpecifier multiWordTypeSuffix? '{' initializerList ','? '}'
     ;
 

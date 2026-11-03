@@ -188,6 +188,47 @@ int testIntegerSimd(int seed)
     return passed;
 }
 
+struct SimdPostfixBox { simd<float, 4> v = default; };
+
+simd<T, 4> incrementGeneric<T>(T seed)
+{
+    simd<T, 4> x = seed;
+    x++;
+    return x;
+}
+
+int testSimdPostfixIncrement()
+{
+    int passed = 0;
+    simd<float, 4> v = 2.0f;
+    simd<float, 4> old = v++;
+    passed += Test("simd postfix old value", old[2], 2.0f);
+    passed += Test("simd float postfix local", v[0], 3.0f);
+
+    simd<float, 4> down = 2.0f;
+    down--;
+    passed += Test("simd float postfix decrement", down[3], 1.0f);
+
+    simd<i32, 4> ints = 4;
+    ints++;
+    passed += Test("simd int postfix local", ints[1], 5);
+    ints--;
+    passed += Test("simd int postfix decrement", ints[2], 4);
+
+    SimdPostfixBox box;
+    box.v = 6.0f;
+    box.v++;
+    passed += Test("simd postfix struct field", box.v[3], 7.0f);
+
+    simd<float, 4>[2] arr = { 8.0f, 10.0f };
+    arr[1]++;
+    passed += Test("simd postfix array element", arr[1][2], 11.0f);
+
+    simd<float, 4> generic = incrementGeneric<float>(12.0f);
+    passed += Test("simd postfix generic", generic[0], 13.0f);
+    return passed;
+}
+
 int testUnsignedSimd(int seed)
 {
     int passed = 0;
@@ -2423,6 +2464,7 @@ extern int main(int argc, char** argv)
     passed += testMixedScalarVector(seed); total += 4;
     passed += testSimdScalarReturn(seed);  total += 9;
     passed += testIntegerSimd(seed);       total += 4;
+    passed += testSimdPostfixIncrement();  total += 8;
     passed += testUnsignedSimd(seed);      total += 1;
     passed += testLaneCounts(seed);        total += 5;
     passed += testElementTypes(seed);      total += 7;

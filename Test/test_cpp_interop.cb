@@ -238,6 +238,7 @@ import cpp "library/cpp_hdrglob_r3_a.hpp";
 import cpp "library/cpp_hdrglob_r3_b.hpp";
 import cpp "library/cpp_hdrglob_r5_path_a.hpp";
 import cpp "library/cpp_hdrglob_r5_path_b.hpp";
+import cpp "library/cpp_castglob.hpp";
 if const (__POSIX__ || __WINDOWS__) { import cpp "library/cpp_hdrglob_r6_static_z.hpp"; }
 import cpp "library/cpp_hdrglob_r6_static_y.hpp";
 if const (__POSIX__ || __WINDOWS__) { import cpp "library/cpp_hdrglob_r6_inline_z.hpp"; }
@@ -2435,6 +2436,59 @@ int t261Lowered(int x) { T261HV hv0 = default; T261LowPair w = { a = hv0, b = t2
 T261HV t261Mk(int x) { T261HV h = default; t261.boom(x); return h; }
 struct T261WB { T261HV c; int b = 0; };
 int t261Field(int x) { T261HV h0 = default; T261WB w = { c = h0, b = t261.bval(x) }; return w.b; }
+typedef t261.Counted T261Alias;
+struct T261AliasField { T261Alias value; };
+int t261AliasParam(T261Alias value) { return value.value; }
+T261Alias t261AliasReturn(int value) { T261Alias result = default; result.value = value; return result; }
+int t261AliasUses()
+{
+    T261Alias local = default;
+    local.value = 17;
+    T261Alias* pointer = &local;
+    T261AliasField field;
+    field.value.value = pointer->value;
+    return t261AliasParam(field.value) + t261AliasReturn(23).value;
+}
+typedef t138.P<int, int> T138TemplateAlias;
+int t138TemplateAliasUse()
+{
+    T138TemplateAlias value;
+    value.t = 5;
+    value.u = 7;
+    return value.t + value.u;
+}
+struct TDefGeneric<T> { T value = default; };
+typedef TDefGeneric<int> TDefGenericInt;
+typedef TDefGeneric<int>* TDefGenericIntPtr;
+typedef TDefGeneric<int>[2] TDefGenericIntArray;
+typedef int[3] TDefArray;
+namespace TDefNamespaceGeneric
+{
+    struct G<T> { T value = default; };
+    typedef G<int> GI;
+}
+int tdefcppGenericAliasUse()
+{
+    TDefGenericInt value;
+    value.value = 19;
+    TDefArray values;
+    values[0] = 2;
+    values[1] = 3;
+    values[2] = 5;
+    return value.value + values[2];
+}
+int tdefcppGenericDecoratedAliasUse()
+{
+    TDefGenericInt value;
+    value.value = 19;
+    TDefGenericIntPtr pointer = &value;
+    TDefGenericIntArray genericArray;
+    genericArray[0].value = 4;
+    genericArray[1].value = 6;
+    TDefNamespaceGeneric.GI namespaced;
+    namespaced.value = 8;
+    return pointer->value + genericArray[0].value + genericArray[1].value + namespaced.value;
+}
 int t430Built = 0;
 int t430Destroyed = 0;
 int t430ObjectDestroyed = 0;
@@ -6226,11 +6280,12 @@ extern int main()
         || cpi_t48.rl(t48Null) != 704)                                                   return 4809;
     // A standard null-pointer conversion beats the user-defined class conversion (clang: 2).
     if (cpi_t48.mx(0) != 2 || cpi_t48.mx(0L) != 2 || cpi_t48.mx(0UL) != 2 || cpi_t48.mx(0ll) != 2
-        || cpi_t48.mx(nullptr) != 2 || cpi_t48.lp(0L) != 5 || cpi_t48.lp(0UL) != 5
-        || cpi_t48.fp(0) != 3 || cpi_t48.fp(0L) != 3)                                    return 4810;
+        || cpi_t48.mx(nullptr) != 2 || cpi_t48.lp(0L) != 5 || cpi_t48.lp(0UL) != 5)      return 4810;
     // Same ranking at function and multi-level pointer parameters.
-    if (cpi_t48.mf(0) != 2 || cpi_t48.mf(0UL) != 2 || cpi_t48.mf(nullptr) != 2
+    if (cpi_t48.mf(nullptr) != 2 || cppfnptr.callback_present(NULL) != 0
         || cpi_t48.mpp(0) != 4 || cpi_t48.mpp(0UL) != 4 || cpi_t48.mpp(nullptr) != 4)   return 4811;
+    // A user macro spelled __null is a null spelling; clang-cl does not bind __null macros.
+    if const (__MACOS__) { if (cppfnptr.callback_present(CPPFN_NULL) != 0) return 48111; }
     // A NAMED std::nullptr_t takes the same pointer conversions (clang: 2 4 6).
     if (cpi_t48.mf(t48Null) != 2 || cpi_t48.mpp(t48Null) != 4 || cpi_t48.md(t48Null) != 6)  return 4812;
     // T52: fixed arrays bind by reference without a copy; expanded ZERO stays a null constant.
@@ -7319,6 +7374,23 @@ extern int main()
     if (t27ptr.arith_kind(1.0f + 1) != 2 || t27ptr.arith_kind(1.5f * 2) != 2
         || t27ptr.arith_kind(t58L + 1.0) != 3 || t27ptr.arith_kind(t58F * 2.0) != 3
         || t27ptr.pick_arith(1.0f + 1) != 2 || t27ptr.pick_arith(t58F * 2.0) != 3) return 27031;
+    // T58 integer auto locals preserve C++ arithmetic identity (clang++ -std=c++20:
+    // int/uint/long/ulong/longlong/int/int; short and char promote to int).
+    int t58AutoI = 2; unsigned t58AutoU = 2; long t58AutoL = 2;
+    unsigned long t58AutoUL = 2; long long t58AutoLL = 2;
+    short t58AutoS = 2; char t58AutoC = 2;
+    auto t58AutoInt = t58AutoI + 1; auto t58AutoUInt = t58AutoU + 1;
+    auto t58AutoLong = t58AutoL + 1; auto t58AutoULong = t58AutoUL + 1;
+    auto t58AutoLongLong = t58AutoLL + 1; auto t58AutoShort = t58AutoS + 1;
+    auto t58AutoChar = t58AutoC + 1; auto t58AutoNative = 1 + 2;
+    if (t27ptr.integer_arith_kind(t58AutoInt) != 1
+        || t27ptr.integer_arith_kind(t58AutoUInt) != 2
+        || t27ptr.integer_arith_kind(t58AutoLong) != 3
+        || t27ptr.integer_arith_kind(t58AutoULong) != 4
+        || t27ptr.integer_arith_kind(t58AutoLongLong) != 5
+        || t27ptr.integer_arith_kind(t58AutoShort) != 1
+        || t27ptr.integer_arith_kind(t58AutoChar) != 1
+        || t27ptr.integer_arith_kind(t58AutoNative) != 1) return 27070;
     // T439: constant-folded comparisons keep bool for C++ template deduction.
     if (t27ptr.bool_kind(1e3 > 1) != 1 || t27ptr.bool_kind(1e3 == 1) != 1
         || t27ptr.bool_kind(1e3 != 1) != 1) return 43901;
@@ -15302,18 +15374,17 @@ extern int main()
         if (returned(5) != 6) return 3293;
         if (apply_fnptr(cppfnptr.Source.callback, 4) != 44) return 3294;
         if (cppfnptr.callback_present(nullptr) != 0) return 3295;
-        if (cppfnptr.callback_present(0) != 0) return 3296;
+        if (cppfnptr.callback_present(nullptr) != 0
+            || cppfnptr.Sink(nullptr).member(nullptr) != 0
+            || cppfnptr.Sink(nullptr).value != -1
+            || cppfnptr.std_function_present(nullptr) != 0) return 32951;
         if (cppfnptr.std_function_callback(std.function<int(int)>(fnptr_add_one), 3) != 4) return 3297;
         if (cppfnptr.void_callback(fnptr_noop) != 1) return 3298;
         function<int(int)> callback = fnptr_add_one;
         if (cppfnptr.callback_call(callback, 4) != 5) return 3299;
         if (cppfnptr.callback_call(cppfnptr.Source.callback, 4) != 44) return 3300;
-        cppfnptr.Sink nullSink = cppfnptr.Sink(0);
-        if (nullSink.value != -1) return 3301;
         cppfnptr.Sink nullptrSink = cppfnptr.Sink(nullptr);
         if (nullptrSink.value != -1) return 3303;
-        cppfnptr.Sink memberSink = default;
-        if (memberSink.member(0) != 0) return 3302;
     }
     // ---- Global C typedefs and macros through `import cpp` ---------------------------------------
     {
@@ -20749,6 +20820,13 @@ int OpMoveNontrivialLegs()
             || cppi_rvref.copies != 0) return 31918;
     }
     if (cppi_rvref.destructors != 2) return 31919;
+    // A CFlat fixed array stays an array reference for C++ template argument deduction.
+    int[3] castglobValues = {7, 8, 9};
+    if (std.size(castglobValues) != 3) return 42201;
+    int* castglobBegin = std.begin(castglobValues);
+    int* castglobEnd = std.end(castglobValues);
+    if (castglobBegin[0] != 7 || castglobEnd[-1] != 9
+        || (int)(castglobEnd - castglobBegin) != 3) return 42202;
     return 0;
 }
 
@@ -22556,6 +22634,10 @@ int LoweredUserDtorAssignLegs(int argc)
     t261.reset();
     t258A = t261.guarded(t261Pair, 0);
     if (t258A != 0 || t261.ctors() != 2 || t261.copies() != 1 || t261.dtors() != 3) return 25333;
+    if (t261AliasUses() != 40) return 26101;
+    if (t138TemplateAliasUse() != 12) return 26102;
+    if (tdefcppGenericAliasUse() != 24) return 26103;
+    if (tdefcppGenericDecoratedAliasUse() != 37) return 26104;
     t261.reset();
     t258A = t261.guarded(t261Lowered, 0);
     if (t258A != 0 || t261.ctors() != 2 || t261.copies() != 1 || t261.dtors() != 3) return 25334;

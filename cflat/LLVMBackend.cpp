@@ -5575,6 +5575,7 @@ void LLVMBackend::ResetForReanalysis()
     synthesizedReflectFunctions.clear();
     pendingCInteropAliases_.clear();
     cxxZeroIntegerMacroNames_.clear();
+    cxxLiteralZeroIntegerMacroNames_.clear();
     cxxMacroGlobalNames_.clear();
     cAbiFunctionThunkCache_.clear();
     dataStructures.clear();

@@ -2827,6 +2827,10 @@ public:
     // The closure value rides IsFunctionPointer + the signature; TypeName is the backing fat type.
     LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
 
+    bool RegisterGenericAlias(const std::string& alias, CFlatParser::TypeSpecifierContext* typeSpec,
+        const std::string& parsedSpelling, const std::string& suffix, uint8_t constMask,
+        bool genericDerived, antlr4::ParserRuleContext* ctx,
+        CFlatParser::GenericTypeParametersContext* genericCtx);
     void ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
     // `Spec<args>.name` in type position: the member type's spelling, or the written text when
     // the scan cannot resolve it yet (the main pass reports).
@@ -4165,6 +4169,11 @@ public:
     // the two passes are separate classes, mirroring the duplicated ParseDeclarationSpecifiers.
     LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
 
+    bool RegisterGenericAlias(const std::string& alias, CFlatParser::TypeSpecifierContext* typeSpec,
+        const std::string& parsedSpelling, const std::string& suffix, uint8_t constMask,
+        bool genericDerived, bool pointerOnly, int displayPointerDepth, antlr4::ParserRuleContext* ctx,
+        CFlatParser::GenericTypeParametersContext* genericCtx, bool emitSymbol,
+        bool isTypedef = false);
     void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
     // `Spec<args>.name[.name...]` in type position: instantiates the owner and returns the
     // member type's spelling; reports a name that is not a member type of the owner.
@@ -5779,6 +5788,8 @@ public:
                                      llvm::Value* value,
                                      const std::string& action,
                                      const std::string& destination);
+    void RejectNewPointerSlotDepthMismatch(antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& source, const LLVMBackend::TypeAndValue& target);
 
     // #5: an implicit pointer conversion of `value` to `target` that discards const.
     bool RejectConstDiscardingConversion(antlr4::ParserRuleContext* ctx,
@@ -7064,6 +7075,7 @@ public:
         CFlatParser::InitializerListContext* initList);
 
     LLVMBackend::NamedVariable ParseNewExpression(CFlatParser::NewExpressionContext* ctx);
+    std::string NewExpressionElementTypeName(CFlatParser::NewExpressionContext* ctx);
 
     // True when the pointee TYPE's own alignment (`struct alignas(64) T`) already routes `new` and
     // `delete` to the aligned pair. Mirrors the free site's recovery in EmitOwningPtrCleanup and the
