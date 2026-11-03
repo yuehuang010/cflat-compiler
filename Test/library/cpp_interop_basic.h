@@ -1220,6 +1220,42 @@ namespace cppi
         RefCell& get() noexcept { return c; }
         const RefCell& cget() const noexcept { return c; }
     };
+    struct AddressTempBox
+    {
+        int value;
+        AddressTempBox* p;
+        explicit AddressTempBox(int v = 0) noexcept : value(v), p(nullptr) {}
+    };
+    inline AddressTempBox& address_temp_leaf() noexcept
+    {
+        static AddressTempBox value(77);
+        return value;
+    }
+    inline AddressTempBox address_temp_box(int v) noexcept
+    {
+        AddressTempBox value(v);
+        value.p = &address_temp_leaf();
+        return value;
+    }
+    struct AddressTempHolder
+    {
+        AddressTempBox field;
+        AddressTempBox& rf;
+        explicit AddressTempHolder(int v) noexcept : field(v), rf(field) {}
+    };
+    inline AddressTempHolder address_temp_holder(int v) noexcept
+    {
+        return AddressTempHolder(v);
+    }
+    inline int address_temp_probe(int* p) noexcept { return 10000 + *p; }
+    inline int address_temp_probe(const int* p) noexcept { return 20000 + *p; }
+    inline int address_temp_probe(AddressTempBox* p) noexcept { return 30000 + p->value; }
+    inline int address_temp_probe(const AddressTempBox* p) noexcept { return 40000 + p->value; }
+    inline int address_temp_probe(AddressTempBox** p) noexcept { return 50000 + (*p == nullptr ? 1 : 0); }
+    inline int address_temp_probe(RefCell* p) noexcept { return 30000 + p->v; }
+    inline int address_temp_probe(const RefCell* p) noexcept { return 40000 + p->v; }
+    inline int address_temp_probe(Tracked* p) noexcept { return 60000 + p->payload; }
+    inline int address_temp_probe(const Tracked* p) noexcept { return 70000 + p->payload; }
     int take_either(const Tracked& t) noexcept;
     int take_either(Tracked&& t) noexcept;
     std::unique_ptr<Tracked> make_tracked_ptr(int payload) noexcept;

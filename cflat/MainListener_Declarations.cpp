@@ -3908,9 +3908,20 @@ void MainListener::GenerateInterfaceDefaultParamOverloads(
         {
             auto arg = compiler->GetFunctionArgument(param.VariableName);
             arg.TypeAndValue.VariableName.clear();
+            arg.IsDefaultParamForward = true;
             if (param.IsMove) arg.IsExplicitMove = true;
             callArgs.push_back(arg);
         }
+
+        if (!compiler->stackNamedVariable.empty())
+            for (const auto& param : methodParams)
+                if (!param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                    && compiler->IsForeignNontrivialCxxClass(param.TypeName)
+                    && compiler->IsCxxParamDestroyedInCallee(param.TypeName))
+                    if (auto it = compiler->stackNamedVariable.back().functionArgument.find(
+                            param.VariableName);
+                        it != compiler->stackNamedVariable.back().functionArgument.end())
+                        it->second.IsOwningStruct = false;
 
         llvm::Value* ifaceStorage = ifaceArg.Storage;
         if (ifaceStorage == nullptr && ifaceArg.Primary != nullptr)

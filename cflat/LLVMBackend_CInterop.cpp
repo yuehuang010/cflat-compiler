@@ -33237,10 +33237,14 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             && !source.TypeAndValue.ElemPointer
             && (IsCxxDerivedToBasePointer(source.TypeAndValue, ctor->params[1])
                 || IsCxxDerivedToClangBasePointer(source.TypeAndValue, ctor->params[1]));
-        const std::vector<NamedVariable> ctorArgVars = derivedPointerCtorArg
-            ? std::vector<NamedVariable>{ source } : std::vector<NamedVariable>{};
+        const bool byValueCxxParameterCopiesSource = ctor->params.size() > 1
+            && !ctor->params[1].IsCxxRef()
+            && IsForeignNontrivialCxxClass(ctor->params[1].TypeName)
+            && !source.IsRvalue;
+        const std::vector<NamedVariable> ctorArgVars{ source };
         if (!EmitCxxStructorCall(param.TypeName, *ctor, slot, { value },
-                                 derivedPointerCtorArg ? &ctorArgVars : nullptr)) return false;
+                                 (derivedPointerCtorArg || byValueCxxParameterCopiesSource)
+                                     ? &ctorArgVars : nullptr)) return false;
         if (intoSlot == nullptr && IsForeignNontrivialCxxClass(param.TypeName))
             RegisterOwnedStructTemp(slot, param.TypeName);
 
@@ -33427,12 +33431,12 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
                                      llvm::Value* resultSlot, llvm::Value* callSink,
                                      const std::string& callReturnSpelling,
                                      std::vector<llvm::Value*>* callerOwnedProducerSlots,
-                                     bool callerOwnedProducerAllowed,
+                                     bool trackConvertedProducer,
                                      llvm::Value* callSinkEnvironment,
                                      bool callSinkTakesReference)
 {
         using Kind = CxxTernaryVerdict::Kind;
-        if (callSink != nullptr && (resultSlot != nullptr || callReturnSpelling.empty()))
+        if (callSink != nullptr && callReturnSpelling.empty())
             return false;
         const TypeAndValue& armType = armIsTrue ? trueArm : falseArm;
         const TypeAndValue& otherType = armIsTrue ? falseArm : trueArm;
@@ -33462,6 +33466,106 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             return false;
         const std::string armCv = (CxxTernaryArmConst(armType) ? "const " : "") + armSpelling;
         const std::string otherCv = (CxxTernaryArmConst(otherType) ? "const " : "") + otherSpelling;
+        if (resultSlot != nullptr && !refResult && armName != resultName)
+        {
+            llvm::Value* sourceSlot = arm.Storage;
+            NamedVariable converted = arm;
+            std::string refusal;
+            const size_t armParamTempMark = pendingOwnedStructTemps.size();
+            if (ConvertThroughCxxConvertingCtor(converted, resultName, resultSlot, refusal)
+                == CxxConvertingCtorResult::Converted)
+            {
+                if (armCategory == CxxArmCategory::Lvalue && trackConvertedProducer
+                    && callerOwnedProducerSlots != nullptr)
+                    for (size_t i = armParamTempMark; i < pendingOwnedStructTemps.size(); ++i)
+                    {
+                        const auto& temp = pendingOwnedStructTemps[i];
+                        if (temp.Alloca == nullptr || ResolveTypeAlias(temp.TypeName) != armName)
+                            continue;
+                        if (std::find(callerOwnedProducerSlots->begin(),
+                                callerOwnedProducerSlots->end(), temp.Alloca)
+                            == callerOwnedProducerSlots->end())
+                            callerOwnedProducerSlots->push_back(temp.Alloca);
+                    }
+                if (armIsPrvalue && trackConvertedProducer && sourceSlot != nullptr
+                    && callerOwnedProducerSlots != nullptr)
+                {
+                    std::vector<llvm::AllocaInst*> sourceSlots;
+                    std::vector<llvm::PHINode*> sourceJoins;
+                    auto collectSourceSlots = [&](auto&& self, llvm::Value* value) -> bool {
+                        if (auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(value))
+                        {
+                            if (std::find(sourceSlots.begin(), sourceSlots.end(), slot)
+                                == sourceSlots.end())
+                                sourceSlots.push_back(slot);
+                            return true;
+                        }
+                        auto* join = llvm::dyn_cast_or_null<llvm::PHINode>(value);
+                        if (join == nullptr || !join->getType()->isPointerTy()) return false;
+                        if (std::find(sourceJoins.begin(), sourceJoins.end(), join)
+                            != sourceJoins.end())
+                            return true;
+                        sourceJoins.push_back(join);
+                        for (llvm::Value* incoming : join->incoming_values())
+                            if (!self(self, incoming)) return false;
+                        return true;
+                    };
+                    if (collectSourceSlots(collectSourceSlots, sourceSlot))
+                        for (llvm::AllocaInst* slot : sourceSlots)
+                            callerOwnedProducerSlots->push_back(slot);
+                    else
+                        callerOwnedProducerSlots->push_back(sourceSlot);
+                }
+                arm = std::move(converted);
+                arm.TypeAndValue.TypeName = resultName;
+                arm.IsRvalue = true;
+                if (callSink == nullptr)
+                {
+                    arm.BaseType = GetType(TypeAndValue{ .TypeName = resultName });
+                    return true;
+                }
+
+                const std::string sinkName = std::format("__cflat_ternary_sink_{:016x}",
+                    HashWrapperKey(resultSpelling + "|direct|" + armCv + "|"
+                        + callReturnSpelling + (callSinkEnvironment != nullptr ? "|env" : "")
+                        + (callSinkTakesReference ? "|ref" : "")));
+                const std::string sinkArgs = callSinkEnvironment != nullptr
+                    ? "void * sink, void * call_env, " : "void * sink, ";
+                const std::string callback = "reinterpret_cast<" + callReturnSpelling + " (*) ("
+                    + resultSpelling + " &&" + (callSinkEnvironment != nullptr ? ", void *" : "")
+                    + ")>(sink)(static_cast<" + resultSpelling + " &&>(*self)"
+                    + (callSinkEnvironment != nullptr ? ", call_env" : "") + ")";
+                const std::string finish = callReturnSpelling == "void"
+                    ? callback + "; guard.value = nullptr; return;"
+                    : "auto result = " + callback + "; guard.value = nullptr; return result;";
+                const std::string source = "#include <memory>\nextern \"C\" __attribute__((weak)) "
+                    + callReturnSpelling + " " + sinkName + "(" + sinkArgs + resultSpelling
+                    + " * self) { struct Guard { " + resultSpelling
+                    + " * value; ~Guard() { if (value != nullptr) std::destroy_at(value); } }; "
+                    + "Guard guard{ self }; " + finish + " }\n";
+                CxxRequestGroup group = MakeCxxClassRequestGroup(resultOwner->second, resultName);
+                if (group.headers.empty()) return false;
+                CxxRequestGroupScope groupScope(*this, &group);
+                CSigEntry signature;
+                std::string error;
+                if (!RequestGeneratedCxxWrapper(group, source, sinkName, "TERNARY_SINK",
+                                                 signature, error))
+                    return false;
+                signature.name = sinkName;
+                RegisterCSignatures({ signature }, group.headers.front());
+                llvm::Function* function = GetFunction(sinkName);
+                if (function == nullptr) return false;
+                std::vector<llvm::Value*> wrapperArgs{ callSink };
+                if (callSinkEnvironment != nullptr)
+                    wrapperArgs.push_back(callSinkEnvironment);
+                wrapperArgs.push_back(resultSlot);
+                arm.Primary = CreateCallOrInvoke(function->getFunctionType(), function,
+                    wrapperArgs, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
+                arm.Storage = resultSlot;
+                arm.BaseType = arm.Primary != nullptr ? arm.Primary->getType() : nullptr;
+                return arm.Primary != nullptr;
+            }
+        }
         /*
          * A prvalue arm converted into a prvalue result keeps guaranteed elision: when its producer
          * is one call returning into the arm's slot (sret), that call moves into a thunk and clang
@@ -33492,7 +33596,7 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             return true;
         };
         if (!collectSlots(collectSlots, arm.Storage)) producerSlots.clear();
-        if (callerOwnedProducerAllowed)
+        if (trackConvertedProducer)
             if (auto* direct = llvm::dyn_cast_or_null<llvm::AllocaInst>(arm.Storage);
                 direct != nullptr
                 && std::find(producerSlots.begin(), producerSlots.end(), direct) == producerSlots.end())
@@ -33560,9 +33664,12 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             }
             if (!indirect) producers.clear();
         }
-        const bool callerOwnedProducer = callerOwnedProducerAllowed && !producerSlots.empty()
-            && (resultSlot != nullptr || callSink != nullptr) && armIsPrvalue && !refResult
-            && armName != resultName;
+        // MS sink wrapper (no result slot, callee-destroyed B): re-call the producer in the
+        // wrapper so A is elided into B's parameter; a caller-owned A would be moved (extra move).
+        const bool callerOwnedProducer = trackConvertedProducer && !producerSlots.empty()
+            && (resultSlot != nullptr
+                || (callSink != nullptr && !IsCxxParamDestroyedInCallee(resultName)))
+            && armIsPrvalue && !refResult && armName != resultName;
         if (callerOwnedProducer && callerOwnedProducerSlots != nullptr)
             for (llvm::AllocaInst* slot : producerSlots)
                 callerOwnedProducerSlots->push_back(slot);
@@ -33586,11 +33693,12 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             + (refResult ? "r" : "v") + (thunkArm ? "k" : "") + (discardInClang ? "d" : "")
             + (callSink != nullptr ? "|call|" + callReturnSpelling
                 + (callSinkEnvironment != nullptr ? "|env" : "")
-                + (callSinkTakesReference ? "|ref" : "") : std::string())
+                + (callSinkTakesReference ? "|ref" : "")
+                + (resultSlot != nullptr ? "|out" : "") : std::string())
             + "|" + conditional;
         const std::string wrapperName = std::format("__cflat_ternary_arm_{:016x}",
             HashWrapperKey(wrapperKey));
-        const std::string prologue = "#include <new>\n#include <type_traits>\n"
+        const std::string prologue = "#include <memory>\n#include <new>\n#include <type_traits>\n"
             "extern \"C\" __attribute__((weak)) ";
         const std::string armParams = thunkArm ? std::string("void * p0, void * p1")
                                                : armCv + " * p0";
@@ -33600,7 +33708,8 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             ? "void * sink, void * call_env, " : "void * sink, ";
         const std::string sinkEnvironmentArg = callSinkHasEnvironment ? ", call_env" : "";
         // A sink taking a reference never destroys B: the wrapper's temporary does, after the call.
-        if (callSink != nullptr && !callSinkTakesReference && IsCxxParamDestroyedInCallee(resultName))
+        if (callSink != nullptr && resultSlot == nullptr && !callSinkTakesReference
+            && IsCxxParamDestroyedInCallee(resultName))
         {
             // MS ABI: callee destroys the by-value parameter; B lives in caller-owned storage.
             // One full-expression keeps the converted-from arm alive through the call.
@@ -33611,6 +33720,21 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             source = prologue + callReturnSpelling + " " + wrapperName + "(" + sinkParams
                 + armParams + ") { alignas(" + resultSpelling + ") unsigned char storage[sizeof("
                 + resultSpelling + ")]; return " + callback + "; }\n";
+        }
+        else if (callSink != nullptr && resultSlot != nullptr)
+        {
+            const std::string callback = "reinterpret_cast<" + callReturnSpelling + " (*) ("
+                + resultSpelling + " &&" + (callSinkHasEnvironment ? ", void *" : std::string())
+                + ")>(sink)(static_cast<" + resultSpelling + " &&>(*self)"
+                + sinkEnvironmentArg + ")";
+            const std::string finish = callReturnSpelling == "void"
+                ? callback + "; guard.value = nullptr; return;"
+                : "auto result = " + callback + "; guard.value = nullptr; return result;";
+            source = prologue + callReturnSpelling + " " + wrapperName + "(" + sinkParams
+                + resultSpelling + " * self, " + armParams + ") { ::new (static_cast<void *>(self)) "
+                + resultSpelling + "(" + conditional + "); struct Guard { " + resultSpelling
+                + " * value; ~Guard() { if (value != nullptr) std::destroy_at(value); } }; "
+                + "Guard guard{ self }; " + finish + " }\n";
         }
         else if (callSink != nullptr)
         {
@@ -33747,11 +33871,12 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
                 {
                     std::vector<llvm::Value*> wrapperArgs{ callSink };
                     if (callSinkHasEnvironment) wrapperArgs.push_back(callSinkEnvironment);
+                    if (resultSlot != nullptr) wrapperArgs.push_back(resultSlot);
                     wrapperArgs.push_back(thunk);
                     wrapperArgs.push_back(env);
                     arm.Primary = CreateCallOrInvoke(function->getFunctionType(), function,
                         wrapperArgs, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
-                    arm.Storage = nullptr;
+                    arm.Storage = resultSlot;
                     arm.BaseType = arm.Primary != nullptr ? arm.Primary->getType() : nullptr;
                     return arm.Primary != nullptr;
                 }
@@ -33779,10 +33904,11 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
             {
                 std::vector<llvm::Value*> wrapperArgs{ callSink };
                 if (callSinkHasEnvironment) wrapperArgs.push_back(callSinkEnvironment);
+                if (resultSlot != nullptr) wrapperArgs.push_back(resultSlot);
                 wrapperArgs.push_back(storage);
                 arm.Primary = CreateCallOrInvoke(function->getFunctionType(), function,
                     wrapperArgs, true, callReturnSpelling == "void" ? "" : "cxx.ternary.arg.call");
-                arm.Storage = nullptr;
+                arm.Storage = resultSlot;
                 arm.BaseType = arm.Primary != nullptr ? arm.Primary->getType() : nullptr;
                 return arm.Primary != nullptr;
             }

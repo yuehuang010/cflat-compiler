@@ -8015,6 +8015,7 @@ private:
     llvm::Value* cxxTernaryCallSinkEnvironment_ = nullptr;
     bool cxxTernaryCallSinkTakesReference_ = false;
     LLVMBackend::TypeAndValue cxxTernaryCallSinkReturnType_;
+    bool cxxTernaryCallPrefixIncompatible_ = false;
     llvm::Value* cxxTernaryCallResult_ = nullptr;
     LLVMBackend::TypeAndValue cxxTernaryCallResultType_;
     bool cxxTernaryCallConsumed_ = false;
@@ -10763,7 +10764,8 @@ public:
         int lhsObjectCv = 0, int rhsObjectCv = 0,
         // An alias-returned native struct is already an addressable receiver, not a value to copy.
         bool lhsIsAlias = false,
-        bool refuseConstWriteOnNoViable = false);
+        bool refuseConstWriteOnNoViable = false,
+        const LLVMBackend::NamedVariable* lhsSourceNV = nullptr);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -10818,6 +10820,8 @@ public:
 
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use = ResultUse::Value);
+    bool IsCxxTemporaryPrvalue(const LLVMBackend::NamedVariable& value) const;
+    void ClearCxxPrvalueProvenance(LLVMBackend::NamedVariable& value) const;
     // `sizeofs` = leading `sizeof` prefixes still to apply to the operand (0 = plain operand).
     LLVMBackend::NamedVariable ParseUnaryExpressionImpl(CFlatParser::UnaryExpressionContext* ctx,
                                                         ResultUse use, size_t sizeofs);

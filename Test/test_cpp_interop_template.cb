@@ -4727,6 +4727,153 @@ extern int main()
         cppsopd.t455FreePrvalue() += 1;
         if (cppsopd.t455FreeLast != 15 || cppsopd.t455FreeDtors != 1) return 55911;
 
+        // T455 r1: a nontrivial C++ K& compound receiver selects && and is moved for later uses.
+        // Each fresh receiver still has its C++ destructor run exactly once.
+        cppsopd.resetT455CmpMove();
+        {
+            cppsopd.T455CmpMoveMember cm_55920 = default; (move cm_55920) += 1;
+            if (cppsopd.t455CmpMoveMemberLast != 3) return 55920;
+            cppsopd.T455CmpMoveMember cm_55921 = default; (move cm_55921) -= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 4) return 55921;
+            cppsopd.T455CmpMoveMember cm_55922 = default; (move cm_55922) *= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 5) return 55922;
+            cppsopd.T455CmpMoveMember cm_55923 = default; (move cm_55923) /= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 6) return 55923;
+            cppsopd.T455CmpMoveMember cm_55924 = default; (move cm_55924) %= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 7) return 55924;
+            cppsopd.T455CmpMoveMember cm_55925 = default; (move cm_55925) &= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 8) return 55925;
+            cppsopd.T455CmpMoveMember cm_55926 = default; (move cm_55926) |= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 9) return 55926;
+            cppsopd.T455CmpMoveMember cm_55927 = default; (move cm_55927) ^= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 10) return 55927;
+            cppsopd.T455CmpMoveMember cm_55928 = default; (move cm_55928) <<= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 11) return 55928;
+            cppsopd.T455CmpMoveMember cm_55929 = default; (move cm_55929) >>= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 12) return 55929;
+        }
+        if (cppsopd.t455CmpMoveMemberDtors != 10) return 55930;
+
+        // Lvalue member receivers and free lvalue receivers remain live; their values and drops match clang.
+        cppsopd.resetT455CmpMove();
+        {
+            cppsopd.T455CmpMoveMemberLvalue cm_55931 = default; cm_55931 += 1;
+            if (cppsopd.t455CmpMoveMemberLast != 103 || cm_55931.f() != 7) return 55931;
+            cppsopd.T455CmpMoveMemberLvalue cm_55932 = default; cm_55932 -= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 104 || cm_55932.f() != 7) return 55932;
+            cppsopd.T455CmpMoveMemberLvalue cm_55933 = default; cm_55933 *= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 105 || cm_55933.f() != 7) return 55933;
+            cppsopd.T455CmpMoveMemberLvalue cm_55934 = default; cm_55934 /= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 106 || cm_55934.f() != 7) return 55934;
+            cppsopd.T455CmpMoveMemberLvalue cm_55935 = default; cm_55935 %= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 107 || cm_55935.f() != 7) return 55935;
+            cppsopd.T455CmpMoveMemberLvalue cm_55936 = default; cm_55936 &= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 108 || cm_55936.f() != 7) return 55936;
+            cppsopd.T455CmpMoveMemberLvalue cm_55937 = default; cm_55937 |= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 109 || cm_55937.f() != 7) return 55937;
+            cppsopd.T455CmpMoveMemberLvalue cm_55938 = default; cm_55938 ^= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 110 || cm_55938.f() != 7) return 55938;
+            cppsopd.T455CmpMoveMemberLvalue cm_55939 = default; cm_55939 <<= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 111 || cm_55939.f() != 7) return 55939;
+            cppsopd.T455CmpMoveMemberLvalue cm_55940 = default; cm_55940 >>= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 112 || cm_55940.f() != 7) return 55940;
+        }
+        if (cppsopd.t455CmpMoveMemberDtors != 10) return 55941;
+
+        cppsopd.resetT455Member();
+        {
+            cppsopd.T455MemberTracked legacyMoved_55973 = default;
+            (move legacyMoved_55973) -= 1;
+            if (cppsopd.t455MemberLast != 2) return 55973;
+        }
+        if (cppsopd.t455MemberDtors != 1) return 55974;
+
+        cppsopd.resetT455CmpMove();
+        {
+            cppsopd.T455CmpMoveFree cf_55942 = default; (move cf_55942) += 1;
+            if (cppsopd.t455CmpMoveFreeLast != 3) return 55942;
+            cppsopd.T455CmpMoveFree cf_55943 = default; (move cf_55943) -= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 4) return 55943;
+            cppsopd.T455CmpMoveFree cf_55944 = default; (move cf_55944) *= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 5) return 55944;
+            cppsopd.T455CmpMoveFree cf_55945 = default; (move cf_55945) /= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 6) return 55945;
+            cppsopd.T455CmpMoveFree cf_55946 = default; (move cf_55946) %= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 7) return 55946;
+            cppsopd.T455CmpMoveFree cf_55947 = default; (move cf_55947) &= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 8) return 55947;
+            cppsopd.T455CmpMoveFree cf_55948 = default; (move cf_55948) |= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 9) return 55948;
+            cppsopd.T455CmpMoveFree cf_55949 = default; (move cf_55949) ^= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 10) return 55949;
+            cppsopd.T455CmpMoveFree cf_55950 = default; (move cf_55950) <<= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 11) return 55950;
+            cppsopd.T455CmpMoveFree cf_55951 = default; (move cf_55951) >>= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 12) return 55951;
+        }
+        if (cppsopd.t455CmpMoveFreeDtors != 10) return 55952;
+
+        cppsopd.resetT455CmpMove();
+        {
+            cppsopd.T455CmpMoveFree cf_55953 = default; cf_55953 += 1;
+            if (cppsopd.t455CmpMoveFreeLast != 103 || cf_55953.value != 7) return 55953;
+            cppsopd.T455CmpMoveFree cf_55954 = default; cf_55954 -= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 104 || cf_55954.value != 7) return 55954;
+            cppsopd.T455CmpMoveFree cf_55955 = default; cf_55955 *= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 105 || cf_55955.value != 7) return 55955;
+            cppsopd.T455CmpMoveFree cf_55956 = default; cf_55956 /= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 106 || cf_55956.value != 7) return 55956;
+            cppsopd.T455CmpMoveFree cf_55957 = default; cf_55957 %= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 107 || cf_55957.value != 7) return 55957;
+            cppsopd.T455CmpMoveFree cf_55958 = default; cf_55958 &= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 108 || cf_55958.value != 7) return 55958;
+            cppsopd.T455CmpMoveFree cf_55959 = default; cf_55959 |= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 109 || cf_55959.value != 7) return 55959;
+            cppsopd.T455CmpMoveFree cf_55960 = default; cf_55960 ^= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 110 || cf_55960.value != 7) return 55960;
+            cppsopd.T455CmpMoveFree cf_55961 = default; cf_55961 <<= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 111 || cf_55961.value != 7) return 55961;
+            cppsopd.T455CmpMoveFree cf_55962 = default; cf_55962 >>= 1;
+            if (cppsopd.t455CmpMoveFreeLast != 112 || cf_55962.value != 7) return 55962;
+        }
+        if (cppsopd.t455CmpMoveFreeDtors != 10) return 55963;
+
+        cppsopd.resetT455CmpMove();
+        {
+            cppsopd.T455CmpMoveMember assigned_55964 = default;
+            (move assigned_55964) = 1;
+            if (cppsopd.t455CmpMoveMemberLast != 2 || assigned_55964.value != 1
+                || assigned_55964.f() != 1) return 55964;
+        }
+        if (cppsopd.t455CmpMoveMemberDtors != 1) return 55965;
+        cppsopd.resetT455CmpMove();
+        {
+            cppsopd.T455CmpMoveMember reinit_55966 = default;
+            (move reinit_55966) -= 1;
+            if (cppsopd.t455CmpMoveMemberLast != 4) return 55966;
+            reinit_55966 = cppsopd.T455CmpMoveMember(1);
+            if (reinit_55966.value != 1 || reinit_55966.f() != 1) return 55967;
+        }
+        if (cppsopd.t455CmpMoveMemberDtors != 2) return 55968;
+
+        // T455 r1 accept-set: the existing tracked fixture revives after assignment and stays live on an lvalue op.
+        cppsopd.resetT455Member();
+        {
+            cppsopd.T455MemberTracked reinit_55969 = default;
+            (move reinit_55969) -= 1;
+            reinit_55969 = cppsopd.T455MemberTracked();
+            reinit_55969 -= 1;
+            if (cppsopd.t455MemberLast != 1) return 55969;
+        }
+        if (cppsopd.t455MemberDtors != 2) return 55970;
+        cppsopd.resetT455Member();
+        {
+            cppsopd.T455MemberTracked live_55971 = default;
+            live_55971 -= 1;
+            if (cppsopd.t455MemberLast != 1) return 55971;
+        }
+        if (cppsopd.t455MemberDtors != 1) return 55972;
+
         // T329: a C++ alias template with a PARAMETER PACK (`using ISeq = Seq<I...>`). Pre-fix
         // it was refused as "takes 1 template argument(s), but 3 were given".
         alnv.ISeq<0,1,2> seqLocal = default;
@@ -4748,5 +4895,199 @@ extern int main()
         alnv.SingleAlias<int> singleLocal = default;
         singleLocal.v = 4;
         if (singleLocal.v != 4)                                              return 5292;
+
+        cppsopd.t455CmpMoveConstRefDtors = 0;
+        {
+            cppsopd.T455CmpMoveConstRef constRef_56001 = default;
+            (move constRef_56001) /= 2;
+            if (cppsopd.t455CmpMoveConstRefLast != 14) return 56001;
+        }
+        if (cppsopd.t455CmpMoveConstRefDtors != 1) return 56002;
+
+        cppsopd.resetT455CmpMoveInPlace();
+        {
+            cppsopd.T455CmpMoveInPlaceHolder field_56002 = default;
+            cppsopd.setT455CmpMoveInPlaceExpected(&field_56002.item);
+            (move field_56002.item) -= 1;
+            if (cppsopd.t455CmpMoveInPlaceLast != 6
+                || cppsopd.t455CmpMoveInPlaceReceiverIsExpected != 1) return 56003;
+        }
+        if (cppsopd.t455CmpMoveInPlaceDtors != 1) return 56004;
+
+        cppsopd.resetT455CmpMoveInPlace();
+        {
+            cppsopd.T455CmpMoveInPlace[1] array_56004;
+            cppsopd.setT455CmpMoveInPlaceExpected(&array_56004[0]);
+            (move array_56004[0]) -= 1;
+            if (cppsopd.t455CmpMoveInPlaceLast != 6
+                || cppsopd.t455CmpMoveInPlaceReceiverIsExpected != 1) return 56005;
+        }
+        if (cppsopd.t455CmpMoveInPlaceDtors != 1) return 56006;
+
+        cppsopd.resetT455CmpMoveInPlace();
+        {
+            cppsopd.T455CmpMoveInPlace pointee_56006 = default;
+            cppsopd.T455CmpMoveInPlace* pointer_56007 = &pointee_56006;
+            cppsopd.setT455CmpMoveInPlaceExpected(pointer_56007);
+            (move *pointer_56007) -= 1;
+            if (cppsopd.t455CmpMoveInPlaceLast != 6
+                || cppsopd.t455CmpMoveInPlaceReceiverIsExpected != 1) return 56007;
+        }
+        if (cppsopd.t455CmpMoveInPlaceDtors != 1) return 56008;
+
+        // CHAINCMP accept-set: reference results on lvalue receivers keep their value and category.
+        cppsopd.resetT711Chain();
+        {
+            cppsopd.T711ChainMember member_57100 = default;
+            member_57100.value = 10;
+            ((member_57100 += 1) += 2) += 3;
+            if (member_57100.value != 16 || cppsopd.t711ChainMemberLHits != 3
+                || cppsopd.t711ChainMemberRHits != 0) return 57100;
+            int field_57101 = (member_57100 += 1).value;
+            if (field_57101 != 17 || cppsopd.t711ChainMemberLHits != 4) return 57101;
+            int method_57102 = (member_57100 += 1).f();
+            if (method_57102 != 18 || cppsopd.t711ChainMemberLHits != 5
+                || cppsopd.t711ChainMemberFRefHits != 1
+                || cppsopd.t711ChainMemberFRvalueHits != 0) return 57102;
+            cppsopd.T711ChainMember* address_57103 = &(member_57100 += 1);
+            if (address_57103 != &member_57100 || member_57100.value != 19
+                || cppsopd.t711ChainMemberLHits != 6) return 57103;
+            (member_57100 += 1) = 20;
+            if (member_57100.value != 20 || cppsopd.t711ChainMemberLHits != 7
+                || cppsopd.t711ChainMemberAssignLHits != 1) return 57104;
+            ((member_57100 = 21) = 22) = 23;
+            if (member_57100.value != 23 || cppsopd.t711ChainMemberAssignLHits != 4
+                || cppsopd.t711ChainMemberAssignRHits != 0) return 57105;
+        }
+        if (cppsopd.t711ChainMemberDtors != 1 || cppsopd.t711ChainMemberCopies != 0
+            || cppsopd.t711ChainMemberMoves != 0) return 57106;
+        cppsopd.resetT711Chain();
+        {
+            cppsopd.T711ChainFree free_57107 = default;
+            free_57107.value = 10;
+            ((free_57107 += 1) += 2) += 3;
+            if (free_57107.value != 16 || cppsopd.t711ChainFreeLHits != 3
+                || cppsopd.t711ChainFreeRHits != 0) return 57107;
+            int field_57108 = (free_57107 += 1).value;
+            if (field_57108 != 17 || cppsopd.t711ChainFreeLHits != 4) return 57108;
+            int method_57109 = (free_57107 += 1).f();
+            if (method_57109 != 18 || cppsopd.t711ChainFreeLHits != 5
+                || cppsopd.t711ChainFreeFRefHits != 1
+                || cppsopd.t711ChainFreeFRvalueHits != 0) return 57109;
+            cppsopd.T711ChainFree* address_57110 = &(free_57107 += 1);
+            if (address_57110 != &free_57107 || free_57107.value != 19
+                || cppsopd.t711ChainFreeLHits != 6) return 57110;
+        }
+        if (cppsopd.t711ChainFreeDtors != 1) return 57111;
+        string chainString_57112 = "a";
+        (chainString_57112 += "b") += "c";
+        if (chainString_57112 != "abc") return 57112;
+        expect_error("use of moved variable 'movedSource_57113'") {
+            cppsopd.T711ChainMember movedSource_57113 = default;
+            (move movedSource_57113) -= 1;
+            int later_57113 = movedSource_57113.value;
+        }
+
+        // CHAINCMP r1: the T& returned by an rvalue-receiver compound operator is an lvalue.
+        cppsopd.resetT711Chain();
+        int memberChain_57114 = (((cppsopd.makeT711ChainMember(10) -= 1) -= 2) -= 3).value;
+        if (memberChain_57114 != 4 || cppsopd.t711ChainMemberRHits != 1
+            || cppsopd.t711ChainMemberLHits != 2
+            || cppsopd.t711ChainMemberLastValue != 4) return 57114;
+        if (cppsopd.t711ChainMemberDtors != 1 || cppsopd.t711ChainMemberCopies != 0
+            || cppsopd.t711ChainMemberMoves != 0) return 57115;
+        cppsopd.resetT711Chain();
+        int memberField_57116 = (cppsopd.makeT711ChainMember(10) -= 1).value;
+        if (memberField_57116 != 9 || cppsopd.t711ChainMemberRHits != 1
+            || cppsopd.t711ChainMemberLHits != 0) return 57116;
+        cppsopd.resetT711Chain();
+        int memberCall_57117 = (cppsopd.makeT711ChainMember(10) -= 1).f();
+        if (memberCall_57117 != 9 || cppsopd.t711ChainMemberRHits != 1
+            || cppsopd.t711ChainMemberFRefHits != 1
+            || cppsopd.t711ChainMemberFRvalueHits != 0) return 57117;
+        cppsopd.resetT711Chain();
+        bool memberAddress_57118 = &(cppsopd.makeT711ChainMember(10) -= 1)
+            == cppsopd.t711ChainMemberLastReceiver;
+        if (!memberAddress_57118 || cppsopd.t711ChainMemberRHits != 1) return 57118;
+        cppsopd.resetT711Chain();
+        int memberAssign_57119 = ((cppsopd.makeT711ChainMember(10) -= 1) = 20).value;
+        if (memberAssign_57119 != 20 || cppsopd.t711ChainMemberRHits != 1
+            || cppsopd.t711ChainMemberAssignLHits != 1
+            || cppsopd.t711ChainMemberAssignRHits != 0) return 57119;
+
+        cppsopd.resetT711Chain();
+        int freeChain_57120 = (((cppsopd.makeT711ChainFree(10) -= 1) -= 2) -= 3).value;
+        if (freeChain_57120 != 4 || cppsopd.t711ChainFreeRHits != 1
+            || cppsopd.t711ChainFreeLHits != 2
+            || cppsopd.t711ChainFreeLastValue != 4) return 57120;
+        if (cppsopd.t711ChainFreeDtors != 1) return 57121;
+        cppsopd.resetT711Chain();
+        int freeField_57122 = (cppsopd.makeT711ChainFree(10) += 1).value;
+        if (freeField_57122 != 11 || cppsopd.t711ChainFreeRHits != 1
+            || cppsopd.t711ChainFreeLHits != 0) return 57122;
+        cppsopd.resetT711Chain();
+        int freeCall_57123 = (cppsopd.makeT711ChainFree(10) += 1).f();
+        if (freeCall_57123 != 11 || cppsopd.t711ChainFreeRHits != 1
+            || cppsopd.t711ChainFreeFRefHits != 1
+            || cppsopd.t711ChainFreeFRvalueHits != 0) return 57123;
+        cppsopd.resetT711Chain();
+        bool freeAddress_57124 = &(cppsopd.makeT711ChainFree(10) -= 1)
+            == cppsopd.t711ChainFreeExpected;
+        if (!freeAddress_57124 || cppsopd.t711ChainFreeRHits != 1) return 57124;
+        cppsopd.resetT711Chain();
+        int freeAssign_57125 = ((cppsopd.makeT711ChainFree(10) -= 1) = 20).value;
+        if (freeAssign_57125 != 20 || cppsopd.t711ChainFreeRHits != 1
+            || cppsopd.t711ChainFreeAssignHits != 1
+            || cppsopd.t711ChainFreeLastValue != 20) return 57125;
+
+        cppsopd.resetT711Chain();
+        {
+            cppsopd.T711ChainMember movedChain_57126 = default;
+            movedChain_57126.value = 10;
+            cppsopd.setT711ChainMemberExpected(&movedChain_57126);
+            ((move movedChain_57126) -= 1) -= 1;
+            if (cppsopd.t711ChainMemberRHits != 1 || cppsopd.t711ChainMemberLHits != 1
+                || cppsopd.t711ChainMemberLastValue != 8
+                || cppsopd.t711ChainMemberRReceiverIsExpected != 1) return 57126;
+        }
+        if (cppsopd.t711ChainMemberDtors != 1) return 57127;
+        cppsopd.resetT711Chain();
+        {
+            cppsopd.T711ChainMember movedField_57128 = default;
+            movedField_57128.value = 10;
+            cppsopd.setT711ChainMemberExpected(&movedField_57128);
+            int field_57128 = ((move movedField_57128) -= 1).value;
+            if (field_57128 != 9 || cppsopd.t711ChainMemberRHits != 1
+                || cppsopd.t711ChainMemberRReceiverIsExpected != 1) return 57128;
+        }
+        if (cppsopd.t711ChainMemberDtors != 1) return 57129;
+        cppsopd.resetT711Chain();
+        {
+            cppsopd.T711ChainMember movedCall_57130 = default;
+            movedCall_57130.value = 10;
+            cppsopd.setT711ChainMemberExpected(&movedCall_57130);
+            int method_57130 = ((move movedCall_57130) -= 1).f();
+            if (method_57130 != 9 || cppsopd.t711ChainMemberRHits != 1
+                || cppsopd.t711ChainMemberRReceiverIsExpected != 1
+                || cppsopd.t711ChainMemberFRefHits != 1
+                || cppsopd.t711ChainMemberFRvalueHits != 0) return 57130;
+        }
+        if (cppsopd.t711ChainMemberDtors != 1) return 57131;
+        cppsopd.resetT711Chain();
+        {
+            cppsopd.T711ChainByValueRvalue byValueRvalue_57132 = default;
+            byValueRvalue_57132.value = 10;
+            long amount_57132 = 2;
+            ((byValueRvalue_57132 += amount_57132) -= 1);
+            if (byValueRvalue_57132.value != 12
+                || cppsopd.t711ChainByValueRvalueResult != 11
+                || cppsopd.t711ChainByValueRvaluePlusHits != 1
+                || cppsopd.t711ChainByValueRvalueMinusHits != 1) return 57132;
+            if (cppsopd.t711ChainByValueRvalueCtors != 1
+                || cppsopd.t711ChainByValueRvalueCopies != 1
+                || cppsopd.t711ChainByValueRvalueMoves != 0
+                || cppsopd.t711ChainByValueRvalueDtors != 1) return 57133;
+        }
+        if (cppsopd.t711ChainByValueRvalueDtors != 2) return 57134;
     return 0;
 }

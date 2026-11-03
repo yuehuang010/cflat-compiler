@@ -6230,6 +6230,7 @@ void MainListener::GenerateDefaultParamOverloads(
             {
                 auto arg = compiler->GetFunctionArgument(params[i].VariableName);
                 arg.TypeAndValue.VariableName = "";   // forward positionally, never as a named arg
+                arg.IsDefaultParamForward = true;
                 // A 'move' parameter must forward AS a move, or the wrapper binds the borrow
                 // overload and its own scope-exit teardown frees what the callee kept.
                 if (params[i].IsMove)
@@ -6387,6 +6388,23 @@ void MainListener::GenerateDefaultParamOverloads(
                 }
                 callArgs.push_back(namedVar);
             }
+
+            // The prefix frame forwards move params and MS-ABI C++ values; the callee owns destruction.
+            if (!compiler->stackNamedVariable.empty())
+                for (int i = 0; i < cutoff; ++i)
+                {
+                    const bool calleeDestroysForwardedCxxValue = !params[i].Pointer
+                        && !params[i].IsAlias && !params[i].IsRvalueRef
+                        && compiler->IsForeignNontrivialCxxClass(params[i].TypeName)
+                        && compiler->IsCxxParamDestroyedInCallee(params[i].TypeName);
+                    if (!(params[i].IsMove && !params[i].Pointer && !params[i].IsAlias)
+                        && !calleeDestroysForwardedCxxValue)
+                        continue;
+                    if (auto it = compiler->stackNamedVariable.back().functionArgument.find(
+                            params[i].VariableName);
+                        it != compiler->stackNamedVariable.back().functionArgument.end())
+                        it->second.IsOwningStruct = false;
+                }
 
             if (returnType.TypeName == "void")
             {

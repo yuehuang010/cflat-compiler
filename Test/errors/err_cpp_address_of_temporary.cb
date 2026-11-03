@@ -1,0 +1,61 @@
+import cpp "cpp_address_temporary.hpp";
+
+extern int main()
+{
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box b = addrtemp.Box(4);
+        addrtemp.Box* p = &(addrtemp.Box)b;
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box* p = &addrtemp.make(1);
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box b = addrtemp.Box(4);
+        addrtemp.Box* p = &b.make();
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box* p = &addrtemp.Box(1);
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        bool choose = true;
+        addrtemp.Box* p = &(choose ? addrtemp.make(1) : addrtemp.make(2));
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box b = addrtemp.Box(4);
+        addrtemp.Box c = addrtemp.Box(6);
+        addrtemp.Box* p = &(b + c);
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box b = addrtemp.Box(4);
+        addrtemp.Box* p = &b(3);
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        int* p = &addrtemp.make(1).value;
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box* p = &(addrtemp.make(1));
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        int* p = &((addrtemp.make(1)).value);
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        addrtemp.Box** p = &addrtemp.make(1).p;
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Holder'") {
+        addrtemp.Box* p = &addrtemp.makeH(1).field;
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Holder'") {
+        int* p = &addrtemp.makeH(1).field.value;
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        bool choose = true;
+        addrtemp.Box b = addrtemp.Box(4);
+        addrtemp.Box* p = &(choose ? b : addrtemp.make(2));
+    }
+    expect_error("cannot take the address of a temporary of C++ type 'addrtemp.Box'") {
+        bool choose = true;
+        addrtemp.Box b = addrtemp.Box(4);
+        addrtemp.Box* p = &(choose ? addrtemp.make(1) : b);
+    }
+    return 0;
+}

@@ -403,3 +403,330 @@ protected:
 struct T456ProtectedFreeUnary : T456ProtectedFreeUnaryBase {};
 inline int operator+(const T456ProtectedFreeUnary&) { return 63; }
 }
+
+namespace cppsopd {
+inline int t455CmpMoveMemberLast = 0;
+inline int t455CmpMoveMemberDtors = 0;
+inline int t455CmpMoveFreeLast = 0;
+inline int t455CmpMoveFreeDtors = 0;
+
+struct T455CmpMoveMember {
+    int value = 7;
+    T455CmpMoveMember() = default;
+    explicit T455CmpMoveMember(int v) : value(v) {}
+    ~T455CmpMoveMember() { ++t455CmpMoveMemberDtors; }
+    int f() & { t455CmpMoveMemberLast = 101; return value; }
+    int f() && { t455CmpMoveMemberLast = 102; return value; }
+    T455CmpMoveMember& operator=(int v) && { value = v; t455CmpMoveMemberLast = 2; return *this; }
+    T455CmpMoveMember& operator+=(int) && { t455CmpMoveMemberLast = 3; return *this; }
+    T455CmpMoveMember& operator-=(int) && { t455CmpMoveMemberLast = 4; return *this; }
+    T455CmpMoveMember& operator*=(int) && { t455CmpMoveMemberLast = 5; return *this; }
+    T455CmpMoveMember& operator/=(int) && { t455CmpMoveMemberLast = 6; return *this; }
+    T455CmpMoveMember& operator%=(int) && { t455CmpMoveMemberLast = 7; return *this; }
+    T455CmpMoveMember& operator&=(int) && { t455CmpMoveMemberLast = 8; return *this; }
+    T455CmpMoveMember& operator|=(int) && { t455CmpMoveMemberLast = 9; return *this; }
+    T455CmpMoveMember& operator^=(int) && { t455CmpMoveMemberLast = 10; return *this; }
+    T455CmpMoveMember& operator<<=(int) && { t455CmpMoveMemberLast = 11; return *this; }
+    T455CmpMoveMember& operator>>=(int) && { t455CmpMoveMemberLast = 12; return *this; }
+};
+
+struct T455CmpMoveMemberLvalue {
+    int value = 7;
+    T455CmpMoveMemberLvalue() = default;
+    ~T455CmpMoveMemberLvalue() { ++t455CmpMoveMemberDtors; }
+    int f() & { t455CmpMoveMemberLast = 101; return value; }
+    T455CmpMoveMemberLvalue& operator+=(int) & { t455CmpMoveMemberLast = 103; return *this; }
+    T455CmpMoveMemberLvalue& operator-=(int) & { t455CmpMoveMemberLast = 104; return *this; }
+    T455CmpMoveMemberLvalue& operator*=(int) & { t455CmpMoveMemberLast = 105; return *this; }
+    T455CmpMoveMemberLvalue& operator/=(int) & { t455CmpMoveMemberLast = 106; return *this; }
+    T455CmpMoveMemberLvalue& operator%=(int) & { t455CmpMoveMemberLast = 107; return *this; }
+    T455CmpMoveMemberLvalue& operator&=(int) & { t455CmpMoveMemberLast = 108; return *this; }
+    T455CmpMoveMemberLvalue& operator|=(int) & { t455CmpMoveMemberLast = 109; return *this; }
+    T455CmpMoveMemberLvalue& operator^=(int) & { t455CmpMoveMemberLast = 110; return *this; }
+    T455CmpMoveMemberLvalue& operator<<=(int) & { t455CmpMoveMemberLast = 111; return *this; }
+    T455CmpMoveMemberLvalue& operator>>=(int) & { t455CmpMoveMemberLast = 112; return *this; }
+};
+
+struct T455CmpMoveFree {
+    int value = 7;
+    T455CmpMoveFree() = default;
+    ~T455CmpMoveFree() { ++t455CmpMoveFreeDtors; }
+};
+inline int operator+=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 103; return 0; }
+inline int operator+=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 3; return 0; }
+inline int operator-=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 104; return 0; }
+inline int operator-=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 4; return 0; }
+inline int operator*=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 105; return 0; }
+inline int operator*=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 5; return 0; }
+inline int operator/=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 106; return 0; }
+inline int operator/=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 6; return 0; }
+inline int operator%=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 107; return 0; }
+inline int operator%=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 7; return 0; }
+inline int operator&=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 108; return 0; }
+inline int operator&=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 8; return 0; }
+inline int operator|=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 109; return 0; }
+inline int operator|=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 9; return 0; }
+inline int operator^=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 110; return 0; }
+inline int operator^=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 10; return 0; }
+inline int operator<<=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 111; return 0; }
+inline int operator<<=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 11; return 0; }
+inline int operator>>=(T455CmpMoveFree&, int) { t455CmpMoveFreeLast = 112; return 0; }
+inline int operator>>=(T455CmpMoveFree&&, int) { t455CmpMoveFreeLast = 12; return 0; }
+
+inline void resetT455CmpMove() {
+    t455CmpMoveMemberLast = 0;
+    t455CmpMoveMemberDtors = 0;
+    t455CmpMoveFreeLast = 0;
+    t455CmpMoveFreeDtors = 0;
+}
+
+inline int t455CmpMoveConstRefLast = 0;
+inline int t455CmpMoveConstRefDtors = 0;
+struct T455CmpMoveConstRef {
+    int value = 7;
+    T455CmpMoveConstRef() = default;
+    explicit T455CmpMoveConstRef(int v) : value(v) {}
+    T455CmpMoveConstRef(const T455CmpMoveConstRef& other) : value(other.value) {}
+    T455CmpMoveConstRef(T455CmpMoveConstRef&& other) : value(other.value) {}
+    T455CmpMoveConstRef& operator=(const T455CmpMoveConstRef& other) {
+        value = other.value;
+        return *this;
+    }
+    T455CmpMoveConstRef& operator=(T455CmpMoveConstRef&& other) {
+        value = other.value;
+        return *this;
+    }
+    ~T455CmpMoveConstRef() { ++t455CmpMoveConstRefDtors; }
+    const T455CmpMoveConstRef& operator/=(int) const& {
+        t455CmpMoveConstRefLast = 14;
+        return *this;
+    }
+    int f() & { return value; }
+};
+
+inline int t455CmpMoveInPlaceLast = 0;
+inline int t455CmpMoveInPlaceDtors = 0;
+inline const void* t455CmpMoveInPlaceExpected = nullptr;
+inline int t455CmpMoveInPlaceReceiverIsExpected = 0;
+struct T455CmpMoveInPlace {
+    int value = 7;
+    T455CmpMoveInPlace() = default;
+    T455CmpMoveInPlace(const T455CmpMoveInPlace& other) : value(other.value) {}
+    ~T455CmpMoveInPlace() { ++t455CmpMoveInPlaceDtors; }
+    T455CmpMoveInPlace& operator-=(int amount) & {
+        value -= amount;
+        t455CmpMoveInPlaceLast = 21;
+        return *this;
+    }
+    T455CmpMoveInPlace& operator-=(int amount) && {
+        value -= amount;
+        t455CmpMoveInPlaceLast = value;
+        t455CmpMoveInPlaceReceiverIsExpected = this == t455CmpMoveInPlaceExpected;
+        return *this;
+    }
+    int f() & { return value; }
+};
+struct T455CmpMoveInPlaceHolder { T455CmpMoveInPlace item; };
+inline void resetT455CmpMoveInPlace() {
+    t455CmpMoveInPlaceLast = 0;
+    t455CmpMoveInPlaceDtors = 0;
+    t455CmpMoveInPlaceExpected = nullptr;
+    t455CmpMoveInPlaceReceiverIsExpected = 0;
+}
+inline void setT455CmpMoveInPlaceExpected(const T455CmpMoveInPlace* value) {
+    t455CmpMoveInPlaceExpected = value;
+}
+}
+
+namespace cppsopd {
+inline int t711ChainMemberLHits = 0;
+inline int t711ChainMemberRHits = 0;
+inline int t711ChainMemberLastValue = 0;
+inline int t711ChainMemberAssignLHits = 0;
+inline int t711ChainMemberAssignRHits = 0;
+inline int t711ChainMemberAssignLastValue = 0;
+inline int t711ChainMemberFRefHits = 0;
+inline int t711ChainMemberFRvalueHits = 0;
+inline int t711ChainMemberDtors = 0;
+inline int t711ChainMemberCopies = 0;
+inline int t711ChainMemberMoves = 0;
+inline const void* t711ChainMemberExpected = nullptr;
+inline const void* t711ChainMemberLastReceiver = nullptr;
+inline int t711ChainMemberRReceiverIsExpected = 0;
+inline int t711ChainFreeLHits = 0;
+inline int t711ChainFreeRHits = 0;
+inline int t711ChainFreeLastValue = 0;
+inline int t711ChainFreeAssignHits = 0;
+inline int t711ChainFreeFRefHits = 0;
+inline int t711ChainFreeFRvalueHits = 0;
+inline int t711ChainFreeDtors = 0;
+inline const void* t711ChainFreeExpected = nullptr;
+inline int t711ChainByValueRvaluePlusHits = 0;
+inline int t711ChainByValueRvalueMinusHits = 0;
+inline int t711ChainByValueRvalueResult = 0;
+inline int t711ChainByValueRvalueCtors = 0;
+inline int t711ChainByValueRvalueCopies = 0;
+inline int t711ChainByValueRvalueMoves = 0;
+inline int t711ChainByValueRvalueDtors = 0;
+
+struct T711ChainMember {
+    int value = 10;
+    T711ChainMember() = default;
+    explicit T711ChainMember(int v) : value(v) {}
+    T711ChainMember(const T711ChainMember& other) : value(other.value) { ++t711ChainMemberCopies; }
+    T711ChainMember(T711ChainMember&& other) : value(other.value) {
+        ++t711ChainMemberMoves;
+        other.value = -1;
+    }
+    ~T711ChainMember() { ++t711ChainMemberDtors; }
+    T711ChainMember& operator+=(int n) & {
+        value += n;
+        t711ChainMemberLastValue = value;
+        ++t711ChainMemberLHits;
+        return *this;
+    }
+    T711ChainMember& operator+=(int n) && {
+        value += n;
+        t711ChainMemberLastValue = value;
+        ++t711ChainMemberRHits;
+        return *this;
+    }
+    T711ChainMember& operator-=(int n) & {
+        value -= n;
+        t711ChainMemberLastValue = value;
+        ++t711ChainMemberLHits;
+        return *this;
+    }
+    T711ChainMember& operator-=(int n) && {
+        value -= n;
+        t711ChainMemberLastValue = value;
+        ++t711ChainMemberRHits;
+        t711ChainMemberLastReceiver = this;
+        t711ChainMemberRReceiverIsExpected = this == t711ChainMemberExpected;
+        return *this;
+    }
+    T711ChainMember& operator=(int n) & {
+        value = n;
+        t711ChainMemberAssignLastValue = value;
+        ++t711ChainMemberAssignLHits;
+        return *this;
+    }
+    T711ChainMember& operator=(int n) && {
+        value = n;
+        t711ChainMemberAssignLastValue = value;
+        ++t711ChainMemberAssignRHits;
+        return *this;
+    }
+    int f() & { ++t711ChainMemberFRefHits; return value; }
+    int f() && { ++t711ChainMemberFRvalueHits; return value; }
+};
+
+inline T711ChainMember makeT711ChainMember(int value) { return T711ChainMember(value); }
+inline void setT711ChainMemberExpected(const T711ChainMember* value) {
+    t711ChainMemberExpected = value;
+}
+
+struct T711ChainFree {
+    int value = 10;
+    T711ChainFree() = default;
+    explicit T711ChainFree(int v) : value(v) {}
+    ~T711ChainFree() { ++t711ChainFreeDtors; }
+    T711ChainFree& operator=(int n) & {
+        value = n;
+        t711ChainFreeLastValue = value;
+        ++t711ChainFreeAssignHits;
+        return *this;
+    }
+    int f() & { ++t711ChainFreeFRefHits; return value; }
+    int f() && { ++t711ChainFreeFRvalueHits; return value; }
+};
+
+inline T711ChainFree makeT711ChainFree(int value) { return T711ChainFree(value); }
+inline T711ChainFree& operator+=(T711ChainFree& value, int n) {
+    value.value += n;
+    t711ChainFreeLastValue = value.value;
+    ++t711ChainFreeLHits;
+    return value;
+}
+inline T711ChainFree& operator+=(T711ChainFree&& value, int n) {
+    value.value += n;
+    t711ChainFreeLastValue = value.value;
+    ++t711ChainFreeRHits;
+    return value;
+}
+inline T711ChainFree& operator-=(T711ChainFree& value, int n) {
+    value.value -= n;
+    t711ChainFreeLastValue = value.value;
+    ++t711ChainFreeLHits;
+    return value;
+}
+inline T711ChainFree& operator-=(T711ChainFree&& value, int n) {
+    value.value -= n;
+    t711ChainFreeLastValue = value.value;
+    t711ChainFreeExpected = &value;
+    ++t711ChainFreeRHits;
+    return value;
+}
+
+struct T711ChainByValue {
+    int value = 0;
+    T711ChainByValue operator+=(long n) & { value += (int)n; return *this; }
+    T711ChainByValue& operator-=(int n) & { value -= n; return *this; }
+};
+
+struct T711ChainByValueRvalue {
+    int value = 0;
+    T711ChainByValueRvalue() { ++t711ChainByValueRvalueCtors; }
+    T711ChainByValueRvalue(const T711ChainByValueRvalue& other) : value(other.value) {
+        ++t711ChainByValueRvalueCopies;
+    }
+    T711ChainByValueRvalue(T711ChainByValueRvalue&& other) : value(other.value) {
+        ++t711ChainByValueRvalueMoves;
+        other.value = -1;
+    }
+    ~T711ChainByValueRvalue() { ++t711ChainByValueRvalueDtors; }
+    T711ChainByValueRvalue operator+=(long n) & {
+        value += (int)n;
+        ++t711ChainByValueRvaluePlusHits;
+        return *this;
+    }
+    T711ChainByValueRvalue& operator-=(int n) && {
+        value -= n;
+        t711ChainByValueRvalueResult = value;
+        ++t711ChainByValueRvalueMinusHits;
+        return *this;
+    }
+};
+
+inline void resetT711Chain() {
+    t711ChainMemberLHits = 0;
+    t711ChainMemberRHits = 0;
+    t711ChainMemberLastValue = 0;
+    t711ChainMemberAssignLHits = 0;
+    t711ChainMemberAssignRHits = 0;
+    t711ChainMemberAssignLastValue = 0;
+    t711ChainMemberFRefHits = 0;
+    t711ChainMemberFRvalueHits = 0;
+    t711ChainMemberDtors = 0;
+    t711ChainMemberCopies = 0;
+    t711ChainMemberMoves = 0;
+    t711ChainMemberExpected = nullptr;
+    t711ChainMemberLastReceiver = nullptr;
+    t711ChainMemberRReceiverIsExpected = 0;
+    t711ChainFreeLHits = 0;
+    t711ChainFreeRHits = 0;
+    t711ChainFreeLastValue = 0;
+    t711ChainFreeAssignHits = 0;
+    t711ChainFreeFRefHits = 0;
+    t711ChainFreeFRvalueHits = 0;
+    t711ChainFreeDtors = 0;
+    t711ChainFreeExpected = nullptr;
+    t711ChainByValueRvaluePlusHits = 0;
+    t711ChainByValueRvalueMinusHits = 0;
+    t711ChainByValueRvalueResult = 0;
+    t711ChainByValueRvalueCtors = 0;
+    t711ChainByValueRvalueCopies = 0;
+    t711ChainByValueRvalueMoves = 0;
+    t711ChainByValueRvalueDtors = 0;
+}
+}

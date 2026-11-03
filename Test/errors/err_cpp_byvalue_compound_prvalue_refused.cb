@@ -1,0 +1,10 @@
+import cpp "cpp_interop_strop.h";
+
+extern int main() {
+    expect_error("C++ member 'operator-=' is &-qualified and cannot be called on an rvalue receiver") {
+        cppsopd.T711ChainByValue value = default;
+        long amount = 1;
+        (value += amount) -= 1;
+    }
+    return 0;
+}

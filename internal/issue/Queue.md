@@ -69,7 +69,7 @@ p2 generic-unique-arg-pointer-spelling (05a00f1af). Run the Windows gate on the 
 | P3 | - | p3/interface-call-overload-ranking-and-conversion | landed IFACEOVL (483f3b83d), IFCONST (2867b87d2 - see issue); residue: native ConstMask hole (needs core const annotations), first-not-ambiguous picks, interface single-slot widen, native pointer-field const carry, const twin mangling (all pre-existing) |
 | P3 | - | p3/ctor-lambda-this-closure-relocation | T515 residue: by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
 | P3 | - | p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
-| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | decl / return / single-argument sink landed MIXCOND (af5834ad3); multi-arg last-argument + nested decl + F1 producer lifetime MIXCOND2 (483f3b83d); open: operators, overloaded callee, defaulted/named/not-last args, by-value param return arm, B dtor order (C++ row) |
+| P3 | - | p3/cpp-mixed-class-conditional-value-return-argument-refused | MIXCOND/MIXCOND2/MIXCOND3 (5ccce18eb) landed operators, overloads, cast, not-last, named args, arm temp hoisting, MS-ABI callee-destroyed sinks; open: S2 re-admission (marker removal, DEFARG landed), S3 sret copy, lv_bv, nested mixed, CFlat/C++ temp order (C++ row) |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
 

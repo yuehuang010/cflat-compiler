@@ -1862,6 +1862,13 @@ public:
         bool IsCFlatBraceInitTemp = false;
         // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
         bool IsCxxPrvalueTemp = false;
+        bool IsCxxPrvalueConditional = false;
+        // This member expression comes from a C++ class prvalue; the owner name supplies its diagnostic type.
+        bool IsCxxPrvalueSubobject = false;
+        bool IsCxxPrvaluePointerSubobject = false;
+        std::string CxxPrvalueOwnerType;
+        // A synthetic default-parameter wrapper forwards its existing parameter slot unchanged.
+        bool IsDefaultParamForward = false;
         bool IsCxxSameTypeCastCopy = false;
         // Direct foreign C++ construction deferred into a generated call wrapper.
         bool IsCxxDirectConstruction = false;
@@ -2250,6 +2257,7 @@ public:
         bool         isAlias    = false;    // value is a borrow from an alias result or join
         bool         isRvalue = false;      // value-producing expression; named lvalues keep this false
         bool         isCxxSameTypeCastCopy = false; // transient provenance for a C++ conditional join
+        bool         isCxxPrvalueConditional = false; // mixed C++ class glvalue/prvalue conditional
         bool         isExplicitMove = false; // written 'move x' operand; transient, read by operator calls
         bool         isPointerArithmeticResult = false; // `p + n` / `p - n` pointer result
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
@@ -11168,7 +11176,7 @@ public:
                             llvm::Value* callSink = nullptr,
                             const std::string& callReturnSpelling = {},
                             std::vector<llvm::Value*>* callerOwnedProducerSlots = nullptr,
-                            bool callerOwnedProducerAllowed = false,
+                            bool trackConvertedProducer = false,
                             llvm::Value* callSinkEnvironment = nullptr,
                             bool callSinkTakesReference = false);
     // clang's std::is_convertible<S&&, P*> for a class xvalue at a P* parameter; cached per pair.
@@ -14222,7 +14230,8 @@ public:
     // 301: zero-initialized scalars are excluded from the dynamic initializer list.
     // 302: dynamic initializer ownership is shared across import groups.
     // 303: initializer cache entries carry internal-linkage file identity and import order.
-    static constexpr int kCHeaderCacheVersion = 305;
+    // 308: remove the default-parameter wrapper marker; the mixed-conditional veto was its only reader.
+    static constexpr int kCHeaderCacheVersion = 308;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

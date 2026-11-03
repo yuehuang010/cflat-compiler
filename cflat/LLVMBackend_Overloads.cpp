@@ -9189,7 +9189,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 slotBefore[i].IsCxxReferenceSink = true;
             }
         }
-        ApplyMoveParamTransfer(functionName, candidate.Parameters, slotWrapper ? slotBefore : matched,
+        std::vector<TypeAndValue> transferParamsStorage;
+        const std::vector<TypeAndValue>* transferParams = &candidate.Parameters;
+        if (candidate.IsCxx && candidate.IsMethod
+            && candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue
+            && !candidate.Parameters.empty())
+        {
+            // The implicit object parameter is pointer-shaped, but a &&-qualified member binds
+            // it as an rvalue reference for move tracking just like an explicit T&& parameter.
+            transferParamsStorage = candidate.Parameters;
+            transferParamsStorage.front().IsRvalueRef = true;
+            transferParams = &transferParamsStorage;
+        }
+        ApplyMoveParamTransfer(functionName, *transferParams, slotWrapper ? slotBefore : matched,
                                true, candidate.IsMethod, true, candidate.IsCxx);
         std::vector<llvm::Value*> sinkConsumedTemps = std::move(moveTransferConsumedTemps_);
         moveTransferConsumedTemps_.clear();
@@ -9334,7 +9346,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // A C++ class prvalue (call, operator or constructor result) already sits in an owned
                 // temp of this full expression. C++17 elision binds that object as the parameter:
                 // no second object and no move, as clang does.
-                if (cxxObject && IsOwnedCxxPrvalueArgument(matched[i], structTy))
+                const bool forwardedDefaultParam = matched[i].IsDefaultParamForward
+                    && matched[i].Storage != nullptr && matched[i].Storage->getType()->isPointerTy()
+                    && !matched[i].TypeAndValue.Pointer && !matched[i].TypeAndValue.IsAlias
+                    && !matched[i].TypeAndValue.IsRvalueRef
+                    && ResolveTypeAlias(matched[i].TypeAndValue.TypeName)
+                        == ResolveTypeAlias(candidate.Parameters[i].TypeName);
+                if (cxxObject && (IsOwnedCxxPrvalueArgument(matched[i], structTy)
+                    || forwardedDefaultParam))
                 {
                     // A callee-destroyed parameter takes the temp's destruction from the caller.
                     if (calleeDestroysCxxParam)
@@ -9974,12 +9993,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         // Retire move temporaries and mark the source moved after the call.
-        std::vector<TypeAndValue> transferParamsStorage;
-        const auto* transferParams = &candidate.Parameters;
         if (candidate.ReturnsAliasOfByValueParam && !candidate.ReturnsAlias && !candidate.External)
         {
-            transferParamsStorage = candidate.Parameters;
-            transferParams = &transferParamsStorage;
+            if (transferParams == &candidate.Parameters)
+            {
+                transferParamsStorage = candidate.Parameters;
+                transferParams = &transferParamsStorage;
+            }
             for (auto& param : transferParamsStorage)
                 if (param.IsReturnInferredSink && !param.IsWriteInferredSink && !param.Pointer
                     && ResolveTypeAlias(param.TypeName) == ResolveTypeAlias(candidate.ReturnType.TypeName))

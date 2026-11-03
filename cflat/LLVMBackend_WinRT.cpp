@@ -5412,10 +5412,32 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                         DisplayCxxClassName(param.TypeName), ifaceName, methodName));
                     continue;
                 }
+                const bool forwardedDefaultParam = nv.IsDefaultParamForward
+                    && nv.Storage->getType()->isPointerTy()
+                    && !nv.TypeAndValue.Pointer && !nv.TypeAndValue.IsAlias
+                    && !nv.TypeAndValue.IsRvalueRef
+                    && ResolveTypeAlias(nv.TypeAndValue.TypeName)
+                        == ResolveTypeAlias(param.TypeName);
+                const bool cxxObject = IsForeignNontrivialCxxClass(param.TypeName);
+                if (cxxObject && forwardedDefaultParam)
+                {
+                    if (IsCxxParamDestroyedInCallee(param.TypeName))
+                    {
+                        if (auto* storageJoin = llvm::dyn_cast_or_null<llvm::PHINode>(nv.Storage))
+                            for (unsigned arm = 0; arm < storageJoin->getNumIncomingValues(); ++arm)
+                                UnregisterOwnedStructTemp(storageJoin->getIncomingValue(arm));
+                        else
+                            UnregisterOwnedStructTemp(nv.Storage);
+                    }
+                    callArgs.push_back(nv.Storage);
+                    if (ParameterCarriesRawArrayCount(param))
+                        callArgs.push_back(RawArrayCountArgument(nv));
+                    paramCallArgIndexes.push_back(firstCallArg);
+                    continue;
+                }
                 auto* temp = AllocaAtEntry(cxxSretRecipe.paramSlots[recipeIndex].structTy,
                                            nullptr, "cxx.interface.argtemp",
                                            cxxSretRecipe.paramSlots[recipeIndex].align);
-                const bool cxxObject = IsForeignNontrivialCxxClass(param.TypeName);
                 const bool cflatHolder = !cxxObject
                     && HasForeignNontrivialCxxField(param.TypeName);
                 const bool interfaceHolderCopy = transferParams[i].IsInterfaceSink

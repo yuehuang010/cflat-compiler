@@ -7,9 +7,19 @@
 // compile fine; only a true mismatch errors here.
 import "string.cb";
 import cpp "../library/cpp_interop_ternaryref.h";
+import cpp "../library/cpp_interop_mixcond3.h";
 
 struct T513VarA { int value = 1; };
 struct T513VarB { int value = 2; };
+
+// MIXCOND3 r4: a lvalue by-value conversion into a CFlat callee in a binary expression stays refused.
+expect_error("ternary branches have incompatible types 't513mix.A' and 't513mix.BV'") {
+    int t513M3LvalueCflatTake(t513mix.BV value) { return value.v; }
+    int t513M3LvalueCflatCall(bool k) {
+        t513mix.A a = t513mix.mkA(3);
+        return t513M3LvalueCflatTake(k ? a : t513mix.mkBV(20)) * 2;
+    }
+}
 
 expect_error("ternary branches have incompatible types 'T513VarA' and 'T513VarB'") {
     int t513DiscardedStructVariables(bool c) {
@@ -184,29 +194,6 @@ expect_error("cannot initialize C++ class 'T513R7LB' from this expression") {
     }
 }
 
-// MIXCOND2: overloads and operator ancestors still refuse a mixed-class call argument.
-expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
-    int t513V10Overloaded(T513V10B b) { return b.value; }
-    int t513V10Overloaded(T513V10B b, int extra) { return b.value + extra; }
-    int t513V10OverloadedCall(bool k) { return t513V10Overloaded(k ? t513V10MakeA(11) : t513V10MakeB()); }
-}
-
-expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
-    int t513V10BinarySink(T513V10B b) { return b.value + 100; }
-    int t513V10BinaryCall(bool k) { return t513V10BinarySink(k ? t513V10MakeA(11) : t513V10MakeB()) * 2; }
-}
-
-expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
-    int t513V10UnarySink(T513V10B b) { return b.value + 100; }
-    int t513V10UnaryCall(bool k) { return -t513V10UnarySink(k ? t513V10MakeA(11) : t513V10MakeB()); }
-}
-
-// T513 r5 (S2): a defaulted trailing parameter is a longer overload; the sink must not forward a copy.
-expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
-    int t513V10Def(T513V10B b, int extra = 3) { return b.value + extra; }
-    int t513V10DefCall(bool k) { return t513V10Def(k ? t513V10MakeA(11) : t513V10MakeB()); }
-}
-
 // T513 r5 (S3): a by-value parameter lvalue arm that converts is refused in return position.
 expect_error("cannot return C++ class 'T513V10B' from this conditional expression") {
     T513V10B t513V10ReturnParam(bool k, T513V10A a) { return k ? a : t513V10MakeB(); }
@@ -228,7 +215,8 @@ expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'
     }
 }
 
-expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
+// The pointee mismatch is the first error (clang agrees); the conditional sink is never reached.
+expect_error("cannot convert 'double*' to 'int*' implicitly: the pointee types differ") {
     int t513M2PointerCall(int* p, T513V10B value) { return *p + value.value; }
     int t513M2PointerArg(bool k) {
         double d = 2.0;

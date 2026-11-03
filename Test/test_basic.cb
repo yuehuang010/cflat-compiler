@@ -233,6 +233,15 @@ bool testUnaryDerefDecay()
     return true;
 }
 
+bool testNdPointerArrayDerefWrite()
+{
+    int a = 1; int b = 2; int c = 3; int d = 4;
+    int*[2][2] pointers = { { &a, &b }, { &c, &d } };
+    *pointers[1][1] = 5;
+    return Test("nd_pointer_array_deref_write_value", d, 5)
+        && Test("nd_pointer_array_deref_write_index", pointers[1][1][0], 5);
+}
+
 bool testPointerToIntegerAccepts()
 {
     int[2] values = {13, 29};
@@ -6484,6 +6493,7 @@ extern int main()
     total++; passed += testT118ConstFloatingDims() ? 1 : 0;
     total++; passed += testPointerToIntegerAccepts() ? 1 : 0;
     total++; passed += testUnaryDerefDecay() ? 1 : 0;
+    total++; passed += testNdPointerArrayDerefWrite() ? 1 : 0;
     total++; passed += Test("testArray", testArray(), 460);
     total++; passed += testNamedParameters()             ? 1 : 0;
     total++; passed += Test("testTotalByValue", my.TotalByValue(), 5);

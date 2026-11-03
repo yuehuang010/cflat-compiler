@@ -1,0 +1,27 @@
+int ndrowRuntimeCtorRuns = 0;
+struct NdrowRuntimeCtor {
+    int value = 4;
+    NdrowRuntimeCtor() { ndrowRuntimeCtorRuns++; value = 5; }
+};
+
+expect_error("could not be reduced to a compile-time constant") {
+    NdrowRuntimeCtor[2][2] ndrowCtorRows = { {}, {} };
+}
+
+expect_error("multi-dimensional fixed-array initializers require nested braces matching each dimension") {
+    int[2][2][2] ndrowInnerMixed = { { {1, 2}, 3 } };
+}
+
+expect_error("too many initializers at dimension 2") {
+    int[2][2][2] ndrowInnerElided = { {1, 2, 3, 4} };
+}
+
+expect_error("too many initializers at dimension 2") {
+    int[2][3] ndrowTooManyLastRow = { {1}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40} };
+}
+
+expect_error("too many initializers at dimension 1") {
+    int[2][3] ndrowTooManyRows = { {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8, 9, 10}, {11, 12, 13}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1, 2, 3}, {4, 5, 6}, {7, 8, 9} };
+}
+
+extern int main() { return 0; }

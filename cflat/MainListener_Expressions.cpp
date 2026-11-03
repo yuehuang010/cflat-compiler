@@ -872,6 +872,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 result.JoinClassPointeeDepth = tv.joinClassPointeeDepth;
                 result.TypeAndValue.IsAlias = tv.isAlias;
                 result.IsRvalue = tv.isRvalue;
+                result.IsCxxPrvalueConditional = tv.isCxxPrvalueConditional;
                 result.IsPointerArithmeticResult = tv.isPointerArithmeticResult;
                 // An arm that is a macro constant is a prvalue, so the `?:` joins to a prvalue
                 // ([expr.cond]) whatever the other arm is and whatever the storage holds.
@@ -954,6 +955,10 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                     result.BaseType = result.Primary->getType();
                     result.TypeAndValue = assignmentResult.TypeAndValue;
                     result.Storage = assignmentResult.Storage;
+                    result.IsRvalue = assignmentResult.IsRvalue;
+                    if (assignmentResult.TypeAndValue.IsAlias
+                        && assignmentResult.Storage != nullptr)
+                        result.Primary = nullptr;
                     result.ChainedAssignSlot = assignmentResult.ChainedAssignSlot;
                     result.ChainedAssignName = assignmentResult.ChainedAssignName;
                     result.IsUniqueFieldAssignmentResult =
@@ -5015,6 +5020,33 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
             }
 
+            // Recover an sret-backed C++ operator value as a prvalue for the next expression.
+            auto cxxPrvalueAssignResult = [&](llvm::Value* opTemp) -> llvm::Value* {
+                auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(opTemp);
+                if (assignmentResult == nullptr || slot == nullptr
+                    || namedVar.TypeAndValue.TypeName.empty()
+                    || compiler->lastCallReturnType.IsAlias)
+                    return nullptr;
+                LLVMBackend::TypeAndValue classType;
+                classType.TypeName = namedVar.TypeAndValue.TypeName;
+                if (slot->getAllocatedType() != compiler->GetType(classType)) return nullptr;
+                llvm::Value* loaded = compiler->CreateLoad(slot->getAllocatedType(), slot);
+                *assignmentResult = {};
+                assignmentResult->TypeAndValue = compiler->lastCallReturnType;
+                if (assignmentResult->TypeAndValue.TypeName.empty())
+                    assignmentResult->TypeAndValue = namedVar.TypeAndValue;
+                assignmentResult->TypeAndValue.VariableName.clear();
+                assignmentResult->TypeAndValue.IsMove = false;
+                assignmentResult->TypeAndValue.IsAlias = false;
+                assignmentResult->Primary = loaded;
+                assignmentResult->BaseType = loaded->getType();
+                assignmentResult->Storage = slot;
+                assignmentResult->IsRvalue = true;
+                compiler->lastCxxRetTemp_ = slot;
+                compiler->lastCxxRetValue_ = loaded;
+                return loaded;
+            };
+
             // An imported C++ call may already have an sret slot for its prvalue. Route every
             // such assignment before the ordinary lvalue and special-member assignment paths.
             const std::string prvalueTypeName = namedVar.TypeAndValue.TypeName;
@@ -5053,11 +5085,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
                 const bool cxxCompound = operatorText != "="
                     && compiler->IsCxxRecord(prvalueTypeName);
+                const bool movedCxxCompoundSource = cxxCompound && namedVar.IsExplicitMove
+                    && namedVar.Storage != nullptr;
                 if (methodName.empty() || (!userDeclared && !cxxCompound))
                     LogErrorContext(unaryCtx,
                         "Left side of assignment is not an addressable lvalue.");
 
-                if (destination == nullptr)
+                if (movedCxxCompoundSource)
+                    destination = namedVar.Storage;
+                else if (destination == nullptr)
                 {
                     destination = compiler->CreateAlloca(namedVar.BaseType);
                     compiler->CreateAssignment(namedVar.Primary, destination);
@@ -5141,14 +5177,20 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             operatorRightNV.Storage, false, false, namedVar.IsRvalue,
                             operatorRightNV.IsRvalue, prvalueTypeName,
                             operatorRightNV.TypeAndValue.TypeName,
-                            0, false, {}, {}, false, {}, {}, false, {}, {},
+                            0, false,
+                            namedVar.CallerName.empty() ? namedVar.TypeAndValue.VariableName
+                                : namedVar.CallerName,
+                            namedVar.FieldName, namedVar.IsElementAccess,
+                            {}, {}, false, namedVar.ConditionalMoveSources, {},
                             operatorRightNV.TypeAndValue.PointeeConstBit()
                                 && operatorRightNV.TypeAndValue.Pointer, {}, operatorRightNV.CxxArithIdentity,
                             operatorRightNV.IsExplicitMove, namedVar.IsExplicitMove,
                             namedVar.TypeAndValue.IsCxxNullptrT,
-                            operatorRightNV.TypeAndValue.IsCxxNullptrT, true, false,
+                            operatorRightNV.TypeAndValue.IsCxxNullptrT,
+                            !movedCxxCompoundSource, false,
                             compiler->CxxOperandObjectCv(namedVar),
-                            compiler->CxxOperandObjectCv(operatorRightNV));
+                            compiler->CxxOperandObjectCv(operatorRightNV), false, false,
+                            &namedVar);
 
                     std::set<std::string> declaredLinkages;
                     if (auto record = compiler->cxxRecordEntries_.find(prvalueTypeName);
@@ -5194,7 +5236,48 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         throw;
                     }
                 };
-                if (auto* result = invokePrvalueOperator()) return result;
+                if (auto* result = invokePrvalueOperator())
+                {
+                    const auto& opResultType = compiler->lastCallReturnType;
+                    if (assignmentResult != nullptr && result->getType()->isPointerTy()
+                        && opResultType.IsAlias && !opResultType.IsRvalueRef
+                        && !opResultType.Pointer && !opResultType.TypeName.empty()
+                        && compiler->IsCxxRecord(opResultType.TypeName))
+                    {
+                        auto valueType = opResultType;
+                        valueType.Pointer = false;
+                        valueType.PointerDepth = 0;
+                        valueType.ElemPointer = false;
+                        auto* llvmValueType = compiler->GetType(valueType);
+                        if (llvmValueType != nullptr && llvmValueType->isStructTy())
+                        {
+                            llvm::Value* resultValue = compiler->CreateLoad(llvmValueType, result);
+                            *assignmentResult = {};
+                            assignmentResult->TypeAndValue = opResultType;
+                            assignmentResult->TypeAndValue.VariableName.clear();
+                            assignmentResult->Primary = result;
+                            PrepareAliasCallResult(unaryCtx, *assignmentResult, false);
+                            return resultValue;
+                        }
+                    }
+                    if (auto* prvalue = cxxPrvalueAssignResult(
+                            compiler->lastCxxRetTemp_))
+                        return prvalue;
+                    if (assignmentResult != nullptr && !opResultType.IsAlias
+                        && result->getType()->isStructTy()
+                        && compiler->IsCxxRecord(prvalueTypeName))
+                    {
+                        *assignmentResult = {};
+                        assignmentResult->TypeAndValue = opResultType;
+                        assignmentResult->TypeAndValue.VariableName.clear();
+                        assignmentResult->TypeAndValue.IsAlias = false;
+                        assignmentResult->Primary = result;
+                        assignmentResult->BaseType = result->getType();
+                        assignmentResult->IsRvalue = true;
+                        return result;
+                    }
+                    return result;
+                }
                 LogErrorContext(unaryCtx,
                     "Left side of assignment is not an addressable lvalue.");
             }
@@ -5205,28 +5288,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(
              * expression) is exposed as the outermost C++ return temporary, so a chained
              * `c = (a = 3)` move-assigns from it and a declarator / return moves from it.
              */
-            auto cxxPrvalueAssignResult = [&](llvm::Value* opTemp) -> llvm::Value* {
-                auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(opTemp);
-                if (assignmentResult == nullptr || slot == nullptr
-                    || namedVar.TypeAndValue.TypeName.empty())
-                    return nullptr;
-                LLVMBackend::TypeAndValue classType;
-                classType.TypeName = namedVar.TypeAndValue.TypeName;
-                if (slot->getAllocatedType() != compiler->GetType(classType)) return nullptr;
-                llvm::Value* loaded = compiler->CreateLoad(slot->getAllocatedType(), slot);
-                *assignmentResult = {};
-                assignmentResult->TypeAndValue = namedVar.TypeAndValue;
-                assignmentResult->TypeAndValue.VariableName.clear();
-                assignmentResult->TypeAndValue.IsMove = false;
-                assignmentResult->TypeAndValue.IsAlias = false;
-                assignmentResult->Primary = loaded;
-                assignmentResult->BaseType = loaded->getType();
-                assignmentResult->Storage = slot;
-                assignmentResult->IsRvalue = true;
-                compiler->lastCxxRetTemp_ = slot;
-                compiler->lastCxxRetValue_ = loaded;
-                return loaded;
-            };
             /*
              * M4b - assignment to a foreign NONTRIVIAL C++ object runs the C++ assignment
              * operator. The generic path would store bytes over a live object, which for a class
@@ -8429,24 +8490,23 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // current object, as the binary operand path reports it.
                     const std::string& lhsSource = namedVar.CallerName.empty()
                         ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
-                    const std::string lhsThisCaller = lhsSource == "this" ? lhsSource : std::string();
-                    const std::string lhsThisField = lhsSource == "this" ? namedVar.FieldName : std::string();
                     auto emitCompound = [&]() {
                         return TryBinaryOperatorOverload(
                             left, operatorText, right, ctx, namedVar.BaseType,
                             rhsDepth, rhsElemPointer, namedVar.Storage,
-                            rightNV.Storage, false, true, false, rhsIsRvalue,
+                            rightNV.Storage, false, true, namedVar.IsRvalue, rhsIsRvalue,
                             namedVar.TypeAndValue.TypeName,
                             rightNV.TypeAndValue.TypeName,
-                            0, false, lhsThisCaller, lhsThisField, false, {}, {}, false, {}, {},
+                            0, false, lhsSource, namedVar.FieldName, namedVar.IsElementAccess,
+                            {}, {}, false, namedVar.ConditionalMoveSources, {},
                             rightNV.TypeAndValue.PointeeConstBit()
                                 && rightNV.TypeAndValue.Pointer, {}, rightNV.CxxArithIdentity,
-                                rightNV.IsExplicitMove, false,
+                                rightNV.IsExplicitMove, namedVar.IsExplicitMove,
                                 namedVar.TypeAndValue.IsCxxNullptrT,
                                 rightNV.TypeAndValue.IsCxxNullptrT, namedVar.IsRvalue, false,
                                 compiler->CxxOperandObjectCv(namedVar),
                                 compiler->CxxOperandObjectCv(rightNV), false,
-                                constCxxCompoundFreeCandidate);
+                                constCxxCompoundFreeCandidate, &namedVar);
                     };
                     auto isCxxClassValue = [&](llvm::Value* value) {
                         auto* st = value != nullptr
@@ -8559,14 +8619,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             rightNV.Storage, false, true, false, rhsIsRvalue,
                             namedVar.TypeAndValue.TypeName,
                             rightNV.TypeAndValue.TypeName,
-                            0, false, lhsThisCaller, lhsThisField, false, {}, {}, false, {}, {},
+                            0, false, lhsSource, namedVar.FieldName, namedVar.IsElementAccess,
+                            {}, {}, false, namedVar.ConditionalMoveSources, {},
                             rightNV.TypeAndValue.PointeeConstBit()
                                 && rightNV.TypeAndValue.Pointer, {}, rightNV.CxxArithIdentity,
-                                rightNV.IsExplicitMove, false,
+                                rightNV.IsExplicitMove, namedVar.IsExplicitMove,
                                 namedVar.TypeAndValue.IsCxxNullptrT,
                                 rightNV.TypeAndValue.IsCxxNullptrT, false, false,
                                 compiler->CxxOperandObjectCv(namedVar),
-                                compiler->CxxOperandObjectCv(rightNV));
+                                compiler->CxxOperandObjectCv(rightNV), false, false, &namedVar);
                     adlSuppress.Release();
                     // Scalar left, C++ class right with no builtin answer: the written compound.
                     if (!cxxClassCompoundAttempted && overload == nullptr
@@ -8597,8 +8658,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
             }
 
-            // The C++ operator mutates its receiver through its reference parameter. Preserve
-            // the returned lvalue-reference pointer when used; discarded results only re-read.
+            // The C++ operator mutates its receiver through its reference parameter. Bind a
+            // returned T& with the same storage form as a plain reference-returning call.
             if (cxxCompoundInPlace && usedCompoundOverload)
             {
                 auto* opTemp = compiler->lastCxxRetTemp_;
@@ -8620,14 +8681,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     if (llvmValueType != nullptr && llvmValueType->isStructTy())
                     {
                         auto* resultValue = compiler->CreateLoad(llvmValueType, right);
+                        *assignmentResult = {};
                         assignmentResult->TypeAndValue = opResultType;
-                        assignmentResult->Primary = resultValue;
-                        assignmentResult->Storage = right;
-                        assignmentResult->BaseType = llvmValueType;
-                        assignmentResult->CallerName.clear();
-                        assignmentResult->FieldName.clear();
-                        assignmentResult->MovePathKey.clear();
-                        assignmentResult->MovePathHasDynamicIndex = false;
+                        assignmentResult->TypeAndValue.VariableName.clear();
+                        assignmentResult->Primary = right;
+                        PrepareAliasCallResult(unaryCtx, *assignmentResult, false);
                         return resultValue;
                     }
                 }
@@ -8643,6 +8701,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     return right;
                 }
                 if (auto* prvalue = cxxPrvalueAssignResult(opTemp)) return prvalue;
+                if (assignmentResult != nullptr && right != nullptr
+                    && right->getType()->isStructTy() && !opResultType.IsAlias
+                    && !opResultType.TypeName.empty()
+                    && compiler->IsCxxRecord(opResultType.TypeName))
+                {
+                    *assignmentResult = {};
+                    assignmentResult->TypeAndValue = opResultType;
+                    assignmentResult->TypeAndValue.VariableName.clear();
+                    assignmentResult->Primary = right;
+                    assignmentResult->BaseType = right->getType();
+                    assignmentResult->IsRvalue = true;
+                    return right;
+                }
                 // A `T&` result is the destination lvalue (C++): a by-value consumer copies it.
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
@@ -13195,6 +13266,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // Outside a declaration, a single-call false arm constructs into the true arm's C++
         // return temporary, so the join is ONE prvalue temporary a declaration can adopt.
         llvm::Value* trueCxxRetTemp = nullptr;
+        llvm::Value* falseCxxRetTemp = nullptr;
         llvm::Value* sharedCxxRetTemp = nullptr;
         // Same for a classified CFlat-only result: both arms build in ONE sret slot, so the
         // join is relocated by the adopting local instead of bitwise from two slots.
@@ -13797,6 +13869,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     falseLoweredRetTemp =
                         llvm::dyn_cast_or_null<llvm::AllocaInst>(compiler->lastLoweredRetTemp_);
             falseJoinSlot = loweredJoinSlotOf(falseValue);
+            if (!cxxTernaryDecl && use != ResultUse::Discard && falseStorage != nullptr
+                && falseStorage == compiler->lastCxxRetTemp_
+                && llvm::isa<llvm::AllocaInst>(falseStorage) && falseValue != nullptr)
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(falseValue->getType());
+                    st != nullptr && st->hasName()
+                    && compiler->IsForeignNontrivialCxxReturnClass(st->getName().str()))
+                    falseCxxRetTemp = falseStorage;
             if (trueLoweredRetTemp != nullptr && falseValue != nullptr && trueValue != nullptr
                 && falseValue == compiler->lastLoweredRetValue_
                 && falseValue->getType() == trueValue->getType())
@@ -14048,6 +14127,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 return CxxValueJoinResult::NotApplicable;
 
             const bool callArgument = !cxxTernaryDecl && inCallArgument_
+                && !cxxTernaryCallPrefixIncompatible_
                 && ternaryDepth.IsOutermost()
                 && (outerExpected.TypeName.empty()
                     || ((!outerExpected.Pointer && !outerExpected.IsAlias
@@ -14058,7 +14138,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                             compiler->ResolveTypeAlias(outerExpected.TypeName)))
                 && IsWholeCxxCallArgumentShape(ctx, outerExpected);
             const bool callThroughSink = callArgument && cxxTernaryCallSink_ != nullptr;
-            if (!cxxTernaryDecl && (!callArgument || !callThroughSink))
+            if (!cxxTernaryDecl && !callArgument)
                 return CxxValueJoinResult::NotApplicable;
             if (cxxTernaryDecl && !trueCxxTernaryDeclDeferred
                 && !falseCxxTernaryDeclDeferred)
@@ -14066,6 +14146,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
             using CxxArmCategory = LLVMBackend::CxxArmCategory;
             auto armCategory = [&](const LLVMBackend::TypedValue& shape) {
+                if (shape.storage != nullptr
+                    && (shape.storage == trueCxxRetTemp || shape.storage == falseCxxRetTemp))
+                    return CxxArmCategory::Prvalue;
                 if (shape.isExplicitMove) return CxxArmCategory::Xvalue;
                 if (!shape.isRvalue) return CxxArmCategory::Lvalue;
                 if (shape.hasSourceType && shape.sourceType.IsRvalueRef)
@@ -14120,7 +14203,39 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             }
             const std::string resultName = compiler->ResolveTypeAlias(
                 verdict.resultIsTrue ? trueType.TypeName : falseType.TypeName);
-            // r5: a converting by-value parameter lvalue arm copies an extra B (wrong sequence); refuse.
+            auto hasUniqueLvalueByValueConversion = [&](const std::string& sourceName) {
+                if (sourceName.empty() || sourceName == resultName) return false;
+                const auto* info = compiler->GetCxxClassInfoWithConstructors(resultName);
+                if (info == nullptr || info->hasCtorTemplate) return false;
+                const LLVMBackend::CxxClassInfo::Structor* matchingCtor = nullptr;
+                for (const auto& ctor : info->constructors)
+                {
+                    if (ctor.isDeleted || ctor.access != cflat_cinterop::AccessPublic
+                        || ctor.isCopyCtor || ctor.isMoveCtor || ctor.params.size() < 2
+                        || ctor.params[1].IsCxxRef() || ctor.params[1].Pointer
+                        || ctor.params[1].ElemPointer
+                        || compiler->ResolveTypeAlias(ctor.params[1].TypeName) != sourceName)
+                        continue;
+                    bool defaults = true;
+                    for (size_t i = 2; i < ctor.params.size(); ++i)
+                        if (i >= ctor.defaultArgs.size() || ctor.defaultArgs[i].kind.empty())
+                            defaults = false;
+                    if (!defaults) continue;
+                    if (matchingCtor != nullptr) return false;
+                    matchingCtor = &ctor;
+                }
+                return matchingCtor != nullptr;
+            };
+            const bool lvalueByValueConversion =
+                (trueCategory == CxxArmCategory::Lvalue
+                    && hasUniqueLvalueByValueConversion(trueName))
+                || (falseCategory == CxxArmCategory::Lvalue
+                    && hasUniqueLvalueByValueConversion(falseName));
+            // CFlat call arguments keep the legacy conditional lowering for lvalue by-value
+            // conversions; the direct sink lowering changes both admission and cleanup order.
+            if (callArgument && !callThroughSink && lvalueByValueConversion)
+                return CxxValueJoinResult::NotApplicable;
+            // A converting by-value parameter lvalue would copy an extra B before returning.
             const bool paramArmConverts =
                 (trueCategory == CxxArmCategory::Lvalue && trueStorage != nullptr
                     && compiler->IsFunctionParameterStorage(trueStorage) && trueName != resultName)
@@ -14160,8 +14275,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                         cxxTernaryCallSinkReturnType_.TypeName, callReturnSpelling))
                     return CxxValueJoinResult::NotApplicable;
             }
+            const bool callerOwnsSinkResult = callThroughSink && !lvalueByValueConversion
+                && (cxxTernaryCallSinkTakesReference_
+                    || !compiler->IsCxxParamDestroyedInCallee(resultName));
             llvm::Value* resultSlot = cxxTernaryDecl ? cxxTernaryDeclDest
-                : callThroughSink ? nullptr
+                : callThroughSink && !callerOwnsSinkResult ? nullptr
                 : compiler->AllocaAtEntry(resultObject, nullptr, "cxx.ternary.arg");
             if (resultSlot == nullptr && !callThroughSink)
                 return CxxValueJoinResult::NotApplicable;
@@ -14174,6 +14292,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 llvm::BasicBlock*& endBlock = trueArm ? trueEnd : falseEnd;
                 const auto& armType = trueArm ? trueType : falseType;
                 const auto armKind = trueArm ? trueCategory : falseCategory;
+                const bool armIsCxxRetTemp = storage != nullptr
+                    && storage == (trueArm ? trueCxxRetTemp : falseCxxRetTemp);
                 if (endBlock == nullptr) return false;
                 auto savedIP = compiler->builder->saveIP();
                 compiler->builder->SetInsertPoint(endBlock);
@@ -14185,9 +14305,15 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 arm.IsRvalue = armKind != CxxArmCategory::Lvalue;
                 const auto& armMark = trueArm ? trueMark : falseMark;
                 std::vector<llvm::Value*> callerOwnedProducerSlots;
-                auto callerOwnedConversion = [&](const LLVMBackend::TypeAndValue& sourceType,
-                                                  const std::string& sourceName) {
-                    if (armKind != CxxArmCategory::Prvalue || sourceName == resultName)
+                auto tracksByValueConversion = [&](const LLVMBackend::TypeAndValue& sourceType,
+                                                    const std::string& sourceName) {
+                    const bool calleeDestroysSource =
+                        compiler->IsCxxParamDestroyedInCallee(sourceName);
+                    if ((!callArgument && !calleeDestroysSource)
+                        || sourceType.Pointer || sourceType.ElemPointer
+                        || (armKind != CxxArmCategory::Prvalue && !armIsCxxRetTemp
+                            && armKind != CxxArmCategory::Lvalue)
+                        || sourceName == resultName)
                         return false;
                     const auto* info = compiler->GetCxxClassInfoWithConstructors(resultName);
                     if (info == nullptr || info->hasCtorTemplate) return false;
@@ -14196,6 +14322,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     {
                         if (ctor.isDeleted || ctor.access != cflat_cinterop::AccessPublic
                             || ctor.isCopyCtor || ctor.isMoveCtor || ctor.params.size() < 2
+                            || ctor.params[1].IsCxxRef() || ctor.params[1].Pointer
+                            || ctor.params[1].ElemPointer
                             || compiler->ResolveTypeAlias(ctor.params[1].TypeName) != sourceName)
                             continue;
                         bool defaults = true;
@@ -14206,25 +14334,67 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                         if (matchingCtor != nullptr) return false;
                         matchingCtor = &ctor;
                     }
-                    (void)sourceType;
-                    return matchingCtor != nullptr && matchingCtor->params[1].IsCxxRef();
+                    return matchingCtor != nullptr
+                        && !compiler->HasImplicitClassConversionOperator(sourceName);
                 };
-                const bool keepProducerForConversion = callerOwnedConversion(armType,
+                const bool trackConvertedProducer = tracksByValueConversion(armType,
                     compiler->ResolveTypeAlias(armType.TypeName));
                 if (!compiler->LowerCxxTernaryArm(arm, trueType, trueCategory,
                         falseType, falseCategory, trueArm, verdict, false, resultSlot,
                         callThroughSink ? cxxTernaryCallSink_ : nullptr, callReturnSpelling,
                         &callerOwnedProducerSlots,
-                        keepProducerForConversion,
+                        trackConvertedProducer,
                         callThroughSink ? cxxTernaryCallSinkEnvironment_ : nullptr,
                         callThroughSink && cxxTernaryCallSinkTakesReference_))
                 {
                     compiler->builder->restoreIP(savedIP);
                     return false;
                 }
+                if (trackConvertedProducer
+                    && compiler->IsCxxParamDestroyedInCallee(
+                        compiler->ResolveTypeAlias(armType.TypeName)))
+                {
+                    std::vector<llvm::PHINode*> visitedProducerJoins;
+                    auto unregisterProducer = [&](auto&& self, llvm::Value* slot) -> void {
+                        auto* join = llvm::dyn_cast_or_null<llvm::PHINode>(slot);
+                        if (join == nullptr || !join->getType()->isPointerTy())
+                        {
+                            compiler->UnregisterOwnedStructTemp(slot);
+                            return;
+                        }
+                        if (std::find(visitedProducerJoins.begin(), visitedProducerJoins.end(), join)
+                            != visitedProducerJoins.end())
+                            return;
+                        visitedProducerJoins.push_back(join);
+                        for (llvm::Value* incoming : join->incoming_values())
+                            self(self, incoming);
+                    };
+                    for (llvm::Value* slot : callerOwnedProducerSlots)
+                        unregisterProducer(unregisterProducer, slot);
+                    callerOwnedProducerSlots.clear();
+                }
                 llvm::Value* keepCallerOwnedProducer = nullptr;
+                // Keep ledger order so reverse cleanup preserves C++ temporary interleaving.
+                auto hoistArmStructTemps = [&](size_t from, llvm::Value* keep) {
+                    for (size_t i = from; i < compiler->pendingOwnedStructTemps.size(); ++i)
+                    {
+                        auto& temp = compiler->pendingOwnedStructTemps[i];
+                        if (temp.Alloca == nullptr || temp.Alloca == keep) continue;
+                        compiler->HoistOwnedStructTempTo(temp, branchBlock);
+                    }
+                };
                 if (callerOwnedProducerSlots.size() == 1)
+                {
                     keepCallerOwnedProducer = callerOwnedProducerSlots.front();
+                    if (!compiler->IsOwnedStructTempSince(armMark, keepCallerOwnedProducer))
+                        compiler->RegisterOwnedStructTemp(keepCallerOwnedProducer, armType.TypeName);
+                    auto producer = std::find_if(compiler->pendingOwnedStructTemps.begin(),
+                        compiler->pendingOwnedStructTemps.end(), [&](const auto& temp) {
+                            return temp.Alloca == keepCallerOwnedProducer;
+                        });
+                    if (producer != compiler->pendingOwnedStructTemps.end())
+                        compiler->HoistOwnedStructTempTo(*producer, branchBlock);
+                }
                 else
                 {
                     size_t insertAt = armMark.Structs;
@@ -14235,11 +14405,28 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                             compiler->ReleaseOwnedStructTempInPlace(slot);
                         compiler->RegisterOwnedCxxParamTempAt(slot, armType.TypeName, insertAt++);
                     }
+                    for (llvm::Value* slot : callerOwnedProducerSlots)
+                    {
+                        auto producer = std::find_if(compiler->pendingOwnedStructTemps.rbegin(),
+                            compiler->pendingOwnedStructTemps.rend(), [&](const auto& temp) {
+                                return temp.Alloca == slot;
+                            });
+                        if (producer != compiler->pendingOwnedStructTemps.rend())
+                            compiler->HoistOwnedStructTempTo(*producer, branchBlock);
+                    }
                     armFlushMark.Structs = insertAt;
-                    compiler->FlushOwnedTempsSince(armFlushMark, nullptr, nullptr);
+                    hoistArmStructTemps(armFlushMark.Structs, nullptr);
+                    armFlushMark.Structs = compiler->pendingOwnedStructTemps.size();
+                    compiler->FlushOwnedTempsSince(armFlushMark, nullptr, branchBlock);
                 }
                 if (callerOwnedProducerSlots.size() <= 1)
-                    compiler->FlushOwnedTempsSince(armMark, keepCallerOwnedProducer, nullptr);
+                {
+                    auto armOtherTempsMark = armMark;
+                    hoistArmStructTemps(armOtherTempsMark.Structs, keepCallerOwnedProducer);
+                    armOtherTempsMark.Structs = compiler->pendingOwnedStructTemps.size();
+                    compiler->FlushOwnedTempsSince(armOtherTempsMark,
+                        keepCallerOwnedProducer, branchBlock);
+                }
                 value = arm.Primary;
                 storage = arm.Storage;
                 shape.value = value;
@@ -14282,6 +14469,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             compiler->SwitchToBlock(resumeBlock);
             if (callThroughSink)
             {
+                if (callerOwnsSinkResult)
+                    compiler->RegisterOwnedStructTemp(resultSlot, resultName);
                 // No PHI for a void result: the true arm's void call stands for the expression, and
                 // only its type is read (no value flows out of the join).
                 llvm::Value* joined = trueValue;
@@ -15304,6 +15493,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             auto* structTy = llvm::cast<llvm::StructType>(trueValue->getType());
             cxxRecordJoin = structTy->hasName() && compiler->IsCxxRecord(structTy->getName().str());
         }
+        const bool mixedCxxRecordCategories = cxxRecordJoin
+            && (trueShape.isRvalue != falseShape.isRvalue);
         // Two addressable arms join their STORAGE, record or plain scalar: `c ? a : b` selects
         // an OBJECT, so a C++ `T&` parameter must bind the selected one, not a copy. POINTER
         // joins are excluded - their ownership analysis reads the value, not a joined slot.
@@ -15459,6 +15650,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             result.isAlias = trueAlias || falseAlias;
             result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
             result.receiverStorage = cxxLvalueStorageJoin;
+            result.isCxxPrvalueConditional = mixedCxxRecordCategories;
             // No storage join means at least one arm was a temporary, so the join is one too:
             // say so, or a `T&` parameter would silently bind a copy.
             result.isRvalue = cxxRecordJoin && cxxLvalueStorageJoin == nullptr;
@@ -15556,6 +15748,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         result.isExplicitMove = trueShape.isExplicitMove && falseShape.isExplicitMove;
         result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
         result.receiverStorage = cxxLvalueStorageJoin;
+        result.isCxxPrvalueConditional = mixedCxxRecordCategories;
         // Both arms fresh (call results, sret temps) make the join fresh even when no record join is
         // visible here: C++ immovable operands are refused by place, so a prvalue join must stay one.
         // A lifted function arm is a fresh closure value, so the join is not assignable (T188).
@@ -17758,6 +17951,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         // An explicit `move` of a C++ record is an xvalue: it binds an rvalue reference as a temp.
         result.isRvalue = namedVar.IsRvalue
             || (namedVar.IsExplicitMove && Compiler(ctx)->IsCxxRecord(namedVar.TypeAndValue.TypeName));
+        result.isCxxPrvalueConditional = namedVar.IsCxxPrvalueConditional;
         result.isCxxSameTypeCastCopy = namedVar.IsCxxSameTypeCastCopy;
         result.cxxRefValueType = namedVar.CxxRefValueType;
         result.isExplicitMove = namedVar.IsExplicitMove;
@@ -21143,7 +21337,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         bool rhsExplicitMove, bool lhsExplicitMove,
         bool lhsCxxNullptrT, bool rhsCxxNullptrT, bool lhsMaterializedPrvalue,
         bool lhsCxxPointeeConst, int lhsObjectCv, int rhsObjectCv, bool lhsIsAlias,
-        bool refuseConstWriteOnNoViable) {
+        bool refuseConstWriteOnNoViable,
+        const LLVMBackend::NamedVariable* lhsSourceNV) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
         // An ADL request for this expression was ambiguous and refused: nested rewrites stay silent.
@@ -23441,7 +23636,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             if (lhsIsAlias && !compiler->IsCxxRecord(typeName)
                 && lhsPointerDepth == 0 && lhsStorage != nullptr)
                 tempAlloca = lhsStorage;
-            else if (!lhsIsRvalue && lhsStorage != nullptr
+            else if ((!lhsIsRvalue || lhsExplicitMove) && lhsStorage != nullptr
                 && (compiler->IsCxxRecord(typeName)
                     || compiler->generatedCxxRecords_.count(typeName) != 0))
                 tempAlloca = lhsStorage;
@@ -23455,8 +23650,40 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.TypeAndValue.TypeName = typeName;
             thisNV.TypeAndValue.Pointer  = true;
             thisNV.TypeAndValue.IsCxxMutableField = lhsMutableFieldReceiver;
+            thisNV.BaseType = structTy;
             thisNV.Primary = tempAlloca;
-            if (lhsCallerName == "this")
+            if (lhsExplicitMove)
+            {
+                thisNV.Storage = lhsStorage;
+                thisNV.CallerName = lhsCallerName.empty()
+                    ? compiler->FindVariableNameByStorage(lhsStorage) : lhsCallerName;
+                thisNV.FieldName = lhsFieldName;
+                thisNV.IsElementAccess = lhsIsElementAccess;
+                thisNV.ConditionalMoveSources = lhsConditionalMoves;
+                if (lhsSourceNV != nullptr)
+                {
+                    thisNV.PointeeMove = lhsSourceNV->PointeeMove;
+                    thisNV.OwningStructName = lhsSourceNV->OwningStructName;
+                    thisNV.MovePathKey = lhsSourceNV->MovePathKey;
+                    thisNV.MovePathHasDynamicIndex = lhsSourceNV->MovePathHasDynamicIndex;
+                    thisNV.FieldPathText = lhsSourceNV->FieldPathText;
+                    thisNV.FieldPathRoot = lhsSourceNV->FieldPathRoot;
+                    thisNV.FieldDropOwnerStorage = lhsSourceNV->FieldDropOwnerStorage;
+                    thisNV.FieldPathThroughPointer = lhsSourceNV->FieldPathThroughPointer;
+                    thisNV.FieldPathHasPointerDereference = lhsSourceNV->FieldPathHasPointerDereference;
+                    thisNV.TypeAndValue.ParentVariableName =
+                        lhsSourceNV->TypeAndValue.ParentVariableName;
+                    if (!lhsSourceNV->FieldPathRoot.empty())
+                        thisNV.CallerName = lhsSourceNV->FieldPathRoot;
+                    else if (!lhsSourceNV->FieldName.empty()
+                        && !lhsSourceNV->TypeAndValue.ParentVariableName.empty())
+                        thisNV.CallerName = lhsSourceNV->TypeAndValue.ParentVariableName;
+                    else if (!lhsSourceNV->CallerName.empty())
+                        thisNV.CallerName = lhsSourceNV->CallerName;
+                }
+                thisNV.IsExplicitMove = true;
+            }
+            else if (lhsCallerName == "this")
             {
                 thisNV.CallerName = lhsCallerName;
                 thisNV.FieldName = lhsFieldName;
@@ -23494,6 +23721,14 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.BaseType = structTy;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
             thisNV.CallerName = lhsCallerName;
+            if (lhsExplicitMove)
+            {
+                thisNV.Storage = lhsStorage;
+                if (thisNV.CallerName.empty())
+                    thisNV.CallerName = compiler->FindVariableNameByStorage(lhsStorage);
+                thisNV.IsExplicitMove = true;
+                thisNV.IsRvalue = true;
+            }
             if ((lhsObjectCv & 1) != 0) thisNV.TypeAndValue.SetPointeeConstBit(true);
             thisNV.FieldName = lhsFieldName;
             thisNV.IsElementAccess = lhsIsElementAccess;
@@ -25248,6 +25483,30 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
         return ParseUnaryExpressionImpl(ctx, use, ctx->Sizeof().size());
     }
 
+bool MainListener::IsCxxTemporaryPrvalue(const LLVMBackend::NamedVariable& value) const
+{
+        const auto& type = value.TypeAndValue;
+        return compilerLLVM != nullptr
+            && !value.IsCxxPrvalueSubobject && !value.IsCxxPrvaluePointerSubobject
+            && (value.IsRvalue || value.IsCxxPrvalueTemp || value.IsCxxDirectConstruction
+                || value.IsCxxPrvalueConditional)
+            && !value.IsNormalizedCxxXvalue
+            && !type.Pointer && !type.IsAlias && !type.IsCxxRef() && !type.IsRvalueRef
+            && compilerLLVM->IsCxxRecord(compilerLLVM->ResolveTypeAlias(type.TypeName));
+}
+
+void MainListener::ClearCxxPrvalueProvenance(LLVMBackend::NamedVariable& value) const
+{
+        value.IsRvalue = false;
+        value.IsNormalizedCxxXvalue = false;
+        value.IsCxxDirectConstruction = false;
+        value.IsCxxPrvalueTemp = false;
+        value.IsCxxPrvalueSubobject = false;
+        value.IsCxxPrvaluePointerSubobject = false;
+        value.IsCxxPrvalueConditional = false;
+        value.CxxPrvalueOwnerType.clear();
+}
+
 LLVMBackend::NamedVariable MainListener::ParseOffsetofText(antlr4::ParserRuleContext* errCtx,
                                                              const std::string& typeText,
                                                              const std::vector<std::string>& path)
@@ -25648,6 +25907,17 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
 
             if (opText == "&")
             {
+                std::string temporaryType;
+                if (IsCxxTemporaryPrvalue(namedVar))
+                    temporaryType = namedVar.TypeAndValue.TypeName;
+                else if (namedVar.IsCxxPrvalueSubobject
+                    || namedVar.IsCxxPrvaluePointerSubobject)
+                    temporaryType = namedVar.CxxPrvalueOwnerType;
+                if (!temporaryType.empty())
+                    LogErrorContext(ctx, std::format(
+                        "cannot take the address of a temporary of C++ type '{}'",
+                        compiler->DisplayCxxClassName(temporaryType)));
+
                 const llvm::GlobalVariable* enumMemberGlobal = nullptr;
                 if (compiler->IsEnumMemberStorage(namedVar.Storage, &enumMemberGlobal))
                     LogErrorContext(ctx, std::format("cannot take the address of enum member '{}'",
@@ -26255,6 +26525,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 namedVar.FieldPathPointerFrameLocal = PointerRootKindEveryArmLocal(loadedPtr, compiler)
                     && (!unarySourceHasPointerDereference || unarySourcePointerFrameLocal);
                 namedVar.FieldPathFromForwardedArrow = false;
+                ClearCxxPrvalueProvenance(namedVar);
                 // `w[i]` identifies a pointer slot in an array view; after `*w[i]`, the result
                 // is the pointed-to lvalue and no longer belongs to the view's element storage.
                 namedVar.IsViewElement = false;
@@ -30283,20 +30554,46 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             ? aggregateLeafCount(tv.TypeName) : 0;
         std::vector<std::pair<size_t, std::vector<CFlatParser::FieldInitContext*>>>
             referenceAggregateRows;
+        std::vector<CFlatParser::FieldInitContext*> mappedArrayElements;
+        bool hasMappedArrayElements = false;
         auto hasUninitializedReferenceMember = [&]() {
             return HasUninitializedForeignCxxAggregateReferenceMember(tv.TypeName, initList);
         };
 
         if (multidim)
         {
-            uint64_t rowWidth = tv.ConstInnerDimensions.front();
+            uint64_t rowWidth = tv.ConstInnerDimensions.back();
+            auto isEmptyBraceRow = [](CFlatParser::FieldInitContext* fi) {
+                return fi->Identifier() == nullptr && fi->assignmentExpression().empty()
+                    && fi->initializerList() == nullptr;
+            };
             bool hasNested = false;
             for (auto* fi : elements)
-                if (fi->initializerList() != nullptr) { hasNested = true; break; }
+                if (fi->initializerList() != nullptr || isEmptyBraceRow(fi))
+                { hasNested = true; break; }
 
-            // The only non-nested multi-dimensional spelling is a string per char row.
-            if (!hasNested && elemTy->isArrayTy()
-                && elemTy->getArrayElementType()->isIntegerTy(8))
+            bool hasBracedOuterElement = false;
+            bool hasElidedOuterElement = false;
+            for (auto* fi : elements)
+            {
+                hasBracedOuterElement |= fi->initializerList() != nullptr;
+                hasElidedOuterElement |= !fi->assignmentExpression().empty();
+            }
+            if (!cxxReferenceAggregateElements && hasBracedOuterElement && hasElidedOuterElement)
+            {
+                LogErrorContext(initList,
+                    "mixed braced and elided initializers are not supported for multi-dimensional fixed arrays");
+                return;
+            }
+
+            // A char row can also be value-initialized with an empty brace.
+            const bool charStringRows = tv.ConstInnerDimensions.size() == 1
+                && elemTy->isArrayTy()
+                && elemTy->getArrayElementType()->isIntegerTy(8)
+                && std::all_of(elements.begin(), elements.end(), [&](auto* fi) {
+                    return isEmptyBraceRow(fi) || fi->assignmentExpression().size() == 1;
+                });
+            if (charStringRows)
             {
                 if (elements.size() > tv.ConstArraySize)
                 {
@@ -30310,6 +30607,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 for (size_t row = 0; row < elements.size(); row++)
                 {
                     auto* fi = elements[row];
+                    if (isEmptyBraceRow(fi)) continue;
                     if (fi->assignmentExpression().size() != 1)
                     {
                         LogErrorContext(fi, "multi-dimensional fixed-array initializers require nested braces or one string per char row");
@@ -30357,10 +30655,6 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             std::vector< CFlatParser::FieldInitContext* > flattened;
             const size_t dimensionCount = 1 + tv.ConstInnerDimensions.size();
             bool flattenFailed = false;
-            auto isEmptyBraceRow = [](CFlatParser::FieldInitContext* fi) {
-                return fi->Identifier() == nullptr && fi->assignmentExpression().empty()
-                    && fi->initializerList() == nullptr;
-            };
             std::function<void(CFlatParser::InitializerListContext*, size_t)> flatten =
                 [&](CFlatParser::InitializerListContext* list, size_t depth) {
                     if (flattenFailed) return;
@@ -30382,8 +30676,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                         {
                             if (fi->initializerList() == nullptr)
                             {
-                                // An empty '{}' sub-array holds no leaves; its rows are value-initialized below.
-                                if (cxxReferenceAggregateElements && isEmptyBraceRow(fi)) continue;
+                                if (isEmptyBraceRow(fi)) continue;
                                 if (cxxReferenceAggregateElements) {
                                     flattened.push_back(fi);
                                     continue;
@@ -30416,52 +30709,75 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 if (flattenFailed) return;
                 elements = std::move(flattened);
 
-                if (cxxReferenceAggregateElements)
-                {
-                    bool validRows = true;
-                    std::vector<std::pair<size_t,
-                        std::vector<CFlatParser::FieldInitContext*>>> collectedRows;
-                    std::function<void(CFlatParser::InitializerListContext*, size_t, size_t)>
-                        collectRows = [&](CFlatParser::InitializerListContext* list,
-                                          size_t depth, size_t rowOrdinal) {
-                            const size_t rank = 1 + tv.ConstInnerDimensions.size();
-                            if (depth + 1 == rank)
+                bool validRows = true;
+                std::vector<std::pair<size_t,
+                    std::vector<CFlatParser::FieldInitContext*>>> collectedRows;
+                std::function<void(CFlatParser::InitializerListContext*, size_t, size_t)>
+                    collectRows = [&](CFlatParser::InitializerListContext* list,
+                                      size_t depth, size_t rowOrdinal) {
+                        const size_t rank = 1 + tv.ConstInnerDimensions.size();
+                        if (depth + 1 == rank)
+                        {
+                            collectedRows.emplace_back(rowOrdinal, list->fieldInit());
+                            return;
+                        }
+                        const size_t expected = depth == 0
+                            ? (size_t)tv.ConstArraySize
+                            : (size_t)tv.ConstInnerDimensions[depth - 1];
+                        size_t rowsPerElement = 1;
+                        for (size_t dim = depth; dim + 1 < tv.ConstInnerDimensions.size(); ++dim)
+                            rowsPerElement *= (size_t)tv.ConstInnerDimensions[dim];
+                        const auto fields = list->fieldInit();
+                        for (size_t i = 0; i < fields.size(); ++i)
+                        {
+                            if (isEmptyBraceRow(fields[i]))
                             {
-                                collectedRows.emplace_back(rowOrdinal, list->fieldInit());
-                                return;
-                            }
-                            const size_t expected = depth == 0
-                                ? (size_t)tv.ConstArraySize
-                                : (size_t)tv.ConstInnerDimensions[depth - 1];
-                            size_t rowsPerElement = 1;
-                            for (size_t dim = depth; dim + 1 < tv.ConstInnerDimensions.size(); ++dim)
-                                rowsPerElement *= (size_t)tv.ConstInnerDimensions[dim];
-                            const auto fields = list->fieldInit();
-                            for (size_t i = 0; i < fields.size(); ++i)
-                            {
-                                if (isEmptyBraceRow(fields[i]))
-                                {
-                                    for (size_t row = 0; row < rowsPerElement; ++row)
-                                        collectedRows.emplace_back(rowOrdinal + i * rowsPerElement + row,
-                                            std::vector<CFlatParser::FieldInitContext*>{});
-                                    continue;
-                                }
-                                if (fields[i]->initializerList() == nullptr)
-                                {
-                                    validRows = false;
-                                    return;
-                                }
-                                collectRows(fields[i]->initializerList(), depth + 1,
-                                    rowOrdinal + i * rowsPerElement);
-                                if (!validRows) return;
-                            }
-                            for (size_t i = fields.size(); i < expected; ++i)
                                 for (size_t row = 0; row < rowsPerElement; ++row)
                                     collectedRows.emplace_back(rowOrdinal + i * rowsPerElement + row,
                                         std::vector<CFlatParser::FieldInitContext*>{});
-                        };
-                    collectRows(initList, 0, 0);
-                    if (validRows) referenceAggregateRows = std::move(collectedRows);
+                                continue;
+                            }
+                            if (fields[i]->initializerList() == nullptr)
+                            {
+                                validRows = false;
+                                return;
+                            }
+                            collectRows(fields[i]->initializerList(), depth + 1,
+                                rowOrdinal + i * rowsPerElement);
+                            if (!validRows) return;
+                        }
+                        for (size_t i = fields.size(); i < expected; ++i)
+                            for (size_t row = 0; row < rowsPerElement; ++row)
+                                collectedRows.emplace_back(rowOrdinal + i * rowsPerElement + row,
+                                    std::vector<CFlatParser::FieldInitContext*>{});
+                    };
+                collectRows(initList, 0, 0);
+                if (validRows)
+                {
+                    if (cxxReferenceAggregateElements)
+                        referenceAggregateRows = std::move(collectedRows);
+                    else
+                    {
+                        mappedArrayElements.resize(n, nullptr);
+                        size_t mappedCount = 0;
+                        for (const auto& [rowOrdinal, row] : collectedRows)
+                        {
+                            for (size_t col = 0; col < row.size(); ++col)
+                            {
+                                const size_t slot = rowOrdinal * rowWidth + col;
+                                if (slot >= mappedArrayElements.size())
+                                {
+                                    validRows = false;
+                                    break;
+                                }
+                                mappedArrayElements[slot] = row[col];
+                                ++mappedCount;
+                            }
+                            if (!validRows) break;
+                        }
+                        hasMappedArrayElements = validRows && mappedCount == elements.size();
+                        if (!hasMappedArrayElements) mappedArrayElements.clear();
+                    }
                 }
             }
         }
@@ -30527,7 +30843,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                                             builtElemPtr, tv.TypeName);
             builtElemPtr = nullptr;
         };
-        uint64_t initializedElementCount = elements.size();
+        uint64_t initializedElementCount = hasMappedArrayElements ? n : elements.size();
         const bool allAggregateElementsBraced = cxxReferenceAggregateElements
             && !elements.empty()
             && std::all_of(elements.begin(), elements.end(), [](auto* element) {
@@ -30692,15 +31008,50 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             }
             noteBuiltElement();
         }
-        for (size_t i = 0; !groupedReferenceAggregateElements && i < elements.size(); i++)
+        const size_t elementLoopCount = hasMappedArrayElements ? (size_t)n : elements.size();
+        for (size_t i = 0; !groupedReferenceAggregateElements && i < elementLoopCount; i++)
         {
             noteBuiltElement();
-            auto* fi = elements[i];
+            auto* fi = hasMappedArrayElements ? mappedArrayElements[i] : elements[i];
             llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
             auto* elemPtr = multidim
                 ? elementPtrs[i]
                 : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
             builtElemPtr = updateExistingElements ? nullptr : elemPtr;
+            if (fi == nullptr)
+            {
+                builtElemPtr = nullptr;
+                if (!updateExistingElements && elemStructTy != nullptr)
+                {
+                    if (compiler->GetFunction(tv.TypeName) != nullptr)
+                    {
+                        ConstructDefaultArrayElement(compiler, tv.TypeName, elemPtr, false);
+                        builtElemPtr = elemPtr;
+                    }
+                    else if (compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+                    {
+                        if (hasUninitializedReferenceMember())
+                        {
+                            LogErrorContext(initList, std::format(
+                                "reference member must be initialized in C++ aggregate array element '{}'",
+                                SpellType(*compiler, fixedElemTV)));
+                            return;
+                        }
+                        if (compiler->CxxEmptyBraceUsesListCtor(tv.TypeName))
+                            EmitCxxEmptyBraceConstruct(elemPtr, tv.TypeName, initList, true);
+                        else
+                        {
+                            std::string ctorError;
+                            if (!compiler->EmitCxxArrayDefaultConstruction(
+                                    tv.TypeName, elemPtr, elemStructTy,
+                                    compiler->builder->getInt64(1), ctorError))
+                                LogErrorContext(initList, ctorError);
+                        }
+                        builtElemPtr = elemPtr;
+                    }
+                }
+                continue;
+            }
             // A BRACED element carries no assignmentExpression at all (CFlat.g4 fieldInit's
             // '{' initializerList? '}' alternative), so it must be split off before the
             // expression read - that read is what walked a null context and crashed.
@@ -31341,6 +31692,317 @@ void MainListener::EmitGlobalFixedArrayInit(
         }
         else if (positionalArray)
         {
+            if (!tv.ConstInnerDimensions.empty())
+            {
+                std::vector<uint64_t> dimensions{ tv.ConstArraySize };
+                dimensions.insert(dimensions.end(), tv.ConstInnerDimensions.begin(),
+                                 tv.ConstInnerDimensions.end());
+                uint64_t totalElements = 1;
+                for (uint64_t dimension : dimensions) totalElements *= dimension;
+
+                std::vector<llvm::ArrayType*> arrayTypes;
+                llvm::Type* leafTy = arrTy;
+                for (size_t depth = 0; depth < dimensions.size(); ++depth)
+                {
+                    auto* dimensionTy = llvm::dyn_cast<llvm::ArrayType>(leafTy);
+                    if (dimensionTy == nullptr)
+                    {
+                        LogErrorContext(errCtx, "invalid nested fixed-array initializer type");
+                        return;
+                    }
+                    arrayTypes.push_back(dimensionTy);
+                    leafTy = dimensionTy->getElementType();
+                }
+
+                auto elements = initList->fieldInit();
+                auto isEmptyBraceRow = [](CFlatParser::FieldInitContext* fi) {
+                    return fi->Identifier() == nullptr && fi->assignmentExpression().empty()
+                        && fi->initializerList() == nullptr;
+                };
+                const bool hasNested = std::any_of(elements.begin(), elements.end(),
+                    [&](auto* fi) { return fi->initializerList() != nullptr || isEmptyBraceRow(fi); });
+                const bool hasBracedOuterElement = std::any_of(elements.begin(), elements.end(),
+                    [](auto* fi) { return fi->initializerList() != nullptr; });
+                const bool hasElidedOuterElement = std::any_of(elements.begin(), elements.end(),
+                    [](auto* fi) { return !fi->assignmentExpression().empty(); });
+                if (hasBracedOuterElement && hasElidedOuterElement)
+                {
+                    LogErrorContext(initList,
+                        "mixed braced and elided initializers are not supported for multi-dimensional fixed arrays");
+                    return;
+                }
+
+                const bool charStringRows = dimensions.size() == 2 && leafTy->isIntegerTy(8)
+                    && std::all_of(elements.begin(), elements.end(), [&](auto* fi) {
+                        return isEmptyBraceRow(fi) || fi->assignmentExpression().size() == 1;
+                    });
+                std::vector<CFlatParser::FieldInitContext*> leaves;
+                std::vector<size_t> leafIndices;
+                if (charStringRows)
+                {
+                    if (elements.size() > dimensions.front())
+                    {
+                        LogErrorContext(initList, std::format(
+                            "too many string rows for '{}[{}][{}]': got {} rows",
+                            SpellType(*compiler, tv), dimensions.front(), dimensions.back(), elements.size()));
+                        return;
+                    }
+                }
+                else
+                {
+                    if (!hasNested)
+                    {
+                        LogErrorContext(initList, std::format(
+                            "flat initializer lists are not supported for '{}[{}]'; use nested braces matching each dimension",
+                            SpellType(*compiler, tv), tv.ConstArraySize));
+                        return;
+                    }
+                    std::vector<std::pair<size_t,
+                        std::vector<CFlatParser::FieldInitContext*>>> rows;
+                    bool validRows = true;
+                    std::function<void(CFlatParser::InitializerListContext*, size_t, size_t)>
+                        collectRows = [&](CFlatParser::InitializerListContext* list,
+                                          size_t depth, size_t rowOrdinal) {
+                            const auto fields = list->fieldInit();
+                            const size_t expected = dimensions[depth];
+                            if (fields.size() > expected)
+                            {
+                                validRows = false;
+                                LogErrorContext(list, std::format(
+                                    "too many initializers at dimension {}: expected at most {}, got {}",
+                                    depth + 1, expected, fields.size()));
+                                return;
+                            }
+                            if (depth + 1 == dimensions.size())
+                            {
+                                rows.emplace_back(rowOrdinal, fields);
+                                return;
+                            }
+                            size_t rowsPerElement = 1;
+                            for (size_t inner = depth + 1; inner + 1 < dimensions.size(); ++inner)
+                                rowsPerElement *= dimensions[inner];
+                            for (size_t i = 0; i < fields.size(); ++i)
+                            {
+                                if (isEmptyBraceRow(fields[i]))
+                                {
+                                    for (size_t row = 0; row < rowsPerElement; ++row)
+                                        rows.emplace_back(rowOrdinal + i * rowsPerElement + row,
+                                            std::vector<CFlatParser::FieldInitContext*>{});
+                                    continue;
+                                }
+                                if (fields[i]->initializerList() == nullptr)
+                                {
+                                    validRows = false;
+                                    LogErrorContext(fields[i],
+                                        "multi-dimensional fixed-array initializers require nested braces matching each dimension");
+                                    return;
+                                }
+                                collectRows(fields[i]->initializerList(), depth + 1,
+                                    rowOrdinal + i * rowsPerElement);
+                                if (!validRows) return;
+                            }
+                            for (size_t i = fields.size(); i < expected; ++i)
+                                for (size_t row = 0; row < rowsPerElement; ++row)
+                                    rows.emplace_back(rowOrdinal + i * rowsPerElement + row,
+                                        std::vector<CFlatParser::FieldInitContext*>{});
+                        };
+                    collectRows(initList, 0, 0);
+                    if (!validRows) return;
+                    const size_t rowWidth = dimensions.back();
+                    for (const auto& [rowOrdinal, row] : rows)
+                        for (size_t col = 0; col < row.size(); ++col)
+                        {
+                            const size_t slot = rowOrdinal * rowWidth + col;
+                            if (slot >= totalElements)
+                            {
+                                LogErrorContext(initList,
+                                    "multi-dimensional fixed-array initializers exceed the array bounds");
+                                return;
+                            }
+                            leaves.push_back(row[col]);
+                            leafIndices.push_back(slot);
+                        }
+                }
+
+                LLVMBackend::TypeAndValue globalElemTV = tv;
+                int globalElemTVStars = FixedArrayElementStars(tv);
+                globalElemTV.Pointer = globalElemTVStars >= 1;
+                globalElemTV.ElemPointer = globalElemTVStars >= 2;
+                globalElemTV.ConstArraySize = 0;
+                globalElemTV.ConstInnerDimensions.clear();
+                globalElemTV.IsArrayView = false;
+                llvm::Constant* leafDefault = llvm::Constant::getNullValue(leafTy);
+                if (leafTy->isStructTy() && leaves.size() < totalElements
+                    && !compiler->IsCxxRecord(tv.TypeName))
+                {
+                    LLVMBackend::DeclTypeAndValue defaultType;
+                    static_cast<LLVMBackend::TypeAndValue&>(defaultType) = globalElemTV;
+                    leafDefault = TryFoldGlobalDefaultConstruction(defaultType);
+                    if (leafDefault == nullptr || leafDefault->getType() != leafTy)
+                    {
+                        LogErrorContext(errCtx, std::format(
+                            "native global '{}' of type '{}' has a default construction that could not be reduced to a compile-time constant; "
+                            "it must be constructed in main or made foldable",
+                            name, tv.TypeName));
+                        return;
+                    }
+                }
+
+                LLVMBackend::BuilderStateGuard savedState(compiler);
+                auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+                auto* tmpFn = llvm::Function::Create(
+                    voidTy, llvm::Function::PrivateLinkage, "__global_arr_init_tmp", compiler->module.get());
+                auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
+                compiler->builder->SetInsertPoint(tmpBB);
+
+                std::vector<llvm::Constant*> leafConstants(totalElements, leafDefault);
+                CFlatParser::FieldInitContext* codeValueElem = nullptr;
+                size_t codeValueIndex = 0;
+                CFlatParser::FieldInitContext* braceElem = nullptr;
+                CFlatParser::FieldInitContext* globalError = nullptr;
+                std::string globalErrorMessage;
+                bool ok = true;
+
+                if (charStringRows)
+                {
+                    const size_t rowWidth = dimensions.back();
+                    for (size_t row = 0; row < elements.size(); ++row)
+                    {
+                        auto* fi = elements[row];
+                        if (isEmptyBraceRow(fi)) continue;
+                        auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+                        auto* literal = llvm::dyn_cast_or_null<llvm::Constant>(LoadNamedVariable(nv));
+                        auto* global = literal == nullptr ? nullptr
+                            : llvm::dyn_cast<llvm::GlobalVariable>(literal->stripPointerCasts());
+                        auto* bytes = global == nullptr ? nullptr
+                            : llvm::dyn_cast<llvm::ConstantDataSequential>(global->getInitializer());
+                        if (bytes == nullptr || !compiler->IsStringLiteralConstant(literal))
+                        {
+                            globalError = fi;
+                            globalErrorMessage = "multi-dimensional char arrays require string literal rows";
+                            ok = false;
+                            break;
+                        }
+                        std::string text = bytes->getAsString().str();
+                        if (!text.empty() && text.size() - 1 > rowWidth)
+                        {
+                            globalError = fi;
+                            globalErrorMessage = std::format(
+                                "string row has {} characters but '{}' has width {}",
+                                text.size() - 1, SpellType(*compiler, tv), rowWidth);
+                            ok = false;
+                            break;
+                        }
+                        for (size_t col = 0; col < rowWidth; ++col)
+                        {
+                            const uint8_t ch = col < text.size() ? (uint8_t)text[col] : 0;
+                            leafConstants[row * rowWidth + col] = llvm::ConstantInt::get(leafTy, ch);
+                        }
+                    }
+                }
+                else
+                {
+                    for (size_t i = 0; i < leaves.size(); ++i)
+                    {
+                        auto* fi = leaves[i];
+                        if (FieldInitIsBraceElement(fi) && cxxEmptyBraceElems) continue;
+                        if (FieldInitIsBraceElement(fi))
+                        {
+                            braceElem = fi;
+                            ok = false;
+                            break;
+                        }
+                        if (fi->assignmentExpression().size() != 1)
+                        {
+                            globalError = fi;
+                            globalErrorMessage =
+                                "multi-dimensional fixed-array initializers require nested braces matching each dimension";
+                            ok = false;
+                            break;
+                        }
+                        auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+                        llvm::Value* val = LoadNamedVariable(nv);
+                        if (const auto* gclo = globalElemTV.IsFunctionPointer
+                                ? &globalElemTV : compiler->GetEncodedClosureType(globalElemTV.TypeName);
+                            gclo && gclo->IsThinFnPtr() && !globalElemTV.Pointer)
+                            val = compiler->BareFunctionToThinValue(val, gclo);
+                        compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, globalElemTV);
+                        RejectConstDiscardingConversion(fi, nv, val, globalElemTV);
+                        if (compiler->CodeValueIntoDataDestination(nv, globalElemTV))
+                        {
+                            codeValueElem = fi;
+                            codeValueIndex = leafIndices[i];
+                            ok = false;
+                            break;
+                        }
+                        if (val != nullptr && leafTy == llvm::StructType::getTypeByName(*compiler->context, "string")
+                            && val->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
+                        {
+                            auto* lit = llvm::dyn_cast<llvm::Constant>(val);
+                            if (lit != nullptr && compiler->IsStringLiteralConstant(lit))
+                                val = compiler->WrapStringLiteralAsString(val);
+                        }
+                        auto* c = llvm::dyn_cast_or_null<llvm::Constant>(val);
+                        if (c)
+                        {
+                            LLVMBackend::NativeBraceScope braceScope(*compiler);
+                            compiler->RefuseImplicitFloatToInt(c, leafTy,
+                                globalElemTV.IsUnsignedInteger() != -1);
+                            compiler->RefuseNarrowingBraceConstant(c,
+                                nv.TypeAndValue.IsUnsignedInteger() != -1, leafTy,
+                                globalElemTV.IsUnsignedInteger() != -1);
+                            c = CoerceConstantToArrayElement(compiler, c, leafTy);
+                        }
+                        if (c == nullptr)
+                        {
+                            globalError = fi;
+                            globalErrorMessage = leafTy->isStructTy()
+                                ? std::format("a global array of '{}' can only be initialized from compile-time constants; "
+                                    "this element needs a runtime constructor - assign it at startup, or use "
+                                    "'const char*[]' for a static table of literals", SpellType(*compiler, tv))
+                                : "global array initializer elements must be compile-time constants";
+                            ok = false;
+                            break;
+                        }
+                        leafConstants[leafIndices[i]] = c;
+                    }
+                }
+
+                tmpFn->eraseFromParent();
+                savedState.restore();
+                if (globalError != nullptr) LogErrorContext(globalError, globalErrorMessage);
+                if (braceElem != nullptr)
+                    LogErrorContext(braceElem, std::format(
+                        "field initializers ('{{field = value}}') are not supported for elements of the "
+                        "global array '{}' of type '{}' at global scope; assign the elements at startup, "
+                        "or declare the array as a local",
+                        name, SpellType(*compiler, tv)));
+                if (codeValueElem != nullptr)
+                    LogErrorContext(codeValueElem, compiler->DescribeCodeValueIntoData(
+                        CodeValueDestSpelling(globalElemTV), "brace-initialize",
+                        CodeValueCastAdvice(globalElemTV),
+                        std::format("element {} of '{}' of", codeValueIndex, name)));
+                if (!ok) return;
+
+                std::vector<llvm::Constant*> level = std::move(leafConstants);
+                for (size_t depth = dimensions.size(); depth-- > 0;)
+                {
+                    const size_t width = dimensions[depth];
+                    std::vector<llvm::Constant*> next;
+                    next.reserve(level.size() / width);
+                    for (size_t offset = 0; offset < level.size(); offset += width)
+                    {
+                        std::vector<llvm::Constant*> children(
+                            level.begin() + (std::ptrdiff_t)offset,
+                            level.begin() + (std::ptrdiff_t)(offset + width));
+                        next.push_back(llvm::ConstantArray::get(arrayTypes[depth], children));
+                    }
+                    level = std::move(next);
+                }
+                arrConst = level.front();
+            }
+            else
+            {
             auto elements = initList->fieldInit();
             if (elements.size() > n)
             {
@@ -31461,6 +32123,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                     std::format("element {} of '{}' of", codeValueIndex, name)));
             if (!ok) return;
             arrConst = llvm::ConstantArray::get(arrTy, elems);
+            }
         }
         else
         {
@@ -34370,6 +35033,10 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.IsRvalue               = src.IsRvalue;
         dst.IsExplicitMove         = src.IsExplicitMove;
         dst.IsNormalizedCxxXvalue = src.IsNormalizedCxxXvalue;
+        dst.IsCxxPrvalueSubobject = src.IsCxxPrvalueSubobject;
+        dst.IsCxxPrvaluePointerSubobject = src.IsCxxPrvaluePointerSubobject;
+        dst.IsCxxPrvalueConditional = src.IsCxxPrvalueConditional;
+        dst.CxxPrvalueOwnerType = src.CxxPrvalueOwnerType;
         // OWNERSHIP state. These travel together with the borrow facts above: a guard that reads
         // one and not the other reports the opposite of the truth - `delete (n)` on a `move`
         // parameter was rejected as "borrowed" when only CallerName came across.

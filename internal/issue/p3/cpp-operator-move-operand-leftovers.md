@@ -12,3 +12,6 @@ From the D8 review (2026-09-28); probes are in scratch/repro_keep/rv8/:
 After T79 (2026-10-10, move into a const T&-only operator is refused, operator= selection from clang Sema); probes in scratch/repro_keep/t79/:
 - `a = cond ? move b : move c` into a forwarding `template<U> operator=(U&&)` picks the copy assignment (a.v=40); clang picks the template (400). Plain `a = move b` gives 400 (rev_t79_r6_condforward.cb).
 - A moved LEFT operand of a MEMBER operator (`move a + b` with `A::operator+(const A&) const`) is not checked; only free/template operators carry the lhs marker.
+From the CHAINCMP r1 review (2026-10-30 box 7, PRE-EXISTING, master = fix); repros scratch/repro_keep/chaincmp/ (header hdr.h):
+- `rv.K k = (mkK(10) *= 2);` (by-value compound result from a prvalue receiver, init) -> one extra move + dtor (mv1 d3 vs clang mv0 d2).
+- `rv.F g = ((f -= 0) |= 4);` (free by-value operator chain, init) -> one extra copy (cp3 d4 vs clang cp2 d3).

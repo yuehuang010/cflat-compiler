@@ -180,6 +180,35 @@ struct NbeR      { int v = default; ~NbeR() { nbeDtors = nbeDtors + 1; } };
 struct NbeH      { NbeR r = default; };
 struct NbeStr    { string s = default; };                    // owning element: implicit copy per slot
 
+// N-D positional array rows keep their own bases; omitted struct elements still run field defaults.
+struct NdrowDmi  { int x = 7; int y = 9; };
+struct NdrowPlain { int x; int y; };
+struct NdrowGridField { int[2][3] grid; };
+int ndrowOwnerDtors = 0;
+string ndrowMakeSeed() { string a = "se"; string b = "ed"; return a + b; }
+struct NdrowOwner { string s = ndrowMakeSeed(); int value = 0; ~NdrowOwner() { ndrowOwnerDtors++; } };
+int[2][3] ndrowGlobal = { {1, 2}, {4} };
+int[2][3] ndrowGlobalEmpty = { {}, {4} };
+int[2][2][2] ndrowGlobal3d = { { {1}, {3, 4} }, { {5, 6}, {7} } };
+char[2][4] ndrowGlobalStrings = { "ab", "cde" };
+NdrowDmi[2][2] ndrowGlobalDmiEmpty = {};
+NdrowDmi[2][2] ndrowGlobalDmiRows = { {}, {} };
+NdrowDmi[2][2][2] ndrowGlobalDmiRows3d = { { {} }, {} };
+NdrowPlain[2][2] ndrowGlobalPlainRows = { {}, {} };
+
+expect_error("too many initializers at dimension 2: expected at most 3, got 4")
+{
+    void ndrowTooManyRowClauses() { int[2][3] bad = { {1, 2, 3, 4}, {5} }; }
+}
+expect_error("too many initializers at dimension 2: expected at most 3, got 4")
+{
+    int[2][3] ndrowGlobalTooMany = { {1, 2, 3, 4}, {5} };
+}
+expect_error("mixed braced and elided initializers are not supported for multi-dimensional fixed arrays")
+{
+    void ndrowMixedTopLevel() { int[2][3] bad = { {1}, 4, 5, 6 }; }
+}
+
 // Reject cell: the element type has no fields for a brace to name.
 expect_error("is not a struct, so there are no fields to initialize")
 {
@@ -718,6 +747,153 @@ extern int main()
     char[2][8] q13Rows = {"ab", "cd"};
     total++; passed += Test("multi-dimensional char string rows",
                             (int)q13Rows[0][0] + (int)q13Rows[1][1], 'a' + 'd');
+
+    total++; passed += Test("NDROW global plain struct rows stay zero",
+        ndrowGlobalPlainRows[1][1].x + ndrowGlobalPlainRows[1][1].y, 0);
+    total++; passed += Test("NDROW global DMI empty-list defaults stay folded",
+        ndrowGlobalDmiEmpty[1][1].x + ndrowGlobalDmiEmpty[1][1].y, 16);
+    total++; passed += Test("NDROW global DMI 2D empty rows use defaults",
+        ndrowGlobalDmiRows[0][0].x * 1000 + ndrowGlobalDmiRows[0][0].y * 100
+            + ndrowGlobalDmiRows[1][1].x * 10 + ndrowGlobalDmiRows[1][1].y, 7979);
+    total++; passed += Test("NDROW global DMI 3D empty rows use defaults",
+        ndrowGlobalDmiRows3d[0][0][1].x * 10 + ndrowGlobalDmiRows3d[1][1][1].y, 79);
+
+    int[2][3] ndrowFirst = { {1}, {4, 5, 6} };
+    total++; passed += Test("NDROW int 2D short first row",
+        ndrowFirst[0][0] * 100 + ndrowFirst[0][1] * 10 + ndrowFirst[1][0], 104);
+    int[3][3] ndrowMiddle = { {1, 2, 3}, {4}, {7, 8, 9} };
+    total++; passed += Test("NDROW int 2D short middle row",
+        ndrowMiddle[1][0] * 100 + ndrowMiddle[1][1] * 10 + ndrowMiddle[2][0], 407);
+    int[3][3] ndrowLast = { {1, 2, 3}, {4, 5, 6}, {7} };
+    total++; passed += Test("NDROW int 2D short last row",
+        ndrowLast[2][0] * 100 + ndrowLast[2][1] * 10 + ndrowLast[1][2], 706);
+
+    char[3][3] ndrowCharFirst = { {'a'}, {'d', 'e', 'f'}, {'g', 'h', 'i'} };
+    total++; passed += Test("NDROW char 2D short first row",
+        (int)ndrowCharFirst[0][1] + (int)ndrowCharFirst[1][0], 100);
+    char[3][3] ndrowCharMiddle = { {'a', 'b', 'c'}, {'d'}, {'g', 'h', 'i'} };
+    total++; passed += Test("NDROW char 2D short middle row",
+        (int)ndrowCharMiddle[1][1] + (int)ndrowCharMiddle[2][0], 103);
+    char[3][3] ndrowCharLast = { {'a', 'b', 'c'}, {'d', 'e', 'f'}, {'g'} };
+    total++; passed += Test("NDROW char 2D short last row",
+        (int)ndrowCharLast[2][1] + (int)ndrowCharLast[1][2], 102);
+
+    double[3][3] ndrowDoubleFirst = { {1.5}, {4.5, 5.5, 6.5}, {7.5, 8.5, 9.5} };
+    total++; passed += Test("NDROW double 2D short first row",
+        (int)(ndrowDoubleFirst[0][1] * 10.0 + ndrowDoubleFirst[1][0] * 10.0), 45);
+    double[3][3] ndrowDoubleMiddle = { {1.5, 2.5, 3.5}, {4.5}, {7.5, 8.5, 9.5} };
+    total++; passed += Test("NDROW double 2D short middle row",
+        (int)(ndrowDoubleMiddle[1][1] * 10.0 + ndrowDoubleMiddle[2][0] * 10.0), 75);
+    double[3][3] ndrowDoubleLast = { {1.5, 2.5, 3.5}, {4.5, 5.5, 6.5}, {7.5} };
+    total++; passed += Test("NDROW double 2D short last row",
+        (int)(ndrowDoubleLast[2][1] * 10.0 + ndrowDoubleLast[1][2] * 10.0), 65);
+
+    i64[3][3] ndrowI64First = { {1}, {4, 5, 6}, {7, 8, 9} };
+    total++; passed += Test("NDROW i64 2D short first row",
+        ndrowI64First[0][1] + ndrowI64First[1][0] * 10, (i64)40);
+    i64[3][3] ndrowI64Middle = { {1, 2, 3}, {4}, {7, 8, 9} };
+    total++; passed += Test("NDROW i64 2D short middle row",
+        ndrowI64Middle[1][0] * 100 + ndrowI64Middle[1][1] * 10 + ndrowI64Middle[2][0], (i64)407);
+    i64[3][3] ndrowI64Last = { {1, 2, 3}, {4, 5, 6}, {7} };
+    total++; passed += Test("NDROW i64 2D short last row",
+        ndrowI64Last[2][0] * 100 + ndrowI64Last[2][1] * 10 + ndrowI64Last[1][2], (i64)706);
+
+    int[2][2][2] ndrowInt3First = { { {1}, {3, 4} }, { {5, 6}, {7, 8} } };
+    total++; passed += Test("NDROW int 3D short first row",
+        ndrowInt3First[0][0][1] + ndrowInt3First[0][1][0] * 10, 30);
+    int[2][2][2] ndrowInt3Middle = { { {1, 2}, {3} }, { {5, 6}, {7, 8} } };
+    total++; passed += Test("NDROW int 3D short middle row",
+        ndrowInt3Middle[0][1][1] + ndrowInt3Middle[1][0][0] * 10, 50);
+    int[2][2][2] ndrowInt3Last = { { {1, 2}, {3, 4} }, { {5, 6}, {7} } };
+    total++; passed += Test("NDROW int 3D short last row",
+        ndrowInt3Last[1][1][1] + ndrowInt3Last[1][0][0] * 10, 50);
+
+    char[2][2][2] ndrowChar3First = { { {'a'}, {'c', 'd'} }, { {'e', 'f'}, {'g', 'h'} } };
+    total++; passed += Test("NDROW char 3D short first row",
+        (int)ndrowChar3First[0][0][1] + (int)ndrowChar3First[0][1][0], 99);
+    char[2][2][2] ndrowChar3Middle = { { {'a', 'b'}, {'c'} }, { {'e', 'f'}, {'g', 'h'} } };
+    total++; passed += Test("NDROW char 3D short middle row",
+        (int)ndrowChar3Middle[0][1][1] + (int)ndrowChar3Middle[1][0][0], 101);
+    char[2][2][2] ndrowChar3Last = { { {'a', 'b'}, {'c', 'd'} }, { {'e', 'f'}, {'g'} } };
+    total++; passed += Test("NDROW char 3D short last row",
+        (int)ndrowChar3Last[1][1][1] + (int)ndrowChar3Last[1][0][0], 101);
+
+    double[2][2][2] ndrowDouble3First = { { {1.5}, {3.5, 4.5} }, { {5.5, 6.5}, {7.5, 8.5} } };
+    total++; passed += Test("NDROW double 3D short first row",
+        (int)(ndrowDouble3First[0][0][1] * 10.0 + ndrowDouble3First[0][1][0] * 10.0), 35);
+    double[2][2][2] ndrowDouble3Middle = { { {1.5, 2.5}, {3.5} }, { {5.5, 6.5}, {7.5, 8.5} } };
+    total++; passed += Test("NDROW double 3D short middle row",
+        (int)(ndrowDouble3Middle[0][1][1] * 10.0 + ndrowDouble3Middle[1][0][0] * 10.0), 55);
+    double[2][2][2] ndrowDouble3Last = { { {1.5, 2.5}, {3.5, 4.5} }, { {5.5, 6.5}, {7.5} } };
+    total++; passed += Test("NDROW double 3D short last row",
+        (int)(ndrowDouble3Last[1][1][1] * 10.0 + ndrowDouble3Last[1][0][0] * 10.0), 55);
+
+    i64[2][2][2] ndrowI643First = { { {1}, {3, 4} }, { {5, 6}, {7, 8} } };
+    total++; passed += Test("NDROW i64 3D short first row",
+        ndrowI643First[0][0][1] + ndrowI643First[0][1][0] * 10, (i64)30);
+    i64[2][2][2] ndrowI643Middle = { { {1, 2}, {3} }, { {5, 6}, {7, 8} } };
+    total++; passed += Test("NDROW i64 3D short middle row",
+        ndrowI643Middle[0][1][1] + ndrowI643Middle[1][0][0] * 10, (i64)50);
+    i64[2][2][2] ndrowI643Last = { { {1, 2}, {3, 4} }, { {5, 6}, {7} } };
+    total++; passed += Test("NDROW i64 3D short last row",
+        ndrowI643Last[1][1][1] + ndrowI643Last[1][0][0] * 10, (i64)50);
+
+    int[3][3] ndrowEmpty = { {}, {4, 5, 6}, {} };
+    total++; passed += Test("NDROW explicit empty rows",
+        ndrowEmpty[0][0] + ndrowEmpty[1][0] * 10 + ndrowEmpty[2][2] * 100, 40);
+    int[3][3] ndrowAllEmpty = { {}, {}, {} };
+    total++; passed += Test("NDROW all empty rows",
+        ndrowAllEmpty[0][0] + ndrowAllEmpty[1][1] + ndrowAllEmpty[2][2], 0);
+    int[2][2][2] ndrowEmpty3 = { {}, { {}, {7} } };
+    total++; passed += Test("NDROW empty 3D subarrays",
+        ndrowEmpty3[0][0][0] + ndrowEmpty3[1][0][0] + ndrowEmpty3[1][1][0], 7);
+
+    char[2][4] ndrowStringRows = { "ab", "cde" };
+    total++; passed += Test("NDROW local char string rows",
+        (int)ndrowStringRows[0][1] + (int)ndrowStringRows[1][2], 199);
+    total++; passed += Test("NDROW global nested rows",
+        ndrowGlobal[0][0] * 100 + ndrowGlobal[0][1] * 10 + ndrowGlobal[1][0], 124);
+    total++; passed += Test("NDROW global empty rows",
+        ndrowGlobalEmpty[0][0] + ndrowGlobalEmpty[1][0] * 10, 40);
+    total++; passed += Test("NDROW global 3D short rows",
+        ndrowGlobal3d[0][0][1] + ndrowGlobal3d[0][1][0] * 10
+            + ndrowGlobal3d[1][1][0] * 100, 730);
+    total++; passed += Test("NDROW global char string rows",
+        (int)ndrowGlobalStrings[0][1] + (int)ndrowGlobalStrings[1][2], 199);
+
+    NdrowDmi[2][2] ndrowDmi = { { {x = 1} }, { {x = 2} } };
+    total++; passed += Test("NDROW struct DMI row defaults",
+        ndrowDmi[0][0].x * 1000 + ndrowDmi[0][1].x * 100
+            + ndrowDmi[1][0].x * 10 + ndrowDmi[1][1].x, 1727);
+    NdrowPlain[2][2] ndrowPlain = { { {x = 1} }, { {x = 2} } };
+    total++; passed += Test("NDROW plain struct row zero fill",
+        ndrowPlain[0][0].x * 100 + ndrowPlain[0][1].x * 10 + ndrowPlain[1][0].x, 102);
+    ndrowOwnerDtors = 0;
+    {
+        NdrowOwner[2][2] ndrowOwners = { { {value = 1} }, { {value = 2} } };
+        total++; passed += Test("NDROW owning struct row mapping",
+            ndrowOwners[0][0].value * 100 + ndrowOwners[0][1].value * 10
+                + ndrowOwners[1][0].value, 102);
+        total++; passed += Test("NDROW owning struct default buffers are distinct",
+            ndrowOwners[0][0].s.data() != ndrowOwners[0][1].s.data()
+                && ndrowOwners[0][0].s.data() != ndrowOwners[1][0].s.data()
+                && ndrowOwners[0][0].s.data() != ndrowOwners[1][1].s.data()
+                && ndrowOwners[0][1].s.data() != ndrowOwners[1][0].s.data()
+                && ndrowOwners[0][1].s.data() != ndrowOwners[1][1].s.data()
+                && ndrowOwners[1][0].s.data() != ndrowOwners[1][1].s.data(), true);
+    }
+    total++; passed += Test("NDROW owning struct destroys all slots once", ndrowOwnerDtors, 4);
+    NdrowGridField ndrowHolder = { grid = { {1}, {4, 5, 6} } };
+    total++; passed += Test("NDROW array field nested short rows",
+        ndrowHolder.grid[0][1] + ndrowHolder.grid[1][0] * 10, 40);
+    int ndrowLoop = 0;
+    while (ndrowLoop < 2)
+    {
+        int[2][3] ndrowEach = { {1}, {4, 5, 6} };
+        total++; passed += Test("NDROW local rows reinitialize in loop",
+            ndrowEach[0][1] + ndrowEach[1][0] * 10, 40);
+        ndrowLoop++;
+    }
 
     // Accept set - identical on both binaries: an empty list on a primitive element is zero.
     FbaEmpty fbae;

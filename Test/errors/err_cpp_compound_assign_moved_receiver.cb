@@ -1,0 +1,226 @@
+import cpp "cpp_interop_strop.h";
+
+struct NativeCmpMove
+{
+    int value = 7;
+    NativeCmpMove operator-=(int amount) { value -= amount; return default; }
+    int f() { return value; }
+};
+struct NativeCmpMoveCall
+{
+    int value = 7;
+    int f() { return value; }
+};
+
+extern int main()
+{
+    // The rvalue-only declaration proves each move reaches the member && overload.
+    expect_error("use of moved variable 'memberPlus'") {
+        cppsopd.T455CmpMoveMember memberPlus = default;
+        (move memberPlus) += 1;
+        memberPlus.f();
+    }
+    expect_error("use of moved variable 'memberMinus'") {
+        cppsopd.T455CmpMoveMember memberMinus = default;
+        (move memberMinus) -= 1;
+        memberMinus.f();
+    }
+    expect_error("use of moved variable 'memberMultiply'") {
+        cppsopd.T455CmpMoveMember memberMultiply = default;
+        (move memberMultiply) *= 1;
+        memberMultiply.f();
+    }
+    expect_error("use of moved variable 'memberDivide'") {
+        cppsopd.T455CmpMoveMember memberDivide = default;
+        (move memberDivide) /= 1;
+        memberDivide.f();
+    }
+    expect_error("use of moved variable 'memberRemainder'") {
+        cppsopd.T455CmpMoveMember memberRemainder = default;
+        (move memberRemainder) %= 1;
+        memberRemainder.f();
+    }
+    expect_error("use of moved variable 'memberBitAnd'") {
+        cppsopd.T455CmpMoveMember memberBitAnd = default;
+        (move memberBitAnd) &= 1;
+        memberBitAnd.f();
+    }
+    expect_error("use of moved variable 'memberBitOr'") {
+        cppsopd.T455CmpMoveMember memberBitOr = default;
+        (move memberBitOr) |= 1;
+        memberBitOr.f();
+    }
+    expect_error("use of moved variable 'memberBitXor'") {
+        cppsopd.T455CmpMoveMember memberBitXor = default;
+        (move memberBitXor) ^= 1;
+        memberBitXor.f();
+    }
+    expect_error("use of moved variable 'memberLeftShift'") {
+        cppsopd.T455CmpMoveMember memberLeftShift = default;
+        (move memberLeftShift) <<= 1;
+        memberLeftShift.f();
+    }
+    expect_error("use of moved variable 'memberRightShift'") {
+        cppsopd.T455CmpMoveMember memberRightShift = default;
+        (move memberRightShift) >>= 1;
+        memberRightShift.f();
+    }
+
+    // Free rvalue-reference operator parameters already use the shared call move transfer.
+    expect_error("use of moved variable 'freePlus'") {
+        cppsopd.T455CmpMoveFree freePlus = default;
+        (move freePlus) += 1;
+        int value = freePlus.value;
+    }
+    expect_error("use of moved variable 'freeMinus'") {
+        cppsopd.T455CmpMoveFree freeMinus = default;
+        (move freeMinus) -= 1;
+        int value = freeMinus.value;
+    }
+    expect_error("use of moved variable 'freeMultiply'") {
+        cppsopd.T455CmpMoveFree freeMultiply = default;
+        (move freeMultiply) *= 1;
+        int value = freeMultiply.value;
+    }
+    expect_error("use of moved variable 'freeDivide'") {
+        cppsopd.T455CmpMoveFree freeDivide = default;
+        (move freeDivide) /= 1;
+        int value = freeDivide.value;
+    }
+    expect_error("use of moved variable 'freeRemainder'") {
+        cppsopd.T455CmpMoveFree freeRemainder = default;
+        (move freeRemainder) %= 1;
+        int value = freeRemainder.value;
+    }
+    expect_error("use of moved variable 'freeBitAnd'") {
+        cppsopd.T455CmpMoveFree freeBitAnd = default;
+        (move freeBitAnd) &= 1;
+        int value = freeBitAnd.value;
+    }
+    expect_error("use of moved variable 'freeBitOr'") {
+        cppsopd.T455CmpMoveFree freeBitOr = default;
+        (move freeBitOr) |= 1;
+        int value = freeBitOr.value;
+    }
+    expect_error("use of moved variable 'freeBitXor'") {
+        cppsopd.T455CmpMoveFree freeBitXor = default;
+        (move freeBitXor) ^= 1;
+        int value = freeBitXor.value;
+    }
+    expect_error("use of moved variable 'freeLeftShift'") {
+        cppsopd.T455CmpMoveFree freeLeftShift = default;
+        (move freeLeftShift) <<= 1;
+        int value = freeLeftShift.value;
+    }
+    expect_error("use of moved variable 'freeRightShift'") {
+        cppsopd.T455CmpMoveFree freeRightShift = default;
+        (move freeRightShift) >>= 1;
+        int value = freeRightShift.value;
+    }
+
+    // Cover the existing T455 nontrivial member fixture too; it returns void instead of K&.
+    expect_error("use of moved variable 'legacySource'") {
+        cppsopd.T455MemberTracked legacySource = default;
+        (move legacySource) -= 1;
+        legacySource -= 1;
+    }
+
+    expect_error("use of moved variable 'readSource'") {
+        cppsopd.T455CmpMoveMember readSource = default;
+        (move readSource) -= 1;
+        int value = readSource.value;
+    }
+    expect_error("use of moved variable 'callSource'") {
+        cppsopd.T455CmpMoveMember callSource = default;
+        (move callSource) -= 1;
+        callSource.f();
+    }
+    expect_error("use of moved variable 'moveAgainSource'") {
+        cppsopd.T455CmpMoveMember moveAgainSource = default;
+        (move moveAgainSource) -= 1;
+        (move moveAgainSource).f();
+    }
+    // The member-call route is the diagnostic oracle for the compound member receiver.
+    expect_error("use of moved variable 'methodSource'") {
+        cppsopd.T455CmpMoveMember methodSource = default;
+        (move methodSource).f();
+        methodSource.f();
+    }
+    // The free-operator route is the diagnostic oracle for free && parameters.
+    expect_error("use of moved variable 'freeCallSource'") {
+        cppsopd.T455CmpMoveFree freeCallSource = default;
+        (move freeCallSource) -= 1;
+        int value = freeCallSource.value;
+    }
+
+    // Native CFlat compound and method receivers already agree on moved-state reporting.
+    expect_error("use of moved variable 'nativeSource'") {
+        NativeCmpMove nativeSource = default;
+        (move nativeSource) -= 1;
+        nativeSource.f();
+    }
+    expect_error("use of moved variable 'nativeCallSource'") {
+        NativeCmpMoveCall nativeCallSource = default;
+        (move nativeCallSource).f();
+        nativeCallSource.f();
+    }
+
+    expect_error("use of moved variable 'constRefSource'") {
+        cppsopd.T455CmpMoveConstRef constRefSource = default;
+        (move constRefSource) /= 2;
+        constRefSource.f();
+    }
+
+    expect_error("use of moved variable 'fieldSource.item'") {
+        cppsopd.T455CmpMoveInPlaceHolder fieldSource = default;
+        (move fieldSource.item) -= 1;
+        fieldSource.item.f();
+    }
+
+    expect_error("use of moved variable 'arraySource[0]'") {
+        cppsopd.T455CmpMoveInPlace[1] arraySource;
+        (move arraySource[0]) -= 1;
+        arraySource[0].f();
+    }
+
+    expect_error("pointee of 'pointerSource' was moved") {
+        cppsopd.T455CmpMoveInPlace pointeeSource = default;
+        cppsopd.T455CmpMoveInPlace* pointerSource = &pointeeSource;
+        (move *pointerSource) -= 1;
+        pointerSource->f();
+    }
+    return 0;
+}
+
+expect_error("use of moved variable 'branchSource'") {
+    void movedInBothBranches(bool condition)
+    {
+        cppsopd.T455CmpMoveMember branchSource = default;
+        if (condition) { (move branchSource) -= 1; }
+        else { (move branchSource) -= 1; }
+        branchSource.f();
+    }
+}
+
+// The loop-carried moved use is diagnosed at the function-end dataflow pass.
+expect_error("use of moved variable 'loopSource' (moved on an earlier loop iteration)");
+void movedInLoop()
+{
+    cppsopd.T455CmpMoveMember loopSource = default;
+    int i = 0;
+    while (i < 2)
+    {
+        if (i > 0) loopSource.f();
+        (move loopSource) -= 1;
+        i += 1;
+    }
+}
+
+// This member-call route changed in r1 and agrees with the existing move-parameter rule.
+expect_error("pointee of 'r' was moved") {
+    int movedPointeeMemberCall(cppsopd.T455CmpMoveMember* r)
+    {
+        (move *r).f();
+        return r->f();
+    }
+}

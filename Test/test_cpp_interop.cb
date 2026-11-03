@@ -228,6 +228,9 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_defarg_trace.hpp";
+import cpp "library/cpp_mixs2.hpp";
+import cpp "library/cpp_interop_mixcond3.h";
 import cpp {"library/cpp_hdrglob_a.hpp", "library/cpp_hdrglob_b.hpp"};
 import cpp "library/cpp_hdrglob_r3_a.hpp";
 import cpp "library/cpp_hdrglob_r3_b.hpp";
@@ -3186,6 +3189,16 @@ int T513V10DeclProbe(bool k, int input)
     }
     return value * 10000 + t513V10Stats();
 }
+int T513V10DeclFalseArmProbe(bool k, int input)
+{
+    t513V10Reset();
+    int value = 0;
+    {
+        T513V10B result = k ? t513V10MakeB() : t513V10MakeA(input);
+        value = result.value;
+    }
+    return value * 10000 + t513V10Stats();
+}
 
 // T513 v11: return uses the function's sret slot for the same common-type result.
 T513V10B T513V11Return(bool k, int input)
@@ -3317,6 +3330,251 @@ int T513M2C05AfterRefProbe(bool k, int input)
 }
 T513V10A t513V10CflatMakeA(int input) { return T513V10A(input); }
 T513V10B t513V10CflatMakeB() { return T513V10B(20); }
+int T513V10MixcondOverload(T513V10B value) { return value.value; }
+int T513V10MixcondOverload(T513V10B value, int extra) { return 1000 + value.value + extra; }
+int T513V10MixcondTake(T513V10B value) { return value.value; }
+int T513V10MixcondFirst(T513V10B value, int extra) { return value.value + extra; }
+int T513V10MixcondNamed(int x, T513V10B value) { return x * 1000 + value.value; }
+int T513V10MixcondDefault(T513V10B value, int extra = 3) { return value.value + extra; }
+int t513V10Def(T513V10B b, int extra = 3) { return b.value + extra; }
+int t513V10DefCall(bool k) { return t513V10Def(k ? t513V10MakeA(11) : t513V10MakeB()); }
+
+int T513S2Take(t513s2.BUserDtor value, int extra = 3) { return value.value + extra; }
+int T513S2Choose(t513s2.BUserDtor value, int extra = 3) { return 1000 + value.value + extra; }
+int T513S2Choose(t513s2.A value, int extra = 9) { return 2000 + value.value + extra; }
+int T513S2Two(t513s2.BUserDtor value, int x = 3, int y = 4)
+{
+    return value.value + x + y;
+}
+int T513S2Prefix(int lead, t513s2.BUserDtor value, int extra = 3)
+{
+    return lead + value.value + extra;
+}
+struct T513S2Host
+{
+    int take(t513s2.BUserDtor value, int extra = 3) { return value.value + extra; }
+};
+struct T513S2Box
+{
+    int result = 0;
+    T513S2Box(t513s2.BUserDtor value, int extra = 3) { result = value.value + extra; }
+};
+int T513S2Generic<T>(T value, int extra = 3) { return value.value + extra; }
+interface T513S2Iface { int take(t513s2.BUserDtor value, int extra = 3); };
+class T513S2Impl : T513S2Iface
+{
+    int take(t513s2.BUserDtor value, int extra = 3) { return value.value + extra; }
+};
+int T513S2NoUserTake(t513s2.BNoUserDtor value, int extra = 3)
+{
+    return value.value + extra;
+}
+int T513S2Check(int value, int expected, int expectedTrace)
+{
+    return value == expected && t513s2.trace_code() == expectedTrace
+        && t513s2.live_count() == 0 ? 0 : 1;
+}
+
+int T513V10MixcondOverloadProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondOverload(k ? t513V10MakeA(11) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondBinaryProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondTake(k ? t513V10MakeA(11) : t513V10MakeB()) * 2;
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondUnaryProbe(bool k)
+{
+    t513V10Reset();
+    int value = -T513V10MixcondTake(k ? t513V10MakeA(11) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondCastProbe(bool k)
+{
+    t513V10Reset();
+    i64 wide = (i64)T513V10MixcondTake(k ? t513V10MakeA(11) : t513V10MakeB());
+    int value = (int)wide;
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFirstProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondFirst(k ? t513V10MakeA(11) : t513V10MakeB(), 5);
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondNamedProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondNamed(x: 1, value: k ? t513V10MakeA(11) : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseASimpleProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(11));
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseABinaryProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(11)) * 2;
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseAUnaryProbe(bool k)
+{
+    t513V10Reset();
+    int value = -T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(11));
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseACastProbe(bool k)
+{
+    t513V10Reset();
+    i64 wide = (i64)T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(11));
+    int value = (int)wide;
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseAOverloadProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondOverload(k ? t513V10MakeB() : t513V10MakeA(11));
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseAFirstProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondFirst(k ? t513V10MakeB() : t513V10MakeA(11), 5);
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseANamedProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondNamed(x: 1, value: k ? t513V10MakeB() : t513V10MakeA(11));
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondTwo(T513V10B first, T513V10B second)
+{
+    return first.value * 1000 + second.value;
+}
+int T513V10MixcondFalseATwoProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondTwo(t513V10MakeB(),
+        k ? t513V10MakeB() : t513V10MakeA(11));
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseACflatFactoryProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondTake(k ? t513V10MakeB() : t513V10CflatMakeA(11));
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondTraceLive(int trace)
+{
+    int live = 0;
+    while (trace > 0)
+    {
+        int event = trace % 10;
+        if (event == 4 || event == 7) live -= 1;
+        else live += 1;
+        trace /= 10;
+    }
+    return live;
+}
+int T513V10MixcondNestedCallFalseArmProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(
+        T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(3))));
+    int trace = t513V10Stats();
+    int expectedTrace = 16167474;
+    if const (__WINDOWS__) { expectedTrace = 16471647; }
+    return value == 203 && trace == expectedTrace
+        && T513V10MixcondTraceLive(trace) == 0 ? 1 : -1;
+}
+int T513V10MixcondNestedCallTrueArmProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondTake(k ? t513V10MakeA(
+        T513V10MixcondTake(k ? t513V10MakeA(1) : t513V10MakeB()))
+        : t513V10MakeB()) * 2;
+    int trace = t513V10Stats();
+    int expectedTrace = 16167474;
+    if const (__WINDOWS__) { expectedTrace = 16471647; }
+    return value == 402 && trace == expectedTrace
+        && T513V10MixcondTraceLive(trace) == 0 ? 1 : -1;
+}
+int T513V10MixcondFalseAEarlyProbe(bool k)
+{
+    t513V10Reset();
+    int first = T513V10MixcondTake(k ? t513V10MakeA(11) : t513V10MakeB()) * 2;
+    int second = T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(11)) * 2;
+    return (first + second) * 10000 + t513V10Stats();
+}
+int T513V10MixcondFalseALoopProbe(bool k)
+{
+    int total = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        t513V10Reset();
+        int value = T513V10MixcondTake(k ? t513V10MakeB() : t513V10MakeA(i + 1));
+        int expected = 101 + i;
+        int trace = 1674;
+        if const (__WINDOWS__) { trace = 1647; }
+        if (value != expected || t513V10Stats() != trace) return -1;
+        total += value;
+    }
+    return total;
+}
+int T513V10MixcondExplicitDefaultProbe(bool k)
+{
+    t513V10Reset();
+    int value = T513V10MixcondDefault(k ? t513V10MakeB() : t513V10MakeA(11), 3);
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondLvalueCflatProbe(bool k)
+{
+    t513V10Reset();
+    T513V10A a = t513V10MakeA(3);
+    int value = T513V10MixcondTake(k ? a : t513V10MakeB());
+    return value * 10000 + t513V10Stats();
+}
+int T513V10MixcondLvalueCflatFalseProbe(bool k)
+{
+    t513V10Reset();
+    T513V10A a = t513V10MakeA(3);
+    int value = T513V10MixcondTake(k ? t513V10MakeB() : a);
+    return value * 10000 + t513V10Stats();
+}
+int T513M3LvalueCppProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    t513mix.A a = t513mix.mkA(3);
+    int value = t513mix.ctakeBV(k ? a : t513mix.mkBV(20));
+    return value * 10000 + t513mix.t513M3Stats();
+}
+int T513M3LvalueCppFalseProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    t513mix.A a = t513mix.mkA(3);
+    int value = t513mix.ctakeBV(k ? t513mix.mkBV(20) : a);
+    return value * 10000 + t513mix.t513M3Stats();
+}
+int T513M3FalseAByValueProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    int value = t513mix.ctakeBV(k ? t513mix.mkBV(20) : t513mix.mkA(11));
+    return value * 10000 + t513mix.t513M3Stats();
+}
+int T513M3FalseAConstRefProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    int value = t513mix.ctakeBVR(k ? t513mix.mkBV(20) : t513mix.mkA(11));
+    return value * 10000 + t513mix.t513M3Stats();
+}
 int T513M2C14Probe(bool k, bool j)
 {
     t513V10Reset();
@@ -3423,6 +3681,75 @@ int t47RefmemEarlyReturn()
     return inside * 100 + (holder.c.v == 5 ? 0 : 1);
 }
 
+int DefArgRoundOne(cppdefarg.Trace v, int e = 3)
+{
+    cppdefarg.mark('[');
+    return v.get() + e;
+}
+int DefArgRoundTwo(cppdefarg.Trace v, int e = 3, int f = 4)
+{
+    cppdefarg.mark('[');
+    return v.get() + e + f;
+}
+int DefArgRoundGeneric<T>(T v, int e = 3)
+{
+    cppdefarg.mark('[');
+    return v.get() + e;
+}
+class DefArgRoundHost
+{
+    int base = 10;
+    int instance_default(cppdefarg.Trace v, int e = 3)
+    {
+        cppdefarg.mark('[');
+        return base + v.get() + e;
+    }
+    static int stat(cppdefarg.Trace v, int e = 3)
+    {
+        cppdefarg.mark('[');
+        return v.get() + e;
+    }
+};
+interface DefArgRoundIface { int m(cppdefarg.Trace v, int e = 3); };
+class DefArgRoundIfaceImpl : DefArgRoundIface
+{
+    int m(cppdefarg.Trace v, int e) { cppdefarg.mark('['); return v.get() + e; }
+};
+int DefArgRoundIfacePrvalue(DefArgRoundIface i)
+{
+    return i.m(cppdefarg.make(20));
+}
+int DefArgRoundIfaceLvalue(DefArgRoundIface i)
+{
+    cppdefarg.Trace v = cppdefarg.make(20);
+    return i.m(v);
+}
+
+int defArgRoundNativeDtors = 0;
+struct DefArgRoundNative
+{
+    int value = 0;
+    ~DefArgRoundNative() { defArgRoundNativeDtors++; }
+};
+DefArgRoundNative DefArgRoundMakeNative(int value)
+{
+    DefArgRoundNative local = default;
+    local.value = value;
+    return move local;
+}
+int DefArgRoundNativeOne(DefArgRoundNative v, int e = 3)
+{
+    return v.value + e;
+}
+int DefArgRoundNativeTwo(DefArgRoundNative v, int e = 3, int f = 4)
+{
+    return v.value + e + f;
+}
+int DefArgRoundNativeMove(move DefArgRoundNative v, int e = 3)
+{
+    return v.value + e;
+}
+
 interface IOvlRound1DerivedPointer
 {
     int f(cppi.ConstPointerRankValue* value);
@@ -3434,8 +3761,55 @@ class OvlRound1DerivedPointer : IOvlRound1DerivedPointer
     int f(cppi.ConstPointerRank* value) { return 2; }
 };
 
+int AddrTempRefByValue(cppi.RefCell value)
+{
+    return cppi.address_temp_probe(&value);
+}
+int AddrTempRefConstAlias(const alias cppi.RefCell value)
+{
+    return cppi.address_temp_probe(&value);
+}
+
 extern int main()
 {
+    // Address-of preserves lvalues through fields, references, pointers, arrays and joins.
+    cppi.RefCell addrTempLocal = default;
+    addrTempLocal.v = 4;
+    if (cppi.address_temp_probe(&addrTempLocal) != 30004) return 54901;
+    cppi.RefCell addrTempOther = default;
+    addrTempOther.v = 9;
+    bool addrTempChooseOther = false;
+    if (cppi.address_temp_probe(&(addrTempChooseOther
+        ? addrTempLocal : addrTempOther)) != 30009) return 54918;
+    cppi.RefBox addrTempHolder = default;
+    addrTempHolder.c.v = 8;
+    if (cppi.address_temp_probe(&addrTempHolder.c) != 30008) return 54902;
+    if (cppi.address_temp_probe(&cppi.ref_cell()) != 30770) return 54903;
+    cppi.RefCell addrTempByValue = default;
+    addrTempByValue.v = 20;
+    if (AddrTempRefByValue(addrTempByValue) != 30020) return 54904;
+    cppi.RefCell* addrTempPointer = &addrTempLocal;
+    if (cppi.address_temp_probe(&*addrTempPointer) != 30004) return 54905;
+    cppi.RefCell[2] addrTempArray = default;
+    addrTempArray[1].v = 40;
+    if (cppi.address_temp_probe(&addrTempArray[1]) != 30040) return 54906;
+    if (cppi.address_temp_probe(&cppi.ref_cell_other()) != 30880) return 54907;
+    cppi.RefBox* addrTempHolderPointer = &addrTempHolder;
+    if (cppi.address_temp_probe(&(*addrTempHolderPointer).c) != 30008) return 54908;
+    if (AddrTempRefConstAlias(addrTempLocal) != 40004) return 54909;
+    if (cppi.address_temp_probe(&(addrTempChooseOther
+        ? cppi.ref_cell() : cppi.ref_cell_other())) != 30880) return 54910;
+    cppi.Tracked addrTempAssignLeft = cppi.Tracked(1);
+    cppi.Tracked addrTempAssignRight = cppi.Tracked(9);
+    cppi.Tracked* addrTempAssignResult = &(addrTempAssignLeft = addrTempAssignRight);
+    if (cppi.address_temp_probe(addrTempAssignResult) != 60009) return 54911;
+    if (cppi.address_temp_probe(&cppi.address_temp_box(1).p->value) != 10077) return 54912;
+    if (cppi.address_temp_probe(&*cppi.address_temp_box(1).p) != 30077) return 54913;
+    if (cppi.address_temp_probe(&cppi.address_temp_box(1).p[0]) != 30077) return 54914;
+    if (cppi.address_temp_probe(&cppi.address_temp_box(1).p->p) != 50001) return 54915;
+    if (cppi.address_temp_probe(&cppi.address_temp_holder(3).rf) != 30003) return 54916;
+    if (cppi.address_temp_probe(&cppi.address_temp_holder(3).rf.value) != 10003) return 54917;
+
     // A C++ Derived* still binds the Base* slot through direct and interface dispatch.
     cppi.ConstPointerRankDerived ovlDerived = default;
     cppi.ConstPointerRankDerived* ovlDerivedPtr = &ovlDerived;
@@ -5089,11 +5463,124 @@ extern int main()
     // T513 v10-v12: value and ctor/dtor sequence match clang++ for both selected arms.
     if (T513V10DeclProbe(true, 11) != 1111647) return 95171;
     if (T513V10DeclProbe(false, 11) != 200057) return 95172;
+    if (T513V10DeclProbe(true, 12) != 1121647) return 95240;
+    if (T513V10DeclFalseArmProbe(false, 12) != 1121647) return 95241;
     if (T513V11Probe(true, 11) != 1111647) return 95173;
     if (T513V11Probe(false, 11) != 200057) return 95174;
+    if (T513V11Probe(true, 12) != 1121647) return 95242;
+    // MIXS2: default wrappers now use the same caller-owned conversion path as full calls.
+    int mixs2TrueTrace = 1674;
+    int mixs2NoUserTrace = 15674;
+    if const (__WINDOWS__) {
+        mixs2TrueTrace = 1647;
+        mixs2NoUserTrace = 15647;
+    }
+    t513V10Reset();
+    if (t513V10DefCall(true) != 114 || t513V10Stats() != mixs2TrueTrace) return 95245;
+    t513V10Reset();
+    if (t513V10DefCall(false) != 23 || t513V10Stats() != 57) return 95246;
+    int mixs2Value = 0;
+    t513s2.reset();
+    mixs2Value = T513S2Take(true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 114, mixs2TrueTrace)) return 95247;
+    t513s2.reset();
+    mixs2Value = T513S2Choose(true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 1114, mixs2TrueTrace)) return 95248;
+    t513s2.reset();
+    mixs2Value = T513S2Two(true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 118, mixs2TrueTrace)) return 95249;
+    t513s2.reset();
+    mixs2Value = T513S2Prefix(2, true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 116, mixs2TrueTrace)) return 95250;
+    t513s2.reset();
+    T513S2Host mixs2Host = default;
+    mixs2Value = mixs2Host.take(true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 114, mixs2TrueTrace)) return 95251;
+    t513s2.reset();
+    T513S2Box mixs2Box = T513S2Box(true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Box.result, 114, mixs2TrueTrace)) return 95252;
+    t513s2.reset();
+    mixs2Value = T513S2Generic<t513s2.BUserDtor>(
+        true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 114, mixs2TrueTrace)) return 95253;
+    t513s2.reset();
+    T513S2Impl mixs2Impl = default;
+    T513S2Iface mixs2Iface = mixs2Impl;
+    mixs2Value = mixs2Iface.take(true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 114, mixs2TrueTrace)) return 95254;
+    t513s2.reset();
+    mixs2Value = T513S2Take(true ? t513s2.make_a(11) : t513s2.make_user(), 3);
+    if (T513S2Check(mixs2Value, 114, mixs2TrueTrace)) return 95255;
+    t513s2.reset();
+    mixs2Value = t513s2.const_ref_take(true ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 114, mixs2TrueTrace)) return 95256;
+    t513s2.reset();
+    mixs2Value = T513S2Take(false ? t513s2.make_a(11) : t513s2.make_user());
+    if (T513S2Check(mixs2Value, 23, 87)) return 95257;
+    t513s2.reset();
+    mixs2Value = T513S2Take(true ? t513s2.make_user() : t513s2.make_a(11));
+    if (T513S2Check(mixs2Value, 23, 87)) return 95258;
+    t513s2.reset();
+    mixs2Value = T513S2Take(false ? t513s2.make_user() : t513s2.make_a(11));
+    if (T513S2Check(mixs2Value, 114, mixs2TrueTrace)) return 95259;
+    t513s2.reset();
+    mixs2Value = T513S2NoUserTake(true ? t513s2.make_a(11) : t513s2.make_no_user());
+    if (T513S2Check(mixs2Value, 114, mixs2NoUserTrace)) return 95260;
+    // MIXCOND3: caller-owned conditional conversions match clang through these contexts.
+    // MS ABI: A dies inside B(A), before B (clang-cl 1647); Itanium ends A last (1674).
+    int t513V10MixTrueTrace = 1674;
+    if const (__WINDOWS__) { t513V10MixTrueTrace = 1647; }
+    if (T513V10MixcondOverloadProbe(true) != 111 * 10000 + t513V10MixTrueTrace
+        || T513V10MixcondOverloadProbe(false) != 200057) return 95210;
+    if (T513V10MixcondBinaryProbe(true) != 222 * 10000 + t513V10MixTrueTrace
+        || T513V10MixcondBinaryProbe(false) != 400057) return 95211;
+    if (T513V10MixcondUnaryProbe(true) != -111 * 10000 + t513V10MixTrueTrace
+        || T513V10MixcondUnaryProbe(false) != -199943) return 95212;
+    if (T513V10MixcondCastProbe(true) != 111 * 10000 + t513V10MixTrueTrace
+        || T513V10MixcondCastProbe(false) != 200057) return 95213;
+    if (T513V10MixcondFirstProbe(true) != 116 * 10000 + t513V10MixTrueTrace
+        || T513V10MixcondFirstProbe(false) != 250057) return 95214;
+    if (T513V10MixcondNamedProbe(true) != 1111 * 10000 + t513V10MixTrueTrace
+        || T513V10MixcondNamedProbe(false) != 10200057) return 95215;
     // MSVC destroys the by-value A parameter inside B(A), before B's call-argument destruction.
     int t513V12TrueExpected = 1111674;
     if const (__WINDOWS__) { t513V12TrueExpected = 1111647; }
+    int t513V10FalseTrace = t513V12TrueExpected % 10000;
+    if (T513V10MixcondFalseASimpleProbe(false) != 1110000 + t513V10FalseTrace) return 95217;
+    if (T513V10MixcondFalseABinaryProbe(false) != 2220000 + t513V10FalseTrace) return 95218;
+    if (T513V10MixcondFalseAUnaryProbe(false) != -1110000 + t513V10FalseTrace) return 95219;
+    if (T513V10MixcondFalseACastProbe(false) != 1110000 + t513V10FalseTrace) return 95220;
+    if (T513V10MixcondFalseAOverloadProbe(false) != 1110000 + t513V10FalseTrace) return 95221;
+    if (T513V10MixcondFalseAFirstProbe(false) != 1160000 + t513V10FalseTrace) return 95222;
+    if (T513V10MixcondFalseANamedProbe(false) != 11110000 + t513V10FalseTrace) return 95223;
+    int t513V10FalseTwoTrace = 516747;
+    if const (__WINDOWS__) { t513V10FalseTwoTrace = 516477; }
+    if (T513V10MixcondFalseATwoProbe(false) != 201110000 + t513V10FalseTwoTrace) return 95224;
+    if (T513M3FalseAByValueProbe(false) != 1110000 + t513V10FalseTrace
+        || T513M3FalseAConstRefProbe(false) != 1110000 + t513V10FalseTrace) return 95225;
+    if (T513V10MixcondFalseACflatFactoryProbe(false) != 1110000 + t513V10FalseTrace) return 95226;
+    int t513V10FalseEarlyTrace = 571674;
+    if const (__WINDOWS__) { t513V10FalseEarlyTrace = 571647; }
+    if (T513V10MixcondFalseAEarlyProbe(false) != 2620000 + t513V10FalseEarlyTrace) return 95227;
+    if (T513V10MixcondFalseALoopProbe(false) != 203
+        || t513V10Stats() != t513V10FalseTrace) return 95228;
+    if (T513V10MixcondExplicitDefaultProbe(false) != 1140000 + t513V10FalseTrace) return 95229;
+    if (T513V10MixcondNestedCallFalseArmProbe(false) != 1) return 95236;
+    if (T513V10MixcondNestedCallTrueArmProbe(true) != 1) return 95237;
+    int t513V10LvalueExpected = 1042674;
+    int t513V10LvalueFullTrace = 126744;
+    if const (__WINDOWS__) {
+        t513V10LvalueExpected = 1042647;
+        t513V10LvalueFullTrace = 126474;
+    }
+    if (T513V10MixcondLvalueCflatProbe(true) != t513V10LvalueExpected
+        || t513V10Stats() != t513V10LvalueFullTrace) return 95231;
+    if (T513V10MixcondLvalueCflatFalseProbe(false) != t513V10LvalueExpected
+        || t513V10Stats() != t513V10LvalueFullTrace) return 95233;
+    int t513M3LvalueExpected = 1042674;
+    if const (__WINDOWS__) { t513M3LvalueExpected = 1042647; }
+    if (T513M3LvalueCppProbe(true) != t513M3LvalueExpected) return 95234;
+    if (T513M3LvalueCppFalseProbe(false) != t513M3LvalueExpected) return 95235;
     if (T513V12Probe(true, 11) != t513V12TrueExpected) return 95175;
     if (T513V12Probe(false, 11) != 200057) return 95176;
     // By-value B(A): MSVC destroys A inside B(A), so A dies before the callee's B (clang-cl 1647).
@@ -7344,6 +7831,95 @@ extern int main()
     // so the enumerator can be written the way C++ writes it instead of as a bare integer.
     if (cppi.Mode.On != 1)                       return 342;
     if (cppi.mode_value(cppi.Mode.On) != 10)     return 343;
+
+    // DEFARG: prefix wrappers must forward the original C++ parameter slot, with the same
+    // construction trace and live count as a direct call with the defaults supplied.
+    int defArgBase = cppdefarg.live_count();
+    cppdefarg.reset_trace();
+    int defArgValue = DefArgRoundOne(cppdefarg.make(20));
+    if (defArgValue != 23 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86100;
+
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = DefArgRoundTwo(cppdefarg.make(20));
+    if (defArgValue != 27 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86101;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = DefArgRoundTwo(cppdefarg.make(20), 9);
+    if (defArgValue != 33 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86102;
+
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    {
+        cppdefarg.Trace defArgLocal = cppdefarg.make(20);
+        defArgValue = DefArgRoundOne(defArgLocal);
+    }
+    if (defArgValue != 23 || !cppdefarg.trace_is("bp[yy")
+        || cppdefarg.live_count() != defArgBase) return 86103;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    {
+        cppdefarg.Trace defArgLocal = cppdefarg.make(20);
+        defArgValue = DefArgRoundOne(move defArgLocal);
+    }
+    if (defArgValue != 23 || !cppdefarg.trace_is("bm[yy")
+        || cppdefarg.live_count() != defArgBase) return 86104;
+
+    DefArgRoundHost defArgHost;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = defArgHost.instance_default(cppdefarg.make(20));
+    if (defArgValue != 33 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86105;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = DefArgRoundHost.stat(cppdefarg.make(20));
+    if (defArgValue != 23 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86106;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = DefArgRoundOne(v: cppdefarg.make(20));
+    if (defArgValue != 23 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86107;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = DefArgRoundGeneric(cppdefarg.make(20));
+    if (defArgValue != 23 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86108;
+
+    int defArgNativeBase = defArgRoundNativeDtors;
+    defArgValue = DefArgRoundNativeOne(DefArgRoundMakeNative(20));
+    if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86109;
+    defArgNativeBase = defArgRoundNativeDtors;
+    {
+        DefArgRoundNative defArgLocal = default;
+        defArgLocal.value = 20;
+        defArgValue = DefArgRoundNativeOne(defArgLocal);
+    }
+    if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86110;
+    defArgNativeBase = defArgRoundNativeDtors;
+    {
+        DefArgRoundNative defArgLocal = default;
+        defArgLocal.value = 20;
+        defArgValue = DefArgRoundNativeMove(move defArgLocal);
+    }
+    if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86111;
+    defArgNativeBase = defArgRoundNativeDtors;
+    defArgValue = DefArgRoundNativeTwo(DefArgRoundMakeNative(20));
+    if (defArgValue != 27 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86112;
+    defArgNativeBase = defArgRoundNativeDtors;
+    {
+        DefArgRoundNative defArgLocal = default;
+        defArgLocal.value = 20;
+        defArgValue = DefArgRoundNativeTwo(defArgLocal, 9);
+    }
+    if (defArgValue != 33 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86113;
+
+    // Interface default dispatch must preserve the value, trace, and lifetime of a by-value C++ class.
+    DefArgRoundIfaceImpl defArgIfaceImpl;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = DefArgRoundIfacePrvalue(defArgIfaceImpl);
+    if (defArgValue != 23 || !cppdefarg.trace_is("b[y")
+        || cppdefarg.live_count() != defArgBase) return 86114;
+    defArgBase = cppdefarg.live_count(); cppdefarg.reset_trace();
+    defArgValue = DefArgRoundIfaceLvalue(defArgIfaceImpl);
+    if (defArgValue != 23 || !cppdefarg.trace_is("bp[yy")
+        || cppdefarg.live_count() != defArgBase) return 86115;
 
     // ---- nontrivial C++ class lifetime ----------------------------------------------------------
     // cppi.Tracked increments an exported counter in every special member, so each check below

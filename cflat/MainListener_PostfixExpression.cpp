@@ -5569,6 +5569,43 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // can reject it when invoked outside the owning struct's own methods.
                                     namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
                                     namedVar.FieldName        = primaryIdentifier;
+                                    const bool fieldIsPointer = fieldType.Pointer || fieldType.ElemPointer
+                                        || fieldType.PointerDepth > 0;
+                                    const bool fieldIsReference = fieldType.IsCxxRef()
+                                        || fieldType.IsRvalueRef;
+                                    const bool parentIsPointer = structVar.TypeAndValue.ValuePointerDepth() >= 1
+                                        || structVar.TypeAndValue.IsCxxRefToPointer;
+                                    const bool parentIsPrvalueObject = !parentIsPointer
+                                        && !structVar.TypeAndValue.IsCxxRef()
+                                        && (IsCxxTemporaryPrvalue(structVar)
+                                            || structVar.IsCxxPrvalueSubobject
+                                            || structVar.IsCxxPrvaluePointerSubobject);
+                                    if (parentIsPrvalueObject && !fieldIsReference)
+                                    {
+                                        const std::string ownerType =
+                                            (structVar.IsCxxPrvalueSubobject
+                                                || structVar.IsCxxPrvaluePointerSubobject)
+                                            ? structVar.CxxPrvalueOwnerType
+                                            : structVar.TypeAndValue.TypeName;
+                                        if (Compiler(ctx)->IsCxxRecord(
+                                                Compiler(ctx)->ResolveTypeAlias(ownerType)))
+                                        {
+                                            namedVar.CxxPrvalueOwnerType = ownerType;
+                                            if (fieldIsPointer)
+                                            {
+                                                ClearCxxPrvalueProvenance(namedVar);
+                                                namedVar.IsCxxPrvaluePointerSubobject = true;
+                                                namedVar.CxxPrvalueOwnerType = ownerType;
+                                            }
+                                            else
+                                            {
+                                                namedVar.IsCxxPrvalueSubobject = true;
+                                                namedVar.IsCxxPrvaluePointerSubobject = false;
+                                            }
+                                        }
+                                        else ClearCxxPrvalueProvenance(namedVar);
+                                    }
+                                    else ClearCxxPrvalueProvenance(namedVar);
                                     namedVar.MovePathHasDynamicIndex = structVar.MovePathHasDynamicIndex;
                                     namedVar.MovePathKey = structVar.MovePathHasDynamicIndex
                                         ? std::string()
@@ -6805,6 +6842,41 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                 namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
                                 namedVar.FieldName = "_ptr";
+                                const bool bufFieldIsPointer = bufField.Pointer || bufField.ElemPointer
+                                    || bufField.PointerDepth > 0;
+                                const bool parentIsPointer = structVar.TypeAndValue.ValuePointerDepth() >= 1
+                                    || structVar.TypeAndValue.IsCxxRefToPointer;
+                                const bool parentIsPrvalueObject = !parentIsPointer
+                                    && !structVar.TypeAndValue.IsCxxRef()
+                                    && (IsCxxTemporaryPrvalue(structVar)
+                                        || structVar.IsCxxPrvalueSubobject
+                                        || structVar.IsCxxPrvaluePointerSubobject);
+                                if (parentIsPrvalueObject && !bufField.IsCxxRef()
+                                    && !bufField.IsRvalueRef)
+                                {
+                                    const std::string ownerType =
+                                        (structVar.IsCxxPrvalueSubobject
+                                            || structVar.IsCxxPrvaluePointerSubobject)
+                                        ? structVar.CxxPrvalueOwnerType
+                                        : structVar.TypeAndValue.TypeName;
+                                    if (Compiler(ctx)->IsCxxRecord(
+                                            Compiler(ctx)->ResolveTypeAlias(ownerType)))
+                                    {
+                                        if (bufFieldIsPointer)
+                                        {
+                                            ClearCxxPrvalueProvenance(namedVar);
+                                            namedVar.IsCxxPrvaluePointerSubobject = true;
+                                        }
+                                        else
+                                        {
+                                            namedVar.IsCxxPrvalueSubobject = true;
+                                            namedVar.IsCxxPrvaluePointerSubobject = false;
+                                        }
+                                        namedVar.CxxPrvalueOwnerType = ownerType;
+                                    }
+                                    else ClearCxxPrvalueProvenance(namedVar);
+                                }
+                                else ClearCxxPrvalueProvenance(namedVar);
                                 // namedVar is now the `_ptr` array-view (Pointer=true): the operator[]
                                 // guard below skips and the IsArrayView subscript branch tags the noalias
                                 // scope from the receiver origin.
@@ -7049,6 +7121,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
+                            // Keep inner dimensions only while the indexed element is another array.
+                            if (!llvm::isa<llvm::ArrayType>(namedVar.BaseType))
+                                namedVar.TypeAndValue.ConstInnerDimensions.clear();
                             namedVar.TypeAndValue.IsFlexibleArrayMember = false;
                             namedVar.TypeAndValue.IsZeroLengthArrayMember = false;
                             namedVar.FieldPathThroughPointer = true;
@@ -7120,6 +7195,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
                             namedVar.BaseType = elementType;
                             namedVar.TypeAndValue = elementTypeAndValue;
+                            ClearCxxPrvalueProvenance(namedVar);
                         }
                         else
                         {
@@ -11898,9 +11974,33 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         ? argumentExpression->conditionalExpression() : nullptr;
                                     const bool isConditionalArgument = conditionalArgument != nullptr
                                         && conditionalArgument->Question() != nullptr;
+                                    bool priorArgsHaveValidConversions = true;
+                                    const size_t priorArgOffset = arguments.size() >= argIdx
+                                        ? arguments.size() - argIdx : 0;
+                                    if (funcSym != nullptr)
+                                        for (size_t prior = 0; prior < argIdx
+                                            && prior + priorArgOffset < arguments.size(); ++prior)
+                                        {
+                                            const int64_t parameterIndex = declaredIdx[prior];
+                                            if (parameterIndex < 0
+                                                || static_cast<size_t>(parameterIndex)
+                                                    >= funcSym->Parameters.size())
+                                                continue;
+                                            const auto& priorArgument =
+                                                arguments[prior + priorArgOffset];
+                                            const auto& priorParameter =
+                                                funcSym->Parameters[static_cast<size_t>(parameterIndex)];
+                                            if (Compiler(ctx)->ClassifyScalarArgConversion(
+                                                    priorArgument, priorParameter)
+                                                    == LLVMBackend::ScalarArgConversion::Narrow
+                                                || Compiler(ctx)->IsImplicitIntegerPointeePointerConversion(
+                                                    priorArgument.TypeAndValue, priorParameter))
+                                                priorArgsHaveValidConversions = false;
+                                        }
                                     if (ternaryCallSink == nullptr && isConditionalArgument
                                         && funcSym != nullptr && funcSym->Function != nullptr
                                         && !funcSym->Variadic && argIdx + 1 == namedArgCtx.size()
+                                        && priorArgsHaveValidConversions
                                         && !ternaryLongerOverload
                                         && !CallUnderOperatorAncestor(ctx)
                                         && declaredIdx[argIdx] >= 0
@@ -12059,6 +12159,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         ternaryCallSinkReturnTypeScope(
                                             cxxTernaryCallSinkReturnType_,
                                             ternaryCallSinkReturnType);
+                                    llvm::SaveAndRestore<bool> ternaryCallPrefixIncompatibleScope(
+                                        cxxTernaryCallPrefixIncompatible_,
+                                        !priorArgsHaveValidConversions);
                                     std::optional<DeclExpectedTypeScope> argExpectedScope;
                                     argExpectedScope.emplace(&declExpectedType, ternaryArgDest, true);
                                     CallArgumentScope callArgumentScope(
