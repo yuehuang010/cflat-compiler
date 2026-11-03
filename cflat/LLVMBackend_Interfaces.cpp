@@ -3209,11 +3209,16 @@ bool LLVMBackend::EnumerateInterfaceImplementors(const std::string& ifaceNameIn,
         if (ifaceName.empty() || !IsInterfaceType(ifaceName)) return false;
         if (InterfaceImplementorSetIsUncertain(ifaceName))
         {
+            // An instance inherits its template's uncertainty, so test the name that carries it
+            // (a core generic class base clause marks only the template when core is parsed).
+            std::string uncertainName = ifaceName;
+            if (uncertainInterfaceImpls.count(uncertainName) == 0)
+                uncertainName = std::string(MangledBase(ifaceName));
             bool onlyGenericClassUncertainty = allowKnownGenericClassInstances
                 && importCompileDepth_ == 0
-                && uncertainInterfaceImpls.count(ifaceName) > 0
-                && uncertainGenericClassInterfaceImpls_.count(ifaceName) > 0
-                && uncertainOtherInterfaceImpls_.count(ifaceName) == 0;
+                && uncertainInterfaceImpls.count(uncertainName) > 0
+                && uncertainGenericClassInterfaceImpls_.count(uncertainName) > 0
+                && uncertainOtherInterfaceImpls_.count(uncertainName) == 0;
             if (!onlyGenericClassUncertainty) return false;
         }
         std::unordered_set<std::string> seen;

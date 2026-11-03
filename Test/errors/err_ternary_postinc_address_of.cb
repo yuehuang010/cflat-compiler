@@ -1,0 +1,32 @@
+// MIX21: `&` of a `?:` needs both arms to be lvalues; a postfix arm, a literal or a call result is a prvalue.
+int m21Call()
+{
+    return 7;
+}
+
+extern int main()
+{
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        int i = 1;
+        int j = 4;
+        bool t = true;
+        int* p = &(t ? i++ : j);
+    }
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        int i = 1;
+        int j = 4;
+        bool t = false;
+        int* p = &(t ? j : i--);
+    }
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        int i = 3;
+        bool t = false;
+        int* p = &(t ? i : 5);
+    }
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        int i = 3;
+        bool t = false;
+        int* p = &(t ? i : m21Call());
+    }
+    return 0;
+}

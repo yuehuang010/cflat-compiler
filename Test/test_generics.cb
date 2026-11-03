@@ -3921,8 +3921,8 @@ bool testGenericArgInference()
     result &= Test("genovlr_expr_size_int_add", genovlrExprSize(1 + 2), 4);
     result &= Test("genovlr_expr_size_int_modulo", genovlrExprSize(5 % 2), 4);
     result &= Test("genovlr_expr_size_shift_left", genovlrExprSize(1 << 2), 4);
-    result &= Test("genovlr_expr_size_shift_wide_right", genovlrExprSize(1 << 2L), (int)sizeof(long));
-    result &= Test("genovlr_expr_size_shift_wide_right_u", genovlrExprSize(1u << 2L), (int)sizeof(ulong));
+    result &= Test("genovlr_expr_size_shift_wide_right", genovlrExprSize(1 << 2L), (int)sizeof(int));
+    result &= Test("genovlr_expr_size_shift_wide_right_u", genovlrExprSize(1u << 2L), (int)sizeof(uint));
     result &= Test("genovlr_expr_size_shift_right", genovlrExprSize(8 >> 2), 4);
     result &= Test("genovlr_expr_size_bitwise_and", genovlrExprSize(1 & 2), 4);
     result &= Test("genovlr_expr_size_bitwise_xor", genovlrExprSize(1 ^ 2), 4);

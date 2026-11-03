@@ -31,3 +31,8 @@ from the q13/q15 reviews (d77dfdae, 5f693b7d).
    door's `LogErrorMessage` is catalogued. Decide whether these belong in the catalog.
 
 Deliberate, not a gap: `bool[]` <-> `u8[]` is rejected on i1-vs-i8 (zero users in the tree).
+
+RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31), item 3: YES, they belong in the catalog. Every user-facing
+diagnostic goes through a `LogError*` format string that the generator turns into `en-pseudo.json` (CLAUDE.md Localization); a
+`LogErrorContext(ctx, std::format(...))` with a pre-formatted string bypasses that by accident, not by design. Rewrite the three gate
+strings as `LogErrorContext` format strings with `{}` holes; the pseudo-locale discovery pass in test.sh then covers them.

@@ -28,3 +28,11 @@ real use, compiled with `-o` and run) and two stream issues. Every gap it indexe
 ## Acceptance
 A refreshed survey table (host, header, L0, L1) exists in this file, and each failure is filed
 separately. Delete this file once the table exists and item 2 has a ruling.
+
+RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31), item 2: NO header gets a CFlat surface. The 2026-09-07 ruling
+"std:: imports as plain foreign types, no CFlat sugar" already decides it: every header in the item-2 list binds exactly what "just
+types" gives - a class or function a C++ signature names (`exception`, `stdexcept`, `system_error`, `new`, `iterator`, `ranges`,
+`typeindex`/`typeinfo`, `source_location`) is reachable like any other C++ entity, and a compile-time-only header (`type_traits`,
+`concepts` - R1 maps CFlat generics to C++ concepts directly, 2026-09-20 -, `ratio`, `version`, `initializer_list`, `execution`,
+`locale`/`codecvt`, `scoped_allocator`, `coroutine`) has no runtime value for a CFlat program to bind, so no spike is owed. A gap found
+when a real header's signature names one of them is filed as its own issue. Item 1 (the survey re-run) stands.

@@ -15,34 +15,28 @@ T490 (2026-10-24) made a moved-from plain CFlat struct (user dtor, no owning fie
   one contract for direct and indirect calls, function values, lambdas and generics. Extern definitions keep the platform ABI.
   Supersedes the T499 "callee destroys only when the body always consumes" attempt. Conditional consumes (`if`, early return, loop, recursive: 20030 vs clang 20020) need the
   same contract plus the callee's conditional drop flag. Repros: scratch/repro_keep/t499/ (main checkout).
-- Local-field moves are fixed by the MVFIELD runtime field-drop tracking. The equivalent heap-field path
-  (`take(move p->inn)`) remains open: it still drops one extra moved-from value after three ownership-root
-  tracking attempts. RULED 2026-10-29 (maintainer): ALL-ZERO IS THE NULL STATE for a by-value user-dtor field - the move
-  zero-fills the source field and a user destructor is skipped on an all-zero object (the by-value analogue of the pointer
-  nullptr check). One rule everywhere; MVFIELD's local drop flags may be replaced by it. Accepted: a live all-zero object
-  also skips its dtor body (never unsafe, no owning fields). Supersedes the 2026-09-02 no-zero-fill drained-state line. Repro: `scratch/repro_keep/mvfield/field_matrix_noaudit.cb` (main checkout).
-- Scope: structs with a raw-pointer or `int[]` view field are excluded from T490 (cautious; C-style `~Buf(){ free(data); }`)
-  and still get 2 dtor runs after a move. RULED 2026-10-29 (main session, from precedent; maintainer may veto): T490 covers every plain struct - a moved-from shell is dead whatever its fields hold (a second
-  `~Buf() { free(data); }` run on a bitwise-moved shell is a double free). Remove the raw-pointer / view-field exclusion.
+- Fixed in MOVEDTOR2: the heap-field path (`take(move p->inn)`) and every other by-value move source (local, parameter,
+  local / nested / generic field, array element, `return move x`) now zero-fill the source and run its destructor on the
+  zero state, matching a clang twin with a zero-filling move constructor (220-cell matrix scratch/movedtor2_matrix.md in
+  the cflat-fix-movedtor2 worktree). MVFIELD's local field drop flags are removed (they skipped a destructor clang runs).
+- Fixed in MOVEDTOR2: the T490 dead-shell rule and its raw-pointer / view exclusion are removed - a moved-from plain struct
+  of any field shape runs its destructor once on its zero state (`~Buf(){ free(data); }` frees null, never twice).
 Repros: scratch/repro_keep/t490/ (main checkout).
 Found: T490 r1 review (2026-10-24).
 
-## QUESTION FOR MAINTAINER (2026-10-30, box 7) - premise of the all-zero ruling
+## Value-type destructors always run (Fixed in MOVEDTOR2)
 
-Branch fix/movedtor (refs/review/movedtor_r7, worktree cflat-fix-movedtor; all gates green, not landed) implements the 2026-10-29 ruling
-literally. The accepted clause "a live all-zero object also skips its dtor body (never unsafe, no owning fields)" has a cost the
-premise did not cover: a user dtor with SIDE EFFECTS on a type with no fields (or only zero fields) no longer runs, while its ctor does.
-- Repro scratch/repro_keep/movedtor_guard/guard.cb (main checkout): `struct Guard { Guard(){ locked++; } ~Guard(){ locked--; } }` used
-  as a scope guard -> master exit 10 (released), branch exit 11 (never released). Any field-less RAII guard (unlock, close, counter,
-  log scope) silently stops working. Frees are never lost (owners are never all-zero).
-- A live padded object whose fields are all zero: whether its dtor runs depends on the (frozen) padding bytes - nondeterministic for live
-  objects; moved-from shells are memset whole, so they always skip.
-- 20+ test fixtures needed an `int alive = 1;` sentinel to keep proving frees/order (the cost lands on users the same way).
-Options:
-  (a) keep the ruling as is (accept the RAII cost);
-  (b) skip the dtor body only for MOVED-FROM objects: the move zero-fills, and the skip test is "all-zero AND the object was a move
-      source" - needs a per-object drained bit only where a move can reach (fields / heap / elements), which is what MVFIELD's drop flags
-      did locally; live all-zero objects always run their dtor;
-  (c) skip on all-zero only for types whose dtor body reads no global state / calls nothing (pure field cleanup) - analysis-heavy.
-Recommendation: (b) - the null-state analogue of `nullptr` is about drained owners, not about live values that happen to be zero.
-T418 (callee destroys by-value params) is queued behind this branch.
+The 2026-10-30 all-zero-skip question (branch fix/movedtor) is answered by the ruling below and implemented in MOVEDTOR2:
+zero-fill + unconditional destructor, no all-zero skip, no drained flag, no `int alive = 1;` sentinels; guard.cb exits 10.
+
+RULED 2026-10-31 (maintainer): VALUE-TYPE DESTRUCTORS ALWAYS RUN; the owning pointers are the tracking. A move of a by-value object
+(`S y = move x`, `take(move p->r)`, elements) copies it bitwise to the destination and zero-fills the source; the source's destructor
+runs at its normal time on that zero state and must tolerate it (delete / free / unique of null are no-ops), as a moved-from C++ object
+is destroyed. The compiler may elide a destructor only when it proves the body does nothing. No all-zero skip test, no drained flag,
+no layout change. Only an OWNING POINTER move (`move g` of a `Guard*` / `unique<T>`) nulls the slot and runs no destructor. Supersedes
+the 2026-10-29 "destructor skipped on an all-zero object" line, the T490 line of 2026-10-24 "a moved-from plain struct is dead, no
+second destructor" (and the 2026-10-29 scope line widening it): a moved-from Guard decrements `locked` twice like clang, a live
+field-less Guard runs once (guard.cb exit 10). What changes: fix/movedtor (worktree cflat-fix-movedtor) is reworked to zero-fill +
+unconditional destructor, dropping the all-zero skip and the `int alive = 1;` fixture sentinels; MVFIELD's local drop flags are no
+longer needed for correctness (keep only as an elision); fixtures pinning one destructor run per moved value (T490 legs, MVFIELD legs,
+the raw-pointer / view exclusion legs) move to clang's counts. T418 (callee destroys by-value params, 2026-10-29) is unaffected.

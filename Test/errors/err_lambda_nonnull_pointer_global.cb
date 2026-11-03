@@ -1,0 +1,10 @@
+int gnum = 1;
+int* gptr = &gnum;
+
+extern int main()
+{
+    expect_error("cannot store a pointer value into struct storage") {
+        Lambda<int(int)> f = gptr;
+    }
+    return 0;
+}

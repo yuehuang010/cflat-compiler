@@ -1,0 +1,32 @@
+// MIX19: an unrelated struct value in a declaration initializer or an assignment is named as an
+// unrelated struct (demangled), not reported as a fixed-array decay (the struct is not an array).
+struct MixAlphaBox { int x = 0; };
+struct MixBetaBox { int y = 0; };
+struct MixGenBox<T> { T v = default; };
+MixBetaBox mixMakeBeta() { MixBetaBox b = default; return move b; }
+MixGenBox<int> mixMakeGen() { MixGenBox<int> g = default; return move g; }
+
+expect_error("cannot initialize or assign 'MixAlphaBox' from unrelated struct type 'MixBetaBox'") {
+    int mixInitMismatch()
+    {
+        MixAlphaBox a = mixMakeBeta();
+        return a.x;
+    }
+}
+
+expect_error("cannot initialize or assign 'MixAlphaBox' from unrelated struct type 'MixBetaBox'") {
+    int mixAssignMismatch()
+    {
+        MixAlphaBox a = default;
+        a = mixMakeBeta();
+        return a.x;
+    }
+}
+
+expect_error("cannot initialize or assign 'MixAlphaBox' from unrelated struct type 'MixGenBox<int>'") {
+    int mixGenMismatch()
+    {
+        MixAlphaBox a = mixMakeGen();
+        return a.x;
+    }
+}

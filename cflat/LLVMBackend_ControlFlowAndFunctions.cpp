@@ -649,6 +649,11 @@ static bool IndirectArgIsUnsigned(const std::vector<LLVMBackend::NamedVariable>*
             && (*argNVs)[i].TypeAndValue.IsUnsignedInteger() != -1;
     }
 
+static unsigned IndirectArgArithWidth(const std::vector<LLVMBackend::NamedVariable>* argNVs, size_t i)
+{
+        return argNVs != nullptr && i < argNVs->size() ? (*argNVs)[i].ArithNarrowWidth : 0;
+    }
+
 llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
                                              std::vector<llvm::Value*> args,
                                              const std::vector<NamedVariable>* argNVs,
@@ -947,7 +952,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                     args[i] = ConvertIntegerCallArgument(args[i], destTy,
                         IndirectArgIsUnsigned(argNVs, i),
                         SpellType(*this, TypeAndValue{ .TypeName = funcPtrType.FuncPtrParams[i].TypeName }),
-                        std::format("parameter {} of a call through a function value", i + 1));
+                        std::format("parameter {} of a call through a function value", i + 1),
+                        IndirectArgArithWidth(argNVs, i));
                 CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
                 abiArgs.push_back(args[i]);
                 TypeAndValue pTV;
@@ -976,6 +982,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             if (!thinCAbi)
                 abiArgs.insert(abiArgs.end(), variadicTail.begin(), variadicTail.end());
             lastCallReturnType = retTV;
+            lastUniqueOwningCallResult = nullptr;
             llvm::Value* thinSretSlot = nullptr;
             if (thinCAbi)
             {
@@ -1141,7 +1148,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 args[i] = ConvertIntegerCallArgument(args[i], destTy,
                         IndirectArgIsUnsigned(argNVs, i),
                         SpellType(*this, TypeAndValue{ .TypeName = funcPtrType.FuncPtrParams[i].TypeName }),
-                        std::format("parameter {} of a call through a function value", i + 1));
+                        std::format("parameter {} of a call through a function value", i + 1),
+                        IndirectArgArithWidth(argNVs, i));
             CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
             userArgs.push_back(args[i]);
             TypeAndValue pTV;
@@ -1173,6 +1181,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         }
 
         lastCallReturnType = retTV;
+        lastUniqueOwningCallResult = nullptr;
         PreserveRetainedJoinArmTempsBeforeCall(ownershipTarget, fullArgs);
         auto* result = CreateCallOrInvoke(invokerTy, fnPtr, fullArgs, /*mayUnwind=*/true);
         markBorrowedPointerReturn(result, retTV);
@@ -1380,7 +1389,8 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond, bool allowOpe
     }
 
 llvm::Value* LLVMBackend::ConvertIntegerCallArgument(llvm::Value* value, llvm::Type* destType,
-        bool srcIsUnsigned, const std::string& paramSpelling, const std::string& what)
+        bool srcIsUnsigned, const std::string& paramSpelling, const std::string& what,
+        unsigned arithNarrowWidth)
 {
         if (value == nullptr || destType == nullptr)
             return value;
@@ -1394,6 +1404,11 @@ llvm::Value* LLVMBackend::ConvertIntegerCallArgument(llvm::Value* value, llvm::T
         if (destType->isIntegerTy(1) && !srcType->isIntegerTy(1))
             return CoerceToBoolCondition(value);
 
+        // An int built from narrow operands (`s + 1`) reaches a narrow parameter the way C converts it:
+        // the value is truncated. ClassifyScalarArgConversion admitted only these.
+        if (srcType->getIntegerBitWidth() > destType->getIntegerBitWidth()
+            && arithNarrowWidth != 0 && arithNarrowWidth <= destType->getIntegerBitWidth())
+            return builder->CreateTrunc(value, destType);
         // Narrowing has no implicit conversion at a call argument. Without this the mistyped
         // value reached the LLVM verifier as "Call parameter type does not match function
         // signature!" with no diagnostic of our own.

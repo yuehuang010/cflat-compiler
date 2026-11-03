@@ -22,3 +22,11 @@ Kept by main-session decision: `f(const int*)` + `f<T>(T*)` with an `int*` picks
 - Named arguments into a generic (`f<T>(T a, T* b)` called `f(b: q, a: l)`): inference is positional.
 - Generic-only `T get<T>(T* p)` from a `const int*`, and `h<T>(T** p)` from a `const int**`.
 - UFCS `p.f()` with a free generic `f<T>(T*)` reports "function 'f' is not known".
+
+Note 2026-10-31: the "pre-existing, kept" expression-typing lines above are SUPERSEDED in part by the 2026-10-31 maintainer ruling in
+arithmetic-result-type-names-vs-clang.md (native arithmetic follows C usual conversions): `1 << 2L` is `int` (promoted LEFT operand),
+and char/u8/short variable arithmetic promotes to `int`, so `'a' + 'b'` into a generic deduces `int` and is no longer refused. `1.5 + x`
+stays float (literal typing DEFERRED 2026-10-13). The `f(const int*)` + `f<T>(T*)` concrete pick stands as a main-session decision
+(maintainer may veto).
+Fixed in ARITH (2026-10-31): both shapes now pass, checked against clang: `gsz('a' + 'b')` deduces int (4 bytes) and
+`gsz(1 << 2L)` deduces int (4 bytes). The char-literal identity no longer accepts `'a'+'b'` as a char literal.

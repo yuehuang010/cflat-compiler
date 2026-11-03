@@ -1,0 +1,12 @@
+// Explicit move of an address-of binding into an existing raw local by assignment. Refused.
+
+extern int main()
+{
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int x = 5;
+        int* p = &x;
+        int* q = nullptr;
+        q = move p;
+    }
+    return 0;
+}

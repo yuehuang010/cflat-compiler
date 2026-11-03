@@ -1,5 +1,6 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
+#include <functional>
 #include <limits>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
@@ -3726,52 +3727,68 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     && IsCoreUniqueType(params[i].TypeName);
                 const bool argIsNull = args[i].Primary != nullptr
                     && llvm::isa<llvm::ConstantPointerNull>(args[i].Primary);
-                const bool argTypeOverAligned = [&] {
-                    if (!args[i].TypeAndValue.Pointer || args[i].TypeAndValue.ElemPointer
-                        || args[i].TypeAndValue.TypeName.empty()
-                        || args[i].TypeAndValue.IsFunctionPointer
-                        || args[i].TypeAndValue.TypeName == "__c_fn_ptr"
-                        || args[i].TypeAndValue.TypeName == "__closure_fat_ptr")
-                        return false;
+                uint64_t argTypeAlignment = 0;
+                if (args[i].TypeAndValue.Pointer && !args[i].TypeAndValue.ElemPointer
+                    && !args[i].TypeAndValue.TypeName.empty()
+                    && !args[i].TypeAndValue.IsFunctionPointer
+                    && args[i].TypeAndValue.TypeName != "__c_fn_ptr"
+                    && args[i].TypeAndValue.TypeName != "__closure_fat_ptr")
+                {
                     TypeAndValue argType{ .TypeName = args[i].TypeAndValue.TypeName };
                     llvm::Type* type = GetType(argType);
-                    return type != nullptr && type->isSized()
-                        && GetEffectiveAlignmentForType(argType.TypeName, type)
-                            > kDefaultNewAlign;
-                }();
+                    if (type != nullptr && type->isSized())
+                        argTypeAlignment = GetEffectiveAlignmentForType(argType.TypeName, type);
+                }
+                const uint64_t sourceAllocAlignment = std::max({ args[i].AllocAlignment,
+                    args[i].TypeAndValue.AllocAlignValue,
+                    args[i].TypeAndValue.NewAllocAlignment });
+                const uint64_t effectiveArgAlignment = std::max(argTypeAlignment,
+                    sourceAllocAlignment);
+                const bool hasTypeAlignment = argTypeAlignment > kDefaultNewAlign;
+                const bool alignmentMismatch = params[i].AllocAlignValue > kDefaultNewAlign
+                    ? effectiveArgAlignment < params[i].AllocAlignValue
+                    : sourceAllocAlignment > kDefaultNewAlign && !hasTypeAlignment
+                        && sourceAllocAlignment != params[i].AllocAlignValue;
                 if (!beforeCall && paramsCarryAllocAlign
                     && !coreUniqueWrapperParam
                     && !argIsNull
-                    && !argTypeOverAligned
-                    && args[i].AllocAlignment != params[i].AllocAlignValue
-                    && (args[i].AllocAlignment > kDefaultNewAlign
-                        || params[i].AllocAlignValue > kDefaultNewAlign))
+                    && alignmentMismatch)
                 {
                     if (params[i].AllocAlignValue == 0)
                         LogErrorMessage(
                             "cannot move the over-aligned buffer '{}' ('{}') into the '{}' "
                             "parameter of '{}': that alignment is a property of the allocation, not of the type, so "
                             "the callee cannot recover it. Declare the parameter '{}' so the block "
-                            "alignment is recorded, or over-align the ELEMENT TYPE instead.",
+                            "alignment is recorded, or over-align the element TYPE instead.",
                             { sourceName.empty() ? SpellType(*this, args[i].TypeAndValue) : sourceName,
-                              std::format("new T[n] alignas(0, {})", args[i].AllocAlignment), "move",
+                              std::format("new T[n] alignas(0, {})", sourceAllocAlignment), "move",
                               SpellFunctionSymbol(*this, functionName),
-                              std::format("alignas(0, {})", args[i].AllocAlignment) });
+                              std::format("alignas(0, {})", sourceAllocAlignment) });
                     else
                     {
                         // A core `unique<T, N>` receiver reaches this check through its own
                         // constructor, so naming a 'move' parameter the user never wrote is wrong.
                         std::string calleeSpelling = SpellFunctionSymbol(*this, functionName);
                         if (IsCoreUniqueType(functionName))
+                        {
+                            const std::string allocationDescription =
+                                argTypeAlignment > kDefaultNewAlign
+                                    && effectiveArgAlignment == argTypeAlignment
+                                    ? std::format("{}, the alignment of its type '{}'",
+                                    argTypeAlignment,
+                                    args[i].TypeAndValue.TypeName)
+                                : effectiveArgAlignment == 0
+                                    ? std::string("ordinary alignment")
+                                    : std::format("'alignas(0, {})'", effectiveArgAlignment);
                             LogErrorMessage(
                                 "alignment mismatch initializing '{}': the declared type allocates at {}, but the "
-                                "value was allocated {}. Allocate the value with the matching 'alignas(0, {})' "
+                                "value was allocated {}. "
+                                "Allocate the value with the matching 'alignas(0, {})' "
                                 "clause, or declare the receiver with the alignment the value already has.",
                                 { calleeSpelling, std::to_string(params[i].AllocAlignValue),
-                                  args[i].AllocAlignment == 0
-                                      ? std::string("at ordinary alignment")
-                                      : std::format("'alignas(0, {})'", args[i].AllocAlignment),
+                                  allocationDescription,
                                   std::to_string(params[i].AllocAlignValue) });
+                        }
                         else
                             LogErrorMessage(
                                 "alignment mismatch moving into the 'move' parameter of '{}': the parameter is declared "
@@ -3996,9 +4013,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             continue;
                         if (isFieldAccess)
                         {
-                            MarkVariableFieldMoved(fieldRootName, movePath,
-                                                   sourceName.empty());
-                            MarkStorageFieldMovedForDrop(args[i].FieldDropOwnerStorage, movePath);
+                            if (!sourceName.empty())
+                                MarkVariableFieldMoved(fieldRootName, movePath);
                         }
                         else if (wholeBindingSource && !sourceName.empty())
                             MarkVariableMoved(sourceName, isPointeeMove(args[i]));
@@ -4237,6 +4253,32 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
             if (arg.Storage != nullptr && arg.TypeAndValue.Pointer && arg.BaseType == paramTy
                 && !arg.IsRvalue)
                 return arg.Storage;
+            // A `?:` join with a string-literal arm (also through a nested `?:`) is a pointer
+            // prvalue with no slot: clang refuses it. Incoming PHIs are followed, each once.
+            llvm::SmallPtrSet<llvm::PHINode*, 4> visitedJoins;
+            std::function<bool(llvm::Value*)> reachesLiteralArm = [&](llvm::Value* value) -> bool {
+                if (value == nullptr) return false;
+                value = value->stripPointerCasts();
+                if (auto* armConst = llvm::dyn_cast<llvm::Constant>(value))
+                    return IsStringLiteralConstant(armConst);
+                auto* join = llvm::dyn_cast<llvm::PHINode>(value);
+                if (join == nullptr || !visitedJoins.insert(join).second) return false;
+                for (llvm::Value* incoming : join->incoming_values())
+                    if (reachesLiteralArm(incoming)) return true;
+                return false;
+            };
+            const bool literalArmJoin = llvm::isa<llvm::PHINode>(arg.Primary) && reachesLiteralArm(arg.Primary);
+            // A pointer join with a prvalue arm (`x + 1`, a call) is marked by the ternary builder.
+            const auto* armJoin = llvm::dyn_cast<llvm::PHINode>(arg.Primary);
+            const bool prvalueArmJoin = armJoin != nullptr
+                && armJoin->getMetadata("cflat.ptr.prvalue.join") != nullptr;
+            if ((literalArmJoin || prvalueArmJoin) && arg.Storage == nullptr && !param.CxxConstRef()
+                && !param.IsRvalueRef)
+            {
+                LogError(std::format("the parameter '{}' is a non-const reference to a pointer and "
+                    "cannot bind a pointer rvalue; pass an lvalue", param.VariableName));
+                return llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(paramTy));
+            }
             llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
             value = LowerByValueArg(value, param, arg);
             if (value == nullptr)
@@ -4396,16 +4438,6 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
                 LogError(
                     "cannot safely copy an owning struct from a null-conditional '?.' access");
         }
-        if ((param.Pointer || ParameterIsAliasByPointer(param))
-            && !arg.TypeAndValue.Pointer && !arg.CallerName.empty()
-            && IsDataStructure(arg.TypeAndValue.TypeName)
-            && !IsCxxRecord(arg.TypeAndValue.TypeName))
-        {
-            // A pointer/reference borrow can rebuild fields through callee storage.
-            const std::string ownerName = arg.FieldPathRoot.empty()
-                ? arg.CallerName : arg.FieldPathRoot;
-            MarkVariableFieldStorageEscaped(ownerName);
-        }
         // Encoded closure param (list<function<...>>::add's `T value`, a substituted generic field).
         // The encoded element has the SAME machine repr as the spelling it encodes - bare code
         // pointer (thin) or fat struct - so convert exactly as an IsFunctionPointer param would.
@@ -4473,7 +4505,7 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
                 ? std::string("a by-value parameter")
                 : std::format("parameter '{}'", param.VariableName);
             value = ConvertIntegerCallArgument(value, GetType(param), argIsUnsigned,
-                SpellType(*this, param), what);
+                SpellType(*this, param), what, arg.ArithNarrowWidth);
         }
 
         // A string not statically known to own its buffer, passed to a move parameter.
@@ -4539,20 +4571,12 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
         return value;
     }
 
-llvm::Value* LLVMBackend::LowerPointerParamArg(const NamedVariable& arg, bool markAggregateEscape)
+llvm::Value* LLVMBackend::LowerPointerParamArg(const NamedVariable& arg)
 {
         if (!arg.TypeAndValue.Pointer
             && (arg.Storage != nullptr || arg.NullConditionalBorrowStorage != nullptr)
             && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
         {
-            if (markAggregateEscape && IsDataStructure(arg.TypeAndValue.TypeName)
-                && !IsCxxRecord(arg.TypeAndValue.TypeName))
-            {
-                const std::string ownerName = !arg.FieldPathRoot.empty()
-                    ? arg.FieldPathRoot : arg.CallerName;
-                if (!ownerName.empty())
-                    MarkVariableFieldStorageEscaped(ownerName);
-            }
             // `p?.f`: borrow the field in place (null-or-field-address), never a temporary copy.
             return arg.NullConditionalBorrowStorage != nullptr ? arg.NullConditionalBorrowStorage : arg.Storage;
         }

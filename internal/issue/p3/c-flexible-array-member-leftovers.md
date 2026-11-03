@@ -9,3 +9,20 @@ Still open:
 - (P3, master too) `sizeof` of one row of an `int data[0][3]` member gives 4; clang gives 12.
 - (P3, master too) `sizeof(*&z->data)` is refused; clang gives 0.
 - (P3, master too) A C++ class with both a method and an anonymous struct member cannot reach the anonymous member's fields.
+
+FIXED in UQRAW for the address-of shapes (narrowed; see the note at the end of this paragraph). RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31): explicit `move` of a raw pointer whose borrowed provenance is
+PROVEN (address-of a local or field, a borrowed pointer parameter, a local copied directly from one) into any slot is REFUSED at compile
+time: "cannot move a borrowed pointer; move from the owning slot". Same polarity as the 2026-09-03 slot-move rule (unknown provenance
+accepts) and the 2026-10-25 line that explicit move nulls only OWNING slots; the scope-exit trap (rc 134) becomes a located error
+(refuse first, refine later). Covers the sibling shape `unique<int>* p = &u; unique<int>* q = move p;` (box 7 MIX12 finding, probe
+scratch/repro_keep/mix12/mix12_tmp/own11.cb, rc 134 on master). Test consequence: one new err_ leg each for the int* and unique<T>*
+
+OPEN (UQRAW): ruling says refuse, test_move bpm legs ~6250 pin accept - maintainer to choose.
+
+Fixed in UQRAW (address-of provenance only): explicit `move` of an ADDRESS-OF binding (`int* p = &x;`, `&s.v`, `unique<int>* p = &u;`) into a
+raw local, a unique local, or by assignment is refused with the ruled text. Legs: Test/errors/err_move_borrowed_addr_slot.cb,
+err_move_borrowed_unique_slot.cb, err_move_borrowed_assign_slot.cb. NOT fixed, needs a maintainer ruling: (1) a borrowed (non-move)
+POINTER PARAMETER, or a local copied from one, moved into a PLAIN `T*` slot stays accepted - the existing test_move.cb bpm* legs
+(`Resource* d = move p;`, "must NOT adopt") pin it, and the ruling's "any slot" wording contradicts them; (2) address-of into a C++
+`move` pointer parameter stays accepted - test_cpp_interop.cb T248 leg (`CallT248DataPick(move t248DataMove)` == 307) pins it.
+shapes; no accept leg flips.

@@ -1,0 +1,28 @@
+// MIX21: a `?:` with a string-literal arm is a pointer prvalue; it cannot bind a C++ `const char*&` (clang).
+import cpp "cpp_t67_postinc.hpp";
+
+extern int main()
+{
+    expect_error("cannot bind a pointer rvalue") {
+        bool t = true;
+        cpp_t67.cbump(t ? "ab" : "cd");
+    }
+    expect_error("cannot bind a pointer rvalue") {
+        bool t = true;
+        const char* p = "ab";
+        cpp_t67.cbump(t ? p : "cd");
+    }
+    expect_error("cannot bind a pointer rvalue") {
+        bool t = false;
+        const char* q = "cd";
+        cpp_t67.cbump(t ? "ab" : q);
+    }
+    expect_error("cannot bind a pointer rvalue") {
+        bool t = true;
+        bool u = false;
+        const char* p = "ab";
+        const char* q = "cd";
+        cpp_t67.cbump(t ? p : (u ? q : "x"));
+    }
+    return 0;
+}

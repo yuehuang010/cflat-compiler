@@ -1,0 +1,30 @@
+// TERNADDR: a `?:` with a pointer prvalue arm (`x + 1`, a call) cannot bind a C++ `int*&` (clang refuses).
+import cpp "cpp_t67_postinc.hpp";
+
+extern int main()
+{
+    expect_error("cannot bind a pointer rvalue") {
+        int[4] a;
+        int* x = &a[0];
+        int* y = &a[1];
+        bool t = true;
+        cpp_t67.ptr_bump(t ? x + 1 : y);
+    }
+    expect_error("cannot bind a pointer rvalue") {
+        int[4] a;
+        int* x = &a[0];
+        int* y = &a[1];
+        bool t = false;
+        cpp_t67.ptr_bump(t ? x : y + 1);
+    }
+    expect_error("cannot bind a pointer rvalue") {
+        int[4] a;
+        int* x = &a[0];
+        int* y = &a[1];
+        int* z = &a[3];
+        bool t = true;
+        bool u = false;
+        cpp_t67.ptr_bump(t ? x : (u ? y : z + 1));
+    }
+    return 0;
+}

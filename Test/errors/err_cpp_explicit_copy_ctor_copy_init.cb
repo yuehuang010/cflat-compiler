@@ -1,0 +1,29 @@
+import cpp "cpp_interop_explicit.h";
+
+int copy_excopy_by_value(cppexp.ExCopy source) { return source.v; }
+
+extern int main()
+{
+    expect_error("clang: no matching constructor for initialization of 'cppexp::ExCopy'") {
+        cppexp.ExCopy source = cppexp.ExCopy(5);
+        cppexp.ExCopy copy = source;
+    }
+    expect_error("clang: chosen constructor is explicit in copy-initialization") {
+        cppexp.ExCopy source = cppexp.ExCopy(5);
+        cppexp.ExCopy copy = { source };
+    }
+    expect_error("clang: no matching constructor for initialization of 'cppexp::ExCopy'") {
+        cppexp.ExCopy source = cppexp.ExCopy(5);
+        int result = copy_excopy_by_value(source);
+    }
+    // The explicit const& copy ctor is not a copy-init candidate and ExMixCopy(ExMixCopy&) cannot
+    // bind a const source.
+    expect_error("clang: no matching constructor for initialization of 'cppexp::ExMixCopy'") {
+        cppexp.ExMixCopy copy = cppexp.exmix_const();
+    }
+    return 0;
+}
+
+expect_error("clang: no matching constructor for initialization of 'cppexp::ExCopy'") {
+    cppexp.ExCopy copy_explicit_by_return(cppexp.ExCopy* source) { return *source; }
+}

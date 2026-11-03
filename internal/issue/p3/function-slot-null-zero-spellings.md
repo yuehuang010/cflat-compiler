@@ -14,11 +14,20 @@ T311 fixed the C `NULL` macro item (see Test/test_function_ptr.cb testFunctionSl
 Fix direction for the literal-0 items: none in this issue (literal 0 is out of scope by design).
 
 ## After T311 review 1 (2026-10-16, all same on master)
-- `Lambda<int(int)> f = MNULL;` and `g = MNULL;` (Lambda<> declaration / assignment) still refused "cannot store a pointer
-  value into struct storage" (LLVMBackend_VariablesAndIR.cpp ~1322-1328 only admits a real null constant); a Lambda<>
-  PARAMETER accepts the macro after T311. Fix direction: substitute a real null at those two sites when the RHS is the
-  ilz macro global load (same test as LLVMBackend_WinRT.cpp ArgumentIsProvablyDataPointer). Repro scratch/repro_keep/wt_t311/rev_t311_repro/lambda_null.cb.
+- Fixed in MIX20: `Lambda<int(int)> f = MNULL;` and `g = MNULL;` (Lambda<> declaration / assignment) now store a null.
+  CreateCast's aggregate backstop (LLVMBackend_VariablesAndIR.cpp) takes a load of a zero macro global as nullptr for
+  closure destinations only. Legs: Test/test_function_ptr.cb testLambdaSlotNullMacro; Test/errors/err_lambda_nonnull_pointer_global.cb.
 - `k ? MNULL : MNULL` into function<> refused; `k ? nullptr : nullptr` accepted; clang accepts both.
+  Root cause (MIX20): ArgumentIsProvablyDataPointer exempts a C null macro only for a direct load of the macro global
+  (arg.IsCxxMacroGlobal). A `?:` join carries IsCxxMacroJoin instead, so JoinDeliversDataValue reads the arms as data
+  and the thin gate (CheckThinFnPtrAssignProvenance) refuses. The Lambda<> form is refused for the same select shape.
+  Fix needs an all-arms-zero-macro proof on the join in the thin gate and the fat backstop; not one site, not done.
 - Literal `function<int(int)> f = 0;` IS accepted (contradicts the literal-0 note above - check against the ruling);
   `#define ZERO 0` / `0L` macros refused everywhere (clang accepts).
 - `import cpp`: `callit(nullptr)` into a std::function / fn-pointer param -> "no overload"; NULL accepted.
+
+RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31): the accepted `function<int(int)> f = 0;` is the DEFECT, not the
+rule - literal 0 is not a pointer constant in CFlat (pointer-is-not-a-number ruling 2026-09-26; the literal-0 note above), so the
+declaration form is refused like the parameter, interface and generic forms. `#define ZERO 0` macros stay refused for the same reason;
+only the C `NULL` macro (a null POINTER constant, T311) and `nullptr` are null spellings. Test consequence: one err_ leg for `= 0`;
+no accept leg pins it today.

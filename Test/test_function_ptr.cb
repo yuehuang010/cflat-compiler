@@ -6334,6 +6334,21 @@ bool testFunctionSlotNullMacro()
     return result;
 }
 
+// MIX20: the C NULL macro enters a Lambda<> local and a Lambda<> assignment as nullptr. A non-null
+// pointer global stays refused (err_lambda_nonnull_pointer_global.cb).
+bool testLambdaSlotNullMacro()
+{
+    bool result = true;
+    Lambda<int(int)> lf = T311_NULL;
+    result &= Test("C NULL macro into a Lambda<> local", lf == nullptr, true);
+    Lambda<int(int)> lg = t182Sq;
+    lg = T311_NULL;
+    result &= Test("C NULL macro assigned to a Lambda<>", lg == nullptr, true);
+    Lambda<int(int)> lh = t182Sq;
+    result &= Test("named function into a Lambda<> stays non-null", lh == nullptr, false);
+    return result;
+}
+
 struct T189Hold
 {
     Lambda<int(int, int)> fn;
@@ -7859,6 +7874,7 @@ extern int main(int argc, char** argv)
     total++; passed += testTernaryArmKinds()               ? 1 : 0;
     total++; passed += testFunctionSlotAccepts()           ? 1 : 0;
     total++; passed += testFunctionSlotNullMacro()         ? 1 : 0;
+    total++; passed += testLambdaSlotNullMacro()           ? 1 : 0;
     total++; passed += testTernaryClosureNamedJoin()       ? 1 : 0;
     total++; passed += testTernaryGenericFunctionArm()     ? 1 : 0;
     total++; passed += testLambdaSlotFewerParams()         ? 1 : 0;

@@ -11,3 +11,9 @@ testMix8TupleTemplates).
 
 Root cause (MIX8): not fixed; tuple literal element conversion is a design question (needs a ruling before a
 fix - whether a literal converts element-wise to a wider declared tuple element type).
+
+RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31): a tuple literal CONVERTS element-wise to the declared tuple
+element types under the assignment rules - widening (`int` literal -> `i64` / `double`) accepted, narrowing refused like brace-init
+(no-implicit-narrowing ruling 2026-09-04, return-follows-assignment 2026-09-04). Both parents agree (`std::tuple<long,int> t = {3, 4}`,
+C# `(long, int) t = (3, 4)`). Test consequence: `(i64,int) t = (3, 4);` and `(double,int) t = (3, 4);` become accept legs in
+Test/test_generics.cb; a narrowing literal tuple (`(int,int) t = (3.5, 4)`) gets an err_ leg.

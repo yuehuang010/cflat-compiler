@@ -1,0 +1,24 @@
+// TERNADDR: `&(c ? a : b)` needs both arms to be lvalues; a call result arm is a prvalue (clang refuses).
+struct AdrPvS { int a; };
+void adrPvBump(AdrPvS* s) { s.a += 100; }
+AdrPvS adrPvMake()
+{
+    AdrPvS r;
+    r.a = 7;
+    return r;
+}
+
+extern int main()
+{
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        AdrPvS s2;
+        bool t = false;
+        adrPvBump(&(t ? adrPvMake() : s2));
+    }
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        AdrPvS s1;
+        bool t = true;
+        adrPvBump(&(t ? s1 : adrPvMake()));
+    }
+    return 0;
+}

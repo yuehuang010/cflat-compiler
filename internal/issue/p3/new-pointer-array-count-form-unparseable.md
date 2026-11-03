@@ -27,3 +27,10 @@ non-class T - the pointer-element spelling is the one form that fix cannot reach
 bitwise operators now produce a LogError naming the operator and operand types, never a verifier
 failure. Pointer +/- integer, pointer - pointer, and comparisons remain legal. Part (1) stays on
 hold.
+
+RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31): FIX THE PARSE. `new int*[2]` is plain C++ (`new T[n]` with a
+pointer element type) and the 2026-09-04 ruling keeps raw `new T[n]` legal and C-compatible; accepting the spelling adds no semantics
+to the on-hold heap-array area. Grammar change narrows the `new` alternative to take a pointer-suffixed element type (no parser
+predicates, per the grammar rule); the sibling `new int*(a)` multiply misparse gets a located error or the C++ meaning (`new int*`
+initialized with `a` - the 2026-09-21 bridge ruling gives `new int(7)` its C++ meaning), never a verifier death. Test consequence:
+`int*[] pv = new int*[2];` becomes an accept leg; `new int*(a)` an err_ or accept leg per the chosen reading.

@@ -2795,7 +2795,8 @@ bool LLVMBackend::IsBorrowStringParamStorage(llvm::Value* storage)
 void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage,
                                    const std::string& interfaceReturnStructName,
                                    bool srcIsUnsigned,
-                                   const std::string& sourceTypeName)
+                                   const std::string& sourceTypeName,
+                                   bool sourceZeroFilled)
 {
         if (!IsInsertBlockLive())
             return;
@@ -2895,7 +2896,8 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
         // value dangles (and double-frees when the caller destroys it). Suppress only for the
         // return-path destructor walk. Mirrors the owned-string / owned-pointer cases above.
         llvm::Value* prevStructSkip = returnedStructDtorSkipAlloca;
-        if (value && !ownedStringReturnVar && !ownedPtrReturnVar)
+        // An explicit `return move x` zero-filled x: its destructor runs on the zero state.
+        if (value && !ownedStringReturnVar && !ownedPtrReturnVar && !sourceZeroFilled)
         {
             llvm::Value* srcAlloca = returnedLocalStorage;
             if (srcAlloca == nullptr)

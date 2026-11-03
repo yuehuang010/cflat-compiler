@@ -391,6 +391,27 @@ namespace cflat_jit
         return mem;
     }
 
+    // Address range of each JIT'd graph and the image base its RVAs were baked against. A C++
+    // throw needs the throw info's image base, which RtlPcToFileHeader cannot find for JIT
+    // memory (no loader entry), so --run's _CxxThrowException looks it up here.
+    struct JitImageRange { uint64_t start; uint64_t end; uint64_t base; };
+    inline std::mutex& JitImageRangesMutex() { static std::mutex m; return m; }
+    inline std::vector<JitImageRange>& JitImageRanges() { static std::vector<JitImageRange> v; return v; }
+    inline uint64_t JitImageBaseFor(uint64_t addr)
+    {
+        std::lock_guard<std::mutex> lock(JitImageRangesMutex());
+        for (const auto& r : JitImageRanges())
+            if (addr >= r.start && addr < r.end) return r.base;
+        return 0;
+    }
+#if defined(_WIN32)
+    // Defined in LLVMBackend.cpp (needs <windows.h>). CxxThrowException raises the same C++
+    // exception record vcruntime does, with the JIT image base; CallJitMain runs the JIT'd main
+    // and turns a C++ exception nobody catches into std::terminate's exit, like the -o exe.
+    [[noreturn]] void CxxThrowException(void* object, void* throwInfo);
+    int CallJitMain(void* mainFn, bool takesArgv, int argc, char** argv);
+#endif
+
     // Without ORC's COFFPlatform (needs orc_rt, not linked), nothing calls RtlAddFunctionTable.
     // Registers .pdata manually so the OS can unwind JIT'd SEH/C++EH frames.
     class SehRegistrationPlugin : public llvm::orc::ObjectLinkingLayer::Plugin
@@ -401,7 +422,7 @@ namespace cflat_jit
                               llvm::jitlink::PassConfiguration& Config) override
         {
             // PostPrune (before allocation, so synthesized blocks get memory): redirect the
-            // SEH language handler (__C_specific_handler, which resolves to ntdll >4GB away)
+            // SEH / C++ EH language handlers (ntdll, vcruntime140 - far outside the image)
             // through an in-image jump stub so its image-relative .xdata reference fits in 32 bits.
             Config.PostPrunePasses.push_back(
                 [](llvm::jitlink::LinkGraph& G) { return LowerSEHHandler(G); });
@@ -443,26 +464,41 @@ namespace cflat_jit
             return lowest;
         }
 
+        // Language handlers named by image-relative .xdata references. __C_specific_handler is
+        // SEH (ntdll); the __CxxFrameHandler / __GSHandlerCheck family comes from clang-cl C++
+        // (vcruntime140.dll). All live far outside the JIT'd image.
+        static bool IsUnwindLanguageHandler(llvm::StringRef name)
+        {
+            return name == "__C_specific_handler" || name == "__CxxFrameHandler3" ||
+                   name == "__CxxFrameHandler4" || name == "__GSHandlerCheck" ||
+                   name == "__GSHandlerCheck_EH" || name == "__GSHandlerCheck_EH4" ||
+                   name == "__GSHandlerCheck_SEH";
+        }
+
         static llvm::Error LowerSEHHandler(llvm::jitlink::LinkGraph& G)
         {
-            llvm::jitlink::Symbol* handler = nullptr;
+            std::vector<llvm::jitlink::Symbol*> handlers;
             for (auto* S : G.external_symbols())
-                if (S->hasName() && (*S->getName()) == "__C_specific_handler") { handler = S; break; }
-            if (!handler)
-                return llvm::Error::success(); // no SEH personality in this graph
+                if (S->hasName() && IsUnwindLanguageHandler(*S->getName())) handlers.push_back(S);
+            for (auto* handler : handlers)
+                RedirectThroughStub(G, *handler);
+            return llvm::Error::success();
+        }
 
+        static void RedirectThroughStub(llvm::jitlink::LinkGraph& G, llvm::jitlink::Symbol& handler)
+        {
             // Collect existing references to the handler FIRST (these are the .xdata image-
             // relative RVAs). Doing this before synthesizing the pointer slot below ensures the
-            // slot's own Pointer64 edge - which must hold the true ntdll address - is excluded;
+            // slot's own Pointer64 edge - which must hold the true handler address - is excluded;
             // repointing it would make the stub jump to itself.
             std::vector<llvm::jitlink::Edge*> toRepoint;
             for (auto& Sec : G.sections())
                 for (auto* B : Sec.blocks())
                     for (auto& E : B->edges())
-                        if (&E.getTarget() == handler)
+                        if (&E.getTarget() == &handler)
                             toRepoint.push_back(&E);
 
-            // 8-byte slot holding the real 64-bit handler address (Pointer64 -> ntdll), plus a
+            // 8-byte slot holding the real 64-bit handler address (Pointer64), plus a
             // 6-byte `jmp *slot(%rip)` stub. Both live in the JIT'd image next to the code, so
             // an image-relative reference to the stub fits in 32 bits.
             // MemProt's bitmask operator| is not exported into llvm::orc here; OR the bits by value.
@@ -470,14 +506,15 @@ namespace cflat_jit
             constexpr unsigned R = (unsigned)llvm::orc::MemProt::Read;
             constexpr unsigned W = (unsigned)llvm::orc::MemProt::Write;
             constexpr unsigned X = (unsigned)llvm::orc::MemProt::Exec;
-            auto& ptrSec  = G.createSection("$__cflat_sehptr",  memProt(R | W));
-            auto& stubSec = G.createSection("$__cflat_sehstub", memProt(R | X));
-            auto& ptrSym  = llvm::jitlink::x86_64::createAnonymousPointer(G, ptrSec, handler);
-            auto& stubSym = llvm::jitlink::x86_64::createAnonymousPointerJumpStub(G, stubSec, ptrSym);
+            auto* ptrSec = G.findSectionByName("$__cflat_sehptr");
+            if (!ptrSec) ptrSec = &G.createSection("$__cflat_sehptr", memProt(R | W));
+            auto* stubSec = G.findSectionByName("$__cflat_sehstub");
+            if (!stubSec) stubSec = &G.createSection("$__cflat_sehstub", memProt(R | X));
+            auto& ptrSym  = llvm::jitlink::x86_64::createAnonymousPointer(G, *ptrSec, &handler);
+            auto& stubSym = llvm::jitlink::x86_64::createAnonymousPointerJumpStub(G, *stubSec, ptrSym);
 
             for (auto* E : toRepoint)
                 E->setTarget(stubSym);
-            return llvm::Error::success();
         }
 
         static llvm::Error FixImageBase(llvm::jitlink::LinkGraph& G)
@@ -485,6 +522,14 @@ namespace cflat_jit
             llvm::jitlink::Block* lowest = LowestBlock(G);
             if (!lowest)
                 return llvm::Error::success(); // empty graph - nothing to anchor to
+            {
+                uint64_t start = lowest->getAddress().getValue(), end = start;
+                for (auto& Sec : G.sections())
+                    for (auto* B : Sec.blocks())
+                        end = std::max<uint64_t>(end, (B->getAddress() + B->getSize()).getValue());
+                std::lock_guard<std::mutex> lock(JitImageRangesMutex());
+                JitImageRanges().push_back({ start, end, start });
+            }
 
             // From LLVM 22 the COFF builder pre-creates __ImageBase as an EXTERNAL symbol
             // whenever the object carries ADDR32NB relocations, and GetImageBaseSymbol prefers
@@ -670,6 +715,7 @@ struct ScopedLookupOptions
     bool PrefixDottedNames = false;
     bool ResolveFirstComponentAlias = true;
 };
+
 
 class LLVMBackend
 {
@@ -1056,6 +1102,9 @@ public:
         // `new T[n]` agree and the free site routes to __delete_aligned. 0 = unset. Power of two,
         // validated at parse time. NOT the field slot's alignment (that is UserAlignValue / arg1).
         uint64_t AllocAlignValue = 0;
+        // Actual alignment supplied to the allocator for this `new` result; distinct from the
+        // free-site tag, which is omitted when the pointee type already selects aligned delete.
+        uint64_t NewAllocAlignment = 0;
 
         // Keyed by ORIGIN (not SSA value) so copies of the same view share a scope and are not
         // treated as disjoint. Never serialized; recomputed per-function from aliasScopes_.
@@ -1490,6 +1539,7 @@ public:
         bool IsFlexibleArrayMember = false;
         bool IsZeroLengthArrayMember = false;
         uint64_t AllocAlignValue = 0;
+        uint64_t NewAllocAlignment = 0;
         std::string EnumBacking;
         bool IsScopedEnum = false;
 
@@ -1576,6 +1626,7 @@ public:
             s.IsFlexibleArrayMember = t.IsFlexibleArrayMember;
             s.IsZeroLengthArrayMember = t.IsZeroLengthArrayMember;
             s.AllocAlignValue = t.AllocAlignValue;
+            s.NewAllocAlignment = t.NewAllocAlignment;
             return s;
         }
 
@@ -1662,6 +1713,7 @@ public:
             t.IsFlexibleArrayMember = IsFlexibleArrayMember;
             t.IsZeroLengthArrayMember = IsZeroLengthArrayMember;
             t.AllocAlignValue = AllocAlignValue;
+            t.NewAllocAlignment = NewAllocAlignment;
             return t;
         }
     };
@@ -1765,6 +1817,7 @@ public:
         uint64_t DeclSequence = 0;
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
+        uint8_t ArithNarrowWidth = 0;    // narrow width of an int arithmetic result (see TypedValue)
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
         // Null-safe aggregate reads keep a conditional field address for borrow arguments.
         llvm::Value* NullConditionalBorrowStorage = nullptr;
@@ -1802,13 +1855,6 @@ public:
         // Runtime liveness for a foreign C++ value whose explicit release is conditional. The
         // static ExplicitlyMovedNull fact remains for same-block diagnostics and fast paths.
         llvm::Value* ConditionalDropFlag = nullptr;
-        // Runtime liveness for moved-out native value fields. Keys are paths below this binding.
-        std::unordered_map<std::string, llvm::Value*> FieldDropFlags;
-        // A field-drop-tracked binding escaped after at least one field move.
-        bool FieldDropStorageEscaped = false;
-        // Field paths below this binding whose method receiver may re-init fields through `this`.
-        // A later move of a path at or below one of them latches FieldDropStorageEscaped.
-        std::vector<std::string> EscapeReceiverPaths;
         size_t DeclarationScopeDepth = 0;
         llvm::BasicBlock* DeclarationBlock = nullptr;
         // compile-time: the DECLARED element type name of this call argument, kept even where the
@@ -1835,6 +1881,8 @@ public:
         // Transient: TypedValue::joinClassPointee of a conditional join, so a nested arm keeps it.
         std::string JoinClassPointee;
         int JoinClassPointeeDepth = 0;
+        // Transient: TypedValue::ownedCallArms of a ?: join (bit 0 true arm, bit 1 false arm).
+        int TernaryOwnedCallArms = 0;
         // Transient: an imported enumerator / integer macro's value as a brace-list literal, set before
         // the element loses its storage. Empty when the element is not such a constant.
         std::string CxxImportedLiteral;
@@ -2130,7 +2178,6 @@ public:
         // Root VARIABLE of a field path ("w" for `w.a.b`). TypeAndValue.ParentVariableName names
         // only the IMMEDIATE parent, which on a nested path is an intermediate field, not a variable.
         std::string FieldPathRoot;
-        llvm::Value* FieldDropOwnerStorage = nullptr;
         // Positive provenance is set only after lookup resolves a field against `this`.
         bool IsThisReceiver = false;
         bool RootIsBorrowedThisField = false;
@@ -2264,7 +2311,12 @@ public:
         bool         isCxxSameTypeCastCopy = false; // transient provenance for a C++ conditional join
         bool         isCxxPrvalueConditional = false; // mixed C++ class glvalue/prvalue conditional
         bool         isExplicitMove = false; // written 'move x' operand; transient, read by operator calls
+        // ?: only: bit 0 = true arm, bit 1 = false arm is an owning unique call result (ruling 2026-10-31).
+        int          ownedCallArms = 0;
         bool         isPointerArithmeticResult = false; // `p + n` / `p - n` pointer result
+        // Narrow width (1, 8 or 16) an int arithmetic result was built from (r3 call-argument mark), else 0.
+        // Set from operand TYPES where the operation is typed; read only by call-argument classification.
+        uint8_t      arithNarrowWidth = 0;
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
         llvm::Value* receiverStorage = nullptr; // lvalue storage retained for synthesized method calls
         // Non-null when `value` is the POINTER a C++ operator returned for a `T&` result: the
@@ -2561,6 +2613,13 @@ public:
 
     public:
     TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
+    // Result value of the LAST call when it returned an owning `unique` result, else null (see
+    // IsUniqueOwningCallResult). Gates compare an RHS value against it, so methods are covered too.
+    llvm::Value* lastUniqueOwningCallResult = nullptr;
+    // Value and owning-arm bits of the most recent ?: join. A parenthesized nested ?: arm loses its
+    // TypedValue bits on the way out, but its value is the same join, so the outer arm matches on it.
+    llvm::Value* lastTernaryJoinValue = nullptr;
+    int lastTernaryJoinArms = 0;
     std::function<void(antlr4::ParserRuleContext*, std::string)> contextualErrorReporter;
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
@@ -6411,6 +6470,18 @@ private:
      * read as a borrow.
      */
     bool TernaryArmIsProvenBorrow(llvm::Value* armValue, llvm::Value* armStorage) const;
+    /*
+     * Ruling 2026-10-31: an explicit `move` source that is a plain local/parameter slot bound from an
+     * ADDRESS-OF (`int* p = &x;`) provably borrows. Owners, fields, elements and unknown provenance
+     * answer false. Borrowed-parameter sources keep their existing per-destination handling.
+     */
+    bool MoveSourceIsAddressBorrow(const NamedVariable& source) const;
+    void LogBorrowedMoveSlotError() const;
+    void LogOwningCallRawBindError(const std::string& destName) const;
+    // A call result that owns: declared `unique T*` (TypeName unique$T) or a core unique value.
+    bool IsUniqueOwningCallResult(const TypeAndValue& result) const;
+    // True when value IS the last unique owning call result, or loads its pointer back from the temp it was spilled to.
+    bool ValueIsUniqueCallResult(llvm::Value* value) const;
 
     // Ledger a pointer value a `move` of a BORROWED source produced (see movedBorrowedPtrValues_).
     void RegisterMovedBorrowedPtrValue(llvm::Value* value, const std::string& originName);
@@ -6820,13 +6891,6 @@ private:
     };
     // Shared field walk and classification for both full-destruction emitters.
     std::vector<FullDestructorMember> CollectFullDestructorMembers(const std::string& typeName);
-    void EmitFullDestructorWithFieldDropFlags(const NamedVariable& namedVar,
-                                               llvm::Value* storage,
-                                               const std::string& typeName,
-                                               const std::string& pathPrefix = {});
-    void EnsureFieldDropFlag(NamedVariable& namedVar, const std::string& field);
-    void SetFieldDropFlagsLive(NamedVariable& namedVar, const std::string& field,
-                               bool ensureExact, bool live);
 
     // `unique T* field`: null-checked delete of the pointee. Emitted into the synthesized
     // .dtorfull wrapper at teardown, and (with `replacement` set) ahead of a reassignment store,
@@ -6917,7 +6981,9 @@ private:
      */
     bool HasCxxClassMember(const std::string& typeName) const;
     bool IsOwningValueType(const std::string& typeName);
-    bool ShouldSkipMovedFromStructDestructor(const std::string& typeName) const;
+    // Zero-fills a by-value move source over its whole allocation (padding included); its
+    // destructor still runs at its normal time on that zero state (ruling 2026-10-31).
+    void ZeroMovedSource(llvm::Value* storage, llvm::Type* type);
     // An `extern` definition with a CFlat body follows the C ABI: the callee owns (and destroys)
     // each owning by-value param, so a call hands the argument over exactly like a `move` param.
     bool CFlatExternOwnsByValueParam(const TypeAndValue& p);
@@ -9744,7 +9810,7 @@ public:
 
     // Lower a plain pointer parameter from a pointer value, addressable value, or struct temporary.
     // Shared by direct calls and calls through function values so implicit borrows cannot drift.
-    llvm::Value* LowerPointerParamArg(const NamedVariable& arg, bool markAggregateEscape);
+    llvm::Value* LowerPointerParamArg(const NamedVariable& arg);
 
     // Address handed to a non-pointer `alias T` parameter: the caller's own slot when the
     // shapes match exactly, otherwise a materialized temp (a converted value has no slot).
@@ -10288,7 +10354,8 @@ public:
      * candidate's declared parameters, and a call through a function value.
      */
     llvm::Value* ConvertIntegerCallArgument(llvm::Value* value, llvm::Type* destType,
-        bool srcIsUnsigned, const std::string& paramSpelling, const std::string& what);
+        bool srcIsUnsigned, const std::string& paramSpelling, const std::string& what,
+        unsigned arithNarrowWidth = 0);
 
     // A declared signature in CFlat spelling, e.g. "int(char*, ...)", for diagnostics that
     // have to show two signatures side by side.
@@ -10298,7 +10365,21 @@ public:
 
     // The one scalar conversion table. Native calls refuse Narrow and EnumMismatch; C++ calls also
     // take the ruled Widen. `param` is the referent of a reference parameter (ScalarArgumentReferent).
-    enum class ScalarArgConversion { NotScalar, Exact, Widen, Narrow, EnumMismatch };
+    // PromotedNarrow: an int built from narrow operands (`s + 1`), which a narrow parameter takes
+    // as C does; it ranks below an exact int overload (RankIntegerConversion), never refused.
+    enum class ScalarArgConversion { NotScalar, Exact, Widen, Narrow, EnumMismatch, PromotedNarrow };
+    // Narrow width of one arithmetic operand before the usual conversions, from its TYPE: an i1/i8/i16
+    // value, an unnamed literal whose value fits 8 or 16 bits, or a marked result (`mark`). 0 = not narrow.
+    static unsigned ArithOperandNarrowWidth(llvm::Value* value, bool namedType, unsigned mark);
+    static unsigned ArithOperandNarrowWidth(const TypedValue& operand)
+    {
+        return ArithOperandNarrowWidth(operand.value,
+            !operand.sourceTypeName.empty(), operand.arithNarrowWidth);
+    }
+    // The mark of a binary int result: narrow only when both operands are and at least one is a
+    // runtime value (folded constants stay int, as master folds them); the wider width.
+    static unsigned ArithResultNarrowWidth(const TypedValue& lhs, const TypedValue& rhs);
+
     ScalarArgConversion ClassifyScalarArgConversion(const NamedVariable& arg, const TypeAndValue& param) const;
     // The value a C++ scalar reference parameter binds (the parameter itself when not a reference).
     static TypeAndValue ScalarArgumentReferent(const TypeAndValue& param);
@@ -11182,6 +11263,8 @@ public:
                                               bool allowTemplateClassConversion);
     std::string CxxRvalueRefBindKey(const NamedVariable& arg, const TypeAndValue& param,
                                     std::string& parameter, std::string& targetSpelling);
+    // Clang's first error line for `T r = source;` (copy-initialization), empty when it compiles.
+    std::string CxxCopyInitRefusal(const NamedVariable& arg, const std::string& targetType);
     // Clang's refusal of a probed `X&& r = source;`, empty when not probed or it binds.
     std::string CxxRvalueRefBindRefusal(const NamedVariable& arg, const TypeAndValue& param);
     bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
@@ -11371,8 +11454,10 @@ public:
     bool HasNonPublicCxxDefaultCtor(const std::string& typeName) const;
     bool CxxDefaultCtorAmbiguous(const std::string& typeName) const;
     bool CxxDefaultCtorAmbiguityError(const std::string& typeName, std::string& error);
+    // `allowExplicit`: direct-initialization (cast, member-wise copy) may pick an explicit copy ctor.
     const CxxClassInfo::Structor* FindCxxCopyCtor(const std::string& typeName,
-                                                   bool constSource = false) const;
+                                                   bool constSource = false,
+                                                   bool allowExplicit = false) const;
     const CxxClassInfo::Structor* FindCxxMoveCtor(const std::string& typeName) const;
     const CxxClassInfo::Structor* TryBindCxxGeneratedMoveCtor(const std::string& typeName);
     /*
@@ -11464,7 +11549,7 @@ public:
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                     llvm::Value* src, bool useMove, const char* context,
                                     const std::string& displayTypeName = {},
-                                    bool constSource = false);
+                                    bool constSource = false, bool directInit = false);
     // Same-class copy of an lvalue through the memoized wrapper request (one per class and
     // constness). False with `error` set when clang refuses; `out.requested` false when no wrapper.
     bool RequestSameClassCopy(const std::string& typeName, const NamedVariable& source,
@@ -12622,9 +12707,6 @@ public:
     // '&name' escaped the address - latch off the deref guard permanently (see AddressEscaped
     // on NamedVariable): the pointee may be rewritten through the escaped pointer from here on.
     void MarkVariableAddressEscaped(const std::string& name);
-    // A borrow may rebuild moved fields through its storage without changing null/move diagnostics.
-    void MarkVariableFieldStorageEscaped(const std::string& name);
-    void MarkReceiverPathEscaped(const std::string& name, const std::string& path);
 
     // The full explicit-move-null deref predicate: fires only for a DEREFERENCE in the SAME
     // block the move was recorded in (never across a branch/merge/loop back-edge - see
@@ -12650,9 +12732,7 @@ public:
     // Key of a field mark: the path below the root binding ('inner.p' for o.inner.p), so a nested
     // path never aliases a one-level field of the same leaf name. Falls back to the leaf name.
     static std::string FieldMoveKey(const NamedVariable& nv);
-    void MarkVariableFieldMoved(const std::string& name, const std::string& field,
-                                bool runtimeOnly = false);
-    void MarkStorageFieldMovedForDrop(llvm::Value* rootStorage, const std::string& field);
+    void MarkVariableFieldMoved(const std::string& name, const std::string& field);
 
     // Reassigning a field (`node->left = ...`) makes it live again.
     void MarkVariableFieldUnmoved(const std::string& name, const std::string& field);
@@ -13612,7 +13692,8 @@ public:
     void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr,
                           const std::string& interfaceReturnStructName = "",
                           bool srcIsUnsigned = false,
-                          const std::string& sourceTypeName = "");
+                          const std::string& sourceTypeName = "",
+                          bool sourceZeroFilled = false);
 
     void BeginAutoReturnCapture();
     std::vector<AutoReturnSite> EndAutoReturnCapture();

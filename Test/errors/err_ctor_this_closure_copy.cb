@@ -212,6 +212,18 @@ void t515RangeElementCopy()
     }
 }
 
+// A user generic class's instance behind a generic interface PARAMETER is a known implementor
+// (its base clause marks only the template uncertain), so the copying get() is refused.
+interface IDiscflakeGet<T> { T get(); };
+class DiscflakeBox<T> : IDiscflakeGet<T> { T v = default; T get() { return this.v; } };
+void discflakeMakeBox() { DiscflakeBox<T515ListS>* box = new DiscflakeBox<T515ListS>(); }
+void discflakeInterfaceParamGet(IDiscflakeGet<T515ListS> getter)
+{
+    expect_error("returning 'T515ListS' by value would leave its stored closure") {
+        T515ListS copy = getter.get();
+    }
+}
+
 extern int main()
 {
     return 0;

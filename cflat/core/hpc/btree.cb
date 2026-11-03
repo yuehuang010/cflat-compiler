@@ -174,9 +174,13 @@ struct btree<K, V>
     // Store a key into slot i of a node, deep-copying an owning key (mirrors dictionary.cb).
     void _storeKey(btree_node<K, V>* n, int i, K key)
     {
-        if const (is_primitive(K))    n->keys[i] = key;
-        else if const (is_pointer(K)) n->keys[i] = key;
-        else                          n->keys[i] = key.copy();
+        if const (is_assignable(K))
+        {
+            if const (is_primitive(K))    n->keys[i] = key;
+            else if const (is_pointer(K)) n->keys[i] = key;
+            else                          n->keys[i] = key.copy();
+        }
+        else compile_error("btree<K, V>._storeKey(): key type K has a const field and cannot be assigned");
     }
 
     // Return an OWNED deep copy of a key: a fresh clone of an owning key (string or a struct that
@@ -185,9 +189,13 @@ struct btree<K, V>
     K _dupKey(K k)
     {
         K r = default;
-        if const (is_primitive(K))    r = k;
-        else if const (is_pointer(K)) r = k;
-        else                          r = k.copy();
+        if const (is_assignable(K))
+        {
+            if const (is_primitive(K))    r = k;
+            else if const (is_pointer(K)) r = k;
+            else                          r = k.copy();
+        }
+        else compile_error("btree<K, V>._dupKey(): key type K has a const field and cannot be assigned");
         return r;
     }
 
@@ -207,7 +215,8 @@ struct btree<K, V>
     // separator (a leaf's own copy of the key stays untouched; only the parent's copy drops).
     void _releaseKeyAt(btree_node<K, V>* n, int i)
     {
-        _ = move n->keys[i];
+        if const (is_assignable(K)) _ = move n->keys[i];
+        else compile_error("btree<K, V>._releaseKeyAt(): key type K has a const field and cannot be assigned");
     }
 
     // Abandon-clear a key/value slot: overwrite with a default WITHOUT freeing, for the one
@@ -219,7 +228,11 @@ struct btree<K, V>
     // borrowed and the node destructor leaves it alone regardless.
     void _clearKey(btree_node<K, V>* n, int i)
     {
-        if const (!is_primitive(K)) if const (!is_pointer(K)) { K e = default; n->keys[i] = e; }
+        if const (is_assignable(K))
+        {
+            if const (!is_primitive(K)) if const (!is_pointer(K)) { K e = default; n->keys[i] = e; }
+        }
+        else compile_error("btree<K, V>._clearKey(): key type K has a const field and cannot be assigned");
     }
     void _clearValue(btree_node<K, V>* n, int i)
     {
@@ -238,21 +251,25 @@ struct btree<K, V>
     // the node this just stored into the tree.
     void _insertChildAt(btree_node<K, V>* parent, int idx, move K sep, move btree_node<K, V>* rightChild)
     {
-        int j = parent->count;
-        while (j > idx)
+        if const (is_assignable(K))
         {
-            // Plain rotation opens a gap at idx: shifts entries UP into the empty tail, and the
-            // source of each copy is overwritten by the next iteration, so no slot is left
-            // double-owned (bit-relocate invariant - kept as a plain store, not a `move`).
-            parent->keys[j] = parent->keys[j - 1];
-            parent->children[j + 1] = parent->children[j];
-            j--;
+            int j = parent->count;
+            while (j > idx)
+            {
+                // Plain rotation opens a gap at idx: shifts entries UP into the empty tail, and the
+                // source of each copy is overwritten by the next iteration, so no slot is left
+                // double-owned (bit-relocate invariant - kept as a plain store, not a `move`).
+                parent->keys[j] = parent->keys[j - 1];
+                parent->children[j + 1] = parent->children[j];
+                j--;
+            }
+            // `sep` is a `move` PARAMETER (owned by this call), so moving it into the freed slot i is
+            // legal and transfers the buffer; the old alias at slot idx was preserved one slot up.
+            parent->keys[idx] = move sep;
+            parent->children[idx + 1] = rightChild;
+            parent->count++;
         }
-        // `sep` is a `move` PARAMETER (owned by this call), so moving it into the freed slot i is
-        // legal and transfers the buffer; the old alias at slot idx was preserved one slot up.
-        parent->keys[idx] = move sep;
-        parent->children[idx + 1] = rightChild;
-        parent->count++;
+        else compile_error("btree<K, V>._insertChildAt(): key type K has a const field and cannot be assigned");
     }
 
     // Split parent->children[idx], which is full (count == BTREE_FANOUT). Leaf split: the
@@ -261,7 +278,7 @@ struct btree<K, V>
     // the median key MOVES up into the parent and is removed from both children.
     void _splitChild(btree_node<K, V>* parent, int idx)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             btree_node<K, V>* left = parent->children[idx];
             btree_node<K, V>* right = new btree_node<K, V>();
@@ -312,6 +329,7 @@ struct btree<K, V>
                 _insertChildAt(parent, idx, move left->keys[mid], right);
             }
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._splitChild(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._splitChild(): value type V has a const field and cannot be assigned");
     }
 
@@ -339,7 +357,7 @@ struct btree<K, V>
     // occupant, which the caller immediately overwrites.
     int _leafOpenSlot(btree_node<K, V>* n, K key)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             int i = 0;
             while (i < n->count && _lt(n->keys[i], key)) i++;
@@ -358,7 +376,8 @@ struct btree<K, V>
         }
         else
         {
-            compile_error("btree<K, V>._leafOpenSlot(): value type V has a const field and cannot be assigned");
+            if const (!is_assignable(K)) compile_error("btree<K, V>._leafOpenSlot(): key type K has a const field and cannot be assigned");
+            else compile_error("btree<K, V>._leafOpenSlot(): value type V has a const field and cannot be assigned");
             return 0;
         }
     }
@@ -374,7 +393,7 @@ struct btree<K, V>
     // Never allocates or frees a node, and never frees a value - safe with only n's lock held.
     void _leafInsertNew(btree_node<K, V>* n, K key, V value)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             // Poisoned for a non-copyable V like every other copying entry point. Guarding only the
             // public add()/set()/insert() is NOT enough: this helper is instantiated regardless.
@@ -390,19 +409,21 @@ struct btree<K, V>
                 n->count++;
             }
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._leafInsertNew(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._leafInsertNew(): value type V has a const field and cannot be assigned");
     }
 
     // _leafInsertNew's transfer counterpart: consumes value on every path.
     void _leafInsertNewMoved(btree_node<K, V>* n, K key, move V value)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             int i = _leafOpenSlot(n, key);
             _storeKey(n, i, key);
             n->values[i] = move value;
             n->count++;
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._leafInsertNewMoved(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._leafInsertNewMoved(): value type V has a const field and cannot be assigned");
     }
 
@@ -411,7 +432,7 @@ struct btree<K, V>
     // Extracted so both insert entry points (add()/set()) share one descent+split walk.
     btree_node<K, V>* _descendSplitting(K key)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             if (_root == nullptr) _root = _newLeaf();
 
@@ -438,7 +459,8 @@ struct btree<K, V>
         }
         else
         {
-            compile_error("btree<K, V>._descendSplitting(): value type V has a const field and cannot be assigned");
+            if const (!is_assignable(K)) compile_error("btree<K, V>._descendSplitting(): key type K has a const field and cannot be assigned");
+            else compile_error("btree<K, V>._descendSplitting(): value type V has a const field and cannot be assigned");
             return nullptr;
         }
     }
@@ -448,7 +470,7 @@ struct btree<K, V>
     // intact); a bare pointer / interface value is BORROWED; a `unique` value is TAKEN.
     bool add(K key, V value)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             // Poison the copying overload for a non-copyable V so the class still instantiates and
             // `add(k, move x)` stays usable; the dead arm emits no store of a non-copyable value.
@@ -474,7 +496,8 @@ struct btree<K, V>
         }
         else
         {
-            compile_error("btree<K, V>.add(): value type V has a const field and cannot be assigned");
+            if const (!is_assignable(K)) compile_error("btree<K, V>.add(): key type K has a const field and cannot be assigned");
+            else compile_error("btree<K, V>.add(): value type V has a const field and cannot be assigned");
             return false;
         }
     }
@@ -484,7 +507,7 @@ struct btree<K, V>
     // released first (a `unique` value is freed, a value type destructed, a borrow dropped).
     void set(K key, V value)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             if const (!is_copyable(V)) compile_error("this btree value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
             else
@@ -508,6 +531,7 @@ struct btree<K, V>
                 }
             }
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>.set(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>.set(): value type V has a const field and cannot be assigned");
     }
 
@@ -521,7 +545,7 @@ struct btree<K, V>
     {
         bool add(K key, move V value)
         {
-            if const (is_assignable(V))
+            if const (is_assignable(V) && is_assignable(K))
             {
                 btree_node<K, V>* n = _descendSplitting(key);
                 // On a duplicate `value` is dropped and destructed at scope exit. That is correct:
@@ -533,14 +557,15 @@ struct btree<K, V>
             }
             else
             {
-                compile_error("btree<K, V>.add(): value type V has a const field and cannot be assigned");
+                if const (!is_assignable(K)) compile_error("btree<K, V>.add(): key type K has a const field and cannot be assigned");
+                else compile_error("btree<K, V>.add(): value type V has a const field and cannot be assigned");
                 return false;
             }
         }
 
         void set(K key, move V value)
         {
-            if const (is_assignable(V))
+            if const (is_assignable(V) && is_assignable(K))
             {
                 btree_node<K, V>* n = _descendSplitting(key);
                 int s = _leafFind(n, key);
@@ -555,6 +580,7 @@ struct btree<K, V>
                     _count++;
                 }
             }
+            else if const (!is_assignable(K)) compile_error("btree<K, V>.set(): key type K has a const field and cannot be assigned");
             else compile_error("btree<K, V>.set(): value type V has a const field and cannot be assigned");
         }
     }
@@ -773,7 +799,7 @@ struct btree<K, V>
     // a `unique` value is TAKEN. Write `insert(k, move x)` to transfer a value type instead.
     bool insert(K key, V value)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             if const (!is_copyable(V)) compile_error("this btree value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
             else
@@ -796,7 +822,8 @@ struct btree<K, V>
         }
         else
         {
-            compile_error("btree<K, V>.insert(): value type V has a const field and cannot be assigned");
+            if const (!is_assignable(K)) compile_error("btree<K, V>.insert(): key type K has a const field and cannot be assigned");
+            else compile_error("btree<K, V>.insert(): value type V has a const field and cannot be assigned");
             return false;
         }
     }
@@ -806,7 +833,7 @@ struct btree<K, V>
     {
         bool insert(K key, move V value)
         {
-            if const (is_assignable(V))
+            if const (is_assignable(V) && is_assignable(K))
             {
                 btree_node<K, V>* leaf = _lockLeafForInsert(key);
                 if (_leafFind(leaf, key) >= 0)
@@ -821,7 +848,8 @@ struct btree<K, V>
             }
             else
             {
-                compile_error("btree<K, V>.insert(): value type V has a const field and cannot be assigned");
+                if const (!is_assignable(K)) compile_error("btree<K, V>.insert(): key type K has a const field and cannot be assigned");
+                else compile_error("btree<K, V>.insert(): value type V has a const field and cannot be assigned");
                 return false;
             }
         }
@@ -833,7 +861,7 @@ struct btree<K, V>
     // share one descent and neither materializes a value before the duplicate check.
     btree_node<K, V>* _lockLeafForInsert(K key)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             btree_node<K, V>* leaf = _fastLockLeafWithRoom(key);
             if (leaf != nullptr) return leaf;
@@ -841,7 +869,8 @@ struct btree<K, V>
         }
         else
         {
-            compile_error("btree<K, V>._lockLeafForInsert(): value type V has a const field and cannot be assigned");
+            if const (!is_assignable(K)) compile_error("btree<K, V>._lockLeafForInsert(): key type K has a const field and cannot be assigned");
+            else compile_error("btree<K, V>._lockLeafForInsert(): value type V has a const field and cannot be assigned");
             return nullptr;
         }
     }
@@ -854,7 +883,7 @@ struct btree<K, V>
     // target leaf EXCLUSIVELY LOCKED and with room; the caller releases it.
     btree_node<K, V>* _lockLeafPessimistic(K key)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             while (true)
             {
@@ -924,7 +953,8 @@ struct btree<K, V>
         }
         else
         {
-            compile_error("btree<K, V>._lockLeafPessimistic(): value type V has a const field and cannot be assigned");
+            if const (!is_assignable(K)) compile_error("btree<K, V>._lockLeafPessimistic(): key type K has a const field and cannot be assigned");
+            else compile_error("btree<K, V>._lockLeafPessimistic(): value type V has a const field and cannot be assigned");
             return nullptr;
         }
     }
@@ -967,7 +997,7 @@ struct btree<K, V>
     // internal/plan/optimistic-lock-coupling.md).
     bool remove(K key)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             if (_root == nullptr) return false;
 
@@ -1009,7 +1039,8 @@ struct btree<K, V>
         }
         else
         {
-            compile_error("btree<K, V>.remove(): value type V has a const field and cannot be assigned");
+            if const (!is_assignable(K)) compile_error("btree<K, V>.remove(): key type K has a const field and cannot be assigned");
+            else compile_error("btree<K, V>.remove(): value type V has a const field and cannot be assigned");
             return false;
         }
     }
@@ -1023,7 +1054,7 @@ struct btree<K, V>
     // node's OWNING SLOT (`_root` / `parent->children[i]`), never this borrowed local.
     void _rebalanceFrom(btree_node<K, V>** path, int* pathIdx, int depth, btree_node<K, V>* node)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             int d = depth;
             while (true)
@@ -1071,6 +1102,7 @@ struct btree<K, V>
                 d--;
             }
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._rebalanceFrom(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._rebalanceFrom(): value type V has a const field and cannot be assigned");
     }
 
@@ -1080,7 +1112,7 @@ struct btree<K, V>
     // fixup below overwrites it before anything reads it.
     void _mergeWithLeft(btree_node<K, V>* parent, int idx, move btree_node<K, V>* node, btree_node<K, V>* leftSib)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             bool leafMerge = node->isLeaf;
             int k = 0;
@@ -1136,6 +1168,7 @@ struct btree<K, V>
             _clearKey(parent, parent->count - 1);
             parent->count--;
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._mergeWithLeft(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._mergeWithLeft(): value type V has a const field and cannot be assigned");
     }
 
@@ -1145,7 +1178,7 @@ struct btree<K, V>
     // and the separator fixup below overwrites it before anything reads it.
     void _mergeWithRight(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, move btree_node<K, V>* rightSib)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             bool leafMerge = node->isLeaf;
             int k = 0;
@@ -1199,6 +1232,7 @@ struct btree<K, V>
             _clearKey(parent, parent->count - 1);
             parent->count--;
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._mergeWithRight(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._mergeWithRight(): value type V has a const field and cannot be assigned");
     }
 
@@ -1216,7 +1250,7 @@ struct btree<K, V>
     // Borrow the last entry of leftSib into node (node is parent->children[idx]).
     void _borrowFromLeft(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, btree_node<K, V>* leftSib)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             // All three nodes are borrowed pointer parameters. Every handoff below is a plain
             // bit-relocate store, not a `move`: `move` releases the DESTINATION's prior content
@@ -1256,13 +1290,14 @@ struct btree<K, V>
                 _clearKey(leftSib, leftSib->count);
             }
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._borrowFromLeft(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._borrowFromLeft(): value type V has a const field and cannot be assigned");
     }
 
     // Borrow the first entry of rightSib into node (node is parent->children[idx]).
     void _borrowFromRight(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, btree_node<K, V>* rightSib)
     {
-        if const (is_assignable(V))
+        if const (is_assignable(V) && is_assignable(K))
         {
             // Same shape and reasoning as _borrowFromLeft: every store is a bit-relocate, and the
             // true vacated tail slot is abandon-cleared (not `move`d) after each down-shift.
@@ -1297,6 +1332,7 @@ struct btree<K, V>
                 _clearKey(rightSib, rightSib->count);
             }
         }
+        else if const (!is_assignable(K)) compile_error("btree<K, V>._borrowFromRight(): key type K has a const field and cannot be assigned");
         else compile_error("btree<K, V>._borrowFromRight(): value type V has a const field and cannot be assigned");
     }
 

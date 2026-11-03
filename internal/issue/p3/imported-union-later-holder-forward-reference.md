@@ -11,3 +11,9 @@ Root cause (MIX8): the cross-file part is a general import-order gap, not union-
 and pointer field, and for a struct by-value and pointer field (scratch/mix8_tmp/u). Same-file forward use works.
 Not fixed: pre-registering importer shells would give an EMPTY layout to by-value uses; needs a deferred-layout
 design. The `struct Never;` forward-declaration syntax is left for a maintainer ruling (not added).
+
+RULED 2026-10-31 (maintainer): KEEP REFUSING, no new syntax. An import is a module, not a textual include: an imported file cannot see
+the importer's declarations, later or earlier (C header model); the located "cannot find the type XLater" error stands. C's
+`struct Never;` forward declaration is NOT added - same-file forward use already works without it (and the same-file by-value
+`list<Later>` field is ruled legal in list-template-later-types-unresolved.md). Test consequence: none; the cross-file shapes may
+get an err_ leg pinning the located error. Closed as intended.

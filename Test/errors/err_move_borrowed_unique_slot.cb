@@ -1,0 +1,13 @@
+// Explicit move of a pointer to a unique local into a unique<T>* slot: the unique local still owns
+// the pointee. Refused; move from the owning slot instead.
+import "unique.cb";
+
+extern int main()
+{
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        unique<int> u = unique<int>(new int(5));
+        unique<int>* p = &u;
+        unique<int>* q = move p;
+    }
+    return 0;
+}

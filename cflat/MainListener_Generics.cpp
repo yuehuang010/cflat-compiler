@@ -305,6 +305,8 @@ bool MainListener::IsFollowedByCall(CFlatParser::PostfixExpressionContext* ctx, 
 
 std::string MainListener::InstantiateGenericFunction(const std::string& baseName,
                                                     const std::vector<std::string>& spelledArgs) {
+        if (StackBytesRemaining() < kMinStackHeadroomBytes)
+            Compiler()->LogError("generic instantiation is nested too deeply; split it into named temporaries");
         std::vector<std::string> typeArgs = spelledArgs;
         ResolveEnumTypeArguments(typeArgs);
         if (genericFunctionTemplates.count(baseName) != 0

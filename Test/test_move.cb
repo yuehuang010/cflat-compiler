@@ -13630,6 +13630,120 @@ int testDiscardMoveReturningCall()
     return passed;
 }
 
+/*
+ * MIX19: a `?:` whose arms are BOTH explicit moves (string fields/locals) joins the moved-out
+ * buffers. The selected one must be freed once and the other arm must stay intact.
+ */
+struct Mix19Pair { string s = default; string t = default; };
+int mix19SeenO = -1;
+int mix19SeenQ = -1;
+
+string mix19Text()
+{
+    return "a moderately long string value for the mix19 ternary move legs 0123456789".copy();
+}
+
+void mix19DiscardMoves(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    _ = c ? move o.s : move q.s;
+    mix19SeenO = o.s.length();
+    mix19SeenQ = q.s.length();
+}
+
+void mix19DiscardParenMoves(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    _ = c ? (move o.s) : (move q.s);
+    mix19SeenO = o.s.length();
+    mix19SeenQ = q.s.length();
+}
+
+void mix19DiscardPlain(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    _ = c ? o.s : q.s;
+    mix19SeenO = o.s.length();
+    mix19SeenQ = q.s.length();
+}
+
+void mix19BindMoves(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    string r = c ? move o.s : move q.s;
+    mix19SeenO = r.length();
+    mix19SeenQ = o.s.length() + q.s.length();
+}
+
+void mix19TakeString(string value)
+{
+    mix19SeenO = value.length();
+}
+
+void mix19ArgMoves(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    mix19TakeString(c ? move o.s : move q.s);
+    mix19SeenQ = o.s.length() + q.s.length();
+}
+
+int testMix19TernaryMoveJoin()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    int len = mix19Text().length();
+
+    i64 before = (i64)HeapAudit.reportLeaks();
+    mix19DiscardMoves(true);
+    passed += Test("mix19 discard move join true frees nothing twice", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("mix19 discard move join true empties selected", mix19SeenO, 0);
+    passed += Test("mix19 discard move join true keeps other arm", mix19SeenQ, len);
+
+    before = (i64)HeapAudit.reportLeaks();
+    mix19DiscardMoves(false);
+    passed += Test("mix19 discard move join false leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("mix19 discard move join false keeps other arm", mix19SeenO, len);
+    passed += Test("mix19 discard move join false empties selected", mix19SeenQ, 0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    mix19DiscardParenMoves(true);
+    passed += Test("mix19 discard paren move join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("mix19 discard paren move join empties selected", mix19SeenO, 0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    mix19BindMoves(true);
+    passed += Test("mix19 bind move join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("mix19 bind move join result length", mix19SeenO, len);
+    passed += Test("mix19 bind move join sources left", mix19SeenQ, len);
+
+    before = (i64)HeapAudit.reportLeaks();
+    mix19ArgMoves(false);
+    passed += Test("mix19 call arg move join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("mix19 call arg move join sources left", mix19SeenQ, len);
+
+    // Neighbour that must not change: a plain (non-move) join copies nothing and frees nothing.
+    before = (i64)HeapAudit.reportLeaks();
+    mix19DiscardPlain(true);
+    passed += Test("mix19 discard plain join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("mix19 discard plain join keeps both", mix19SeenO + mix19SeenQ, len * 2);
+    return passed;
+}
+
 // `move` of a BORROWED parameter transfers nothing: nulling the callee's copy leaves the CALLER
 // the sole owner. Neither helper may adopt the join - the pointee is still the caller's, and
 // freeing it here destroys a live object the caller frees again at its own scope exit.
@@ -17022,6 +17136,23 @@ int t490RunPlainLoop()
     }
     return value;
 }
+// MOVEDTOR2 (ruling 2026-10-31): a moved-from value is zero-filled and still destroyed, as clang's
+// zero-filling move constructor leaves an object its destructor then runs on.
+int md2Locked = 0;
+int md2Dtors = 0;
+int md2Frees = 0;
+struct Md2Guard { Md2Guard() { md2Locked++; } ~Md2Guard() { md2Locked--; md2Dtors++; } };
+struct Md2Buf
+{
+    int* data = nullptr;
+    ~Md2Buf() { if (data != nullptr) md2Frees++; free((void*)data); md2Dtors++; }
+};
+struct Md2Box<T> { T val = default; };
+int md2GuardScope() { Md2Guard g = Md2Guard(); return md2Locked; }
+int md2TakeGuard(move Md2Guard g) { return md2Locked; }
+int md2TakeBuf(move Md2Buf b) { return b.data != nullptr ? 1 : 0; }
+T490Plain md2BareReturn() { T490Plain x = default; x.value = 5; return x; }
+T490Plain md2MoveReturn() { T490Plain x = default; x.value = 5; return move x; }
 int t490PayloadDtors = 0;
 int t490OwnerDtors = 0;
 struct T490Payload { ~T490Payload() { t490PayloadDtors++; } };
@@ -17846,6 +17977,9 @@ extern int main()
     passed += testDiscardMoveReturningCall();
     total += 6;
 
+    passed += testMix19TernaryMoveJoin();
+    total += 15;
+
     passed += testUniqueFieldStoreRemedies();
     total += 29;
 
@@ -18309,11 +18443,14 @@ extern int main()
 
     passed += testT364NativeOperatorReturnFacts();
     passed += testMix9ReleaseReturn();
+    passed += uqrawAcceptLegs();
+    total += 11; // UQRAW accept-set legs (uqrawAcceptLegs)
     total += 3; // release() results returned as bare pointers (heap-array gate)
     total += 97; // mvfield legs and four CALLEEREF accept-set legs
     passed += testT523ByrefClosureRebind();
     total += 15;
     total += 3; // T499 branch, loop and for-increment reassign legs
+    total += 8; // MOVEDTOR2 zero-filled move-source destructor legs
     total += 3;
     total += 18;
     total += 16;
@@ -19393,7 +19530,7 @@ int testImmovableFactoryReturn()
     passed += Test("t442_tracked_nested_assignment_true_true", t442NestedAssignTracked(true, true), 2212);
     passed += Test("t442_tracked_nested_assignment_true_false", t442NestedAssignTracked(true, false), 3212);
     passed += Test("t442_tracked_nested_assignment_outer_false", t442NestedAssignTracked(false, true), 4212);
-    passed += Test("mix4_moved_out_field_reassign_drops_once", mix4FieldSwapCounts(), 4420);
+    passed += Test("mix4_moved_out_field_reassign_drops_once", mix4FieldSwapCounts(), 6420);
     return passed;
 }
 
@@ -24170,41 +24307,71 @@ int testT364NativeOperatorReturnFacts()
     int t490Value = 0;
     { T490Plain local = default; local.value = 3; t490Value = t490TakePlain(move local); }
     passed += Test("t490_plain_move_param_value", t490Value, 3);
-    passed += Test("t490_plain_move_param_dtors", t490PlainDtors, 1);
+    passed += Test("t490_plain_move_param_dtors", t490PlainDtors, 2);
 
     t490PlainDtors = 0;
     { T490Plain source = default; source.value = 4; T490Plain target = default; target = move source; t490Value = target.value; }
     passed += Test("t490_plain_assign_move_value", t490Value, 4);
-    passed += Test("t490_plain_assign_move_dtors", t490PlainDtors, 2);
+    passed += Test("t490_plain_assign_move_dtors", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     { T490Plain local = default; local.value = 5; _ = move local; }
-    passed += Test("t490_plain_discard_move_dtors", t490PlainDtors, 1);
+    passed += Test("t490_plain_discard_move_dtors", t490PlainDtors, 2);
 
     t490PlainDtors = 0;
     { T490Plain result = t490ReturnPlain(); t490Value = result.value; }
     passed += Test("t490_plain_return_move_value", t490Value, 6);
-    passed += Test("t490_plain_return_move_dtors", t490PlainDtors, 1);
+    passed += Test("t490_plain_return_move_dtors", t490PlainDtors, 2);
 
     t490PlainDtors = 0;
     t490Value = t490RunPlainBranch(true, 7) + t490RunPlainBranch(false, 8);
     passed += Test("t490_plain_branch_move_value", t490Value, 15);
-    passed += Test("t490_plain_branch_move_dtors", t490PlainDtors, 2);
+    passed += Test("t490_plain_branch_move_dtors", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     t490Value = t490RunPlainLoop();
     passed += Test("t490_plain_loop_move_value", t490Value, 22);
-    passed += Test("t490_plain_loop_move_dtors", t490PlainDtors, 4);
+    passed += Test("t490_plain_loop_move_dtors", t490PlainDtors, 6);
 
     t490PlainDtors = 0;
     { T490PlainBox box = default; T490Plain source = default; source.value = 9; box.value = move source; t490Value = box.value.value; }
     passed += Test("t490_plain_field_move_value", t490Value, 9);
-    passed += Test("t490_plain_field_move_dtors", t490PlainDtors, 2);
+    passed += Test("t490_plain_field_move_dtors", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     { T490Plain[2] values = default; T490Plain source = default; source.value = 11; values[0] = move source; t490Value = values[0].value; }
     passed += Test("t490_plain_element_move_value", t490Value, 11);
-    passed += Test("t490_plain_element_move_dtors", t490PlainDtors, 3);
+    passed += Test("t490_plain_element_move_dtors", t490PlainDtors, 4);
+
+    md2Locked = 0;
+    md2Dtors = 0;
+    t490Value = md2GuardScope();
+    passed += Test("movedtor2_live_guard_runs_once", t490Value * 10 + md2Locked + md2Dtors * 100, 110);
+    md2Locked = 0;
+    md2Dtors = 0;
+    { Md2Guard a = Md2Guard(); Md2Guard b = move a; }
+    passed += Test("movedtor2_moved_guard_runs_twice", md2Locked * 10 + md2Dtors, -8);
+    md2Locked = 0;
+    md2Dtors = 0;
+    { Md2Guard a = Md2Guard(); t490Value = md2TakeGuard(move a); }
+    passed += Test("movedtor2_guard_param_runs_twice", md2Locked * 10 + md2Dtors, -8);
+    md2Dtors = 0;
+    md2Frees = 0;
+    { Md2Buf b = default; b.data = (int*)malloc(4); t490Value = md2TakeBuf(move b); }
+    passed += Test("movedtor2_buf_frees_once", t490Value * 100 + md2Frees * 10 + md2Dtors, 112);
+    t490PlainDtors = 0;
+    { Md2Box<T490Plain> box = default; box.val.value = 7; t490Value = t490TakePlain(move box.val); }
+    passed += Test("movedtor2_generic_field_move_dtors", t490Value * 10 + t490PlainDtors, 72);
+    t490PlainDtors = 0;
+    { T490Plain r = md2BareReturn(); t490Value = r.value; }
+    passed += Test("movedtor2_bare_return_relocates", t490Value * 10 + t490PlainDtors, 51);
+    t490PlainDtors = 0;
+    { T490Plain r = md2MoveReturn(); t490Value = r.value; }
+    passed += Test("movedtor2_move_return_destroys_source", t490Value * 10 + t490PlainDtors, 52);
+    md2Locked = 0;
+    md2Dtors = 0;
+    { unique Md2Guard* g = new Md2Guard(); unique Md2Guard* h = move g; }
+    passed += Test("movedtor2_owning_pointer_move_runs_once", md2Locked * 10 + md2Dtors, 1);
 
     t490PayloadDtors = 0;
     t490OwnerDtors = 0;
@@ -24214,58 +24381,58 @@ int testT364NativeOperatorReturnFacts()
     t499PlainTrace = 0;
     int t499Value = 0;
     { T499Plain local = default; local.value = 5; t499Value = t499TakePlain(move local); local = t499MakePlain(3); }
-    // The zero digit must be absent: reassigning the moved-from local does not destroy its husk.
-    passed += Test("t499_reassign_after_move_value_trace", t499Value * 1000 + t499PlainTrace, 5064);
+    // Each moved-from husk is zero-filled and destroyed like clang's: a '1' digit per move.
+    passed += Test("t499_reassign_after_move_value_trace", t499Value * 1000 + t499PlainTrace, 11114);
 
     t499PlainTrace = 0;
     { T499Plain a = default; a.value = 6; T499Plain b = default; b.value = 7; a = move b; b = t499MakePlain(2); a = t499MakePlain(4); t499Value = a.value * 100 + b.value; }
-    // The moved-from b contributes no zero-valued destructor between a's drop and its reinit.
-    passed += Test("t499_move_assign_reassign_value_trace", t499Value * 10000 + t499PlainTrace, 4027835);
+    // The moved-from b and each maker's moved-from result add a zero-valued ('1') destructor.
+    passed += Test("t499_move_assign_reassign_value_trace", t499Value * 10000 + t499PlainTrace, 11131835);
 
     t499PlainTrace = 0;
     { T499Plain local = default; local.value = 1; t499TakePlain(move local); local = t499MakePlain(2); t499TakePlain(move local); local = t499MakePlain(3); t499Value = local.value; }
-    // Both moved-from generations stay dead; the three real objects append 2, 3 and 4.
-    passed += Test("t499_move_twice_reinit_value_trace", t499Value * 10000 + t499PlainTrace, 30234);
+    // Both moved-from generations are destroyed on their zero state ('1'), like clang.
+    passed += Test("t499_move_twice_reinit_value_trace", t499Value * 10000 + t499PlainTrace, 2143114);
 
     t499PlainTrace = 0;
     t499Value = 0;
     bool t499BranchReassign = true;
     { T499Plain local = default; local.value = 5; t499Value = t499TakePlain(move local); if (t499BranchReassign) { local = t499MakePlain(3); } }
-    passed += Test("t499_branch_reassign_value_trace", t499Value * 100 + t499PlainTrace, 564);
+    passed += Test("t499_branch_reassign_value_trace", t499Value * 100 + t499PlainTrace, 6614);
 
     t499PlainTrace = 0;
     t499Value = 0;
     { T499Plain local = default; local.value = 5; t499Value = t499TakePlain(move local); for (int i = 1; i <= 3; i++) { local = t499MakePlain(i); } }
-    passed += Test("t499_loop_reassign_value_trace", t499Value * 10000 + t499PlainTrace, 56234);
+    passed += Test("t499_loop_reassign_value_trace", t499Value * 10000 + t499PlainTrace, 61162134);
     t499PlainTrace = 0;
     t499Value = 0;
     { T499Plain local = default; local.value = 5; t499Value = t499TakePlain(move local); for (int i = 0; i < 3; local = t499MakePlain(i)) { i++; } }
-    passed += Test("t499_for_increment_reassign_value_trace", t499Value * 10000 + t499PlainTrace, 56234);
+    passed += Test("t499_for_increment_reassign_value_trace", t499Value * 10000 + t499PlainTrace, 61162134);
 
     t490PlainDtors = 0;
     { T490PlainOuter box = default; box.inn.value = 41; box.other.value = 42; t490Value = t490TakePlain(move box.inn); }
     passed += Test("mvfield_param_value", t490Value, 41);
-    passed += Test("mvfield_param_drop_count", t490PlainDtors, 2);
+    passed += Test("mvfield_param_drop_count", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     { T490PlainOuter box = default; box.inn.value = 43; box.other.value = 44; T490Plain local = move box.inn; t490Value = local.value; }
     passed += Test("mvfield_local_value", t490Value, 43);
-    passed += Test("mvfield_local_drop_count", t490PlainDtors, 2);
+    passed += Test("mvfield_local_drop_count", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     { T490Plain local = t490ReturnOuterField(); t490Value = local.value; }
     passed += Test("mvfield_return_value", t490Value, 31);
-    passed += Test("mvfield_return_drop_count", t490PlainDtors, 2);
+    passed += Test("mvfield_return_drop_count", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     { T490Plain target = default; target.value = 45; T490PlainOuter box = default; box.inn.value = 46; box.other.value = 47; target = move box.inn; t490Value = target.value; }
     passed += Test("mvfield_assign_value", t490Value, 46);
-    passed += Test("mvfield_assign_drop_count", t490PlainDtors, 3);
+    passed += Test("mvfield_assign_drop_count", t490PlainDtors, 4);
 
     t490PlainDtors = 0;
     { T490PlainNested box = default; box.inner.inn.value = 48; box.inner.other.value = 49; box.other.value = 50; t490Value = t490TakePlain(move box.inner.inn); }
     passed += Test("mvfield_nested_value", t490Value, 48);
-    passed += Test("mvfield_nested_drop_count", t490PlainDtors, 3);
+    passed += Test("mvfield_nested_drop_count", t490PlainDtors, 4);
 
     t490PlainDtors = 0;
     { T490PlainOuter box = default; box.inn.value = 51; box.other.value = 52; t490Value = 0; if (false) { t490Value = t490TakePlain(move box.inn); } }
@@ -24273,7 +24440,7 @@ int testT364NativeOperatorReturnFacts()
     t490PlainDtors = 0;
     { T490PlainOuter box = default; box.inn.value = 53; box.other.value = 54; t490Value = 0; if (true) { t490Value = t490TakePlain(move box.inn); } }
     passed += Test("mvfield_conditional_value", t490Value, 53);
-    passed += Test("mvfield_conditional_drop_count", t490PlainDtors, 2);
+    passed += Test("mvfield_conditional_drop_count", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     { T490PlainOuter box = default; box.inn.value = 55; box.other.value = 56; int i = 0; while (i < 0) { t490Value = t490TakePlain(move box.inn); break; } }
@@ -24281,32 +24448,32 @@ int testT364NativeOperatorReturnFacts()
     t490PlainDtors = 0;
     { T490PlainOuter box = default; box.inn.value = 57; box.other.value = 58; int i = 0; while (i < 1) { t490Value = t490TakePlain(move box.inn); break; } }
     passed += Test("mvfield_loop_value", t490Value, 57);
-    passed += Test("mvfield_loop_drop_count", t490PlainDtors, 2);
+    passed += Test("mvfield_loop_drop_count", t490PlainDtors, 3);
 
     t490PlainDtors = 0;
     { T490PlainOuter box = default; box.inn.value = 59; box.other.value = 60; t490TakePlain(move box.inn); t490Value = box.inn.value; }
     passed += Test("mvfield_read_default_value", t490Value, 0);
-    passed += Test("mvfield_read_drop_count", t490PlainDtors, 2);
+    passed += Test("mvfield_read_drop_count", t490PlainDtors, 3);
 
     t490FieldOwnerDtors = 0;
     i64 mvfieldStringBase = (i64)HeapAudit.reportLeaks();
     { T490FieldStringOuter box = default; box.inn.value = 61; box.inn.text = "" + "moved"; box.other.value = 62; box.other.text = "" + "kept"; t490Value = t490TakeFieldString(move box.inn); }
     passed += Test("mvfield_string_value", t490Value, 61);
-    passed += Test("mvfield_string_owner_dtors", t490FieldOwnerDtors, 2);
+    passed += Test("mvfield_string_owner_dtors", t490FieldOwnerDtors, 3);
     passed += Test("mvfield_string_no_leak", (i64)HeapAudit.reportLeaks() - mvfieldStringBase, 0);
 
     t490FieldOwnerDtors = 0;
     t490FieldPayloadDtors = 0;
     { T490FieldListOuter box = default; box.inn.value = 63; box.inn.items.add(new T490FieldPayload()); box.other.value = 64; box.other.items.add(new T490FieldPayload()); t490Value = t490TakeFieldList(move box.inn); }
     passed += Test("mvfield_list_value", t490Value, 63);
-    passed += Test("mvfield_list_owner_dtors", t490FieldOwnerDtors, 2);
+    passed += Test("mvfield_list_owner_dtors", t490FieldOwnerDtors, 3);
     passed += Test("mvfield_list_payload_dtors", t490FieldPayloadDtors, 2);
 
     t490FieldOwnerDtors = 0;
     t490FieldPayloadDtors = 0;
     { T490FieldUniqueOuter box = default; box.inn.value = 65; box.inn.item = new T490FieldPayload(); box.other.value = 66; box.other.item = new T490FieldPayload(); t490Value = t490TakeFieldUnique(move box.inn); }
     passed += Test("mvfield_unique_value", t490Value, 65);
-    passed += Test("mvfield_unique_owner_dtors", t490FieldOwnerDtors, 2);
+    passed += Test("mvfield_unique_owner_dtors", t490FieldOwnerDtors, 3);
     passed += Test("mvfield_unique_payload_dtors", t490FieldPayloadDtors, 2);
 
     // Each case transfers the original owner, then installs a new payload through an escaped
@@ -24530,7 +24697,7 @@ int testT364NativeOperatorReturnFacts()
     { T490BraceLeaf value = T490BraceLeaf(1); { T490BraceBox box = { inn = move value }; t490Value = box.inn.value * 10 + box.other.value; } }
     passed += Test("mvfield_brace_move_value", t490Value, 10);
     passed += Test("mvfield_brace_move_ctor_count", t490BraceCtorCount, 2);
-    passed += Test("mvfield_brace_move_dtor_count", t490BraceDtorCount, 2);
+    passed += Test("mvfield_brace_move_dtor_count", t490BraceDtorCount, 3);
 
     t490BraceCtorCount = 0;
     t490BraceDtorCount = 0;
@@ -24546,7 +24713,7 @@ int testT364NativeOperatorReturnFacts()
     { T490BraceBox box = { inn = t490MakeBraceLeaf(3) }; t490Value = box.inn.value * 10 + box.other.value; }
     passed += Test("mvfield_brace_temp_value", t490Value, 30);
     passed += Test("mvfield_brace_temp_ctor_count", t490BraceCtorCount, 3);
-    passed += Test("mvfield_brace_temp_dtor_count", t490BraceDtorCount, 3);
+    passed += Test("mvfield_brace_temp_dtor_count", t490BraceDtorCount, 4);
 
     expect_error("use of moved variable 'local'") {
         T490Plain local = default;
@@ -24605,5 +24772,49 @@ int testMix9ReleaseReturn()
     Mix9Wrap<Mix9ReleaseBox>* wrapped = mix9ReleaseWrap(move wrapOwner);
     passed += Test("mix9 release generic wrap return", wrapped->v.id, 11);
     delete wrapped;
+    return passed;
+}
+
+// UQRAW accept-set: owning call results that are used without leaking, and explicit moves from
+// owning slots that stay legal next to the new borrowed-pointer refusals.
+int uqrawDtors = 0;
+struct UqrawBox { int v = 0; ~UqrawBox() { uqrawDtors = uqrawDtors + 1; } int val() { return v; } };
+unique UqrawBox* uqrawMk(int n) { unique UqrawBox* p = new UqrawBox(); p->v = n; return move p; }
+unique UqrawBox* uqrawWrap(int n) { return uqrawMk(n); }
+UqrawBox* uqrawIdp(UqrawBox* p) { return p; }
+int uqrawUse(UqrawBox* p) { return p->v; }
+void uqrawSink(unique UqrawBox* p) { }
+
+int uqrawAcceptLegs()
+{
+    int passed = 0;
+    uqrawDtors = 0;
+    {
+        unique UqrawBox* u = uqrawMk(1);
+        UqrawBox* b = u.get();
+        passed += Test("uqraw get borrow", b->v, 1);
+        UqrawBox* d = &*u;
+        passed += Test("uqraw deref borrow", d->v, 1);
+        UqrawBox* w = uqrawIdp(u.get());
+        passed += Test("uqraw borrowed call result", w->v, 1);
+        UqrawBox* t = true ? u.get() : nullptr;
+        passed += Test("uqraw borrowed ternary", t->v, 1);
+        UqrawBox* r = uqrawMk(2).release();
+        passed += Test("uqraw release bind", r->v, 2);
+        delete r;
+        passed += Test("uqraw temp field read", uqrawMk(3)->v, 3);
+        int uqrawTempGet = uqrawMk(4)->val();
+        passed += Test("uqraw temp method", uqrawTempGet, 4);
+        passed += Test("uqraw temp borrow arg", uqrawUse(uqrawMk(5).get()), 5);
+        uqrawSink(uqrawMk(6));
+        unique UqrawBox* wrapped = uqrawWrap(7);
+        passed += Test("uqraw return wrap", wrapped->v, 7);
+    }
+    passed += Test("uqraw all boxes freed", uqrawDtors, 7);
+
+    int* owned = new int(9);
+    int* moved = move owned;
+    passed += Test("uqraw move owning slot", *moved, 9);
+    delete moved;
     return passed;
 }

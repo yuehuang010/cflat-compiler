@@ -377,7 +377,9 @@ if [ "$RUN_MODE" -eq 0 ] && [ "${#err_discovery_files[@]}" -gt 0 ]; then
   if ! "$CFLAT" --locale pseudo --update-locale en-pseudo --locale-dir "$LOCALE_DIR" \
       --check -i "$LIB" "${err_discovery_files[@]}" >"$RES/_locale.log" 2>&1; then
     echo "FAIL: pseudo-locale diagnostic discovery failed"
-    tail -n 20 "$RES/_locale.log"
+    # Name the failing fixtures with the output that led to each FAIL, then the batch summary.
+    grep -B 8 "^FAIL: " "$RES/_locale.log" | tail -n 40
+    tail -n 1 "$RES/_locale.log"
     exit 1
   fi
 fi

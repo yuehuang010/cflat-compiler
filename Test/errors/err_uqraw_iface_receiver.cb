@@ -1,0 +1,14 @@
+// A member called on an owning interface call result (mkI()->m()) has no local to free the temp.
+// Refused; bind the result to a 'unique' local first.
+
+interface UqrawI { int val(); };
+class UqrawImpl : UqrawI { int val() { return 7; } };
+unique UqrawI uqrawIMk() { unique UqrawI p = new UqrawImpl(); return move p; }
+
+extern int main()
+{
+    expect_error("cannot use an owning call result as an interface receiver for 'val'") {
+        int v = uqrawIMk()->val();
+    }
+    return 0;
+}

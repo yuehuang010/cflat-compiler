@@ -16,3 +16,7 @@ keeps across chunks, so the member harvest refuses the lookup member.
 **Fix direction.** Decide whether the non-incremental path stays supported. If yes, diff the
 `-v` member harvest of `std::map<...>::find` between the two modes and align the request-TU
 completion with the live-Sema one; if no, remove the switch.
+
+RULED 2026-10-31 (maintainer): KEEP the non-incremental switch; the divergence is a real defect to FIX, not a path to delete - the
+fallback must bind what the incremental executor binds. Severity: p3 while the fallback only refuses; a CRASH in the fallback is p2.
+Fix direction stands (diff the `-v` member harvest of `std::map<...>::find` between the two modes, align the request-TU completion).

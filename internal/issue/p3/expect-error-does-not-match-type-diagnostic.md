@@ -9,3 +9,7 @@ the localized catalog text ("cannot find the type" exists only in en.json). Wide
 test.sh pseudo-locale discovery pass (~line 370), whose comment says source-English matching is by design.
 MAINTAINER QUESTION: (a) keep source-English matching and close this as usage (recommended), or (b) match printed text and
 rework the discovery pass with it.
+RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31): (a) - `expect_error` matches the SOURCE-ENGLISH `LogError`
+format text, never catalog text. Precedent: the locale files are generated from the format strings (CLAUDE.md Localization) and the
+test.sh pseudo-locale discovery pass states source-English matching as design. Closed as usage: the T463 expectation is reworded
+to the source text (`unknown type '`); no compiler change, no leg flips.

@@ -1,0 +1,248 @@
+// TERNADDR: a ?: nested 41 deep overflowed the 8 MB stack in the expression walk; the nesting limit reports it
+// (100 deep here, so every host refuses on the first descent, before the exponential arm walk).
+extern int main()
+{
+    expect_error("nested too deeply") {
+        int i = 3;
+        int a = 1;
+        int b = 2;
+        int* p = &a;
+        int* q = &b;
+        int* r = (i == 1 ? p :
+        (i == 2 ? p :
+        (i == 3 ? p :
+        (i == 4 ? p :
+        (i == 5 ? p :
+        (i == 6 ? p :
+        (i == 7 ? p :
+        (i == 8 ? p :
+        (i == 9 ? p :
+        (i == 10 ? p :
+        (i == 11 ? p :
+        (i == 12 ? p :
+        (i == 13 ? p :
+        (i == 14 ? p :
+        (i == 15 ? p :
+        (i == 16 ? p :
+        (i == 17 ? p :
+        (i == 18 ? p :
+        (i == 19 ? p :
+        (i == 20 ? p :
+        (i == 21 ? p :
+        (i == 22 ? p :
+        (i == 23 ? p :
+        (i == 24 ? p :
+        (i == 25 ? p :
+        (i == 26 ? p :
+        (i == 27 ? p :
+        (i == 28 ? p :
+        (i == 29 ? p :
+        (i == 30 ? p :
+        (i == 31 ? p :
+        (i == 32 ? p :
+        (i == 33 ? p :
+        (i == 34 ? p :
+        (i == 35 ? p :
+        (i == 36 ? p :
+        (i == 37 ? p :
+        (i == 38 ? p :
+        (i == 39 ? p :
+        (i == 40 ? p :
+        (i == 41 ? p :
+        (i == 42 ? p :
+        (i == 43 ? p :
+        (i == 44 ? p :
+        (i == 45 ? p :
+        (i == 46 ? p :
+        (i == 47 ? p :
+        (i == 48 ? p :
+        (i == 49 ? p :
+        (i == 50 ? p :
+        (i == 51 ? p :
+        (i == 52 ? p :
+        (i == 53 ? p :
+        (i == 54 ? p :
+        (i == 55 ? p :
+        (i == 56 ? p :
+        (i == 57 ? p :
+        (i == 58 ? p :
+        (i == 59 ? p :
+        (i == 60 ? p :
+        (i == 61 ? p :
+        (i == 62 ? p :
+        (i == 63 ? p :
+        (i == 64 ? p :
+        (i == 65 ? p :
+        (i == 66 ? p :
+        (i == 67 ? p :
+        (i == 68 ? p :
+        (i == 69 ? p :
+        (i == 70 ? p :
+        (i == 71 ? p :
+        (i == 72 ? p :
+        (i == 73 ? p :
+        (i == 74 ? p :
+        (i == 75 ? p :
+        (i == 76 ? p :
+        (i == 77 ? p :
+        (i == 78 ? p :
+        (i == 79 ? p :
+        (i == 80 ? p :
+        (i == 81 ? p :
+        (i == 82 ? p :
+        (i == 83 ? p :
+        (i == 84 ? p :
+        (i == 85 ? p :
+        (i == 86 ? p :
+        (i == 87 ? p :
+        (i == 88 ? p :
+        (i == 89 ? p :
+        (i == 90 ? p :
+        (i == 91 ? p :
+        (i == 92 ? p :
+        (i == 93 ? p :
+        (i == 94 ? p :
+        (i == 95 ? p :
+        (i == 96 ? p :
+        (i == 97 ? p :
+        (i == 98 ? p :
+        (i == 99 ? p :
+        (i == 100 ? p :
+        q))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
+    }
+    expect_error("nested too deeply") {
+        int x = 1;
+        int r = -(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(x))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
+    }
+    return 0;
+    expect_error("nested too deeply") {
+        int i = 999;
+        int r = 0;
+        if (i == 0) r = 0; else if (i == 1) r = 1; else if (i == 2) r = 2; else if (i == 3) r = 3; else if (i == 4) r = 4; else if (i == 5) r = 5; else if (i == 6) r = 6; else if (i == 7) r = 7; else
+        if (i == 8) r = 8; else if (i == 9) r = 9; else if (i == 10) r = 10; else if (i == 11) r = 11; else if (i == 12) r = 12; else if (i == 13) r = 13; else if (i == 14) r = 14; else if (i == 15) r = 15; else
+        if (i == 16) r = 16; else if (i == 17) r = 17; else if (i == 18) r = 18; else if (i == 19) r = 19; else if (i == 20) r = 20; else if (i == 21) r = 21; else if (i == 22) r = 22; else if (i == 23) r = 23; else
+        if (i == 24) r = 24; else if (i == 25) r = 25; else if (i == 26) r = 26; else if (i == 27) r = 27; else if (i == 28) r = 28; else if (i == 29) r = 29; else if (i == 30) r = 30; else if (i == 31) r = 31; else
+        if (i == 32) r = 32; else if (i == 33) r = 33; else if (i == 34) r = 34; else if (i == 35) r = 35; else if (i == 36) r = 36; else if (i == 37) r = 37; else if (i == 38) r = 38; else if (i == 39) r = 39; else
+        if (i == 40) r = 40; else if (i == 41) r = 41; else if (i == 42) r = 42; else if (i == 43) r = 43; else if (i == 44) r = 44; else if (i == 45) r = 45; else if (i == 46) r = 46; else if (i == 47) r = 47; else
+        if (i == 48) r = 48; else if (i == 49) r = 49; else if (i == 50) r = 50; else if (i == 51) r = 51; else if (i == 52) r = 52; else if (i == 53) r = 53; else if (i == 54) r = 54; else if (i == 55) r = 55; else
+        if (i == 56) r = 56; else if (i == 57) r = 57; else if (i == 58) r = 58; else if (i == 59) r = 59; else if (i == 60) r = 60; else if (i == 61) r = 61; else if (i == 62) r = 62; else if (i == 63) r = 63; else
+        if (i == 64) r = 64; else if (i == 65) r = 65; else if (i == 66) r = 66; else if (i == 67) r = 67; else if (i == 68) r = 68; else if (i == 69) r = 69; else if (i == 70) r = 70; else if (i == 71) r = 71; else
+        if (i == 72) r = 72; else if (i == 73) r = 73; else if (i == 74) r = 74; else if (i == 75) r = 75; else if (i == 76) r = 76; else if (i == 77) r = 77; else if (i == 78) r = 78; else if (i == 79) r = 79; else
+        if (i == 80) r = 80; else if (i == 81) r = 81; else if (i == 82) r = 82; else if (i == 83) r = 83; else if (i == 84) r = 84; else if (i == 85) r = 85; else if (i == 86) r = 86; else if (i == 87) r = 87; else
+        if (i == 88) r = 88; else if (i == 89) r = 89; else if (i == 90) r = 90; else if (i == 91) r = 91; else if (i == 92) r = 92; else if (i == 93) r = 93; else if (i == 94) r = 94; else if (i == 95) r = 95; else
+        if (i == 96) r = 96; else if (i == 97) r = 97; else if (i == 98) r = 98; else if (i == 99) r = 99; else if (i == 100) r = 100; else if (i == 101) r = 101; else if (i == 102) r = 102; else if (i == 103) r = 103; else
+        if (i == 104) r = 104; else if (i == 105) r = 105; else if (i == 106) r = 106; else if (i == 107) r = 107; else if (i == 108) r = 108; else if (i == 109) r = 109; else if (i == 110) r = 110; else if (i == 111) r = 111; else
+        if (i == 112) r = 112; else if (i == 113) r = 113; else if (i == 114) r = 114; else if (i == 115) r = 115; else if (i == 116) r = 116; else if (i == 117) r = 117; else if (i == 118) r = 118; else if (i == 119) r = 119; else
+        if (i == 120) r = 120; else if (i == 121) r = 121; else if (i == 122) r = 122; else if (i == 123) r = 123; else if (i == 124) r = 124; else if (i == 125) r = 125; else if (i == 126) r = 126; else if (i == 127) r = 127; else
+        if (i == 128) r = 128; else if (i == 129) r = 129; else if (i == 130) r = 130; else if (i == 131) r = 131; else if (i == 132) r = 132; else if (i == 133) r = 133; else if (i == 134) r = 134; else if (i == 135) r = 135; else
+        if (i == 136) r = 136; else if (i == 137) r = 137; else if (i == 138) r = 138; else if (i == 139) r = 139; else if (i == 140) r = 140; else if (i == 141) r = 141; else if (i == 142) r = 142; else if (i == 143) r = 143; else
+        if (i == 144) r = 144; else if (i == 145) r = 145; else if (i == 146) r = 146; else if (i == 147) r = 147; else if (i == 148) r = 148; else if (i == 149) r = 149; else if (i == 150) r = 150; else if (i == 151) r = 151; else
+        if (i == 152) r = 152; else if (i == 153) r = 153; else if (i == 154) r = 154; else if (i == 155) r = 155; else if (i == 156) r = 156; else if (i == 157) r = 157; else if (i == 158) r = 158; else if (i == 159) r = 159; else
+        if (i == 160) r = 160; else if (i == 161) r = 161; else if (i == 162) r = 162; else if (i == 163) r = 163; else if (i == 164) r = 164; else if (i == 165) r = 165; else if (i == 166) r = 166; else if (i == 167) r = 167; else
+        if (i == 168) r = 168; else if (i == 169) r = 169; else if (i == 170) r = 170; else if (i == 171) r = 171; else if (i == 172) r = 172; else if (i == 173) r = 173; else if (i == 174) r = 174; else if (i == 175) r = 175; else
+        if (i == 176) r = 176; else if (i == 177) r = 177; else if (i == 178) r = 178; else if (i == 179) r = 179; else if (i == 180) r = 180; else if (i == 181) r = 181; else if (i == 182) r = 182; else if (i == 183) r = 183; else
+        if (i == 184) r = 184; else if (i == 185) r = 185; else if (i == 186) r = 186; else if (i == 187) r = 187; else if (i == 188) r = 188; else if (i == 189) r = 189; else if (i == 190) r = 190; else if (i == 191) r = 191; else
+        if (i == 192) r = 192; else if (i == 193) r = 193; else if (i == 194) r = 194; else if (i == 195) r = 195; else if (i == 196) r = 196; else if (i == 197) r = 197; else if (i == 198) r = 198; else if (i == 199) r = 199; else
+        if (i == 200) r = 200; else if (i == 201) r = 201; else if (i == 202) r = 202; else if (i == 203) r = 203; else if (i == 204) r = 204; else if (i == 205) r = 205; else if (i == 206) r = 206; else if (i == 207) r = 207; else
+        if (i == 208) r = 208; else if (i == 209) r = 209; else if (i == 210) r = 210; else if (i == 211) r = 211; else if (i == 212) r = 212; else if (i == 213) r = 213; else if (i == 214) r = 214; else if (i == 215) r = 215; else
+        if (i == 216) r = 216; else if (i == 217) r = 217; else if (i == 218) r = 218; else if (i == 219) r = 219; else if (i == 220) r = 220; else if (i == 221) r = 221; else if (i == 222) r = 222; else if (i == 223) r = 223; else
+        if (i == 224) r = 224; else if (i == 225) r = 225; else if (i == 226) r = 226; else if (i == 227) r = 227; else if (i == 228) r = 228; else if (i == 229) r = 229; else if (i == 230) r = 230; else if (i == 231) r = 231; else
+        if (i == 232) r = 232; else if (i == 233) r = 233; else if (i == 234) r = 234; else if (i == 235) r = 235; else if (i == 236) r = 236; else if (i == 237) r = 237; else if (i == 238) r = 238; else if (i == 239) r = 239; else
+        if (i == 240) r = 240; else if (i == 241) r = 241; else if (i == 242) r = 242; else if (i == 243) r = 243; else if (i == 244) r = 244; else if (i == 245) r = 245; else if (i == 246) r = 246; else if (i == 247) r = 247; else
+        if (i == 248) r = 248; else if (i == 249) r = 249; else if (i == 250) r = 250; else if (i == 251) r = 251; else if (i == 252) r = 252; else if (i == 253) r = 253; else if (i == 254) r = 254; else if (i == 255) r = 255; else
+        if (i == 256) r = 256; else if (i == 257) r = 257; else if (i == 258) r = 258; else if (i == 259) r = 259; else if (i == 260) r = 260; else if (i == 261) r = 261; else if (i == 262) r = 262; else if (i == 263) r = 263; else
+        if (i == 264) r = 264; else if (i == 265) r = 265; else if (i == 266) r = 266; else if (i == 267) r = 267; else if (i == 268) r = 268; else if (i == 269) r = 269; else if (i == 270) r = 270; else if (i == 271) r = 271; else
+        if (i == 272) r = 272; else if (i == 273) r = 273; else if (i == 274) r = 274; else if (i == 275) r = 275; else if (i == 276) r = 276; else if (i == 277) r = 277; else if (i == 278) r = 278; else if (i == 279) r = 279; else
+        if (i == 280) r = 280; else if (i == 281) r = 281; else if (i == 282) r = 282; else if (i == 283) r = 283; else if (i == 284) r = 284; else if (i == 285) r = 285; else if (i == 286) r = 286; else if (i == 287) r = 287; else
+        if (i == 288) r = 288; else if (i == 289) r = 289; else if (i == 290) r = 290; else if (i == 291) r = 291; else if (i == 292) r = 292; else if (i == 293) r = 293; else if (i == 294) r = 294; else if (i == 295) r = 295; else
+        if (i == 296) r = 296; else if (i == 297) r = 297; else if (i == 298) r = 298; else if (i == 299) r = 299; else if (i == 300) r = 300; else if (i == 301) r = 301; else if (i == 302) r = 302; else if (i == 303) r = 303; else
+        if (i == 304) r = 304; else if (i == 305) r = 305; else if (i == 306) r = 306; else if (i == 307) r = 307; else if (i == 308) r = 308; else if (i == 309) r = 309; else if (i == 310) r = 310; else if (i == 311) r = 311; else
+        if (i == 312) r = 312; else if (i == 313) r = 313; else if (i == 314) r = 314; else if (i == 315) r = 315; else if (i == 316) r = 316; else if (i == 317) r = 317; else if (i == 318) r = 318; else if (i == 319) r = 319; else
+        if (i == 320) r = 320; else if (i == 321) r = 321; else if (i == 322) r = 322; else if (i == 323) r = 323; else if (i == 324) r = 324; else if (i == 325) r = 325; else if (i == 326) r = 326; else if (i == 327) r = 327; else
+        if (i == 328) r = 328; else if (i == 329) r = 329; else if (i == 330) r = 330; else if (i == 331) r = 331; else if (i == 332) r = 332; else if (i == 333) r = 333; else if (i == 334) r = 334; else if (i == 335) r = 335; else
+        if (i == 336) r = 336; else if (i == 337) r = 337; else if (i == 338) r = 338; else if (i == 339) r = 339; else if (i == 340) r = 340; else if (i == 341) r = 341; else if (i == 342) r = 342; else if (i == 343) r = 343; else
+        if (i == 344) r = 344; else if (i == 345) r = 345; else if (i == 346) r = 346; else if (i == 347) r = 347; else if (i == 348) r = 348; else if (i == 349) r = 349; else if (i == 350) r = 350; else if (i == 351) r = 351; else
+        if (i == 352) r = 352; else if (i == 353) r = 353; else if (i == 354) r = 354; else if (i == 355) r = 355; else if (i == 356) r = 356; else if (i == 357) r = 357; else if (i == 358) r = 358; else if (i == 359) r = 359; else
+        if (i == 360) r = 360; else if (i == 361) r = 361; else if (i == 362) r = 362; else if (i == 363) r = 363; else if (i == 364) r = 364; else if (i == 365) r = 365; else if (i == 366) r = 366; else if (i == 367) r = 367; else
+        if (i == 368) r = 368; else if (i == 369) r = 369; else if (i == 370) r = 370; else if (i == 371) r = 371; else if (i == 372) r = 372; else if (i == 373) r = 373; else if (i == 374) r = 374; else if (i == 375) r = 375; else
+        if (i == 376) r = 376; else if (i == 377) r = 377; else if (i == 378) r = 378; else if (i == 379) r = 379; else if (i == 380) r = 380; else if (i == 381) r = 381; else if (i == 382) r = 382; else if (i == 383) r = 383; else
+        if (i == 384) r = 384; else if (i == 385) r = 385; else if (i == 386) r = 386; else if (i == 387) r = 387; else if (i == 388) r = 388; else if (i == 389) r = 389; else if (i == 390) r = 390; else if (i == 391) r = 391; else
+        if (i == 392) r = 392; else if (i == 393) r = 393; else if (i == 394) r = 394; else if (i == 395) r = 395; else if (i == 396) r = 396; else if (i == 397) r = 397; else if (i == 398) r = 398; else if (i == 399) r = 399; else
+        if (i == 400) r = 400; else if (i == 401) r = 401; else if (i == 402) r = 402; else if (i == 403) r = 403; else if (i == 404) r = 404; else if (i == 405) r = 405; else if (i == 406) r = 406; else if (i == 407) r = 407; else
+        if (i == 408) r = 408; else if (i == 409) r = 409; else if (i == 410) r = 410; else if (i == 411) r = 411; else if (i == 412) r = 412; else if (i == 413) r = 413; else if (i == 414) r = 414; else if (i == 415) r = 415; else
+        if (i == 416) r = 416; else if (i == 417) r = 417; else if (i == 418) r = 418; else if (i == 419) r = 419; else if (i == 420) r = 420; else if (i == 421) r = 421; else if (i == 422) r = 422; else if (i == 423) r = 423; else
+        if (i == 424) r = 424; else if (i == 425) r = 425; else if (i == 426) r = 426; else if (i == 427) r = 427; else if (i == 428) r = 428; else if (i == 429) r = 429; else if (i == 430) r = 430; else if (i == 431) r = 431; else
+        if (i == 432) r = 432; else if (i == 433) r = 433; else if (i == 434) r = 434; else if (i == 435) r = 435; else if (i == 436) r = 436; else if (i == 437) r = 437; else if (i == 438) r = 438; else if (i == 439) r = 439; else
+        if (i == 440) r = 440; else if (i == 441) r = 441; else if (i == 442) r = 442; else if (i == 443) r = 443; else if (i == 444) r = 444; else if (i == 445) r = 445; else if (i == 446) r = 446; else if (i == 447) r = 447; else
+        if (i == 448) r = 448; else if (i == 449) r = 449; else if (i == 450) r = 450; else if (i == 451) r = 451; else if (i == 452) r = 452; else if (i == 453) r = 453; else if (i == 454) r = 454; else if (i == 455) r = 455; else
+        if (i == 456) r = 456; else if (i == 457) r = 457; else if (i == 458) r = 458; else if (i == 459) r = 459; else if (i == 460) r = 460; else if (i == 461) r = 461; else if (i == 462) r = 462; else if (i == 463) r = 463; else
+        if (i == 464) r = 464; else if (i == 465) r = 465; else if (i == 466) r = 466; else if (i == 467) r = 467; else if (i == 468) r = 468; else if (i == 469) r = 469; else if (i == 470) r = 470; else if (i == 471) r = 471; else
+        if (i == 472) r = 472; else if (i == 473) r = 473; else if (i == 474) r = 474; else if (i == 475) r = 475; else if (i == 476) r = 476; else if (i == 477) r = 477; else if (i == 478) r = 478; else if (i == 479) r = 479; else
+        if (i == 480) r = 480; else if (i == 481) r = 481; else if (i == 482) r = 482; else if (i == 483) r = 483; else if (i == 484) r = 484; else if (i == 485) r = 485; else if (i == 486) r = 486; else if (i == 487) r = 487; else
+        if (i == 488) r = 488; else if (i == 489) r = 489; else if (i == 490) r = 490; else if (i == 491) r = 491; else if (i == 492) r = 492; else if (i == 493) r = 493; else if (i == 494) r = 494; else if (i == 495) r = 495; else
+        if (i == 496) r = 496; else if (i == 497) r = 497; else if (i == 498) r = 498; else if (i == 499) r = 499; else if (i == 500) r = 500; else if (i == 501) r = 501; else if (i == 502) r = 502; else if (i == 503) r = 503; else
+        if (i == 504) r = 504; else if (i == 505) r = 505; else if (i == 506) r = 506; else if (i == 507) r = 507; else if (i == 508) r = 508; else if (i == 509) r = 509; else if (i == 510) r = 510; else if (i == 511) r = 511; else
+        if (i == 512) r = 512; else if (i == 513) r = 513; else if (i == 514) r = 514; else if (i == 515) r = 515; else if (i == 516) r = 516; else if (i == 517) r = 517; else if (i == 518) r = 518; else if (i == 519) r = 519; else
+        if (i == 520) r = 520; else if (i == 521) r = 521; else if (i == 522) r = 522; else if (i == 523) r = 523; else if (i == 524) r = 524; else if (i == 525) r = 525; else if (i == 526) r = 526; else if (i == 527) r = 527; else
+        if (i == 528) r = 528; else if (i == 529) r = 529; else if (i == 530) r = 530; else if (i == 531) r = 531; else if (i == 532) r = 532; else if (i == 533) r = 533; else if (i == 534) r = 534; else if (i == 535) r = 535; else
+        if (i == 536) r = 536; else if (i == 537) r = 537; else if (i == 538) r = 538; else if (i == 539) r = 539; else if (i == 540) r = 540; else if (i == 541) r = 541; else if (i == 542) r = 542; else if (i == 543) r = 543; else
+        if (i == 544) r = 544; else if (i == 545) r = 545; else if (i == 546) r = 546; else if (i == 547) r = 547; else if (i == 548) r = 548; else if (i == 549) r = 549; else if (i == 550) r = 550; else if (i == 551) r = 551; else
+        if (i == 552) r = 552; else if (i == 553) r = 553; else if (i == 554) r = 554; else if (i == 555) r = 555; else if (i == 556) r = 556; else if (i == 557) r = 557; else if (i == 558) r = 558; else if (i == 559) r = 559; else
+        if (i == 560) r = 560; else if (i == 561) r = 561; else if (i == 562) r = 562; else if (i == 563) r = 563; else if (i == 564) r = 564; else if (i == 565) r = 565; else if (i == 566) r = 566; else if (i == 567) r = 567; else
+        if (i == 568) r = 568; else if (i == 569) r = 569; else if (i == 570) r = 570; else if (i == 571) r = 571; else if (i == 572) r = 572; else if (i == 573) r = 573; else if (i == 574) r = 574; else if (i == 575) r = 575; else
+        if (i == 576) r = 576; else if (i == 577) r = 577; else if (i == 578) r = 578; else if (i == 579) r = 579; else if (i == 580) r = 580; else if (i == 581) r = 581; else if (i == 582) r = 582; else if (i == 583) r = 583; else
+        if (i == 584) r = 584; else if (i == 585) r = 585; else if (i == 586) r = 586; else if (i == 587) r = 587; else if (i == 588) r = 588; else if (i == 589) r = 589; else if (i == 590) r = 590; else if (i == 591) r = 591; else
+        if (i == 592) r = 592; else if (i == 593) r = 593; else if (i == 594) r = 594; else if (i == 595) r = 595; else if (i == 596) r = 596; else if (i == 597) r = 597; else if (i == 598) r = 598; else if (i == 599) r = 599; else
+        if (i == 600) r = 600; else if (i == 601) r = 601; else if (i == 602) r = 602; else if (i == 603) r = 603; else if (i == 604) r = 604; else if (i == 605) r = 605; else if (i == 606) r = 606; else if (i == 607) r = 607; else
+        if (i == 608) r = 608; else if (i == 609) r = 609; else if (i == 610) r = 610; else if (i == 611) r = 611; else if (i == 612) r = 612; else if (i == 613) r = 613; else if (i == 614) r = 614; else if (i == 615) r = 615; else
+        if (i == 616) r = 616; else if (i == 617) r = 617; else if (i == 618) r = 618; else if (i == 619) r = 619; else if (i == 620) r = 620; else if (i == 621) r = 621; else if (i == 622) r = 622; else if (i == 623) r = 623; else
+        if (i == 624) r = 624; else if (i == 625) r = 625; else if (i == 626) r = 626; else if (i == 627) r = 627; else if (i == 628) r = 628; else if (i == 629) r = 629; else if (i == 630) r = 630; else if (i == 631) r = 631; else
+        if (i == 632) r = 632; else if (i == 633) r = 633; else if (i == 634) r = 634; else if (i == 635) r = 635; else if (i == 636) r = 636; else if (i == 637) r = 637; else if (i == 638) r = 638; else if (i == 639) r = 639; else
+        if (i == 640) r = 640; else if (i == 641) r = 641; else if (i == 642) r = 642; else if (i == 643) r = 643; else if (i == 644) r = 644; else if (i == 645) r = 645; else if (i == 646) r = 646; else if (i == 647) r = 647; else
+        if (i == 648) r = 648; else if (i == 649) r = 649; else if (i == 650) r = 650; else if (i == 651) r = 651; else if (i == 652) r = 652; else if (i == 653) r = 653; else if (i == 654) r = 654; else if (i == 655) r = 655; else
+        if (i == 656) r = 656; else if (i == 657) r = 657; else if (i == 658) r = 658; else if (i == 659) r = 659; else if (i == 660) r = 660; else if (i == 661) r = 661; else if (i == 662) r = 662; else if (i == 663) r = 663; else
+        if (i == 664) r = 664; else if (i == 665) r = 665; else if (i == 666) r = 666; else if (i == 667) r = 667; else if (i == 668) r = 668; else if (i == 669) r = 669; else if (i == 670) r = 670; else if (i == 671) r = 671; else
+        if (i == 672) r = 672; else if (i == 673) r = 673; else if (i == 674) r = 674; else if (i == 675) r = 675; else if (i == 676) r = 676; else if (i == 677) r = 677; else if (i == 678) r = 678; else if (i == 679) r = 679; else
+        if (i == 680) r = 680; else if (i == 681) r = 681; else if (i == 682) r = 682; else if (i == 683) r = 683; else if (i == 684) r = 684; else if (i == 685) r = 685; else if (i == 686) r = 686; else if (i == 687) r = 687; else
+        if (i == 688) r = 688; else if (i == 689) r = 689; else if (i == 690) r = 690; else if (i == 691) r = 691; else if (i == 692) r = 692; else if (i == 693) r = 693; else if (i == 694) r = 694; else if (i == 695) r = 695; else
+        if (i == 696) r = 696; else if (i == 697) r = 697; else if (i == 698) r = 698; else if (i == 699) r = 699; else if (i == 700) r = 700; else if (i == 701) r = 701; else if (i == 702) r = 702; else if (i == 703) r = 703; else
+        if (i == 704) r = 704; else if (i == 705) r = 705; else if (i == 706) r = 706; else if (i == 707) r = 707; else if (i == 708) r = 708; else if (i == 709) r = 709; else if (i == 710) r = 710; else if (i == 711) r = 711; else
+        if (i == 712) r = 712; else if (i == 713) r = 713; else if (i == 714) r = 714; else if (i == 715) r = 715; else if (i == 716) r = 716; else if (i == 717) r = 717; else if (i == 718) r = 718; else if (i == 719) r = 719; else
+        if (i == 720) r = 720; else if (i == 721) r = 721; else if (i == 722) r = 722; else if (i == 723) r = 723; else if (i == 724) r = 724; else if (i == 725) r = 725; else if (i == 726) r = 726; else if (i == 727) r = 727; else
+        if (i == 728) r = 728; else if (i == 729) r = 729; else if (i == 730) r = 730; else if (i == 731) r = 731; else if (i == 732) r = 732; else if (i == 733) r = 733; else if (i == 734) r = 734; else if (i == 735) r = 735; else
+        if (i == 736) r = 736; else if (i == 737) r = 737; else if (i == 738) r = 738; else if (i == 739) r = 739; else if (i == 740) r = 740; else if (i == 741) r = 741; else if (i == 742) r = 742; else if (i == 743) r = 743; else
+        if (i == 744) r = 744; else if (i == 745) r = 745; else if (i == 746) r = 746; else if (i == 747) r = 747; else if (i == 748) r = 748; else if (i == 749) r = 749; else if (i == 750) r = 750; else if (i == 751) r = 751; else
+        if (i == 752) r = 752; else if (i == 753) r = 753; else if (i == 754) r = 754; else if (i == 755) r = 755; else if (i == 756) r = 756; else if (i == 757) r = 757; else if (i == 758) r = 758; else if (i == 759) r = 759; else
+        if (i == 760) r = 760; else if (i == 761) r = 761; else if (i == 762) r = 762; else if (i == 763) r = 763; else if (i == 764) r = 764; else if (i == 765) r = 765; else if (i == 766) r = 766; else if (i == 767) r = 767; else
+        if (i == 768) r = 768; else if (i == 769) r = 769; else if (i == 770) r = 770; else if (i == 771) r = 771; else if (i == 772) r = 772; else if (i == 773) r = 773; else if (i == 774) r = 774; else if (i == 775) r = 775; else
+        if (i == 776) r = 776; else if (i == 777) r = 777; else if (i == 778) r = 778; else if (i == 779) r = 779; else if (i == 780) r = 780; else if (i == 781) r = 781; else if (i == 782) r = 782; else if (i == 783) r = 783; else
+        if (i == 784) r = 784; else if (i == 785) r = 785; else if (i == 786) r = 786; else if (i == 787) r = 787; else if (i == 788) r = 788; else if (i == 789) r = 789; else if (i == 790) r = 790; else if (i == 791) r = 791; else
+        if (i == 792) r = 792; else if (i == 793) r = 793; else if (i == 794) r = 794; else if (i == 795) r = 795; else if (i == 796) r = 796; else if (i == 797) r = 797; else if (i == 798) r = 798; else if (i == 799) r = 799; else
+        if (i == 800) r = 800; else if (i == 801) r = 801; else if (i == 802) r = 802; else if (i == 803) r = 803; else if (i == 804) r = 804; else if (i == 805) r = 805; else if (i == 806) r = 806; else if (i == 807) r = 807; else
+        if (i == 808) r = 808; else if (i == 809) r = 809; else if (i == 810) r = 810; else if (i == 811) r = 811; else if (i == 812) r = 812; else if (i == 813) r = 813; else if (i == 814) r = 814; else if (i == 815) r = 815; else
+        if (i == 816) r = 816; else if (i == 817) r = 817; else if (i == 818) r = 818; else if (i == 819) r = 819; else if (i == 820) r = 820; else if (i == 821) r = 821; else if (i == 822) r = 822; else if (i == 823) r = 823; else
+        if (i == 824) r = 824; else if (i == 825) r = 825; else if (i == 826) r = 826; else if (i == 827) r = 827; else if (i == 828) r = 828; else if (i == 829) r = 829; else if (i == 830) r = 830; else if (i == 831) r = 831; else
+        if (i == 832) r = 832; else if (i == 833) r = 833; else if (i == 834) r = 834; else if (i == 835) r = 835; else if (i == 836) r = 836; else if (i == 837) r = 837; else if (i == 838) r = 838; else if (i == 839) r = 839; else
+        if (i == 840) r = 840; else if (i == 841) r = 841; else if (i == 842) r = 842; else if (i == 843) r = 843; else if (i == 844) r = 844; else if (i == 845) r = 845; else if (i == 846) r = 846; else if (i == 847) r = 847; else
+        if (i == 848) r = 848; else if (i == 849) r = 849; else if (i == 850) r = 850; else if (i == 851) r = 851; else if (i == 852) r = 852; else if (i == 853) r = 853; else if (i == 854) r = 854; else if (i == 855) r = 855; else
+        if (i == 856) r = 856; else if (i == 857) r = 857; else if (i == 858) r = 858; else if (i == 859) r = 859; else if (i == 860) r = 860; else if (i == 861) r = 861; else if (i == 862) r = 862; else if (i == 863) r = 863; else
+        if (i == 864) r = 864; else if (i == 865) r = 865; else if (i == 866) r = 866; else if (i == 867) r = 867; else if (i == 868) r = 868; else if (i == 869) r = 869; else if (i == 870) r = 870; else if (i == 871) r = 871; else
+        if (i == 872) r = 872; else if (i == 873) r = 873; else if (i == 874) r = 874; else if (i == 875) r = 875; else if (i == 876) r = 876; else if (i == 877) r = 877; else if (i == 878) r = 878; else if (i == 879) r = 879; else
+        if (i == 880) r = 880; else if (i == 881) r = 881; else if (i == 882) r = 882; else if (i == 883) r = 883; else if (i == 884) r = 884; else if (i == 885) r = 885; else if (i == 886) r = 886; else if (i == 887) r = 887; else
+        if (i == 888) r = 888; else if (i == 889) r = 889; else if (i == 890) r = 890; else if (i == 891) r = 891; else if (i == 892) r = 892; else if (i == 893) r = 893; else if (i == 894) r = 894; else if (i == 895) r = 895; else
+        if (i == 896) r = 896; else if (i == 897) r = 897; else if (i == 898) r = 898; else if (i == 899) r = 899; else if (i == 900) r = 900; else if (i == 901) r = 901; else if (i == 902) r = 902; else if (i == 903) r = 903; else
+        if (i == 904) r = 904; else if (i == 905) r = 905; else if (i == 906) r = 906; else if (i == 907) r = 907; else if (i == 908) r = 908; else if (i == 909) r = 909; else if (i == 910) r = 910; else if (i == 911) r = 911; else
+        if (i == 912) r = 912; else if (i == 913) r = 913; else if (i == 914) r = 914; else if (i == 915) r = 915; else if (i == 916) r = 916; else if (i == 917) r = 917; else if (i == 918) r = 918; else if (i == 919) r = 919; else
+        if (i == 920) r = 920; else if (i == 921) r = 921; else if (i == 922) r = 922; else if (i == 923) r = 923; else if (i == 924) r = 924; else if (i == 925) r = 925; else if (i == 926) r = 926; else if (i == 927) r = 927; else
+        if (i == 928) r = 928; else if (i == 929) r = 929; else if (i == 930) r = 930; else if (i == 931) r = 931; else if (i == 932) r = 932; else if (i == 933) r = 933; else if (i == 934) r = 934; else if (i == 935) r = 935; else
+        if (i == 936) r = 936; else if (i == 937) r = 937; else if (i == 938) r = 938; else if (i == 939) r = 939; else if (i == 940) r = 940; else if (i == 941) r = 941; else if (i == 942) r = 942; else if (i == 943) r = 943; else
+        if (i == 944) r = 944; else if (i == 945) r = 945; else if (i == 946) r = 946; else if (i == 947) r = 947; else if (i == 948) r = 948; else if (i == 949) r = 949; else if (i == 950) r = 950; else if (i == 951) r = 951; else
+        if (i == 952) r = 952; else if (i == 953) r = 953; else if (i == 954) r = 954; else if (i == 955) r = 955; else if (i == 956) r = 956; else if (i == 957) r = 957; else if (i == 958) r = 958; else if (i == 959) r = 959; else
+        if (i == 960) r = 960; else if (i == 961) r = 961; else if (i == 962) r = 962; else if (i == 963) r = 963; else if (i == 964) r = 964; else if (i == 965) r = 965; else if (i == 966) r = 966; else if (i == 967) r = 967; else
+        if (i == 968) r = 968; else if (i == 969) r = 969; else if (i == 970) r = 970; else if (i == 971) r = 971; else if (i == 972) r = 972; else if (i == 973) r = 973; else if (i == 974) r = 974; else if (i == 975) r = 975; else
+        if (i == 976) r = 976; else if (i == 977) r = 977; else if (i == 978) r = 978; else if (i == 979) r = 979; else if (i == 980) r = 980; else if (i == 981) r = 981; else if (i == 982) r = 982; else if (i == 983) r = 983; else
+        if (i == 984) r = 984; else if (i == 985) r = 985; else if (i == 986) r = 986; else if (i == 987) r = 987; else if (i == 988) r = 988; else if (i == 989) r = 989; else if (i == 990) r = 990; else if (i == 991) r = 991; else
+        if (i == 992) r = 992; else if (i == 993) r = 993; else if (i == 994) r = 994; else if (i == 995) r = 995; else if (i == 996) r = 996; else if (i == 997) r = 997; else if (i == 998) r = 998; else if (i == 999) r = 999; else r = -1;
+    }
+    return 0;
+}

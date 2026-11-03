@@ -7717,7 +7717,8 @@ cxx_dtor_ready:
                 argVar.Primary = argValue;
                 argVar.Storage = nullptr;
                 argVar.BaseType = argValue ? argValue->getType() : nullptr;
-                argVar.IsRvalue = true;
+                argVar.IsRvalue = nv.IsRvalue;
+                argVar.CxxLvalueKind = CxxArgumentLvalueKind(argAssign);
                 // A positional argument keeps its source variable's name here; the wrapper call
                 // would read it as a named argument (`T(l1, l2)` -> "named argument 'l1'").
                 argVar.TypeAndValue.VariableName.clear();
@@ -7803,8 +7804,12 @@ cxx_dtor_ready:
             const bool clangOnlyConstructorSet = scalarReferenceSet || nullPointerCandidate;
             hardReferenceRejection = !clangOnlyConstructorSet
                 && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
+            // The copy-sink verdict refuses NAMED copy-deleted lvalues only: a reference-returning
+            // call (`generic_category()`) binds a const& parameter without a copy.
+            std::vector<LLVMBackend::NamedVariable> sinkArguments = ctorArguments;
+            for (auto& sinkArgument : sinkArguments) sinkArgument.IsRvalue = true;
             if (const std::string sink =
-                    compiler->CxxConstructorCopySinkError(ctor, ctorArguments);
+                    compiler->CxxConstructorCopySinkError(ctor, sinkArguments);
                 !sink.empty())
                 LogErrorContext(direct, sink);
             const bool narrowingRefused
@@ -8357,11 +8362,13 @@ cxx_dtor_ready:
                 const bool useMove = compiler->IsCxxRvalueReferenceArgument(rightNV)
                     && compiler->FindCxxCopyCtor(typeName) == nullptr
                     && compiler->FindCxxMoveCtor(typeName) != nullptr;
+                // A same-class cast `(T)a` is direct-initialization: an explicit copy ctor runs.
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
                                                      useMove,
                                                      std::format("into local '{}'", name).c_str(),
                                                      declType.DiagnosticTypeName,
-                                                     compiler->CxxConstReceiverKind(rightNV) != 0);
+                                                     compiler->CxxConstReceiverKind(rightNV) != 0,
+                                                     /*directInit*/ castInit);
                 return true;
             }
             if (sameType && compiler->lastCxxRetTemp_ != nullptr)
@@ -11852,6 +11859,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     ctorArg.AllocAlignment = initializerSourceNV.AllocAlignment;
                                     ctorArg.TypeAndValue.AllocAlignValue =
                                         initializerSourceNV.TypeAndValue.AllocAlignValue;
+                                    ctorArg.TypeAndValue.NewAllocAlignment =
+                                        initializerSourceNV.TypeAndValue.NewAllocAlignment;
                                     // A moved container slot can retain the slot's pointer depth
                                     // witness even though its loaded LLVM value is one raw T*.
                                     // The unique constructor consumes that actual value, so present
@@ -13754,10 +13763,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // mark this local as owning so it is freed on scope exit.
                         if (typeAndValue.Pointer && compiler->lastCallReturnsOwned)
                         {
+                            // Ruling 2026-10-31: a `unique T*` call result bound to a raw local is never
+                            // freed by it; refuse and steer to a unique local or .release().
+                            if (!typeAndValue.IsUnique && !typeAndValue.IsArrayView && !InGenericInstantiation()
+                                && haveInitializerSourceNV && initializerSourceNV.Storage == nullptr
+                                && compiler->ValueIsUniqueCallResult(initializerSourceNV.Primary))
+                                compiler->LogOwningCallRawBindError(name);
                             compiler->GetOrCreateStackVariable(name).IsOwning = true;
                             compiler->lastCallReturnsOwned = false;
                         }
 
+                        // Ruling 2026-10-31: an owning `?:` arm (a null arm does not help) bound to a raw local.
+                        if (typeAndValue.Pointer && !typeAndValue.IsUnique && !typeAndValue.IsArrayView
+                            && !InGenericInstantiation() && haveInitializerSourceNV
+                            && initializerSourceNV.TernaryOwnedCallArms != 0)
+                            compiler->LogOwningCallRawBindError(name);
                         // Same for a `move <interface>`-returning call: the fat-ptr local owns the
                         // boxed heap object. Keep the existing ownership flag propagation for unique
                         // locals and mark only a direct plain-local move result for auto cleanup.
@@ -13830,11 +13850,20 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             || (srcIsBorrowed && !srcMovedFromSlot
                                 && typeAndValue.Pointer && !typeAndValue.ElemPointer
                                 && !typeAndValue.IsUnique && !destUniqueLoc);
+                        // Ruling 2026-10-31: an explicit `move` of a PROVEN borrowed pointer into any slot
+                        // is refused; the move-from-owning-slot fix stays legal (srcMovedFromSlot).
+                        const bool borrowedMoveSlotRefused = typeAndValue.Pointer
+                            && !typeAndValue.IsArrayView && !srcMovedFromSlot && haveInitializerSourceNV
+                            && initAssignExprOwn != nullptr
+                            && TopLevelMoveExpression(initAssignExprOwn) != nullptr
+                            && compiler->MoveSourceIsAddressBorrow(initializerSourceNV);
+                        if (borrowedMoveSlotRefused)
+                            compiler->LogBorrowedMoveSlotError();
                         if (initResultOwns)
                         {
                             // ParseMoveExpression sets lastOwningResult unconditionally and records the
                             // true provenance in IsBorrowed, so consult that; the `=` path has the same gate.
-                            if (srcIsBorrowed && !srcMovedFromSlot && destUniqueLoc)
+                            if (srcIsBorrowed && !srcMovedFromSlot && destUniqueLoc && !borrowedMoveSlotRefused)
                             {
                                 bool srcIsField = !srcBorrowedField.empty();
                                 std::string srcDesc = srcIsField

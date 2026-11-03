@@ -1436,6 +1436,13 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
             if (srcConst != nullptr && srcConst->isNullValue())
                 return llvm::Constant::getNullValue(destType);
 
+            // A C NULL macro is a load of its zero backing global: a closure slot takes it as nullptr
+            // (the test ArgumentIsProvablyDataPointer uses on the parameter path).
+            if (srcType->isPointerTy() && destType == GetClosureFatPtrType())
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand());
+                        global != nullptr && cxxZeroIntegerMacroNames_.count(global->getName().str()) != 0)
+                        return llvm::Constant::getNullValue(destType);
             if (srcType->isPointerTy())
             {
                 LogError(std::format(
@@ -1463,6 +1470,23 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
             // here ('int i = k;'): apply the operator, plus at most one standard conversion.
             if (auto* converted = ConvertAggregateViaImplicitConversionOperator(value, destType))
                 return converted;
+            // A struct source is never an array: name it (demangled) instead of the decay rule.
+            // Not a convertibility claim: a converting constructor may still apply upstream.
+            if (auto* srcStruct = llvm::dyn_cast<llvm::StructType>(srcType))
+            {
+                auto spell = [&](llvm::StructType* st) {
+                    return st->hasName() ? SpellType(*this, TypeAndValue{ .TypeName = st->getName().str() })
+                                         : std::string("<anonymous struct>");
+                };
+                const std::string srcName = spell(srcStruct);
+                if (auto* destStruct = llvm::dyn_cast<llvm::StructType>(destType))
+                    LogError(std::format("cannot cast an aggregate value - cannot initialize or "
+                        "assign '{}' from unrelated struct type '{}'", spell(destStruct), srcName));
+                else
+                    LogError(std::format("cannot cast an aggregate value - cannot initialize or "
+                        "assign a non-struct value from unrelated struct type '{}'", srcName));
+                return value;
+            }
             LogError("cannot cast an aggregate value - a fixed array decays to a pointer to its first element");
             return value;
         }
@@ -2920,25 +2944,21 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
         if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
             return CreateVectorOperation(op, left, right, leftIsUnsigned, rightIsUnsigned);
 
-        // C integer promotion: an i8/i16/u8/u16 operand becomes a SIGNED i32 before the usual
-        // arithmetic conversions, so `(i8)-1 < (u8)3` compares signed as C does.
+        // C integer promotion: a bool (i1) or i8/i16/u8/u16 operand becomes a SIGNED i32 (bool and
+        // unsigned zero-extend) before the usual arithmetic conversions, so `(i8)-1 < (u8)3` compares
+        // signed and `s + s` is int. The result keeps the promoted width; narrowing is the store's job.
         unsigned preLeftBits  = left->getType()->isIntegerTy()  ? left->getType()->getIntegerBitWidth()  : 0;
         unsigned preRightBits = right->getType()->isIntegerTy() ? right->getType()->getIntegerBitWidth() : 0;
-        bool leftNarrow  = (preLeftBits == 8 || preLeftBits == 16);
-        bool rightNarrow = (preRightBits == 8 || preRightBits == 16);
-        bool bothConstant = llvm::isa<llvm::ConstantInt>(left) && llvm::isa<llvm::ConstantInt>(right);
-        // Runtime narrow arithmetic narrows back so the expression keeps its narrow type; a
-        // constant fold keeps the promoted i32 so `1 << 20` does not overflow the literal width.
-        unsigned narrowBits = (!bothConstant && leftNarrow && rightNarrow)
-            ? std::max(preLeftBits, preRightBits) : 0;
+        bool leftNarrow  = (preLeftBits == 1 || preLeftBits == 8 || preLeftBits == 16);
+        bool rightNarrow = (preRightBits == 1 || preRightBits == 8 || preRightBits == 16);
         if (leftNarrow)
         {
-            left = PromoteToInt(left, leftIsUnsigned);
+            left = Upconvert(left, builder->getInt32Ty(), leftIsUnsigned);
             leftIsUnsigned = false;
         }
         if (rightNarrow)
         {
-            right = PromoteToInt(right, rightIsUnsigned);
+            right = Upconvert(right, builder->getInt32Ty(), rightIsUnsigned);
             rightIsUnsigned = false;
         }
 
@@ -2990,10 +3010,13 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
         };
 
         llvm::Value* result = emitIntegerOp();
-        // Narrow the promoted result back so a sub-int expression keeps its declared width.
-        if (narrowBits != 0 && result != nullptr && result->getType()->isIntegerTy()
-            && result->getType()->getIntegerBitWidth() > narrowBits)
-            result = builder->CreateTrunc(result, llvm::Type::getIntNTy(*context, narrowBits));
+        // A shift's result is its promoted LEFT operand (C 6.5.7): the count was widened to the common
+        // width above, so narrow the result back to the left width (`i << l` is int, not long).
+        const bool isShift = op == Operation::ShiftLeft || op == Operation::LeftShiftAssignment
+            || op == Operation::ShiftRight || op == Operation::RightShiftAssignment;
+        if (isShift && result != nullptr && result->getType()->isIntegerTy()
+            && result->getType()->getIntegerBitWidth() > leftBits && leftBits != 0)
+            result = builder->CreateTrunc(result, llvm::Type::getIntNTy(*context, leftBits));
         return result;
     }
 

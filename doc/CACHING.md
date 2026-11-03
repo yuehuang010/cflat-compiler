@@ -296,7 +296,9 @@ Missing, truncated, or hash-mismatched sidecars are misses and are rewritten wit
 By default header, request, and core bitcode metadata record the compiler build that wrote them
 (`cstamp`, the cflat binary's mtime and size). A load by another build is a `compiler build` miss;
 header/request entries are rewritten in place, and demand companions are keyed per build too. Set
-`CFLAT_CACHE_BUILD_STAMP=0` to omit these stamps and let those entries survive a rebuild. PCH keys
+`CFLAT_CACHE_BUILD_STAMP=0` to omit these stamps and let those entries survive a rebuild. Any other
+value except `1` (a gate passes the commit id) is appended to the stamp, so a run under a new value
+starts from fresh entries even when the binary did not change. PCH keys
 always include the build stamp because a PCH belongs to the clang that wrote it. The cache schema
 still must be bumped when the extractor's harvested data changes. The switch is
 `LLVMBackend::CacheBuildStampEnabled()`. Core bitcode is written only by `--init` / `--init-local`, so

@@ -46,3 +46,8 @@ leg in Test/test_cpp_interop.cb is a guard, it already passed on master.)
 On LLP64 a `((int*)0)` macro at a C++ `long*` param is accepted (CFlat `long` = target width, so the int pointee matches);
 clang-cl refuses. T296 leg retargeted to `long long*` (distinct on both ABIs). Whether CFlat should keep C++ `long` distinct from
 `int` on Windows at C++ pointer params is open (L = target long ruling covers CFlat-side spelling only).
+
+RULED 2026-10-31 (maintainer), the 2026-10-16 note: ALIAS EVERYWHERE. CFlat's identity rule holds at C++ parameters and template
+arguments too: on LLP64 `long` is `int`, so `((int*)0)` / an `int*` into a C++ `long*` parameter is ACCEPTED and deduction may give
+`int` where clang-cl gives `long`. Reason: the alternative is a program that compiles on macOS/Linux and fails on Windows. Divergence
+from clang-cl accepted by design. Test consequence: none; the T296 leg stays on `long long*` (distinct on both ABIs).

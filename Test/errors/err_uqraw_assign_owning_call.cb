@@ -1,0 +1,32 @@
+// Assigning an owning call result to a raw local leaks the previous value and the new one.
+// Refused, same rule as the declaration form.
+
+struct UqrawE { int v = 0; };
+unique UqrawE* uqrawEMk(int n) { unique UqrawE* p = new UqrawE(); p->v = n; return move p; }
+
+struct UqrawFac { int k = 0; unique UqrawE* make(int n) { unique UqrawE* p = new UqrawE(); p->v = n; return move p; } };
+
+extern int main()
+{
+    UqrawE* q = nullptr;
+    expect_error("cannot bind an owning call result to raw pointer 'q'") {
+        q = uqrawEMk(2);
+    }
+    UqrawFac uf = default;
+    UqrawE* mr = nullptr;
+    expect_error("cannot bind an owning call result to raw pointer 'mr'") {
+        mr = uf.make(3);
+    }
+    bool tk = true;
+    UqrawE* tb = nullptr;
+    UqrawE* ta = nullptr;
+    expect_error("cannot bind an owning call result to raw pointer 'ta'") {
+        ta = tk ? uqrawEMk(4) : tb;
+    }
+    bool tj = false;
+    UqrawE* na = nullptr;
+    expect_error("cannot bind an owning call result to raw pointer 'na'") {
+        na = tk ? (tj ? uqrawEMk(5) : tb) : tb;
+    }
+    return 0;
+}

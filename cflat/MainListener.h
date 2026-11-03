@@ -35,6 +35,7 @@
 #include <charconv>
 #include <bit>
 #include <cassert>
+#include "CompilerManager.h"
 #include <vector>
 
 #include "platform/GeneratedParser.h"
@@ -8016,6 +8017,12 @@ private:
 
     // Marks an expression position where a ternary owning temp may need per-arm cleanup
     // before its value is joined with a borrowed consumer.
+    // Refuses a construct once the thread's C stack is nearly used up (see kMinStackHeadroomBytes).
+    void RequireStackHeadroom(antlr4::ParserRuleContext* ctx)
+    {
+        if (StackBytesRemaining() >= kMinStackHeadroomBytes) return;
+        LogErrorContext(ctx, "expression or statement is nested too deeply; split it into named temporaries");
+    }
     bool inCallArgument_ = false;
     const CFlatParser::PostfixExpressionContext* directViewCallArgument_ = nullptr;
     bool inCxxCallArgument_ = false;
@@ -8828,7 +8835,6 @@ public:
     // Must run while still in the body block: FlushOwnedTemps' dominance guard frees only temps
     // registered in the current block, so the caller branches to the loop latch / resume after.
     void PrepareLoopConditionalDropFlags(CFlatParser::StatementContext* body);
-    void PrepareMovedReassignments(antlr4::tree::ParseTree* node);
     void ParseControlledBody(CFlatParser::StatementContext* body);
     void MarkLoopBackEdgeCxxConstPointers(
         LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop);
@@ -10265,10 +10271,11 @@ public:
      * kept unless the copy above already consumed it. `hoistTo` is the block holding the arm
      * branch: an alloca-based struct temp is zeroed and re-keyed there instead of freed here, so
      * a joined pointer INTO it stays live until the statement ends (see FlushOwnedTempsSince).
+     * movedString (both arms explicit moves): a string arm is the moved-out buffer, not copied.
      */
     void FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
                           const LLVMBackend::OwnedTempMark& mark, bool& deepCopied,
-                          llvm::BasicBlock* hoistTo);
+                          llvm::BasicBlock* hoistTo, bool movedString = false);
 
     llvm::Value* CloneTernaryClosureValue(
         llvm::Value* value, antlr4::ParserRuleContext* ctx);
@@ -10324,6 +10331,19 @@ public:
         const std::string& cxxTernaryDeclType,
         bool collapseLvalueArms,
         bool collapseLvalueSink);
+    // Body of ParseTernaryBranches; ownedCallArms receives the per-arm owning-call bits.
+    LLVMBackend::TypedValue ParseTernaryBranchesBody(
+        CFlatParser::ConditionalExpressionContext* ctx,
+        const LLVMBackend::TypedValue& condTv,
+        CFlatParser::ExpressionContext* expressionTrueCtx,
+        CFlatParser::ConditionalExpressionContext* expressionFalseCtx,
+        ResultUse use,
+        const LLVMBackend::TypeAndValue& outerExpected,
+        llvm::Value* cxxTernaryDeclDest,
+        const std::string& cxxTernaryDeclType,
+        bool collapseLvalueArms,
+        bool collapseLvalueSink,
+        int& ownedCallArms);
 
     LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx,
                                                         ResultUse use = ResultUse::Value);

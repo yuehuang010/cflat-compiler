@@ -3774,9 +3774,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.IsStaticLocal = namedVar.IsStaticLocal;
                 structVar.FieldPathHasPointerDereference = true;
                 structVar.FieldPathFromForwardedArrow = false;
-                structVar.FieldDropOwnerStorage = namedVar.FieldDropOwnerStorage != nullptr
-                    ? namedVar.FieldDropOwnerStorage
-                    : namedVar.Storage != nullptr ? namedVar.Storage : namedVar.Primary;
                 const bool frameLocalFieldContainer = namedVar.FieldPathPointerFrameLocal
                     && !namedVar.FieldName.empty() && !namedVar.OwningStructName.empty()
                     && !Compiler(ctx)->IsCxxRecord(namedVar.OwningStructName);
@@ -4956,6 +4953,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             nullIfaceRecvText = ReceiverSourceText();
 
                             auto* compiler = Compiler(ctx);
+                            // Ruling 2026-10-31: an owning interface call result is a temp nothing binds;
+                            // a member on it (`mkI()->m()`) is refused - bind it to a unique local first.
+                            if (compiler->ValueIsUniqueCallResult(interfaceVar.Primary))
+                                LogErrorContext(ctx, std::format(
+                                    "cannot use an owning call result as an interface receiver for '{}' - "
+                                    "bind it to a 'unique' local first", primaryIdentifier));
                             // Deref of a moved interface local (method receiver or interface field)
                             // is null - record it for the cross-block MAY-null fixpoint. SKIP '?.'.
                             if (!nullConditionalPending)
@@ -5619,10 +5622,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // of `.b` is the field `a`, whose own root is still `w`.
                                     namedVar.FieldPathRoot = structVar.FieldPathRoot.empty()
                                         ? structVar.TypeAndValue.VariableName : structVar.FieldPathRoot;
-                                    namedVar.FieldDropOwnerStorage = structVar.FieldDropOwnerStorage
-                                        != nullptr ? structVar.FieldDropOwnerStorage
-                                        : structVar.Storage != nullptr ? structVar.Storage
-                                        : structVar.Primary;
                                     namedVar.RootIsBorrowedThisField = structVar.IsThisReceiver
                                         || structVar.RootIsBorrowedThisField;
                                     if (namedVar.RootIsBorrowedThisField)
@@ -6609,6 +6608,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // A parenthesized `?:` joining macro constants stays a prvalue.
                             if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroJoin)
                                 namedVar.IsCxxMacroJoin = true;
+                            // r3: parentheses are transparent to an arithmetic mark: `(s + 1)` is still narrow.
+                            if (prevPrimary->expression() != nullptr)
+                                namedVar.ArithNarrowWidth = parenInnerNamed.ArithNarrowWidth;
                             if (prevPrimary->expression() != nullptr && childLimit == 1
                                 && parenInnerNamed.IsCxxDirectConstruction)
                             {
@@ -10020,16 +10022,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (argParamIndex < funcPtrTV.FuncPtrParams.size())
                                         {
                                             const auto& param = funcPtrTV.FuncPtrParams[argParamIndex];
-                                            if ((param.Pointer || param.IsAlias || param.IsRvalueRef)
-                                                && !argNV.TypeAndValue.Pointer && !argNV.CallerName.empty()
-                                                && backend->IsDataStructure(argNV.TypeAndValue.TypeName)
-                                                && !backend->IsCxxRecord(argNV.TypeAndValue.TypeName))
-                                            {
-                                                const std::string ownerName = argNV.FieldPathRoot.empty()
-                                                    ? argNV.CallerName : argNV.FieldPathRoot;
-                                                // Function values can retain the same mutable borrow.
-                                                backend->MarkVariableFieldStorageEscaped(ownerName);
-                                            }
                                             const bool nullPointerValue = backend->IsNullPointerConstantArgument(
                                                 argNV, false)
                                                 || (!argNV.TypeAndValue.Pointer
@@ -10117,7 +10109,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                             || argExpectedDest.PointerDepth > 1)
                                                             rejectFunctionValuePointerArg();
                                                         else
-                                                            argValue = backend->LowerPointerParamArg(argNV, false);
+                                                            argValue = backend->LowerPointerParamArg(argNV);
                                                     }
                                                     else
                                                         argValue = backend->AdjustCxxPointerForStore(
@@ -10784,7 +10776,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.FieldPathRoot = argNV.FieldPathRoot;
                                     argVar.NullConditionalBorrowStorage = argNV.NullConditionalBorrowStorage;
                                     argVar.IsNullConditionalOwningValue = argNV.IsNullConditionalOwningValue;
-                                    argVar.FieldDropOwnerStorage = argNV.FieldDropOwnerStorage;
                                     argVar.MovedFields = argNV.MovedFields;
                                     argVar.TypeAndValue.IsInterface = argNV.TypeAndValue.IsInterface;
                                     argVar.IsBonded = argNV.IsBonded;
@@ -12909,6 +12900,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LLVMBackend::NamedVariable argVar;
                                     argVar.OriginalArgumentType = argNV.TypeAndValue;
                                     argVar.HasOriginalArgumentType = true;
+                                    argVar.ArithNarrowWidth = argNV.ArithNarrowWidth;
                                     argVar.AddressedUniqueSlot = argNV.AddressedUniqueSlot;
                                     argVar.AddressedUniqueTypeName = argNV.AddressedUniqueTypeName;
                                     argVar.IsTopLevelConst = argNV.IsTopLevelConst;
@@ -12948,7 +12940,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.FieldPathRoot = argNV.FieldPathRoot;
                                     argVar.NullConditionalBorrowStorage = argNV.NullConditionalBorrowStorage;
                                     argVar.IsNullConditionalOwningValue = argNV.IsNullConditionalOwningValue;
-                                    argVar.FieldDropOwnerStorage = argNV.FieldDropOwnerStorage;
                                     argVar.MovedFields = argNV.MovedFields;
                                     // Propagate storage and ownership so move-param zeroing works at the call site.
                                     argVar.Storage = argNV.Storage;

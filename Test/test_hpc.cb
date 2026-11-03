@@ -1203,6 +1203,26 @@ int testBtreeRemoveDescending()
 // keys=[9,17,25] over four leaves of size 8,8,8,16), each engineered to hit exactly
 // one rebalance path. Verified structurally with a debug dump during development;
 // here we check behavior (count/contains) rather than internal node shape.
+// MIX20: a key type with a const field. Lookups compile and run; insert/add/set/remove on it are
+// refused (err_btree_const_key_insert.cb). Only empty-tree reads: such a key cannot be stored.
+struct BtreeConstKey
+{
+    const int id = 0;
+    BtreeConstKey(int n) { id = n; }
+    bool operator<(BtreeConstKey o) { return id < o.id; }
+    BtreeConstKey copy() { return BtreeConstKey(id); }
+};
+
+int testBtreeConstFieldKeyLookup()
+{
+    int passed = 0;
+    btree<BtreeConstKey, int> t = default;
+    passed += Test("btree const-field key contains on empty", t.contains(BtreeConstKey(3)), false);
+    passed += Test("btree const-field key count", t.count(), 0);
+    passed += Test("btree const-field key get on empty", t.get(BtreeConstKey(3)), 0);
+    return passed;
+}
+
 int testBtreeRebalanceScenarios()
 {
     int passed = 0;
@@ -2510,6 +2530,7 @@ extern int main(int argc, char** argv)
     passed += testBtreePointerValues();      total += 5;
     passed += testBtreeBorrowedPointerValues(); total += 3;
     passed += testBtreeValueCopySemantics();    total += 8;
+    passed += testBtreeConstFieldKeyLookup();   total += 3;
 
     // ---- btree<K,V> concurrent (optimistic lock coupling) ----
     passed += testBtreeConcurrentLookupInsert();  total += 7;

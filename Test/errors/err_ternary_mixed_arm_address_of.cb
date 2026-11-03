@@ -1,0 +1,13 @@
+// TERNADDR: `&(c ? a : b)` with arms of different types joins through a conversion, a prvalue (clang refuses).
+void ternMixBump(i64* p) { }
+
+extern int main()
+{
+    expect_error("cannot take the address of a '?:' whose arms have different types") {
+        int x = 1;
+        i64 y = 2;
+        bool t = true;
+        ternMixBump(&(t ? x : y));
+    }
+    return 0;
+}

@@ -1,0 +1,14 @@
+// Explicit move of an address-of binding into a CFlat `move` parameter. The callee would free a
+// stack address at scope exit. Refused; C++ callees keep their own pointer semantics.
+
+void uqrawSnk(move int* q) { }
+
+extern int main()
+{
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int x = 5;
+        int* p = &x;
+        uqrawSnk(move p);
+    }
+    return 0;
+}

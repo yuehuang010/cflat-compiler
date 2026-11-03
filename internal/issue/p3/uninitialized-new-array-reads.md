@@ -172,3 +172,9 @@ Not queued. `T* p = new T[n]` stays uninitialized by the 2026-09-04 C-compatibil
 (raw `new T[n]` into `T*` stays legal; no migration to `array<T>`). The `init` contract,
 `init_capacity` and its poison fill have landed. The only remaining work here is the
 `alloc_zeroed` allocator optimization, pending measurement of the recycled-block allocators.
+
+## Ruling 2026-10-31 (main session, from precedent; maintainer may veto): policy settled, no further ruling owed
+Option 4 (zeroing `array<T>.init(n)` vs the `init_capacity(n)` opt-out) and option 1 for `init_capacity` in Debug landed 2026-09-03.
+Option 2 (zero every `new T[n]`) is OFF: it contradicts the 2026-09-04 C-compatibility ruling (`T* p = new T[n]` behaves as in C) and
+the HPC budget. Option 3 (`--sanitize=uninit`) is plan-sized and not queued; file it under internal/plan/ if wanted. The only residue
+is the `alloc_zeroed` allocator measurement (p3 perf). Test consequence: none; the issue stays as the record until that measurement.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <mutex>
 #include <algorithm>
@@ -12,6 +14,18 @@
 #include <llvm/Support/Error.h>
 
 class LLVMBackend;
+
+// Bytes of C stack left on the calling thread (SIZE_MAX if the bounds are unknown). Bounds are
+// read once per thread, so LSP pool threads and other small-stack workers use their own limit.
+size_t StackBytesRemaining();
+// Recursion sites refuse ("nested too deeply") below this headroom; one `?:` level is about 200 KB
+// under clang. MSVC frames are far larger (ParsePostfixExpressionInner alone ~965 KB, ~2.3 MB per
+// paren level), so Windows keeps a headroom that covers several frames between two checks.
+#if defined(_WIN32)
+constexpr size_t kMinStackHeadroomBytes = 4 * 1024 * 1024;
+#else
+constexpr size_t kMinStackHeadroomBytes = 256 * 1024;
+#endif
 
 // DumpAllState is defined after LLVMBackend is fully declared (see bottom of LLVMBackend.h).
 // This header only holds the class layout and the hook installer.

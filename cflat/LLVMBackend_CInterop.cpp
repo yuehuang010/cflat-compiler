@@ -17340,7 +17340,10 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                         && CxxSpellingForCflatType(arg.TypeAndValue.TypeName, spelling))
                     {
                         const bool named = arg.Storage != nullptr || (!arg.CallerName.empty()
-                            && FindVariableStorage(arg.CallerName).Storage != nullptr);
+                            && FindVariableStorage(arg.CallerName).Storage != nullptr)
+                            || (!arg.IsExplicitMove
+                                && (arg.CxxLvalueKind == 1 || arg.CxxLvalueKind == 2))
+                            || !arg.IsRvalue;
                         one = "declval<" + spelling + (named && !arg.IsExplicitMove ? " &" : "") + ">()";
                     }
                     else if (one.empty() && arg.TypeAndValue.Pointer)
@@ -18199,7 +18202,12 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             }
             // A class element binds by reference: clang copies an lvalue, moves an rvalue.
             else if (!type.Pointer && IsCxxRecord(type.TypeName))
-                spelling += elements[i].IsRvalue || elements[i].IsExplicitMove ? " &&" : " const &";
+            {
+                const bool xvalue = elements[i].IsExplicitMove
+                    || IsCxxRvalueReferenceArgument(elements[i]);
+                const bool isConst = CxxConstReceiverKind(elements[i]) != 0;
+                spelling += xvalue ? " &&" : isConst ? " const &" : " &";
+            }
             elementParameters[i] = "p" + std::to_string(nextParameter++);
             elementParameterTypes[i] = parameterTypes.size();
             parameterTypes.push_back(std::move(spelling));
@@ -19088,6 +19096,12 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             && !arguments.front().TypeAndValue.Pointer
             && IsCxxRecord(arguments.front().TypeAndValue.TypeName)
             && HasImplicitClassConversionOperator(arguments.front().TypeAndValue.TypeName))
+            declaredWrapperCtor = true;
+        if (!declaredWrapperCtor && copyInit && arguments.size() == 1
+            && !arguments.front().TypeAndValue.Pointer
+            && IsCxxRecord(arguments.front().TypeAndValue.TypeName)
+            && ResolveTypeAlias(arguments.front().TypeAndValue.TypeName)
+                == ResolveTypeAlias(typeName))
             declaredWrapperCtor = true;
         // A deleted converting constructor is clang's refusal for this source: report it.
         if (!declaredWrapperCtor && copyInit && arguments.size() == 1
@@ -31565,7 +31579,7 @@ bool LLVMBackend::EmitCxxArrayDefaultConstruction(const std::string& typeName, l
     }
 
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxCopyCtor(
-        const std::string& typeName, bool constSource) const
+        const std::string& typeName, bool constSource, bool allowExplicit) const
 {
         const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__ctor");
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
@@ -31575,6 +31589,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxCopyCtor(
         for (const auto& c : info->constructors)
             if (c.isCopyCtor)
             {
+                if (c.isExplicit && !allowExplicit) continue;
                 const bool takesConst = c.params.size() > 1 && c.params[1].CxxConstRef();
                 if (takesConst && constCopy == nullptr) constCopy = &c;
                 else if (!takesConst && mutableCopy == nullptr) mutableCopy = &c;
@@ -32116,6 +32131,19 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     }
                 }
                 const bool rvalue = argumentIsRvalue(i);
+                const bool constClassArgument = argVars != nullptr && i < argVars->size()
+                    && !got.Pointer && CxxConstReceiverKind((*argVars)[i]) != 0;
+                const bool mutableClassReference = want.Pointer
+                    && (want.IsAlias || want.IsRvalueRef) && !want.CxxConstRef()
+                    && !want.ElemPointer && isForeignClass(want.TypeName);
+                if (constClassArgument && mutableClassReference)
+                {
+                    if (!blocked && !softRefused && !c.needsLocalDefinition
+                        && referenceRejection.empty())
+                        referenceRejection = "const class object cannot bind a non-const class reference";
+                    ok = false;
+                    break;
+                }
                 const bool originalFunctionPointer = argVars != nullptr && i < argVars->size()
                     && (*argVars)[i].HasOriginalArgumentType
                     && (*argVars)[i].OriginalArgumentType.IsFunctionPointer;
@@ -33028,10 +33056,12 @@ bool LLVMBackend::IsCxxConvertingTemporaryForRvalueRef(const NamedVariable& arg,
         // Cheap filter: some listed converting ctor or conversion operator could make the temp.
         const bool viaCtor = CanImplicitlyConstructCxxClass(arg, param, /*cxxByValueParam*/ false,
                                                             allowTemplateClassConversion);
+        const bool constClassSource = !argType.Pointer && IsCxxRecord(argType.TypeName)
+            && CxxConstReceiverKind(arg) != 0;
         TypeAndValue referent = param;
         referent.Pointer = referent.IsAlias = referent.IsRvalueRef = false;
         referent.PointerDepth = 0;
-        if (!viaCtor && (argType.Pointer || argType.TypeName.empty()
+        if (!viaCtor && !constClassSource && (argType.Pointer || argType.TypeName.empty()
                          || CxxConversionOperatorTo(argType.TypeName, referent, false).empty()))
             return false;
         // Clang decides: `X&& r = source;` on the source's real cv and category (ambiguity between
@@ -33094,6 +33124,58 @@ std::string LLVMBackend::CxxRvalueRefBindKey(const NamedVariable& arg, const Typ
         else
             parameter = (CxxConstReceiverKind(arg) != 0 ? "const " : "") + sourceSpelling + " &";
         return parameter + "|" + targetSpelling;
+}
+
+// Clang's refusal of `T r = source;` on the source's real cv and category (an rvalue source is
+// spelled as an xvalue), empty when it compiles. Asked only on a refused path; cached per shape.
+std::string LLVMBackend::CxxCopyInitRefusal(const NamedVariable& arg, const std::string& targetType)
+{
+        TypeAndValue target;
+        target.TypeName = targetType;
+        std::string parameter;
+        std::string targetSpelling;
+        std::string key = CxxRvalueRefBindKey(arg, target, parameter, targetSpelling);
+        const TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        if (key.empty() || argType.Pointer || !parameter.ends_with(" &")) return {};
+        const bool rvalue = IsCxxRvalueReferenceArgument(arg);
+        key = (rvalue ? "copyinit|rvalue|" : "copyinit|lvalue|") + key;
+        if (auto known = cxxRvalueRefBindVerdicts_.find(key); known != cxxRvalueRefBindVerdicts_.end())
+            return known->second.first ? std::string() : known->second.second;
+        bool verdict = true;
+        std::string error;
+        auto groupIt = cxxTypeOwnerGroup_.find(targetType);
+        if (groupIt == cxxTypeOwnerGroup_.end()) return {};
+        std::string generatedTypeSource;
+        std::set<size_t> dependencySet;
+        std::unordered_set<std::string> incompleteTypes;
+        GeneratedCxxDefinitionsFor({ targetType, argType.TypeName }, generatedTypeSource,
+                                   dependencySet, incompleteTypes);
+        if (auto owner = cxxTypeOwnerGroup_.find(argType.TypeName);
+            owner != cxxTypeOwnerGroup_.end() && owner->second != groupIt->second)
+            dependencySet.insert(owner->second);
+        const std::vector<size_t> dependencies(dependencySet.begin(), dependencySet.end());
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, dependencies);
+        if (group.headers.empty()) return {};
+        const std::string wrapperName = std::format("__cflat_copyinit_{:016x}",
+            HashWrapperKey(key));
+        const std::string initializer = rvalue
+            ? "static_cast<" + parameter.substr(0, parameter.size() - 1) + "&&>(p0)" : "p0";
+        const std::string wrapperSource = "extern \"C\" __attribute__((weak)) void "
+            + wrapperName + "(" + parameter + " p0) { " + targetSpelling + " r = "
+            + initializer + "; (void)r; }\n";
+        {
+            CxxRequestGroupScope groupScope(*this, &group);
+            CSigEntry bound;
+            verdict = RequestGeneratedCxxWrapper(group, generatedTypeSource + wrapperSource,
+                                                 wrapperName, "COPY_INIT", bound, error,
+                                                 incompleteTypes.empty());
+        }
+        if (verbose)
+            std::cout << std::format("[verbose]   copy-init probe {} -> {}\n", key,
+                                     verdict ? "compiles" : "refused");
+        const std::string line = verdict ? std::string() : FirstCxxErrorLine(error);
+        cxxRvalueRefBindVerdicts_.emplace(key, std::pair{ verdict, line });
+        return line;
 }
 
 std::string LLVMBackend::CxxRvalueRefBindRefusal(const NamedVariable& arg, const TypeAndValue& param)
@@ -34522,6 +34604,48 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         // When the source has an implicit conversion operator, let clang resolve the whole
         // copy-initialization sequence before the listed constructor fast path can choose one.
         const TypeAndValue argType = InferImplicitCxxArgumentType(source, *this);
+        if (!argType.Pointer && IsCxxRecord(argType.TypeName) && IsCxxRecord(targetType)
+            && ResolveTypeAlias(argType.TypeName) != ResolveTypeAlias(targetType))
+        {
+            NamedVariable probe = source;
+            probe.TypeAndValue = argType;
+            probe.TypeAndValue.VariableName.clear();
+            std::string why;
+            std::vector<NamedVariable> arguments{ probe };
+            if (SelectCxxConstructorListed(targetType, { argType }, why,
+                    /*allowNumericConversions*/ true, &arguments,
+                    /*allowExplicit*/ false, allowScalarNarrowing) == nullptr
+                && (why == "const class object cannot bind a non-const class reference"
+                    || why.find("non-const lvalue reference") != std::string::npos
+                    || (CxxConstReceiverKind(probe) != 0
+                        && [&]() {
+                            const CxxClassInfo* info = GetCxxClassInfo(targetType);
+                            if (info == nullptr) return false;
+                            return std::any_of(info->constructors.begin(), info->constructors.end(),
+                                [](const CxxClassInfo::Structor& candidate) {
+                                    return candidate.params.size() > 1
+                                        && candidate.params[1].Pointer
+                                        && candidate.params[1].IsAlias
+                                        && !candidate.params[1].CxxConstRef();
+                                });
+                        }())))
+            {
+                std::string wrapperName;
+                std::string wrapperError;
+                if (!RequestCxxVariadicConstructor(targetType, { probe }, wrapperName,
+                                                   wrapperError, /*copyInit*/ true))
+                {
+                    refusal = wrapperError;
+                    // No wrapper text: relay clang's own copy-initialization refusal (lazy, cached).
+                    if (refusal.empty())
+                        if (std::string clangText = CxxCopyInitRefusal(probe, targetType);
+                            !clangText.empty())
+                            refusal = "clang: " + clangText;
+                    return refusal.empty() ? CxxConvertingCtorResult::NotApplicable
+                                           : CxxConvertingCtorResult::Refused;
+                }
+            }
+        }
         // A deleted converting constructor (`Src&&`, `const Src&&`, a template) may win the pick for
         // this source: clang's copy-initialization decides, not CFlat's ranking.
         if (!source.TypeAndValue.Pointer && IsCxxRecord(argType.TypeName)
@@ -34607,6 +34731,10 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
                                                        allowScalarNarrowing)
                 ? CxxConvertingCtorResult::Converted : CxxConvertingCtorResult::NotApplicable;
         case CxxArgConversion::ExplicitCtor:
+            refusal = DescribeCxxImplicitArgumentBlock(source, param,
+                                                       /*cxxByValueParam*/ true);
+            return refusal.empty() ? CxxConvertingCtorResult::NotApplicable
+                                   : CxxConvertingCtorResult::Refused;
         case CxxArgConversion::NonConstLvalueRef:
             refusal = DescribeCxxImplicitArgumentBlock(source, param, /*cxxByValueParam*/ true);
             return refusal.empty() ? CxxConvertingCtorResult::NotApplicable
@@ -34619,10 +34747,15 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
             return CxxConvertingCtorResult::NotApplicable;
         if (argType.TypeName.empty() || argType.TypeName == targetType)
             return CxxConvertingCtorResult::NotApplicable;
+        NamedVariable rankingArgument = source;
+        rankingArgument.TypeAndValue = argType;
+        rankingArgument.TypeAndValue.VariableName.clear();
+        const std::vector<NamedVariable> rankingArguments{ rankingArgument };
         std::string why;
         TryBindRefusedCxxMember(targetType, "__ctor", 1);
         if (SelectCxxConstructor(targetType, { argType }, why, /*allowNumericConversions*/ true,
-                                 nullptr, /*allowExplicit*/ false, allowScalarNarrowing) == nullptr
+                                 &rankingArguments, /*allowExplicit*/ false,
+                                 allowScalarNarrowing) == nullptr
             && why.starts_with("matches more than one constructor overload"))
         {
             NamedVariable probe = source;
@@ -34809,7 +34942,8 @@ bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::T
                     "in synthesized copy of struct '{}', field '{}'", typeName,
                     field.VariableName);
                 if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstField, srcField, false,
-                                                fieldContext.c_str()))
+                                                fieldContext.c_str(), {}, false,
+                                                /*directInit*/ true))
                     return false;
                 NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
                 continue;
@@ -34843,7 +34977,8 @@ bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::T
                     if (IsForeignNontrivialCxxClass(field.TypeName))
                     {
                         if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstElem, srcElem,
-                                                         false, fieldContext.c_str()))
+                                                         false, fieldContext.c_str(), {}, false,
+                                                /*directInit*/ true))
                             return false;
                     }
                     else if (hasExplicitCopy(field.TypeName))
@@ -34883,7 +35018,8 @@ bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::T
             if (IsForeignNontrivialCxxClass(field.TypeName))
             {
                 if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstField, srcField, false,
-                                                 fieldContext.c_str()))
+                                                 fieldContext.c_str(), {}, false,
+                                                /*directInit*/ true))
                     return false;
                 NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
             }
@@ -35115,7 +35251,7 @@ bool LLVMBackend::RequestSameClassCopy(const std::string& typeName, const NamedV
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                              llvm::Value* src, bool useMove, const char* context,
                                              const std::string& displayTypeName,
-                                             bool constSource)
+                                             bool constSource, bool directInit)
 {
         if (dest == nullptr || src == nullptr) return false;
         if (IsLoweredCFlatOnlyStruct(typeName))
@@ -35167,13 +35303,13 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
             }
         }
         const CxxClassInfo::Structor* ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
-        if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource);
+        if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource, directInit);
         // A class first constructed through a generated wrapper (a CFlat closure into
         // std::function) never ran constructor selection: bind its one-argument ctors now.
         if (ctor == nullptr && TryBindRefusedCxxMember(typeName, "__ctor", 1))
         {
             ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
-            if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource);
+            if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource, directInit);
         }
         if (ctor == nullptr && useMove) ctor = TryBindCxxGeneratedMoveCtor(typeName);
         if (ctor == nullptr)
@@ -35207,6 +35343,30 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                     displayTypeName.empty() ? typeName : displayTypeName, context,
                     useMove ? "move" : "copy"));
                 return false;
+            }
+            const bool hasExplicitCopy = !useMove && !directInit && info != nullptr
+                && std::any_of(info->constructors.begin(), info->constructors.end(),
+                    [](const CxxClassInfo::Structor& candidate) {
+                        return candidate.isCopyCtor && candidate.isExplicit;
+                    });
+            if (hasExplicitCopy)
+            {
+                std::string wrapperName;
+                std::string wrapperError;
+                if (!RequestCxxVariadicConstructor(typeName, { sourceObject }, wrapperName,
+                                                   wrapperError, /*copyInit*/ true))
+                {
+                    if (!wrapperError.empty())
+                    {
+                        LogError(wrapperError);
+                        return false;
+                    }
+                }
+                else if (llvm::Function* wrapper = FindCxxWrapperFunction(wrapperName))
+                {
+                    builder->CreateCall(wrapper->getFunctionType(), wrapper, { dest, src });
+                    return true;
+                }
             }
             if (constSource && FindCxxCopyCtor(typeName) != nullptr)
             {

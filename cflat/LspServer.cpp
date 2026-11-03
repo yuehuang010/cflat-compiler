@@ -375,8 +375,13 @@ struct OpenDocument
 // peak stack scales with parse-tree depth and import nesting. A std::thread gets the platform
 // default - only 512 KB on macOS and 1 MB on Windows - which the deeper example/ui sources
 // exhaust, faulting the guard page. The CLI compiles on the main thread (8 MB) and never hit
-// this. 16 MB is reserved address space, committed only as touched.
+// this. 16 MB is reserved address space, committed only as touched. Windows matches the CLI's
+// 64 MB main stack (/STACK in CMakeLists.txt): MSVC frames cost ~9x more per nesting level.
+#if defined(_WIN32)
+constexpr unsigned kDefaultAnalysisStackBytes = 64u * 1024 * 1024;
+#else
 constexpr unsigned kDefaultAnalysisStackBytes = 16u * 1024 * 1024;
+#endif
 
 // CFLAT_LSP_STACK_KB overrides the worker stack size, for reproducing/bisecting stack
 // exhaustion (mirrors CFLAT_LSP_POOL_SIZE). 0 or unset means the default above.

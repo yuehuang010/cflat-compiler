@@ -55,6 +55,79 @@ struct ExCopy {
     explicit ExCopy(const ExCopy& o) : v(o.v + 1000) {}
 };
 inline int take_excopy_cref(const ExCopy& c) { return c.v; }
+// Explicit copy ctor plus a destructor (passed indirectly): `(ExCopyD)a` as an argument / return.
+struct ExCopyD {
+    int v;
+    ExCopyD(int a) : v(a) {}
+    explicit ExCopyD(const ExCopyD& o) : v(o.v + 1000) {}
+    ~ExCopyD() {}
+};
+inline int take_excopyd_value(ExCopyD c) { return c.v; }
+inline int take_excopyd_cref(const ExCopyD& c) { return c.v; }
+inline ExCopyD& excopyd_ref() { static ExCopyD c(5); return c; }
+// An explicit const& copy ctor beside a non-explicit mutable one: copy-init of a const source has
+// no candidate, a non-const source takes ExMixCopy(ExMixCopy&), direct-init takes the explicit one.
+struct ExMixCopy {
+    int v;
+    ExMixCopy(int a) : v(a) {}
+    explicit ExMixCopy(const ExMixCopy& o) : v(o.v + 200) {}
+    ExMixCopy(ExMixCopy& o) : v(o.v + 100) {}
+};
+inline const ExMixCopy& exmix_const() { static const ExMixCopy c(7); return c; }
+inline ExMixCopy& exmix_mutable() { static ExMixCopy c(7); return c; }
+
+struct RankSource { int v = 1; };
+inline RankSource& rank_mutable() { static RankSource s; return s; }
+inline const RankSource& rank_const() { static const RankSource s; return s; }
+struct RankHolder { RankSource member; };
+inline const RankSource& rank_const_member() { static const RankHolder h; return h.member; }
+inline RankSource rank_temporary() { return RankSource{}; }
+struct RefRankTarget {
+    int v;
+    RefRankTarget(RankSource& s) : v(10 + s.v) {}
+    RefRankTarget(const RankSource& s) : v(20 + s.v) {}
+};
+inline int take_ref_rank(RefRankTarget t) { return t.v; }
+struct ExplicitConstRankTarget {
+    int v;
+    explicit ExplicitConstRankTarget(const RankSource& s) : v(60 + s.v) {}
+};
+struct ExplicitConstAndMutableRankTarget {
+    int v;
+    explicit ExplicitConstAndMutableRankTarget(const RankSource& s) : v(70 + s.v) {}
+    ExplicitConstAndMutableRankTarget(RankSource& s) : v(80 + s.v) {}
+};
+struct MutableRefRankTarget {
+    int v;
+    MutableRefRankTarget(RankSource& s) : v(90 + s.v) {}
+};
+struct ConstRefRankTarget {
+    int v;
+    ConstRefRankTarget(const RankSource& s) : v(100 + s.v) {}
+};
+struct ValueRankTarget {
+    int v;
+    ValueRankTarget(RankSource& s) : v(30 + s.v) {}
+    ValueRankTarget(RankSource s) : v(40 + s.v) {}
+};
+struct ExplicitValueRankTarget {
+    int v;
+    explicit ExplicitValueRankTarget(RankSource s) : v(50 + s.v) {}
+};
+// A non-copyable class reached through a const-reference-returning call (std::error_category
+// shape) binds a constructor's const& parameter without a copy.
+struct NoCopyCat {
+    int id;
+    NoCopyCat(int i) : id(i) {}
+    NoCopyCat(const NoCopyCat&) = delete;
+    NoCopyCat& operator=(const NoCopyCat&) = delete;
+};
+inline const NoCopyCat& nocopy_cat() { static const NoCopyCat c(7); return c; }
+struct CatHolder {
+    int v;
+    const NoCopyCat* cat;
+    CatHolder(int a, const NoCopyCat& c) : v(a + c.id), cat(&c) {}
+};
 
 // ACCEPT set - a NON-explicit converting constructor, offered at every parameter kind.
 struct Options { double lr; Options(double l) : lr(l) {} };

@@ -1,0 +1,34 @@
+// An owning call result (unique pointer return) bound to a raw local leaks: nothing frees it.
+// Refused; bind it to a unique local, or call .release().
+
+struct UqrawE { int v = 0; };
+unique UqrawE* uqrawEMk(int n) { unique UqrawE* p = new UqrawE(); p->v = n; return move p; }
+
+struct UqrawFac { int k = 0; unique UqrawE* make(int n) { unique UqrawE* p = new UqrawE(); p->v = n; return move p; } };
+
+extern int main()
+{
+    expect_error("cannot bind an owning call result to raw pointer 'q'") {
+        UqrawE* q = uqrawEMk(1);
+    }
+    UqrawFac uf = default;
+    expect_error("cannot bind an owning call result to raw pointer 'mq'") {
+        UqrawE* mq = uf.make(1);
+    }
+    bool tk = true;
+    UqrawE* tb = nullptr;
+    expect_error("cannot bind an owning call result to raw pointer 'tq'") {
+        UqrawE* tq = tk ? uqrawEMk(1) : tb;
+    }
+    expect_error("cannot bind an owning call result to raw pointer 'tn'") {
+        UqrawE* tn = tk ? uqrawEMk(1) : nullptr;
+    }
+    bool tj = false;
+    expect_error("cannot bind an owning call result to raw pointer 'nq'") {
+        UqrawE* nq = tk ? (tj ? uqrawEMk(1) : tb) : tb;
+    }
+    expect_error("cannot bind an owning call result to raw pointer 'nr'") {
+        UqrawE* nr = tk ? tb : (tj ? tb : uqrawEMk(1));
+    }
+    return 0;
+}

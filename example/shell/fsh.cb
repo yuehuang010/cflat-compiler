@@ -941,7 +941,7 @@ void reapJobs()
             i32 code = 0;
             GetExitCodeProcess(last, &code);
             printf("[%d] finished (exit %d): %s\n", job->id, (int)code, job->cmdline.data());
-            Job* owned = gJobs->take(i);
+            Job* owned = gJobs->take(i).release();
             closeJob(owned);
         }
         else
@@ -1373,7 +1373,7 @@ int cmdFg(list<string>* argv)
                 k++;
             }
             printf("[%d] finished (exit %d): %s\n", job->id, code, job->cmdline.data());
-            Job* owned = gJobs->take(i);
+            Job* owned = gJobs->take(i).release();
             closeJob(owned);
             return code;
         }
@@ -1401,7 +1401,7 @@ int cmdKill(list<string>* argv)
                 k++;
             }
             printf("[%d] killed: %s\n", job->id, job->cmdline.data());
-            Job* owned = gJobs->take(i);
+            Job* owned = gJobs->take(i).release();
             closeJob(owned);
             return 0;
         }

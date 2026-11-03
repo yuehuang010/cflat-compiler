@@ -4265,6 +4265,7 @@ int bridge_global_field_static_value()
 // core unique<T> cannot bind, and counts Widget structors to prove single destruction.
 using T473UQ = unique;
 using T473UQW = unique<uqp.W>;
+using T473UQW64 = unique<uqp.W64, 64>;
 namespace T473UQNs { using UQ = unique; }
 struct T473Native { int v = 0; };
 struct UqHolder { unique cpuq.Widget* w = default; int tag = 0; };
@@ -4286,6 +4287,15 @@ int uq_scope_exit()
     }
     if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 3550;
     return 0;
+}
+int uq_aligned_cpp_type()
+{
+    uqp.reset_aligned_counts();
+    {
+        unique<uqp.W64, 64> p = new uqp.W64(64);
+        if ((u64)p % 64 != 0 || p->v != 64) return 3552;
+    }
+    return uqp.aligned_dtors() == 1 ? 0 : 3552;
 }
 int uq_take_by_value()
 {
@@ -4997,7 +5007,7 @@ extern int main(int argc, char** argv)
     bridge_check("list Twin CFlat ctor", bridge_cf_ctor, 3);
     bridge_check("list Twin CFlat copy", bridge_cf_copy, 4);
     bridge_check("list Twin CFlat move", bridge_cf_move, 0);
-    bridge_check("list Twin CFlat dtor", bridge_cf_dtor, 9);
+    bridge_check("list Twin CFlat dtor", bridge_cf_dtor, 13);
     bridge_check("list Twin CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -6324,7 +6334,7 @@ extern int main(int argc, char** argv)
     bridge_reset_cf();
     int bridgeBraceLvalueCf = bridge_brace_array_lvalue_cf();
     bridge_check("bridge brace-init array lvalue CFlat value", bridgeBraceLvalueCf, 15);
-    bridge_check("bridge brace-init array lvalue CFlat dtor", bridge_cf_dtor, 4);
+    bridge_check("bridge brace-init array lvalue CFlat dtor", bridge_cf_dtor, 6);
     bridge_check("bridge brace-init array lvalue CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -6394,7 +6404,7 @@ extern int main(int argc, char** argv)
     bridge_check("bridge copy field CFlat ctor", bridge_cf_ctor, 1);
     bridge_check("bridge copy field CFlat copy", bridge_cf_copy, 1);
     bridge_check("bridge copy field CFlat move", bridge_cf_move, 0);
-    bridge_check("bridge copy field CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge copy field CFlat dtor", bridge_cf_dtor, 3);
     bridge_check("bridge copy field CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -6411,7 +6421,7 @@ extern int main(int argc, char** argv)
     bridge_check("bridge enclosing copy CFlat value", bridgeEnclosingCopyCf, 16);
     bridge_check("bridge enclosing copy CFlat ctor", bridge_cf_ctor, 1);
     bridge_check("bridge enclosing copy CFlat copy", bridge_cf_copy, 1);
-    bridge_check("bridge enclosing copy CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge enclosing copy CFlat dtor", bridge_cf_dtor, 3);
     bridge_check("bridge enclosing copy CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -6442,7 +6452,7 @@ extern int main(int argc, char** argv)
     bridge_check("bridge enclosing assignment CFlat value", bridgeEnclosingAssignCf, 7);
     bridge_check("bridge enclosing assignment CFlat ctor", bridge_cf_ctor, 2);
     bridge_check("bridge enclosing assignment CFlat copy", bridge_cf_copy, 1);
-    bridge_check("bridge enclosing assignment CFlat dtor", bridge_cf_dtor, 3);
+    bridge_check("bridge enclosing assignment CFlat dtor", bridge_cf_dtor, 4);
     bridge_check("bridge enclosing assignment CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -6460,7 +6470,7 @@ extern int main(int argc, char** argv)
     bridge_check("bridge nested enclosing copy CFlat value", bridgeEnclosingNestedCf, 7);
     bridge_check("bridge nested enclosing copy CFlat ctor", bridge_cf_ctor, 1);
     bridge_check("bridge nested enclosing copy CFlat copy", bridge_cf_copy, 1);
-    bridge_check("bridge nested enclosing copy CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge nested enclosing copy CFlat dtor", bridge_cf_dtor, 3);
     bridge_check("bridge nested enclosing copy CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -6969,7 +6979,7 @@ extern int main(int argc, char** argv)
     bridge_check("bridge array-field copy CFlat value", bridgeEnclosingArrayCf, 15);
     bridge_check("bridge array-field copy CFlat ctor", bridge_cf_ctor, 2);
     bridge_check("bridge array-field copy CFlat copy", bridge_cf_copy, 2);
-    bridge_check("bridge array-field copy CFlat dtor", bridge_cf_dtor, 4);
+    bridge_check("bridge array-field copy CFlat dtor", bridge_cf_dtor, 6);
     bridge_check("bridge array-field copy CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -6985,7 +6995,7 @@ extern int main(int argc, char** argv)
     bridge_check("bridge enclosing brace lvalue CFlat value", bridgeBraceFieldCf, 4);
     bridge_check("bridge enclosing brace lvalue CFlat ctor", bridge_cf_ctor, 2);
     bridge_check("bridge enclosing brace lvalue CFlat copy", bridge_cf_copy, 1);
-    bridge_check("bridge enclosing brace lvalue CFlat dtor", bridge_cf_dtor, 3);
+    bridge_check("bridge enclosing brace lvalue CFlat dtor", bridge_cf_dtor, 4);
     bridge_check("bridge enclosing brace lvalue CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -7028,7 +7038,7 @@ extern int main(int argc, char** argv)
     bridge_check("bridge return field CFlat ctor", bridge_cf_ctor, 1);
     bridge_check("bridge return field CFlat copy", bridge_cf_copy, 1);
     bridge_check("bridge return field CFlat move", bridge_cf_move, 0);
-    bridge_check("bridge return field CFlat dtor", bridge_cf_dtor, 2);
+    bridge_check("bridge return field CFlat dtor", bridge_cf_dtor, 3);
     bridge_check("bridge return field CFlat live", bridge_cf_live, 0);
 
     cpptw.reset_counts();
@@ -7507,37 +7517,37 @@ extern int main(int argc, char** argv)
     // ---- owning ternary lvalue sinks (1950-1969) -----------------------------------
     bridge_reset_cf();
     if (bridge_ternary_lvalue_cf(true) != 110000 + 1100 + 22) return 1950;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1951;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1951;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_cf(false) != 220000 + 1100 + 22) return 1952;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1953;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1953;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_nested_cf(false, true) != 22000000 + 110000 + 2200 + 33) return 1954;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1955;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 6 || bridge_cf_live != 0) return 1955;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_nested_cf(true, false) != 11000000 + 110000 + 2200 + 33) return 1954;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1955;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 6 || bridge_cf_live != 0) return 1955;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_nested_cf(false, false) != 33000000 + 110000 + 2200 + 33) return 1954;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1955;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 6 || bridge_cf_live != 0) return 1955;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_field_cf(true) != 410000 + 4100 + 42) return 1956;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1957;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1957;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_field_cf(false) != 420000 + 4100 + 42) return 1956;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1957;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1957;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_array_cf(false) != 520000 + 5100 + 52) return 1958;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1959;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1959;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_array_cf(true) != 510000 + 5100 + 52) return 1958;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1959;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1959;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_deref_cf(true) != 610000 + 6100 + 62) return 1960;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1961;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1961;
     bridge_reset_cf();
     if (bridge_ternary_lvalue_deref_cf(false) != 620000 + 6100 + 62) return 1960;
-    if (bridge_cf_copy != 1 || bridge_cf_dtor != 4 || bridge_cf_live != 0) return 1961;
+    if (bridge_cf_copy != 1 || bridge_cf_dtor != 5 || bridge_cf_live != 0) return 1961;
 
     cpptw.reset_counts();
     if (bridge_ternary_lvalue_cppfield(true) != 710000 + 7100 + 72) return 1962;
@@ -8237,6 +8247,7 @@ extern int main(int argc, char** argv)
 
     // ---- `unique T*` on a C++ class is std::unique_ptr<T> (3550-3559) -------------------
     int uqResult = uq_scope_exit();
+    if (uqResult == 0) uqResult = uq_aligned_cpp_type();
     if (uqResult == 0) uqResult = uq_take_by_value();
     if (uqResult == 0) uqResult = uq_take_rvalue_ref();
     if (uqResult == 0) uqResult = uq_returns();

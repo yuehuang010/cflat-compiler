@@ -1,0 +1,14 @@
+// A plain int local is not a narrow operand: it stays refused at a short parameter (ruling
+// 2026-09-04), and a sum wider than the parameter (short + 1 into u8) stays refused too.
+short takeShortOnly(short x) { return x; }
+u8 takeU8Only(u8 x) { return x; }
+
+expect_error("no overload of 'takeShortOnly' matches the given arguments") {
+    int i = 3;
+    short r = takeShortOnly(i);
+}
+
+expect_error("no overload of 'takeU8Only' matches the given arguments") {
+    short s = 3;
+    u8 r = takeU8Only(s + 1);
+}

@@ -1,0 +1,13 @@
+// A narrow-promoted int (`s + 1`) converts to short and to long at the same cost, so f(short) and
+// f(long) are ambiguous, as in clang. No exact int overload is declared here.
+int f(short x) { return 1; }
+int f(long x) { return 2; }
+
+extern int main()
+{
+    expect_error("ambiguous call to 'f'") {
+        short s = 3;
+        int r = f(s + 1);
+    }
+    return 0;
+}

@@ -298,6 +298,9 @@
       "int[]",
       "int"
     ],
+    "cannotbindanowningca...rawpointerexplicitly97184b875fcd0fe7": [
+      "q"
+    ],
     "cannotbraceinitializ...lonenotasingleobjectec2caca65ac1fee1": [
       "BviDest",
       "v",
@@ -344,6 +347,7 @@
     "cannotcopyarg0unique...nethepointeeyourselfb6e9ff574f9a1595": [
       "unique<IShape>"
     ],
+    "cannotmoveaborrowedp...ovefromtheowningslotf2bbb423758673ed": [],
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": [
       "borrowed parameter 'p'",
       "q",
@@ -2067,6 +2071,7 @@
     "cannotassignarg0toar...thanexplicitcastarg4fac024c4cf80f689": "cannot assign {0} to '{1}' destination {2}: only a named function, a '{3}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{4}'.",
     "cannotassignarg0tocl...thanexplicitcastarg3b001825100666242": "cannot assign {0} to closure destination {1}: only a named function, a '{2}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotbindaarg0value...llonenotasinglevalue0596274fbb0f0913": "cannot bind a '{0}' value to array view '{1}' - a view indexes whole '{2}' elements, so its source must be an array view (or a null one), not a single value",
+    "cannotbindanowningca...rawpointerexplicitly97184b875fcd0fe7": "cannot bind an owning call result to raw pointer '{0}' - nothing frees it. Bind it to a 'unique' local, or call '.release()' to take the raw pointer explicitly",
     "cannotbraceinitializ...lonenotasingleobjectec2caca65ac1fee1": "cannot brace-initialize array-view field '{0}.{1}' ('{2}') from '{3}' - a view indexes whole '{4}' elements, so its source must be an array view of '{5}' (or a null one), not a single object",
     "cannotconvertarg0tob...implicitoperatorbool61d893b2ebf00f2d": "cannot convert '{0}' to 'bool': it is not a scalar and declares no implicit 'operator bool'",
     "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": "cannot convert interface '{0}' to interface '{1}' - no class implementing '{2}' implements '{3}'",
@@ -2085,6 +2090,7 @@
     "cannotlowerexternret...rtheactivecabirecipe7d08233bdb7fb8eb": "cannot lower extern return value for the active C ABI recipe",
     "cannotlowerexternsre...singhiddenreturnslot205bdd697f2b57c7": "cannot lower extern sret return: missing hidden return slot",
     "cannotmaterializeimp...classargumentforarg058a97d9c8a4df65b": "cannot materialize implicit C++ class argument for '{0}'",
+    "cannotmoveaborrowedp...ovefromtheowningslotf2bbb423758673ed": "cannot move a borrowed pointer; move from the owning slot",
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": "cannot move {0} into move parameter '{1}' of '{2}' - the caller may still own this pointer and will free it on scope exit. Move it out of the owning slot instead (e.g. 'move parent->children[i]'), or declare '{3}' as 'move {4}' if this function owns it.",
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": "cannot 'move' '{0}' - it was returned as a borrow of unique field '{1}', and moving the alias does not null the field, so the field's synthesized destructor still frees the pointee. Pass it to a plain (non-'move') parameter, which borrows, or pass a value the receiver can own.",
     "cannotmoveborrowedpo...ointerthatisnotacopy3009dc2e4fffaa0f": "cannot move borrowed pointer '{0}' (copied from owning local '{1}') into move parameter '{2}' of '{3}' - '{4}' still owns the pointee and frees it on scope exit. Pass '{5}' itself with 'move {6}' to transfer ownership, or pass a pointer that is not a copy.",

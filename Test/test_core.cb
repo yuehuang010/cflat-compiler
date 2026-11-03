@@ -2748,6 +2748,18 @@ class RawCountElem
     }
 };
 
+struct alignas(64) RawCountAlignedElem
+{
+    int id = 0;
+    ~RawCountAlignedElem() { g_raw_count_dtors++; }
+};
+
+struct alignas(32) RawCountAligned32
+{
+    int id = 0;
+    ~RawCountAligned32() { g_raw_count_dtors++; }
+};
+
 class RawCountResource
 {
     int id = 0;
@@ -3215,6 +3227,50 @@ int runExplicitUniqueAlignDecl()
     {
         unique<RawCountElem, 64> p = new RawCountElem();
         p->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+int runUniqueAlignFromType()
+{
+    resetRawCountState();
+    {
+        unique<RawCountAlignedElem, 64> p = new RawCountAlignedElem();
+        if ((u64)p % 64 != 0) return -1;
+        p->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+int runUniqueAlignFromTypeDecl32()
+{
+    resetRawCountState();
+    {
+        unique<RawCountAligned32, 64> p = new RawCountAligned32();
+        if ((u64)p % 64 != 0) return -1;
+        p->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+int runUniqueAlignFromTypeAssign32()
+{
+    resetRawCountState();
+    {
+        unique<RawCountAligned32, 64> p = default;
+        p = new RawCountAligned32();
+        if ((u64)p % 64 != 0) return -1;
+        p->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+int runUniqueAlignFromTypeGeneric32<T>()
+{
+    resetRawCountState();
+    {
+        unique<T, 64> p = new T();
+        if ((u64)p % 64 != 0) return -1;
     }
     return g_raw_count_dtors;
 }
@@ -4836,6 +4892,14 @@ int testRawArrayRuntimeCount()
         runRawCountAlignedGlobal(1) * 100 + runRawCountAlignedGlobal(0), 2545);
     passed += Test("explicit unique<T,64> decl-init frees once",
         runExplicitUniqueAlignDecl(), 1);
+    passed += Test("unique<T,64> accepts its pointee's natural alignment",
+        runUniqueAlignFromType(), 1);
+    passed += Test("unique<T,64> accepts inherited alignment on over-aligned decl-init",
+        runUniqueAlignFromTypeDecl32(), 1);
+    passed += Test("unique<T,64> accepts inherited alignment on over-aligned assignment",
+        runUniqueAlignFromTypeAssign32(), 1);
+    passed += Test("unique<T,64> accepts inherited alignment on over-aligned generic new",
+        runUniqueAlignFromTypeGeneric32<RawCountAligned32>(), 1);
     passed += Test("explicit unique<T,64> assignment frees once",
         runExplicitUniqueAlignAssign(), 1);
     passed += Test("explicit unique<T,64> field default frees once",
@@ -5336,7 +5400,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 115;
+    r = testRawArrayRuntimeCount(); passed += r; total += 119;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 89;

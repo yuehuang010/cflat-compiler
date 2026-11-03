@@ -443,6 +443,7 @@ int OpUnwStructCtorFields(int x)
 // Override helpers and struct-returning callbacks run behind a reverse ABI thunk that must
 // stay unwindable (it was nounwind: the throw terminated even at -O0).
 import cpp "library/cpp_interop_override_abi.h";
+import cpp "library/cpp_t78_scalar_table.h";
 [cpp] struct OpUnwOverride : cppoa.Base
 {
     int k = 0;
@@ -1154,6 +1155,8 @@ extern int main()
 
 
     int promoPassed = promotionAndLiteralLegs();
+    int arithResultPassed = arithmeticResultTypeLegs();
+    int callArgNarrowPassed = callArgNarrowLegs();
     int signednessPassed = primitiveBinarySignednessLegs();
     int autoNarrowPassed = autoNarrowMixedSignednessLegs();
     int joinAcceptPassed = stringLiteralJoinAcceptLegs();
@@ -1170,6 +1173,9 @@ extern int main()
     if (byValueAliasOperatorLegs() != 11) return 61;
     if (t412AliasReturnOperatorLeg() != 4) return 75;
     if (cppUnwindThroughHelperLegs() != 0) return 60;
+    if (ternaddrLegs() != 15) return 81;
+    if (ternaddrDeepLegs() != 9) return 82;
+    if (nestedReceiverLegs() != 10) return 83;
 
     if (t484CallableVariableLegs() != 2) return 63;
     if (t484MemberFieldCallLegs() != 1) return 64;
@@ -1180,7 +1186,7 @@ extern int main()
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5
         && narrowPromoPassed == 46 && i128Passed == 29
         && reversedPassed == 3 && sizeofUnevalPassed == 67
-        && boolFpPassed == 20 && userLibcAtollWins()) ? 0 : 1;
+        && boolFpPassed == 20 && arithResultPassed == 18 && callArgNarrowPassed == 12 && userLibcAtollWins()) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness
@@ -1247,8 +1253,8 @@ int promotionAndLiteralLegs()
     // pure-signed case, the logical shift of an unsigned operand, or the 32-bit rule.
     u8 bigByte = 200;
     u8 halfByte = 100;
-    passed += Test("u8 addition still wraps in 8 bits", (int)(bigByte + halfByte), 44);
-    passed += Test("u8 multiply still wraps in 8 bits", (int)(bigByte * 2), 144);
+    passed += Test("u8 addition still wraps in 8 bits", (int)(bigByte + halfByte), 300);
+    passed += Test("u8 multiply still wraps in 8 bits", (int)(bigByte * 2), 400);
     i8 negByte = -8;
     i8 twoByte = 2;
     passed += Test("i8 divided by i8 stays signed", (int)(negByte / twoByte), -4);
@@ -1453,6 +1459,86 @@ u8  narrowRetPick(bool c, u8 a, i8 b) { return c ? a : b; }
 i16 narrowRetInt() { int i = 70000; return i; }
 int narrowRetWiden(u8 x) { return x; }
 T   narrowRetNegT<T>(T x) { return -x; }
+
+// ARITH (2026-10-31 ruling): a native arithmetic result follows C's usual arithmetic conversions.
+// The overload codes name the picked type: char 1, u8 2, short 3, u16 4, int 5, uint 6, long 7,
+// bool 8. Every expected value is the clang++ -std=c++20 oracle for the same expression.
+int arithPick(char x) { return 1; }
+int arithPick(u8 x) { return 2; }
+int arithPick(short x) { return 3; }
+int arithPick(u16 x) { return 4; }
+int arithPick(int x) { return 5; }
+int arithPick(uint x) { return 6; }
+int arithPick(long x) { return 7; }
+int arithPick(bool x) { return 8; }
+int arithKindSize<T>(T x) { return (int)sizeof(T); }
+
+int arithmeticResultTypeLegs()
+{
+    int passed = 0;
+    short s = 3; char c = 'a'; int i = 5; long l = 7; u8 ub = 200; u16 uh = 1000; uint ui = 3; bool b = true;
+    u8[4] pa = default;
+    u8* pq = &pa[3];
+    u8* pp = &pa[1];
+    short big = 32767;
+    short t = 32767;
+    passed += Test("short + short picks the int overload", arithPick(s + s), 5);
+    passed += Test("char + char picks the int overload", arithPick(c + c), 5);
+    passed += Test("same-type char ternary keeps char", arithPick(b ? c : c), 1);
+    passed += Test("int << long picks the int overload", arithPick(i << l), 5);
+    passed += Test("u8 >> picks the int overload", arithPick(ub >> 1), 5);
+    passed += Test("u8 + u16 picks the int overload", arithPick(ub + uh), 5);
+    passed += Test("int + uint picks the uint overload", arithPick(i + ui), 6);
+    passed += Test("bool + bool picks the int overload", arithPick(b + b), 5);
+    passed += Test("unary minus on char picks the int overload", arithPick(-c), 5);
+    passed += Test("unary complement on short picks the int overload", arithPick(~s), 5);
+    passed += Test("generic deduces int from char + char", arithKindSize(c + c), 4);
+    passed += Test("generic deduces int from char literal sum", arithKindSize('a' + 'b'), 4);
+    passed += Test("generic deduces int from short + short", arithKindSize(s + s), 4);
+    passed += Test("generic deduces int from int << long", arithKindSize(i << l), 4);
+    passed += Test("pointer difference is the 64-bit ptrdiff_t", arithKindSize(pq - pp), 8);
+    passed += Test("short + 1 does not wrap at 16 bits", (int)(big + 1), 32768);
+    short r = s + s;
+    passed += Test("narrow store of a short sum keeps its value", (int)r, 6);
+    t += 1;
+    passed += Test("compound short += stays short", (int)t, -32768);
+    return passed;
+}
+
+// ARITH round 2 (review 1): an int built from narrow operands binds a narrow parameter at a call,
+// as C converts it (`s + 1` is int, then the value is truncated). Clang++ -std=c++20 is the oracle.
+int cargShort(short x) { return (int)x; }
+int cargU8(u8 x) { return (int)x; }
+int cargPick(short x) { return 3; }
+int cargPick(int x) { return 5; }
+T cargIdt<T>(T x) { return x; }
+struct CargTaker
+{
+    int take(short x) { return (int)x; }
+};
+
+int callArgNarrowLegs()
+{
+    int passed = 0;
+    short s = 3; short big = 32767; u8 ub = 200; u8 b = 3;
+    CargTaker tk = default;
+    passed += Test("short + 1 binds a short parameter", cargShort(s + 1), 4);
+    passed += Test("short + 1 truncates into a short parameter", cargShort(big + 1), -32768);
+    passed += Test("nested narrow sum binds a short parameter", cargShort((s + 1) + s), 7);
+    passed += Test("u8 + 1 binds a short parameter", cargShort(ub + 1), 201);
+    passed += Test("u8 << 1 binds a u8 parameter", cargU8(b << 1), 6);
+    passed += Test("explicit generic takes a short sum", (int)cargIdt<short>(s + 1), 4);
+    passed += Test("method takes a short sum", tk.take(s + 1), 4);
+    t78.Tmpl ct = t78.Tmpl(s + 1);
+    passed += Test("C++ constructor takes a short sum", ct.v, 4);
+    passed += Test("short + short picks the int overload", cargPick(s + s), 5);
+    passed += Test("short variable still picks the short overload", cargPick(s), 3);
+    // r3: a `?:` of two narrow sums keeps the narrow mark on both arms (master and clang accept).
+    bool tt = true;
+    passed += Test("ternary of two narrow sums binds a short parameter", cargShort(tt ? s + 1 : s + 2), 4);
+    passed += Test("the other ternary arm binds a short parameter", cargShort(!tt ? s + 1 : s + 2), 5);
+    return passed;
+}
 
 // C integer promotion for unary '-' / '~' and for a mixed-sign sub-int '?:' join. Every
 // expected value here is the clang oracle for the same expression written as C.
@@ -2614,5 +2700,321 @@ int mix12UniqueArrayDecayLegs()
         passed += Test("unique array decay this field value", h.firstValue(), 5);
     }
     passed += Test("unique array decay this field owner dtor", mix12Dtors, 1);
+    return passed;
+}
+
+// TERNADDR: `&(c ? a : b)` names the SELECTED object in every context, at any ?: depth.
+struct AdrS { int a; };
+struct AdrO { AdrS f1; AdrS f2; };
+struct AdrD { int a; ~AdrD() { } };
+AdrS adrG1;
+AdrS adrG2;
+void adrBump(AdrS* s) { s.a += 100; }
+void adrBumpD(AdrD* d) { d.a += 100; }
+AdrS* adrPick(bool t) { return &(t ? adrG1 : adrG2); }
+
+int ternaddrLegs()
+{
+    int passed = 0;
+    bool t = false;
+    bool u = false;
+    AdrS s1;
+    AdrS s2;
+    s1.a = 1;
+    s2.a = 2;
+    adrBump(&(t ? s1 : s2));
+    passed += Test("adr_call_struct_false_arm", s2.a, 102);
+    passed += Test("adr_call_struct_true_arm_kept", s1.a, 1);
+    t = true;
+    AdrS* sp = &(t ? s1 : s2);
+    sp.a += 10;
+    passed += Test("adr_init_struct_true_arm", s1.a, 11);
+    int x = 1;
+    int y = 2;
+    int* ip = &(t ? x : y);
+    *ip = 5;
+    passed += Test("adr_int_arm_true", x, 5);
+    AdrS a;
+    AdrS b;
+    AdrS c;
+    a.a = 1;
+    b.a = 2;
+    c.a = 3;
+    adrBump(&(t ? (u ? a : b) : c));
+    passed += Test("adr_nested_arm_selected", b.a, 102);
+    passed += Test("adr_nested_arm_others", a.a + c.a, 4);
+    AdrO o;
+    o.f1.a = 1;
+    o.f2.a = 2;
+    t = false;
+    adrBump(&(t ? o.f1 : o.f2));
+    passed += Test("adr_field_arm_selected", o.f2.a, 102);
+    passed += Test("adr_field_arm_other", o.f1.a, 1);
+    AdrS[2] arr;
+    arr[0].a = 1;
+    arr[1].a = 2;
+    t = true;
+    adrBump(&(t ? arr[0] : arr[1]));
+    passed += Test("adr_array_arm_selected", arr[0].a, 101);
+    AdrS d1;
+    AdrS d2;
+    d1.a = 1;
+    d2.a = 2;
+    AdrS* dp = &d1;
+    t = false;
+    adrBump(&(t ? *dp : d2));
+    passed += Test("adr_deref_arm_selected", d2.a, 102);
+    passed += Test("adr_deref_arm_other", d1.a, 1);
+    AdrD e1;
+    AdrD e2;
+    e1.a = 1;
+    e2.a = 2;
+    t = true;
+    adrBumpD(&(t ? e1 : e2));
+    passed += Test("adr_dtor_struct_arm_selected", e1.a, 101);
+    adrG1.a = 1;
+    adrG2.a = 2;
+    t = false;
+    adrPick(t).a += 100;
+    passed += Test("adr_return_global_arm", adrG2.a, 102);
+    int ia = 1;
+    int ib = 2;
+    int ic = 3;
+    int* pa = &ia;
+    int* pb = &ib;
+    int* pc = &ic;
+    t = true;
+    u = false;
+    int** pp = &(t ? pa : (u ? pb : pc));
+    **pp = 5;
+    passed += Test("adr_nested_pointer_slot", ia, 5);
+    passed += Test("adr_nested_pointer_others", ib + ic, 5);
+    return passed;
+}
+
+
+struct AdrW { int a; };
+int ternaddrMemberArm()
+{
+    int passed = 0;
+    AdrW s1;
+    AdrW s2;
+    s1.a = 1;
+    s2.a = 2;
+    bool t = true;
+    (t ? s1 : s2).a = 8;
+    passed += Test("tern_member_write_true_arm", s1.a * 10 + s2.a, 82);
+    t = false;
+    (t ? s1 : s2).a = 9;
+    passed += Test("tern_member_write_false_arm", s1.a * 10 + s2.a, 89);
+    return passed;
+}
+
+T ternGen1<T>(T x) { return (x > 0 ? ((ternGen2<T>(x) + (1 - 1))) : (x)); }
+T ternGen2<T>(T x) { return (x > 0 ? ((ternGen3<T>(x) + (1 - 1))) : (x)); }
+T ternGen3<T>(T x) { return (x > 0 ? ((ternGen4<T>(x) + (1 - 1))) : (x)); }
+T ternGen4<T>(T x) { return (x > 0 ? ((ternGen5<T>(x) + (1 - 1))) : (x)); }
+T ternGen5<T>(T x) { return (x > 0 ? ((ternGen6<T>(x) + (1 - 1))) : (x)); }
+T ternGen6<T>(T x) { return (x > 0 ? ((ternGen7<T>(x) + (1 - 1))) : (x)); }
+T ternGen7<T>(T x) { return (x > 0 ? ((ternGen8<T>(x) + (1 - 1))) : (x)); }
+T ternGen8<T>(T x) { return (x > 0 ? ((ternGen9<T>(x) + (1 - 1))) : (x)); }
+T ternGen9<T>(T x) { return (x > 0 ? ((ternGen10<T>(x) + (1 - 1))) : (x)); }
+T ternGen10<T>(T x) { return (x > 0 ? ((ternGen11<T>(x) + (1 - 1))) : (x)); }
+T ternGen11<T>(T x) { return (x > 0 ? ((ternGen12<T>(x) + (1 - 1))) : (x)); }
+T ternGen12<T>(T x) { return x; }
+int ternaddrGenericChain()
+{
+    int passed = 0;
+    passed += Test("tern_generic_chain_12", ternGen1<int>(3), 3);
+    passed += Test("tern_generic_chain_12_neg", ternGen1<int>(-4), -4);
+    return passed;
+}
+
+int ternaddrFlatArms(int i)
+{
+    return i == 1 ? 1 :
+        i == 2 ? 2 :
+        i == 3 ? 3 :
+        i == 4 ? 4 :
+        i == 5 ? 5 :
+        i == 6 ? 6 :
+        i == 7 ? 7 :
+        i == 8 ? 8 :
+        i == 9 ? 9 :
+        i == 10 ? 10 :
+        i == 11 ? 11 :
+        i == 12 ? 12 :
+        i == 13 ? 13 :
+        i == 14 ? 14 :
+        i == 15 ? 15 :
+        i == 16 ? 16 :
+        i == 17 ? 17 :
+        i == 18 ? 18 :
+        i == 19 ? 19 :
+        i == 20 ? 20 :
+        i == 21 ? 21 :
+        i == 22 ? 22 :
+        i == 23 ? 23 :
+        i == 24 ? 24 :
+        i == 25 ? 25 :
+        i == 26 ? 26 :
+        i == 27 ? 27 :
+        i == 28 ? 28 :
+        i == 29 ? 29 :
+        i == 30 ? 30 :
+        i == 31 ? 31 :
+        i == 32 ? 32 :
+        i == 33 ? 33 :
+        i == 34 ? 34 :
+        i == 35 ? 35 :
+        i == 36 ? 36 :
+        i == 37 ? 37 :
+        i == 38 ? 38 :
+        i == 39 ? 39 :
+        i == 40 ? 40 :
+        i == 41 ? 41 :
+        i == 42 ? 42 :
+        i == 43 ? 43 :
+        i == 44 ? 44 :
+        i == 45 ? 45 :
+        i == 46 ? 46 :
+        i == 47 ? 47 :
+        i == 48 ? 48 :
+        i == 49 ? 49 :
+        i == 50 ? 50 :
+        i == 51 ? 51 :
+        i == 52 ? 52 :
+        i == 53 ? 53 :
+        i == 54 ? 54 :
+        i == 55 ? 55 :
+        i == 56 ? 56 :
+        i == 57 ? 57 :
+        i == 58 ? 58 :
+        i == 59 ? 59 :
+        i == 60 ? 60 :
+        i == 61 ? 61 :
+        i == 62 ? 62 :
+        i == 63 ? 63 :
+        i == 64 ? 64 :
+        i == 65 ? 65 :
+        i == 66 ? 66 :
+        i == 67 ? 67 :
+        i == 68 ? 68 :
+        i == 69 ? 69 :
+        i == 70 ? 70 :
+        0;
+}
+int ternaddrParenArms(int i)
+{
+    return (i == 1 ? 1 :
+        (i == 2 ? 2 :
+        (i == 3 ? 3 :
+        (i == 4 ? 4 :
+        (i == 5 ? 5 :
+        (i == 6 ? 6 :
+        (i == 7 ? 7 :
+        (i == 8 ? 8 :
+        (i == 9 ? 9 :
+        (i == 10 ? 10 :
+        (i == 11 ? 11 :
+        (i == 12 ? 12 :
+        (i == 13 ? 13 :
+        (i == 14 ? 14 :
+        (i == 15 ? 15 :
+        (i == 16 ? 16 :
+        (i == 17 ? 17 :
+        (i == 18 ? 18 :
+        (i == 19 ? 19 :
+        (i == 20 ? 20 :
+        (i == 21 ? 21 :
+        (i == 22 ? 22 :
+        (i == 23 ? 23 :
+        (i == 24 ? 24 :
+        (i == 25 ? 25 :
+        0)))))))))))))))))))))))));
+}
+
+int ternaddrPlusArms(int i)
+{
+    return ((((((((((((((((((((((((((((((((((((((((i) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1)) + 1);
+}
+
+int ternaddrNegArms(int i)
+{
+    return -(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(-(i))))))))))))))))))))))))))))))))))))))));
+}
+
+int ternaddrUnaryArms(int i)
+{
+    return - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - i;
+}
+
+int ternaddrDepthShapes()
+{
+    int passed = 0;
+    passed += Test("tern_flat_arms_70", ternaddrFlatArms(69), 69);
+    passed += Test("tern_paren_arms_25", ternaddrParenArms(20), 20);
+    passed += Test("tern_plus_paren_20", ternaddrPlusArms(3), 23);
+    passed += Test("tern_neg_paren_40", ternaddrNegArms(3), 3);
+    passed += Test("tern_unary_minus_70", ternaddrUnaryArms(3), 3);
+    return passed;
+}
+
+int ternaddrDeepLegs()
+{
+    return ternaddrMemberArm() + ternaddrGenericChain() + ternaddrDepthShapes();
+}
+
+
+// TERNADDR r3: `.` receiver through nested `?:` arms writes the selected record (clang).
+struct NrF { int f; };
+int nrOuterInner(bool t, bool u)
+{
+    NrF a;
+    NrF b;
+    NrF c;
+    a.f = 1;
+    b.f = 2;
+    c.f = 3;
+    (t ? c : (u ? a : b)).f = 9;
+    return a.f * 100 + b.f * 10 + c.f;
+}
+int nrInnerOuter(bool t, bool u)
+{
+    NrF a;
+    NrF b;
+    NrF c;
+    a.f = 1;
+    b.f = 2;
+    c.f = 3;
+    (t ? (u ? a : b) : c).f = 9;
+    return a.f * 100 + b.f * 10 + c.f;
+}
+int nrThreeDeep(bool t, bool u, bool v)
+{
+    NrF a;
+    NrF b;
+    NrF c;
+    NrF d;
+    a.f = 1;
+    b.f = 2;
+    c.f = 3;
+    d.f = 4;
+    (t ? (u ? (v ? a : b) : c) : d).f = 9;
+    return a.f * 1000 + b.f * 100 + c.f * 10 + d.f;
+}
+int nestedReceiverLegs()
+{
+    int passed = 0;
+    passed += Test("nr_outer_inner_selects_a", nrOuterInner(false, true), 923);
+    passed += Test("nr_outer_inner_selects_b", nrOuterInner(false, false), 193);
+    passed += Test("nr_outer_inner_selects_c", nrOuterInner(true, true), 129);
+    passed += Test("nr_inner_outer_selects_a", nrInnerOuter(true, true), 923);
+    passed += Test("nr_inner_outer_selects_b", nrInnerOuter(true, false), 193);
+    passed += Test("nr_inner_outer_selects_c", nrInnerOuter(false, true), 129);
+    passed += Test("nr_three_deep_selects_a", nrThreeDeep(true, true, true), 9234);
+    passed += Test("nr_three_deep_selects_b", nrThreeDeep(true, true, false), 1934);
+    passed += Test("nr_three_deep_selects_c", nrThreeDeep(true, false, true), 1294);
+    passed += Test("nr_three_deep_selects_d", nrThreeDeep(false, true, true), 1239);
     return passed;
 }

@@ -2184,7 +2184,12 @@ std::string LLVMBackend::CompilerBuildStamp()
             if (ec) return "unknown";
             long long ticks = (long long)mtime.time_since_epoch().count();
             unsigned long long bytes = (unsigned long long)size;
-            return std::to_string(ticks) + "-" + std::to_string(bytes);
+            std::string out = std::to_string(ticks) + "-" + std::to_string(bytes);
+            // A token value (e.g. a commit id) joins the stamp so a gate can force entries per commit.
+            const char* token = std::getenv("CFLAT_CACHE_BUILD_STAMP");
+            if (token && *token && std::string_view(token) != "0" && std::string_view(token) != "1")
+                out += "-" + std::string(token);
+            return out;
         }();
         return stamp;
     }

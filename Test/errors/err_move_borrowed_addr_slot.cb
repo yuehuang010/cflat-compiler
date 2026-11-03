@@ -1,0 +1,12 @@
+// Explicit move of a pointer that provably borrows (address-of a local) into a raw slot.
+// The moved-to local would free a stack address at scope exit. Refused.
+
+extern int main()
+{
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int x = 5;
+        int* p = &x;
+        int* q = move p;
+    }
+    return 0;
+}

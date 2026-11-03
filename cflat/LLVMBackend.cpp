@@ -71,6 +71,13 @@
 #if defined(_WIN32)
 extern "C" unsigned char RtlAddFunctionTable(
     void* FunctionTable, unsigned long EntryCount, unsigned long long BaseAddress);
+// The --run C++ throw shim and main guard below, same bare-signature pattern (kernel32 / ntdll).
+#include <excpt.h>
+extern "C" __declspec(noreturn) void RaiseException(
+    unsigned long code, unsigned long flags, unsigned long argc, const unsigned long long* args);
+extern "C" void* RtlPcToFileHeader(void* pc, void** baseOfImage);
+extern "C" void* GetCurrentProcess();
+extern "C" int TerminateProcess(void* process, unsigned int exitCode);
 #endif
 
 // A for-init `S s;` parses as declarationSpecifiers alone: the greedy specifier loop takes the
@@ -160,6 +167,57 @@ void NormalizeForInitTree(CFlatParser& parser, antlr4::tree::ParseTree* root)
         pending.insert(pending.end(), node->children.begin(), node->children.end());
     }
 }
+
+#if defined(_WIN32)
+[[noreturn]] void cflat_jit::CxxThrowException(void* object, void* throwInfo)
+{
+    // The record vcruntime's _CxxThrowException raises: magic, object, ThrowInfo, and the image
+    // base the ThrowInfo RVAs are relative to (the JIT graph holding it). A rethrow passes nulls.
+    constexpr unsigned long kCxxExceptionCode = 0xE06D7363, kNonContinuable = 0x1;
+    constexpr unsigned long long kEhMagic = 0x19930520, kEhPureMagic = 0x01994000;
+    constexpr unsigned kThrowInfoIsPure = 0x8;
+    unsigned long long args[4] = { kEhMagic, (unsigned long long)(uintptr_t)object,
+                                   (unsigned long long)(uintptr_t)throwInfo, 0 };
+    if (throwInfo)
+    {
+        if (*static_cast<const unsigned*>(throwInfo) & kThrowInfoIsPure) args[0] = kEhPureMagic;
+        args[3] = cflat_jit::JitImageBaseFor((uint64_t)(uintptr_t)throwInfo);
+        if (args[3] == 0)
+        {
+            void* hostBase = nullptr;
+            RtlPcToFileHeader(throwInfo, &hostBase);
+            args[3] = (unsigned long long)(uintptr_t)hostBase;
+        }
+    }
+    RaiseException(kCxxExceptionCode, kNonContinuable, 4, args);
+}
+
+// First-pass filter at the JIT main boundary: a C++ exception reaching it has no handler in
+// the program. The -o exe's CRT calls std::terminate there without unwinding (abort ->
+// fail-fast 0xC0000409), so end the process the same way before any frame is unwound.
+static long JitMainFilter(unsigned long code)
+{
+    constexpr unsigned long kCxxExceptionCode = 0xE06D7363;
+    constexpr unsigned int kStatusStackBufferOverrun = 0xC0000409;
+    constexpr long kContinueSearch = 0;
+    if (code == kCxxExceptionCode)
+        TerminateProcess(GetCurrentProcess(), kStatusStackBufferOverrun);
+    return kContinueSearch;
+}
+
+int cflat_jit::CallJitMain(void* mainFn, bool takesArgv, int argc, char** argv)
+{
+    __try
+    {
+        return takesArgv ? reinterpret_cast<int (*)(int, char**)>(mainFn)(argc, argv)
+                         : reinterpret_cast<int (*)()>(mainFn)();
+    }
+    __except (JitMainFilter(_exception_code()))
+    {
+        return 0; // unreachable: the filter never selects this handler
+    }
+}
+#endif
 
 llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::LinkGraph& G)
 {
@@ -428,6 +486,10 @@ bool LLVMBackend::IsOutputUpToDate(const std::string& outputPath,
             || manifest.at("compiler").at("mtime").get<int64_t>() != compilerMtime
             || manifest.at("compiler").at("size").get<int64_t>() != compilerSize)
             return false;
+        // A CFLAT_CACHE_BUILD_STAMP token (a gate's commit id) keys the output like every cache entry.
+        if (manifest.at("compiler").value("stamp", std::string{})
+                != (CacheBuildStampEnabled() ? CompilerBuildStamp() : std::string{}))
+            return false;
 
         int64_t outputMtime = 0, outputSize = 0;
         if (!ReadFileStamp(OutputStampPath(output), outputMtime, outputSize)
@@ -468,7 +530,8 @@ bool LLVMBackend::WriteDependencyManifest(const std::string& outputPath,
     manifest["format"] = "cflat-dep";
     manifest["format_version"] = 1;
     manifest["compiler"] = { {"path", compiler.string()},
-                              {"mtime", compilerMtime}, {"size", compilerSize} };
+                              {"mtime", compilerMtime}, {"size", compilerSize},
+                              {"stamp", CacheBuildStampEnabled() ? CompilerBuildStamp() : std::string{}} };
     manifest["output"] = { {"path", output.string()}, {"mtime", outputMtime} };
     manifest["args"] = normalizedArgs;
     manifest["inputs"] = nlohmann::json::array();
@@ -5719,6 +5782,9 @@ void LLVMBackend::ResetForReanalysis()
     // resolution, and a stale value misbinds templates in the NEXT file of a batched --check.
     currentNamespace_.clear();
     lastCallReturnType = TypeAndValue{};
+    lastUniqueOwningCallResult = nullptr;
+    lastTernaryJoinValue = nullptr;
+    lastTernaryJoinArms = 0;
     lastCallReturnValueCv_ = 0;
     cxxFilteredOperatorCandidates_.clear();
     lastCallReturnsOwned = false;
@@ -7757,6 +7823,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsFlexibleArrayMember) o["fam"] = true;
     if (s.IsZeroLengthArrayMember) o["zfam"] = true;
     if (s.AllocAlignValue > 0) o["aa"] = static_cast<int64_t>(s.AllocAlignValue);
+    if (s.NewAllocAlignment > 0) o["naa"] = static_cast<int64_t>(s.NewAllocAlignment);
     return o;
 }
 
@@ -7857,6 +7924,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("fam")) s.IsFlexibleArrayMember = *v;
     if (auto v = o.getBoolean("zfam")) s.IsZeroLengthArrayMember = *v;
     if (auto v = o.getInteger("aa")) s.AllocAlignValue = static_cast<uint64_t>(*v);
+    if (auto v = o.getInteger("naa")) s.NewAllocAlignment = static_cast<uint64_t>(*v);
     return s.ToTypeAndValue();
 }
 

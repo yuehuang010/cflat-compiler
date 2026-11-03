@@ -29,6 +29,7 @@
 #else
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -475,4 +476,49 @@ void CompilerManager::InstallCrashHandlers(int argc, char** argv)
     for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP})
         sigaction(sig, &sa, nullptr);
 #endif
+}
+
+size_t StackBytesRemaining()
+{
+    struct Bounds
+    {
+        uintptr_t low = 0;
+        bool queried = false;   // a failed query is cached too, so it is not repeated per call
+        bool known = false;
+    };
+    static thread_local Bounds bounds;
+    if (!bounds.queried)
+    {
+        bounds.queried = true;
+#if defined(_WIN32)
+        ULONG_PTR low = 0;
+        ULONG_PTR high = 0;
+        GetCurrentThreadStackLimits(&low, &high);
+        bounds.low = static_cast<uintptr_t>(low);
+        bounds.known = low != 0;
+#elif defined(__APPLE__)
+        pthread_t self = pthread_self();
+        auto high = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
+        size_t size = pthread_get_stacksize_np(self);
+        bounds.low = high - size;
+        bounds.known = high != 0 && size != 0;
+#else
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0)
+        {
+            void* addr = nullptr;
+            size_t size = 0;
+            if (pthread_attr_getstack(&attr, &addr, &size) == 0 && addr != nullptr)
+            {
+                bounds.low = reinterpret_cast<uintptr_t>(addr);
+                bounds.known = true;
+            }
+            pthread_attr_destroy(&attr);
+        }
+#endif
+    }
+    if (!bounds.known) return SIZE_MAX;
+    volatile char marker = 0;
+    auto here = reinterpret_cast<uintptr_t>(&marker);
+    return here > bounds.low ? here - bounds.low : 0;
 }

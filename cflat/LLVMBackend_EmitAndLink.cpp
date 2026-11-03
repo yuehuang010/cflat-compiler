@@ -40,6 +40,10 @@
 #include <llvm/Object/SymbolSize.h>
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/CommandLine.h>
+#include <climits>
+#include <condition_variable>
+#include <new>
+#include <typeinfo>
 #include <llvm/Support/TimeProfiler.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/FormattedStream.h>
@@ -4690,6 +4694,119 @@ void LLVMBackend::InjectHeapAuditIntoMain()
         }
     }
 
+#if defined(_WIN32)
+// --run on Windows: clang-cl C++ guards function-local statics with the MSVC thread-safe-statics
+// protocol (_Init_thread_header/_footer/_abort + the thread-local _Init_thread_epoch). Those live
+// in the static vcruntime startup objects, never in a DLL, and the JIT reaches the epoch through
+// emulated TLS (__emutls_v._Init_thread_epoch), so supply the whole protocol here.
+namespace cflat_jit_tss
+{
+    constexpr int kUninitialized = 0;
+    constexpr int kBeingInitialized = -1;
+    constexpr int kEpochStart = INT_MIN;
+    std::mutex mtx;
+    std::condition_variable cv;
+    int globalEpoch = kEpochStart;
+    const int epochInit = kEpochStart;
+    cflat_jit::EmutlsControl epochControl{ sizeof(int), alignof(int), nullptr,
+                                           const_cast<int*>(&epochInit) };
+
+    int& ThreadEpoch()
+    { return *static_cast<int*>(cflat_jit::CflatEmutlsGetAddress(&epochControl)); }
+
+    void InitThreadHeader(int* once)
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        if (*once == kUninitialized)
+        {
+            *once = kBeingInitialized;
+            return;
+        }
+        while (*once == kBeingInitialized)
+        {
+            cv.wait(lock);
+            if (*once == kUninitialized)
+            {
+                *once = kBeingInitialized;
+                return;
+            }
+        }
+        ThreadEpoch() = globalEpoch;
+    }
+
+    void InitThreadAbort(int* once)
+    {
+        { std::lock_guard<std::mutex> lock(mtx); *once = kUninitialized; }
+        cv.notify_all();
+    }
+
+    void InitThreadFooter(int* once)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            ++globalEpoch;
+            *once = globalEpoch;
+            ThreadEpoch() = globalEpoch;
+        }
+        cv.notify_all();
+    }
+}
+
+// --run on Windows: clang-cl C++ registers static destructors with CRT atexit, and CFlat code may
+// call atexit/_onexit itself. Route them to a per-session registry the JIT runs (LIFO, like the
+// CRT) when main returns or the program calls exit(), so they run in the same place as the -o
+// build instead of in whichever host CRT table the process symbol search happened to find.
+namespace cflat_jit_exit
+{
+    struct Entry { void (*atexitFn)(); int (*onexitFn)(); };
+    std::mutex mtx;
+    std::vector<Entry> entries;
+
+    int Atexit(void (*fn)())
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        entries.push_back({ fn, nullptr });
+        return 0;
+    }
+
+    int (*Onexit(int (*fn)()))()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        entries.push_back({ nullptr, fn });
+        return fn;
+    }
+
+    // A handler may register further handlers; those run too, newest first.
+    void RunAll()
+    {
+        for (;;)
+        {
+            Entry e;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                if (entries.empty()) return;
+                e = entries.back();
+                entries.pop_back();
+            }
+            if (e.atexitFn) e.atexitFn();
+            else if (e.onexitFn) e.onexitFn();
+        }
+    }
+
+    [[noreturn]] void Exit(int code)
+    {
+        RunAll();
+        std::fflush(nullptr);
+        std::exit(code);
+    }
+
+    // typeid(x).name() caches undecorated names on a list headed by __type_info_root_node, a
+    // static vcruntime object (an SLIST_HEADER: 16 bytes, 16-aligned). The JIT gets its own head;
+    // the cached names live until the process exits.
+    alignas(16) unsigned char typeInfoRootNode[16] = {};
+}
+#endif
+
 bool LLVMBackend::JitRun(int& runExitCode)
 {
         runExitCode = 0;
@@ -4868,6 +4985,81 @@ bool LLVMBackend::JitRun(int& runExitCode)
                 return false;
             }
         }
+#if defined(_WIN32)
+        {
+            llvm::orc::SymbolMap syms;
+            auto fn = llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable;
+            syms[jit->mangleAndIntern("_Init_thread_header")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_tss::InitThreadHeader), fn);
+            syms[jit->mangleAndIntern("_Init_thread_footer")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_tss::InitThreadFooter), fn);
+            syms[jit->mangleAndIntern("_Init_thread_abort")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_tss::InitThreadAbort), fn);
+            syms[jit->mangleAndIntern("__emutls_v._Init_thread_epoch")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_tss::epochControl),
+                llvm::JITSymbolFlags::Exported);
+            syms[jit->mangleAndIntern("atexit")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_exit::Atexit), fn);
+            syms[jit->mangleAndIntern("_onexit")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_exit::Onexit), fn);
+            syms[jit->mangleAndIntern("exit")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_exit::Exit), fn);
+            // type_info vftable + new/delete family: static-CRT only (no vcruntime140 in a /MT
+            // host), bound to the host runtime so allocation and release share one heap.
+            syms[jit->mangleAndIntern("??_7type_info@@6B@")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(*reinterpret_cast<void* const*>(&typeid(int))),
+                llvm::JITSymbolFlags::Exported);
+            using NewFn = void* (*)(size_t);
+            using NewAlignFn = void* (*)(size_t, std::align_val_t);
+            using DelFn = void (*)(void*) noexcept;
+            using DelSizeFn = void (*)(void*, size_t) noexcept;
+            using DelAlignFn = void (*)(void*, std::align_val_t) noexcept;
+            using DelSizeAlignFn = void (*)(void*, size_t, std::align_val_t) noexcept;
+            using NewNtFn = void* (*)(size_t, const std::nothrow_t&) noexcept;
+            using NewAlignNtFn = void* (*)(size_t, std::align_val_t, const std::nothrow_t&) noexcept;
+            using DelNtFn = void (*)(void*, const std::nothrow_t&) noexcept;
+            using DelAlignNtFn = void (*)(void*, std::align_val_t, const std::nothrow_t&) noexcept;
+            const std::pair<const char*, void*> newDelete[] = {
+                { "??2@YAPEAX_K@Z", (void*)static_cast<NewFn>(&::operator new) },
+                { "??_U@YAPEAX_K@Z", (void*)static_cast<NewFn>(&::operator new[]) },
+                { "??2@YAPEAX_KW4align_val_t@std@@@Z", (void*)static_cast<NewAlignFn>(&::operator new) },
+                { "??_U@YAPEAX_KW4align_val_t@std@@@Z", (void*)static_cast<NewAlignFn>(&::operator new[]) },
+                { "??3@YAXPEAX@Z", (void*)static_cast<DelFn>(&::operator delete) },
+                { "??_V@YAXPEAX@Z", (void*)static_cast<DelFn>(&::operator delete[]) },
+                { "??3@YAXPEAX_K@Z", (void*)static_cast<DelSizeFn>(&::operator delete) },
+                { "??_V@YAXPEAX_K@Z", (void*)static_cast<DelSizeFn>(&::operator delete[]) },
+                { "??3@YAXPEAXW4align_val_t@std@@@Z", (void*)static_cast<DelAlignFn>(&::operator delete) },
+                { "??_V@YAXPEAXW4align_val_t@std@@@Z", (void*)static_cast<DelAlignFn>(&::operator delete[]) },
+                { "??3@YAXPEAX_KW4align_val_t@std@@@Z", (void*)static_cast<DelSizeAlignFn>(&::operator delete) },
+                { "??_V@YAXPEAX_KW4align_val_t@std@@@Z", (void*)static_cast<DelSizeAlignFn>(&::operator delete[]) },
+                { "??2@YAPEAX_KAEBUnothrow_t@std@@@Z", (void*)static_cast<NewNtFn>(&::operator new) },
+                { "??_U@YAPEAX_KAEBUnothrow_t@std@@@Z", (void*)static_cast<NewNtFn>(&::operator new[]) },
+                { "??3@YAXPEAXAEBUnothrow_t@std@@@Z", (void*)static_cast<DelNtFn>(&::operator delete) },
+                { "??_V@YAXPEAXAEBUnothrow_t@std@@@Z", (void*)static_cast<DelNtFn>(&::operator delete[]) },
+                { "??2@YAPEAX_KW4align_val_t@std@@AEBUnothrow_t@1@@Z", (void*)static_cast<NewAlignNtFn>(&::operator new) },
+                { "??_U@YAPEAX_KW4align_val_t@std@@AEBUnothrow_t@1@@Z", (void*)static_cast<NewAlignNtFn>(&::operator new[]) },
+                { "??3@YAXPEAXW4align_val_t@std@@AEBUnothrow_t@1@@Z", (void*)static_cast<DelAlignNtFn>(&::operator delete) },
+                { "??_V@YAXPEAXW4align_val_t@std@@AEBUnothrow_t@1@@Z", (void*)static_cast<DelAlignNtFn>(&::operator delete[]) },
+            };
+            syms[jit->mangleAndIntern("?__type_info_root_node@@3U__type_info_node@@A")] =
+                llvm::orc::ExecutorSymbolDef(
+                    llvm::orc::ExecutorAddr::fromPtr(&cflat_jit_exit::typeInfoRootNode),
+                    llvm::JITSymbolFlags::Exported);
+            syms[jit->mangleAndIntern("_CxxThrowException")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit::CxxThrowException), fn);
+            syms[jit->mangleAndIntern("?nothrow@std@@3Unothrow_t@1@B")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&std::nothrow), llvm::JITSymbolFlags::Exported);
+            for (const auto& nd : newDelete)
+                syms[jit->mangleAndIntern(nd.first)] = llvm::orc::ExecutorSymbolDef(
+                    llvm::orc::ExecutorAddr::fromPtr(nd.second), fn);
+            if (auto err = cxxRuntimeJD.define(llvm::orc::absoluteSymbols(std::move(syms))))
+            {
+                LogErrorMessage("{}: failed to define {}: {}",
+                                { "--run", "_Init_thread_header", llvm::toString(std::move(err)) });
+                return false;
+            }
+        }
+#endif
 
         // Imported C sources are compiled to native objects during the import walk. The AOT
         // linker consumes cObjectFiles_, while --run must add the same objects to the ORC
@@ -4972,16 +5164,28 @@ bool LLVMBackend::JitRun(int& runExitCode)
                 argv.push_back(s.data());
             argv.push_back(nullptr);
 
+#if defined(_WIN32)
+            runExitCode = cflat_jit::CallJitMain(mainSym->toPtr<void*>(), true,
+                                                 static_cast<int>(argvStorage.size()), argv.data());
+#else
             auto mainPtr = mainSym->toPtr<int (*)(int, char**)>();
             runExitCode = mainPtr(static_cast<int>(argvStorage.size()), argv.data());
+#endif
         }
         else
         {
+#if defined(_WIN32)
+            runExitCode = cflat_jit::CallJitMain(mainSym->toPtr<void*>(), false, 0, nullptr);
+#else
             auto mainPtr = mainSym->toPtr<int (*)()>();
             runExitCode = mainPtr();
+#endif
         }
 
         // Run static destructors (atexit-style) registered via the JIT.
+#if defined(_WIN32)
+        cflat_jit_exit::RunAll();
+#endif
         if (auto err = jit->deinitialize(jit->getMainJITDylib()))
             llvm::consumeError(std::move(err)); // best-effort; program already ran
         cxxRuntimeOverrides.runDestructors();

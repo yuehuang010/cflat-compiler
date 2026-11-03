@@ -1,0 +1,24 @@
+import cpp "cpp_interop_explicit.h";
+
+extern int main()
+{
+    expect_error("ambiguous") {
+        cppexp.RankSource source = cppexp.rank_mutable();
+        cppexp.ValueRankTarget bad = source;
+    }
+    expect_error("cannot cast an aggregate value") {
+        cppexp.ExplicitValueRankTarget bad = cppexp.rank_temporary();
+    }
+    expect_error("cannot cast an aggregate value") {
+        cppexp.ExplicitConstRankTarget bad = cppexp.rank_const();
+    }
+    // A const object never binds a non-const class reference: clang's copy-init refusal is relayed.
+    expect_error("clang: no viable conversion from 'const cppexp::RankSource' to 'cppexp::MutableRefRankTarget'") {
+        cppexp.MutableRefRankTarget bad = cppexp.rank_const();
+    }
+    // A prvalue never binds a non-const class reference either.
+    expect_error("clang: no viable conversion from 'cppexp::RankSource' to 'cppexp::MutableRefRankTarget'") {
+        cppexp.MutableRefRankTarget bad = cppexp.rank_temporary();
+    }
+    return 0;
+}

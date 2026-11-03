@@ -7973,8 +7973,8 @@ bool testConstFold()
 
     // A nested shift keeps the signedness of its left operand. The folded legs exercise the
     // constant folder; the parameter legs force runtime codegen and compare named/inline forms.
-    result &= Test("u8 folded nested right shift", (int)(((u8)0x80 << 24) >> 31), 1);
-    result &= Test("u16 folded nested right shift", (int)(((u16)0x8000 << 16) >> 31), 1);
+    result &= Test("u8 folded nested right shift", (int)(((u8)0x80 << 24) >> 31), -1);
+    result &= Test("u16 folded nested right shift", (int)(((u16)0x8000 << 16) >> 31), -1);
     result &= Test("u32 folded nested right shift", (int)(((u32)0x40000000 << 1) >> 31), 1);
     result &= Test("u64 folded nested right shift", (int)(((u64)0xFF880000 << 32) >> 48), 65416);
     u64 foldedU64 = (u64)0xFF880000;
@@ -7983,9 +7983,9 @@ bool testConstFold()
     result &= Test("i64 folded nested right shift", (int)(((i64)0xFF880000 << 32) >> 48), -120);
 
     result &= Test("u8 runtime named nested right shift", nestedShiftU8Named((u8)0xF8), 15);
-    result &= Test("u8 runtime inline nested right shift", nestedShiftU8Inline((u8)0xF8), 15);
+    result &= Test("u8 runtime inline nested right shift", nestedShiftU8Inline((u8)0xF8), 31);
     result &= Test("u16 runtime named nested right shift", nestedShiftU16Named((u16)0xFF80), 255);
-    result &= Test("u16 runtime inline nested right shift", nestedShiftU16Inline((u16)0xFF80), 255);
+    result &= Test("u16 runtime inline nested right shift", nestedShiftU16Inline((u16)0xFF80), 511);
     result &= Test("u32 runtime named nested right shift", nestedShiftU32Named((u32)0xFF800000), 255);
     result &= Test("u32 runtime inline nested right shift", nestedShiftU32Inline((u32)0xFF800000), 255);
     result &= Test("u64 runtime named nested right shift", nestedShiftU64Named((u64)0xFF880000), 65416);

@@ -3876,6 +3876,10 @@ int DefClsBraceTrace(cppdefcls.Implicit first, cppdefcls.Implicit last = {})
 {
     return first.value * 1000 + last.value;
 }
+cppexp.RefRankTarget ctorexp_rank_return() { return cppexp.rank_mutable(); }
+// A same-class cast `(T)a` is direct-initialization in a return and as an argument.
+cppexp.ExCopyD ctorexp_excopy_cast_return() { return (cppexp.ExCopyD)cppexp.excopyd_ref(); }
+int ctorexp_excopy_take(cppexp.ExCopyD c) { return c.v; }
 
 extern int main()
 {
@@ -6372,7 +6376,7 @@ extern int main()
     expect_error("reference initialization of type 'cpi_t42::AmbTarget &&' with initializer of type 'cpi_t42::AmbSource' is ambiguous") {
         int t42Ambiguous = cpi_t42.takeAmb(t42Amb);
     }
-    expect_error("no viable conversion from 'const cpi_t42::CvSource' to 'cpi_t42::CvTarget'") {
+    expect_error("clang: no viable conversion from 'const cpi_t42::CvSource' to 'cpi_t42::CvTarget'") {
         int t42CvLoss = cpi_t42.takeCv(cpi_t42.cvSource());
     }
     // T104-B1: clang accepts a template converting ctor from a non-template class lvalue.
@@ -8202,7 +8206,7 @@ extern int main()
 
     int defArgNativeBase = defArgRoundNativeDtors;
     defArgValue = DefArgRoundNativeOne(DefArgRoundMakeNative(20));
-    if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86109;
+    if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 2) return 86109;
     defArgNativeBase = defArgRoundNativeDtors;
     {
         DefArgRoundNative defArgLocal = default;
@@ -8216,10 +8220,10 @@ extern int main()
         defArgLocal.value = 20;
         defArgValue = DefArgRoundNativeMove(move defArgLocal);
     }
-    if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86111;
+    if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 2) return 86111;
     defArgNativeBase = defArgRoundNativeDtors;
     defArgValue = DefArgRoundNativeTwo(DefArgRoundMakeNative(20));
-    if (defArgValue != 27 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86112;
+    if (defArgValue != 27 || defArgRoundNativeDtors - defArgNativeBase != 2) return 86112;
     defArgNativeBase = defArgRoundNativeDtors;
     {
         DefArgRoundNative defArgLocal = default;
@@ -13163,11 +13167,50 @@ extern int main()
     // A C++ CONSTRUCTOR parameter of class type, spelled.
     cppexp.ExOwner excOwner = cppexp.ExOwner(cppexp.Ex(5));
     if (excOwner.v != 6)                                                       return 2211;
-    // An `explicit` COPY constructor still copies: the declaration copy runs it (+1000), and
-    // the class binds to a const-reference parameter unchanged.
+    // Direct-initialization can select an explicit copy constructor.
     cppexp.ExCopy excCopy = cppexp.ExCopy(5);
-    cppexp.ExCopy excCopy2 = excCopy;
-    if (excCopy2.v != 1005 || cppexp.take_excopy_cref(excCopy) != 5)           return 2212;
+    cppexp.ExCopy excCopy2 = cppexp.ExCopy(excCopy);
+    cppexp.ExCopy excCopy3 = (cppexp.ExCopy)excCopy;
+    if (excCopy2.v != 1005 || excCopy3.v != 1005
+        || cppexp.take_excopy_cref(excCopy) != 5)                              return 2212;
+    cppexp.RefRankTarget refRankMutable = cppexp.rank_mutable();
+    cppexp.RefRankTarget refRankConst = cppexp.rank_const();
+    cppexp.RefRankTarget refRankMember = cppexp.rank_const_member();
+    cppexp.RefRankTarget refRankTemporary = cppexp.rank_temporary();
+    if (refRankMutable.v != 11 || refRankConst.v != 21 || refRankMember.v != 21
+        || refRankTemporary.v != 21 || ctorexp_rank_return().v != 11)
+        return 2318;
+    if (cppexp.take_ref_rank(cppexp.rank_mutable()) != 11)                     return 2319;
+    cppexp.ValueRankTarget valueRankConst = cppexp.rank_const();
+    cppexp.ValueRankTarget valueRankTemporary = cppexp.rank_temporary();
+    if (valueRankConst.v != 41 || valueRankTemporary.v != 41)                   return 2320;
+    cppexp.RefRankTarget refRankBraced = { cppexp.rank_mutable() };
+    cppexp.RefRankTarget refRankDirect = cppexp.RefRankTarget(cppexp.rank_mutable());
+    if (refRankBraced.v != 11 || refRankDirect.v != 11)                        return 2321;
+    cppexp.ExplicitConstRankTarget explicitConstRank =
+        cppexp.ExplicitConstRankTarget(cppexp.rank_const());
+    cppexp.ExplicitConstAndMutableRankTarget explicitConstMutable =
+        cppexp.rank_mutable();
+    cppexp.ExplicitConstAndMutableRankTarget explicitConstDirect =
+        cppexp.ExplicitConstAndMutableRankTarget(cppexp.rank_const());
+    cppexp.MutableRefRankTarget mutableRefRank = cppexp.rank_mutable();
+    cppexp.ConstRefRankTarget constRefRank = cppexp.rank_const();
+    if (explicitConstRank.v != 61 || explicitConstMutable.v != 81
+        || explicitConstDirect.v != 71 || mutableRefRank.v != 91
+        || constRefRank.v != 101)                                               return 2322;
+    cppexp.ExplicitValueRankTarget explicitValueRank =
+        cppexp.ExplicitValueRankTarget(cppexp.rank_temporary());
+    if (explicitValueRank.v != 51)                                             return 2323;
+    // A non-copyable class from a const&-returning call binds a const& ctor parameter.
+    cppexp.CatHolder catHolder = cppexp.CatHolder(3, cppexp.nocopy_cat());
+    if (catHolder.v != 10 || catHolder.cat != &cppexp.nocopy_cat())          return 2324;
+    cppexp.ExMixCopy exMixMutable = cppexp.exmix_mutable();
+    cppexp.ExMixCopy exMixDirect = cppexp.ExMixCopy(cppexp.exmix_const());
+    if (exMixMutable.v != 107 || exMixDirect.v != 207)                         return 2325;
+    if (cppexp.take_excopyd_value((cppexp.ExCopyD)cppexp.excopyd_ref()) != 1005
+        || cppexp.take_excopyd_cref((cppexp.ExCopyD)cppexp.excopyd_ref()) != 1005
+        || ctorexp_excopy_take((cppexp.ExCopyD)cppexp.excopyd_ref()) != 1005
+        || ctorexp_excopy_cast_return().v != 1005)                             return 2326;
     // ACCEPT SET: a NON-explicit converting constructor is still offered at every parameter
     // kind C++ allows - by value, by const reference, by rvalue reference, and through a C++
     // constructor's own parameter. Each function tags its result, so a wrong leg is visible.
@@ -21513,6 +21556,26 @@ int LoweredUserDtorAssignLegs(int argc)
     int* t475ArmPtr = &(t325T ? t475I : t475J);
     *t475ArmPtr = 12;
     if (t475I != 12 || t475J != 21) return 67049;
+    // MIX21: `&` of a `?:` of two lvalues names the selected object; a postfix arm is refused (errors leg).
+    int* m21Addr = &(t325F ? t475I : t475J);
+    if (m21Addr != &t475J) return 67050;
+    // MIX21: a `?:` of two const char* lvalues binds the selected slot at a `const char*&` (clang).
+    const char* m21P = "ab";
+    const char* m21Q = "cd";
+    cpp_t67.cbump(t325T ? m21P : m21Q);
+    if (m21P[1] != 'h' || m21Q[1] != 'd') return 67051;
+    cpp_t67.cbump(t325F ? m21P : m21Q);
+    if (m21Q[1] != 'h') return 67052;
+    // MIX21: a postfix arm is a value, not a slot: the increment still lands on the arm's object.
+    int m21V = (t325T ? t475I++ : t475J);
+    if (m21V != 12 || t475I != 13) return 67053;
+    // MIX21 r2: `&` of a `?:` of two pointer lvalues names the selected pointer slot.
+    int m21Ia = 1;
+    int m21Ib = 2;
+    int* m21Ipa = &m21Ia;
+    int* m21Ipb = &m21Ib;
+    int** m21PP = &(t325T ? m21Ipa : m21Ipb);
+    if (m21PP != &m21Ipa) return 67054;
     t67CallCount = 0;
     if (cpp_t67.by_value(t67NextValue()) != 101 || t67CallCount != 1) return 67013;
     t67CallCount = 0;
@@ -21942,7 +22005,7 @@ int LoweredUserDtorAssignLegs(int argc)
     if (t336EarlyValue != 708 || t312Ct != 2 || t312Dt != 2) return 33607;
     t312Ct = 0; t312Dt = 0;
     int t336CallValue = t336TakeO(t336MakeO());
-    if (t336CallValue != 14 || t312Ct != 2 || t312Dt != 2) return 33608;
+    if (t336CallValue != 14 || t312Ct != 2 || t312Dt != 4) return 33608;
     t312Ct = 0; t312Dt = 0;
     {
         T312O t336Named = { h = { { w = 5 }, { w = 6 } } };

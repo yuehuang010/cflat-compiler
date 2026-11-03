@@ -1116,7 +1116,7 @@ int testTake()
     {
         list<unique Res*> l = default;
         l.add(new Res(1)); l.add(new Res(2)); l.add(new Res(3));
-        Res* taken = l.take(1);                       // take the middle
+        Res* taken = l.take(1).release();             // take the middle
         passed += Test("take unique leaves list smaller", l.count(), 2);
         passed += Test("take unique freed nothing yet", g_dtor, 0);
         delete taken;                                 // caller owns it

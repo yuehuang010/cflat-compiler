@@ -1,0 +1,9 @@
+import cpp "t473_unique_alias.hpp";
+
+expect_error("32, the alignment of its type 'uqp.W32'") {
+    extern int rejectCxxAlign32()
+    {
+        unique<uqp.W32, 64> p = new uqp.W32(32);
+        return p->v;
+    }
+}

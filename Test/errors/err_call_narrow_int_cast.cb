@@ -1,0 +1,16 @@
+// An explicit (int) cast spells an int: `(int)(s + 1)` and `(int)s + 1` stay refused at a short
+// parameter like a plain int local (ruling 2026-09-04; master refuses both, clang accepts).
+short takeShortCast(short x) { return x; }
+
+extern int main()
+{
+    expect_error("no overload of 'takeShortCast' matches the given arguments") {
+        short s = 3;
+        short r = takeShortCast((int)(s + 1));
+    }
+    expect_error("no overload of 'takeShortCast' matches the given arguments") {
+        short t = 3;
+        short q = takeShortCast((int)t + 1);
+    }
+    return 0;
+}

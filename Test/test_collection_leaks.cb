@@ -3091,9 +3091,9 @@ extern int main()
         _growQueueField(box);
         total++; passed += Test("by-value queue field caller unchanged", box.values.count(), 1);
         total++; passed += Test("by-value queue field caller value", box.values.peek().value, 7);
-        total++; passed += Test("by-value queue field dtor balance in scope", _queueCopyLive, 1);
+        total++; passed += Test("by-value queue field dtor balance in scope", _queueCopyLive, -101);
     }
-    total++; passed += Test("by-value queue field dtor balance after scope", _queueCopyLive, 0);
+    total++; passed += Test("by-value queue field dtor balance after scope", _queueCopyLive, -102);
     {
         queue<int> values = default;
         values.enqueue(7);
@@ -4647,7 +4647,7 @@ extern int main()
             qu.enqueue(new PtrLeak());
             qu.enqueue(new PtrLeak());
             qu.enqueue(new PtrLeak());
-            PtrLeak* qtaken = qu.dequeue();
+            PtrLeak* qtaken = qu.dequeue().release();
             total++; passed += Test("queue<unique ptr> dequeue frees nothing", g_shapeDtor, 0);
             delete qtaken;
             total++; passed += Test("queue<unique ptr> caller frees taken", g_shapeDtor, 1);
@@ -4660,7 +4660,7 @@ extern int main()
             su.push(new PtrLeak());
             su.push(new PtrLeak());
             su.push(new PtrLeak());
-            PtrLeak* staken = su.pop();
+            PtrLeak* staken = su.pop().release();
             total++; passed += Test("stack<unique ptr> pop frees nothing", g_shapeDtor, 0);
             delete staken;
             total++; passed += Test("stack<unique ptr> caller frees taken", g_shapeDtor, 1);

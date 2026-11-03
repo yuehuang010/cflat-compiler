@@ -1,0 +1,17 @@
+import "hpc/btree.cb";
+
+struct MIX20ConstKey
+{
+    const int id = 0;
+    MIX20ConstKey(int n) { id = n; }
+    bool operator<(MIX20ConstKey o) { return id < o.id; }
+    MIX20ConstKey copy() { return MIX20ConstKey(id); }
+};
+
+expect_error("btree<K, V>.insert(): key type K has a const field and cannot be assigned");
+extern int main()
+{
+    btree<MIX20ConstKey, int> tree = default;
+    tree.insert(MIX20ConstKey(1), 7);
+    return 0;
+}

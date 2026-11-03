@@ -13,3 +13,11 @@ declared BEFORE `struct Later`: ProcessPendingInstantiations instantiates list<T
 is incomplete", reported at a list.cb location). Pointer-only uses already defer (PendingWaitsOnStructBody).
 Fix direction: defer method-body instantiation of a generic class instance whose type argument is scanned but
 undefined (needs a ruling: destructor of the enclosing holder depends on those methods).
+
+RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31), same-file part: a by-value `list<Later>` field (or any generic
+class instance whose type argument is scanned but not yet defined) declared BEFORE `struct Later` is LEGAL in one file - C++ accepts
+`std::vector<Later> f;` on an incomplete element type and completes it at first member use, and CFlat's pointer uses already defer
+(PendingWaitsOnStructBody). Method-body instantiation (and the holder's destructor, which calls them) is deferred until the argument
+type is defined or the module scan ends; still undefined at module end = the existing incomplete-type error at the holder's line.
+Test consequence: the T433 probe shape becomes an accept leg in Test/test_generics.cb. The CROSS-FILE part (imported file naming the
+importer's later type) and the `struct Never;` syntax were RULED 2026-10-31 (maintainer): keep refusing, no `struct Never;` - see imported-union-later-holder-forward-reference.md.

@@ -3631,7 +3631,7 @@ silent UAF never acceptable). Per-item detail and probes (scratch/rulings1024/) 
 - `p3/chained-assign-raw-inner-into-unique-refused` part 2 (T443): a parameter-borrow-returning call is refused on assignment into a unique like the declaration; the four accept legs that pin a non-owning `unique` become err_ legs.
 - T442: untyped `return { ... }` is supported for EVERY CFlat struct, not only `[immovable]` (movable structs had no brace-return spelling at all). T449: closed by the no-narrowing-at-calls + exact function-type rulings.
 - `p3/member-destruction-declaration-order`: members destroyed in REVERSE declaration order (C++; matches locals and globals). T368 control leg updated.
-- `p3/moved-from-plain-struct-destructed-after-move-param`: a moved-from plain struct is dead - no second destructor (bitwise relocation has no valid shell to destroy).
+- `p3/moved-from-plain-struct-destructed-after-move-param`: a moved-from plain struct is dead - no second destructor (bitwise relocation has no valid shell to destroy). SUPERSEDED 2026-10-31 (maintainer): value dtors always run on the zero-filled source; see p3/moved-from-struct-leftovers-after-t490.md.
 - `p3/array-of-non-default-ctor-elements-accepted`: by design - field initializers make every struct default-constructible; a ctor with arguments never deletes that (scalar form behaves the same). Document, then close.
 - `p3/cpp-ctor-address-of-pointer-spelling-vs-clang`: `&p` is a `T**` value whenever any candidate accepts that reading (clang pick wins); the `T*&` slot binding is only a fallback.
 - `p3/cpp-ctor-ranking-leftovers` item 3: no floating -> integer at C++ ctor args in any form (`new` = declaration = expression), reference parameters included.

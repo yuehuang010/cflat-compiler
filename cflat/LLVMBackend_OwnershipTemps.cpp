@@ -2876,11 +2876,6 @@ void LLVMBackend::EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::V
             builder->SetInsertPoint(doneBB);
             return;
         }
-        if (!namedVar.FieldDropFlags.empty() && !IsCxxRecord(typeName))
-        {
-            EmitFullDestructorWithFieldDropFlags(namedVar, ptrVal, typeName);
-            return;
-        }
         builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
     }
 
@@ -7103,6 +7098,59 @@ bool LLVMBackend::TernaryArmIsProvenBorrow(llvm::Value* armValue, llvm::Value* a
             || nv->PointsToBorrowedAddress;
     }
 
+bool LLVMBackend::MoveSourceIsAddressBorrow(const NamedVariable& source) const
+{
+        // Only a plain local or parameter slot is provable; fields, elements and derefs keep
+        // their own owning-slot rules.
+        if (!source.FieldName.empty() || !source.FieldPathText.empty() || source.IsElementAccess)
+            return false;
+        const llvm::Value* storage = source.MoveSourceStorage != nullptr
+            ? source.MoveSourceStorage : source.Storage;
+        if (!llvm::isa_and_nonnull<llvm::AllocaInst>(storage)) return false;
+        const NamedVariable* live = FindVariableByStorage(storage);
+        if (live == nullptr || live->IsOwning || live->IsNewAllocated
+            || live->IsOwningStruct || live->IsOwningString)
+            return false;
+        return live->PointsToBorrowedAddress || source.PointsToBorrowedAddress;
+    }
+
+void LLVMBackend::LogBorrowedMoveSlotError() const
+{
+        LogErrorMessage("cannot move a borrowed pointer; move from the owning slot");
+    }
+
+bool LLVMBackend::IsUniqueOwningCallResult(const TypeAndValue& result) const
+{
+        return (result.Pointer && result.IsUnique) || IsCoreUniqueType(result.TypeName);
+    }
+
+bool LLVMBackend::ValueIsUniqueCallResult(llvm::Value* value) const
+{
+        if (value == nullptr || lastUniqueOwningCallResult == nullptr) return false;
+        if (value == lastUniqueOwningCallResult) return true;
+        // The unique result is spilled to a temp and its pointer field loaded back (`%4 = load`
+        // from a GEP of `%2 = alloca unique$S`, `store unique$S %1, %2`). Match that shape only.
+        auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+        if (load == nullptr) return false;
+        llvm::Value* slot = load->getPointerOperand();
+        if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(slot)) slot = gep->getPointerOperand();
+        // The call-result spill is an unnamed temp; a named local that stores the same result is not.
+        auto* temp = llvm::dyn_cast<llvm::AllocaInst>(slot);
+        if (temp == nullptr || temp->hasName()) return false;
+        for (llvm::User* user : temp->users())
+            if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                if (store->getValueOperand() == lastUniqueOwningCallResult) return true;
+        return false;
+    }
+
+void LLVMBackend::LogOwningCallRawBindError(const std::string& destName) const
+{
+        LogErrorMessage(
+            "cannot bind an owning call result to raw pointer '{}' - nothing frees it. Bind it to a "
+            "'unique' local, or call '.release()' to take the raw pointer explicitly",
+            { destName });
+    }
+
 void LLVMBackend::RegisterMovedBorrowedPtrValue(llvm::Value* value, const std::string& originName)
 {
         if (value == nullptr || !value->getType()->isPointerTy()) return;
@@ -8518,8 +8566,7 @@ bool LLVMBackend::NeedsConditionalDropFlag(const NamedVariable& namedVar) const
         if (namedVar.ConditionalDropFlag != nullptr || namedVar.Storage == nullptr || builder == nullptr)
             return namedVar.ConditionalDropFlag != nullptr;
         const std::string& typeName = namedVar.TypeAndValue.TypeName;
-        if (!(IsForeignNontrivialCxxClass(typeName) || HasForeignNontrivialCxxField(typeName)
-              || ShouldSkipMovedFromStructDestructor(typeName)))
+        if (!(IsForeignNontrivialCxxClass(typeName) || HasForeignNontrivialCxxField(typeName)))
             return false;
         auto* moveBlock = builder->GetInsertBlock();
         if (moveBlock == nullptr) return false;
@@ -8591,82 +8638,6 @@ void LLVMBackend::EnsureConditionalDropFlag(NamedVariable& namedVar, bool initia
         if (savedBlock != nullptr) builder->SetInsertPoint(savedBlock, savedPoint);
     }
 
-void LLVMBackend::EnsureFieldDropFlag(NamedVariable& namedVar, const std::string& field)
-{
-        if (field.empty() || field.find('[') != std::string::npos
-            || namedVar.FieldDropFlags.contains(field) || namedVar.Storage == nullptr
-            || builder == nullptr || namedVar.IsStaticLocal || namedVar.IsRangeForBorrow
-            || namedVar.IsAliasBorrow || IsCxxRecord(namedVar.TypeAndValue.TypeName))
-            return;
-
-        std::string currentType = namedVar.TypeAndValue.TypeName;
-        size_t start = 0;
-        const auto root = GetDataStructure(currentType);
-        if (root.StructType == nullptr || root.IsUnion) return;
-        while (start < field.size())
-        {
-            const size_t dot = field.find('.', start);
-            const bool last = dot == std::string::npos;
-            const std::string component = field.substr(start,
-                last ? std::string::npos : dot - start);
-            const auto data = GetDataStructure(currentType);
-            auto member = std::find_if(data.StructFields.begin(), data.StructFields.end(),
-                [&](const auto& candidate) { return candidate.VariableName == component; });
-            if (data.StructType == nullptr || data.IsUnion || member == data.StructFields.end()
-                || member->IsAlias || member->IsArrayView || member->IsSimd
-                || member->IsBitfield || member->IsPadding || member->ConstArraySize != 0
-                || member->ConstInnerDimensions.size() != 0)
-                return;
-            if (last)
-            {
-                if (member->IsUnique || IsCoreUniqueType(member->TypeName)
-                    || member->Pointer || member->ElemPointer)
-                    return;
-                if (IsCxxRecord(member->TypeName)
-                    || HasForeignNontrivialCxxField(member->TypeName))
-                    return;
-                if (!IsCoreUniqueType(member->TypeName)
-                    && GetOrCreateFullDestructor(member->TypeName) == nullptr)
-                    return;
-                break;
-            }
-            if (member->Pointer || member->ElemPointer || member->IsUnique
-                || IsCxxRecord(member->TypeName)
-                || HasForeignNontrivialCxxField(member->TypeName))
-                return;
-            currentType = member->TypeName;
-            start = dot + 1;
-        }
-
-        auto* savedBlock = builder->GetInsertBlock();
-        auto savedPoint = builder->GetInsertPoint();
-        llvm::Value* flag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "field.dropflag");
-        namedVar.FieldDropFlags.emplace(field, flag);
-        auto* declarationBlock = namedVar.DeclarationBlock;
-        if (auto* terminator = declarationBlock != nullptr && declarationBlock != savedBlock
-                ? cflat_llvm::GetTerminatorOrNull(declarationBlock) : nullptr)
-            builder->SetInsertPoint(declarationBlock, terminator->getIterator());
-        else if (declarationBlock != nullptr && declarationBlock != savedBlock)
-            builder->SetInsertPoint(declarationBlock);
-        builder->CreateStore(builder->getInt1(true), flag);
-        if (savedBlock != nullptr) builder->SetInsertPoint(savedBlock, savedPoint);
-    }
-
-void LLVMBackend::SetFieldDropFlagsLive(NamedVariable& namedVar, const std::string& field,
-                                         bool ensureExact, bool live)
-{
-        if (ensureExact) EnsureFieldDropFlag(namedVar, field);
-        if (builder == nullptr) return;
-        const std::string prefix = field + ".";
-        for (const auto& [path, flag] : namedVar.FieldDropFlags)
-        {
-            if (path != field && path.compare(0, prefix.size(), prefix) != 0
-                && field.compare(0, (path + ".").size(), path + ".") != 0)
-                continue;
-            builder->CreateStore(builder->getInt1(live), flag);
-        }
-    }
-
 void LLVMBackend::RearmConditionalDropFlag(NamedVariable& namedVar)
 {
         if (namedVar.ConditionalDropFlag == nullptr || builder == nullptr) return;
@@ -8677,12 +8648,8 @@ void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, l
 {
         if (dtor == nullptr) return;
         auto emitDestructor = [&]() {
-            if (!namedVar.FieldDropFlags.empty())
-                EmitFullDestructorWithFieldDropFlags(namedVar, namedVar.Storage,
-                                                      namedVar.TypeAndValue.TypeName);
-            else
-                EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
-                                              namedVar.TypeAndValue.TypeName, true);
+            EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
+                                          namedVar.TypeAndValue.TypeName, true);
         };
         if (namedVar.ConditionalDropFlag == nullptr)
         {
@@ -8764,8 +8731,6 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             // on another branch even when merged moved-state marks this source as maybe moved.
             if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")
                 && !IsCoreUniqueType(namedVar.TypeAndValue.TypeName)) return;
-            if (namedVar.IsMoved && namedVar.ConditionalDropFlag == nullptr
-                && ShouldSkipMovedFromStructDestructor(namedVar.TypeAndValue.TypeName)) return;
             // A foreign nontrivial C++ local released explicitly (`_ = move x;`) already ran its
             // C++ destructor and had its storage zeroed - running it again is a double destruction.
             // A plain `move x` (into another slot or a by-value parameter) does NOT set this flag:

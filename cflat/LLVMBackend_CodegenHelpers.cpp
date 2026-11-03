@@ -379,6 +379,10 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
 
         currentFunction = fn;
         autoVaListAlloca = nullptr;
+        // Per-function call state: a stale value from the last function must not match this one.
+        lastUniqueOwningCallResult = nullptr;
+        lastTernaryJoinValue = nullptr;
+        lastTernaryJoinArms = 0;
     }
 
 llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
@@ -1218,85 +1222,6 @@ std::vector<LLVMBackend::FullDestructorMember> LLVMBackend::CollectFullDestructo
         return work;
     }
 
-void LLVMBackend::EmitFullDestructorWithFieldDropFlags(const NamedVariable& namedVar,
-                                                        llvm::Value* storage,
-                                                        const std::string& typeName,
-                                                        const std::string& pathPrefix)
-{
-        auto data = GetDataStructure(typeName);
-        if (storage == nullptr || data.StructType == nullptr || data.IsUnion
-            || IsCxxRecord(typeName))
-        {
-            if (auto* dtor = GetOrCreateFullDestructor(typeName))
-                builder->CreateCall(dtor->getFunctionType(), dtor, { storage });
-            return;
-        }
-
-        if (data.Destructor != nullptr)
-            builder->CreateCall(data.Destructor->getFunctionType(), data.Destructor, { storage });
-
-        const auto memberWork = CollectFullDestructorMembers(typeName);
-        std::unordered_map<unsigned, const FullDestructorMember*> workByIndex;
-        for (const auto& work : memberWork) workByIndex.emplace(work.Index, &work);
-        auto emitFieldDestructor = [&](unsigned index, llvm::Value* fieldPtr, llvm::Type* fieldTy) {
-            auto it = workByIndex.find(index);
-            if (it == workByIndex.end()) return;
-            const auto& work = *it->second;
-            if (work.IsUniqueIface)
-                EmitUniqueInterfaceFieldRelease(*builder, fieldPtr, work.TypeName);
-            else if (work.IsUniqueArray)
-                EmitUniqueArrayFieldRelease(*builder, fieldPtr, fieldTy, work.TypeName,
-                                            work.IsIface, work.AllocAlign);
-            else if (work.IsUniquePtr)
-                EmitUniqueFieldDelete(*builder, fieldPtr, work.Dtor);
-            else
-                EmitFullDestructorOverStorage(*builder, fieldPtr, fieldTy, work.Dtor,
-                                               work.TypeName, true);
-        };
-
-        for (size_t offset = 0; offset < data.StructFields.size(); ++offset)
-        {
-            const unsigned index = static_cast<unsigned>(data.StructFields.size() - 1 - offset);
-            const auto& field = data.StructFields[index];
-            if (field.IsAlias) continue;
-            const unsigned element = CxxFieldElementIndex(data, index);
-            auto* fieldPtr = CreateCxxFieldGEP(data, storage, index, "drop.field");
-            auto* fieldTy = element == std::numeric_limits<unsigned>::max()
-                ? GetType(field) : data.StructType->getElementType(element);
-            const std::string fieldPath = pathPrefix.empty() ? field.VariableName
-                : pathPrefix + "." + field.VariableName;
-            const auto exact = namedVar.FieldDropFlags.find(fieldPath);
-            const std::string descendantPrefix = fieldPath + ".";
-            const bool hasDescendant = std::any_of(namedVar.FieldDropFlags.begin(),
-                namedVar.FieldDropFlags.end(), [&](const auto& entry) {
-                    return entry.first.compare(0, descendantPrefix.size(), descendantPrefix) == 0;
-                });
-            if (exact != namedVar.FieldDropFlags.end())
-            {
-                auto* function = builder->GetInsertBlock()->getParent();
-                auto* liveBlock = llvm::BasicBlock::Create(*context, "field.drop.live", function);
-                auto* afterBlock = llvm::BasicBlock::Create(*context, "field.drop.after", function);
-                auto* live = builder->CreateLoad(builder->getInt1Ty(), exact->second,
-                                                  "field.drop.livef");
-                builder->CreateCondBr(live, liveBlock, afterBlock);
-                builder->SetInsertPoint(liveBlock);
-                emitFieldDestructor(index, fieldPtr, fieldTy);
-                builder->CreateBr(afterBlock);
-                builder->SetInsertPoint(afterBlock);
-            }
-            else if (hasDescendant && !field.Pointer && !field.ElemPointer
-                && !field.IsArrayView && !field.IsUnique && field.ConstArraySize == 0)
-            {
-                EmitFullDestructorWithFieldDropFlags(namedVar, fieldPtr, field.TypeName,
-                                                      fieldPath);
-            }
-            else
-            {
-                emitFieldDestructor(index, fieldPtr, fieldTy);
-            }
-        }
-    }
-
 bool LLVMBackend::HasCxxClassMember(const std::string& typeName) const
 {
         std::unordered_set<std::string> seen;
@@ -2118,38 +2043,12 @@ bool LLVMBackend::IsOwningValueType(const std::string& typeName)
         return HasTypeAnnotation(typeName, "unique") || HasNonTrivialDestructor(typeName);
     }
 
-bool LLVMBackend::ShouldSkipMovedFromStructDestructor(const std::string& typeName) const
+void LLVMBackend::ZeroMovedSource(llvm::Value* storage, llvm::Type* type)
 {
-        if (typeName.empty() || typeName == "string"
-            || IsForeignNontrivialCxxClass(typeName)
-            || HasForeignNontrivialCxxField(typeName)
-            || GetEncodedClosureType(typeName) != nullptr
-            || TypeOwnsUniquePointer(typeName))
-            return false;
-
-        auto root = dataStructures.find(typeName);
-        if (root == dataStructures.end() || root->second.Destructor == nullptr)
-            return false;
-
-        std::unordered_set<std::string> seen;
-        std::function<bool(const std::string&)> hasOwningField =
-            [&](const std::string& current) {
-                if (current == "string" || GetEncodedClosureType(current) != nullptr) return true;
-                if (!seen.insert(current).second) return false;
-                auto it = dataStructures.find(current);
-                if (it == dataStructures.end()) return false;
-                for (const auto& field : it->second.StructFields)
-                {
-                    if (field.IsAlias) continue;
-                    if (field.Pointer || field.ElemPointer) return true;
-                    if (field.IsArrayView
-                        || field.IsSimd || field.IsBitfield || field.IsPadding)
-                        continue;
-                    if (hasOwningField(field.TypeName)) return true;
-                }
-                return false;
-            };
-        return !hasOwningField(typeName);
+        if (storage == nullptr || type == nullptr || builder == nullptr || !type->isSized()) return;
+        const uint64_t size = module->getDataLayout().getTypeAllocSize(type);
+        if (size == 0) return;
+        builder->CreateMemSet(storage, builder->getInt8(0), builder->getInt64(size), llvm::Align(1));
     }
 
 bool LLVMBackend::CFlatExternOwnsByValueParam(const TypeAndValue& p)
@@ -2686,7 +2585,8 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                     if (EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceFieldPtr,
                             /*useMove*/ false,
                             std::format("in synthesized copy of struct '{}', field '{}'",
-                                        typeName, f.VariableName).c_str()))
+                                        typeName, f.VariableName).c_str(),
+                            {}, false, /*directInit*/ true))
                         NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
                 }
                 continue;
@@ -2719,7 +2619,8 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                         EmitCxxCopyOrMoveConstruct(f.TypeName, elemPtr, sourceElem,
                             /*useMove*/ false,
                             std::format("in synthesized copy of struct '{}', field '{}'",
-                                        typeName, f.VariableName).c_str());
+                                        typeName, f.VariableName).c_str(),
+                            {}, false, /*directInit*/ true);
                         return;
                     }
                     if (IsLoweredCFlatOnlyStruct(f.TypeName))
@@ -2755,7 +2656,8 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
                 EmitCxxCopyOrMoveConstruct(f.TypeName, fieldPtr, sourceFieldPtr,
                     /*useMove*/ false,
                     std::format("in synthesized copy of struct '{}', field '{}'",
-                                typeName, f.VariableName).c_str());
+                                typeName, f.VariableName).c_str(),
+                    {}, false, /*directInit*/ true);
                 NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, fieldPtr, f.TypeName);
                 continue;
             }
