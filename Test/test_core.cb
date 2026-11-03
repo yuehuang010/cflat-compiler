@@ -3012,6 +3012,109 @@ int runRawOwnerLoopNestedOuterAssignReown()
     return g_raw_count_dtors * 100 + g_raw_count_sum;
 }
 
+int runRawOwnerMoveBreak()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* p = &stack;
+        RawCountElem* raw = new RawCountElem();
+        raw->id = 1;
+        RawCountElem* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            owner = move raw;
+            if (i == 1) { raw = p; break; }
+            raw = new RawCountElem();
+            raw->id = i + 2;
+        }
+    }
+    return g_raw_count_dtors * 10000 + g_raw_count_order * 100 + g_raw_count_sum;
+}
+
+void runRawOwnerMoveReturnBody()
+{
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = new RawCountElem();
+    raw->id = 1;
+    RawCountElem* owner = nullptr;
+    for (int i = 0; i < 3; i++)
+    {
+        owner = move raw;
+        if (i == 1) { raw = p; return; }
+        raw = new RawCountElem();
+        raw->id = i + 2;
+    }
+}
+
+int runRawOwnerMoveReturn()
+{
+    resetRawCountState();
+    runRawOwnerMoveReturnBody();
+    return g_raw_count_dtors * 10000 + g_raw_count_order * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerUniqueMoveBreak()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* p = &stack;
+        RawCountElem* raw = new RawCountElem();
+        raw->id = 1;
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            owner = move raw;
+            if (i == 1) { raw = p; break; }
+            raw = new RawCountElem();
+            raw->id = i + 2;
+        }
+    }
+    return g_raw_count_dtors * 10000 + g_raw_count_order * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerInnerLoopReown()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* p = &stack;
+        RawCountElem* raw = new RawCountElem();
+        raw->id = 1;
+        RawCountElem* owner = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            owner = move raw;
+            raw = p;
+            for (int k = 0; k < 1; k++) { }
+            raw = new RawCountElem();
+            raw->id = i + 2;
+        }
+    }
+    return g_raw_count_dtors * 10000 + g_raw_count_order * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerPlainBreak()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* p = &stack;
+        RawCountElem* raw = new RawCountElem();
+        raw->id = 1;
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            owner = raw;
+            if (i == 0) { raw = p; break; }
+            raw = new RawCountElem();
+        }
+    }
+    return g_raw_count_dtors * 10000 + g_raw_count_order * 100 + g_raw_count_sum;
+}
+
 int runRawOwnerConsumeThenBorrowReset()
 {
     resetRawCountState();
@@ -3154,6 +3257,49 @@ int runRawCountJoinAssign(int choose)
         values = choose != 0
             ? new RawCountElem[2] : new RawCountElem[4];
         rawCountSink(move values);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawOwnerInnerBreakOuterReownMove()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* borrowed = &stack;
+        RawCountElem* raw = new RawCountElem();
+        RawCountElem* owner = nullptr;
+        for (int j = 0; j < 2; j++)
+        {
+            for (int k = 0; k < 2; k++)
+            {
+                owner = move raw;
+                if (k == 0) { raw = borrowed; break; }
+                raw = new RawCountElem();
+            }
+            raw = new RawCountElem();
+        }
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawOwnerOuterSinkInnerBreakReown()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* borrowed = &stack;
+        RawCountElem* raw = new RawCountElem();
+        RawCountElem* owner = nullptr;
+        for (int j = 0; j < 2; j++)
+        {
+            owner = move raw;
+            for (int k = 0; k < 2; k++)
+            {
+                if (k == 0) { raw = borrowed; break; }
+            }
+            raw = new RawCountElem();
+        }
     }
     return g_raw_count_dtors;
 }
@@ -4725,6 +4871,10 @@ int testRawArrayRuntimeCount()
 
     passed += Test("raw owner loop re-owns before consume and destructs once",
                    runRawOwnerLoopReown(), 303);
+    passed += Test("raw owner inner break permits outer re-own after move sink",
+                   runRawOwnerInnerBreakOuterReownMove(), 4);
+    passed += Test("raw owner outer sink permits re-own after inner break",
+                   runRawOwnerOuterSinkInnerBreakReown(), 4);
     passed += Test("raw owner loop without a borrow destructs once",
                    runRawOwnerLoopNeverBorrowed(), 306);
     passed += Test("raw owner constructor loop re-owns before consume",
@@ -4741,6 +4891,16 @@ int testRawArrayRuntimeCount()
                    runRawOwnerLoopNestedReown(), 621);
     passed += Test("raw owner nested loop re-owns after an outer assignment",
                    runRawOwnerLoopNestedOuterAssignReown(), 621);
+    passed += Test("raw owner move break excludes its exit from the back-edge",
+                   runRawOwnerMoveBreak(), 42003);
+    passed += Test("raw owner move return excludes its exit from the back-edge",
+                   runRawOwnerMoveReturn(), 42003);
+    passed += Test("unique raw owner move break excludes its exit from the back-edge",
+                   runRawOwnerUniqueMoveBreak(), 42003);
+    passed += Test("raw owner fresh assignment after inner loop retires borrow",
+                   runRawOwnerInnerLoopReown(), 163006);
+    passed += Test("raw owner plain break excludes its exit from the back-edge",
+                   runRawOwnerPlainBreak(), 21001);
     passed += Test("unique reset clears consumed raw own flag",
                    runRawOwnerConsumeThenBorrowReset(), 101);
     passed += Test("unique constructor clears consumed raw own flag",
@@ -5033,22 +5193,22 @@ int testRawArrayRuntimeCount()
     passed += Test("raw count move counted parameter into local",
         runRawCountMoveParamLocal(), 3);
     passed += Test("raw count move parameter scalar reassignment delete",
-        runRawCountMoveParamReassignDelete(), 1);
+        runRawCountMoveParamReassignDelete(), 4);
     passed += Test("raw count move parameter scalar reassignment scope cleanup",
-        runRawCountMoveParamReassignScope(), 1);
+        runRawCountMoveParamReassignScope(), 4);
     passed += Test("raw count move parameter array reassignment delete",
-        runRawCountMoveParamReassignArrayDelete(), 4);
+        runRawCountMoveParamReassignArrayDelete(), 7);
     passed += Test("raw count move parameter array reassignment scope cleanup",
-        runRawCountMoveParamReassignArrayScope(), 4);
+        runRawCountMoveParamReassignArrayScope(), 7);
     passed += Test("raw count move parameter reassignment from counted local",
-        runRawCountMoveParamReassignMoveLocal(), 2);
+        runRawCountMoveParamReassignMoveLocal(), 5);
     // Clause-bearing parameters may be reassigned aligned blocks; the declared clause routes the free.
     passed += Test("raw count aligned move parameter reassignment delete",
-        runRawCountMoveParamReassignAlignedDelete(), 2);
+        runRawCountMoveParamReassignAlignedDelete(), 3);
     passed += Test("raw count aligned move parameter reassignment both branches",
-        runRawCountMoveParamReassignAlignedBranch(), 32);
+        runRawCountMoveParamReassignAlignedBranch(), 43);
     passed += Test("raw count aligned move parameter reassignment forward",
-        runRawCountMoveParamReassignAlignedForward(), 2);
+        runRawCountMoveParamReassignAlignedForward(), 3);
     // Plain delete must use the move-pointer raw count; old code returns 1 instead of 3.
     // The nested resource leg similarly returns 11 instead of 33 on the pre-fix compiler.
     passed += Test("raw count move return comparison temp",
@@ -5434,7 +5594,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 119;
+    r = testRawArrayRuntimeCount(); passed += r; total += 126;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 89;

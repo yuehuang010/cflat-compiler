@@ -1,6 +1,6 @@
 # Intermittent: a C++ TU sees a [cpp] struct without its C++ base (ODR split), freeing through the wrong delete
 
-Summary: one test.sh Release run on master aa25d932 (box 7 run 2, 2026-10-31) built a test_cpp_interop.bin that returns
+Summary: one test.sh Release run on master 3deaad3e (box 7 run 2, 2026-10-31) built a test_cpp_interop.bin that returns
 3421 (leg ~15739, T320UniqN: `[cpp] struct T320UN : cppon.Cls` with its own operator new only, `unique<T320UN>` drop must
 free through cppon::Cls::operator delete). In that binary the default_delete<T320UN> / ~T320UN code (C++ side) calls the
 global ::operator delete(void*, size_t) and T320UN's D2 does not call cppon::Cls::~Cls, while the CFlat side and the

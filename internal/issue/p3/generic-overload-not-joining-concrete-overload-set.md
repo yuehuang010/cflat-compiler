@@ -5,7 +5,7 @@ resolves the call on its own, so every call master REFUSED and clang accepts now
 namespace, both declaration orders). Matrix and probes: scratch/repro_keep/genovl/ (genovl_report.md, genovl_review1.md,
 review1/cases/).
 
-## RULED 2026-10-29, landed GENOVLR (df9618d95)
+## RULED 2026-10-29, landed GENOVLR (5344802ed)
 
 Exact generic beats a concrete candidate reached by widening (C++/C# non-template tiebreak on the deduced parameter types,
 free, method and implicit-this calls); `nullptr` to two pointer overloads is ambiguous; `void*` no longer picks an object

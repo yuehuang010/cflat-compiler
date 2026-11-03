@@ -5344,6 +5344,7 @@ void LLVMBackend::ResetForReanalysis()
     userNoArgCtorTypes_.clear();
     loopIterationAssigned_.clear();
     ownFlagLoopReownSnapshots_.clear();
+    assignBorrowLoopDepth_.clear();
     ownReleaseGates_.clear();
     receiverScanFacts_.clear();
     returnBorrowMemo_.clear();

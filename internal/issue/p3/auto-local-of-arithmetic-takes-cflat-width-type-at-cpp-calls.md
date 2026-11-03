@@ -19,7 +19,7 @@ matches C++ (ruling 2026-09-10; L-suffix = target long 2026-09-30); `auto` is th
 over CFlat-spelled operands is unchanged. The floating half (`auto x = 1e3 + 1;` float vs double) is the literal-typing question
 DEFERRED 2026-10-13 and is not ruled here. Test consequence: `vv.fwd(x)` with `auto x = l + 1` deduces `long` (accept leg); no leg flips.
 
-Pre-existing, seen in the autoloc review (2026-11-01, master 871a238f): a direct native call `nf(l + 1)` (`long l`, overloads
+Pre-existing, seen in the autoloc review (2026-11-01, master a9e82a96): a direct native call `nf(l + 1)` (`long l`, overloads
 `nf(long)` + `nf(long long)`) picks `nf(long long)`, clang `nf(long)`; after autoloc `auto x = l + 1; nf(x)` picks `nf(long)` (main-session
 decision: accepted - `auto` is the expression's type and `long` is a C spelling), so the direct call is now the odd one out. Repro
 scratch/repro_keep/autoloc/rev_autoloc_nat_direct.cb (main checkout).

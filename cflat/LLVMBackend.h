@@ -4734,10 +4734,12 @@ public:
     // Records the innermost loop's view-rebind names on its frame (see FindLoopViewRebindTargets).
     void NoteLoopViewAssignments(const std::unordered_set<std::string>& names);
     void RecordUniqueOwnerLoopSink(const NamedVariable& source, const std::string& uniqueType,
-                                   const std::string& destination, bool isReset);
+                                   const std::string& destination, bool isReset, bool isUnique = true);
     void RecordMoveOwnerLoopSink(const NamedVariable& source, const std::string& function,
                                  const std::string& parameter);
     void CheckOwnFlagLoopBackEdge();
+    bool RetainLoopBreakBorrowState() const;
+    bool RetainCurrentLoopBreakBorrowState() const;
 private:
     std::string cppStandard_ = "c++20";
     // --error-on-cpp-reparse: at most 1 clang parse (or cache load in its place) per translation unit.
@@ -4761,6 +4763,7 @@ private:
     uint64_t nextOwnFlagControlFrameId_ = 1;
     std::unordered_set<const llvm::Value*> ownFlagDefinitelyReowned_;
     std::unordered_set<const llvm::Value*> loopIterationAssigned_;
+    std::unordered_map<const llvm::Value*, size_t> assignBorrowLoopDepth_;
     bool AssignedSinceLoopEntry(size_t frameIndex, const llvm::Value* storage) const;
     struct OwnFlagLoopReownFrame
     {
@@ -4779,6 +4782,8 @@ private:
             std::string UniqueType;
             std::string Destination;
             bool IsReset = true;
+            bool IsUnique = true;
+            bool IsMove = false;
             std::string File;
             size_t Line = 0;
             size_t Column = 0;
@@ -4796,6 +4801,8 @@ private:
         std::unordered_set<const llvm::Value*> exitIntersection;
         std::unordered_set<const llvm::Value*> entryAssigned;
         std::unordered_set<const llvm::Value*> exitAssignedIntersection;
+        std::unordered_set<const llvm::Value*> borrowedContinueStorages;
+        std::unordered_map<const llvm::Value*, std::string> borrowedExitSources;
         bool isDoWhile = false;
         bool hasIncrement = false;
         bool hasExitState = false;
@@ -10344,6 +10351,8 @@ public:
     void EnterOwnershipControlRegion(uint8_t frameKind = 0);
     void LeaveOwnershipControlRegion();
     void RecordOwnFlagLoopExitState();
+    void RecordOwnFlagLoopBreakState();
+    void RecordOwnFlagLoopContinueState();
 
     void SwitchToBlock(llvm::BasicBlock* block);
 
@@ -12783,13 +12792,9 @@ public:
                                   const std::string& source, size_t scopeDepth);
 
     /*
-     * Drop a borrow that a plain '=' recorded (never a declaration-time one) when a later '='
-     * stores a provably OWNED value into the same binding from the SAME basic block - the block
-     * the storing STATEMENT starts in (statementBlock; the RHS may split blocks internally). Same
-     * block is the whole proof: any path that ran the borrow store also ran this one, so the binding
-     * cannot still hold the borrow. Across blocks the borrow stands - `d = p; if (c) { d = new T(); }`
-     * leaves a path where it does not, the hazard tracked as
-     * conditional-store-retires-borrow-facts-unconditionally. Returns true when it retired a borrow.
+     * Retire an assigned borrow when a later store proves ownership. Same-block stores are safe;
+     * after an inner-loop join, matching loop depth also proves the owner rebind stays in-iteration.
+     * Conditional paths retain the borrow through the join snapshot. Returns true when retired.
      */
     bool RetireAssignBorrow(const std::string& name,
                             llvm::BasicBlock* statementBlock = nullptr);
@@ -13114,6 +13119,23 @@ public:
 
     struct OwnFlagJoinSnapshot
     {
+        struct BorrowProvenance
+        {
+            bool IsBorrowed = false;
+            bool IsAliasBorrow = false;
+            bool IsTypeAlias = false;
+            bool BorrowsOwnedElement = false;
+            bool BorrowedThroughField = false;
+            bool BorrowedUniqueFieldViaCall = false;
+            bool BorrowsOwningLocal = false;
+            bool OwningLocalBorrowAfterRebind = false;
+            bool PointerRebound = false;
+            llvm::Value* OwningLocalStorage = nullptr;
+            std::string BorrowedOrigin;
+            std::string BorrowedUniqueField;
+            std::string OwningLocalOrigin;
+        };
+        std::unordered_map<const llvm::Value*, BorrowProvenance> borrowProvenance;
         std::unordered_map<const llvm::Value*, std::vector<uint64_t>> mayBeFalsePaths;
         std::unordered_set<const llvm::Value*> definitelyReowned;
         std::unordered_set<const llvm::Value*> loopIterationAssigned;

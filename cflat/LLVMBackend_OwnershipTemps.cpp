@@ -1707,6 +1707,7 @@ void LLVMBackend::LeaveOwnershipControlRegion()
             && !ownFlagLoopReownSnapshots_.empty())
         {
             const auto& frame = ownFlagLoopReownSnapshots_.back();
+            const auto borrowedExitSources = frame.borrowedExitSources;
             loopIterationAssigned_ = frame.entryAssigned;
             if (frame.isDoWhile && frame.hasExitAssigned)
                 loopIterationAssigned_.insert(frame.exitAssignedIntersection.begin(),
@@ -1735,6 +1736,32 @@ void LLVMBackend::LeaveOwnershipControlRegion()
                 }
             }
             ownFlagLoopReownSnapshots_.pop_back();
+            for (const auto& [storage, origin] : borrowedExitSources)
+            {
+                const bool reachesOuterSink = std::ranges::any_of(ownFlagLoopReownSnapshots_,
+                    [&](const auto& outerFrame) {
+                        return std::ranges::any_of(outerFrame.uniqueOwnerSinks,
+                            [&](const auto& sink) { return sink.Storage == storage; })
+                            || std::ranges::any_of(outerFrame.moveOwnerSinks,
+                                [&](const auto& sink) { return sink.Storage == storage; });
+                    });
+                if (!reachesOuterSink) continue;
+                for (auto& scope : stackNamedVariable)
+                {
+                    auto applyBorrow = [&](auto& variables) {
+                        for (auto& [name, namedVar] : variables)
+                            if (namedVar.Storage == storage)
+                            {
+                                namedVar.IsBorrowed = true;
+                                if (!origin.empty()) namedVar.BorrowedOrigin = origin;
+                                namedVar.AssignBorrowBlock = builder->GetInsertBlock();
+                                assignBorrowLoopDepth_[storage] = ownFlagLoopReownSnapshots_.size();
+                            }
+                    };
+                    applyBorrow(scope.functionArgument);
+                    applyBorrow(scope.namedVariable);
+                }
+            }
         }
         ownFlagControlPath_.pop_back();
         ownFlagControlKind_.pop_back();
@@ -1775,6 +1802,61 @@ void LLVMBackend::RecordOwnFlagLoopExitState()
         }
 }
 
+void LLVMBackend::RecordOwnFlagLoopBreakState()
+{
+        if (ownFlagLoopReownSnapshots_.empty()) return;
+        auto& frame = ownFlagLoopReownSnapshots_.back();
+        for (const auto& sink : frame.uniqueOwnerSinks)
+        {
+            const auto* live = FindVariableByStorage(sink.Storage);
+            if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
+                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
+                frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceName(*live));
+        }
+        for (const auto& sink : frame.moveOwnerSinks)
+        {
+            const auto* live = FindVariableByStorage(sink.Storage);
+            if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
+                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
+                frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceName(*live));
+        }
+        for (size_t i = 0; i + 1 < ownFlagLoopReownSnapshots_.size(); ++i)
+        {
+            const auto& outerFrame = ownFlagLoopReownSnapshots_[i];
+            auto captureOuterSinkBorrow = [&](const auto& sinks) {
+                for (const auto& sink : sinks)
+                {
+                    const auto* live = FindVariableByStorage(sink.Storage);
+                    if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
+                        || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
+                        frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceName(*live));
+                }
+            };
+            captureOuterSinkBorrow(outerFrame.uniqueOwnerSinks);
+            captureOuterSinkBorrow(outerFrame.moveOwnerSinks);
+        }
+}
+
+void LLVMBackend::RecordOwnFlagLoopContinueState()
+{
+        if (ownFlagLoopReownSnapshots_.empty()) return;
+        auto& storages = ownFlagLoopReownSnapshots_.back().borrowedContinueStorages;
+        auto recordBorrowed = [&](const auto& variables) {
+            for (const auto& entry : variables)
+            {
+                const auto& namedVar = entry.second;
+                if (namedVar.Storage != nullptr && namedVar.IsBorrowed
+                    && namedVar.AssignBorrowBlock != nullptr)
+                    storages.insert(namedVar.Storage);
+            }
+        };
+        for (const auto& scope : stackNamedVariable)
+        {
+            recordBorrowed(scope.namedVariable);
+            recordBorrowed(scope.functionArgument);
+        }
+}
+
 LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::SaveOwnFlagJoinState()
 {
         OwnFlagJoinSnapshot state;
@@ -1784,6 +1866,22 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::SaveOwnFlagJoinState()
             ? stackNamedVariable.size() : ownFlagLoopReownSnapshots_.back().scopeDepth;
         auto saveOne = [&](const NamedVariable& namedVar, size_t frameIndex) {
             if (namedVar.Storage == nullptr) return;
+            const bool isLoopSinkSource = std::ranges::any_of(ownFlagLoopReownSnapshots_,
+                [&](const auto& loop) {
+                    return std::ranges::any_of(loop.uniqueOwnerSinks, [&](const auto& sink) {
+                        return sink.Storage == namedVar.Storage;
+                    }) || std::ranges::any_of(loop.moveOwnerSinks, [&](const auto& sink) {
+                        return sink.Storage == namedVar.Storage;
+                    });
+                });
+            if (isLoopSinkSource)
+                state.borrowProvenance[namedVar.Storage] = {
+                    namedVar.IsBorrowed, namedVar.IsAliasBorrow, namedVar.TypeAndValue.IsAlias,
+                    namedVar.BorrowsOwnedElement, namedVar.BorrowedThroughField,
+                    namedVar.BorrowedUniqueFieldViaCall, namedVar.BorrowsOwningLocal,
+                    namedVar.OwningLocalBorrowAfterRebind,
+                    namedVar.PointerRebound, namedVar.OwningLocalStorage, namedVar.BorrowedOrigin,
+                    namedVar.BorrowedUniqueField, namedVar.OwningLocalOrigin };
             if (namedVar.OwnFlagMayBeFalse)
                 state.mayBeFalsePaths[namedVar.Storage] = namedVar.OwnFlagMayBeFalseControlPath;
             if (namedVar.TypeAndValue.IsArrayView
@@ -1827,6 +1925,23 @@ void LLVMBackend::RestoreOwnFlagJoinState(const OwnFlagJoinSnapshot& state)
 {
         auto restoreOne = [&](NamedVariable& namedVar) {
             if (namedVar.Storage == nullptr) return;
+            auto borrow = state.borrowProvenance.find(namedVar.Storage);
+            if (borrow != state.borrowProvenance.end())
+            {
+                namedVar.IsBorrowed = borrow->second.IsBorrowed;
+                namedVar.IsAliasBorrow = borrow->second.IsAliasBorrow;
+                namedVar.TypeAndValue.IsAlias = borrow->second.IsTypeAlias;
+                namedVar.BorrowsOwnedElement = borrow->second.BorrowsOwnedElement;
+                namedVar.BorrowedThroughField = borrow->second.BorrowedThroughField;
+                namedVar.BorrowedUniqueFieldViaCall = borrow->second.BorrowedUniqueFieldViaCall;
+                namedVar.BorrowsOwningLocal = borrow->second.BorrowsOwningLocal;
+                namedVar.OwningLocalBorrowAfterRebind = borrow->second.OwningLocalBorrowAfterRebind;
+                namedVar.PointerRebound = borrow->second.PointerRebound;
+                namedVar.OwningLocalStorage = borrow->second.OwningLocalStorage;
+                namedVar.BorrowedOrigin = borrow->second.BorrowedOrigin;
+                namedVar.BorrowedUniqueField = borrow->second.BorrowedUniqueField;
+                namedVar.OwningLocalOrigin = borrow->second.OwningLocalOrigin;
+            }
             auto it = state.mayBeFalsePaths.find(namedVar.Storage);
             namedVar.OwnFlagMayBeFalse = it != state.mayBeFalsePaths.end();
             namedVar.OwnFlagMayBeFalseControlPath = it != state.mayBeFalsePaths.end()
@@ -1866,6 +1981,35 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
         bool keepMayBeFalse) const
 {
         OwnFlagJoinSnapshot merged;
+        std::unordered_set<const llvm::Value*> borrowStorages;
+        for (const auto& [storage, borrow] : first.borrowProvenance) borrowStorages.insert(storage);
+        for (const auto& [storage, borrow] : second.borrowProvenance) borrowStorages.insert(storage);
+        for (const auto* storage : borrowStorages)
+        {
+            const auto firstIt = first.borrowProvenance.find(storage);
+            const auto secondIt = second.borrowProvenance.find(storage);
+            const OwnFlagJoinSnapshot::BorrowProvenance empty;
+            const auto& a = firstIt == first.borrowProvenance.end() ? empty : firstIt->second;
+            const auto& b = secondIt == second.borrowProvenance.end() ? empty : secondIt->second;
+            auto borrow = a;
+            borrow.IsBorrowed = a.IsBorrowed || b.IsBorrowed;
+            borrow.IsAliasBorrow = a.IsAliasBorrow || b.IsAliasBorrow;
+            borrow.IsTypeAlias = a.IsTypeAlias || b.IsTypeAlias;
+            borrow.BorrowsOwnedElement = a.BorrowsOwnedElement || b.BorrowsOwnedElement;
+            borrow.BorrowedThroughField = a.BorrowedThroughField || b.BorrowedThroughField;
+            borrow.BorrowedUniqueFieldViaCall = a.BorrowedUniqueFieldViaCall || b.BorrowedUniqueFieldViaCall;
+            borrow.BorrowsOwningLocal = a.BorrowsOwningLocal || b.BorrowsOwningLocal;
+            borrow.OwningLocalBorrowAfterRebind = a.OwningLocalBorrowAfterRebind
+                || b.OwningLocalBorrowAfterRebind;
+            borrow.PointerRebound = a.PointerRebound || b.PointerRebound;
+            if (a.OwningLocalStorage != b.OwningLocalStorage)
+                borrow.OwningLocalStorage = a.BorrowsOwningLocal
+                    ? a.OwningLocalStorage : b.OwningLocalStorage;
+            if (borrow.BorrowedOrigin.empty()) borrow.BorrowedOrigin = b.BorrowedOrigin;
+            if (borrow.BorrowedUniqueField.empty()) borrow.BorrowedUniqueField = b.BorrowedUniqueField;
+            if (borrow.OwningLocalOrigin.empty()) borrow.OwningLocalOrigin = b.OwningLocalOrigin;
+            merged.borrowProvenance.emplace(storage, std::move(borrow));
+        }
         for (const auto* storage : first.loopIterationAssigned)
             if (second.loopIterationAssigned.contains(storage))
                 merged.loopIterationAssigned.insert(storage);
@@ -1995,11 +2139,16 @@ void LLVMBackend::NoteLoopViewAssignments(const std::unordered_set<std::string>&
 }
 
 void LLVMBackend::RecordUniqueOwnerLoopSink(const NamedVariable& source,
-        const std::string& uniqueType, const std::string& destination, bool isReset)
+        const std::string& uniqueType, const std::string& destination, bool isReset, bool isUnique)
 {
-        if (source.Storage == nullptr || !source.TypeAndValue.Pointer
+        const bool isMove = source.IsExplicitMove || source.TypeAndValue.IsMove;
+        const llvm::Value* sourceStorage = source.MoveSourceStorage != nullptr
+            ? source.MoveSourceStorage : source.Storage;
+        if (sourceStorage == nullptr && !source.CallerName.empty())
+            sourceStorage = FindVariableStorage(source.CallerName).Storage;
+        if (sourceStorage == nullptr || !source.TypeAndValue.Pointer
             || source.TypeAndValue.IsArrayView || !source.FieldName.empty()
-            || !llvm::isa<llvm::AllocaInst>(source.Storage)
+            || !llvm::isa<llvm::AllocaInst>(sourceStorage)
             || ownFlagLoopReownSnapshots_.empty())
             return;
 
@@ -2009,7 +2158,7 @@ void LLVMBackend::RecordUniqueOwnerLoopSink(const NamedVariable& source,
         {
             const auto& scope = stackNamedVariable[i];
             for (const auto& [name, variable] : scope.functionArgument)
-                if (variable.Storage == source.Storage)
+                if (variable.Storage == sourceStorage)
                 {
                     scopeIndex = i;
                     hasScope = true;
@@ -2017,7 +2166,7 @@ void LLVMBackend::RecordUniqueOwnerLoopSink(const NamedVariable& source,
                 }
             if (hasScope) break;
             for (const auto& [name, variable] : scope.namedVariable)
-                if (variable.Storage == source.Storage)
+                if (variable.Storage == sourceStorage)
                 {
                     scopeIndex = i;
                     hasScope = true;
@@ -2030,18 +2179,38 @@ void LLVMBackend::RecordUniqueOwnerLoopSink(const NamedVariable& source,
         {
             auto& frame = ownFlagLoopReownSnapshots_[k];
             if (scopeIndex >= frame.scopeDepth) continue;
-            if (AssignedSinceLoopEntry(k, source.Storage))
+            if (AssignedSinceLoopEntry(k, sourceStorage))
                 continue;
             const bool duplicate = std::ranges::any_of(frame.uniqueOwnerSinks,
                 [&](const auto& sink) {
-                    return sink.Storage == source.Storage && sink.Line == currentLine
+                    return sink.Storage == sourceStorage && sink.Line == currentLine
                         && sink.Column == currentColumn && sink.Destination == destination
-                        && sink.IsReset == isReset;
+                        && sink.IsReset == isReset && sink.IsUnique == isUnique
+                        && sink.IsMove == isMove;
                 });
             if (!duplicate)
-                frame.uniqueOwnerSinks.push_back({ source.Storage, uniqueType, destination,
-                    isReset, sourceFileName, currentLine, currentColumn });
+                frame.uniqueOwnerSinks.push_back({ sourceStorage, uniqueType, destination,
+                    isReset, isUnique, isMove, sourceFileName, currentLine, currentColumn });
         }
+}
+
+bool LLVMBackend::RetainLoopBreakBorrowState() const
+{
+        return std::ranges::any_of(ownFlagLoopReownSnapshots_, [](const auto& frame) {
+            return std::ranges::any_of(frame.uniqueOwnerSinks, [](const auto& sink) {
+                    return !sink.IsUnique || sink.IsMove;
+                }) || !frame.moveOwnerSinks.empty() || !frame.nonNewViewAssigns.empty();
+        });
+}
+
+bool LLVMBackend::RetainCurrentLoopBreakBorrowState() const
+{
+        // An enclosing loop re-enters this one after the break, so the break arm's borrow can reach the sink.
+        if (ownFlagLoopReownSnapshots_.size() != 1) return false;
+        const auto& frame = ownFlagLoopReownSnapshots_.back();
+        return std::ranges::any_of(frame.uniqueOwnerSinks, [](const auto& sink) {
+            return !sink.IsUnique || (sink.IsUnique && !sink.IsMove);
+        }) || !frame.moveOwnerSinks.empty();
 }
 
 // Assigned in loop frame k's current iteration: the live set plus what each deeper loop saved on entry.
@@ -2056,9 +2225,11 @@ bool LLVMBackend::AssignedSinceLoopEntry(size_t frameIndex, const llvm::Value* s
 void LLVMBackend::RecordMoveOwnerLoopSink(const NamedVariable& source,
         const std::string& function, const std::string& parameter)
 {
-        if (source.Storage == nullptr || !source.TypeAndValue.Pointer
+        const llvm::Value* sourceStorage = source.MoveSourceStorage != nullptr
+            ? source.MoveSourceStorage : source.Storage;
+        if (sourceStorage == nullptr || !source.TypeAndValue.Pointer
             || source.TypeAndValue.IsArrayView || source.TypeAndValue.IsFunctionPointer
-            || !source.FieldName.empty() || !llvm::isa<llvm::AllocaInst>(source.Storage)
+            || !source.FieldName.empty() || !llvm::isa<llvm::AllocaInst>(sourceStorage)
             || ownFlagLoopReownSnapshots_.empty())
             return;
 
@@ -2068,7 +2239,7 @@ void LLVMBackend::RecordMoveOwnerLoopSink(const NamedVariable& source,
         {
             const auto& scope = stackNamedVariable[i];
             for (const auto& [name, variable] : scope.functionArgument)
-                if (variable.Storage == source.Storage)
+                if (variable.Storage == sourceStorage)
                 {
                     scopeIndex = i;
                     hasScope = true;
@@ -2076,7 +2247,7 @@ void LLVMBackend::RecordMoveOwnerLoopSink(const NamedVariable& source,
                 }
             if (hasScope) break;
             for (const auto& [name, variable] : scope.namedVariable)
-                if (variable.Storage == source.Storage)
+                if (variable.Storage == sourceStorage)
                 {
                     scopeIndex = i;
                     hasScope = true;
@@ -2088,16 +2259,16 @@ void LLVMBackend::RecordMoveOwnerLoopSink(const NamedVariable& source,
         for (size_t k = 0; k < ownFlagLoopReownSnapshots_.size(); ++k)
         {
             auto& frame = ownFlagLoopReownSnapshots_[k];
-            if (scopeIndex >= frame.scopeDepth || AssignedSinceLoopEntry(k, source.Storage))
+            if (scopeIndex >= frame.scopeDepth || AssignedSinceLoopEntry(k, sourceStorage))
                 continue;
             const bool duplicate = std::ranges::any_of(frame.moveOwnerSinks,
                 [&](const auto& sink) {
-                    return sink.Storage == source.Storage && sink.Line == currentLine
+                    return sink.Storage == sourceStorage && sink.Line == currentLine
                         && sink.Column == currentColumn && sink.Function == function
                         && sink.Parameter == parameter;
                 });
             if (!duplicate)
-                frame.moveOwnerSinks.push_back({ source.Storage, parameter, function,
+                frame.moveOwnerSinks.push_back({ sourceStorage, parameter, function,
                     sourceFileName, currentLine, currentColumn });
         }
 }

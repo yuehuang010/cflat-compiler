@@ -1,4 +1,6 @@
 struct R { int value = 0; };
+R* rawOwnerLoopGlobal = nullptr;
+void takeRawExit(move R* p) { delete p; }
 
 expect_error("cannot reset unique<R> 'owner' from borrowed value") {
     void rawOwnerForBackedge()
@@ -89,6 +91,193 @@ expect_error("cannot pass borrowed pointer 'raw' to move parameter 'p' of 'takeR
             takeRaw(move raw);
             raw = p;
         }
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value") {
+    void rawOwnerMoveAssignmentBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        for (int i = 0; i < 2; i++) { owner = move raw; raw = p; }
+    }
+}
+
+expect_error("cannot assign owning pointer 'owner' from borrowed value 'p'") {
+    void rawOwnerMoveRawPointerBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        R* owner = nullptr;
+        for (int i = 0; i < 2; i++) { owner = move raw; raw = p; }
+    }
+}
+
+expect_error("cannot assign owning pointer 'owner' from borrowed value 'p'") {
+    void rawOwnerPlainAdoptionBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        R* owner = nullptr;
+        for (int i = 0; i < 2; i++) { owner = raw; raw = p; }
+    }
+}
+
+expect_error("cannot assign owning pointer 'rawOwnerLoopGlobal' from borrowed value 'p'") {
+    void rawOwnerGlobalAdoptionBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        for (int i = 0; i < 2; i++) { rawOwnerLoopGlobal = move raw; raw = p; }
+    }
+}
+
+expect_error("cannot assign owning pointer 'owner' from borrowed value 'p'") {
+    void rawOwnerPlainDeclarationBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        for (int i = 0; i < 2; i++)
+        {
+            R* owner = move raw;
+            raw = p;
+        }
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value 'p'") {
+    void rawOwnerUniqueBreakBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            owner = raw;
+            if (i == 1) { raw = p; break; }
+            raw = new R();
+        }
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value 'p'") {
+    void rawOwnerUniqueInnerReownBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            owner = raw;
+            raw = p;
+            for (int k = 0; k < 1; k++) { }
+            raw = new R();
+        }
+    }
+}
+
+expect_error("cannot pass borrowed pointer 'raw' to move parameter 'p' of 'takeRawExit'") {
+    void rawOwnerMoveParameterBreakBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        for (int i = 0; i < 3; i++)
+        {
+            takeRawExit(move raw);
+            if (i == 1) { raw = p; break; }
+            raw = new R();
+        }
+    }
+}
+
+expect_error("cannot pass borrowed pointer 'raw' to move parameter 'p' of 'takeRawExit'") {
+    void rawOwnerMoveParameterInnerBreakAtZero()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        for (int i = 0; i < 2; i++)
+        {
+            takeRawExit(move raw);
+            raw = new R();
+            for (int k = 0; k < 1; k++)
+                if (k == 0) { raw = p; break; }
+        }
+    }
+}
+
+expect_error("cannot assign owning pointer 'owner' from borrowed value 'p'") {
+    void rawOwnerMoveInnerBreakAtZero()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        R* owner = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            owner = move raw;
+            for (int k = 0; k < 2; k++)
+                if (k == 0) { raw = p; break; }
+        }
+    }
+}
+
+expect_error("cannot assign owning pointer 'owner' from borrowed value 'p'") {
+    void rawOwnerMoveContinueBackedgeAtOne()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        R* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            owner = move raw;
+            if (i == 1) { raw = p; continue; }
+            raw = new R();
+        }
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value 'p'") {
+    void rawOwnerUniqueNestedInnerBreakAtZero()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        for (int j = 0; j < 2; j++)
+            for (int k = 0; k < 2; k++)
+            {
+                owner = raw;
+                if (k == 0) { raw = p; break; }
+                raw = new R();
+            }
+    }
+}
+
+expect_error("cannot assign owning pointer 'owner' from borrowed value 'p'") {
+    void rawOwnerMoveNestedInnerBreakAtZero()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        R* owner = nullptr;
+        for (int j = 0; j < 2; j++)
+            for (int k = 0; k < 2; k++)
+            {
+                owner = move raw;
+                if (k == 0) { raw = p; break; }
+                raw = new R();
+            }
     }
 }
 

@@ -3142,15 +3142,29 @@ void LLVMBackend::CheckOwnFlagLoopBackEdge()
             if (!localMayBeBorrowed) continue;
             ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
             const std::string sourceName = BorrowedSourceName(*live);
-            const std::string action = sink.IsReset ? "reset" : "initialize";
-            if (sourceName.empty())
-                LogError(std::format("cannot {} {} '{}' from a borrowed value - the source still owns it; "
-                    "use 'new', a 'move' expression, or a move-returning call",
-                    action, sink.UniqueType, sink.Destination));
+            if (!sink.IsUnique)
+            {
+                if (sourceName.empty())
+                    LogError(std::format("cannot assign owning pointer '{}' from a borrowed value - "
+                        "the source still owns it; use 'new', a 'move' expression, or a move-returning call",
+                        sink.Destination));
+                else
+                    LogError(std::format("cannot assign owning pointer '{}' from borrowed value '{}' - "
+                        "the source still owns it; use 'new', a 'move' expression, or a move-returning call",
+                        sink.Destination, sourceName));
+            }
             else
-                LogError(std::format("cannot {} {} '{}' from borrowed value '{}' - the source still owns it; "
-                    "use 'new', a 'move' expression, or a move-returning call",
-                    action, sink.UniqueType, sink.Destination, sourceName));
+            {
+                const std::string action = sink.IsReset ? "reset" : "initialize";
+                if (sourceName.empty())
+                    LogError(std::format("cannot {} {} '{}' from a borrowed value - the source still owns it; "
+                        "use 'new', a 'move' expression, or a move-returning call",
+                        action, sink.UniqueType, sink.Destination));
+                else
+                    LogError(std::format("cannot {} {} '{}' from borrowed value '{}' - the source still owns it; "
+                        "use 'new', a 'move' expression, or a move-returning call",
+                        action, sink.UniqueType, sink.Destination, sourceName));
+            }
             return;
         }
         for (const auto& sink : frame.moveOwnerSinks)

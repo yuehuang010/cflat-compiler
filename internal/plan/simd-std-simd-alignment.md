@@ -19,7 +19,7 @@ separately when the maintainer says so, not plan items.
 Source notes: C++26 side is the working draft [simd]; CFlat side is `doc/HPC.md` (simd section),
 `cflat/LLVMBackend_VariablesAndIR.cpp` (`CreateVectorOperation`), `cflat/MainListener_Expressions.cpp`
 (`ParseSimdStaticMethod`), `Test/test_hpc.cb`, `Test/errors/err_simd_*.cb`. Every CFlat claim marked "(probed)" was
-compiled with `x64/Release/cflat <file> --run` on master a3ff4fac; probes lived in `scratch/simd_cmp/` (deleted).
+compiled with `x64/Release/cflat <file> --run` on master 3deaad3e; probes lived in `scratch/simd_cmp/` (deleted).
 "keep" in the Direction column = CFlat's current shape is the right one for CFlat.
 
 ## 1. Type, width, element types

@@ -3568,6 +3568,7 @@ private:
     // return the moves are not dead: they are collected in loopBreakMovedStates_ and merged
     // back at loop exit, so a use-after-move past the loop is still diagnosed.
     bool straightLineJumped_ = false;
+    bool straightLineContinued_ = false;
 
     // Per-loop stack of moved-state snapshots taken at each break/continue inside the body.
     std::vector<std::vector<LLVMBackend::MovedStateSnapshot>> loopBreakMovedStates_;

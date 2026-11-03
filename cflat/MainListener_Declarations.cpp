@@ -14102,6 +14102,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && compiler->MoveSourceIsAddressBorrow(initializerSourceNV);
                         if (borrowedMoveSlotRefused)
                             compiler->LogBorrowedMoveSlotError();
+                        if (typeAndValue.Pointer && !typeAndValue.IsUnique
+                            && !typeAndValue.IsArrayView && initResultOwns
+                            && !borrowMoveKeepsBorrow && haveInitializerSourceNV)
+                            compiler->RecordUniqueOwnerLoopSink(initializerSourceNV,
+                                SpellType(*compiler, typeAndValue), name, false, false);
                         if (initResultOwns)
                         {
                             // ParseMoveExpression sets lastOwningResult unconditionally and records the

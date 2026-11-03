@@ -9,7 +9,7 @@ Spelled or substituted pointer depth >= 2 (`new int**[2]`, `new T*` with T = int
 new-pointer depth-cap diagnostic: the NamedVariable / TypeAndValue path has no carrier for a pointee that
 is itself a multi-level pointer. A real carrier would lift the cap.
 
-## Pre-existing, seen while verifying (master 4c796645)
+## Pre-existing, seen while verifying (master a9e82a96)
 
 - Plain `new T(v)` with T = int** loses a pointer level (no diagnostic).
 - `new const int*(&cx)` fails to parse.

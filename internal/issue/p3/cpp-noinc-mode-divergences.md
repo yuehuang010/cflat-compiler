@@ -1,7 +1,7 @@
 # Non-incremental C++ request mode still refuses what the incremental executor binds
 
 **Summary.** Keep `CFLAT_CPP_INCREMENTAL=0`; the fallback must bind what the default incremental executor binds.
-Both fallback crashes are fixed (GEP APInt width compare, landed 5feb5d63; Clang CodeGen over an error expression in a
+Both fallback crashes are fixed (GEP APInt width compare, landed 33e7a93c; Clang CodeGen over an error expression in a
 constructor member initializer, fixed with this issue's move to p3), so only refusals remain - p3 per the ruling.
 
 **Switch.** `UseCxxIncrementalRequests()` in `cflat/LLVMBackend_CInteropShared.h` reads `CFLAT_CPP_INCREMENTAL`: unset

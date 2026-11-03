@@ -56,8 +56,8 @@ Found: MIX7 r1 opus review, 2026-10-30 box 7, PRE-EXISTING (same on master). Pro
   into `const int&`, clang 2 / 6) are refused: cflat refuses the implicit narrowing/float->bool at a call (rulings
   2026-09-04 narrowing, 2026-10-13 float->int); decide before any change.
 - RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31), MIX18 constructor sets: a C++ CONSTRUCTOR follows the same
-  by-value-beats-const&-temporary rule as free functions, methods and operators (967d0a9a) and the MIX11 line at
-  LLVMBackend_Overloads.cpp ~4528 (dffcb4b7): `S(i)` with `S(const double&)` + `S(long)` picks `long`, `U(i)` with `U(const long&)` +
+  by-value-beats-const&-temporary rule as free functions, methods and operators (8f4e46c8) and the MIX11 line at
+  LLVMBackend_Overloads.cpp ~4528 (8f4e46c8): `S(i)` with `S(const double&)` + `S(long)` picks `long`, `U(i)` with `U(const long&)` +
   `U(double)` picks `double`; only an lvalue of exactly the referent type ties, and two const& temporaries stay ambiguous. CFlat decides
   such sets itself: the clang deferral (CxxConstructorNeedsClangResolution / CxxCtorForwardsScalarReference) and the numeric-off
   viability no longer apply to a scalar-reference candidate set;

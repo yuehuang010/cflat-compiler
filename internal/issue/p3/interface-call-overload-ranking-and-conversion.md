@@ -1,6 +1,6 @@
 # Interface-call overload residue after IFACEOVL + IFCONST
 
-IFACEOVL (483f3b83d) landed: interface method calls rank overloads exactly as a direct class call. IFCONST (2867b87d2) landed:
+IFACEOVL (483f3b83d) landed: interface method calls rank overloads exactly as a direct class call. IFCONST (5344802ed) landed:
 an unrelated object pointer to `{f(Pt*), f(Qt*)}` is refused on the interface path like the direct class call; on a const
 receiver only const-qualified overloads are viable on both paths (C++ rule); C++ pointer parents keep only pointee const.
 Repros scratch/repro_keep/ifaceovl/; direct = the same call on a class receiver.

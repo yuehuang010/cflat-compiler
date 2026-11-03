@@ -1,7 +1,7 @@
 # Mixed-class C++ conditional residue after MIXCOND3
 
 MIXCOND (af5834ad3) landed decl / sret / single-argument sink; MIXCOND2 (483f3b83d) the last argument of a multi-argument
-call, nested decl arm, F1 producer lifetime; MIXCOND3 (5ccce18eb, 2026-10-30) the converted B in caller-owned storage on the
+call, nested decl arm, F1 producer lifetime; MIXCOND3 (8844053c8, 2026-10-30) the converted B in caller-owned storage on the
 full-expression ledger, which routes operator / unary / cast operands, overloaded callees, not-last and named arguments
 through one path, hoists nested arm temps in place (either arm, unwind), and keeps callee-destroyed by-value sources and
 sinks off the caller ledger on the MS ABI (both ABIs gated). clang++ -std=c++20 / clang-cl oracle.

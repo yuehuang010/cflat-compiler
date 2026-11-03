@@ -757,6 +757,56 @@ std::string LoopDeclaredName(CFlatParser::DeclaratorContext* declarator)
         return {};
 }
 
+bool IsFirstIterationBreakCondition(LLVMBackend* compiler,
+                                    CFlatParser::SelectionStatementContext* selection)
+{
+        if (selection == nullptr || selection->expression() == nullptr) return false;
+        auto* condition = selection->expression();
+        std::string conditionText = condition->getText();
+        for (antlr4::tree::ParseTree* ancestor = selection->parent; ancestor != nullptr;
+             ancestor = ancestor->parent)
+        {
+            if (auto* nestedSelection = dynamic_cast<CFlatParser::SelectionStatementContext*>(ancestor);
+                nestedSelection != nullptr && nestedSelection->Switch() != nullptr)
+                return false;
+            auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(ancestor);
+            if (loop == nullptr) continue;
+            auto* forCondition = loop->forCondition();
+            if (forCondition == nullptr || forCondition->forDeclaration() == nullptr
+                || forCondition->forDeclaration()->initDeclaratorList() == nullptr)
+                return false;
+            for (auto* item : forCondition->forDeclaration()->initDeclaratorList()->initDeclarator())
+            {
+                const auto initial = item->initializer() != nullptr
+                    ? FoldCompileTimeInt(compiler, item->initializer()->assignmentExpression())
+                    : std::nullopt;
+                const std::string name = LoopDeclaredName(item->declarator());
+                if (name.empty() || !initial.has_value()) continue;
+                const std::string value = std::to_string(*initial);
+                if (conditionText == name + "==" + value || conditionText == value + "==" + name)
+                {
+                    const size_t conditionToken = selection->expression()->getStart()->getTokenIndex();
+                    bool priorUse = false;
+                    auto scan = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                        if (node == nullptr || priorUse) return;
+                        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+                        {
+                            auto* token = terminal->getSymbol();
+                            if (token->getText() == name && token->getTokenIndex() < conditionToken)
+                                priorUse = true;
+                            return;
+                        }
+                        for (auto* child : node->children) self(self, child);
+                    };
+                    scan(scan, loop->statement());
+                    if (!priorUse) return true;
+                }
+            }
+            return false;
+        }
+        return false;
+}
+
 bool LoopDeclarationHasName(CFlatParser::DeclarationContext* declaration, const std::string& name)
 {
         if (declaration == nullptr || declaration->initDeclaratorList() == nullptr) return false;
@@ -4676,6 +4726,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
             else if (jump->Continue())
             {
                 // continue re-tests the condition; an always-true condition never exits the loop there.
+                compiler->RecordOwnFlagLoopContinueState();
                 if (loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
                 {
                     RecordLoopExitMovedState();
@@ -4684,6 +4735,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // The jump skips later stores inside the loop: joins made there move out of it.
                 compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagLoopFrame);
                 straightLineJumped_ = true;
+                straightLineContinued_ = true;
                 compiler->CreateContinueCall();
                 return;
             }
@@ -4698,6 +4750,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 else
                 {
                     RecordLoopExitMovedState();
+                    compiler->RecordOwnFlagLoopBreakState();
                     compiler->RecordOwnFlagLoopExitState();
                 }
                 // The jump skips later stores inside the exited construct: joins made there move out of it.
@@ -4734,6 +4787,8 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
             // return in its body does not mark the enclosing straight-line as returned.
             ReturnFlagGuard returnFlagGuard(&straightLineReturned_);
             ReturnFlagGuard jumpFlagGuard(&straightLineJumped_);
+            ReturnFlagGuard continueFlagGuard(&straightLineContinued_);
+            straightLineContinued_ = false;
             // do-while runs its body once; while/for/for-in may run zero times unless the condition is
             // a literal true (such a loop exits only through break).
             bool loopMayRunZero = false;
@@ -5978,19 +6033,23 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // to dead code after a return that would hide the ret terminator from a block check.
                 bool enclosingReturned = straightLineReturned_;
                 bool enclosingJumped = straightLineJumped_;
+                bool enclosingContinued = straightLineContinued_;
 
                 compiler->InitializeBlock(blockTrue, false);
                 straightLineReturned_ = false;
                 straightLineJumped_ = false;
+                straightLineContinued_ = false;
                 ParseControlledBody(innerStatement[0]);
                 bool thenReturned = straightLineReturned_ || straightLineJumped_;
                 bool thenJumped = straightLineJumped_;
+                bool thenContinued = straightLineContinued_;
                 auto thenMovedState = compiler->SaveMovedState();
                 auto thenOwnFlagState = compiler->SaveOwnFlagJoinState();
 
                 compiler->CreateBlockBreak(blockResume, true);
 
                 bool elseReturned = false;
+                bool elseContinued = false;
                 if (blockElse != nullptr)
                 {
                     // Restore pre-branch moved state so else doesn't inherit if-branch moves.
@@ -6001,8 +6060,10 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     compiler->InitializeBlock(blockElse, true);
                     straightLineReturned_ = false;
                     straightLineJumped_ = false;
+                    straightLineContinued_ = false;
                     ParseControlledBody(innerStatement[1]);
                     elseReturned = straightLineReturned_ || straightLineJumped_;
+                    elseContinued = straightLineContinued_;
                     auto elseMovedState = compiler->SaveMovedState();
                     auto elseOwnFlagState = compiler->SaveOwnFlagJoinState();
                     compiler->CreateBlockBreak(blockResume, true);
@@ -6043,7 +6104,10 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     // then-branch, so an exiting (return/break/continue) then-branch contributes
                     // no moves here. A break/continue's moves rejoin at loop exit instead.
                     compiler->RestoreMovedState(preIfMovedState);
-                    if (thenJumped)
+                    if (thenJumped && (thenContinued
+                        || (compiler->RetainLoopBreakBorrowState()
+                            && !(compiler->RetainCurrentLoopBreakBorrowState()
+                                && IsFirstIterationBreakCondition(compiler, selectionStatement)))))
                     {
                         // Preserve loop re-anchoring from break/continue paths. The branch does
                         // not reach this merge, but it can skip a later re-own on another iteration.
@@ -6072,6 +6136,9 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     || (blockElse != nullptr && thenReturned && elseReturned);
                 straightLineJumped_ = enclosingJumped
                     || (blockElse != nullptr && thenReturned && elseReturned);
+                straightLineContinued_ = enclosingContinued
+                    || (blockElse != nullptr && thenReturned && elseReturned
+                        && thenContinued && elseContinued);
 
                 // resume
                 compiler->InitializeBlock(blockResume, false);

@@ -6652,6 +6652,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 const std::string sourceName = rightNV.CallerName.empty()
                     ? compiler->FindVariableNameByStorage(rightNV.Storage)
                     : rightNV.CallerName;
+                compiler->RecordUniqueOwnerLoopSink(rightNV,
+                    SpellType(*compiler, namedVar.TypeAndValue), namedVar.CallerName, true, false);
                 rightNV.IsOwning = false;
                 rightNV.BorrowsOwningLocal = true;
                 assignmentBorrowsOwningLocal = true;
@@ -10535,7 +10537,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // once a borrow reached it (ActivateParamOwnFlag), so this finds it in the argument frames.
                     auto* viewLocal = compiler->FindStackVariableByStorage(namedVar.Storage);
                     if (viewLocal == nullptr)
+                    {
                         viewLocal = compiler->FindStackArgumentByStorage(namedVar.Storage);
+                        if (viewLocal != nullptr && viewLocal->IsOwning
+                            && !viewLocal->OwnFlagActive)
+                            compiler->ActivateParamOwnFlag(*viewLocal);
+                    }
                     if (viewLocal != nullptr)
                         compiler->EmitOwnedPtrRelease(
                             *viewLocal, right,
@@ -10745,6 +10752,23 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // A plain pointer local adopts an owned new/move/call result at assignment, just as
             // declaration-init does. Borrowed named-pointer stores never reach this gate.
             // `p = q` from an owning pointer local nulled q above, so p is now the owner.
+            if (operatorText == "="
+                && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty())
+                    || rightNV.IsExplicitMove || rightNV.TypeAndValue.IsMove)
+                && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
+                && !namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.IsInterface
+                && namedVar.FieldName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination)))
+            {
+                std::string sinkName = namedVar.CallerName.empty()
+                    ? compiler->FindVariableNameByStorage(destination) : namedVar.CallerName;
+                if (sinkName.empty())
+                    for (const auto& [globalName, globalStorage] : compiler->globalNamedVariable)
+                        if (globalStorage == destination) { sinkName = globalName; break; }
+                compiler->RecordUniqueOwnerLoopSink(rightNV,
+                    SpellType(*compiler, namedVar.TypeAndValue), sinkName, true, false);
+            }
             if (operatorText == "="
                 && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty()))
                 && (!destinationHadBorrowProvenance

@@ -11555,6 +11555,8 @@ void LLVMBackend::RecordAssignBorrow(const std::string& name, const std::string&
             nv->BorrowedUniqueFieldViaCall = uniqueFieldViaCall;
             nv->BorrowedThroughField = throughField;
             nv->AssignBorrowBlock = builder->GetInsertBlock();
+            if (nv->Storage != nullptr)
+                assignBorrowLoopDepth_[nv->Storage] = ownFlagLoopReownSnapshots_.size();
             return;
         }
     }
@@ -11642,8 +11644,8 @@ void LLVMBackend::SetStackCharBufferBorrow(const std::string& name, bool value,
 bool LLVMBackend::RetireAssignBorrow(const std::string& name, llvm::BasicBlock* statementBlock)
 {
         if (name.empty()) return false;
-        // The store's STATEMENT block, when the caller captured it: an owning RHS such as `new` may
-        // split blocks internally, but the store itself still runs on every path from the statement.
+        // The statement block proves same-statement retirement; loop depth also allows a fresh
+        // owning store after an inner-loop join, without crossing a possibly-zero-trip loop.
         llvm::BasicBlock* here = statementBlock != nullptr ? statementBlock : builder->GetInsertBlock();
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -11653,7 +11655,22 @@ bool LLVMBackend::RetireAssignBorrow(const std::string& name, llvm::BasicBlock* 
             else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
                 nv = &it2->second;
             if (nv == nullptr) continue;
-            if (nv->AssignBorrowBlock == nullptr || nv->AssignBorrowBlock != here)
+            auto borrowLoopDepth = assignBorrowLoopDepth_.find(nv->Storage);
+            const bool nonMoveUniqueSink = std::ranges::any_of(
+                ownFlagLoopReownSnapshots_, [&](const auto& loop) {
+                    return std::ranges::any_of(loop.uniqueOwnerSinks, [&](const auto& sink) {
+                        return sink.Storage == nv->Storage && sink.IsUnique && !sink.IsMove;
+                    }) || std::ranges::any_of(loop.moveOwnerSinks, [&](const auto& sink) {
+                        return sink.Storage == nv->Storage;
+                    });
+                });
+            const bool sameLoopDepth = !nonMoveUniqueSink
+                && borrowLoopDepth != assignBorrowLoopDepth_.end()
+                && borrowLoopDepth->second != 0
+                && borrowLoopDepth->second == ownFlagLoopReownSnapshots_.size()
+                && !ownFlagLoopReownSnapshots_.back().borrowedContinueStorages.contains(nv->Storage);
+            if (nv->AssignBorrowBlock == nullptr
+                || (nv->AssignBorrowBlock != here && !sameLoopDepth))
                 return false;
             nv->IsBorrowed = false;
             nv->BorrowedOrigin.clear();
@@ -11665,6 +11682,7 @@ bool LLVMBackend::RetireAssignBorrow(const std::string& name, llvm::BasicBlock* 
             nv->OwningLocalStorage = nullptr;
             nv->OwningLocalBorrowAfterRebind = false;
             nv->AssignBorrowBlock = nullptr;
+            assignBorrowLoopDepth_.erase(nv->Storage);
             return true;
         }
         return false;

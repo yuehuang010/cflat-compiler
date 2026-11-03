@@ -6,7 +6,7 @@ lifetime extension, `{ r = move x }`, and nested aggregates landed in REFMEM (1c
 clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch/repro_keep/t47/.
 
 1. Positional base/member-aggregate reference members landed REFBASE (ef83ffa02). The array alias residue landed REFRES
-   (be42f0234): 1-D and 2-D arrays, fixed-array fields, and globals now preserve aliases in brace-elided and fully braced forms.
+   (5344802ed): 1-D and 2-D arrays, fixed-array fields, and globals now preserve aliases in brace-elided and fully braced forms.
    Remaining pre-existing residue found by the REFBASE reviews (master behaves the same): a C++ class prvalue element
    (`T(3)`) into an aggregate member inside an elided range makes an extra copy + destroy (CFlat 127458969, clang 1274569);
    a converting element into a class-type member inside an elided range runs the ctor after later elements
