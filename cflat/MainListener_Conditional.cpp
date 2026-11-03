@@ -67,6 +67,17 @@ bool MainListener::RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpre
         return true;
     }
 
+// A parenthesized `?:` arm returns the join just parsed by value: that join's element-borrow fact
+// (set on lastTernaryJoinShape by ParseTernaryBranches) carries over to the arm.
+static void CarryNestedTernaryBorrow(LLVMBackend* compiler, LLVMBackend::TypedValue& tv)
+{
+    const auto& nested = compiler->lastTernaryJoinShape;
+    if (tv.value == nullptr || tv.value != nested.value || !nested.borrowsOwnedElement) return;
+    tv.borrowsOwnedElement = true;
+    tv.borrowedElementExternallyOwned = nested.borrowedElementExternallyOwned;
+    tv.ownedElementContainer = nested.ownedElementContainer;
+}
+
 // A ternary arm parsed for its VALUE. Same lowering as ParseExpression (which forwards a
 // non-assignment expression straight to ParseConditionalExpression), but it keeps the arm's
 // signedness so the join can zero-extend an unsigned arm instead of sign-extending it.
@@ -80,6 +91,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryArmExpression(
         {
             auto tv = ParseConditionalExpression(assignCtx->conditionalExpression());
             ProcessPlusPlus();
+            CarryNestedTernaryBorrow(Compiler(ctx), tv);
             return tv;
         }
         if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr
@@ -91,6 +103,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryArmExpression(
         LLVMBackend::TypedValue tv;
         tv.value = ParseExpression(ctx);
         tv.isAlias = tv.value != nullptr && Compiler(ctx)->IsAliasValue(tv.value);
+        CarryNestedTernaryBorrow(Compiler(ctx), tv);
         return tv;
 }
 
@@ -1956,6 +1969,33 @@ static LLVMBackend::TypeAndValue TernaryLambdaArmHint(const LLVMBackend::TypeAnd
     return slot;
 }
 
+// An arm reads a container-owned element: the predicate the declaration and assignment paths apply to a
+// named source, read off the arm's own type (a nested ?: arm carries it on its TypedValue).
+static bool ArmBorrowsOwnedElement(LLVMBackend* compiler, const LLVMBackend::TypedValue& shape)
+{
+    if (shape.borrowsOwnedElement) return true;
+    if (!shape.hasSourceType) return false;
+    const auto& type = shape.sourceType;
+    if (type.IsBorrowOfAliasElement) return true;
+    return type.IsAlias && !type.IsMove && compiler->IsCoreUniqueType(type.TypeName);
+}
+
+// A `?:` / `??` join of two operands borrows an element when either operand does; the container
+// is named by that operand (the first one when both do). The other operand may be a fresh `new`.
+static void JoinElementBorrow(LLVMBackend* compiler, LLVMBackend::TypedValue& result,
+    const LLVMBackend::TypedValue& first, const LLVMBackend::TypedValue& second)
+{
+    const bool firstElem = ArmBorrowsOwnedElement(compiler, first);
+    if (!firstElem && !ArmBorrowsOwnedElement(compiler, second)) return;
+    const auto& elem = firstElem ? first : second;
+    result.borrowsOwnedElement = true;
+    result.borrowedElementExternallyOwned = elem.borrowedElementExternallyOwned
+        || (elem.hasSourceType && elem.sourceType.IsBorrowOfAliasElement);
+    result.ownedElementContainer = elem.borrowsOwnedElement ? elem.ownedElementContainer
+        : !elem.sourceType.ParentVariableName.empty() ? elem.sourceType.ParentVariableName
+        : elem.sourceCallerName;
+}
+
 // The `?:` an arm is, looking through parentheses: `a ? X : (b ? Y : Z)` nests a claim on the
 // declaration slot, which a plain operand (not a `?:`) must pass on rather than consume.
 
@@ -1975,6 +2015,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         joined.ownedCallArms = ownedCallArms;
         Compiler(ctx)->lastTernaryJoinValue = joined.value;
         Compiler(ctx)->lastTernaryJoinArms = ownedCallArms;
+        Compiler(ctx)->lastTernaryJoinShape = joined;
         return joined;
 }
 
@@ -2049,6 +2090,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     return TypedValueOfNamedOperand(named, arm);
                 }
             auto value = ParseConditionalExpression(arm, nestedArmUse(arm));
+            CarryNestedTernaryBorrow(compiler, value);
             if (isFunctionValueDestination(destination) && value.value != nullptr
                 && value.value->getType()->isPointerTy()
                 && compiler->IsNullFunctionSlotJoin(value.value))
@@ -4311,7 +4353,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             && (!structJoin || anyFieldArm);
         if (lowerUniqueFieldJoin)
         {
-            auto joinOwnedArm = [&](llvm::Value*& value, llvm::Value* storage, llvm::BasicBlock* block) {
+            auto joinOwnedArm = [&](llvm::Value*& value, llvm::Value* storage, llvm::BasicBlock*& block) {
                 const std::string nullKey = compiler->UniqueFieldReadNullKey(value);
                 if (!isCoreUniqueStructValue(value))
                 {
@@ -4320,6 +4362,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     return;
                 }
                 lowerCoreUniqueField(value, storage, block, nullKey);
+                // The get() call may be an invoke that splits the arm: track its new end.
+                block = compiler->builder->GetInsertBlock();
             };
             if (trueOwnedArm) joinOwnedArm(trueValue, trueStorage, trueEnd);
             if (falseOwnedArm) joinOwnedArm(falseValue, falseStorage, falseEnd);
@@ -4981,6 +5025,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             : closureJoinOwnsArms ? phi : CloneTernaryClosureValue(phi, ctx);
         if (closureJoinOwnsArms) compiler->RegisterOwnedClosureTemp(phi);
         LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
+        // A join reading a container-owned element borrows it, whichever arm is the fresh one: the
+        // `new` arm does not make the join owning, so the element arm's fact is carried through.
+        JoinElementBorrow(compiler, result, trueShape, falseShape);
         result.isAlias = (trueAlias || falseAlias) && !cxxRefBorrowJoin;
         // A join is an explicit move only when every arm is one: `cond ? move a : b` stays a borrow.
         result.isExplicitMove = trueShape.isExplicitMove && falseShape.isExplicitMove;
@@ -5337,6 +5384,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     return TypedValueOfNamedOperand(named, arm);
                 }
             auto value = ParseConditionalExpression(arm, use);
+            CarryNestedTernaryBorrow(compiler, value);
             if (isFunctionValueDestination(destination) && value.value != nullptr
                 && value.value->getType()->isPointerTy()
                 && compiler->IsNullFunctionSlotJoin(value.value))
@@ -5491,6 +5539,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 lhsOcc = armScope.Id;
                 lhsTv = ParseLogicalOrExpression(logicCtx, ResultUse::Value);
+                CarryNestedTernaryBorrow(compiler, lhsTv);
                 lhs = lhsTv.value;
             }
             if (!lhs) return {};
@@ -5545,8 +5594,37 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         [](const auto& field) { return field.VariableName == "_p"; });
                 }
             }
+            // An owning unique LOCAL or FIELD lhs joins as a raw pointer, like a '?:' arm; the
+            // destination nulls its slot on the taken path only, a raw destination borrows it.
+            // A unique struct value (not an interface) with a storage slot and no explicit move.
+            auto ownedUniqueShape = [&](llvm::Value* value, llvm::Value* storage,
+                                        const LLVMBackend::TypedValue& shape) {
+                auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+                    value == nullptr ? nullptr : value->getType());
+                if (st == nullptr || !st->hasName() || !compiler->IsCoreUniqueType(st->getName().str())
+                    || storage == nullptr || shape.isExplicitMove)
+                    return false;
+                // An interface unique<I> keeps its struct shape (a named interface argument).
+                return !compiler->IsInterfaceType(MangledGenericArgument(*compiler, st->getName().str()));
+            };
+            // Shared by both arms: a unique struct value whose storage is an owning local.
+            auto owningUniqueLocal = [&](llvm::Value* value, llvm::Value* storage,
+                                         const LLVMBackend::TypedValue& shape) {
+                if (!ownedUniqueShape(value, storage, shape)) return false;
+                const std::string localName = compiler->FindVariableNameByStorage(storage);
+                const auto* local = compiler->FindVariableByStorage(storage);
+                return local != nullptr && !localName.empty() && localName.find('.') == std::string::npos
+                    && !local->IsBorrowed && !local->IsAliasBorrow && !local->TypeAndValue.IsAlias;
+            };
+            // An owning unique FIELD lhs (`o.p`) takes the same raw arm: only the taken path nulls it.
+            // A field reached through a borrowed `this` keeps the struct join (T466 pins its sink).
+            const bool uniqueFieldJoin = !moveUniquePointerJoin && lhsUniqueFieldRead
+                && !lhsTv.sourceRootIsBorrowedThisField && ownedUniqueShape(lhs, lhsStorage, lhsTv);
+            const bool localUniqueJoin = !moveUniquePointerJoin && !lhsUniqueFieldRead
+                && owningUniqueLocal(lhs, lhsStorage, lhsTv);
+            const bool rawUniqueJoin = uniqueFieldJoin || localUniqueJoin;
             llvm::Type* resultType = lhs->getType();
-            if (moveUniquePointerJoin)
+            if (moveUniquePointerJoin || rawUniqueJoin)
             {
                 auto* lhsStruct = llvm::cast<llvm::StructType>(lhs->getType());
                 const auto& uniqueData = compiler->GetDataStructure(lhsStruct->getName().str());
@@ -5595,11 +5673,29 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     lhsStorage = nullptr;
                 }
             }
+            if (rawUniqueJoin)
+            {
+                // Raw `get` arm: the destination's implicit move nulls the slot on this path. A field
+                // arm keeps its read's null key, so a deref after the join is refused as maybe-moved.
+                const std::string lhsNullKey = compiler->UniqueFieldReadNullKey(lhs);
+                auto* lhsStruct = llvm::cast<llvm::StructType>(lhs->getType());
+                LLVMBackend::NamedVariable receiver;
+                receiver.Primary = lhs;
+                receiver.Storage = lhsStorage;
+                receiver.BaseType = lhsStruct;
+                receiver.TypeAndValue.TypeName = lhsStruct->getName().str();
+                LLVMBackend::TypeAndValue rawType;
+                rawType.TypeName = MangledGenericArgument(*compiler, receiver.TypeAndValue.TypeName);
+                rawType.Pointer = true;
+                lhs = compiler->CreateCoreUniqueRawPointerCall(receiver, rawType);
+                compiler->RegisterUniqueFieldRead(lhs, lhsStorage, lhsNullKey);
+            }
             // A named-function LHS becomes its thin pointer before the join store (thin result only).
             if (resultAlloca->getAllocatedType()->isPointerTy())
                 lhs = compiler->BareFunctionToThinValue(lhs, nullptr);
             compiler->CreateAssignment(lhs, resultAlloca);
-            if (lhsUniqueFieldRead)
+            // A struct-join field lhs (an interface field, an explicit move) is still cleared here.
+            if (lhsUniqueFieldRead && !rawUniqueJoin)
                 clearUniqueFieldRead(lhs, lhsStorage);
             compiler->builder->CreateStore(
                 compiler->IsRawArrayResult(lhs)
@@ -5726,6 +5822,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     rhsAlias = compiler->IsAliasValue(rhs);
                     rhsTempField = compiler->IsTempFieldValue(rhs);
                 }
+                // An owning unique LOCAL rhs joins like the lhs local: its slot is a join source.
+                const bool rhsOwnedLocal = !moveUniquePointerJoin && !rhsUniqueFieldRead
+                    && owningUniqueLocal(rhs, rhsStorage, rhsShape);
                 // A raw-pointer coalesce result observes a desugared unique field on its RHS.
                 if (rhs != nullptr && resultAlloca->getAllocatedType()->isPointerTy())
                 {
@@ -5733,6 +5832,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     if (rhsStruct != nullptr && rhsStruct->hasName()
                         && compiler->IsCoreUniqueType(rhsStruct->getName().str()))
                     {
+                        const std::string rhsNullKey = compiler->UniqueFieldReadNullKey(rhs);
                         LLVMBackend::NamedVariable receiver;
                         receiver.Primary = rhs;
                         receiver.Storage = rhsStorage;
@@ -5751,10 +5851,13 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                             compiler->RegisterOwningTempUniqueField(rhs);
                         // The raw read keeps the field slot as its source, so the join records it and
                         // the destination's implicit move (not this join) nulls it when it is consumed.
-                        if (rhsUniqueFieldRead)
-                            compiler->RegisterUniqueFieldRead(rhs, rhsStorage);
+                        if (rhsUniqueFieldRead || rhsOwnedLocal)
+                            compiler->RegisterUniqueFieldRead(rhs, rhsStorage, rhsNullKey);
                     }
                 }
+                // A struct join (a unique field lhs) keeps the struct rhs: its slot is still the source.
+                else if (rhsOwnedLocal)
+                    compiler->RegisterUniqueFieldRead(rhs, rhsStorage);
                 // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
                 // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
                 // branch block does dominate the resume, so struct temps hoist there instead.
@@ -5907,6 +6010,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 }
             }
             LLVMBackend::TypedValue result{ joined, false };
+            JoinElementBorrow(compiler, result, lhsTv, rhsShape);
             // Both arms named one raw pointer shape: the '??' join carries it like a '?:' join.
             JoinTernaryPointerShape(result, lhsTv, rhsShape);
             JoinTernaryClassPointee(result, lhsTv, rhsShape);
@@ -5950,7 +6054,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         markThisSources(firstThisSource);
                         return;
                     }
+                    // A unique field arm is a join source below (FindUniqueFieldReadJoin), with its null key.
                     if (value == nullptr || storage == nullptr || !value->getType()->isPointerTy()
+                        || compiler->IsUniqueFieldReadValue(value)
                         || (shape.sourceFieldName.empty() && !shape.sourceRootIsBorrowedThisField)
                         || shape.sourceIsElementAccess)
                         return;
@@ -6376,6 +6482,8 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
 
             LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
             auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
+            // Tag for the null-state walker: only these compiler slots carry condition temps.
+            resultStorage->setName("cond.or");
             auto resumeBlock = compiler->CreateBasicBlock("resumeOR");
             llvm::BasicBlock* logicStart = nullptr;   // dominates every operand and the resume
 
@@ -6460,6 +6568,8 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
 
             LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
             auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
+            // Tag for the null-state walker: only these compiler slots carry condition temps.
+            resultStorage->setName("cond.and");
             auto resumeBlock = compiler->CreateBasicBlock("resumeAND");
             llvm::BasicBlock* logicStart = nullptr;   // dominates every operand and the resume
 

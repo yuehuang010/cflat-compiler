@@ -3,6 +3,8 @@
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include "CxxSpelling.h"
+#include "LLVMBackend_CInteropShared.h"
 #include "MainListener_ExpressionsShared.h"
 bool MainListener::CastTypeNameNamesValue(CFlatParser::CastTypeNameContext* typeName) {
         if (typeName == nullptr || typeName->typeQualifier() != nullptr
@@ -2850,10 +2852,10 @@ llvm::Value* MainListener::LoadNamedVariableImpl(LLVMBackend::NamedVariable& nam
         auto* compiler = Compiler();
         // Every value read of a named local. A dereference site records its Deref event BEFORE
         // calling this, so the read below cannot swallow its own check (see RecordNullRead).
-        compiler->RecordNullRead(namedVar.CallerName);
+        compiler->RecordNullRead(namedVar.CallerName, namedVar.Storage, namedVar.Primary);
         // A consumed `unique` field path reads as null; the read is a guard for its null state.
         if (std::string key = compiler->UniqueFieldNullKey(namedVar); !key.empty())
-            compiler->RecordNullRead(key);
+            compiler->RecordNullRead(key, namedVar.Storage, namedVar.Primary);
         if (namedVar.TypeAndValue.Pointer)
         {
             if (namedVar.Primary != nullptr)
@@ -3004,6 +3006,8 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         llvm::Value* freeOperandStorage = operandStorage != nullptr ? operandStorage : readOnlyStorage;
         if (compiler->IsCxxRecord(typeName))
             compiler->EnsureCxxMemberProjected(typeName, opName);
+        if (compiler->IsCxxRecord(typeName) && !UseCxxIncrementalRequests())
+            compiler->TryBindRefusedCxxMember(typeName, opName);
         if (!compiler->GetFunction(opName))
             return TryUnaryFreeOperatorOverload(operand, op, ctx, freeOperandStorage,
                                                 constOperand || constPrvalue,

@@ -649,6 +649,10 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 result.JoinClassPointee = tv.joinClassPointee;
                 result.JoinClassPointeeDepth = tv.joinClassPointeeDepth;
                 result.TypeAndValue.IsAlias = tv.isAlias;
+                // A `?:` join reading a container-owned element (see TypedValue::borrowsOwnedElement).
+                result.BorrowsOwnedElement = tv.borrowsOwnedElement;
+                result.BorrowedElementExternallyOwned = tv.borrowedElementExternallyOwned;
+                result.OwnedElementContainer = tv.ownedElementContainer;
                 result.IsRvalue = tv.isRvalue;
                 result.IsCxxPrvalueConditional = tv.isCxxPrvalueConditional;
                 result.IsPointerArithmeticResult = tv.isPointerArithmeticResult;
@@ -2606,6 +2610,8 @@ static PointerValueRootKind PointerValueRootImpl(llvm::Value* value, LLVMBackend
                                     == rightCall->getArgOperand(i)->stripPointerCasts();
                         if (sameArguments) return true;
                     }
+                    // A single-store resolution can yield a non-pointer value: it is no address.
+                    if (!left->getType()->isPointerTy() || !right->getType()->isPointerTy()) return false;
                     int64_t leftOffset = 0;
                     int64_t rightOffset = 0;
                     const llvm::Value* leftBase = llvm::GetPointerBaseWithConstantOffset(
@@ -2627,7 +2633,9 @@ static PointerValueRootKind PointerValueRootImpl(llvm::Value* value, LLVMBackend
                         auto* rightConstant = llvm::dyn_cast<llvm::ConstantInt>(*rightIndex);
                         if (leftConstant != nullptr && rightConstant != nullptr)
                         {
-                            if (leftConstant->getValue() != rightConstant->getValue()) return false;
+                            // GEP indices may differ in width (i32 vs i64): compare values, not APInts.
+                            if (!llvm::APInt::isSameValue(leftConstant->getValue(), rightConstant->getValue()))
+                                return false;
                         }
                         else if (!sameIndex(*leftIndex, *rightIndex)) return false;
                     }
@@ -7548,6 +7556,113 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (srcIsOwnedForCoreUnique || sourceIsUniqueField || nullSource || unprovenRawValue)
                 {
                     LLVMBackend::NamedVariable resetArg = rightNV;
+                    bool rangeSlotJoin = false;
+                    if (rightNV.Storage == nullptr)
+                    {
+                        // A join may adopt a foreach slot's element. Elements are unique, so the slot holds the
+                        // adopted pointer exactly when this path took that element: clear it here, at the
+                        // adoption point, with a select. Producer arms never null a slot, so an earlier join
+                        // whose arm is not the one adopted cannot release it.
+                        auto traceSlotSource = [](auto&& self, llvm::Value* value, llvm::Value* slot,
+                                                  std::vector<llvm::Value*>& visited) -> bool {
+                            if (value == nullptr || std::ranges::find(visited, value) != visited.end())
+                                return false;
+                            visited.push_back(value);
+                            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                            {
+                                llvm::Value* source = load->getPointerOperand();
+                                if (source == slot) return true;
+                                bool found = false;
+                                for (auto* user : source->users())
+                                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                                        store != nullptr && store->getPointerOperand() == source)
+                                        found = self(self, store->getValueOperand(), slot, visited) || found;
+                                return found;
+                            }
+                            bool found = false;
+                            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                            {
+                                for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+                                    found = self(self, phi->getIncomingValue(i), slot, visited) || found;
+                            }
+                            else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                            {
+                                found = self(self, select->getTrueValue(), slot, visited) || found;
+                                found = self(self, select->getFalseValue(), slot, visited) || found;
+                            }
+                            return found;
+                        };
+                        llvm::Value* adopted = right;
+                        if (auto* structType = llvm::dyn_cast_or_null<llvm::StructType>(adopted->getType());
+                            structType != nullptr && structType->getNumElements() == 1)
+                            adopted = compiler->builder->CreateExtractValue(adopted, 0);
+                        std::vector<llvm::Value*> adoptedSlots;
+                        for (const auto& range : rangeForStack_)
+                        {
+                            if (range.elementStorage == nullptr) continue;
+                            std::vector<llvm::Value*> visited;
+                            if (!traceSlotSource(traceSlotSource, right, range.elementStorage, visited))
+                                continue;
+                            // Fixed arrays and views never move their elements: the bound address stays valid.
+                            if (range.isFixedArray || range.isArrayView)
+                            {
+                                adoptedSlots.push_back(range.elementStorage);
+                                continue;
+                            }
+                            // Live slot = data[index] now; only the adopting path reads the container.
+                            // Other collections keep master's behaviour (no clear).
+                            if (range.headerDataField < 0 || range.headerSizeField < 0
+                                || range.collectionStorage == nullptr || range.indexStorage == nullptr
+                                || range.elementValue == nullptr)
+                                continue;
+                            auto* headerType = range.collection.BaseType;
+                            auto* iterValue = range.elementValue;
+                            auto* nullPtr = llvm::ConstantPointerNull::get(compiler->builder->getPtrTy());
+                            auto* adoptsElement = compiler->builder->CreateAnd(
+                                compiler->builder->CreateICmpEQ(adopted, iterValue),
+                                compiler->builder->CreateICmpNE(iterValue, nullPtr));
+                            auto* standIn = compiler->CreateAlloca(headerType);
+                            compiler->builder->CreateStore(llvm::Constant::getNullValue(headerType), standIn);
+                            auto* header = compiler->builder->CreateSelect(
+                                adoptsElement, range.collectionStorage, standIn, "adoptheader");
+                            auto* dataSlot = compiler->CreateStructGEP(headerType, header,
+                                (unsigned)range.headerDataField);
+                            auto* liveData = compiler->builder->CreateLoad(
+                                compiler->builder->getPtrTy(), dataSlot, "liverangedata");
+                            auto* sizeSlot = compiler->CreateStructGEP(headerType, header,
+                                (unsigned)range.headerSizeField);
+                            auto* liveSize = compiler->builder->CreateLoad(
+                                compiler->builder->getInt32Ty(), sizeSlot, "liverangesize");
+                            auto* index = compiler->builder->CreateLoad(
+                                compiler->builder->getInt32Ty(), range.indexStorage, "liverangeindex");
+                            auto* inRange = compiler->builder->CreateICmpSLT(index, liveSize);
+                            auto* index64 = compiler->builder->CreateZExt(index, compiler->builder->getInt64Ty());
+                            auto* livePtr = compiler->builder->CreateGEP(
+                                range.elementBaseType, liveData, index64, "liverangeelem");
+                            auto* scratch = compiler->CreateAlloca(compiler->builder->getPtrTy());
+                            adoptedSlots.push_back(compiler->builder->CreateSelect(inRange, livePtr, scratch));
+                        }
+                        if (adopted->getType()->isPointerTy())
+                        {
+                            for (llvm::Value* slot : adoptedSlots)
+                            {
+                                llvm::Value* current = compiler->builder->CreateLoad(adopted->getType(), slot);
+                                llvm::Value* cleared = llvm::ConstantPointerNull::get(
+                                    llvm::cast<llvm::PointerType>(adopted->getType()));
+                                llvm::Value* same = compiler->builder->CreateICmpEQ(current, adopted);
+                                compiler->builder->CreateStore(
+                                    compiler->builder->CreateSelect(same, cleared, current), slot);
+                                rangeSlotJoin = true;
+                            }
+                        }
+                    }
+                    // A foreach binding aliases a live slot; pass its loaded value, not its address.
+                    if ((rightNV.IsRangeForBorrow && rightNV.Storage != nullptr) || rangeSlotJoin)
+                    {
+                        resetArg.Primary = right;
+                        resetArg.Storage = nullptr;
+                        resetArg.TypeAndValue.IsMove = true;
+                    }
                     // An adopted '?:' join owns its arms (the if/else join is named): the reset sees it owned.
                     if (uniquePointerJoinOwns) resetArg.IsOwning = true;
                     if (unprovenRawValue)
@@ -10777,11 +10892,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
                     && !rightNV.TypeAndValue.IsMove);
                 bool rhsBorrowsElem = (rightNV.TypeAndValue.IsBorrowOfAliasElement
-                    || coreUniqueElementBorrow) && !compiler->lastOwningResult;
-                bool rhsExternallyOwned = rightNV.TypeAndValue.IsBorrowOfAliasElement
+                    || coreUniqueElementBorrow || rightNV.BorrowsOwnedElement) && !compiler->lastOwningResult;
+                bool rhsExternallyOwned = (rightNV.TypeAndValue.IsBorrowOfAliasElement
+                    || (rightNV.BorrowsOwnedElement && rightNV.BorrowedElementExternallyOwned))
                     && !compiler->lastOwningResult;
                 std::string container = rightNV.TypeAndValue.ParentVariableName.empty()
                     ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
+                if (rightNV.BorrowsOwnedElement && !rightNV.OwnedElementContainer.empty())
+                    container = rightNV.OwnedElementContainer;
                 if (rhsBorrowsElem || coalesceResume == nullptr)
                     compiler->SetVariableBorrowsOwnedElement(namedVar.CallerName, rhsBorrowsElem, container, rhsExternallyOwned);
             }

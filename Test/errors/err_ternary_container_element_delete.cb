@@ -1,0 +1,192 @@
+import "list.cb";
+
+struct B { int v = 7; ~B() {} };
+
+expect_error("borrows an element that its container owns") {
+    void ternaryElementDeclaration(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = c ? items.get(0) : new B();
+        delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void ternaryElementAssignment(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B();
+        b = c ? items.get(0) : new B();
+        delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void nestedTernaryElement(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = c ? (d ? items.get(0) : new B()) : new B();
+        delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void falseArmElement(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = c ? new B() : items.get(0);
+        delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void falseArmNestedElement(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = c ? new B() : (d ? new B() : items.get(0));
+        delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void coalesceTernaryElement(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = (c ? items.get(0) : new B()) ?? new B();
+        delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void reborrowElseDelete(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = items.get(0);
+        if (c) { b = items.get(0); } else { delete b; }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void reborrowReturnDelete(bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = items.get(0);
+        if (d) { b = items.get(0); return; }
+        delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void switchReborrowDelete(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = items.get(0);
+        switch (c) { case true: b = items.get(0); break; default: delete b; break; }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void killThenReborrowElseDelete(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = items.get(0);
+        if (c) { b = new B(); b = items.get(0); } else { delete b; }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void continueElseDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); int i = 0; while (i < 2) { if (i++ == 0) { b = items.get(0); continue; } else { delete b; break; } }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void breakExitDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); while (c) { b = items.get(0); break; } delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void switchFallthroughDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); switch (c) { case true: b = items.get(0); default: delete b; break; }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void coalesceJoinDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = (c ? items.get(0) : new B()) ?? new B(); delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void reborrowThenKillSameDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = items.get(0); if (c) { b = items.get(0); b = new B(); } delete b;
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void loopElseDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); int i = 0; while (i < 2) { if (i == 0) { b = items.get(0); } else { delete b; } i++; }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void doElseDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); int i = 0; do { if (i == 0) { b = items.get(0); } else { delete b; } i++; } while (i < 2);
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void forElseDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); for (int i = 0; i < 2; i++) { if (i == 0) { b = items.get(0); } else { delete b; } }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void loopSwitchDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); for (int i = 0; i < 2; i++) { switch (i) { case 0: b = items.get(0); break; default: delete b; break; } }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void loopLateBorrowDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); int i = 0; while (i < 2) { if (i == 1) { delete b; } b = items.get(0); i++; }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void deleteThenBorrowLoop(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); int i = 0; while (i < 2) { delete b; b = items.get(0); i++; }
+    }
+}
+
+expect_error("borrows an element that its container owns") {
+    void reviewGo() { return { delete b; }; }
+    void inlineLoopDelete(bool c) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); int i = 0; while (i < 2) { if (i == 0) { b = items.get(0); } else { reviewGo(); } i++; }
+    }
+}

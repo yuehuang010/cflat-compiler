@@ -6526,11 +6526,28 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             };
             const bool wasBound = instanceBound();
             std::string error;
+            const std::string previousBodyRequest = cxxMemberBodyRequest_;
+            std::optional<std::string> previousRequest;
+            const bool hadDefinition = cxxForeignDefinitions_.count(typeName) != 0;
+            if (!UseCxxIncrementalRequests())
+            {
+                if (auto request = cxxForeignRequests_.find(typeName);
+                    request != cxxForeignRequests_.end())
+                    previousRequest = request->second;
+                cxxForeignRequests_.erase(typeName);
+                cxxForeignDefinitions_.erase(typeName);
+                cxxMemberBodyRequest_ = memberName;
+            }
             const bool requested = RequestCxxForeignType(typeName, spellingIt->second, error,
                                                          /*needDefinitions*/ true,
                                                          /*explicitInstantiation*/ true);
+            cxxMemberBodyRequest_ = previousBodyRequest;
             if (!requested)
+            {
+                if (previousRequest) cxxForeignRequests_[typeName] = *previousRequest;
+                if (hadDefinition) cxxForeignDefinitions_.insert(typeName);
                 return false;
+            }
             auto updated = cxxClasses_.find(typeName);
             if (updated == cxxClasses_.end()) return false;
             /*
@@ -6551,6 +6568,8 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
                 statics != functionTable.end()
                 && std::any_of(statics->second.begin(), statics->second.end(),
                                [](const FunctionSymbol& f) { return f.IsCxx && !f.IsMethod; }))
+                return true;
+            if (!UseCxxIncrementalRequests() && TryBindRefusedCxxBaseMember(typeName, memberName))
                 return true;
             if (memberName == "__ctor") return !updated->second.constructors.empty();
             return memberName == "__dtor" && updated->second.hasDtor;

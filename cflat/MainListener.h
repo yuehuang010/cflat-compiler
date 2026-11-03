@@ -2935,6 +2935,14 @@ private:
     std::vector<ArrowOwnedTemp> arrowOwnedTemps_;
     std::unordered_map<CFlatParser::FunctionDefinitionContext*,
         std::unordered_set<std::string>> functionLocalEnumNamesCache_;
+    struct ReturnedStructFrameCandidate
+    {
+        antlr4::ParserRuleContext* Context = nullptr;
+        LLVMBackend::NamedVariable Value;
+        llvm::ReturnInst* Return = nullptr;
+        std::unordered_map<std::string, std::string> RootNames;
+    };
+    std::unordered_map<llvm::Function*, std::vector<ReturnedStructFrameCandidate>> returnedStructFrameCandidates_;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     inline LLVMBackend* Compiler() { return compilerLLVM; }
@@ -3580,6 +3588,12 @@ private:
         bool isFixedArray = false;
         bool isArrayView = false;
         bool isInterface = false;
+        // list<T> (_data/_size) / array<T> (_ptr/_len) buffer and count field indices: the live slot is
+        // recomputed from the container since its buffer may move. -1 = no live slot.
+        int headerDataField = -1;
+        int headerSizeField = -1;
+        // The element as the iteration bound it, loaded before the body: the adopted-value test.
+        llvm::Value* elementValue = nullptr;
     };
     std::vector<RangeForContext> rangeForStack_;
 
@@ -4508,6 +4522,7 @@ public:
                               CFlatParser::ReturnBraceInitializerContext* braceInitializer = nullptr);
 
     void ParseStatement(CFlatParser::StatementContext* statement);
+    void ParseStatementBody(CFlatParser::StatementContext* statement);
 
     void GenerateDefaultParamOverloads(
         const std::string& name,
@@ -5337,6 +5352,7 @@ public:
     // Return-position consume/copy of an owning value read out of another object's storage.
     bool ReturnSourceIsIndirectOwningLvalue(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
     bool FieldPathRootIsFrameLocal(llvm::Value* storage);
+    void CheckReturnedStructFramePointerFields(LLVMBackend* compiler, llvm::Function* function);
     bool CoreUniqueOwnerPathIsFrameLocal(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& owner);
 

@@ -1312,31 +1312,11 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             // The container owns the pointee and its destructor frees it, so this delete is a
             // guaranteed double-free. Binding the borrow to a named local defeated the direct-call
             // check; this tag (set at decl-init) catches the laundered form.
-            if (!namedVar.IsOwning
-                && namedVar.BorrowsOwnedElement
+            if (compiler->OwnedElementBorrowReaches(namedVar)
                 && namedVar.Storage != nullptr
                 && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
             {
-                std::string name = namedVar.CallerName.empty()
-                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
-                std::string owner = namedVar.OwnedElementContainer.empty()
-                    ? "its container" : "'" + namedVar.OwnedElementContainer + "'";
-                if (namedVar.BorrowedElementExternallyOwned)
-                {
-                    // Container-agnostic: any 'alias'-element container (list<alias T*>,
-                    // queue<alias T*>, ...) hands back pure borrows owned elsewhere.
-                    LogErrorContext(ctx, std::format(
-                        "cannot delete '{}' - {} declares its elements 'alias' (a pure borrow owned "
-                        "elsewhere), so deleting this double-frees when the real owner releases it. Do "
-                        "not delete a borrow, or use a 'unique'-element container if it should own them.",
-                        name, owner));
-                    return {};
-                }
-                LogErrorContext(ctx, std::format(
-                    "cannot delete '{}' - it borrows an element that {} owns, whose "
-                    "destructor already frees it, so this is a double-free. Remove and free through "
-                    "the owner instead (e.g. the container's removeAt/erase), or do not delete a borrow.",
-                    name, owner));
+                LogErrorContext(ctx, compiler->OwnedElementDeleteMessage(namedVar));
                 return {};
             }
 
@@ -1744,6 +1724,13 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 return {};
             }
         }
+
+        // Inside a loop the backedge may still bring a borrow to this delete: re-check it when the
+        // loop closes (LLVMBackend::EndDeferredLoop).
+        if (!loopBreakMovedStates_.empty() && operandNamedVar.Storage != nullptr
+            && llvm::isa<llvm::AllocaInst>(operandNamedVar.Storage))
+            compiler->DeferOwnedElementDelete(operandNamedVar, static_cast<int>(ctx->getStart()->getLine()),
+                static_cast<int>(ctx->getStart()->getCharPositionInLine()));
 
         // 1. Call the full destructor (user dtor + member fields) if needed (non-array only).
         // Guard on null: 'delete nullptr' must be a no-op (operator delete below already
@@ -2259,8 +2246,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.BorrowedInterfaceBoxSlots      = src.BorrowedInterfaceBoxSlots;
         dst.OwnedStringBorrowBlock         = src.OwnedStringBorrowBlock;
         dst.OwnedStringBorrowFunction      = src.OwnedStringBorrowFunction;
-        dst.OwnedElementBorrowBlock        = src.OwnedElementBorrowBlock;
-        dst.OwnedElementBorrowFunction     = src.OwnedElementBorrowFunction;
+        dst.OwnedElementEvents             = src.OwnedElementEvents;
         dst.BondDeclBlock                  = src.BondDeclBlock;
         dst.BondDeclFunction               = src.BondDeclFunction;
         dst.IsBonded                        = src.IsBonded;

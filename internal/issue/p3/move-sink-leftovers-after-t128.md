@@ -3,12 +3,6 @@
 PRE-EXISTING on master (T128 reviews 1-2, 2026-10-11). The review probes went with the worktree;
 items 1-3 landed in T227 and were removed; each remaining item is its own repro (P = struct with a destructor, mv takes `move P*`).
 
-12. (T259 probe, pre-existing; OPEN after T262b - sink transfer from a local through `??` is unsolved, Luna patch and report at
-   ./scratch/repro_keep/t262/t262_luna.patch and t262_report.md) `??` with a unique LOCAL lhs double frees when stored into a unique field:
-   `unique P* u = new P(); t.p = u ?? nullptr;` (abort under MallocScribble). The field `??` form clears
-   its lhs slot at the `??` site whatever the destination, so clearing a local there the same way would
-   also null `P* r = u ?? nullptr;` (a borrow that is correct on master). Fix needs the destination at
-   the `??` site; the ternary join (T259) already consumes a local arm at the destination.
 13. (T259 review, pre-existing; repros scratch/repro_keep/t259_rev/rev_t259_opus_cases/) a field of a BY-VALUE struct
     param consumed through `?:` / `??` (c38b/c38d), through a nested field `o.inner.p`, and through a named
     brace or tag initializer - FIXED T262b (RejectJoinedSourceIntoUniqueField). OPEN, same item, forms disagree
@@ -25,3 +19,6 @@ items 1-3 landed in T227 and were removed; each remaining item is its own repro 
 `mv(s.p); s.p = new P(); s.p->v` is legal: reassigning a consumed field clears its moved mark, as for a local and as T230
 already does for the `t.p = s.p` path. Direct and ternary sink forms alike. Check whether T230 already covers the call-sink
 path before implementing (may be stale).
+16. (coalfield review, pre-existing) a borrowing destination of `this.p ?? v` / an interface-typed field `?? v` still
+    leaks the taken field (eager `??`-site clear kept for those two forms, T466 leg); consuming a field of a by-value
+    struct param through `??` / `?:` aborts on the non-null path (see 13).

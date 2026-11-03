@@ -3604,11 +3604,12 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         // vsnprintf), recursing forever. Hidden visibility makes each definition local
         // to the image while still callable from cflat code; external declarations
         // (the libc imports) are left untouched so they still bind to libc.
+        // Local-linkage symbols are already image-local and must keep default visibility.
         for (llvm::Function& F : module->functions())
-            if (!F.isDeclaration())
+            if (!F.isDeclaration() && !F.hasLocalLinkage())
                 F.setVisibility(llvm::GlobalValue::HiddenVisibility);
         for (llvm::GlobalVariable& G : module->globals())
-            if (!G.isDeclaration())
+            if (!G.isDeclaration() && !G.hasLocalLinkage())
                 G.setVisibility(llvm::GlobalValue::HiddenVisibility);
 
         if (lliPath)

@@ -16139,15 +16139,17 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         {
             LLVMBackend* Compiler;
             llvm::Function* Function;
+            std::unordered_map<llvm::Function*, std::vector<ReturnedStructFrameCandidate>>* StructReturns;
             bool Completed = false;
             ~LambdaDeferredCheckGuard()
             {
                 if (Completed) return;
+                StructReturns->erase(Function);
                 Compiler->DiscardNullDerefEvents(Function);
                 Compiler->DiscardPendingReturnDangleChecks(Function);
                 Compiler->DiscardPendingNullIfaceDispatch(Function);
             }
-        } deferredCheckGuard{ compiler, fn };
+        } deferredCheckGuard{ compiler, fn, &returnedStructFrameCandidates_ };
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -16368,6 +16370,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
 
         // Lambda invokers do not pass through the named-function completion hook. Run the same
         // deferred checks while this function's CFG and per-function ledgers are still current.
+        CheckReturnedStructFramePointerFields(compiler, fn);
         compiler->RunDeferredEndOfBodyChecks(fn);
         deferredCheckGuard.Completed = true;
 

@@ -358,29 +358,24 @@ namespace movedf
 // moved-out local stays legally readable-as-null by design, so its dereferences must not join
 // movedf's plain-read Use stream.
 //
-// The reporting rule is CONTROL-DEPENDENCE CONTAINMENT, chosen because it is false-positive-free
-// BY CONSTRUCTION rather than by enumerating guard shapes:
+// The reporting rule uses CONTROL-DEPENDENCE CONTAINMENT for explicit moves:
 //
 //   report a dereference of x at block D, witnessed by a move of x at block M, only when
 //   CD*(D) is a SUBSET of CD*(M) - that is, D is not guarded by any branch edge the move
 //   was not already guarded by - and x is neither read, revived nor address-escaped on the
 //   path from M to D.
 //
-// A guard is, by definition, a control-flow decision that can let the dereference be skipped
-// while the move still happened. Such a decision necessarily puts an extra edge in the
-// dereference's control-dependence set, so it necessarily suppresses the report - whatever the
-// guard is written in terms of (the pointer itself, a bool, an int, a struct field, a global, a
-// correlated scrutinee, or an expression the compiler cannot interpret at all). No guard
-// recognition, and therefore no guard-shape enumeration, is involved.
+// For explicit moves, any extra dereference control edge suppresses the report. Join-consumed
+// field witnesses ignore extra edges whose condition does not read that field; a field-reading
+// edge still suppresses the report because that condition can prove the field non-null.
 //
-// Conditions are compared by BRANCH EDGE IDENTITY. Two syntactically identical conditions in
-// two different `if` statements are different edges, so `if (c) { move a; } if (c) { a->v; }`
-// is not reported. That is a false negative, and false negatives are the acceptable direction.
+// Explicit-move conditions use BRANCH EDGE IDENTITY. Identical conditions in separate `if`
+// statements remain separate edges, so false negatives are the acceptable direction.
 namespace nulldf
 {
     enum class EventKind
     {
-        SetNull,    // explicit 'move x' of a whole local - x is null from here on this path
+        SetNull,    // a consuming move leaves x null from here on this path
         ClearNull,  // fresh binding or reassignment - x is live again
         Escape,     // '&x' - the pointee may be rewritten through the escaped address
         Read,       // any NON-dereference read of x - the only way a guard can consult it
@@ -397,6 +392,9 @@ namespace nulldf
         int line = 0;
         int col = 0;
         bool pointeeMove = false;
+        bool joinConsumed = false;
+        llvm::Value* readStorage = nullptr;
+        llvm::Value* readValue = nullptr;
     };
 
     struct Divergence
@@ -418,6 +416,7 @@ namespace nulldf
     {
         std::unordered_set<llvm::BasicBlock*> wholeMoves;
         std::unordered_set<llvm::BasicBlock*> pointeeMoves;
+        std::unordered_set<llvm::BasicBlock*> joinConsumedMoves;
         bool operator==(const WitnessSet&) const = default;
     };
     using NullState = std::map<std::string, WitnessSet>;
@@ -658,7 +657,8 @@ namespace nulldf
         switch (e.kind)
         {
         case EventKind::SetNull:
-            (e.pointeeMove ? s[e.name].pointeeMoves : s[e.name].wholeMoves).insert(e.block);
+            if (e.joinConsumed) s[e.name].joinConsumedMoves.insert(e.block);
+            else (e.pointeeMove ? s[e.name].pointeeMoves : s[e.name].wholeMoves).insert(e.block);
             break;
         case EventKind::ClearNull:
         case EventKind::ClearFields:
@@ -681,6 +681,7 @@ namespace nulldf
         {
             into[name].wholeMoves.insert(w.wholeMoves.begin(), w.wholeMoves.end());
             into[name].pointeeMoves.insert(w.pointeeMoves.begin(), w.pointeeMoves.end());
+            into[name].joinConsumedMoves.insert(w.joinConsumedMoves.begin(), w.joinConsumedMoves.end());
         }
     }
 
@@ -747,6 +748,68 @@ namespace nulldf
         }
 
         std::unordered_set<std::string> seen;
+        std::unordered_map<std::string, std::unordered_set<llvm::BasicBlock*>> fieldReadBranches;
+        // Every value a branch condition depends on, through loads and compiler temp slots.
+        std::unordered_map<const llvm::Value*, std::unordered_set<llvm::BasicBlock*>> branchesByValue;
+        // Stores that reach THIS load: scan backwards from the load, nearest store per path.
+        auto reachingStores = [](const llvm::LoadInst* load, std::vector<const llvm::Value*>& out)
+        {
+            const llvm::Value* slot = load->getPointerOperand();
+            std::unordered_set<llvm::BasicBlock*> seenBlocks;
+            std::vector<std::pair<llvm::BasicBlock*, const llvm::Instruction*>> pending;
+            pending.push_back({ const_cast<llvm::BasicBlock*>(load->getParent()),
+                                llvm::cast<llvm::Instruction>(load) });
+            while (!pending.empty())
+            {
+                auto [bb, from] = pending.back();
+                pending.pop_back();
+                if (from == nullptr && !seenBlocks.insert(bb).second) continue;
+                bool passed = from == nullptr;
+                bool stored = false;
+                for (auto it = bb->rbegin(); it != bb->rend() && !stored; ++it)
+                {
+                    if (!passed) { passed = &*it == from; continue; }
+                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&*it);
+                        store != nullptr && store->getPointerOperand() == slot)
+                    {
+                        out.push_back(store->getValueOperand());
+                        stored = true;
+                    }
+                }
+                if (!stored)
+                    for (llvm::BasicBlock* pred : llvm::predecessors(bb))
+                        pending.push_back({ pred, nullptr });
+            }
+        };
+        for (llvm::BasicBlock* branchBlock : blocks)
+        {
+            auto* branch = llvm::dyn_cast_or_null<llvm::BranchInst>(branchBlock->getTerminator());
+            if (branch == nullptr || !branch->isConditional()) continue;
+            std::unordered_set<const llvm::Value*> visited;
+            std::vector<const llvm::Value*> work{ branch->getCondition() };
+            while (!work.empty())
+            {
+                const llvm::Value* value = work.back();
+                work.pop_back();
+                if (!visited.insert(value).second) continue;
+                branchesByValue[value].insert(branchBlock);
+                // Only the && / || result slots ("cond.*") are followed; user locals never
+                // carry a field exemption, so a saved bool cannot tie an earlier read to a branch.
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                    if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand());
+                        slot != nullptr && slot->getName().starts_with("cond."))
+                        reachingStores(load, work);
+                if (auto* inst = llvm::dyn_cast<llvm::Instruction>(value))
+                    for (const llvm::Use& operand : inst->operands())
+                        work.push_back(operand.get());
+            }
+        }
+        for (const auto& e : events)
+            if (e.kind == EventKind::Read && e.block && e.block->getParent() == F)
+                for (const llvm::Value* read : { e.readStorage, e.readValue })
+                    if (read != nullptr)
+                        if (auto it = branchesByValue.find(read); it != branchesByValue.end())
+                            fieldReadBranches[e.name].insert(it->second.begin(), it->second.end());
         for (llvm::BasicBlock* bb : blocks)
         {
             auto it = byBlock.find(bb);
@@ -763,16 +826,41 @@ namespace nulldf
                 if (wit == running.end()) continue;
                 bool foundUnguardedWitness = false;
                 bool allUnguardedWitnessesArePointeeMoves = true;
+                // A later condition cannot prove a unique field is non-null; only a field read
+                // in the condition clears this path's moved witness.
+                const CdSet& derefCd = cd.Closure(bb);
                 auto inspectWitnesses = [&](const auto& witnesses, bool isPointeeMove) {
                     for (llvm::BasicBlock* m : witnesses)
-                        if (IsSubset(cd.Closure(bb), cd.Closure(m)))
+                        if (IsSubset(derefCd, cd.Closure(m)))
                         {
                             foundUnguardedWitness = true;
                             allUnguardedWitnessesArePointeeMoves &= isPointeeMove;
                         }
                 };
+                auto inspectJoinWitnesses = [&](const auto& witnesses) {
+                    for (llvm::BasicBlock* m : witnesses)
+                    {
+                        const CdSet& moveCd = cd.Closure(m);
+                        bool hasFieldReadGuard = false;
+                        auto readIt = fieldReadBranches.find(e->name);
+                        for (const CdEdge& edge : derefCd)
+                            if (!std::binary_search(moveCd.begin(), moveCd.end(), edge)
+                                && readIt != fieldReadBranches.end()
+                                && readIt->second.count(edge.first))
+                            {
+                                hasFieldReadGuard = true;
+                                break;
+                            }
+                        if (!hasFieldReadGuard)
+                        {
+                            foundUnguardedWitness = true;
+                            allUnguardedWitnessesArePointeeMoves = false;
+                        }
+                    }
+                };
                 inspectWitnesses(wit->second.wholeMoves, false);
                 inspectWitnesses(wit->second.pointeeMoves, true);
+                inspectJoinWitnesses(wit->second.joinConsumedMoves);
                 if (!foundUnguardedWitness) continue;
                 if (seen.insert(e->name + ":" + std::to_string(e->line) + ":" +
                                 std::to_string(e->col)).second)

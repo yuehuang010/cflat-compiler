@@ -964,6 +964,8 @@ bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* mem
             const std::string templateBase = ResolveGenericTemplateSpellingAtScope(
                 compiler, spelledBase, args, EnclosingAggregateScopesFromContext(compiler, useSite),
                 useSite, spelledBase, false);
+            // An unresolved spelling (a non-generic name given template arguments) is refused elsewhere.
+            if (templateBase.empty()) return false;
             compiler->CompleteCxxTemplateTypeArgs(templateBase, args);
             const std::string typeName = MangleGenericInstance(*compiler, templateBase, args);
             auto found = compiler->dataStructures.find(typeName);

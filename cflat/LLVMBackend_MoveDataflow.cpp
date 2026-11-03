@@ -160,17 +160,19 @@ void LLVMBackend::RecordMoveUse(const std::string& name, const std::string& fiel
 { RecordMoveEvent(movedf::EventKind::Use, name, field, line, col); }
 
 void LLVMBackend::RecordNullEvent(nulldf::EventKind kind, const std::string& name,
-                                  int line, int col, bool pointeeMove)
+                                  int line, int col, bool pointeeMove, bool joinConsumed,
+                                  llvm::Value* readStorage, llvm::Value* readValue)
 {
         if (name.empty() || !builder) return;
         llvm::BasicBlock* bb = builder->GetInsertBlock();
         if (!bb || !bb->getParent()) return;
         nullEventLog_[bb->getParent()].push_back(
-            nulldf::Event{ bb, kind, name, line, col, pointeeMove });
+            nulldf::Event{ bb, kind, name, line, col, pointeeMove, joinConsumed,
+                           readStorage, readValue });
     }
 
-void LLVMBackend::RecordNullSet(const std::string& name, bool pointeeMove)
-{ RecordNullEvent(nulldf::EventKind::SetNull, name, 0, 0, pointeeMove); }
+void LLVMBackend::RecordNullSet(const std::string& name, bool pointeeMove, bool joinConsumed)
+{ RecordNullEvent(nulldf::EventKind::SetNull, name, 0, 0, pointeeMove, joinConsumed); }
 
 void LLVMBackend::RecordNullClear(const std::string& name)
 { RecordNullEvent(nulldf::EventKind::ClearNull, name, 0, 0); }
@@ -178,8 +180,8 @@ void LLVMBackend::RecordNullClear(const std::string& name)
 void LLVMBackend::RecordNullEscape(const std::string& name)
 { RecordNullEvent(nulldf::EventKind::Escape, name, 0, 0); }
 
-void LLVMBackend::RecordNullRead(const std::string& name)
-{ RecordNullEvent(nulldf::EventKind::Read, name, 0, 0); }
+void LLVMBackend::RecordNullRead(const std::string& name, llvm::Value* storage, llvm::Value* value)
+{ RecordNullEvent(nulldf::EventKind::Read, name, 0, 0, false, false, storage, value); }
 
 void LLVMBackend::RecordNullDeref(const std::string& name, int line, int col)
 { RecordNullEvent(nulldf::EventKind::Deref, name, line, col); }

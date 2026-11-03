@@ -1,6 +1,364 @@
 #include "MainListener.h"
 #include <llvm/Analysis/ValueTracking.h>
 
+void MainListener::CheckReturnedStructFramePointerFields(
+    LLVMBackend* compiler, llvm::Function* function)
+{
+    if (compiler == nullptr || function == nullptr) return;
+    auto candidates = returnedStructFrameCandidates_.find(function);
+    if (candidates == returnedStructFrameCandidates_.end() || candidates->second.empty()) return;
+
+    using Roots = std::set<std::string>;
+    using State = std::unordered_map<std::string, Roots>;
+    constexpr int64_t AnyIndex = std::numeric_limits<int64_t>::min();
+    constexpr int64_t GepBoundary = std::numeric_limits<int64_t>::max();
+    auto slotPath = [&](llvm::Value* storage, std::string& root,
+                       std::vector<int64_t>& indices) -> bool {
+        std::function<bool(llvm::Value*)> walk = [&](llvm::Value* current) {
+            current = current->stripPointerCasts();
+            if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(current))
+            {
+                root = std::to_string(reinterpret_cast<uintptr_t>(alloca));
+                return true;
+            }
+            auto* gep = llvm::dyn_cast<llvm::GEPOperator>(current);
+            if (gep == nullptr || !walk(gep->getPointerOperand())) return false;
+            if (!indices.empty()) indices.push_back(GepBoundary);
+            for (auto it = gep->idx_begin(); it != gep->idx_end(); ++it)
+            {
+                auto* constant = llvm::dyn_cast<llvm::ConstantInt>(it->get());
+                indices.push_back(constant == nullptr ? AnyIndex : constant->getSExtValue());
+            }
+            return true;
+        };
+        return storage != nullptr && walk(storage);
+    };
+    std::unordered_map<std::string, llvm::AllocaInst*> allocas;
+    auto rootNameFor = [&](const std::string& root,
+                           const std::unordered_map<std::string, std::string>& names) {
+        if (auto name = names.find(root); name != names.end()) return name->second;
+        auto found = allocas.find(root);
+        if (found == allocas.end()) return std::string("<local>");
+        llvm::AllocaInst* alloca = found->second;
+        std::string name = alloca->getName().empty() ? "<local>" : alloca->getName().str();
+        for (const auto& scope : compiler->stackNamedVariable)
+        {
+            auto findName = [&](const auto& variables) {
+                for (const auto& [key, nv] : variables)
+                    if (nv.Storage == alloca || nv.Primary == alloca)
+                    {
+                        name = nv.TypeAndValue.VariableName.empty() ? key : nv.TypeAndValue.VariableName;
+                        return true;
+                    }
+                return false;
+            };
+            if (findName(scope.namedVariable) || findName(scope.functionArgument)) break;
+        }
+        return name;
+    };
+    for (llvm::BasicBlock& block : *function)
+        for (llvm::Instruction& instruction : block)
+            if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction))
+            {
+                const std::string key = std::to_string(reinterpret_cast<uintptr_t>(alloca));
+                allocas.emplace(key, alloca);
+            }
+    auto makeKey = [](const std::string& root, const std::vector<int64_t>& indices) {
+        std::string key = root + "/";
+        for (int64_t index : indices)
+            key += std::to_string(index) + "/";
+        return key;
+    };
+    auto pointerRoots = [&](llvm::Value* pointer, const State& state) {
+        Roots roots;
+        std::unordered_set<llvm::Value*> seen;
+        std::function<void(llvm::Value*)> walk = [&](llvm::Value* current) {
+            if (current == nullptr || !current->getType()->isPointerTy()) return;
+            current = current->stripPointerCasts();
+            if (!seen.insert(current).second) return;
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(current))
+            {
+                std::string root;
+                std::vector<int64_t> indices;
+                if (slotPath(load->getPointerOperand(), root, indices))
+                {
+                    auto found = state.find(makeKey(root, indices));
+                    if (found != state.end()) roots.insert(found->second.begin(), found->second.end());
+                }
+                return;
+            }
+            if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(current))
+            {
+                if (PointsIntoStackFrame(current))
+                    roots.insert(std::to_string(reinterpret_cast<uintptr_t>(alloca)));
+                return;
+            }
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(current))
+            {
+                walk(gep->getPointerOperand());
+                return;
+            }
+            if (auto* select = llvm::dyn_cast<llvm::SelectInst>(current))
+            {
+                walk(select->getTrueValue());
+                walk(select->getFalseValue());
+                return;
+            }
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(current))
+                for (llvm::Value* incoming : phi->incoming_values()) walk(incoming);
+        };
+        if (PointsIntoStackFrame(pointer)) walk(pointer);
+        else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(pointer->stripPointerCasts()))
+        {
+            std::string root;
+            std::vector<int64_t> indices;
+            if (slotPath(load->getPointerOperand(), root, indices))
+            {
+                auto found = state.find(makeKey(root, indices));
+                if (found != state.end()) roots.insert(found->second.begin(), found->second.end());
+            }
+        }
+        return roots;
+    };
+    auto merge = [](State& into, const State& from) {
+        bool changed = false;
+        for (const auto& [key, names] : from)
+            for (const auto& name : names)
+                changed |= into[key].insert(name).second;
+        return changed;
+    };
+    auto transfer = [&](llvm::Instruction& instruction, State& state) {
+        auto escape = [&](llvm::Value* pointer) {
+            Roots escaped = pointerRoots(pointer, state);
+            if (escaped.empty()) return;
+            for (auto it = state.begin(); it != state.end();)
+            {
+                bool drop = false;
+                for (const auto& name : escaped)
+                {
+                    if (it->second.contains(name) || it->first.starts_with(name + "/"))
+                    { drop = true; break; }
+                }
+                if (drop) it = state.erase(it); else ++it;
+            }
+        };
+        if (auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        {
+            for (llvm::Value* arg : call->args())
+                if (arg->getType()->isPointerTy()) escape(arg);
+            return;
+        }
+        auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+        if (store == nullptr) return;
+        std::string destRoot;
+        std::vector<int64_t> destIndices;
+        if (!slotPath(store->getPointerOperand(), destRoot, destIndices))
+        {
+            // A write through an unknown pointer may overwrite whatever that pointer reaches.
+            escape(store->getPointerOperand());
+            if (store->getValueOperand()->getType()->isPointerTy()) escape(store->getValueOperand());
+            return;
+        }
+        const std::string dest = makeKey(destRoot, destIndices);
+        llvm::Value* stored = store->getValueOperand();
+        if (stored->getType()->isPointerTy())
+        {
+            std::string storedRoot;
+            std::vector<int64_t> storedIndices;
+            auto storedBase = slotPath(stored, storedRoot, storedIndices)
+                ? allocas.find(storedRoot) : allocas.end();
+            bool pointsAtEscapingLocal = storedBase != allocas.end()
+                && (storedBase->second->getAllocatedType()->isAggregateType()
+                    || storedBase->second->getAllocatedType()->isPointerTy());
+            auto* destAlloca = llvm::dyn_cast<llvm::AllocaInst>(
+                store->getPointerOperand()->stripPointerCasts());
+            const bool bindsPointerLocal = destAlloca != nullptr
+                && destAlloca->getAllocatedType()->isPointerTy();
+            if (bindsPointerLocal && pointsAtEscapingLocal)
+                escape(stored);
+            if (bindsPointerLocal) state.erase(dest);
+            if (!bindsPointerLocal
+                && destIndices.end() != std::find(destIndices.begin(), destIndices.end(), AnyIndex))
+            {
+                Roots roots = pointerRoots(stored, state);
+                if (!roots.empty()) state[dest].insert(roots.begin(), roots.end());
+                return;
+            }
+            else if (!bindsPointerLocal) state.erase(dest);
+            Roots roots = pointerRoots(stored, state);
+            if (!roots.empty()) state[dest] = std::move(roots);
+            return;
+        }
+        if (!stored->getType()->isAggregateType()) return;
+        State before = state;
+        for (auto it = state.begin(); it != state.end();)
+            if (it->first.starts_with(dest)) it = state.erase(it);
+            else ++it;
+        auto* load = llvm::dyn_cast<llvm::LoadInst>(stored);
+        if (load == nullptr) return;
+        std::string sourceRoot;
+        std::vector<int64_t> sourceIndices;
+        if (!slotPath(load->getPointerOperand(), sourceRoot, sourceIndices)) return;
+        const std::string source = makeKey(sourceRoot, sourceIndices);
+        State copied;
+        for (const auto& [key, roots] : before)
+            if (key.starts_with(source))
+                copied[dest + key.substr(source.size())] = roots;
+        for (auto& [key, roots] : copied) state[key] = std::move(roots);
+    };
+
+    std::unordered_map<llvm::BasicBlock*, State> out;
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (llvm::BasicBlock& block : *function)
+        {
+            State state;
+            for (llvm::BasicBlock* predecessor : llvm::predecessors(&block))
+                merge(state, out[predecessor]);
+            for (auto it = block.begin(); it != block.end(); ++it)
+            {
+                transfer(*it, state);
+            }
+            State& previous = out[&block];
+            if (previous != state) { previous = std::move(state); changed = true; }
+        }
+    }
+    for (const auto& candidate : candidates->second)
+    {
+        if (candidate.Return == nullptr || candidate.Value.Storage == nullptr
+            || !candidate.Value.Storage->getType()->isPointerTy()) continue;
+        llvm::BasicBlock* stopBlock = candidate.Return->getParent();
+        State state;
+        for (llvm::BasicBlock* predecessor : llvm::predecessors(stopBlock))
+            merge(state, out[predecessor]);
+        for (llvm::Instruction& instruction : *stopBlock)
+        {
+            if (&instruction == candidate.Return) break;
+            transfer(instruction, state);
+        }
+        std::string valueRoot;
+        std::vector<int64_t> valueIndices;
+        if (!slotPath(candidate.Value.Storage, valueRoot, valueIndices)) continue;
+        const std::string prefix = makeKey(valueRoot, valueIndices);
+        for (const auto& [key, roots] : state)
+        {
+            if (!key.starts_with(prefix) || roots.empty()) continue;
+            auto data = compiler->dataStructures.find(candidate.Value.TypeAndValue.TypeName);
+            std::string fieldName;
+            std::function<std::string(llvm::StructType*)> firstPointerField =
+                [&](llvm::StructType* structure) -> std::string {
+                    if (structure == nullptr) return {};
+                    std::unordered_set<llvm::StructType*> seen;
+                    std::function<std::string(llvm::StructType*)> visit =
+                        [&](llvm::StructType* current) -> std::string {
+                            if (current == nullptr || !seen.insert(current).second) return {};
+                            auto nestedData = std::find_if(compiler->dataStructures.begin(),
+                                compiler->dataStructures.end(), [&](const auto& entry) {
+                                    return entry.second.StructType == current;
+                                });
+                            if (nestedData == compiler->dataStructures.end()) return {};
+                            const auto& fields = nestedData->second.StructFields;
+                            for (size_t fieldIndex = 0; fieldIndex < current->getNumElements(); ++fieldIndex)
+                            {
+                                llvm::Type* fieldType = current->getElementType(
+                                    static_cast<unsigned>(fieldIndex));
+                                while (auto* array = llvm::dyn_cast<llvm::ArrayType>(fieldType))
+                                    fieldType = array->getElementType();
+                                if (fieldIndex >= fields.size()) continue;
+                                const std::string& component = fields[fieldIndex].VariableName;
+                                if (fieldType->isPointerTy()) return component;
+                                if (auto* nested = llvm::dyn_cast<llvm::StructType>(fieldType))
+                                {
+                                    std::string child = visit(nested);
+                                    if (!child.empty()) return component + "." + child;
+                                }
+                            }
+                            return {};
+                        };
+                    return visit(structure);
+                };
+            if (key == prefix)
+            {
+                if (data == compiler->dataStructures.end() || data->second.StructType == nullptr) continue;
+                fieldName = firstPointerField(data->second.StructType);
+                if (fieldName.empty() && !data->second.StructFields.empty())
+                    fieldName = data->second.StructFields.front().VariableName;
+            }
+            else
+            {
+                const std::string suffix = key.substr(prefix.size());
+                std::vector<int64_t> indices;
+                std::vector<int64_t> gepIndices;
+                for (size_t start = 0, end = suffix.find('/'); end != std::string::npos;
+                     start = end + 1, end = suffix.find('/', start))
+                    gepIndices.push_back(std::strtoll(suffix.substr(start, end - start).c_str(), nullptr, 10));
+                for (size_t start = 0; start < gepIndices.size();)
+                {
+                    size_t end = start;
+                    while (end < gepIndices.size() && gepIndices[end] != GepBoundary) ++end;
+                    if (end > start) indices.insert(indices.end(), gepIndices.begin() + start + 1,
+                                                    gepIndices.begin() + end);
+                    start = end + 1;
+                }
+                if (indices.empty()) continue;
+                std::function<llvm::StructType*(llvm::Type*)> findStructDataType = [&](llvm::Type* type) {
+                    if (auto* array = llvm::dyn_cast<llvm::ArrayType>(type))
+                        return findStructDataType(array->getElementType());
+                    return llvm::dyn_cast<llvm::StructType>(type);
+                };
+                if (data == compiler->dataStructures.end()) continue;
+                auto* currentType = data->second.StructType;
+                if (currentType == nullptr) continue;
+                size_t indexPos = 0;
+                bool valid = true;
+                while (currentType != nullptr && indexPos < indices.size())
+                {
+                    int64_t fieldIndex = indices[indexPos++];
+                    if ((fieldIndex < 0 || static_cast<uint64_t>(fieldIndex) >= currentType->getNumElements())
+                        && data->second.StructFields.size() == 1
+                        && llvm::isa<llvm::ArrayType>(currentType->getElementType(0)))
+                    {
+                        fieldIndex = 0;
+                        indexPos = 1;
+                    }
+                    if (fieldIndex < 0 || static_cast<uint64_t>(fieldIndex) >= currentType->getNumElements())
+                    { valid = false; break; }
+                    std::string component = static_cast<size_t>(fieldIndex) < data->second.StructFields.size()
+                        ? data->second.StructFields[fieldIndex].VariableName : "field";
+                    if (!fieldName.empty()) fieldName += ".";
+                    fieldName += component;
+                    llvm::Type* fieldType = currentType->getElementType(static_cast<unsigned>(fieldIndex));
+                    while (llvm::isa<llvm::ArrayType>(fieldType) && indexPos < indices.size())
+                    {
+                        fieldType = llvm::cast<llvm::ArrayType>(fieldType)->getElementType();
+                        ++indexPos;
+                    }
+                    currentType = findStructDataType(fieldType);
+                    if (currentType == nullptr) break;
+                    data = std::find_if(compiler->dataStructures.begin(), compiler->dataStructures.end(),
+                        [&](const auto& entry) { return entry.second.StructType == currentType; });
+                    if (data == compiler->dataStructures.end()) { valid = false; break; }
+                }
+                if (valid && currentType != nullptr && indexPos == indices.size())
+                {
+                    std::string child = firstPointerField(currentType);
+                    if (!child.empty()) fieldName += "." + child;
+                }
+                if (!valid || fieldName.empty()) continue;
+            }
+            LogErrorContext(candidate.Context, std::format(
+                "cannot return '{}': its field '{}' holds the address of '{}', which points into "
+                "this function's own frame and would dangle once the function returns",
+                candidate.Value.CallerName.empty() ? candidate.Value.TypeAndValue.VariableName
+                                                    : candidate.Value.CallerName,
+                fieldName, rootNameFor(*roots.begin(), candidate.RootNames)));
+        }
+    }
+    returnedStructFrameCandidates_.erase(candidates);
+}
+
 MainListener::ExpectErrorRecoveryMark MainListener::MarkExpectErrorRecoveryState() const
 {
         ExpectErrorRecoveryMark mark;
@@ -3384,7 +3742,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 "return does not change that). Return a pointer into caller-owned, global or heap "
                 "storage instead.", what));
         }
-        else if (!compiler->currentFunctionReturnTV.IsAlias && !cxxReferenceResultTernaryJoin
+        if (!frameLocalPointerReturn && !compiler->currentFunctionReturnTV.IsAlias
+            && !cxxReferenceResultTernaryJoin
             && (((SourceIsDanglingAliasBorrow(compiler, returnNV)
                     || returnNV.PointsToAliasBorrow)
                  && !aliasBorrowRootExcused)
@@ -4052,9 +4411,55 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                        ? returnNV.TypeAndValue.TypeName
                                        : returnNV.InferSourceTypeName,
                                    returnSourceZeroFilled);
+        if (!frameLocalPointerReturn && !compiler->currentFunctionReturnTV.Pointer
+            && !compiler->currentFunctionReturnTV.IsAlias && right != nullptr
+            && right->getType()->isStructTy())
+            if (auto* returned = compiler->builder->GetInsertBlock()->getTerminator();
+                llvm::isa_and_nonnull<llvm::ReturnInst>(returned))
+            {
+                ReturnedStructFrameCandidate candidate{
+                    errCtx, returnNV, llvm::cast<llvm::ReturnInst>(returned), {} };
+                auto recordNames = [&](const auto& variables) {
+                    for (const auto& [key, nv] : variables)
+                        for (llvm::Value* value : { nv.Storage, nv.Primary })
+                            if (auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(value))
+                                candidate.RootNames.emplace(
+                                    std::to_string(reinterpret_cast<uintptr_t>(alloca)),
+                                    nv.TypeAndValue.VariableName.empty() ? key : nv.TypeAndValue.VariableName);
+                };
+                for (const auto& scope : compiler->stackNamedVariable)
+                {
+                    recordNames(scope.namedVariable);
+                    recordNames(scope.functionArgument);
+                }
+                returnedStructFrameCandidates_[compiler->currentFunction].push_back(std::move(candidate));
+            }
     }
 
+// Scopes one loop's deferred element-borrow deletes (LLVMBackend::BeginDeferredLoop). Closed on normal
+// exit; on unwinding it only pops, because the re-check can itself throw.
+struct DeferredLoopScope
+{
+        LLVMBackend* compiler;
+        size_t mark;
+        bool closed = false;
+        ~DeferredLoopScope() { if (!closed) compiler->AbandonDeferredLoop(); }
+        void Close() { closed = true; compiler->EndDeferredLoop(mark); }
+};
+
 void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
+        if (statement->iterationStatement() == nullptr && statement->vectorizeStatement() == nullptr)
+        {
+            ParseStatementBody(statement);
+            return;
+        }
+        auto* compiler = Compiler(statement);
+        DeferredLoopScope loop{ compiler, compiler->BeginDeferredLoop() };
+        ParseStatementBody(statement);
+        loop.Close();
+}
+
+void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) {
         RequireStackHeadroom(statement);
         DiagnoseBraceListsUnder(statement);
         auto* compiler = Compiler(statement);
@@ -5289,6 +5694,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     }
 
                     int dataFieldIndex = -1;
+                    int sizeFieldIndex = -1;
                     if (isDirectContainer && !isFaceType && !isFixedArray && !isArrayView && collNV.BaseType
                         && collNV.BaseType->isStructTy())
                     {
@@ -5300,6 +5706,15 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                                 && data.StructFields[i].Pointer)
                             {
                                 dataFieldIndex = (int)i;
+                                break;
+                            }
+                        const std::string containerBase(MangledBase(collNV.TypeAndValue.TypeName));
+                        const std::string sizeName = containerBase == "list" ? "_size"
+                            : containerBase == "array" ? "_len" : "";
+                        for (size_t i = 0; i < data.StructFields.size() && !sizeName.empty(); ++i)
+                            if (data.StructFields[i].VariableName == sizeName)
+                            {
+                                sizeFieldIndex = (int)i;
                                 break;
                             }
                     }
@@ -5473,6 +5888,13 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     rangeCtx.isFixedArray = isFixedArray;
                     rangeCtx.isArrayView = isArrayView;
                     rangeCtx.isInterface = isFaceType;
+                    if (dataFieldIndex >= 0 && sizeFieldIndex >= 0)
+                    {
+                        rangeCtx.headerDataField = dataFieldIndex;
+                        rangeCtx.headerSizeField = sizeFieldIndex;
+                        if (elemVal != nullptr && elemVal->getType()->isPointerTy())
+                            rangeCtx.elementValue = elemVal;
+                    }
                     rangeForStack_.push_back(std::move(rangeCtx));
                     compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
                     PrepareLoopConditionalDropFlags(bodyStmt);

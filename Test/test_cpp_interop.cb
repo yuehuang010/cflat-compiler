@@ -3953,8 +3953,120 @@ cppexp.RefRankTarget ctorexp_rank_return() { return cppexp.rank_mutable(); }
 cppexp.ExCopyD ctorexp_excopy_cast_return() { return (cppexp.ExCopyD)cppexp.excopyd_ref(); }
 int ctorexp_excopy_take(cppexp.ExCopyD c) { return c.v; }
 
+int selfRetCppImportDtorCount = 0;
+struct SelfRetCppImportProbe
+{
+    int id = 0;
+    ~SelfRetCppImportProbe() { selfRetCppImportDtorCount = selfRetCppImportDtorCount + 1; }
+    SelfRetCppImportProbe* self() { return this; }
+};
+move SelfRetCppImportProbe* makeSelfRetCppImportProbe(int id)
+{
+    SelfRetCppImportProbe* p = new SelfRetCppImportProbe();
+    p->id = id;
+    return p;
+}
+
+int InteropElementReassignDtorCount = 0;
+interface InteropElementReassignShape { int area(); };
+class InteropElementReassignItem : InteropElementReassignShape
+{
+    int value = 0;
+    int area() { return value; }
+    ~InteropElementReassignItem()
+    {
+        InteropElementReassignDtorCount = InteropElementReassignDtorCount + 1;
+    }
+};
+int InteropElementReassignBox()
+{
+    list<unique InteropElementReassignItem*> items = default;
+    items.add(new InteropElementReassignItem());
+    InteropElementReassignItem* item = items.get(0);
+    item = new InteropElementReassignItem();
+    item->value = 7;
+    InteropElementReassignShape shape = item;
+    int value = shape.area();
+    delete shape;
+    return value;
+}
+int InteropElementReassignIdentity(int value) { return value; }
+int InteropElementReassignDelete()
+{
+    list<unique InteropElementReassignItem*> items = default;
+    InteropElementReassignItem* first = new InteropElementReassignItem();
+    first->value = 67;
+    items.add(first);
+    InteropElementReassignItem* borrowed = items.get(0);
+    InteropElementReassignItem* copy = borrowed;
+    copy = new InteropElementReassignItem();
+    copy->value = 68;
+    int value = InteropElementReassignIdentity(copy->value);
+    delete copy;
+    if (items.get(0)->value != 67) return -1;
+    return value;
+}
+
+int InteropJoinReassignDtorCount = 0;
+interface InteropJoinReassignShape { int area(); };
+class InteropJoinReassignItem : InteropJoinReassignShape
+{
+    int area() { return 9; }
+    ~InteropJoinReassignItem()
+    {
+        InteropJoinReassignDtorCount = InteropJoinReassignDtorCount + 1;
+    }
+};
+move InteropJoinReassignShape InteropJoinReassign()
+{
+    unique InteropJoinReassignItem* first = new InteropJoinReassignItem();
+    unique InteropJoinReassignItem* second = new InteropJoinReassignItem();
+    return first ?? second;
+}
+
+// A unique-field '?:' arm lowers through get(); with C++ imported that call is an invoke whose
+// continuation block must still jump to the ternary join (it used to be left unterminated).
+struct TmcRes
+{
+    int id = 0;
+    ~TmcRes() { }
+};
+struct TmcBox
+{
+    unique TmcRes* item = nullptr;
+};
+int tmcFieldArm(bool f)
+{
+    TmcBox s = default;
+    s.item = new TmcRes();
+    s.item->id = 21;
+    TmcBox t = default;
+    t.item = f ? s.item : nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+
 extern int main()
 {
+    selfRetCppImportDtorCount = 0;
+    {
+        unique SelfRetCppImportProbe* b = nullptr;
+        b = makeSelfRetCppImportProbe(54012)->self();
+        if (b->id != 54012 || selfRetCppImportDtorCount != 0) return 54012;
+    }
+    if (selfRetCppImportDtorCount != 1) return 54013;
+    InteropElementReassignDtorCount = 0;
+    if (InteropElementReassignBox() != 7 || InteropElementReassignDtorCount != 2) return 54014;
+    InteropElementReassignDtorCount = 0;
+    if (InteropElementReassignDelete() != 68 || InteropElementReassignDtorCount != 2) return 54017;
+    InteropJoinReassignDtorCount = 0;
+    {
+        InteropJoinReassignShape shape = InteropJoinReassign();
+        if (shape.area() != 9) return 54015;
+        delete shape;
+    }
+    if (InteropJoinReassignDtorCount != 2) return 54016;
+    if (tmcFieldArm(true) != 21) return 54010;
+    if (tmcFieldArm(false) != -1) return 54011;
     // A trailing alias pack accepts zero or more unused arguments and keeps the first argument's type.
     t458.PD<> aliasPackDefault = t458.PD<>(7);
     t458.PD<long> aliasPackFixed = t458.PD<long>(7);

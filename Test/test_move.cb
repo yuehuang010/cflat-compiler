@@ -1,5 +1,6 @@
 import "function.cb";
 import "list.cb";
+import "array.cb";
 import "unique.cb";
 import "stack.cb";
 import "queue.cb";
@@ -1159,6 +1160,327 @@ int t259LocalArm(bool f)
     return t.item != nullptr ? t.item->id : -1;
 }
 
+// '??' with an owning unique LOCAL lhs joins like a '?:' arm: a unique destination consumes the
+// taken local on its path. The fallback `new` is owned by the destination once, never leaked.
+int coalLocalField(bool f)
+{
+    UniqueBox t = default;
+    unique Resource* u = nullptr;
+    if (f)
+    {
+        u = new Resource();
+        u->id = 81;
+    }
+    t.item = u ?? nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+int coalLocalSourceNull()
+{
+    UniqueBox t = default;
+    unique Resource* u = new Resource();
+    t.item = u ?? nullptr;
+    return u == nullptr ? 1 : 0;
+}
+
+int coalLocalFallback(bool f)
+{
+    UniqueBox t = default;
+    unique Resource* u = nullptr;
+    if (f)
+    {
+        u = new Resource();
+        u->id = 82;
+    }
+    t.item = u ?? new Resource();
+    return t.item->id;
+}
+
+// '??' with an owning unique LOCAL rhs: the taken local is consumed on its path, as in '?:'.
+int coalRhsLocalField(bool f)
+{
+    UniqueBox t = default;
+    unique Resource* u = nullptr;
+    if (f)
+    {
+        u = new Resource();
+        u->id = 85;
+    }
+    unique Resource* v = new Resource();
+    v->id = 86;
+    t.item = u ?? v;
+    return t.item->id;
+}
+
+int coalRhsSourceNull()
+{
+    UniqueBox t = default;
+    unique Resource* u = nullptr;
+    unique Resource* v = new Resource();
+    t.item = u ?? v;
+    return v == nullptr ? 1 : 0;
+}
+
+// A raw destination borrows both locals: no consume, each freed once at its scope exit.
+int coalRhsBorrow(bool f)
+{
+    unique Resource* u = nullptr;
+    if (f)
+    {
+        u = new Resource();
+        u->id = 87;
+    }
+    unique Resource* v = new Resource();
+    v->id = 88;
+    Resource* r = u ?? v;
+    return r->id;
+}
+
+interface CoalIface { int val(); };
+class CoalImpl : CoalIface
+{
+    int val() { return 31; }
+    ~CoalImpl() { dtorCount = dtorCount + 1; }
+};
+int coalSeeIface(CoalIface r) { return r.val(); }
+
+// A unique<I> LOCAL through '??' into a borrowing interface parameter: no consume during the call.
+int coalIfaceBorrow()
+{
+    unique CoalIface u = new CoalImpl();
+    int v = coalSeeIface(u ?? nullptr);
+    return v * 1000 + dtorCount;
+}
+
+// '??' with a unique FIELD lhs and an owning unique LOCAL rhs: the taken side is consumed once.
+int coalFieldRhsLocal(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 91;
+    }
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    v->id = 92;
+    t.item = o.item ?? v;
+    return t.item->id;
+}
+
+int coalFieldReassignedAfterJoin(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 91;
+    }
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    v->id = 92;
+    t.item = o.item != nullptr ? o.item : v;
+    o.item = new Resource();
+    o.item->id = 99;
+    return t.item->id * 100 + o.item->id;
+}
+
+int coalFieldNullGuardAfterJoin(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 91;
+    }
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    v->id = 92;
+    t.item = o.item != nullptr ? o.item : v;
+    int guarded = -1;
+    if (o.item != nullptr) guarded = o.item->id;
+    return t.item->id * 100 + guarded;
+}
+
+int coalFieldAndGuardAfterJoin(bool k)
+{
+    UniqueBox o = default;
+    o.item = new Resource();
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    t.item = o.item != nullptr ? o.item : v;
+    if (k && o.item != nullptr) return o.item->id;
+    return 51;
+}
+
+int coalFieldOrGuardAfterJoin(bool k)
+{
+    UniqueBox o = default;
+    o.item = new Resource();
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    t.item = o.item != nullptr ? o.item : v;
+    if (!k || o.item == nullptr) return 0;
+    return o.item->id;
+}
+
+int coalFieldNestedAndGuardAfterJoin(bool c, bool k)
+{
+    UniqueBox o = default;
+    o.item = new Resource();
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    t.item = o.item != nullptr ? o.item : v;
+    if (k && (c && o.item != nullptr)) return o.item->id;
+    return 51;
+}
+
+int coalFieldNestedOrGuardAfterJoin(bool c, bool k)
+{
+    UniqueBox o = default;
+    o.item = new Resource();
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    t.item = o.item != nullptr ? o.item : v;
+    if (!k || (!c || o.item == nullptr)) return 0;
+    return o.item->id;
+}
+
+int coalFieldWhileGuardAfterJoin()
+{
+    UniqueBox o = default;
+    o.item = new Resource();
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    t.item = o.item != nullptr ? o.item : v;
+    int i = 0;
+    while (i < 2 && o.item != nullptr)
+    {
+        i++;
+        return o.item->id;
+    }
+    return i;
+}
+
+int correlatedExplicitFieldMove(bool c)
+{
+    UniqueBox o = default;
+    o.item = new Resource();
+    o.item->id = 73;
+    UniqueBox t = default;
+    if (c) t.item = move o.item;
+    if (!c) return o.item->id;
+    return 0;
+}
+
+int coalFieldRhsSourceNull()
+{
+    UniqueBox o = default;
+    UniqueBox t = default;
+    unique Resource* v = new Resource();
+    t.item = o.item ?? v;
+    return v == nullptr ? 1 : 0;
+}
+
+// A unique FIELD lhs with a raw borrow destination: the field stays owned by its struct, so only
+// the local v is released early; the field is freed once at o's scope exit.
+int coalFieldStoreNull(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 111;
+    }
+    UniqueBox t = default;
+    t.item = o.item ?? nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+int coalFieldBorrowDecl(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 101;
+    }
+    unique Resource* v = new Resource();
+    v->id = 102;
+    Resource* r = o.item ?? v;
+    return r->id;
+}
+
+int coalFieldBorrowAssign(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 103;
+    }
+    unique Resource* v = new Resource();
+    v->id = 104;
+    Resource* r = v;
+    r = o.item ?? v;
+    return r->id;
+}
+
+int coalSeeResource(Resource* r) { return r->id; }
+
+int coalFieldBorrowArg(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 105;
+    }
+    unique Resource* v = new Resource();
+    v->id = 106;
+    return coalSeeResource(o.item ?? v);
+}
+
+int coalTakeSink(move unique Resource* p) { return p == nullptr ? -1 : p->id; }
+
+// A unique FIELD lhs into a move sink: the taken arm is consumed by the call, the other one stays.
+int coalFieldMoveSink(bool f)
+{
+    UniqueBox o = default;
+    if (f)
+    {
+        o.item = new Resource();
+        o.item->id = 107;
+    }
+    unique Resource* v = new Resource();
+    v->id = 108;
+    return coalTakeSink(o.item ?? v);
+}
+
+// An owning unique PARAMETER stored through '??' is consumed on its path, as '?:' consumes it.
+int coalParamStore(move unique Resource* p)
+{
+    UniqueBox t = default;
+    t.item = p ?? nullptr;
+    return t.item->id;
+}
+
+int coalParamCall()
+{
+    unique Resource* u = new Resource();
+    u->id = 95;
+    return coalParamStore(move u);
+}
+
+// A raw destination borrows the owning local: no consume, one destructor at the local's scope exit.
+int coalLocalBorrow()
+{
+    unique Resource* u = new Resource();
+    u->id = 84;
+    Resource* r = u ?? nullptr;
+    return r->id;
+}
+
 int t259DeclArm(bool f)
 {
     UniqueBox s;
@@ -1505,6 +1827,103 @@ int testUniqueField()
     t259v = t259LocalArm(false);
     passed += Test("t259_local_arm_untaken_value", t259v, -1);
     passed += Test("t259_local_arm_untaken_freed_once", dtorCount, 1);
+
+    // '??' with an owning unique LOCAL lhs: the unique field consumes the taken local once.
+    dtorCount = 0;
+    passed += Test("coal_local_field_taken_value", coalLocalField(true), 81);
+    passed += Test("coal_local_field_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_local_field_untaken_value", coalLocalField(false), -1);
+    passed += Test("coal_local_field_untaken_freed_once", dtorCount, 0);
+    dtorCount = 0;
+    passed += Test("coal_local_source_taken_null", coalLocalSourceNull(), 1);
+    passed += Test("coal_local_source_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_local_fallback_taken_value", coalLocalFallback(true), 82);
+    passed += Test("coal_local_fallback_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_local_fallback_untaken_value", coalLocalFallback(false), 0);
+    passed += Test("coal_local_fallback_untaken_freed_once", dtorCount, 1);
+    // A raw destination borrows: the local still owns the object and frees it at return.
+    dtorCount = 0;
+    passed += Test("coal_local_borrow_value", coalLocalBorrow(), 84);
+    passed += Test("coal_local_borrow_freed_once", dtorCount, 1);
+    // '??' with an owning unique LOCAL rhs: the taken local is consumed once, the other frees itself.
+    dtorCount = 0;
+    passed += Test("coal_rhs_field_null_value", coalRhsLocalField(false), 86);
+    passed += Test("coal_rhs_field_null_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_rhs_source_taken_null", coalRhsSourceNull(), 1);
+    passed += Test("coal_rhs_source_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_rhs_field_taken_value", coalRhsLocalField(true), 85);
+    passed += Test("coal_rhs_field_taken_freed_twice", dtorCount, 2);
+    dtorCount = 0;
+    passed += Test("coal_rhs_borrow_null_value", coalRhsBorrow(false), 88);
+    passed += Test("coal_rhs_borrow_null_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_rhs_borrow_taken_value", coalRhsBorrow(true), 87);
+    passed += Test("coal_rhs_borrow_taken_freed_twice", dtorCount, 2);
+    // A unique FIELD lhs with an owning LOCAL rhs: the taken side is consumed once.
+    dtorCount = 0;
+    passed += Test("coal_field_rhs_null_value", coalFieldRhsLocal(false), 92);
+    passed += Test("coal_field_rhs_null_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_field_rhs_source_taken_null", coalFieldRhsSourceNull(), 1);
+    passed += Test("coal_field_rhs_source_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_field_rhs_taken_value", coalFieldRhsLocal(true), 91);
+    passed += Test("coal_field_rhs_taken_freed_twice", dtorCount, 2);
+    passed += Test("coal_field_reassigned_after_join_takes_field", coalFieldReassignedAfterJoin(true), 9199);
+    passed += Test("coal_field_reassigned_after_join_takes_fallback", coalFieldReassignedAfterJoin(false), 9299);
+    passed += Test("coal_field_null_guard_after_join_takes_field", coalFieldNullGuardAfterJoin(true), 9099);
+    passed += Test("coal_field_null_guard_after_join_takes_fallback", coalFieldNullGuardAfterJoin(false), 9199);
+    passed += Test("coal_field_and_guard_after_join", coalFieldAndGuardAfterJoin(true), 51);
+    passed += Test("coal_field_and_guard_after_join_short_circuit", coalFieldAndGuardAfterJoin(false), 51);
+    passed += Test("coal_field_or_guard_after_join", coalFieldOrGuardAfterJoin(true), 0);
+    passed += Test("coal_field_nested_and_guard_after_join", coalFieldNestedAndGuardAfterJoin(true, true), 51);
+    passed += Test("coal_field_nested_and_guard_after_join_short_circuit", coalFieldNestedAndGuardAfterJoin(false, true), 51);
+    passed += Test("coal_field_nested_or_guard_after_join", coalFieldNestedOrGuardAfterJoin(true, true), 0);
+    passed += Test("coal_field_nested_or_guard_after_join_short_circuit", coalFieldNestedOrGuardAfterJoin(false, false), 0);
+    passed += Test("coal_field_while_guard_after_join", coalFieldWhileGuardAfterJoin(), 0);
+    passed += Test("correlated_explicit_field_move_taken", correlatedExplicitFieldMove(true), 0);
+    passed += Test("correlated_explicit_field_move_untaken", correlatedExplicitFieldMove(false), 73);
+    // An owning unique parameter through '??' into a field: consumed once.
+    dtorCount = 0;
+    passed += Test("coal_param_store_value", coalParamCall(), 95);
+    passed += Test("coal_param_store_freed_once", dtorCount, 1);
+    // A unique FIELD lhs through '??': only an owning destination takes the field; a raw borrow
+    // leaves it owned, so the field's object is freed once at its struct's scope exit.
+    dtorCount = 0;
+    passed += Test("coal_field_store_null_value", coalFieldStoreNull(false), -1);
+    passed += Test("coal_field_store_null_freed_none", dtorCount, 0);
+    dtorCount = 0;
+    passed += Test("coal_field_store_taken_value", coalFieldStoreNull(true), 111);
+    passed += Test("coal_field_store_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_field_borrow_decl_null_value", coalFieldBorrowDecl(false), 102);
+    passed += Test("coal_field_borrow_decl_null_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_field_borrow_decl_taken_value", coalFieldBorrowDecl(true), 101);
+    passed += Test("coal_field_borrow_decl_taken_freed_twice", dtorCount, 2);
+    dtorCount = 0;
+    passed += Test("coal_field_borrow_assign_null_value", coalFieldBorrowAssign(false), 104);
+    passed += Test("coal_field_borrow_assign_null_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_field_borrow_assign_taken_value", coalFieldBorrowAssign(true), 103);
+    passed += Test("coal_field_borrow_assign_taken_freed_twice", dtorCount, 2);
+    dtorCount = 0;
+    passed += Test("coal_field_borrow_arg_null_value", coalFieldBorrowArg(false), 106);
+    passed += Test("coal_field_borrow_arg_null_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_field_borrow_arg_taken_value", coalFieldBorrowArg(true), 105);
+    passed += Test("coal_field_borrow_arg_taken_freed_twice", dtorCount, 2);
+    dtorCount = 0;
+    passed += Test("coal_field_move_sink_null_value", coalFieldMoveSink(false), 108);
+    passed += Test("coal_field_move_sink_null_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("coal_field_move_sink_taken_value", coalFieldMoveSink(true), 107);
+    passed += Test("coal_field_move_sink_taken_freed_twice", dtorCount, 2);
 
     // T259 - the declaration-init form and a loop body consume each iteration's taken arm once.
     dtorCount = 0;
@@ -3958,6 +4377,141 @@ int elemBorrowReassignedBox()
     return a;
 }
 
+// A conditional element borrow in an UNTAKEN branch: the owned pointer keeps its own pointee, freed
+// once at scope exit, and the element is freed once by its container (2 destructors, as on master).
+int elemBorrowUntakenBranch(bool flag)
+{
+    int a = 0;
+    {
+        list<unique CiMove*> lg = default;
+        lg.add(new CiMove());
+        CiMove* b = new CiMove();
+        if (flag) { b = lg.get(0); }
+        a = b->area();
+    }
+    return a;
+}
+
+// r4: a branch borrow overwritten by an owned `new` AFTER the join: no path keeps the element at the
+// delete, so the owned repoint is accepted (3 destructors, as master).
+void elemRepointAfterBranch(bool c)
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = new CiMove();
+    if (c) { b = items.get(0); }
+    b = new CiMove();
+    delete b;
+}
+
+// r4: a straight borrow overwritten by an owned `new` in BOTH arms (3 destructors, as master).
+void elemRepointBothArms(bool c)
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = new CiMove();
+    b = items.get(0);
+    if (c) { b = new CiMove(); } else { b = new CiMove(); }
+    delete b;
+}
+
+// r4: a branch borrow overwritten by a `move` AFTER the join (3 destructors, as master).
+void elemRepointMoveAfterBranch(bool c)
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = new CiMove();
+    if (c) { b = items.get(0); }
+    CiMove* a = new CiMove();
+    b = move a;
+    delete b;
+}
+
+// r4: a straight borrow overwritten by a `move` in BOTH arms (4 destructors, as master).
+void elemRepointMoveBothArms(bool c)
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = new CiMove();
+    b = items.get(0);
+    CiMove* a = new CiMove();
+    CiMove* z = new CiMove();
+    if (c) { b = move a; } else { b = move z; }
+    delete b;
+}
+
+// r5: every path overwrites the element borrow with an owned `new` before the delete, so no path
+// holds the element and the delete is accepted (2 destructors: the container element and the new one).
+void elemKillBothWrapped(bool c)
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = items.get(0);
+    if (c) { b = new CiMove(); } else { b = new CiMove(); }
+    delete ((CiMove*)b);
+}
+
+// r5: a `do` body overwrites the borrow with an owned `new` on its only pass (2 destructors).
+void elemKillDoAll()
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = items.get(0);
+    do { b = new CiMove(); } while (false);
+    delete b;
+}
+
+// r5: both `?:` arms overwrite the borrow with an owned `new` (2 destructors).
+void elemKillTernaryBoth(bool c)
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = items.get(0);
+    CiMove* x = c ? (b = new CiMove()) : (b = new CiMove());
+    delete b;
+}
+
+// r6: a loop whose body overwrites the element borrow with an owned `new` before the delete on every
+// pass: no pass reaches the delete with the element (3 destructors: container element + two new).
+void elemLoopKillSafe()
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = items.get(0);
+    int i = 0;
+    while (i < 2) { b = new CiMove(); delete b; i++; }
+}
+
+// r6: the same loop with the borrow re-taken and overwritten inside the body (3 destructors).
+void elemLoopBorrowOverwriteSafe()
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = items.get(0);
+    int i = 0;
+    while (i < 2) { b = items.get(0); b = new CiMove(); delete b; i++; }
+}
+
+// r6: a loop that borrows and never deletes: the owned pointer is replaced and freed once (2 destructors).
+void elemLoopBorrowNeverDeleted()
+{
+    list<unique CiMove*> items = default;
+    items.add(new CiMove());
+    CiMove* b = new CiMove();
+    int i = 0;
+    while (i < 2) { b = items.get(0); i++; }
+}
+
+// A `?:` element borrow that is only READ: the join borrows the container's element and nothing is
+// deleted through it, so the read is accepted and yields the element's value.
+int elemBorrowTernaryRead(bool c)
+{
+    list<unique CiMove*> lg = default;
+    lg.add(new CiMove());
+    CiMove* e = c ? lg.get(0) : new CiMove();
+    return e->area();
+}
+
 class PlainHolderMove { CiMove* h = default; };
 
 // A PLAIN pointer field read is ACCEPTED because nothing at the boxing site can prove another
@@ -4482,6 +5036,54 @@ int testUniqueInterfaceTernary()
     passed += Test("delete_box_elem_reassigned_freed_twice", dtorCount, 2);
 
     dtorCount = 0;
+    passed += Test("delete_ternary_elem_read_value", elemBorrowTernaryRead(true), 7);
+    passed += Test("delete_ternary_elem_read_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    passed += Test("delete_branch_elem_untaken_value", elemBorrowUntakenBranch(false), 7);
+    passed += Test("delete_branch_elem_untaken_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    elemRepointAfterBranch(true);
+    passed += Test("delete_repoint_after_branch_freed", dtorCount, 3);
+
+    dtorCount = 0;
+    elemRepointBothArms(true);
+    passed += Test("delete_repoint_both_arms_freed", dtorCount, 3);
+
+    dtorCount = 0;
+    elemRepointMoveAfterBranch(true);
+    passed += Test("delete_repoint_move_after_branch_freed", dtorCount, 3);
+
+    dtorCount = 0;
+    elemRepointMoveBothArms(true);
+    passed += Test("delete_repoint_move_both_arms_freed", dtorCount, 4);
+
+    dtorCount = 0;
+    elemKillBothWrapped(true);
+    passed += Test("delete_kill_both_wrapped_freed", dtorCount, 2);
+
+    dtorCount = 0;
+    elemKillDoAll();
+    passed += Test("delete_kill_do_all_freed", dtorCount, 2);
+
+    dtorCount = 0;
+    elemKillTernaryBoth(true);
+    passed += Test("delete_kill_ternary_both_freed", dtorCount, 2);
+
+    dtorCount = 0;
+    elemLoopKillSafe();
+    passed += Test("delete_loop_kill_safe_freed", dtorCount, 3);
+
+    dtorCount = 0;
+    elemLoopBorrowOverwriteSafe();
+    passed += Test("delete_loop_borrow_overwrite_safe_freed", dtorCount, 3);
+
+    dtorCount = 0;
+    elemLoopBorrowNeverDeleted();
+    passed += Test("delete_loop_borrow_never_deleted_freed", dtorCount, 2);
+
+    dtorCount = 0;
     passed += Test("coalesce_revives_moved_local_value", coalesceRevivesMovedLocal(), 19);
     passed += Test("coalesce_revives_moved_local_freed_twice", dtorCount, 2);
 
@@ -4541,6 +5143,11 @@ int testUniqueInterfaceTernary()
         passed += Test("iface_nullcoalesce_return_left_arm", pickJoinNC(rA, rB).area(), 9);
         passed += Test("iface_nullcoalesce_arg_right_arm", takeJoinIface(rNull ?? rB), 37);
         passed += Test("iface_nullcoalesce_arg_left_arm", takeJoinIface(rA ?? rB), 9);
+        // A unique<I> LOCAL lhs through '??' into a borrowing interface parameter keeps its shape:
+        // 31000 pins val=31 with no dtor during the call; one dtor once the local leaves scope.
+        dtorCount = 0;
+        passed += Test("iface_coal_local_borrow_value", coalIfaceBorrow(), 31000);
+        passed += Test("iface_coal_local_borrow_freed_once", dtorCount, 1);
         delete rA;
         delete rB;
     }
@@ -17551,6 +18158,26 @@ int mix4FieldSwapCounts()
     return mix4Dc * 1000 + mix4Cc * 100 + seen;
 }
 
+struct Fe2FieldHolder { unique Resource* p = nullptr; };
+struct Fe2ListBox { list<unique Resource*> a = default; };
+bool fe2PriorYes = true;
+bool fe2PriorNo = false;
+unique Resource* fe2GrowResource(int id) { unique Resource* r = new Resource(); r->id = id; return r; }
+void fe2FieldSinkParam(unique Resource* q)
+{
+    unique Resource* p = q;
+    Fe2FieldHolder t = default;
+    t.p = p;
+}
+bool fe2FieldPick(bool value) { return value; }
+Resource* fe2FieldNull() { return nullptr; }
+unique Resource* fe2FieldMake(int id)
+{
+    unique Resource* p = new Resource();
+    p->id = id;
+    return move p;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -17925,11 +18552,13 @@ extern int main()
     total += 7;
 
     passed += testUniqueField();
-    total += 73;
+    total += 123;
+    total += 4;  // r4 nested join guard legs in testUniqueField
     total += 18;  // T230 legs in testUniqueField
     total += 19;  // T230 r3 legs in testUniqueField
     total += 22;  // T259 legs in testUniqueField
     total += 15;  // T466 legs in testUniqueField
+    total += 10;  // mfcond join guards and correlated explicit-move control
 
     passed += testUniqueAssignmentOwnership();
     total += 23;
@@ -18007,7 +18636,7 @@ extern int main()
     total += 25;
 
     passed += testUniqueInterfaceTernary();
-    total += 184;
+    total += 200;
 
     dtorCount = 0;
     {
@@ -18481,6 +19110,7 @@ extern int main()
     total += 21;
 
     passed += testC15DataMutHeap();
+    total += 76;
     total += 12;
     total += 6;
 
@@ -22747,6 +23377,402 @@ int testC15DataMutHeap()
     after = (i64)HeapAudit.reportLeaks();
     passed += Test("t361_data_mut_empty_alias_value_heap",
         emptyAliasValue == (int)'X' && after - before == (i64)0, true);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = p;
+            passed += Test("fe2_foreach_field_value", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_field_source_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_field_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (alias unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = p;
+            passed += Test("fe2_alias_foreach_field_value", t.p->id, 37);
+        }
+        passed += Test("fe2_alias_foreach_field_source_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_alias_foreach_field_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = true ? p : nullptr;
+            passed += Test("fe2_foreach_ternary_left_value", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_ternary_left_source_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_ternary_left_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = p ?? nullptr;
+            passed += Test("fe2_foreach_coalesce_left_value", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_coalesce_left_source_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_coalesce_left_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = nullptr ?? p;
+            passed += Test("fe2_foreach_coalesce_right_value", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_coalesce_right_source_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_coalesce_right_dtor_once", dtorCount, 1);
+
+    // An earlier join's producer arm takes the slot but the consumer picks another value: the slot keeps its element.
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 41;
+        elements.add(seed);
+        unique Resource* other = new Resource();
+        other->id = 42;
+        for (unique Resource* p in elements)
+        {
+            Resource* x = fe2PriorYes ? p : nullptr;
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorNo ? x : other;
+            passed += Test("fe2_prior_phi_untaken_value", t.p->id, 42);
+        }
+        passed += Test("fe2_prior_phi_untaken_slot_kept", elements.get(0) == nullptr, false);
+        passed += Test("fe2_prior_phi_untaken_dtor_loop", dtorCount, 1);
+    }
+    passed += Test("fe2_prior_phi_untaken_dtor_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 43;
+        elements.add(seed);
+        unique Resource* other = new Resource();
+        other->id = 44;
+        for (unique Resource* p in elements)
+        {
+            Resource* x = p ?? nullptr;
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorNo ? x : other;
+            passed += Test("fe2_prior_coalesce_untaken_value", t.p->id, 44);
+        }
+        passed += Test("fe2_prior_coalesce_untaken_slot_kept", elements.get(0) == nullptr, false);
+        passed += Test("fe2_prior_coalesce_untaken_dtor_loop", dtorCount, 1);
+    }
+    passed += Test("fe2_prior_coalesce_untaken_dtor_once", dtorCount, 2);
+
+    // The body grows the list (16 adds, buffer may move) before the adoption: the live slot is data[index].
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(51));
+        unique Resource* other = fe2GrowResource(52);
+        for (unique Resource* p in elements)
+        {
+            Resource* x = fe2PriorYes ? p : nullptr;
+            for (int j = 0; j < 16; j++) { elements.add(fe2GrowResource(60 + j)); }
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorNo ? x : other;
+            passed += Test("fe2_grow_untaken_value", t.p->id, 52);
+            break;
+        }
+        passed += Test("fe2_grow_untaken_slot_kept", elements.get(0) == nullptr, false);
+        passed += Test("fe2_grow_untaken_dtor_loop", dtorCount, 1);
+    }
+    passed += Test("fe2_grow_untaken_dtor_once", dtorCount, 18);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(71));
+        unique Resource* other = fe2GrowResource(72);
+        for (unique Resource* p in elements)
+        {
+            Resource* x = fe2PriorYes ? p : nullptr;
+            for (int j = 0; j < 16; j++) { elements.add(fe2GrowResource(60 + j)); }
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorYes ? x : other;
+            passed += Test("fe2_grow_taken_value", t.p->id, 71);
+            break;
+        }
+        passed += Test("fe2_grow_taken_slot_cleared", elements.get(0) == nullptr, true);
+        passed += Test("fe2_grow_taken_dtor_loop", dtorCount, 1);
+    }
+    passed += Test("fe2_grow_taken_dtor_once", dtorCount, 18);
+
+    // The container is freed in the body before an untaken adoption: the untaken arm never reads it.
+    dtorCount = 0;
+    {
+        list<unique Resource*>* hl = new list<unique Resource*>();
+        hl->add(fe2GrowResource(81));
+        unique Resource* other = fe2GrowResource(82);
+        for (unique Resource* p in *hl)
+        {
+            Resource* x = fe2PriorYes ? p : nullptr;
+            delete hl;
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorNo ? x : other;
+            passed += Test("fe2_delete_untaken_value", t.p->id, 82);
+            break;
+        }
+        passed += Test("fe2_delete_untaken_dtor_loop", dtorCount, 2);
+    }
+    passed += Test("fe2_delete_untaken_dtor_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        Fe2ListBox* bp = new Fe2ListBox();
+        bp->a.add(fe2GrowResource(83));
+        unique Resource* other = fe2GrowResource(84);
+        for (unique Resource* p in bp->a)
+        {
+            Resource* x = fe2PriorYes ? p : nullptr;
+            delete bp;
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorNo ? x : other;
+            passed += Test("fe2_fielddel_untaken_value", t.p->id, 84);
+            break;
+        }
+        passed += Test("fe2_fielddel_untaken_dtor_loop", dtorCount, 2);
+    }
+    passed += Test("fe2_fielddel_untaken_dtor_once", dtorCount, 2);
+
+    // array<unique T*>: the live slot is _ptr[index] (the header's _len bounds it).
+    dtorCount = 0;
+    {
+        array<unique Resource*> arr = default;
+        arr.init(2);
+        arr.set(0, fe2GrowResource(91));
+        arr.set(1, fe2GrowResource(92));
+        int fe2ArrSum = 0;
+        for (unique Resource* p in arr)
+        {
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorYes ? p : nullptr;
+            fe2ArrSum = fe2ArrSum + t.p->id;
+        }
+        passed += Test("fe2_array_tern_sum", fe2ArrSum, 183);
+        passed += Test("fe2_array_tern_slot0_null", arr.get(0) == nullptr, true);
+        passed += Test("fe2_array_tern_slot1_null", arr.get(1) == nullptr, true);
+        passed += Test("fe2_array_tern_dtor_loop", dtorCount, 2);
+    }
+    passed += Test("fe2_array_tern_dtor_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        array<unique Resource*> arr = default;
+        arr.init(2);
+        arr.set(0, fe2GrowResource(93));
+        arr.set(1, fe2GrowResource(94));
+        int fe2ArrSum = 0;
+        for (unique Resource* p in arr)
+        {
+            Fe2FieldHolder t = default;
+            t.p = p ?? nullptr;
+            fe2ArrSum = fe2ArrSum + t.p->id;
+        }
+        passed += Test("fe2_array_coal_sum", fe2ArrSum, 187);
+        passed += Test("fe2_array_coal_slot0_null", arr.get(0) == nullptr, true);
+        passed += Test("fe2_array_coal_slot1_null", arr.get(1) == nullptr, true);
+        passed += Test("fe2_array_coal_dtor_loop", dtorCount, 2);
+    }
+    passed += Test("fe2_array_coal_dtor_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        array<unique Resource*> arr = default;
+        arr.init(2);
+        arr.set(0, fe2GrowResource(95));
+        arr.set(1, fe2GrowResource(96));
+        for (unique Resource* p in arr)
+        {
+            Fe2FieldHolder t = default;
+            t.p = fe2PriorNo ? p : nullptr;
+        }
+        passed += Test("fe2_array_untaken_slot0_kept", arr.get(0) == nullptr, false);
+        passed += Test("fe2_array_untaken_slot1_kept", arr.get(1) == nullptr, false);
+        passed += Test("fe2_array_untaken_dtor_loop", dtorCount, 0);
+    }
+    passed += Test("fe2_array_untaken_dtor_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = fe2FieldPick(true) ? p : nullptr;
+            passed += Test("fe2_foreach_runtime_ternary_left_source", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_runtime_ternary_source_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_runtime_ternary_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = fe2FieldPick(false) ? nullptr : p;
+            passed += Test("fe2_foreach_runtime_ternary_right_source", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_runtime_ternary_right_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_runtime_ternary_right_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = fe2FieldPick(false) ? p : nullptr;
+            passed += Test("fe2_foreach_runtime_ternary_null", t.p == nullptr, true);
+        }
+        passed += Test("fe2_foreach_runtime_ternary_null_source_kept", elements.get(0) != nullptr, true);
+    }
+    passed += Test("fe2_foreach_runtime_ternary_null_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = p ?? nullptr;
+            passed += Test("fe2_foreach_runtime_coalesce_left", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_runtime_coalesce_left_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_runtime_coalesce_left_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* seed = new Resource();
+        seed->id = 37;
+        elements.add(seed);
+        for (unique Resource* p in elements)
+        {
+            Fe2FieldHolder t = default;
+            t.p = fe2FieldNull() ?? p;
+            passed += Test("fe2_foreach_runtime_coalesce_right", t.p->id, 37);
+        }
+        passed += Test("fe2_foreach_runtime_coalesce_right_nulled", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_foreach_runtime_coalesce_right_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        unique Resource* first = new Resource();
+        unique Resource* second = new Resource();
+        unique Resource* third = new Resource();
+        first->id = 1; second->id = 2; third->id = 3;
+        elements.add(first); elements.add(second); elements.add(third);
+        for (unique Resource* p in elements)
+        {
+            if (p->id == 2)
+            {
+                Fe2FieldHolder t = default;
+                t.p = p;
+                passed += Test("fe2_foreach_multi_element_selected", t.p->id, 2);
+            }
+        }
+        passed += Test("fe2_foreach_multi_element_only_selected_nulled",
+            elements.get(0) != nullptr && elements.get(1) == nullptr && elements.get(2) != nullptr, true);
+    }
+    passed += Test("fe2_foreach_multi_element_dtor_once_each", dtorCount, 3);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        elements.add(fe2FieldMake(1));
+        unique Resource* v = fe2FieldMake(9);
+        for (unique Resource* p in elements)
+        {
+            Resource* x = p;
+            Fe2FieldHolder t = default;
+            t.p = fe2FieldPick(false) ? x : v;
+            passed += Test("fe2_foreach_raw_local_other_arm", t.p->id, 9);
+        }
+        passed += Test("fe2_foreach_raw_local_other_arm_keeps_slot", elements.get(0) != nullptr, true);
+    }
+    passed += Test("fe2_foreach_raw_local_other_arm_dtor_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        list<unique Resource*> elements = default;
+        elements.add(fe2FieldMake(1));
+        for (unique Resource* p in elements)
+        {
+            Resource* x = p;
+            x = nullptr;
+            Fe2FieldHolder t = default;
+            t.p = fe2FieldPick(true) ? x : nullptr;
+            passed += Test("fe2_foreach_raw_local_reassigned_null", t.p == nullptr, true);
+        }
+        passed += Test("fe2_foreach_raw_local_reassigned_keeps_slot", elements.get(0) != nullptr, true);
+    }
+    passed += Test("fe2_foreach_raw_local_reassigned_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* seed = new Resource();
+        fe2FieldSinkParam(seed);
+    }
+    passed += Test("fe2_sink_param_decl_then_field_dtor_once", dtorCount, 1);
     return passed;
 }
 

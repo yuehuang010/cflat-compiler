@@ -87,6 +87,54 @@ expect_error("dereference of moved variable 'b.p'") {
     }
 }
 
+expect_error("dereference of moved variable 'o.p'") {
+    int joinedFieldReadUnderIf(bool c, bool full)
+    {
+        S o = default; S dst = default;
+        if (c) o.p = new P();
+        unique P* v = new P();
+        dst.p = o.p != nullptr ? o.p : v;
+        if (full) return o.p->v;
+        return 0;
+    }
+}
+
+expect_error("dereference of moved variable 'o.p'") {
+    int joinedFieldReadUnderWhile(bool c, bool full)
+    {
+        S o = default; S dst = default;
+        if (c) o.p = new P();
+        unique P* v = new P();
+        dst.p = o.p != nullptr ? o.p : v;
+        while (full) { return o.p->v; }
+        return 0;
+    }
+}
+
+expect_error("dereference of moved variable 'o.p'") {
+    int joinedFieldReadUnderNestedIf(bool c, bool outer, bool inner)
+    {
+        S o = default; S dst = default;
+        if (c) o.p = new P();
+        unique P* v = new P();
+        dst.p = o.p != nullptr ? o.p : v;
+        if (outer) { if (inner) return o.p->v; }
+        return 0;
+    }
+}
+
+expect_error("dereference of moved variable 'o.p'") {
+    int coalesceFieldReadUnderIf(bool full)
+    {
+        S o = default; S dst = default;
+        o.p = new P();
+        unique P* v = new P();
+        dst.p = o.p ?? v;
+        if (full) return o.p->v;
+        return 0;
+    }
+}
+
 expect_error("dereference of moved variable 'a.p'") {
     void ternaryJoinLeftArmThenRead(bool f)
     {
@@ -550,6 +598,35 @@ expect_error("dereference of moved variable 'b.p'") {
         b.p = new P();
         mvP(a.p ?? b.p);
         int value = b.p->v;
+    }
+}
+
+// A saved bool is not a field guard: its read happened before the join consumed the field.
+expect_error("dereference of moved variable 'o.p'") {
+    int staleSavedBoolFieldRead()
+    {
+        S o = default;
+        o.p = new P();
+        S dst = default;
+        unique P* v = new P();
+        bool b = o.p != nullptr;
+        dst.p = o.p != nullptr ? o.p : v;
+        if (b) return o.p->v;
+        return 3;
+    }
+}
+
+expect_error("dereference of moved variable 'o.p'") {
+    int staleSavedNestedFieldRead(bool c)
+    {
+        S o = default;
+        o.p = new P();
+        S dst = default;
+        unique P* v = new P();
+        bool b = c && o.p != nullptr;
+        dst.p = o.p != nullptr ? o.p : v;
+        if (b) return o.p->v;
+        return 3;
     }
 }
 

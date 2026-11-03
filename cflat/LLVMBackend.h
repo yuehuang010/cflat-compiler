@@ -1812,6 +1812,14 @@ public:
         bool PointeeMove = false;
     };
 
+    // One element-borrow event of a local in one block (see NamedVariable::OwnedElementEvents).
+    struct OwnedElementBorrowEvent
+    {
+        llvm::BasicBlock* Block = nullptr;
+        llvm::Function* Function = nullptr;
+        bool Borrow = false; // true: the fact is set here; false: overwritten with a non-element value
+    };
+
     struct NamedVariable
     {
     public:
@@ -2142,10 +2150,9 @@ public:
         // elsewhere) rather than a container-owned unique element. Selects the delete message only.
         bool BorrowedElementExternallyOwned = false;
         std::string OwnedElementContainer; // container variable name, for the delete diagnostic
-        // The block that established the current element-borrow fact. A conditional owned rebind
-        // cannot retire the fact globally, because the old element remains live on another path.
-        llvm::BasicBlock* OwnedElementBorrowBlock = nullptr;
-        llvm::Function* OwnedElementBorrowFunction = nullptr;
+        // One event per block: the LAST Borrow or Kill recorded there. Non-empty exactly while
+        // BorrowsOwnedElement holds; a `delete` walks backward over these (OwnedElementBorrowReaches).
+        std::vector<OwnedElementBorrowEvent> OwnedElementEvents;
         // compile-time: this pointer local's DECLARATION plainly copied a live OWNING local
         // (`T* b = c;` / `alias T* b = c;`), which still frees the pointee at its own scope exit.
         // Retired by PointerRebound like the other declaration-time facts. Kept off the general
@@ -2323,6 +2330,11 @@ public:
         bool         isExplicitMove = false; // written 'move x' operand; transient, read by operator calls
         // ?: only: bit 0 = true arm, bit 1 = false arm is an owning unique call result (ruling 2026-10-31).
         int          ownedCallArms = 0;
+        // ?: only, transient: an arm reads a container-owned element (list<unique X*>.get); the join
+        // carries that fact to the declaration / assignment that binds it (NamedVariable::BorrowsOwnedElement).
+        bool         borrowsOwnedElement = false;
+        bool         borrowedElementExternallyOwned = false;
+        std::string  ownedElementContainer;
         bool         isPointerArithmeticResult = false; // `p + n` / `p - n` pointer result
         // Narrow width (1, 8 or 16) an int arithmetic result was built from (r3 call-argument mark), else 0.
         // Set from operand TYPES where the operation is typed; read only by call-argument classification.
@@ -2631,6 +2643,8 @@ public:
     // TypedValue bits on the way out, but its value is the same join, so the outer arm matches on it.
     llvm::Value* lastTernaryJoinValue = nullptr;
     int lastTernaryJoinArms = 0;
+    // The whole last ?: join: a parenthesized ?: arm reads its element-borrow fact from it (by value).
+    TypedValue lastTernaryJoinShape;
     std::function<void(antlr4::ParserRuleContext*, std::string)> contextualErrorReporter;
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
@@ -5720,6 +5734,38 @@ private:
     // over `g = l.get(0)` clears it so a later `delete g` is allowed (see BorrowsOwnedElement).
     void SetVariableBorrowsOwnedElement(const std::string& name, bool value,
         const std::string& container, bool externallyOwned = false);
+    // True when the element-borrow fact of `nv` may reach the current insertion point: walking
+    // predecessors back from it, a Borrow event is found before a Kill on some path.
+    bool OwnedElementBorrowReaches(const NamedVariable& nv) const;
+    // The same walk from an explicit block. originBorrow is the event that block held when the delete
+    // was emitted (nullopt none, true Borrow, false Kill): later events in that block follow the delete.
+    bool OwnedElementBorrowReachesFrom(const NamedVariable& nv, llvm::BasicBlock* from,
+        std::optional<bool> originBorrow) const;
+    // The open local whose storage is `storage`, or nullptr once its scope has closed.
+    const NamedVariable* FindLocalNamedVariable(const llvm::Value* storage) const;
+    // A delete inside a loop that the walk accepted while the loop's backedge did not exist yet.
+    // Keyed by function. Each open loop re-checks the records added since it opened (EndDeferredLoop);
+    // the outermost loop of a function erases them.
+    struct DeferredOwnedElementDelete
+    {
+        llvm::Value* Storage = nullptr;
+        llvm::BasicBlock* Block = nullptr;
+        std::optional<bool> OriginBorrow;
+        int Line = 0;
+        int Column = 0;
+    };
+    std::unordered_map<llvm::Function*, std::vector<DeferredOwnedElementDelete>> deferredOwnedElementDeletes_;
+    void DeferOwnedElementDelete(const NamedVariable& nv, int line, int column);
+    // Open loops, innermost last: (function, record count when the loop opened).
+    std::vector<std::pair<llvm::Function*, size_t>> openDeferredLoops_;
+public:
+    size_t BeginDeferredLoop();
+    void EndDeferredLoop(size_t mark);
+    void AbandonDeferredLoop() noexcept;
+private:
+    void RecheckDeferredOwnedElementDeletes(llvm::Function* function, size_t from);
+    // The diagnostic for deleting a local that borrows a container-owned element.
+    std::string OwnedElementDeleteMessage(const NamedVariable& nv) const;
 
     void SetInterfaceBoxBorrowSlots(const std::string& name,
         const std::vector<llvm::Value*>& slots);
@@ -7371,6 +7417,7 @@ private:
     };
     // Spelling of the specialization RequestCxxType is requesting over an incomplete argument.
     std::string cxxIncompleteArgumentSpelling_;
+    std::string cxxMemberBodyRequest_;
     std::string BuildCxxRequestIncludes(const CxxRequestGroup& group) const;
     std::vector<std::string> BuildCxxRequestClangArgs(const CxxRequestGroup& group) const;
     std::string BuildCxxRequestMarkers(const std::vector<CxxRequestItem>& items,
@@ -12822,13 +12869,16 @@ public:
     // Same block-tagging discipline as RecordMoveEvent: dropped when no block is being
     // emitted into (e.g. the ForwardRefScanner pre-pass).
     void RecordNullEvent(nulldf::EventKind kind, const std::string& name, int line, int col,
-                         bool pointeeMove = false);
-    void RecordNullSet(const std::string& name, bool pointeeMove = false);
+                         bool pointeeMove = false, bool joinConsumed = false,
+                         llvm::Value* readStorage = nullptr, llvm::Value* readValue = nullptr);
+    void RecordNullSet(const std::string& name, bool pointeeMove = false,
+                       bool joinConsumed = false);
     void RecordNullClear(const std::string& name);
     void RecordNullEscape(const std::string& name);
     // Any NON-dereference read. Recorded broadly on purpose: an unrecorded read is the only way
     // a guard could slip past the read-kill, and an extra one only costs a diagnostic.
-    void RecordNullRead(const std::string& name);
+    void RecordNullRead(const std::string& name, llvm::Value* storage = nullptr,
+                        llvm::Value* value = nullptr);
     void RecordNullDeref(const std::string& name, int line, int col);
 
     // Drop a function's null-state log without analyzing it (an aborted body has a partial CFG).

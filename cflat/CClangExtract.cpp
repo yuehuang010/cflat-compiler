@@ -7588,6 +7588,9 @@ namespace cflat_cinterop
                 // Off for a translation unit that reported no error at all: no body can hold an
                 // error expression then, so the whole walk is skipped.
                 bool active = true;
+                // Walk constructor and in-class member initializers: one-shot eager harvests only (the
+                // live Interpreter refuses these through clang's own text on the request path).
+                bool walkDefaultInits = false;
                 // A live Interpreter's bodies emptied by an earlier chunk (see ExtractRequest).
                 const std::unordered_map<const FunctionDecl*, std::string>* poisoned = nullptr;
 
@@ -7678,9 +7681,30 @@ namespace cflat_cinterop
                             found = found || TouchesInvalidRecord(expr);
                             return !found;
                         }
+                        // An in-class member initializer is implicit code the visitor would skip;
+                        // only one-shot eager harvests walk it (see walkDefaultInits).
+                        bool walkDefaultInits = false;
+                        bool VisitCXXDefaultInitExpr(CXXDefaultInitExpr* init)
+                        {
+                            return found || !walkDefaultInits || TraverseStmt(init->getExpr());
+                        }
                     } visitor;
+                    visitor.walkDefaultInits = walkDefaultInits;
                     if (fd->getBody() != nullptr) visitor.TraverseStmt(fd->getBody());
+                    if (walkDefaultInits)
+                        ForEachCtorInit(fd, [&](Stmt* init) { visitor.TraverseStmt(init); });
                     return visitor.found;
+                }
+
+                // A constructor's member initializers are part of the code it emits: an error
+                // expression there crashes CodeGen just like one in the body.
+                static void ForEachCtorInit(const FunctionDecl* fd, const std::function<void(Stmt*)>& visit)
+                {
+                    const FunctionDecl* def = nullptr;
+                    if (!fd->hasBody(def) || def == nullptr) def = fd;
+                    if (const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(def))
+                        for (const CXXCtorInitializer* init : ctor->inits())
+                            if (init->getInit() != nullptr) visit(init->getInit());
                 }
 
                 bool Reaches(const FunctionDecl* fd, unsigned depth = 0)
@@ -7721,6 +7745,13 @@ namespace cflat_cinterop
                             callees.push_back(llvm::dyn_cast<FunctionDecl>(ref->getDecl()));
                             return true;
                         }
+                        // An in-class member initializer is implicit code the visitor would skip;
+                        // only one-shot eager harvests walk it (see walkDefaultInits).
+                        bool walkDefaultInits = false;
+                        bool VisitCXXDefaultInitExpr(CXXDefaultInitExpr* init)
+                        {
+                            return found || !walkDefaultInits || TraverseStmt(init->getExpr());
+                        }
                     } visitor;
                     if (def->isInvalidDecl() || IsPoisoned(def))
                     {
@@ -7728,7 +7759,10 @@ namespace cflat_cinterop
                         causeMemo[def] = OwnCause(def);
                         return true;
                     }
+                    visitor.walkDefaultInits = walkDefaultInits;
                     if (def->getBody() != nullptr) visitor.TraverseStmt(def->getBody());
+                    if (walkDefaultInits)
+                        ForEachCtorInit(def, [&](Stmt* init) { visitor.TraverseStmt(init); });
                     bool bad = visitor.found;
                     if (bad) causeMemo[def] = OwnCause(def);
                     for (const FunctionDecl* callee : visitor.callees)
@@ -7745,6 +7779,8 @@ namespace cflat_cinterop
             auto errorReach = std::make_shared<ErrorReachScan>();
             errorReach->poisoned = st.req.poisonedFunctions;
             errorReach->causes = st.req.errorCauses;
+            // Only a one-shot eager harvest (no live Interpreter) hands such a body to CodeGen.
+            errorReach->walkDefaultInits = !st.req.demandOnlyDefinitions && st.req.poisonedFunctions == nullptr;
             errorReach->active = sawParseErrors
                 || (st.req.poisonedFunctions != nullptr && !st.req.poisonedFunctions->empty());
             auto declHasErrors = [errorReach](const Decl* d) {
@@ -7961,6 +7997,7 @@ namespace cflat_cinterop
                             std::cout << "[verbose]   C++ body emptied, its instantiation reported an "
                                          "error: " << fd->getQualifiedNameAsString() << "\n";
                         fd->setBody(CompoundStmt::CreateEmpty(ctx, /*NumStmts*/ 0, /*HasFPFeatures*/ false));
+                        if (auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(fd)) ctor->setNumCtorInitializers(0);
                         // A live Interpreter keeps this specialization; a later chunk must not see it clean.
                         if (st.req.poisonedFunctions != nullptr)
                             st.req.poisonedFunctions->emplace(fd, "clang reported an error inside the "

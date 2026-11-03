@@ -199,7 +199,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         std::string err;
         const bool incrementalHeader = cxxMode && activeCxxRequestGroup_ != nullptr
             && UseCxxIncrementalRequests();
-        req.demandOnlyDefinitions = incrementalHeader && !cflat_cinterop::CxxEagerBodies()
+        req.demandOnlyDefinitions = incrementalHeader
+            && !cflat_cinterop::CxxEagerBodies()
             && symbolSink_ == nullptr;  // LSP keeps the eager definition path
         if (req.demandOnlyDefinitions)
         {
@@ -2189,7 +2190,8 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
         using Member = cflat_cinterop::RawCxxMember;
         // Over an incomplete [cpp] struct argument every body is instantiated, so the request
         // is refused here rather than after the struct is defined.
-        const bool evaluated = !cxxIncompleteArgumentSpelling_.empty();
+        const bool evaluated = !cxxIncompleteArgumentSpelling_.empty()
+            || !cxxMemberBodyRequest_.empty();
         std::string src;
         // The one-shot fallback ODR-uses every nontrivial destructor; the default path (and its cache key) is master's.
         const bool oneShotFallback = !UseCxxIncrementalRequests();
@@ -2203,6 +2205,7 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
         unsigned n = 0;
         for (const auto& m : rec.members)
         {
+            if (!cxxMemberBodyRequest_.empty() && m.name != cxxMemberBodyRequest_) continue;
             if (m.access != cflat_cinterop::AccessPublic || m.isDeleted || m.variadic) continue;
             // `auto` is not a valid return type in a member-pointer cast. Its body cannot be
             // explicitly instantiated through this probe, so do not let it poison sibling uses.
@@ -2259,7 +2262,8 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
                 if (m.isNoexcept) functionQualifiers += " noexcept";
             }
             // Member-template specializations retain the evaluated surface-growing probe.
-            const bool signatureOnly = !m.isTemplateSpecialization && !evaluated;
+            const bool signatureOnly = cxxMemberBodyRequest_.empty()
+                && !m.isTemplateSpecialization && !evaluated;
             src += (signatureOnly ? "using __cflat_use" : "static auto __cflat_use") + tag
                  + (signatureOnly ? " = decltype(static_cast<" : " = static_cast<")
                  + m.retType + " " + ptrTo + "(" + params + ")" + functionQualifiers
@@ -2721,6 +2725,9 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             }
             return requestFailed();
         }
+        std::unordered_map<std::string, const clang::CXXRecordDecl*> specialMemberRecords;
+        if (req.completeCxxSpecialMembers)
+            req.specialMemberRecords = &specialMemberRecords;
         const std::string pch = EnsureCxxRequestPch(group, req.args);
         if (!pch.empty())
         {
@@ -2735,6 +2742,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                 return cflat_cinterop::IsCxxAccessFreeSpelling(item.cxxSpelling);
             }))
             req.source = cflat_cinterop::AliasCxxNestedSpecializationNames(req.source);
+        specialMemberRecords.clear();
         bool ok = cflat_cinterop::ExtractCInterop(req, raw, error);
         // The PCH must only ever change the speed, never the answer. A stale or truncated one can
         // fail the frontend outright, but it can also be error-recovered into an AST where the
@@ -2755,6 +2763,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             // makes every other request in the group re-parse the include prologue.
             llvm::TimeTraceScope retryScope("CxxRequestPchRetry", group.label);
             cflat_cinterop::ExtractRequest full = req;
+            specialMemberRecords.clear();
             full.source = BuildCxxRequestIncludes(group) + prefixSource + completionSource
                         + BuildCxxRequestMarkers(items, /*instantiateAll*/ !emitDefinitions)
                         + extraSource;
@@ -2768,6 +2777,19 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             raw = std::move(retryRaw);
             error = std::move(retryError);
             ok = retryOk;
+        }
+        if (UseCxxIncrementalRequests())
+        {
+            std::string scopeError;
+            if (CxxIncrementalGroup* scope = GetCxxIncrementalGroup(group, scopeError);
+                scope != nullptr)
+                DropCxxDeclarationsOutsideRequestGroup(group, items, *scope, raw);
+        }
+        if (req.completeCxxSpecialMembers)
+        {
+            raw.sigs.clear();
+            raw.functionTemplates.clear();
+            raw.enums.clear();
         }
         return ok;
     }

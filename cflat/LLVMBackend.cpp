@@ -5329,6 +5329,8 @@ void LLVMBackend::DiscardOptimizedViewState()
 
 void LLVMBackend::ResetForReanalysis()
 {
+    deferredOwnedElementDeletes_.clear();
+    openDeferredLoops_.clear();
     JoinCHeaderDiskCacheWriters();
     EndActiveRoot();
     lexicalAggregateMemberNameCache_.clear();
@@ -5400,6 +5402,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxVerdictFiles_.clear();
     cxxDemandRefusalRelay_ = {};
     cxxIncompleteArgumentSpelling_.clear();
+    cxxMemberBodyRequest_.clear();
     cxxDemandRequestGroups_.clear();
     cxxDemandLiveKeys_.clear();
     pendingCxxDemandGroupKey_.clear();
@@ -5786,6 +5789,7 @@ void LLVMBackend::ResetForReanalysis()
     lastUniqueOwningCallResult = nullptr;
     lastTernaryJoinValue = nullptr;
     lastTernaryJoinArms = 0;
+    lastTernaryJoinShape = {};
     lastCallReturnValueCv_ = 0;
     cxxFilteredOperatorCandidates_.clear();
     lastCallReturnsOwned = false;

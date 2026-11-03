@@ -1,0 +1,12 @@
+import "list.cb";
+import cpp "cpp_defarg_trace.hpp";
+
+struct B { int v = 7; ~B() {} };
+
+expect_error("borrows an element that its container owns") {
+    void invokeLoopDelete(bool c, bool d) {
+        list<unique B*> items = default;
+        items.add(new B());
+        B* b = new B(); int i = 0; while (i < 2) { if (i == 0) { b = items.get(0); cppdefarg.mark('x'); } else { delete b; } i++; }
+    }
+}

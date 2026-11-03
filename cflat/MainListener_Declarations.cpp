@@ -5566,6 +5566,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // lambda body installs.
         struct FunctionDeferredCheckGuard
         {
+            MainListener* Listener;
             LLVMBackend* Compiler;
             llvm::Function* Function;
             bool Completed = false;
@@ -5575,8 +5576,10 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                 Compiler->DiscardNullDerefEvents(Function);
                 Compiler->DiscardPendingReturnDangleChecks(Function);
                 Compiler->DiscardPendingNullIfaceDispatch(Function);
+                Listener->returnedStructFrameCandidates_.erase(Function);
             }
-        } deferredCheckGuard{ compiler, fn };
+        } deferredCheckGuard{ this, compiler, fn };
+        returnedStructFrameCandidates_.erase(fn);
 
         currentFunctionIsVariadic = varargs;
 
@@ -5694,6 +5697,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
 
             if (!compiler->IsBlockTerminated() && blockUnreachable)
                 compiler->builder->CreateUnreachable();
+
+            CheckReturnedStructFramePointerFields(compiler, fn);
 
             compiler->ClearCurrentSubprogram();
 
@@ -11477,6 +11482,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcElementExternallyOwned = rightNV.TypeAndValue.IsBorrowOfAliasElement;
                                 srcOwnedElementContainer = rightNV.TypeAndValue.ParentVariableName.empty()
                                     ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
+                                // A `?:` join that reads a container-owned element carries the fact on
+                                // the NamedVariable (no source binding or unique type names it here).
+                                if (rightNV.BorrowsOwnedElement)
+                                {
+                                    srcBorrowsOwnedElement = true;
+                                    srcElementExternallyOwned = rightNV.BorrowedElementExternallyOwned;
+                                    srcOwnedElementContainer = rightNV.OwnedElementContainer;
+                                }
                                 // One hop off a source BINDING that already borrows the element: the
                                 // flags above read the ACCESSOR result, so a plain copy carried none.
                                 // The CONTAINER still owns whatever the source was rebound to since,
@@ -13681,6 +13694,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 && srcStorage != nullptr
                                 && srcInferredTypeName == typeAndValue.TypeName
                                 && compiler->HasForeignNontrivialCxxField(typeAndValue.TypeName);
+                            const bool movedOwningCoreUnique = srcIsMove
+                                && initializerSourceNV.IsOwningStruct
+                                && !typeAndValue.Pointer && right->getType()->isStructTy()
+                                && srcStorage != nullptr
+                                && srcInferredTypeName == typeAndValue.TypeName
+                                && compiler->IsCoreUniqueType(typeAndValue.TypeName);
                             if (!typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
                                 && haveInitializerSourceNV && right->getType()->isStructTy())
                             {
@@ -13741,6 +13760,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     compiler->MarkVariableMoved(srcCallerName);
                                     compiler->MarkVariableExplicitlyMovedNull(srcCallerName);
                                 }
+                            }
+                            if (movedOwningCoreUnique)
+                            {
+                                compiler->builder->CreateStore(
+                                    llvm::ConstantAggregateZero::get(right->getType()), srcStorage);
+                                if (!srcCallerName.empty())
+                                    compiler->MarkVariableMoved(srcCallerName);
                             }
                             // A runtime '??' fallback that is a bare `new` hands its hidden owner to this
                             // declaration; the declared pointer stays a borrow (see BindNullCoalesceFallbackOwner).
@@ -14906,7 +14932,7 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
                     // Each consumed arm is null-tracked on its own predecessor, as a plain consume is:
                     // a deref after a join is refused as maybe-moved, `== nullptr` reads stay legal.
                     if (!source.NullKey.empty())
-                        compilerLLVM->RecordNullSet(source.NullKey);
+                        compilerLLVM->RecordNullSet(source.NullKey, false, true);
                     if (right->getType()->isPointerTy())
                         compilerLLVM->builder->CreateStore(
                             llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(right->getType())),
@@ -14946,8 +14972,9 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
         rightNV.TypeAndValue.IsMove = true;
         rightNV.Storage = nullptr;
         // The implicit move nulls the FIELD only: its path is null like an explicitly moved local.
+        const bool joinConsumed = compilerLLVM->FindUniqueFieldReadJoin(rightNV.Primary) != nullptr;
         if (std::string key = compilerLLVM->UniqueFieldNullKey(rightNV); !key.empty())
-            compilerLLVM->RecordNullSet(key);
+            compilerLLVM->RecordNullSet(key, false, joinConsumed);
     }
 
 bool MainListener::RejectFieldAllocAlignMismatch(

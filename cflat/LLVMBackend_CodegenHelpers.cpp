@@ -379,10 +379,13 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
 
         currentFunction = fn;
         autoVaListAlloca = nullptr;
+        // Deferred loop-delete records belong to one function; a new function starts with none.
+        deferredOwnedElementDeletes_.erase(fn);
         // Per-function call state: a stale value from the last function must not match this one.
         lastUniqueOwningCallResult = nullptr;
         lastTernaryJoinValue = nullptr;
         lastTernaryJoinArms = 0;
+        lastTernaryJoinShape = {};
     }
 
 llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)

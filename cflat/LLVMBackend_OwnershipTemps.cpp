@@ -819,10 +819,12 @@ std::vector<llvm::Value*> LLVMBackend::FindPendingStructTempOwnersOf(const llvm:
             }
             for (llvm::Value* owner : FindOwningTempRawPointerFieldOwners(v)) add(owner);
             // A value spilled into a pending temp names it (`store %call, %owntemp`).
-            for (const llvm::User* user : v->users())
-                if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
-                    store != nullptr && store->getValueOperand() == v)
-                    add(pendingTemp(store->getPointerOperand()));
+            // Constants carry no use list (LLVM asserts on users() of one).
+            if (v->hasUseList())
+                for (const llvm::User* user : v->users())
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getValueOperand() == v)
+                        add(pendingTemp(store->getPointerOperand()));
             if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(v))
                 pending.push_back(load->getPointerOperand());
             else if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(v))
@@ -2468,6 +2470,16 @@ void LLVMBackend::EmitOwnedPtrRelease(const NamedVariable& namedVar, llvm::Value
         }
     }
 
+// Drops the element-borrow fact once no block still holds a Borrow event.
+static void ClearOwnedElementFactWithoutBorrow(LLVMBackend::NamedVariable& nv)
+{
+        if (std::ranges::any_of(nv.OwnedElementEvents, [](const auto& e) { return e.Borrow; })) return;
+        nv.OwnedElementEvents.clear();
+        nv.BorrowsOwnedElement = false;
+        nv.OwnedElementContainer.clear();
+        nv.BorrowedElementExternallyOwned = false;
+}
+
 void LLVMBackend::RetargetStraightLineBlockFacts(llvm::BasicBlock* from, llvm::BasicBlock* to)
 {
         if (from == nullptr || to == nullptr || from == to) return;
@@ -2475,9 +2487,15 @@ void LLVMBackend::RetargetStraightLineBlockFacts(llvm::BasicBlock* from, llvm::B
         {
             for (llvm::BasicBlock** b : { &nv.OwnedStringBorrowBlock, &nv.DeclarationBlock,
                                           &nv.ReboundBlock, &nv.ExplicitNullBlock, &nv.BondDeclBlock,
-                                          &nv.AliasBorrowDeclBlock, &nv.AssignBorrowBlock,
-                                          &nv.OwnedElementBorrowBlock })
+                                          &nv.AssignBorrowBlock })
                 if (*b == from) *b = to;
+            // The invoke's block events move to its normal destination; an event already there is newer.
+            auto& events = nv.OwnedElementEvents;
+            for (auto& e : events)
+                if (e.Block == from && std::ranges::none_of(events, [&](const auto& o) { return o.Block == to; }))
+                    e.Block = to;
+            std::erase_if(events, [&](const auto& e) { return e.Block == from; });
+            ClearOwnedElementFactWithoutBorrow(nv);
         };
         for (auto& frame : stackNamedVariable)
         {
@@ -2826,31 +2844,191 @@ void LLVMBackend::SetVariableBorrowsOwnedString(const std::string& name, bool va
         }
     }
 
+// The event `block` held as the delete in it was emitted: nullopt none, true Borrow, false Kill.
+static std::optional<bool> OriginBorrowOf(const LLVMBackend::NamedVariable& nv, const llvm::BasicBlock* block)
+{
+        if (block == nullptr) return std::nullopt;
+        auto event = std::ranges::find(nv.OwnedElementEvents, block, &LLVMBackend::OwnedElementBorrowEvent::Block);
+        if (event == nv.OwnedElementEvents.end()) return std::nullopt;
+        return event->Borrow;
+}
+
+bool LLVMBackend::OwnedElementBorrowReaches(const NamedVariable& nv) const
+{
+        llvm::BasicBlock* here = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        return OwnedElementBorrowReachesFrom(nv, here, OriginBorrowOf(nv, here));
+}
+
+bool LLVMBackend::OwnedElementBorrowReachesFrom(const NamedVariable& nv, llvm::BasicBlock* from,
+        std::optional<bool> originBorrow) const
+{
+        if (!nv.BorrowsOwnedElement) return false;
+        // No insert block, or a fact with no recorded events: keep the may-borrow answer.
+        if (from == nullptr || nv.OwnedElementEvents.empty()) return true;
+        llvm::Function* function = from->getParent();
+        if (std::ranges::any_of(nv.OwnedElementEvents,
+                [&](const OwnedElementBorrowEvent& e) { return e.Function != function; }))
+            return true;
+        // The origin block answers for itself only as it stood at the delete; a later event in it
+        // comes after the delete and reaches the delete only through a backedge (read below).
+        if (originBorrow.has_value()) return *originBorrow;
+        // Backward walk from the origin's predecessors. The first event on a path decides it (Borrow
+        // keeps the element live, Kill ends that path). Only predecessor edges are read, so a block
+        // still being emitted (no terminator yet) is never touched.
+        llvm::SmallPtrSet<const llvm::BasicBlock*, 16> seen;
+        llvm::SmallVector<llvm::BasicBlock*, 16> work;
+        for (llvm::BasicBlock* pred : llvm::predecessors(from))
+            if (seen.insert(pred).second) work.push_back(pred);
+        while (!work.empty())
+        {
+            llvm::BasicBlock* block = work.pop_back_val();
+            if (auto event = std::ranges::find(nv.OwnedElementEvents, block, &OwnedElementBorrowEvent::Block);
+                event != nv.OwnedElementEvents.end())
+            {
+                if (event->Borrow) return true;
+                continue;
+            }
+            for (llvm::BasicBlock* pred : llvm::predecessors(block))
+                if (seen.insert(pred).second) work.push_back(pred);
+        }
+        return false;
+}
+
+const LLVMBackend::NamedVariable* LLVMBackend::FindLocalNamedVariable(const llvm::Value* storage) const
+{
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            for (const auto& [name, nv] : frame.namedVariable)
+                if (nv.Storage == storage) return &nv;
+            for (const auto& [name, nv] : frame.functionArgument)
+                if (nv.Storage == storage) return &nv;
+        }
+        return nullptr;
+}
+
+void LLVMBackend::DeferOwnedElementDelete(const NamedVariable& operand, int line, int column)
+{
+        // The live frame variable carries the events; the operand is a copy taken at parse time.
+        auto* here = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        const NamedVariable* live = FindLocalNamedVariable(operand.Storage);
+        if (here == nullptr || live == nullptr) return;
+        // A block that already held an event answers the walk on its own; that answer cannot change
+        // at a later backedge, so there is nothing to re-check.
+        const auto origin = OriginBorrowOf(*live, here);
+        if (origin.has_value()) return;
+        deferredOwnedElementDeletes_[here->getParent()].push_back(
+            { operand.Storage, here, origin, line, column });
+}
+
+size_t LLVMBackend::BeginDeferredLoop()
+{
+        auto* here = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        llvm::Function* function = here != nullptr ? here->getParent() : nullptr;
+        size_t mark = 0;
+        if (function != nullptr)
+        {
+                auto found = deferredOwnedElementDeletes_.find(function);
+                if (found != deferredOwnedElementDeletes_.end()) mark = found->second.size();
+        }
+        openDeferredLoops_.emplace_back(function, mark);
+        return mark;
+}
+
+// Normal loop exit. The loop is popped before the re-check, so a throw from it leaves no open entry.
+void LLVMBackend::EndDeferredLoop(size_t mark)
+{
+        if (openDeferredLoops_.empty()) return;
+        llvm::Function* function = openDeferredLoops_.back().first;
+        openDeferredLoops_.pop_back();
+        if (function == nullptr) return;
+        RecheckDeferredOwnedElementDeletes(function, mark);
+        // The outermost loop of this function: no backedge can reach its records any more.
+        if (std::ranges::none_of(openDeferredLoops_, [&](const auto& open) { return open.first == function; }))
+            deferredOwnedElementDeletes_.erase(function);
+}
+
+// Unwinding exit (LogError may throw): pops only, never checks.
+void LLVMBackend::AbandonDeferredLoop() noexcept
+{
+        if (!openDeferredLoops_.empty()) openDeferredLoops_.pop_back();
+}
+
+void LLVMBackend::RecheckDeferredOwnedElementDeletes(llvm::Function* function, size_t from)
+{
+        auto found = deferredOwnedElementDeletes_.find(function);
+        if (found == deferredOwnedElementDeletes_.end() || from >= found->second.size()) return;
+        auto& records = found->second;
+        // The diagnostic moves the location; restore the caller's on every exit, including a throw.
+        struct LocationRestore
+        {
+                LLVMBackend* self; size_t line; size_t column;
+                ~LocationRestore() { self->currentLine = line; self->currentColumn = column; }
+        } restore{ this, currentLine, currentColumn };
+        for (size_t i = from; i < records.size();)
+        {
+            const DeferredOwnedElementDelete record = records[i];
+            const NamedVariable* nv = FindLocalNamedVariable(record.Storage);
+            // Out of scope: the local is re-declared on every later pass, so no backedge reaches it.
+            if (nv == nullptr) { records.erase(records.begin() + i); continue; }
+            if (!OwnedElementBorrowReachesFrom(*nv, record.Block, record.OriginBorrow)) { ++i; continue; }
+            records.erase(records.begin() + i);
+            currentLine = record.Line;
+            currentColumn = record.Column;
+            LogError(OwnedElementDeleteMessage(*nv));
+            return;
+        }
+}
+
+std::string LLVMBackend::OwnedElementDeleteMessage(const NamedVariable& nv) const
+{
+        std::string name = nv.CallerName.empty() ? nv.TypeAndValue.VariableName : nv.CallerName;
+        std::string owner = nv.OwnedElementContainer.empty()
+            ? "its container" : "'" + nv.OwnedElementContainer + "'";
+        if (nv.BorrowedElementExternallyOwned)
+        {
+                // Container-agnostic: any 'alias'-element container (list<alias T*>,
+                // queue<alias T*>, ...) hands back pure borrows owned elsewhere.
+                return std::format(
+                    "cannot delete '{}' - {} declares its elements 'alias' (a pure borrow owned "
+                    "elsewhere), so deleting this double-frees when the real owner releases it. Do "
+                    "not delete a borrow, or use a 'unique'-element container if it should own them.",
+                    name, owner);
+        }
+        return std::format(
+            "cannot delete '{}' - it borrows an element that {} owns, whose "
+            "destructor already frees it, so this is a double-free. Remove and free through "
+            "the owner instead (e.g. the container's removeAt/erase), or do not delete a borrow.",
+            name, owner);
+}
+
 void LLVMBackend::SetVariableBorrowsOwnedElement(const std::string& name, bool value,
         const std::string& container, bool externallyOwned)
 {
         if (name.empty()) return;
         auto* here = builder != nullptr ? builder->GetInsertBlock() : nullptr;
         auto* function = here != nullptr ? here->getParent() : nullptr;
+        // This block's event: a later event of the same block replaces the earlier one.
+        auto record = [&](NamedVariable& nv, bool borrow) {
+            auto& events = nv.OwnedElementEvents;
+            if (auto event = std::ranges::find(events, here, &OwnedElementBorrowEvent::Block);
+                event != events.end())
+                event->Borrow = borrow;
+            else
+                events.push_back({ here, function, borrow });
+        };
         auto apply = [&](NamedVariable& nv) {
             if (value)
             {
+                record(nv, true);
                 nv.BorrowsOwnedElement = true;
                 nv.OwnedElementContainer = container;
                 nv.BorrowedElementExternallyOwned = externallyOwned;
-                nv.OwnedElementBorrowBlock = here;
-                nv.OwnedElementBorrowFunction = function;
+                return;
             }
-            else if (nv.BorrowsOwnedElement
-                     && nv.OwnedElementBorrowBlock == here
-                     && nv.OwnedElementBorrowFunction == function)
-            {
-                nv.BorrowsOwnedElement = false;
-                nv.OwnedElementContainer.clear();
-                nv.BorrowedElementExternallyOwned = false;
-                nv.OwnedElementBorrowBlock = nullptr;
-                nv.OwnedElementBorrowFunction = nullptr;
-            }
+            // A non-element overwrite matters only while a Borrow event exists.
+            if (!nv.BorrowsOwnedElement || nv.OwnedElementEvents.empty()) return;
+            record(nv, false);
+            ClearOwnedElementFactWithoutBorrow(nv);
         };
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -5761,7 +5939,7 @@ bool LLVMBackend::ParameterIsExactlyReturned(const llvm::Function* fn, unsigned 
 
 void LLVMBackend::AdoptLaunderedOwningTempResult(llvm::Value* callResult)
 {
-        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callResult);
         if (call == nullptr || !call->getType()->isPointerTy()) return;
         const llvm::Function* callee = call->getCalledFunction();
         if (callee == nullptr) return;
@@ -7061,7 +7239,7 @@ std::string LLVMBackend::ResolvePointerElementTypeName(llvm::Value* value) const
 {
         std::string name = FindValueElementTypeName(value);
         if (!name.empty()) return name;
-        if (auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(value))
+        if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(value))
         {
             const auto* symbol = FindSymbolForFunction(call->getCalledFunction());
             if (symbol == nullptr) return {};
@@ -9856,6 +10034,7 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
                 builder->CreateUnreachable();
         }
         builder->SetInsertPoint(contBB);
+        RetargetStraightLineBlockFacts(invoke->getParent(), contBB);
         builder->SetCurrentDebugLocation(savedLoc);
         return invoke;
 }

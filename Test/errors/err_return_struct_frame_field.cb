@@ -1,0 +1,123 @@
+// Returning a struct by value must not carry pointers into the returning frame.
+struct DSFPointer { int* p = nullptr; };
+struct DSFNested { DSFPointer inner = default; };
+struct DSFArray { int*[2] p = default; };
+struct DSFValue { int value = 0; };
+int dsfGlobal = 17;
+
+DSFPointer accepts_global() { DSFPointer m = { p = &dsfGlobal }; return m; }
+DSFPointer accepts_heap() { DSFPointer m = { p = new int(19) }; return m; }
+DSFPointer accepts_pointer_param(int* q) { DSFPointer m = { p = q }; return m; }
+DSFPointer accepts_param_field(DSFValue* q) { DSFPointer m = { p = &q->value }; return m; }
+struct DSFChars { const char* p = nullptr; };
+DSFChars accepts_string_literal() { DSFChars m = { p = "ok" }; return m; }
+DSFPointer accepts_overwrite() {
+    int x = 5;
+    DSFPointer m = { p = &x };
+    m.p = &dsfGlobal;
+    return m;
+}
+DSFPointer accepts_param_borrow(int* q) { DSFPointer m = { p = q }; return m; }
+
+expect_error("cannot return 'm': its field 'p' holds the address of 'x'") {
+    DSFPointer frame_from_brace() {
+        int x = 5;
+        DSFPointer m = { p = &x };
+        return m;
+    }
+}
+expect_error("cannot return 'm': its field 'p' holds the address of 'x'") {
+    DSFPointer frame_from_assignment() {
+        int x = 5;
+        DSFPointer m = default;
+        m.p = &x;
+        return m;
+    }
+}
+expect_error("cannot return 'm': its field 'inner.p' holds the address of 'x'") {
+    DSFNested frame_from_nested_field() {
+        int x = 5;
+        DSFNested m = default;
+        m.inner.p = &x;
+        return m;
+    }
+}
+DSFPointer accepts_after_struct_address_escape() {
+    int x = 5;
+    DSFPointer m = { p = &x };
+    DSFPointer* pm = &m;
+    pm->p = &dsfGlobal;
+    return m;
+}
+void dsf_reset(DSFPointer* m) { m->p = &dsfGlobal; }
+DSFPointer accepts_after_call_escape() {
+    int x = 5;
+    DSFPointer m = { p = &x };
+    dsf_reset(&m);
+    return m;
+}
+void dsf_setp(int** r, int* q) { *r = q; }
+DSFPointer accepts_after_pointer_local_escape(int* q) {
+    int x = 5;
+    int* r = &x;
+    dsf_setp(&r, q);
+    DSFPointer m = { p = r };
+    return m;
+}
+expect_error("cannot return 'm': its field 'p' holds the address of 'x'") {
+    DSFArray frame_from_pointer_array() {
+        int x = 5;
+        DSFArray m = default;
+        m.p[1] = &x;
+        return m;
+    }
+}
+expect_error("cannot return 'm': its field 'p' holds the address of 'x'") {
+    DSFArray frame_from_variable_pointer_array_index(int i) {
+        int x = 5;
+        DSFArray m = default;
+        m.p[i] = &x;
+        return m;
+    }
+}
+expect_error("cannot return 'n': its field 'p' holds the address of 'x'") {
+    DSFPointer frame_from_struct_copy() {
+        int x = 5;
+        DSFPointer m = default;
+        m.p = &x;
+        DSFPointer n = m;
+        return n;
+    }
+}
+expect_error("cannot return 'm': its field 'p' holds the address of 'x'") {
+    DSFPointer frame_may_hold(bool c) {
+        int x = 5;
+        DSFPointer m = default;
+        if (c) m.p = &x;
+        return m;
+    }
+}
+expect_error("cannot return 'm': its field 'p' holds the address of 'x'") {
+    DSFPointer frame_from_by_value_param(int x) {
+        DSFPointer m = { p = &x };
+        return m;
+    }
+}
+struct DSFHolder { DSFPointer* q = nullptr; };
+DSFPointer accepts_after_field_pointer_escape() {
+    int x = 5;
+    DSFPointer m = { p = &x };
+    DSFHolder h = default;
+    h.q = &m;
+    h.q->p = &dsfGlobal;
+    return m;
+}
+expect_error("cannot return 'm': its field 'p' holds the address of 'x'") {
+    int frame_from_lambda_return() {
+        Lambda<DSFPointer()> fn = () => { int x = 1; DSFPointer m = { p = &x }; return m; };
+        DSFPointer r = fn();
+        return 0;
+    }
+}
+
+extern int main() { return 0; }
