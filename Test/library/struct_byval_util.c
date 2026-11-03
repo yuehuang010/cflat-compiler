@@ -234,3 +234,9 @@ long long t77_call_cb_ushort(t77_cb_ushort f, struct T77Big b) { return f(b); }
 long long t77_call_cb_bool(t77_cb_bool f, struct T77Big b) { return f(b); }
 typedef short (*t77_cb_short_int)(int);
 long long t77_call_cb_short_int(t77_cb_short_int f, int value) { return f(value); }
+
+/* CFlat-defined 'extern alias' struct return called from C: the alias contract is CFlat-side
+   only, so the C ABI lowering must stay the plain by-value return (two ints -> one i64). */
+struct AliasRet { int x; int y; };
+struct AliasRet cflat_alias_ret(void);
+int call_cflat_alias_ret(void) { struct AliasRet r = cflat_alias_ret(); return r.x * 10 + r.y; }

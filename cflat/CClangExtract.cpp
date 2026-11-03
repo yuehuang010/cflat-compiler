@@ -2944,8 +2944,12 @@ namespace cflat_cinterop
                 // A member operator() template (MSVC STL _Not_fn) is CFlat's `obj(args)`.
                 const bool isMemberCallOperatorTemplate = md != nullptr
                     && md->getOverloadedOperator() == OO_Call;
+                // A member operator template (`template<class U> T& operator&=(U&&)`) has no identifier
+                // either; publish it so the receiver's operator lookup can instantiate it.
+                const bool isMemberOperatorTemplate = md != nullptr
+                    && md->getOverloadedOperator() != OO_None;
                 if (!fd->getIdentifier() && !isFreeBinaryOperatorTemplate
-                    && !isMemberCallOperatorTemplate
+                    && !isMemberCallOperatorTemplate && !isMemberOperatorTemplate
                     && !isMemberAssignmentOperatorTemplate) return true;
 
                 unsigned typeParameterCount = 0;
@@ -3024,6 +3028,7 @@ namespace cflat_cinterop
                         return true;
                 }
                 else if (isMemberAssignmentOperatorTemplate || isMemberCallOperatorTemplate
+                    || isMemberOperatorTemplate
                     ? !IsValidDottedName(ownerName)
                     : !IsValidDottedName(result.name)) return true;
                 if (md != nullptr)
@@ -3234,6 +3239,30 @@ namespace cflat_cinterop
                 LocOfRaw(spec, file, line, col);
                 if (st.req.requireInScope && !st.InScope(file)) return true;
                 const std::string name = CxxQualifiedName(spec->getSpecializedTemplate());
+                if (!name.empty()
+                    && std::find(st.out.classTemplateSpecializations.begin(),
+                                 st.out.classTemplateSpecializations.end(), name)
+                           == st.out.classTemplateSpecializations.end())
+                    st.out.classTemplateSpecializations.push_back(name);
+                return true;
+            }
+
+            /*
+             * An explicit or partial variable template specialization names its template like a
+             * class one: a group declaring it must join requests for that template, else the
+             * primary's value is bound. Shares the list; Clang Sema picks the specialization.
+             */
+            bool VisitVarTemplateSpecializationDecl(VarTemplateSpecializationDecl* spec)
+            {
+                if (!st.req.cxxMode || spec == nullptr || spec->isInvalidDecl()
+                    || (spec->getSpecializationKind() != TSK_ExplicitSpecialization
+                        && !llvm::isa<VarTemplatePartialSpecializationDecl>(spec)))
+                    return true;
+                std::string file;
+                int line = 1, col = 0;
+                LocOfRaw(spec, file, line, col);
+                if (st.req.requireInScope && !st.InScope(file)) return true;
+                const std::string name = CxxQualifiedName(spec->getSpecializedTemplate()->getTemplatedDecl());
                 if (!name.empty()
                     && std::find(st.out.classTemplateSpecializations.begin(),
                                  st.out.classTemplateSpecializations.end(), name)

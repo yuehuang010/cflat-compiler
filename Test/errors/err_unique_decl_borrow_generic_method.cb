@@ -1,0 +1,31 @@
+import "unique.cb";
+
+struct Resource { int id = 0; ~Resource() { } };
+
+// Declaration initializers name the demangled generic instance and the method's owner type.
+Resource* declGenericBorrowedGlobal = nullptr;
+Resource* declPickGeneric<T>(T k) { return declGenericBorrowedGlobal; }
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'declPickGeneric<bool>'") {
+    void declInitGenericReturn()
+    {
+        unique Resource* owner = declPickGeneric<bool>(true);
+    }
+}
+
+Resource* declMethodBorrowedGlobal = nullptr;
+struct DeclBorrowBox
+{
+    Resource* pickMember() { return declMethodBorrowedGlobal; }
+};
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'DeclBorrowBox.pickMember'") {
+    void declInitMethodReturn()
+    {
+        DeclBorrowBox box = default;
+        unique Resource* owner = box.pickMember();
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

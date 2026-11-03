@@ -26,3 +26,22 @@ already matched clang on master (refused ambiguous, verified by the OPBIN review
   refused, clang 61.
 - `struct Tf { int operator+(int); }; x + 1.5` with only the member (or an unrelated namespaced operator+ template): refused with
   "cannot pass parameter 'b' of 'operator+' of type 'char*' from 'float'"; clang 11.
+
+Root cause (MIX17, 2026-10-30): items 1 and 2 FIXED. Item 1: TryUnaryFreeOperatorOverload never tested the
+operand's cv against the free candidates. Now a volatile operand binds only a volatile reference (a volatile
+lvalue only `volatile &`, a volatile prvalue only `volatile &&`), and a by-value copy of a volatile LVALUE asks
+clang (RequestCxxVariadicConstructor copyInit; only a no-viable refusal drops the candidate); the class-lvalue
+wrapper spelling keeps `volatile`. Item 2: a non-const `T&&` free was bound to a const operand; now refused.
+Legs: Test/test_cpp_interop.cb (15012, 15013; header namespace mix17 in Test/library/cpp_interop_basic.h);
+refusals Test/errors/err_cpp_unary_cv_free.cb (3 blocks).
+Fixed (MIX17, r2/r3): (a) a `T&` call result (`S& sref(S&)`, `-sref(x)` with free `operator-(S&)`) was classified
+rvalue by the call-category override; an alias (IsAlias, not IsRvalueRef) call result now stays an lvalue, in the
+free and member paths. Same cells: `-vr(x)` with a volatile `&` member or `&&` free. (b) A cv-refused non-template
+free beside a function template (`template<class T> int operator-(const T&)`) lets the template decide: refused
+frees are removed from the operator's free table and the template call's table during the call; a template that
+does not bind gives the original "binds no free overload" refusal. Template class-argument wrappers keep `volatile`.
+(c) A const operand with a mutable `operator-(C&)` tries the template before the mutable-reference refusal.
+Legs: Test/test_cpp_interop.cb 15014-15019 (header namespace mix17r2, mix17r3); refusals
+Test/errors/err_cpp_unary_cv_free.cb (3 blocks).
+Still open (MIX17): (d) residue bullets above (template operator+= on const receiver, template parameter named like
+a record, Tf::operator+ with 1.5) not attempted in MIX17.

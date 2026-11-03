@@ -1,0 +1,12 @@
+// MIX18: a const double& and a const long& free overload tie for an int (both are converted
+// temporaries at the same rank): C++ finds no best function (clang: ambiguous), so neither is picked.
+import cpp "cpp_mix18_overloads.hpp";
+
+extern int main()
+{
+    int i = 4;
+    expect_error("ambiguous call to") {
+        int r = m18ov.a7(i);
+    }
+    return 0;
+}

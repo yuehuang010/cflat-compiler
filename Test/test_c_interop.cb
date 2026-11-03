@@ -658,8 +658,15 @@ static int t174CAlignLegs()
 // A field default may take the address of a transparent anonymous-union member of a later field.
 struct TFieldInitAnonAddr { int* q = &o.as_int; ML_Overlap o = default; };
 
+// C calls a CFlat-defined 'extern alias' struct return (struct_byval_util.c).
+AliasRet gAliasRet = default;
+extern alias AliasRet cflat_alias_ret() { return gAliasRet; }
+
 extern int main()
 {
+    gAliasRet.x = 5;
+    gAliasRet.y = 9;
+    if (call_cflat_alias_ret() != 59) return 17001;
     int fnabi2Result = testFnabi2LongFnAbi();
     if (fnabi2Result != 0) return 8320 + fnabi2Result;
     if (offsetof(T38CRecord, value) != 8) return 7990;

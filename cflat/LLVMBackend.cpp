@@ -4932,23 +4932,15 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     // verbose retains the value set by the LSP via SetVerbose() - left unmodified.
     bool debugInfo = analyzeDebugInfo_;
 
-    platformValue = 64;
-#if defined(_WIN32)
-    const char* platformOption = "win64";
-    targetWindows_ = true;
-    targetMacOS_ = false;
-    targetArm64_ = false;
-#elif defined(__APPLE__)
-    const char* platformOption = "macos";
-    targetWindows_ = false;
-    targetMacOS_ = true;
-    targetArm64_ = true;
-#else
-    const char* platformOption = "linux";
-    targetWindows_ = false;
-    targetMacOS_ = false;
-    targetArm64_ = false;
-#endif
+    // Same target resolution as Compile(): --platform (via SetAnalysisPlatform), else the host.
+    const std::string platformOption = analysisPlatform_.empty()
+        ? std::string(DefaultPlatform()) : analysisPlatform_;
+    platformValue = (platformOption == "win32") ? 32 : 64;
+    targetWindows_ = (platformOption == "win32" || platformOption == "win64");
+    targetMacOS_ = (platformOption == "macos" || platformOption == "macos-arm64");
+    targetArm64_ = targetMacOS_;
+    if (targetMacOS_ && !cflat::platform::MacDeploymentInfo().error.empty())
+        LogError(cflat::platform::MacDeploymentInfo().error);
     SetTargetLongWidth(targetWindows_, platformValue, targetArm64_, targetMacOS_);
 
     // A core file analyzed as the ROOT document (LSP open / --check on core/*.cb) must
@@ -5595,6 +5587,7 @@ void LLVMBackend::ResetForReanalysis()
     // Body origins describe definitions in the module just discarded; a survivor would make the
     // next analysis of the same file report its own definition as a redefinition of itself.
     functionBodyOrigin_.clear();
+    genericTemplateOrigin_.clear();
     isolatedCoreFunctions_.clear();
     // Memoized full-destructor wrappers are synthesized llvm::Function* objects that live
     // in `module`, so they MUST be discarded with it - a stale entry would hand the next
@@ -6656,6 +6649,19 @@ const char* LLVMBackend::DefaultPlatform()
 #else
     return "linux";
 #endif
+}
+
+bool LLVMBackend::SetAnalysisPlatform(const std::string& platform)
+{
+    if (platform != "win32" && platform != "win64" && platform != "linux"
+        && platform != "macos" && platform != "macos-arm64")
+    {
+        LogErrorMessage("unknown target platform '{}'; expected win64, win32, linux or macos",
+                        { platform });
+        return false;
+    }
+    analysisPlatform_ = platform;
+    return true;
 }
 
 std::string LLVMBackend::PlatformTargetTriple(const std::string& platform)
@@ -9078,7 +9084,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                         sym.Recipe = std::move(recipe);
                     continue;
                 }
-                auto recipe = ComputeAbiRecipe(sym.ReturnType, sym.Parameters);
+                auto recipe = ComputeAbiRecipe(ExternAbiReturnShape(sym.ReturnType, !sym.IsCxx), sym.Parameters);
                 if (recipe.hasLowering) sym.Recipe = std::move(recipe);
             }
             else

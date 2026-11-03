@@ -1,0 +1,18 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+expect_error("binds no free overload") {
+    mix17.VolCrS volCr = default;
+    int volCrResult = -mix17.volCrRef(volCr);
+}
+
+expect_error("binds no free overload") {
+    mix17.VolCopyS volCopy = default;
+    int volCopyResult = -mix17.volCopyRef(volCopy);
+}
+
+expect_error("binds no free overload") {
+    int constRvBadResult = -mix17.constRvBadMake();
+}
+}

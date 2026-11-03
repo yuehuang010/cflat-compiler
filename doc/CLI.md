@@ -483,8 +483,8 @@ cflat.exe app.cb -i lib --symbol Math
 | Switch | Value | Description |
 |--------|-------|-------------|
 | `--symbol-dump` | selector | Dump symbol info for source elements, then exit (repeatable). Requires a positional source file. |
-| `--symbol-dump-ir` | selector | Dump unoptimized LLVM IR for a selector, then exit (repeatable). Requires a positional source file. |
-| `--symbol-dump-opt` | selector | Dump optimized LLVM IR for a selector, then exit (repeatable). Defaults to `-O2`; explicit `-O0`, `-O1`, or `-O2` overrides it. Requires a positional source file. |
+| `--symbol-dump-ir` | selector | Dump unoptimized LLVM IR for a selector, then exit (repeatable). Requires a positional source file. Honours `--platform` like a normal compile. |
+| `--symbol-dump-opt` | selector | Dump optimized LLVM IR for a selector, then exit (repeatable). Defaults to `-O2`; explicit `-O0`, `-O1`, or `-O2` overrides it. Requires a positional source file. Honours `--platform` like a normal compile. |
 
 Selectors are:
 

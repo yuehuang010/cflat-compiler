@@ -5108,6 +5108,13 @@ struct ExternAliasRow { int a = default; int b = default; };
 ExternAliasRow g_externAliasRow = default;
 extern alias ExternAliasRow externAliasRow() { return g_externAliasRow; }
 
+// An `extern alias` OWNER return is a borrow too, like a defined `alias`: the caller must not adopt
+// or free the global's resource (the C-ABI shape is kept, only the ownership contract is restored).
+UniqueBox g_externBorrowBox = default;
+// A prototype of an owner alias return agrees with its definition (no conflicting declaration).
+extern alias UniqueBox externBorrowBox();
+extern alias UniqueBox externBorrowBox() { return g_externBorrowBox; }
+
 // A '?:' of `&` over CFlat alias results is refused at a non-alias return for every root, like
 // the direct form (Test/errors/err_cflat_alias_ternary_return.cb); `alias T*` is the override.
 struct AtRow { int v = default; string s = default; };
@@ -5394,6 +5401,14 @@ int testOwningStructTernaryJoin()
     g_externAliasRow.b = 6;
     passed += Test("extern_alias_return_first_field", externAliasRow().a, 5);
     passed += Test("extern_alias_return_second_field", externAliasRow().b, 6);
+    g_externBorrowBox.item = new Resource();
+    g_externBorrowBox.item->id = 9;
+    int externBorrowDtors = dtorCount;
+    {
+        UniqueBox eb = externBorrowBox();
+        passed += Test("extern_alias_owner_borrow_value", eb.item->id, 9);
+    }
+    passed += Test("extern_alias_owner_borrow_no_free", dtorCount - externBorrowDtors, 0);
     AtTab atT;
     atT.r.v = 7;
     passed += Test("alias_ternary_return_alias_type", atPickAliasLocal(&atT, false).v, 7);
@@ -17325,6 +17340,27 @@ void tCalleeRefForward(move TCalleeRefElem* p) { tCalleeRefExternSink(move p); }
 int tCalleeRefFlatSink(TCalleeRefBig b, move TCalleeRefElem* p) { return 0; }
 void tCalleeRefDirectRead(int* p) { int ignored = *p; }
 
+// MIX4: a moved-out owning field is null; assigning a value into it must not destroy the null.
+int mix4Cc = 0;
+int mix4Dc = 0;
+struct Mix4Own { int v = 0; Mix4Own() { mix4Cc = mix4Cc + 1; } ~Mix4Own() { mix4Dc = mix4Dc + 1; } };
+Mix4Own mix4Make(int v) { Mix4Own o = default; o.v = v; return o; }
+struct Mix4H { Mix4Own o; int y = 0; };
+int mix4FieldSwapCounts()
+{
+    mix4Cc = 0; mix4Dc = 0;
+    int seen = 0;
+    {
+        Mix4H a = { o = mix4Make(1) };
+        Mix4H b = { o = mix4Make(2) };
+        a.o = move b.o;
+        b.o = move a.o;
+        seen = b.o.v * 10 + a.o.v;
+    }
+    // 2 field-default constructions (each replaced by its override) + 2 owned values; cc 4, dc 4.
+    return mix4Dc * 1000 + mix4Cc * 100 + seen;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -17802,7 +17838,7 @@ extern int main()
     total += 22;
 
     passed += testOwningStructTernaryJoin();
-    total += 119;
+    total += 121;
 
     passed += testBucketAExpressionOwnership();
     total += 109;
@@ -17929,6 +17965,7 @@ extern int main()
     total += 26;
     passed += testT487ReturnBrace();
     total += 21;
+    total += 1;   // MIX4 leg in testImmovableFactoryReturn
     passed += testImmovableFactoryReturn();
     total += 27;
 
@@ -18271,6 +18308,8 @@ extern int main()
     total += 15;
 
     passed += testT364NativeOperatorReturnFacts();
+    passed += testMix9ReleaseReturn();
+    total += 3; // release() results returned as bare pointers (heap-array gate)
     total += 97; // mvfield legs and four CALLEEREF accept-set legs
     passed += testT523ByrefClosureRebind();
     total += 15;
@@ -19354,6 +19393,7 @@ int testImmovableFactoryReturn()
     passed += Test("t442_tracked_nested_assignment_true_true", t442NestedAssignTracked(true, true), 2212);
     passed += Test("t442_tracked_nested_assignment_true_false", t442NestedAssignTracked(true, false), 3212);
     passed += Test("t442_tracked_nested_assignment_outer_false", t442NestedAssignTracked(false, true), 4212);
+    passed += Test("mix4_moved_out_field_reassign_drops_once", mix4FieldSwapCounts(), 4420);
     return passed;
 }
 
@@ -24532,5 +24572,38 @@ int testT364NativeOperatorReturnFacts()
     function<int(TCalleeRefBig, move TCalleeRefElem*)> tCalleeRefArrayFn = tCalleeRefFlatSink;
     tCalleeRefArrayFn(tCalleeRefBig, move tCalleeRefArray);
     passed += Test("calleeref nonextern function array count dtor", tCalleeRefElemDtors, 3);
+    return passed;
+}
+
+// A release() result is one object: a bare `T*` return of it is not a heap array.
+struct Mix9ReleaseBox { int id = 0; };
+struct Mix9Wrap<T> { T v; ~Mix9Wrap() { } };
+Mix9ReleaseBox* mix9ReleaseByValue(unique<Mix9ReleaseBox> owner) { return owner.release(); }
+struct Mix9ReleaseHolder { unique<Mix9ReleaseBox> box; };
+Mix9ReleaseBox* mix9ReleaseHeld(Mix9ReleaseHolder* h) { return h->box.release(); }
+Mix9Wrap<Mix9ReleaseBox>* mix9ReleaseWrap(unique<Mix9Wrap<Mix9ReleaseBox>> u) { return u.release(); }
+
+int testMix9ReleaseReturn()
+{
+    int passed = 0;
+    unique<Mix9ReleaseBox> owner = unique<Mix9ReleaseBox>(new Mix9ReleaseBox());
+    owner->id = 23;
+    Mix9ReleaseBox* byValue = mix9ReleaseByValue(move owner);
+    passed += Test("mix9 release by-value return", byValue->id, 23);
+    delete byValue;
+
+    Mix9ReleaseHolder* holder = new Mix9ReleaseHolder();
+    holder->box = unique<Mix9ReleaseBox>(new Mix9ReleaseBox());
+    holder->box->id = 7;
+    Mix9ReleaseBox* held = mix9ReleaseHeld(holder);
+    passed += Test("mix9 release through field return", held->id, 7);
+    delete held;
+    delete holder;
+
+    unique<Mix9Wrap<Mix9ReleaseBox>> wrapOwner = unique<Mix9Wrap<Mix9ReleaseBox>>(new Mix9Wrap<Mix9ReleaseBox>());
+    wrapOwner->v.id = 11;
+    Mix9Wrap<Mix9ReleaseBox>* wrapped = mix9ReleaseWrap(move wrapOwner);
+    passed += Test("mix9 release generic wrap return", wrapped->v.id, 11);
+    delete wrapped;
     return passed;
 }

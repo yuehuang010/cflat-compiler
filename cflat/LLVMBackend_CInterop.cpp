@@ -13476,6 +13476,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             }
             else if (!cxxTemplateArgumentSpelling(cflatType, spelling))
                 return noMatch("an argument type cannot be spelled in C++");
+            // A volatile class lvalue keeps its volatile in the wrapper, so clang ranks the template
+            // against the same cv as the source site (a plain reference overload must not win).
+            if (classArgument && (CxxReceiverCv(arg) & 2) != 0 && !spelling.starts_with("volatile "))
+                spelling = "volatile " + spelling;
             if (arg.TypeAndValue.CxxConstRef() && !arg.TypeAndValue.Pointer
                 && !arg.TypeAndValue.IsCxxRefToPointer)
             {
@@ -19085,6 +19089,12 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             && IsCxxRecord(arguments.front().TypeAndValue.TypeName)
             && HasImplicitClassConversionOperator(arguments.front().TypeAndValue.TypeName))
             declaredWrapperCtor = true;
+        // A deleted converting constructor is clang's refusal for this source: report it.
+        if (!declaredWrapperCtor && copyInit && arguments.size() == 1
+            && !arguments.front().TypeAndValue.Pointer
+            && IsCxxRecord(arguments.front().TypeAndValue.TypeName)
+            && HasDeletedConvertingCtor(typeName))
+            declaredWrapperCtor = true;
         if (!declaredWrapperCtor && IsForeignCxxClassWithConstructors(typeName))
             declaredWrapperCtor = std::any_of(arguments.begin(), arguments.end(),
                 [](const NamedVariable& arg) { return IsCxxFixedArrayArgument(arg); });
@@ -19306,6 +19316,10 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 }
                 else
                 {
+                    // A volatile lvalue keeps its volatile in the wrapper: clang copies or binds it
+                    // as the source site does (a copy ctor taking `const S&` refuses it).
+                    if ((CxxReceiverCv(arg) & 2) != 0 && !spelling.starts_with("volatile "))
+                        spelling = "volatile " + spelling;
                     if (CxxConstReceiverKind(arg) != 0 && !spelling.starts_with("const "))
                         spelling = "const " + spelling;
                     spelling += " &";
@@ -26458,6 +26472,19 @@ bool LLVMBackend::CxxProtectedAccessAllowed(const std::string& typeName,
             && !inaccessible;
     }
 
+int LLVMBackend::CxxSelectedMethodAccess(const std::string& typeName, const std::string& linkageName,
+                                         std::set<std::string>& visited) const
+{
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        if (info == nullptr || !visited.insert(typeName).second) return -1;
+        for (const auto& method : info->directMethods)
+            if (!linkageName.empty() && method.raw.linkageName == linkageName) return method.raw.access;
+        for (const auto& base : info->bases)
+            if (const int access = CxxSelectedMethodAccess(base.name, linkageName, visited); access >= 0)
+                return access;
+        return -1;
+    }
+
 size_t LLVMBackend::CxxBaseSubobjectCount(const std::string& derivedType,
                                           const std::string& baseType) const
 {
@@ -27042,7 +27069,13 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     known->second = displayedWhy;
             };
             recordDirectMethod(m);
-            if (m.access == cflat_cinterop::AccessPrivate)    { refuse("is private");   continue; }
+            // Private ordinary instance methods follow the protected rule: a named lookup registers
+            // them, so the selected-overload access check refuses a private pick. Special assignments
+            // stay refused (an inaccessible copy-assign has no symbol to call).
+            if (m.access == cflat_cinterop::AccessPrivate
+                && (m.kind != Member::Instance || m.isCopyAssign || m.isMoveAssign
+                    || (memberFilter.empty() && !m.isVirtual)))
+            { refuse("is private");   continue; }
             if (m.access == cflat_cinterop::AccessProtected
                 && (m.kind != Member::Instance || (memberFilter.empty() && !m.isVirtual)))
             { refuse("is protected"); continue; }
@@ -27446,6 +27479,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 st.isMoveCtor = m.isMoveCtor;
                 st.isDeleted = m.isDeleted;
                 st.isConstReceiver = m.isConst;
+                st.rhsConstRef = m.isCopyAssign && m.paramTypes.size() > 1 && m.paramTypes[1].starts_with("const ");
                 st.needsLocalDefinition = m.needsLocalDefinition;
                 st.isNoexcept = m.isNoexcept;
                 st.refQualifier = m.refQualifier;
@@ -30991,6 +31025,41 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                     a = CreateCast(a, paramType, !sourceUnsigned, param->IsUnsignedInteger() != -1);
                 }
             }
+            // A C++ bool by value takes a pointer value (a CFlat function pointer) as its truth,
+            // as the call-argument path does; the raw pointer failed module verification.
+            if (param != nullptr && a != nullptr && a->getType()->isPointerTy()
+                && !param->Pointer && !param->IsAlias && !param->IsRvalueRef
+                && param->TypeName == "bool")
+                if (llvm::Type* paramType = GetType(*param); paramType != nullptr && paramType->isIntegerTy(1))
+                    a = builder->CreateIsNotNull(a, "ptr.to.bool");
+            // A function value bound to a `const bool&` binds a temporary holding its truth (clang's
+            // boolean conversion); the raw function address would read the code bytes as the bool.
+            if (param != nullptr && a != nullptr && a->getType()->isPointerTy()
+                && param->Pointer && param->IsAlias && param->CxxConstRef() && !param->IsRvalueRef
+                && !param->ElemPointer && param->TypeName == "bool" && callArgVars != nullptr
+                && i < callArgVars->size()
+                && ((*callArgVars)[i].TypeAndValue.IsFunctionPointer
+                    || llvm::isa_and_nonnull<llvm::Function>((*callArgVars)[i].Primary)))
+            {
+                llvm::AllocaInst* truthSlot = CreateAlloca(llvm::Type::getInt1Ty(*context));
+                builder->CreateStore(builder->CreateIsNotNull(a, "ptr.to.bool"), truthSlot);
+                a = truthSlot;
+            }
+            // Pointer -> integer needs an explicit cast everywhere (ruling 2026-09-26). A function
+            // or pointer value into a by-value C++ integer parameter is refused; the null stand-in
+            // keeps the module verifiable so the refusal is the only diagnostic.
+            if (param != nullptr && a != nullptr && a->getType()->isPointerTy()
+                && !param->Pointer && !param->IsAlias && !param->IsRvalueRef
+                && param->TypeName != "bool")
+                if (llvm::Type* paramType = GetType(*param);
+                    paramType != nullptr && paramType->isIntegerTy())
+                {
+                    LogError(std::format("no matching conversion to parameter {} ('{}') of C++ "
+                        "constructor '{}': a function or pointer value cannot convert to an integer "
+                        "(pointer -> integer needs an explicit cast)",
+                        i + 1, param->TypeName, DisplayCxxClassName(typeName)));
+                    a = llvm::Constant::getNullValue(paramType);
+                }
             if (callArgVars != nullptr && i < callArgVars->size() && param != nullptr)
             {
                 const NamedVariable& source = (*callArgVars)[i];
@@ -31763,6 +31832,12 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 && ((want.IsFloatingPoint() != -1 || want.IsInteger() != -1)
                     && (got.IsFloatingPoint() != -1 || got.IsInteger() != -1)))
                 return true;                  // scalar references use an indirect pointer shape
+            // A CFlat function value is a non-null pointer: a bool target (by value, or `const bool&`
+            // binding a converted temporary) takes its truth, as clang's boolean conversion does.
+            if (want.TypeName == "bool" && !want.ElemPointer
+                && (!want.IsAlias || want.CxxConstRef()) && !want.IsRvalueRef
+                && (got.IsFunctionPointer || got.TypeName == "__c_fn_ptr") && !got.ElemPointer)
+                return true;
             if (want.Pointer != got.Pointer) return false;
             if (want.Pointer)
             {
@@ -32381,6 +32456,27 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                             return true;
                     return false;
                 };
+                // [over.ics.rank] breaks a tie by reference binding only between two reference
+                // parameters. A by-value parameter against a reference one stays tied only when
+                // each such position binds an lvalue of exactly the referent type (clang: `Amb(const
+                // V&)` with `Amb(V)` is ambiguous for an lvalue V). A materialized temporary keeps
+                // the legacy pick, which takes the by-value parameter (ruling, Overloads ~4528).
+                auto exactLvalueMixes = [&](const CxxClassInfo::Structor& x,
+                                            const CxxClassInfo::Structor& y) {
+                    for (size_t k = 1; k < x.params.size() && k < y.params.size(); ++k)
+                    {
+                        const bool xRef = x.params[k].IsAlias || x.params[k].IsRvalueRef;
+                        const bool yRef = y.params[k].IsAlias || y.params[k].IsRvalueRef;
+                        if (xRef == yRef) continue;
+                        const size_t i = k - 1;
+                        if (argVars == nullptr || i >= argVars->size()) return false;
+                        const NamedVariable& arg = (*argVars)[i];
+                        if (argumentIsRvalue(i) || arg.TypeAndValue.Pointer || arg.Storage == nullptr)
+                            return false;
+                        if (arg.TypeAndValue.TypeName != x.params[k].TypeName) return false;
+                    }
+                    return true;
+                };
                 bool indistinguishable = distinct.size() > 1;
                 for (size_t i = 0; indistinguishable && i < distinct.size(); ++i)
                 {
@@ -32390,7 +32486,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                         bool crossing = false;
                         indistinguishable = CompareCxxConversionRanks(
                                 distinct[i]->ranks, distinct[j]->ranks, crossing) == 0
-                            && !referenceMix(*distinct[i]->ctor, *distinct[j]->ctor);
+                            && (!referenceMix(*distinct[i]->ctor, *distinct[j]->ctor)
+                                || exactLvalueMixes(*distinct[i]->ctor, *distinct[j]->ctor));
                     }
                 }
                 if (indistinguishable)
@@ -32608,7 +32705,9 @@ static LLVMBackend::TypeAndValue InferImplicitCxxArgumentType(
         {
             if (llvm::isa<llvm::ConstantInt>(arg.Primary))
             {
-                type.TypeName = arg.BaseType->getIntegerBitWidth() > 32 ? "i64" : "int";
+                // A bool literal is an i1 constant; it is a C++ bool, so B(bool) outranks B(int).
+                if (arg.BaseType->getIntegerBitWidth() == 1) type.TypeName = "bool";
+                else type.TypeName = arg.BaseType->getIntegerBitWidth() > 32 ? "i64" : "int";
                 return type;
             }
             switch (arg.BaseType->getIntegerBitWidth())
@@ -33624,6 +33723,25 @@ bool LLVMBackend::HasImplicitClassConversionOperator(const std::string& sourceTy
         return hasOperator(hasOperator, sourceType);
 }
 
+bool LLVMBackend::HasDeletedConvertingCtor(const std::string& targetType)
+{
+        // Deleted constructors never reach the ranked table, so read the raw record members.
+        // Any deleted non-explicit one-argument constructor (template included) can win a pick
+        // CFlat's ranking cannot see, so clang decides for every class source of this target.
+        EnsureCxxRecordProjected(targetType, false);
+        auto record = cxxRecordEntries_.find(targetType);
+        if (record == cxxRecordEntries_.end()) return false;
+        for (const auto& member : record->second.members)
+            if (member.kind == cflat_cinterop::RawCxxMember::Constructor && member.isDeleted
+                && !member.isExplicit && !member.isCopyCtor && !member.isMoveCtor
+                && member.paramTypes.size() == 2)
+                return true;
+        for (const auto& tmpl : record->second.ctorTemplates)
+            if (tmpl.isDeleted && !tmpl.isExplicit && !tmpl.paramTypes.empty())
+                return true;
+        return false;
+}
+
 bool LLVMBackend::HasCxxImplicitConvertingCtor(const std::string& targetType)
 {
         EnsureCxxRecordProjected(targetType, false);
@@ -34404,6 +34522,27 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         // When the source has an implicit conversion operator, let clang resolve the whole
         // copy-initialization sequence before the listed constructor fast path can choose one.
         const TypeAndValue argType = InferImplicitCxxArgumentType(source, *this);
+        // A deleted converting constructor (`Src&&`, `const Src&&`, a template) may win the pick for
+        // this source: clang's copy-initialization decides, not CFlat's ranking.
+        if (!source.TypeAndValue.Pointer && IsCxxRecord(argType.TypeName)
+            && argType.TypeName != targetType && IsCxxRecord(targetType)
+            && HasDeletedConvertingCtor(targetType))
+        {
+            NamedVariable probe = source;
+            probe.TypeAndValue = argType;
+            probe.TypeAndValue.VariableName.clear();
+            probe.IsRvalue = true;
+            std::string wrapperName;
+            std::string wrapperError;
+            if (RequestCxxVariadicConstructor(targetType, { probe }, wrapperName, wrapperError,
+                                              /*copyInit*/ true))
+            {
+                ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
+                return CxxConvertingCtorResult::Converted;
+            }
+            refusal = wrapperError;
+            return CxxConvertingCtorResult::Refused;
+        }
         if (!source.TypeAndValue.Pointer && IsCxxRecord(argType.TypeName)
             && HasImplicitClassConversionOperator(argType.TypeName)
             && argType.TypeName != targetType && IsCxxRecord(targetType))
@@ -35775,7 +35914,10 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
         lastOwningResult = savedOwningResult;
         if (result == nullptr) return false;
 
-        if (!dest.Pointer && conversionReturnType.Pointer
+        // A scalar `T&` return is an address too (MIX4: `operator const double&()`).
+        const bool scalarRefReturn = conversionReturnType.IsCxxRef()
+            && !conversionReturnType.IsCxxRefToPointer && !IsCxxRecord(dest.TypeName);
+        if (!dest.Pointer && (conversionReturnType.Pointer || scalarRefReturn)
             && conversionReturnType.TypeName == dest.TypeName
             && result->getType()->isPointerTy())
         {

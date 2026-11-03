@@ -1,0 +1,15 @@
+// MIX11: a by-value and a const& constructor parameter tie for an lvalue (clang: ambiguous), so
+// neither is picked. Direct-init reports clang's text, copy-init reports the refused conversion.
+import cpp "cpp_mix11_ctor.hpp";
+
+extern int main()
+{
+    Mx11V2 lv = 1;
+    expect_error("is ambiguous") {
+        Mx11Amb direct = Mx11Amb(lv);
+    }
+    expect_error("cannot initialize C++ class 'Mx11Amb'") {
+        Mx11Amb copied = lv;
+    }
+    return 0;
+}

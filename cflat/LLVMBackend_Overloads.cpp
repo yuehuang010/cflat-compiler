@@ -1487,6 +1487,25 @@ bool LLVMBackend::CxxDeductionWrapperDeducesOther(const NamedVariable& arg, cons
             && argSpelling != paramSpelling;
 }
 
+bool LLVMBackend::CxxConstScalarBindsTemporary(const FunctionSymbol& candidate, size_t paramIndex,
+                                               const TypeAndValue& param, const NamedVariable& arg) const
+{
+        // Const-ness comes from the spelled signature, as RankCxxConversionSequences reads it.
+        if (!candidate.IsCxx || arg.TypeAndValue.Pointer || !param.IsAlias || param.IsRvalueRef
+            || param.ElemPointer || param.IsCxxRefToPointer || param.IsFunctionPointer)
+            return false;
+        const int referenceCv = CxxSpellingCv(CxxReferenceParameterSpelling(candidate, paramIndex))
+            | (param.CxxConstRef() || param.PointeeConstBit() ? 1 : 0);
+        if ((referenceCv & 1) == 0) return false;
+        const TypeAndValue referent = ScalarArgumentReferent(param);
+        TypeAndValue probe;
+        probe.TypeName = referent.TypeName;
+        if (referent.TypeName == "bool" || (probe.IsInteger() == -1 && probe.IsFloatingPoint() == -1)
+            || enumBackingTypes.count(arg.TypeAndValue.TypeName) != 0)
+            return false;
+        return arg.TypeAndValue.TypeName != referent.TypeName;
+}
+
 std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequences(
         const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate,
         bool allowTemplateClassConversion)
@@ -1975,13 +1994,16 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 out.from = pointee;
                 continue;
             }
-            // Pointer-to-bool is a standard conversion, but [over.ics.rank] makes it worse
-            // than every other standard conversion sequence for the same argument.
+            // Pointer-to-bool ranks below every other standard conversion ([over.ics.rank]); a stored
+            // `function<>` (thin C pointer) keeps its pointer type in OriginalArgumentType.
+            const TypeAndValue& boolFunctionArg = arg.HasOriginalArgumentType
+                ? arg.OriginalArgumentType : arg.TypeAndValue;
             if (candidate.IsCxx && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
                 && param.TypeName == "bool" && !IsCxxNullTypedArgument(arg)
                 && !IsNullPointerConstantArgument(arg, candidate.IsCxx)
                 && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
                     || arg.TypeAndValue.IsFunctionPointer
+                    || (boolFunctionArg.IsFunctionPointer && boolFunctionArg.IsThinFnPtr())
                     || llvm::isa_and_nonnull<llvm::Function>(arg.Primary) || arg.IsStringLiteral
                     || fixedArrayArgument))
             {
@@ -2196,8 +2218,12 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
 
             if (reference && !constReference)
                 continue;
-            const std::string to = arithmeticName(
+            // A `const T&` scalar binds a converted temporary of its referent: judged as that
+            // referent (no integer identity exists for it). bool keeps its own table.
+            std::string to = arithmeticName(
                 CxxIntegerParameterIdentity(candidate, i, param));
+            if (to.empty() && constReference && ScalarArgumentReferent(param).TypeName != "bool")
+                to = arithmeticName(ScalarArgumentReferent(param).TypeName);
             // An unscoped enum promotes to its promotion type; every other arithmetic target is a
             // conversion. A fixed underlying type narrower than int is a better promotion (4.2),
             // ranked 0 here since no other candidate can match an enum argument exactly.
@@ -2218,12 +2244,23 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 out.from = at.TypeName;
                 continue;
             }
+            // Pointer -> integer is not a standard conversion (ruling: an explicit cast is needed), so
+            // a pointer or function value is non-viable at a non-bool arithmetic parameter.
+            if (candidate.IsCxx && !to.empty() && to != "bool" && !at.IsAlias && !at.IsRvalueRef
+                && (at.Pointer || at.IsFunctionPointer || llvm::isa_and_nonnull<llvm::Function>(arg.Primary)))
+            {
+                out.rank = kCxxNonViableRank;
+                out.cxxViable = false;
+                out.from = at.TypeName.empty() ? arg.InferSourceTypeName : at.TypeName;
+                continue;
+            }
             const std::string from = argumentIdentity(arg);
             if (from.empty() || to.empty())
                 continue;
             out.rank = arithmeticRank(from, to);
             out.cxxViable = true;
             out.from = from;
+            out.constRefTemporary = out.rank > 0 && CxxConstScalarBindsTemporary(candidate, i, param, arg);
         }
         return ranks;
 }
@@ -2236,6 +2273,9 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             return 2;
         // [over.ics.rank] tie-breakers between two sequences of the same rank.
         auto tieBreak = [&](const CxxConversionRank& x, const CxxConversionRank& y) {
+            // RULING: at the same rank a materialized `const T&` scalar temporary loses to a by-value bind.
+            if (x.constRefTemporary != y.constRefTemporary)
+                return x.constRefTemporary ? 1 : -1;
             // 3.2.3: a derived-to-base `Base&&` bound to an rvalue beats `Base&` / `const Base&`.
             if (x.derivedRefBind != 0 && y.derivedRefBind != 0 && x.from == y.from
                 && x.toClass == y.toClass && x.derivedRefBind != y.derivedRefBind)
@@ -3171,11 +3211,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                         // A C++ `const T&` scalar parameter reached by a DIFFERENT scalar type
                         // (a `char` local into `const int&`) converts to the referent and binds it.
+                        // An int into `const double&` / `const bool&` is no upconvert of the
+                        // lowered type, but clang materializes the converted temporary: the scalar
+                        // table's Widen arm (the same one the unnamed branch below uses) decides it.
                         if (result < 0 && !tmpArg.Pointer)
                         {
                             TypeAndValue constRefReferent;
                             if (CxxConstScalarRefReferent(tmpParam, constRefReferent)
-                                && CompareUpconvert(GetType(tmpArg), GetType(constRefReferent)) >= 0)
+                                && (CompareUpconvert(GetType(tmpArg), GetType(constRefReferent)) >= 0
+                                    || ClassifyScalarArgConversion(arg, constRefReferent)
+                                        == ScalarArgConversion::Widen))
                             {
                                 result = 1;
                                 constRefReferentArm = true;
@@ -3269,6 +3314,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             constRefReferentIdentity = IntegerParameterIdentity(rvalueReferent);
                         }
                     }
+                    else if (TypeAndValue truthReferent;
+                             candidate.IsCxx && ArgumentIsCodeValue(arg, arg.CastOccurrenceId)
+                             && CxxConstScalarRefReferent(*candidateParamItr, truthReferent)
+                             && truthReferent.TypeName == "bool")
+                        // A function value binds a `const bool&` through its truth (clang's boolean conversion).
+                        result = 1;
                     else if (TypeAndValue constRefReferent;
                              !arg.TypeAndValue.Pointer
                              && CxxConstScalarRefReferent(*candidateParamItr, constRefReferent))
@@ -3384,7 +3435,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                     // The pointee is never itself a function-pointer type here: the funcptr arm
                     // above claims every such parameter whenever the argument is code.
-                    if (result >= 0 && candidateParamItr->Pointer && argIsCodeValue
+                    // A C++ `const bool&` takes a function value as its truth (clang's boolean conversion).
+                    TypeAndValue constBoolReferent;
+                    const bool boolTruthParam = candidate.IsCxx
+                        && CxxConstScalarRefReferent(*candidateParamItr, constBoolReferent)
+                        && constBoolReferent.TypeName == "bool";
+                    if (result >= 0 && candidateParamItr->Pointer && argIsCodeValue && !boolTruthParam
                         && !arg.IsStringLiteral && !isStringLiteralValue(arg.Primary))
                         result = -1;
 
@@ -3605,6 +3661,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && !candidateParamItr->IsRvalueRef && candidateParamItr->TypeName == "bool"
                     && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
                         || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral
+                        // A stored `function<>` variable: the thin C pointer is its original type.
+                        || (arg.HasOriginalArgumentType && arg.OriginalArgumentType.IsFunctionPointer
+                            && arg.OriginalArgumentType.IsThinFnPtr())
                         || (!arg.TypeAndValue.IsArrayView
                             && (arg.TypeAndValue.ConstArraySize > 0
                                 || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType))));
@@ -3757,11 +3816,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     const std::string argIdentity = IntegerArgumentIdentity(arg, candidate.IsCxx);
                     // A reference parameter has no identity of its own; the arms above supply the
                     // referent's, so `const int&` outranks `const long long&` for an int literal.
-                    const std::string paramIdentity = constRefReferentIdentity.empty()
+                    std::string paramIdentity = constRefReferentIdentity.empty()
                         ? (candidate.IsCxx
                             ? CxxIntegerParameterIdentity(candidate, paramIndex, *candidateParamItr)
                             : IntegerParameterIdentity(*candidateParamItr))
                         : constRefReferentIdentity;
+                    // A floating referent has no integer identity, so its arm stayed unjudged (-1) and
+                    // ranked best in the tiers. An integer argument converts to it: rank it as a conversion.
+                    if (constRefReferentArm && constRefReferentIdentity.empty()
+                        && FloatingBitsOfName(ScalarArgumentReferent(*candidateParamItr).TypeName) != -1)
+                        paramIdentity = ScalarArgumentReferent(*candidateParamItr).TypeName;
                     if (!argIdentity.empty() && !paramIdentity.empty())
                     {
                         integerCost = RankIntegerConversion(argIdentity, paramIdentity, candidate.IsCxx);
@@ -4443,6 +4507,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             keepLowest(best, [](const Ranked& r) { return r.callbackConstMismatches; });
         };
 
+        // RULING, every candidate shape: at the same rank a by-value bind beats a C++ `const T&` scalar
+        // temporary. Counted from the candidate's own parameters (a method's integer identity names the
+        // referent, so the arm count never sees it); a leading implicit `this` is skipped, as classifyTie does.
+        auto keepFewestConstRefTemporaries = [&](std::vector<const Ranked*>& best) {
+            keepLowest(best, [&](const Ranked& r) {
+                // The rank flag is set only where the conversion rank is above identity, so an identity
+                // bind (`gi(i)` with `const int&` and `int`) is never a temporary.
+                int count = 0;
+                for (const CxxConversionRank& rank : RankCxxConversionSequences(
+                         r.pair->first, r.pair->second, candidates.size() > 1))
+                    count += rank.constRefTemporary ? 1 : 0;
+                return count;
+            });
+        };
         auto preferCxxDefaultWrapperForSameDeclaration = [&](std::vector<const Ranked*>& best) {
             if (!cxxRanking)
             {
@@ -4472,6 +4550,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
+            keepFewestConstRefTemporaries(best);
             preferCallbackConstSpelling(best);
             preferCxxDefaultWrapperForSameDeclaration(best);
             return finish(settle(best, /*legacyLastWins=*/false));
@@ -4522,6 +4601,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Ruling: at the SAME conversion a by-value or rvalue-ref bind beats materializing a
             // temporary for a `const T&`. After dominance, so an identity match still wins first.
             keepLowest(best, [](const Ranked& r) { return r.constRefMaterializations; });
+            keepFewestConstRefTemporaries(best);
             // Same move tie-break as the perfect tier: `d.add(1, namedLvalue)` must not silently
             // keep the `move` overload and consume the caller's variable.
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
@@ -6474,6 +6554,25 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const size_t sourceDot = candidate.SourceName.rfind('.');
             const std::string memberName = candidate.SourceName.substr(
                 sourceDot == std::string::npos ? 0 : sourceDot + 1);
+            // Access is the SELECTED overload's: a public sibling in a mixed-access set must not
+            // launder a protected or private overload the call actually binds (clang's rule).
+            if (candidate.IsMethod && IsCxxRecord(arguments.front().TypeAndValue.TypeName))
+            {
+                const auto& receiver = arguments.front();
+                const std::string receiverType = receiver.TypeAndValue.TypeName;
+                std::set<std::string> visited;
+                const int selectedAccess = CxxSelectedMethodAccess(receiverType, candidate.UniqueName, visited);
+                if (selectedAccess == cflat_cinterop::AccessPrivate
+                    || (selectedAccess == cflat_cinterop::AccessProtected
+                        && !CxxProtectedAccessAllowed(receiverType,
+                            receiver.CallerName == "this" && receiver.FieldName.empty())))
+                {
+                    LogErrorMessage("member '{}' of C++ class '{}' is {}",
+                        { memberName, DisplayCxxClassName(receiverType),
+                          selectedAccess == cflat_cinterop::AccessPrivate ? "private" : "protected" });
+                    return nullptr;
+                }
+            }
             if (memberName.starts_with("operator"))
             {
                 bool instanceTemplateWrapper = false;
@@ -7670,6 +7769,24 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                     { diagnosticFunctionName });
                 continue;
             }
+            // A deleted converting constructor of a by-value class parameter: clang copy-initializes.
+            if (!candidate.Parameters[i].Pointer && !matched[i].TypeAndValue.Pointer
+                && IsCxxRecord(candidate.Parameters[i].TypeName)
+                && IsCxxRecord(matched[i].TypeAndValue.TypeName)
+                && matched[i].TypeAndValue.TypeName != candidate.Parameters[i].TypeName
+                && HasDeletedConvertingCtor(candidate.Parameters[i].TypeName))
+            {
+                std::string refusal;
+                const auto verdict = ConvertThroughCxxConvertingCtor(
+                    matched[i], candidate.Parameters[i].TypeName, nullptr, refusal);
+                if (verdict == CxxConvertingCtorResult::Converted) continue;
+                if (verdict == CxxConvertingCtorResult::Refused)
+                {
+                    LogErrorMessage("cannot pass this expression to '{}'; {}",
+                                    { diagnosticFunctionName, refusal });
+                    continue;
+                }
+            }
             if (!MaterializeImplicitCxxClassArgument(matched[i], candidate.Parameters[i], nullptr,
                                                       candidates.size() > 1))
                 LogErrorMessage("cannot materialize implicit C++ class argument for '{}'",
@@ -8193,7 +8310,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 argList.push_back(LowerAliasByPointerArg(arg, *candParamItr));
             }
             else if (TypeAndValue pointerBoolReferent;
-                     !inVariadicRange && candidate.IsCxx && arg.TypeAndValue.Pointer
+                     !inVariadicRange && candidate.IsCxx
+                     && (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsFunctionPointer
+                         || llvm::isa_and_nonnull<llvm::Function>(arg.Primary))
                      && !IsCxxAddressOfReferent(arg, "bool")
                      && CxxConstScalarRefReferent(*candParamItr, pointerBoolReferent)
                      && pointerBoolReferent.TypeName == "bool")
@@ -8207,6 +8326,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             else if (!inVariadicRange && candidate.IsCxx
                      && (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsFunctionPointer
+                         || (arg.HasOriginalArgumentType && arg.OriginalArgumentType.IsFunctionPointer
+                             && arg.OriginalArgumentType.IsThinFnPtr())
                          || llvm::isa_and_nonnull<llvm::Function>(arg.Primary) || arg.IsStringLiteral
                          || (!arg.TypeAndValue.IsArrayView
                              && (arg.TypeAndValue.ConstArraySize > 0
@@ -10483,9 +10604,16 @@ LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& nam
         else
         {
             namedVar.Storage = CreateCxxFieldGEP(sd, memberStructInstance, (unsigned)count);
-            namedVar.Primary = CreateLoad(fieldLLVMType, namedVar.Storage);
+            // A plain fixed-array field keeps only its storage (as 'this.f'), so the bare name decays;
+            // element-pointer arrays (T*[N], unique<T>[N]) keep the load and their clean refusal.
+            const bool plainArrayField = llvm::isa<llvm::ArrayType>(fieldLLVMType)
+                && !structField.Pointer && !structField.IsUnique && !IsCoreUniqueType(structField.TypeName);
+            if (plainArrayField)
+                namedVar.Primary = nullptr;
+            else
+                namedVar.Primary = CreateLoad(fieldLLVMType, namedVar.Storage);
         }
-        namedVar.BaseType = namedVar.Primary->getType();
+        namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : fieldLLVMType;
         namedVar.TypeAndValue = structField;
         namedVar.RootIsBorrowedThisField = true;
         namedVar.ThisFieldPath = name;
@@ -10493,7 +10621,7 @@ LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& nam
         // self-field read (`(Res*)p` inside a method) stays a tracked alias.
         bool isUniqueField = (structField.IsUnique && structField.Pointer)
             || (IsCoreUniqueType(structField.TypeName) && !structField.Pointer);
-        if (isUniqueField)
+        if (isUniqueField && namedVar.Primary != nullptr)
         {
             namedVar.IsUniqueFieldAlias = true;
             RegisterUniqueFieldRead(namedVar.Primary, namedVar.Storage);

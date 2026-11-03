@@ -168,6 +168,10 @@ LLVMBackend::CxxConvertingCtorResult ConvertThroughCxxReturnCtor(
                 converted, targetType, intoSlot, refusal);
             if (verdict == LLVMBackend::CxxConvertingCtorResult::Converted)
                 return verdict;
+            // A deleted rvalue constructor is clang's refusal: the const& fallback must not mask it.
+            if (verdict == LLVMBackend::CxxConvertingCtorResult::Refused
+                && compiler->HasDeletedConvertingCtor(targetType))
+                return verdict;
         }
 
         converted = source;
@@ -701,6 +705,9 @@ void MainListener::EnsureTupleInstantiated(const std::string& mangledName) {
             return;  // tuple.cb not imported - nothing to instantiate from
         auto it = tupleTypeArgs.find(mangledName);
         if (it == tupleTypeArgs.end())
+            return;
+        // A generic template's signature names unbound type parameters: nested tuples wait for the instance.
+        if (genericTemplateSignatureDepth_ > 0)
             return;
         if (!instantiatedGenerics.count(mangledName))
         {
@@ -2245,6 +2252,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && compiler->currentFunctionReturnTV.Pointer
             && !compiler->currentFunctionReturnTV.IsAlias
             && !compiler->ReturnCarriesRawArrayCount(compiler->currentFunctionReturnTV)
+            && !compiler->IsCoreUniqueReleaseResult(returnNV.Primary)
             && (compiler->HasRawNewArrayProvenance(returnNV)
                 || compiler->FindRawArrayResult(returnNV.Primary) != nullptr))
         {

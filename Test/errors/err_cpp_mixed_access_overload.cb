@@ -1,0 +1,16 @@
+// A mixed-access overload set (public + protected under one name): overload resolution selects the
+// protected overload for an int argument, so the call is refused, as clang refuses it. The public
+// overload (double argument) is accepted; see Test/test_cpp_interop.cb.
+import cpp "cpp_mixed_access.hpp";
+
+extern int main()
+{
+    mixacc.M m = mixacc.M();
+    expect_error("member 'operator-' of C++ class 'mixacc.M' is protected") {
+        int r = m - 2;
+    }
+    expect_error("member 'g' of C++ class 'mixacc.M' is protected") {
+        int r = m.g(2);
+    }
+    return 0;
+}

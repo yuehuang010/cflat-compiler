@@ -1,17 +1,18 @@
 # C++ operator `move` operand: leftovers after D8
 
-Summary: these are the leftovers from the D8 report (2026-09-28). D8 binds `move d` straight to a `T&&` or by-value operator operand, the same as `f(move d)`. Probes are in scratch/repro_keep/d8/.
-- A template `operator&=(U&&)` is still refused ("no overload for compound assignment"); clang accepts it.
-- A ctor-call prvalue into a BY-VALUE operator param: clang elides it (mv0 dt2); cflat gives mv1 dt3.
-- `P1 p2 = p & P1(4)` / `p & mkP1(4)`: the class result takes one extra move (mv1, dt+1 vs clang). Master is identical.
-- `c &= move a[1]` marks nothing moved, while `f(move a[1])` marks the whole array moved. Values match clang.
-From the D8 review (2026-09-28); probes are in scratch/repro_keep/rv8/:
-- An `&`-qualified member operator refuses even a plain lvalue `c &= d`, on master too. With `move d` the message now says "rvalue receiver", which is misleading; clang gives c=401, d=-7.
-- `c &= (cond ? move a : move b)` picks the `const T&` overload and steals nothing. Clang gives c=201, a=-7; cflat gives c=3, a=2, the same as master.
-- A `const T&&` or non-stealing `T&&` operator after `move d`: reading `d` afterwards now errors "use of moved variable", the same as `f(move d)`. Master picked the wrong overload here. This is RULING-adjacent: consistent with calls.
-After T79 (2026-10-10, move into a const T&-only operator is refused, operator= selection from clang Sema); probes in scratch/repro_keep/t79/:
-- `a = cond ? move b : move c` into a forwarding `template<U> operator=(U&&)` picks the copy assignment (a.v=40); clang picks the template (400). Plain `a = move b` gives 400 (rev_t79_r6_condforward.cb).
-- A moved LEFT operand of a MEMBER operator (`move a + b` with `A::operator+(const A&) const`) is not checked; only free/template operators carry the lhs marker.
-From the CHAINCMP r1 review (2026-10-30 box 7, PRE-EXISTING, master = fix); repros scratch/repro_keep/chaincmp/ (header hdr.h):
-- `rv.K k = (mkK(10) *= 2);` (by-value compound result from a prvalue receiver, init) -> one extra move + dtor (mv1 d3 vs clang mv0 d2).
-- `rv.F g = ((f -= 0) |= 4);` (free by-value operator chain, init) -> one extra copy (cp3 d4 vs clang cp2 d3).
+Summary: leftovers from the D8 report (2026-09-28) and its reviews. D8 binds `move d` straight to a `T&&` or by-value operator operand, the same as `f(move d)`. Probes: scratch/repro_keep/d8/, rv8/, t79/, chaincmp/ (main checkout).
+
+Open (MIX16 run, 2026-10-30):
+- Member template BINARY operator: `template<class U> P4 operator&(U&& o) const` with `a & P4(4)` or `a & b` is refused ("no overload of 'operator&'"); clang accepts. Compound `template<class U> T& operator&=(U&&)` is FIXED (MIX16).
+  Root cause (MIX16): the gate in CClangExtract.cpp dropped member operator templates (no identifier); fixed to publish them. The compound path now requests the instance (MainListener_Expressions.cpp, cxxClassLeft block). The binary path (TryBinaryOperatorOverload) never requests a member template instance. Forcing the request there (receiver = lhs storage, operand = rhs with IsRvalue) makes the member wrapper visible in functionTable["operator&"] (isMemberCandidate true, params tp.P4, tp.P4), but overload ranking still rejects it; not traced further. Reverted from the change.
+
+Not reproduced (MIX16), premise does not hold on master or fix:
+- MIX16: not reproduced, shapes: by-value operator param with a ctor prvalue (`P3 operator&(P3)`, `c &= P3(4)`, block-scoped `P3 r = a & P3(4)`): mv/dt match clang.
+- MIX16: not reproduced, shapes: class-result binary `P1 p2 = p & P1(4)` and `p & mkP1(4)`: mv/dt match clang.
+- MIX16: not reproduced, shapes: `c &= move a[1]` on a Q1/MO array element: values match clang (9, 8, 7); reading the moved element or another element after the operator or after `takeMO(move a[1])` gives the same result (no move-tracking difference observable). Only an internal flag difference is left, unobserved.
+- MIX16: not reproduced, shapes: ref-qualified `RQ`/`RQ3` `c &= d` and `c &= move d` (value 5 and 401 as clang). `RQ2` (only `RQ2&&` `&`-qualified) with a plain lvalue is refused by clang too (no viable overload); cflat refuses with "takes ownership ... pass move"; no "rvalue receiver" message reproduced.
+- MIX16: not reproduced, shapes: `c &= (cond ? move a : move b)` with `K` (value 211 both, as clang).
+- MIX16: not reproduced, shapes: `a = (cond ? move b : move c)` into the forwarding `template<U> operator=(U&&)` (returns 400 as clang).
+- MIX16: not reproduced, shapes: `move a + b` with member `A::operator+(const A&) const` and free `operator+`: both report "use of moved variable 'a'" on a later read (no unchecked lhs seen).
+
+Fixed here (MIX16): by-value compound result from a prvalue receiver used as an initializer (`K k = (mkK(10) *= 2)`) and the chained free compound into a copy-only class (`F g = ((f -= 0) |= 4)`): the prvalue-receiver operator call now runs under CxxAssignSretScope::EmitOperatorCall (MainListener_Expressions.cpp invokePrvalueOperator), so the result constructs into the declarator slot (mv 0 / cp 2 as clang). Legs: Test/test_cpp_interop.cb (cpp_move_operand_ops.hpp Cnt/Cpy).

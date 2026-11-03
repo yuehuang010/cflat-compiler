@@ -2892,6 +2892,9 @@ public:
 
     void RegisterAliasValue(llvm::Value* value);
     bool IsAliasValue(const llvm::Value* value) const;
+    // A C++ reference-result call (alias-registered, reference return): one '??' / '?:' arm of a
+    // mixed join with a plain pointer is a borrowed pointer, not a cflat alias.
+    bool IsCxxReferenceAliasArm(const llvm::Value* value) const;
     // An alias call result that took over its temporary argument (B21): it owns, but a discarded
     // one is destroyed rather than refused - the callee never promised an owned result.
     bool IsAliasTransferResult(const llvm::Value* value) const;
@@ -3428,6 +3431,7 @@ private:
         std::vector<TypeAndValue> Arguments;
         bool External = false;
         bool Varargs = false;
+        bool IsCxx = false;
         // Alias frames open at park time; re-derivation resolves the signature in THIS scope,
         // so a body's `using P = T*` cannot rename a file-scope `P` under a later flush.
         std::vector<AliasScopeFrame> AliasScope;
@@ -3636,6 +3640,9 @@ private:
     // value the callee receives is not the argument NamedVariable's Primary. Map it back so the
     // temp-field diagnostics keep naming the source field.
     std::unordered_map<const llvm::Value*, const llvm::Value*> coreUniqueGetterSource_;
+    // True when the value is a unique<T>::release() call result. A unique never holds a heap
+    // array, so the count its count-carrying `move T*` return reports is not an array count.
+    bool IsCoreUniqueReleaseResult(const llvm::Value* value) const;
 
     // A direct call whose owning-local argument must wait for a callee body emitted below it.
     // The answer is resolved after all direct bodies are complete.
@@ -4268,6 +4275,8 @@ private:
     // Override name for diagnostics: LSP analyzes a temp copy, so this carries the real
     // source path so diagnostics and __FILE__ don't show the temp name.
     std::string sourceDisplayName_;
+    // --platform for Analyze() (SetAnalysisPlatform). Empty = host, the LSP default.
+    std::string analysisPlatform_;
     // Canonical path of the root file handed to Compile()/Analyze() - under the LSP that is the
     // temp copy, which DefinitionSitePath() maps back to the real document.
     std::string analyzedRootPath_;
@@ -5545,6 +5554,8 @@ private:
     // Keyed by LLVM overload name; logical source leaf and line/column identify one body across rewalks.
     // Per-compile; cleared by ResetForReanalysis with the module it describes.
     std::unordered_map<std::string, FunctionBodyOrigin> functionBodyOrigin_;
+    // Same rewalk identity for generic function templates, keyed by name plus parameter types.
+    std::unordered_map<std::string, FunctionBodyOrigin> genericTemplateOrigin_;
     std::unordered_set<std::string> isolatedCoreFunctions_;
     llvm::AllocaInst* autoVaListAlloca = nullptr;
 
@@ -6161,6 +6172,9 @@ private:
     // or a join has already dropped half the provenance. MainListener delegates to this copy.
     static std::string DescribeUniqueFieldAccess(const NamedVariable& nv);
     static std::string BorrowedSourceName(const NamedVariable& nv);
+    // Diagnostic spelling of a borrow source: 'f<T>' for a generic instance, 'S.m' for a
+    // method call (decided from the resolved callee symbol), else the plain source name.
+    std::string BorrowedSourceDisplayName(const NamedVariable& nv) const;
 
     /*
      * Parks `currentFunction` for the end-of-module resolves. FunctionBodyIsComplete refuses
@@ -10288,6 +10302,10 @@ public:
     ScalarArgConversion ClassifyScalarArgConversion(const NamedVariable& arg, const TypeAndValue& param) const;
     // The value a C++ scalar reference parameter binds (the parameter itself when not a reference).
     static TypeAndValue ScalarArgumentReferent(const TypeAndValue& param);
+    // RULING (one predicate for the rank tie-break and the tier count): a C++ `const T&` scalar, not
+    // bool, that binds a converted temporary for this argument (its type is not the referent's).
+    bool CxxConstScalarBindsTemporary(const FunctionSymbol& candidate, size_t paramIndex,
+                                      const TypeAndValue& param, const NamedVariable& arg) const;
 
     // True when this argument is an integer bound to a 'bool' parameter - legal, and lowered
     // by ConvertIntegerCallArgument.
@@ -10388,6 +10406,13 @@ public:
     // fast path (existing CreateFunctionCall) or the ABI-rewriting path.
     AbiRecipe ComputeAbiRecipe(const TypeAndValue& retType,
                                const std::vector<TypeAndValue>& params);
+    // C ABI shape of a return: an extern declaration's 'alias' is a CFlat-side borrow contract
+    // only, so its lowering is exactly the plain by-value return (master's shape).
+    static TypeAndValue ExternAbiReturnShape(TypeAndValue ret, bool external)
+    {
+        if (external) ret.IsAlias = false;
+        return ret;
+    }
 
     // A CFlat definition returning a nontrivial foreign C++ class uses the same indirect
     // return slot as the C++ declaration path, while keeping CFlat parameters on their ABI.
@@ -10559,6 +10584,7 @@ public:
             bool isMoveCtor = false;
             bool isDeleted = false;
             bool isConstReceiver = false;   // a const-qualified assignment operator
+            bool rhsConstRef = false;       // a copy assignment whose source parameter is `const T&`
             bool needsLocalDefinition = false;
             bool isNoexcept = false;
             int refQualifier = cflat_cinterop::CxxRefQualifierNone;
@@ -10925,6 +10951,10 @@ public:
     bool CxxHasDeletedAssignment(const std::string& typeName, bool useMove) const;
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
+    // Access of the SELECTED overload (by its linkage name), searched in the class then its bases;
+    // -1 when no direct method carries that linkage. The per-name access is the most permissive.
+    int CxxSelectedMethodAccess(const std::string& typeName, const std::string& linkageName,
+                                std::set<std::string>& visited) const;
     size_t CxxBaseSubobjectCount(const std::string& derivedType,
                                  const std::string& baseType) const;
     std::string CxxInheritedMemberOwner(const std::string& receiverType,
@@ -11191,6 +11221,9 @@ public:
     // A C++ record with a non-explicit conversion operator to a non-primitive type (libc++
     // `__val_expr::operator valarray<T>()`): copy-initializing a class from it is clang's call.
     bool HasImplicitClassConversionOperator(const std::string& sourceType);
+    // A non-explicit DELETED converting constructor (template included): clang must decide the
+    // copy-initialization of a class source, since CFlat's ranking never sees a deleted candidate.
+    bool HasDeletedConvertingCtor(const std::string& targetType);
     // A C++ record with a non-explicit constructor (or ctor template) callable with one argument.
     bool HasCxxImplicitConvertingCtor(const std::string& targetType);
     // Asks clang about the actual conditional with each arm's exact cv and category (a prvalue
@@ -11714,6 +11747,13 @@ public:
     void DiagnoseDuplicateFunctionBody(const std::string& functionName,
         const std::string& mangledName, size_t line, size_t column,
         bool isMethod, bool isConstMethod) const;
+    // Shared report for a second definition against an earlier origin (bodies and templates).
+    void DiagnoseDuplicateBodyOrigin(const std::string& functionName, const std::string& mangledName,
+        const FunctionBodyOrigin& first, size_t line, size_t column,
+        bool isMethod, bool isConstMethod) const;
+    // A generic function template keeps one slot per name; a second definition is a duplicate.
+    void RecordGenericTemplateOrigin(const std::string& name, const std::string& signature,
+        size_t line, size_t column);
 
     /*
      * Is this overload slot already occupied by a BODY? Answers the exact question
@@ -12246,6 +12286,9 @@ public:
         bool implicitObjectCvNonViable = false;
         std::vector<std::string> ambiguousOperators;
         std::string from;   // the argument's type as ranked, for diagnostics
+        // RULING: a C++ `const T&` scalar bound to a materialized temporary (argument type differs from
+        // the referent). At the same rank a by-value bind beats it; two such temporaries still tie.
+        bool constRefTemporary = false;
         // Same-rank tie-breakers ([over.ics.rank] 3.2.5 / 3.2.6 / 4.4): a reference or pointer
         // binding to `cvBase` itself, `cv` bit 1 const and bit 2 volatile; a derived-to-base (or
         // to `void*`) conversion from `from` to `toClass`; an implicit object's ref-qualifier.
@@ -13999,6 +14042,9 @@ public:
     void SetRunArgs(std::vector<std::string> a);
     int  GetJitExitCode() const;
     void SetBatchMode(bool v);
+    // Target for Analyze(): the --platform name a normal compile would use. Unset = host.
+    // Returns false (after LogError) on an unknown name.
+    bool SetAnalysisPlatform(const std::string& platform);
     void SetNoCache(bool v);
     // Retry after a companion miss: rebuild every demand-group entry from clang.
     void SetCxxDemandCacheBypass(bool v) { cxxDemandBypass_ = v; }
@@ -14289,7 +14335,8 @@ public:
     // 311: by-value class defaults carry their scope + source text (direct default initializers).
     // 312: class-default text only when the bound expression re-reads to the same meaning.
     // 313: default initializers are verified against the bound default (identity), else refused.
-    static constexpr int kCHeaderCacheVersion = 313;
+    // 314: variable template explicit/partial specializations join the template's group; deleted-rvalue ctor requests.
+    static constexpr int kCHeaderCacheVersion = 315;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

@@ -3825,3 +3825,57 @@ struct X { int v; X(int x): v(x) {}
   friend int operator==(const X& a, double b) { return 20; }
   friend int operator==(const X& a, int b) { return 30; } };
 }
+
+// MIX17: unary free overloads on a cv-qualified operand (clang++ -std=c++20 oracle in comments).
+namespace mix17 {
+// A `const volatile&&` free binds a volatile prvalue; the const member cannot bind it (clang: 22).
+struct VolRvS { int operator-() const { return 11; } };
+inline int operator-(const volatile VolRvS&&) { return 22; }
+inline volatile VolRvS volRvMake() { return VolRvS{}; }
+// A `const&&` free binds a const prvalue; the non-const member cannot bind it (clang: 22).
+struct ConstRvS { int operator-() { return 11; } };
+inline int operator-(const ConstRvS&&) { return 22; }
+inline const ConstRvS constRvMake() { return ConstRvS{}; }
+// Refusals (Test/errors/err_cpp_unary_cv_free.cb): clang refuses each shape.
+// A `const&` free cannot bind a volatile lvalue.
+struct VolCrS { int operator-() const { return 11; } };
+inline int operator-(const VolCrS&) { return 22; }
+inline volatile VolCrS& volCrRef(VolCrS& v) { return v; }
+// A by-value free needs a copy of a volatile lvalue; the implicit copy ctor takes `const S&`.
+struct VolCopyS { int operator-() const { return 11; } };
+inline int operator-(VolCopyS) { return 22; }
+inline volatile VolCopyS& volCopyRef(VolCopyS& v) { return v; }
+// A non-const `&&` free cannot bind a const prvalue.
+struct ConstRvBad { int operator-() { return 11; } };
+inline int operator-(ConstRvBad&&) { return 22; }
+inline const ConstRvBad constRvBadMake() { return ConstRvBad{}; }
+}
+
+// MIX17 r2: a `T&` call result is an lvalue for unary free ranking, and a function template
+// overload is not cv-refused (clang++ -std=c++20 oracle in comments).
+namespace mix17r2 {
+// The volatile `&` free outranks the const one for a volatile lvalue call result (clang: 7).
+struct F1S { int v; };
+inline int operator-(volatile F1S&) { return 7; }
+inline int operator-(const F1S&) { return 2; }
+inline volatile F1S& f1Ref(F1S& v) { return v; }
+// A non-const `S&` free binds a `T&` call result and writes through it (clang: 22, m.v == 5).
+struct MutS { int v; };
+inline int operator-(MutS& v) { v.v = 5; return 22; }
+inline MutS& mutRef(MutS& v) { return v; }
+// A function template `const T&` binds a const prvalue and a volatile lvalue; the `C&&` free cannot (clang: 6).
+struct F2S { int v; };
+inline int operator-(F2S&&) { return 3; }
+template<class T> int operator-(const T&) { return 6; }
+inline const F2S f2Make() { return F2S{}; }
+inline volatile F2S& f2Ref(F2S& v) { return v; }
+}
+namespace mix17r3 {
+// A volatile C& call result: the non-template `C&` free is refused, the `const T&` template binds (clang: 6).
+struct R3S { int v; };
+inline volatile R3S& r3VolRef(R3S& x) { return x; }
+inline int operator-(R3S&) { return 1; }
+template<class T> int operator-(const T&) { return 6; }
+// A const C& call result: the mutable `C&` free is refused, the template binds (clang: 6).
+inline const R3S& r3ConstRef(R3S& x) { return x; }
+}

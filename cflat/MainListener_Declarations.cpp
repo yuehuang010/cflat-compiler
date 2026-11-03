@@ -566,6 +566,50 @@ bool MainListener::InGenericInstantiation() const {
             || !activePackSubstitutions.empty();
 }
 
+bool MainListener::MentionsSignatureTypeParam(const std::string& name) const {
+        if (genericTemplateSignatureDepth_ == 0 || genericTemplateSignatureNames_.empty()) return false;
+        auto isIdentChar = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        };
+        // Mangled tuple names split on '$', so "tuple$int$T" mentions T.
+        size_t start = 0;
+        while (start < name.size())
+        {
+            while (start < name.size() && !isIdentChar(name[start])) ++start;
+            size_t end = start;
+            while (end < name.size() && isIdentChar(name[end])) ++end;
+            if (end > start && genericTemplateSignatureNames_.count(name.substr(start, end - start)))
+                return true;
+            start = end;
+        }
+        return false;
+}
+
+void MainListener::ReportUnknownSignatureTupleElements(CFlatParser::TupleTypeSpecifierContext* tts) {
+        if (tts == nullptr || tts->tupleTypePackEntry() != nullptr) return;
+        auto elementContext = TupleTypeElementContext(tts);
+        for (auto* entry : tts->tupleTypeEntry())
+        {
+            auto* typeSpec = entry->typeSpecifier();
+            if (typeSpec == nullptr) continue;
+            if (typeSpec->tupleTypeSpecifier() != nullptr)
+            {
+                ReportUnknownSignatureTupleElements(typeSpec->tupleTypeSpecifier());
+                continue;
+            }
+            if (typeSpec->genericIdentifier() == nullptr
+                || typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
+                continue;
+            PrimitiveTypeError argError;
+            const std::string argName = ResolveTupleTypeElementArgName(elementContext, entry, &argError);
+            if (HasPrimitiveTypeError(argError)) continue;
+            if (MentionsSignatureTypeParam(argName)
+                || Compiler(entry)->IsKnownTypeName(argName) || Compiler(entry)->IsTypeArgTypeKey(argName))
+                continue;
+            LogErrorContext(entry, Compiler(entry)->LocalizeMessage("unknown type '{}'", { argName }));
+        }
+}
+
 void MainListener::RecordLoopExitMovedState() {
         if (loopBreakMovedStates_.empty()) return;
         loopBreakMovedStates_.back().push_back(Compiler()->SaveMovedState());
@@ -1559,7 +1603,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.TypeName = mangledName;
                     tupleTypeArgs[mangledName] = typeArgs;
                     // Queue instantiation if inside a generic context and not already done
-                    if (!instantiatedGenerics.count(mangledName) &&
+                    if (genericTemplateSignatureDepth_ > 0) ReportUnknownSignatureTupleElements(tts);
+                    if (!instantiatedGenerics.count(mangledName) && genericTemplateSignatureDepth_ == 0 &&
                         (genericStructTemplates.count("tuple") || genericClassTemplates.count("tuple")))
                     {
                         QueuePendingInstantiation("tuple", typeArgs, mangledName);
@@ -4993,6 +5038,36 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             LogErrorContext(func, "'operator()' cannot be static; declare it as a non-static struct member");
             return;
         }
+        // A generic template's signature is parsed here with its own type parameters unbound;
+        // see genericTemplateSignatureDepth_.
+        std::unordered_set<std::string> signatureNames;
+        const bool templateSignature = nameOverride.empty() && func->genericTypeParameters() != nullptr;
+        if (templateSignature)
+            for (auto* entry : func->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                if (auto* ts = entry->typeSpecifier();
+                    ts != nullptr && ts->genericIdentifier() != nullptr
+                    && ts->genericIdentifier()->Identifier() != nullptr)
+                    signatureNames.insert(ts->genericIdentifier()->Identifier()->getText());
+        struct TemplateSignatureScope
+        {
+            MainListener* self;
+            bool on;
+            std::unordered_set<std::string> savedNames;
+            TemplateSignatureScope(MainListener* s, bool active, std::unordered_set<std::string> names)
+                : self(active ? s : nullptr), on(active)
+            {
+                if (!on) return;
+                ++self->genericTemplateSignatureDepth_;
+                savedNames = std::move(self->genericTemplateSignatureNames_);
+                self->genericTemplateSignatureNames_ = std::move(names);
+            }
+            ~TemplateSignatureScope()
+            {
+                if (!on) return;
+                --self->genericTemplateSignatureDepth_;
+                self->genericTemplateSignatureNames_ = std::move(savedNames);
+            }
+        } templateSignatureScope(this, templateSignature, std::move(signatureNames));
         auto returnType = this->getFunctionReturnType(func);
         if (returnType.external && !returnType.Pointer && !returnType.IsAlias
             && !returnType.IsArrayView
@@ -5044,6 +5119,19 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             std::vector<std::string> valueDefaults;
             auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
                                                          &valueDefaults);
+            // Identity is positional: each template type parameter is replaced by its index in the
+            // parsed TypeAndValue, so `T f<T>(T)` and `U f<U>(U)` are one slot. The count keeps
+            // differently-sized parameter lists apart.
+            std::string signature = std::to_string(typeParams.size()) + "<";
+            for (auto p : params)
+            {
+                const auto position = std::find(typeParams.begin(), typeParams.end(), p.TypeName);
+                if (position != typeParams.end())
+                    p.TypeName = "#" + std::to_string(position - typeParams.begin());
+                signature += SpellType(*compiler, p) + ",";
+            }
+            compiler->RecordGenericTemplateOrigin(name, signature, line,
+                func->getStart()->getCharPositionInLine());
             genericFunctionTemplates[name] = func;
             if (compiler->CurrentSourceIsCoreLibrary())
                 compiler->gts.coreGenericTemplates.insert(name);
@@ -5224,7 +5312,6 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // infer 'alias'; paths that disagree give the caller no answer at all, so reject.
         // Copyable returns are untouched - a copy duplicates no ownership.
         bool aliasOfByValueParam = false;
-        if (returnType.external) returnType.IsAlias = false;
         if (!returnType.external && compiler->TypeOwnsUniquePointer(returnType.TypeName))
         {
             std::string borrowedParam;
@@ -9330,7 +9417,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 std::vector<LLVMBackend::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
                 bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
-                if (typeAndValue.external) typeAndValue.IsAlias = false;
                 // A declaration at namespace scope registers under its qualified name
                 // (os.windows.Sleep) so lookup is namespaced, but an extern keeps its
                 // bare linkage symbol (Sleep) - the import library only knows that name.
@@ -10730,7 +10816,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (right != nullptr && autoUniqueIfaceFieldBorrow)
                                 {
                                     const std::string sourceName =
-                                        LLVMBackend::BorrowedSourceName(rightNV);
+                                        compiler->BorrowedSourceDisplayName(rightNV);
                                     const std::string uniqueType =
                                         SpellType(*compiler, rightNV.TypeAndValue);
                                     if (sourceName.empty())
@@ -10797,7 +10883,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !compiler->lastCallReturnsOwned)
                                 {
                                     const std::string sourceName =
-                                        LLVMBackend::BorrowedSourceName(rightNV);
+                                        compiler->BorrowedSourceDisplayName(rightNV);
                                     if (sourceName.empty())
                                         LogErrorContext(assignmentExpression, std::format(
                                             "cannot initialize {} '{}' from a borrowed value - the source still "
@@ -10821,7 +10907,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         MangledGenericArgument(*compiler, typeAndValue.TypeName)))
                                 {
                                     const std::string sourceName =
-                                        LLVMBackend::BorrowedSourceName(rightNV);
+                                        compiler->BorrowedSourceDisplayName(rightNV);
                                     if (sourceName.empty())
                                         LogErrorContext(assignmentExpression, std::format(
                                             "cannot initialize {} '{}' from a borrowed value - the source is a stack value; "
@@ -10840,8 +10926,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // A `unique X*` destination the desugar deliberately left on the
                                 // builtin spelling still takes a core unique<X> source: unwrap `_p`
                                 // and let the move/borrow classification below decide ownership.
+                                // A unique<T>[N] source is not one unique value: it decays to the
+                                // address of element 0 (as `&a[0]`), so `_p` is never extracted.
                                 if (right != nullptr && typeAndValue.Pointer
                                     && !rightNV.TypeAndValue.Pointer
+                                    && rightNV.TypeAndValue.ConstArraySize == 0
                                     && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName))
                                 {
                                     srcCoreUniqueElementBorrow = rightNV.TypeAndValue.IsAlias
@@ -11295,6 +11384,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     isStaticLocal, rightNV, assignmentExpression);
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
                                 RejectRawPointerToArrayView(assignmentExpression, typeAndValue, rightNV);
+                                RejectUniqueArrayMoveIntoPointer(assignmentExpression, typeAndValue, rightNV);
                                 // int[] v = ptrView; binds a view whose ELEMENT differs - reject.
                                 RejectArrayViewElementMismatch(assignmentExpression, typeAndValue, rightNV);
                                 // int[] v = runtimeInt; reinterprets a number as an address.
@@ -11702,7 +11792,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !genericCoreUniqueTypeArg)
                                 {
                                     const std::string sourceName =
-                                        LLVMBackend::BorrowedSourceName(initializerSourceNV);
+                                        compiler->BorrowedSourceDisplayName(initializerSourceNV);
                                     if (sourceName.empty())
                                         LogErrorContext(initDecl, std::format(
                                             "cannot initialize {} '{}' from a borrowed value - the source still owns it; "
@@ -14038,7 +14128,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         compiler, srcFieldPathNV, false, initDecl))
                                     return allocList;
                                 const std::string sourceName = borrowedParamCall.empty()
-                                    ? LLVMBackend::BorrowedSourceName(initializerSourceNV)
+                                    ? compiler->BorrowedSourceDisplayName(initializerSourceNV)
                                     : borrowedParamCall;
                                 if (sourceName.empty())
                                     LogErrorContext(initDecl, std::format(

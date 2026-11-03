@@ -1,0 +1,19 @@
+// A class operand whose namespace operator and global operator are equally good: C++ ranks both in
+// one candidate set and clang reports the call ambiguous; CFlat refuses it too.
+import cpp "cpp_mix7_operator_rank.hpp";
+
+extern int main()
+{
+    mix7op.X mix7X = default;
+    mix7X.v = 1;
+    expect_error("use of overloaded operator '+' is ambiguous") {
+        int r = mix7X + 1;
+    }
+    // The compound form ties the same way (clang: ambiguous).
+    mix7op.T mix7T = default;
+    mix7T.v = 1;
+    expect_error("use of overloaded operator '+=' is ambiguous") {
+        int r = mix7T += 1;
+    }
+    return 0;
+}

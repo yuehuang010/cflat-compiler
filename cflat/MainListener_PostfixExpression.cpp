@@ -6580,6 +6580,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.FieldName = lastParenExprFieldName;
                                 namedVar.CallerName = lastParenExprCallerName;
                             }
+                            // A parenthesized C++ `T&` operator result carries its referent pointer and no
+                            // storage; `(s << 2).v` names the referent, as a call result does (PrepareAliasCallResult).
+                            if (prevPrimary->expression() != nullptr && childLimit > 1
+                                && namedVar.Storage == nullptr && namedVar.CxxRefValueType != nullptr
+                                && namedVar.Primary != nullptr && namedVar.Primary->getType()->isPointerTy())
+                            {
+                                auto* refSuffix = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[1]);
+                                if (refSuffix != nullptr && refSuffix->getSymbol()->getType() == CFlatParser::Dot)
+                                    NormalizeCxxReferenceNamed(ctx, namedVar);
+                            }
                             lastParenExprType = {};
                             lastParenExprStorage = nullptr;
                             lastParenExprFromOwningTempField = false;
@@ -17543,6 +17553,25 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             if (const auto* encoded = compiler->GetEncodedClosureType(functionDestination.TypeName))
                 functionDestination = *encoded;
         const bool hasFunctionDestination = !functionDestination.FuncPtrReturnTypeName.empty();
+        // A return-block name has no entry point: only a direct call `f(...)` may name it. Any other
+        // use (a function-pointer destination, a bare value, `&f`) is refused here, not run as a trap.
+        auto refuseReturnBlockValue = [&](const std::string& spelled) -> bool {
+            antlr4::tree::ParseTree* child = node;
+            bool followedByCall = false;
+            for (antlr4::tree::ParseTree* parent = node->parent; parent != nullptr; parent = parent->parent)
+            {
+                auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent);
+                if (postfix == nullptr) continue;
+                while (child->parent != nullptr && child->parent != postfix) child = child->parent;
+                if (child->parent == postfix) followedByCall = IsFollowedByCall(postfix, child);
+                break;
+            }
+            if (followedByCall) return false;
+            LogErrorContext(node, std::format(
+                "return-block function '{}' has no function value - its 'return' exits the caller, "
+                "so it cannot be used as a function pointer or a value; call it directly", spelled));
+            return true;
+        };
         auto rejectsGenericScalarValue = [&]() {
             auto isBinaryOperator = [](antlr4::tree::ParseTree* parent) {
                 return (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent) != nullptr
@@ -17768,7 +17797,10 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 return namedVar;
             }
             if (compiler->GetReturnBlock(nsQualified) != nullptr)
+            {
+                refuseReturnBlockValue(name);
                 return {};
+            }
             if (hasNsGenericTemplate && !hasFunctionDestination)
             {
                 if (rejectsGenericScalarValue())
@@ -17955,7 +17987,10 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
 
         // Return-block functions have no IR entry; they are inlined at the call site.
         if (compiler->GetReturnBlock(name) != nullptr)
+        {
+            refuseReturnBlockValue(name);
             return {};
+        }
 
         // Generic function templates have no IR entry until instantiated.
         // The call-site dispatch (PostfixExpression's RuleArgumentExpressionList branch)
@@ -18054,6 +18089,15 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             if (call != nullptr && call->children.size() >= 3 && call->children[1]->getText() == "("
                 && call->primaryExpression() != nullptr && call->primaryExpression()->getStart() == node->getSymbol())
                 return {};
+        }
+        // A return-block of an enclosing namespace is not in the function table, so ResolveQualifiedName
+        // cannot see it: probe each enclosing namespace prefix before the generic "undefined" message.
+        for (std::string scope = compiler->GetCurrentNamespace(); !scope.empty();)
+        {
+            if (compiler->GetReturnBlock(scope + "." + name) != nullptr)
+                if (refuseReturnBlockValue(name)) return {};
+            const auto dot = scope.rfind('.');
+            scope = dot == std::string::npos ? std::string() : scope.substr(0, dot);
         }
         // C++ never declares a scoped enumerator in the enclosing scope; name the enum as a hint.
         if (const std::string enumName = compiler->GetScopedCppEnumeratorHint(name); !enumName.empty())

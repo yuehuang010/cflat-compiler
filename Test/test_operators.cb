@@ -1163,6 +1163,7 @@ extern int main()
     int sizeofUnevalPassed = sizeofUnevaluatedLegs();
     int boolFpPassed = boolToFloatingLegs();
     if (compoundResultOwnershipLegs() != 26) return 57;
+    if (mix12UniqueArrayDecayLegs() != 8) return 80;
     if (byValueParamOwnershipLegs() != 66) return 58;
     if (byValueAliasTempLegs() != 68) return 59;
     if (sameVarAcceptLegs() != 16) return 62;
@@ -2577,5 +2578,41 @@ int shiftNativeCallResultLegs()
     passed += Test("free native shift, call-result rhs", fpLhsShift.value, 16);
     ShiftFp fpBothCall = shiftFpMake(1) << shiftFpMake(3);
     passed += Test("free native shift, call-result lhs and rhs", fpBothCall.value, 8);
+    return passed;
+}
+
+// unique<T>[N] decays to the address of element 0 (as `&a[0]`): the pointer borrows, never owns.
+int mix12Dtors = 0;
+struct Mix12Res { int v = 0; ~Mix12Res() { mix12Dtors++; } };
+struct Mix12Holder
+{
+    unique<Mix12Res>[2] us = default;
+    int firstValue() { unique<Mix12Res>* p = this.us; return (**p).v; }
+};
+int mix12UniqueArrayDecayLegs()
+{
+    int passed = 0;
+    mix12Dtors = 0;
+    {
+        unique<Mix12Res>[2] us = default;
+        us[0] = unique<Mix12Res>(new Mix12Res{ v = 3 });
+        us[1] = unique<Mix12Res>(new Mix12Res{ v = 4 });
+        unique<Mix12Res>* p = us;
+        passed += Test("unique array decay local init address", p == &us[0], true);
+        passed += Test("unique array decay local init second element", p + 1 == &us[1], true);
+        passed += Test("unique array decay local init value", (**p).v, 3);
+        unique<Mix12Res>* q = nullptr;
+        q = us;
+        passed += Test("unique array decay local assign address", q == &us[0], true);
+        passed += Test("unique array decay borrows without a dtor", mix12Dtors, 0);
+    }
+    passed += Test("unique array decay owners dtor once each", mix12Dtors, 2);
+    mix12Dtors = 0;
+    {
+        Mix12Holder h = default;
+        h.us[0] = unique<Mix12Res>(new Mix12Res{ v = 5 });
+        passed += Test("unique array decay this field value", h.firstValue(), 5);
+    }
+    passed += Test("unique array decay this field owner dtor", mix12Dtors, 1);
     return passed;
 }

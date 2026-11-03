@@ -1,0 +1,21 @@
+// A bare unique<int>[2] field is not a pointer: it must not initialize unique<int>* (MIX5 regression leg;
+// refused like a bare T*[N] field since MIX12, this.us decays).
+import "unique.cb";
+
+struct U
+{
+    unique<int>[2] us = default;
+    int t()
+    {
+        expect_error("cannot cast an aggregate value - a fixed array decays to a pointer") {
+            unique<int>* p = us;
+        }
+        return 0;
+    }
+};
+
+extern int main()
+{
+    U u = default;
+    return u.t();
+}

@@ -957,8 +957,6 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         }
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
-        if (returnType.external) returnType.IsAlias = false;
-
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         const IfConstEvaluator scannerIfConst = [this](CFlatParser::ExpressionContext* expr) {
             return ScannerDecideIfConst(expr);

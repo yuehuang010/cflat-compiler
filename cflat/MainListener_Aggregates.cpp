@@ -113,14 +113,23 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 auto field = std::find_if(fields.begin(), fields.end(), [&](const auto& value) {
                     return value.VariableName == fieldName;
                 });
+                // T[N][M]: each inner dimension is one brace level before the elements.
                 bool hasExpressionElement = false;
-                for (auto* element : fi->initializerList()->fieldInit())
-                    if (element != nullptr && element->Identifier() == nullptr
-                        && !element->assignmentExpression().empty())
+                auto scanElements = [&](auto&& scanSelf, CFlatParser::InitializerListContext* level,
+                                        size_t dimension) -> void {
+                    for (auto* element : level->fieldInit())
                     {
-                        hasExpressionElement = true;
-                        break;
+                        if (element == nullptr || hasExpressionElement) continue;
+                        if (field != fields.end() && dimension < field->ConstInnerDimensions.size())
+                        {
+                            if (element->initializerList() != nullptr)
+                                scanSelf(scanSelf, element->initializerList(), dimension + 1);
+                        }
+                        else if (element->Identifier() == nullptr && !element->assignmentExpression().empty())
+                            hasExpressionElement = true;
                     }
+                };
+                scanElements(scanElements, fi->initializerList(), 0);
                 const bool ctorArrayOverride = hasExpressionElement && field != fields.end()
                     && field->ConstArraySize > 0 && !field->Pointer && !field->ElemPointer
                     && !field->IsArrayView && !compiler->IsCxxRecord(field->TypeName)
@@ -677,15 +686,28 @@ bool MainListener::CanFreshBraceInitializeAggregate(
                 && CflatStructNeedsCtorConstruction(field->TypeName);
             if (ctorArray)
             {
-                for (auto* element : fi->initializerList()->fieldInit())
-                {
-                    if (element != nullptr && element->Identifier() == nullptr
-                        && !element->assignmentExpression().empty())
-                        return true;
-                    if (FieldInitIsBraceElement(element)
-                        && self(self, field->TypeName, element->initializerList(), depth + 1))
-                        return true;
-                }
+                // Each inner dimension is one brace level (T[N][M]: rows, then elements).
+                auto elementLevel = [&](auto&& levelSelf, CFlatParser::InitializerListContext* level,
+                                        size_t dimension) -> bool {
+                    for (auto* element : level->fieldInit())
+                    {
+                        if (element == nullptr) continue;
+                        if (dimension < field->ConstInnerDimensions.size())
+                        {
+                            if (element->initializerList() != nullptr
+                                && levelSelf(levelSelf, element->initializerList(), dimension + 1))
+                                return true;
+                            continue;
+                        }
+                        if (element->Identifier() == nullptr && !element->assignmentExpression().empty())
+                            return true;
+                        if (FieldInitIsBraceElement(element)
+                            && self(self, field->TypeName, element->initializerList(), depth + 1))
+                            return true;
+                    }
+                    return false;
+                };
+                if (elementLevel(elementLevel, fi->initializerList(), 0)) return true;
             }
             else if (field->ConstArraySize > 0 && !field->Pointer && !field->ElemPointer
                 && !field->IsArrayView && !compiler->IsCxxRecord(field->TypeName))

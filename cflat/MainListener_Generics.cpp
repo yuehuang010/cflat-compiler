@@ -841,6 +841,18 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
         return {};
 }
 
+// The tuple spelling of a by-value parameter '(T1, T2) name', or null for any other shape.
+static CFlatParser::TupleTypeSpecifierContext* ParameterTupleSpecifier(
+    CFlatParser::ParameterDeclarationContext* decl)
+{
+    if (decl == nullptr || decl->declarationSpecifiers() == nullptr) return nullptr;
+    for (auto* ds : decl->declarationSpecifiers()->declarationSpecifier())
+        if (ds->typeSpecifier() != nullptr && ds->typeSpecifier()->tupleTypeSpecifier() != nullptr)
+            return ds->pointer() == nullptr && ds->arrayTypeSuffix() == nullptr
+                ? ds->typeSpecifier()->tupleTypeSpecifier() : nullptr;
+    return nullptr;
+}
+
 std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& funcName,
                                                const std::vector<LLVMBackend::NamedVariable>& args,
                                                CFlatParser::ArgumentExpressionListContext* argList,
@@ -870,6 +882,34 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             ? args.size() - argumentExpressions.size() : 0;
         for (size_t i = 0; i < paramDecls.size() && i < args.size(); i++)
         {
+            // A tuple parameter '(int, U)' binds each bare type-parameter element from the matching
+            // element of a tuple argument (`h((1, 2))` binds U = int), before any LLVM-type fallback.
+            if (auto* paramTuple = ParameterTupleSpecifier(paramDecls[i]))
+            {
+                const auto& entries = paramTuple->tupleTypeEntry();
+                auto argTuple = tupleTypeArgs.find(args[i].TypeAndValue.TypeName);
+                if (paramTuple->tupleTypePackEntry() == nullptr && argTuple != tupleTypeArgs.end()
+                    && argTuple->second.size() == entries.size())
+                    for (size_t j = 0; j < entries.size(); ++j)
+                    {
+                        auto* gid = entries[j]->typeSpecifier() != nullptr
+                            ? entries[j]->typeSpecifier()->genericIdentifier() : nullptr;
+                        if (gid == nullptr || gid->Identifier() == nullptr
+                            || gid->genericTypeParameters() != nullptr
+                            || entries[j]->pointer() != nullptr || entries[j]->arrayTypeSuffix() != nullptr)
+                            continue;
+                        const std::string name = gid->Identifier()->getText();
+                        if (std::find(typeParams.begin(), typeParams.end(), name) == typeParams.end())
+                            continue;
+                        if (!inferred.count(name))
+                        {
+                            inferred[name] = argTuple->second[j];
+                            declaredBinding[name] = true;
+                            literalBinding[name] = false;
+                        }
+                    }
+                continue;
+            }
             std::string paramTypeName;
             std::string nestedParamTypeName;
             std::string nestedGenericBase;
@@ -1351,7 +1391,8 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
                 ResolveEnumTypeArguments(typeArgs);
                 std::string mangledName = MangledGenericName("tuple", typeArgs);
                 tupleTypeArgs[mangledName] = typeArgs;
-                if (!instantiatedGenerics.count(mangledName))
+                if (genericTemplateSignatureDepth_ > 0) ReportUnknownSignatureTupleElements(tts);
+                if (!instantiatedGenerics.count(mangledName) && genericTemplateSignatureDepth_ == 0)
                 {
                     QueuePendingInstantiation("tuple", typeArgs, mangledName);
                     instantiatedGenerics.insert(mangledName);

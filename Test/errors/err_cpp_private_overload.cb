@@ -1,0 +1,20 @@
+// A private overload set (public + private under one name): overload resolution selects the private
+// overload for an int argument, so the call is refused, as clang refuses it. The public overload
+// (double argument) is accepted; see Test/test_cpp_interop.cb.
+import cpp "cpp_private_overloads.hpp";
+
+extern int main()
+{
+    privacc.P p = privacc.P();
+    expect_error("member 'h' of C++ class 'privacc.P' is private") {
+        int r = p.h(2);
+    }
+    expect_error("member 'operator-' of C++ class 'privacc.P' is private") {
+        int r = p - 2;
+    }
+    expect_error("member 'h' of C++ class 'privacc.PD' is private") {
+        privacc.PD d = privacc.PD();
+        int r = d.h(2);
+    }
+    return 0;
+}

@@ -922,6 +922,39 @@ else
 fi
 fi
 
+# --symbol-dump-ir/-opt honour --platform like a normal compile: the win64 view names C++ symbols
+# MS-style and carries the win64 target triple; an unknown --platform is refused (rc 1, named).
+if [ "$RUN_MODE" -eq 0 ]; then
+platdump_name="symbol_dump_platform"
+platdump_src="$RES/$platdump_name.cb"
+platdump_ir="$RES/$platdump_name.ir.log"
+platdump_opt="$RES/$platdump_name.opt.log"
+platdump_bad="$RES/$platdump_name.bad.log"
+platdump_t0=$(now_ms)
+printf '%s\n' 'import cpp "cpp_interop_mm.h";' \
+  'float platdumpUse(float v) { return mmprobe.accept_float(v); }' \
+  'extern int main() { return (int)platdumpUse(1.0f); }' >"$platdump_src"
+platdump_rc=0
+$TIMEOUT "$CFLAT" "$platdump_src" -i "$LIB" --locale-dir "$LOCALE_DIR" --platform win64 \
+  --symbol-dump-ir function:platdumpUse >"$platdump_ir" 2>&1 || platdump_rc=1
+$TIMEOUT "$CFLAT" "$platdump_src" -i "$LIB" --locale-dir "$LOCALE_DIR" --platform win64 \
+  --symbol-dump-opt module >"$platdump_opt" 2>&1 || platdump_rc=1
+$TIMEOUT "$CFLAT" "$platdump_src" -i "$LIB" --locale-dir "$LOCALE_DIR" --platform windows \
+  --symbol-dump-ir module >"$platdump_bad" 2>&1
+platdump_badrc=$?
+if [ "$platdump_rc" -ne 0 ]; then
+  write_result "$platdump_name" "FAIL: win64 dump rc $platdump_rc" "$platdump_t0"
+elif ! grep -Fq '?accept_float@mmprobe@@YAMM@Z' "$platdump_ir"; then
+  write_result "$platdump_name" "FAIL: win64 IR dump is not MS-mangled" "$platdump_t0"
+elif ! grep -Fq 'target triple = "x86_64-pc-windows-msvc"' "$platdump_opt"; then
+  write_result "$platdump_name" "FAIL: win64 optimized dump has the wrong triple" "$platdump_t0"
+elif [ "$platdump_badrc" -ne 1 ] || ! grep -Fq "unknown target platform 'windows'" "$platdump_bad"; then
+  write_result "$platdump_name" "FAIL: unknown --platform not refused" "$platdump_t0"
+else
+  write_result "$platdump_name" "PASS" "$platdump_t0"
+fi
+fi
+
 # Darwin debug-info tooling: -g must leave source lines reachable through either a dSYM
 # or the retained object when dsymutil is unavailable.
 if [ "$RUN_MODE" -eq 0 ] && [ "$(uname -s)" = "Darwin" ] \

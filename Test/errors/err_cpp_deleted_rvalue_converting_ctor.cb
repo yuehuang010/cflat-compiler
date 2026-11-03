@@ -1,0 +1,39 @@
+// A converting constructor is DELETED for an rvalue of its source (CfxDst(CfxSrc&&) = delete),
+// beside a viable const& one. An rvalue (`move s`, a returned local, a by-value argument or a
+// prvalue) selects the deleted one in clang's overload resolution, so each form is ill-formed.
+// A deleted constructor template and a deleted const&& constructor are picked the same way.
+// The const& copies below stay legal.
+import cpp "cpp_cppfix_deleted.hpp";
+
+expect_error("invokes a deleted function") {
+    CfxDst returnLocal(CfxSrc s) { return s; }
+}
+expect_error("invokes a deleted function") {
+    CfxDst returnMoved(CfxSrc s) { return move s; }
+}
+
+extern int main()
+{
+    CfxSrc src = default;
+    expect_error("invokes a deleted function") {
+        CfxDst moved = move src;
+    }
+    expect_error("invokes a deleted function") {
+        int taken = cfxTake(move src);
+    }
+    expect_error("invokes a deleted function") {
+        int takenPrvalue = cfxTake(cfxMake());
+    }
+    expect_error("invokes a deleted function") {
+        CfxTmpl tmplCopied = src;
+    }
+    expect_error("invokes a deleted function") {
+        CfxTmpl tmplMoved = move src;
+    }
+    expect_error("invokes a deleted function") {
+        CfxConst constMoved = move src;
+    }
+    CfxDst copied = src;
+    int byValueCopy = cfxTake(src);
+    return copied.w - 1 + byValueCopy - 1;
+}

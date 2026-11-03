@@ -1,0 +1,16 @@
+// `move` of a unique<T>[N] array into a raw pointer: a pointer cannot own the array, and the
+// compiler would otherwise free it through the pointer. Rejected at the declaration and at the
+// assignment; the borrow spelling `p = us` is legal (it decays to the address of element 0).
+struct Mix12ErrRes { int v = 0; };
+extern int main()
+{
+    expect_error("cannot move unique array 'us' into a pointer") {
+        unique<Mix12ErrRes>[2] us = default;
+        unique<Mix12ErrRes>* p = move us;
+    }
+    expect_error("cannot move unique array 'us' into a pointer") {
+        unique<Mix12ErrRes>[2] us = default;
+        unique<Mix12ErrRes>* p = nullptr;
+        p = move us;
+    }
+}

@@ -153,6 +153,35 @@ bool LLVMBackend::IsAliasValue(const llvm::Value* value) const
             && std::find(aliasValues_.begin(), aliasValues_.end(), value) != aliasValues_.end();
     }
 
+bool LLVMBackend::IsCoreUniqueReleaseResult(const llvm::Value* value) const
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+        const llvm::Function* callee = call != nullptr ? call->getCalledFunction() : nullptr;
+        const FunctionSymbol* sym = callee != nullptr ? FindSymbolForFunction(callee) : nullptr;
+        return sym != nullptr && sym->IsMethod && sym->SourceName == "release"
+            && !sym->Parameters.empty() && IsCoreUniqueType(sym->Parameters.front().TypeName);
+    }
+
+bool LLVMBackend::IsCxxReferenceAliasArm(const llvm::Value* value) const
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+        if (call == nullptr || !IsAliasValue(call)) return false;
+        const FunctionSymbol* sym = call->getCalledFunction() != nullptr
+            ? FindSymbolForFunction(call->getCalledFunction()) : nullptr;
+        if (sym == nullptr || !sym->IsCxx || !sym->ReturnType.IsAlias || sym->ReturnType.Pointer)
+            return false;
+        // A constant argument is safe only if its parameter cannot reach other storage
+        // (pointer-to-pointer or reference-to-pointer can); a loaded pointer keeps the alias.
+        if (sym->Parameters.size() != call->arg_size()) return false;
+        for (unsigned i = 0; i < call->arg_size(); ++i)
+        {
+            const TypeAndValue& param = sym->Parameters[i];
+            if (!llvm::isa<llvm::Constant>(call->getArgOperand(i))
+                || param.IsCxxRefToPointer || param.PointerDepth > 1) return false;
+        }
+        return true;
+    }
+
 bool LLVMBackend::IsAliasTransferResult(const llvm::Value* value) const
 {
         return value != nullptr
@@ -5782,6 +5811,25 @@ std::string LLVMBackend::BorrowedSourceName(const NamedVariable& nv)
         if (!nv.BorrowedOrigin.empty()) return nv.BorrowedOrigin;
         if (!nv.CallerName.empty()) return nv.CallerName;
         return nv.TypeAndValue.VariableName;
+    }
+
+std::string LLVMBackend::BorrowedSourceDisplayName(const NamedVariable& nv) const
+{
+        // A method call resolved to a symbol with a self parameter names its owner type.
+        if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(nv.Primary))
+            if (const llvm::Function* callee = call->getCalledFunction())
+                if (const FunctionSymbol* sym = FindSymbolForFunction(callee);
+                    sym != nullptr && sym->IsMethod && !sym->IsCxx && !sym->Parameters.empty()
+                    && !sym->SourceName.empty())
+                {
+                    TypeAndValue self = sym->Parameters.front();
+                    self.Pointer = false;
+                    self.IsAlias = false;
+                    return SpellType(*this, self) + "." + sym->SourceName;
+                }
+        const std::string raw = BorrowedSourceName(nv);
+        if (raw.find('$') == std::string::npos) return raw;
+        return SpellType(*this, TypeAndValue{ .TypeName = raw });
     }
 
 void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,

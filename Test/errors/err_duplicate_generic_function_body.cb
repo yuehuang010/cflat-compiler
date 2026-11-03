@@ -1,0 +1,18 @@
+// A generic function template defined twice is a redefinition, as a plain function is. Before the
+// fix the template registry kept the second body silently ("second body wins") and compiled.
+// Two legs: the bodies on separate lines, and both on one line (different columns).
+
+expect_error("redefinition of 'tDupGen'") {
+    T tDupGen<T>(T a) { return a; }
+    T tDupGen<T>(T a) { return a + a; }
+}
+
+expect_error("redefinition of 'tDupGenSameLine'") {
+    T tDupGenSameLine<T>(T a) { return a; } T tDupGenSameLine<T>(T a) { return a + a; }
+}
+
+// Same body with the type parameter renamed: the template identity is positional, so this is one slot.
+expect_error("redefinition of 'tDupGenRenamed'") {
+    T tDupGenRenamed<T>(T a) { return a; }
+    U tDupGenRenamed<U>(U a) { return a + a; }
+}

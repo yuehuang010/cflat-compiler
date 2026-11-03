@@ -283,6 +283,7 @@ import cpp "library/cpp_immovable.hpp";
 import cpp "library/cpp_t89_char_pointer.hpp";
 import cpp "library/cpp_t102_assign_routes.hpp";
 import cpp "library/cpp_t43_ref_ops.hpp";
+import cpp "library/cpp_mix15_ref_result.hpp";
 import cpp "library/cpp_t85_pointee.hpp";
 import cpp "library/cpp_t94_anon_typedef.hpp";
 import cpp "library/cpp_t95_deref.hpp";
@@ -411,6 +412,9 @@ import cpp "library/cpp_interop_c2_accept_a.h";
 import cpp "library/cpp_interop_c2_accept_b.h";
 import cpp "library/cpp_t436_spec_primary.hpp";
 import cpp "library/cpp_t436_spec_long.hpp";
+// CPPFIX: variable template specializations in a later import win over the primary.
+import cpp "library/cpp_cppfix.hpp";
+import cpp "library/cpp_cppfix_spec.hpp";
 // Importing the exact same header twice must retain the existing entity.
 import cpp "library/cpp_interop_c2_repeat.h";
 import cpp "library/cpp_interop_c2_repeat.h";
@@ -422,6 +426,14 @@ using T469GateExplicit = cppt.dflt.Gate<cppt.dflt.CountDone>;
 import cpp "library/cpp_interop_varctor.h";
 import cpp "library/cpp_interop_freeoptpl.h";
 import cpp "library/cpp_t460_operator_lookup.hpp";
+import cpp "library/cpp_mix7_operator_rank.hpp";
+import cpp "library/cpp_mix7_fnptr_bool.hpp";
+import cpp "library/cpp_mix14_scalar_ctor.hpp";
+import cpp "library/cpp_mix18_overloads.hpp";
+
+int mix7FnTwice(int x) { return x * 2; }
+int mix14Twice(int x) { return x * 2; }
+import cpp "library/cpp_mix4_conv_builtin.hpp";
 import cpp "library/cpp_interop_fixedarray.hpp";
 import cpp "library/cpp_interop_arraybool.hpp";
 // `explicit` constructors are not implicit conversions at a call argument; the non-explicit
@@ -589,6 +601,10 @@ import cpp "library/cpp_t87_null_zero.h";
 import cpp "library/cpp_t132_s7_byval.hpp";
 import cpp "library/cpp_t310_fldinit.hpp";
 import cpp "library/cpp_private_base_shadow.h";
+import cpp "library/cpp_mixed_access.hpp";
+import cpp "library/cpp_private_overloads.hpp";
+import cpp "library/cpp_move_operand_ops.hpp";
+import cpp "library/cpp_copy_parity.hpp";
 // T310 FLDINIT: scalar field defaults of C++ class type run the converting constructor.
 int tFieldInitCppRead() { return 101; }
 [cpp] struct TFieldInitCppEarlier { int first = 4; int second = first + 2; };
@@ -1427,6 +1443,9 @@ alias cpprefgate.C* RgAlias() { return cpprefgate.cell(); }
 alias cpprefgate.C* RgAliasAmp() { return &cpprefgate.cell(); }
 struct RgFields { cpprefgate.B* r = default; };
 struct RgFieldDefault { cpprefgate.B* r = cpprefgate.bref(); };
+// A C pointer joined with a C++ reference address is a plain pointer: `p ?? &cell()`, `p ? p : &cell()`.
+cpprefgate.C* RgJoinCoalesce(cpprefgate.C* p) { return p ?? &cpprefgate.cell(); }
+cpprefgate.C* RgJoinTernary(cpprefgate.C* p) { return p != nullptr ? p : &cpprefgate.cell(); }
 
 cppi.RefCell* RrCell() { return cppi.ref_cell(); }
 (const cppi.RefCell)* RrCellConst() { return cppi.ref_cell_const(); }
@@ -2340,6 +2359,10 @@ struct T468R { int z = 0; T468R() { t468Alloc = t468Alloc + 1; t468Live = t468Li
 struct T468U { unique<T468R> u; int k = 1; T468U() { k = 2; u = unique<T468R>(new T468R()); } };
 struct T468UO { T468U[2] h; };
 struct T468UO2 { T468UO[2] a; };
+int t468cc = 0;
+int t468dc = 0;
+struct T468E2 { int w = 0; T468E2() { t468cc = t468cc + 1; } ~T468E2() { t468dc = t468dc + 1; } };
+struct T468G2 { T468E2[2][2] g; };
 // T336: by-value CFlat brace-argument ownership coverage.
 struct T336Plain { T312E e; };
 struct T336Array3 { T312E[3] h; };
@@ -3856,6 +3879,50 @@ int DefClsBraceTrace(cppdefcls.Implicit first, cppdefcls.Implicit last = {})
 
 extern int main()
 {
+    // Mixed-access sets: the PUBLIC overload is selected and runs. A protected selection is refused
+    // in Test/errors/err_cpp_mixed_access_overload.cb.
+    mixacc.M mixM = mixacc.M();
+    if (mixM - 2.0 != 1) return 54990;
+    if (mixM.g(2.5) != 3) return 54991;
+    // Private sets: a public pick runs (named and operator form, and through a derived class); a
+    // private pick is refused in Test/errors/err_cpp_private_overload.cb.
+    privacc.P privP = privacc.P();
+    if (privP.h(2.0) != 1) return 54994;
+    if (privP - 2.0 != 1) return 54995;
+    privacc.PD privD = privacc.PD();
+    if (privD.h(2.0) != 1) return 54996;
+    // Member template compound operator: instantiated for an lvalue and for a written move operand.
+    mvops.TP4 tpA = mvops.TP4(3);
+    mvops.TP4 tpB = mvops.TP4(4);
+    tpA &= tpB;
+    if (tpA.v != 7) return 54997;
+    tpA &= move tpB;
+    if (tpA.v != 11) return 54998;
+    // By-value compound results: a free chain into a copy-only class copies once, and a compound on a
+    // prvalue receiver constructs into the declared object (no move), as clang elides them.
+    mvops.Cpy.reset();
+    {
+        mvops.Cpy cpF = mvops.Cpy(1);
+        mvops.Cpy cpG = ((cpF -= 0) |= 4);
+        if (cpG.v != 5) return 54999;
+    }
+    if (mvops.Cpy.cp != 2) return 55000;
+    mvops.Cnt.reset();
+    {
+        mvops.Cnt cntK = (mvops.mkCnt(10) *= 2);
+        if (cntK.v != 20) return 55001;
+    }
+    if (mvops.Cnt.mv != 0) return 55002;
+    // Copy assignment binds the overload clang picks: a const source takes operator=(const CV&),
+    // a non-const lvalue takes operator=(CV&).
+    const cppcp.CV cpCx = cppcp.CV(7);
+    cppcp.CV cpCy = cppcp.CV(0);
+    cpCy = cpCx;
+    if (cpCy.v != 27) return 54992;
+    cppcp.CV cpNx = cppcp.CV(7);
+    cppcp.CV cpNy = cppcp.CV(0);
+    cpNy = cpNx;
+    if (cpNy.v != 17) return 54993;
     // Address-of preserves lvalues through fields, references, pointers, arrays and joins.
     cppi.RefCell addrTempLocal = default;
     addrTempLocal.v = 4;
@@ -4305,6 +4372,20 @@ extern int main()
     if (-t150.volRef(t150VolRef) != 22) return 15010;
     t150.VolTemplateCopyS t150VolCopy = default;
     if (-t150.volTemplateCopyRef(t150VolCopy) != 22) return 15011;
+    // MIX17 (clang++ -std=c++20 oracle: 22 each): a `&&` free binds a volatile or const prvalue.
+    if (-mix17.volRvMake() != 22) return 15012;
+    if (-mix17.constRvMake() != 22) return 15013;
+    // MIX17 r2 (clang++ -std=c++20 oracle): a `T&` call result is an lvalue; a template overload is not cv-refused.
+    mix17r2.F1S f1Source = default;
+    if (-mix17r2.f1Ref(f1Source) != 7) return 15014;
+    mix17r2.MutS mutSource = default;
+    if (-mix17r2.mutRef(mutSource) != 22 || mutSource.v != 5) return 15015;
+    if (-mix17r2.f2Make() != 6) return 15016;
+    mix17r2.F2S f2Source = default;
+    if (-mix17r2.f2Ref(f2Source) != 6) return 15017;
+    mix17r3.R3S r3Source = default;
+    if (-mix17r3.r3VolRef(r3Source) != 6) return 15018;
+    if (-mix17r3.r3ConstRef(r3Source) != 6) return 15019;
     // T275 (clang++ -std=c++20 oracle: 1 7 1 8 9): rvalue receiver member beats the `S&` free; xvalue receivers.
     if (-t275.rvalueMemberRefFreeMake() != 1) return 27501;
     t275.XvalueNot t275XvNot = default;
@@ -5217,6 +5298,18 @@ extern int main()
     if (t43shift.value != 10) return 3913;
     t43.RefOps t43shiftRight = t43c * t43c >> t43a;
     if (t43shiftRight.value != 10) return 3917;
+    // MIX15: a parenthesized C++ T& operator/method result names its referent for member reads and
+    // writes; a const T& result stays read-only (err_cpp_paren_const_ref_member_write.cb).
+    mix15r.Ref mix15a = mix15r.Ref(1);
+    if ((mix15a << 2).v != 4) return 39950;
+    if ((mix15a + 1).v != 5 || mix15a.v != 5) return 39951;
+    if ((mix15a << 1).get() != 100) return 39952;
+    if ((mix15a << 1).bump().v != 21) return 39953;
+    (mix15a << 1).v = 9;
+    if (mix15a.v != 9) return 39954;
+    (mix15a << 1).v++;
+    if (mix15a.v != 19 || (mix15a >> 3).v != 19) return 39955;
+    if ((mix15a << 1 << 1).v != 76 || mix15a.v != 76) return 39956;
     t43.RefOps t43logical = t43c + t43c && t43a;
     if (t43logical.value != 10) return 3914;
     t43.RefOps t43logicalOr = t43c + t43c || t43a;
@@ -9953,8 +10046,93 @@ extern int main()
     if (t460_beside_f(t460GlobalBesideValue) != 85 || t460_beside_f(5) != 33) return 65027;
     // A hidden friend reached through an enum nested in its class (ADL associated class).
     if (t460_enum_f(T460EnumHolder.E.one) != 89) return 65040;
+    // MIX7: a namespace and a global operator rank in one set: the exact global int wins over the
+    // namespace long (clang 12), the exact namespace int wins over the global long (clang 21).
+    mix7op.Y mix7Y = default; mix7Y.v = 1;
+    if (mix7Y + 1 != 12) return 65041;
+    mix7op.Z mix7Z = default; mix7Z.v = 1;
+    long mix7L = 2;
+    if (mix7Z + 1 != 21 || mix7Z + mix7L != 22) return 65042;
+    // MIX7: compound assignment ranks the namespace and global operator+= in one set (clang 101).
+    mix7op.W mix7W = default; mix7W.v = 1;
+    mix7W += 1;
+    if (mix7W.v != 101) return 65045;
+    // MIX7: a function pointer binds a C++ bool by value: set -> true, null -> false (clang 3 and 4).
+    function<int(int)> mix7Fn = mix7FnTwice;
+    function<int(int)> mix7FnNull = default;
+    if (mix7fpb.take_bool(mix7Fn) != 3 || mix7fpb.take_bool(mix7FnNull) != 4) return 65043;
+    if (mix7fpb.take_bool(mix7FnTwice) != 3) return 65044;
+    // MIX14: a const double& / const bool& / const float& parameter takes an int (or long, float)
+    // through a converted temporary, like clang (8, 8, 10, 3; 1, 1; 16); fdr/fbr/fff bind alike.
+    int mix14B = 4; long mix14L = 5; float mix14F = 1.5f;
+    if (((mix14sc.DR)(4)).v != 8 || ((mix14sc.DR)(mix14B)).v != 8) return 65050;
+    if (((mix14sc.DR)(mix14L)).v != 10 || ((mix14sc.DR)(mix14F)).v != 3) return 65051;
+    if (((mix14sc.BR)(4)).v != 1 || ((mix14sc.BR)(mix14B)).v != 1) return 65052;
+    if (((mix14sc.FR)(mix14B)).v != 16 || ((mix14sc.DRV)(mix14B)).v != 104) return 65053;
+    if (mix14sc.fdr(mix14B) != 8 || mix14sc.fbr(mix14B) != 1 || mix14sc.fff(mix14B) != 16) return 65054;
+    // MIX14: a CFlat function, a function<> value, or a null function<> passed to a C++ constructor
+    // taking bool by value is its truth: set -> 1, null -> 2 (clang 1, 1, 2).
+    function<int(int)> mix14Fn = mix14Twice;
+    function<int(int)> mix14FnNull = default;
+    mix14sc.OB mix14Ob1 = mix14sc.OB(mix14Twice);
+    mix14sc.OB mix14Ob2 = mix14sc.OB(mix14Fn);
+    mix14sc.OB mix14Ob3 = mix14sc.OB(mix14FnNull);
+    if (mix14Ob1.v != 1 || mix14Ob2.v != 1 || mix14Ob3.v != 2) return 65055;
+    // MIX14: an int and a bool constructor beside each other: an int takes the int one (104), and a
+    // function value takes the bool one (clang 105 for the pair; the function is refused as an int).
+    mix14sc.CIB mix14Cib1 = mix14sc.CIB(mix14B);
+    mix14sc.CIB mix14Cib2 = mix14sc.CIB(mix14Twice);
+    if (mix14Cib1.v != 104 || mix14Cib2.v != 1) return 65056;
+    // MIX18: a free overload with a by-value long / unsigned / float beside a const double& takes an
+    // int by value (ruling: a converted temporary ranks below a by-value bind; clang reports ambiguous).
+    // a9: the exact int overload beats the const double&.
+    if (m18ov.a1(mix14B) != 2 || m18ov.a2(mix14B) != 2 || m18ov.a11(mix14B) != 2) return 65057;
+    if (m18ov.a1(mix14L) != 2 || m18ov.a9(mix14B) != 2 || m18ov.a1(mix14F) != 1) return 65058;
+    // MIX18: a function value into a bool constructor beside an int one is the bool one (clang 1); a
+    // const bool& constructor takes a function value or a pointer as its truth (clang 1, 1, 7).
+    m18ov.CBI mix18Cbi = m18ov.CBI(mix14Twice);
+    m18ov.CB mix18Cb = m18ov.CB(mix14Twice);
+    int* mix18P = &mix14B;
+    if (mix18Cbi.v != 1 || mix18Cb.v != 1 || ((m18ov.CB)(mix18P)).v != 1) return 65059;
+    // MIX18 r2: a const double& + long tie on a method and an operator picks the by-value long for an int
+    // (ruling; clang reports ambiguous); identity picks (double, long) stay. The constructor is not yet ruled.
+    int mix18I = 4; long mix18L = 6; double mix18D = 2.5;
+    if (m18ov.TieS(mix18D).v != 1 || m18ov.TieS(mix18L).v != 2) return 65060;
+    m18ov.TieS mix18S = m18ov.TieS(mix18D);
+    if (mix18S.m(mix18I) != 2 || mix18S.m(mix18D) != 1 || mix18S.m(mix18L) != 2) return 65061;
+    if (mix18S + mix18I != 2 || mix18S + mix18D != 1) return 65062;
+    // MIX18 r2: a long lvalue binds the const long& (identity) over the by-value double.
+    if (m18ov.TieU(mix18L).v != 1) return 65063;
+    // MIX18 r2: a CFlat function value into a free `const bool&` overload is its truth (clang 1); an int picks int.
+    if (m18ov.a3(mix7FnTwice) != 1 || m18ov.a3(mix18I) != 2) return 65064;
+    // MIX18 r3: identity binds (same scalar type) keep master's pick (the const& overload, 1); a literal picks int (2).
+    char mix18C = 3; short mix18Sh = 2; long long mix18Ll = 7;
+    if (m18ov.gi(mix18I) != 1 || m18ov.gc(mix18C) != 1 || m18ov.gs(mix18Sh) != 1 || m18ov.gll(mix18Ll) != 1) return 65065;
+    if (m18ov.gi(4) != 2) return 65066;
     t460gate.X t460GateValue = default;
     if (t460gate.f(t460GateValue, 2) != 82) return 65028;
+    // MIX4: a class whose only conversion is a scalar reaches the built-in operators through it,
+    // in the conversion's own return type (clang: `d + 2` is double + int, `l + 2` is long long).
+    mix4conv.DOnly m4cD = default;
+    mix4conv.LOnly m4cL = { v = 5000000000 };
+    mix4conv.BOnly m4cB = default;
+    mix4conv.COnly m4cC = default;
+    mix4conv.DPlus m4cP = default;
+    mix4conv.MOnly m4cM = { v = 7 };
+    if (m4cD + 2 != 5.5 || 2 + m4cD != 5.5 || m4cD - 2 != 1.5 || 2 - m4cD != -1.5) return 77101;
+    if (m4cD * 2 != 7.0 || m4cD / 2 != 1.75 || 2.5 * m4cD != 8.75) return 77102;
+    if (!(m4cD > 3) || !(3 < m4cD) || m4cD == 3) return 77103;
+    if (m4cB + 2 != 3 || m4cC + 2 != 67) return 77104;
+    if (m4cL + 2 != 5000000002 || m4cL * 2 != 10000000000) return 77105;
+    if (m4cP + 2 != 99.0) return 77106;
+    if (m4cM - 2 != 1005 || m4cM + 2 != 9) return 77107;
+    mix4conv.SShortConv m4cS = default;
+    mix4conv.UCharConv m4cUC = default;
+    mix4conv.RDoubleRef m4cR = default;
+    if (2 * m4cS != 60000) return 77108;
+    if (100 + m4cUC != 300) return 77109;
+    double m4cRV = m4cR;
+    if (m4cRV != 2.25 || m4cR * 2 != 4.5 || m4cR + 2.0 != 4.25) return 77110;
 
     // ---- scalar-to-class reference conversion and chained class returns -------------------------
     double screfScalar = 2.5;
@@ -16507,6 +16685,9 @@ extern int main()
         || RgAlias() != &cpprefgate.cell() || RgAliasAmp() != &cpprefgate.cell()) return 3568;
     delete rgHeap;
     if (cpprefgate.cell().v != 43 || cpprefgate.other_cell().v != 47) return 3569;
+    cpprefgate.C mixedLocal = { v = 61 };
+    if (RgJoinCoalesce(&mixedLocal) != &mixedLocal || RgJoinCoalesce(nullptr) != &cpprefgate.cell()) return 99151;
+    if (RgJoinTernary(&mixedLocal) != &mixedLocal || RgJoinTernary(nullptr) != &cpprefgate.cell()) return 99152;
 
     // ---- C++ value ternaries keep temporary ownership through every destination (3570-3579) ----
     for (int i = 0; i < 2; i++)
@@ -21003,6 +21184,12 @@ int LoweredUserDtorAssignLegs(int argc)
     t436spec.S<int> t436Primary = default; t436Primary.v = 4;
     t436spec.S<long> t436Explicit = default; t436Explicit.v = 2; t436Explicit.w = 5;
     if (t436Primary.v + (int)t436Explicit.w != 9) return 43602;
+    // Explicit, partial and same-header variable template specializations (clang Sema picks).
+    int cppfixV = cppfix.V<long>; int cppfixVPrim = cppfix.V<int>;
+    int cppfixWPtr = cppfix.W<int*>; int cppfixWPrim = cppfix.W<int>;
+    int cppfixX = cppfix.X<char>; int cppfixXPrim = cppfix.X<int>;
+    if (cppfixV != 5 || cppfixVPrim != 3 || cppfixWPtr != 7 || cppfixWPrim != 1
+        || cppfixX != 21 || cppfixXPrim != 20) return 43604;
     // T33: a class-typed variable template is the real C++ object: range-for over STATIC
     // begin/end (views::empty<T>), `v<T>.member()` (not a class template), address identity.
     int vtvSum = 0;
@@ -21720,6 +21907,15 @@ int LoweredUserDtorAssignLegs(int argc)
         if (t468Alloc != 3 || t468Live != 0) return 46808;
     }
     if (t468Live != 0 || HeapAudit.reportLeaks() != t468HeapBase) return 46809;
+    // MIX4: a named override of a 2-D element-constructed field builds each element once, as the
+    // 1-D field does: a full override constructs nothing, a partial one defaults only the rest.
+    T468E2 t468Seed = default;
+    t468cc = 0; t468dc = 0;
+    { T468G2 t468Full = { g = { { t468Seed, t468Seed }, { t468Seed, t468Seed } } }; }
+    if (t468cc != 0 || t468dc != 4) return 46810;
+    t468cc = 0; t468dc = 0;
+    { T468G2 t468Part = { g = { { t468Seed } } }; }
+    if (t468cc != 3 || t468dc != 4) return 46811;
     // T336: a by-value brace argument owns its temporary through the call's full-expression.
     t312Ct = 0; t312Dt = 0;
     int t336SingleValue = t336TakeO({ h = { { w = 11 }, { w = 12 } } });

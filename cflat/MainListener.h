@@ -7585,6 +7585,11 @@ private:
     TypeSubstitutionMap activeTypeSubstitutions;
     // Active compile-time value substitutions during generic instantiation (e.g. "N" -> "8").
     std::unordered_map<std::string, std::string> activeValueSubstitutions;
+    // >0 while a generic free-function template's signature is parsed at its definition: its own
+    // type parameters are unbound there, so a tuple return/param naming one must not instantiate.
+    // Names holds exactly that template's type parameter names (suppressed only when mentioned).
+    int genericTemplateSignatureDepth_ = 0;
+    std::unordered_set<std::string> genericTemplateSignatureNames_;
 
     // Pack param index per template: index of the variadic param, or npos if not variadic
     std::unordered_map<std::string, size_t>& genericStructPackIndex;
@@ -7628,6 +7633,10 @@ private:
     // Unused-decl candidates must not be recorded here: the faded "never used" hint would
     // land at a bogus location in the instantiating file (e.g. on an import line).
     bool InGenericInstantiation() const;
+    // True when a resolved element name mentions (whole token, '$'-split) a signature type parameter.
+    bool MentionsSignatureTypeParam(const std::string& name) const;
+    // Definition-time check of a tuple signature: reports unknown element names the instance would hit.
+    void ReportUnknownSignatureTupleElements(CFlatParser::TupleTypeSpecifierContext* tts);
 
     // Struct scope stack: pushed when parsing fields/methods of a struct/class so that
     // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
@@ -10122,6 +10131,12 @@ public:
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhs);
 
+    // `unique<T>* p = move us;` on a unique<T>[N] source: a pointer cannot own the array. Logs and
+    // returns true when the bind is rejected.
+    bool RejectUniqueArrayMoveIntoPointer(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhs);
+
     // Element-axis sibling of RejectRawPointerToArrayView, same two binding doors.
     bool RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
@@ -10656,7 +10671,8 @@ public:
         llvm::Value* operand, const std::string& op,
         antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage,
         bool operandIsConst = false, bool operandExplicitMove = false,
-        bool operandIsConstPrvalue = false);
+        bool operandIsConstPrvalue = false, bool operandIsVolatile = false,
+        bool operandIsVolatileLvalue = false, bool operandIsLvalueRefResult = false);
 
     // If an operator overload (e.g. operator+) just returned an owned heap string as an
     // unnamed SSA temporary, register it for end-of-full-expression cleanup. This is the

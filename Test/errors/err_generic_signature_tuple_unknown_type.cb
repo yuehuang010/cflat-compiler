@@ -1,0 +1,11 @@
+// A tuple in a generic function signature that names an unknown type is reported at the definition,
+// even though the template is never instantiated.
+
+expect_error("type 'Nope'") {
+    (int,Nope) mk<T>(T x) { (int,Nope) r; return r; }
+}
+
+extern int main()
+{
+    return 0;
+}

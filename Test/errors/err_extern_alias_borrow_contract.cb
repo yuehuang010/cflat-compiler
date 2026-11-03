@@ -1,0 +1,42 @@
+// An `extern alias` by-value owner return keeps the borrow contract of a defined `alias` return:
+// the result of the call borrows the global, so it cannot be returned from a plain function, moved,
+// or stored into an owning variable. The C-ABI return shape is unchanged; only ownership is checked.
+struct XaRes { int id = 0; };
+struct XaBox { unique XaRes* item = nullptr; };
+XaBox gXaBox = default;
+extern alias XaBox xaGet() { return gXaBox; }
+
+void xaSink(move XaBox b) { }
+
+// Prototype-only C-backed form: the alias contract applies to the declaration alone.
+extern alias XaBox cget();
+
+XaBox cgetPlain()
+{
+    expect_error("cannot return an 'alias' value 'cget'");
+    return cget();
+}
+
+XaBox xaPlain()
+{
+    expect_error("cannot return an 'alias' value 'xaGet'");
+    return xaGet();
+}
+
+extern int main()
+{
+    expect_error("cannot 'move' the 'alias' value 'xaGet'") {
+        XaBox j = move xaGet();
+    }
+    expect_error("cannot 'move' the 'alias' value 'xaGet'") {
+        xaSink(move xaGet());
+    }
+    expect_error("cannot 'move' the 'alias' value 'cget'") {
+        XaBox c = move cget();
+    }
+    expect_error("cannot store an 'alias' value 'xaGet' into an owning variable") {
+        XaBox k = default;
+        k = xaGet();
+    }
+    return 0;
+}

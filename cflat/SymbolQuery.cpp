@@ -1329,6 +1329,13 @@ int RunSymbolDumpIrQuery(ArgParser& args, const std::string& runtimeDir)
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
     compiler.SetBatchMode(true);
+    // The dump must target the same --platform a normal compile would (triple, layout, ABI).
+    try
+    {
+        if (!compiler.SetAnalysisPlatform(args.getOption("platform").value_or(LLVMBackend::DefaultPlatform())))
+            return 1;
+    }
+    catch (const CompilerAbortException&) { return 1; }
     // The dump must see the sanitizer-gated IR the real compile would emit, the same way the
     // -O level already reaches --symbol-dump-opt.
     compiler.SetAsan(args.hasFlag("asan"));
@@ -1352,7 +1359,11 @@ int RunSymbolDumpIrQuery(ArgParser& args, const std::string& runtimeDir)
 
         LspSymbolIndex index;
         compiler.SetSymbolSink(&index);
-        const bool analysisOk = compiler.Analyze(file, importDirs, runtimeDir);
+        // An abort outside Analyze's own handlers (e.g. a broken --platform core import) is a
+        // failed analysis, not a crash: the same exit a normal compile gives.
+        bool analysisOk = false;
+        try { analysisOk = compiler.Analyze(file, importDirs, runtimeDir); }
+        catch (const CompilerAbortException&) { analysisOk = false; }
         compiler.SetSymbolSink(nullptr);
         const std::string analyzedFile = compiler.GetSourceFilePath();
         if (!analysisOk)

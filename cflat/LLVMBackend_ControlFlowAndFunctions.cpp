@@ -2543,7 +2543,7 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
                 auto& d = parked[next++];
                 aliasScopeStack_ = d.AliasScope;
                 // Still incomplete: park it again, untouched.
-                if (FindIncompleteByValueAggregate(d.ReturnType, d.Arguments, d.External) != nullptr)
+                if (FindIncompleteByValueAggregate(ExternAbiReturnShape(d.ReturnType, d.External && !d.IsCxx), d.Arguments, d.External) != nullptr)
                 {
                     pendingFunctionDeclarations_.push_back(std::move(d));
                     continue;
@@ -2553,11 +2553,12 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
                 bool useRecipe = false;
                 if (d.External)
                 {
-                    recipe = ComputeAbiRecipe(d.ReturnType, d.Arguments);
-                    if (!d.ReturnType.Pointer && !d.ReturnType.IsAlias
-                        && ReturnsViaCxxSret(d.ReturnType.TypeName))
+                    const TypeAndValue abiRet = ExternAbiReturnShape(d.ReturnType, !d.IsCxx);
+                    recipe = ComputeAbiRecipe(abiRet, d.Arguments);
+                    if (!abiRet.Pointer && !abiRet.IsAlias
+                        && ReturnsViaCxxSret(abiRet.TypeName))
                     {
-                        auto cxxReturn = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
+                        auto cxxReturn = ComputeCxxReturnAbiRecipe(abiRet, d.Arguments);
                         if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
                         {
                             recipe.retSlot = cxxReturn.retSlot;
@@ -2695,7 +2696,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         // by-value aggregate has no legal FunctionType yet, so the declaration is emitted with a
         // PROVISIONAL signature and re-derived by FlushPendingFunctionDeclarations once the main
         // pass sets the real body. Registration order in functionTable is unchanged.
-        bool provisional = FindIncompleteByValueAggregate(returnType, arguments, external) != nullptr;
+        bool provisional = FindIncompleteByValueAggregate(ExternAbiReturnShape(returnType, external && !isCxx), arguments, external) != nullptr;
 
         if (external)
         {
@@ -2709,6 +2710,8 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         // For extern C declarations, compute an ABI recipe so struct-by-value params/returns
         // are lowered (coerce-to-int / byval / sret) per the Win64 or Win32 MSVC ABI. If the
         // recipe has no lowering (scalar/pointer only) the existing GetFunctionType path is used.
+        // An extern 'alias' is a CFlat-side borrow contract; the C ABI lowering is the plain return.
+        const TypeAndValue abiRet = ExternAbiReturnShape(returnType, external && !isCxx);
         AbiRecipe recipe;
         bool useRecipe = false;
         // A C++ declaration carries clang's OWN arrangement; C keeps the size heuristic. A plan
@@ -2724,11 +2727,11 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         }
         else if (external && !provisional)
         {
-            recipe = ComputeAbiRecipe(returnType, arguments);
-            if (!returnType.Pointer && !returnType.IsAlias
-                && ReturnsViaCxxSret(returnType.TypeName))
+            recipe = ComputeAbiRecipe(abiRet, arguments);
+            if (!abiRet.Pointer && !abiRet.IsAlias
+                && ReturnsViaCxxSret(abiRet.TypeName))
             {
-                auto cxxReturn = ComputeCxxReturnAbiRecipe(returnType, arguments);
+                auto cxxReturn = ComputeCxxReturnAbiRecipe(abiRet, arguments);
                 if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
                 {
                     recipe.retSlot = cxxReturn.retSlot;
@@ -2749,10 +2752,10 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         const bool cflatSretReturn = cflatAbiLowering
             && recipe.retSlot.kind == AbiSlot::SRetReturn;
         llvm::FunctionType* functionType = cflatAbiLowering
-            ? BuildCFlatSRetFunctionType(returnType, arguments, varargs, recipe)
+            ? BuildCFlatSRetFunctionType(abiRet, arguments, varargs, recipe)
             : (useRecipe
-                ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
-                : GetFunctionType(returnType, arguments, varargs, external, provisional));
+                ? BuildExternFunctionType(abiRet, arguments, varargs, recipe)
+                : GetFunctionType(abiRet, arguments, varargs, external, provisional));
 
         // Whole-signature cross-check against clang's own llvm::FunctionType for the callee.
         // Any difference means the lowering above does not match the real ABI - refuse rather
@@ -2938,6 +2941,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                     .Arguments = arguments,
                     .External = external,
                     .Varargs = varargs,
+                    .IsCxx = isCxx,
                     .AliasScope = aliasScopeStack_,
                 });
         }
@@ -3193,7 +3197,27 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
 {
         auto it = functionBodyOrigin_.find(mangledName);
         if (it == functionBodyOrigin_.end()) return;
-        const FunctionBodyOrigin& first = it->second;
+        DiagnoseDuplicateBodyOrigin(functionName, mangledName, it->second, line, column,
+                                    isMethod, isConstMethod);
+    }
+
+void LLVMBackend::RecordGenericTemplateOrigin(const std::string& name, const std::string& signature,
+        size_t line, size_t column)
+{
+        // Templates of one name may differ in parameter types (an arity overload), so the slot is
+        // name plus signature; only the same signature is a redefinition.
+        const std::string key = name + "(" + signature + ")";
+        FunctionBodyOrigin origin { SourceFileLeaf(sourceFileName), line, column, false, false };
+        auto it = genericTemplateOrigin_.find(key);
+        if (it != genericTemplateOrigin_.end())
+            DiagnoseDuplicateBodyOrigin(name, key, it->second, line, column, false, false);
+        genericTemplateOrigin_[key] = std::move(origin);
+    }
+
+void LLVMBackend::DiagnoseDuplicateBodyOrigin(const std::string& functionName,
+        const std::string& mangledName, const FunctionBodyOrigin& first, size_t line, size_t column,
+        bool isMethod, bool isConstMethod) const
+{
         const std::string& firstFile = first.file;
         if (line == 0 || first.line == 0) return;
         if (line == first.line
@@ -3236,15 +3260,16 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         // A signature parked during the scan must reach the function table before this body
         // (and its call sites) are emitted.
         FlushPendingFunctionDeclarations();
+        const TypeAndValue abiRet = ExternAbiReturnShape(returnType, external);
         AbiRecipe recipe;
         bool useRecipe = false;
         if (external)
         {
-            recipe = ComputeAbiRecipe(returnType, arguments);
-            if (!returnType.Pointer && !returnType.IsAlias
-                && ReturnsViaCxxSret(returnType.TypeName))
+            recipe = ComputeAbiRecipe(abiRet, arguments);
+            if (!abiRet.Pointer && !abiRet.IsAlias
+                && ReturnsViaCxxSret(abiRet.TypeName))
             {
-                auto cxxReturn = ComputeCxxReturnAbiRecipe(returnType, arguments);
+                auto cxxReturn = ComputeCxxReturnAbiRecipe(abiRet, arguments);
                 if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
                 {
                     recipe.retSlot = cxxReturn.retSlot;
@@ -3264,10 +3289,10 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         const bool cflatSretReturn = cflatAbiLowering
             && recipe.retSlot.kind == AbiSlot::SRetReturn;
         llvm::FunctionType* functionType = cflatAbiLowering
-            ? BuildCFlatSRetFunctionType(returnType, arguments, varargs, recipe)
+            ? BuildCFlatSRetFunctionType(abiRet, arguments, varargs, recipe)
             : (useRecipe
-                ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
-                : GetFunctionType(returnType, arguments, varargs, external));
+                ? BuildExternFunctionType(abiRet, arguments, varargs, recipe)
+                : GetFunctionType(abiRet, arguments, varargs, external));
 
         // Only a `main` declared in the root translation unit is the program entry point -
         // an imported library's own `main` must mangle normally or it collides with the app's.

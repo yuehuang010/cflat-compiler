@@ -1,0 +1,18 @@
+import cpp "cpp_mix15_ref_result.hpp";
+
+/*
+ * A parenthesized C++ operator result that returns `const T&` names a read-only referent: a member
+ * write through it is refused like any other write through a const reference result (MIX15).
+ */
+extern int main()
+{
+    expect_error("it is reached through a C++ const reference result") {
+        mix15r.Ref mix15w = mix15r.Ref(1);
+        (mix15w >> 3).v = 9;
+    }
+
+    expect_error("it is reached through a C++ const reference result") {
+        mix15r.Ref mix15x = mix15r.Ref(1);
+        (mix15x >> 3).v++;
+    }
+}

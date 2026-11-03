@@ -7486,6 +7486,17 @@ namespace T465OuterNamespace
     struct Outer { struct Mid { int value = default; }; };
     namespace B { int Run() { return (int)sizeof(Outer.Mid); } }
 }
+// T465 natfix: a local named like a global namespace hides the type of that name in sizeof (C).
+namespace T465ShadowNs { struct B { char c[24]; }; }
+struct T465ShadowHolder { int B = default; int C = default; };
+int T465LocalShadowsGlobalNs() { T465ShadowHolder T465ShadowNs = default; return (int)sizeof(T465ShadowNs.B); }
+namespace T465GlobalShadowNs { struct B { char c[24]; }; }
+T465ShadowHolder T465GlobalShadowNs = default;
+int T465GlobalVarShadowsNs() { return (int)sizeof(T465GlobalShadowNs.B); }
+struct T465ShadowMethod
+{
+    int Run() { T465ShadowHolder T465ShadowNs = default; return (int)sizeof(T465ShadowNs.B) + (int)sizeof(T465ShadowNs.C); }
+};
 
 bool testT465NestedTemplates()
 {
@@ -7512,6 +7523,10 @@ bool testT465NestedTemplates()
     result &= Test("t465 local hides scoped type in sizeof", collision.LocalHidesType(), 4);
     result &= Test("t465 param hides scoped type in sizeof", collision.ParamHidesType(default), 4);
     result &= Test("t465 local hides namespace type in sizeof", T465LookupCollision.LocalHidesNamespaceType(), 4);
+    result &= Test("t465 local hides global namespace type in sizeof", T465LocalShadowsGlobalNs(), 4);
+    result &= Test("t465 global variable hides namespace type in sizeof", T465GlobalVarShadowsNs(), 4);
+    T465ShadowMethod shadowMethod = default;
+    result &= Test("t465 method local hides global namespace type in sizeof", shadowMethod.Run(), 8);
     return result;
 }
 
@@ -7719,6 +7734,8 @@ extern int main()
     total++; passed += testConstGenerics()                           ? 1 : 0;
     total++; passed += testConstGenericList()                        ? 1 : 0;
     total++; passed += testConstGenericAliasPack()                   ? 1 : 0;
+    total++; passed += testMix5BareArrayDeduction()                  ? 1 : 0;
+    total++; passed += testMix8TupleTemplates()                      ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -7827,5 +7844,71 @@ bool testConstGenericAliasPack()
     *cell.v_1 = 6;
     expect_error("cannot assign to '*cell.v_0': it is reached through a pointer to const") { *cell.v_0 = 1; }
     result &= Test("const_generic_pack_read", *cell.v_0, 6);
+    return result;
+}
+
+// MIX5: an implicit-this fixed-array field is an array argument like 'this.f': bare generic
+// deduction, the explicit <T> form, a plain view parameter, a pointer parameter, a declaration init.
+T mix5First<T>(T[] v) { return v[0]; }
+int mix5View(int[] v) { return v[1]; }
+int mix5Ptr(int* p) { return *p; }
+
+struct Mix5Arr
+{
+    int[2] arr = {4, 5};
+    int bareGeneric() { return mix5First(arr); }
+    int explicitGeneric() { return mix5First<int>(arr); }
+    int bareView() { return mix5View(arr); }
+    int barePtr() { return mix5Ptr(arr); }
+    int bareInit() { int[] v = arr; return v[1]; }
+};
+
+struct Mix5ArrG<U>
+{
+    U[2] items = default;
+    int first() { return (int)mix5First(items); }
+};
+
+bool testMix5BareArrayDeduction()
+{
+    bool result = true;
+    Mix5Arr m = default;
+    result &= Test("mix5 bare generic deduction field", m.bareGeneric(), 4);
+    result &= Test("mix5 explicit generic field", m.explicitGeneric(), 4);
+    result &= Test("mix5 bare view argument field", m.bareView(), 5);
+    result &= Test("mix5 bare pointer argument field", m.barePtr(), 4);
+    result &= Test("mix5 bare declaration init field", m.bareInit(), 5);
+    Mix5ArrG<int> g = default;
+    g.items[0] = 7;
+    result &= Test("mix5 generic struct bare field", g.first(), 7);
+    return result;
+}
+
+// MIX8: a tuple naming a generic function's own type parameter (return or parameter), and a bare
+// call that binds a type parameter from a tuple element.
+(int,T) mix8Mk<T>(T x) { return (1, x); }
+int mix8G<T>((int,T) p) { return p.item_0 + (int)p.item_1; }
+int mix8H<U>(int a, (int,U) p) { return a + p.item_0 + (int)p.item_1; }
+int mix8Nest<T,U>(((T,int),U) p) { return (int)p.item_0.item_0 + p.item_0.item_1 + (int)p.item_1; }
+(int,(int,T)) mix8Mk2<T>(T x) { return (1, (2, x)); }
+struct Mix8W<T>
+{
+    T v;
+    int m<U>((T,U) p) { return (int)p.item_0 + (int)p.item_1; }
+};
+
+bool testMix8TupleTemplates()
+{
+    bool result = true;
+    (int,int) m = mix8Mk<int>(4);
+    result &= Test("mix8 generic return tuple binds T", m.item_1, 4);
+    result &= Test("mix8 generic param tuple explicit", mix8G<int>((1, 2)), 3);
+    result &= Test("mix8 generic param tuple bare call binds T", mix8G((1, 2)), 3);
+    result &= Test("mix8 bare tuple param after plain arg", mix8H(1, (1, 2)), 4);
+    Mix8W<int> w = default;
+    result &= Test("mix8 generic method bare tuple binds U", w.m((1, 2)), 3);
+    result &= Test("mix8 nested tuple param names T", mix8Nest<int,int>(((1, 2), 3)), 6);
+    (int,(int,int)) nested = mix8Mk2<int>(3);
+    result &= Test("mix8 nested tuple return names T", nested.item_1.item_1, 3);
     return result;
 }

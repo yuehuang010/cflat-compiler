@@ -146,6 +146,59 @@ expect_error("cannot return C++ aggregate 'cppref.BraceRvalRef': reference membe
     }
 }
 
+// A frame-rooted C++ reference arm stays refused when its pointer joins a C pointer.
+expect_error("refers into a local object that is destroyed when the function returns") {
+    cpprefgate.C* RrJoinLocal(cpprefgate.C* p)
+    {
+        cpprefgate.C lc = { v = 3 };
+        return p ?? &cpprefgate.local_ref(lc);
+    }
+}
+
+// A frame-rooted C++ reference arm keeps the join an alias: it must stay refused in every form.
+expect_error("cannot return an 'alias' value") {
+    cpprefgate.C* RrTernaryLocalA(cpprefgate.C* p)
+    {
+        cpprefgate.C lc = { v = 3 };
+        return p != nullptr ? p : &cpprefgate.local_ref(lc);
+    }
+}
+expect_error("cannot return an 'alias' value") {
+    cpprefgate.C* RrTernaryLocalB(cpprefgate.C* p, bool c)
+    {
+        cpprefgate.C lc = { v = 3 };
+        return c ? &cpprefgate.local_ref(lc) : p;
+    }
+}
+struct RrJoinHolder { cpprefgate.C* r = default; };
+expect_error("cannot store an 'alias' value") {
+    void RrJoinFieldStore(RrJoinHolder* h, cpprefgate.C* p)
+    {
+        cpprefgate.C lc = { v = 3 };
+        h->r = p ?? &cpprefgate.local_ref(lc);
+    }
+}
+expect_error("cannot return an 'alias' value") {
+    cpprefgate.C* RrJoinViaPointer(cpprefgate.C* p)
+    {
+        cpprefgate.C lc = { v = 3 };
+        cpprefgate.C* q = &lc;
+        return p ?? &cpprefgate.local_ref(*q);
+    }
+}
+
+// A global pointer passed by reference reaches a local through the callee: the join stays an alias.
+import cpp "cpp_interop_refptr.h";
+refptr.C* refptrGlobal = nullptr;
+expect_error("cannot return an 'alias' value") {
+    refptr.C* RrDerefGlobalLocal(refptr.C* p)
+    {
+        refptr.C lc = { v = 3 };
+        refptrGlobal = &lc;
+        return p ?? &refptr.deref(refptrGlobal);
+    }
+}
+
 extern int main()
 {
     return 0;

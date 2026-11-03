@@ -1,0 +1,14 @@
+// A CFlat function passed to a C++ constructor that takes int by value is refused: pointer ->
+// integer needs an explicit cast (clang: no matching conversion). The same value into a bool
+// parameter is its truth (cpp_mix14_scalar_ctor.hpp, OB).
+import cpp "cpp_mix14_scalar_ctor.hpp";
+
+int mix14Pick(int x) { return x; }
+
+extern int main()
+{
+    expect_error("no matching conversion to parameter 1 ('int') of C++ constructor") {
+        mix14sc.CI ci = mix14sc.CI(mix14Pick);
+    }
+    return 0;
+}

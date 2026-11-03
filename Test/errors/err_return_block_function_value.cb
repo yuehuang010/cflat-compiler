@@ -1,0 +1,17 @@
+// A return-block function has no entry point (its 'return' exits the caller), so it cannot be taken
+// as a function value: the conversion is refused. A direct call `f(...)` stays legal.
+int rbValue(int c) { return { if (c > 0) { return 1; } }; }
+
+expect_error("return-block function 'rbValue' has no function value") {
+    int rbValueUse() { function<int(int)> h = rbValue; return h(1); }
+}
+
+expect_error("return-block function 'rbNsValue' has no function value") {
+    namespace RbErrNs
+    {
+        int rbNsValue(int c) { return { if (c > 0) { return 1; } }; }
+        int rbNsUse() { function<int(int)> h = rbNsValue; return h(1); }
+    }
+}
+
+extern int main() { rbValue(1); return 0; }

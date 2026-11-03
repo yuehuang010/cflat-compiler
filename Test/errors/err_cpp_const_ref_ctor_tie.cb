@@ -1,0 +1,12 @@
+// MIX18 r2: two const T& scalar constructors tie for an int (both are converted temporaries at the
+// same rank): C++ finds no best constructor (clang: ambiguous), so the construction is refused.
+import cpp "cpp_mix18_overloads.hpp";
+
+extern int main()
+{
+    int i = 4;
+    expect_error("has no constructor that binds these arguments") {
+        m18ov.TieT x = m18ov.TieT(i);
+    }
+    return 0;
+}

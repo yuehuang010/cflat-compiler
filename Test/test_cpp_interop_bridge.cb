@@ -114,6 +114,7 @@ import "malloc_allocator.cb";
 import cpp "array";
 import cpp "library/cpp_interop_view_decay.h";
 import cpp "library/cpp_interop_lvalue_sink.h";
+import cpp "library/cpp_mix6_fcast.hpp";
 import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_interop_arrayelem.h";
 import cpp "library/cpp_interop_proxy_assign.h";
@@ -8886,6 +8887,47 @@ extern int main(int argc, char** argv)
     if (ownerW.owner_before(ownerA) || ownerA.owner_before(ownerW)
         || ownerB.owner_before(ownerW) != ownerB.owner_before(ownerA))
         return 3651;
+
+    // MIX6: a scalar cast operand direct-initializes a C++ class via its constructor: `(R)(7)` is
+    // `R(7)`. Explicit ctors, variables, doubles and bool literals count (B(bool) beats B(int)).
+    cppfc.R fcA = (cppfc.R)(7);
+    cppfc.RE fcB = (cppfc.RE)(7);
+    cppfc.R fcC = cppfc.R(7);
+    int fcK = 4;
+    cppfc.R fcE = (cppfc.R)(fcK);
+    if (fcA.v != 21 || fcB.v != 107 || fcC.v != 21 || fcE.v != 12)
+        return 4750;
+    if (((cppfc.R)(5)).v != 15 || cppfc.take_r((cppfc.R)(2)) != 6)
+        return 4751;
+    if (((cppfc.RD)(2.5)).v != 5 || ((cppfc.RB)(true)).v != 11 || ((cppfc.RB)(0)).v != 22)
+        return 4752;
+    // Both B(bool) and B(int): a bool literal in the cast parens picks B(bool), an int literal B(int).
+    if (((cppfc.RBI)(true)).v != 1 || ((cppfc.RBI)(false)).v != 2 || ((cppfc.RBI)(0)).v != 50)
+        return 4753;
+    if (((cppfc.RBI)(7)).v != 57)
+        return 4754;
+
+    // MIX10: an unparenthesized scalar lvalue operand binds the constructor's `const T&` slot like
+    // `(R)(b)` does; it used to be passed as a value and read as an address (segfault).
+    {
+        int mixL = 4;
+        float mixF = 2.5f;
+        cppfc.RT mixL1 = (cppfc.RT)mixL;
+        cppfc.RT mixL2 = (cppfc.RT)(mixL + 1);
+        if (mixL1.v != 11 || mixL2.v != 12 || ((cppfc.RD)mixF).v != 5) return 4755;
+        if (cppfc.rt_live() != 2) return 4756;
+    }
+    if (cppfc.rt_live() != 0) return 4757;
+    {
+        int mixL = 4;
+        cppfc.RT mixO = cppfc.RT(3);
+        bool mixYes = mixL == 4;
+        bool mixNo = mixL == 5;
+        cppfc.RT mixT = mixYes ? (cppfc.RT)mixL : mixO;
+        cppfc.RT mixF = mixNo ? (cppfc.RT)mixL : mixO;
+        if (mixT.v != 11 || mixF.v != 10) return 4758;
+    }
+    if (cppfc.rt_live() != 0) return 4759;
 
     return 0;
 }
