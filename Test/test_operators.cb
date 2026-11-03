@@ -1172,6 +1172,7 @@ extern int main()
 
     if (t484CallableVariableLegs() != 2) return 63;
     if (t484MemberFieldCallLegs() != 1) return 64;
+    if (shiftNativeCallResultLegs() != 6) return 79;
     return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
@@ -2550,5 +2551,31 @@ int byValueAliasTempLegs()
         passed += Test("alias chain rebind then sink", a.val() * 10 + x.val(), 13); }
     passed += Test("alias chain rebind sink ctor dtor", baCtor * 10 + baDtor, 34);
     passed += Test("alias chain rebind sink payload", baTMade * 10 + baTFreed, 33);
+    return passed;
+}
+
+// SHIFTCH: a native struct's member operator<< on a call-result lhs, and chains on lvalue/call.
+struct ShiftNb { int value = 0; ShiftNb operator<<(int s) { ShiftNb r; r.value = value << s; return r; } };
+ShiftNb shiftNbMake(int v) { ShiftNb n; n.value = v; return n; }
+struct ShiftFp { int value = 0; };
+ShiftFp operator<<(ShiftFp a, ShiftFp b) { ShiftFp r; r.value = a.value << b.value; return r; }
+ShiftFp shiftFpMake(int v) { ShiftFp n; n.value = v; return n; }
+int shiftNativeCallResultLegs()
+{
+    int passed = 0;
+    ShiftNb nb = shiftNbMake(5);
+    ShiftNb callShift = shiftNbMake(1) << 3;
+    passed += Test("native shift on call result", callShift.value, 8);
+    ShiftNb lvalueShift = nb << 3;
+    passed += Test("native shift on lvalue", lvalueShift.value, 40);
+    ShiftNb lvalueChain = nb << 1 << 3;
+    passed += Test("native shift chain on lvalue", lvalueChain.value, 80);
+    ShiftNb callChain = shiftNbMake(3) << 1 << 2;
+    passed += Test("native shift chain on call result", callChain.value, 24);
+    ShiftFp fpLhs = shiftFpMake(2);
+    ShiftFp fpLhsShift = fpLhs << shiftFpMake(3);
+    passed += Test("free native shift, call-result rhs", fpLhsShift.value, 16);
+    ShiftFp fpBothCall = shiftFpMake(1) << shiftFpMake(3);
+    passed += Test("free native shift, call-result lhs and rhs", fpBothCall.value, 8);
     return passed;
 }

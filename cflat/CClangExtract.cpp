@@ -50,6 +50,7 @@
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/FrontendOptions.h"
 #include "clang/Frontend/Utils.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
@@ -626,6 +627,68 @@ namespace cflat_cinterop
             };
             visit(visit, body);
             return out;
+        }
+
+        // Report the constructor selected by Clang for a same-class copy/move wrapper: exactly
+        // (dst, source) with dst pointing at the source's class. Other wrappers keep their identity.
+        std::string WrapperCopyMoveConstructorPick(const FunctionDecl* fd)
+        {
+            if (fd == nullptr || fd->getBody() == nullptr || fd->getNumParams() != 2
+                || !fd->getNameAsString().starts_with("__cflat_ctor_"))
+                return {};
+            QualType sourceType = fd->getParamDecl(1)->getType();
+            if (const auto* reference = sourceType->getAs<ReferenceType>())
+                sourceType = reference->getPointeeType();
+            const CXXRecordDecl* sourceRecord = sourceType.getUnqualifiedType()->getAsCXXRecordDecl();
+            if (sourceRecord == nullptr) return {};
+            const auto* destinationPointer = fd->getParamDecl(0)->getType()->getAs<PointerType>();
+            const CXXRecordDecl* destinationRecord = destinationPointer != nullptr
+                ? destinationPointer->getPointeeType().getUnqualifiedType()->getAsCXXRecordDecl()
+                : nullptr;
+            if (destinationRecord == nullptr
+                || destinationRecord->getCanonicalDecl() != sourceRecord->getCanonicalDecl())
+                return {};
+            struct Visitor : RecursiveASTVisitor<Visitor>
+            {
+                const ParmVarDecl* source;
+                const CXXRecordDecl* sourceRecord;
+                const CXXConstructorDecl* selected = nullptr;
+
+                Visitor(const ParmVarDecl* sourceParam, const CXXRecordDecl* sourceType)
+                    : source(sourceParam), sourceRecord(sourceType) {}
+
+                bool VisitCXXConstructExpr(CXXConstructExpr* construct)
+                {
+                    if (selected != nullptr || construct == nullptr || construct->getNumArgs() != 1)
+                        return true;
+                    const Expr* argument = construct->getArg(0)->IgnoreParenImpCasts();
+                    for (;;)
+                    {
+                        if (const auto* cleanups = llvm::dyn_cast<ExprWithCleanups>(argument))
+                            argument = cleanups->getSubExpr();
+                        else if (const auto* bind = llvm::dyn_cast<CXXBindTemporaryExpr>(argument))
+                            argument = bind->getSubExpr();
+                        else if (const auto* materialize = llvm::dyn_cast<MaterializeTemporaryExpr>(argument))
+                            argument = materialize->getSubExpr();
+                        else if (const auto* cast = llvm::dyn_cast<CastExpr>(argument))
+                            argument = cast->getSubExpr();
+                        else
+                            break;
+                        argument = argument->IgnoreParens();
+                    }
+                    const auto* reference = llvm::dyn_cast<DeclRefExpr>(argument);
+                    const auto* ctor = construct->getConstructor();
+                    if (reference != nullptr && reference->getDecl() == source
+                        && ctor != nullptr
+                        && ctor->getParent()->getCanonicalDecl() == sourceRecord->getCanonicalDecl())
+                        selected = ctor;
+                    return true;
+                }
+            } visitor{ fd->getParamDecl(1), sourceRecord };
+            visitor.TraverseStmt(fd->getBody());
+            if (visitor.selected == nullptr) return {};
+            return visitor.selected->isCopyOrMoveConstructor()
+                ? "__cflat_ctor_pick_copy_move" : "__cflat_ctor_pick_other";
         }
 
         /*
@@ -1484,6 +1547,193 @@ namespace cflat_cinterop
             return false;
         }
 
+        /*
+         * Whether the default's bound expression means the same thing when its text is re-read at
+         * the end of the header in a function of its own scope, and has no temporary that must
+         * outlive that function (C++ keeps them to the end of the caller's full-expression). Any
+         * doubt refuses: the call then keeps the forwarding wrapper, whose meaning is clang's.
+         */
+        class DefaultReReadGate : public RecursiveASTVisitor<DefaultReReadGate>
+        {
+        public:
+            DefaultReReadGate(const DeclContext* from) : from_(from) {}
+            bool ok = true;
+            // The result object itself may be bound/materialized; nothing below it.
+            std::unordered_set<const Stmt*> resultChain;
+
+            bool VisitStmt(Stmt* s)
+            {
+                if (s->getBeginLoc().isMacroID() || s->getEndLoc().isMacroID()) ok = false;
+                return ok;
+            }
+            bool VisitMaterializeTemporaryExpr(MaterializeTemporaryExpr* e) { return refuseUnlessResult(e); }
+            bool VisitCXXBindTemporaryExpr(CXXBindTemporaryExpr* e) { return refuseUnlessResult(e); }
+            bool VisitCXXDefaultArgExpr(CXXDefaultArgExpr*) { return ok = false; }
+            bool VisitCXXDefaultInitExpr(CXXDefaultInitExpr*) { return ok = false; }
+            bool VisitLambdaExpr(LambdaExpr*) { return ok = false; }
+            bool VisitCXXOperatorCallExpr(CXXOperatorCallExpr*) { return ok = false; }
+            bool VisitUnresolvedLookupExpr(UnresolvedLookupExpr*) { return ok = false; }
+            bool VisitCallExpr(CallExpr* call)
+            {
+                // ADL looks in the arguments' namespaces, where a later overload may appear.
+                if (call->usesADL())
+                    for (const Expr* arg : call->arguments())
+                    {
+                        const QualType t = arg->getType().getNonReferenceType();
+                        if (t->isRecordType() || t->isEnumeralType() || t->isPointerType()) ok = false;
+                    }
+                return ok;
+            }
+            bool VisitDeclRefExpr(DeclRefExpr* ref)
+            {
+                const ValueDecl* d = ref->getDecl();
+                if (llvm::isa<ParmVarDecl>(d) || isPrivateMember(d)) return ok = false;
+                if (const auto* var = llvm::dyn_cast<VarDecl>(d); var != nullptr && var->isLocalVarDeclOrParm())
+                    return ok = false;
+                if (!ref->hasQualifier() && !nameStable(ref->getFoundDecl())) ok = false;
+                return ok;
+            }
+            bool VisitTypeLoc(TypeLoc tl)
+            {
+                if (tl.getBeginLoc().isMacroID() || tl.getEndLoc().isMacroID()) return ok = false;
+                const clang::Type* t = tl.getTypePtr();
+                const NamedDecl* named = nullptr;
+                bool qualified = false;
+                if (const auto* tag = llvm::dyn_cast<TagType>(t))
+                {
+                    named = tag->getDecl();
+                    qualified = bool(tag->getQualifier());
+                }
+                else if (const auto* td = llvm::dyn_cast<TypedefType>(t))
+                {
+                    named = td->getDecl();
+                    qualified = bool(td->getQualifier());
+                }
+                else if (const auto* spec = llvm::dyn_cast<TemplateSpecializationType>(t))
+                {
+                    named = spec->getTemplateName().getAsTemplateDecl();
+                    qualified = spec->getTemplateName().getAsQualifiedTemplateName() != nullptr;
+                }
+                else if (llvm::isa<UsingType>(t))
+                    return ok = false;
+                if (named != nullptr && (isPrivateMember(named) || (!qualified && !nameStable(named))))
+                    ok = false;
+                return ok;
+            }
+
+        private:
+            const DeclContext* from_;
+
+            bool refuseUnlessResult(const Stmt* s)
+            {
+                if (resultChain.count(s) == 0) ok = false;
+                return ok;
+            }
+            static bool isPrivateMember(const Decl* d)
+            {
+                return llvm::isa<CXXRecordDecl>(d->getDeclContext()) && d->getAccess() == AS_private;
+            }
+            static const Decl* canonicalTarget(const NamedDecl* d)
+            {
+                if (const auto* shadow = llvm::dyn_cast<UsingShadowDecl>(d)) d = shadow->getTargetDecl();
+                return d->getCanonicalDecl();
+            }
+            /*
+             * Unqualified lookup from the default's scope, run at the end of the header: it must
+             * still find exactly this one declaration (no later overload, redeclared shadow, or
+             * second entity of the name). Class scopes are complete, so a member hit is final.
+             */
+            bool nameStable(const NamedDecl* found) const
+            {
+                const DeclarationName name = found->getDeclName();
+                if (!name.isIdentifier()) return false;
+                const Decl* want = canonicalTarget(found);
+                for (const DeclContext* dc = from_; dc != nullptr; dc = dc->getParent())
+                {
+                    if (const auto* rd = llvm::dyn_cast<CXXRecordDecl>(dc))
+                    {
+                        bool hit = !rd->lookup(name).empty();
+                        if (!hit && rd->hasDefinition())
+                            rd->forallBases([&](const CXXRecordDecl* base) {
+                                hit = hit || !base->lookup(name).empty();
+                                return true;
+                            });
+                        if (!hit) continue;
+                        const auto* owner = llvm::dyn_cast<CXXRecordDecl>(
+                            want->getDeclContext()->getRedeclContext());
+                        return owner != nullptr && (owner->getCanonicalDecl() == rd->getCanonicalDecl()
+                                                    || rd->isDerivedFrom(owner));
+                    }
+                    if (!dc->isFileContext()) continue;
+                    const auto result = dc->lookup(name);
+                    if (result.empty()) continue;
+                    std::set<const Decl*> distinct;
+                    for (const NamedDecl* d : result)
+                        if (!llvm::isa<UsingDecl>(d)) distinct.insert(canonicalTarget(d));   // its shadows stand for it
+                    return distinct.size() == 1 && *distinct.begin() == want;
+                }
+                return false;
+            }
+        };
+
+        /*
+         * A by-value class default as "<enclosing namespace>\x1f<source text>", so the backend can
+         * re-evaluate it in its own scope (a generated initializer, see BuildCxxDefaultInitHelpers).
+         * Empty when the text cannot be re-read there (DefaultReReadGate), in an anonymous
+         * namespace, or for a member of a final or nested class (the initializer derives from it).
+         */
+        std::string ClassDefaultInitializerText(const ParmVarDecl* p, ASTContext& ctx)
+        {
+            const auto* fd = llvm::dyn_cast_or_null<FunctionDecl>(p->getDeclContext());
+            if (fd == nullptr) return {};
+            if (const auto* method = llvm::dyn_cast<CXXMethodDecl>(fd))
+            {
+                const CXXRecordDecl* owner = method->getParent();
+                if (owner == nullptr || owner->hasAttr<FinalAttr>() || owner->isUnion()
+                    || !owner->getDeclContext()->getRedeclContext()->isFileContext())
+                    return {};
+            }
+            else if (!fd->getDeclContext()->getRedeclContext()->isFileContext())
+                return {};
+            std::string scope;
+            for (const DeclContext* dc = fd->getEnclosingNamespaceContext();
+                 dc != nullptr && !dc->isTranslationUnit(); dc = dc->getParent())
+            {
+                const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc);
+                if (ns == nullptr) continue;   // a linkage spec block
+                if (ns->isAnonymousNamespace()) return {};
+                scope = ns->getNameAsString() + (scope.empty() ? "" : "::" + scope);
+            }
+            if (p->hasUninstantiatedDefaultArg() || p->getDefaultArg() == nullptr) return {};
+            DefaultReReadGate gate(fd->getDeclContext());
+            for (const Stmt* e = p->getDefaultArg(); e != nullptr;)
+            {
+                gate.resultChain.insert(e);
+                if (const auto* full = llvm::dyn_cast<ExprWithCleanups>(e)) e = full->getSubExpr();
+                else if (const auto* bind = llvm::dyn_cast<CXXBindTemporaryExpr>(e)) e = bind->getSubExpr();
+                else if (const auto* mat = llvm::dyn_cast<MaterializeTemporaryExpr>(e)) e = mat->getSubExpr();
+                else if (const auto* cast = llvm::dyn_cast<CastExpr>(e)) e = cast->getSubExpr();
+                else if (const auto* paren = llvm::dyn_cast<ParenExpr>(e)) e = paren->getSubExpr();
+                else if (const auto* constant = llvm::dyn_cast<ConstantExpr>(e)) e = constant->getSubExpr();
+                else break;
+            }
+            gate.TraverseStmt(const_cast<Expr*>(p->getDefaultArg()));
+            if (!gate.ok) return {};
+            const SourceRange range = p->getDefaultArgRange();
+            if (range.isInvalid() || !range.getBegin().isFileID() || !range.getEnd().isFileID())
+                return {};
+            const SourceManager& sm = ctx.getSourceManager();
+            std::string text = clang::Lexer::getSourceText(
+                CharSourceRange::getTokenRange(range), sm, ctx.getLangOpts()).str();
+            // A copy-initialized default's range can begin at its '=' token.
+            size_t first = 0;
+            while (first < text.size() && (std::isspace((unsigned char)text[first]) || text[first] == '='))
+                ++first;
+            text.erase(0, first);
+            if (text.empty() || text.find('\x1f') != std::string::npos) return {};
+            return scope + '\x1f' + text;
+        }
+
         RawDefaultArg DefaultArgumentOf(const ParmVarDecl* p, ASTContext& ctx)
         {
             RawDefaultArg result;
@@ -1512,6 +1762,12 @@ namespace cflat_cinterop
             if (p->getType()->isAnyPointerType() || p->getType()->isMemberPointerType())
             {
                 result.kind = "nonconst";
+                return result;
+            }
+            if (p->getType()->isRecordType())
+            {
+                result.kind = "nonconst";
+                result.value = ClassDefaultInitializerText(p, ctx);
                 return result;
             }
             Expr::EvalResult ev;
@@ -1563,6 +1819,180 @@ namespace cflat_cinterop
             llvm::raw_svector_ostream os(storage);
             mangle->mangleName(gd, os);
             return os.str().str();
+        }
+
+        /*
+         * Re-read verification for a generated default initializer (`__cflat_dfi_<linkage>`): the
+         * expression each `<helper>_<i>_make()` returns must bind exactly what the declaration's
+         * own default bound - same node kinds, canonical types, referenced declarations (calls,
+         * constructors, members, conversion functions) and literal values. Both live in this
+         * request TU, so identity is pointer identity. Anything else refuses the initializer.
+         */
+        class DefaultIdentityPrinter : public RecursiveASTVisitor<DefaultIdentityPrinter>
+        {
+        public:
+            std::string out;
+            bool shouldVisitImplicitCode() const { return true; }
+            bool VisitStmt(Stmt* s)
+            {
+                out += s->getStmtClassName();
+                out += ' ';
+                if (const auto* e = llvm::dyn_cast<Expr>(s))
+                    ptr(e->getType().getCanonicalType().getAsOpaquePtr());
+                if (const auto* ref = llvm::dyn_cast<DeclRefExpr>(s)) decl(ref->getDecl());
+                else if (const auto* member = llvm::dyn_cast<MemberExpr>(s)) decl(member->getMemberDecl());
+                else if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(s))
+                    decl(construct->getConstructor());
+                else if (const auto* call = llvm::dyn_cast<CallExpr>(s)) decl(call->getCalleeDecl());
+                else if (const auto* cast = llvm::dyn_cast<CastExpr>(s))
+                {
+                    out += cast->getCastKindName();
+                    decl(cast->getConversionFunction());
+                }
+                else if (const auto* integer = llvm::dyn_cast<IntegerLiteral>(s))
+                    out += llvm::toString(integer->getValue(), 10, true);
+                else if (const auto* floating = llvm::dyn_cast<FloatingLiteral>(s))
+                {
+                    llvm::SmallString<32> text;
+                    floating->getValue().toString(text);
+                    out += text.str();
+                }
+                else if (const auto* str = llvm::dyn_cast<StringLiteral>(s))
+                    out += std::to_string(str->getByteLength()) + ":" + str->getBytes().str();
+                else if (const auto* ch = llvm::dyn_cast<CharacterLiteral>(s))
+                    out += std::to_string(ch->getValue());
+                else if (const auto* b = llvm::dyn_cast<CXXBoolLiteralExpr>(s))
+                    out += b->getValue() ? "1" : "0";
+                else if (const auto* trait = llvm::dyn_cast<UnaryExprOrTypeTraitExpr>(s))
+                {
+                    out += std::to_string((int)trait->getKind());
+                    if (trait->isArgumentType())
+                        ptr(trait->getArgumentType().getCanonicalType().getAsOpaquePtr());
+                }
+                out += ';';
+                return true;
+            }
+
+        private:
+            void ptr(const void* p) { out += std::to_string(reinterpret_cast<uintptr_t>(p)) + ' '; }
+            void decl(const Decl* d) { ptr(d == nullptr ? nullptr : d->getCanonicalDecl()); }
+        };
+
+        std::string DefaultIdentityOf(const Expr* e)
+        {
+            // The result object's own wrapping differs between a parameter and a return value.
+            while (e != nullptr)
+            {
+                if (const auto* full = llvm::dyn_cast<ExprWithCleanups>(e)) e = full->getSubExpr();
+                else if (const auto* bind = llvm::dyn_cast<CXXBindTemporaryExpr>(e)) e = bind->getSubExpr();
+                else if (const auto* mat = llvm::dyn_cast<MaterializeTemporaryExpr>(e)) e = mat->getSubExpr();
+                else if (const auto* cast = llvm::dyn_cast<CastExpr>(e)) e = cast->getSubExpr();
+                else if (const auto* paren = llvm::dyn_cast<ParenExpr>(e)) e = paren->getSubExpr();
+                else if (const auto* constant = llvm::dyn_cast<ConstantExpr>(e)) e = constant->getSubExpr();
+                else break;
+            }
+            if (e == nullptr) return {};
+            DefaultIdentityPrinter printer;
+            printer.TraverseStmt(const_cast<Expr*>(e));
+            return printer.out;
+        }
+
+        // The declaration whose default `make` re-reads: same scope (or the helper struct's base).
+        const FunctionDecl* FindDefaultInitOwner(const FunctionDecl* make, const std::string& linkage,
+                                                 unsigned index, ASTContext& ctx)
+        {
+            std::vector<const DeclContext*> scopes;
+            if (const auto* helperStruct = llvm::dyn_cast<CXXRecordDecl>(make->getDeclContext()))
+            {
+                for (const CXXBaseSpecifier& base : helperStruct->bases())
+                    if (const CXXRecordDecl* owner = base.getType()->getAsCXXRecordDecl())
+                        scopes.push_back(owner);
+            }
+            else if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(make->getDeclContext()))
+            {
+                for (const NamespaceDecl* redecl : ns->redecls()) scopes.push_back(redecl);
+            }
+            else
+                scopes.push_back(make->getDeclContext());
+            const FunctionDecl* found = nullptr;
+            std::function<void(const DeclContext*)> scan = [&](const DeclContext* dc) {
+                for (const Decl* d : dc->decls())
+                {
+                    if (found != nullptr) return;
+                    if (llvm::isa<LinkageSpecDecl>(d) || llvm::isa<ExportDecl>(d))
+                    {
+                        scan(llvm::cast<DeclContext>(d));
+                        continue;
+                    }
+                    const auto* fd = llvm::dyn_cast<FunctionDecl>(d);
+                    if (fd == nullptr || fd->isTemplated()) continue;
+                    const auto* method = llvm::dyn_cast<CXXMethodDecl>(fd);
+                    const unsigned param = method != nullptr && method->isInstance() ? index - 1 : index;
+                    if ((method != nullptr && method->isInstance() && index == 0)
+                        || param >= fd->getNumParams() || !fd->getParamDecl(param)->hasDefaultArg())
+                        continue;
+                    const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(fd);
+                    const std::string mangled = ctor != nullptr
+                        ? CxxLinkageName(ctx, GlobalDecl(ctor, Ctor_Complete)) : CxxLinkageName(ctx, fd);
+                    if (mangled == linkage) found = fd;
+                }
+            };
+            for (const DeclContext* dc : scopes) scan(dc);
+            return found;
+        }
+
+        std::string CheckDefaultInitIdentity(const FunctionDecl* helper, ASTContext& ctx)
+        {
+            const std::string name = helper->getNameAsString();
+            constexpr std::string_view prefix = "__cflat_dfi_";
+            std::string linkage;
+            for (size_t i = prefix.size(); i < name.size(); ++i)
+            {
+                if (name[i] != '_') { linkage += name[i]; continue; }
+                if (i + 2 >= name.size()) return "malformed initializer name";
+                linkage += (char)std::stoi(name.substr(i + 1, 2), nullptr, 16);
+                i += 2;
+            }
+            const FunctionDecl* body = nullptr;
+            if (!helper->hasBody(body) || body == nullptr) return "initializer has no body";
+            std::string refusal;
+            unsigned checked = 0;
+            struct Calls : RecursiveASTVisitor<Calls>
+            {
+                std::vector<const CallExpr*> calls;
+                bool VisitCallExpr(CallExpr* c) { calls.push_back(c); return true; }
+            } calls;
+            calls.TraverseStmt(body->getBody());
+            for (const CallExpr* call : calls.calls)
+            {
+                const FunctionDecl* make = call->getDirectCallee();
+                if (make == nullptr) continue;
+                const std::string makeName = make->getNameAsString();
+                if (!makeName.starts_with(name + "_") || !makeName.ends_with("_make")) continue;
+                const std::string digits = makeName.substr(name.size() + 1,
+                    makeName.size() - name.size() - 1 - std::strlen("_make"));
+                if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos)
+                    return "malformed initializer name";
+                const unsigned index = (unsigned)std::stoul(digits);
+                const FunctionDecl* makeBody = nullptr;
+                const auto* compound = make->hasBody(makeBody) && makeBody != nullptr
+                    ? llvm::dyn_cast_or_null<CompoundStmt>(makeBody->getBody()) : nullptr;
+                const auto* ret = compound != nullptr && compound->size() == 1
+                    ? llvm::dyn_cast<ReturnStmt>(compound->body_front()) : nullptr;
+                const FunctionDecl* owner = FindDefaultInitOwner(make, linkage, index, ctx);
+                if (ret == nullptr || ret->getRetValue() == nullptr || owner == nullptr)
+                    return "the declaration of a re-read default was not found";
+                const auto* method = llvm::dyn_cast<CXXMethodDecl>(owner);
+                const ParmVarDecl* param = owner->getParamDecl(
+                    method != nullptr && method->isInstance() ? index - 1 : index);
+                if (param->hasUninstantiatedDefaultArg() || param->getDefaultArg() == nullptr)
+                    return "the default argument is not instantiated";
+                const std::string original = DefaultIdentityOf(param->getDefaultArg());
+                if (original.empty() || original != DefaultIdentityOf(ret->getRetValue()))
+                    return "the re-read default argument binds a different expression";
+                ++checked;
+            }
+            return checked == 0 ? "the initializer re-reads no default" : refusal;
         }
 
         // The symbol CodeGen gives GD: its mangled name, or the plain name for C linkage.
@@ -2964,6 +3394,8 @@ namespace cflat_cinterop
                     sig.paramTemporaryTypes = WrapperConvertedTemporaryTypes(ctx, fd);
                     WrapperLiteralPointerTemporaries(ctx, fd, sig.paramTemporaryTypes,
                                                      sig.calleeIdentity);
+                    if (std::string pick = WrapperCopyMoveConstructorPick(fd); !pick.empty())
+                        sig.calleeIdentity = std::move(pick);
                     sig.resultBorrowsBraceList = WrapperResultBorrowsBraceList(
                         ctx, fd, sig.braceListElementTypes);
                     sig.paramBindKinds = WrapperParameterBindKinds(fd);
@@ -3064,6 +3496,10 @@ namespace cflat_cinterop
                     sig.bindRefusal = std::string("C++ function '") + sig.name
                         + "' is declared 'consteval'; an immediate function has no runtime symbol, "
                           "so cflat cannot call it";
+                if (st.req.cxxMode && sig.bindRefusal.empty() && !st.req.cxxFunctionWrapperNames.empty()
+                    && fd->getName().starts_with("__cflat_dfi_"))
+                    if (std::string mismatch = CheckDefaultInitIdentity(fd, ctx); !mismatch.empty())
+                        sig.bindRefusal = "C++ default initializer refused: " + mismatch;
                 if (st.req.cxxMode && !fd->isVariadic() && sig.bindRefusal.empty())
                     st.abiWork.emplace_back(st.out.sigs.size(), fd);
                 else if (st.req.cxxMode && fd->isVariadic() && inlineFunction

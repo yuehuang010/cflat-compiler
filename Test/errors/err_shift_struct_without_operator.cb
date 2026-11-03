@@ -1,0 +1,12 @@
+struct ShiftNoOp { int value = 0; };
+ShiftNoOp shiftNoOpMake() { ShiftNoOp n; return n; }
+extern int main()
+{
+    ShiftNoOp y;
+    expect_error("no operator '<<' for type 'ShiftNoOp'") {
+        ShiftNoOp x = y << 2;
+    }
+    expect_error("no operator '<<' for type 'ShiftNoOp'") {
+        ShiftNoOp x = shiftNoOpMake() << 2;
+    }
+}

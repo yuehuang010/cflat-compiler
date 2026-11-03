@@ -15283,6 +15283,191 @@ int testLibraryUnique()
     return passed;
 }
 
+int tUqTempBorrow(Resource* value) { return value->id; }
+int tUqTempBorrowLib(Resource* value) { return value->id; }
+int tUqTempGenericBorrow<T>(T* value) { return value->id; }
+int tUqTempSum(Resource* a, Resource* b) { return a->id + b->id; }
+int tUqTempOuter(int value) { return value * 2; }
+int tUqTempReturnBuiltin() { return tUqTempBorrow(t505MakeUniqueResource(8)); }
+int tUqTempReturnLibrary() { return tUqTempBorrowLib(makeLibraryUnique(8)); }
+int tUqTempLoopCalls = 0;
+bool tUqTempLoop(Resource* value)
+{
+    tUqTempLoopCalls = tUqTempLoopCalls + 1;
+    return value->id >= 0 && tUqTempLoopCalls < 3;
+}
+move unique<ILibraryUnique> tUqTempMakeIface()
+{
+    return unique<ILibraryUnique>(new LibraryUniqueA());
+}
+int tUqTempBorrowIface(ILibraryUnique value) { return value.value(); }
+Resource* tUqTempIdentity(Resource* value) { return value; }
+Resource* tUqTempReturnParam(Resource* value) { return tUqTempIdentity(value); }
+Resource* tUqTempSelectSecond(Resource* ignored, Resource* selected) { return selected; }
+Resource* tUqTempReturnSelected(Resource* selected)
+{
+    return tUqTempSelectSecond(t505MakeUniqueResource(34), selected);
+}
+Resource* tUqTempGlobalBorrow = nullptr;
+Resource* tUqTempReturnGlobal() { return tUqTempIdentity(tUqTempGlobalBorrow); }
+Resource* tUqTempStoredBorrow = nullptr;
+int tUqTempKeepValue = 0;
+void tUqTempKeep(Resource* value)
+{
+    tUqTempKeepValue = value->id;
+    tUqTempStoredBorrow = value;
+}
+
+int testUniqueTemporaryBorrowParams()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = (i64)HeapAudit.reportLeaks();
+
+    dtorCount = 0;
+    passed += Test("uqtemp_builtin_borrow_value", tUqTempBorrow(t505MakeUniqueResource(5)), 5);
+    passed += Test("uqtemp_builtin_borrow_dtor", dtorCount, 1);
+    passed += Test("uqtemp_builtin_borrow_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    sinkUnique(t505MakeUniqueResource(6));
+    passed += Test("uqtemp_builtin_sink_dtor", dtorCount, 1);
+    passed += Test("uqtemp_builtin_sink_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_builtin_nested_value",
+        tUqTempOuter(tUqTempBorrow(t505MakeUniqueResource(7))), 14);
+    passed += Test("uqtemp_builtin_nested_dtor", dtorCount, 1);
+    passed += Test("uqtemp_builtin_nested_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_builtin_two_value", tUqTempSum(
+        t505MakeUniqueResource(3), t505MakeUniqueResource(4)), 7);
+    passed += Test("uqtemp_builtin_two_dtors", dtorCount, 2);
+    passed += Test("uqtemp_builtin_two_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    tUqTempLoopCalls = 0;
+    while (tUqTempLoop(t505MakeUniqueResource(tUqTempLoopCalls + 1))) { }
+    passed += Test("uqtemp_builtin_loop_calls", tUqTempLoopCalls, 3);
+    passed += Test("uqtemp_builtin_loop_dtors", dtorCount, 3);
+    passed += Test("uqtemp_builtin_loop_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_builtin_return_value", tUqTempReturnBuiltin(), 8);
+    passed += Test("uqtemp_builtin_return_dtor", dtorCount, 1);
+    passed += Test("uqtemp_builtin_return_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_builtin_generic_value",
+        tUqTempGenericBorrow<Resource>(t505MakeUniqueResource(15)), 15);
+    passed += Test("uqtemp_builtin_generic_dtor", dtorCount, 1);
+    passed += Test("uqtemp_builtin_generic_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_library_borrow_value", tUqTempBorrowLib(makeLibraryUnique(16)), 16);
+    passed += Test("uqtemp_library_borrow_dtor", dtorCount, 1);
+    passed += Test("uqtemp_library_borrow_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_library_nested_value",
+        tUqTempOuter(tUqTempBorrowLib(makeLibraryUnique(18))), 36);
+    passed += Test("uqtemp_library_nested_dtor", dtorCount, 1);
+    passed += Test("uqtemp_library_nested_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_library_two_value", tUqTempSum(
+        makeLibraryUnique(23), makeLibraryUnique(24)), 47);
+    passed += Test("uqtemp_library_two_dtors", dtorCount, 2);
+    passed += Test("uqtemp_library_two_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    tUqTempLoopCalls = 0;
+    while (tUqTempLoop(makeLibraryUnique(tUqTempLoopCalls + 1))) { }
+    passed += Test("uqtemp_library_loop_calls", tUqTempLoopCalls, 3);
+    passed += Test("uqtemp_library_loop_dtors", dtorCount, 3);
+    passed += Test("uqtemp_library_loop_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_library_return_value", tUqTempReturnLibrary(), 8);
+    passed += Test("uqtemp_library_return_dtor", dtorCount, 1);
+    passed += Test("uqtemp_library_return_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_library_generic_value",
+        tUqTempGenericBorrow<Resource>(makeLibraryUnique(26)), 26);
+    passed += Test("uqtemp_library_generic_dtor", dtorCount, 1);
+    passed += Test("uqtemp_library_generic_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    int trueValue = 0;
+    int falseValue = 0;
+    {
+        unique<Resource> owner = makeLibraryUnique(19);
+        Resource* borrowed = owner.get();
+        trueValue = tUqTempBorrowLib(true ? makeLibraryUnique(20) : borrowed);
+        passed += Test("uqtemp_library_cond_true_value", trueValue, 20);
+        passed += Test("uqtemp_library_cond_true_dtor", dtorCount, 1);
+        falseValue = tUqTempBorrowLib(false ? makeLibraryUnique(21) : borrowed);
+        passed += Test("uqtemp_library_cond_false_value", falseValue, 19);
+        passed += Test("uqtemp_library_cond_false_dtor", dtorCount, 1);
+    }
+    passed += Test("uqtemp_library_cond_scope_dtor", dtorCount, 2);
+    passed += Test("uqtemp_library_cond_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    libraryUniqueADtor = 0;
+    passed += Test("uqtemp_library_iface_value", tUqTempBorrowIface(tUqTempMakeIface()), 41);
+    passed += Test("uqtemp_library_iface_dtor", libraryUniqueADtor, 1);
+    passed += Test("uqtemp_library_iface_no_leak", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    Resource callerOwned = default;
+    callerOwned.id = 31;
+    passed += Test("uqtemp_return_pointer_param_value",
+        tUqTempReturnParam(&callerOwned)->id, 31);
+    dtorCount = 0;
+    passed += Test("uqtemp_return_unselected_temp_value",
+        tUqTempReturnSelected(&callerOwned)->id, 31);
+    passed += Test("uqtemp_return_unselected_temp_dtor", dtorCount, 1);
+    tUqTempGlobalBorrow = &callerOwned;
+    passed += Test("uqtemp_return_pointer_global_value",
+        tUqTempReturnGlobal()->id, 31);
+    tUqTempGlobalBorrow = nullptr;
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    passed += Test("uqtemp_return_temp_same_expression_value",
+        tUqTempIdentity(t505MakeUniqueResource(32))->id, 32);
+    passed += Test("uqtemp_return_temp_same_expression_dtor", dtorCount, 1);
+    passed += Test("uqtemp_return_temp_same_expression_no_leak",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    tUqTempKeepValue = 0;
+    tUqTempStoredBorrow = nullptr;
+    tUqTempKeep(t505MakeUniqueResource(33));
+    passed += Test("uqtemp_keep_temp_observed_value", tUqTempKeepValue, 33);
+    passed += Test("uqtemp_keep_temp_dtor", dtorCount, 1);
+    passed += Test("uqtemp_keep_temp_no_leak",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    tUqTempStoredBorrow = nullptr;
+    return passed;
+}
+
 int desugaredFieldUserDtorCount = 0;
 
 struct DesugaredUniqueFieldHolder
@@ -17714,6 +17899,9 @@ extern int main()
     passed += testLibraryUnique();
     total += 49;
     total += 4;
+
+    passed += testUniqueTemporaryBorrowParams();
+    total += 57;
 
     passed += testDesugaredUniquePointerForms();
     total += 43;

@@ -5364,6 +5364,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionParameterSpellingsByLinkage_.clear();
     cxxTopLevelConstTypeAliases_.clear();
     cxxDefaultWrapperRequests_.clear();
+    cxxDefaultInitHelpers_.clear();
     cxxVariadicCtorRequestsInProgress_.clear();
     cxxRvalueRefBindVerdicts_.clear();
     cxxFunctionBindAttempts_.clear();
@@ -5642,6 +5643,8 @@ void LLVMBackend::ResetForReanalysis()
     scopedEnumTypes_.clear();
     scopedCppEnumeratorHints_.clear();
     importedEnumeratorGlobals_.clear();
+    cxxUnnamedEnumExpressions_.clear();
+    sameClassCopyRequests_.clear();
     enumPromotedTypes_.clear();
     importedEnumTypes_.clear();
     enumDeclSites_.clear();
@@ -8863,6 +8866,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     scopedEnumTypes_.clear();
     scopedCppEnumeratorHints_.clear();
     importedEnumeratorGlobals_.clear();
+    cxxUnnamedEnumExpressions_.clear();
+    sameClassCopyRequests_.clear();
     enumPromotedTypes_.clear();
     importedEnumTypes_.clear();
     enumDeclSites_.clear();

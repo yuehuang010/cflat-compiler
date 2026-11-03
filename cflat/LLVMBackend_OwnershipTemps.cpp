@@ -3103,6 +3103,66 @@ bool LLVMBackend::IsPendingOwnedStringTemp(llvm::Value* value) const
         return false;
     }
 
+bool LLVMBackend::IsStatementOwnedTempBorrowSource(llvm::Value* value)
+{
+        if (value == nullptr) return false;
+        llvm::StructType* stringType = llvm::StructType::getTypeByName(*context, "string");
+        std::vector<llvm::Value*> pending{ value };
+        std::unordered_set<llvm::Value*> seen;
+        while (!pending.empty() && seen.size() < 64)
+        {
+            llvm::Value* current = pending.back();
+            pending.pop_back();
+            if (current == nullptr || !seen.insert(current).second) continue;
+            const OwnedReturnReleaseTemp* ownedReturn = FindOwnedReturnEntry(current);
+            if (ownedReturn != nullptr && ownedReturn->IsOwningPtr) return true;
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(current))
+                if (const FunctionSymbol* symbol = call->getCalledFunction() != nullptr
+                        ? FindSymbolForFunction(call->getCalledFunction()) : nullptr;
+                    symbol != nullptr && !symbol->IsCxx && !symbol->ReturnType.Pointer
+                    && !symbol->ReturnType.IsAlias && symbol->ReturnType.IsMove
+                    && IsOwningValueType(symbol->ReturnType.TypeName))
+                    return true;
+            for (llvm::Value* owner : FindPendingStructTempOwnersOf(current))
+                for (const auto& temp : pendingOwnedStructTemps)
+                    if (temp.Alloca == owner
+                        && ResolveTypeAlias(temp.TypeName) != "string"
+                        && IsOwningValueType(temp.TypeName))
+                        return true;
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(current))
+                pending.push_back(load->getPointerOperand());
+            else if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(current))
+                pending.push_back(gep->getPointerOperand());
+            else if (auto* cast = llvm::dyn_cast<llvm::CastInst>(current))
+                pending.push_back(cast->getOperand(0));
+            else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(current))
+                for (llvm::Value* incoming : phi->incoming_values()) pending.push_back(incoming);
+            else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(current))
+            {
+                pending.push_back(select->getTrueValue());
+                pending.push_back(select->getFalseValue());
+            }
+            else if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(current))
+                pending.push_back(extract->getAggregateOperand());
+            else if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(current))
+            {
+                pending.push_back(insert->getAggregateOperand());
+                pending.push_back(insert->getInsertedValueOperand());
+            }
+            else if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(current);
+                     slot != nullptr && stringType != nullptr && slot->getAllocatedType() == stringType
+                     && std::any_of(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                         [&](const PendingOwnedStructTemp& temp) {
+                             return temp.Alloca == slot && ResolveTypeAlias(temp.TypeName) == "string";
+                         }))
+                for (llvm::User* user : slot->users())
+                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getPointerOperand()->stripPointerCasts() == slot)
+                        pending.push_back(store->getValueOperand());
+        }
+        return false;
+    }
+
 bool LLVMBackend::TryAdoptAliasReturnStringTemp(llvm::Value*& result,
         const TypeAndValue& returnType, bool returnsOwned, bool returnsAlias,
         const std::vector<TypeAndValue>& params, const std::vector<llvm::Value*>& args,
@@ -7806,7 +7866,8 @@ bool LLVMBackend::BorrowedOwningStructTempQualifies(const NamedVariable& arg, bo
         if (!arg.BaseType->isStructTy() || arg.Primary->getType() != arg.BaseType) return false;
         if (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsAlias || arg.FromOwningTempField) return false;
         if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return false;
-        return IsOwningValueType(typeName);
+        if (!IsOwningValueType(typeName)) return false;
+        return GetType(arg.TypeAndValue) == arg.BaseType;
     }
 
 void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg, bool fromTernaryArm)
@@ -7872,6 +7933,24 @@ LLVMBackend::OwnedTempMark LLVMBackend::MarkOwnedTemps() const
 {
         return { pendingOwnedStringTemps.size(), pendingOwnedClosureTemps.size(),
                  pendingOwnedStructTemps.size(), pendingOwnedPtrTemps.size(), ownedNewTemps_.size() };
+    }
+
+void LLVMBackend::DropNonCxxOwnedTempsSince(const OwnedTempMark& mark)
+{
+        // Keep only C++-holder struct temps; every other entry since `mark` is forgotten.
+        auto dropFrom = [](auto& list, size_t from, auto&& keep) {
+            size_t write = from;
+            for (size_t i = from; i < list.size(); ++i)
+                if (keep(list[i])) list[write++] = list[i];
+            list.erase(list.begin() + write, list.end());
+        };
+        auto none = [](const auto&) { return false; };
+        dropFrom(pendingOwnedStringTemps, mark.Strings, none);
+        dropFrom(pendingOwnedClosureTemps, mark.Closures, none);
+        dropFrom(pendingOwnedStructTemps, mark.Structs, [&](const PendingOwnedStructTemp& t) {
+            return HasCxxClassMember(t.TypeName); });
+        dropFrom(pendingOwnedPtrTemps, mark.Ptrs, none);
+        dropFrom(ownedNewTemps_, mark.NewPtrs, none);
     }
 
 bool LLVMBackend::AddressDerivesFromOwnedStructTempSince(const OwnedTempMark& mark,

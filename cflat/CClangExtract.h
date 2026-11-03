@@ -223,7 +223,8 @@ namespace cflat_cinterop
         // With resultBorrowsBraceList: each materialized list's element type, in source order.
         std::vector<std::string> braceListElementTypes;
         // Generated wrappers only: the callee that receives a literal's decayed pointer temporary
-        // or a reference-to-pointer parameter (WrapperLiteralPointerTemporaries).
+        // or a reference-to-pointer parameter. Same-class ctor wrappers also store Clang's
+        // selected copy/move-vs-other constructor kind here for the trivial-copy fast path.
         std::string calleeIdentity;
         // Generated wrappers only: per wrapper parameter, how the callee clang SELECTED binds it
         // (WrapperParameterBindKinds): '.' unused, 'v'/'r' by value / reference, 'V'/'R' the same

@@ -229,7 +229,9 @@
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_defarg_trace.hpp";
+import cpp "library/cpp_cdefarg.hpp";
 import cpp "library/cpp_mixs2.hpp";
+import cpp "library/cpp_defcls.hpp";
 import cpp "library/cpp_interop_mixcond3.h";
 import cpp {"library/cpp_hdrglob_a.hpp", "library/cpp_hdrglob_b.hpp"};
 import cpp "library/cpp_hdrglob_r3_a.hpp";
@@ -349,6 +351,7 @@ import cpp "library/cpp_interop_throw.h";
 import cpp "library/cpp_interop_scoped_enum.h";
 import cpp "library/cpp_interop_errc.h";
 import cpp "library/cpp_t49_enum_args.hpp";
+import cpp "library/cpp_ctortpl.hpp";
 import cpp "library/cpp_t86_literals.hpp";
 import cpp "library/cpp_t100_long_double.hpp";
 enum T49Own : int { T49V = 6 };
@@ -467,6 +470,7 @@ import cpp "library/cpp_interop_list.h";
 // Assignment into a live object from a temporary: instrumented, header-only.
 import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_t231_byvalue.hpp";
+import cpp "library/cpp_t239_ternary_byvalue.hpp";
 import cpp "library/cpp_t331_override.hpp";
 import cpp "library/cpp_interop_proxy_assign.h";
 import cpp "library/t29_valarray_subscript.hpp";
@@ -3681,6 +3685,22 @@ int t47RefmemEarlyReturn()
     return inside * 100 + (holder.c.v == 5 ? 0 : 1);
 }
 
+// CDEFARG leg: checked after the call's own statement, so its temporaries are already gone.
+int cdefLegBase = 0;
+void CdefStart()
+{
+    cppcdef.reset_trace();
+    cdefLegBase = cppcdef.live_count();
+}
+bool CdefOk(int value, int expected, int liveArgs, bool traceOk)
+{
+    if (value != expected || cppcdef.seen_live - cdefLegBase != liveArgs
+        || cppcdef.live_count() != cdefLegBase)
+        return false;
+    if const (__WINDOWS__) { return true; }
+    return traceOk;
+}
+
 int DefArgRoundOne(cppdefarg.Trace v, int e = 3)
 {
     cppdefarg.mark('[');
@@ -3768,6 +3788,70 @@ int AddrTempRefByValue(cppi.RefCell value)
 int AddrTempRefConstAlias(const alias cppi.RefCell value)
 {
     return cppi.address_temp_probe(&value);
+}
+// TERNELIDE r3: CFlat-side shapes; clang's own counts for the same shapes are pinned in the legs.
+cppternary.Item ternaryPlusCflat(bool pick)
+{
+    return (pick ? cppternary.Item(1) : cppternary.Item(2)) + cppternary.Item(3);
+}
+int ternaryNativeUse(cppternary.Item value)
+{
+    return value.value;
+}
+
+int DefClsTrace(cppdefcls.Trace first, cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsTraceNoDefault(cppdefcls.Trace first, cppdefcls.Trace last)
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsTraceReturn(cppdefcls.Trace first, cppdefcls.Trace last = cppdefcls.make(7))
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsTraceCopy(cppdefcls.Trace first, cppdefcls.Trace last = cppdefcls.global)
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsTraceTwo(cppdefcls.Trace first = cppdefcls.Trace(2),
+                   cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsTraceAfterInt(cppdefcls.Trace first, int extra = 3,
+                        cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return first.value * 1000 + last.value + extra;
+}
+int DefClsTraceGeneric<T>(T first, cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return first.value * 1000 + last.value;
+}
+class DefClsTraceMethod
+{
+    int take(cppdefcls.Trace first, cppdefcls.Trace last = cppdefcls.Trace(5))
+    {
+        return first.value * 1000 + last.value;
+    }
+};
+class DefClsTraceConstructor
+{
+    int value;
+    DefClsTraceConstructor(cppdefcls.Trace first,
+                           cppdefcls.Trace last = cppdefcls.Trace(5))
+    {
+        value = first.value * 1000 + last.value;
+    }
+};
+int DefClsDefaultTrace(cppdefcls.Trace first, cppdefcls.Trace last = default)
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsBraceTrace(cppdefcls.Implicit first, cppdefcls.Implicit last = {})
+{
+    return first.value * 1000 + last.value;
 }
 
 extern int main()
@@ -6726,6 +6810,82 @@ extern int main()
         expect_error("cannot assign to C++ class") { refused = t54.Other.OtherValue; }
     }
 
+    // CTORTPL round 1: unnamed-enum Sema pick and same-class forwarding construction.
+    {
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.Both unnamed = ctortpl.AnonValue;
+        if (unnamed.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54301;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.Both named = ctortpl.NamedValue;
+        if (named.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54302;
+        ctortpl.Named enumValue = ctortpl.NamedValue;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.Both fromEnumVariable = enumValue;
+        if (fromEnumVariable.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54303;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.Both fromInt = 3;
+        if (fromInt.value != 3 || ctortpl.picked != 1 || ctortpl.calls != 0) return 54304;
+
+        ctortpl.Forward source = ctortpl.Forward(5);
+        ctortpl.calls = 0;
+        ctortpl.Forward copy = source;
+        if (source.value != -1 || copy.value != 105 || ctortpl.calls != 1) return 54305;
+        ctortpl.Forward left = ctortpl.Forward(10), right = ctortpl.Forward(20);
+        ctortpl.calls = 0;
+        ctortpl.Forward ternary = true ? left : right;
+        if (left.value != -1 || ternary.value != 110 || ctortpl.calls != 1) return 54306;
+        ctortpl.Forward[2] array = {ctortpl.Forward(30), ctortpl.Forward(40)};
+        ctortpl.calls = 0;
+        ctortpl.Forward element = array[1];
+        if (array[1].value != -1 || element.value != 140 || ctortpl.calls != 1) return 54307;
+
+        const ctortpl.Forward constSource = ctortpl.Forward(50);
+        ctortpl.calls = 0;
+        ctortpl.Forward constCopy = constSource;
+        if (constSource.value != 50 || constCopy.value != 50 || ctortpl.calls != 0) return 54308;
+        ctortpl.calls = 0;
+        ctortpl.Forward prvalue = ctortpl.makeForward(60);
+        if (prvalue.value != 60 || ctortpl.calls != 0) return 54309;
+        ctortpl.Forward assignSource = ctortpl.Forward(70);
+        ctortpl.Forward assignDest = ctortpl.Forward(0);
+        ctortpl.calls = 0;
+        assignDest = assignSource;
+        if (assignSource.value != 70 || assignDest.value != 70 || ctortpl.calls != 0) return 54310;
+        ctortpl.Forward paramSource = ctortpl.Forward(80);
+        ctortpl.calls = 0;
+        int paramValue = ctortpl.takeForward(paramSource);
+        if (paramSource.value != -1 || paramValue != 180 || ctortpl.calls != 1) return 54311;
+        ctortpl.calls = 0;
+        ctortpl.Forward returned = ctortpl.returnForward();
+        if (returned.value != 90 || ctortpl.calls != 0) return 54312;
+
+        ctortpl.NoTemplate noSource = default;
+        noSource.value = 100;
+        ctortpl.NoTemplate noCopy = noSource;
+        if (noSource.value != 100 || noCopy.value != 100) return 54313;
+        ctortpl.Away awaySource = default;
+        awaySource.value = 110;
+        ctortpl.calls = 0;
+        ctortpl.Away awayCopy = awaySource;
+        if (awaySource.value != 110 || awayCopy.value != 110 || ctortpl.calls != 0) return 54314;
+
+        // CTORTPL round 3: unnamed-enum identity on direct-init, `new`, and multi-argument ctors.
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.Both direct = ctortpl.Both(ctortpl.AnonValue);
+        if (direct.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54315;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.Both* heap = new ctortpl.Both(ctortpl.AnonValue);
+        int heapValue = heap->value;
+        delete heap;
+        if (heapValue != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54316;
+        ctortpl.picked = 0;
+        ctortpl.Two two = ctortpl.Two(ctortpl.FlagB, 5);
+        if (two.value != 107 || ctortpl.picked != 2) return 54317;
+        ctortpl.picked = 0;
+        ctortpl.Two plain = ctortpl.Two(2, 5);
+        if (plain.value != 7 || ctortpl.picked != 1) return 54318;
+    }
+
     // T34: a static non-template member beside same-name static member templates binds by
     // arity (allocator_traits::allocate(a, n)); clang: 104 1104 2109.
     {
@@ -7882,6 +8042,71 @@ extern int main()
     if (defArgValue != 23 || !cppdefarg.trace_is("b[y")
         || cppdefarg.live_count() != defArgBase) return 86108;
 
+    int defClsBase = cppdefcls.live_count();
+    cppdefcls.reset_trace();
+    int defClsValue = DefClsTrace(cppdefcls.make(20));
+    if (defClsValue != 20005 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86110;
+    cppdefcls.reset_trace();
+    defClsValue = DefClsTraceReturn(cppdefcls.make(20));
+    if (defClsValue != 20007 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86111;
+    cppdefcls.reset_trace();
+    defClsValue = DefClsTraceCopy(cppdefcls.make(20));
+    if (defClsValue != 20008 || !cppdefcls.trace_is("bpyy")
+        || cppdefcls.live_count() != defClsBase) return 86112;
+    cppdefcls.reset_trace();
+    defClsValue = DefClsTraceTwo();
+    if (defClsValue != 2005 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86113;
+    cppdefcls.reset_trace();
+    defClsValue = DefClsTraceAfterInt(cppdefcls.make(20));
+    if (defClsValue != 20008 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86114;
+    cppdefcls.reset_trace();
+    defClsValue = DefClsTrace(cppdefcls.make(20), cppdefcls.make(6));
+    if (defClsValue != 20006 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86115;
+    cppdefcls.reset_trace();
+    int defClsNoDefaultValue = DefClsTraceNoDefault(cppdefcls.make(20), cppdefcls.make(6));
+    if (defClsNoDefaultValue != defClsValue || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86116;
+    cppdefcls.reset_trace();
+    defClsValue = DefClsTraceGeneric<cppdefcls.Trace>(cppdefcls.make(20));
+    if (defClsValue != 20005 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86117;
+    DefClsTraceMethod defClsMethod;
+    cppdefcls.reset_trace();
+    defClsValue = defClsMethod.take(cppdefcls.make(20));
+    if (defClsValue != 20005 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86118;
+    cppdefcls.reset_trace();
+    DefClsTraceConstructor defClsConstructed = DefClsTraceConstructor(cppdefcls.make(20));
+    if (defClsConstructed.value != 20005 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86119;
+    // '= default' and '= {}' C++ class defaults build an owned temp like 'T(args)' does.
+    cppdefcls.reset_trace();
+    defClsValue = DefClsDefaultTrace(cppdefcls.make(20));
+    if (defClsValue != 20000 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86122;
+    cppdefcls.reset_trace();
+    defClsValue = DefClsBraceTrace(cppdefcls.make_implicit(20));
+    if (defClsValue != 20009 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsBase) return 86123;
+
+    {
+        cppdefcls.Trace defClsLocal = cppdefcls.make(20);
+        defClsBase = cppdefcls.live_count();
+        cppdefcls.reset_trace();
+        defClsValue = DefClsTrace(defClsLocal);
+        if (defClsValue != 20005 || !cppdefcls.trace_is("pbyy")
+            || cppdefcls.live_count() != defClsBase) return 86120;
+        cppdefcls.reset_trace();
+        defClsValue = DefClsTrace(move defClsLocal);
+        if (defClsValue != 20005 || !cppdefcls.trace_is("mbyy")
+            || cppdefcls.live_count() != defClsBase) return 86121;
+    }
+
     int defArgNativeBase = defArgRoundNativeDtors;
     defArgValue = DefArgRoundNativeOne(DefArgRoundMakeNative(20));
     if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86109;
@@ -7909,6 +8134,53 @@ extern int main()
         defArgValue = DefArgRoundNativeTwo(defArgLocal, 9);
     }
     if (defArgValue != 33 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86113;
+
+    // CDEFARG: an omitted by-value C++ class default is built in its parameter slot after the
+    // explicit arguments (prvalue elided, lvalue copied, move moved) and lives to the end of the
+    // full expression. MS ABI: the callee destroys its parameters, so the y-order is not checked.
+    int cdefValue = 0;
+    CdefStart(); cdefValue = cppcdef.cdefB(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2005, 2, cppcdef.trace_is("b2b5[0y5y2"))) return 86150;
+    CdefStart(); cdefValue = cppcdef.cdefFn(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2007, 2, cppcdef.trace_is("b2b7[0y7y2"))) return 86151;
+    CdefStart(); cdefValue = cppcdef.cdefCopy(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2008, 2, cppcdef.trace_is("b2c8[0y8y2"))) return 86152;
+    CdefStart(); cdefValue = cppcdef.cdefTwo(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2056, 3, cppcdef.trace_is("b2b5b6[0y6y5y2"))) return 86153;
+    CdefStart(); cdefValue = cppcdef.cdefAfter(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2053, 2, cppcdef.trace_is("b2b5[0y5y2"))) return 86154;
+    {
+        cppcdef.B cdefLocal = cppcdef.mk(1);
+        CdefStart(); cdefValue = cppcdef.cdefB(cdefLocal);
+        if (!CdefOk(cdefValue, 1005, 2, cppcdef.trace_is("c1b5[0y5y1"))) return 86155;
+        CdefStart(); cdefValue = cppcdef.cdefB(move cdefLocal);
+        if (!CdefOk(cdefValue, 1005, 2, cppcdef.trace_is("m1b5[0y5y1"))) return 86156;
+    }
+    cppcdef.H cdefHost = default;
+    CdefStart(); cdefValue = cdefHost.take(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2005, 2, cppcdef.trace_is("b2b5[0y5y2"))) return 86157;
+    CdefStart(); cdefValue = cdefHost.takeS(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2009, 2, cppcdef.trace_is("b2b9[0y9y2"))) return 86158;
+    CdefStart(); cdefValue = cppcdef.K(cppcdef.mk(2)).value;
+    if (!CdefOk(cdefValue, 2005, 2, cppcdef.trace_is("b2b5[0y5y2"))) return 86159;
+    {
+        cppcdef.B cdefLocal = cppcdef.mk(1);
+        CdefStart(); cdefValue = cdefHost.take(cdefLocal);
+        if (!CdefOk(cdefValue, 1005, 2, cppcdef.trace_is("c1b5[0y5y1"))) return 86160;
+        CdefStart(); cdefValue = cppcdef.K(cdefLocal).value;
+        if (!CdefOk(cdefValue, 1005, 2, cppcdef.trace_is("c1b5[0y5y1"))) return 86161;
+    }
+    cppcdef.M cdefMaker = default;
+    CdefStart(); cdefValue = cdefMaker.take(cppcdef.mk(2));
+    if (!CdefOk(cdefValue, 2004, 2, cppcdef.trace_is("b2b4[0y4y2"))) return 86162;
+    CdefStart(); cdefValue = cppcdef.cdefNest(cppcdef.mk(2));
+    if (cdefValue != 2031 || cppcdef.live_count() != cdefLegBase) return 86163;
+    CdefStart(); cdefValue = cppcdef.cdefQual(cppcdef.mk(2));
+    if (cdefValue != 2001 || cppcdef.live_count() != cdefLegBase) return 86164;
+    CdefStart(); cdefValue = cppcdef.cdefDir(cppcdef.mk(2));
+    if (cdefValue != 2001 || cppcdef.live_count() != cdefLegBase) return 86165;
+    CdefStart(); cdefValue = cppcdef.cdefGlob(cppcdef.mk(2));
+    if (cdefValue != 2001 || cppcdef.live_count() != cdefLegBase) return 86166;
 
     // Interface default dispatch must preserve the value, trace, and lifetime of a by-value C++ class.
     DefArgRoundIfaceImpl defArgIfaceImpl;
@@ -16400,17 +16672,17 @@ extern int main()
         int value = cppas.read_life(c ? cppas.Life(41) : cppas.Life(42));
         int expected = c ? 41 : 42;
         if (value != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
-            || cppas.Life.moves != 1 || cppas.Life.dtors != 2
+            || cppas.Life.moves != 0 || cppas.Life.dtors != 1
             || cppas.Life.last_dtor != expected) return 3572;
     }
 
-    // DTORORD: a nested conditional moved into a by-value param destroys its arm temp before the param.
+    // DTORORD: a nested conditional prvalue builds its selected arm in the by-value param (one object).
     for (int i = 0; i < 3; i++)
     {
         cppas.Life.reset();
         int value = cppas.read_life(i != 2 ? (i == 0 ? cppas.Life(41) : cppas.Life(43)) : cppas.Life(42));
         int expected = i == 0 ? 41 : (i == 1 ? 43 : 42);
-        if (value != expected || cppas.Life.moves != 1 || cppas.Life.dtors != 2
+        if (value != expected || cppas.Life.moves != 0 || cppas.Life.dtors != 1
             || cppas.Life.last_dtor != expected) return 35721;
     }
 
@@ -16557,6 +16829,207 @@ extern int main()
                 return 3699;
         }
         if (cppbv.Cnt.dtors != 3 || cppbv.Cnt.plusCalls != 1) return 3699;
+    }
+    // TERNELIDE: same-class conditional prvalues construct directly in C++ by-value parameter slots.
+    {
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            int expected = pick != 0 ? 1 : 2;
+            cppternary.Item.reset();
+            int value = cppternary.use(pick != 0 ? cppternary.Item(1) : cppternary.Item(2));
+            if (value != expected || cppternary.Item.ctors != 1 || cppternary.Item.copies != 0
+                || cppternary.Item.moves != 0 || cppternary.Item.dtors != 1
+                || cppternary.Item.live != 0 || cppternary.Item.which != 1) return 3760;
+
+            cppternary.Item.reset();
+            cppternary.Holder holder = default;
+            int methodValue = holder.use(pick != 0 ? cppternary.Item(1) : cppternary.Item(2));
+            if (methodValue != expected || cppternary.Item.ctors != 1 || cppternary.Item.copies != 0
+                || cppternary.Item.moves != 0 || cppternary.Item.dtors != 1
+                || cppternary.Item.live != 0 || cppternary.Item.which != 3) return 3761;
+
+            cppternary.Item.reset();
+            cppternary.Box box = cppternary.Box(
+                pick != 0 ? cppternary.Item(1) : cppternary.Item(2));
+            if (box.value != expected || cppternary.Item.ctors != 1 || cppternary.Item.copies != 0
+                || cppternary.Item.moves != 0 || cppternary.Item.dtors != 1
+                || cppternary.Item.live != 0 || cppternary.Item.which != 4) return 3762;
+
+            cppternary.Item.reset();
+            int nonlast = cppternary.use2(
+                pick != 0 ? cppternary.Item(1) : cppternary.Item(2), cppternary.Item(7));
+            if (nonlast != expected * 10 + 7 || cppternary.Item.ctors != 2
+                || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 2 || cppternary.Item.live != 0
+                || cppternary.Item.which != 2) return 3763;
+
+            cppternary.Item.reset();
+            int callArm = cppternary.use(
+                pick != 0 ? cppternary.make(1) : cppternary.make(2));
+            if (callArm != expected || cppternary.Item.ctors != 1 || cppternary.Item.copies != 0
+                || cppternary.Item.moves != 0 || cppternary.Item.dtors != 1
+                || cppternary.Item.live != 0 || cppternary.Item.which != 1) return 3764;
+
+            cppternary.Item.reset();
+            cppternary.Item returned = cppternary.retPlus(pick != 0);
+            if (returned.value != expected + 3 || cppternary.Item.ctors != 3
+                || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 2 || cppternary.Item.live != 1
+                || cppternary.Item.which != 5 || cppternary.Item.plusCalls != 1) return 3765;
+        }
+
+        for (int first = 0; first < 2; first = first + 1)
+            for (int second = 0; second < 2; second = second + 1)
+            {
+                int a = first != 0 ? 1 : 2;
+                int b = second != 0 ? 3 : 4;
+                cppternary.Item.reset();
+                int values = cppternary.use2(
+                    first != 0 ? cppternary.Item(1) : cppternary.Item(2),
+                    second != 0 ? cppternary.Item(3) : cppternary.Item(4));
+                if (values != a * 10 + b || cppternary.Item.ctors != 2
+                    || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                    || cppternary.Item.dtors != 2 || cppternary.Item.live != 0
+                    || cppternary.Item.which != 2) return 3766;
+
+                cppternary.Item.reset();
+                int nested = cppternary.use(first != 0
+                    ? (second != 0 ? cppternary.Item(1) : cppternary.Item(2))
+                    : cppternary.Item(3));
+                int nestedExpected = first != 0 ? (second != 0 ? 1 : 2) : 3;
+                if (nested != nestedExpected || cppternary.Item.ctors != 1
+                    || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                    || cppternary.Item.dtors != 1 || cppternary.Item.live != 0
+                    || cppternary.Item.which != 1) return 3767;
+            }
+
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            int expected = pick != 0 ? 1 : 2;
+            cppternary.Item b = cppternary.Item(4);
+            cppternary.Item.reset();
+            cppternary.Item freeLeft = (pick != 0 ? cppternary.Item(1) : cppternary.Item(2)) + b;
+            if (freeLeft.value != expected + 4 || cppternary.Item.ctors != 2
+                || cppternary.Item.copies != 1 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 2 || cppternary.Item.live != 2
+                || cppternary.Item.which != 5 || cppternary.Item.plusCalls != 1) return 3768;
+        }
+
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            int expected = pick != 0 ? 1 : 2;
+            cppternary.Item b = cppternary.Item(4);
+            cppternary.Item.reset();
+            cppternary.Item freeRight = b + (pick != 0 ? cppternary.Item(1) : cppternary.Item(2));
+            if (freeRight.value != expected + 4 || cppternary.Item.ctors != 2
+                || cppternary.Item.copies != 1 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 2 || cppternary.Item.live != 2
+                || cppternary.Item.which != 5 || cppternary.Item.plusCalls != 1) return 3769;
+        }
+
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            cppternary.Item b = cppternary.Item(4);
+            cppternary.Item.reset();
+            cppternary.Item member = b * (pick != 0 ? cppternary.Item(2) : cppternary.Item(3));
+            if (member.value != (pick != 0 ? 8 : 12) || cppternary.Item.ctors != 2
+                || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 1 || cppternary.Item.live != 2
+                || cppternary.Item.which != 6 || cppternary.Item.memberCalls != 1) return 3770;
+        }
+
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            cppternary.Item a = cppternary.Item(5);
+            cppternary.Item b = cppternary.Item(8);
+            cppternary.Item.reset();
+            int value = cppternary.use(pick != 0 ? a : b);
+            int expected = pick != 0 ? 5 : 8;
+            if (value != expected || cppternary.Item.ctors != 0 || cppternary.Item.copies != 1
+                || cppternary.Item.moves != 0 || cppternary.Item.dtors != 1
+                || cppternary.Item.live != 2 || cppternary.Item.which != 1) return 3771;
+        }
+
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            cppternary.Item a = cppternary.Item(5);
+            cppternary.Item b = cppternary.Item(8);
+            cppternary.Item.reset();
+            int value = cppternary.use(pick != 0 ? move a : move b);
+            int expected = pick != 0 ? 5 : 8;
+            if (value != expected || cppternary.Item.ctors != 0 || cppternary.Item.copies != 0
+                || cppternary.Item.moves != 1 || cppternary.Item.dtors != 1
+                || cppternary.Item.live != 2 || cppternary.Item.which != 1) return 3772;
+        }
+
+        // TERNELIDE r3: a native callee's by-value C++ parameter, a CFlat function returning the
+        // `(c ? a : b) + c` prvalue (clang: 3,0,0,2), and overloaded operators taking the arm.
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            int expected = pick != 0 ? 1 : 2;
+            cppternary.Item.reset();
+            int nativeValue = ternaryNativeUse(pick != 0 ? cppternary.Item(1) : cppternary.Item(2));
+            if (nativeValue != expected || cppternary.Item.ctors != 1 || cppternary.Item.copies != 0
+                || cppternary.Item.moves != 0 || cppternary.Item.dtors != 1
+                || cppternary.Item.live != 0) return 3773;
+
+            {
+                cppternary.Item.reset();
+                cppternary.Item flatReturned = ternaryPlusCflat(pick != 0);
+                if (flatReturned.value != expected + 3 || cppternary.Item.ctors != 3
+                    || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                    || cppternary.Item.dtors != 2 || cppternary.Item.live != 1
+                    || cppternary.Item.which != 5 || cppternary.Item.plusCalls != 1) return 3774;
+            }
+
+            {
+                cppternary.Item operand = cppternary.Item(1);
+                cppternary.Item.reset();
+                bool same = (pick != 0 ? cppternary.Item(1) : cppternary.Item(2)) == operand;
+                if (same != (pick != 0) || cppternary.Item.ctors != 1 || cppternary.Item.copies != 1
+                    || cppternary.Item.moves != 0 || cppternary.Item.dtors != 2
+                    || cppternary.Item.live != 1 || cppternary.Item.which != 7) return 3775;
+            }
+
+            cppternary.Item.reset();
+            int shifted = (pick != 0 ? cppternary.Item(1) : cppternary.Item(2)) << 2;
+            if (shifted != (pick != 0 ? 4 : 8) || cppternary.Item.ctors != 1
+                || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 1 || cppternary.Item.live != 0
+                || cppternary.Item.which != 8) return 3776;
+
+            cppternary.Item.reset();
+            int negated = -(pick != 0 ? cppternary.Item(1) : cppternary.Item(2));
+            if (negated != (pick != 0 ? -1 : -2) || cppternary.Item.ctors != 1
+                || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 1 || cppternary.Item.live != 0
+                || cppternary.Item.which != 9) return 3777;
+
+            cppternary.Item.reset();
+            int inverted = ~(pick != 0 ? cppternary.Item(1) : cppternary.Item(2));
+            if (inverted != (pick != 0 ? -2 : -3) || cppternary.Item.ctors != 1
+                || cppternary.Item.copies != 0 || cppternary.Item.moves != 0
+                || cppternary.Item.dtors != 1 || cppternary.Item.live != 0
+                || cppternary.Item.which != 10) return 3778;
+        }
+    }
+    // SHIFTCH: a chained shift on a prvalue takes no declaration slot for its intermediate
+    // (clang: member 8, free 2; the destroyed intermediate is the last temporary destroyed).
+    {
+        cppternary.Shift.reset();
+        {
+            cppternary.Shift member = cppternary.Shift(1) << 1 << 2;
+            if (member.value != 8 || cppternary.Shift.ctors != 3 || cppternary.Shift.copies != 0
+                || cppternary.Shift.moves != 0 || cppternary.Shift.dtors != 2
+                || cppternary.Shift.live != 1 || cppternary.Shift.lastDtor != 1) return 3779;
+        }
+        cppternary.Shift.reset();
+        {
+            cppternary.Shift freeValue = cppternary.Shift(16) >> 1 >> 2;
+            if (freeValue.value != 2 || cppternary.Shift.ctors != 3 || cppternary.Shift.copies != 0
+                || cppternary.Shift.moves != 0 || cppternary.Shift.dtors != 2
+                || cppternary.Shift.live != 1 || cppternary.Shift.lastDtor != 16) return 3780;
+        }
     }
     // T239: parentheses preserve C++17 ternary prvalue elision in init, fields, and returns.
     {

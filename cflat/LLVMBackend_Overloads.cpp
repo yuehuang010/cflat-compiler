@@ -7475,6 +7475,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         if (displayName.empty() && diagnosticFunctionName == functionName)
             diagnosticFunctionName = SpellType(*this, TypeAndValue{ .TypeName = functionName });
 
+        // A class default built in place: call the C++ declaration itself, as clang does.
+        if (candidate.UniqueName.starts_with("__cflat_dflt_"))
+            SwitchCxxDefaultWrapperToDirect(candidate, matched);
+
         if (!candidate.Variadic && matched.size() < candidate.Parameters.size())
         {
             for (size_t i = matched.size(); i < candidate.Parameters.size(); ++i)
@@ -9252,6 +9256,24 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 const bool cxxObject = IsForeignNontrivialCxxClass(pn);
                 const bool cflatHolder = !cxxObject && HasForeignNontrivialCxxField(pn);
                 if (!cxxObject && !cflatHolder) continue;
+                if (cxxObject && i < matched.size() && matched[i].CxxDefaultInitIndex >= 0)
+                {
+                    // An omitted class default: constructed now, after the explicit arguments.
+                    auto* initTy = llvm::FunctionType::get(builder->getVoidTy(),
+                        { builder->getInt32Ty(), builder->getPtrTy() }, false);
+                    const std::string initName = CxxDefaultInitHelperName(candidate.UniqueName);
+                    CreateCallOrInvoke(initTy, module->getOrInsertFunction(initName, initTy).getCallee(),
+                        { builder->getInt32(matched[i].CxxDefaultInitIndex), matched[i].Storage },
+                        /*mayUnwind*/ true);
+                    if (!IsCxxParamDestroyedInCallee(pn))
+                    {
+                        RegisterOwnedCxxParamTempAt(matched[i].Storage, pn, pendingOwnedStructTemps.size());
+                        ++insertedCxxParamTemps;
+                    }
+                    cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                    cxxIndirectArgAddrs[i] = matched[i].Storage;
+                    continue;
+                }
                 if (cflatHolder && IsLoweredCFlatOnlyStruct(pn) && i < matched.size())
                 {
                     auto* resultSlot = LoweredSretTempOf(matched[i].Primary,
@@ -10744,6 +10766,7 @@ llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
         // Resolve the wrapper observer/release method through a pointer receiver so a pointee
         // method named `get` cannot win overload scoring.
         auto* wrapperTy = GetType(arg.TypeAndValue);
+        llvm::Value* temporaryStorage = nullptr;
         if (receiver.Storage != nullptr)
         {
             receiver.Primary = receiver.Storage;
@@ -10754,6 +10777,7 @@ llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
         {
             auto* wrapperStorage = AllocaAtEntry(wrapperTy, nullptr, "unique.receiver");
             builder->CreateStore(receiver.Primary, wrapperStorage);
+            temporaryStorage = wrapperStorage;
             receiver.Primary = wrapperStorage;
         }
         receiver.BaseType = wrapperTy == nullptr ? receiver.BaseType
@@ -10763,6 +10787,8 @@ llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
         receiver.IsExplicitMove = false;
         EnsureCxxMemberProjected(arg.TypeAndValue.TypeName,
                                  consumesCoreUnique ? "release" : "get");
+        if (!consumesCoreUnique && temporaryStorage != nullptr)
+            RegisterBorrowedOwningStructTempAt(arg, temporaryStorage);
         auto* result = CreateOverloadedFunctionCall(consumesCoreUnique ? "release" : "get", { receiver });
         // The getter is an ABI adapter, not a new ownership boundary. Preserve the temporary
         // field ledger across it so a later call/return still rejects the escaping raw pointer.

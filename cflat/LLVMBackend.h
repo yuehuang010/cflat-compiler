@@ -674,6 +674,8 @@ struct ScopedLookupOptions
 class LLVMBackend
 {
 public:
+    // Clang's same-class copy request for one class and constness (see RequestSameClassCopy).
+    struct SameClassCopyRequest { bool requested = false; std::string wrapperName; std::string pick; };
     bool LastOptimizedViewWasIncremental() const;
     struct LineFrame
     {
@@ -1885,6 +1887,9 @@ public:
         // T518: for a non-trivially-copyable class, the copy built at the argument's position (live
         // only once the decision is set): the parameter of a by-value selection called by address.
         llvm::AllocaInst* CxxEarlyCopySlot = nullptr;
+        // An omitted C++ class default: Storage is its unconstructed slot, built in parameter order
+        // by the callee's generated initializer (CxxDefaultInitHelperName) at the by-value lowering.
+        int CxxDefaultInitIndex = -1;
         // T518: for a `c ? default : x` argument, the join of the owned default temp and that copy.
         llvm::PHINode* CxxEarlyCopyJoin = nullptr;
         // T142: the value of a `default` call argument. Overload ranking refuses it for reference and
@@ -3199,6 +3204,8 @@ public:
     // False only when no value of `typeName` can reach (by value, pointer, element, owner) an
     // object of a type implementing `iface`; "" and anything opaque or foreign answer true.
     bool TypeMayReachImplementer(const std::string& typeName, const std::string& iface) const;
+    // True when a call argument resolves to an owner temporary still pending in this statement.
+    bool IsStatementOwnedTempBorrowSource(llvm::Value* value);
 private:
     RawPointerStoreVerdict ClassifyArgumentStoreOutsideCall(const llvm::Function* function,
             size_t argumentIndex);
@@ -4044,6 +4051,11 @@ private:
     std::unordered_map<std::string, std::string> scopedCppEnumeratorHints_;
     // Globals created for imported C/C++ enumerators: named constants, foldable like enum members.
     std::unordered_set<std::string> importedEnumeratorGlobals_;
+    // C++ enumerators from unnamed enums have no TypeAndValue spelling; retain their resolved
+    // global identity so constructor wrappers can pass the original enum expression to Clang.
+    std::unordered_map<const llvm::GlobalVariable*, std::string> cxxUnnamedEnumExpressions_;
+    // Same-class copy request per class and constness: one wrapper and clang's pick, not per site.
+    std::unordered_map<std::string, SameClassCopyRequest> sameClassCopyRequests_;
     // Unscoped C++ enum -> CFlat name of its integral promotion type ([conv.prom]/3-4).
     std::unordered_map<std::string, std::string> enumPromotedTypes_;
     // Enum keys read from a clang declaration (imported C/C++). A registered enum key outside this
@@ -4789,7 +4801,7 @@ private:
         bool resultBorrowsBraceList = false;
         // RawSig::braceListElementTypes (round-trips through the cache).
         std::vector<std::string> braceListElementSpellings;
-        // RawSig::calleeIdentity (round-trips through the cache).
+        // RawSig::calleeIdentity, including same-class ctor selection metadata (cached).
         std::string calleeIdentity;
         // RawSig::paramBindKinds of a generated wrapper (round-trips through the cache).
         std::string paramBindKinds;
@@ -4857,7 +4869,24 @@ private:
         int result = 0; // 0 pending, 1 available, -1 unsupported
         bool ambiguous = false; // the shortened call is ambiguous in C++
         std::string error;
+        // The call goes to the declaration itself, its class defaults built by an initializer.
+        bool direct = false;
+        bool forceWrapper = false;
     };
+    // Per linkage name: 1 the default initializer compiled, -1 it did not.
+    std::unordered_map<std::string, int> cxxDefaultInitHelpers_;
+    bool TryCxxDirectDefaultInit(const std::string& wrapperName, const CxxDefaultWrapperRequest& request,
+                                 const std::vector<cflat_cinterop::RawSig>& sigs,
+                                 const std::vector<cflat_cinterop::RawRecord>& records);
+    bool CxxDirectDefaultEligible(const FunctionSymbol& wrapper, const FunctionSymbol& original,
+                                  size_t arity);
+    const FunctionSymbol* FindFunctionSymbolByUniqueName(const std::string& uniqueName) const;
+    static std::string CxxDefaultInitHelperName(const std::string& linkageName);
+    bool EnsureCxxDefaultInitHelper(const std::string& linkage,
+                                    const std::vector<cflat_cinterop::RawDefaultArg>& defaults,
+                                    const std::vector<std::string>& spellings, bool member,
+                                    const std::string& owner, const CxxRequestGroup& group);
+    void SwitchCxxDefaultWrapperToDirect(FunctionSymbol& candidate, std::vector<NamedVariable>& matched);
     std::unordered_map<std::string, CxxDefaultWrapperRequest> cxxDefaultWrapperRequests_;
     // Constructor ranking can re-enter clang for the same target and argument shape.
     std::unordered_set<std::string> cxxVariadicCtorRequestsInProgress_;
@@ -6583,6 +6612,9 @@ private:
     void FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
                               llvm::BasicBlock* hoistTo = nullptr,
                               bool preserveReturnedPtrTemps = false);
+    // Forget (never destroy) every owned temp registered since `mark` except C++-holder structs:
+    // a native default's temps keep the leak they had instead of gaining a wrapper-return destroy.
+    void DropNonCxxOwnedTempsSince(const OwnedTempMark& mark);
     std::vector<PendingOwnedStructTemp> HoistBraceListTempsSince(const OwnedTempMark& mark,
                                                                  llvm::BasicBlock* hoistTo);
 
@@ -11232,6 +11264,7 @@ public:
                                                const TypeAndValue& param);
     // True when every parameter from 'first' on has a constant default the call can omit.
     static bool CxxConstantDefaultsFrom(const CxxClassInfo::Structor& st, size_t first);
+    bool CxxCtorDefaultsDirect(const std::string& typeName, const CxxClassInfo::Structor& st, size_t first);
     // The complete-object destructor (Dtor_Complete) of a foreign nontrivial class, registered
     // as the class's CFlat destructor so every existing scope-exit path destroys it.
     llvm::Function* GetOrCreateCxxClassDestructor(const std::string& typeName);
@@ -11399,6 +11432,12 @@ public:
                                     llvm::Value* src, bool useMove, const char* context,
                                     const std::string& displayTypeName = {},
                                     bool constSource = false);
+    // Same-class copy of an lvalue through the memoized wrapper request (one per class and
+    // constness). False with `error` set when clang refuses; `out.requested` false when no wrapper.
+    bool RequestSameClassCopy(const std::string& typeName, const NamedVariable& source,
+                              bool constSource, SameClassCopyRequest& out, std::string& error);
+    // The external module function of a generated constructor wrapper, or nullptr.
+    llvm::Function* FindCxxWrapperFunction(const std::string& wrapperName);
     bool ResetMovedStdFunctionSource(const std::string& typeName, llvm::Value* sourceStorage,
                                      const std::string& sourceName = {});
     bool EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
@@ -13694,6 +13733,20 @@ public:
         auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
         return gv != nullptr && importedEnumeratorGlobals_.count(std::string(gv->getName())) != 0;
     }
+    const std::string* CxxUnnamedEnumExpression(const llvm::Value* storage) const
+    {
+        auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
+        if (gv == nullptr) return nullptr;
+        auto it = cxxUnnamedEnumExpressions_.find(gv);
+        return it == cxxUnnamedEnumExpressions_.end() ? nullptr : &it->second;
+    }
+    // An unnamed C++ enum constant bound for a class with constructor templates: clang must rank
+    // the enum template, since the listed int constructor would otherwise win on the `int` type.
+    bool CxxUnnamedEnumTemplateArgument(const std::string& typeName, const NamedVariable& arg) const
+    {
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
+        return info != nullptr && info->hasCtorTemplate && CxxUnnamedEnumExpression(arg.Storage) != nullptr;
+    }
     // Find a member through lvalue PHIs/selects and the slot ledger used by `??` joins.
     const llvm::GlobalVariable* FindEnumMemberStorage(const llvm::Value* storage) const
     {
@@ -14231,7 +14284,12 @@ public:
     // 302: dynamic initializer ownership is shared across import groups.
     // 303: initializer cache entries carry internal-linkage file identity and import order.
     // 308: remove the default-parameter wrapper marker; the mixed-conditional veto was its only reader.
-    static constexpr int kCHeaderCacheVersion = 308;
+    // 309: same-class copy wrappers carry clang's copy/move pick in calleeIdentity (CTORTPL r2).
+    // 310: only same-class (dst, source) wrappers carry that pick; converting wrappers keep theirs.
+    // 311: by-value class defaults carry their scope + source text (direct default initializers).
+    // 312: class-default text only when the bound expression re-reads to the same meaning.
+    // 313: default initializers are verified against the bound default (identity), else refused.
+    static constexpr int kCHeaderCacheVersion = 313;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by
@@ -14752,7 +14810,8 @@ inline void CompilerManager::DumpAllState() const
 // 1 a local owner, 2 frame storage, 3 unproven provenance (refused with its own text). Defined
 // with PointerValueRoot (MainListener_Expressions.cpp).
 int CallResultFrameBorrowKind(llvm::Value* call, LLVMBackend* compiler, llvm::Function* fn,
-                              std::vector<LLVMBackend::DeferredCallBorrow>* deferred = nullptr);
+                              std::vector<LLVMBackend::DeferredCallBorrow>* deferred = nullptr,
+                              bool* statementOwnedTempRoot = nullptr);
 // T522: true (and cleared) when the last root query's frame verdict came from unproven provenance.
 bool TakeUnprovenPointerRoot();
 // The one "cannot prove the returned interface ..." text (T522), interface spelled via SpellType.

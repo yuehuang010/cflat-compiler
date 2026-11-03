@@ -5000,6 +5000,14 @@ bool LLVMBackend::EnsureCxxDefaultWrapper(const std::string& name)
         CxxExtractionStageTimer timer(verbose, "default-wrapper demand parse/cache");
         const bool canRequest = !source.empty() && ambiguous.empty()
             && request.group.primary < cxxImportGroups_.size();
+        // Class defaults built in place by an initializer: the wrapper body is never needed.
+        if (canRequest && !request.forceWrapper && TryCxxDirectDefaultInit(name, request, sigs, records))
+        {
+            auto& direct = cxxDefaultWrapperRequests_.at(name);
+            direct.result = 1;
+            direct.direct = true;
+            return true;
+        }
         const bool ok = canRequest
             && RequestGeneratedCxxWrapper(request.group, source, name, "DEFAULT", ignored, error);
         auto& result = cxxDefaultWrapperRequests_.at(name);
@@ -5030,6 +5038,258 @@ void LLVMBackend::PrepareCxxDefaultCandidates(std::vector<FunctionSymbol>& candi
             // Lowering failure does not remove the C++ declaration from overload ranking.
             EnsureCxxDefaultWrapper(name);
         }
+}
+
+// One initializer per C++ declaration: `void <name>(int param, void* slot)`.
+std::string LLVMBackend::CxxDefaultInitHelperName(const std::string& linkageName)
+{
+        std::string out = CxxDefaultWrapperName(linkageName, 0);
+        out.replace(0, std::strlen("__cflat_dflt_"), "__cflat_dfi_");
+        out.erase(out.rfind('_'));
+        return out;
+}
+
+const LLVMBackend::FunctionSymbol* LLVMBackend::FindFunctionSymbolByUniqueName(
+    const std::string& uniqueName) const
+{
+        for (const auto& entry : functionTable)
+            for (const FunctionSymbol& symbol : entry.second)
+                if (symbol.UniqueName == uniqueName) return &symbol;
+        return nullptr;
+}
+
+/*
+ * Whether a call through default wrapper `wrapper` (its first `arity` parameters) can call
+ * `original` directly: the kept parameters agree, every omitted default is a constant CFlat can
+ * spell or a by-value C++ class default with captured text passed in memory, and one is a class.
+ */
+bool LLVMBackend::CxxDirectDefaultEligible(const FunctionSymbol& wrapper, const FunctionSymbol& original,
+                                           size_t arity)
+{
+        if (!original.IsCxx || original.Variadic || !original.Recipe.hasLowering
+            || wrapper.Parameters.size() != arity || original.Parameters.size() <= arity
+            || original.DefaultArguments.size() != original.Parameters.size()
+            || original.Recipe.paramSlots.size() < original.Parameters.size())
+            return false;
+        for (size_t i = 0; i < arity; ++i)
+        {
+            const TypeAndValue& a = wrapper.Parameters[i];
+            const TypeAndValue& b = original.Parameters[i];
+            if (ResolveTypeAlias(a.TypeName) != ResolveTypeAlias(b.TypeName) || a.Pointer != b.Pointer
+                || a.PointerDepth != b.PointerDepth || a.IsAlias != b.IsAlias || a.IsRvalueRef != b.IsRvalueRef)
+                return false;
+        }
+        bool classDefault = false;
+        for (size_t i = arity; i < original.Parameters.size(); ++i)
+        {
+            const TypeAndValue& param = original.Parameters[i];
+            const cflat_cinterop::RawDefaultArg& def = original.DefaultArguments[i];
+            if (param.IsAlias || param.IsRvalueRef || param.IsCxxRef()) return false;
+            if (def.kind != "nonconst")
+            {
+                if (def.kind.empty() || def.kind == "unsupported"
+                    || MaterializeCxxDefaultArgument(def, param) == nullptr)
+                    return false;
+                continue;
+            }
+            if (param.Pointer || param.PointerDepth != 0 || !IsForeignNontrivialCxxClass(param.TypeName)
+                || original.Recipe.paramSlots[i].kind != AbiSlot::ByVal
+                || original.Recipe.paramSlots[i].structTy == nullptr
+                || def.value.find('\x1f') == std::string::npos)
+                return false;
+            classDefault = true;
+        }
+        return classDefault;
+}
+
+/*
+ * Compiles `original`'s class-default initializer: each default's text is re-read in its own
+ * namespace (a member's inside a class derived from the owner, so the owner's static members
+ * and nested types resolve) and copy-initializes the caller's parameter slot. The prvalue of
+ * the inner function is the slot object itself (guaranteed elision), as C++'s own call does.
+ */
+bool LLVMBackend::TryCxxDirectDefaultInit(const std::string& wrapperName,
+                                          const CxxDefaultWrapperRequest& request,
+                                          const std::vector<cflat_cinterop::RawSig>& sigs,
+                                          const std::vector<cflat_cinterop::RawRecord>& records)
+{
+        const FunctionSymbol* wrapper = FindFunctionSymbolByUniqueName(wrapperName);
+        const FunctionSymbol* original = FindFunctionSymbolByUniqueName(request.linkage);
+        if (wrapper == nullptr || original == nullptr
+            || !CxxDirectDefaultEligible(*wrapper, *original, request.arity))
+            return false;
+        const std::vector<std::string>* spellings = nullptr;
+        std::string owner;
+        if (!request.member)
+        {
+            for (const auto& sig : sigs)
+                if (sig.linkageName == request.linkage) spellings = &sig.paramTypes;
+        }
+        else if (!records.empty())
+        {
+            const auto& record = records.front();
+            owner = record.canonicalCtype.empty() ? CxxNameFromCflat(record.name) : "::" + record.canonicalCtype;
+            for (const auto& member : record.members)
+                if (member.linkageName == request.linkage) spellings = &member.paramTypes;
+        }
+        if (spellings == nullptr) return false;
+        return EnsureCxxDefaultInitHelper(request.linkage, original->DefaultArguments, *spellings,
+                                          request.member, owner, request.group);
+}
+
+bool LLVMBackend::EnsureCxxDefaultInitHelper(const std::string& linkage,
+                                             const std::vector<cflat_cinterop::RawDefaultArg>& defaults,
+                                             const std::vector<std::string>& spellings, bool member,
+                                             const std::string& owner, const CxxRequestGroup& group)
+{
+        if (auto known = cxxDefaultInitHelpers_.find(linkage); known != cxxDefaultInitHelpers_.end())
+            return known->second > 0;
+        cxxDefaultInitHelpers_[linkage] = -1;
+        if (spellings.size() != defaults.size() || (member && owner.size() <= 2)
+            || group.primary >= cxxImportGroups_.size())
+            return false;
+        const std::string helper = CxxDefaultInitHelperName(linkage);
+        std::string source = "#include <new>\n";
+        std::string cases;
+        for (size_t i = 0; i < defaults.size(); ++i)
+        {
+            const cflat_cinterop::RawDefaultArg& def = defaults[i];
+            const size_t split = def.value.find('\x1f');
+            if (def.kind != "nonconst" || split == std::string::npos) continue;
+            const std::string scope = def.value.substr(0, split);
+            const std::string text = def.value.substr(split + 1);
+            const std::string stem = helper + "_" + std::to_string(i);
+            source += "using " + stem + "_t = " + spellings[i] + ";\n";
+            if (!scope.empty()) source += "namespace " + scope + " { ";
+            std::string make;
+            if (member)
+            {
+                // Only reserved names: a plain member name would hide the owner's (R1: `make()`).
+                source += "struct " + stem + "_s : " + owner + " { static ::" + stem + "_t " + stem
+                    + "_make() { return " + text + "; } };";
+                make = stem + "_s::" + stem + "_make()";
+            }
+            else
+            {
+                source += "static ::" + stem + "_t " + stem + "_make() { return " + text + "; }";
+                make = stem + "_make()";
+            }
+            if (!scope.empty()) source += " }";
+            source += "\n";
+            cases += "case " + std::to_string(i) + ": ::new (slot) ::" + stem + "_t("
+                + (scope.empty() ? "::" : "::" + scope + "::") + make + "); break; ";
+        }
+        if (cases.empty()) return false;
+        source += "extern \"C\" __attribute__((weak)) void " + helper + "(int param, void* slot) { switch (param) { "
+            + cases + "default: break; } }\n";
+        CSigEntry ignored;
+        std::string error;
+        CxxRequestGroupScope groupScope(*this, &group);
+        if (!RequestGeneratedCxxWrapper(group, source, helper, "DEFAULT", ignored, error))
+            return false;
+        cxxDefaultInitHelpers_[linkage] = 1;
+        return true;
+}
+
+/*
+ * Whether a constructor call omitting `st`'s parameters from `first` on builds its class
+ * defaults in place (EmitCxxStructorCall) instead of through clang's constructor wrapper.
+ */
+bool LLVMBackend::CxxCtorDefaultsDirect(const std::string& typeName, const CxxClassInfo::Structor& st,
+                                        size_t first)
+{
+        if (st.linkageName.empty() || st.isDeleted || st.defaultArgs.size() != st.params.size()
+            || first == 0 || first >= st.params.size())
+            return false;
+        bool classDefault = false;
+        for (size_t i = first; i < st.params.size(); ++i)
+        {
+            const TypeAndValue& param = st.params[i];
+            const cflat_cinterop::RawDefaultArg& def = st.defaultArgs[i];
+            if (param.IsAlias || param.IsRvalueRef || param.IsCxxRef()) return false;
+            if (def.kind != "nonconst")
+            {
+                if (def.kind.empty() || def.kind == "unsupported"
+                    || MaterializeCxxDefaultArgument(def, param) == nullptr)
+                    return false;
+                continue;
+            }
+            if (param.Pointer || param.PointerDepth != 0 || !IsForeignNontrivialCxxClass(param.TypeName)
+                || def.value.find('\x1f') == std::string::npos)
+                return false;
+            classDefault = true;
+        }
+        if (!classDefault) return false;
+        // Built in memory the callee is handed: a class passed in registers (MS x64) keeps clang's wrapper.
+        AbiRecipe recipe;
+        if (!BuildAbiRecipeFromClangPlan(typeName, st.abi, st.ret, st.params, recipe)
+            || recipe.paramSlots.size() < st.params.size())
+            return false;
+        for (size_t i = first; i < st.params.size(); ++i)
+            if (st.defaultArgs[i].kind == "nonconst"
+                && (recipe.paramSlots[i].kind != AbiSlot::ByVal || recipe.paramSlots[i].structTy == nullptr))
+                return false;
+        if (auto known = cxxDefaultInitHelpers_.find(st.linkageName); known != cxxDefaultInitHelpers_.end())
+            return known->second > 0;
+        auto record = cxxRecordEntries_.find(typeName);
+        size_t primary = static_cast<size_t>(-1);
+        if (record == cxxRecordEntries_.end() || !GetCxxTypeOwnerGroup(typeName, primary)
+            || primary >= cxxImportGroups_.size())
+            return false;
+        const std::string owner = record->second.canonicalCtype.empty()
+            ? CxxNameFromCflat(record->second.name) : "::" + record->second.canonicalCtype;
+        for (const auto& member : record->second.members)
+            if (member.kind == cflat_cinterop::RawCxxMember::Constructor
+                && member.linkageName == st.linkageName)
+            {
+                const CxxRequestGroup group = MakeCxxRequestGroup(primary, {});
+                return EnsureCxxDefaultInitHelper(st.linkageName, st.defaultArgs, member.paramTypes,
+                                                  /*member*/ true, owner, group);
+            }
+        return false;
+}
+
+void LLVMBackend::SwitchCxxDefaultWrapperToDirect(FunctionSymbol& candidate,
+                                                  std::vector<NamedVariable>& matched)
+{
+        auto request = cxxDefaultWrapperRequests_.find(candidate.UniqueName);
+        if (request == cxxDefaultWrapperRequests_.end() || !request->second.direct) return;
+        const FunctionSymbol* found = FindFunctionSymbolByUniqueName(request->second.linkage);
+        if (found == nullptr || matched.size() != request->second.arity
+            || !CxxDirectDefaultEligible(candidate, *found, request->second.arity))
+        {
+            // Not this call's shape after all: the forwarding wrapper's body is requested now.
+            request->second.direct = false;
+            request->second.forceWrapper = true;
+            request->second.result = 0;
+            EnsureCxxDefaultWrapper(candidate.UniqueName);
+            return;
+        }
+        FunctionSymbol original = *found;
+        for (size_t i = matched.size(); i < original.Parameters.size(); ++i)
+        {
+            const TypeAndValue& param = original.Parameters[i];
+            const cflat_cinterop::RawDefaultArg& def = original.DefaultArguments[i];
+            NamedVariable value;
+            value.TypeAndValue = param;
+            value.IsRvalue = true;
+            if (def.kind == "nonconst")
+            {
+                const AbiSlot& slot = original.Recipe.paramSlots[i];
+                value.Storage = AllocaAtEntry(slot.structTy, nullptr, "cxx.default.arg", slot.align);
+                value.BaseType = slot.structTy;
+                value.Primary = llvm::PoisonValue::get(slot.structTy);
+                value.IsCxxPrvalueTemp = true;
+                value.CxxDefaultInitIndex = static_cast<int>(i);
+            }
+            else
+            {
+                value.BaseType = GetType(param);
+                value.Primary = MaterializeCxxDefaultArgument(def, param);
+            }
+            matched.push_back(std::move(value));
+        }
+        candidate = std::move(original);
 }
 
 void LLVMBackend::RejectFailedCxxDefaultCandidate(const FunctionSymbol& candidate, size_t arity)
@@ -10943,6 +11203,10 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                             failedSourcePath, failedSource, wrapperSource);
                     if (!*failureInsideWrapper && wrapperName.starts_with("__cflat_ctor_")
                         && !requestDiagnostics.empty())
+                        *failureInsideWrapper = true;
+                    // A default initializer whose re-read binds differently: remember the verdict.
+                    if (wrapperName.starts_with("__cflat_dfi_") && probeSig != nullptr
+                        && !probeSig->bindRefusal.empty())
                         *failureInsideWrapper = true;
                 }
                 if (probeSig != nullptr && !probeSig->refusalCause.empty())
@@ -18249,6 +18513,12 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
         bool* nullPointerCandidate) const
 {
         if (nullPointerCandidate != nullptr) *nullPointerCandidate = false;
+        // An unnamed enum constant reaches here as int: only clang ranks the enum constructor template.
+        if (argVars != nullptr
+            && std::any_of(argVars->begin(), argVars->end(), [&](const NamedVariable& arg) {
+                return CxxUnnamedEnumTemplateArgument(typeName, arg);
+            }))
+            return true;
         const bool addressValue = argVars != nullptr
             && std::any_of(argVars->begin(), argVars->end(), [](const NamedVariable& arg) {
                 return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr;
@@ -19010,6 +19280,9 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             const bool namedLvalue = arg.Storage != nullptr
                 || (!arg.CallerName.empty() && FindVariableStorage(arg.CallerName).Storage != nullptr);
             std::string callArgument = "p" + std::to_string(i + 1);
+            const std::string* unnamedEnumExpression = CxxUnnamedEnumExpression(arg.Storage);
+            if (unnamedEnumExpression != nullptr)
+                callArgument = *unnamedEnumExpression;
             // An operator result can arrive with only its struct type: key on the resolved name.
             // A record that may not cross by value (an Eigen expression template has bases and
             // a user copy constructor) is forwarded by reference like a nontrivial one.
@@ -19044,7 +19317,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 // The by-value copy of a temporary is still a temporary for clang.
                 callArgument = "static_cast<" + spelling + " &&>(" + callArgument + ")";
             }
-            else if (!arg.TypeAndValue.Pointer && !stringLiteral
+            else if (unnamedEnumExpression == nullptr && !arg.TypeAndValue.Pointer && !stringLiteral
                      && !IsCxxRecord(arg.TypeAndValue.TypeName))
             {
                 // A scalar is forwarded with the caller's exact C++ type and value category, so
@@ -19098,8 +19371,11 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             }
             // A null pointer constant keeps its literal in the target call: a forwarded `int` is an
             // integral conversion to clang, so `(int*, double)` would lose to `(short, int)`.
-            if (std::string literal = nullConstantSpelling(arg); !literal.empty())
-                callArgument = std::move(literal);
+            if (unnamedEnumExpression == nullptr)
+            {
+                if (std::string literal = nullConstantSpelling(arg); !literal.empty())
+                    callArgument = std::move(literal);
+            }
             parameterSpellings.push_back(std::move(spelling));
             callArguments.push_back(std::move(callArgument));
         }
@@ -22746,7 +23022,19 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
             auto* sink = GetSymbolSink();
             const std::string sinkTypeName = sink != nullptr ? tv.TypeName : std::string{};
             if (auto* gv = CreateGlobalVariable(std::move(tv), c))
+            {
                 importedEnumeratorGlobals_.insert(std::string(gv->getName()));
+                if (cxxBoundary && e.enumType.empty())
+                {
+                    std::string cxxExpression = "::";
+                    for (char ch : e.name)
+                    {
+                        if (ch == '.') cxxExpression += "::";
+                        else cxxExpression += ch;
+                    }
+                    cxxUnnamedEnumExpressions_.insert_or_assign(gv, std::move(cxxExpression));
+                }
+            }
 
             if (sink != nullptr)
                 sink->Register(SymbolKind::Variable, e.name, fileForLsp, e.line, e.col < 0 ? 0 : e.col,
@@ -30880,9 +31168,37 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
             }
             args.push_back(a);
         }
-        // Omitted trailing parameters take their constant C++ defaults.
+        // Omitted trailing parameters take their constant C++ defaults; class defaults are built
+        // in their slots by the generated initializer, after the explicit arguments.
+        const bool directDefaults = args.size() < st.params.size()
+            && CxxCtorDefaultsDirect(typeName, st, args.size());
+        // Built at their by-value lowering below, so explicit copies run first (as clang does).
+        std::vector<llvm::AllocaInst*> directDefaultSlots;
+        auto constructDirectDefault = [&](size_t i) {
+            llvm::AllocaInst* defaultSlot = directDefaultSlots[i];
+            directDefaultSlots[i] = nullptr;
+            auto* initTy = llvm::FunctionType::get(builder->getVoidTy(),
+                { builder->getInt32Ty(), builder->getPtrTy() }, false);
+            CreateCallOrInvoke(initTy, module->getOrInsertFunction(
+                    CxxDefaultInitHelperName(st.linkageName), initTy).getCallee(),
+                { builder->getInt32(static_cast<int>(i)), defaultSlot }, /*mayUnwind*/ true);
+            if (!IsCxxParamDestroyedInCallee(st.params[i].TypeName))
+                RegisterOwnedCxxParamTempAt(defaultSlot, st.params[i].TypeName,
+                                            pendingOwnedStructTemps.size());
+            return defaultSlot;
+        };
         for (size_t i = args.size(); i < st.params.size() && i < st.defaultArgs.size(); ++i)
         {
+            if (directDefaults && st.defaultArgs[i].kind == "nonconst")
+            {
+                llvm::Type* classTy = GetType(TypeAndValue{ .TypeName = st.params[i].TypeName });
+                if (classTy == nullptr) break;
+                auto* defaultSlot = AllocaAtEntry(classTy, nullptr, "cxx.default.arg");
+                directDefaultSlots.resize(st.params.size(), nullptr);
+                directDefaultSlots[i] = defaultSlot;
+                args.push_back(defaultSlot);
+                continue;
+            }
             llvm::Value* v = MaterializeCxxDefaultArgument(st.defaultArgs[i], st.params[i]);
             if (v == nullptr) break;
             args.push_back(v);
@@ -30922,6 +31238,12 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 if (recipe.paramSlots[i].kind != AbiSlot::ByVal) continue;
                 const std::string& pn = st.params[i].TypeName;
                 if (!IsForeignNontrivialCxxClass(pn)) continue;
+                if (i < directDefaultSlots.size() && directDefaultSlots[i] != nullptr)
+                {
+                    indirectArgAddrs.resize(recipe.paramSlots.size(), nullptr);
+                    indirectArgAddrs[i] = constructDirectDefault(i);
+                    continue;
+                }
                 const size_t argIndex = i - 1;
                 if (argIndex >= callArgVars->size()
                     || (*callArgVars)[argIndex].Storage == nullptr)
@@ -30973,6 +31295,8 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 indirectArgAddrs.resize(recipe.paramSlots.size(), nullptr);
                 indirectArgAddrs[i] = temp;
             }
+        for (size_t i = 0; i < directDefaultSlots.size(); ++i)
+            if (directDefaultSlots[i] != nullptr) constructDirectDefault(i);
         // The argument values are loaded: a by-value `move f` nulls its source BEFORE the call, so
         // a write the constructor makes to the source survives (no after-call pass nulls it).
         if (callArgVars != nullptr)
@@ -31648,7 +31972,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             const size_t omitted = c.params.size() - argTypes.size() - 1;
             // A candidate whose omitted defaults are not constants cannot be CALLED here, but C++
             // still ranks it: it is kept as `blocked` so a better one is refused, not skipped.
-            const bool blocked = omitted != 0 && !CxxConstantDefaultsFrom(c, argTypes.size() + 1);
+            const bool blocked = omitted != 0 && !CxxConstantDefaultsFrom(c, argTypes.size() + 1)
+                && !const_cast<LLVMBackend*>(this)->CxxCtorDefaultsDirect(typeName, c, argTypes.size() + 1);
             if (blocked)
             {
                 // Viable in C++ only when EVERY omitted parameter has some default at all.
@@ -32437,6 +32762,18 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         auto answer = [&](CxxArgConversion found) {
             return nonConstLvalueRef ? CxxArgConversion::NonConstLvalueRef : found;
         };
+        // An unnamed imported enum is represented as int, so the listed int ctor would
+        // otherwise return before clang can rank the enum template's exact match.
+        if (!nonConstLvalueRef && CxxUnnamedEnumTemplateArgument(param.TypeName, arg))
+            {
+                NamedVariable probe = arg;
+                probe.TypeAndValue = argType;
+                std::string wrapperName;
+                std::string wrapperError;
+                if (RequestCxxVariadicConstructor(param.TypeName, { probe }, wrapperName,
+                                                  wrapperError, /*copyInit*/ true))
+                    return answer(CxxArgConversion::Convertible);
+            }
         if (IsCxxSharedPtrUpcast(argType, param)) return answer(CxxArgConversion::Convertible);
         // A derived lvalue binds directly to a C++ base reference. Do not turn that standard
         // conversion into a user-defined base copy, even when the base has a copy constructor.
@@ -32516,6 +32853,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         const bool enumArgument = argType.IsScopedEnum || !argType.EnumBacking.empty()
             || enumBackingTypes.count(argType.TypeName) != 0
             || !ResolveEnumTypeName(argType.TypeName).empty()
+            || CxxUnnamedEnumExpression(arg.Storage) != nullptr
             || (!argType.TypeName.empty() && arg.BaseType != nullptr
                 && arg.BaseType->isIntegerTy()
                 && !IsPrimitiveTypeName(argType.TypeName)
@@ -33072,10 +33410,12 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         const bool operatorOnly = ctor == nullptr && !slicesToBase && !argType.Pointer
             && (param.IsRvalueRef || param.CxxConstRef()) && IsCxxRecord(argType.TypeName)
             && HasImplicitClassConversionOperator(argType.TypeName);
+        const bool unnamedEnumTemplateSelection = CxxUnnamedEnumTemplateArgument(param.TypeName, arg);
         // A slice with no listed constructor is the implicit base copy: clang's wrapper builds it.
         const bool sliceByWrapper = slicesToBase && ctor == nullptr;
         const bool wrapped = (sliceByWrapper || info != nullptr)
             && (sliceByWrapper || operatorBindsBetter || classTemplateConversion || operatorOnly || zeroTie
+                || unnamedEnumTemplateSelection
                 || ((ctor == nullptr || clangResolves)
                     && (info->constructors.empty()
                         || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))
@@ -34591,6 +34931,48 @@ bool LLVMBackend::EmitLoweredMemberwiseAssign(const std::string& typeName, llvm:
         return true;
 }
 
+llvm::Function* LLVMBackend::FindCxxWrapperFunction(const std::string& wrapperName)
+{
+        if (auto symbols = functionTable.find(wrapperName); symbols != functionTable.end())
+            for (const FunctionSymbol& symbol : symbols->second)
+                if (symbol.External && symbol.UniqueName == wrapperName && symbol.Function != nullptr)
+                    return symbol.Function;
+        return nullptr;
+}
+
+bool LLVMBackend::RequestSameClassCopy(const std::string& typeName, const NamedVariable& source,
+                                       bool constSource, SameClassCopyRequest& out,
+                                       std::string& error)
+{
+        error.clear();
+        out = {};
+        const std::string key = typeName + (constSource ? "|const" : "|lvalue");
+        if (auto cached = sameClassCopyRequests_.find(key); cached != sameClassCopyRequests_.end())
+        {
+            // A memoized wrapper whose module function is gone is requested again.
+            if (!cached->second.requested || FindCxxWrapperFunction(cached->second.wrapperName) != nullptr)
+            {
+                out = cached->second;
+                return true;
+            }
+            sameClassCopyRequests_.erase(cached);
+        }
+        std::string wrapperName;
+        if (!RequestCxxVariadicConstructor(typeName, { source }, wrapperName, error, /*copyInit*/ true))
+        {
+            if (!error.empty()) return false;
+            sameClassCopyRequests_[key] = out;
+            return true;
+        }
+        out.requested = true;
+        out.wrapperName = wrapperName;
+        if (auto signatures = cxxFunctionSignatures_.find(wrapperName);
+            signatures != cxxFunctionSignatures_.end() && !signatures->second.empty())
+            out.pick = signatures->second.front().calleeIdentity;
+        sameClassCopyRequests_[key] = out;
+        return true;
+}
+
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                              llvm::Value* src, bool useMove, const char* context,
                                              const std::string& displayTypeName,
@@ -34612,6 +34994,39 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
         sourceObject.TypeAndValue.TypeName = typeName;
         constSource = constSource || CxxConstReceiverKind(sourceObject) != 0;
         sourceObject.IsTopLevelConst = constSource;
+        const CxxClassInfo* implicitInfo = GetCxxClassInfo(typeName);
+        if (!useMove && !constSource && implicitInfo != nullptr
+            && implicitInfo->hasCtorTemplate && implicitInfo->hasTrivialCopyCtor
+            && !implicitInfo->hasDeletedCopyCtor
+            && cxxTriviallyCopyableRecords_.count(typeName) != 0)
+        {
+            SameClassCopyRequest request;
+            std::string wrapperError;
+            if (!RequestSameClassCopy(typeName, sourceObject, constSource, request, wrapperError))
+            {
+                LogError(std::format(
+                    "cannot copy C++ class '{}' {}: clang could not resolve its same-class "
+                    "constructor",
+                    displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName,
+                    context));
+                return false;
+            }
+            if (request.requested && request.pick != "__cflat_ctor_pick_copy_move")
+            {
+                llvm::Function* wrapper = FindCxxWrapperFunction(request.wrapperName);
+                if (wrapper == nullptr)
+                {
+                    LogError(std::format(
+                        "cannot copy C++ class '{}' {}: clang selected a constructor but its "
+                        "generated wrapper could not be called",
+                        displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName,
+                        context));
+                    return false;
+                }
+                builder->CreateCall(wrapper->getFunctionType(), wrapper, { dest, src });
+                return true;
+            }
+        }
         const CxxClassInfo::Structor* ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
         if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource);
         // A class first constructed through a generated wrapper (a CFlat closure into
@@ -34625,7 +35040,6 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
         if (ctor == nullptr)
         {
             // An implicit trivial copy constructor (clang's verdict) has no symbol: a byte copy.
-            const CxxClassInfo* implicitInfo = GetCxxClassInfo(typeName);
             if (implicitInfo != nullptr && !implicitInfo->hasDeletedCopyCtor)
             {
                 auto* recordType = GetType(TypeAndValue{ .TypeName = typeName });

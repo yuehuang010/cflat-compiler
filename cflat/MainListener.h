@@ -10944,8 +10944,8 @@ public:
         llvm::Value* slot, LLVMBackend::NamedVariable& sourceNV, llvm::Value* sourceValue,
         antlr4::ParserRuleContext* ctx, const char* context = "into construct_at storage");
 
-    // Construct one foreign nontrivial C++ value into a fresh or replacement slot. This is
-    // shared by scalar struct fields and fixed-array elements so their copy/move decisions agree.
+    // Construct a foreign C++ value into a fresh or replacement slot when overload selection
+    // matters. Shared by scalar fields and fixed-array elements so copy/move decisions agree.
     bool EmitForeignCxxValueIntoSlot(
         const LLVMBackend::TypeAndValue& destType,
         llvm::Value* destination,

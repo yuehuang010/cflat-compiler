@@ -18,12 +18,16 @@ clang++ -std=c++20 before changing the transfer path.
   "cannot initialize C++ class ... from this expression" (master too); clang accepts, 2,0,0,1. T239 r1 armed the slot
   for it and produced invalid IR (`sub ptr`), so a unary operand containing a call is not armed; arming it needs a
   ParseCxxFoldOperand scope around the unary operand in ParseUnaryExpression.
-- A ternary as the operand of a free by-value operator, `(k ? C(1) : C(2)) + b` (also `b + (k ? ...)`; the
-  returned form `return (k ? C(1) : C(2)) + C(3)` moves once more, 3,0,1,3 vs clang 3,0,0,2): one extra move
-  (master 2,1,1,3; clang 2,1,0,2). The same extra move
-  happens for a ternary prvalue passed to a plain by-value parameter, `use(k ? C(1) : C(2))` (1,0,1,2 vs
-  clang 1,0,0,1), so the cause is the call-argument path, not the operator route. Not fixed in T246.
 
 - (T246 review 1, pre-existing; repros scratch/repro_keep/t246_rev/cases/) subscript operands of a by-value operator
   keep one extra temp: `(vv[0] + b)` 1,2,1,3 (clang 1,2,0,2), `(vv[0] * b)`, `(vr[0] * b)`; `(-vv[1])` one extra copy,
   bare `-vv[1]` / `-vr[1]` refused; `auto z = k ? move a : C(2)` and `k ? (move a) : C(2)` still copy (paren hides move).
+
+## Left after TERNELIDE (92c0054a, 2026-10-30 box 7; Opus reviews, repros scratch/repro_keep/ternelide/ w/x/y/z .cb + .cpp twins, w.hpp)
+- Same-class prvalue conditional (and plain prvalue) into `gen<T>(...)`, `function<>` and `Lambda<>` calls: one extra move (indirect /
+  generic call path has no elision). Counts balanced.
+- Hidden-friend and function-template `operator<<` with a prvalue/conditional lhs: one extra move (`k8 kmv8 hfr kd8 kd-8` vs clang
+  `k8 hfr kd8`); same for a plain prvalue lhs.
+- Compound assignment with a conditional rhs, `a += (k ? C(1) : C(2))`, is outside the operand gate (not probed against clang).
+- `use(C(f(D(1))))`: D destroyed right after f returns (clang: end of full expression). MS ABI: `use2(k ? C(1) : C(2), b)` with a
+  throwing copy ctor for b - the first slot is already handed to the callee, an unwind there leaks it (same as `use2(C(1), b)`).

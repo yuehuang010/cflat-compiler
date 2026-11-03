@@ -1,0 +1,70 @@
+import "unique.cb";
+
+struct ReturnStatementTemp { int value = 0; ~ReturnStatementTemp() { } };
+unique ReturnStatementTemp* returnTempBuiltin(int value)
+{
+    unique ReturnStatementTemp* owner = new ReturnStatementTemp();
+    owner->value = value;
+    return move owner;
+}
+move unique<ReturnStatementTemp> returnTempLibrary(int value)
+{
+    ReturnStatementTemp* owner = new ReturnStatementTemp();
+    owner->value = value;
+    return unique<ReturnStatementTemp>(owner);
+}
+ReturnStatementTemp* returnTempIdentity(ReturnStatementTemp* value) { return value; }
+ReturnStatementTemp* returnTempAddressAlias(alias ReturnStatementTemp value) { return &value; }
+alias int returnTempAliasField(ReturnStatementTemp* value) { return value->value; }
+(const char)* returnTempStringIdentity((const char)* value) { return value; }
+
+expect_error("cannot return the address") {
+    ReturnStatementTemp* returnBuiltinTemp()
+    {
+        return returnTempIdentity(returnTempBuiltin(1));
+    }
+}
+
+expect_error("cannot return the address") {
+    ReturnStatementTemp* returnLibraryOwnerTemp()
+    {
+        return returnTempIdentity(returnTempLibrary(6));
+    }
+}
+
+expect_error("cannot return the address") {
+    ReturnStatementTemp* returnLibraryGetTemp()
+    {
+        return returnTempIdentity(returnTempLibrary(2).get());
+    }
+}
+
+expect_error("cannot return the address") {
+    ReturnStatementTemp* returnBuiltinReferenceTemp()
+    {
+        return returnTempAddressAlias(*returnTempBuiltin(3));
+    }
+}
+
+expect_error("cannot return the address") {
+    ReturnStatementTemp* returnLibraryReferenceTemp()
+    {
+        return returnTempAddressAlias(*returnTempLibrary(4));
+    }
+}
+
+expect_error("cannot return an 'alias' value") {
+    alias int returnAliasFromBuiltinTemp()
+    {
+        return returnTempAliasField(returnTempBuiltin(5));
+    }
+}
+
+expect_error("cannot return the address") {
+    (const char)* returnStringTemp()
+    {
+        return returnTempStringIdentity("statement-temp".copy().data());
+    }
+}
+
+extern int main() { return 0; }

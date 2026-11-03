@@ -12766,6 +12766,52 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             argNV.CxxEarlyCopyDecision = decision;
                                         }
                                     }
+                                    // A trivial by-value C++ argument normally crosses in registers,
+                                    // so materialize only when clang selects a forwarding ctor.
+                                    if (funcSym != nullptr && funcSym->IsCxx
+                                        && !funcSym->UniqueName.starts_with("__cflat_")
+                                        && declaredIdx[argIdx] >= 0
+                                        && static_cast<size_t>(declaredIdx[argIdx])
+                                            < funcSym->Parameters.size()
+                                        && !Compiler(ctx)->IsCxxReferenceParameter(
+                                            *funcSym, static_cast<size_t>(declaredIdx[argIdx]))
+                                        && argNV.Storage != nullptr && !argNV.IsRvalue
+                                        && !argNV.IsExplicitMove && !argNV.IsTopLevelConst
+                                        && Compiler(ctx)->CxxConstReceiverKind(argNV) == 0
+                                        && !argNV.TypeAndValue.Pointer
+                                        && argNV.TypeAndValue.TypeName == argExpectedDest.TypeName
+                                        && Compiler(ctx)->IsCxxTriviallyCopyableRecord(
+                                            argExpectedDest.TypeName))
+                                    {
+                                        auto* backend = Compiler(ctx);
+                                        if (const auto* info = backend->GetCxxClassInfoWithConstructors(
+                                                argExpectedDest.TypeName);
+                                            info != nullptr && info->hasCtorTemplate)
+                                        {
+                                            std::string wrapperError;
+                                            LLVMBackend::NamedVariable source = argNV;
+                                            source.TypeAndValue.VariableName.clear();
+                                            LLVMBackend::SameClassCopyRequest request;
+                                            if (!backend->RequestSameClassCopy(
+                                                    argExpectedDest.TypeName, source, /*constSource*/ false,
+                                                    request, wrapperError))
+                                            {
+                                                LogErrorContext(namedArgument, std::format(
+                                                    "cannot copy C++ class '{}' for a by-value argument: clang could not resolve its same-class constructor",
+                                                    backend->DisplayCxxClassName(argExpectedDest.TypeName)));
+                                                cxxCallRefused = true;
+                                                return;
+                                            }
+                                            if (request.requested && request.pick != "__cflat_ctor_pick_copy_move")
+                                            {
+                                                auto constructed = argNV;
+                                                backend->ConstructThroughCxxCtorWrapper(
+                                                    constructed, source, argExpectedDest.TypeName,
+                                                    request.wrapperName, nullptr);
+                                                argNV = std::move(constructed);
+                                            }
+                                        }
+                                    }
                                     // T235: a C++ class prvalue before a direct construction keeps it out of
                                     // the wrapper, whose by-value param would move the prvalue (clang: 0).
                                     if (cxxDirectConstructionCallOrderSafe_ != nullptr && argNV.IsRvalue

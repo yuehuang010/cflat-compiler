@@ -2332,6 +2332,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 // A new-expression result (`(new R())->v`) has no owner that outlives the frame.
                 if (compiler->IsOwnedNewTemp(value)) return true;
                 if (IsFrameOwnedBorrowingMemberCall(compiler, value)) return true;
+                if (call != nullptr && call->getType()->isPointerTy())
+                {
+                    bool statementOwnedTempRoot = false;
+                    CallResultFrameBorrowKind(call, compiler, currentFn, nullptr,
+                                              &statementOwnedTempRoot);
+                    if (statementOwnedTempRoot) return true;
+                }
                 if (call == nullptr || call->getCalledFunction() == nullptr) return false;
                 const auto* symbol = compiler->FindSymbolForFunction(call->getCalledFunction());
                 if (symbol == nullptr || symbol->IsCxx || symbol->ReturnType.Pointer
@@ -2670,6 +2677,15 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 }
                 frameLocalPointerReturn = PointsIntoStackFrame(value)
                     || IsFrameOwnedBorrowingMemberCall(compiler, value);
+                if (!frameLocalPointerReturn)
+                    if (auto* borrowedCall = llvm::dyn_cast<llvm::CallBase>(value);
+                        borrowedCall != nullptr && borrowedCall->getType()->isPointerTy())
+                    {
+                        bool statementOwnedTempRoot = false;
+                        CallResultFrameBorrowKind(borrowedCall, compiler, currentFn, nullptr,
+                                                  &statementOwnedTempRoot);
+                        frameLocalPointerReturn = statementOwnedTempRoot;
+                    }
                 if (frameLocalPointerReturn && armJoin != nullptr)
                     frameLocalArmJoin = armJoin;
                 if (!frameLocalPointerReturn && armJoin != nullptr && isCflatAliasCall(value))
@@ -6221,6 +6237,7 @@ void MainListener::GenerateDefaultParamOverloads(
             // Fresh straight-line for the wrapper body; restore the enclosing walk's flag on exit.
             ReturnFlagGuard wrapperReturnFlagGuard(&straightLineReturned_);
             straightLineReturned_ = false;
+            const auto wrapperTempMark = compiler->MarkOwnedTemps();
 
             // Clear each arg's VariableName: MatchFunction treats a non-empty VariableName as a
             // NAMED argument, which hard-errors on same-named methods of unrelated types instead of rejecting.
@@ -6238,11 +6255,62 @@ void MainListener::GenerateDefaultParamOverloads(
                 callArgs.push_back(arg);
             }
 
+            bool wrapperHasCxxDefault = false;
             for (int i = cutoff; i < (int)params.size(); i++)
             {
                 auto* initCtx = params[i].DefaultValue;
                 llvm::Value* defaultVal = nullptr;
+                LLVMBackend::NamedVariable defaultArg;
                 bool defaultIsUnsigned = false;
+                // By-value C++ class or CFlat holder default: its owned temps are wrapper-flushed.
+                const bool cxxHolderDefault = !params[i].Pointer && !params[i].IsAlias
+                    && !params[i].IsRvalueRef && compiler->HasCxxClassMember(params[i].TypeName);
+                const bool cxxClassDefault = cxxHolderDefault && compiler->IsCxxRecord(params[i].TypeName);
+                // A C++ class default is built into an owned slot like a 'T(args)' prvalue, so the
+                // callee binds it as an owned argument and the wrapper flush destroys it.
+                auto buildCxxDefaultSlot = [&](antlr4::ParserRuleContext* where, bool emptyBrace) {
+                    const std::string& typeName = params[i].TypeName;
+                    if (compiler->IsForeignNontrivialCxxClass(typeName)
+                        && !compiler->HasTrivialCxxDtor(typeName)
+                        && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
+                    {
+                        compiler->TryBindRefusedCxxMember(typeName, "__dtor");
+                        if (compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
+                            LogErrorContext(where, std::format(
+                                "cannot use a default of C++ class '{}': it has no destructor cflat can "
+                                "call (the destructor is implicit or defined inline in the header)",
+                                compiler->DisplayCxxClassName(typeName)));
+                    }
+                    auto* objectType = compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                    auto* slot = compiler->AllocaAtEntry(objectType, nullptr, "cxx.default.arg");
+                    bool constructed = true;
+                    if (emptyBrace)
+                        EmitCxxEmptyBraceConstruct(slot, typeName, where, true);
+                    else
+                    {
+                        std::string implicitCtorError;
+                        compiler->TryBindCxxImplicitDefaultCtor(typeName, implicitCtorError);
+                        if (!implicitCtorError.empty()) LogErrorContext(where, implicitCtorError);
+                        const auto* ctor = compiler->FindCxxDefaultCtor(typeName);
+                        if (ctor == nullptr)
+                        {
+                            LogErrorContext(where, std::format(
+                                "C++ class '{}' has no default constructor cflat can call - write a "
+                                "constructor call as the default instead", compiler->DisplayCxxClassName(typeName)));
+                            constructed = false;
+                        }
+                        else
+                            compiler->EmitCxxStructorCall(typeName, *ctor, slot, {});
+                    }
+                    if (constructed)
+                        compiler->RegisterOwnedStructTemp(slot, typeName);
+                    defaultArg = {};
+                    defaultArg.BaseType = objectType;
+                    defaultArg.Storage = slot;
+                    defaultArg.IsRvalue = true;
+                    defaultArg.IsCxxPrvalueTemp = true;
+                    defaultVal = compiler->CreateLoad(objectType, slot);
+                };
                 if (auto* ae = initCtx->assignmentExpression())
                 {
                     // Default arguments are lowered in a synthesized forwarding wrapper, but a
@@ -6257,6 +6325,7 @@ void MainListener::GenerateDefaultParamOverloads(
                     // Parameter-DEFAULT leg of the code-value store gate: `f(Rec* p = ro)` put a
                     // code address in the omitted argument's slot and the body wrote through it.
                     auto defNV = ParseAssignmentExpressionNamed(ae);
+                    defaultArg = defNV;
                     defaultVal = LoadNamedVariable(defNV);
                     defaultIsUnsigned = defNV.TypeAndValue.IsUnsignedInteger() != -1;
                     RejectCodeValueIntoDataSlot(ae, defNV, params[i], "default-initialize",
@@ -6283,7 +6352,8 @@ void MainListener::GenerateDefaultParamOverloads(
                 }
                 else if (initCtx->Default())
                 {
-                    defaultVal = GenerateDefaultValue(params[i]);
+                    if (cxxClassDefault) buildCxxDefaultSlot(initCtx, false);
+                    else defaultVal = GenerateDefaultValue(params[i]);
                 }
                 else if (initCtx->LeftBrace() != nullptr)
                 {
@@ -6332,7 +6402,8 @@ void MainListener::GenerateDefaultParamOverloads(
                     }
 
                     // Field initializer default: build the struct, apply overrides, pass by value.
-                    defaultVal = GenerateDefaultValue(params[i]);
+                    if (cxxClassDefault && initList == nullptr) buildCxxDefaultSlot(initCtx, true);
+                    else defaultVal = GenerateDefaultValue(params[i]);
                     if (defaultVal && initList != nullptr)
                     {
                         auto* alloca = compiler->CreateAlloca(defaultVal->getType());
@@ -6369,11 +6440,12 @@ void MainListener::GenerateDefaultParamOverloads(
                     }
                 }
 
-                LLVMBackend::NamedVariable namedVar;
+                wrapperHasCxxDefault = wrapperHasCxxDefault || cxxHolderDefault;
+                LLVMBackend::NamedVariable namedVar = cxxHolderDefault ? defaultArg : LLVMBackend::NamedVariable{};
                 namedVar.Primary = defaultVal;
                 namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
-                namedVar.TypeAndValue.TypeName = params[i].TypeName;
-                namedVar.TypeAndValue.Pointer = params[i].Pointer;
+                namedVar.TypeAndValue = params[i];
+                namedVar.TypeAndValue.VariableName.clear();
                 // Naming the PARAMETER type would sign-extend an unsigned default into a wider
                 // slot; carry the default expression's own unsigned width instead.
                 if (defaultIsUnsigned && defaultVal != nullptr && defaultVal->getType()->isIntegerTy()
@@ -6409,6 +6481,12 @@ void MainListener::GenerateDefaultParamOverloads(
             if (returnType.TypeName == "void")
             {
                 compiler->CreateOverloadedFunctionCall(name, callArgs);
+                if (wrapperHasCxxDefault)
+                {
+                    // Native temps (defaults and call-made argtemps) keep master's leak.
+                    compiler->DropNonCxxOwnedTempsSince(wrapperTempMark);
+                    compiler->FlushOwnedTempsSince(wrapperTempMark, nullptr);
+                }
                 compiler->CreateReturnCall(nullptr);
             }
             else
@@ -6436,6 +6514,12 @@ void MainListener::GenerateDefaultParamOverloads(
                     compiler->pendingCxxSretTypeName_.clear();
                     compiler->pendingCxxSretReturn_ = false;
                     compiler->pendingCxxSretForFixedArray_ = false;
+                }
+                if (wrapperHasCxxDefault)
+                {
+                    compiler->DropNonCxxOwnedTempsSince(wrapperTempMark);
+                    compiler->FlushOwnedTempsSince(wrapperTempMark,
+                        builtInPlace ? nullptr : result, nullptr, true);
                 }
                 compiler->CreateReturnCall(builtInPlace ? nullptr : result);
             }
