@@ -1,0 +1,92 @@
+int tFieldLocalSelfInt = 9;
+int tFieldLocalSelfAdd = 9;
+int tFieldLocalSelfArgument = 9;
+int tFieldLocalSelfIdentity(int value) { return value; }
+struct TFieldLocalSelfValue { int value = 6; };
+TFieldLocalSelfValue tFieldLocalSelfValue = default;
+int tFieldLocalPointee = 12;
+int* tFieldLocalSelfPointer = &tFieldLocalPointee;
+int tFieldLocalSelfLambda = 14;
+int tFieldLocalSelfFor = 12;
+
+expect_error("'tFieldLocalSelfInt' is read in its own initializer") {
+    int tFieldLocalSelfIntError() {
+        int tFieldLocalSelfInt = tFieldLocalSelfInt;
+        return tFieldLocalSelfInt;
+    }
+}
+
+expect_error("'tFieldLocalSelfAdd' is read in its own initializer") {
+    int tFieldLocalSelfAddError() {
+        int tFieldLocalSelfAdd = tFieldLocalSelfAdd + 1;
+        return tFieldLocalSelfAdd;
+    }
+}
+
+expect_error("'tFieldLocalSelfArgument' is read in its own initializer") {
+    int tFieldLocalSelfArgumentError() {
+        int tFieldLocalSelfArgument = tFieldLocalSelfIdentity(tFieldLocalSelfArgument);
+        return tFieldLocalSelfArgument;
+    }
+}
+
+expect_error("'tFieldLocalSelfValue' is read in its own initializer") {
+    int tFieldLocalSelfValueError() {
+        TFieldLocalSelfValue tFieldLocalSelfValue = tFieldLocalSelfValue;
+        return tFieldLocalSelfValue.value;
+    }
+}
+
+expect_error("'tFieldLocalSelfPointer' is read in its own initializer") {
+    int tFieldLocalSelfPointerError() {
+        int* tFieldLocalSelfPointer = tFieldLocalSelfPointer;
+        return *tFieldLocalSelfPointer;
+    }
+}
+
+expect_error("'tFieldLocalSelfLambda' is read in its own initializer") {
+    int tFieldLocalSelfLambdaError() {
+        Lambda<int()> tFieldLocalSelfLambda = () => { return tFieldLocalSelfLambda; };
+        return tFieldLocalSelfLambda();
+    }
+}
+
+expect_error("'tFieldLocalSelfFor' is read in its own initializer") {
+    int tFieldLocalSelfForError() {
+        int sum = 0;
+        for (int tFieldLocalSelfFor = tFieldLocalSelfFor;
+             tFieldLocalSelfFor < 13;
+             tFieldLocalSelfFor = tFieldLocalSelfFor + 1)
+            sum += tFieldLocalSelfFor;
+        return sum;
+    }
+}
+
+expect_error("'tFieldLocalNested' is read in its own initializer") {
+    int tFieldLocalNestedError() {
+        int tFieldLocalNested = 1;
+        { int tFieldLocalNested = tFieldLocalNested; return tFieldLocalNested; }
+    }
+}
+
+expect_error("'tFieldLocalSelfDerefAddress' is read in its own initializer") {
+    int tFieldLocalSelfDerefAddressError() {
+        int tFieldLocalSelfDerefAddress = *&tFieldLocalSelfDerefAddress;
+        return tFieldLocalSelfDerefAddress;
+    }
+}
+
+expect_error("'tFieldLocalSelfDerefAddressArith' is read in its own initializer") {
+    int tFieldLocalSelfDerefAddressArithError() {
+        int tFieldLocalSelfDerefAddressArith = *(&tFieldLocalSelfDerefAddressArith + 0);
+        return tFieldLocalSelfDerefAddressArith;
+    }
+}
+
+expect_error("'tFieldLocalNestedSelfDerefAddress' is read in its own initializer") {
+    int tFieldLocalNestedSelfDerefAddressError() {
+        int tFieldLocalNestedSelfDerefAddress = 5;
+        { int tFieldLocalNestedSelfDerefAddress = *&tFieldLocalNestedSelfDerefAddress;
+          return tFieldLocalNestedSelfDerefAddress; }
+    }
+}

@@ -4748,7 +4748,7 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
 
 int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const std::string& methodName,
         const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
-        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot)
+        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot, bool constReceiver)
 {
         matchedArgs = args;
         fallbackDefaultSlot = -1;
@@ -4771,6 +4771,7 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
         NamedVariable receiverArg;
         receiverArg.TypeAndValue.TypeName = ifaceName;
         receiverArg.TypeAndValue.Pointer = true;
+        receiverArg.TypeAndValue.ConstMask = 0;
         receiverArg.TypeAndValue.IsInterface = true;
         receiverArg.TypeAndValue.IsInterfacePointer = true;
         receiverArg.TypeAndValue.VariableName = "this";
@@ -4801,6 +4802,15 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                     return sameMethodSignature(methods[inheritedIdx], methods[ownIdx]);
                 });
             if (!redeclared) byName.push_back(inheritedIdx);
+        }
+        const bool hasConstOverload = constReceiver
+            && std::any_of(byName.begin(), byName.end(), [&](int idx) {
+                return methods[idx].IsConst;
+            });
+        if (hasConstOverload)
+        {
+            receiverArg.TypeAndValue.ConstMask = 1u;
+            std::erase_if(byName, [&](int idx) { return !methods[idx].IsConst; });
         }
         if (byName.empty())
         {
@@ -5014,25 +5024,75 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                         }
                     }
                 }
+                auto isObjectPointer = [&](const TypeAndValue& type) {
+                    return type.Pointer && !type.IsInterface && !type.IsFunctionPointer
+                        && !type.IsArrayView && type.ValuePointerDepth() == 1
+                        && !type.ElemPointer && !type.TypeName.empty()
+                        && IsDataStructure(type.TypeName);
+                };
                 const bool unrankedObjectPointers = !args.empty()
                     && std::all_of(args.begin(), args.end(), [&](const NamedVariable& arg) {
-                        return arg.TypeAndValue.Pointer && !arg.TypeAndValue.TypeName.empty()
-                            && IsDataStructure(arg.TypeAndValue.TypeName);
+                        return isObjectPointer(arg.TypeAndValue);
                     })
                     && std::all_of(byName.begin(), byName.end(), [&](int idx) {
                         const auto& params = methods[idx].Parameters;
                         return params.size() == args.size()
                             && std::all_of(params.begin(), params.end(), [&](const TypeAndValue& param) {
-                                return param.Pointer && !param.TypeName.empty()
-                                    && IsDataStructure(param.TypeName);
+                                return isObjectPointer(param);
                             });
                     });
                 if (unrankedObjectPointers)
                 {
-                    matchedArgs = std::move(diagnosticArgs);
-                    return firstSlot;
+                    int pointerSlot = -1;
+                    size_t bestDerivedCount = SIZE_MAX;
+                    bool tiedPointerSlots = false;
+                    for (int idx : exactSlots)
+                    {
+                        const auto& params = methods[idx].Parameters;
+                        bool related = params.size() == args.size();
+                        size_t derivedCount = 0;
+                        for (size_t i = 0; related && i < args.size(); ++i)
+                        {
+                            const TypeAndValue& actual = args[i].TypeAndValue;
+                            const TypeAndValue& param = params[i];
+                            if (actual.ValuePointerDepth() != param.ValuePointerDepth()
+                                || (actual.ConstMask & ~param.ConstMask) != 0)
+                            {
+                                related = false;
+                                break;
+                            }
+                            const bool exactPointee = ResolveTypeAlias(actual.TypeName)
+                                == ResolveTypeAlias(param.TypeName);
+                            const bool derivedPointee = !exactPointee
+                                && IsCxxRecord(actual.TypeName) && IsCxxRecord(param.TypeName)
+                                && IsCxxBaseOf(param.TypeName, actual.TypeName);
+                            if (derivedPointee) ++derivedCount;
+                            else if (!exactPointee) related = false;
+                        }
+                        if (!related) continue;
+                        if (derivedCount < bestDerivedCount)
+                        {
+                            pointerSlot = idx;
+                            bestDerivedCount = derivedCount;
+                            tiedPointerSlots = false;
+                        }
+                        else if (derivedCount == bestDerivedCount)
+                            tiedPointerSlots = true;
+                    }
+                    if (tiedPointerSlots)
+                    {
+                        LogError(std::format("ambiguous call to '{}.{}' with object pointer arguments",
+                                             displayIface, methodName));
+                        return -1;
+                    }
+                    if (pointerSlot >= 0)
+                    {
+                        auto matched = MatchFunction(args, methods[pointerSlot].Parameters);
+                        if (!matched.empty()) matchedArgs = std::move(matched);
+                        return pointerSlot;
+                    }
                 }
-                // Keep exact/widening scalar calls whose conversion is lowered but not ranked.
+                // Keep exact calls and safely lowerable scalar widenings.
                 bool safelyLowerableScalars = diagnosticArgs.size() == firstMethod.Parameters.size();
                 for (size_t i = 0; safelyLowerableScalars && i < diagnosticArgs.size(); ++i)
                 {
@@ -5040,10 +5100,10 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                         diagnosticArgs[i], firstMethod.Parameters[i]);
                     safelyLowerableScalars = conversion == ScalarArgConversion::Exact
                         || conversion == ScalarArgConversion::Widen;
+                    auto* targetType = GetType(firstMethod.Parameters[i]);
                     if (safelyLowerableScalars && diagnosticArgs[i].BaseType != nullptr
                         && diagnosticArgs[i].BaseType->isFloatingPointTy())
                     {
-                        auto* targetType = GetType(firstMethod.Parameters[i]);
                         if (targetType != nullptr && targetType->isFloatingPointTy()
                             && diagnosticArgs[i].BaseType->getPrimitiveSizeInBits().getFixedValue()
                                 > targetType->getPrimitiveSizeInBits().getFixedValue())
@@ -5137,35 +5197,50 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             return CreateOverloadedFunctionCall(wrapperMethod.DefaultWrapperName, helperArgs,
                                                 false, displayMethod);
         };
-        if (userReceiver != nullptr)
+        const bool constReceiver = userReceiver != nullptr
+            && (userReceiver->TypeAndValue.ConstMask & 1u) != 0;
+        if (constReceiver)
         {
             std::string constObject, constReason;
             if (ConstReceiverReason(*userReceiver, constObject, constReason))
             {
-                std::vector<int> bindableSlots;
+                bool hasConstBindable = false;
+                std::vector<int> bindableNonConstSlots;
                 for (int i = 0; i < static_cast<int>(ifaceMethods->size()); ++i)
                 {
                     const auto& method = (*ifaceMethods)[i];
-                    if (method.Name != methodName || method.Parameters.size() != extraArgNVs.size())
-                        continue;
+                    if (method.Name != methodName) continue;
+                    if (method.Parameters.size() != extraArgNVs.size()) continue;
                     auto bound = MatchFunction(extraArgNVs, method.Parameters, false, true);
-                    if (bound.size() == extraArgNVs.size()) bindableSlots.push_back(i);
+                    bool methodBinds = bound.size() == extraArgNVs.size();
+                    for (size_t argIndex = 0; methodBinds && argIndex < extraArgNVs.size(); ++argIndex)
+                    {
+                        auto* targetType = GetType(method.Parameters[argIndex]);
+                        const auto conversion = ClassifyScalarArgConversion(
+                            extraArgNVs[argIndex], method.Parameters[argIndex]);
+                        if (conversion == ScalarArgConversion::Widen
+                            && extraArgNVs[argIndex].BaseType != nullptr
+                            && extraArgNVs[argIndex].BaseType->isIntegerTy()
+                            && targetType != nullptr && targetType->isFloatingPointTy())
+                            methodBinds = false;
+                    }
+                    if (!methodBinds) continue;
+                    if (method.IsConst) hasConstBindable = true;
+                    else bindableNonConstSlots.push_back(i);
                 }
-                if (bindableSlots.size() == 1 && !(*ifaceMethods)[bindableSlots.front()].IsConst)
+                if (!hasConstBindable && bindableNonConstSlots.size() == 1)
                 {
-                    const auto& method = (*ifaceMethods)[bindableSlots.front()];
-                    auto bound = MatchFunction(extraArgNVs, method.Parameters, false, true);
-                    if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, bound,
-                                                              method.Parameters))
-                        return nullptr;
-                    RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName);
+                    const auto& method = (*ifaceMethods)[bindableNonConstSlots.front()];
+                    RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName, &method);
+                    return nullptr;
                 }
             }
         }
         std::vector<NamedVariable> callArgNVs;
         int fallbackDefaultSlot = -1;
         int methodIdx = ResolveInterfaceMethodSlot(ifaceName, methodName, *ifaceMethods,
-                                                   extraArgNVs, callArgNVs, fallbackDefaultSlot);
+                                                   extraArgNVs, callArgNVs, fallbackDefaultSlot,
+                                                   constReceiver);
         if (methodIdx < 0)
         {
             if (fallbackDefaultSlot >= 0)

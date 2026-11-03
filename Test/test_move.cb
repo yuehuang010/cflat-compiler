@@ -17127,6 +17127,19 @@ void t490SaveNullableMid(int value)
 int t490NullableReadScalar(T490NullableNode* value) { return value?.scalar ?? -1; }
 int t490NullableReadChain(T490NullableNode* value) { return value?.next?.leaf?.Read() ?? -1; }
 
+int tCalleeRefElemDtors = 0;
+struct TCalleeRefElem
+{
+    int value = 0;
+    TCalleeRefElem(int v) { value = v; }
+    ~TCalleeRefElem() { tCalleeRefElemDtors = tCalleeRefElemDtors + 1; }
+};
+struct TCalleeRefBig { i64 a, b, c; };
+extern void tCalleeRefExternSink(move TCalleeRefElem* p) { }
+void tCalleeRefForward(move TCalleeRefElem* p) { tCalleeRefExternSink(move p); }
+int tCalleeRefFlatSink(TCalleeRefBig b, move TCalleeRefElem* p) { return 0; }
+void tCalleeRefDirectRead(int* p) { int ignored = *p; }
+
 extern int main()
 {
     int passed = 0;
@@ -18070,7 +18083,7 @@ extern int main()
     total += 15;
 
     passed += testT364NativeOperatorReturnFacts();
-    total += 93; // mvfield legs, including NULLARG round 3
+    total += 97; // mvfield legs and four CALLEEREF accept-set legs
     passed += testT523ByrefClosureRebind();
     total += 15;
     total += 3; // T499 branch, loop and for-increment reassign legs
@@ -24312,5 +24325,24 @@ int testT364NativeOperatorReturnFacts()
         t490TakePlain(move local);
         int movedRead = local.value;
     }
+
+    tCalleeRefElemDtors = 0;
+    tCalleeRefDirectRead(&(new TCalleeRefElem(0))->value);
+    passed += Test("calleeref ordinary direct call temp dtor", tCalleeRefElemDtors, 1);
+
+    tCalleeRefElemDtors = 0;
+    tCalleeRefExternSink(new TCalleeRefElem(1));
+    passed += Test("calleeref extern scalar move dtor", tCalleeRefElemDtors, 1);
+
+    tCalleeRefElemDtors = 0;
+    tCalleeRefForward(new TCalleeRefElem(2));
+    passed += Test("calleeref unknown provenance pass-through dtor", tCalleeRefElemDtors, 1);
+
+    tCalleeRefElemDtors = 0;
+    TCalleeRefElem* tCalleeRefArray = new TCalleeRefElem[3];
+    TCalleeRefBig tCalleeRefBig = { a = 1, b = 2, c = 3 };
+    function<int(TCalleeRefBig, move TCalleeRefElem*)> tCalleeRefArrayFn = tCalleeRefFlatSink;
+    tCalleeRefArrayFn(tCalleeRefBig, move tCalleeRefArray);
+    passed += Test("calleeref nonextern function array count dtor", tCalleeRefElemDtors, 3);
     return passed;
 }

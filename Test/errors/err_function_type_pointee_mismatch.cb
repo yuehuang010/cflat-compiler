@@ -1,3 +1,5 @@
+import "c_fnabi2_long.h";
+
 int t427FromVoid(void* p) { return 41; }
 int t427FromChar(char* p) { return 42; }
 int t427FromConstVoid(const void* p) { return 43; }
@@ -257,5 +259,65 @@ expect_error("cannot pass parameter 'p' of 'fnvbScalarFieldErrorTarget' of type 
         o.y = 12;
         function<int(int*)> fn = fnvbScalarFieldErrorTarget;
         fn(o.y);
+    }
+}
+
+// LP64 long and i64 are both 64-bit, but remain distinct pointee type identities.
+void fnabiFromLong(long* p) { }
+void fnabiFromI64(i64* p) { }
+expect_error("cannot bind function 'fnabiFromLong'") {
+    void fnabiLongI64Binding() { function<void(i64*)> slot = fnabiFromLong; }
+}
+extern int fnabiExternLong(long* p);
+expect_error("cannot bind function 'fnabiExternLong'") {
+    void fnabiLongI64ExternBinding() { function<int(i64*)> slot = fnabiExternLong; }
+}
+expect_error("cannot bind function 'fnabiFromLong'") {
+    void fnabiLongI64Assignment() {
+        function<void(i64*)> slot = fnabiFromI64;
+        slot = fnabiFromLong;
+    }
+}
+int fnabiTakeI64(function<int(i64*)> cb) { return cb(nullptr); }
+int fnabiCallFromLong(long* p) { return 1; }
+expect_error("no overload of 'fnabiTakeI64' matches the given arguments") {
+    void fnabiLongI64CallArgument() { fnabiTakeI64(fnabiCallFromLong); }
+}
+i64* fnabiReturnI64() { return nullptr; }
+long* fnabiReturnLong() { return nullptr; }
+expect_error("cannot bind function 'fnabiReturnLong'") {
+    void fnabiLongI64Return() { function<i64*()> slot = fnabiReturnLong; }
+}
+
+int fnabiInnerI64(i64* p) { return 1; }
+int fnabiNestedFromLong(function<int(long*)> cb) { return cb(nullptr); }
+int fnabiNestedFromI64(function<int(i64*)> cb) { return cb(nullptr); }
+expect_error("cannot bind function 'fnabiNestedFromLong'") {
+    void fnabiNestedLongI64Binding() {
+        function<int(function<int(i64*)>)> slot = fnabiNestedFromLong;
+    }
+}
+expect_error("cannot bind function 'fnabiNestedFromLong'") {
+    void fnabiNestedLongI64Assignment() {
+        function<int(function<int(i64*)>)> slot = fnabiNestedFromI64;
+        slot = fnabiNestedFromLong;
+    }
+}
+int fnabiTakeLongCallback(function<int(long*)> cb) { return cb(nullptr); }
+expect_error("no overload of 'fnabiTakeLongCallback' matches the given arguments") {
+    void fnabiNestedLongI64CallArgument() { fnabiTakeLongCallback(fnabiInnerI64); }
+}
+
+// A plain C header keeps native-long identity inside the function-pointer signature.
+expect_error("cannot bind function 'fnabi2_c_take_long'") {
+    void fnabi2CFunctionLongI64Binding() {
+        function<int(i64*)> slot = fnabi2_c_take_long;
+    }
+}
+
+int fnabi2FromI64(i64* p) { return 1; }
+expect_error("cannot bind function 'fnabi2FromI64'") {
+    void fnabi2CCallbackLongI64Assignment() {
+        Fnabi2LongCallback slot = fnabi2FromI64;
     }
 }

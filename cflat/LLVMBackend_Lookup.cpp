@@ -1120,6 +1120,9 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
         }
         else
         {
+            if (!scalar.empty())
+                c.ScalarPointeeClass = resolved == "long" || resolved == "ulong"
+                    ? "long" : scalar;
             if (scalar == "v") { c.Known = true; c.Canon = "p:v"; return c; }
             if (!scalar.empty()) { c.Known = true; c.Canon = "p:" + scalar; return c; }
         }
@@ -1175,6 +1178,10 @@ bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const Func
             && a.ConstMask >= 0 && b.ConstMask >= 0 && a.ConstMask != b.ConstMask)
             return true;
         if (a.Canon != b.Canon) return true;
+        if (a.Canon.starts_with("p:") && b.Canon.starts_with("p:")
+            && !a.ScalarPointeeClass.empty() && !b.ScalarPointeeClass.empty()
+            && a.ScalarPointeeClass != b.ScalarPointeeClass)
+            return true;
         if (a.IsFunctionType != b.IsFunctionType) return true;
         if (a.IsFunctionType)
         {
@@ -1661,6 +1668,7 @@ std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::NamedVar
             for (size_t i = 0; i < sa.size(); i++)
                 if (!sa[i].Known || !sb[i].Known || sa[i].IsArrayView != sb[i].IsArrayView
                     || sa[i].Canon != sb[i].Canon
+                    || sa[i].ScalarPointeeClass != sb[i].ScalarPointeeClass
                     || sa[i].StructKey != sb[i].StructKey || sa[i].PointerDepth != sb[i].PointerDepth)
                     return false;
             return FuncPtrValueOwnershipReason(sig, slot, compareReturnOwnership).empty();

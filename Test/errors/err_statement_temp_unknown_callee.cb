@@ -117,3 +117,54 @@ expect_error("cannot pass an owning statement temporary to a callee whose retent
         }
     }
 }
+
+void t521ReadLambdaNoCapture(int* p) { int value = *p; }
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectLambdaNoCapture(Lambda<void(int*)> k)
+    {
+        k(&(new T521ErrorTemp(12))->value);
+    }
+    void t521UseLambdaNoCapture() { t521RejectLambdaNoCapture(t521ReadLambdaNoCapture); }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectLambdaCapture(Lambda<void(int*)> k)
+    {
+        k(&(new T521ErrorTemp(13))->value);
+    }
+    void t521UseLambdaCapture()
+    {
+        int captured = 0;
+        Lambda<void(int*)> k = (int* p) => { captured = *p; };
+        t521RejectLambdaCapture(k);
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectGenericLambda<F>(F k)
+    {
+        k(&(new T521ErrorTemp(14))->value);
+    }
+    void t521UseGenericLambda()
+    {
+        Lambda<void(int*)> k = t521ReadLambdaNoCapture;
+        t521RejectGenericLambda(k);
+    }
+}
+
+struct T521LambdaFieldHolder { Lambda<void(int*)> callback = default; };
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectLambdaField(T521LambdaFieldHolder* h)
+    {
+        h->callback(&(new T521ErrorTemp(15))->value);
+    }
+}
+
+expect_error("cannot pass an owning statement temporary to a callee whose retention cannot be proven") {
+    void t521RejectLambdaSafeCall(T521LambdaFieldHolder? h)
+    {
+        h?.callback(&(new T521ErrorTemp(16))->value);
+    }
+}

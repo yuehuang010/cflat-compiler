@@ -3688,15 +3688,25 @@ void LLVMBackend::RecordConstInterfaceImplementer(const FunctionSymbol& impl, co
 }
 
 void LLVMBackend::RefuseConstInterfaceReceiverCall(const NamedVariable& receiver, const std::string& ifaceName,
-                                                   const std::string& member)
+                                                   const std::string& member,
+                                                   const InterfaceMethod* matchingNonConst)
 {
     std::string object, reason;
     if (!ConstReceiverReason(receiver, object, reason)) return;
+    const std::string interfaceName = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
+    std::string overloadDetail;
+    if (matchingNonConst != nullptr)
+    {
+        std::string parameters;
+        for (const auto& param : matchingNonConst->Parameters)
+            parameters += (parameters.empty() ? "" : ", ") + SpellType(*this, param);
+        overloadDetail = std::format(" The matching overload '{}.{}({})' is not declared const.",
+            interfaceName, member, parameters);
+    }
     LogError(std::format(
         "cannot call non-const member '{}' on '{}': {}, so it is read-only and only a const "
-        "member function may be called on it. {}", member, object, reason,
-        std::format("'{}.{}' is not declared const in the interface.",
-                    SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), member)));
+        "member function may be called on it. '{}.{}' is not declared const in the interface.",
+        member, object, reason, interfaceName, member) + overloadDetail);
 }
 
 // The #8 / #10 text of a pending entry; #10 names what the implementer's body writes.

@@ -2743,6 +2743,46 @@ class OvlPointer : IOvlPointer
     int f(char* a) { return 12; }
 };
 
+interface IOvlRound1ConstOnly { int f(int a) const; };
+class OvlRound1ConstOnly : IOvlRound1ConstOnly { int f(int a) const { return 2; } };
+interface IOvlRound1NonConstOnly { int f(int a); };
+class OvlRound1NonConstOnly : IOvlRound1NonConstOnly { int f(int a) { return 1; } };
+interface IOvlRound1Mixed { int f(int a); int f(double a) const; };
+class OvlRound1Mixed : IOvlRound1Mixed
+{
+    int f(int a) { return 1; }
+    int f(double a) const { return 2; }
+};
+interface IOvlExactDouble { int f(double value); };
+class OvlExactDouble : IOvlExactDouble { int f(double value) { return 3; } };
+interface IOvlRound1Generic<T> { int f(T a); int f(double a) const; };
+class OvlRound1GenericImpl : IOvlRound1Generic<int>
+{
+    int f(int a) { return 1; }
+    int f(double a) const { return 2; }
+};
+struct OvlRound1PtrFirst { int value = 0; };
+struct OvlRound1PtrSecond { int value = 0; };
+interface IOvlRound1ObjectPointer
+{
+    int f(OvlRound1PtrFirst* a);
+    int f(OvlRound1PtrSecond* a);
+};
+class OvlRound1ObjectPointer : IOvlRound1ObjectPointer
+{
+    int f(OvlRound1PtrFirst* a) { return 1; }
+    int f(OvlRound1PtrSecond* a) { return 2; }
+};
+struct OvlRound1ConstField
+{
+    OvlRound1Mixed concrete;
+    IOvlRound1Mixed iface;
+};
+
+int ovlRound1ConstParamDirect(const OvlRound1Mixed value) { return value.f(1.0); }
+int ovlRound1ConstParamIface(const IOvlRound1Mixed value) { return value.f(1.0); }
+
+
 interface IOvlNamed { int g(int x, int y); int g(int x, long z); };
 class OvlNamed : IOvlNamed
 {
@@ -2850,6 +2890,58 @@ bool testInterfaceOverloadDispatch()
     result &= Test("iface_ov_pointer_concrete_null", pointers.f(nullptr), 11);
     result &= Test("iface_ov_pointer_null", pointerIface.f(nullptr), 11);
 
+    // Freeze the IFACEOVL round-1 accept-set before changing const viability or pointer fallback.
+    OvlRound1ConstOnly constOnlyImpl;
+    IOvlRound1ConstOnly constOnlyIface = constOnlyImpl;
+    OvlRound1NonConstOnly nonConstOnlyImpl;
+    IOvlRound1NonConstOnly nonConstOnlyIface = nonConstOnlyImpl;
+    OvlRound1Mixed mixedImpl;
+    IOvlRound1Mixed mixedIface = mixedImpl;
+    result &= Test("iface_ovl_r1_const_only_direct", constOnlyImpl.f(1), 2);
+    result &= Test("iface_ovl_r1_const_only_iface", constOnlyIface.f(1), 2);
+    result &= Test("iface_ovl_r1_nonconst_only_direct", nonConstOnlyImpl.f(1), 1);
+    result &= Test("iface_ovl_r1_nonconst_only_iface", nonConstOnlyIface.f(1), 1);
+    result &= Test("iface_ovl_r1_mixed_nonconst_direct", mixedImpl.f(1), 1);
+    result &= Test("iface_ovl_r1_mixed_nonconst_iface", mixedIface.f(1), 1);
+    OvlExactDouble exactDoubleImpl;
+    IOvlExactDouble exactDoubleIface = exactDoubleImpl;
+    result &= Test("iface_ovl_r3_exact_double_iface", exactDoubleIface.f(1.0), 3);
+    const OvlRound1ConstOnly constOnlyValue = constOnlyImpl;
+    const IOvlRound1ConstOnly constOnlyIfaceValue = constOnlyIface;
+    result &= Test("iface_ovl_r1_const_only_const_direct", constOnlyValue.f(1), 2);
+    result &= Test("iface_ovl_r1_const_only_const_iface", constOnlyIfaceValue.f(1), 2);
+
+    // A double argument selects f(double) const; native calls do not widen int to double.
+    const OvlRound1Mixed constMixedValue = mixedImpl;
+    const IOvlRound1Mixed constMixedIfaceValue = mixedIface;
+    result &= Test("iface_ovl_r1_const_mixed_local_direct", constMixedValue.f(1.0), 2);
+    result &= Test("iface_ovl_r1_const_mixed_local_iface", constMixedIfaceValue.f(1.0), 2);
+    result &= Test("iface_ovl_r1_const_mixed_param_direct", ovlRound1ConstParamDirect(mixedImpl), 2);
+    result &= Test("iface_ovl_r1_const_mixed_param_iface", ovlRound1ConstParamIface(mixedIface), 2);
+    const OvlRound1Mixed* constMixedPointer = &mixedImpl;
+    result &= Test("iface_ovl_r1_const_mixed_pointer_direct", constMixedPointer.f(1.0), 2);
+
+    OvlRound1ConstField mixedHolder;
+    mixedHolder.concrete = mixedImpl;
+    mixedHolder.iface = mixedIface;
+    const OvlRound1ConstField constMixedHolder = mixedHolder;
+    result &= Test("iface_ovl_r1_const_mixed_field_direct", constMixedHolder.concrete.f(1.0), 2);
+    result &= Test("iface_ovl_r1_const_mixed_field_iface", constMixedHolder.iface.f(1.0), 2);
+
+    OvlRound1GenericImpl genericMixedImpl;
+    IOvlRound1Generic<int> genericMixedIface = genericMixedImpl;
+    const IOvlRound1Generic<int> constGenericMixedIface = genericMixedIface;
+    result &= Test("iface_ovl_r1_const_mixed_generic_iface", constGenericMixedIface.f(1.0), 2);
+
+    OvlRound1ObjectPointer objectPointerImpl;
+    IOvlRound1ObjectPointer objectPointerIface = objectPointerImpl;
+    OvlRound1PtrFirst pointerFirst;
+    OvlRound1PtrSecond pointerSecond;
+    result &= Test("iface_ovl_r1_object_ptr_second_direct", objectPointerImpl.f(&pointerSecond), 2);
+    result &= Test("iface_ovl_r1_object_ptr_second_iface", objectPointerIface.f(&pointerSecond), 2);
+    result &= Test("iface_ovl_r1_object_ptr_first_direct", objectPointerImpl.f(&pointerFirst), 1);
+    result &= Test("iface_ovl_r1_object_ptr_first_iface", objectPointerIface.f(&pointerFirst), 1);
+
     OvlNamed named;
     IOvlNamed namedIface = named;
     long namedLong = 7;
@@ -2931,13 +3023,10 @@ class NArgOvImpl : INArgOv
     int f(double c, double d) { return (int)(c * 100.0 + d); }
 };
 
-// Two same-arity slots the type scorer cannot rank: the argument type implements neither
-// parameter type, so every candidate scores negative and resolution falls back to the first
-// slot. That fallback must still apply the named-argument permutation. The three classes share
-// one `int t` layout on purpose - the point is to defeat the scorer, not the field read.
+// Two exact slots with distinct pointee types; the argument types select the first slot.
+// Named-argument matching must carry that exact slot's permutation into the call.
 class NArgP { int t = 0; };
 class NArgQ { int t = 0; };
-class NArgR { int t = 0; };
 interface INArgUnrank
 {
     int g(NArgP* p, NArgP* q);
@@ -2988,12 +3077,12 @@ bool testInterfaceNamedArguments()
     result &= Test("iface_named_ov_double",   ovio.f(d: 2.0, c: 1.0), 102);
     result &= Test("iface_named_ov_positional", ovio.f(1, 2), 12);
 
-    // No type winner: the fallback first-slot pick must still carry the permutation.
-    // p is the second argument here, so a dropped permutation would score 12 instead.
+    // The exact first-slot winner must carry the named-argument permutation.
+    // p is the second argument here, so a dropped permutation would return 12 instead.
     NArgUnrankImpl ur;
     INArgUnrank urio = ur;
-    NArgR* r1 = new NArgR(); r1.t = 1;
-    NArgR* r2 = new NArgR(); r2.t = 2;
+    NArgP* r1 = new NArgP(); r1.t = 1;
+    NArgP* r2 = new NArgP(); r2.t = 2;
     result &= Test("iface_named_unrank_perm", urio.g(q: r1, p: r2), 21);
 
     return result;

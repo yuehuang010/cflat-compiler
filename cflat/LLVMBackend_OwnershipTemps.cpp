@@ -4965,11 +4965,44 @@ const llvm::Function* LLVMBackend::FunctionPointerTargetFromValue(const llvm::Va
         return nullptr;
     }
 
+bool LLVMBackend::FunctionPointerStorageDtorCall(const llvm::CallBase* call,
+        const llvm::AllocaInst* slot) const
+{
+        if (slot == nullptr || call == nullptr
+            || slot->getAllocatedType() != GetClosureFatPtrType()) return false;
+        const auto closure = dataStructures.find("__closure_fat_ptr");
+        const llvm::Function* closureDtor = closure != dataStructures.end()
+            ? closure->second.Destructor : nullptr;
+        return closureDtor != nullptr && call->getCalledFunction() == closureDtor
+            && call->arg_size() == 1 && call->getArgOperand(0) == slot;
+}
+
+bool LLVMBackend::FunctionPointerStorageIsLoadStoreOnly(const llvm::AllocaInst* slot) const
+{
+        if (slot == nullptr) return false;
+        for (const llvm::User* user : slot->users())
+        {
+            if (llvm::isa<llvm::LoadInst>(user)) continue;
+            if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                if (store->getPointerOperand() == slot) continue;
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            {
+                const llvm::Function* function = call->getCalledFunction();
+                if (function != nullptr && (function->getName().starts_with("llvm.dbg.")
+                    || function->getName().starts_with("llvm.lifetime."))) continue;
+                if (FunctionPointerStorageDtorCall(call, slot)) continue;
+            }
+            return false;
+        }
+        return true;
+}
+
 const llvm::Function* LLVMBackend::FunctionPointerTargetFromLocal(const llvm::Value* storage,
         int depth, const llvm::DominatorTree* dominatorTree) const
 {
         const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(storage);
-        if (slot == nullptr || depth > kMaxRetainDepth || !AllocaIsLoadStoreOnly(slot)
+        if (slot == nullptr || depth > kMaxRetainDepth
+            || !FunctionPointerStorageIsLoadStoreOnly(slot)
             || slot->getFunction() == nullptr) return nullptr;
         const llvm::StoreInst* targetStore = nullptr;
         std::vector<const llvm::LoadInst*> loads;
@@ -5040,7 +5073,7 @@ std::vector<const llvm::Function*> LLVMBackend::FunctionPointerTargetsFromStorag
 
         if (const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(storage))
         {
-            if (!AllocaIsLoadStoreOnly(slot) || slot->getFunction() == nullptr)
+            if (!FunctionPointerStorageIsLoadStoreOnly(slot) || slot->getFunction() == nullptr)
             {
                 complete = false;
                 return targets;
@@ -5064,6 +5097,9 @@ std::vector<const llvm::Function*> LLVMBackend::FunctionPointerTargetsFromStorag
                     if (load->getPointerOperand() != slot) complete = false;
                     else ++loads;
                 }
+                else if (FunctionPointerStorageDtorCall(
+                    llvm::dyn_cast<llvm::CallBase>(user), slot))
+                    continue;
                 else
                     complete = false;
             }

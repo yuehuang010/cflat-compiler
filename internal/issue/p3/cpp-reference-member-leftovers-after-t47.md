@@ -5,11 +5,12 @@ lifetime extension, `{ r = move x }`, and nested aggregates landed in REFMEM (1c
 (T104) and const C& result ranking already matched clang on master. All below are pre-existing (master behaves the same);
 clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch/repro_keep/t47/.
 
-1. Positional base/member-aggregate reference members landed REFBASE (ef83ffa02). Pre-existing residue found by its reviews
-   (master behaves the same): a C++ class prvalue element (`T(3)`) into an aggregate member inside an elided range makes an
-   extra copy + destroy (CFlat 127458969, clang 1274569); a converting element into a class-type member inside an elided range
-   runs the ctor after later elements (12345769, clang 12374569); an array of aggregates with reference members loses the alias,
-   elided and fully braced (exit 3, clang 0). Repros in the REFBASE review files (scratch/repro_keep/refbase/).
+1. Positional base/member-aggregate reference members landed REFBASE (ef83ffa02). The array alias residue landed REFRES
+   (be42f0234): 1-D and 2-D arrays, fixed-array fields, and globals now preserve aliases in brace-elided and fully braced forms.
+   Remaining pre-existing residue found by the REFBASE reviews (master behaves the same): a C++ class prvalue element
+   (`T(3)`) into an aggregate member inside an elided range makes an extra copy + destroy (CFlat 127458969, clang 1274569);
+   a converting element into a class-type member inside an elided range runs the ctor after later elements
+   (12345769, clang 12374569). Repros in the REFBASE review files (scratch/repro_keep/refbase/).
 2. Function-reference members landed REFFN (ef83ffa02): a named function or an existing C++ function reference binds, a
    function-pointer value is refused. RULED 2026-10-29 (main session, from precedent; maintainer may veto): `{ &f, 5 }` and `{ (function<int(int)>)f, 5 }` stay ACCEPTED - working
    as intended (T478: `&f` on a named function is the function value; no runtime risk; clang's pointer-prvalue refusal is a

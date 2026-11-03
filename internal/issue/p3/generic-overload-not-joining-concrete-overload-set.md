@@ -5,17 +5,16 @@ resolves the call on its own, so every call master REFUSED and clang accepts now
 namespace, both declaration orders). Matrix and probes: scratch/repro_keep/genovl/ (genovl_report.md, genovl_review1.md,
 review1/cases/).
 
-## NEEDS RULING: master compiles with a different pick than clang (kept unchanged)
+## RULED 2026-10-29, landed GENOVLR (df9618d95)
 
-`f(double*)=2; f(float*)=3; f<T>(T*)=9` and `f(int)=1; f(long)=2; f<T>(T)=9` sets, both declaration orders:
-- `void*` argument: CFlat 3, clang 9. `nullptr`: CFlat 2, clang ambiguous.
-- `short` / `char` value: CFlat 1 (widening to f(int)), clang 9 (exact generic).
-- two-parameter `short,char` and `int,long`: CFlat 2, clang 9.
-- int -> bool, a long/double tie, variadic: CFlat 2, clang 9.
-Question: should an exact generic beat a concrete candidate reached by a widening conversion (C++ rule), changing these
-compiling programs?
-RULED 2026-10-29 (maintainer): YES - follow C++ and C#: identity beats widening, an exact generic wins; `nullptr` is
-ambiguous as in clang; the `void*` -> f(float*) pick is a bug. Every cell above follows clang.
+Exact generic beats a concrete candidate reached by widening (C++/C# non-template tiebreak on the deduced parameter types,
+free, method and implicit-this calls); `nullptr` to two pointer overloads is ambiguous; `void*` no longer picks an object
+pointer overload. Literal expressions deduce their C type (`1.0+2.0` -> double, `true+false` -> int); a shift whose right
+operand is wider keeps CFlat's own wider type (`1 << 2L` -> long, see below).
+
+Pre-existing, kept (expression typing, not ranking): CFlat types `1 << 2L` as long (clang int); `1.5 + x` with int x is
+float (clang double); char/u8/short variable arithmetic is not promoted to int; `'a' + 'b'` into a generic is refused.
+Kept by main-session decision: `f(const int*)` + `f<T>(T*)` with an `int*` picks f(const int*) (clang: the generic).
 
 ## Leftovers (no ruling needed; clang accepts, CFlat refuses)
 

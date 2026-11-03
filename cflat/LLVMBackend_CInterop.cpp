@@ -2454,7 +2454,7 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             static const std::unordered_set<std::string> cLongUnsigned = {
                 "unsigned long", "unsigned long int" };
 
-            // C declarations use target width; C++ declarations retain long identity for mangling.
+            // Both C and C++ retain native long identity; its width follows the target ABI.
             if (cxxBoundary && base == "char8_t")
                 mapped = "c8";
             else if (cxxBoundary && base == "char16_t")
@@ -2471,9 +2471,9 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
                 if (ptr == 0) { ptr = 1; nullptrT = true; }
             }
             else if (cLongSigned.count(base) > 0)
-                mapped = cxxBoundary ? "long" : (targetWindows_ ? "i32" : "i64");
+                mapped = "long";
             else if (cLongUnsigned.count(base) > 0)
-                mapped = cxxBoundary ? "ulong" : (targetWindows_ ? "u32" : "u64");
+                mapped = "ulong";
             else if (base == "wchar_t")
                 mapped = targetWindows_ ? "u16" : "i32";
             else if (base == "long double")
@@ -2979,6 +2979,9 @@ bool LLVMBackend::LowerNonCapturingClosureForCxx(NamedVariable& arg, const TypeA
             if (overloads != functionTable.end() && overloads->second.size() > 1) return false;
             // An `alias` param has no function-pointer spelling (same door as a function<> bind).
             const FunctionSymbol* fnSym = FindSymbolForFunction(fn);
+            if (fnSym != nullptr
+                && RejectExternMoveCountFuncPtrBind(arg.CallerName, *fnSym, target))
+                return false;
             if (fnSym != nullptr && RejectAliasParamFuncPtrBind(arg.CallerName, *fnSym)) return false;
             TypeAndValue thin = FuncPtrSigOfBoundFunction(arg.CallerName, fn);
             if (!thin.IsFunctionPointer) return false;
@@ -30661,6 +30664,9 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                             NamedFunctionOverloadForFuncPtr(named.CallerName, st.params[i + 1]);
                         sym != nullptr && sym->Function != nullptr)
                     {
+                        if (RejectExternMoveCountFuncPtrBind(
+                                named.CallerName, *sym, &st.params[i + 1]))
+                            return false;
                         RejectAliasParamFuncPtrBind(named.CallerName, *sym);
                         RejectThrowingCxxFunction(*sym, named.CallerName);
                         named.Primary = sym->Function;

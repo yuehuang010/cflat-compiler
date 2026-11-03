@@ -1,0 +1,38 @@
+struct IfaceOvlPt { int value = 0; };
+struct IfaceOvlQt { int value = 0; };
+struct IfaceOvlRt { int value = 0; };
+interface IIfaceOvlObjectPointer
+{
+    int f(IfaceOvlPt* value);
+    int f(IfaceOvlQt* value);
+};
+class IfaceOvlObjectPointer : IIfaceOvlObjectPointer
+{
+    int f(IfaceOvlPt* value) { return 1; }
+    int f(IfaceOvlQt* value) { return 2; }
+};
+
+expect_error("no overload of 'f' matches the given arguments.")
+{
+    int ifaceUnrelated(IIfaceOvlObjectPointer value, IfaceOvlRt* ptr) { return value.f(ptr); }
+}
+expect_error("no overload of 'f' matches the given arguments.")
+{
+    int directUnrelated(IfaceOvlObjectPointer value, IfaceOvlRt* ptr) { return value.f(ptr); }
+}
+
+class NArgP { int t = 0; };
+class NArgQ { int t = 0; };
+class NArgR { int t = 0; };
+interface INArgUnrank
+{
+    int g(NArgP* p, NArgP* q);
+    int g(NArgQ* p, NArgQ* q);
+};
+expect_error("no overload of 'g' matches the given arguments.")
+{
+    int namedUnrelated(INArgUnrank value, NArgR* r1, NArgR* r2)
+    {
+        return value.g(q: r1, p: r2);
+    }
+}

@@ -12704,6 +12704,20 @@ void MainListener::UnifyTernaryFunctionArms(antlr4::ParserRuleContext* ctx,
                 }
         }
         if (!haveTrue || !haveFalse) return;
+        auto rejectExternCountArm = [&](llvm::Value*& value,
+                const LLVMBackend::TypeAndValue& sig) {
+            auto* fn = llvm::dyn_cast_or_null<llvm::Function>(value);
+            if (fn == nullptr) return false;
+            const auto* sym = compiler->FindSymbolForFunction(fn);
+            if (sym == nullptr || !compiler->RejectExternMoveCountFuncPtrBind(
+                    sym->UniqueName, *sym, &sig))
+                return false;
+            value = nullptr;
+            return true;
+        };
+        if (rejectExternCountArm(trueValue, trueSig)
+            || rejectExternCountArm(falseValue, falseSig))
+            return;
         if (compiler->FuncPtrSignaturesProvablyDiffer(trueSig, falseSig)
             || trueSig.FuncPtrVariadic != falseSig.FuncPtrVariadic)
         {
@@ -28476,6 +28490,8 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         const std::string fieldDefaultOwner = structName;
         llvm::SaveAndRestore<std::string> fieldDefaultOwnerScope(
             fieldDefaultAggregateOwner_, fieldDefaultOwner);
+        llvm::SaveAndRestore<std::string> fieldDefaultNameScope(
+            fieldDefaultAggregateFieldName_, field.VariableName);
         std::string fieldOwner = lambdaEnclosingAggregateOwner_;
         if (!fieldDefaultOwner.empty()) fieldOwner = fieldDefaultOwner;
         llvm::SaveAndRestore<std::string> fieldOwnerScope(
@@ -28811,6 +28827,15 @@ void MainListener::EmitBraceElementIntoFixedSlot(
         bool rejectFrameBoundReferences) {
         auto* compiler = Compiler(fi);
         auto* list = fi->initializerList();
+        const bool emptyList = list == nullptr || list->fieldInit().empty();
+        if (emptyList && compiler->GetFunction(elemTypeName) == nullptr
+            && HasUninitializedForeignCxxAggregateReferenceMember(elemTypeName, fi))
+        {
+            LogErrorContext(fi, std::format(
+                "reference member must be initialized in C++ aggregate array element '{}'",
+                elemTypeName));
+            return;
+        }
         if (list != nullptr && !list->fieldInit().empty()
             && compiler->IsForeignCxxAggregateClass(elemTypeName)
             && HasForeignCxxAggregateReferenceMember(elemTypeName, fi))
@@ -28834,7 +28859,6 @@ void MainListener::EmitBraceElementIntoFixedSlot(
         if (seed == nullptr && compiler->CxxElementNeedsDefaultConstruction(elemTypeName))
         {
             // An empty `{}` element of a list-constructor-only class is that constructor, n == 0.
-            const bool emptyList = list == nullptr || list->fieldInit().empty();
             std::string ctorError;
             if (emptyList && compiler->CxxEmptyBraceUsesListCtor(elemTypeName))
                 EmitCxxEmptyBraceConstruct(elemPtr, elemTypeName, fi, true);
@@ -29205,6 +29229,16 @@ void MainListener::EmitArrayValueInitSlots(
         uint64_t n = tv.ConstArraySize;
         for (uint64_t d : tv.ConstInnerDimensions) n *= d;
         if (n == 0) return;
+
+        antlr4::ParserRuleContext* errorContext = list != nullptr ? list : emptyBraceCtx;
+        if (errorContext != nullptr && compiler->GetFunction(tv.TypeName) == nullptr
+            && HasUninitializedForeignCxxAggregateReferenceMember(tv.TypeName, errorContext))
+        {
+            LogErrorContext(errorContext, std::format(
+                "reference member must be initialized in C++ aggregate array element '{}'",
+                tv.TypeName));
+            return;
+        }
 
         // `T[N] a = {};` on a C++-class element value-initializes each element, which for a
         // nontrivial default constructor means calling it - not storing N zeroed slots.
@@ -30197,6 +30231,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             }
         if (rejectedNamedBrace) return;
         auto elements = initList->fieldInit();
+        const auto initialElements = elements;
         bool multidim = !tv.ConstInnerDimensions.empty();
         // A STRUCT element type is the only one a braced element can construct.
         auto* elemStructTy = (FixedArrayElementStars(tv) == 0 && !tv.IsArrayView
@@ -30208,6 +30243,49 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
 
         auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
         auto* elemTy = arrTy->getElementType();
+        const bool cxxReferenceAggregateElements = elemStructTy != nullptr
+            && compiler->IsForeignCxxAggregateClass(tv.TypeName)
+            && HasForeignCxxAggregateReferenceMember(tv.TypeName, initList);
+        std::function<size_t(const std::string&)> aggregateLeafCount;
+        aggregateLeafCount = [&](const std::string& recordName) -> size_t {
+            if (!compiler->IsForeignCxxAggregateClass(recordName)) return 1;
+            const auto record = compiler->GetDataStructure(recordName);
+            if (record.IsUnion) return record.StructFields.empty() ? 0 : 1;
+            size_t count = 0;
+            const size_t baseCount = compiler->CxxAggregateBaseCount(recordName);
+            for (size_t baseIndex = 0; baseIndex < baseCount; ++baseIndex)
+            {
+                const std::string baseType = compiler->CxxAggregateBaseTypeAt(
+                    recordName, baseIndex);
+                if (!baseType.empty()) count += aggregateLeafCount(baseType);
+            }
+            for (const auto& field : record.StructFields)
+            {
+                const std::string fieldType = compiler->ResolveTypeAlias(field.TypeName);
+                if (field.Pointer || field.ElemPointer || field.IsArrayView)
+                {
+                    ++count;
+                    continue;
+                }
+                uint64_t arrayCount = field.ConstArraySize;
+                for (uint64_t dimension : field.ConstInnerDimensions)
+                    arrayCount *= dimension;
+                if (arrayCount > 0)
+                {
+                    count += (size_t)arrayCount * aggregateLeafCount(fieldType);
+                    continue;
+                }
+                count += aggregateLeafCount(fieldType);
+            }
+            return count;
+        };
+        const size_t elementLeafCount = cxxReferenceAggregateElements
+            ? aggregateLeafCount(tv.TypeName) : 0;
+        std::vector<std::pair<size_t, std::vector<CFlatParser::FieldInitContext*>>>
+            referenceAggregateRows;
+        auto hasUninitializedReferenceMember = [&]() {
+            return HasUninitializedForeignCxxAggregateReferenceMember(tv.TypeName, initList);
+        };
 
         if (multidim)
         {
@@ -30221,16 +30299,22 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 && elemTy->getArrayElementType()->isIntegerTy(8))
             {
                 if (elements.size() > tv.ConstArraySize)
+                {
                     LogErrorContext(initList, std::format(
                         "too many string rows for '{}[{}][{}]': got {} rows",
                         SpellType(*compiler, tv), tv.ConstArraySize, rowWidth, elements.size()));
+                    return;
+                }
                 compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
                 llvm::Value* zero = compiler->builder->getInt32(0);
                 for (size_t row = 0; row < elements.size(); row++)
                 {
                     auto* fi = elements[row];
                     if (fi->assignmentExpression().size() != 1)
+                    {
                         LogErrorContext(fi, "multi-dimensional fixed-array initializers require nested braces or one string per char row");
+                        return;
+                    }
                     auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
                     auto* literal = llvm::dyn_cast_or_null<llvm::Constant>(LoadNamedVariable(nv));
                     auto* global = literal == nullptr ? nullptr
@@ -30238,11 +30322,17 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     auto* bytes = global == nullptr ? nullptr
                         : llvm::dyn_cast<llvm::ConstantDataSequential>(global->getInitializer());
                     if (bytes == nullptr || !compiler->IsStringLiteralConstant(literal))
+                    {
                         LogErrorContext(fi, "multi-dimensional char arrays require string literal rows");
+                        return;
+                    }
                     std::string text = bytes->getAsString().str();
                     if (!text.empty() && text.size() - 1 > rowWidth)
+                    {
                         LogErrorContext(fi, std::format("string row has {} characters but '{}' has width {}",
                             text.size() - 1, SpellType(*compiler, tv), rowWidth));
+                        return;
+                    }
                     for (uint64_t col = 0; col < rowWidth; col++)
                     {
                         auto* colVal = compiler->builder->getInt32((uint32_t)col);
@@ -30256,27 +30346,54 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 return;
             }
 
-            if (!hasNested)
+            if (!hasNested && !cxxReferenceAggregateElements)
+            {
                 LogErrorContext(initList, std::format(
                     "flat initializer lists are not supported for '{}[{}]'; use nested braces matching each dimension",
                     SpellType(*compiler, tv), tv.ConstArraySize));
+                return;
+            }
 
             std::vector< CFlatParser::FieldInitContext* > flattened;
+            const size_t dimensionCount = 1 + tv.ConstInnerDimensions.size();
+            bool flattenFailed = false;
+            auto isEmptyBraceRow = [](CFlatParser::FieldInitContext* fi) {
+                return fi->Identifier() == nullptr && fi->assignmentExpression().empty()
+                    && fi->initializerList() == nullptr;
+            };
             std::function<void(CFlatParser::InitializerListContext*, size_t)> flatten =
                 [&](CFlatParser::InitializerListContext* list, size_t depth) {
+                    if (flattenFailed) return;
                     uint64_t expected = depth == 0 ? tv.ConstArraySize
                         : tv.ConstInnerDimensions[depth - 1];
-                    if (list->fieldInit().size() > expected)
+                    if (list->fieldInit().size() > expected
+                        && !(cxxReferenceAggregateElements
+                            && depth + 1 == dimensionCount))
+                    {
                         LogErrorContext(list, std::format(
                             "too many initializers at dimension {}: expected at most {}, got {}",
                             depth + 1, expected, list->fieldInit().size()));
+                        flattenFailed = true;
+                        return;
+                    }
                     for (auto* fi : list->fieldInit())
                     {
-                        if (depth + 1 < 1 + tv.ConstInnerDimensions.size())
+                        if (depth + 1 < dimensionCount)
                         {
                             if (fi->initializerList() == nullptr)
+                            {
+                                // An empty '{}' sub-array holds no leaves; its rows are value-initialized below.
+                                if (cxxReferenceAggregateElements && isEmptyBraceRow(fi)) continue;
+                                if (cxxReferenceAggregateElements) {
+                                    flattened.push_back(fi);
+                                    continue;
+                                }
                                 LogErrorContext(fi, "multi-dimensional fixed-array initializers require nested braces matching each dimension");
+                                flattenFailed = true;
+                                return;
+                            }
                             flatten(fi->initializerList(), depth + 1);
+                            if (flattenFailed) return;
                         }
                         else
                         {
@@ -30284,16 +30401,72 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                             // element type ('P[2][2] a = { { {x=1}, ... } }'); for any other
                             // element type there is nothing a brace could construct.
                             if (fi->initializerList() != nullptr && elemStructTy == nullptr)
+                            {
                                 LogErrorContext(fi, "too many nested braces for fixed-array element");
+                                flattenFailed = true;
+                                return;
+                            }
                             flattened.push_back(fi);
                         }
                     }
                 };
-            flatten(initList, 0);
-            elements = std::move(flattened);
+            if (hasNested)
+            {
+                flatten(initList, 0);
+                if (flattenFailed) return;
+                elements = std::move(flattened);
+
+                if (cxxReferenceAggregateElements)
+                {
+                    bool validRows = true;
+                    std::vector<std::pair<size_t,
+                        std::vector<CFlatParser::FieldInitContext*>>> collectedRows;
+                    std::function<void(CFlatParser::InitializerListContext*, size_t, size_t)>
+                        collectRows = [&](CFlatParser::InitializerListContext* list,
+                                          size_t depth, size_t rowOrdinal) {
+                            const size_t rank = 1 + tv.ConstInnerDimensions.size();
+                            if (depth + 1 == rank)
+                            {
+                                collectedRows.emplace_back(rowOrdinal, list->fieldInit());
+                                return;
+                            }
+                            const size_t expected = depth == 0
+                                ? (size_t)tv.ConstArraySize
+                                : (size_t)tv.ConstInnerDimensions[depth - 1];
+                            size_t rowsPerElement = 1;
+                            for (size_t dim = depth; dim + 1 < tv.ConstInnerDimensions.size(); ++dim)
+                                rowsPerElement *= (size_t)tv.ConstInnerDimensions[dim];
+                            const auto fields = list->fieldInit();
+                            for (size_t i = 0; i < fields.size(); ++i)
+                            {
+                                if (isEmptyBraceRow(fields[i]))
+                                {
+                                    for (size_t row = 0; row < rowsPerElement; ++row)
+                                        collectedRows.emplace_back(rowOrdinal + i * rowsPerElement + row,
+                                            std::vector<CFlatParser::FieldInitContext*>{});
+                                    continue;
+                                }
+                                if (fields[i]->initializerList() == nullptr)
+                                {
+                                    validRows = false;
+                                    return;
+                                }
+                                collectRows(fields[i]->initializerList(), depth + 1,
+                                    rowOrdinal + i * rowsPerElement);
+                                if (!validRows) return;
+                            }
+                            for (size_t i = fields.size(); i < expected; ++i)
+                                for (size_t row = 0; row < rowsPerElement; ++row)
+                                    collectedRows.emplace_back(rowOrdinal + i * rowsPerElement + row,
+                                        std::vector<CFlatParser::FieldInitContext*>{});
+                        };
+                    collectRows(initList, 0, 0);
+                    if (validRows) referenceAggregateRows = std::move(collectedRows);
+                }
+            }
         }
 
-        if (elements.size() > n)
+        if (elements.size() > n && !cxxReferenceAggregateElements)
         {
             LogErrorContext(initList, std::format(
                 "too many initializers for '{}[{}]': got {} elements",
@@ -30354,7 +30527,172 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                                             builtElemPtr, tv.TypeName);
             builtElemPtr = nullptr;
         };
-        for (size_t i = 0; i < elements.size(); i++)
+        uint64_t initializedElementCount = elements.size();
+        const bool allAggregateElementsBraced = cxxReferenceAggregateElements
+            && !elements.empty()
+            && std::all_of(elements.begin(), elements.end(), [](auto* element) {
+                return element->LeftBrace() != nullptr;
+            });
+        const bool hasUnbracedAggregateElement = cxxReferenceAggregateElements
+            && std::any_of(elements.begin(), elements.end(), [](auto* element) {
+                return element->LeftBrace() == nullptr;
+            });
+        const bool groupedReferenceAggregateElements = cxxReferenceAggregateElements
+            && elementLeafCount > 0 && !elements.empty()
+            && (allAggregateElementsBraced || hasUnbracedAggregateElement);
+        if (groupedReferenceAggregateElements)
+        {
+            std::vector<std::vector<CFlatParser::FieldInitContext*>> aggregateElements;
+            std::vector<size_t> aggregateElementIndices;
+            const bool groupedByRows = multidim && !referenceAggregateRows.empty()
+                && std::all_of(initialElements.begin(), initialElements.end(),
+                    [](auto* row) { return row->LeftBrace() != nullptr; });
+            if (groupedByRows)
+            {
+                const size_t rowWidth = (size_t)tv.ConstInnerDimensions.back();
+                for (const auto& [rowOrdinal, row] : referenceAggregateRows)
+                {
+                    size_t sourceIndex = 0;
+                    size_t rowElementIndex = 0;
+                    while (sourceIndex < row.size())
+                    {
+                        auto* first = row[sourceIndex];
+                        if (rowElementIndex >= rowWidth)
+                        {
+                            LogErrorContext(first, std::format(
+                                "too many initializers at dimension {}: expected at most {}, got more",
+                                tv.ConstInnerDimensions.size() + 1, rowWidth));
+                            return;
+                        }
+                        if (first->LeftBrace() != nullptr)
+                        {
+                            aggregateElements.push_back({ first });
+                            ++sourceIndex;
+                        }
+                        else
+                        {
+                            if (elementLeafCount > row.size() - sourceIndex)
+                            {
+                                LogErrorContext(first, std::format(
+                                    "too few initializer clauses for C++ aggregate array element '{}'",
+                                    SpellType(*compiler, fixedElemTV)));
+                                return;
+                            }
+                            aggregateElements.emplace_back(
+                                row.begin() + static_cast<std::ptrdiff_t>(sourceIndex),
+                                row.begin() + static_cast<std::ptrdiff_t>(sourceIndex + elementLeafCount));
+                            sourceIndex += elementLeafCount;
+                        }
+                        aggregateElementIndices.push_back(rowOrdinal * rowWidth + rowElementIndex);
+                        ++rowElementIndex;
+                    }
+                    while (rowElementIndex < rowWidth)
+                    {
+                        aggregateElements.emplace_back();
+                        aggregateElementIndices.push_back(rowOrdinal * rowWidth + rowElementIndex);
+                        ++rowElementIndex;
+                    }
+                }
+                initializedElementCount = referenceAggregateRows.size() * rowWidth;
+            }
+            else
+            {
+                size_t sourceIndex = 0;
+                while (sourceIndex < elements.size())
+                {
+                    auto* first = elements[sourceIndex];
+                    if (first->LeftBrace() != nullptr)
+                    {
+                        aggregateElements.push_back({ first });
+                        ++sourceIndex;
+                    }
+                    else
+                    {
+                        if (elementLeafCount > elements.size() - sourceIndex)
+                        {
+                            LogErrorContext(first, std::format(
+                                "too few initializer clauses for C++ aggregate array element '{}'",
+                                SpellType(*compiler, fixedElemTV)));
+                            return;
+                        }
+                        aggregateElements.emplace_back(
+                            elements.begin() + static_cast<std::ptrdiff_t>(sourceIndex),
+                            elements.begin() + static_cast<std::ptrdiff_t>(sourceIndex + elementLeafCount));
+                        sourceIndex += elementLeafCount;
+                    }
+                    aggregateElementIndices.push_back(aggregateElements.size() - 1);
+                }
+                initializedElementCount = aggregateElements.size();
+            }
+            if (aggregateElements.size() > n
+                || std::any_of(aggregateElementIndices.begin(), aggregateElementIndices.end(),
+                    [&](size_t index) { return index >= n; }))
+            {
+                LogErrorContext(initList, std::format(
+                    "too many initializers for '{}[{}]': expected at most {} elements",
+                    SpellType(*compiler, tv), n, n));
+                return;
+            }
+            auto* globalOwner = llvm::dyn_cast<llvm::GlobalVariable>(arrAlloc);
+            for (size_t index = 0; index < aggregateElements.size(); ++index)
+            {
+                noteBuiltElement();
+                const size_t elementIndex = aggregateElementIndices[index];
+                auto* elemPtr = multidim
+                    ? elementPtrs[elementIndex]
+                    : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc,
+                        { zero, compiler->builder->getInt32((uint32_t)elementIndex) }, "arrelem");
+                auto& group = aggregateElements[index];
+                if (group.empty())
+                {
+                    if (!updateExistingElements && hasUninitializedReferenceMember())
+                    {
+                        LogErrorContext(initList, std::format(
+                            "reference member must be initialized in C++ aggregate array element '{}'",
+                            SpellType(*compiler, fixedElemTV)));
+                        return;
+                    }
+                    builtElemPtr = updateExistingElements ? nullptr : elemPtr;
+                    if (!updateExistingElements
+                        && compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+                    {
+                        if (compiler->CxxEmptyBraceUsesListCtor(tv.TypeName))
+                            EmitCxxEmptyBraceConstruct(elemPtr, tv.TypeName, initList, true);
+                        else
+                        {
+                            std::string ctorError;
+                            if (!compiler->EmitCxxArrayDefaultConstruction(tv.TypeName,
+                                    elemPtr, elemStructTy, compiler->builder->getInt64(1),
+                                    ctorError))
+                                LogErrorContext(initList, ctorError);
+                        }
+                    }
+                    continue;
+                }
+                auto* first = group.front();
+                builtElemPtr = updateExistingElements ? nullptr : elemPtr;
+                if (updateExistingElements)
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(tv.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
+                if (group.size() == 1 && first->LeftBrace() != nullptr
+                    && first->initializerList() != nullptr
+                    && !first->initializerList()->fieldInit().empty())
+                {
+                    TryEmitForeignCxxAggregateBraceInit(tv.TypeName,
+                        first->initializerList(), first, elemPtr, true, false,
+                        globalOwner, rejectFrameBoundReferences);
+                }
+                else if (group.size() == 1 && first->LeftBrace() != nullptr)
+                    EmitBraceElementIntoFixedSlot(elemPtr, elemStructTy, tv.TypeName,
+                        first, rejectFrameBoundReferences);
+                else
+                    TryEmitForeignCxxAggregateBraceInitFields(tv.TypeName, group,
+                        first, elemPtr, true, false, globalOwner,
+                        rejectFrameBoundReferences);
+            }
+            noteBuiltElement();
+        }
+        for (size_t i = 0; !groupedReferenceAggregateElements && i < elements.size(); i++)
         {
             noteBuiltElement();
             auto* fi = elements[i];
@@ -30618,44 +30956,56 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
          * unconstructed while scope exit still destroyed all N. The tail is contiguous in the
          * flat layout (elementPtrs is built in row-major order), so one walk covers it.
          */
-        if (elemStructTy != nullptr && (uint64_t)elements.size() < n
-            && compiler->GetFunction(tv.TypeName) == nullptr
-            && compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+        if (elemStructTy != nullptr && initializedElementCount < n
+            && compiler->GetFunction(tv.TypeName) == nullptr)
         {
-            uint64_t first = (uint64_t)elements.size();
-            llvm::Value* tailBase = multidim
-                ? elementPtrs[first]
-                : compiler->builder->CreateInBoundsGEP(
-                    arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)first) },
-                    "arrtail");
-            std::string ctorError;
-            if (compiler->CxxEmptyBraceUsesListCtor(tv.TypeName))
+            if (hasUninitializedReferenceMember())
             {
-                // Each unlisted slot is value-initialized from `{}`: the list constructor, n == 0.
-                for (uint64_t slot = first; slot < n; ++slot)
+                LogErrorContext(initList, std::format(
+                    "reference member must be initialized in C++ aggregate array element '{}'",
+                    SpellType(*compiler, fixedElemTV)));
+                return;
+            }
+            if (compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+            {
+                uint64_t first = initializedElementCount;
+                llvm::Value* tailBase = multidim
+                    ? elementPtrs[first]
+                    : compiler->builder->CreateInBoundsGEP(
+                        arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)first) },
+                        "arrtail");
+                std::string ctorError;
+                if (compiler->CxxEmptyBraceUsesListCtor(tv.TypeName))
                 {
-                    llvm::Value* slotPtr = multidim
-                        ? elementPtrs[slot]
-                        : compiler->builder->CreateInBoundsGEP(
-                            arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)slot) },
-                            "arrslot");
-                    EmitCxxEmptyBraceConstruct(slotPtr, tv.TypeName, initList, true);
+                    // Each unlisted slot is value-initialized from `{}`: the list constructor, n == 0.
+                    for (uint64_t slot = first; slot < n; ++slot)
+                    {
+                        llvm::Value* slotPtr = multidim
+                            ? elementPtrs[slot]
+                            : compiler->builder->CreateInBoundsGEP(
+                                arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)slot) },
+                                "arrslot");
+                        EmitCxxEmptyBraceConstruct(slotPtr, tv.TypeName, initList, true);
+                    }
+                }
+                else if (!compiler->EmitCxxArrayDefaultConstruction(
+                        tv.TypeName, tailBase, elemStructTy,
+                        compiler->builder->getInt64(n - first), ctorError))
+                {
+                    LogErrorContext(initList, ctorError);
+                    return;
                 }
             }
-            else if (!compiler->EmitCxxArrayDefaultConstruction(
-                    tv.TypeName, tailBase, elemStructTy,
-                    compiler->builder->getInt64(n - first), ctorError))
-                LogErrorContext(initList, ctorError);
         }
         /*
          * A native struct tail takes the element's own default, field defaults or CFlat constructor,
          * exactly as an omitted element does; the zero fill above would leave `0` where clang keeps
          * `7`. Update mode keeps the elements the containing aggregate already built.
          */
-        if (!updateExistingElements && elemStructTy != nullptr && (uint64_t)elements.size() < n
+        if (!updateExistingElements && elemStructTy != nullptr && initializedElementCount < n
             && compiler->GetFunction(tv.TypeName) != nullptr)
         {
-            uint64_t first = (uint64_t)elements.size();
+            uint64_t first = initializedElementCount;
             llvm::Value* tailBase = multidim
                 ? elementPtrs[first]
                 : compiler->builder->CreateInBoundsGEP(
@@ -30954,6 +31304,10 @@ void MainListener::EmitGlobalFixedArrayInit(
 
         bool emptyInit = (initList == nullptr || initList->fieldInit().empty());
         llvm::Constant* arrConst = nullptr;
+        const bool cxxReferenceAggregateArray = !emptyInit && positionalArray
+            && !tv.Pointer && !tv.ElemPointer && !tv.IsAlias && !tv.IsArrayView
+            && compiler->IsForeignCxxAggregateClass(tv.TypeName)
+            && HasForeignCxxAggregateReferenceMember(tv.TypeName, errCtx);
         // Every element `{}` of a C++ class: the startup walk builds each one through the empty-brace
         // route (the default ctor, else the list ctor), so the stored constant is only zero storage.
         // The outer `{}` of a C++-class array is the same thing: every element value-initialized at startup.
@@ -30962,7 +31316,9 @@ void MainListener::EmitGlobalFixedArrayInit(
                && !tv.IsArrayView && tv.ConstInnerDimensions.empty())
             : (positionalArray && IsCxxEmptyBraceArrayInit(tv, initList));
 
-        if (emptyInit)
+        if (cxxReferenceAggregateArray)
+            arrConst = llvm::Constant::getNullValue(arrTy);
+        else if (emptyInit)
         {
             if (compiler->IsCxxRecord(tv.TypeName))
             {
@@ -31117,6 +31473,17 @@ void MainListener::EmitGlobalFixedArrayInit(
         auto* globalArr = compiler->CreateGlobalVariable(tv, arrConst, threadLocal);
         const size_t pendingConstructionsBefore = pendingGlobalDefaultConstructions_.size()
             + pendingGlobalCxxConstructions_.size();
+        if (cxxReferenceAggregateArray && globalArr != nullptr
+            && !globalArr->isDeclaration())
+        {
+            LLVMBackend::DeclTypeAndValue declTv;
+            static_cast<LLVMBackend::TypeAndValue&>(declTv) = tv;
+            declTv.threadLocal = threadLocal;
+            QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_,
+                {globalArr, declTv, direct});
+            pendingGlobalCxxConstructions_.back().BraceInitializer = initList;
+            pendingGlobalCxxConstructions_.back().CopyListInit = true;
+        }
         // `S*[2] a = {&tls, ...}`: a thread_local address is per thread, so the array starts zero and
         // the value is stored at its turn in the ordered (module or per-thread) initializer.
         if (globalArr != nullptr && !globalArr->isDeclaration() && globalArr->hasInitializer()
@@ -35801,7 +36168,8 @@ bool MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
             }
             const bool constPointeeAccess = constElement && cxxPointerField
                 && pointerSlot != nullptr && pointerSlot->Pointer
-                && pointerSlot->PointeeConstBit();
+                && pointerSlot->PointeeConstBit()
+                && destination == pointeeBase;
             // By value inside a const C++ class object, or a const global of C/C++ (any write).
             const auto cause = compiler->FindConstWriteCause(destination);
             using Kind = LLVMBackend::ConstWriteCause::CauseKind;

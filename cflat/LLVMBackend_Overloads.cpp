@@ -2372,8 +2372,11 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
 
 std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
-        std::vector<FunctionSymbol>* tiedOut, CxxPreferredOverload* preferredOut)
+        std::vector<FunctionSymbol>* tiedOut, CxxPreferredOverload* preferredOut,
+        bool* selectedPerfectOut, bool reportNullPointerTemplateAmbiguity,
+        bool rankEnumToIntegerAsConversion)
 {
+        if (selectedPerfectOut != nullptr) *selectedPerfectOut = false;
         if (!candidates.empty() && candidates.front().first.size() == 1)
         {
             const NamedVariable& source = candidates.front().first.front();
@@ -2434,6 +2437,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         struct Ranked
         {
             const std::pair<std::vector<NamedVariable>, FunctionSymbol>* pair = nullptr;
+            bool perfectMatch = false;
+            bool enumToIntegerConversion = false;
             // Function-pointer arguments whose indirection shape disagrees with the parameter.
             int shapeMismatches = 0;
             // Integer -> bool coercions. Without it `sb.append(n)` picked append(bool) over
@@ -2664,6 +2669,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int userConversionCost = 0;
             std::string userConversionNames;
             std::vector<int> integerCosts;
+            bool enumToIntegerConversion = false;
             integerCosts.reserve(arguments.size());
 
             auto candidateParamItr = candidate.Parameters.begin();
@@ -3567,7 +3573,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     result = -1;
                 // A native candidate whose parameter would discard the argument's const is not
                 // viable (C++); removed while another is viable, else kept so the call reports #6.
-                if (result >= 0 && candidates.size() > 1 && !candidate.IsCxx
+                if (result >= 0 && !candidate.IsCxx
                     && !(candidate.IsMethod && candidateParamItr == candidate.Parameters.begin()))
                 {
                     std::string from, to;
@@ -3620,13 +3626,31 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && argumentIsPointer && argumentPointerName == "void"
                     && candidateParamItr->Pointer && candidateParamItr->TypeName != "void")
                     result = -1;
+                if (!candidate.IsCxx && result == 0 && argumentIsPointer
+                    && argumentPointerName == "void" && candidateParamItr->Pointer
+                    && candidateParamItr->TypeName != "void")
+                    result = 1;
                 const std::string sourceEnum = !arg.TypeAndValue.TypeName.empty()
                     ? arg.TypeAndValue.TypeName : arg.InferSourceTypeName;
                 const bool sourceIsEnum = arg.TypeAndValue.IsScopedEnum
                     || !arg.TypeAndValue.EnumBacking.empty()
-                    || IsScopedEnumTypeName(sourceEnum) || !ResolveEnumTypeName(sourceEnum).empty();
+                    || IsScopedEnumTypeName(sourceEnum) || !ResolveEnumTypeName(sourceEnum).empty()
+                    || IsScopedEnumTypeName(arg.InferSourceTypeName)
+                    || !ResolveEnumTypeName(arg.InferSourceTypeName).empty()
+                    || (arg.HasOriginalArgumentType
+                        && (arg.OriginalArgumentType.IsScopedEnum
+                            || !arg.OriginalArgumentType.EnumBacking.empty()
+                            || IsScopedEnumTypeName(arg.OriginalArgumentType.TypeName)
+                            || !ResolveEnumTypeName(arg.OriginalArgumentType.TypeName).empty()));
                 const std::string sourceEnumKey = ResolveEnumTypeName(sourceEnum);
                 const std::string targetEnumKey = ResolveEnumTypeName(candidateParamItr->TypeName);
+                const bool targetIsEnum = !targetEnumKey.empty()
+                    || IsScopedEnumTypeName(candidateParamItr->TypeName)
+                    || enumBackingTypes.count(candidateParamItr->TypeName) != 0;
+                if (sourceIsEnum && !targetIsEnum && !candidateParamItr->Pointer
+                    && !candidateParamItr->ElemPointer && !candidateParamItr->IsFunctionPointer
+                    && candidateParamItr->IsInteger() != -1)
+                    enumToIntegerConversion = true;
                 const bool exactEnumPointer = arg.TypeAndValue.Pointer && candidateParamItr->Pointer
                     && arg.TypeAndValue.ElemPointer == candidateParamItr->ElemPointer
                     && arg.TypeAndValue.PointerDepth == candidateParamItr->PointerDepth
@@ -3884,6 +3908,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             {
                 Ranked ranked;
                 ranked.pair = &pair;
+                // In a joined native-template set, enum-to-integer is a promotion, so an exact
+                // instantiated enum parameter must rank above the concrete integer overload.
+                const bool exactForRanking = perfectMatch && !constDiscardNotViable
+                    && !(rankEnumToIntegerAsConversion && enumToIntegerConversion)
+                    && !(candidate.Variadic && arguments.size() > candidate.Parameters.size());
+                ranked.perfectMatch = exactForRanking;
+                ranked.enumToIntegerConversion = enumToIntegerConversion;
                 ranked.shapeMismatches = shapeMismatches;
                 ranked.boolCoercions = boolCoercions;
                 ranked.constRefMaterializations = constRefMaterializations;
@@ -3906,7 +3937,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.integerCosts = std::move(integerCosts);
                 ranked.standardCosts = std::move(standardCosts);
                 ranked.nullPointerConversions = nullPointerConversions;
-                (perfectMatch ? perfect : possible).push_back(std::move(ranked));
+                (exactForRanking ? perfect : possible).push_back(std::move(ranked));
             }
         }
 
@@ -3996,10 +4027,22 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && a.integerCosts[i] >= 0 && b.integerCosts[i] >= 0
                     && enumBackingTypes.count(aParams[i].TypeName) == 0
                     && enumBackingTypes.count(bParams[i].TypeName) == 0;
-                const bool nullPointerJudged = i < a.integerCosts.size() && i < b.integerCosts.size()
+                const bool nullPointerRanked = i < a.integerCosts.size() && i < b.integerCosts.size()
                     && i < a.standardCosts.size() && i < b.standardCosts.size()
                     && a.integerCosts[i] < 0 && b.integerCosts[i] < 0
                     && a.standardCosts[i] >= 0 && b.standardCosts[i] >= 0;
+                size_t sourceArgumentIndex = i;
+                if (a.pair->second.IsMethod
+                    && a.pair->second.Parameters.size() == a.pair->first.size() + 1
+                    && i > 0 && !a.pair->second.Parameters.front().VariableName.empty())
+                    sourceArgumentIndex = i - 1;
+                const bool templateNullPointerTie = reportNullPointerTemplateAmbiguity
+                    && sourceArgumentIndex < a.pair->first.size()
+                    && (IsNullptrLiteralArgument(a.pair->first[sourceArgumentIndex])
+                        || IsNullPointerConstantArgument(a.pair->first[sourceArgumentIndex], false))
+                    && aParams[i].Pointer && bParams[i].Pointer
+                    && !aParams[i].IsArrayView && !bParams[i].IsArrayView;
+                const bool nullPointerJudged = nullPointerRanked || templateNullPointerTie;
                 const bool judged = integerJudged || nullPointerJudged;
                 if (!judged)
                     return TieKind::Other;
@@ -4272,6 +4315,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         auto finish = [&](const Ranked* winner) -> Result {
             if (winner == nullptr)
                 return Result{};
+            if (selectedPerfectOut != nullptr)
+                *selectedPerfectOut = winner->perfectMatch && !winner->enumToIntegerConversion;
             if (!cxxRanking || !fullyRanked(cxxRanks[winner->pair]))
                 return *winner->pair;
             const auto& won = cxxRanks[winner->pair];
@@ -4499,7 +4544,21 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         if (cxxRanking && ellipsisWinner != nullptr)
             return finish(ellipsisWinner);
         if (variadicFallback != nullptr && !cxxRanking)
+        {
+            if (selectedPerfectOut != nullptr
+                && variadicFallback->first.size() == variadicFallback->second.Parameters.size())
+            {
+                FunctionSymbol fixedCandidate = variadicFallback->second;
+                fixedCandidate.Variadic = false;
+                const std::vector<Result> fixedOnly = {
+                    Result{ variadicFallback->first, std::move(fixedCandidate) } };
+                bool fixedArgsPerfect = false;
+                const Result fixedSelection = ComputeOverloadFunction(
+                    fixedOnly, nullptr, nullptr, &fixedArgsPerfect);
+                *selectedPerfectOut = fixedSelection.second.Function != nullptr && fixedArgsPerfect;
+            }
             return *variadicFallback;
+        }
         // Nothing viable: the const-dropping variadic reaches the selected-candidate guard.
         if (variadicConstDropFallback != nullptr)
             return *variadicConstDropFallback;
@@ -5387,7 +5446,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         bool allowOperatorAliasReturnStringTemp, llvm::Value* operatorReceiverStorage,
         const NamedVariable* implicitReceiver,
         const std::vector<std::string>& lexicalAggregateScopes,
-        const FunctionSymbol* additionalCandidate)
+        const FunctionSymbol* additionalCandidate,
+        bool reportNullPointerTemplateAmbiguity)
 {
         std::vector<NamedVariable> arguments(inputArguments);
         // These describe only the call being lowered. Clear them before overload probing so a
@@ -5810,6 +5870,35 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             joinedCandidateSet.push_back(*additionalCandidate);
             candidateSet = &joinedCandidateSet;
         }
+        const NamedVariable* nativeReceiverConstSource = callReceiver.has_value()
+            ? &*callReceiver : implicitReceiver;
+        auto isReceiverNativeMethod = [&](const FunctionSymbol& candidate) {
+            return candidate.IsMethod && !candidate.IsCxx && !candidate.Parameters.empty()
+                && ResolveTypeAlias(candidate.Parameters.front().TypeName)
+                    == ResolveTypeAlias(receiverType);
+        };
+        const bool constNativeReceiver = nativeReceiverConstSource != nullptr
+            && (nativeReceiverConstSource->TypeAndValue.ConstMask & 1u) != 0;
+        const bool hasConstNativeOverload = constNativeReceiver
+            && std::any_of(candidateSet->begin(), candidateSet->end(), [&](const auto& candidate) {
+                return isReceiverNativeMethod(candidate) && candidate.IsExplicitConstMethod();
+            });
+        std::vector<FunctionSymbol> constReceiverCandidates;
+        std::vector<FunctionSymbol> constReceiverNonConstCandidates;
+        if (hasConstNativeOverload)
+        {
+            for (const auto& candidate : *candidateSet)
+            {
+                const bool isNativeMethod = candidate.IsMethod && !candidate.IsCxx
+                    && !candidate.Parameters.empty();
+                if (isNativeMethod && !isReceiverNativeMethod(candidate)) continue;
+                if (isReceiverNativeMethod(candidate) && !candidate.IsExplicitConstMethod())
+                    constReceiverNonConstCandidates.push_back(candidate);
+                if (!isReceiverNativeMethod(candidate) || candidate.IsExplicitConstMethod())
+                    constReceiverCandidates.push_back(candidate);
+            }
+            candidateSet = &constReceiverCandidates;
+        }
         std::vector<FunctionSymbol> cxxOperatorCandidates;
         // Free C++ operators dropped because a const receiver cannot bind their non-const `T&`
         // parameter: kept for the no-overload diagnostic, which names them and the const reason.
@@ -6030,7 +6119,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     resolvedCandidate.emplace_back(std::move(matched), candidate);
                     // A C++ variadic is one candidate of its overload set: its non-variadic
                     // siblings still score (ComputeOverloadFunction ranks the variadic last).
-                    if (!candidate.IsCxx) break;
+                    if (!candidate.IsCxx && additionalCandidate == nullptr) break;
                 }
                 else if (candidateArguments.empty() && candidate.Parameters.empty() && candidate.IsCxx)
                 {
@@ -6094,7 +6183,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         std::vector<FunctionSymbol> tiedCandidates;
         CxxPreferredOverload cxxPreferred;
         auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates,
-                                                            &cxxPreferred);
+                                                            &cxxPreferred, nullptr,
+                                                            reportNullPointerTemplateAmbiguity,
+                                                            additionalCandidate != nullptr);
         if (candidate.Function == nullptr && tiedCandidates.empty() && !cxxPreferred.set
             && std::any_of(arguments.begin(), arguments.end(), [](const NamedVariable& arg) {
                 return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr
@@ -6890,6 +6981,27 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogError(std::format(
                     "call to non-static member function '{}' without an object argument",
                     bareMemberName));
+            if (constNativeReceiver && hasConstNativeOverload
+                && nativeReceiverConstSource != nullptr)
+            {
+                for (const auto& rejected : constReceiverNonConstCandidates)
+                {
+                    if (MatchFunction(arguments, rejected.Parameters).size() != arguments.size())
+                        continue;
+                    std::string object, reason;
+                    if (!ConstReceiverReason(*nativeReceiverConstSource, object, reason)) continue;
+                    std::string parameters;
+                    for (size_t i = 1; i < rejected.Parameters.size(); ++i)
+                        parameters += (parameters.empty() ? "" : ", ")
+                            + SpellType(*this, rejected.Parameters[i]);
+                    const std::string overload = bareMemberName + "(" + parameters + ")";
+                    LogError(std::format(
+                        "cannot call non-const member '{}' on '{}': {}, so it is read-only and "
+                        "only a const member function may be called on it. The matching overload "
+                        "'{}' is not declared const.",
+                        bareMemberName, object, reason, overload));
+                }
+            }
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names
@@ -8311,6 +8423,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // overload and may have an alias ABI the destination overload does not.
                 if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
                     if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
+                        if (RejectExternMoveCountFuncPtrBind(
+                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName,
+                                *fnSym, &*candParamItr))
+                            return nullptr;
+                if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
+                    if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
                         if (RejectAliasParamFuncPtrBind(
                                 arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym, &*candParamItr))
                             return nullptr;
@@ -8875,6 +8993,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // provenance is visible here before move transfer; unknown sources fail open.
             const auto& arg = matched[i];
             const auto& adoptedParam = candidate.Parameters[i];
+            if (candidate.External && candidate.HasCFlatBody
+                && ParameterCarriesRawArrayCount(adoptedParam)
+                && HasRawNewArrayProvenance(arg))
+            {
+                const std::string sourceName = arg.CallerName.empty()
+                    ? (arg.TypeAndValue.VariableName.empty() ? std::string("<expression>")
+                                                              : arg.TypeAndValue.VariableName)
+                    : arg.CallerName;
+                LogError(std::format(
+                    "cannot pass owning heap array '{}' to parameter '{}' of '{}': the extern C ABI "
+                    "does not carry the array element count",
+                    sourceName, adoptedParam.VariableName, diagnosticFunctionName));
+            }
             const bool coreUniqueReceiver = candidate.IsMethod
                 && !candidate.Parameters.empty()
                 && IsCoreUniqueType(candidate.Parameters.front().TypeName);
@@ -9981,6 +10112,28 @@ bool LLVMBackend::RejectAliasParamFuncPtrBind(const std::string& functionName,
         return false;
     }
 
+bool LLVMBackend::RejectExternMoveCountFuncPtrBind(const std::string& functionName,
+        const FunctionSymbol& sym, const TypeAndValue* destSig)
+{
+        if (!sym.External || !sym.HasCFlatBody || destSig == nullptr
+            || !destSig->IsFunctionPointer)
+            return false;
+        for (size_t i = 0; i < sym.Parameters.size() && i < destSig->FuncPtrParams.size(); ++i)
+        {
+            const auto& param = sym.Parameters[i];
+            const auto& slot = destSig->FuncPtrParams[i];
+            if (!ParameterCarriesRawArrayCount(param) || !slot.Pointer || !slot.IsMove) continue;
+            LogError(std::format(
+                "cannot bind extern function '{}' to function-pointer type '{}': "
+                "parameter '{}' is '{}', which requires a hidden array-count slot that "
+                "the extern C ABI does not provide",
+                SpellFunctionSymbol(*this, functionName), FuncPtrSpellingOf(*destSig),
+                param.VariableName, SpellType(*this, param)));
+            return true;
+        }
+        return false;
+    }
+
 llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int expectedParamCount,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams,
                                           const TypeAndValue* destSig,
@@ -10038,6 +10191,9 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
                             const auto& b = expected[i];
                             if (a.Known && b.Known
                                 && (a.Canon != b.Canon
+                                    || (!a.ScalarPointeeClass.empty()
+                                        && !b.ScalarPointeeClass.empty()
+                                        && a.ScalarPointeeClass != b.ScalarPointeeClass)
                                     || (a.PointerDepth > 0 && b.PointerDepth > 0
                                         && a.PointerDepth != b.PointerDepth)
                                     || (!a.StructKey.empty() && !b.StructKey.empty()
@@ -10066,6 +10222,9 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
             if (bindingFuncPtr && sym->IsCxx && sym->IsDeleted)
                 LogError("clang: attempt to use a deleted function");
             if (bindingFuncPtr) RejectAliasParamFuncPtrBind(functionName, *sym, destSig);
+            if (bindingFuncPtr
+                && RejectExternMoveCountFuncPtrBind(functionName, *sym, destSig))
+                return nullptr;
             // Taking the address is as unsafe as calling it - the eventual indirect call has
             // no landing pad either.
             if (bindingFuncPtr) RejectThrowingCxxFunction(*sym, functionName);

@@ -1,0 +1,46 @@
+int tFieldInitSelf = 31;
+int tFieldInitLater = 41;
+
+expect_error("field 'tFieldInitSelf' is read before initialization") {
+    struct TFieldInitSelfError { int tFieldInitSelf = tFieldInitSelf; };
+}
+
+expect_error("field 'tFieldInitLater' is read before initialization") {
+    struct TFieldInitLaterError { int first = tFieldInitLater; int tFieldInitLater = 7; };
+}
+
+expect_error("field 'tFieldInitSelf' is read before initialization") {
+    [cpp] struct TFieldInitCppSelfError { int tFieldInitSelf = tFieldInitSelf; };
+}
+
+expect_error("field 'tFieldInitLater' is read before initialization") {
+    [cpp] struct TFieldInitCppLaterError { int first = tFieldInitLater; int tFieldInitLater = 7; };
+}
+
+expect_error("field 'tFieldInitClassSelf' is read before initialization") {
+    class TFieldInitClassSelfError { int tFieldInitClassSelf = tFieldInitClassSelf; };
+}
+
+expect_error("field 'tFieldInitClassLater' is read before initialization") {
+    class TFieldInitClassLaterError { int first = tFieldInitClassLater; int tFieldInitClassLater = 7; };
+}
+
+expect_error("field 'tFieldInitSelfDerefAddress' is read before initialization") {
+    struct TFieldInitSelfDerefAddressError {
+        int tFieldInitSelfDerefAddress = *&tFieldInitSelfDerefAddress;
+    };
+}
+
+struct TFieldInitPointee { int value = 6; };
+
+expect_error("field 'later' is read before initialization") {
+    struct TFieldInitPointerArrowError {
+        int* address = &later->value;
+        TFieldInitPointee* later = nullptr;
+    };
+}
+
+expect_error("field 'later' is read before initialization") {
+    struct TFieldInitPointerIndexError { int* address = &later[0]; int* later = nullptr; };
+}
+

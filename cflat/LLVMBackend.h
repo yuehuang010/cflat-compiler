@@ -6057,6 +6057,9 @@ private:
         int depth = 0, const llvm::DominatorTree* dominatorTree = nullptr) const;
     const llvm::Function* FunctionPointerTargetFromLocal(const llvm::Value* storage,
         int depth = 0, const llvm::DominatorTree* dominatorTree = nullptr) const;
+    bool FunctionPointerStorageDtorCall(const llvm::CallBase* call,
+        const llvm::AllocaInst* storage) const;
+    bool FunctionPointerStorageIsLoadStoreOnly(const llvm::AllocaInst* storage) const;
     const llvm::Function* FunctionPointerTargetFromStorage(const llvm::Value* storage) const;
     std::vector<const llvm::Function*> FunctionPointerTargetsFromStorage(
         const llvm::Value* storage, bool& complete) const;
@@ -9756,7 +9759,7 @@ public:
      */
     int ResolveInterfaceMethodSlot(const std::string& ifaceName, const std::string& methodName,
         const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
-        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot);
+        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot, bool constReceiver);
 
     // receiver: the user's receiver expression, judged for #8 (a const one needs a const method).
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
@@ -11863,6 +11866,8 @@ public:
         bool IsAlias = false;       // by-address ABI identity: an alias param or return
         int ConstMask = -1;
         std::string Canon;          // "i32", "f64", "p:v", "s", "p:s", ...
+        // Scalar pointer pointees erase signedness but keep target-long identity apart from fixed-width integers.
+        std::string ScalarPointeeClass;
         // The ONE registered struct key this component names, when Canon is "s"/"p:s". Empty
         // means the spelling named no registered struct, which is Known == false.
         std::string StructKey;
@@ -12225,7 +12230,9 @@ public:
     // `preferredOut` is set (result empty) when C++ would call a candidate CFlat refuses.
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
-        std::vector<FunctionSymbol>* tiedOut = nullptr, CxxPreferredOverload* preferredOut = nullptr);
+        std::vector<FunctionSymbol>* tiedOut = nullptr, CxxPreferredOverload* preferredOut = nullptr,
+        bool* selectedPerfectOut = nullptr, bool reportNullPointerTemplateAmbiguity = false,
+        bool rankEnumToIntegerAsConversion = false);
     std::vector<std::string> CxxClassConversionTies(const std::string& source,
                                                     const std::string& target) const;
     struct CxxClassConversionPair
@@ -12312,7 +12319,8 @@ public:
                                               llvm::Value* operatorReceiverStorage = nullptr,
                                               const NamedVariable* implicitReceiver = nullptr,
                                               const std::vector<std::string>& lexicalAggregateScopes = {},
-                                              const FunctionSymbol* additionalCandidate = nullptr);
+                                              const FunctionSymbol* additionalCandidate = nullptr,
+                                              bool reportNullPointerTemplateAmbiguity = false);
 
     llvm::Function* GetFunction(const std::string& functionName);
 
@@ -12339,6 +12347,9 @@ public:
     // function-pointer type cannot describe.
     bool RejectAliasParamFuncPtrBind(const std::string& functionName, const FunctionSymbol& sym,
                                      const TypeAndValue* destSig = nullptr);
+    bool RejectExternMoveCountFuncPtrBind(const std::string& functionName,
+                                          const FunctionSymbol& sym,
+                                          const TypeAndValue* destSig);
 
     llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr,
@@ -13159,7 +13170,8 @@ public:
                                          const std::string& ifaceName, const std::string& member);
     // #8 on an interface receiver: only a method the interface spells `const` may be called.
     void RefuseConstInterfaceReceiverCall(const NamedVariable& receiver, const std::string& ifaceName,
-                                          const std::string& member);
+                                          const std::string& member,
+                                          const InterfaceMethod* matchingNonConst = nullptr);
     // Settle every recorded method into FunctionSymbol::ConstMethodState before the cache is written.
     void ResolveConstMethodStates();
     std::unordered_map<std::string, ReceiverScanFacts> receiverScanFacts_;
@@ -14210,7 +14222,7 @@ public:
     // 301: zero-initialized scalars are excluded from the dynamic initializer list.
     // 302: dynamic initializer ownership is shared across import groups.
     // 303: initializer cache entries carry internal-linkage file identity and import order.
-    static constexpr int kCHeaderCacheVersion = 304;
+    static constexpr int kCHeaderCacheVersion = 305;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

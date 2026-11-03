@@ -373,6 +373,7 @@ void CxxDerefPointer(cpp_derefcopy.Cursor16* value, int x) { **value = x; **valu
 import cpp "library/cpp_interop_ref_member.h";
 import cpp "library/cpp_interop_ref_alias.h";
 import cpp "library/cpp_interop_refctx_overload.h";
+import cpp "library/cpp_interop_refres_array.hpp";
 import cpp "library/cpp_t495_amppick.hpp";
 import cpp "library/cpp_interop_field.h";
 int RefFnCflat(int x) { return x + 3000; }
@@ -383,6 +384,21 @@ import "library/cpp_interop_globals.cb";
 import cpp "library/cpp_interop_usingns.h";
 // The same using-declarations again from a second header: same entity, no conflict.
 import cpp "library/cpp_interop_usingns_again.h";
+
+int refresGlobalConst0 = 101;
+int refresGlobalRef0 = 102;
+int refresGlobalConst1 = 103;
+int refresGlobalRef1 = 104;
+cpprefres.Pair[2] refresGlobalElided = {
+    refresGlobalConst0, refresGlobalRef0, 1,
+    refresGlobalConst1, refresGlobalRef1, 2 };
+cpprefres.Pair[2] refresGlobalBraced = {
+    { refresGlobalConst0, refresGlobalRef0, 3 },
+    { refresGlobalConst1, refresGlobalRef1, 4 } };
+int refresDmiGlobalX = 111;
+int refresDmiGlobalY = 112;
+cpprefres.Defaulted[2] refresDmiGlobal = {
+    { refresDmiGlobalX, refresDmiGlobalY, 21 } };
 // Forward/definition, template redeclaration, and specialization forms accepted by clang.
 // Separate lines: a grouped import registers one file and never reaches the conflict check.
 import cpp "library/cpp_interop_c2_accept_a.h";
@@ -567,6 +583,9 @@ import cpp "library/cpp_t132_s7_byval.hpp";
 import cpp "library/cpp_t310_fldinit.hpp";
 import cpp "library/cpp_private_base_shadow.h";
 // T310 FLDINIT: scalar field defaults of C++ class type run the converting constructor.
+int tFieldInitCppRead() { return 101; }
+[cpp] struct TFieldInitCppEarlier { int first = 4; int second = first + 2; };
+[cpp] struct TFieldInitCppMethod { int seed = 3; int tFieldInitCppRead() { return seed + 4; } int value = tFieldInitCppRead(); };
 struct T310FieldW { t310.IntC c = 5; };
 struct T310FieldK { t310.KP k = 0; };
 struct T310FieldCT { t310.CT c = 5; };
@@ -3404,8 +3423,27 @@ int t47RefmemEarlyReturn()
     return inside * 100 + (holder.c.v == 5 ? 0 : 1);
 }
 
+interface IOvlRound1DerivedPointer
+{
+    int f(cppi.ConstPointerRankValue* value);
+    int f(cppi.ConstPointerRank* value);
+};
+class OvlRound1DerivedPointer : IOvlRound1DerivedPointer
+{
+    int f(cppi.ConstPointerRankValue* value) { return 1; }
+    int f(cppi.ConstPointerRank* value) { return 2; }
+};
+
 extern int main()
 {
+    // A C++ Derived* still binds the Base* slot through direct and interface dispatch.
+    cppi.ConstPointerRankDerived ovlDerived = default;
+    cppi.ConstPointerRankDerived* ovlDerivedPtr = &ovlDerived;
+    OvlRound1DerivedPointer ovlDerivedImpl;
+    IOvlRound1DerivedPointer ovlDerivedIface = ovlDerivedImpl;
+    if (ovlDerivedImpl.f(ovlDerivedPtr) != 1 || ovlDerivedIface.f(ovlDerivedPtr) != 1)
+        return 53001;
+
     // Header dynamic initializers run once in declaration order, including unused globals.
     if (hdrglob.counter_now() != 7 || hdrglob.sequence_now() != 1234567) return 52801;
     if (hdrglob.referenced_now() != 40) return 52802;
@@ -4215,6 +4253,10 @@ extern int main()
     delete t180IntLit;
     // T310 FLDINIT: field defaults of C++ class type (clang: 5, 5, 5, 1) and their one construction and
     // destruction (live counter: +1 inside the block, back afterwards).
+    TFieldInitCppEarlier tFieldInitCppEarlier;
+    if (tFieldInitCppEarlier.second != 6) return 14901;
+    TFieldInitCppMethod tFieldInitCppMethod;
+    if (tFieldInitCppMethod.value != 7) return 14902;
     T310FieldW t310W;
     if (t310W.c.v != 5) return 13301;
     T310FieldW t310WBrace{};
@@ -10007,6 +10049,212 @@ extern int main()
         return 47747;
     refbaseObject.r = 75;
     if (refbaseObjectX != 75) return 47748;
+
+    int refresConst0 = 76; int refresRef0 = 77;
+    int refresConst1 = 78; int refresRef1 = 79;
+    cpprefres.Pair[2] refresElided = {
+        refresConst0, refresRef0, 1, refresConst1, refresRef1, 2 };
+    refresElided[0].r = 80; refresElided[1].r = 81;
+    if (refresElided[0].c != 76 || refresElided[1].c != 78
+        || refresRef0 != 80 || refresRef1 != 81
+        || refresElided[0].value != 1 || refresElided[1].value != 2)
+        return 47750;
+
+    cpprefres.Pair[2] refresBraced = {
+        { refresConst0, refresRef0, 3 }, { refresConst1, refresRef1, 4 } };
+    refresBraced[0].r = 82; refresBraced[1].r = 83;
+    if (refresBraced[0].c != 76 || refresBraced[1].c != 78
+        || refresRef0 != 82 || refresRef1 != 83
+        || refresBraced[0].value != 3 || refresBraced[1].value != 4)
+        return 47751;
+
+    cpprefres.Pair[2][2] refres2DElided = {
+        { refresConst0, refresRef0, 5, refresConst1, refresRef1, 6 },
+        { refresConst0, refresRef0, 7, refresConst1, refresRef1, 8 } };
+    refres2DElided[0][0].r = 84; refres2DElided[1][1].r = 85;
+    if (refres2DElided[0][0].c != 76 || refres2DElided[0][1].c != 78
+        || refres2DElided[1][1].c != 78 || refresRef0 != 84 || refresRef1 != 85
+        || refres2DElided[0][1].value != 6 || refres2DElided[1][1].value != 8)
+        return 47752;
+
+    cpprefres.Pair[2][2] refres2DBraced = {
+        { { refresConst0, refresRef0, 9 }, { refresConst1, refresRef1, 10 } },
+        { { refresConst0, refresRef0, 11 }, { refresConst1, refresRef1, 12 } } };
+    refres2DBraced[0][0].r = 86; refres2DBraced[1][1].r = 87;
+    if (refres2DBraced[0][0].c != 76 || refres2DBraced[1][1].c != 78
+        || refresRef0 != 86 || refresRef1 != 87
+        || refres2DBraced[0][1].value != 10 || refres2DBraced[1][1].value != 12)
+        return 47753;
+
+    cpprefres.Holder refresFieldElided = {
+        refresConst0, refresRef0, 13, refresConst1, refresRef1, 14, 15 };
+    refresFieldElided.items[0].r = 88; refresFieldElided.items[1].r = 89;
+    if (refresFieldElided.items[0].c != 76 || refresFieldElided.items[1].c != 78
+        || refresRef0 != 88 || refresRef1 != 89 || refresFieldElided.tail != 15)
+        return 47754;
+
+    cpprefres.Holder refresFieldBraced = {
+        { { refresConst0, refresRef0, 16 }, { refresConst1, refresRef1, 17 } }, 18 };
+    refresFieldBraced.items[0].r = 90; refresFieldBraced.items[1].r = 91;
+    if (refresFieldBraced.items[0].c != 76 || refresFieldBraced.items[1].c != 78
+        || refresRef0 != 90 || refresRef1 != 91 || refresFieldBraced.tail != 18)
+        return 47755;
+
+    cpprefres.Holder refresFieldDesignated = {
+        items = { { c = refresConst0, r = refresRef0, value = 19 },
+                  { c = refresConst1, r = refresRef1, value = 20 } }, tail = 21 };
+    refresFieldDesignated.items[0].r = 92; refresFieldDesignated.items[1].r = 93;
+    if (refresFieldDesignated.items[0].c != 76
+        || refresFieldDesignated.items[1].c != 78
+        || refresRef0 != 92 || refresRef1 != 93 || refresFieldDesignated.tail != 21)
+        return 47756;
+
+    refresGlobalElided[0].r = 105; refresGlobalElided[1].r = 106;
+    refresGlobalBraced[0].r = 107; refresGlobalBraced[1].r = 108;
+    if (refresGlobalElided[0].c != 101 || refresGlobalElided[1].c != 103
+        || refresGlobalBraced[0].c != 101 || refresGlobalBraced[1].c != 103
+        || refresGlobalRef0 != 107 || refresGlobalRef1 != 108
+        || refresGlobalElided[1].value != 2 || refresGlobalBraced[1].value != 4)
+        return 47757;
+
+    int refresDmiBracedX = 31; int refresDmiBracedY = 32;
+    cpprefres.Defaulted[3] refresDmiPartialBraced = {
+        { refresDmiBracedX, refresDmiBracedY, 1 } };
+    if (refresDmiPartialBraced[0].c != 31 || refresDmiPartialBraced[0].r != 32
+        || refresDmiPartialBraced[0].value != 1
+        || refresDmiPartialBraced[2].c != 700 || refresDmiPartialBraced[2].r != 800
+        || refresDmiPartialBraced[2].value != 0)
+        return 47758;
+    refresDmiPartialBraced[2].r = 801;
+    if (cpprefres.defaultRef != 801) return 47759;
+
+    int refresDmiTwoX = 41; int refresDmiTwoY = 42;
+    int refresDmiTwoA = 43; int refresDmiTwoB = 44;
+    cpprefres.Defaulted[3] refresDmiPartialTwo = {
+        { refresDmiTwoX, refresDmiTwoY, 2 }, { refresDmiTwoA, refresDmiTwoB, 3 } };
+    if (refresDmiPartialTwo[1].c != 43 || refresDmiPartialTwo[1].r != 44
+        || refresDmiPartialTwo[1].value != 3 || refresDmiPartialTwo[2].c != 700
+        || refresDmiPartialTwo[2].r != 801 || refresDmiPartialTwo[2].value != 0)
+        return 47760;
+    refresDmiPartialTwo[1].r = 45;
+    if (refresDmiTwoB != 45) return 47761;
+
+    int refresDmiElidedX = 51; int refresDmiElidedY = 52;
+    cpprefres.Defaulted[3] refresDmiPartialElided = {
+        refresDmiElidedX, refresDmiElidedY, 4 };
+    if (refresDmiPartialElided[0].c != 51 || refresDmiPartialElided[0].r != 52
+        || refresDmiPartialElided[0].value != 4
+        || refresDmiPartialElided[1].c != 700 || refresDmiPartialElided[1].r != 801
+        || refresDmiPartialElided[2].value != 0)
+        return 47762;
+
+    int refresExactX = 61; int refresExactY = 62;
+    cpprefres.RefOnly[2] refresExact = { refresExactX, refresExactY };
+    refresExact[0].r = 63; refresExact[1].r = 64;
+    if (refresExactX != 63 || refresExactY != 64) return 47763;
+
+    int refresRowsX = 71; int refresRowsY = 72;
+    int refresRowsA = 73; int refresRowsB = 74;
+    cpprefres.Defaulted[2][2] refresRows = {
+        { refresRowsX, refresRowsY, 5 },
+        { refresRowsA, refresRowsB, 6, refresRowsX, refresRowsY, 7 } };
+    if (refresRows[0][1].c != 700 || refresRows[0][1].r != 801
+        || refresRows[0][1].value != 0 || refresRows[1][0].c != 73
+        || refresRows[1][0].value != 6 || refresRows[1][1].c != 71
+        || refresRows[1][1].r != 72 || refresRows[1][1].value != 7)
+        return 47764;
+    refresRows[1][1].r = 75;
+    if (refresRowsY != 75) return 47765;
+
+    int refresH2X = 81; int refresH2Y = 82;
+    int refresH2A = 83; int refresH2B = 84;
+    cpprefres.Holder2D refresH2Braced = {
+        { { { refresH2X, refresH2Y, 1 }, { refresH2A, refresH2B, 2 } },
+          { { refresH2X, refresH2Y, 3 }, { refresH2A, refresH2B, 4 } } }, 9 };
+    refresH2Braced.items[1][1].r = 85;
+    if (refresH2B != 85 || refresH2Braced.items[1][0].c != 81
+        || refresH2Braced.items[0][1].value != 2 || refresH2Braced.tail != 9)
+        return 47766;
+
+    cpprefres.Holder2D refresH2Elided = {
+        refresH2X, refresH2Y, 1, refresH2A, refresH2B, 2,
+        refresH2X, refresH2Y, 3, refresH2A, refresH2B, 4, 10 };
+    refresH2Elided.items[1][1].r = 86;
+    if (refresH2B != 86 || refresH2Elided.items[1][0].c != 81
+        || refresH2Elided.items[0][1].value != 2 || refresH2Elided.tail != 10)
+        return 47767;
+
+    refresDmiGlobal[1].r = 113;
+    if (refresDmiGlobal[0].c != 111 || refresDmiGlobal[0].r != 112
+        || refresDmiGlobal[0].value != 21 || refresDmiGlobal[1].c != 700
+        || refresDmiGlobal[1].r != 113 || refresDmiGlobal[1].value != 0
+        || cpprefres.defaultRef != 113)
+        return 47768;
+
+    int refres3DX = 121; int refres3DY = 122;
+    int refres3DA = 123; int refres3DB = 124;
+    cpprefres.Defaulted[2][2][2] refres3DShortRows = {
+        { { refres3DX, refres3DY, 1 }, { refres3DA, refres3DB, 2,
+            refres3DX, refres3DY, 3 } },
+        { { refres3DX, refres3DY, 4, refres3DA, refres3DB, 5 },
+          { refres3DA, refres3DB, 6 } }
+    };
+    if (refres3DShortRows[0][0][0].c != 121
+        || refres3DShortRows[0][0][0].value != 1
+        || refres3DShortRows[0][0][1].c != 700
+        || refres3DShortRows[0][0][1].value != 0
+        || refres3DShortRows[0][1][0].c != 123
+        || refres3DShortRows[0][1][0].value != 2
+        || refres3DShortRows[0][1][1].c != 121
+        || refres3DShortRows[0][1][1].value != 3
+        || refres3DShortRows[1][0][0].value != 4
+        || refres3DShortRows[1][0][1].value != 5
+        || refres3DShortRows[1][1][0].value != 6
+        || refres3DShortRows[1][1][1].c != 700
+        || refres3DShortRows[1][1][1].value != 0)
+        return 47769;
+    refres3DShortRows[0][1][1].r = 125;
+    if (refres3DY != 125) return 47770;
+    refres3DShortRows[0][0][1].r = 126;
+    if (cpprefres.defaultRef != 126) return 47771;
+
+    cpprefres.Defaulted[1] refresDmiEmptyArray = {};
+    if (refresDmiEmptyArray[0].c != 700 || refresDmiEmptyArray[0].r != 126
+        || refresDmiEmptyArray[0].value != 0)
+        return 47772;
+    refresDmiEmptyArray[0].r = 127;
+    if (cpprefres.defaultRef != 127) return 47773;
+
+    cpprefres.Defaulted[1] refresDmiEmptyElement = { {} };
+    if (refresDmiEmptyElement[0].c != 700 || refresDmiEmptyElement[0].r != 127
+        || refresDmiEmptyElement[0].value != 0)
+        return 47774;
+    refresDmiEmptyElement[0].r = 128;
+    if (cpprefres.defaultRef != 128) return 47775;
+    // An empty '{}' sub-array at a non-innermost dimension keeps the later rows in place.
+    cpprefres.Defaulted[2][2] refresEmptyMidRow = { {}, { refres3DX, refres3DY, 7, refres3DA, refres3DB, 8 } };
+    if (refresEmptyMidRow[0][1].c != 700 || refresEmptyMidRow[0][1].value != 0
+        || refresEmptyMidRow[1][0].value != 7 || refresEmptyMidRow[1][1].c != 123
+        || refresEmptyMidRow[1][1].value != 8)
+        return 47790;
+    cpprefres.Defaulted[2][2][2] refresEmptyMid3D = { { {}, { refres3DX, refres3DY, 9 } }, {} };
+    if (refresEmptyMid3D[0][0][1].c != 700 || refresEmptyMid3D[0][1][0].value != 9
+        || refresEmptyMid3D[1][1][1].value != 0)
+        return 47791;
+
+    int refresEmptyX = 131; int refresEmptyY = 132;
+    cpprefres.Defaulted[2] refresDmiExplicitEmptySlot = {
+        { refresEmptyX, refresEmptyY, 7 }, {} };
+    if (refresDmiExplicitEmptySlot[0].c != 131
+        || refresDmiExplicitEmptySlot[0].value != 7
+        || refresDmiExplicitEmptySlot[1].c != 700
+        || refresDmiExplicitEmptySlot[1].r != 128
+        || refresDmiExplicitEmptySlot[1].value != 0)
+        return 47776;
+    refresDmiExplicitEmptySlot[1].r = 129;
+    if (cpprefres.defaultRef != 129) return 47777;
+    refresDmiExplicitEmptySlot[0].r = 133;
+    if (refresEmptyY != 133) return 47778;
 
     int refmemX = 5;
     cppref.RefHolder refmemH = cppref.make_ref(&refmemX);      // by-value return of the record
@@ -17143,6 +17391,7 @@ extern int main()
     *cppi.mt_const_ipcr() = 5;
     mtcH.mcr()->v = 4;
     if (cppi.mtConstInt != 5 || mtcH.s.v != 4) return 7960;
+    if (mtcH.mcr()->v != 4) return 7988;
     mtcH.lr() = 9;
     mtcH.lr() += 1;
     mtcH.lr()++;

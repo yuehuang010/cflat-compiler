@@ -32,6 +32,47 @@ int fnvbGenericRead<T>(T* p) { return p->value; }
 int fnvbApply(function<int(FnvbArgBox*)> fn, FnvbArgBox box) { return fn(box); }
 int fnvbIncrement(int value) { return value + 1; }
 
+int tCalleeRefFnTempDtors = 0;
+struct TCalleeRefFnTemp
+{
+    int value = 0;
+    TCalleeRefFnTemp(int v) { value = v; }
+    ~TCalleeRefFnTemp() { tCalleeRefFnTempDtors = tCalleeRefFnTempDtors + 1; }
+};
+int tCalleeRefFnTempRead(int* p) { return *p; }
+extern int tCalleeRefRawFn(int* p) { return p == nullptr ? 17 : 0; }
+
+bool testCalleeRefFunctionPointerAcceptSet()
+{
+    tCalleeRefFnTempDtors = 0;
+    function<int(int*)> known = tCalleeRefFnTempRead;
+    int readValue = known(&(new TCalleeRefFnTemp(8))->value);
+    bool passed = Test("calleeref known function temp value and dtor",
+        readValue * 10 + tCalleeRefFnTempDtors, 81) != 0;
+
+    tCalleeRefFnTempDtors = 0;
+    Lambda<int(int*)> knownLambda = tCalleeRefFnTempRead;
+    int lambdaRead = knownLambda(&(new TCalleeRefFnTemp(9))->value);
+    passed &= Test("calleeref known Lambda temp value and dtor",
+        lambdaRead * 10 + tCalleeRefFnTempDtors, 91) != 0;
+
+    tCalleeRefFnTempDtors = 0;
+    int immediateRead = ((int* p) => { return *p; })(&(new TCalleeRefFnTemp(10))->value);
+    passed &= Test("calleeref immediate Lambda temp value and dtor",
+        immediateRead * 10 + tCalleeRefFnTempDtors, 101) != 0;
+
+    tCalleeRefFnTempDtors = 0;
+    int bias = 2;
+    Lambda<int(int*)> captured = (int* p) => { return *p + bias; };
+    int capturedRead = captured(&(new TCalleeRefFnTemp(11))->value);
+    passed &= Test("calleeref captured Lambda temp value and dtor",
+        capturedRead * 10 + tCalleeRefFnTempDtors, 131) != 0;
+
+    function<int(int*)> raw = tCalleeRefRawFn;
+    passed &= Test("calleeref raw C function pointer binding", raw(nullptr), 17) != 0;
+    return passed;
+}
+
 int fnvbPayloadLive = 0;
 struct FnvbPayload
 {
@@ -7405,6 +7446,83 @@ bool testT427VoidFunctionPointeeOverload()
     return Test("t427 exact void callback overload", t427SelectCallback(callback), 202) != 0;
 }
 
+int fnabiAcceptU8(u8* p) { return 111; }
+int fnabiAcceptU32(u32* p) { return 121; }
+int fnabiAcceptU64(u64* p) { return 131; }
+int fnabiAcceptU32PP(u32** p) { return 141; }
+int fnabiExactChar(char* p) { return 0; }
+int fnabiExactInt(int* p) { return 0; }
+int fnabiExactI64(i64* p) { return 0; }
+int fnabiExactIntPP(int** p) { return 0; }
+int fnabiLongOverload(long* p) { return 161; }
+int fnabiLongOverload(i64* p) { return 162; }
+int fnabiCallChar(function<int(char*)> f) { return f(nullptr); }
+int fnabiCallInt(function<int(int*)> f) { return f(nullptr); }
+int fnabiCallI64(function<int(i64*)> f) { return f(nullptr); }
+int fnabiCallIntPP(function<int(int**)> f) { return f(nullptr); }
+u8 fnabiReturnByte = 71;
+u32 fnabiReturnWord = 72;
+u64 fnabiReturnDword = 73;
+u32* fnabiReturnWordPtr = &fnabiReturnWord;
+u8* fnabiReturnU8() { return &fnabiReturnByte; }
+u32* fnabiReturnU32() { return &fnabiReturnWord; }
+u64* fnabiReturnU64() { return &fnabiReturnDword; }
+u32** fnabiReturnU32PP() { return &fnabiReturnWordPtr; }
+int fnabiInnerCharForNested(char* p) { return 151; }
+int fnabiNestedU8(function<int(u8*)> f) { return f(nullptr); }
+int fnabiNestedChar(function<int(char*)> f) { return f(nullptr); }
+
+bool testFnabiPointeeAcceptSet()
+{
+    bool result = true;
+    using FnabiCharSlot = function<int(char*)>;
+    FnabiCharSlot charBinding = fnabiAcceptU8;
+    result &= Test("fnabi u8*/char* binding", charBinding(nullptr), 111);
+    function<int(int*)> intBinding = fnabiAcceptU32;
+    result &= Test("fnabi u32*/int* binding", intBinding(nullptr), 121);
+    function<int(i64*)> i64Binding = fnabiAcceptU64;
+    result &= Test("fnabi u64*/i64* binding", i64Binding(nullptr), 131);
+    function<int(int**)> intPPBinding = fnabiAcceptU32PP;
+    result &= Test("fnabi u32**/int** binding", intPPBinding(nullptr), 141);
+    function<int(i64*)> overloadedI64Binding = fnabiLongOverload;
+    result &= Test("fnabi overload chooses exact i64 pointee", overloadedI64Binding(nullptr), 162);
+
+    function<int(char*)> charAssignment = fnabiExactChar;
+    charAssignment = fnabiAcceptU8;
+    result &= Test("fnabi u8*/char* assignment", charAssignment(nullptr), 111);
+    function<int(int*)> intAssignment = fnabiExactInt;
+    intAssignment = fnabiAcceptU32;
+    result &= Test("fnabi u32*/int* assignment", intAssignment(nullptr), 121);
+    function<int(i64*)> i64Assignment = fnabiExactI64;
+    i64Assignment = fnabiAcceptU64;
+    result &= Test("fnabi u64*/i64* assignment", i64Assignment(nullptr), 131);
+    function<int(int**)> intPPAssignment = fnabiExactIntPP;
+    intPPAssignment = fnabiAcceptU32PP;
+    result &= Test("fnabi u32**/int** assignment", intPPAssignment(nullptr), 141);
+
+    result &= Test("fnabi u8*/char* call argument", fnabiCallChar(fnabiAcceptU8), 111);
+    result &= Test("fnabi u32*/int* call argument", fnabiCallInt(fnabiAcceptU32), 121);
+    result &= Test("fnabi u64*/i64* call argument", fnabiCallI64(fnabiAcceptU64), 131);
+    result &= Test("fnabi u32**/int** call argument", fnabiCallIntPP(fnabiAcceptU32PP), 141);
+
+    function<char*()> charReturn = fnabiReturnU8;
+    result &= Test("fnabi u8*/char* return pointee", (u8*)charReturn() == &fnabiReturnByte, true);
+    function<int*()> intReturn = fnabiReturnU32;
+    result &= Test("fnabi u32*/int* return pointee", (u32*)intReturn() == &fnabiReturnWord, true);
+    function<i64*()> i64Return = fnabiReturnU64;
+    result &= Test("fnabi u64*/i64* return pointee", (u64*)i64Return() == &fnabiReturnDword, true);
+    function<int**()> intPPReturn = fnabiReturnU32PP;
+    result &= Test("fnabi u32**/int** return pointee", (u32**)intPPReturn() == &fnabiReturnWordPtr, true);
+
+    function<int(function<int(char*)>)> nestedBinding = fnabiNestedU8;
+    result &= Test("fnabi nested u8*/char* binding", nestedBinding(fnabiInnerCharForNested), 151);
+    function<int(function<int(char*)>)> nestedAssignment = fnabiNestedChar;
+    nestedAssignment = fnabiNestedU8;
+    result &= Test("fnabi nested u8*/char* assignment", nestedAssignment(fnabiInnerCharForNested), 151);
+    result &= Test("fnabi nested u8*/char* call argument", fnabiNestedU8(fnabiInnerCharForNested), 151);
+    return result;
+}
+
 int t501NamedPlusThree(int x) { return x + 3; }
 int t501GenericSlot<T>(T** pp) { return (**pp)(6); }
 
@@ -7530,6 +7648,8 @@ extern int main(int argc, char** argv)
 
     int passed = 0;
     int total  = 0;
+
+    total++; passed += testCalleeRefFunctionPointerAcceptSet() ? 1 : 0;
 
     total++; passed += testT414MoveSourcesNull() ? 1 : 0;
 
@@ -7767,6 +7887,7 @@ extern int main(int argc, char** argv)
     // T427: function-pointer values select an exact pointee signature, including overloads.
     total++; passed += testT427FunctionPointeeAcceptSet() ? 1 : 0;
     total++; passed += testT427VoidFunctionPointeeOverload() ? 1 : 0;
+    total++; passed += testFnabiPointeeAcceptSet() ? 1 : 0;
     total++; passed += testT501FunctionPointerSlotAddresses() ? 1 : 0;
     total++; passed += testT500NestedFunctionAcceptSet() ? 1 : 0;
     total++; passed += testT512NamedClosureReturnSlots() ? 1 : 0;

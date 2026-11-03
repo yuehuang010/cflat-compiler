@@ -40,3 +40,11 @@ stores `&this->field` leaves the heap object pointing into a dead frame (clang c
 test_move fixtures relied on this and read stale stack memory (passed on arm64 by luck, garbage on Windows); 2940475db
 moved them to global pools. The same ruling (in-place construction for dtor-bearing / self-pointing structs) covers
 `new T()`.
+
+## Same root: field-default self address (FIELDINIT, 2026-10-29)
+
+`struct S { int* q = &pp.k; P pp = default; };` then `S x = default; x.pp.k = 3; *x.q` reads the stale 6 (clang++ 3): the default
+constructor builds a temporary and copies it into x, so an address taken in a field default (also `&s.a.b`, `&pp.v[1]`, a transparent
+anonymous member `&o.as_int`) or a C++ member ctor storing `this` inside a native aggregate points at the dead temporary. In-place
+default construction (sret / destination slot) fixes both. Legs that pin only value-at-default / non-null until then:
+Test/test_basic.cb TFieldInitMemberAddress*, Test/test_c_interop.cb TFieldInitAnonAddr.

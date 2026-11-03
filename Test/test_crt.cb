@@ -40,10 +40,21 @@ extern int main()
     // --- stdlib.h scalars ---
     total++; passed += Test("abs(-7) == 7",       abs(-7) == 7,            true);
     total++; passed += Test("atoi(\"123\") == 123", atoi("123") == 123,    true);
+    function<long(long)> tFnabiLabs = labs;
+    total++; passed += Test("labs callback", tFnabiLabs((long)-46) == 46, true);
+    function<long((const char)*, char**, int)> tFnabiStrtol = strtol;
+    char* tFnabiEnd = nullptr;
+    long tFnabiParsed = tFnabiStrtol("123abc", &tFnabiEnd, 10);
+    total++; passed += Test("strtol callback value and end", tFnabiParsed == 123
+        && tFnabiEnd != nullptr && *tFnabiEnd == 'a', true);
 
     // --- time.h: time_t (i64) return ---
     i64 now = time(nullptr);
     total++; passed += Test("time(nullptr) > 0",  now > (i64)0,            true);
+    if const (__MACOS__) {
+        function<long(long*)> tFnabiTime = time;
+        total++; passed += Test("time_t long callback", tFnabiTime(nullptr) > 0, true);
+    }
 
     // --- stdlib.h qsort with a CFlat comparator passed as a bare C function pointer ---
     int[5] nums = default;

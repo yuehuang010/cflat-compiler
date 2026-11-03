@@ -1,0 +1,9 @@
+int gv(int value) { return value + 1; }
+
+expect_error("unknown type 'gv'") {
+    struct TFieldParenCalleeOne { int gv = (gv)(1); };
+}
+
+expect_error("'gv' is a variable of type 'int' and cannot be called; it hides function 'gv'") {
+    struct TFieldParenCalleeTwo { int gv = ((gv))(1); };
+}

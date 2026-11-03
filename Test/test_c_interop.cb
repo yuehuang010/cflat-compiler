@@ -51,6 +51,7 @@ import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import "library/c_variadic_aggregate.c";
 import "library/c_variadic_fnptr.h";
+import "library/c_fnabi2_long.h";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
 import "library/c_inline_demand_a.h";
@@ -77,6 +78,55 @@ extern int  strcmp(const char* a, const char* b);
 int my_add_cb(int a, int b) { return a + b; }
 int my_sub_cb(int a, int b) { return a - b; }
 int my_inc_cb(int x) { return x + 1; }
+
+using Fnabi2LongAlias = long;
+long fnabi2LongValue = 37;
+int fnabi2LongTarget(long* value) { return (int)*value; }
+int fnabi2LongAliasTarget(Fnabi2LongAlias* value) { return (int)*value; }
+int fnabi2SizeTarget(ulong* value) { return (int)*value; }
+long* fnabi2LongReturnTarget() { return &fnabi2LongValue; }
+static int testFnabi2LongFnAbi()
+{
+    long value = 5;
+    function<int(long*)> importedLong = fnabi2_c_take_long;
+    if (importedLong(&value) != 105) return 1;
+    if (fnabi2_c_call_long(fnabi2LongTarget) != 7) return 2;
+    Fnabi2LongCallback assigned = fnabi2LongTarget;
+    value = 19;
+    if (assigned(&value) != 19) return 3;
+    if (fnabi2_c_call_long(fnabi2LongAliasTarget) != 7) return 4;
+    if const (__MACOS__) {
+        if (fnabi2_c_call_size(fnabi2SizeTarget) != 9) return 5;
+    }
+    function<long*()> importedReturn = fnabi2_c_return_long;
+    long* returned = importedReturn();
+    if (returned == nullptr || *returned != 31) return 6;
+    Fnabi2LongReturnCallback returnAssigned = fnabi2LongReturnTarget;
+    returned = returnAssigned();
+    if (returned == nullptr || *returned != 37) return 7;
+    if (fnabi2_c_call_return(fnabi2LongReturnTarget) != 37) return 8;
+    if (fnabi2_c_return_scalar() != 41) return 9;
+    long scalarInput = 29;
+    long scalarResult = fnabi2_c_add_long(scalarInput);
+    if (scalarResult != 42) return 10;
+    Fnabi2LongFields fields = default;
+    fields.signed_value = 13;
+    fields.unsigned_value = 17;
+    if (sizeof(Fnabi2LongFields) != fnabi2_c_long_fields_size()) return 11;
+    if (fnabi2_c_long_fields_sum(&fields) != 30) return 12;
+    fnabi2_c_long_fields_fill(&fields);
+    if (fields.signed_value != 31 || fields.unsigned_value != 37) return 13;
+    if (fnabi2_c_long_fields_sum(&fields) != 68) return 14;
+    Fnabi2AnonLongFields anonFields = default;
+    anonFields.signed_value = 19;
+    anonFields.unsigned_value = 23;
+    if (sizeof(Fnabi2AnonLongFields) != fnabi2_c_anon_fields_size()) return 15;
+    if (fnabi2_c_anon_fields_sum(&anonFields) != 42) return 16;
+    fnabi2_c_anon_fields_fill(&anonFields);
+    if (anonFields.signed_value != 41 || anonFields.unsigned_value != 43) return 17;
+    if (fnabi2_c_anon_fields_sum(&anonFields) != 84) return 18;
+    return 0;
+}
 
 
 string abiStringGlobal = default;
@@ -304,16 +354,6 @@ static int t77FnPtrLegs()
     function<i64(T77Big)> et = ew.toFunction();
     if (et == nullptr) return 8130;
     if (et(b) != 6) return 8131;
-    // (18b) an extern whose signature carries a hidden count: the closure gets a counted C entry.
-    Lambda<i64(T77Big, move T77Elem*)> ec = t77ExternSumCount;
-    if (ec(b, nullptr) != 6) return 8134;
-    function<i64(T77Big, move T77Elem*)> ect = ec.toFunction();
-    if (ect == nullptr) return 8135;
-    if (ect(b, nullptr) != 6) return 8136;
-    // (18c) a direct function<> bind of a counted extern, with a scalar after the count.
-    function<i64(T77Big, move T77Elem*, i64)> fs = t77ExternSumCountScalar;
-    if (fs == nullptr) return 8137;
-    if (fs(b, nullptr, 7) != b.a + b.b + 7) return 8138;
     // (19) a null thin pointer widens to the null closure, not a non-null Lambda.
     function<i64(T77Big)> nf = nullptr;
     Lambda<i64(T77Big)> nw = nf;
@@ -615,8 +655,13 @@ static int t174CAlignLegs()
     return 0;
 }
 
+// A field default may take the address of a transparent anonymous-union member of a later field.
+struct TFieldInitAnonAddr { int* q = &o.as_int; ML_Overlap o = default; };
+
 extern int main()
 {
+    int fnabi2Result = testFnabi2LongFnAbi();
+    if (fnabi2Result != 0) return 8320 + fnabi2Result;
     if (offsetof(T38CRecord, value) != 8) return 7990;
     T38CRecord namedOffset;
     namedOffset.offsetof = 41;
@@ -1006,6 +1051,9 @@ extern int main()
     // Symmetric write from cflat: write as_float through the anon, read as_int.
     o.__anon0.as_float = 3.14159274f;
     if (o.__anon0.as_int != ref2)                return 134;
+    // Compile + non-null only: a field-default self address still points at the construction temporary (p3).
+    TFieldInitAnonAddr anonAddr = default;
+    if (anonAddr.q == nullptr) return 9135;
 
     // ---- Section O: _Bool and long double round-trip -----------------------
     // _Bool (C99) maps to CFlat bool; clang's target-derived IEEE-double long

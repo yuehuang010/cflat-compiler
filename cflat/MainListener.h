@@ -2437,6 +2437,18 @@ static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string&
     return MangleType(*compiler, type);
 }
 
+static std::string SpellFunctionParameterValueType(
+    const LLVMBackend& compiler, const LLVMBackend::TypeAndValue& type)
+{
+    std::string spelling = SpellType(compiler, type);
+    const int depth = type.ValuePointerDepth();
+    const uint8_t pointeeConst = static_cast<uint8_t>(type.PointeeConstMask());
+    int constDepth = 0;
+    while (constDepth < depth && (pointeeConst & (1u << constDepth)) != 0)
+        ++constDepth;
+    return JoinConstTypeArgument(spelling, constDepth);
+}
+
 // One `using` declaration considered as a mangling-visible PURE RENAME. Shared by the two
 // pre-scans (ForwardRefScanner::ScanGenericTypeUses and MainListener::ScanAndQueueGenericTypeUses)
 // so a body-scope alias binds to the same target in both. With an alias frame open the rename
@@ -7448,6 +7460,7 @@ private:
     LLVMBackend::TypeAndValue lastLambdaType;
     std::string lambdaEnclosingAggregateOwner_;
     std::string fieldDefaultAggregateOwner_;
+    std::string fieldDefaultAggregateFieldName_;
     // Destination type of the initializer/assignment being evaluated, for ANY type - not just a
     // function pointer. An immediately-invoked lambda literal reads its return type from here
     // instead of inheriting the enclosing literal's. Empty (and never "auto") when no context.
@@ -7672,6 +7685,7 @@ private:
         llvm::Function* Function = nullptr;
         size_t ScopeDepth = 0;
         antlr4::ParserRuleContext* Initializer = nullptr;
+        llvm::Value* AddressStorage = nullptr;
     };
     std::vector<PendingCallVisibleLocal> pendingCallVisibleLocals_;
     const PendingCallVisibleLocal* FindPendingCallVisibleLocal(
@@ -7704,6 +7718,48 @@ private:
                     || NameShadowedByEnclosingLocal(use, name, nullptr, it->Initializer))
                     continue;
             }
+            return &*it;
+        }
+        return nullptr;
+    }
+    const PendingCallVisibleLocal* FindPendingInitializerReadLocal(
+        LLVMBackend* backend, const std::string& name, antlr4::tree::ParseTree* use) const
+    {
+        while (use != nullptr && dynamic_cast<antlr4::ParserRuleContext*>(use) == nullptr)
+            use = use->parent;
+        if (backend == nullptr || use == nullptr) return nullptr;
+        const size_t visibleDepth = backend->FindVariableScopeDepth(name);
+        for (auto it = pendingCallVisibleLocals_.rbegin(); it != pendingCallVisibleLocals_.rend(); ++it)
+        {
+            if (it->Name != name) continue;
+            bool inInitializer = false;
+            bool inLambda = false;
+            bool shadowedByLambdaParameter = false;
+            for (auto* node = use; node != nullptr; node = node->parent)
+            {
+                if (node == it->Initializer)
+                {
+                    inInitializer = true;
+                    break;
+                }
+                if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
+                {
+                    inLambda = true;
+                    if (auto* params = lambda->lambdaParamList())
+                        for (auto* param : params->lambdaParam())
+                            if (param->Identifier() != nullptr
+                                && param->Identifier()->getText() == name)
+                                shadowedByLambdaParameter = true;
+                }
+            }
+            if (!inInitializer || shadowedByLambdaParameter) continue;
+            if (it->Function == backend->currentFunction)
+            {
+                if (visibleDepth != SIZE_MAX && visibleDepth > it->ScopeDepth) continue;
+            }
+            else if (!inLambda)
+                continue;
+            if (NameShadowedByEnclosingLocal(use, name, nullptr, it->Initializer)) continue;
             return &*it;
         }
         return nullptr;
@@ -8461,11 +8517,13 @@ public:
     // Returns the mangled name of the instantiated function, or empty string on failure.
     std::string InferAndInstantiateGenericFunction(const std::string& funcName, const std::string& receiverType);
 
-    // Infer type arguments for a generic function from call argument types and instantiate it.
-    // Handles simple positional matching: where parameter type == type param name, bind to arg TypeName.
+    // Infer type arguments from call arguments; optionally return substituted direct-T parameter types.
+    // Set instantiate=false to query those types without generating the generic function body.
     std::string TryInferAndInstantiateFromArgs(const std::string& funcName,
                                                const std::vector<LLVMBackend::NamedVariable>& args,
-                                               CFlatParser::ArgumentExpressionListContext* argList = nullptr);
+                                               CFlatParser::ArgumentExpressionListContext* argList = nullptr,
+                                               std::vector<std::string>* deducedParameterTypes = nullptr,
+                                               bool instantiate = true);
 
     // Infer a bare function template's arguments from a function-pointer destination.
     std::string TryInferAndInstantiateFromFuncPtr(const std::string& funcName,
@@ -8968,8 +9026,18 @@ public:
      */
     bool HasForeignCxxAggregateReferenceMember(const std::string& ownerTypeName,
         antlr4::ParserRuleContext* context);
+    bool HasUninitializedForeignCxxAggregateReferenceMember(const std::string& ownerTypeName,
+        antlr4::ParserRuleContext* context);
     bool TryEmitForeignCxxAggregateBraceInit(const std::string& typeName,
         CFlatParser::InitializerListContext* list,
+        antlr4::ParserRuleContext* errorContext,
+        llvm::Value* slotValue,
+        bool copyListInit,
+        bool rejectEscapingReferences = false,
+        llvm::GlobalVariable* referenceLifetimeOwner = nullptr,
+        bool rejectFrameBoundReferences = false);
+    bool TryEmitForeignCxxAggregateBraceInitFields(const std::string& typeName,
+        const std::vector<CFlatParser::FieldInitContext*>& fields,
         antlr4::ParserRuleContext* errorContext,
         llvm::Value* slotValue,
         bool copyListInit,
@@ -11010,6 +11078,19 @@ public:
         llvm::Value* destination = nullptr,
         CFlatParser::InitializerListContext* braceOverrides = nullptr,
         bool preservePartialScope = false);
+
+    llvm::Value* ComputeAggregateFieldDefault(
+        const std::string& structName,
+        llvm::StructType*& structType,
+        std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+        size_t fieldIndex,
+        bool& fieldSrcUnsigned);
+    llvm::Value* ResolveAggregateFieldValue(
+        llvm::StructType* structType,
+        std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+        size_t fieldIndex,
+        llvm::Value* rvalue,
+        bool fieldSrcUnsigned);
 
     // True when a CFlat struct type runs a user-declared no-arg constructor for itself or for a
     // struct element reachable through its by-value fields (arrays included).

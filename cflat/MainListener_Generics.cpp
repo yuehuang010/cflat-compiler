@@ -621,6 +621,157 @@ static unsigned LiteralDefaultBits(const std::string& name)
         return 0;
 }
 
+static std::string GenericIntegerPromotion(const std::string& name)
+{
+        if (name == "c32") return "u32";
+        if (name == "bool" || name == "char" || name == "i8" || name == "u8"
+            || name == "short" || name == "i16" || name == "u16"
+            || name == "wchar" || name == "c16")
+            return "int";
+        return name;
+}
+
+struct GenericIntegerIdentity
+{
+        int rank;
+        unsigned bits;
+        bool isUnsigned;
+        const char* unsignedCounterpart;
+};
+
+static bool GetGenericIntegerIdentity(const std::string& name, GenericIntegerIdentity& out)
+{
+        if (name == "int") out = { 2, 32, false, "u32" };
+        else if (name == "u32") out = { 2, 32, true, "u32" };
+        else if (name == "long") out = { 3, static_cast<unsigned>(LLVMBackend::longBits_), false, "ulong" };
+        else if (name == "ulong") out = { 3, static_cast<unsigned>(LLVMBackend::longBits_), true, "ulong" };
+        else if (name == "c32") out = { 2, 32, true, "u32" };
+        else if (name == "i64") out = { 4, 64, false, "u64" };
+        else if (name == "u64") out = { 4, 64, true, "u64" };
+        else return false;
+        return true;
+}
+
+static std::string GenericLiteralArithmeticIdentity(const std::string& leftName,
+                                                    const std::string& rightName)
+{
+        auto floatRank = [](const std::string& name) {
+            if (name == "float") return 1;
+            if (name == "double") return 2;
+            if (name == "longdouble") return 3;
+            return 0;
+        };
+        const int leftFloatRank = floatRank(leftName);
+        const int rightFloatRank = floatRank(rightName);
+        if (leftFloatRank != 0 || rightFloatRank != 0)
+        {
+            if (leftFloatRank == 3 || rightFloatRank == 3) return "longdouble";
+            if (leftFloatRank == 2 || rightFloatRank == 2) return "double";
+            return "float";
+        }
+
+        const std::string left = GenericIntegerPromotion(leftName);
+        const std::string right = GenericIntegerPromotion(rightName);
+        GenericIntegerIdentity leftType{}, rightType{};
+        if (!GetGenericIntegerIdentity(left, leftType)
+            || !GetGenericIntegerIdentity(right, rightType))
+            return {};
+        if (leftType.isUnsigned == rightType.isUnsigned)
+            return leftType.rank >= rightType.rank ? left : right;
+        const std::string& unsignedName = leftType.isUnsigned ? left : right;
+        const GenericIntegerIdentity& unsignedType = leftType.isUnsigned ? leftType : rightType;
+        const std::string& signedName = leftType.isUnsigned ? right : left;
+        const GenericIntegerIdentity& signedType = leftType.isUnsigned ? rightType : leftType;
+        if (unsignedType.rank >= signedType.rank) return unsignedName;
+        if (signedType.bits > unsignedType.bits) return signedName;
+        return signedType.unsignedCounterpart;
+}
+
+static std::string GenericLiteralBinaryIdentity(const std::string& leftName,
+                                                const std::string& rightName,
+                                                bool shift, bool integerOnly)
+{
+        if (shift)
+        {
+            const std::string left = GenericIntegerPromotion(leftName);
+            GenericIntegerIdentity leftType{}, rightType{};
+            if (!GetGenericIntegerIdentity(left, leftType)
+                || !GetGenericIntegerIdentity(GenericIntegerPromotion(rightName), rightType))
+                return {};
+            // CFlat types `1 << 2L` by the wider operand, unlike C; keep the argument's own type there.
+            if (rightType.rank > leftType.rank || rightType.bits > leftType.bits) return {};
+            return left;
+        }
+        if (integerOnly)
+        {
+            GenericIntegerIdentity leftType{}, rightType{};
+            if (!GetGenericIntegerIdentity(GenericIntegerPromotion(leftName), leftType)
+                || !GetGenericIntegerIdentity(GenericIntegerPromotion(rightName), rightType))
+                return {};
+        }
+        return GenericLiteralArithmeticIdentity(leftName, rightName);
+}
+
+static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node);
+
+enum class GenericBinaryIdentityKind { Arithmetic, Shift, Bitwise };
+
+static std::string GenericLiteralBinaryExpressionIdentity(
+    antlr4::tree::ParseTree* node, GenericBinaryIdentityKind kind)
+{
+        if (node == nullptr || node->children.empty()) return {};
+        if (node->children.size() == 1)
+            return GenericLiteralExpressionIdentity(node->children[0]);
+        if (node->children.size() < 3) return {};
+        std::string identity = GenericLiteralExpressionIdentity(node->children[0]);
+        if (identity.empty()) return {};
+        size_t child = 1;
+        while (child < node->children.size())
+        {
+            auto* op = dynamic_cast<antlr4::tree::TerminalNode*>(node->children[child]);
+            if (op == nullptr) return {};
+            const size_t token = op->getSymbol()->getType();
+            size_t rightChild = child + 1;
+            bool shift = false;
+            bool integerOnly = kind == GenericBinaryIdentityKind::Bitwise;
+            if (kind == GenericBinaryIdentityKind::Arithmetic)
+            {
+                if (token != CFlatParser::Plus && token != CFlatParser::Minus
+                    && token != CFlatParser::Star && token != CFlatParser::Div
+                    && token != CFlatParser::Mod)
+                    return {};
+                integerOnly = token == CFlatParser::Mod;
+            }
+            else if (kind == GenericBinaryIdentityKind::Bitwise)
+            {
+                if (token != CFlatParser::And && token != CFlatParser::Caret
+                    && token != CFlatParser::Or)
+                    return {};
+            }
+            else
+            {
+                if (token == CFlatParser::LeftShift)
+                    shift = true;
+                else if (token == CFlatParser::Greater && child + 1 < node->children.size())
+                {
+                    auto* second = dynamic_cast<antlr4::tree::TerminalNode*>(node->children[child + 1]);
+                    if (second == nullptr || second->getSymbol()->getType() != CFlatParser::Greater)
+                        return {};
+                    shift = true;
+                    rightChild = child + 2;
+                }
+                else return {};
+            }
+            if (rightChild >= node->children.size()) return {};
+            const std::string right = GenericLiteralExpressionIdentity(node->children[rightChild]);
+            if (right.empty()) return {};
+            identity = GenericLiteralBinaryIdentity(identity, right, shift, integerOnly);
+            if (identity.empty()) return {};
+            child = rightChild + 1;
+        }
+        return identity;
+}
+
 static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node)
 {
         if (node == nullptr) return {};
@@ -658,6 +809,16 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
                 }
             }
         }
+        if (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node) != nullptr)
+            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Arithmetic);
+        if (dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node) != nullptr)
+            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Arithmetic);
+        if (dynamic_cast<CFlatParser::ShiftExpressionContext*>(node) != nullptr)
+            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Shift);
+        if (dynamic_cast<CFlatParser::AndExpressionContext*>(node) != nullptr
+            || dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node) != nullptr
+            || dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node) != nullptr)
+            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Bitwise);
         if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
             conditional != nullptr && conditional->children.size() == 5)
         {
@@ -671,20 +832,7 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
                 const std::string right = GenericLiteralExpressionIdentity(conditional->children[4]);
                 if (left.empty() || right.empty()) return {};
                 if (left == right) return left;
-                const bool leftFloat = left == "float" || left == "double" || left == "longdouble";
-                const bool rightFloat = right == "float" || right == "double" || right == "longdouble";
-                if (leftFloat || rightFloat)
-                {
-                    if (left == "longdouble" || right == "longdouble") return "longdouble";
-                    if (left == "double" || right == "double") return "double";
-                    if (leftFloat && rightFloat) return "float";
-                    return leftFloat ? left : right;
-                }
-                const unsigned leftBits = LiteralDefaultBits(left);
-                const unsigned rightBits = LiteralDefaultBits(right);
-                if (leftBits != 0 && rightBits != 0 && leftBits != rightBits)
-                    return leftBits > rightBits ? left : right;
-                return {};
+                return GenericLiteralArithmeticIdentity(left, right);
             }
         }
         if (node->children.size() == 1
@@ -695,7 +843,9 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
 
 std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& funcName,
                                                const std::vector<LLVMBackend::NamedVariable>& args,
-                                               CFlatParser::ArgumentExpressionListContext* argList) {
+                                               CFlatParser::ArgumentExpressionListContext* argList,
+                                               std::vector<std::string>* deducedParameterTypes,
+                                               bool instantiate) {
         auto templateIt = genericFunctionTemplates.find(funcName);
         if (templateIt == genericFunctionTemplates.end()) return {};
 
@@ -950,6 +1100,23 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             if (it == inferred.end()) return {};
             typeArgs.push_back(it->second);
         }
+        if (deducedParameterTypes != nullptr)
+        {
+            deducedParameterTypes->clear();
+            deducedParameterTypes->reserve(paramDecls.size());
+            const auto savedSubstitutions = activeTypeSubstitutions;
+            for (const auto& tp : typeParams)
+                activeTypeSubstitutions.Bind(tp, inferred.at(tp));
+            for (auto* declaration : paramDecls)
+            {
+                const auto parameterType = ParseDeclarationSpecifiers(
+                    declaration->declarationSpecifiers());
+                deducedParameterTypes->push_back(
+                    SpellFunctionParameterValueType(*compilerLLVM, parameterType));
+            }
+            activeTypeSubstitutions = savedSubstitutions;
+        }
+        if (!instantiate) return {};
         return InstantiateGenericFunction(funcName, typeArgs);
     }
 

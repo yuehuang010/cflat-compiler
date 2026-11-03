@@ -3280,6 +3280,476 @@ struct GenOvlTakeConcrete { int value = default; };
 int take(GenOvlTakeConcrete value) { return value.value; }
 int take<T>(list<T>* values, int index) { return values->get(index).value; }
 
+    int genovlrFreePtrGenericFirst<T>(T* value) { return 9; }
+    int genovlrFreePtrGenericFirst(double* value) { return 2; }
+    int genovlrFreePtrGenericFirst(float* value) { return 3; }
+    int genovlrFreePtrConcreteFirst(double* value) { return 2; }
+    int genovlrFreePtrConcreteFirst(float* value) { return 3; }
+    int genovlrFreePtrConcreteFirst<T>(T* value) { return 9; }
+    int genovlrFreeScGenericFirst<T>(T value) { return 9; }
+    int genovlrFreeScGenericFirst(int value) { return 1; }
+    int genovlrFreeScGenericFirst(i64 value) { return 2; }
+    int genovlrFreeScConcreteFirst(int value) { return 1; }
+    int genovlrFreeScConcreteFirst(i64 value) { return 2; }
+    int genovlrFreeScConcreteFirst<T>(T value) { return 9; }
+    int genovlrFreeBoolGenericFirst<T>(T value) { return 9; }
+    int genovlrFreeBoolGenericFirst(bool value) { return 2; }
+    int genovlrFreeBoolConcreteFirst(bool value) { return 2; }
+    int genovlrFreeBoolConcreteFirst<T>(T value) { return 9; }
+    int genovlrFreeLdGenericFirst<T>(T value) { return 9; }
+    int genovlrFreeLdGenericFirst(i64 value) { return 2; }
+    int genovlrFreeLdGenericFirst(double value) { return 3; }
+    int genovlrFreeLdConcreteFirst(i64 value) { return 2; }
+    int genovlrFreeLdConcreteFirst(double value) { return 3; }
+    int genovlrFreeLdConcreteFirst<T>(T value) { return 9; }
+    int genovlrFreeVarGenericFirst<T>(T first, T second) { return 9; }
+    int genovlrFreeVarGenericFirst(int first, ...) { return 2; }
+    int genovlrFreeVarConcreteFirst(int first, ...) { return 2; }
+    int genovlrFreeVarConcreteFirst<T>(T first, T second) { return 9; }
+    int genovlrFreePairGenericFirst<T, U>(T first, U second) { return 9; }
+    int genovlrFreePairGenericFirst(int first, double second) { return 1; }
+    int genovlrFreePairGenericFirst(i64 first, i64 second) { return 2; }
+    int genovlrFreePairConcreteFirst(int first, double second) { return 1; }
+    int genovlrFreePairConcreteFirst(i64 first, i64 second) { return 2; }
+    int genovlrFreePairConcreteFirst<T, U>(T first, U second) { return 9; }
+
+namespace GenOvlRNamespace
+{
+    int ptrGenericFirst<T>(T* value) { return 9; }
+    int ptrGenericFirst(double* value) { return 2; }
+    int ptrGenericFirst(float* value) { return 3; }
+    int ptrConcreteFirst(double* value) { return 2; }
+    int ptrConcreteFirst(float* value) { return 3; }
+    int ptrConcreteFirst<T>(T* value) { return 9; }
+    int scGenericFirst<T>(T value) { return 9; }
+    int scGenericFirst(int value) { return 1; }
+    int scGenericFirst(i64 value) { return 2; }
+    int scConcreteFirst(int value) { return 1; }
+    int scConcreteFirst(i64 value) { return 2; }
+    int scConcreteFirst<T>(T value) { return 9; }
+    int boolGenericFirst<T>(T value) { return 9; }
+    int boolGenericFirst(bool value) { return 2; }
+    int boolConcreteFirst(bool value) { return 2; }
+    int boolConcreteFirst<T>(T value) { return 9; }
+    int ldGenericFirst<T>(T value) { return 9; }
+    int ldGenericFirst(i64 value) { return 2; }
+    int ldGenericFirst(double value) { return 3; }
+    int ldConcreteFirst(i64 value) { return 2; }
+    int ldConcreteFirst(double value) { return 3; }
+    int ldConcreteFirst<T>(T value) { return 9; }
+    int varGenericFirst<T>(T first, T second) { return 9; }
+    int varGenericFirst(int first, ...) { return 2; }
+    int varConcreteFirst(int first, ...) { return 2; }
+    int varConcreteFirst<T>(T first, T second) { return 9; }
+    int pairGenericFirst<T, U>(T first, U second) { return 9; }
+    int pairGenericFirst(int first, double second) { return 1; }
+    int pairGenericFirst(i64 first, i64 second) { return 2; }
+    int pairConcreteFirst(int first, double second) { return 1; }
+    int pairConcreteFirst(i64 first, i64 second) { return 2; }
+    int pairConcreteFirst<T, U>(T first, U second) { return 9; }
+}
+
+struct GenOvlRMethods
+{
+    int ptrGenericFirst<T>(T* value) { return 9; }
+    int ptrGenericFirst(double* value) { return 2; }
+    int ptrGenericFirst(float* value) { return 3; }
+    int ptrConcreteFirst(double* value) { return 2; }
+    int ptrConcreteFirst(float* value) { return 3; }
+    int ptrConcreteFirst<T>(T* value) { return 9; }
+    int scGenericFirst<T>(T value) { return 9; }
+    int scGenericFirst(int value) { return 1; }
+    int scGenericFirst(i64 value) { return 2; }
+    int scConcreteFirst(int value) { return 1; }
+    int scConcreteFirst(i64 value) { return 2; }
+    int scConcreteFirst<T>(T value) { return 9; }
+    int boolGenericFirst<T>(T value) { return 9; }
+    int boolGenericFirst(bool value) { return 2; }
+    int boolConcreteFirst(bool value) { return 2; }
+    int boolConcreteFirst<T>(T value) { return 9; }
+    int ldGenericFirst<T>(T value) { return 9; }
+    int ldGenericFirst(i64 value) { return 2; }
+    int ldGenericFirst(double value) { return 3; }
+    int ldConcreteFirst(i64 value) { return 2; }
+    int ldConcreteFirst(double value) { return 3; }
+    int ldConcreteFirst<T>(T value) { return 9; }
+    int varGenericFirst<T>(T first, T second) { return 9; }
+    int varGenericFirst(int first, ...) { return 2; }
+    int varConcreteFirst(int first, ...) { return 2; }
+    int varConcreteFirst<T>(T first, T second) { return 9; }
+    int pairGenericFirst<T, U>(T first, U second) { return 9; }
+    int pairGenericFirst(int first, double second) { return 1; }
+    int pairGenericFirst(i64 first, i64 second) { return 2; }
+    int pairConcreteFirst(int first, double second) { return 1; }
+    int pairConcreteFirst(i64 first, i64 second) { return 2; }
+    int pairConcreteFirst<T, U>(T first, U second) { return 9; }
+};
+
+struct GenOvlRStatics
+{
+    static int ptrGenericFirst<T>(T* value) { return 9; }
+    static int ptrGenericFirst(double* value) { return 2; }
+    static int ptrGenericFirst(float* value) { return 3; }
+    static int ptrConcreteFirst(double* value) { return 2; }
+    static int ptrConcreteFirst(float* value) { return 3; }
+    static int ptrConcreteFirst<T>(T* value) { return 9; }
+    static int scGenericFirst<T>(T value) { return 9; }
+    static int scGenericFirst(int value) { return 1; }
+    static int scGenericFirst(i64 value) { return 2; }
+    static int scConcreteFirst(int value) { return 1; }
+    static int scConcreteFirst(i64 value) { return 2; }
+    static int scConcreteFirst<T>(T value) { return 9; }
+    static int boolGenericFirst<T>(T value) { return 9; }
+    static int boolGenericFirst(bool value) { return 2; }
+    static int boolConcreteFirst(bool value) { return 2; }
+    static int boolConcreteFirst<T>(T value) { return 9; }
+    static int ldGenericFirst<T>(T value) { return 9; }
+    static int ldGenericFirst(i64 value) { return 2; }
+    static int ldGenericFirst(double value) { return 3; }
+    static int ldConcreteFirst(i64 value) { return 2; }
+    static int ldConcreteFirst(double value) { return 3; }
+    static int ldConcreteFirst<T>(T value) { return 9; }
+    static int varGenericFirst<T>(T first, T second) { return 9; }
+    static int varGenericFirst(int first, ...) { return 2; }
+    static int varConcreteFirst(int first, ...) { return 2; }
+    static int varConcreteFirst<T>(T first, T second) { return 9; }
+    static int pairGenericFirst<T, U>(T first, U second) { return 9; }
+    static int pairGenericFirst(int first, double second) { return 1; }
+    static int pairGenericFirst(i64 first, i64 second) { return 2; }
+    static int pairConcreteFirst(int first, double second) { return 1; }
+    static int pairConcreteFirst(i64 first, i64 second) { return 2; }
+    static int pairConcreteFirst<T, U>(T first, U second) { return 9; }
+};
+int genovlrStringLiteral(char* value) { return 2; }
+int genovlrStringLiteral<T>(T value) { return 9; }
+int genovlrConstPtr(int* value) { return 2; }
+int genovlrConstPtr<T>(T* value) { return 9; }
+int genovlrFloatGenericFirst<T>(T value) { return 9; }
+int genovlrFloatGenericFirst(double value) { return 3; }
+int genovlrFloatConcreteFirst(double value) { return 3; }
+int genovlrFloatConcreteFirst<T>(T value) { return 9; }
+int genovlrVariadicFixedGenericFirst<T>(T value) { return 9; }
+int genovlrVariadicFixedGenericFirst(int value, ...) { return 2; }
+int genovlrVariadicFixedConcreteFirst(int value, ...) { return 2; }
+int genovlrVariadicFixedConcreteFirst<T>(T value) { return 9; }
+int genovlrVariadicTail2GenericFirst<T, U>(T first, U second) { return 9; }
+int genovlrVariadicTail2GenericFirst(int first, ...) { return 2; }
+int genovlrVariadicTail2ConcreteFirst(int first, ...) { return 2; }
+int genovlrVariadicTail2ConcreteFirst<T, U>(T first, U second) { return 9; }
+int genovlrVariadicTail3GenericFirst<T, U, V>(T first, U second, V third) { return 9; }
+int genovlrVariadicTail3GenericFirst(int first, ...) { return 2; }
+int genovlrVariadicTail3ConcreteFirst(int first, ...) { return 2; }
+int genovlrVariadicTail3ConcreteFirst<T, U, V>(T first, U second, V third) { return 9; }
+enum GenOvlREnum : int { Value = 5 };
+int genovlrEnumGenericFirst<T>(T value) { return 9; }
+int genovlrEnumGenericFirst(int value) { return 2; }
+int genovlrEnumConcreteFirst(int value) { return 2; }
+int genovlrEnumConcreteFirst<T>(T value) { return 9; }
+
+int genovlrNegIntGenericFirst<T>(T value) { return 9; }
+int genovlrNegIntGenericFirst(int value) { return 2; }
+int genovlrNegIntConcreteFirst(int value) { return 2; }
+int genovlrNegIntConcreteFirst<T>(T value) { return 9; }
+int genovlrNegDoubleGenericFirst<T>(T value) { return 9; }
+int genovlrNegDoubleGenericFirst(double value) { return 3; }
+int genovlrNegDoubleConcreteFirst(double value) { return 3; }
+int genovlrNegDoubleConcreteFirst<T>(T value) { return 9; }
+int genovlrUllGenericFirst<T>(T value) { return 9; }
+int genovlrUllGenericFirst(ulong value) { return 2; }
+int genovlrUllConcreteFirst(ulong value) { return 2; }
+int genovlrUllConcreteFirst<T>(T value) { return 9; }
+int genovlrPairDoubleGenericFirst<T, U>(T first, U second) { return 9; }
+int genovlrPairDoubleGenericFirst(double first, double second) { return 3; }
+int genovlrPairDoubleConcreteFirst(double first, double second) { return 3; }
+int genovlrPairDoubleConcreteFirst<T, U>(T first, U second) { return 9; }
+int genovlrPairIntDoubleGenericFirst<T, U>(T first, U second) { return 9; }
+int genovlrPairIntDoubleGenericFirst(int first, double second) { return 3; }
+int genovlrPairIntDoubleConcreteFirst(int first, double second) { return 3; }
+int genovlrPairIntDoubleConcreteFirst<T, U>(T first, U second) { return 9; }
+int genovlrSubstIntGenericFirst<T>(T first, int second) { return 9; }
+int genovlrSubstIntGenericFirst(double first, int second) { return 3; }
+int genovlrSubstIntConcreteFirst(double first, int second) { return 3; }
+int genovlrSubstIntConcreteFirst<T>(T first, int second) { return 9; }
+int genovlrSubstLongGenericFirst<T>(T first, long second) { return 9; }
+int genovlrSubstLongGenericFirst(double first, long second) { return 3; }
+int genovlrSubstLongConcreteFirst(double first, long second) { return 3; }
+int genovlrSubstLongConcreteFirst<T>(T first, long second) { return 9; }
+int genovlrSubstCharGenericFirst<T>(T first, int second) { return 9; }
+int genovlrSubstCharGenericFirst(double first, int second) { return 3; }
+int genovlrSubstCharConcreteFirst(double first, int second) { return 3; }
+int genovlrSubstCharConcreteFirst<T>(T first, int second) { return 9; }
+int genovlrSubstPtrGenericFirst<T>(T* first, int second) { return 9; }
+int genovlrSubstPtrGenericFirst(int* first, int second) { return 3; }
+int genovlrSubstPtrConcreteFirst(int* first, int second) { return 3; }
+int genovlrSubstPtrConcreteFirst<T>(T* first, int second) { return 9; }
+
+int genovlrExprAddGenericFirst<T>(T value) { return 9; }
+int genovlrExprAddGenericFirst(double value) { return 3; }
+int genovlrExprAddConcreteFirst(double value) { return 3; }
+int genovlrExprAddConcreteFirst<T>(T value) { return 9; }
+int genovlrExprMulGenericFirst<T>(T value) { return 9; }
+int genovlrExprMulGenericFirst(double value) { return 3; }
+int genovlrExprMulConcreteFirst(double value) { return 3; }
+int genovlrExprMulConcreteFirst<T>(T value) { return 9; }
+int genovlrExprMixGenericFirst<T>(T value) { return 9; }
+int genovlrExprMixGenericFirst(double value) { return 3; }
+int genovlrExprMixConcreteFirst(double value) { return 3; }
+int genovlrExprMixConcreteFirst<T>(T value) { return 9; }
+int genovlrExprSize<T>(T value) { return (int)sizeof(T); }
+
+struct GenOvlRExprMethodGenericFirst
+{
+    int m<T>(T value) { return 9; }
+    int m(double value) { return 3; }
+};
+struct GenOvlRExprMethodConcreteFirst
+{
+    int m(double value) { return 3; }
+    int m<T>(T value) { return 9; }
+};
+
+struct GenOvlRMethodGenericFirst
+{
+    int m<T>(T value) { return 9; }
+    int m(double value) { return 3; }
+    int self() { return m(1.5); }
+};
+struct GenOvlRMethodConcreteFirst
+{
+    int m(double value) { return 3; }
+    int m<T>(T value) { return 9; }
+    int self() { return m(1.5); }
+};
+
+int genovlrFreeChanged()
+{
+    void* vp = nullptr;
+    short sv = 1;
+    char cv = 1;
+    int iv = 1;
+    int jv = 2;
+    i64 lv = 2;
+    return genovlrFreePtrGenericFirst(vp) +
+        genovlrFreePtrConcreteFirst(vp) +
+        genovlrFreeScGenericFirst(sv) +
+        genovlrFreeScGenericFirst(cv) +
+        genovlrFreeScConcreteFirst(sv) +
+        genovlrFreeScConcreteFirst(cv) +
+        genovlrFreeBoolGenericFirst(iv) +
+        genovlrFreeBoolConcreteFirst(iv) +
+        genovlrFreeLdGenericFirst(iv) +
+        genovlrFreeLdConcreteFirst(iv) +
+        genovlrFreeVarGenericFirst(iv, jv) +
+        genovlrFreeVarConcreteFirst(iv, jv) +
+        genovlrFreePairGenericFirst(iv, lv) +
+        genovlrFreePairGenericFirst(sv, cv) +
+        genovlrFreePairConcreteFirst(iv, lv) +
+        genovlrFreePairConcreteFirst(sv, cv);
+}
+int genovlrFreePointerControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    float fv = 1.0f;
+    int* ip = &iv;
+    double* dp = &dv;
+    float* fp = &fv;
+    return genovlrFreePtrGenericFirst(ip) * 100000 +
+        genovlrFreePtrGenericFirst(dp) * 10000 +
+        genovlrFreePtrGenericFirst(fp) * 1000 +
+        genovlrFreePtrConcreteFirst(ip) * 100 +
+        genovlrFreePtrConcreteFirst(dp) * 10 +
+        genovlrFreePtrConcreteFirst(fp) * 1;
+}
+int genovlrFreeValueControls()
+{
+    int iv = 1;
+    i64 lv = 2;
+    return genovlrFreeScGenericFirst(iv) * 1000 +
+        genovlrFreeScGenericFirst(lv) * 100 +
+        genovlrFreeScConcreteFirst(iv) * 10 +
+        genovlrFreeScConcreteFirst(lv) * 1;
+}
+int genovlrFreePairControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    return genovlrFreePairGenericFirst(iv, dv) * 10 +
+        genovlrFreePairConcreteFirst(iv, dv) * 1;
+}
+int genovlrNamespaceChanged()
+{
+    void* vp = nullptr;
+    short sv = 1;
+    char cv = 1;
+    int iv = 1;
+    int jv = 2;
+    i64 lv = 2;
+    return GenOvlRNamespace.ptrGenericFirst(vp) +
+        GenOvlRNamespace.ptrConcreteFirst(vp) +
+        GenOvlRNamespace.scGenericFirst(sv) +
+        GenOvlRNamespace.scGenericFirst(cv) +
+        GenOvlRNamespace.scConcreteFirst(sv) +
+        GenOvlRNamespace.scConcreteFirst(cv) +
+        GenOvlRNamespace.boolGenericFirst(iv) +
+        GenOvlRNamespace.boolConcreteFirst(iv) +
+        GenOvlRNamespace.ldGenericFirst(iv) +
+        GenOvlRNamespace.ldConcreteFirst(iv) +
+        GenOvlRNamespace.varGenericFirst(iv, jv) +
+        GenOvlRNamespace.varConcreteFirst(iv, jv) +
+        GenOvlRNamespace.pairGenericFirst(iv, lv) +
+        GenOvlRNamespace.pairGenericFirst(sv, cv) +
+        GenOvlRNamespace.pairConcreteFirst(iv, lv) +
+        GenOvlRNamespace.pairConcreteFirst(sv, cv);
+}
+int genovlrNamespacePointerControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    float fv = 1.0f;
+    int* ip = &iv;
+    double* dp = &dv;
+    float* fp = &fv;
+    return GenOvlRNamespace.ptrGenericFirst(ip) * 100000 +
+        GenOvlRNamespace.ptrGenericFirst(dp) * 10000 +
+        GenOvlRNamespace.ptrGenericFirst(fp) * 1000 +
+        GenOvlRNamespace.ptrConcreteFirst(ip) * 100 +
+        GenOvlRNamespace.ptrConcreteFirst(dp) * 10 +
+        GenOvlRNamespace.ptrConcreteFirst(fp) * 1;
+}
+int genovlrNamespaceValueControls()
+{
+    int iv = 1;
+    i64 lv = 2;
+    return GenOvlRNamespace.scGenericFirst(iv) * 1000 +
+        GenOvlRNamespace.scGenericFirst(lv) * 100 +
+        GenOvlRNamespace.scConcreteFirst(iv) * 10 +
+        GenOvlRNamespace.scConcreteFirst(lv) * 1;
+}
+int genovlrNamespacePairControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    return GenOvlRNamespace.pairGenericFirst(iv, dv) * 10 +
+        GenOvlRNamespace.pairConcreteFirst(iv, dv) * 1;
+}
+int genovlrMethodChanged()
+{
+    void* vp = nullptr;
+    short sv = 1;
+    char cv = 1;
+    int iv = 1;
+    int jv = 2;
+    i64 lv = 2;
+    GenOvlRMethods genovlrMethods = default;
+    return genovlrMethods.ptrGenericFirst(vp) +
+        genovlrMethods.ptrConcreteFirst(vp) +
+        genovlrMethods.scGenericFirst(sv) +
+        genovlrMethods.scGenericFirst(cv) +
+        genovlrMethods.scConcreteFirst(sv) +
+        genovlrMethods.scConcreteFirst(cv) +
+        genovlrMethods.boolGenericFirst(iv) +
+        genovlrMethods.boolConcreteFirst(iv) +
+        genovlrMethods.ldGenericFirst(iv) +
+        genovlrMethods.ldConcreteFirst(iv) +
+        genovlrMethods.varGenericFirst(iv, jv) +
+        genovlrMethods.varConcreteFirst(iv, jv) +
+        genovlrMethods.pairGenericFirst(iv, lv) +
+        genovlrMethods.pairGenericFirst(sv, cv) +
+        genovlrMethods.pairConcreteFirst(iv, lv) +
+        genovlrMethods.pairConcreteFirst(sv, cv);
+}
+int genovlrMethodPointerControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    float fv = 1.0f;
+    int* ip = &iv;
+    double* dp = &dv;
+    float* fp = &fv;
+    GenOvlRMethods genovlrMethods = default;
+    return genovlrMethods.ptrGenericFirst(ip) * 100000 +
+        genovlrMethods.ptrGenericFirst(dp) * 10000 +
+        genovlrMethods.ptrGenericFirst(fp) * 1000 +
+        genovlrMethods.ptrConcreteFirst(ip) * 100 +
+        genovlrMethods.ptrConcreteFirst(dp) * 10 +
+        genovlrMethods.ptrConcreteFirst(fp) * 1;
+}
+int genovlrMethodValueControls()
+{
+    int iv = 1;
+    i64 lv = 2;
+    GenOvlRMethods genovlrMethods = default;
+    return genovlrMethods.scGenericFirst(iv) * 1000 +
+        genovlrMethods.scGenericFirst(lv) * 100 +
+        genovlrMethods.scConcreteFirst(iv) * 10 +
+        genovlrMethods.scConcreteFirst(lv) * 1;
+}
+int genovlrMethodPairControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    GenOvlRMethods genovlrMethods = default;
+    return genovlrMethods.pairGenericFirst(iv, dv) * 10 +
+        genovlrMethods.pairConcreteFirst(iv, dv) * 1;
+}
+int genovlrStaticChanged()
+{
+    void* vp = nullptr;
+    short sv = 1;
+    char cv = 1;
+    int iv = 1;
+    int jv = 2;
+    i64 lv = 2;
+    return GenOvlRStatics.ptrGenericFirst(vp) +
+        GenOvlRStatics.ptrConcreteFirst(vp) +
+        GenOvlRStatics.scGenericFirst(sv) +
+        GenOvlRStatics.scGenericFirst(cv) +
+        GenOvlRStatics.scConcreteFirst(sv) +
+        GenOvlRStatics.scConcreteFirst(cv) +
+        GenOvlRStatics.boolGenericFirst(iv) +
+        GenOvlRStatics.boolConcreteFirst(iv) +
+        GenOvlRStatics.ldGenericFirst(iv) +
+        GenOvlRStatics.ldConcreteFirst(iv) +
+        GenOvlRStatics.varGenericFirst(iv, jv) +
+        GenOvlRStatics.varConcreteFirst(iv, jv) +
+        GenOvlRStatics.pairGenericFirst(iv, lv) +
+        GenOvlRStatics.pairGenericFirst(sv, cv) +
+        GenOvlRStatics.pairConcreteFirst(iv, lv) +
+        GenOvlRStatics.pairConcreteFirst(sv, cv);
+}
+int genovlrStaticPointerControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    float fv = 1.0f;
+    int* ip = &iv;
+    double* dp = &dv;
+    float* fp = &fv;
+    return GenOvlRStatics.ptrGenericFirst(ip) * 100000 +
+        GenOvlRStatics.ptrGenericFirst(dp) * 10000 +
+        GenOvlRStatics.ptrGenericFirst(fp) * 1000 +
+        GenOvlRStatics.ptrConcreteFirst(ip) * 100 +
+        GenOvlRStatics.ptrConcreteFirst(dp) * 10 +
+        GenOvlRStatics.ptrConcreteFirst(fp) * 1;
+}
+int genovlrStaticValueControls()
+{
+    int iv = 1;
+    i64 lv = 2;
+    return GenOvlRStatics.scGenericFirst(iv) * 1000 +
+        GenOvlRStatics.scGenericFirst(lv) * 100 +
+        GenOvlRStatics.scConcreteFirst(iv) * 10 +
+        GenOvlRStatics.scConcreteFirst(lv) * 1;
+}
+int genovlrStaticPairControls()
+{
+    int iv = 1;
+    double dv = 1.0;
+    return GenOvlRStatics.pairGenericFirst(iv, dv) * 10 +
+        GenOvlRStatics.pairConcreteFirst(iv, dv) * 1;
+}
+
 bool testGenericArgInference()
 {
     bool result = true;
@@ -3366,6 +3836,136 @@ bool testGenericArgInference()
         GenOvlPtrConcreteFirst.select(genOvlIntPtr), 9);
     list<int> genOvlTakeList = default;
     genOvlTakeList.add(43);
+    result &= Test("genovlr_free_ruled_picks", genovlrFreeChanged(), 144);
+    result &= Test("genovlr_free_pointer_accept_set", genovlrFreePointerControls(), 923923);
+    result &= Test("genovlr_free_value_accept_set", genovlrFreeValueControls(), 1212);
+    result &= Test("genovlr_free_pair_accept_set", genovlrFreePairControls(), 11);
+    result &= Test("genovlr_namespace_ruled_picks", genovlrNamespaceChanged(), 144);
+    result &= Test("genovlr_namespace_pointer_accept_set", genovlrNamespacePointerControls(), 923923);
+    result &= Test("genovlr_namespace_value_accept_set", genovlrNamespaceValueControls(), 1212);
+    result &= Test("genovlr_namespace_pair_accept_set", genovlrNamespacePairControls(), 11);
+    result &= Test("genovlr_method_ruled_picks", genovlrMethodChanged(), 144);
+    result &= Test("genovlr_method_pointer_accept_set", genovlrMethodPointerControls(), 923923);
+    result &= Test("genovlr_method_value_accept_set", genovlrMethodValueControls(), 1212);
+    result &= Test("genovlr_method_pair_accept_set", genovlrMethodPairControls(), 11);
+    result &= Test("genovlr_static_ruled_picks", genovlrStaticChanged(), 144);
+    result &= Test("genovlr_static_pointer_accept_set", genovlrStaticPointerControls(), 923923);
+    result &= Test("genovlr_static_value_accept_set", genovlrStaticValueControls(), 1212);
+    result &= Test("genovlr_static_pair_accept_set", genovlrStaticPairControls(), 11);
+    result &= Test("genovlr_strlit_exact_generic", genovlrStringLiteral("hi"), 9);
+    result &= Test("genovlr_const_pointee_exact_generic", genovlrConstPtr(genOvlConstPtr), 9);
+    result &= Test("genovlr_neg_int_generic_first", genovlrNegIntGenericFirst(-(1)), 2);
+    result &= Test("genovlr_neg_int_concrete_first", genovlrNegIntConcreteFirst(-(1)), 2);
+    result &= Test("genovlr_neg_double_generic_first", genovlrNegDoubleGenericFirst(-(1.5)), 3);
+    result &= Test("genovlr_neg_double_concrete_first", genovlrNegDoubleConcreteFirst(-(1.5)), 3);
+    if const (__WINDOWS__)
+    {
+        result &= Test("genovlr_ull_generic_first", genovlrUllGenericFirst(1ull), 9);
+        result &= Test("genovlr_ull_concrete_first", genovlrUllConcreteFirst(1ull), 9);
+    }
+    else
+    {
+        result &= Test("genovlr_ull_generic_first", genovlrUllGenericFirst(1ull), 2);
+        result &= Test("genovlr_ull_concrete_first", genovlrUllConcreteFirst(1ull), 2);
+    }
+    result &= Test("genovlr_pair_double_generic_first",
+        genovlrPairDoubleGenericFirst(1.5, 2.5), 3);
+    result &= Test("genovlr_pair_double_concrete_first",
+        genovlrPairDoubleConcreteFirst(1.5, 2.5), 3);
+    int genovlrPairIntDoubleValue = 7;
+    result &= Test("genovlr_pair_int_double_generic_first",
+        genovlrPairIntDoubleGenericFirst(genovlrPairIntDoubleValue, 1.5), 3);
+    result &= Test("genovlr_pair_int_double_concrete_first",
+        genovlrPairIntDoubleConcreteFirst(genovlrPairIntDoubleValue, 1.5), 3);
+    result &= Test("genovlr_subst_int_generic_first",
+        genovlrSubstIntGenericFirst(1.5, 1), 3);
+    result &= Test("genovlr_subst_int_concrete_first",
+        genovlrSubstIntConcreteFirst(1.5, 1), 3);
+    result &= Test("genovlr_subst_long_generic_first",
+        genovlrSubstLongGenericFirst(1.5, 1L), 3);
+    result &= Test("genovlr_subst_long_concrete_first",
+        genovlrSubstLongConcreteFirst(1.5, 1L), 3);
+    char genovlrSubstChar = 1;
+    result &= Test("genovlr_subst_char_generic_first",
+        genovlrSubstCharGenericFirst(1.5, genovlrSubstChar), 3);
+    result &= Test("genovlr_subst_char_concrete_first",
+        genovlrSubstCharConcreteFirst(1.5, genovlrSubstChar), 3);
+    int genovlrSubstPointed = 1;
+    result &= Test("genovlr_subst_pointer_generic_first",
+        genovlrSubstPtrGenericFirst(&genovlrSubstPointed, 1), 3);
+    result &= Test("genovlr_subst_pointer_concrete_first",
+        genovlrSubstPtrConcreteFirst(&genovlrSubstPointed, 1), 3);
+    result &= Test("genovlr_expr_add_generic_first",
+        genovlrExprAddGenericFirst(1.0 + 2.0), 3);
+    result &= Test("genovlr_expr_add_concrete_first",
+        genovlrExprAddConcreteFirst(1.0 + 2.0), 3);
+    result &= Test("genovlr_expr_mul_generic_first",
+        genovlrExprMulGenericFirst(2.0 * 3.0), 3);
+    result &= Test("genovlr_expr_mul_concrete_first",
+        genovlrExprMulConcreteFirst(2.0 * 3.0), 3);
+    result &= Test("genovlr_expr_mixed_generic_first",
+        genovlrExprMixGenericFirst(1 + 2.0), 3);
+    result &= Test("genovlr_expr_mixed_concrete_first",
+        genovlrExprMixConcreteFirst(1 + 2.0), 3);
+    GenOvlRExprMethodGenericFirst genovlrExprMethodGenericFirst;
+    GenOvlRExprMethodConcreteFirst genovlrExprMethodConcreteFirst;
+    result &= Test("genovlr_expr_method_generic_first",
+        genovlrExprMethodGenericFirst.m(1.0 + 2.0), 3);
+    result &= Test("genovlr_expr_method_concrete_first",
+        genovlrExprMethodConcreteFirst.m(1.0 + 2.0), 3);
+    result &= Test("genovlr_expr_size_add", genovlrExprSize(1.0 + 2.0), 8);
+    result &= Test("genovlr_expr_size_subtract", genovlrExprSize(5.0 - 2.0), 8);
+    result &= Test("genovlr_expr_size_multiply", genovlrExprSize(2.0 * 3.0), 8);
+    result &= Test("genovlr_expr_size_divide", genovlrExprSize(6.0 / 2.0), 8);
+    result &= Test("genovlr_expr_size_mixed", genovlrExprSize(1 + 2.0), 8);
+    result &= Test("genovlr_expr_size_int_add", genovlrExprSize(1 + 2), 4);
+    result &= Test("genovlr_expr_size_int_modulo", genovlrExprSize(5 % 2), 4);
+    result &= Test("genovlr_expr_size_shift_left", genovlrExprSize(1 << 2), 4);
+    result &= Test("genovlr_expr_size_shift_wide_right", genovlrExprSize(1 << 2L), (int)sizeof(long));
+    result &= Test("genovlr_expr_size_shift_wide_right_u", genovlrExprSize(1u << 2L), (int)sizeof(ulong));
+    result &= Test("genovlr_expr_size_shift_right", genovlrExprSize(8 >> 2), 4);
+    result &= Test("genovlr_expr_size_bitwise_and", genovlrExprSize(1 & 2), 4);
+    result &= Test("genovlr_expr_size_bitwise_xor", genovlrExprSize(1 ^ 2), 4);
+    result &= Test("genovlr_expr_size_bitwise_or", genovlrExprSize(1 | 2), 4);
+    GenOvlRMethodGenericFirst genovlrMethodGenericFirst;
+    GenOvlRMethodConcreteFirst genovlrMethodConcreteFirst;
+    result &= Test("genovlr_method_explicit_generic_first",
+        genovlrMethodGenericFirst.m(1.5), 3);
+    result &= Test("genovlr_method_explicit_concrete_first",
+        genovlrMethodConcreteFirst.m(1.5), 3);
+    result &= Test("genovlr_method_implicit_generic_first",
+        genovlrMethodGenericFirst.self(), 3);
+    result &= Test("genovlr_method_implicit_concrete_first",
+        genovlrMethodConcreteFirst.self(), 3);
+    result &= Test("genovlr_float_literal_generic_first",
+        genovlrFloatGenericFirst(1.5) * 10 + genovlrFloatGenericFirst(-1.5), 33);
+    result &= Test("genovlr_float_literal_concrete_first",
+        genovlrFloatConcreteFirst(1.5) * 10 + genovlrFloatConcreteFirst(-1.5), 33);
+    double genovlrFloatVariable = 1.5;
+    result &= Test("genovlr_float_variable_generic_first",
+        genovlrFloatGenericFirst(genovlrFloatVariable), 3);
+    result &= Test("genovlr_float_variable_concrete_first",
+        genovlrFloatConcreteFirst(genovlrFloatVariable), 3);
+    int genovlrVariadicFirst = 4;
+    int genovlrVariadicSecond = 5;
+    int genovlrVariadicThird = 6;
+    GenOvlREnum genovlrEnumValue = GenOvlREnum.Value;
+    result &= Test("genovlr_variadic_fixed_generic_first",
+        genovlrVariadicFixedGenericFirst(genovlrVariadicFirst), 2);
+    result &= Test("genovlr_variadic_fixed_concrete_first",
+        genovlrVariadicFixedConcreteFirst(genovlrVariadicFirst), 2);
+    result &= Test("genovlr_variadic_tail2_generic_first",
+        genovlrVariadicTail2GenericFirst(genovlrVariadicFirst, genovlrVariadicSecond), 9);
+    result &= Test("genovlr_variadic_tail2_concrete_first",
+        genovlrVariadicTail2ConcreteFirst(genovlrVariadicFirst, genovlrVariadicSecond), 9);
+    result &= Test("genovlr_variadic_tail3_generic_first",
+        genovlrVariadicTail3GenericFirst(genovlrVariadicFirst,
+            genovlrVariadicSecond, genovlrVariadicThird), 9);
+    result &= Test("genovlr_variadic_tail3_concrete_first",
+        genovlrVariadicTail3ConcreteFirst(genovlrVariadicFirst,
+            genovlrVariadicSecond, genovlrVariadicThird), 9);
+    result &= Test("genovlr_enum_generic_first", genovlrEnumGenericFirst(genovlrEnumValue), 9);
+    result &= Test("genovlr_enum_concrete_first", genovlrEnumConcreteFirst(genovlrEnumValue), 9);
     result &= Test("genovl_member_skips_same_named_free_generic",
         genOvlTakeList.take(0), 43);
     return result;

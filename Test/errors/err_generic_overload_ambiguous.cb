@@ -1,0 +1,78 @@
+int genovlrAmbFreeGenericFirst<T>(T* value) { return 9; }
+int genovlrAmbFreeGenericFirst(double* value) { return 2; }
+int genovlrAmbFreeGenericFirst(float* value) { return 3; }
+int genovlrAmbFreeConcreteFirst(double* value) { return 2; }
+int genovlrAmbFreeConcreteFirst(float* value) { return 3; }
+int genovlrAmbFreeConcreteFirst<T>(T* value) { return 9; }
+
+namespace GenOvlRNullGenericFirst
+{
+    int pick<T>(T* value) { return 9; }
+    int pick(double* value) { return 2; }
+    int pick(float* value) { return 3; }
+}
+namespace GenOvlRNullConcreteFirst
+{
+    int pick(double* value) { return 2; }
+    int pick(float* value) { return 3; }
+    int pick<T>(T* value) { return 9; }
+}
+
+struct GenOvlRNullMethodsGenericFirst
+{
+    int pick<T>(T* value) { return 9; }
+    int pick(double* value) { return 2; }
+    int pick(float* value) { return 3; }
+};
+struct GenOvlRNullStaticsGenericFirst
+{
+    static int pick<T>(T* value) { return 9; }
+    static int pick(double* value) { return 2; }
+    static int pick(float* value) { return 3; }
+};
+
+struct GenOvlRNullMethodsConcreteFirst
+{
+    int pick(double* value) { return 2; }
+    int pick(float* value) { return 3; }
+    int pick<T>(T* value) { return 9; }
+};
+struct GenOvlRNullStaticsConcreteFirst
+{
+    static int pick(double* value) { return 2; }
+    static int pick(float* value) { return 3; }
+    static int pick<T>(T* value) { return 9; }
+};
+
+expect_error("ambiguous") {
+    int genovlrTestFreeGenericFirst() { return genovlrAmbFreeGenericFirst(nullptr); }
+}
+
+expect_error("ambiguous") {
+    int genovlrTestFreeConcreteFirst() { return genovlrAmbFreeConcreteFirst(nullptr); }
+}
+
+expect_error("ambiguous") {
+    int genovlrTestGenOvlRNullGenericFirst() { return GenOvlRNullGenericFirst.pick(nullptr); }
+}
+
+expect_error("ambiguous") {
+    int genovlrTestGenOvlRNullConcreteFirst() { return GenOvlRNullConcreteFirst.pick(nullptr); }
+}
+
+expect_error("ambiguous") {
+    int genovlrTestMethodGenericFirst() { GenOvlRNullMethodsGenericFirst value = default; return value.pick(nullptr); }
+}
+
+expect_error("ambiguous") {
+    int genovlrTestStaticGenericFirst() { return GenOvlRNullStaticsGenericFirst.pick(nullptr); }
+}
+
+expect_error("ambiguous") {
+    int genovlrTestMethodConcreteFirst() { GenOvlRNullMethodsConcreteFirst value = default; return value.pick(nullptr); }
+}
+
+expect_error("ambiguous") {
+    int genovlrTestStaticConcreteFirst() { return GenOvlRNullStaticsConcreteFirst.pick(nullptr); }
+}
+

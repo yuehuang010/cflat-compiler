@@ -9902,8 +9902,61 @@ int t511LambdaLocalCallableShadowCall()
     }, 3);
     return t511GenericTarget;
 }
+int tFieldInitLambdaParameterShadow()
+{
+    Lambda<int(int)> tFieldInitLambdaParameter =
+        (int tFieldInitLambdaParameter) => { return tFieldInitLambdaParameter; };
+    return tFieldInitLambdaParameter(7);
+}
+int tFieldInitLambdaLocalShadow()
+{
+    Lambda<int()> tFieldInitLambdaLocal = () => {
+        int tFieldInitLambdaLocal = 7;
+        return tFieldInitLambdaLocal;
+    };
+    return tFieldInitLambdaLocal();
+}
 int t504SelfReadGlobal = 9;
-int t504ReadSelfInitializer() { int t504SelfReadGlobal = t504SelfReadGlobal; return t504SelfReadGlobal; }
+int tFieldInitRead() { return 101; }
+struct TFieldInitEarlier { int a = 1; int b = a + 1; };
+class TFieldInitClassEarlier { int tFieldInitClassFirst = 1; int tFieldInitClassNext = tFieldInitClassFirst + 1; int get() { return tFieldInitClassNext; } };
+struct TFieldInitExplicitCtor { int a = 1; int b = a + 1; TFieldInitExplicitCtor() { } };
+struct TFieldInitSelfAddress { TFieldInitSelfAddress* self; };
+struct TFieldInitFieldAddress { int* p = &tFieldInitFieldAddressValue; int tFieldInitFieldAddressValue = 3; };
+struct TFieldInitMemberAddressP { int k = 6; };
+struct TFieldInitMemberAddress { int* p = &pp.k; TFieldInitMemberAddressP pp = default; };
+struct TFieldInitMemberChainQ { int b = 7; };
+struct TFieldInitMemberChainP { TFieldInitMemberChainQ a = default; };
+struct TFieldInitMemberChain { int* p = &s.a.b; TFieldInitMemberChainP s = default; };
+struct TFieldInitMemberArrayP { int[2] v = { 4, 9 }; };
+struct TFieldInitMemberArray { int* p = &pp.v[1]; TFieldInitMemberArrayP pp = default; };
+struct TFieldInitMemberArrayQ { int b = 10; };
+struct TFieldInitMemberArrayStructP { TFieldInitMemberArrayQ[2] v = default; };
+struct TFieldInitMemberArrayStruct
+{
+    int* p = &s.v[1].b;
+    TFieldInitMemberArrayStructP s = default;
+};
+struct TFieldInitArrayAddress { int* p = &values[1]; int[2] values = { 4, 9 }; };
+int tFieldInitPickTarget = 8;
+int* tFieldInitPick(int* ignored) { return &tFieldInitPickTarget; }
+int tFieldInitCallArgument()
+{
+    int tFieldInitCallLocal = *tFieldInitPick(&tFieldInitCallLocal);
+    return tFieldInitCallLocal;
+}
+struct TFieldInitMethod { int seed = 3; int tFieldInitRead() { return seed + 4; } int value = tFieldInitRead(); };
+struct TFieldInitGeneric<T> { T a = 3; T b = a + 1; };
+struct TFieldInitInner { int value = 4; };
+struct TFieldInitNested { TFieldInitInner inner = default; int result = inner.value + 1; };
+int tFieldInitGlobalCollision = 91;
+struct TFieldInitGlobal { int tFieldInitGlobalCollision = 5; int copied = tFieldInitGlobalCollision; };
+int tFieldInitParameter(int x) { int x2 = x; return x2; }
+int tFieldInitInc(int v) { return v + 1; }
+int tFieldInitGv(int value) { return value + 1; }
+struct TFieldInitParenField { function<int(int)> fp = tFieldInitInc; int viaParen = (fp)(1); };
+struct TFieldInitParenDeref { function<int(int)> fn = tFieldInitInc; function<int(int)>* fp = &fn; int viaDeref = (*fp)(1); };
+struct TFieldInitParenArith { int a = 3; int b = (a + 1) * 2; };
 namespace T504GenericMemberUniqueNS
 {
     struct Holder
@@ -10589,10 +10642,58 @@ bool testT471BareCalls()
     bool result = true;
     result &= Test("t504 valid call initializer", t504ValidCallInitializer(), 6);
     result &= Test("t504 struct call initializer", t504StructCallInitializer(), 7);
-    result &= Test("t504 non-call self initializer", t504ReadSelfInitializer(), 9);
+    TFieldInitEarlier fieldEarlier = default;
+    result &= Test("field initializer reads earlier field", fieldEarlier.b, 2);
+    TFieldInitClassEarlier classEarlier = default;
+    result &= Test("class field initializer reads earlier field", classEarlier.get(), 2);
+    void* selfAddress = &selfAddress;
+    result &= Test("local self address initializer", selfAddress == &selfAddress ? 1 : 0, 1);
+    TFieldInitSelfAddress selfAddressObject = { self = &selfAddressObject };
+    result &= Test("typed local self address initializer",
+        selfAddressObject.self == &selfAddressObject ? 1 : 0, 1);
+    TFieldInitFieldAddress fieldAddress = default;
+    result &= Test("field initializer takes later field address", *fieldAddress.p, 3);
+    TFieldInitMemberAddress memberAddress = default;
+    result &= Test("field initializer takes later by-value member address",
+        *memberAddress.p, 6);
+    TFieldInitMemberChain memberChain = default;
+    result &= Test("field initializer takes nested later by-value member address",
+        *memberChain.p, 7);
+    TFieldInitMemberArray memberArray = default;
+    result &= Test("field initializer takes later member array element address",
+        *memberArray.p, 9);
+    TFieldInitMemberArrayStruct memberArrayStruct = default;
+    result &= Test("field initializer takes member array element field address",
+        *memberArrayStruct.p, 10);
+    TFieldInitArrayAddress arrayAddress = default;
+    result &= Test("field initializer takes later fixed-array element address",
+        *arrayAddress.p, 9);
+    result &= Test("local initializer dereferences call result, not pending argument",
+        tFieldInitCallArgument(), 8);
+    TFieldInitExplicitCtor fieldExplicitCtor = default;
+    result &= Test("explicit constructor seeds earlier-field default", fieldExplicitCtor.b, 2);
+    TFieldInitMethod fieldMethod = default;
+    result &= Test("field initializer calls member over free function", fieldMethod.value, 7);
+    TFieldInitGeneric<int> fieldGeneric = default;
+    result &= Test("generic field initializer reads earlier field", fieldGeneric.b, 4);
+    TFieldInitNested fieldNested = default;
+    result &= Test("nested field initializer reads earlier field", fieldNested.result, 5);
+    TFieldInitGlobal fieldGlobalCollision = default;
+    result &= Test("field initializer hides same-named global", fieldGlobalCollision.copied, 5);
+    result &= Test("parameter remains visible in local initializer", tFieldInitParameter(17), 17);
+    TFieldInitParenField parenField = default;
+    result &= Test("field initializer calls function-typed field through parens", parenField.viaParen, 2);
+    TFieldInitParenDeref parenDeref = default;
+    result &= Test("field initializer calls dereferenced function pointer field", parenDeref.viaDeref, 2);
+    TFieldInitParenArith parenArith = default;
+    result &= Test("field initializer keeps parenthesized arithmetic", parenArith.b, 8);
+    result &= Test("parenthesized free call outside a struct", (tFieldInitGv)(1), 2);
     result &= Test("t511 generic initializer stays accepted", t511GenericInitializerCall(), 4);
     result &= Test("t511 lambda parameter shadows pending local", t511LambdaParameterShadowCall(), 5);
     result &= Test("t511 lambda local shadows pending local", t511LambdaLocalCallableShadowCall(), 5);
+    result &= Test("lambda parameter shadows pending value read",
+        tFieldInitLambdaParameterShadow(), 7);
+    result &= Test("lambda local shadows pending value read", tFieldInitLambdaLocalShadow(), 7);
     T504NamespaceMethod.M t504NamespaceValue = default;
     result &= Test("t504 namespace variable yields to member", t504NamespaceValue.call(), 23);
     T504StaticMethodNS.M t504StaticNamespaceValue = default;

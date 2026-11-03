@@ -1,0 +1,10 @@
+import cpp "cpp_interop_refres_array.hpp";
+
+extern int main()
+{
+    int x = 10; int y = 20; int a = 30; int b = 40;
+    expect_error("reference member must be initialized") {
+        cpprefres.Pair[2][2] bad = { { x, y, 1 }, { a, b, 2, x, y, 3 } };
+    }
+    return 0;
+}

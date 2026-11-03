@@ -1,0 +1,87 @@
+expect_error("cannot bind extern function 'sink' to function-pointer type") {
+    int elemDtors = 0;
+    class Elem { int id = 0; ~Elem() { elemDtors++; } };
+    struct Big { i64 a, b, c; };
+    extern int sink(Big b, move Elem* p) { return 0; }
+    extern int main()
+    {
+        int n = 3;
+        Elem* p = new Elem[n];
+        Big b = { a = 1, b = 2, c = 3 };
+        function<int(Big, move Elem*)> f = sink;
+        f(b, move p);
+        return elemDtors == 3 ? 0 : 42;
+    }
+}
+
+expect_error("cannot bind extern function 'sinkScalar' to function-pointer type") {
+    int elemScalarDtors = 0;
+    struct BigScalar { i64 a, b, c; };
+    class ElemScalar { int id = 0; ~ElemScalar() { elemScalarDtors++; } };
+    extern i64 sinkScalar(BigScalar b, move ElemScalar* p, i64 x)
+    { return b.a + b.b + x; }
+    extern int main()
+    {
+        BigScalar b = { a = 1, b = 2, c = 3 };
+        function<i64(BigScalar, move ElemScalar*, i64)> f = sinkScalar;
+        return f(b, nullptr, 7) == b.a + b.b + 7 ? 0 : 42;
+    }
+}
+
+expect_error("cannot bind extern function 'extArg' to function-pointer type") {
+    struct ArgBig { i64 a, b, c; };
+    class ArgElem { int id = 0; ~ArgElem() { } };
+    extern i64 extArg(ArgBig b, move ArgElem* p) { return b.a; }
+    i64 call(function<i64(ArgBig, move ArgElem*)> f)
+    {
+        ArgBig b = { a = 1, b = 2, c = 3 };
+        ArgElem* p = new ArgElem[3];
+        return f(b, move p);
+    }
+    extern int main() { call(extArg); return 0; }
+}
+
+expect_error("cannot bind extern function 'extRet' to function-pointer type") {
+    struct RetBig { i64 a, b, c; };
+    class RetElem { int id = 0; ~RetElem() { } };
+    extern i64 extRet(RetBig b, move RetElem* p) { return b.a; }
+    function<i64(RetBig, move RetElem*)> get() { return extRet; }
+    extern int main() { return 0; }
+}
+
+expect_error("cannot bind extern function 'extTernary' to function-pointer type") {
+    struct TernaryBig { i64 a, b, c; };
+    class TernaryElem { int id = 0; ~TernaryElem() { } };
+    extern i64 extTernary(TernaryBig b, move TernaryElem* p) { return b.a; }
+    i64 other(TernaryBig b, move TernaryElem* p) { return 0; }
+    extern int main()
+    {
+        int argc = 0;
+        function<i64(TernaryBig, move TernaryElem*)> f = argc > 5 ? other : extTernary;
+        return f == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("cannot bind extern function 'extLambda' to function-pointer type") {
+    struct LambdaBig { i64 a, b, c; };
+    class LambdaElem { int id = 0; ~LambdaElem() { } };
+    extern i64 extLambda(LambdaBig b, move LambdaElem* p) { return b.a; }
+    i64 call(Lambda<i64(LambdaBig, move LambdaElem*)> f)
+    {
+        LambdaBig b = { a = 1, b = 2, c = 3 };
+        LambdaElem* p = new LambdaElem[3];
+        return f(b, move p);
+    }
+    extern int main() { call(extLambda); return 0; }
+}
+
+expect_error("cannot pass owning heap array") {
+    int arrayElemDtors = 0;
+    class ArrayElem { int id = 0; ~ArrayElem() { arrayElemDtors++; } };
+    extern void take(move ArrayElem* p) { }
+    void passArray()
+    {
+        ArrayElem* p = new ArrayElem[3];
+        take(move p);
+    }
+}

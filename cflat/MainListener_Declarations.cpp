@@ -3206,6 +3206,16 @@ bool MainListener::FieldDefaultNamesMember(antlr4::tree::ParseTree* node,
                 && generic->genericTypeParameters() == nullptr
                 && isMember(generic->Identifier()->getText()))
                 return true;
+        // `(name)(args)` parses as a cast whose type name is the callee, so it names a member too.
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+            cast != nullptr && cast->castTypeName() != nullptr && cast->castExpression() != nullptr
+            && cast->castTypeName()->typeSpecifier().size() == 1
+            && cast->castTypeName()->typeQualifier() == nullptr
+            && cast->castTypeName()->abstractDeclarator() == nullptr)
+            if (auto* generic = cast->castTypeName()->typeSpecifier()[0]->genericIdentifier();
+                generic != nullptr && generic->genericTypeParameters() == nullptr
+                && generic->Identifier() != nullptr && isMember(generic->Identifier()->getText()))
+                return true;
         for (auto* child : node->children)
             if (FieldDefaultNamesMember(child, isMember)) return true;
         return false;
@@ -3330,9 +3340,14 @@ void MainListener::EmitPendingGlobalCxxConstructions(
             const std::string& typeName = item.TypeValue.TypeName;
             if (item.BraceInitializer != nullptr)
             {
-                TryEmitForeignCxxAggregateBraceInit(
-                    typeName, item.BraceInitializer, item.Context, item.Global, item.CopyListInit,
-                    false, item.Global);
+                if (item.TypeValue.ConstArraySize > 0
+                    || !item.TypeValue.ConstInnerDimensions.empty())
+                    EmitPositionalFixedArrayIntoSlot(typeName, item.TypeValue,
+                        item.BraceInitializer, item.Global);
+                else
+                    TryEmitForeignCxxAggregateBraceInit(
+                        typeName, item.BraceInitializer, item.Context, item.Global,
+                        item.CopyListInit, false, item.Global);
                 return;
             }
             if (!compiler->IsCxxRecord(typeName))
@@ -6330,6 +6345,15 @@ bool MainListener::HasForeignCxxAggregateReferenceMember(
         return false;
 }
 
+bool MainListener::HasUninitializedForeignCxxAggregateReferenceMember(
+        const std::string& ownerTypeName,
+        antlr4::ParserRuleContext* context)
+{
+        auto* compiler = Compiler(context);
+        return !compiler->CxxElementNeedsDefaultConstruction(ownerTypeName)
+            && HasForeignCxxAggregateReferenceMember(ownerTypeName, context);
+}
+
 bool MainListener::TryEmitForeignCxxAggregateBraceInit(
         const std::string& typeName,
         CFlatParser::InitializerListContext* list,
@@ -6340,8 +6364,24 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInit(
         llvm::GlobalVariable* referenceLifetimeOwner,
         bool rejectFrameBoundReferences)
 {
+        if (list == nullptr) return false;
+        return TryEmitForeignCxxAggregateBraceInitFields(typeName, list->fieldInit(),
+            errorContext, slotValue, copyListInit, rejectEscapingReferences,
+            referenceLifetimeOwner, rejectFrameBoundReferences);
+}
+
+bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
+        const std::string& typeName,
+        const std::vector<CFlatParser::FieldInitContext*>& fields,
+        antlr4::ParserRuleContext* errorContext,
+        llvm::Value* slotValue,
+        bool copyListInit,
+        bool rejectEscapingReferences,
+        llvm::GlobalVariable* referenceLifetimeOwner,
+        bool rejectFrameBoundReferences)
+{
         auto* compiler = Compiler(errorContext);
-        if (list != nullptr && !list->fieldInit().empty())
+        if (!fields.empty())
         {
             BranchPostfixScope braceElementPostfix(this);
             std::vector<LLVMBackend::NamedVariable> braceElements;
@@ -6491,10 +6531,93 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInit(
                 }
                 return consumed;
             };
-            auto appendFields = [&](auto&& self,
-                                    const std::vector<CFlatParser::FieldInitContext*>& fields,
-                                    std::string& out, bool topLevel,
-                                    const std::string& ownerTypeName) -> void {
+            using BraceFields = std::vector<CFlatParser::FieldInitContext*>;
+            std::function<void(const BraceFields&, std::string&, bool, const std::string&)>
+                appendFields;
+            std::function<size_t(const BraceFields&, size_t,
+                const LLVMBackend::DeclTypeAndValue&, std::string&)> appendCxxArray;
+            auto isCxxReferenceAggregateArray = [&](const LLVMBackend::DeclTypeAndValue& field) {
+                return field.ConstArraySize > 0
+                    && compiler->IsForeignCxxAggregateClass(field.TypeName)
+                    && HasForeignCxxAggregateReferenceMember(field.TypeName, errorContext);
+            };
+            appendCxxArray = [&](const BraceFields& fields, size_t firstElement,
+                                 const LLVMBackend::DeclTypeAndValue& arrayField,
+                                 std::string& out) -> size_t {
+                if (!isCxxReferenceAggregateArray(arrayField)) return 0;
+                std::vector<size_t> dimensions;
+                dimensions.reserve(arrayField.ConstInnerDimensions.size() + 1);
+                dimensions.push_back((size_t)arrayField.ConstArraySize);
+                for (uint64_t dimension : arrayField.ConstInnerDimensions)
+                    dimensions.push_back((size_t)dimension);
+                std::function<size_t(const BraceFields&, size_t, size_t, std::string&)> appendArrayLevel;
+                appendArrayLevel = [&](const BraceFields& levelFields, size_t levelFirst,
+                                       size_t depth, std::string& levelOut) -> size_t {
+                    levelOut += "{";
+                    size_t sourceIndex = levelFirst;
+                    for (size_t arrayIndex = 0; arrayIndex < dimensions[depth]; ++arrayIndex)
+                    {
+                        if (arrayIndex != 0) levelOut += ", ";
+                        if (depth + 1 < dimensions.size())
+                        {
+                            if (sourceIndex < levelFields.size()
+                                && levelFields[sourceIndex]->LeftBrace() != nullptr)
+                            {
+                                auto* row = levelFields[sourceIndex];
+                                if (row->initializerList() != nullptr)
+                                    appendArrayLevel(row->initializerList()->fieldInit(), 0,
+                                        depth + 1, levelOut);
+                                else
+                                    levelOut += "{}";
+                                ++sourceIndex;
+                            }
+                            else
+                                sourceIndex += appendArrayLevel(
+                                    levelFields, sourceIndex, depth + 1, levelOut);
+                            continue;
+                        }
+                        if (sourceIndex >= levelFields.size())
+                        {
+                            levelOut += "{}";
+                            continue;
+                        }
+                        auto* element = levelFields[sourceIndex];
+                        if (element->LeftBrace() != nullptr)
+                        {
+                            levelOut += "{";
+                            if (element->initializerList() != nullptr)
+                                appendFields(element->initializerList()->fieldInit(), levelOut,
+                                    false, arrayField.TypeName);
+                            levelOut += "}";
+                            ++sourceIndex;
+                            continue;
+                        }
+                        const size_t elementCount = countElidedAggregateElements(
+                            countElidedAggregateElements, arrayField.TypeName,
+                            levelFields, sourceIndex);
+                        if (elementCount == 0 || elementCount > levelFields.size() - sourceIndex)
+                        {
+                            LogErrorContext(element,
+                                "not enough initializer clauses for a C++ aggregate array element");
+                            valid = false;
+                            levelOut += "{}";
+                            break;
+                        }
+                        BraceFields elementFields(
+                            levelFields.begin() + static_cast<std::ptrdiff_t>(sourceIndex),
+                            levelFields.begin() + static_cast<std::ptrdiff_t>(sourceIndex + elementCount));
+                        levelOut += "{";
+                        appendFields(elementFields, levelOut, false, arrayField.TypeName);
+                        levelOut += "}";
+                        sourceIndex += elementCount;
+                    }
+                    levelOut += "}";
+                    return sourceIndex - levelFirst;
+                };
+                return appendArrayLevel(fields, firstElement, 0, out);
+            };
+            appendFields = [&](const BraceFields& fields, std::string& out, bool topLevel,
+                               const std::string& ownerTypeName) -> void {
                 if (!topLevel)
                 {
                     auto unsupported = std::find_if(fields.begin(), fields.end(),
@@ -6613,7 +6736,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInit(
                                         std::vector<CFlatParser::FieldInitContext*> nestedFields(
                                             fields.begin() + static_cast<std::ptrdiff_t>(i),
                                             fields.begin() + static_cast<std::ptrdiff_t>(i + elidedCount));
-                                        self(self, nestedFields, out, false, fieldType);
+                                        appendFields(nestedFields, out, false, fieldType);
                                         i += elidedCount - 1;
                                         continue;
                                     }
@@ -6634,13 +6757,29 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInit(
                     }
                     if (element->initializerList() != nullptr)
                     {
-                        out += "{";
-                        const std::string nestedType = !targetBaseType.empty()
-                            ? targetBaseType : targetField != nullptr
-                                ? targetField->TypeName : std::string();
-                        self(self, element->initializerList()->fieldInit(), out, false,
-                             nestedType);
-                        out += "}";
+                        if (targetField != nullptr && targetBaseType.empty()
+                            && isCxxReferenceAggregateArray(*targetField))
+                            appendCxxArray(element->initializerList()->fieldInit(), 0,
+                                *targetField, out);
+                        else
+                        {
+                            out += "{";
+                            const std::string nestedType = !targetBaseType.empty()
+                                ? targetBaseType : targetField != nullptr
+                                    ? targetField->TypeName : std::string();
+                            appendFields(element->initializerList()->fieldInit(), out, false,
+                                nestedType);
+                            out += "}";
+                        }
+                        continue;
+                    }
+                    if (targetField != nullptr && targetBaseType.empty()
+                        && element->LeftBrace() == nullptr
+                        && isCxxReferenceAggregateArray(*targetField))
+                    {
+                        const size_t consumed = appendCxxArray(fields, i, *targetField, out);
+                        if (consumed == 0) { valid = false; break; }
+                        i += consumed - 1;
                         continue;
                     }
                     if (element->LeftBrace() != nullptr
@@ -6661,7 +6800,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInit(
                     if (topLevel && (IsDefaultOnlyExpression(expression)
                         || HasDefaultOnlyTernaryArm(expression)))
                         compiler->GetUniqueCxxConstructorValueParameter(typeName, braceElements.size(),
-                            list->fieldInit().size(), argExpected);
+                            fields.size(), argExpected);
                     const bool deferredDefault = topLevel && IsDefaultOnlyExpression(expression)
                         && !argExpected.TypeName.empty() && !argExpected.Pointer
                         && !argExpected.IsAlias && !argExpected.IsRvalueRef;
@@ -6897,8 +7036,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInit(
                 }
             };
             const size_t braceReferenceTempMark = compiler->MarkAliasDeclTemps();
-            appendFields(appendFields, list->fieldInit(), braceExpression, true,
-                         typeName);
+            appendFields(fields, braceExpression, true, typeName);
             braceExpression += "}";
             if (!valid) return true;
             std::string wrapperName;
@@ -12482,10 +12620,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         else
                             nrvo.declarators.erase(nrvoCandidate);
                     }
+                    llvm::Value* pendingAddressStorage = nullptr;
+                    for (auto it = pendingCallVisibleLocals_.rbegin();
+                         it != pendingCallVisibleLocals_.rend(); ++it)
+                        if (it->Name == name && it->Function == compiler->currentFunction)
+                        {
+                            pendingAddressStorage = it->AddressStorage;
+                            break;
+                        }
+                    llvm::Value* localTargetStorage = nrvoStorage != nullptr
+                        ? nrvoStorage : armedImmovableSretStorage != nullptr
+                            ? armedImmovableSretStorage : pendingAddressStorage;
                     auto alloc = compiler->CreateLocalVariable(typeAndValue,
                         right ? right->getType() : nullptr, arraySize, line,
-                        typeAndValue.UserAlignValue,
-                        nrvoStorage != nullptr ? nrvoStorage : armedImmovableSretStorage);
+                        typeAndValue.UserAlignValue, localTargetStorage);
+                    if (pendingAddressStorage != nullptr && alloc != nullptr
+                        && alloc != pendingAddressStorage)
+                        pendingAddressStorage->replaceAllUsesWith(alloc);
                     compiler->GetOrCreateStackVariable(name).IsTopLevelConst
                         = DeclSpecHasConst(declSpec) && typeAndValue.IsFunctionPointer;
                     // A const integer local with a constant initializer folds (array dims, value generic args).

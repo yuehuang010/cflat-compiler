@@ -139,3 +139,18 @@ expect_error("cannot call non-const member 'set' on 'c': it is declared const, s
 {
     int c11ForSet(const IC11Set c) { for (int x in c) x = 0; return 0; }
 }
+
+interface ICIfconstNoConst { int f(int a); };
+class CIfconstNoConst : ICIfconstNoConst
+{
+    int n = 0;
+    int f(int a) { n += a; return n; }
+};
+expect_error("cannot call non-const member 'f' on")
+{
+    int cIfconstNoConstDirect(const CIfconstNoConst value) { return value.f(1); }
+}
+expect_error("cannot call non-const member 'f' on")
+{
+    int cIfconstNoConstIface(const ICIfconstNoConst value) { return value.f(1); }
+}
