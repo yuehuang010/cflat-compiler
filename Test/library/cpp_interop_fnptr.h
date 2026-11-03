@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <cstddef>
 #define CPPFN_ZERO 0
 #define CPPFN_ZEROL 0L
 #define CPPFN_NULL __null
@@ -20,6 +21,15 @@ struct Sink {
     explicit Sink(Cb f) : value(f ? f(4) : -1) {}
     int member(Cb f) { return f ? 1 : 0; }
     int value;
+};
+struct FunctionSink {
+    int value;
+    explicit FunctionSink(std::function<int(int)> f) : value(f ? 1 : 0) {}
+    FunctionSink(std::function<int(int)> f, int v) : value(f ? v : -v) {}
+};
+struct PointerSink {
+    int value;
+    explicit PointerSink(int* p) : value(p ? 1 : 0) {}
 };
 inline int inline_callback(int (*f)(int), int x) { return f ? f(x) : -1; }
 inline int std_function_callback(std::function<int(int)> f, int x) { return f(x); }

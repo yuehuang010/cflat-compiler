@@ -21,6 +21,7 @@ typedef int (*T170Cb)(int);
 /* T311: the C null-pointer macro into function slots (Test/test_function_ptr.cb). */
 #include <stddef.h>
 #define T311_NULL NULL
+#define T311_ZERO 0
 
 typedef int (*T311Bin)(int, int);
 struct T311Ops { T311Bin f; int k; };

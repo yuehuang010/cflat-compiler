@@ -1455,13 +1455,10 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
             if (srcConst != nullptr && srcConst->isNullValue())
                 return llvm::Constant::getNullValue(destType);
 
-            // A C NULL macro is a load of its zero backing global: a closure slot takes it as nullptr
-            // (the test ArgumentIsProvablyDataPointer uses on the parameter path).
-            if (srcType->isPointerTy() && destType == GetClosureFatPtrType())
-                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
-                    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand());
-                        global != nullptr && cxxZeroIntegerMacroNames_.count(global->getName().str()) != 0)
-                        return llvm::Constant::getNullValue(destType);
+            // Null macro loads and joins made only from null spellings initialize closure slots.
+            if (srcType->isPointerTy() && destType == GetClosureFatPtrType()
+                && IsNullFunctionSlotJoin(value))
+                return llvm::Constant::getNullValue(destType);
             if (srcType->isPointerTy())
             {
                 LogError(std::format(

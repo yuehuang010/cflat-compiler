@@ -9,4 +9,14 @@ namespace N {
     }
 }
 
-extern int main() { return N.useUndefined(); }
+// A namespace nested only in the enclosing namespace is not a root namespace: global::GB is undefined.
+namespace GA {
+    namespace GB { int g() { return 10; } }
+    int useNestedAsRoot()
+    {
+        expect_error("Undefined global symbol 'GB'.");
+        return global::GB.g();
+    }
+}
+
+extern int main() { return N.useUndefined() + GA.useNestedAsRoot(); }

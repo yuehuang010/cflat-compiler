@@ -3726,6 +3726,26 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     tupleCost = tupleCostResult.value_or(-1);
                     result = tupleCost < 0 ? -1 : tupleCost == 0 ? 0 : 1;
                 }
+                // simd identity is element + lane count: a simd argument binds only a simd parameter
+                // of the same shape, and never converts to a scalar (scalar -> simd is unchanged).
+                const TypeAndValue& simdArg = arg.TypeAndValue;
+                const TypeAndValue& simdParam = *candidateParamItr;
+                if (simdArg.IsSimd && !simdArg.Pointer && !simdArg.ElemPointer
+                    && !simdParam.Pointer && !simdParam.ElemPointer)
+                {
+                    const bool sameShape = simdParam.IsSimd
+                        && CanonicalPrimitiveTypeName(simdArg.TypeName)
+                            == CanonicalPrimitiveTypeName(simdParam.TypeName)
+                        && simdArg.SimdLanes == simdParam.SimdLanes;
+                    const bool scalarParam = simdParam.IsInteger() != -1
+                        || simdParam.IsUnsignedInteger() != -1 || simdParam.IsFloatingPoint() != -1;
+                    if (sameShape)
+                    {
+                        if (result < 0) result = 0;
+                    }
+                    else if (simdParam.IsSimd || scalarParam)
+                        result = -1;
+                }
                 const ScalarArgConversion scalarConv = tuplePair
                     ? ScalarArgConversion::NotScalar
                     : ClassifyScalarArgConversion(arg, ScalarArgumentReferent(*candidateParamItr));

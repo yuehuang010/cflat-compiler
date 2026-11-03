@@ -1432,7 +1432,12 @@ int apply_fnptr(function<int(int)> f, int x) { return f(x); }
 void fnptr_noop() {}
 // A C++ reference return and a derived pointer at a RETURN statement (3370-3389). Each helper
 // returns through the conversion the declaration and '=' forms already applied.
+cpprefgate.C* RgGlobalPointer = nullptr;
+cpprefgate.C RgGlobalStruct = default;
 cpprefgate.C* RgStaticAmp() { return &cpprefgate.cell(); }
+cpprefgate.C* RgGlobalByValue() { return &cpprefgate.pointer_ref(RgGlobalPointer); }
+cpprefgate.C* RgGlobalStructByValue() { return &cpprefgate.value_ref(RgGlobalStruct); }
+(const cpprefgate.C)* RgGlobalConstRef() { return &cpprefgate.const_ref(RgGlobalStruct); }
 cpprefgate.C* RgHeap(cpprefgate.Hold* h) { return h.member(); }
 cpprefgate.C* RgHeapAmp(cpprefgate.Hold* h) { return &h.member(); }
 cpprefgate.C* RgParam(cpprefgate.C* p) { return cpprefgate.local_ref(*p); }
@@ -1836,6 +1841,19 @@ int testT71PostfixFloatConstRef()
 
 // Brace temporary argument carrying an address into a `new` temporary (leg 3635).
 struct EscAddrRef { int* p = nullptr; };
+struct McCppPodHolder { cppfopun.F field; };
+cppfopun.F mcMoveCppPod(McCppPodHolder* p) { return move p->field; }
+// A C++ field with a user move ctor and a trivial destructor moves (source moved-from), any spelling.
+struct McMoveTrivIn { cppi.XvMoveTrivDtor m = default; };
+struct McMoveTrivOuter
+{
+    McMoveTrivIn inr = default;
+    cppi.XvMoveTrivDtor m = default;
+    McMoveTrivIn takeBare() { return move inr; }
+    McMoveTrivIn takeThis() { return move this.inr; }
+    cppi.XvMoveTrivDtor takeField() { return move m; }
+};
+McMoveTrivIn mcMoveTrivBorrowed(McMoveTrivOuter* p) { return move p->inr; }
 
 int TestIsCppClass<T>() { return is_cpp_class(T) ? 1 : 0; }
 
@@ -3937,6 +3955,18 @@ int ctorexp_excopy_take(cppexp.ExCopyD c) { return c.v; }
 
 extern int main()
 {
+    // A trailing alias pack accepts zero or more unused arguments and keeps the first argument's type.
+    t458.PD<> aliasPackDefault = t458.PD<>(7);
+    t458.PD<long> aliasPackFixed = t458.PD<long>(7);
+    t458.PD<long, int, char> aliasPackExtra = t458.PD<long, int, char>(7);
+    if (aliasPackDefault.value != 7 || t458.pick(aliasPackDefault) != 11) return 54001;
+    if (aliasPackFixed.value != 7 || t458.pick(aliasPackFixed) != 22) return 54002;
+    if (aliasPackExtra.value != 7 || t458.pick(aliasPackExtra) != 22) return 54003;
+    // A class template's trailing pack and an expanded alias pack still bind all their elements.
+    alnv.TypeList<int, char> classTrailingPack = default;
+    alnv.Tup<char, long> expandedAliasPack = default;
+    if (classTrailingPack.size() != 2 || alnv.class_pack_pick(classTrailingPack) != 31) return 54004;
+    if (expandedAliasPack.size() != 2 || alnv.expanded_alias_pick(expandedAliasPack) != 32) return 54005;
     // Mixed-access sets: the PUBLIC overload is selected and runs. A protected selection is refused
     // in Test/errors/err_cpp_mixed_access_overload.cb.
     mixacc.M mixM = mixacc.M();
@@ -4278,6 +4308,22 @@ extern int main()
     if (gpm != &t450r2PickArray[1]) return 45019;
     pp.mcp += 1;
     if (pp.mcp != &t450r2PickArray[1]) return 45020;
+    T217ConstCompound t217Compound = default;
+    t217Compound.v = 80;
+    t217Compound.selected = 0;
+    const T217ConstCompound* t217ConstCompoundPtr = &t217Compound;
+    int t217CompoundResult = *t217ConstCompoundPtr += 1;
+    if (t217CompoundResult != 82 || t217Compound.selected != 2) return 45023;
+    T217CompoundHolder t217CompoundHolder = default;
+    t217CompoundHolder.mcp = &t217Compound;
+    t217CompoundResult = *t217CompoundHolder.mcp += 1;
+    if (t217CompoundResult != 82 || t217Compound.selected != 2) return 45024;
+    T217CompoundHolder* t217CompoundHolderPtr = &t217CompoundHolder;
+    t217CompoundResult = *t217CompoundHolderPtr->mcp += 1;
+    if (t217CompoundResult != 82 || t217Compound.selected != 2) return 45026;
+    const T217ConstCompound* t217CompoundArray = &t217Compound;
+    t217CompoundResult = t217CompoundArray[0] += 1;
+    if (t217CompoundResult != 82 || t217Compound.selected != 2) return 45025;
     // ADL function-template free operators keep the first operand's mutable-field cv.
     if (t450r2_tpl.templateHolder.m + 1 != 51) return 45021;
     if (t450r2_tpl.templateHolder.n + 1 != 62) return 45022;
@@ -6434,6 +6480,24 @@ extern int main()
     expect_error("clang: no viable conversion from 'const cpi_t42::CvSource' to 'cpi_t42::CvTarget'") {
         int t42CvLoss = cpi_t42.takeCv(cpi_t42.cvSource());
     }
+    // A cast to a C++ class is direct-initialization even for a trivially destructible target.
+    cpi_t42.T800CastTarget t800CastMut = (cpi_t42.T800CastTarget)cpi_t42.t800_cast_mut_source();
+    cpi_t42.T800CastTarget t800CastConst = (cpi_t42.T800CastTarget)cpi_t42.t800_cast_const_source();
+    if (t800CastMut.value != 11 || t800CastConst.value != 22) return 8001;
+    cpi_t42.T800CastScalar t800CastScalar = (cpi_t42.T800CastScalar)7;
+    if (t800CastScalar.value != 10) return 8002;
+    // With both a converting constructor and conversion operator, clang selects the constructor.
+    cpi_t42.T800CastChoice t800CastChoice =
+        (cpi_t42.T800CastChoice)cpi_t42.t800_cast_choice_source();
+    if (t800CastChoice.picked != 1) return 8003;
+    cpi_t42.t800_cast_reset();
+    {
+        cpi_t42.T800CastTracked t800Tracked =
+            (cpi_t42.T800CastTracked)cpi_t42.t800_cast_mut_source();
+        if (t800Tracked.value != 10 || cpi_t42.t800_cast_born != 1
+            || cpi_t42.t800_cast_gone != 0) return 8004;
+    }
+    if (cpi_t42.t800_cast_born != 1 || cpi_t42.t800_cast_gone != 1) return 8005;
     // T104-B1: clang accepts a template converting ctor from a non-template class lvalue.
     t104.Source t104Source = default;
     if (t104.takeTemplated(t104Source) != 617) return 10401;
@@ -10181,6 +10245,35 @@ extern int main()
     if (m18ov.TieU(mix18L).v != 1) return 65063;
     // MIX18 r2: a CFlat function value into a free `const bool&` overload is its truth (clang 1); an int picks int.
     if (m18ov.a3(mix7FnTwice) != 1 || m18ov.a3(mix18I) != 2) return 65064;
+    // MIX18 ctor: scalar-reference candidates use CFlat ranking; a converted temporary loses to by-value.
+    if (m18ov.TieS(mix18I).v != 2) return 65067;
+    if (m18ov.TieS(4).v != 2) return 65068;
+    if (m18ov.TieU(mix18I).v != 2) return 65069;
+    if (m18ov.TieU(4).v != 2) return 65070;
+    // MIX18 ctor positions: converted const& temporaries lose to the by-value overload.
+    m18ov.TieS mix18CopyS = m18ov.TieS(mix18I);
+    if (mix18CopyS.v != 2) return 65071;
+    m18ov.TieS* mix18NewS = new m18ov.TieS(mix18I);
+    if (mix18NewS->v != 2) return 65072;
+    delete mix18NewS;
+    m18ov.TieS mix18BraceS{mix18I};
+    if (mix18BraceS.v != 2) return 65073;
+    m18ov.TieS mix18CopyBraceS = {mix18I};
+    if (mix18CopyBraceS.v != 2) return 65074;
+    m18ov.TieU mix18CopyU = m18ov.TieU(mix18I);
+    if (mix18CopyU.v != 2) return 65075;
+    m18ov.TieU* mix18NewU = new m18ov.TieU(mix18I);
+    if (mix18NewU->v != 2) return 65076;
+    delete mix18NewU;
+    m18ov.TieU mix18CopyULong = m18ov.TieU(mix18L);
+    if (mix18CopyULong.v != 1) return 65079;
+    m18ov.TieU* mix18NewULong = new m18ov.TieU(mix18L);
+    if (mix18NewULong->v != 1) return 65080;
+    delete mix18NewULong;
+    m18ov.TieU mix18BraceULong{mix18L};
+    if (mix18BraceULong.v != 1) return 65081;
+    m18ov.TieU mix18CopyBraceULong = {mix18L};
+    if (mix18CopyBraceULong.v != 1) return 65082;
     // MIX18 r3: identity binds (same scalar type) keep master's pick (the const& overload, 1); a literal picks int (2).
     char mix18C = 3; short mix18Sh = 2; long long mix18Ll = 7;
     if (m18ov.gi(mix18I) != 1 || m18ov.gc(mix18C) != 1 || m18ov.gs(mix18Sh) != 1 || m18ov.gll(mix18Ll) != 1) return 65065;
@@ -15384,7 +15477,16 @@ extern int main()
         if (cppfnptr.callback_call(callback, 4) != 5) return 3299;
         if (cppfnptr.callback_call(cppfnptr.Source.callback, 4) != 44) return 3300;
         cppfnptr.Sink nullptrSink = cppfnptr.Sink(nullptr);
-        if (nullptrSink.value != -1) return 3303;
+        cppfnptr.Sink nullMacroSink = cppfnptr.Sink(NULL);
+        if (nullptrSink.value != -1 || nullMacroSink.value != -1) return 3303;
+        // __null is a GNU spelling; clang-cl headers do not define it.
+        if const (__MACOS__)
+        {
+            cppfnptr.Sink gnuNullSink = cppfnptr.Sink(CPPFN_NULL);
+            if (gnuNullSink.value != -1) return 3306;
+        }
+        cppfnptr.PointerSink zeroDataPointerSink = cppfnptr.PointerSink(0);
+        if (zeroDataPointerSink.value != 0) return 3305;
     }
     // ---- Global C typedefs and macros through `import cpp` ---------------------------------------
     {
@@ -16771,6 +16873,11 @@ extern int main()
     cpprefgate.C* rgStatic = RgStaticAmp();
     rgStatic.v = 31;
     if (rgStatic != &cpprefgate.cell() || cpprefgate.cell().v != 31) return 3560;
+    RgGlobalPointer = &cpprefgate.cell();
+    if (RgGlobalByValue() != &cpprefgate.cell()
+        || RgGlobalConstRef() != &RgGlobalStruct
+        || RgGlobalStructByValue() == nullptr
+        || RgGlobalStructByValue().v != RgGlobalStruct.v) return 3566;
     cpprefgate.Hold* rgHeap = new cpprefgate.Hold();
     cpprefgate.C* rgMember = RgHeap(rgHeap);
     rgMember.v = 37;
@@ -19704,6 +19811,22 @@ extern int main()
     // 31923-31926 (refusals: Test/errors/err_cpp_no_free_operator.cb).
     {
         cppfopun.F f = default;
+        McCppPodHolder cppHolder = default;
+        cppHolder.field.v = 8;
+        cppfopun.F cppPod = mcMoveCppPod(&cppHolder);
+        if (cppPod.v != 8 || cppHolder.field.v != 8) return 31899;
+        McMoveTrivOuter mto1 = default;
+        McMoveTrivIn mtr1 = mto1.takeBare();
+        if (mtr1.m.v != 5 || mto1.inr.m.v != 0) return 31898;
+        McMoveTrivOuter mto2 = default;
+        McMoveTrivIn mtr2 = mto2.takeThis();
+        if (mtr2.m.v != 5 || mto2.inr.m.v != 0) return 31897;
+        McMoveTrivOuter mto3 = default;
+        cppi.XvMoveTrivDtor mtf3 = mto3.takeField();
+        if (mtf3.v != 5 || mto3.m.v != 0) return 31896;
+        McMoveTrivOuter mto4 = default;
+        McMoveTrivIn mtr4 = mcMoveTrivBorrowed(&mto4);
+        if (mtr4.m.v != 5 || mto4.inr.m.v != 0) return 31895;
         if ((-f).v != -51) return 31900;
         if ((+f).v != 52) return 31901;
         if (!f != 205) return 31902;

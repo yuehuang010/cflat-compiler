@@ -3235,9 +3235,19 @@ void LLVMBackend::RecordGenericTemplateOrigin(const std::string& name, const std
             if (!firstKey.starts_with(prefix)) continue;
             const std::string currentFile = SourceFileLeaf(sourceFileName);
             if (first.file == currentFile && first.line == line && first.column == column) return;
+            std::string displayName = SpellFunctionSymbol(*this, name);
+            const size_t memberSeparator = displayName.rfind('.');
+            const size_t genericOpen = displayName.find('<');
+            const size_t genericClose = displayName.rfind('>');
+            if (memberSeparator != std::string::npos && genericOpen < memberSeparator
+                && genericClose != std::string::npos && genericClose > memberSeparator)
+            {
+                displayName.insert(memberSeparator, ">");
+                displayName.erase(genericClose + 1, 1);
+            }
             LogError(std::format("generic template overloading is not supported yet: redefinition of '{}' - "
                 "a template with a different parameter shape is already defined at {}({})",
-                SpellFunctionSymbol(*this, name), first.file, first.line));
+                displayName, first.file, first.line));
             return;
         }
         genericTemplateOrigin_[key] = std::move(origin);

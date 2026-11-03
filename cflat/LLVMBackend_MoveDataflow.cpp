@@ -45,7 +45,78 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
+
+namespace
+{
+    struct ConstLevelKey
+    {
+        const llvm::Value* Value = nullptr;
+        int Depth = 0;
+        bool Stored = false;
+        std::string InputName;
+
+        bool operator==(const ConstLevelKey&) const = default;
+    };
+
+    struct ConstLevelKeyHash
+    {
+        size_t operator()(const ConstLevelKey& key) const
+        {
+            size_t hash = std::hash<const llvm::Value*>{}(key.Value);
+            hash ^= std::hash<int>{}(key.Depth) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<bool>{}(key.Stored) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<std::string>{}(key.InputName) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+
+    struct ConstLevelResult
+    {
+        uint8_t Levels = 0;
+        std::string Name;
+    };
+
+    // Per-query memo for ValueConstLevels / StoredConstLevels / FindConstWriteCause; FindConstWriteCause re-enters
+    // the level walks at depth 0, so without it nested ?: joins are walked exponentially (dropped when the query returns).
+    struct ConstAnalysisContext
+    {
+        const LLVMBackend* Backend = nullptr;
+        std::unordered_map<ConstLevelKey, ConstLevelResult, ConstLevelKeyHash> Levels;
+        std::unordered_set<ConstLevelKey, ConstLevelKeyHash> ActiveLevels;
+        std::unordered_map<const llvm::Value*, LLVMBackend::ConstWriteCause> Causes;
+        std::unordered_set<const llvm::Value*> ActiveCauses;
+    };
+
+    constexpr int kConstAnalysisMaxDepth = 128;
+
+    thread_local ConstAnalysisContext* activeConstAnalysis = nullptr;
+
+    class ConstAnalysisScope
+    {
+        ConstAnalysisContext local_;
+        ConstAnalysisContext* previous_ = nullptr;
+        bool installed_ = false;
+
+    public:
+        explicit ConstAnalysisScope(const LLVMBackend* backend)
+        {
+            if (activeConstAnalysis != nullptr && activeConstAnalysis->Backend == backend) return;
+            local_.Backend = backend;
+            previous_ = activeConstAnalysis;
+            activeConstAnalysis = &local_;
+            installed_ = true;
+        }
+
+        ~ConstAnalysisScope()
+        {
+            if (installed_) activeConstAnalysis = previous_;
+        }
+
+        ConstAnalysisContext& Query() const { return *activeConstAnalysis; }
+    };
+}
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -2041,8 +2112,13 @@ const LLVMBackend::TypeAndValue* LLVMBackend::DeclaredConstSlot(const llvm::Valu
 
 LLVMBackend::ConstWriteCause LLVMBackend::FindConstWriteCause(const llvm::Value* address) const
 {
+        ConstAnalysisScope queryScope(this);
+        auto& query = queryScope.Query();
+        if (address == nullptr) return {};
+        if (auto it = query.Causes.find(address); it != query.Causes.end()) return it->second;
+        if (!query.ActiveCauses.insert(address).second) return {};
+        auto compute = [&]() -> ConstWriteCause {
         ConstWriteCause cause;
-        if (address == nullptr) return cause;
         // A C++ mutable member is writable inside a const object.
         if (IsCxxMutableFieldAccess(const_cast<llvm::Value*>(address))) return cause;
         // Const native fields on the GEP chain, innermost first. The running constructor's own
@@ -2186,6 +2262,11 @@ LLVMBackend::ConstWriteCause LLVMBackend::FindConstWriteCause(const llvm::Value*
             cause.CxxShallow = cxxPointer();
         }
         return cause;
+        };
+        ConstWriteCause cause = compute();
+        query.ActiveCauses.erase(address);
+        query.Causes.emplace(address, cause);
+        return cause;
 }
 
 namespace
@@ -2277,7 +2358,17 @@ bool LLVMBackend::IsStringLiteralGlobal(const llvm::Value* value) const
  */
 uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& name, int depth) const
 {
-        if (address == nullptr || depth > 8) return 0;
+        ConstAnalysisScope queryScope(this);
+        auto& query = queryScope.Query();
+        if (address == nullptr || depth > kConstAnalysisMaxDepth) return 0;
+        ConstLevelKey key{ address, depth, true, name };
+        if (auto it = query.Levels.find(key); it != query.Levels.end())
+        {
+            name = it->second.Name;
+            return it->second.Levels;
+        }
+        if (!query.ActiveLevels.insert(key).second) return 0;
+        auto compute = [&]() -> uint8_t {
         if (IsStringLiteralGlobal(address)) return ValueConstLevels(address, name, depth + 1);
         if (auto* inst = llvm::dyn_cast<llvm::Instruction>(address);
             inst != nullptr && inst->getMetadata("cflat.const.cast") != nullptr)
@@ -2331,6 +2422,11 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
             if (!llvm::isa<llvm::GEPOperator>(address)) return 0;
         }
         return ValueConstLevels(address, name, depth + 1);
+        };
+        const uint8_t levels = compute();
+        query.ActiveLevels.erase(key);
+        query.Levels.emplace(std::move(key), ConstLevelResult{ levels, name });
+        return levels;
 }
 
 /*
@@ -2340,7 +2436,17 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
  */
 uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth) const
 {
-        if (pointer == nullptr || depth > 8) return 0;
+        ConstAnalysisScope queryScope(this);
+        auto& query = queryScope.Query();
+        if (pointer == nullptr || depth > kConstAnalysisMaxDepth) return 0;
+        ConstLevelKey key{ pointer, depth, false, name };
+        if (auto it = query.Levels.find(key); it != query.Levels.end())
+        {
+            name = it->second.Name;
+            return it->second.Levels;
+        }
+        if (!query.ActiveLevels.insert(key).second) return 0;
+        auto compute = [&]() -> uint8_t {
         // A string literal is a `(const char)*` (R11): its characters are read-only.
         if (IsStringLiteralGlobal(pointer))
         {
@@ -2418,6 +2524,11 @@ uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& n
             return StoredConstLevels(gep->getPointerOperand(), name, depth + 1);
         }
         return 0;
+        };
+        const uint8_t levels = compute();
+        query.ActiveLevels.erase(key);
+        query.Levels.emplace(std::move(key), ConstLevelResult{ levels, name });
+        return levels;
 }
 
 bool LLVMBackend::PointerValuePointeeConst(const llvm::Value* pointer, std::string& name, int depth) const

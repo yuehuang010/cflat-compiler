@@ -2087,6 +2087,8 @@ namespace alnv
     template <unsigned long... I> using ISeq = Seq<I...>;            // non-type pack
     template <class... T> struct TypeList { static constexpr unsigned long size() noexcept { return sizeof...(T); } };
     template <class... T> using Tup = TypeList<T...>;                // type pack
+    inline int class_pack_pick(const TypeList<int, char>&) noexcept { return 31; }
+    inline int expanded_alias_pick(const TypeList<char, long>&) noexcept { return 32; }
     template <class A, class B> struct Pair
     {
         A a; B b;
@@ -2709,4 +2711,6 @@ template <class T = int> struct Box
 };
 template <class... Ts> using P0 = Box<>;
 template <class T = int, class... Ts> using PD = Box<T>;
+inline int pick(const Box<int>&) noexcept { return 11; }
+inline int pick(const Box<long>&) noexcept { return 22; }
 }

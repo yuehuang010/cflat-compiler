@@ -42,11 +42,16 @@ Found: MIX7 r1 opus review, 2026-10-30 box 7, PRE-EXISTING (same on master). Pro
   own parameters (keepFewestConstRefTemporaries) with the same predicate as the rank tie-break (CxxConstScalarBindsTemporary,
   CxxConversionRank::constRefTemporary). Legs: Test/test_cpp_interop.cb 65061-65062. Two const T& temporaries still tie
   (Test/errors/err_cpp_const_ref_scalar_tie.cb, err_cpp_const_ref_ctor_tie.cb).
-- Root cause (MIX18 r2, unfixed): a CONSTRUCTOR `S(i)` with `S(const double&)` + `S(long)` (and `U(i)` with `U(const long&)` +
-  `U(double)`) is still refused (clang: ambiguous). The postfix construction path selects with allowNumericConversions=false, so
-  a `const double&` candidate is not viable there, and CxxConstructorNeedsClangResolution hands every scalar-reference
-  constructor set to clang (CxxCtorForwardsScalarReference), which reports the tie. The ruling needs CFlat to decide such sets:
-  a policy change to the clang deferral plus numeric-off viability, not a tie-break alone.
+- Fixed in MIX18 ctor: declaration initializer, `new`, and direct/copy-list brace construction now use the same shared
+  const-scalar-reference ranking predicate as postfix construction. The predicate enables numeric ranking only when a
+  constructor set has a const scalar reference and not every viable constructor narrows; mutable-reference forwarding and
+  clang-ranked template/variadic sets remain deferred. Legs: Test/test_cpp_interop.cb 65067-65082 and
+  Test/errors/err_cpp_const_ref_ctor_tie.cb (postfix, declaration, `new`, and both brace forms).
+  Ranking within a constructor set (LLVMBackend_CxxLowering.cpp SelectCxxConstructorListed, candidate loop): a converted
+  scalar argument binds a temporary, so `T&&` beats by-value beats `const T&` (clang: [over.ics.rank] rvalue-reference
+  tie-break). `cppcr.RvalueOrConst(int lvalue)` with `(unsigned&&)` + `(const long&)` picks `unsigned&&` (chosen 1;
+  the leg is return code 7133 in Test/test_cpp_interop.cb); before this the `const&` candidate won and the leg exited 221.
+  Brace forms refuse a narrowing conversion to the tie-broken constructor (C++ list-init); paren/new forms follow the ruling.
 - Observed, not MIX18 scope: `rv.CB(d)` (double into `const bool&`, clang 1) and `rv.CNI(d)` / `rv.CNI(l)` (double/long
   into `const int&`, clang 2 / 6) are refused: cflat refuses the implicit narrowing/float->bool at a call (rulings
   2026-09-04 narrowing, 2026-10-13 float->int); decide before any change.
@@ -55,6 +60,6 @@ Found: MIX7 r1 opus review, 2026-10-30 box 7, PRE-EXISTING (same on master). Pro
   LLVMBackend_Overloads.cpp ~4528 (dffcb4b7): `S(i)` with `S(const double&)` + `S(long)` picks `long`, `U(i)` with `U(const long&)` +
   `U(double)` picks `double`; only an lvalue of exactly the referent type ties, and two const& temporaries stay ambiguous. CFlat decides
   such sets itself: the clang deferral (CxxConstructorNeedsClangResolution / CxxCtorForwardsScalarReference) and the numeric-off
-  viability no longer apply to a scalar-reference candidate set. Test consequence: `S(i)` / `U(i)` become accept legs next to 65057-65062;
+  viability no longer apply to a scalar-reference candidate set;
   err_cpp_const_ref_ctor_tie.cb (two const& temporaries) stands. The narrowing items (`rv.CB(d)`, `rv.CNI(d)`) stay refused by the
   2026-09-04 and 2026-10-13 rulings - no change.

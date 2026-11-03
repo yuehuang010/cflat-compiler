@@ -7,6 +7,8 @@ std::string GenericMemberTemplateSignature(CFlatParser::FunctionDefinitionContex
 {
     const auto entries = func->genericTypeParameters()->typeParameterList()->typeParameterEntry();
     std::string signature = std::to_string(entries.size()) + "<";
+    if (func->declarationSpecifiers() != nullptr)
+        signature += "return:" + func->declarationSpecifiers()->getText() + ";";
     if (func->parameterTypeList() != nullptr
         && func->parameterTypeList()->parameterList() != nullptr)
         for (auto* param : func->parameterTypeList()->parameterList()->parameterDeclaration())
@@ -2875,7 +2877,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + displayFieldName, {}, displayFieldName);
+                            annSig + typeSig + " " + displayFieldName, {}, {}, displayFieldName);
             }
         }
 
@@ -5185,7 +5187,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + displayFieldName, {}, displayFieldName);
+                            annSig + typeSig + " " + displayFieldName, {}, {}, displayFieldName);
             }
         }
 
@@ -5845,7 +5847,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + displayFieldName, {}, displayFieldName);
+                            annSig + typeSig + " " + displayFieldName, {}, {}, displayFieldName);
             }
         }
 

@@ -4036,6 +4036,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
 
 bool LLVMBackend::ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedVariable& arg) const
 {
+        if (IsNullFunctionSlotJoin(value)) return false;
         if (llvm::isa<llvm::Function>(value)) return false;               // a named function
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return false;    // parity with the direct path
         // A C NULL macro reads as a load of its backing global; the ilz macro flags make it the

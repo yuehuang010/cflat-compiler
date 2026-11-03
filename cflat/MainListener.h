@@ -1197,6 +1197,8 @@ void ForgetIfConstGuardedImpls(LLVMBackend* compiler, antlr4::tree::ParseTree* n
 // (the explicit SIMD type is the hardware-control escape hatch, so a non-power-of-2 that would
 // silently waste a lane is rejected rather than padded). Returns true and sets lanesOut on
 // success; otherwise sets errorOut and returns false.
+// Decodes a raw `simd<E,N>` spelling (LLVMBackend_Lookup.cpp); false for any other name.
+bool DecodeSimdSpelling(const std::string& text, std::string& elemOut, uint64_t& lanesOut);
 bool TryParseSimdLaneCount(LLVMBackend* compiler,
                                   CFlatParser::AssignmentExpressionContext* expr,
                                   uint64_t& lanesOut, std::string& errorOut);

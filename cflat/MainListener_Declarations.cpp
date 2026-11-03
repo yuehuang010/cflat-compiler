@@ -1286,6 +1286,25 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         int retConst = 0;
         std::string retName = ResolveSigComponentConstCodegen(fpSpec->typeSpecifier(), retPtr,
             retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn);
+        bool nestedFunctionType = false;
+        for (auto* ancestor = fpSpec->parent; ancestor != nullptr; ancestor = ancestor->parent)
+            if (dynamic_cast<CFlatParser::FunctionPointerSpecifierContext*>(ancestor) != nullptr)
+            {
+                nestedFunctionType = true;
+                break;
+            }
+        auto validateSignatureComponent = [&](const std::string& name, bool pointer) {
+            if (nestedFunctionType && !Compiler(fpSpec)->IsKnownTypeName(name)
+                && !Compiler(fpSpec)->IsTypeArgTypeKey(name)
+                && !MentionsSignatureTypeParam(name))
+            {
+                LLVMBackend::TypeAndValue component;
+                component.TypeName = name;
+                component.Pointer = pointer;
+                Compiler(fpSpec)->GetType(component);
+            }
+        };
+        validateSignatureComponent(retName, retPtr);
         sig.FuncPtrReturnConstMask = retConst;
         // A signature component over the cap can never be matched: no function may declare a
         // 3-star return or parameter, so the closure type would be unpopulatable.
@@ -1315,6 +1334,7 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 std::string pName = ResolveSigComponentConstCodegen(param->typeSpecifier(), pPtr,
                                                                     pStars, pConst, param->multiWordTypeSuffix(),
                                                                     false, &pSpelling);
+                validateSignatureComponent(pName, pPtr);
                 const int pDepth = ReconcilePointerDepth(pPtr, pStars);
                 if (pDepth > PointerDepthCap)
                     LogErrorContext(param, PointerDepthCapMessage(
@@ -1658,6 +1678,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         declType.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                             fpSpec->typeSpecifier(), retPtr, retStars, retConst,
                             fpSpec->multiWordTypeSuffix(), aliasReturn);
+                        if (!retPtr)
+                            if (const auto* nested = Compiler(declSpecs)->GetEncodedClosureType(
+                                    declType.FuncPtrReturnTypeName))
+                                declType.FuncPtrReturnFunctionType =
+                                    std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                         if (aliasReturn && !returnTypeWasSubstituted && !returnTypeIsGenericDerivedAlias
                             && retStars == 0
                             && Compiler(declSpecs)->ResolveTypeAlias(declType.FuncPtrReturnTypeName) == "string")
@@ -1692,6 +1717,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 p.TypeName = ResolveSigComponentConstCodegen(
                                     param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix(),
                                         false, &p.AliasSpelling);
+                                if (!pPtr)
+                                    if (const auto* nested = Compiler(declSpecs)->GetEncodedClosureType(p.TypeName))
+                                        p.FunctionTypeSignature =
+                                            std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                                 p.ConstMask = pConst;
                                 const int pDepth = ReconcilePointerDepth(pPtr, pStars);
                                 LLVMBackend::TypeAndValue pType;
@@ -2021,6 +2050,16 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         bool substAliasArg = false;
                         PeelTypeArgSuffix(typeName, substPointerDepth, substArrayView,
                                           &substAliasArg, &substArgElemPtrDepth);
+                        // T bound to `simd<E,N>` (deduced or explicit) declares a simd value, like the
+                        // simd<T,N> specifier branch above.
+                        std::string simdElem;
+                        uint64_t simdLanes = 0;
+                        if (DecodeSimdSpelling(typeName, simdElem, simdLanes))
+                        {
+                            typeName = simdElem;
+                            declType.IsSimd = true;
+                            declType.SimdLanes = simdLanes;
+                        }
                         // An `alias` element (list<alias X*>) is a pure borrow whose owner lives
                         // elsewhere, so ANY value of that element type is a borrow - not only the
                         // `alias T get` return but also `take()`'s plain-T return (take removes the
@@ -5146,6 +5185,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             // Normalize parameter types from the parse tree so nested `List<T>` shapes are
             // positional too; parsed TypeAndValue names preserve only top-level parameters.
             std::string signature = std::to_string(typeParams.size()) + "<";
+            if (func->declarationSpecifiers() != nullptr)
+                signature += "return:" + func->declarationSpecifiers()->getText() + ";";
             if (paramTypeList != nullptr && paramTypeList->parameterList() != nullptr)
                 for (auto* param : paramTypeList->parameterList()->parameterDeclaration())
                     signature += param->declarationSpecifiers()->getText() + ",";
@@ -7178,6 +7219,12 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
             if (!valid) return true;
             std::string wrapperName;
             std::string constructorError;
+            std::vector<llvm::Value*> braceValues;
+            braceValues.reserve(braceElements.size());
+            for (const auto& element : braceElements)
+                braceValues.push_back(element.Primary);
+            compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                typeName, braceElements, braceValues);
             std::vector<size_t> forwardedBraceElements;
             if (!compiler->RequestCxxDirectBraceConstructor(
                     typeName, braceElements, braceExpression,
@@ -7561,6 +7608,16 @@ cxx_dtor_ready:
                             ctorArgumentPostfix.Flush();
                         }
                     if (!valid) return true;
+                    if (ctorArgs->argumentNamedExpression().size() == 1
+                        && brace.argumentIndex == 0)
+                    {
+                        std::vector<llvm::Value*> braceValues;
+                        braceValues.reserve(brace.elements.size());
+                        for (const auto& element : brace.elements)
+                            braceValues.push_back(element.Primary);
+                        compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                            typeName, brace.elements, braceValues);
+                    }
                     LLVMBackend::NamedVariable placeholder;
                     placeholder.TypeAndValue.TypeName = "__cflat_brace_arg";
                     ctorArgumentAddresses.push_back(placeholder);
@@ -7767,6 +7824,8 @@ cxx_dtor_ready:
             {
                 std::string wrapperName;
                 std::string constructorError;
+                compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                    typeName, ctorArgumentAddresses, argValues);
                 if (!compiler->RequestCxxBraceConstructor(
                         typeName, ctorArguments, braceArguments,
                         wrapperName, constructorError))
@@ -7794,18 +7853,19 @@ cxx_dtor_ready:
             }
             std::string why;
             compiler->TryBindRefusedCxxMember(typeName, "__ctor", argTypes.size());
-            const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
+            const bool scalarReferenceSet = compiler->CxxCtorSetRankedByCflat(
+                typeName, argTypes, &ctorArgumentAddresses);
+            const bool forwardsScalarRef = compiler->CxxCtorForwardsScalarReference(typeName, argTypes);
+            const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, scalarReferenceSet,
                                                              &ctorArgumentAddresses);
-            // A scalar-reference overload set is clang's to resolve: no listed refusal is final.
-            const bool scalarReferenceSet = compiler->CxxCtorForwardsScalarReference(typeName, argTypes);
-            bool hardReferenceRejection = !scalarReferenceSet
+            bool hardReferenceRejection = !forwardsScalarRef
                 && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
             if (ctor == nullptr && !hardReferenceRejection)
             {
                 compiler->TryBindRefusedCxxMember(typeName, "__ctor", argTypes.size());
-                ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
+                ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, scalarReferenceSet,
                                                       &ctorArgumentAddresses);
-                hardReferenceRejection = !scalarReferenceSet
+                hardReferenceRejection = !forwardsScalarRef
                     && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
             }
             // A constructor template can outrank the listed pick (or the listed refusal): let
@@ -7814,7 +7874,7 @@ cxx_dtor_ready:
             bool clangResolves =
                 compiler->CxxConstructorNeedsClangResolution(
                     typeName, ctor, argTypes, &ctorArgumentAddresses, /*allowExplicit*/ true,
-                    &nullPointerCandidate);
+                    &nullPointerCandidate, /*rankScalarReferenceSet*/ scalarReferenceSet);
             if (ctor == nullptr && !clangResolves
                 && !why.starts_with("matches more than one constructor overload"))
             {
@@ -7832,15 +7892,18 @@ cxx_dtor_ready:
                 if (slotBound)
                 {
                     why.clear();
-                    ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
+                    ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, scalarReferenceSet,
                                                           &ctorArgumentAddresses);
                     nullPointerCandidate = false;
                     clangResolves = compiler->CxxConstructorNeedsClangResolution(
                         typeName, ctor, argTypes, &ctorArgumentAddresses, /*allowExplicit*/ true,
-                        &nullPointerCandidate);
+                            &nullPointerCandidate, /*rankScalarReferenceSet*/ scalarReferenceSet);
                 }
             }
-            const bool clangOnlyConstructorSet = scalarReferenceSet || nullPointerCandidate;
+            compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                typeName, ctorArgumentAddresses, argValues);
+            const bool clangOnlyConstructorSet = (forwardsScalarRef && !scalarReferenceSet)
+                || nullPointerCandidate;
             hardReferenceRejection = !clangOnlyConstructorSet
                 && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
             // The copy-sink verdict refuses NAMED copy-deleted lvalues only: a reference-returning

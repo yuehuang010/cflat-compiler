@@ -17,11 +17,6 @@ Fix direction for the literal-0 items: none in this issue (literal 0 is out of s
 - Fixed in MIX20: `Lambda<int(int)> f = MNULL;` and `g = MNULL;` (Lambda<> declaration / assignment) now store a null.
   CreateCast's aggregate backstop (LLVMBackend_VariablesAndIR.cpp) takes a load of a zero macro global as nullptr for
   closure destinations only. Legs: Test/test_function_ptr.cb testLambdaSlotNullMacro; Test/errors/err_lambda_nonnull_pointer_global.cb.
-- `k ? MNULL : MNULL` into function<> refused; `k ? nullptr : nullptr` accepted; clang accepts both.
-  Root cause (MIX20): ArgumentIsProvablyDataPointer exempts a C null macro only for a direct load of the macro global
-  (arg.IsCxxMacroGlobal). A `?:` join carries IsCxxMacroJoin instead, so JoinDeliversDataValue reads the arms as data
-  and the thin gate (CheckThinFnPtrAssignProvenance) refuses. The Lambda<> form is refused for the same select shape.
-  Fix needs an all-arms-zero-macro proof on the join in the thin gate and the fat backstop; not one site, not done.
 - `#define ZERO 0` / `0L` macros refused everywhere (clang accepts).
 - `import cpp`: `callit(nullptr)` into a std::function / fn-pointer param -> "no overload"; NULL accepted.
 
@@ -34,7 +29,13 @@ the original ruling text incorrectly said no accept leg pinned it.
 2026-10-31: T185 accept legs for literal 0 in testFunctionSlotAccepts flipped to err legs per this ruling (premise
 'no accept leg pins it' was wrong). Literal zero was rejected for function<>, Lambda<>, and C function-pointer sinks.
 
-Open (2026-11-01, fnzcpp review 2): literal 0 into a C++ CONSTRUCTOR std::function parameter (`S2(std::function<int(int)>)`,
-`S(std::function<int(int)>, int)` with `S(0, 5)`) is still accepted; the free / member call is refused. The ctor path appears to
-convert the argument before RejectLiteralZeroFunctionSlot sees it (LLVMBackend_CxxLowering.cpp EmitCxxStructorCall).
-Repro: cflat-fix-fnzcpp scratch/rev_fnzcpp_r2/ctorsf1.cb (kept in scratch/repro_keep/fnzcpp/).
+Open question (mnulljoin review 1, 2026-11-01, master same): typed null pointer constants `(void*)0`, `(int*)0`, `(int*)nullptr` are
+accepted at function<> slots (direct and, after mnulljoin, in joins). `(void*)0` is the C NULL body; whether a DATA-pointer-typed null
+(`(int*)nullptr`) is a null spelling for a function slot needs a maintainer ruling.
+
+Open (ctor0fn review 1, 2026-11-01): literal 0 into a C++ ctor std::function slot by DIRECT BRACE (`cppfnptr.FunctionSink v{ 0 };`,
+`rv.G g{0}`) is refused only when an earlier postfix construction of the same class loaded its CFlat constructor list; as the first
+construction it is accepted (the brace path goes straight to RequestCxxDirectBraceConstructor and never populates info->constructors).
+Also pre-existing (master same): nullptr into a std::function ctor param fails "no constructor whose parameter types match" in postfix /
+multi-param / defaulted sets (clang accepts); `rv.G g = 0;` compiles (clang: no viable conversion); `rv.G{0}` as an expression does not parse.
+Repros: cflat-fix-ctor0fn scratch/rev_ctor0fn_opus_tmp/ (copied to scratch/repro_keep/ctor0fn/).

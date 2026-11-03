@@ -1,0 +1,57 @@
+import cpp "cpp_interop_refgate.h";
+
+cpprefgate.C* RgGlobalPointer = nullptr;
+cpprefgate.C** RgGlobalPointerAddress = nullptr;
+cpprefgate.Hold RgGlobalHolder;
+cpprefgate.Callable RgGlobalCallable;
+
+expect_error("refers into a local object that is destroyed when the function returns") {
+    cpprefgate.C* RgGlobalTRef() {
+        cpprefgate.C local = { v = 71 };
+        RgGlobalPointer = &local;
+        return &cpprefgate.pointer_ref_ref(RgGlobalPointer);
+    }
+}
+
+expect_error("refers into a local object that is destroyed when the function returns") {
+    cpprefgate.C* RgGlobalT2() {
+        cpprefgate.C local = { v = 73 };
+        RgGlobalPointer = &local;
+        RgGlobalPointerAddress = &RgGlobalPointer;
+        return &cpprefgate.double_pointer_ref(RgGlobalPointerAddress);
+    }
+}
+
+expect_error("refers into a local object that is destroyed when the function returns") {
+    cpprefgate.C* RgMethodT2() {
+        cpprefgate.C local = { v = 75 };
+        RgGlobalPointer = &local;
+        RgGlobalPointerAddress = &RgGlobalPointer;
+        return &RgGlobalHolder.via(RgGlobalPointerAddress);
+    }
+}
+
+expect_error("refers into a local object that is destroyed when the function returns") {
+    cpprefgate.C* RgMethodTRef() {
+        cpprefgate.C local = { v = 77 };
+        RgGlobalPointer = &local;
+        return &RgGlobalHolder.viar(RgGlobalPointer);
+    }
+}
+
+expect_error("refers into a local object that is destroyed when the function returns") {
+    cpprefgate.C* RgOperatorT2() {
+        cpprefgate.C local = { v = 79 };
+        RgGlobalPointer = &local;
+        RgGlobalPointerAddress = &RgGlobalPointer;
+        return &RgGlobalCallable(RgGlobalPointerAddress);
+    }
+}
+
+expect_error("refers into a local object that is destroyed when the function returns") {
+    cpprefgate.C* RgGlobalTernary(bool choose) {
+        cpprefgate.C local = { v = 81 };
+        RgGlobalPointer = &local;
+        return choose ? cpprefgate.pointer_ref_ref(RgGlobalPointer) : cpprefgate.cell();
+    }
+}

@@ -569,11 +569,14 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 && !destTypeName.IsArrayView
                 && (compiler->IsForeignNontrivialCxxClass(destTypeName.TypeName)
                     || ((scalarSource || pointerSource)
-                        && compiler->IsForeignCxxClassWithConstructors(destTypeName.TypeName)))
+                        && compiler->IsForeignCxxClassWithConstructors(destTypeName.TypeName))
+                    || (cxxClassSource && compiler->IsCxxRecord(destTypeName.TypeName)))
                 && namedVar.TypeAndValue.TypeName != destTypeName.TypeName)
             {
                 auto converted = namedVar;
                 converted.TypeAndValue.VariableName.clear();
+                if (cxxClassSource && cxxCastStorage != nullptr)
+                    converted.Storage = cxxCastStorage;
                 if (scalarSource && scalarCastStorage != nullptr) converted.Storage = scalarCastStorage;
                 std::string refusal;
                 llvm::Value* intoSlot = nullptr;

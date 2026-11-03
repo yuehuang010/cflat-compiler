@@ -442,7 +442,10 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             }
             std::string why;
             compiler->TryBindRefusedCxxMember(typeName, "__ctor", ctorArgTypes.size());
-            const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, false,
+            bool scalarReferenceSet = compiler->CxxCtorSetRankedByCflat(
+                typeName, ctorArgTypes, &ctorArgVars);
+            bool forwardsScalarRef = compiler->CxxCtorForwardsScalarReference(typeName, ctorArgTypes);
+            const auto* ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, scalarReferenceSet,
                                                              &ctorArgVars);
             // A constructor template can outrank the listed pick: clang resolves it then.
             std::string wrapperName;
@@ -451,7 +454,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             bool clangResolves = trivialCopyNeedsClangResolution
                 || compiler->CxxConstructorNeedsClangResolution(
                 typeName, ctor, ctorArgTypes, &ctorArgVars, /*allowExplicit*/ true,
-                &nullPointerCandidate);
+                &nullPointerCandidate, /*rankScalarReferenceSet*/ scalarReferenceSet);
             if (ctor == nullptr && !clangResolves
                 && !why.starts_with("matches more than one constructor overload"))
             {
@@ -469,17 +472,17 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 if (slotBound)
                 {
                     why.clear();
-                    ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, false,
+                    ctor = compiler->SelectCxxConstructor(typeName, ctorArgTypes, why, scalarReferenceSet,
                                                          &ctorArgVars);
                     nullPointerCandidate = false;
                     clangResolves = trivialCopyNeedsClangResolution
                         || compiler->CxxConstructorNeedsClangResolution(
                             typeName, ctor, ctorArgTypes, &ctorArgVars, /*allowExplicit*/ true,
-                            &nullPointerCandidate);
+                            &nullPointerCandidate, /*rankScalarReferenceSet*/ scalarReferenceSet);
                 }
             }
             const bool clangOnlyConstructorSet =
-                compiler->CxxCtorForwardsScalarReference(typeName, ctorArgTypes)
+                (forwardsScalarRef && !scalarReferenceSet)
                 || nullPointerCandidate;
             const bool hardReferenceRejection = !clangOnlyConstructorSet
                 && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
@@ -553,6 +556,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     LogErrorContext(ctx, refusal);
                     return {};
                 }
+            compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                typeName, ctorArgVars, ctorArgs);
             newCallPostfix.Flush();
             llvm::Value* block = compiler->EmitCxxHeapAllocate(typeName);
             if (block == nullptr)
@@ -836,6 +841,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         argVar.TypeAndValue = argNV.TypeAndValue;
                     argVar.BaseType = argVal->getType();
                     argVar.Primary = argVal;
+                    argVar.IsTupleLiteral = argNV.IsTupleLiteral;
+                    argVar.TupleLiteralElements = argNV.TupleLiteralElements;
                     argVar.TypeAndValue.VariableName.clear();
                     argVar.CastOccurrenceId = thisCastOcc;
                     argVar.OwnedStructTempEnd = compiler->pendingOwnedStructTemps.size();
@@ -2307,6 +2314,30 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         const auto operandLayers = DirectOperandPostfixes(ctx->unaryExpression());
         FlexibleArrayKeepScope keep(flexibleArrayKeep_, operandLayers);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+        // A copied field is non-owning, not [immovable], and holds no C++ class beyond a trivially
+        // copyable record (a C++ move ctor must still run and leave the source moved-from).
+        const auto copiesAsPlainValue = [&](const LLVMBackend::NamedVariable& nv) {
+            const std::string& tn = nv.TypeAndValue.TypeName;
+            return !FieldIsOwningValue(compiler, nv) && !compiler->IsImmovableType(tn)
+                && (!compiler->HasCxxClassMember(tn)
+                    || (compiler->IsCxxRecord(tn) && compiler->IsCxxTriviallyCopyableRecord(tn)));
+        };
+        const std::string moveOperandText = ctx->unaryExpression()->getText();
+        const auto* currentFunctionSymbol = compiler->builder->GetInsertBlock() != nullptr
+            ? compiler->FindSymbolForFunction(compiler->builder->GetInsertBlock()->getParent())
+            : nullptr;
+        const bool namesImplicitThisField = IsBareIdentifierText(moveOperandText)
+            && compiler->GetScopedLocalOrArgument(moveOperandText).Storage == nullptr
+            && compiler->HasMemberVariable(moveOperandText)
+            && currentFunctionSymbol != nullptr && currentFunctionSymbol->IsMethod;
+        if (namesImplicitThisField && !argNV.TypeAndValue.Pointer
+            && !argNV.TypeAndValue.ElemPointer && copiesAsPlainValue(argNV))
+        {
+            argNV.TypeAndValue.IsMove = false;
+            argNV.IsExplicitMove = false;
+            argNV.IsRvalue = false;
+            return argNV;
+        }
         // The operand's LAST suffix decides member vs element: `arr[0].data` is a member, `a->data[0]` an element.
         bool operandEndsInMember = false;
         if (!operandLayers.empty() && operandLayers.back()->children.size() >= 3)
@@ -2479,20 +2510,37 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             return {};
         }
 
+        // `move` of any non-owning value field through a borrow is a copy; it preserves the field
+        // and carries no ownership-transfer state into later lowering.
+        if ((!argNV.OwningStructName.empty() || argNV.RootIsBorrowedThisField)
+            && (argNV.IsBorrowed || argNV.RootIsBorrowedThisField)
+            && (!argNV.BorrowedOrigin.empty() || argNV.RootIsBorrowedThisField)
+            && !argNV.FieldName.empty()
+            && !argNV.IsElementAccess
+            && !argNV.TypeAndValue.ElemPointer
+            && !argNV.TypeAndValue.Pointer
+            && copiesAsPlainValue(argNV))
+        {
+            argNV.TypeAndValue.IsMove = false;
+            argNV.IsExplicitMove = false;
+            argNV.IsRvalue = false;
+            return argNV;
+        }
+
         /*
          * RULED 2026-08-12 (move required, move allowed): `move w.b` through a borrowed POINTER
          * parameter is LEGAL for an owning VALUE field. The move nulls the one real object the
          * caller can see - exactly what the implicit store already did silently, and that spelling
          * is the one now rejected with this as its named remedy. A POINTER field keeps the
          * rejection: handing out the raw pointer is the delete-borrow hazard q10 ruled DEFER, and
-         * its own downstream guards would reject the remedy anyway. The by-value and alias-borrow
-         * roots above also stay rejected - there the move nulls only a shallow copy.
+         * its own downstream guards would reject the remedy anyway. Non-owning value fields are
+         * plain copies and bypass this refusal; by-value and alias-borrow roots above stay rejected.
          */
         if (!argNV.OwningStructName.empty()
             && argNV.IsBorrowed
             && !argNV.BorrowedOrigin.empty()
             && !argNV.IsElementAccess
-            && !FieldIsOwningValue(compiler, argNV)
+            && argNV.TypeAndValue.Pointer
             && !BorrowOriginIsMethodReceiver(compiler, argNV.BorrowedOrigin))
         {
             LogErrorContext(ctx, std::format(

@@ -1,3 +1,5 @@
+import "../library/c_variadic_fnptr.h";
+
 int gnum = 1;
 int* gptr = &gnum;
 
@@ -5,6 +7,22 @@ extern int main()
 {
     expect_error("cannot store a pointer value into struct storage") {
         Lambda<int(int)> f = gptr;
+    }
+    expect_error("cannot assign") {
+        bool k = true;
+        function<int(int)> f = k ? T311_NULL : (void*)gptr;
+    }
+    expect_error("cannot store a pointer value into struct storage") {
+        bool k = true;
+        Lambda<int(int)> f = k ? T311_NULL : (void*)gptr;
+    }
+    expect_error("incompatible types") {
+        bool k = true;
+        function<int(int)> f = k ? T311_NULL : T311_ZERO;
+    }
+    expect_error("incompatible types") {
+        bool k = true;
+        Lambda<int(int)> f = k ? T311_NULL : T311_ZERO;
     }
     return 0;
 }

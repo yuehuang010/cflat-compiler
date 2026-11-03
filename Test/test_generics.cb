@@ -7933,6 +7933,23 @@ bool testMix8TupleTemplates()
 }
 
 (i64, int) tupleLiteralWideningReturn() { return (3, 4); }
+typedef (int, int) TupleLiteralAlias;
+T tupleLiteralIdentity<T>(T value) { return value; }
+int tupleLiteralWideCtorValue = 0;
+class TupleLiteralWideCtor
+{
+    int value = default;
+    TupleLiteralWideCtor((i64, int) pair)
+    {
+        value = (int)pair.item_0 + pair.item_1;
+        tupleLiteralWideCtorValue = value;
+    }
+};
+int tupleLiteralUniqueDtorCount = 0;
+struct TupleLiteralOwned
+{
+    ~TupleLiteralOwned() { tupleLiteralUniqueDtorCount++; }
+};
 int tupleLiteralWideningArgument((i64, int) value)
 {
     return (int)value.item_0 + value.item_1;
@@ -7954,6 +7971,7 @@ int tupleLiteralWideningOverloadA((i64, int) value) { return 1; }
 int tupleLiteralWideningOverloadA((double, int) value) { return 2; }
 int tupleLiteralWideningOverloadB((double, int) value) { return 2; }
 int tupleLiteralWideningOverloadB((i64, int) value) { return 1; }
+int tupleArrayFunctionPointerTarget((int, int)* q) { return q[1].item_0; }
 int tupleLiteralFunctionPointerTarget((i64, int) pair) { return (int)pair.item_0 + pair.item_1; }
 
 bool testTupleLiteralElementConversions()
@@ -7966,6 +7984,36 @@ bool testTupleLiteralElementConversions()
     (double, int) wideDouble = (3, 4);
     result &= Test("tuple literal declaration double", wideDouble.item_0 == 3.0, true);
     result &= Test("tuple literal declaration double tail", wideDouble.item_1, 4);
+
+    (int*, int) nullPointer = (nullptr, 4);
+    result &= Test("tuple literal declaration nullptr", nullPointer.item_0 == nullptr, true);
+    result &= Test("tuple literal declaration nullptr tail", nullPointer.item_1, 4);
+    (simd<float, 4>, int) simdSplat = (1.0f, 4);
+    result &= Test("tuple literal declaration simd splat", simdSplat.item_0[3], 1.0f);
+    result &= Test("tuple literal declaration simd tail", simdSplat.item_1, 4);
+    TupleLiteralAlias aliasValue = (3, 4);
+    result &= Test("tuple literal typedef declaration", aliasValue.item_0 + aliasValue.item_1, 7);
+    TupleLiteralWideCtor* wideCtor = new TupleLiteralWideCtor((3, 4));
+    result &= Test("tuple literal wider constructor argument", tupleLiteralWideCtorValue, 7);
+    delete wideCtor;
+    tupleLiteralUniqueDtorCount = 0;
+    {
+        (unique<TupleLiteralOwned>, int) ownedTuple = (new TupleLiteralOwned(), 4);
+        result &= Test("tuple literal unique element value", ownedTuple.item_1, 4);
+    }
+    result &= Test("tuple literal unique element destroyed once", tupleLiteralUniqueDtorCount, 1);
+
+    tupleLiteralUniqueDtorCount = 0;
+    {
+        (unique<TupleLiteralOwned>, int) emptyTuple = (nullptr, 4);
+        result &= Test("tuple literal unique nullptr element", emptyTuple.item_0 == nullptr, true);
+        result &= Test("tuple literal unique nullptr tail", emptyTuple.item_1, 4);
+    }
+    result &= Test("tuple literal unique nullptr skips destructor", tupleLiteralUniqueDtorCount, 0);
+
+    (bool, int) boolNullTuple = (nullptr, 4);
+    result &= Test("tuple literal bool nullptr element", boolNullTuple.item_0, false);
+    result &= Test("tuple literal bool nullptr tail", boolNullTuple.item_1, 4);
 
     (i64, int) assigned = default;
     assigned = (3, 4);
@@ -7986,6 +8034,10 @@ bool testTupleLiteralElementConversions()
     result &= Test("tuple literal function pointer argument i64", tupleFn((3, 4)), 7);
     (i64, int) tupleVariable = (3, 4);
     result &= Test("same-type tuple variable function pointer argument", tupleFn(tupleVariable), 7);
+    function<int((int, int)*)> tupleArrayFn = tupleArrayFunctionPointerTarget;
+    (int, int)[2] tupleArray;
+    tupleArray[1] = (5, 6);
+    result &= Test("tuple array decays to a tuple pointer through a function value", tupleArrayFn(tupleArray), 5);
     result &= Test("tuple literal parenthesized argument i64", tupleLiteralWideningArgument(((3, 4))), 7);
     int tupleLiteralSize = sizeof (3, 4);
     result &= Test("sizeof tuple literal is its layout", tupleLiteralSize, 8);

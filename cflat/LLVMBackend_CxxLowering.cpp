@@ -87,6 +87,47 @@ llvm::Value* LLVMBackend::MaterializeCxxDefaultArgument(const cflat_cinterop::Ra
         return nullptr;
 }
 
+void LLVMBackend::RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+        const std::string& typeName, const std::vector<NamedVariable>& args,
+        const std::vector<llvm::Value*>& values) const
+{
+        const CxxClassInfo* info = nullptr;
+        for (size_t i = 0; i < args.size() && i < values.size(); ++i)
+        {
+            if (args[i].LiteralIdentity.empty() && !args[i].IsCxxMacroGlobal) continue;
+            llvm::Value* source = args[i].Primary != nullptr ? args[i].Primary : values[i];
+            if (!IsLiteralZeroIntegerToPointer(source, args[i])) continue;
+            // A constructor template may take the zero (clang deduces T = int), so its set stays with clang.
+            if (info == nullptr) info = GetCxxClassInfoWithConstructors(typeName);
+            if (info == nullptr || info->hasCtorTemplate) return;
+            bool hasApplicableCtor = false;
+            bool everyCandidateUsesFunctionSlot = true;
+            for (const auto& ctor : info->constructors)
+            {
+                if (ctor.params.empty() || ctor.params.size() < args.size() + 1) continue;
+                // Copy / move / deleted / inaccessible ctors never take a literal 0 ([over.best.ics]/4).
+                if (ctor.isDeleted || ctor.access != cflat_cinterop::AccessPublic
+                    || ctor.isCopyCtor || ctor.isMoveCtor)
+                    continue;
+                bool defaultsPresent = true;
+                for (size_t n = args.size() + 1; n < ctor.params.size(); ++n)
+                    if (n >= ctor.defaultArgs.size() || ctor.defaultArgs[n].kind.empty())
+                        defaultsPresent = false;
+                if (!defaultsPresent) continue;
+                hasApplicableCtor = true;
+                const auto& param = ctor.params[i + 1];
+                if (!param.IsFunctionPointer && !IsStdFunctionTypeName(param.TypeName)
+                    && !IsStdFunctionSpecialization(param.TypeName))
+                {
+                    everyCandidateUsesFunctionSlot = false;
+                    break;
+                }
+            }
+            if (hasApplicableCtor && everyCandidateUsesFunctionSlot)
+                RejectLiteralZeroFunctionSlot(source, args[i]);
+        }
+}
+
 bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                       const CxxClassInfo::Structor& selected,
                                       llvm::Value* slot,
@@ -854,6 +895,18 @@ bool LLVMBackend::CxxConstructorThunkParameterIsReference(
         return false;
 }
 
+// [over.ics.rank] 3.2.1 integral / floating promotion of a scalar: bool and every integer narrower
+// than int, to int; float to double. Other scalar conversions are plain conversions (rank 2).
+static bool IsCxxPromotionTo(const std::string& from, const std::string& to)
+{
+        if (from == "float" && to == "double") return true;
+        if (to != "int") return false;
+        if (from == "bool") return true;
+        LLVMBackend::TypeAndValue probe;
+        probe.TypeName = from;
+        return probe.IsInteger() > 0 && probe.IsInteger() < 32;
+}
+
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorListed(
         const std::string& typeName, const std::vector<TypeAndValue>& argTypes,
         std::string& why, bool allowNumericConversions,
@@ -963,7 +1016,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             // A scalar C++ reference is represented as an indirect pointer at this stage, but
             // an ordinary pointer parameter is not a numeric conversion target. Without the
             // reference check, an integer index could select std::string(const char*) over size_t.
-            if (allowNumericConversions && (want.IsAlias || want.IsRvalueRef)
+            if (allowNumericConversions && (want.CxxConstRef() || want.IsRvalueRef)
                 && want.Pointer != got.Pointer
                 && !want.ElemPointer && !got.ElemPointer
                 && ((want.IsFloatingPoint() != -1 || want.IsInteger() != -1)
@@ -1145,6 +1198,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
         };
         size_t foundOmitted = 0;
         size_t foundExact = 0;
+        size_t foundPromotion = 0;
         size_t foundReferencePreference = 0;
         std::string referenceRejection;
         auto referenceParameterName = [](const TypeAndValue& param, size_t index) {
@@ -1162,6 +1216,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             const CxxClassInfo::Structor* ctor;
             size_t omitted;
             size_t exact;
+            size_t promotion;
             size_t referencePreference;
             bool blocked;
             bool numeric;   // blocked by an integer <-> floating argument, not by a default
@@ -1198,6 +1253,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             bool softRefused = false;
             bool ok = true;
             size_t exact = 0;
+            size_t promotion = 0;
             size_t currentReferencePreference = 0;
             for (size_t i = 0; i < argTypes.size(); ++i)
             {
@@ -1343,7 +1399,30 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     ok = false;
                     break;
                 }
-                currentReferencePreference += referencePreference(want, rvalue);
+                // Ruling (MIX18): a converted scalar binds a temporary; by-value and T&& tie (clang: by-value
+                // vs T&& is ambiguous), both beat const T&. Standard rank (promotion) is compared first.
+                const auto scalarTarget = [&](const TypeAndValue& t) {
+                    return !t.ElemPointer && !IsCxxRecord(t.TypeName) && !t.IsScopedEnum
+                        && (t.IsInteger() != -1 || t.IsFloatingPoint() != -1);
+                };
+                const bool convertedScalar = allowNumericConversions && scalarTarget(want)
+                    && scalarTarget(got) && !got.Pointer && want.TypeName != got.TypeName
+                    && (!want.Pointer || (want.IsAlias && !want.IsCxxRefToPointer)
+                        || (want.IsRvalueRef && !want.IsCxxRefToPointer));
+                if (convertedScalar && IsCxxPromotionTo(got.TypeName, want.TypeName))
+                    ++promotion;
+                if (convertedScalar && !want.Pointer)
+                    currentReferencePreference += 1;
+                else if (convertedScalar && want.IsRvalueRef)
+                    currentReferencePreference += 1;
+                else if (convertedScalar && want.CxxConstRef())
+                    currentReferencePreference += 0;
+                // An exact scalar `const T&` ties a by-value `T` (both identity): clang finds no best.
+                else if (scalarTarget(want) && scalarTarget(got) && want.Pointer && want.CxxConstRef()
+                    && want.TypeName == got.TypeName && !got.Pointer)
+                    currentReferencePreference += 0;
+                else
+                    currentReferencePreference += referencePreference(want, rvalue);
                 if (want.TypeName == got.TypeName
                     && (want.Pointer == got.Pointer
                         || (allowNumericConversions && want.Pointer && !got.Pointer)))
@@ -1453,7 +1532,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 std::cout << std::format("[verbose]   ctor candidate {}({}) for ({}): exact={} omitted={} linkage={} blocked={}\n",
                                          typeName, shape, got, exact, omitted, c.linkageName, blocked || softRefused);
             }
-            viable.push_back({ &c, omitted, exact, currentReferencePreference, blocked || softRefused,
+            viable.push_back({ &c, omitted, exact, promotion, currentReferencePreference, blocked || softRefused,
                                softRefused, {}, false });
         }
         // Legacy pick over `pool` (in declaration order). C++ ranks only the PASSED arguments:
@@ -1467,12 +1546,17 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 const auto& c = *v->ctor;
                 auto take = [&] {
                     found = &c; foundOmitted = v->omitted; foundExact = v->exact;
+                    foundPromotion = v->promotion;
                     foundReferencePreference = v->referencePreference;
                     ambiguous = false; tied.clear();
                 };
                 if (found == nullptr) { take(); continue; }
                 if (v->exact < foundExact) continue;
                 if (v->exact > foundExact) { take(); continue; }
+                // A summed promotion count only equals the per-argument [over.ics.rank] verdict for one
+                // argument; crossed multi-argument promotions stay with the remaining tie-breaks (ambiguous).
+                if (argTypes.size() == 1 && v->promotion < foundPromotion) continue;
+                if (argTypes.size() == 1 && v->promotion > foundPromotion) { take(); continue; }
                 if (v->referencePreference < foundReferencePreference) continue;
                 if (v->referencePreference > foundReferencePreference) { take(); continue; }
                 if (v->omitted > foundOmitted) continue;
@@ -3681,11 +3765,12 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         // ranks them, so the wrapper is spelled as the constructor call (literals as const char*).
         if (directInit)
         {
-            if (!IsForeignCxxClassWithConstructors(targetType))
+            if (!IsCxxRecord(targetType))
                 return CxxConvertingCtorResult::NotApplicable;
             NamedVariable probe = source;
             // Only a literal is const char*; a mutable char* rvalue keeps its spelling.
             if (!source.IsStringLiteral) probe.IsRvalue = false;
+            probe.IsTopLevelConst = CxxConstReceiverKind(source) != 0;
             // Keep array shape here so clang can bind array references before applying decay.
             if (!IsCxxFixedArrayArgument(source))
                 probe.TypeAndValue = InferImplicitCxxArgumentType(source, *this);

@@ -70,6 +70,13 @@
 
 #include "LLVMBackend_CInteropShared.h"
 
+// The referent of a ranked reference spelling ("unsigned &&", "long const &") for a list-init check.
+static std::string RankedReferentSpelling(const std::string& spelling)
+{
+        const size_t amp = spelling.find(" &");
+        return amp == std::string::npos ? spelling : spelling.substr(0, amp);
+}
+
 bool LLVMBackend::RequestCxxBraceConstructor(
         const std::string& typeName, std::vector<NamedVariable>& arguments,
         std::vector<CxxBraceArgument>& braceArguments, std::string& wrapperName,
@@ -109,6 +116,29 @@ bool LLVMBackend::RequestCxxBraceConstructor(
             for (const auto& brace : braceArguments)
                 if (brace.argumentIndex == index) return &brace;
             return nullptr;
+        };
+        std::vector<TypeAndValue> argumentTypes;
+        argumentTypes.reserve(arguments.size());
+        for (const auto& argument : arguments) argumentTypes.push_back(argument.TypeAndValue);
+        const bool scalarReferenceSet = CxxCtorSetRankedByCflat(
+            typeName, argumentTypes, &arguments);
+        std::string selectedWhy;
+        const auto* rankedConstructor = scalarReferenceSet
+            ? SelectCxxConstructor(typeName, argumentTypes, selectedWhy, true, &arguments)
+            : nullptr;
+        auto rankedParameterSpelling = [&](size_t index, std::string& spelling) {
+            if (rankedConstructor == nullptr || index + 1 >= rankedConstructor->params.size())
+                return false;
+            const TypeAndValue& parameter = rankedConstructor->params[index + 1];
+            if (!CxxSpellingForCflatType(parameter.TypeName, spelling)) return false;
+            if (parameter.Pointer && !parameter.ElemPointer)
+            {
+                if (parameter.CxxConstRef()) spelling += " const &";
+                else if (parameter.IsRvalueRef) spelling += " &&";
+                else if (parameter.IsAlias) spelling += " &";
+                else spelling += " *";
+            }
+            return true;
         };
         std::vector<std::string> parameterSpellings{ ownerSpelling + " *" };
         std::vector<std::string> callArguments;
@@ -609,6 +639,34 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                     error = "the C++ constructor has too few parameters for this call";
                     return false;
                 }
+                if (scalarReferenceSet && i < arguments.size())
+                {
+                    std::string rankedType;
+                    const std::string argumentName = "p" + std::to_string(flatParameterIndex++);
+                    if (rankedParameterSpelling(i, rankedType))
+                    {
+                        parameterSpellings.push_back(rankedType);
+                        callArguments.push_back("static_cast<" + rankedType + ">("
+                                                + argumentName + ")");
+                        continue;
+                    }
+                    std::string sourceType;
+                    const auto& argument = arguments[i];
+                    if (!CxxSpellingForCflatType(argument.TypeAndValue.TypeName, sourceType))
+                    {
+                        error = std::format("C++ constructor argument {} of '{}' has no C++ spelling",
+                                            i + 1, DisplayCxxClassName(typeName));
+                        return false;
+                    }
+                    if (argument.TypeAndValue.Pointer)
+                        sourceType += " *";
+                    else if (!argument.IsRvalue && (argument.CxxLvalueKind == 1
+                                                     || argument.CxxLvalueKind == 2))
+                        sourceType += " &";
+                    parameterSpellings.push_back(sourceType);
+                    callArguments.push_back("p" + std::to_string(flatParameterIndex++));
+                    continue;
+                }
                 parameterSpellings.push_back(selected->paramTypes[rawIndex]);
                 callArguments.push_back("p" + std::to_string(flatParameterIndex++));
             }
@@ -998,6 +1056,29 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         std::vector<std::string> elementParameters(elements.size());
         std::vector<size_t> elementParameterTypes(elements.size(), 0);
         std::vector<bool> elementIsFunctionReference(elements.size(), false);
+        std::vector<TypeAndValue> elementTypes;
+        elementTypes.reserve(elements.size());
+        for (const auto& element : elements) elementTypes.push_back(element.TypeAndValue);
+        const bool scalarReferenceSet = CxxCtorSetRankedByCflat(typeName, elementTypes, &elements);
+        std::string selectedWhy;
+        const auto* rankedConstructor = scalarReferenceSet
+            ? SelectCxxConstructor(typeName, elementTypes, selectedWhy, true, &elements)
+            : nullptr;
+        auto rankedParameterSpelling = [&](size_t index, std::string& spelling) {
+            if (rankedConstructor == nullptr || index + 1 >= rankedConstructor->params.size())
+                return false;
+            const TypeAndValue& parameter = rankedConstructor->params[index + 1];
+            if (!CxxSpellingForCflatType(parameter.TypeName, spelling)) return false;
+            if (parameter.Pointer && !parameter.ElemPointer)
+            {
+                if (parameter.CxxConstRef()) spelling += " const &";
+                else if (parameter.IsRvalueRef) spelling += " &&";
+                else if (parameter.IsAlias) spelling += " &";
+                else spelling += " *";
+            }
+            return true;
+        };
+        std::string narrowingChecks;
         std::string init = initializerList;
         size_t nextParameter = 1;
         auto isBareNullptrLiteral = [](const NamedVariable& element) {
@@ -1011,7 +1092,11 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         {
             std::string spelling;
             const auto& type = elements[i].TypeAndValue;
-            const std::string targetType = elementTargetTypes != nullptr
+            const bool scalarElement = !type.ElemPointer && !type.Pointer
+                && !IsCxxRecord(type.TypeName) && !type.IsScopedEnum
+                && (type.IsInteger() != -1 || type.IsFloatingPoint() != -1);
+            const std::string targetType = !(scalarReferenceSet && scalarElement)
+                && elementTargetTypes != nullptr
                 && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
             if (elements[i].IsDefaultArgument)
             {
@@ -1119,7 +1204,12 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             if (elements[i].IsDefaultArgument || isBareNullptrLiteral(elements[i])) continue;
             const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
             const std::string& param = elementParameters[i];
-            const std::string targetType = elementTargetTypes != nullptr
+            const auto& type = elements[i].TypeAndValue;
+            const bool scalarElement = !type.ElemPointer && !type.Pointer
+                && !IsCxxRecord(type.TypeName) && !type.IsScopedEnum
+                && (type.IsInteger() != -1 || type.IsFloatingPoint() != -1);
+            const std::string targetType = !(scalarReferenceSet && scalarElement)
+                && elementTargetTypes != nullptr
                 && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
             if (CxxBraceFieldIsReference(targetType))
             {
@@ -1152,7 +1242,6 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 }
                 continue;
             }
-            const auto& type = elements[i].TypeAndValue;
             const bool pointerValue = type.Pointer
                 && (!type.IsAlias || type.IsCxxRefToPointer) && !type.IsFunctionPointer;
             const bool pointerXvalue = pointerValue && IsCxxRvalueReferenceArgument(elements[i]);
@@ -1186,6 +1275,14 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             }
             size_t at = 0;
             std::string replacement = param;
+            std::string rankedType;
+            if (scalarReferenceSet && scalarElement && rankedParameterSpelling(i, rankedType))
+            {
+                // Ruling (MIX18 r3): a brace element narrows as list-init judges the ORIGINAL argument.
+                narrowingChecks += "(void)[&]() { " + RankedReferentSpelling(rankedType) + " narrowed"
+                    + std::to_string(i) + "{ " + param + " }; }; ";
+                replacement = "static_cast<" + rankedType + ">( " + param + " )";
+            }
             if (pointerXvalue)
             {
                 std::string castType = parameterTypes[i + 1];
@@ -1203,7 +1300,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         const std::string copyCheck = copyListInit
             ? "(void)[&]() -> " + ownerSpelling + " { return " + init + "; }; " : std::string();
         const std::string key = typeName + "|direct-brace|"
-            + (copyListInit ? "copy|" : "direct|") + init
+            + (copyListInit ? "copy|" : "direct|") + init + "|" + narrowingChecks
             + [&] { std::string k; for (const auto& p : parameterTypes) k += "|" + p; return k; }();
         wrapperName = std::format("__cflat_dbrace_{:016x}", HashWrapperKey(key));
         std::string source = "#include <new>\n#include <utility>\n"
@@ -1216,7 +1313,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             source += CxxNamedParameter(parameterTypes[i], "p" + std::to_string(i));
         }
         // `::new`: a class-scope operator new would hide the global placement form.
-        source += ") { " + copyCheck + "::new ((void*)p0) " + ownerSpelling + init
+        source += ") { " + narrowingChecks + copyCheck + "::new ((void*)p0) " + ownerSpelling + init
             + "; }\n";
         CxxRequestGroupScope groupScope(*this, &group);
         CSigEntry bound;
@@ -1267,6 +1364,45 @@ bool LLVMBackend::CxxCtorForwardsScalarReference(const std::string& typeName,
             }
         }
         return false;
+}
+
+bool LLVMBackend::CxxCtorHasConstScalarReference(
+        const std::string& typeName, const std::vector<TypeAndValue>& argTypes) const
+{
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
+        if (info == nullptr || argTypes.empty()) return false;
+        // A constructor template or a C `...` constructor takes part in ranking only clang performs.
+        if (auto raw = cxxRecordEntries_.find(typeName); raw != cxxRecordEntries_.end())
+        {
+            if (!raw->second.ctorTemplates.empty()) return false;
+            for (const auto& member : raw->second.members)
+                if (member.kind == cflat_cinterop::RawCxxMember::Constructor && member.variadic) return false;
+        }
+        auto scalar = [&](const TypeAndValue& t) {
+            return !t.ElemPointer && !IsCxxRecord(t.TypeName) && !t.IsScopedEnum
+                && (t.IsInteger() != -1 || t.IsFloatingPoint() != -1);
+        };
+        for (const auto& c : info->constructors)
+        {
+            if (c.params.size() < argTypes.size() + 1) continue;
+            for (size_t i = 0; i < argTypes.size(); ++i)
+            {
+                const TypeAndValue& want = c.params[i + 1];
+                const TypeAndValue& got = argTypes[i];
+                if (!got.Pointer && scalar(got) && want.Pointer && want.CxxConstRef()
+                    && !want.IsCxxRefToPointer && scalar(want))
+                    return true;
+            }
+        }
+        return false;
+}
+
+bool LLVMBackend::CxxCtorSetRankedByCflat(
+        const std::string& typeName, const std::vector<TypeAndValue>& argTypes,
+        const std::vector<NamedVariable>* argVars) const
+{
+        return CxxCtorHasConstScalarReference(typeName, argTypes)
+            && (argVars == nullptr || !CxxCtorSetRequiresNarrowing(typeName, argVars));
 }
 
 /*
@@ -1423,7 +1559,7 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
         const std::string& typeName, const CxxClassInfo::Structor* selected,
         const std::vector<TypeAndValue>& argTypes,
         const std::vector<NamedVariable>* argVars, bool allowExplicit,
-        bool* nullPointerCandidate) const
+        bool* nullPointerCandidate, bool rankScalarReferenceSet) const
 {
         if (nullPointerCandidate != nullptr) *nullPointerCandidate = false;
         // An unnamed enum constant reaches here as int: only clang ranks the enum constructor template.
@@ -1436,7 +1572,8 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
             && std::any_of(argVars->begin(), argVars->end(), [](const NamedVariable& arg) {
                 return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr;
             });
-        if (!addressValue && CxxCtorForwardsScalarReference(typeName, argTypes)) return true;
+        if (!rankScalarReferenceSet && !addressValue
+            && CxxCtorForwardsScalarReference(typeName, argTypes)) return true;
         if (argVars != nullptr && argVars->size() == argTypes.size())
             if (const CxxClassInfo* listed = GetCxxClassInfoWithConstructors(typeName);
                 listed != nullptr)

@@ -1489,8 +1489,8 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
             const std::string local = activeGenericEnumSpecialization_ + "." + spelled;
             if (enumBackingTypes.count(local) != 0) return local;
         }
-        // Two hops at most: the written spelling, then one `using D = Dir;` alias step. Each hop
-        // walks the enclosing namespaces so a sibling enum resolves unqualified.
+        // Two hops at most: the written spelling, then one `using D = Dir;` alias step. Dotted
+        // spellings try the rooted name before enclosing-namespace prefixes.
         std::string cur = spelled;
         for (int hop = 0; hop < 2; hop++)
         {
@@ -1498,6 +1498,12 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
                     [this](const std::string& c) { return enumBackingTypes.count(c) != 0; });
                 !enumKey.empty())
                 return enumKey;
+            if (cur.find('.') != std::string::npos)
+                if (const std::string enumKey = FirstVisibleScopedKey(cur,
+                        [this](const std::string& c) { return enumBackingTypes.count(c) != 0; },
+                        ScopedLookupOptions{ .PrefixDottedNames = true });
+                    !enumKey.empty())
+                    return enumKey;
             std::string aliased = ResolveTypeAlias(cur);
             if (aliased == cur) break;
             cur = aliased;
@@ -1511,10 +1517,15 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
 
 std::string LLVMBackend::ResolveScannedEnumTypeName(const std::string& spelled) const
 {
+        auto isScannedEnum = [this](const std::string& candidate) {
+            return gts.scannedNonLocalEnumNames.count(candidate) != 0;
+        };
+        if (std::string key = FirstVisibleScopedKey(spelled, isScannedEnum,
+                ScopedLookupOptions{ .ResolveFirstComponentAlias = false }); !key.empty())
+            return key;
         return FirstVisibleScopedKey(spelled,
-            [this](const std::string& candidate) {
-                return gts.scannedNonLocalEnumNames.count(candidate) != 0;
-            }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+            isScannedEnum, ScopedLookupOptions{ .PrefixDottedNames = true,
+                                                .ResolveFirstComponentAlias = false });
 }
 
 bool LLVMBackend::IsGenericLocalEnumKey(const std::string& key) const
@@ -1597,12 +1608,12 @@ bool LLVMBackend::TryGetScanTimeIntegerCast(const std::string& typeName, int64_t
         return true;
     }
 
-bool LLVMBackend::IsNamespace(const std::string& name) const
+bool LLVMBackend::IsNamespace(const std::string& name, bool rootOnly) const
 {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
             if (frame.namespaceAliases.count(name)) return true;
         return namespaceTable.count(name) > 0 || namespaceAliasTable.count(name) > 0
-            || ResolveNamespace(name) != name;
+            || ResolveNamespace(name, rootOnly) != name;
     }
 
 bool LLVMBackend::IsImportAlias(const std::string& name) const
@@ -1672,7 +1683,7 @@ std::string LLVMBackend::ResolveNamespaceAliasExact(const std::string& name) con
         return name;
     }
 
-std::string LLVMBackend::ResolveNamespace(const std::string& name) const
+std::string LLVMBackend::ResolveNamespace(const std::string& name, bool rootOnly) const
 {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -1681,6 +1692,14 @@ std::string LLVMBackend::ResolveNamespace(const std::string& name) const
         }
         auto it = namespaceAliasTable.find(name);
         if (it != namespaceAliasTable.end()) return it->second;
+
+        if (namespaceTable.count(name) != 0) return name;
+
+        // rootOnly (global::B): never fall back to an enclosing namespace's nested B.
+        if (!rootOnly && name.find('.') == std::string::npos && !currentNamespace_.empty())
+            for (const auto& candidate : ScopedNameCandidates(
+                    name, ScopedLookupOptions{ .ResolveFirstComponentAlias = false }))
+                if (namespaceTable.count(candidate) != 0) return candidate;
 
         // A using-directive can expose a nested namespace through a parent namespace, as in
         // `namespace torch { using namespace at; }` followed by `torch::indexing::Slice`.
@@ -1899,7 +1918,30 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
                 || !ResolveEnumTypeName(candidate).empty();
         };
         const std::string through = ResolveThroughUsingDirectives(qualified, isKnownQualified);
-        return through != qualified || isKnownQualified(qualified) ? through : name;
+        if (through != qualified || isKnownQualified(qualified)) return through;
+
+        if (!forceRoot && !currentNamespace_.empty() && name.find('.') != std::string::npos)
+        {
+            const std::string relativeType = FirstVisibleScopedKey(name,
+                [this, &isPublishedCxxName](const std::string& candidate) {
+                    return dataStructures.count(candidate) != 0
+                        || interfaceTable.count(candidate) != 0
+                        || functionTable.count(candidate) != 0
+                        || globalNamedVariable.count(candidate) != 0
+                        || enumBackingTypes.count(candidate) != 0
+                        || gts.scannedTypeNames.count(candidate) != 0
+                        || ResolveTypeAlias(candidate) != candidate
+                        || AnyGenericTypeTemplateNamed(candidate)
+                        || HasCxxFunctionTemplate(candidate)
+                        || cxxFunctionSignatures_.count(candidate) != 0
+                        || cxxRecordEntries_.count(candidate) != 0
+                        || cxxClasses_.count(candidate) != 0
+                        || cxxCflatToCxxSpelling_.count(candidate) != 0
+                        || isPublishedCxxName(candidate);
+                }, ScopedLookupOptions{ .PrefixDottedNames = true });
+            if (!relativeType.empty()) return relativeType;
+        }
+        return name;
 }
 
 std::string LLVMBackend::ResolveThroughUsingDirectives(

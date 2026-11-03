@@ -197,6 +197,21 @@ simd<T, 4> incrementGeneric<T>(T seed)
     return x;
 }
 
+T id<T>(T x)
+{
+    return x;
+}
+
+int simdIntParamFirst(simd<int, 4> x)
+{
+    return x[0];
+}
+
+float simdFloatParamLast(simd<float, 4> x)
+{
+    return x[3];
+}
+
 int testSimdPostfixIncrement()
 {
     int passed = 0;
@@ -204,6 +219,34 @@ int testSimdPostfixIncrement()
     simd<float, 4> old = v++;
     passed += Test("simd postfix old value", old[2], 2.0f);
     passed += Test("simd float postfix local", v[0], 3.0f);
+
+    simd<float, 4> paren = 2.0f;
+    passed += Test("simd parenthesized postfix old lane", (paren++)[0], 2.0f);
+    passed += Test("simd parenthesized postfix increments", paren[0], 3.0f);
+
+    float[] floatLanes = new float[4];
+    floatLanes[0] = 1.0f; floatLanes[1] = 2.0f;
+    floatLanes[2] = 3.0f; floatLanes[3] = 4.0f;
+    simd<int, 4> plainInt = 9;
+    passed += Test("simd int plain param call", simdIntParamFirst(plainInt), 9);
+    simd<float, 4> plainFloat = 1.5f;
+    passed += Test("simd float plain param call", simdFloatParamLast(plainFloat), 1.5f);
+
+    simd<float, 4> copiedFloat = id(simd<float, 4>.load(floatLanes, 0));
+    passed += Test("simd generic id float lane 0", copiedFloat[0], 1.0f);
+    passed += Test("simd generic id float lane 1", copiedFloat[1], 2.0f);
+    passed += Test("simd generic id float lane 2", copiedFloat[2], 3.0f);
+    passed += Test("simd generic id float lane 3", copiedFloat[3], 4.0f);
+    delete[] floatLanes;
+
+    int[] intLanes = new int[4];
+    intLanes[0] = 5; intLanes[1] = 6; intLanes[2] = 7; intLanes[3] = 8;
+    simd<int, 4> copiedInt = id(simd<int, 4>.load(intLanes, 0));
+    passed += Test("simd generic id int lane 0", copiedInt[0], 5);
+    passed += Test("simd generic id int lane 1", copiedInt[1], 6);
+    passed += Test("simd generic id int lane 2", copiedInt[2], 7);
+    passed += Test("simd generic id int lane 3", copiedInt[3], 8);
+    delete[] intLanes;
 
     simd<float, 4> down = 2.0f;
     down--;
@@ -2464,7 +2507,7 @@ extern int main(int argc, char** argv)
     passed += testMixedScalarVector(seed); total += 4;
     passed += testSimdScalarReturn(seed);  total += 9;
     passed += testIntegerSimd(seed);       total += 4;
-    passed += testSimdPostfixIncrement();  total += 8;
+    passed += testSimdPostfixIncrement();  total += 20;
     passed += testUnsignedSimd(seed);      total += 1;
     passed += testLaneCounts(seed);        total += 5;
     passed += testElementTypes(seed);      total += 7;

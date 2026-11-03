@@ -395,6 +395,11 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             declType.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
                                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
                                 fpSpec->multiWordTypeSuffix(), aliasReturn);
+                            if (!retPtr)
+                                if (const auto* nested = compiler->GetEncodedClosureType(
+                                        declType.FuncPtrReturnTypeName))
+                                    declType.FuncPtrReturnFunctionType =
+                                        std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                             if (aliasReturn && !returnTypeWasSubstituted && !returnTypeIsGenericDerivedAlias
                                 && retStars == 0
                                 && compiler->ResolveTypeAlias(declType.FuncPtrReturnTypeName) == "string")
@@ -421,6 +426,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                                     p.TypeName = ResolveSigComponentConstScanner(
                                         param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix(),
                                             false, &p.AliasSpelling);
+                                    if (!pPtr)
+                                        if (const auto* nested = compiler->GetEncodedClosureType(p.TypeName))
+                                            p.FunctionTypeSignature =
+                                                std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                                     p.ConstMask = pConst;
                                     p.Pointer = pPtr;
                                     p.IsArrayView = pIsArrayView;
@@ -1972,6 +1981,9 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
         bool isThin = fpSpec->Function() != nullptr;
         if (fpSpec->typeSpecifier() == nullptr)
             return isThin ? "__c_fn_ptr" : "__closure_fat_ptr";  // main pass reports the error
+        LLVMBackend::TypeAndValue sig;
+        sig.IsFunctionPointer = true;
+        sig.TypeName = isThin ? "__c_fn_ptr" : "__closure_fat_ptr";
         bool retPtr = fpSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fpSpec->pointer());
         const bool aliasReturn = fpSpec->functionReturnQualifier() != nullptr
@@ -1979,9 +1991,18 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
         int retConst = 0;
         std::string retName = ResolveSigComponentConstScanner(fpSpec->typeSpecifier(), retPtr,
             retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn);
-        std::vector<std::pair<std::string, int>> encParams;
-        std::vector<int> paramConsts;
-        std::vector<bool> paramArrayViews;
+        sig.FuncPtrReturnTypeName = retName;
+        sig.FuncPtrReturnPointer = retPtr;
+        sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
+        sig.FuncPtrReturnConstMask = retConst;
+        sig.FuncPtrReturnAlias = aliasReturn;
+        sig.FuncPtrReturnOwned = fpSpec->functionReturnQualifier() != nullptr
+            && fpSpec->functionReturnQualifier()->getText() == "move";
+        sig.FuncPtrReturnResolvedKey = SigComponentResolvedKeyScanner(retName);
+        if (!retPtr)
+            if (const auto* nested = compilerLLVM->GetEncodedClosureType(retName))
+                sig.FuncPtrReturnFunctionType =
+                    std::make_shared<LLVMBackend::TypeAndValue>(*nested);
         if (fpSpec->functionPointerParamList() != nullptr)
             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
             {
@@ -1995,13 +2016,21 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
                 std::string pName = ResolveSigComponentConstScanner(param->typeSpecifier(), pPtr,
                                                                     pStars, pConst, param->multiWordTypeSuffix());
                 const int pDepth = ReconcilePointerDepth(pPtr, pStars);
-                encParams.push_back({ pName, pDepth });
-                paramConsts.push_back(pConst);
-                paramArrayViews.push_back(pIsArrayView);
+                LLVMBackend::TypeAndValue::FuncPtrParam p;
+                p.TypeName = pName;
+                p.Pointer = pPtr;
+                p.PointerDepth = pDepth;
+                p.IsArrayView = pIsArrayView;
+                p.ConstMask = pConst;
+                p.IsMove = param->Move() != nullptr;
+                p.ResolvedTypeKey = SigComponentResolvedKeyScanner(pName);
+                if (!pPtr)
+                    if (const auto* nested = compilerLLVM->GetEncodedClosureType(pName))
+                        p.FunctionTypeSignature =
+                            std::make_shared<LLVMBackend::TypeAndValue>(*nested);
+                sig.FuncPtrParams.push_back(p);
             }
-        return BuildEncodedClosureName(compilerLLVM, isThin, retName, ReconcilePointerDepth(retPtr, retStars),
-                                       encParams, retConst, &paramConsts, &paramArrayViews,
-                                       nullptr, aliasReturn);
+        return MainListener::EncodeClosureFromSig(compilerLLVM, sig);
     }
 
 std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(

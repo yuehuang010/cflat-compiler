@@ -1,0 +1,48 @@
+int fnpTuple(tuple<i64, int>* p) { return 1; }
+int fnpLong(i64* p) { return 2; }
+int fnpLongDepth(i64** p) { return 3; }
+int fnpInt(int* p) { return 4; }
+
+extern int main()
+{
+    expect_error("pointer pointee types differ") {
+        tuple<int, int> t = default;
+        tuple<int, int>* tp = &t;
+        function<int(tuple<i64, int>*)> pf = fnpTuple;
+        pf(tp);
+    }
+    expect_error("pointer pointee types differ") {
+        int value = 4;
+        int* p = &value;
+        function<int(i64*)> pf = fnpLong;
+        pf(p);
+    }
+    expect_error("pointer pointee types differ") {
+        int value = 4;
+        int* p = &value;
+        int** pp = &p;
+        function<int(i64**)> pf = fnpLongDepth;
+        pf(pp);
+    }
+    expect_error("pointer pointee types differ") {
+        int value = 4;
+        int* p = &value;
+        Lambda<int(i64*)> pf = fnpLong;
+        pf(p);
+    }
+    expect_error("pointer pointee types differ") {
+        function<int(int*)> pf = fnpInt;
+        pf("hi");
+    }
+    expect_error("pointer pointee types differ") {
+        function<int(i64*)> pf = fnpLong;
+        int[4] values = default;
+        pf(values);
+    }
+    expect_error("pointer pointee types differ") {
+        function<int(tuple<i64, int>*)> pf = fnpTuple;
+        tuple<int, int> t = default;
+        pf(&t);
+    }
+    return 0;
+}

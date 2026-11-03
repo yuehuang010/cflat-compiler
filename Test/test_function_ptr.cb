@@ -31,6 +31,14 @@ int fnvbReadAlias(FnvbArgBoxPtr p) { return p->value; }
 int fnvbGenericRead<T>(T* p) { return p->value; }
 int fnvbApply(function<int(FnvbArgBox*)> fn, FnvbArgBox box) { return fn(box); }
 int fnvbIncrement(int value) { return value + 1; }
+typedef int FnpteeInt;
+enum FnpteeColor : int { FnpteeRed = 1 };
+int fnpteeReadLong(long* p) { return *p; }
+int fnpteeReadI64(i64* p) { return *p; }
+int fnpteeReadAlias(FnpteeInt* p) { return *p; }
+int fnpteeReadInt(int* p) { return *p; }
+int fnpteeReadColor(FnpteeColor* p) { return (int)*p; }
+int fnpteeReadVoid(void** p) { return *p == nullptr ? 0 : 1; }
 
 int tCalleeRefFnTempDtors = 0;
 struct TCalleeRefFnTemp
@@ -6298,6 +6306,7 @@ bool testFunctionSlotAccepts()
 }
 
 int t311TakeFn(function<int(int)> f) { return f == nullptr ? 1 : 0; }
+int t311TakeLambda(Lambda<int(int)> f) { return f == nullptr ? 1 : 0; }
 int t311TakeCFn(T311Bin f) { return f == nullptr ? 1 : 0; }
 struct T311Hold { function<int(int)> fn = T311_NULL; };
 int t311DefaultArg(function<int(int)> f = T311_NULL) { return f == nullptr ? 1 : 0; }
@@ -6309,9 +6318,30 @@ bool testFunctionSlotNullMacro()
     bool result = true;
     function<int(int)> fm = T311_NULL;
     result &= Test("C NULL macro into a function<> local", fm == nullptr, true);
+    bool pickNull = true;
+    function<int(int)> joined = pickNull ? T311_NULL : T311_NULL;
+    result &= Test("all-null C NULL macro function join", joined == nullptr, true);
+    if (joined != nullptr)
+        result &= Test("guarded call through all-null C NULL macro function join", joined(5), 6);
+    result &= Test("all-null C NULL macro function join passed as argument",
+        t311TakeFn(pickNull ? T311_NULL : T311_NULL), 1);
+    function<int(int)> mixedMacro = pickNull ? T311_NULL : t182Sq;
+    function<int(int)> mixedNullptr = pickNull ? nullptr : t182Sq;
+    result &= Test("mixed C NULL macro function join matches nullptr (null pick)",
+        mixedMacro == nullptr, mixedNullptr == nullptr);
+    pickNull = false;
+    mixedMacro = pickNull ? T311_NULL : t182Sq;
+    mixedNullptr = pickNull ? nullptr : t182Sq;
+    result &= Test("mixed C NULL macro function join matches nullptr (function pick)",
+        mixedMacro != nullptr, mixedNullptr != nullptr);
+    if (mixedMacro != nullptr && mixedNullptr != nullptr)
+        result &= Test("mixed C NULL macro function join guarded call value",
+            mixedMacro(5), mixedNullptr(5));
     function<int(int)> fa = t182Sq;
     fa = T311_NULL;
     result &= Test("C NULL macro assigned to a function<>", fa == nullptr, true);
+    fa = pickNull ? T311_NULL : T311_NULL;
+    result &= Test("all-null C NULL macro function join assignment", fa == nullptr, true);
     T311Bin cb = T311_NULL;
     result &= Test("C NULL macro into a C function pointer", cb == nullptr, true);
     T311Ops ops = { f = T311_NULL, k = 3 };
@@ -6333,9 +6363,30 @@ bool testLambdaSlotNullMacro()
     bool result = true;
     Lambda<int(int)> lf = T311_NULL;
     result &= Test("C NULL macro into a Lambda<> local", lf == nullptr, true);
+    bool pickNull = true;
+    Lambda<int(int)> joined = pickNull ? T311_NULL : T311_NULL;
+    result &= Test("all-null C NULL macro Lambda join", joined == nullptr, true);
+    if (joined != nullptr)
+        result &= Test("guarded call through all-null C NULL macro Lambda join", joined(5), 6);
+    result &= Test("all-null C NULL macro Lambda join passed as argument",
+        t311TakeLambda(pickNull ? T311_NULL : T311_NULL), 1);
+    Lambda<int(int)> mixedMacro = pickNull ? T311_NULL : t182Sq;
+    Lambda<int(int)> mixedNullptr = pickNull ? nullptr : t182Sq;
+    result &= Test("mixed C NULL macro Lambda join matches nullptr (null pick)",
+        mixedMacro == nullptr, mixedNullptr == nullptr);
+    pickNull = false;
+    mixedMacro = pickNull ? T311_NULL : t182Sq;
+    mixedNullptr = pickNull ? nullptr : t182Sq;
+    result &= Test("mixed C NULL macro Lambda join matches nullptr (function pick)",
+        mixedMacro != nullptr, mixedNullptr != nullptr);
+    if (mixedMacro != nullptr && mixedNullptr != nullptr)
+        result &= Test("mixed C NULL macro Lambda join guarded call value",
+            mixedMacro(5), mixedNullptr(5));
     Lambda<int(int)> lg = t182Sq;
     lg = T311_NULL;
     result &= Test("C NULL macro assigned to a Lambda<>", lg == nullptr, true);
+    lg = pickNull ? T311_NULL : T311_NULL;
+    result &= Test("all-null C NULL macro Lambda join assignment", lg == nullptr, true);
     Lambda<int(int)> lh = t182Sq;
     result &= Test("named function into a Lambda<> stays non-null", lh == nullptr, false);
     return result;
@@ -7453,6 +7504,45 @@ bool testT427VoidFunctionPointeeOverload()
     return Test("t427 exact void callback overload", t427SelectCallback(callback), 202) != 0;
 }
 
+bool testFunctionValuePointeeAcceptedShapes()
+{
+    bool result = true;
+    char c = 'Q';
+    char* cp = &c;
+    void* vp = cp;
+    char[2] chars = "R";
+    function<int(void*)> voidCallback = t427AcceptVoid;
+    function<int(char*)> charCallback = t427AcceptChar;
+    function<int((const char)*)> constCharCallback = t427AcceptConstChar;
+    result &= Test("fnptee char pointer to void pointer slot", voidCallback(cp), 22);
+    result &= Test("fnptee void pointer to char pointer slot", charCallback(vp), 11);
+    result &= Test("fnptee nullptr pointer argument", charCallback(nullptr), 11);
+    result &= Test("fnptee const char literal decay", constCharCallback("S"), 83);
+    result &= Test("fnptee char array decay", constCharCallback(chars), 82);
+    long longValue = 31;
+    i64 i64Value = 32;
+    FnpteeInt aliasValue = 33;
+    int intValue = 34;
+    FnpteeColor colorValue = FnpteeColor.FnpteeRed;
+    void* voidValue = &intValue;
+    function<int(long*)> longSlot = fnpteeReadLong;
+    function<int(i64*)> i64Slot = fnpteeReadI64;
+    function<int(FnpteeInt*)> aliasSlot = fnpteeReadAlias;
+    function<int(int*)> intSlot = fnpteeReadInt;
+    function<int(FnpteeColor*)> colorSlot = fnpteeReadColor;
+    function<int(void**)> voidSlot = fnpteeReadVoid;
+    // long is i64 only where the target long is 64-bit (not Windows, ruled 2026-09-30).
+    if const (!__WINDOWS__)
+    {
+        result &= Test("fnptee long and i64 canonical pointee", longSlot(&i64Value), 32);
+        result &= Test("fnptee i64 and long canonical pointee", i64Slot(&longValue), 31);
+    }
+    result &= Test("fnptee typedef alias pointee", aliasSlot(&intValue), 34);
+    result &= Test("fnptee enum backing pointee", colorSlot(&intValue), 34);
+    result &= Test("fnptee void double pointer", voidSlot(&voidValue), 1);
+    return result;
+}
+
 int fnabiAcceptU8(u8* p) { return 111; }
 int fnabiAcceptU32(u32* p) { return 121; }
 int fnabiAcceptU64(u64* p) { return 131; }
@@ -7607,14 +7697,46 @@ int t512InvokeGetter<T>(T get)
 
 T t512ReturnNamedGetter<T>() { return t512GetGlobal; }
 
+int t512CallNamedGetter(function<Lambda<int(int)>()> get, int value)
+{
+    return get()(value);
+}
+
+int t512CallNestedThinGetter(function<function<int(int)>()> get, int value)
+{
+    function<int(int)> fn = get();
+    return fn(value);
+}
+
+int t512CallNestedClosureGetter(
+    function<function<Lambda<int(int)>()>()> get, int value)
+{
+    function<Lambda<int(int)>()> closureGetter = get();
+    Lambda<int(int)> closure = closureGetter();
+    return closure(value);
+}
+
+int t512PickGetter(function<int(int)> get) { return 31; }
+int t512PickGetter(function<function<int(int)>()> get) { return 41; }
+int t512PickClosureGetter(function<Lambda<int(int)>()> get) { return 51; }
+int t512PickClosureGetter(function<function<Lambda<int(int)>()>()> get) { return 42; }
+
 bool testT512NamedClosureReturnSlots()
 {
     bool result = true;
     t512Global = (int x) => { return x + 4; };
 
+    result &= Test("fnlam thin nested getter parameter", t512CallNestedThinGetter(t512GetThin, 7), 14);
+    result &= Test("fnlam thin nested getter overload pick", t512PickGetter(t512GetThin), 41);
+    result &= Test("fnlam double nested getter parameter",
+        t512CallNestedClosureGetter(t512GetClosureGetter, 7), 11);
+    result &= Test("fnlam double nested getter overload pick",
+        t512PickClosureGetter(t512GetClosureGetter), 42);
+
     function<Lambda<int(int)>()> get = t512GetGlobal;
     Lambda<int(int)> value = get();
     result &= Test("t512 named closure return declaration", value(7), 11);
+    result &= Test("fnlam closure-return getter parameter", t512CallNamedGetter(t512GetGlobal, 7), 11);
 
     function<alias Lambda<int(int)>()> getAlias = t512GetAliasGlobal;
     Lambda<int(int)> aliasValue = getAlias();
@@ -7640,7 +7762,10 @@ bool testT512NamedClosureReturnSlots()
 }
 
 Lambda<int(int)> t512GetGlobal() { return t512Global; }
+Lambda<int(int)> t512GetGlobal(int bias) { return (int x) => { return x + bias; }; }
 alias Lambda<int(int)> t512GetAliasGlobal() { return t512Global; }
+function<int(int)> t512GetThin() { return doubleIt; }
+function<Lambda<int(int)>()> t512GetClosureGetter() { return t512GetGlobal; }
 
 extern int main(int argc, char** argv)
 {
@@ -7895,6 +8020,7 @@ extern int main(int argc, char** argv)
     // T427: function-pointer values select an exact pointee signature, including overloads.
     total++; passed += testT427FunctionPointeeAcceptSet() ? 1 : 0;
     total++; passed += testT427VoidFunctionPointeeOverload() ? 1 : 0;
+    total++; passed += testFunctionValuePointeeAcceptedShapes() ? 1 : 0;
     total++; passed += testFnabiPointeeAcceptSet() ? 1 : 0;
     total++; passed += testT501FunctionPointerSlotAddresses() ? 1 : 0;
     total++; passed += testT500NestedFunctionAcceptSet() ? 1 : 0;

@@ -12,3 +12,12 @@ Evidence: scratch/repro_keep/odr_t320/ (bad_rc93.bin, its compile log, bad.dis v
 Fix direction: find where the C++ request for unique_ptr<T> / default_delete<T> gets the [cpp] struct prelude (incremental
 executor TU vs request-cache entry); check that the prelude text for a [cpp] struct always includes its base list and that a
 cache entry keyed without the base cannot be reused; loop the full test.sh interop tier under load to reproduce.
+2026-11-01: second sample - the fix/mix18ctor torch bar (test.sh -j 4 under load ~6.5, another bar's Luna run in parallel) built a
+test_cpp_interop.bin returning 3421 (rc 93) on every run; binary kept as scratch/repro_keep/odr_t320/bad2_mix18ctor_rc93.bin.
+2026-11-01 Opus investigation (1 h, report scratch/repro_keep/odr_t320/odr_investigation_2026-11-01.md): no repro in 6 setups (fresh,
+warm, full test.sh, shared-group siblings cold, err tests, aged markers). Only the cpp_interop_basic.h group companion defines ~T320UN, so
+the bad compile saw T320UN without its base INSIDE that one group - not a cross-TU split. Both failing bars ran on a bloated local cache
+(bar_wt.sh uses --init-local, 18 min prewarm vs 2 min clean). Hypothesis (unverified): a failed chunk attempt defines a [cpp] struct while
+::cppon::Cls is not visible; the rollback keeps that class, the retry hits "redefinition of 'cf5x...'" (seen for enable_shared_from_this
+structs), drops it and reuses the base-less class silently. Next: reproduce with the bloated cache + -v and grep "dropped declarations after"
+/ "redefinition of 'cf6x54333230554e'"; candidate guard = refuse a retry whose dropped part holds a generated __cflat_user record.

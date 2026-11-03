@@ -5,6 +5,19 @@
 
 int add2(int a, int b) { return a + b; }
 
+// A function returning a closure reports the CFlat closure spelling in the bind diagnostic.
+expect_error("cannot bind function 'fnlamBadGetter' to function-pointer type 'Lambda<int(int)>()': 'fnlamBadGetter' is 'Lambda<int(double)>()'") {
+    int fnlamBadGetterValue() {
+        function<Lambda<int(int)>()> get = fnlamBadGetter;
+        return get()(1);
+    }
+}
+
+Lambda<int(double)> fnlamBadGetter() { return (double x) => { return 7; }; }
+
+expect_error("type 'intt'");
+int fnlamUnusedBadNested(function<int(Lambda<intt(int)>)> f) { return 0; }
+
 // Declaration initializer, more parameters than the slot.
 expect_error("cannot bind this lambda of type 'int(int, int)' to function-pointer type 'int(int)'") {
     int declMore()

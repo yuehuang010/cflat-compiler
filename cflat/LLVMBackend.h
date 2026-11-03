@@ -3414,6 +3414,7 @@ private:
      * bound into the code slot on its own branch.
      */
     bool JoinDeliversDataValue(const llvm::Value* value, size_t occurrence, int depth = 0) const;
+    bool IsNullFunctionSlotJoin(const llvm::Value* value, int depth = 0) const;
 
     /*
      * Deferred interface-return check. Once the CFG is complete, follow the definitions that
@@ -11389,6 +11390,9 @@ public:
     bool EmitCxxStructorCall(const std::string& typeName, const CxxClassInfo::Structor& st,
                              llvm::Value* slot, const std::vector<llvm::Value*>& extraArgs,
                              const std::vector<NamedVariable>* extraArgVars = nullptr);
+    void RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+        const std::string& typeName, const std::vector<NamedVariable>& args,
+        const std::vector<llvm::Value*>& values) const;
     /*
      * A fixed array / `new T[n]` element of this C++ class must be default-CONSTRUCTED rather
      * than zero-filled: the class has a NONTRIVIAL default constructor. This is the same fact
@@ -11537,7 +11541,8 @@ public:
                                             const std::vector<TypeAndValue>& argTypes,
                                             const std::vector<NamedVariable>* argVars = nullptr,
                                             bool allowExplicit = true,
-                                            bool* nullPointerCandidate = nullptr) const;
+                                            bool* nullPointerCandidate = nullptr,
+                                            bool rankScalarReferenceSet = false) const;
     bool CxxConstructorThunkParameterIsReference(const std::string& typeName,
                                                  const std::vector<NamedVariable>& arguments,
                                                  size_t index, bool rvalueReference,
@@ -11550,6 +11555,11 @@ public:
     // parameter: clang resolves it through the forwarding thunk, never the listed pick.
     bool CxxCtorForwardsScalarReference(const std::string& typeName,
                                         const std::vector<TypeAndValue>& argTypes) const;
+    bool CxxCtorHasConstScalarReference(const std::string& typeName,
+                                        const std::vector<TypeAndValue>& argTypes) const;
+    bool CxxCtorSetRankedByCflat(const std::string& typeName,
+                                 const std::vector<TypeAndValue>& argTypes,
+                                 const std::vector<NamedVariable>* argVars) const;
     // The constructor C++ selects for a clang-resolved call narrows a scalar argument: the
     // refusal (after "C++ class 'X' "), empty when nothing narrows or the ranking cannot decide.
     std::string CxxCtorSelectedNarrowingError(const std::string& typeName,
@@ -14022,11 +14032,11 @@ public:
     bool TryGetScanTimeFieldOffset(const std::string& typeName, const std::vector<std::string>& path,
                                    int64_t& out) const;
     bool TryGetScanTimeIntegerCast(const std::string& typeName, int64_t value, int64_t& out) const;
-    bool IsNamespace(const std::string& name) const;
+    bool IsNamespace(const std::string& name, bool rootOnly = false) const;
     bool IsImportAlias(const std::string& name) const;
     bool IsImportAliasMember(const std::string& alias, const std::string& member) const;
     bool IsDataStructure(const std::string& name) const;
-    std::string ResolveNamespace(const std::string& name) const;
+    std::string ResolveNamespace(const std::string& name, bool rootOnly = false) const;
     // Exact alias hop only - no using-directive rewrite. A dotted C++ namespace path with no
     // alias entry of its own comes back unchanged.
     std::string ResolveNamespaceAliasExact(const std::string& name) const;

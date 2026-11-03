@@ -3703,3 +3703,6 @@ Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintaine
   or bind the join to a local. err_ternary_mixed_ownership.cb case (d) pins it; do not re-file.
 - An imported file cannot see the importer's declarations, earlier or later (ruling 2026-10-31: an import is a module, not a
   textual include); "cannot find the type X" stands. C's `struct X;` forward declaration is not added. Do not re-file.
+- A `depth` cap does not bound a walk that re-enters through a helper without a depth parameter: FindConstWriteCause calls
+  ValueConstLevels / StoredConstLevels at depth 0, so nested `?:` pointer joins were walked exponentially (2026-11-01 ternexp,
+  fixed with a per-query memo). Look for re-entry before blaming the parser.

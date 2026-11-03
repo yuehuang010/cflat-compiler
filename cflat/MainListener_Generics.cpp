@@ -983,6 +983,12 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                     declared = true;
                 }
                 else if (paramStars == 0 && !paramView && !sourceTV.Pointer
+                    && sourceTV.IsSimd)
+                {
+                    argType = std::format("simd<{},{}>", sourceTV.TypeName, sourceTV.SimdLanes);
+                    declared = true;
+                }
+                else if (paramStars == 0 && !paramView && !sourceTV.Pointer
                     && sourceTV.IsFunctionPointer && !sourceTV.FuncPtrReturnTypeName.empty())
                 {
                     argType = EncodeClosureFromSig(compilerLLVM, sourceTV);

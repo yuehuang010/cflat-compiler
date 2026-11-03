@@ -1207,6 +1207,35 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, size_t occurre
         return false;
     }
 
+bool LLVMBackend::IsNullFunctionSlotJoin(const llvm::Value* value, int depth) const
+{
+        if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+        if (llvm::isa<llvm::ConstantPointerNull>(value)) return true;
+        if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+            if (const auto* global = llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand()))
+            {
+                const std::string name = global->getName().str();
+                return cxxZeroIntegerMacroNames_.count(name) != 0
+                    && cxxLiteralZeroIntegerMacroNames_.count(name) == 0;
+            }
+
+        auto allNull = [&](auto&& arms, size_t count) {
+            if (count == 0) return false;
+            for (size_t i = 0; i < count; ++i)
+                if (!IsNullFunctionSlotJoin(arms(i), depth + 1)) return false;
+            return true;
+        };
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+            return allNull([&](size_t i) { return phi->getIncomingValue(static_cast<unsigned>(i)); },
+                phi->getNumIncomingValues());
+        if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+            return IsNullFunctionSlotJoin(select->getTrueValue(), depth + 1)
+                && IsNullFunctionSlotJoin(select->getFalseValue(), depth + 1);
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+            return allNull([&](size_t i) { return join->Arms[i].Value; }, join->Arms.size());
+        return false;
+    }
+
 void LLVMBackend::RecordPendingReturnDangleCheck(llvm::AllocaInst* slot,
                                         llvm::LoadInst* returnedLoad, int line, int col,
                                         const std::string& ifaceName)

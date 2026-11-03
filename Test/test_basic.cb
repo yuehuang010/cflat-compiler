@@ -2102,6 +2102,51 @@ namespace ShadowOther2
     int aliasedPlainStruct() { ShadowIN2.ShadowPt2 p; p.a = 4; p.b = 3; return p.a + p.b; }
 }
 
+namespace B { struct Late { int pick() { return 20; } }; }
+namespace A
+{
+    namespace B
+    {
+        struct Late { int pick() { return 10; } };
+        struct Box<T> { T item = default; };
+    }
+    struct QualifiedHolder { B.Late value = default; };
+    B.Late qualifiedPass(B.Late value) { return value; }
+    int qualifiedLocalPick() { B.Late value; return value.pick(); }
+    int qualifiedParameterReturnPick() { return qualifiedPass(B.Late()).pick(); }
+    int qualifiedGenericPick() { B.Box<B.Late> value; return value.item.pick(); }
+    (B.Late, int) qualifiedTupleValue() { B.Late value; return (value, 4); }
+    int qualifiedFieldPick() { QualifiedHolder value; return value.value.pick(); }
+    namespace Inner
+    {
+        int qualifiedNestedScopePick() { B.Late value; return value.pick(); }
+    }
+}
+namespace QualifiedSibling { int qualifiedFallbackPick() { B.Late value; return value.pick(); } }
+int qualifiedTuplePick() {
+    (B.Late, int) value = A.qualifiedTupleValue();
+    return value.item_0.pick() + value.item_1;
+}
+
+namespace QualifiedFallback
+{
+    namespace Local
+    {
+        struct Late { int pick() { return 8; } };
+        enum Tone : int { High = 3 };
+        struct Box<T> { T item = default; };
+        int read() { return 2; }
+    }
+    (Local.Late, int) pair() { Local.Late value; return (value, 1); }
+    int run() {
+        Local.Late direct;
+        Local.Box<Local.Late> boxed;
+        (Local.Late, int) value = pair();
+        return direct.pick() + boxed.item.pick() + value.item_0.pick() + value.item_1
+            + Local.Tone.High + Local.read();
+    }
+}
+
 bool testNamespaceTypeShadowing()
 {
     bool result = true;
@@ -2113,6 +2158,14 @@ bool testNamespaceTypeShadowing()
     result &= Test("ns_alias_reaches_generic_base", ShadowOther2.aliasedGenericBase(), 9);
     result &= Test("ns_alias_reaches_plain_struct", ShadowOther2.aliasedPlainStruct(), 7);
     result &= Test("ns_real_namespace_outranks_alias", shadowRealNamespaceOutranksAlias(), 1);
+    result &= Test("qualified_type_rooted_local_wins", A.qualifiedLocalPick(), 20);
+    result &= Test("qualified_type_rooted_parameter_return_wins", A.qualifiedParameterReturnPick(), 20);
+    result &= Test("qualified_type_rooted_tuple_wins", qualifiedTuplePick(), 24);
+    result &= Test("qualified_type_rooted_generic_arg_wins", A.qualifiedGenericPick(), 20);
+    result &= Test("qualified_type_rooted_field_wins", A.qualifiedFieldPick(), 20);
+    result &= Test("qualified_type_rooted_nested_scope_wins", A.Inner.qualifiedNestedScopePick(), 20);
+    result &= Test("qualified_type_sibling_fallback_pick", QualifiedSibling.qualifiedFallbackPick(), 20);
+    result &= Test("qualified_type_enclosing_fallbacks", QualifiedFallback.run(), 30);
     return result;
 }
 

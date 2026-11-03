@@ -1,4 +1,5 @@
 import "../library/c_variadic_fnptr.h";
+import cpp "../library/cpp_interop_fnptr.h";
 
 expect_error("integer constant zero is not a null spelling for a function slot") {
     int t185ZeroDeclaration() {
@@ -133,4 +134,28 @@ expect_error("integer constant zero is not a null spelling for a function slot")
 expect_error("integer constant zero is not a null spelling for a function slot 'f'") {
     int t185ZeroThinDefault(T311Bin f = 0) { return 0; }
     int t185CallThinDefault() { return t185ZeroThinDefault(); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppStdFunctionCtor() {
+        cppfnptr.FunctionSink value = cppfnptr.FunctionSink(0);
+        return value.value;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppStdFunctionCtorTwoArgs() {
+        cppfnptr.FunctionSink value = cppfnptr.FunctionSink(0L, 5);
+        return value.value;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppStdFunctionNew() {
+        cppfnptr.FunctionSink* value = new cppfnptr.FunctionSink(0);
+        return value.value;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int tFnzCppStdFunctionCtorMacro() {
+        cppfnptr.FunctionSink value = cppfnptr.FunctionSink(CPPFN_ZERO);
+        return value.value;
+    }
 }

@@ -1879,6 +1879,14 @@ namespace cppi
         XvMultiMove& operator=(const XvMultiMove&&) = delete;
         ~XvMultiMove() noexcept {}
     };
+    // A user move constructor with a trivial destructor: `move` of a field must still run it.
+    struct XvMoveTrivDtor
+    {
+        int v = 5;
+        XvMoveTrivDtor() noexcept {}
+        XvMoveTrivDtor(const XvMoveTrivDtor& o) noexcept : v(o.v) {}
+        XvMoveTrivDtor(XvMoveTrivDtor&& o) noexcept : v(o.v) { o.v = 0; }
+    };
     // Trivially copyable, yet clang selects the constructor template for a `T&&` source.
     struct XvTrivialTemplate
     {

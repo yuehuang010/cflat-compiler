@@ -5854,13 +5854,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             auto* gid = prevPrimary->genericIdentifier();
                             std::string rootName = gid->Identifier()->getText();
 
-                            if (compiler->IsNamespace(rootName) || compiler->IsCxxNamespace(rootName))
+                            if (compiler->IsNamespace(rootName, true) || compiler->IsCxxNamespace(rootName))
                             {
                                 // global::Outer.Inner.x - seed the namespace context at root; the
                                 // following `.member` postfix builds a dotted (root-anchored) name,
                                 // which ResolveQualifiedName never prepends the current namespace to.
                                 namespaceContext = compiler->IsCxxNamespace(rootName)
-                                    ? rootName : compiler->ResolveNamespace(rootName);
+                                    ? rootName : compiler->ResolveNamespace(rootName, true);
                                 primaryIdentifier = namespaceContext;
                                 namedVar = {};
                                 structVar = {};
@@ -6472,6 +6472,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if ((prevPrimary->expression() != nullptr || prevPrimary->elementExpression() != nullptr)
                                 && !lastParenExprType.TypeName.empty())
                                 namedVar.TypeAndValue = lastParenExprType;
+                            if (prevPrimary->expression() != nullptr && lastParenExprType.IsSimd
+                                && lastParenExprNamed.BaseType != nullptr)
+                                namedVar.BaseType = lastParenExprNamed.BaseType;
                             if (prevPrimary->elementExpression() != nullptr)
                                 AdoptWrapperProvenance(namedVar, lastParenExprNamed);
                             // A parenthesized lvalue keeps its storage so a STORE writes through to
@@ -9839,9 +9842,105 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             return this->ParseAssignmentExpressionNamed(
                                                 namedArgument->assignmentExpression());
                                         });
-                                        // A tuple literal converts element-wise to the slot under the scalar call
-                                        // rule (as overload ranking checks it); a refused element is an error here.
-                                        if (argNV.IsTupleLiteral && argParamIndex < funcPtrTV.FuncPtrParams.size())
+                                        const std::string sourceTupleName = backend->ResolveTypeAlias(
+                                            argNV.TypeAndValue.TypeName);
+                                        const std::string targetTupleName = backend->ResolveTypeAlias(
+                                            argExpectedDest.TypeName);
+                                        LLVMBackend::TypeAndValue sourcePointerType = argNV.TypeAndValue;
+                                        if (argNV.IsStringLiteral && !sourcePointerType.Pointer)
+                                        {
+                                            sourcePointerType.TypeName = "char";
+                                            sourcePointerType.Pointer = true;
+                                        }
+                                        if (sourcePointerType.IsArrayView || sourcePointerType.ConstArraySize > 0)
+                                        {
+                                            sourcePointerType.Pointer = true;
+                                            sourcePointerType.IsArrayView = false;
+                                            sourcePointerType.ConstArraySize = 0;
+                                            sourcePointerType.ConstInnerDimensions.clear();
+                                        }
+                                        if (argParamIndex < funcPtrTV.FuncPtrParams.size()
+                                            && sourcePointerType.Pointer && argExpectedDest.Pointer
+                                            && !argNV.TypeAndValue.IsFunctionPointer
+                                            && !argExpectedDest.IsFunctionPointer
+                                            && !argNV.TypeAndValue.IsInterfacePointer
+                                            && !argExpectedDest.IsInterfacePointer
+                                            && !argNV.TypeAndValue.IsSimd
+                                            && !argExpectedDest.IsSimd
+                                            && !argNV.TypeAndValue.IsCxxRefToPointer
+                                            && !argExpectedDest.IsCxxRefToPointer
+                                            && !backend->IsNullPointerConstantArgument(argNV, false))
+                                        {
+                                            auto resolvedPointee = [&](const LLVMBackend::TypeAndValue& type) {
+                                                std::string name = backend->ResolveTypeAlias(type.TypeName);
+                                                if (name.empty()) name = type.TypeName;
+                                                std::string manglingAlias = backend->ResolveManglingPointerAlias(name);
+                                                if (!manglingAlias.empty()) name = std::move(manglingAlias);
+                                                std::string backing = backend->GetEnumBackingType(name);
+                                                if (!backing.empty()) name = backend->ResolveTypeAlias(backing);
+                                                return name;
+                                            };
+                                            const std::string sourcePointee = resolvedPointee(sourcePointerType);
+                                            const std::string targetPointee = resolvedPointee(argExpectedDest);
+                                            const auto& functionParam = funcPtrTV.FuncPtrParams[argParamIndex];
+                                            const bool sameResolvedType =
+                                                !functionParam.ResolvedTypeKey.empty()
+                                                && LLVMBackend::CanonicalPointeeTypeName(sourcePointee)
+                                                    == LLVMBackend::CanonicalPointeeTypeName(
+                                                        functionParam.ResolvedTypeKey);
+                                            const bool exactPointee = LLVMBackend::CanonicalPointeeTypeName(
+                                                sourcePointee) == LLVMBackend::CanonicalPointeeTypeName(targetPointee)
+                                                || sameResolvedType
+                                                || sourcePointerType.TypeName == functionParam.TypeName
+                                                || sourcePointerType.TypeName == argExpectedDest.TypeName
+                                                || argNV.TypeAndValue.IsTypeMatch(argExpectedDest);
+                                            const bool integerPointeeMismatch =
+                                                backend->IsImplicitIntegerPointeePointerConversion(
+                                                    sourcePointerType, argExpectedDest);
+                                            const bool derivedToBase = backend->IsCxxDerivedToBasePointer(
+                                                sourcePointerType, argExpectedDest);
+                                            // `&t` reports depth 0 with Pointer set; compare normalized depths.
+                                            const auto depthOf = [](const LLVMBackend::TypeAndValue& tv) {
+                                                return tv.Pointer ? std::max(1, tv.PointerDepth) : 0;
+                                            };
+                                            if (integerPointeeMismatch
+                                                || (depthOf(sourcePointerType) == depthOf(argExpectedDest)
+                                                    && !exactPointee && sourcePointee != "void"
+                                                    && targetPointee != "void" && !derivedToBase))
+                                            {
+                                                std::string sourceType = SpellType(*backend, sourcePointerType);
+                                                if (sourceType.empty() && argNV.IsStringLiteral)
+                                                    sourceType = "const char*";
+                                                const std::string targetType = SpellType(
+                                                    *backend, argExpectedDest);
+                                                LogErrorContext(namedArgument, backend->LocalizeMessage(
+                                                    "no overload matches the call through a function value.\n  cannot pass argument of type '{}' to parameter of type '{}': pointer pointee types differ",
+                                                    { sourceType, targetType }));
+                                            }
+                                        }
+                                        const bool sourceIsTuple = argNV.IsTupleLiteral
+                                            || (!argNV.TypeAndValue.Pointer && tupleTypeArgs.contains(sourceTupleName));
+                                        const bool targetIsTuple = !argExpectedDest.Pointer
+                                            && tupleTypeArgs.contains(targetTupleName);
+                                        // Pointer, array and view shapes keep the pointer diagnostics (a tuple array decays to a tuple pointer).
+                                        auto pointerShaped = [](const LLVMBackend::TypeAndValue& tv) {
+                                            return tv.Pointer || tv.IsArrayView || tv.ConstArraySize > 0 || tv.IsCxxRefToPointer;
+                                        };
+                                        if (argParamIndex < funcPtrTV.FuncPtrParams.size()
+                                            && sourceIsTuple != targetIsTuple
+                                            && !pointerShaped(argNV.TypeAndValue) && !pointerShaped(argExpectedDest))
+                                        {
+                                            std::string sourceType = SpellType(*backend, argNV.TypeAndValue);
+                                            if (sourceType.empty())
+                                                sourceType = backend->LlvmTypeToTypeName(argNV.Primary != nullptr
+                                                    ? argNV.Primary->getType() : argNV.BaseType);
+                                            LogErrorContext(namedArgument, backend->LocalizeMessage(
+                                                "cannot pass argument of type '{}' to parameter of type '{}' through a function value: tuple and non-tuple types cannot be mixed",
+                                                { sourceType,
+                                                  SpellType(*backend, argExpectedDest) }));
+                                        }
+                                        // A tuple literal converts element-wise to a tuple slot, as overload ranking does.
+                                        if (argNV.IsTupleLiteral && targetIsTuple)
                                         {
                                             const auto elementCost = backend->TupleLiteralElementCost(
                                                 argNV, argExpectedDest, false);
@@ -9853,10 +9952,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                         else if (argParamIndex < funcPtrTV.FuncPtrParams.size())
                                         {
-                                            const std::string sourceTupleName = backend->ResolveTypeAlias(
-                                                argNV.TypeAndValue.TypeName);
-                                            const std::string targetTupleName = backend->ResolveTypeAlias(
-                                                argExpectedDest.TypeName);
                                             if (tupleTypeArgs.contains(sourceTupleName)
                                                 && tupleTypeArgs.contains(targetTupleName)
                                                 && sourceTupleName != targetTupleName)
@@ -10752,6 +10847,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1
                                         || !argNV.TypeAndValue.EnumBacking.empty())
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                    // A simd argument keeps its element name and lane count, so it
+                                    // binds a simd parameter of the same shape (overload gate).
+                                    if (argNV.TypeAndValue.IsSimd)
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                        argVar.TypeAndValue.IsSimd = true;
+                                        argVar.TypeAndValue.SimdLanes = argNV.TypeAndValue.SimdLanes;
+                                    }
 
                                     // An INTERFACE argument's LLVM type is the shared fat-ptr struct, so the
                                     // struct-name extraction below would name it "__iface_fat_ptr" and the
@@ -13015,6 +13118,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1
                                         || !argNV.TypeAndValue.EnumBacking.empty())
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                    // A simd argument keeps its element name and lane count, so it
+                                    // binds a simd parameter of the same shape (overload gate).
+                                    if (argNV.TypeAndValue.IsSimd)
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                        argVar.TypeAndValue.IsSimd = true;
+                                        argVar.TypeAndValue.SimdLanes = argNV.TypeAndValue.SimdLanes;
+                                    }
 
                                     // Propagate interface type so overload resolution matches IFoo->IFoo parameters.
                                     if (argNV.TypeAndValue.IsInterface)
@@ -13910,12 +14021,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string why;
                                 compiler->TryBindRefusedCxxMember(
                                     functionName, "__ctor", ctorTypes.size());
-                                auto* ctor = compiler->SelectCxxConstructor(
-                                    functionName, ctorTypes, why, false, &arguments);
-                                // A scalar-reference overload set is clang's to resolve.
-                                bool scalarReferenceSet =
+                                // A set that narrows on every constructor keeps the clang path's narrowing refusal.
+                                bool scalarReferenceSet = compiler->CxxCtorSetRankedByCflat(
+                                    functionName, ctorTypes, &arguments);
+                                // A mutable scalar reference stays clang's to resolve; CFlat ranks const& sets.
+                                bool forwardsScalarRef =
                                     compiler->CxxCtorForwardsScalarReference(functionName, ctorTypes);
-                                bool hardReferenceRejection = !scalarReferenceSet
+                                auto* ctor = compiler->SelectCxxConstructor(
+                                    functionName, ctorTypes, why, scalarReferenceSet, &arguments);
+                                bool hardReferenceRejection = !forwardsScalarRef
                                     && (why.starts_with("constructor '")
                                         || why.starts_with("no overload of '"));
                                 if (ctor == nullptr && !hardReferenceRejection)
@@ -13923,8 +14037,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     compiler->TryBindRefusedCxxMember(
                                         functionName, "__ctor", ctorTypes.size());
                                     ctor = compiler->SelectCxxConstructor(
-                                        functionName, ctorTypes, why, false, &arguments);
-                                    hardReferenceRejection = !scalarReferenceSet
+                                        functionName, ctorTypes, why, scalarReferenceSet, &arguments);
+                                    hardReferenceRejection = !forwardsScalarRef
                                         && (why.starts_with("constructor '")
                                             || why.starts_with("no overload of '"));
                                 }
@@ -13933,7 +14047,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 bool nullPointerCandidate = false;
                                 bool clangResolves = compiler->CxxConstructorNeedsClangResolution(
                                     functionName, ctor, ctorTypes, &arguments,
-                                    /*allowExplicit*/ true, &nullPointerCandidate);
+                                    /*allowExplicit*/ true, &nullPointerCandidate,
+                                    /*rankScalarReferenceSet*/ scalarReferenceSet);
                                 auto bindCtorPointerSlots = [&]() {
                                     bool slotBound = false;
                                     for (size_t i = 0; i < arguments.size(); ++i)
@@ -13957,22 +14072,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         why.clear();
                                         ctor = compiler->SelectCxxConstructor(
-                                            functionName, ctorTypes, why, false, &arguments);
-                                        scalarReferenceSet = compiler->CxxCtorForwardsScalarReference(
-                                            functionName, ctorTypes);
+                                            functionName, ctorTypes, why, scalarReferenceSet, &arguments);
+                                        scalarReferenceSet = compiler->CxxCtorSetRankedByCflat(
+                                            functionName, ctorTypes, &arguments);
+                                        forwardsScalarRef = compiler->CxxCtorForwardsScalarReference(functionName, ctorTypes);
                                         nullPointerCandidate = false;
                                         clangResolves = compiler->CxxConstructorNeedsClangResolution(
                                             functionName, ctor, ctorTypes, &arguments,
-                                            /*allowExplicit*/ true, &nullPointerCandidate);
+                                            /*allowExplicit*/ true, &nullPointerCandidate,
+                                            /*rankScalarReferenceSet*/ scalarReferenceSet);
                                     }
                                 }
+                                compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                                    functionName, arguments, ctorValues);
                                 if (!clangResolves)
                                     if (const std::string refusal =
                                             compiler->CxxConstructorRvalueRefBindRefusal(
                                                 functionName, arguments);
                                         !refusal.empty())
                                         LogErrorContext(ctx, refusal);
-                                bool clangOnlyConstructorSet = scalarReferenceSet
+                                bool clangOnlyConstructorSet = (forwardsScalarRef && !scalarReferenceSet)
                                     || nullPointerCandidate;
                                 hardReferenceRejection = !clangOnlyConstructorSet
                                     && (why.starts_with("constructor '")
@@ -14012,7 +14131,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                 bool noViableCandidate = false;
                                 bool wrapped = !narrowingRefused
-                                    && ((ctor == nullptr && !hardReferenceRejection)
+                                    && ((ctor == nullptr && !hardReferenceRejection
+                                         && !scalarReferenceSet)
                                         || clangResolves)
                                     && compiler->RequestCxxVariadicConstructor(
                                         functionName, arguments, wrapperName, wrapperError,
@@ -14028,14 +14148,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // the listed mutable T*& constructor with the caller's slot.
                                     why.clear();
                                     ctor = compiler->SelectCxxConstructor(
-                                        functionName, ctorTypes, why, false, &arguments);
-                                    scalarReferenceSet = compiler->CxxCtorForwardsScalarReference(
-                                        functionName, ctorTypes);
+                                        functionName, ctorTypes, why, scalarReferenceSet, &arguments);
+                                    scalarReferenceSet = compiler->CxxCtorSetRankedByCflat(
+                                        functionName, ctorTypes, &arguments);
+                                    forwardsScalarRef = compiler->CxxCtorForwardsScalarReference(functionName, ctorTypes);
                                     nullPointerCandidate = false;
                                     clangResolves = compiler->CxxConstructorNeedsClangResolution(
                                         functionName, ctor, ctorTypes, &arguments,
-                                        /*allowExplicit*/ true, &nullPointerCandidate);
-                                    clangOnlyConstructorSet = scalarReferenceSet
+                                        /*allowExplicit*/ true, &nullPointerCandidate,
+                                        /*rankScalarReferenceSet*/ scalarReferenceSet);
+                                    clangOnlyConstructorSet = (forwardsScalarRef && !scalarReferenceSet)
                                         || nullPointerCandidate;
                                     hardReferenceRejection = !clangOnlyConstructorSet
                                         && (why.starts_with("constructor '")
@@ -14054,7 +14176,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     wrapperError.clear();
                                     noViableCandidate = false;
                                     if (!narrowingRefused
-                                        && ((ctor == nullptr && !hardReferenceRejection)
+                                        && ((ctor == nullptr && !hardReferenceRejection
+                                             && !scalarReferenceSet)
                                             || clangResolves))
                                         wrapped = compiler->RequestCxxVariadicConstructor(
                                             functionName, arguments, wrapperName, wrapperError,
@@ -15688,15 +15811,38 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             for (auto* param : paramList->lambdaParam())
             {
                 LLVMBackend::DeclTypeAndValue p;
-                PrimitiveTypeError canonicalError;
-                p.TypeName = CanonicalTypeSpecifierText(
-                    param->typeSpecifier(), param->multiWordTypeSuffix(), false, &canonicalError);
-                if (HasPrimitiveTypeError(canonicalError))
-                    LogErrorContext(param, LocalizePrimitiveTypeError(compiler, canonicalError));
-                if (auto* memberType = param->typeSpecifier()->memberTypeSpecifier())
-                    p.TypeName = ResolveMemberTypeSpecifier(memberType);
-                p.TypeName = compiler->ResolveTypeAlias(p.TypeName);
-                p.Pointer = param->pointer() != nullptr;
+                auto* functionPointerType = param->typeSpecifier()->functionPointerSpecifier();
+                if (functionPointerType != nullptr)
+                {
+                    bool pointer = param->pointer() != nullptr;
+                    int stars = PointerDepthOf(param->pointer());
+                    int constMask = 0;
+                    std::string encodedName = ResolveSigComponentConstCodegen(
+                        param->typeSpecifier(), pointer, stars, constMask,
+                        param->multiWordTypeSuffix());
+                    if (const auto* nested = compiler->GetEncodedClosureType(encodedName))
+                    {
+                        static_cast<LLVMBackend::TypeAndValue&>(p) = *nested;
+                        p.Pointer = pointer;
+                        p.PointerDepth = ReconcilePointerDepth(pointer, stars);
+                        p.ElemPointer = p.PointerDepth >= 2;
+                        p.ConstMask = static_cast<uint8_t>(constMask);
+                    }
+                    else
+                        p.TypeName = encodedName;
+                }
+                else
+                {
+                    PrimitiveTypeError canonicalError;
+                    p.TypeName = CanonicalTypeSpecifierText(
+                        param->typeSpecifier(), param->multiWordTypeSuffix(), false, &canonicalError);
+                    if (HasPrimitiveTypeError(canonicalError))
+                        LogErrorContext(param, LocalizePrimitiveTypeError(compiler, canonicalError));
+                    if (auto* memberType = param->typeSpecifier()->memberTypeSpecifier())
+                        p.TypeName = ResolveMemberTypeSpecifier(memberType);
+                    p.TypeName = compiler->ResolveTypeAlias(p.TypeName);
+                    p.Pointer = param->pointer() != nullptr;
+                }
                 // `((const char)* s) => ...`: the whole-word wrapper keeps its pointee const.
                 if (auto* nested = param->typeSpecifier()->typeName(); nested != nullptr)
                 {
@@ -16244,7 +16390,10 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         for (const auto& p : params)
         {
             LLVMBackend::TypeAndValue::FuncPtrParam fp;
-            fp.TypeName = p.TypeName;
+            fp.TypeName = p.IsFunctionPointer
+                ? MainListener::EncodeClosureFromSig(compiler, p) : p.TypeName;
+            if (p.IsFunctionPointer)
+                fp.FunctionTypeSignature = std::make_shared<LLVMBackend::TypeAndValue>(p);
             fp.Pointer  = p.Pointer;
             fp.IsArrayView = p.IsArrayView;
             fp.PointerDepth = p.ValuePointerDepth();
@@ -16405,6 +16554,7 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         // Evaluate each element and collect its type name
         std::vector<llvm::Value*> elemValues;
         std::vector<LLVMBackend::NamedVariable> tupleLiteralElements;
+        std::vector<bool> uniqueRawTransfers;
         std::vector<std::string> typeArgs;
         for (size_t i = 0; i < entries.size(); ++i)
         {
@@ -16420,6 +16570,10 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                 elementRecord.BaseType = loaded->getType();
             tupleLiteralElements.push_back(std::move(elementRecord));
             bool matchesExpectedTupleElement = false;
+            bool expectedArrayView = false;
+            bool expectedPointer = false;
+            bool expectedUnique = false;
+            bool transferUniqueRaw = false;
 
             if (!expectedFields.empty() && loaded != nullptr)
             {
@@ -16438,16 +16592,83 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                         expected.IsUnsignedInteger() != -1);
                     matchesExpectedTupleElement = true;
                 }
+                if (!matchesExpectedTupleElement && expectedType != nullptr
+                    && entry->assignmentExpression()->getText() == "nullptr")
+                {
+                    if (expectedType->isPointerTy())
+                        loaded = llvm::ConstantPointerNull::get(
+                            llvm::cast<llvm::PointerType>(expectedType));
+                    else if (compiler->IsCoreUniqueType(expected.TypeName))
+                        loaded = llvm::Constant::getNullValue(expectedType);
+                    else if (expectedType->isIntegerTy(1))
+                        loaded = llvm::ConstantInt::getFalse(*compiler->context);
+                    else
+                        LogErrorContext(entry->assignmentExpression(), "a pointer is not a number");
+                    matchesExpectedTupleElement = true;
+                }
+                if (!matchesExpectedTupleElement && expectedType != nullptr
+                    && llvm::isa<llvm::FixedVectorType>(expectedType)
+                    && (loaded->getType()->isIntegerTy()
+                        || loaded->getType()->isFloatingPointTy()))
+                {
+                    loaded = compiler->SplatToSimd(loaded, expected,
+                        nv.TypeAndValue.IsUnsignedInteger() != -1);
+                    matchesExpectedTupleElement = true;
+                }
+                if (!matchesExpectedTupleElement && compiler->IsCoreUniqueType(expected.TypeName)
+                    && loaded->getType()->isPointerTy())
+                {
+                    const bool moved = nv.TypeAndValue.IsMove || nv.IsExplicitMove;
+                    const bool directNew = AsDirectNew(entry->assignmentExpression()) != nullptr;
+                    const std::string borrowedParamCall = BorrowedParameterCallName(nv, loaded);
+                    // An explicit move of a proven borrow stays a borrow (declaration srcIsBorrowed rule).
+                    const bool borrowedMove = moved && nv.IsBorrowed && !compiler->lastMovedFromContainerSlot;
+                    const bool borrowed = nv.TypeAndValue.Pointer && (borrowedMove || (!moved
+                        && (!(UniquePointerSourceIsOwned(nv) || directNew)
+                            || !borrowedParamCall.empty())));
+                    if (!borrowed)
+                    {
+                        matchesExpectedTupleElement = true;
+                        transferUniqueRaw = nv.TypeAndValue.Pointer
+                            && UniquePointerSourceIsOwned(nv) && !moved && !directNew
+                            && nv.Storage != nullptr;
+                    }
+                    else
+                    {
+                        const std::string sourceName = compiler->BorrowedSourceDisplayName(nv);
+                        if (sourceName.empty())
+                            LogErrorContext(entry->assignmentExpression(), std::format(
+                                "cannot initialize {} from a borrowed value - the source still owns it; "
+                                "use 'new', a 'move' expression, or a move-returning call",
+                                SpellType(*compiler, expected)));
+                        else
+                            LogErrorContext(entry->assignmentExpression(), std::format(
+                                "cannot initialize {} from borrowed value '{}' - the source still owns it; "
+                                "use 'new', a 'move' expression, or a move-returning call",
+                                SpellType(*compiler, expected), sourceName));
+                    }
+                }
+                if (matchesExpectedTupleElement)
+                {
+                    expectedArrayView = expected.IsArrayView;
+                    expectedPointer = expected.Pointer;
+                    expectedUnique = expected.IsUnique
+                        || compiler->IsCoreUniqueType(expected.TypeName);
+                }
             }
             elemValues.push_back(loaded);
+            uniqueRawTransfers.push_back(transferUniqueRaw);
 
             // Prefer TypeAndValue.TypeName (set for variables); fall back to LLVM type
             std::string typeName = nv.TypeAndValue.TypeName;
             bool typeNameInferred = typeName.empty();
             if (typeName.empty() && loaded)
                 typeName = LLVMTypeToTypeName(loaded->getType(), nv.TypeAndValue.TypeName);
+            // A simd element spells its declared `simd<E,N>` so the tuple mangles to the declared type.
             if (!expectedFields.empty() && matchesExpectedTupleElement)
-                typeName = expectedFields[i].TypeName;
+                typeName = expectedFields[i].IsSimd
+                    ? std::format("simd<{},{}>", expectedFields[i].TypeName, expectedFields[i].SimdLanes)
+                    : expectedFields[i].TypeName;
             // C integer promotion: untyped small-integer literals widen to int (i32)
             if (typeNameInferred && (typeName == "i8" || typeName == "i16"))
             {
@@ -16458,10 +16679,17 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             // Encode the element's reference kind in the type-arg string so the constructed
             // tuple mangles to the same name as its declared `(T[], ...)` / `tuple<T*, ...>` type:
             // "[]" for a noalias array-view, "*" for a plain pointer.
-            if (nv.TypeAndValue.IsArrayView && !typeName.empty() && typeName.back() != ']')
+            const bool elementIsArrayView = matchesExpectedTupleElement
+                ? expectedArrayView : nv.TypeAndValue.IsArrayView;
+            const bool elementIsPointer = matchesExpectedTupleElement
+                ? expectedPointer : nv.TypeAndValue.Pointer;
+            const bool elementIsUnique = matchesExpectedTupleElement
+                ? expectedUnique : nv.TypeAndValue.IsUnique;
+            if (elementIsArrayView
+                && !typeName.empty() && typeName.back() != ']')
                 // A view OF pointers carries its element's star: `int*[]`, not `int[]`.
                 typeName += std::string(nv.TypeAndValue.ElemPointer ? 1 : 0, '*') + "[]";
-            else if (nv.TypeAndValue.Pointer && !nv.TypeAndValue.IsArrayView
+            else if (elementIsPointer && !elementIsArrayView && !elementIsUnique
                      && !typeName.empty() && typeName.back() != '*')
                 typeName += "*";
             typeArgs.push_back(typeName);
@@ -16507,6 +16735,18 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             }
             auto* gep = compiler->CreateStructGEP(structType, alloca, fieldIdx);
             compiler->builder->CreateStore(elemValues[i], gep);
+            if (uniqueRawTransfers[i])
+            {
+                auto& source = tupleLiteralElements[i];
+                compiler->builder->CreateStore(
+                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(
+                        elemValues[i]->getType())), source.Storage);
+                if (!source.CallerName.empty())
+                {
+                    compiler->MarkVariableMoved(source.CallerName);
+                    compiler->MarkVariableExplicitlyMovedNull(source.CallerName);
+                }
+            }
         }
 
         LLVMBackend::NamedVariable result;

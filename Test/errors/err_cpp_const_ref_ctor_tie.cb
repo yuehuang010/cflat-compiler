@@ -8,5 +8,21 @@ extern int main()
     expect_error("has no constructor that binds these arguments") {
         m18ov.TieT x = m18ov.TieT(i);
     }
+    expect_error("has no constructor that binds these arguments") {
+        m18ov.TieT* x = new m18ov.TieT(i);
+    }
+    expect_error("brace constructor call 'm18ov.TieT'") {
+        m18ov.TieT x{i};
+    }
+    expect_error("brace constructor call 'm18ov.TieT'") {
+        m18ov.TieT x = {i};
+    }
+    // Brace forms refuse the narrowing int -> double of the by-value tie winner (C++ list-init).
+    expect_error("brace constructor call 'm18ov.TieU'") {
+        m18ov.TieU x{i};
+    }
+    expect_error("brace constructor call 'm18ov.TieU'") {
+        m18ov.TieU x = {i};
+    }
     return 0;
 }

@@ -1,0 +1,24 @@
+// A simd argument binds a simd parameter only with the same element type and lane count.
+// simd<int,4> into simd<float,4>, or simd<float,4> into simd<float,8>, is refused.
+int takesFloat4(simd<float, 4> x)
+{
+    return 1;
+}
+
+int takesFloat8(simd<float, 8> x)
+{
+    return 1;
+}
+
+extern int main()
+{
+    simd<int, 4> v = 0;
+    expect_error("no overload of 'takesFloat4' matches the given arguments") {
+        int r = takesFloat4(v);
+    }
+    simd<float, 4> f4 = 0.0f;
+    expect_error("no overload of 'takesFloat8' matches the given arguments") {
+        int r = takesFloat8(f4);
+    }
+    return 0;
+}

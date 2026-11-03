@@ -28,5 +28,11 @@ extern int main()
     expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*'): the conversion discards const") {
         t477_take_mutable(&t217_const_ptr()->n);
     }
+    expect_error("cannot modify '*p': it is reached through a pointer to const ('p')") {
+        T217NonConstCompound nonConst = default;
+        nonConst.v = 80;
+        const T217NonConstCompound* p = &nonConst;
+        *p += 1;
+    }
     return 0;
 }

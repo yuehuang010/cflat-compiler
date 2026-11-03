@@ -477,6 +477,10 @@
       ".data()",
       "printf(\"%s\", s.data())"
     ],
+    "cannotpassargumentof...letypescannotbemixed7e1f0efd871eb670": [
+      "tuple<int, int>",
+      "int"
+    ],
     "cannotpassatuplevalu...iresanexacttupletype9c6c9b3aa6368426": [
       "tuple<int, int>",
       "1",
@@ -921,6 +925,10 @@
       "IClosureIntArg",
       "lam",
       ""
+    ],
+    "nooverloadmatchesthe...erpointeetypesdiffer56cd32041472827f": [
+      "tuple<int, int>*",
+      "tuple<i64, int>*"
     ],
     "nooverloadofarg0matchesfunctiontypearg1": [
       "n65NoMatch",
@@ -2141,6 +2149,7 @@
     "cannotpassarg0tothea...binditfirstarg9arg1069e931e3bcfc1bb6": "cannot pass '{0}' to the '{1}' parameter '{2}' of '{3}': a '{4}' is a {5} value, not a '{6}' - the callee would read the pair itself. Pass the buffer explicitly with '{7}'. An interpolated string literal is a '{8}': bind it first ({9}; {10}).",
     "cannotpassarg0tothea...erexplicitlywitharg685f9bb80ecf24438": "cannot pass '{0}' to the '{1}' parameter {2} through a function value: a '{3}' is a {4} value, not a '{5}'. Pass the buffer explicitly with '{6}'.",
     "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": "cannot pass '{0}' to the variadic '{1}' of '{2}': a variadic slot is untyped and a '{3}' is a {4} value, not a '{5}' - the length field would be read as the next argument. Pass the buffer explicitly with '{6}' (e.g. {7}).",
+    "cannotpassargumentof...letypescannotbemixed7e1f0efd871eb670": "cannot pass argument of type '{0}' to parameter of type '{1}' through a function value: tuple and non-tuple types cannot be mixed",
     "cannotpassatuplevalu...iresanexacttupletype9c6c9b3aa6368426": "cannot pass a tuple value of type '{0}' to parameter {1} of a call through a function value with tuple type '{2}'; a tuple value that is not a literal requires an exact tuple type",
     "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": "cannot pass bonded value to interface method '{0}.{1}' parameter '{2}' - bonded values cannot be transferred out of their source's scope",
     "cannotpassowningheap...quetdoesnotownarrays57d0d857da621597": "cannot pass owning heap array '{0}' to parameter '{1}' of '{2}': unique<T> does not own arrays",
@@ -2271,6 +2280,7 @@
     "noarg0compilerdriver...dtolinktheexecutable11639c2d0b9f1811": "no {0} compiler driver found to link the executable.",
     "noarg0compilerdriver...pilenativesourcearg16740382ea0548b90": "no {0} compiler driver found - cannot compile native source '{1}'.",
     "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": "no method of '{0}.{1}' matches the given arguments{2}",
+    "nooverloadmatchesthe...erpointeetypesdiffer56cd32041472827f": "no overload matches the call through a function value.\n  cannot pass argument of type '{0}' to parameter of type '{1}': pointer pointee types differ",
     "nooverloadofarg0matchesfunctiontypearg1": "no overload of '{0}' matches function type '{1}'",
     "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": "no overload of interface method '{0}.{1}' takes {2} argument(s); expected {3}",
     "noviablealternativeatinputarg0": "no viable alternative at input {0}",

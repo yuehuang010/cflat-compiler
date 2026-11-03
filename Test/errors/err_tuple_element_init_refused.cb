@@ -1,0 +1,36 @@
+import "unique.cb";
+
+int tupleElementDtorCount = 0;
+struct TupleElementOwned { ~TupleElementOwned() { tupleElementDtorCount++; } };
+TupleElementOwned* tupleElementBorrowReturn(TupleElementOwned* p) { return p; }
+
+expect_error("cannot initialize unique<TupleElementOwned> from borrowed value 'p'") {
+    int tupleElementMoveBorrowedParam(TupleElementOwned* p)
+    {
+        (unique<TupleElementOwned>, int) value = (move p, 4);
+        return 0;
+    }
+}
+
+extern int main()
+{
+    expect_error("a pointer is not a number") {
+        (int, int) value = (nullptr, 4);
+    }
+
+    expect_error("cannot initialize unique<TupleElementOwned> from borrowed value") {
+        TupleElementOwned object;
+        (unique<TupleElementOwned>, int) value = (&object, 4);
+    }
+
+    expect_error("cannot initialize unique<TupleElementOwned> from borrowed value") {
+        TupleElementOwned object;
+        (unique<TupleElementOwned>, int) value = (tupleElementBorrowReturn(&object), 4);
+    }
+
+    expect_error("cannot initialize unique<TupleElementOwned> from borrowed value") {
+        TupleElementOwned object;
+        TupleElementOwned* newp = &object;
+        (unique<TupleElementOwned>, int) value = (newp, 4);
+    }
+}

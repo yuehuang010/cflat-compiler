@@ -2048,7 +2048,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     auto named = ParseIdentifier(identifier);
                     return TypedValueOfNamedOperand(named, arm);
                 }
-            return ParseConditionalExpression(arm, nestedArmUse(arm));
+            auto value = ParseConditionalExpression(arm, nestedArmUse(arm));
+            if (isFunctionValueDestination(destination) && value.value != nullptr
+                && value.value->getType()->isPointerTy()
+                && compiler->IsNullFunctionSlotJoin(value.value))
+                value.value = llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(value.value->getType()));
+            return value;
         };
         const bool autoDeclTernary = std::exchange(autoDeclTernaryActive_, false);
         LLVMBackend::TypeAndValue pointerJoinDest;
@@ -3082,6 +3088,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 compiler->RestoreMovedState(ternaryPreMovedState);
                 parseFalseArm();
                 falseTernaryMovedState = compiler->SaveMovedState();
+            }
+            if (functionValueDestination)
+            {
+                auto normalizeNullMacroArm = [&](llvm::Value*& value) {
+                    if (value != nullptr && value->getType()->isPointerTy()
+                        && compiler->IsNullFunctionSlotJoin(value))
+                        value = llvm::ConstantPointerNull::get(
+                            llvm::cast<llvm::PointerType>(value->getType()));
+                };
+                normalizeNullMacroArm(trueValue);
+                normalizeNullMacroArm(falseValue);
             }
             resolveDerivedArm(trueDerived, falseDerived, trueEnd);
             resolveDerivedArm(falseDerived, trueDerived, falseEnd);
@@ -5319,7 +5336,13 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     auto named = ParseIdentifier(identifier);
                     return TypedValueOfNamedOperand(named, arm);
                 }
-            return ParseConditionalExpression(arm, use);
+            auto value = ParseConditionalExpression(arm, use);
+            if (isFunctionValueDestination(destination) && value.value != nullptr
+                && value.value->getType()->isPointerTy()
+                && compiler->IsNullFunctionSlotJoin(value.value))
+                value.value = llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(value.value->getType()));
+            return value;
         };
         if (ctx->expression() != nullptr && ctx->conditionalExpression() != nullptr
             && IsGenericFunctionScalarDestination(compiler, outerExpected))

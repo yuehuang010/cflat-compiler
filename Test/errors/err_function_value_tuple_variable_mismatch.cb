@@ -1,12 +1,22 @@
 int tupleMismatchTarget((i64, int) value) { return (int)value.item_0 + value.item_1; }
+int tupleMismatchScalarTarget(int value) { return value; }
 using TupleMismatchFn = function<int((i64, int))>;
 struct TupleMismatchBox { function<int((i64, int))> fn = tupleMismatchTarget; };
+struct TupleMismatchScalarBox { function<int(int)> fn = tupleMismatchScalarTarget; };
 
 int tupleMismatchGeneric<T>(T fn)
 {
     (int, int) value = (3, 4);
     return fn(value);
 }
+
+int tupleMismatchScalarGeneric<T>(T fn)
+{
+    (int, int) value = (3, 4);
+    return fn(value);
+}
+
+T tupleMismatchIdentity<T>(T value) { return value; }
 
 extern int main()
 {
@@ -37,5 +47,63 @@ extern int main()
     expect_error("a tuple value that is not a literal requires an exact tuple type") {
         TupleMismatchFn fn = tupleMismatchTarget;
         tupleMismatchGeneric(fn);
+    }
+
+    expect_error("cannot cast an aggregate value") {
+        (i64, int) value = tupleMismatchIdentity((3, 4));
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        function<int(int)> fn = tupleMismatchScalarTarget;
+        (int, int) value = (3, 4);
+        fn(value);
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        function<int(int)> fn = tupleMismatchScalarTarget;
+        fn((3, 4));
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        TupleMismatchScalarBox box;
+        (int, int) value = (3, 4);
+        box.fn(value);
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        Lambda<int(int)> fn = tupleMismatchScalarTarget;
+        (int, int) value = (3, 4);
+        fn(value);
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        using ScalarMismatchFn = function<int(int)>;
+        ScalarMismatchFn fn = tupleMismatchScalarTarget;
+        (int, int) value = (3, 4);
+        fn(value);
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        function<int((i64, int))> fn = tupleMismatchTarget;
+        fn(3);
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        function<int(int)> fn = tupleMismatchScalarTarget;
+        function<int(int)>* pp = &fn;
+        (int, int) value = (3, 4);
+        (*pp)(value);
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        TupleMismatchScalarBox* box = new TupleMismatchScalarBox;
+        (int, int) value = (3, 4);
+        box->fn(value);
+        delete box;
+    }
+
+    expect_error("tuple and non-tuple types cannot be mixed") {
+        function<int(int)> fn = tupleMismatchScalarTarget;
+        tupleMismatchScalarGeneric(fn);
     }
 }

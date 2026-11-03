@@ -627,13 +627,16 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
         {
             const CxxAliasPattern* pattern = FindFirstVisibleScoped(cxxAliasPatterns_, base);
             if (pattern == nullptr || pattern->targetBase.empty()) break;
-            // A LAST parameter that the pattern expands (`Seq<I...>`) is a pack: it takes every
-            // remaining use-site argument, possibly none. A pack elsewhere is not spelled here.
-            const bool packParam = !pattern->params.empty()
+            // A trailing pack accepts every remaining use-site argument, even when unused.
+            const bool trailingPack = !pattern->params.empty()
+                && !pattern->paramPackFlags.empty()
+                && pattern->paramPackFlags.back() != 0;
+            // Only an expanded pack contributes arguments to the alias target pattern.
+            const bool packParam = trailingPack
                 && std::ranges::any_of(pattern->args, [&](const std::string& patternArg) {
                        return SpellsPackExpansion(patternArg, pattern->params.back());
                    });
-            const size_t fixedCount = packParam ? pattern->params.size() - 1 : pattern->params.size();
+            const size_t fixedCount = trailingPack ? pattern->params.size() - 1 : pattern->params.size();
             for (size_t i = 0; args.empty() && i < fixedCount; ++i)
             {
                 if (i < pattern->paramPackFlags.size() && pattern->paramPackFlags[i] != 0)
@@ -647,7 +650,7 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
                         "but {} were given", pattern->alias, i + 1, args.size());
                 return false;
             }
-            if (!packParam && args.size() > pattern->params.size())
+            if (!trailingPack && args.size() > pattern->params.size())
             {
                 if (error != nullptr)
                     *error = std::format(
@@ -848,10 +851,13 @@ bool LLVMBackend::IsTypeArgTypeKey(const std::string& key) const
 std::string LLVMBackend::ResolveTypeArgBaseName(const std::string& base) const
 {
         if (base.empty() || currentNamespace_.empty()) return base;
-        if (base.find('.') != std::string::npos) return base;
-        std::string key = FirstVisibleScopedKey(base,
-            [this](const std::string& c) { return IsTypeArgTypeKey(c); },
+        auto isTypeArg = [this](const std::string& c) { return IsTypeArgTypeKey(c); };
+        std::string key = FirstVisibleScopedKey(base, isTypeArg,
             ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+        if (key.empty() && base.find('.') != std::string::npos)
+            key = FirstVisibleScopedKey(base, isTypeArg,
+                ScopedLookupOptions{ .PrefixDottedNames = true,
+                                     .ResolveFirstComponentAlias = false });
         return key.empty() ? base : key;
     }
 

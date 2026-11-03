@@ -14061,6 +14061,23 @@ OaiCopyBox rfldCopyable(OaiCopyWrap* p) { return p->b; }
 int rfldIntField(OaiWrap w)           { return w.b.item->id; }
 Resource* rfldPtrField(OaiWrap w)     { return w.b.item; }
 
+struct McPlain { int value = 17; };
+struct McHolder { McPlain field = default; int scalar = 23; };
+McPlain mcMoveReturn(McHolder* p) { return move p->field; }
+McPlain mcMoveDecl(McHolder* p) { McPlain result = move p->field; return result; }
+McPlain mcMoveAssign(McHolder* p) { McPlain result = default; result = move p->field; return result; }
+McPlain mcTakePlain(McPlain value) { return value; }
+McPlain mcMoveArg(McHolder* p) { return mcTakePlain(move p->field); }
+int mcMoveScalar(McHolder* p) { return move p->scalar; }
+struct McFnHolder { function<int()> fn = default; };
+int mcMoveFnField(McFnHolder* p) { function<int()> fn = move p->fn; return fn(); }
+struct McReceiverHolder
+{
+    McPlain field = default;
+    McPlain takeExplicit() { return move this.field; }
+    McPlain takeImplicit() { return move field; }
+};
+
 string rfldStrLocal()                 { OaiSBox b; b.s = "ab" + "cd"; return b.s; }
 string rfldStrMoveParam(move OaiSBox b) { return b.s; }
 string rfldStrNested()                { OaiSWrap w; w.b.s = "ef" + "gh"; return w.b.s; }
@@ -14272,6 +14289,48 @@ int testReturnOfOwningField()
     }
     passed += Test("rfld_accept_freed_once", dtorCount, 1);
 
+    // A non-owning value field is copied by `move` through a borrowed pointer in every context.
+    {
+        McHolder holder = default;
+        holder.field.value = 61;
+        McPlain returned = mcMoveReturn(&holder);
+        passed += Test("mc_move_return_value", returned.value, 61);
+        passed += Test("mc_move_return_source_live", holder.field.value, 61);
+
+        holder.field.value = 62;
+        McPlain declared = mcMoveDecl(&holder);
+        passed += Test("mc_move_decl_value", declared.value, 62);
+        passed += Test("mc_move_decl_source_live", holder.field.value, 62);
+
+        holder.field.value = 63;
+        McPlain assigned = mcMoveAssign(&holder);
+        passed += Test("mc_move_assign_value", assigned.value, 63);
+        passed += Test("mc_move_assign_source_live", holder.field.value, 63);
+
+        holder.field.value = 64;
+        McPlain argument = mcMoveArg(&holder);
+        passed += Test("mc_move_arg_value", argument.value, 64);
+        passed += Test("mc_move_arg_source_live", holder.field.value, 64);
+
+        holder.scalar = 65;
+        passed += Test("mc_move_scalar_value", mcMoveScalar(&holder), 65);
+        passed += Test("mc_move_scalar_source_live", holder.scalar, 65);
+
+        McFnHolder fnHolder = default;
+        fnHolder.fn = () => { return 66; };
+        passed += Test("mc_move_function_field_result", mcMoveFnField(&fnHolder), 66);
+        passed += Test("mc_move_function_field_source_live", fnHolder.fn(), 66);
+
+        McReceiverHolder receiver = default;
+        receiver.field.value = 6;
+        McPlain explicitReceiver = receiver.takeExplicit();
+        passed += Test("mc_move_receiver_explicit_value", explicitReceiver.value, 6);
+        passed += Test("mc_move_receiver_explicit_source_live", receiver.field.value, 6);
+        receiver.field.value = 7;
+        McPlain implicitReceiver = receiver.takeImplicit();
+        passed += Test("mc_move_receiver_implicit_value", implicitReceiver.value, 7);
+        passed += Test("mc_move_receiver_implicit_source_live", receiver.field.value, 7);
+    }
     // 7. The `string` FIELD sibling. Every leg below returned the EMPTY string before the fix
     // (rc 0), because the frame's destructor freed the buffer the caller was handed. The value
     // leg is therefore the discriminator; there is no abort to notice.
@@ -18041,7 +18100,7 @@ extern int main()
     total += 83;
 
     passed += testReturnOfOwningField();
-    total += 93;
+    total += 109;
     passed += testForInOverFixedArrayElement();
     total += 45;
 

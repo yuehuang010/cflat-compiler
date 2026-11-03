@@ -8529,7 +8529,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 auto* opTemp = compiler->lastCxxRetTemp_;
                 auto* stored = finishStore(derefLoad());
                 if (assignmentResult == nullptr || coalesceResume != nullptr
-                    || namedVar.TypeAndValue.Pointer || destination == nullptr)
+                    || destination == nullptr)
                     return stored;
                 const auto& opResultType = compiler->lastCallReturnType;
                 if (right != nullptr && right->getType()->isPointerTy()
@@ -8569,6 +8569,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && right->getType()->isStructTy() && !opResultType.IsAlias
                     && !opResultType.TypeName.empty()
                     && compiler->IsCxxRecord(opResultType.TypeName))
+                {
+                    *assignmentResult = {};
+                    assignmentResult->TypeAndValue = opResultType;
+                    assignmentResult->TypeAndValue.VariableName.clear();
+                    assignmentResult->Primary = right;
+                    assignmentResult->BaseType = right->getType();
+                    assignmentResult->IsRvalue = true;
+                    return right;
+                }
+                if (right != nullptr && !right->getType()->isPointerTy()
+                    && !right->getType()->isStructTy() && !opResultType.IsAlias)
                 {
                     *assignmentResult = {};
                     assignmentResult->TypeAndValue = opResultType;

@@ -21,3 +21,22 @@ expect_error("generic template overloading is not supported yet") {
     T diffShape<T>(T value) { return value; }
     T diffShape<T>(T value, T other) { return value + other; }
 }
+
+expect_error("generic template overloading is not supported yet: redefinition of 'ptrReturn'") {
+    T* ptrReturn<T>(T value) { return nullptr; }
+    T ptrReturn<T>(T value) { return value; }
+}
+
+expect_error("generic template overloading is not supported yet: redefinition of 'ptrParam'") {
+    T ptrParam<T>(T* value) { return *value; }
+    T ptrParam<T>(T value) { return value; }
+}
+
+expect_error("generic template overloading is not supported yet: redefinition of 'ArrayMember<int>.f'") {
+    struct ArrayMember<T>
+    {
+        U f<U>(T[] value) { return value[0]; }
+        U f<U>(T* value) { return value[0]; }
+    };
+    ArrayMember<int> instance;
+}

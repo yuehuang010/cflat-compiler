@@ -1,6 +1,10 @@
 import cpp "cpp_t42_convref.hpp";
 
 extern int main() {
+    expect_error("cannot cast 'cpi_t42.T800CastSource' to 'cpi_t42.T800CastNoMatch'") {
+        cpi_t42.T800CastNoMatch bad =
+            (cpi_t42.T800CastNoMatch)cpi_t42.t800_cast_mut_source();
+    }
     expect_error("clang: no matching constructor for initialization of 'cpi_t42::T334ArrChar'") {
         int[3] source = {1, 2, 3};
         cpi_t42.T334ArrChar bad = (cpi_t42.T334ArrChar)source;

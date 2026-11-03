@@ -16,6 +16,20 @@ struct T217Inner { mutable int m; int n; };
 struct T217Outer { T217Inner inner; };
 inline const T217Outer t217_outer{{5, 6}};
 
+struct T217ConstCompound
+{
+    int v;
+    mutable int selected;
+    int operator+=(int d) { selected = 1; return v + d + 101; }
+    int operator+=(int d) const { selected = 2; return v + d + 1; }
+};
+struct T217NonConstCompound
+{
+    int v;
+    int operator+=(int d) { return v + d + 101; }
+};
+struct T217CompoundHolder { const T217ConstCompound* mcp; };
+
 struct T335Base { mutable int bm; int bn; };
 struct T335Derived : T335Base { int d; };
 inline const T335Derived t335Derived{{10, 11}, 12};

@@ -71,7 +71,7 @@ bool LLVMBackend::IsKnownTypeName(const std::string& name) const
  * lambda parameter, tuple element, closure signature component) only ever sees this text, so
  * this is where the special form re-enters the type system. Returns false for any other name.
  */
-static bool DecodeSimdSpelling(const std::string& text, std::string& elemOut, uint64_t& lanesOut)
+bool DecodeSimdSpelling(const std::string& text, std::string& elemOut, uint64_t& lanesOut)
 {
     static const std::string kPrefix = "simd<";
     if (!text.starts_with(kPrefix) || text.back() != '>') return false;
@@ -1435,9 +1435,16 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
             }
             return SpellType(*this, type);
         };
-        std::string returnSpelling = component(signature.FuncPtrReturnTypeName,
-            signature.FuncPtrReturnPointer, signature.FuncPtrReturnPointerDepth,
-            signature.FuncPtrReturnConstMask, false);
+        auto nestedFunctionType = [&](const TypeAndValue& nested) {
+            return std::string(nested.IsThinFnPtr() ? "function<" : "Lambda<")
+                + FuncPtrSpellingOf(nested) + ">";
+        };
+        std::string returnSpelling = signature.FuncPtrReturnFunctionType
+                && !signature.FuncPtrReturnPointer
+            ? nestedFunctionType(*signature.FuncPtrReturnFunctionType)
+            : component(signature.FuncPtrReturnTypeName,
+                signature.FuncPtrReturnPointer, signature.FuncPtrReturnPointerDepth,
+                signature.FuncPtrReturnConstMask, false);
         if (signature.FuncPtrReturnOwned) returnSpelling = "move " + returnSpelling;
         std::string s = returnSpelling + "(";
         for (size_t i = 0; i < signature.FuncPtrParams.size(); i++)
@@ -1446,6 +1453,8 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
             const auto& p = signature.FuncPtrParams[i];
             if (!p.AliasSpelling.empty())
                 s += FuncPtrAliasParamSpelling(p);
+            else if (p.FunctionTypeSignature && !p.Pointer)
+                s += nestedFunctionType(*p.FunctionTypeSignature);
             else
                 s += component(p.TypeName, p.Pointer, p.PointerDepth, p.ConstMask, p.IsArrayView);
         }

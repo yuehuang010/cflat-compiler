@@ -199,3 +199,49 @@ inline T454TrivialBox t454_make_trivial_box() { return T454TrivialBox{7}; }
 inline void t454_take_trivial(const T454TrivialBox&) { t454_trivial_chosen = 1; }
 inline void t454_take_trivial(T454TrivialBox&&) { t454_trivial_chosen = 2; }
 }
+
+namespace cpi_t42 {
+struct T800CastSource { int value; };
+struct T800CastTarget {
+    int value;
+    explicit T800CastTarget(T800CastSource& source) : value(source.value + 1) {}
+    explicit T800CastTarget(const T800CastSource& source) : value(source.value + 2) {}
+};
+inline T800CastSource& t800_cast_mut_source() {
+    static T800CastSource source{10};
+    return source;
+}
+inline const T800CastSource& t800_cast_const_source() {
+    static const T800CastSource source{20};
+    return source;
+}
+
+struct T800CastChoice;
+struct T800CastChoiceSource { operator T800CastChoice() const; };
+struct T800CastChoice {
+    int picked;
+    explicit T800CastChoice(const T800CastChoiceSource&) : picked(1) {}
+    T800CastChoice(int value) : picked(value) {}
+};
+inline T800CastChoiceSource::operator T800CastChoice() const {
+    return T800CastChoice(2);
+}
+inline const T800CastChoiceSource& t800_cast_choice_source() {
+    static const T800CastChoiceSource source{};
+    return source;
+}
+
+struct T800CastScalar {
+    int value;
+    explicit T800CastScalar(int source) : value(source + 3) {}
+};
+struct T800CastNoMatch { explicit T800CastNoMatch(double) {} };
+
+inline int t800_cast_born = 0, t800_cast_gone = 0;
+inline void t800_cast_reset() { t800_cast_born = t800_cast_gone = 0; }
+struct T800CastTracked {
+    int value;
+    explicit T800CastTracked(T800CastSource& source) : value(source.value) { ++t800_cast_born; }
+    ~T800CastTracked() { ++t800_cast_gone; }
+};
+}

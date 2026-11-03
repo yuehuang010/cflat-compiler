@@ -2513,9 +2513,11 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 bool frameRootedReferenceFound = false;
                 bool sawReferenceResultCall = false;
                 bool onlyReferenceResultArms = true;
+                const bool sourceIsNullCoalesceJoin =
+                    compiler->FindNullCoalesceJoin(cxxReturnSource) != nullptr;
                 const bool sourceIsJoin = llvm::isa_and_nonnull<llvm::PHINode>(cxxReturnSource)
                     || llvm::isa_and_nonnull<llvm::SelectInst>(cxxReturnSource)
-                    || compiler->FindNullCoalesceJoin(cxxReturnSource) != nullptr;
+                    || sourceIsNullCoalesceJoin;
                 // An argument is frame-rooted directly, or through a nested C++ reference-result
                 // call whose own receiver/arguments are (`local_ref(local_ref(lc))`).
                 std::function<bool(llvm::Value*, unsigned)> argumentRootedInFrame;
@@ -2537,6 +2539,27 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     for (unsigned j = 0; j < inner->arg_size(); ++j)
                         if (argumentRootedInFrame(inner->getArgOperand(j), depth + 1)) return true;
                     return false;
+                };
+                auto argumentComesFromGlobal = [](llvm::Value* arg) {
+                    std::unordered_set<llvm::Value*> seen;
+                    std::function<bool(llvm::Value*)> fromGlobal = [&](llvm::Value* value) {
+                        if (value == nullptr || !value->getType()->isPointerTy()) return false;
+                        value = value->stripPointerCasts();
+                        if (!seen.insert(value).second) return false;
+                        if (llvm::isa<llvm::GlobalValue>(value)) return true;
+                        if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                            return fromGlobal(gep->getPointerOperand());
+                        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                            return fromGlobal(load->getPointerOperand());
+                        if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                            return fromGlobal(select->getTrueValue())
+                                || fromGlobal(select->getFalseValue());
+                        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                            for (llvm::Value* incoming : phi->incoming_values())
+                                if (fromGlobal(incoming)) return true;
+                        return false;
+                    };
+                    return fromGlobal(arg);
                 };
                 std::function<void(llvm::Value*)> rejectFrameRootedReferenceArm;
                 rejectFrameRootedReferenceArm = [&](llvm::Value* value) {
@@ -2586,8 +2609,15 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     for (unsigned i = 0; i < call->arg_size(); ++i)
                     {
                         llvm::Value* arg = call->getArgOperand(i);
-                        if (!argumentRootedInFrame(arg, 0)) continue;
                         const bool isReceiver = sym->IsMethod && i == 0;
+                        const size_t parameterIndex = i;
+                        const bool indirectPointerParameter = !sourceIsNullCoalesceJoin && !isReceiver
+                            && parameterIndex < sym->Parameters.size()
+                            && (sym->Parameters[parameterIndex].IsCxxRefToPointer
+                                || sym->Parameters[parameterIndex].ValuePointerDepth() >= 2);
+                        if (!argumentRootedInFrame(arg, 0)
+                            && !(indirectPointerParameter && argumentComesFromGlobal(arg)))
+                            continue;
                         const std::string role = isReceiver ? "receiver"
                             : std::format("argument #{}", i - (sym->IsMethod ? 1 : 0));
                         LogErrorContext(errCtx, std::format(

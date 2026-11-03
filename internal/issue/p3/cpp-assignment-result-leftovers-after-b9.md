@@ -19,3 +19,6 @@ From the B18 review (2026-09-29; scratch/repro_keep/b18rv/). B18 routes a parent
 ## T102 status (2026-10-10)
 
 Open. Parenthesized ternary/call result and assignment count cases were not changed. The focused converting-constructor assignment was attempted under cpp-assign-operator-route-leftovers.md, but the full interop test exited 140; that item remains open.
+- (uconstop review 1, 2026-11-01, master same) a C++ `int& operator+=` (scalar REFERENCE result) through a pointer: `int r = *p += 1` ->
+  "cannot convert value of type 'IR' to 'int'" (clang 22), `(*p += 1) = 9` -> "cannot store a single scalar value into struct storage"
+  (clang 9); the T& branch in MainListener_Assignment.cpp (~8592) treats every reference result as the destination object.
