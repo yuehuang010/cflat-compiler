@@ -2172,35 +2172,50 @@ uint64_t LLVMBackend::VcpkgDiskCacheKey(const std::string& fileForLsp,
         return h;
     }
 
+namespace {
+struct BuildStampState
+{
+    bool Enabled;
+    std::string Stamp;
+};
+
+const BuildStampState& GetBuildStampState()
+{
+    static const BuildStampState state = []() {
+        const char* token = std::getenv("CFLAT_CACHE_BUILD_STAMP");
+        BuildStampState result{ token == nullptr || std::string_view(token) != "0", "unknown" };
+        std::string exe = PlatformExePath();
+        if (exe.empty()) return result;
+        std::error_code ec;
+        auto size = std::filesystem::file_size(exe, ec);
+        if (ec) return result;
+        auto mtime = std::filesystem::last_write_time(exe, ec);
+        if (ec) return result;
+        const long long ticks = (long long)mtime.time_since_epoch().count();
+        const unsigned long long bytes = (unsigned long long)size;
+        result.Stamp = std::to_string(ticks) + "-" + std::to_string(bytes);
+        if (token && *token && std::string_view(token) != "0" && std::string_view(token) != "1")
+            result.Stamp += "-" + std::string(token);
+        return result;
+    }();
+    return state;
+}
+}
+
 std::string LLVMBackend::CompilerBuildStamp()
 {
-        static const std::string stamp = []() -> std::string {
-            std::string exe = PlatformExePath();
-            if (exe.empty()) return "unknown";
-            std::error_code ec;
-            auto size = std::filesystem::file_size(exe, ec);
-            if (ec) return "unknown";
-            auto mtime = std::filesystem::last_write_time(exe, ec);
-            if (ec) return "unknown";
-            long long ticks = (long long)mtime.time_since_epoch().count();
-            unsigned long long bytes = (unsigned long long)size;
-            std::string out = std::to_string(ticks) + "-" + std::to_string(bytes);
-            // A token value (e.g. a commit id) joins the stamp so a gate can force entries per commit.
-            const char* token = std::getenv("CFLAT_CACHE_BUILD_STAMP");
-            if (token && *token && std::string_view(token) != "0" && std::string_view(token) != "1")
-                out += "-" + std::string(token);
-            return out;
-        }();
-        return stamp;
+        return GetBuildStampState().Stamp;
+}
+
+std::string LLVMBackend::EffectiveBuildStamp()
+{
+        const auto& state = GetBuildStampState();
+        return state.Enabled ? state.Stamp : std::string{};
     }
 
 bool LLVMBackend::CacheBuildStampEnabled()
 {
-        static const bool enabled = []() {
-            const char* value = std::getenv("CFLAT_CACHE_BUILD_STAMP");
-            return value == nullptr || std::string_view(value) != "0";
-        }();
-        return enabled;
+        return GetBuildStampState().Enabled;
     }
 
 // Removes sibling cheaders/v<M> (M != current) directories whose newest mtime, over the directory
@@ -2612,6 +2627,8 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         if (e.resultBorrowsBraceList) j["rbl"] = true;
         if (!e.braceListElementSpellings.empty()) j["blel"] = e.braceListElementSpellings;
         if (!e.calleeIdentity.empty()) j["callee"] = e.calleeIdentity;
+        if (e.ctorPick != cflat_cinterop::CtorPick::Unknown)
+            j["ctor_pick"] = static_cast<int>(e.ctorPick);
         if (!e.paramBindKinds.empty()) j["pbind"] = e.paramBindKinds;
         if (!e.conditionalArgumentKinds.empty()) j["pcond"] = e.conditionalArgumentKinds;
         if (!e.closureKeptParams.empty()) j["pckeep"] = e.closureKeptParams;
@@ -2682,6 +2699,7 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         e.resultBorrowsBraceList = j.value("rbl", false);
         if (j.contains("blel")) e.braceListElementSpellings = j["blel"].to_string_vector();
         e.calleeIdentity = j.value("callee", std::string());
+        e.ctorPick = static_cast<cflat_cinterop::CtorPick>(j.value("ctor_pick", 0));
         e.paramBindKinds = j.value("pbind", std::string());
         e.conditionalArgumentKinds = j.value("pcond", std::string());
         e.closureKeptParams = j.value("pckeep", std::string());

@@ -497,6 +497,7 @@ llvm::Value* MainListener::ComputeAggregateFieldDefault(
     auto* braceList = FieldDefaultBraceList(typeValue);
     if (braceList != nullptr || FieldHasEmptyCxxBraceInitializer(typeValue))
     {
+        // Clear stale file-scope state so this body's stores and calls become instructions.
         GlobalScopeGuard defaultCtorScope(global_scope);
         rvalue = ParseFieldDefaultBraceInitializer(structName, typeValue, braceList);
     }
@@ -515,6 +516,7 @@ llvm::Value* MainListener::ComputeAggregateFieldDefault(
         }
         else if (initializer->Default() != nullptr)
         {
+            // This default is generated for the aggregate body, not as a file-scope initializer.
             GlobalScopeGuard defaultCtorScope(global_scope);
             rvalue = GenerateDefaultValue(typeValue);
         }
@@ -531,6 +533,7 @@ llvm::Value* MainListener::ComputeAggregateFieldDefault(
         && (compiler->CxxElementNeedsDefaultConstruction(typeValue.TypeName)
             || compiler->HasNonPublicCxxDefaultCtor(typeValue.TypeName)))
     {
+        // Defer missing-ctor errors until a caller actually default-constructs this type.
         std::string ctorError;
         compiler->TryBindCxxImplicitDefaultCtor(typeValue.TypeName, ctorError);
         if (ctorError.empty()
@@ -562,6 +565,7 @@ llvm::Value* MainListener::ResolveAggregateFieldValue(
         if (destType->isArrayTy())
             rvalue = GenerateDefaultValue(typeValue);
         else if (compiler->GetFunction(fieldTypeName))
+            // forceRoot is an exact-key lookup; a namespace walk could select a sibling type's ctor.
             rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
         else
             rvalue = llvm::Constant::getNullValue(destType);
@@ -577,6 +581,7 @@ llvm::Value* MainListener::ResolveAggregateFieldValue(
         {
             std::string fieldTypeName = typeValue.TypeName;
             if (compiler->GetFunction(fieldTypeName))
+                // forceRoot is an exact-key lookup; a namespace walk could select a sibling type's ctor.
                 rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
             else
                 rvalue = llvm::Constant::getNullValue(destType);

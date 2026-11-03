@@ -631,11 +631,11 @@ namespace cflat_cinterop
 
         // Report the constructor selected by Clang for a same-class copy/move wrapper: exactly
         // (dst, source) with dst pointing at the source's class. Other wrappers keep their identity.
-        std::string WrapperCopyMoveConstructorPick(const FunctionDecl* fd)
+        CtorPick WrapperCopyMoveConstructorPick(const FunctionDecl* fd)
         {
             if (fd == nullptr || fd->getBody() == nullptr || fd->getNumParams() != 2
                 || !fd->getNameAsString().starts_with("__cflat_ctor_"))
-                return {};
+                return CtorPick::Unknown;
             QualType sourceType = fd->getParamDecl(1)->getType();
             if (const auto* reference = sourceType->getAs<ReferenceType>())
                 sourceType = reference->getPointeeType();
@@ -686,9 +686,9 @@ namespace cflat_cinterop
                 }
             } visitor{ fd->getParamDecl(1), sourceRecord };
             visitor.TraverseStmt(fd->getBody());
-            if (visitor.selected == nullptr) return {};
+            if (visitor.selected == nullptr) return CtorPick::Unknown;
             return visitor.selected->isCopyOrMoveConstructor()
-                ? "__cflat_ctor_pick_copy_move" : "__cflat_ctor_pick_other";
+                ? CtorPick::CopyOrMove : CtorPick::Other;
         }
 
         /*
@@ -1955,7 +1955,6 @@ namespace cflat_cinterop
             }
             const FunctionDecl* body = nullptr;
             if (!helper->hasBody(body) || body == nullptr) return "initializer has no body";
-            std::string refusal;
             unsigned checked = 0;
             struct Calls : RecursiveASTVisitor<Calls>
             {
@@ -1992,7 +1991,7 @@ namespace cflat_cinterop
                     return "the re-read default argument binds a different expression";
                 ++checked;
             }
-            return checked == 0 ? "the initializer re-reads no default" : refusal;
+            return checked == 0 ? "the initializer re-reads no default" : std::string{};
         }
 
         // The symbol CodeGen gives GD: its mangled name, or the plain name for C linkage.
@@ -3423,8 +3422,7 @@ namespace cflat_cinterop
                     sig.paramTemporaryTypes = WrapperConvertedTemporaryTypes(ctx, fd);
                     WrapperLiteralPointerTemporaries(ctx, fd, sig.paramTemporaryTypes,
                                                      sig.calleeIdentity);
-                    if (std::string pick = WrapperCopyMoveConstructorPick(fd); !pick.empty())
-                        sig.calleeIdentity = std::move(pick);
+                    sig.ctorPick = WrapperCopyMoveConstructorPick(fd);
                     sig.resultBorrowsBraceList = WrapperResultBorrowsBraceList(
                         ctx, fd, sig.braceListElementTypes);
                     sig.paramBindKinds = WrapperParameterBindKinds(fd);

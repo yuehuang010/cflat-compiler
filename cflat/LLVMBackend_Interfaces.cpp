@@ -2199,13 +2199,13 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
         // by-value `alias` param rides a reference ABI has no function-pointer spelling.
         if (auto* fnVal = llvm::dyn_cast<llvm::Function>(val))
             if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
-                RejectExternMoveCountFuncPtrBind(
-                    returnNV.CallerName.empty() ? fnSym->UniqueName : returnNV.CallerName,
-                    *fnSym, &retTV);
-        if (auto* fnVal = llvm::dyn_cast<llvm::Function>(val))
-            if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
+            {
+                const std::string& functionName = returnNV.CallerName.empty()
+                    ? fnSym->UniqueName : returnNV.CallerName;
+                RejectExternMoveCountFuncPtrBind(functionName, *fnSym, &retTV);
                 RejectAliasParamFuncPtrBind(
-                    returnNV.CallerName.empty() ? fnSym->UniqueName : returnNV.CallerName, *fnSym);
+                    functionName, *fnSym);
+            }
         if (retTV.IsThinFnPtr())
         {
             if (auto* fn = llvm::dyn_cast<llvm::Function>(val)) return MakeThinFnPtrValue(fn, retTV);

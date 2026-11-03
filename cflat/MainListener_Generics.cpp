@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include <llvm/Support/SaveAndRestore.h>
 
 namespace {
 // The drain body has early 'continue's, so the previous origin is restored by a scope guard.
@@ -1146,7 +1147,7 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         {
             deducedParameterTypes->clear();
             deducedParameterTypes->reserve(paramDecls.size());
-            const auto savedSubstitutions = activeTypeSubstitutions;
+            llvm::SaveAndRestore savedSubstitutions(activeTypeSubstitutions);
             for (const auto& tp : typeParams)
                 activeTypeSubstitutions.Bind(tp, inferred.at(tp));
             for (auto* declaration : paramDecls)
@@ -1156,7 +1157,6 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 deducedParameterTypes->push_back(
                     SpellFunctionParameterValueType(*compilerLLVM, parameterType));
             }
-            activeTypeSubstitutions = savedSubstitutions;
         }
         if (!instantiate) return {};
         return InstantiateGenericFunction(funcName, typeArgs);

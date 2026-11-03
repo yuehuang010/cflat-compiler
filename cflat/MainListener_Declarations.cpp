@@ -1,5 +1,6 @@
 #include "MainListener.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 LLVMBackend* MainListener::Compiler(antlr4::ParserRuleContext* ctx) {
         if (ctx)
@@ -5050,22 +5051,16 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     signatureNames.insert(ts->genericIdentifier()->Identifier()->getText());
         struct TemplateSignatureScope
         {
-            MainListener* self;
-            bool on;
-            std::unordered_set<std::string> savedNames;
-            TemplateSignatureScope(MainListener* s, bool active, std::unordered_set<std::string> names)
-                : self(active ? s : nullptr), on(active)
+            std::optional<llvm::SaveAndRestore<int>> savedDepth;
+            std::optional<llvm::SaveAndRestore<std::unordered_set<std::string>>> savedNames;
+            TemplateSignatureScope(MainListener* self, bool active,
+                    std::unordered_set<std::string> names)
             {
-                if (!on) return;
+                if (!active) return;
+                savedDepth.emplace(self->genericTemplateSignatureDepth_);
                 ++self->genericTemplateSignatureDepth_;
-                savedNames = std::move(self->genericTemplateSignatureNames_);
+                savedNames.emplace(self->genericTemplateSignatureNames_);
                 self->genericTemplateSignatureNames_ = std::move(names);
-            }
-            ~TemplateSignatureScope()
-            {
-                if (!on) return;
-                --self->genericTemplateSignatureDepth_;
-                self->genericTemplateSignatureNames_ = std::move(savedNames);
             }
         } templateSignatureScope(this, templateSignature, std::move(signatureNames));
         auto returnType = this->getFunctionReturnType(func);

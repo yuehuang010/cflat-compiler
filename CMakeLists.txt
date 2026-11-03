@@ -161,7 +161,14 @@ set(CFLAT_SOURCES
   ${CFLAT_DIR}/LLVMBackend.cpp
   ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp
   ${CFLAT_DIR}/LLVMBackend_CodegenHelpers.cpp
-  ${CFLAT_DIR}/LLVMBackend_CInterop.cpp
+  ${CFLAT_DIR}/LLVMBackend_CTypeMapping.cpp
+  ${CFLAT_DIR}/LLVMBackend_CSignatures.cpp
+  ${CFLAT_DIR}/LLVMBackend_CHeaderDemand.cpp
+  ${CFLAT_DIR}/LLVMBackend_CxxRequestFunctions.cpp
+  ${CFLAT_DIR}/LLVMBackend_CxxRequestTypes.cpp
+  ${CFLAT_DIR}/LLVMBackend_CRecords.cpp
+  ${CFLAT_DIR}/LLVMBackend_CxxLowering.cpp
+  ${CFLAT_DIR}/CxxSpelling.cpp
   ${CFLAT_DIR}/CxxIncrementalGroup.cpp
   ${CFLAT_DIR}/AppResources.cpp
   ${CFLAT_DIR}/LLVMBackend_EmitAndLink.cpp
@@ -177,10 +184,16 @@ set(CFLAT_SOURCES
   ${CFLAT_DIR}/MainListener_Declarations.cpp
   ${CFLAT_DIR}/MainListener_Generics.cpp
   ${CFLAT_DIR}/MainListener_Statements.cpp
-  ${CFLAT_DIR}/MainListener_Expressions.cpp
+  ${CFLAT_DIR}/MainListener_Assignment.cpp
+  ${CFLAT_DIR}/MainListener_Conditional.cpp
+  ${CFLAT_DIR}/MainListener_BinaryOperators.cpp
+  ${CFLAT_DIR}/MainListener_UnaryCast.cpp
+  ${CFLAT_DIR}/MainListener_Initializers.cpp
+  ${CFLAT_DIR}/MainListener_NewDeleteMove.cpp
   ${CFLAT_DIR}/MainListener_PostfixExpression.cpp
   ${CFLAT_DIR}/MainListener_Aggregates.cpp
   ${CFLAT_DIR}/MainListener_Utilities.cpp
+  ${CFLAT_DIR}/MainListener_Support.cpp
   ${CFLAT_DIR}/CClangExtract.cpp
   ${CFLAT_DIR}/JsonRpcLoop.cpp
   ${CFLAT_DIR}/LspServer.cpp
@@ -299,7 +312,14 @@ if(MSVC)
     ${CFLAT_DIR}/LLVMBackend.cpp
     ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp
     ${CFLAT_DIR}/LLVMBackend_CodegenHelpers.cpp
-    ${CFLAT_DIR}/LLVMBackend_CInterop.cpp
+    ${CFLAT_DIR}/LLVMBackend_CTypeMapping.cpp
+    ${CFLAT_DIR}/LLVMBackend_CSignatures.cpp
+    ${CFLAT_DIR}/LLVMBackend_CHeaderDemand.cpp
+    ${CFLAT_DIR}/LLVMBackend_CxxRequestFunctions.cpp
+    ${CFLAT_DIR}/LLVMBackend_CxxRequestTypes.cpp
+    ${CFLAT_DIR}/LLVMBackend_CRecords.cpp
+    ${CFLAT_DIR}/LLVMBackend_CxxLowering.cpp
+    ${CFLAT_DIR}/CxxSpelling.cpp
     ${CFLAT_DIR}/LLVMBackend_EmitAndLink.cpp
     ${CFLAT_DIR}/LLVMBackend_Interfaces.cpp
     ${CFLAT_DIR}/LLVMBackend_WinRT.cpp
@@ -313,10 +333,16 @@ if(MSVC)
     ${CFLAT_DIR}/MainListener_Declarations.cpp
     ${CFLAT_DIR}/MainListener_Generics.cpp
     ${CFLAT_DIR}/MainListener_Statements.cpp
-    ${CFLAT_DIR}/MainListener_Expressions.cpp
+    ${CFLAT_DIR}/MainListener_Assignment.cpp
+    ${CFLAT_DIR}/MainListener_Conditional.cpp
+    ${CFLAT_DIR}/MainListener_BinaryOperators.cpp
+    ${CFLAT_DIR}/MainListener_UnaryCast.cpp
+    ${CFLAT_DIR}/MainListener_Initializers.cpp
+    ${CFLAT_DIR}/MainListener_NewDeleteMove.cpp
     ${CFLAT_DIR}/MainListener_PostfixExpression.cpp
     ${CFLAT_DIR}/MainListener_Aggregates.cpp
     ${CFLAT_DIR}/MainListener_Utilities.cpp
+    ${CFLAT_DIR}/MainListener_Support.cpp
     ${CFLAT_DIR}/CClangExtract.cpp
     ${CFLAT_DIR}/CxxIncrementalGroup.cpp
     ${ANTLR_GEN_DIR}/CFlatParser.cpp

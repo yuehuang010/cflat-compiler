@@ -43,43 +43,12 @@
 #include "TypeMangling.h"
 #include "LspSymbolIndex.h"
 
-static std::string FlexibleArrayMemberLengthError(const LLVMBackend::TypeAndValue& type)
-{
-    if (!type.IsFlexibleArrayMember) return {};
-    const std::string member = type.VariableName.empty() ? "<unknown>" : type.VariableName;
-    return std::format("flexible array member '{}' has no known length", member);
-}
+std::string FlexibleArrayMemberLengthError(const LLVMBackend::TypeAndValue& type);
 
 // Every postfix expression that IS the operand of `sizeof` / `&`: the outer one and each
 // parenthesised layer down to the member expression. Empty when the operand is anything more
 // than that, e.g. `*m` or `m + 1`.
-static std::vector<antlr4::ParserRuleContext*> DirectOperandPostfixes(antlr4::tree::ParseTree* node)
-{
-    std::vector<antlr4::ParserRuleContext*> layers;
-    while (node != nullptr)
-    {
-        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-        {
-            layers.push_back(postfix);
-            auto* primary = postfix->primaryExpression();
-            if (postfix->children.size() == 1 && primary != nullptr && primary->children.size() == 3
-                && primary->expression() != nullptr && primary->children[0]->getText() == "(")
-            {
-                node = primary->expression();
-                continue;
-            }
-            return layers;
-        }
-        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
-        {
-            node = unary->postfixExpression();
-            continue;
-        }
-        if (node->children.size() != 1) return layers;
-        node = node->children[0];
-    }
-    return layers;
-}
+std::vector<antlr4::ParserRuleContext*> DirectOperandPostfixes(antlr4::tree::ParseTree* node);
 
 // Installs the keep list for ONE operand and restores the enclosing list afterwards (also on a
 // LogError throw), so a nested `*p` / `&x` / assignment cannot wipe `sizeof((*p).data)`'s list.
@@ -98,245 +67,41 @@ struct FlexibleArrayKeepScope
 // Parentheses around a whole initializer add nothing (`C x = (f(a));` is `C x = f(a);`): peel
 // `( expression )` primaries reached through single-child rules only. A call with a suffix, or any
 // operator above the parens, stops the peel. Shape only, never the text of the expression (T272).
-inline CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
-    CFlatParser::AssignmentExpressionContext* assign)
-{
-    while (assign != nullptr)
-    {
-        antlr4::tree::ParseTree* node = assign;
-        while (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node))
-        {
-            if (rule->children.size() != 1) break;
-            node = rule->children[0];
-        }
-        auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-        if (primary == nullptr || primary->children.size() != 3 || primary->expression() == nullptr
-            || primary->NameOf() != nullptr || primary->TypeOf() != nullptr)
-            break;
-        auto* inner = primary->expression()->assignmentExpression();
-        if (inner == nullptr) break;
-        assign = inner;
-    }
-    return assign;
-}
+CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
+    CFlatParser::AssignmentExpressionContext* assign);
 
-inline CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
-    antlr4::tree::ParseTree* node)
-{
-    if (node == nullptr) return nullptr;
-    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node)) return postfix;
-    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
-    if (rule == nullptr) return nullptr;
-    if (rule->children.size() == 1) return SolePostfixExpressionShape(rule->children[0]);
-    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(rule);
-        primary != nullptr && primary->expression() != nullptr)
-        return SolePostfixExpressionShape(primary->expression());
-    return nullptr;
-}
+CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
+    antlr4::tree::ParseTree* node);
 
-inline std::string EnumMemberSourceSpelling(antlr4::tree::ParseTree* node)
-{
-    while (node != nullptr)
-    {
-        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-        {
-            auto* primary = postfix->primaryExpression();
-            size_t childCount = postfix->children.size();
-            while (childCount > 1 && (postfix->children[childCount - 1]->getText() == "++"
-                                      || postfix->children[childCount - 1]->getText() == "--"))
-                --childCount;
-            if (childCount == 1 && primary != nullptr && primary->expression() != nullptr)
-            {
-                node = primary->expression();
-                continue;
-            }
-            std::string spelling;
-            for (size_t i = 0; i < childCount; ++i) spelling += postfix->children[i]->getText();
-            return spelling;
-        }
-        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-            primary != nullptr && primary->expression() != nullptr)
-        {
-            node = primary->expression();
-            continue;
-        }
-        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
-        if (rule == nullptr) return node->getText();
-        if (rule->children.size() != 1) return {};
-        node = rule->children[0];
-    }
-    return {};
-}
+std::string EnumMemberSourceSpelling(antlr4::tree::ParseTree* node);
 
-inline std::string EnumMemberDiagnosticName(const LLVMBackend::NamedVariable& member,
+std::string EnumMemberDiagnosticName(const LLVMBackend::NamedVariable& member,
                                             antlr4::tree::ParseTree* expression,
-                                            const llvm::GlobalVariable* foundMember = nullptr)
-{
-    const std::string sourceName = EnumMemberSourceSpelling(expression);
-    if (!sourceName.empty()) return sourceName;
-    return foundMember != nullptr ? foundMember->getName().str() : member.TypeAndValue.VariableName;
-}
+                                            const llvm::GlobalVariable* foundMember = nullptr);
 
-inline antlr4::tree::TerminalNode* BareIdentifierInExpression(
-    antlr4::tree::ParseTree* expression)
-{
-    auto* postfix = SolePostfixExpressionShape(expression);
-    if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
-    auto* primary = postfix->primaryExpression();
-    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-    return generic != nullptr ? generic->Identifier() : nullptr;
-}
+antlr4::tree::TerminalNode* BareIdentifierInExpression(
+    antlr4::tree::ParseTree* expression);
 
-inline antlr4::tree::TerminalNode* GenericFunctionValueIdentifier(
-    antlr4::tree::ParseTree* expression, bool allowAddressOf = true)
-{
-    if (auto* identifier = dynamic_cast<antlr4::tree::TerminalNode*>(expression))
-    {
-        auto bareArmIdentifier = [](antlr4::tree::ParseTree* arm)
-            -> antlr4::tree::TerminalNode* {
-            auto* postfix = SolePostfixExpressionShape(arm);
-            if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
-            auto* primary = postfix->primaryExpression();
-            auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-            return generic != nullptr && generic->genericTypeParameters() == nullptr
-                ? generic->Identifier() : nullptr;
-        };
-        for (auto* ancestor = identifier->parent; ancestor != nullptr;
-             ancestor = ancestor->parent)
-            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(ancestor))
-            {
-                if ((conditional->expression() != nullptr
-                        && bareArmIdentifier(conditional->expression()) == identifier)
-                    || (conditional->conditionalExpression() != nullptr
-                        && bareArmIdentifier(conditional->conditionalExpression()) == identifier))
-                    return identifier;
-            }
-
-        auto* node = identifier->parent;
-        while (node != nullptr
-            && dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node) == nullptr)
-            node = node->parent;
-        return node != nullptr && GenericFunctionValueIdentifier(node, allowAddressOf) == identifier
-            ? identifier : nullptr;
-    }
-
-    auto bareIdentifier = [](antlr4::tree::ParseTree* node)
-        -> antlr4::tree::TerminalNode* {
-        auto* postfix = SolePostfixExpressionShape(node);
-        if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
-        auto* primary = postfix->primaryExpression();
-        auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-        return generic != nullptr && generic->genericTypeParameters() == nullptr
-            ? generic->Identifier() : nullptr;
-    };
-    if (auto* identifier = bareIdentifier(expression))
-        return identifier;
-
-    auto* node = expression;
-    while (node != nullptr)
-    {
-        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
-            cast != nullptr && cast->castTypeName() != nullptr && cast->castExpression() != nullptr
-            && cast->castTypeName()->typeSpecifier().empty()
-            && cast->castTypeName()->typeQualifier() == nullptr
-            && cast->castTypeName()->abstractDeclarator() == nullptr)
-        {
-            node = cast->castExpression();
-            continue;
-        }
-        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
-        {
-            node = primary->expression();
-            continue;
-        }
-        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
-        if (rule != nullptr && rule->children.size() == 1)
-        {
-            node = rule->children[0];
-            continue;
-        }
-        break;
-    }
-
-    if (auto* identifier = bareIdentifier(node))
-        return identifier;
-    auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
-    if (!allowAddressOf || unary == nullptr || unary->unaryOperator() == nullptr
-        || unary->unaryOperator()->And() == nullptr || unary->castExpression() == nullptr)
-        return nullptr;
-    return GenericFunctionValueIdentifier(unary->castExpression(), false);
-}
+antlr4::tree::TerminalNode* GenericFunctionValueIdentifier(
+    antlr4::tree::ParseTree* expression, bool allowAddressOf = true);
 
 // Every '(' suffix and parenthesized primary under `node`: a single-call initializer has exactly one.
-inline size_t CountCallParens(antlr4::tree::ParseTree* node)
-{
-    if (node == nullptr) return 0;
-    size_t count = 0;
-    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-        count += postfix->LeftParen().size();
-    else if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-             primary != nullptr && primary->LeftParen() != nullptr)
-        ++count;
-    for (auto* child : node->children) count += CountCallParens(child);
-    return count;
-}
+size_t CountCallParens(antlr4::tree::ParseTree* node);
 
 // A field initializer may build straight into the field slot only when it is ONE call (T272): after
 // peeling redundant parentheses, a postfix chain whose top suffix is the call's `( ... )` and that
 // holds no other call or parenthesis. A conditional or a member access/subscript above the call fails.
-inline bool FieldInitializerIsSingleCall(CFlatParser::AssignmentExpressionContext* expr)
-{
-    if (expr == nullptr) return true;
-    antlr4::tree::ParseTree* node = UnwrapInitializerParens(expr);
-    while (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node))
-    {
-        if (rule->children.size() != 1) break;
-        node = rule->children[0];
-    }
-    auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
-    if (postfix == nullptr || postfix->RightParen().empty()
-        || postfix->children.back() != postfix->RightParen().back())
-        return false;
-    return postfix->LeftParen().size() == 1 && CountCallParens(postfix) == 1;
-}
+bool FieldInitializerIsSingleCall(CFlatParser::AssignmentExpressionContext* expr);
 
 // A zero-length member (`T m[0]`) still undecayed: the one operand `sizeof` measures as 0.
-static bool IsZeroLengthArrayMemberOperand(const LLVMBackend::TypeAndValue& type)
-{
-    return type.IsFlexibleArrayMember && type.IsZeroLengthArrayMember;
-}
+bool IsZeroLengthArrayMemberOperand(const LLVMBackend::TypeAndValue& type);
 
-static bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContext* specs,
-                                        const std::string& name)
-{
-    if (specs == nullptr) return false;
-    for (auto* spec : specs->declarationSpecifier())
-        if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == name)
-            return true;
-    return false;
-}
+bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContext* specs,
+                                        const std::string& name);
 
-static std::string ImportProgramAlias(CFlatParser::ImportDeclarationContext* imp)
-{
-    if (imp == nullptr || imp->As() == nullptr) return {};
-    for (size_t i = 0; i + 1 < imp->children.size(); i++)
-        if (imp->children[i] == imp->As())
-            return imp->children[i + 1]->getText();
-    return {};
-}
+std::string ImportProgramAlias(CFlatParser::ImportDeclarationContext* imp);
 
-static std::string ImportNamespace(CFlatParser::ImportDeclarationContext* imp)
-{
-    if (imp == nullptr || imp->children.size() < 2) return {};
-    std::string first = imp->children[1]->getText();
-    // `cpp` selects C++ binding mode for the named file or import group, whatever its extension.
-    if (first == "program" || first == "package" || first == "framework"
-        || first == "cpp" || first == "package-vcpkg" || first == "package-nuget")
-        return {};
-    auto ids = imp->Identifier();
-    return ids.empty() ? std::string{} : ids.front()->getText();
-}
+std::string ImportNamespace(CFlatParser::ImportDeclarationContext* imp);
 
 template <typename Fn>
 static void ForEachImportClause(CFlatParser::ImportDeclarationContext* imp, Fn&& fn)
@@ -350,53 +115,15 @@ static void ForEachImportClause(CFlatParser::ImportDeclarationContext* imp, Fn&&
     fn(imp->priClause());
 }
 
-static bool ImportClauseHasWord(antlr4::ParserRuleContext* clause, const char* word)
-{
-    return clause != nullptr && !clause->children.empty() && clause->children.front()->getText() == word;
-}
+bool ImportClauseHasWord(antlr4::ParserRuleContext* clause, const char* word);
 
-static std::string ValidateImportSoftKeywords(CFlatParser::ImportDeclarationContext* imp)
-{
-    std::string error;
-    ForEachImportClause(imp, [&](antlr4::ParserRuleContext* clause) {
-        if (!error.empty() || clause == nullptr || clause->children.empty()) return;
-        std::string actual = clause->children.front()->getText();
-        if (actual == "lib" || actual == "framework" || actual == "define"
-            || actual == "cache" || actual == "from" || actual == "pri")
-            return;
-        error = std::format("unknown '{}' in import clause", actual);
-    });
-    return error;
-}
+std::string ValidateImportSoftKeywords(CFlatParser::ImportDeclarationContext* imp);
 
-static std::string ValidateImportLeadingMarker(CFlatParser::ImportDeclarationContext* imp)
-{
-    if (imp == nullptr || imp->children.size() < 2) return "malformed import declaration";
-    std::string first = imp->children[1]->getText();
-    if (!first.empty() && (first.front() == '"' || first.front() == '{')) return {};
-    // `cpp` binds the named file as C++ - the marker, not the extension, selects the mode.
-    if (first == "program" || first == "package" || first == "framework"
-        || first == "cpp" || first == "package-vcpkg" || first == "package-nuget")
-        return {};
-    return std::format("unknown '{}' in import marker", first);
-}
+std::string ValidateImportLeadingMarker(CFlatParser::ImportDeclarationContext* imp);
 
 // Returns true when a function's entire body is a single 'return { ... };' statement,
 // marking it as a return-block function (to be inlined at every call site).
-static bool IsReturnBlockFunction(CFlatParser::FunctionDefinitionContext* func)
-{
-    auto* cs = func->compoundStatement();
-    if (!cs) return false;
-    auto* bil = cs->blockItemList();
-    if (!bil) return false;
-    auto items = bil->blockItem();
-    if (items.size() != 1) return false;
-    auto* stmt = items[0]->statement();
-    if (!stmt) return false;
-    auto* jump = stmt->jumpStatement();
-    if (!jump) return false;
-    return jump->Return() != nullptr && jump->compoundStatement() != nullptr;
-}
+bool IsReturnBlockFunction(CFlatParser::FunctionDefinitionContext* func);
 
 // The grammar nests `arrayDimSpec` and the illegal trailing-'*' `arrayPtrSuffix` under a
 // shared `arrayTypeSuffix` wrapper (so the declaration and cast/sizeof paths cannot drift).
@@ -413,35 +140,12 @@ static CFlatParser::ArrayPtrSuffixContext* ArrayPtrOf(Ctx* c)
     return c->arrayTypeSuffix() ? c->arrayTypeSuffix()->arrayPtrSuffix() : nullptr;
 }
 
-inline std::string FixedArrayPointerTypeMessage(const std::string& typeName)
-{
-    return std::format(
-        "pointer to fixed array '{}[N]*' is not a valid type; pass '{}*' (a fixed array decays to a pointer to its first element).",
-        typeName, typeName);
-}
+std::string FixedArrayPointerTypeMessage(const std::string& typeName);
 
 // simd needs its own wording: the generic message steers to 'T*', but a pointer to a simd
 // vector is not a supported type either, so decaying is not the fix here.
-inline std::string SimdPointerTypeMessage(const std::string& spelling, bool fixedArray)
-{
-    return std::format(
-        "{} is not a valid type: a pointer to a simd vector is not supported. Pass the fixed "
-        "array '{}[N]' by value, or use '{}.load(array, index)' / '{}.store(vector, array, "
-        "index)' to move between memory and vectors.",
-        fixedArray ? std::format("pointer to fixed array '{}[N]*'", spelling)
-                   : std::format("'{}*'", spelling),
-        spelling, spelling, spelling);
-}
-static std::string JoinTypeSpecifierWords(const std::vector<std::string>& words)
-{
-    std::string spelling;
-    for (const auto& word : words)
-    {
-        if (!spelling.empty()) spelling += " ";
-        spelling += word;
-    }
-    return spelling;
-}
+std::string SimdPointerTypeMessage(const std::string& spelling, bool fixedArray);
+std::string JoinTypeSpecifierWords(const std::vector<std::string>& words);
 
 enum class PrimitiveTypeErrorKind
 {
@@ -458,322 +162,90 @@ struct PrimitiveTypeError
     std::string suggestion;
 };
 
-static bool HasPrimitiveTypeError(const PrimitiveTypeError& error)
-{
-    return error.kind != PrimitiveTypeErrorKind::None;
-}
+bool HasPrimitiveTypeError(const PrimitiveTypeError& error);
 
-static bool HasLongDoubleTypeArgument(const std::vector<std::string>& typeArgs)
-{
-    for (std::string arg : typeArgs)
-    {
-        while (!arg.empty() && (arg.back() == '*' || arg.back() == '[' || arg.back() == ']'))
-            arg.pop_back();
-        if (arg == "longdouble") return true;
-    }
-    return false;
-}
+bool HasLongDoubleTypeArgument(const std::vector<std::string>& typeArgs);
 
-static std::string LocalizePrimitiveTypeError(const LLVMBackend* compiler,
-                                              const PrimitiveTypeError& error)
-{
-    if (compiler == nullptr) return {};
-    switch (error.kind)
-    {
-    case PrimitiveTypeErrorKind::ExpectedType:
-        return compiler->LocalizeMessage("expected a type", {});
-    case PrimitiveTypeErrorKind::InvalidSpelling:
-        return compiler->LocalizeMessage("invalid type spelling '{}'", { error.spelling });
-    case PrimitiveTypeErrorKind::InvalidSpellingSuggestion:
-        return compiler->LocalizeMessage("invalid type spelling '{}': use '{}'",
-            { error.spelling, error.suggestion });
-    case PrimitiveTypeErrorKind::None:
-        break;
-    }
-    return {};
-}
+std::string LocalizePrimitiveTypeError(const LLVMBackend* compiler,
+                                              const PrimitiveTypeError& error);
 
 // Canonicalize one complete C/C++ primitive spelling. A single unknown word is left alone so
 // user-defined and generic names continue through the ordinary name-resolution path.
-static bool CanonicalizePrimitiveTypeWords(const std::vector<std::string>& words,
-                                           std::string& canonical, PrimitiveTypeError& error)
-{
-    static const std::unordered_map<std::string, std::string> aliases = {
-        { "signed char", "i8" }, { "unsigned char", "u8" },
-        { "short int", "short" }, { "signed short", "short" },
-        { "signed short int", "short" }, { "unsigned short", "u16" },
-        { "unsigned short int", "u16" }, { "signed", "int" },
-        { "signed int", "int" }, { "unsigned", "u32" },
-        { "unsigned int", "u32" }, { "long int", "long" },
-        { "signed long", "long" }, { "signed long int", "long" },
-        { "unsigned long", "ulong" }, { "unsigned long int", "ulong" },
-        { "uint", "u32" }, { "longlong", "i64" }, { "ulonglong", "u64" },
-        { "long long", "i64" }, { "long long int", "i64" },
-        { "signed long long", "i64" }, { "signed long long int", "i64" },
-        { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },
-        { "long double", "longdouble" },
-        { "char8_t", "c8" }, { "char16_t", "c16" },
-        { "char32_t", "c32" }, { "wchar_t", "wchar" },
-    };
-    if (words.empty())
-    {
-        error.kind = PrimitiveTypeErrorKind::ExpectedType;
-        return false;
-    }
-    const std::string spelling = JoinTypeSpecifierWords(words);
-    if (auto it = aliases.find(spelling); it != aliases.end())
-    {
-        canonical = it->second;
-        return true;
-    }
-    if (words.size() == 1)
-    {
-        canonical = words[0];
-        return true;
-    }
-
-    // A C sign modifier on a CFlat fixed-width word: name the word that has that signedness.
-    static const std::unordered_map<std::string, std::string> signedWords = {
-        { "i8", "i8" }, { "u8", "i8" }, { "i16", "i16" }, { "u16", "i16" },
-        { "i32", "i32" }, { "u32", "i32" }, { "i64", "i64" }, { "u64", "i64" },
-        { "i128", "i128" }, { "u128", "i128" },
-    };
-    static const std::unordered_map<std::string, std::string> unsignedWords = {
-        { "i8", "u8" }, { "u8", "u8" }, { "i16", "u16" }, { "u16", "u16" },
-        { "i32", "u32" }, { "u32", "u32" }, { "i64", "u64" }, { "u64", "u64" },
-        { "i128", "u128" }, { "u128", "u128" },
-    };
-    if (words.size() == 2 && (words[0] == "signed" || words[0] == "unsigned"))
-    {
-        const auto& table = words[0] == "signed" ? signedWords : unsignedWords;
-        if (auto it = table.find(words[1]); it != table.end())
-        {
-            error = { PrimitiveTypeErrorKind::InvalidSpellingSuggestion, spelling, it->second };
-            return false;
-        }
-    }
-    error = { PrimitiveTypeErrorKind::InvalidSpelling, spelling, {} };
-    return false;
-}
+bool CanonicalizePrimitiveTypeWords(const std::vector<std::string>& words,
+                                           std::string& canonical, PrimitiveTypeError& error);
 
 // A soft keyword parsed as a typeSpecifier that qualifies the declaration rather than naming
 // part of its type.
-static bool IsSoftKeywordTypeSpecifier(const std::string& text)
-{
-    return text == "move" || text == "adopt" || text == "alias" || text == "bond"
-        || text == "unique" || text == "manifest" || text == "application"
-        || text == "virtual" || text == "override";
-}
+bool IsSoftKeywordTypeSpecifier(const std::string& text);
 
-static std::vector<std::string> CollectDeclarationTypeSpecifierWords(
-    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs)
-{
-    std::vector<std::string> words;
-    for (auto* declSpec : declSpecs)
-    {
-        auto* typeSpec = declSpec->typeSpecifier();
-        if (typeSpec == nullptr) continue;
-        const std::string text = typeSpec->getText();
-        if (IsSoftKeywordTypeSpecifier(text)) continue;
-        words.push_back(text);
-    }
-    return words;
-}
+std::vector<std::string> CollectDeclarationTypeSpecifierWords(
+    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs);
 
 // A '?', '*' or '[N]' written on a NON-final word of a multi-word type (`unsigned* int p`). Both
 // passes read the suffix only from the last word, so it would be dropped. Returns the offending
 // specifier and its suffix text, or null when every suffix follows the complete type.
-static CFlatParser::DeclarationSpecifierContext* MisplacedMultiWordTypeSuffix(
+CFlatParser::DeclarationSpecifierContext* MisplacedMultiWordTypeSuffix(
     const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs,
-    std::string& suffixText)
-{
-    std::vector<CFlatParser::DeclarationSpecifierContext*> typeWordSpecs;
-    for (auto* declSpec : declSpecs)
-        if (declSpec->typeSpecifier() != nullptr
-            && !IsSoftKeywordTypeSpecifier(declSpec->typeSpecifier()->getText()))
-            typeWordSpecs.push_back(declSpec);
-    for (size_t i = 0; i + 1 < typeWordSpecs.size(); ++i)
-    {
-        auto* declSpec = typeWordSpecs[i];
-        std::string suffix;
-        if (declSpec->Question() != nullptr) suffix += "?";
-        if (declSpec->pointer() != nullptr) suffix += declSpec->pointer()->getText();
-        if (declSpec->arrayTypeSuffix() != nullptr) suffix += declSpec->arrayTypeSuffix()->getText();
-        if (!suffix.empty())
-        {
-            suffixText = suffix;
-            return declSpec;
-        }
-    }
-    return nullptr;
-}
+    std::string& suffixText);
 
-static CFlatParser::DeclarationSpecifierContext* LastDeclarationTypeSpecifier(
-    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs)
-{
-    for (auto it = declSpecs.rbegin(); it != declSpecs.rend(); ++it)
-        if ((*it)->typeSpecifier() != nullptr)
-            return *it;
-    return nullptr;
-}
+CFlatParser::DeclarationSpecifierContext* LastDeclarationTypeSpecifier(
+    const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs);
 
 // The CFlat word a declaration's type specifiers spell, for diagnostics: `unsigned int` -> `u32`.
 // A spelling that does not canonicalize keeps `fallback`; the type-parsing pass reports it.
-static std::string CanonicalDeclarationTypeName(
+std::string CanonicalDeclarationTypeName(
     const std::vector<CFlatParser::DeclarationSpecifierContext*>& declSpecs,
-    const std::string& fallback)
-{
-    std::string canonical;
-    PrimitiveTypeError error;
-    return CanonicalizePrimitiveTypeWords(CollectDeclarationTypeSpecifierWords(declSpecs), canonical, error)
-        ? canonical : fallback;
-}
+    const std::string& fallback);
 
 // True for non-pointer primitive destinations, excluding function-pointer types.
-static bool IsGenericFunctionScalarDestination(LLVMBackend* compiler,
-                                               LLVMBackend::TypeAndValue destination)
-{
-    if (compiler == nullptr || destination.TypeName.empty() || destination.TypeName == "auto"
-        || destination.Pointer || destination.ElemPointer || destination.PointerDepth > 0
-        || destination.IsArrayView || destination.IsFunctionPointer
-        || !destination.FuncPtrReturnTypeName.empty())
-        return false;
-    destination.TypeName = compiler->ResolveTypeAlias(destination.TypeName);
-    return destination.TypeName != "void" && destination.IsPrimitive();
-}
+bool IsGenericFunctionScalarDestination(LLVMBackend* compiler,
+                                               LLVMBackend::TypeAndValue destination);
 
-static std::string GenericFunctionScalarValueDiagnostic(LLVMBackend* compiler,
-                                                        const std::string& functionName)
-{
-    std::string spelling = SpellFunctionSymbol(*compiler, functionName);
-    if (spelling == functionName)
-        spelling = SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = functionName });
-    return std::format(
-        "'{}' is a function used as a value - did you mean '{}()'? (a bare function name is only valid as a function<T> value)",
-        spelling, spelling);
-}
+std::string GenericFunctionScalarValueDiagnostic(LLVMBackend* compiler,
+                                                        const std::string& functionName);
 
-inline antlr4::tree::TerminalNode* BareGenericFunctionValueIdentifierInExpression(
-    antlr4::tree::ParseTree* expression)
-{
-    auto* postfix = SolePostfixExpressionShape(expression);
-    if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
-    auto* primary = postfix->primaryExpression();
-    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-    if (generic == nullptr || generic->genericTypeParameters() != nullptr) return nullptr;
-    return generic->Identifier();
-}
+antlr4::tree::TerminalNode* BareGenericFunctionValueIdentifierInExpression(
+    antlr4::tree::ParseTree* expression);
 
 // True when `name` resolves as a visible variable in ParseIdentifier lookup order.
-static bool NamesVisibleVariable(LLVMBackend* compiler, const std::string& name)
-{
-    if (compiler->FindVariableScopeDepth(name) != SIZE_MAX
-        || compiler->HasMemberVariable(name)
-        || compiler->GetGlobalVariableNV(name).Storage != nullptr)
-        return true;
-    const std::string nsQualified = compiler->ResolveQualifiedName(name);
-    return nsQualified != name && compiler->GetGlobalVariableNV(nsQualified).Storage != nullptr;
-}
+bool NamesVisibleVariable(LLVMBackend* compiler, const std::string& name);
 
 // The declared type of the variable NamesVisibleVariable finds, looked up in the same order.
 // Call only after NamesVisibleVariable returned true.
-static LLVMBackend::TypeAndValue VisibleVariableType(LLVMBackend* compiler, const std::string& name)
-{
-    if (compiler->FindVariableScopeDepth(name) != SIZE_MAX)
-        return compiler->GetScopedLocalOrArgument(name).TypeAndValue;
-    if (compiler->HasMemberVariable(name))
-        return compiler->GetMemberVariable(name).TypeAndValue;
-    // Same order as ParseIdentifier: an enclosing-namespace variable shadows the global of its name.
-    if (const std::string nsQualified = compiler->ResolveQualifiedName(name);
-        nsQualified != name && compiler->GetGlobalVariableNV(nsQualified).Storage != nullptr)
-        return compiler->GetGlobalVariableNV(nsQualified).TypeAndValue;
-    return compiler->GetGlobalVariableNV(name).TypeAndValue;
-}
+LLVMBackend::TypeAndValue VisibleVariableType(LLVMBackend* compiler, const std::string& name);
 
 // The identifier a typeName spells when it is exactly one unqualified, non-generic name with no
 // declarator (`(c16)`, `sizeof(Foo)`); null for any other shape.
-static antlr4::tree::TerminalNode* BareTypeNameIdentifier(CFlatParser::TypeNameContext* typeName)
-{
-    if (typeName == nullptr || typeName->abstractDeclarator() != nullptr) return nullptr;
-    auto* specCtx = typeName->specifierQualifierList();
-    if (specCtx == nullptr) return nullptr;
-    auto typeSpecs = specCtx->typeSpecifier();
-    if (typeSpecs.size() != 1) return nullptr;
-    auto* gid = typeSpecs[0]->genericIdentifier();
-    if (gid == nullptr || gid->genericTypeParameters() != nullptr) return nullptr;
-    return gid->Identifier();
-}
+antlr4::tree::TerminalNode* BareTypeNameIdentifier(CFlatParser::TypeNameContext* typeName);
 
-static antlr4::tree::TerminalNode* BareCastTypeNameIdentifier(CFlatParser::CastTypeNameContext* typeName)
-{
-    if (typeName == nullptr || typeName->typeQualifier() != nullptr
-        || typeName->abstractDeclarator() != nullptr || typeName->typeSpecifier().size() != 1)
-        return nullptr;
-    auto* gid = typeName->typeSpecifier()[0]->genericIdentifier();
-    if (gid == nullptr || gid->genericTypeParameters() != nullptr) return nullptr;
-    return gid->Identifier();
-}
+antlr4::tree::TerminalNode* BareCastTypeNameIdentifier(CFlatParser::CastTypeNameContext* typeName);
 
-static std::vector<std::string> TypeSpecifierWords(
+std::vector<std::string> TypeSpecifierWords(
     CFlatParser::TypeSpecifierContext* typeSpec,
-    CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr)
-{
-    std::vector<std::string> words;
-    if (typeSpec != nullptr) words.push_back(typeSpec->getText());
-    if (suffix != nullptr)
-        for (auto* part : suffix->multiWordPrimitiveSpecifier())
-            words.push_back(part->getText());
-    return words;
-}
+    CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
 
-static std::string CanonicalTypeSpecifierText(
+std::string CanonicalTypeSpecifierText(
     CFlatParser::TypeSpecifierContext* typeSpec,
     CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
     bool = false,
-    PrimitiveTypeError* errorOut = nullptr)
-{
-    std::string canonical;
-    PrimitiveTypeError error;
-    if (!CanonicalizePrimitiveTypeWords(TypeSpecifierWords(typeSpec, suffix), canonical, error))
-    {
-        if (errorOut != nullptr) *errorOut = error;
-        return typeSpec != nullptr ? typeSpec->getText() : std::string{};
-    }
-    return canonical;
-}
+    PrimitiveTypeError* errorOut = nullptr);
 
 // Keep C and C++ spellings of the same primitive on one specialization key.
-static std::string CanonicalTemplateTypeArgument(
-    CFlatParser::TypeParameterEntryContext* entry, PrimitiveTypeError* errorOut = nullptr)
-{
-    if (entry == nullptr) return {};
-    return CanonicalTypeSpecifierText(entry->typeSpecifier(), entry->multiWordTypeSuffix(), true,
-                                      errorOut);
-}
+std::string CanonicalTemplateTypeArgument(
+    CFlatParser::TypeParameterEntryContext* entry, PrimitiveTypeError* errorOut = nullptr);
 
 // An empty `[]` is representable ONLY as the sole dimension: the `T[]` array-view is a thin
 // `ptr` and carries no row stride, so `T[][]`, `T[][M]` and `T[N][]` have no lowering. The
 // grammar folds every bracket pair into one arrayDimSpec and drops the empty ones from
 // assignmentExpression(), so an unsized dimension is visible only as a bracket-count mismatch.
-static bool DimSpecIsUnsizedMultiDim(CFlatParser::ArrayDimSpecContext* dims)
-{
-    return dims != nullptr && dims->LeftBracket().size() > 1
-        && dims->assignmentExpression().size() < dims->LeftBracket().size();
-}
+bool DimSpecIsUnsizedMultiDim(CFlatParser::ArrayDimSpecContext* dims);
 template <class Ctx>
 static bool HasUnsizedMultiDim(Ctx* c)
 {
     return DimSpecIsUnsizedMultiDim(ArrayDimsOf(c));
 }
 // One wording for every site that rejects an unsized multi-dimensional bracket form.
-static std::string UnsizedMultiDimMessage(const std::string& typeName)
-{
-    return std::format("'{0}' with an empty '[]' among several dimensions ('{0}[][]', '{0}[][M]', "
-        "'{0}[N][]') is not a valid type - a '{0}[]' array view is a thin pointer and carries no "
-        "row stride. Write a single '{0}[]' for a flat view of the whole allocation, or size "
-        "every dimension ('{0}[N][M]'); a row of a sized 2-D array binds to a '{0}[]' one at a "
-        "time.", typeName);
-}
+std::string UnsizedMultiDimMessage(const std::string& typeName);
 // A type-argument position (tuple element, generic type arg) admits exactly the bare `T[]`
 // array-view among the bracket forms. Returns true for `T[]` (one empty pair, no trailing '*').
 template <class Ctx>
@@ -802,56 +274,23 @@ static std::string FunctionTypeArraySuffixError(Ctx* c)
 }
 // Number of '*' written on a pointer() context. The grammar is ('*' typeQualifierList?)+, so the
 // depth is Star().size(); the funcptr signature sites used to collapse it to a bool.
-static int PointerDepthOf(CFlatParser::PointerContext* p)
-{
-    return p == nullptr ? 0 : (int)p->Star().size();
-}
+int PointerDepthOf(CFlatParser::PointerContext* p);
 
-static std::vector<CFlatParser::TypeQualifierContext*> ConstQualifiersAfterPointerStar(
-    CFlatParser::PointerContext* pointer)
-{
-    std::vector<CFlatParser::TypeQualifierContext*> result;
-    if (pointer == nullptr) return result;
-    for (auto* qualifierList : pointer->typeQualifierList())
-        for (auto* qualifier : qualifierList->typeQualifier())
-            if (qualifier->getText() == "const") result.push_back(qualifier);
-    return result;
-}
+std::vector<CFlatParser::TypeQualifierContext*> ConstQualifiersAfterPointerStar(
+    CFlatParser::PointerContext* pointer);
 
-static std::string ConstAfterPointerDiagnostic(const std::string& spelledBaseType)
-{
-    return std::format("'const' after '*' is not allowed: const applies to the whole type. "
-        "Write 'const {}' (pointer and target fixed) or '(const {})*' (target read-only)",
-        spelledBaseType, spelledBaseType);
-}
+std::string ConstAfterPointerDiagnostic(const std::string& spelledBaseType);
 
-static std::string SpelledTypeNameBase(
+std::string SpelledTypeNameBase(
     const std::vector<CFlatParser::TypeSpecifierContext*>& typeSpecs);
 
-static std::string SpelledTypeNameBase(CFlatParser::TypeNameContext* typeName)
-{
-    auto* spec = typeName == nullptr ? nullptr : typeName->specifierQualifierList();
-    if (spec == nullptr) return "T";
-    return SpelledTypeNameBase(spec->typeSpecifier());
-}
+std::string SpelledTypeNameBase(CFlatParser::TypeNameContext* typeName);
 
-static std::string SpelledTypeNameBase(
-    const std::vector<CFlatParser::TypeSpecifierContext*>& typeSpecs)
-{
-    if (typeSpecs.size() == 1 && typeSpecs.front()->typeName() != nullptr)
-        return SpelledTypeNameBase(typeSpecs.front()->typeName());
-    std::vector<std::string> words;
-    for (auto* spec : typeSpecs) words.push_back(spec->getText());
-    return words.empty() ? "T" : JoinTypeSpecifierWords(words);
-}
+std::string SpelledTypeNameBase(
+    const std::vector<CFlatParser::TypeSpecifierContext*>& typeSpecs);
 
-static std::string SpelledTypeNameBase(CFlatParser::TypeSpecifierContext* typeSpec,
-                                       CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr)
-{
-    if (typeSpec != nullptr && typeSpec->typeName() != nullptr)
-        return SpelledTypeNameBase(typeSpec->typeName());
-    return JoinTypeSpecifierWords(TypeSpecifierWords(typeSpec, suffix));
-}
+std::string SpelledTypeNameBase(CFlatParser::TypeSpecifierContext* typeSpec,
+                                       CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
 
 // Type-arg string for one tuple element: the bare type plus its reference-kind suffix
 // ("*" pointer, "[]" noalias array-view). Bad bracket forms (`[N]`, `[]*`) contribute no
@@ -863,12 +302,7 @@ static std::string SpelledTypeNameBase(CFlatParser::TypeSpecifierContext* typeSp
 // returning the pointer depth removed. A pointer alias keeps its stars in the stored string
 // (no type-descriptor struct); this re-derives the depth at the resolution site so it can be
 // OR'd onto the flat TypeAndValue.Pointer / .ElemPointer flags.
-static int PeelAliasPointerStars(std::string& name)
-{
-    int depth = 0;
-    while (!name.empty() && name.back() == '*') { name.pop_back(); depth++; }
-    return depth;
-}
+int PeelAliasPointerStars(std::string& name);
 
 // Resolve an enum base without its generic-argument pointer/view suffix, then restore that suffix.
 template <class ResolveBase>
@@ -885,31 +319,12 @@ static bool ResolveEnumTypeArgumentBase(std::string& argument, ResolveBase&& res
 }
 
 // Function signatures store pointer shape separately from the base type name.
-static std::string SignatureComponentAliasBase(const LLVMBackend* compiler, std::string name)
-{
-    if (compiler != nullptr) name = compiler->ResolveTypeAlias(name);
-    PeelAliasPointerStars(name);
-    return name;
-}
+std::string SignatureComponentAliasBase(const LLVMBackend* compiler, std::string name);
 
 // Fold a POINTER alias (`using IP = int*;`) into a type-ARGUMENT spelling: rebinds `name` to the
 // alias target's bare base and adds the target's stars to `stars` (the ELEMENT depth for a view).
 // One rule for every type-argument encoder, so `V<IP[]>` and `V<int*[]>` are one instantiation.
-static bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, int& stars)
-{
-    if (compiler == nullptr) return false;
-    if (compiler->FindFunctionTypeAlias(name) != nullptr) return false;
-    std::string aliased = compiler->ResolveTypeAlias(name);
-    // The scanner's pre-registered pointer aliases live in a mangling-only table, so that a
-    // pointer alias stays order-DEPENDENT for ordinary declarations, exactly like a pure rename.
-    if (aliased == name) aliased = compiler->ResolveManglingPointerAlias(name);
-    if (aliased.empty() || aliased == name) return false;
-    int aliasStars = PeelAliasPointerStars(aliased);
-    if (aliasStars == 0 || !IsBareTypeName(aliased)) return false;
-    name = compiler->ResolveManglingAlias(compiler->ResolveTypeArgBaseName(aliased));
-    stars += aliasStars;
-    return true;
-}
+bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, int& stars);
 
 struct TupleTypeElementResolveContext
 {
@@ -921,163 +336,17 @@ struct TupleTypeElementResolveContext
                               CFlatParser::MultiWordTypeSuffixContext*)> ResolveType;
 };
 
-static std::string ResolveTupleTypeElementArgName(
+std::string ResolveTupleTypeElementArgName(
     const TupleTypeElementResolveContext& context,
     CFlatParser::TupleTypeEntryContext* entry,
-    PrimitiveTypeError* errorOut = nullptr)
-{
-    PrimitiveTypeError error;
-    auto* typeSpec = entry != nullptr ? entry->typeSpecifier() : nullptr;
-    std::string writtenName = CanonicalTypeSpecifierText(
-        typeSpec, entry != nullptr ? entry->multiWordTypeSuffix() : nullptr, false, &error);
-    std::string argName;
-    auto* compiler = context.Compiler;
-    bool substituted = false;
-    if (compiler != nullptr)
-    {
-        LLVMBackend::NamespaceScope namespaceScope(compiler, context.Namespace);
-        auto substitution = context.Substitutions != nullptr
-            ? context.Substitutions->find(writtenName)
-            : std::unordered_map<std::string, std::string>::const_iterator{};
-        if (context.Substitutions != nullptr && substitution != context.Substitutions->end())
-        {
-            argName = substitution->second;
-            substituted = true;
-        }
-        else if (!HasPrimitiveTypeError(error) && context.ResolveType && typeSpec != nullptr)
-            argName = context.ResolveType(typeSpec, entry->multiWordTypeSuffix());
-        else
-            argName = std::move(writtenName);
-    }
-    else
-        argName = std::move(writtenName);
-    if (errorOut != nullptr) *errorOut = error;
+    PrimitiveTypeError* errorOut = nullptr);
 
-    // Substitutions and nested type names can already carry pointer/view suffixes.
-    int pointerDepth = PointerDepthOf(entry != nullptr ? entry->pointer() : nullptr);
-    bool isArrayView = entry != nullptr && IsArrayViewArg(entry);
-    int elementPointerDepth = isArrayView ? pointerDepth : 0;
-    if (isArrayView) pointerDepth = 0;
-    bool resolvedArrayView = argName.ends_with("[]");
-    if (resolvedArrayView) argName.resize(argName.size() - 2);
-    const int resolvedPointerDepth = PeelAliasPointerStars(argName);
-    if (resolvedArrayView)
-    {
-        isArrayView = true;
-        elementPointerDepth += resolvedPointerDepth;
-    }
-    else if (isArrayView)
-        elementPointerDepth += resolvedPointerDepth;
-    else
-        pointerDepth += resolvedPointerDepth;
+std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId);
 
-    if (compiler != nullptr)
-    {
-        LLVMBackend::NamespaceScope namespaceScope(compiler, context.Namespace);
-        if (!substituted)
-        {
-            const bool namesLocalType = context.LocalTypes.count(argName) != 0;
-            std::string enumName = compiler->ResolveEnumTypeName(argName);
-            if (!enumName.empty()) argName = std::move(enumName);
-            else if (!namesLocalType)
-            {
-                std::string scannedEnum = compiler->ResolveScannedEnumTypeName(argName);
-                if (!scannedEnum.empty()) argName = std::move(scannedEnum);
-                else argName = compiler->ResolveTypeArgBaseName(argName);
-            }
-            FoldPointerAliasArg(compiler, argName,
-                isArrayView ? elementPointerDepth : pointerDepth);
-        }
-    }
-    if (isArrayView && entry != nullptr && !IsArrayViewArg(entry)
-        && PointerDepthOf(entry->pointer()) > 0)
-    {
-        isArrayView = false;
-        pointerDepth = elementPointerDepth + PointerDepthOf(entry->pointer());
-        elementPointerDepth = 0;
-    }
-    if (isArrayView)
-        argName += std::string(elementPointerDepth, '*') + "[]";
-    else if (pointerDepth > 0)
-        argName += std::string(pointerDepth, '*');
-    return argName;
-}
+std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId,
+                                  const LLVMBackend* compiler);
 
-inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
-{
-    if (opId->New())          return "operator new";
-    if (opId->Delete())       return "operator delete";
-    if (opId->String())       return "operator string";
-    if (opId->Bool())         return "operator bool";
-    if (opId->Plus())         return "operator+";
-    if (opId->Minus())        return "operator-";
-    if (opId->PlusPlus())     return "operator++";
-    if (opId->MinusMinus())   return "operator--";
-    if (opId->Star())         return "operator*";
-    if (opId->Div())          return "operator/";
-    if (opId->Mod())          return "operator%";
-    if (opId->And())          return "operator&";
-    if (opId->Or())           return "operator|";
-    if (opId->Caret())        return "operator^";
-    if (opId->PlusAssign())       return "operator+=";
-    if (opId->MinusAssign())      return "operator-=";
-    if (opId->StarAssign())       return "operator*=";
-    if (opId->DivAssign())        return "operator/=";
-    if (opId->ModAssign())        return "operator%=";
-    if (opId->LeftShiftAssign())  return "operator<<=";
-    if (opId->RightShiftAssign()) return "operator>>=";
-    if (opId->AndAssign())        return "operator&=";
-    if (opId->XorAssign())        return "operator^=";
-    if (opId->OrAssign())         return "operator|=";
-    if (opId->Assign())           return "operator=";
-    if (opId->Equal())        return "operator==";
-    if (opId->NotEqual())     return "operator!=";
-    if (opId->Less())         return "operator<";
-    if (opId->LessEqual())    return "operator<=";
-    if (opId->GreaterEqual()) return "operator>=";
-    if (opId->LeftShift())    return "operator<<";
-    // '>>' is two Greater tokens; '>' is one. Check before single-Greater.
-    if (opId->Greater().size() == 2) return "operator>>";
-    if (opId->Greater().size() == 1) return "operator>";
-    if (opId->LeftBracket())  return "operator[]";
-    if (opId->LeftParen())    return "operator()";
-    if (opId->Arrow())        return "operator->";
-    if (opId->Not())          return "operator!";
-    if (opId->Tilde())        return "operator~";
-    if (auto* target = opId->typeName())
-        return "operator " + target->getText();
-    return "";
-}
-
-inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId,
-                                  const LLVMBackend* compiler)
-{
-    std::string name = getOperatorName(opId);
-    auto* target = opId->typeName();
-    if (target == nullptr || compiler == nullptr) return name;
-
-    LLVMBackend::TypeAndValue targetType;
-    targetType.TypeName = compiler->ResolveTypeAlias(target->getText());
-    if (targetType.TypeName == target->getText())
-        targetType.TypeName = compiler->ResolveManglingPointerAlias(target->getText());
-    if (targetType.TypeName.empty()) targetType.TypeName = target->getText();
-    if (auto* abstractDecl = target->abstractDeclarator(); abstractDecl != nullptr
-        && abstractDecl->pointer() != nullptr)
-    {
-        targetType.Pointer = true;
-        targetType.PointerDepth = PointerDepthOf(abstractDecl->pointer());
-        targetType.ElemPointer = targetType.PointerDepth >= 2;
-    }
-    std::string spelling = SpellType(*compiler, targetType);
-    return "operator " + (spelling.empty() ? target->getText() : spelling);
-}
-
-inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m)
-{
-    if (auto* opId = m->operatorFunctionId())
-        return getOperatorName(opId);
-    return m->directDeclarator()->getText();
-}
+std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m);
 
 // The compiler's ENTIRE lock vocabulary: the capability interfaces it knows how to lower a
 // `lock (...)` statement against, and the acquire/release method roles within each. No lock
@@ -1102,61 +371,29 @@ static constexpr CapabilitySpec kCapabilities[] = {
 
 // Quote-stripped text of one annotation argument. A string literal loses its surrounding
 // quotes; any other token (Constant, Identifier) is returned verbatim.
-inline std::string AnnotationArgOne(CFlatParser::AnnotationArgContext* arg)
-{
-    std::string raw = arg->getText();
-    if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
-        return raw.substr(1, raw.size() - 2);
-    return raw;
-}
+std::string AnnotationArgOne(CFlatParser::AnnotationArgContext* arg);
 
 // Every quote-stripped argument of an annotation, in source order (empty when it has none).
-inline std::vector<std::string> AnnotationArgTexts(CFlatParser::AnnotationContext* ann)
-{
-    std::vector<std::string> out;
-    if (!ann->annotationArgList()) return out;
-    for (auto* arg : ann->annotationArgList()->annotationArg())
-        out.push_back(AnnotationArgOne(arg));
-    return out;
-}
+std::vector<std::string> AnnotationArgTexts(CFlatParser::AnnotationContext* ann);
 
 // The FIRST argument of an annotation (empty if it has none). Single-arg annotations
 // ([uuid], [JsonName], [MaxLength]) read through this; multi-arg ones read Values.
-inline std::string AnnotationArgText(CFlatParser::AnnotationContext* ann)
-{
-    auto args = AnnotationArgTexts(ann);
-    return args.empty() ? std::string{} : args.front();
-}
+std::string AnnotationArgText(CFlatParser::AnnotationContext* ann);
 
 // Extract every [Name(arg, ...)] as a raw annotation value, WITHOUT registry validation. Used by
 // the forward scan to record type-level annotations (e.g. [uuid]) before the main pass validates.
-inline std::vector<LLVMBackend::AnnotationValue> ExtractAnnotations(CFlatParser::AnnotationListContext* annList)
-{
-    std::vector<LLVMBackend::AnnotationValue> result;
-    if (!annList) return result;
-    for (auto* ann : annList->annotation())
-    {
-        if (!ann->Identifier()) continue;
-        auto args = AnnotationArgTexts(ann);
-        LLVMBackend::AnnotationValue av;
-        av.Name = ann->Identifier()->getText();
-        av.Value = args.empty() ? std::string{} : args.front();
-        av.Values = std::move(args);
-        result.push_back(std::move(av));
-    }
-    return result;
-}
+std::vector<LLVMBackend::AnnotationValue> ExtractAnnotations(CFlatParser::AnnotationListContext* annList);
 
-static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler,
+std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler,
                                                      antlr4::tree::ParseTree* node);
-static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
+std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
                                                         CFlatParser::GenericIdentifierContext* gid);
-static bool InScannerInt32Range(int64_t v);
-static bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out);
-static bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out);
-static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out);
-static std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn);
-static std::string ResolveCastTypeNameForScanner(
+bool InScannerInt32Range(int64_t v);
+bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out);
+bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out);
+bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out);
+std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn);
+std::string ResolveCastTypeNameForScanner(
     LLVMBackend* compiler, CFlatParser::CastTypeNameContext* castTypeName);
 
 /*
@@ -1169,352 +406,22 @@ static std::string ResolveCastTypeNameForScanner(
  */
 // A grouped &&/||/?: that the syntax folder may decide. Typed casts are excluded: the folder computes
 // in plain int64, so `(u32)0` would lose its unsignedness in a relational compare.
-static bool HasNoTypedCast(antlr4::tree::ParseTree* node) {
-    if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
-        cast != nullptr && cast->castTypeName() != nullptr)
-        return false;
-    for (auto* child : node->children)
-        if (!HasNoTypedCast(child)) return false;
-    return true;
-}
+bool HasNoTypedCast(antlr4::tree::ParseTree* node);
 // Structural (never text: a string literal can hold "&&" or "?").
-static bool HasShortCircuit(antlr4::tree::ParseTree* node) {
-    if (node == nullptr) return false;
-    if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node);
-        a != nullptr && a->inclusiveOrExpression().size() > 1)
-        return true;
-    if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node);
-        o != nullptr && o->logicalAndExpression().size() > 1)
-        return true;
-    for (auto* child : node->children)
-        if (HasShortCircuit(child)) return true;
-    return false;
-}
-static bool HasTernary(antlr4::tree::ParseTree* node) {
-    if (node == nullptr) return false;
-    if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
-        c != nullptr && c->expression() != nullptr)
-        return true;
-    for (auto* child : node->children)
-        if (HasTernary(child)) return true;
-    return false;
-}
-static bool IsStructurallyGrouped(antlr4::tree::ParseTree* node) {
-    return HasShortCircuit(node) || HasTernary(node);
-}
-static bool IsGroupedFoldCandidate(antlr4::tree::ParseTree* node) {
-    return IsStructurallyGrouped(node) && HasNoTypedCast(node);
-}
-static std::optional<int64_t> FoldCompileTimeInt(LLVMBackend* compiler, antlr4::tree::ParseTree* node) {
-        if (node == nullptr) return std::nullopt;
-        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
-        {
-            if (c->expression() != nullptr)
-            {
-                auto cond = FoldCompileTimeInt(compiler, c->logicalOrExpression());
-                if (!cond) return std::nullopt;
-                return (*cond != 0) ? FoldCompileTimeInt(compiler, c->expression())
-                                    : FoldCompileTimeInt(compiler, c->conditionalExpression());
-            }
-            if (c->children.size() > 1) return std::nullopt;  // `??` null-coalescing
-            return FoldCompileTimeInt(compiler, c->logicalOrExpression());
-        }
-        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
-        {
-            auto operands = o->logicalAndExpression();
-            if (operands.size() == 1) return FoldCompileTimeInt(compiler, operands[0]);
-            bool allKnownFalse = true;
-            for (auto* op : operands)
-            {
-                auto v = FoldCompileTimeInt(compiler, op);
-                if (v && *v != 0) return (int64_t)1;
-                if (!v) allKnownFalse = false;
-            }
-            return allKnownFalse ? std::optional<int64_t>(0) : std::nullopt;
-        }
-        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
-        {
-            auto operands = a->inclusiveOrExpression();
-            if (operands.size() == 1) return FoldCompileTimeInt(compiler, operands[0]);
-            bool allKnownTrue = true;
-            for (auto* op : operands)
-            {
-                auto v = FoldCompileTimeInt(compiler, op);
-                if (v && *v == 0) return (int64_t)0;
-                if (!v) allKnownTrue = false;
-            }
-            return allKnownTrue ? std::optional<int64_t>(1) : std::nullopt;
-        }
-        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
-            return FoldCompileTimeInt(compiler, e->assignmentExpression());
-        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
-        {
-            if (asn->conditionalExpression() != nullptr)
-                return FoldCompileTimeInt(compiler, asn->conditionalExpression());
-            return std::nullopt;  // an actual assignment is not a constant
-        }
-        return FoldCompileTimeIntLeaf(compiler, node);
-    }
+bool HasShortCircuit(antlr4::tree::ParseTree* node);
+bool HasTernary(antlr4::tree::ParseTree* node);
+bool IsStructurallyGrouped(antlr4::tree::ParseTree* node);
+bool IsGroupedFoldCandidate(antlr4::tree::ParseTree* node);
+std::optional<int64_t> FoldCompileTimeInt(LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
 // The leaf half: constant-folds the integer operator chain without emitting IR. Covers a
 // compile-time macro (a -D define, a platform builtin, or a seeded const int global), an integer
 // literal, redundant parens, unary !/-/~/+, and the comparison / bitwise / arithmetic chain over
 // those. Anything else folds to nullopt.
-static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antlr4::tree::ParseTree* node) {
-        if (node == nullptr) return std::nullopt;
-
-        // Left-associative binary chains: fold pairwise using the operator token between operands.
-        auto foldChain = [&](const std::vector<antlr4::tree::ParseTree*>& ops,
-                            antlr4::RuleContext* parent) -> std::optional<int64_t>
-        {
-            if (ops.empty()) return std::nullopt;
-            auto acc = FoldCompileTimeIntLeaf(compiler, ops[0]);
-            if (ops.size() == 1 || !acc) return acc;
-            // Walk the parent's children to recover the operator tokens in source order.
-            size_t opIdx = 0;
-            for (size_t i = 0; i < parent->children.size(); i++)
-            {
-                auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i]);
-                if (term == nullptr) continue;
-                std::string op = term->getText();
-                if (op == "<" || op == ">")
-                {
-                    // '>' '>' is a shift written as two tokens; join it when adjacent.
-                    if (i + 1 < parent->children.size())
-                        if (auto* n2 = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i + 1]))
-                            if (op == ">" && n2->getText() == ">") { op = ">>"; i++; }
-                }
-                if (++opIdx > ops.size() - 1) break;
-                auto rhs = FoldCompileTimeIntLeaf(compiler, ops[opIdx]);
-                if (!rhs) return std::nullopt;
-                int64_t l = *acc, r = *rhs, out = 0;
-                // Every operand is already inside the 32-bit range (ParseScannerIntegerLiteral and
-                // the macro leaf both guarantee it), so computing in int64 and rejecting an
-                // out-of-range RESULT means no fold can differ from codegen's i32 arithmetic by a
-                // wraparound - it becomes undecidable instead.
-                if (op == "|")       out = l | r;
-                else if (op == "^")  out = l ^ r;
-                else if (op == "&")  out = l & r;
-                else if (op == "==") out = (l == r) ? 1 : 0;
-                else if (op == "!=") out = (l != r) ? 1 : 0;
-                else if (op == "<")  out = (l < r) ? 1 : 0;
-                else if (op == ">")  out = (l > r) ? 1 : 0;
-                else if (op == "<=") out = (l <= r) ? 1 : 0;
-                else if (op == ">=") out = (l >= r) ? 1 : 0;
-                else if (op == "<<") { if (r < 0 || r > 31) return std::nullopt; out = l << r; }
-                else if (op == ">>") { if (r < 0 || r > 31) return std::nullopt; out = l >> r; }
-                else if (op == "+")  { if (ScannerAddOverflow(l, r, &out)) return std::nullopt; }
-                else if (op == "-")  { if (ScannerSubOverflow(l, r, &out)) return std::nullopt; }
-                else if (op == "*")  { if (ScannerMulOverflow(l, r, &out)) return std::nullopt; }
-                else if (op == "/")  { if (r == 0) return std::nullopt; out = l / r; }
-                else if (op == "%")  { if (r == 0) return std::nullopt; out = l % r; }
-                else return std::nullopt;
-                if (!InScannerInt32Range(out)) return std::nullopt;
-                acc = out;
-            }
-            return acc;
-        };
-
-        if (auto* n = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
-        {
-            auto ops = n->exclusiveOrExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node))
-        {
-            auto ops = n->andExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::AndExpressionContext*>(node))
-        {
-            auto ops = n->equalityExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
-        {
-            auto ops = n->typeCheckExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node))
-        {
-            // `is` / `as` are not integer constants; a bare relational passes through.
-            if (n->children.size() != 1) return std::nullopt;
-            return FoldCompileTimeIntLeaf(compiler, n->relationalExpression());
-        }
-        if (auto* n = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
-        {
-            auto ops = n->shiftExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node))
-        {
-            auto ops = n->additiveExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node))
-        {
-            auto ops = n->multiplicativeExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node))
-        {
-            auto ops = n->castExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
-        {
-            if (n->castTypeName() != nullptr)
-            {
-                // A C-cast to an integer (or enum) target folds as the main pass's truncation;
-                // every other target leaves the condition undecidable.
-                if (compiler == nullptr) return std::nullopt;
-                auto v = FoldCompileTimeIntLeaf(compiler, n->castExpression());
-                if (!v) return std::nullopt;
-                std::string targetTypeName = ResolveCastTypeNameForScanner(compiler, n->castTypeName());
-                if (targetTypeName.empty()) return std::nullopt;
-                int64_t out = 0;
-                if (!compiler->TryGetScanTimeIntegerCast(targetTypeName, *v, out))
-                    return std::nullopt;
-                return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
-            }
-            if (n->unaryExpression() != nullptr) return FoldCompileTimeIntLeaf(compiler, n->unaryExpression());
-            return ParseScannerIntegerLiteral(n->getText());
-        }
-        if (auto* n = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
-        {
-            if (n->offsetofFieldPath() != nullptr
-                && n->getStart()->getText() == "__builtin_offsetof")
-            {
-                if (compiler == nullptr) return std::nullopt;
-                std::vector<std::string> path;
-                for (auto* part : n->offsetofFieldPath()->Identifier()) path.push_back(part->getText());
-                int64_t offset = 0;
-                if (!compiler->TryGetScanTimeFieldOffset(n->typeName()->getText(), path, offset))
-                    return std::nullopt;
-                return InScannerInt32Range(offset) ? std::optional<int64_t>(offset) : std::nullopt;
-            }
-            // `sizeof '(' typeName ')'` - exactly four children, so `sizeof alignof(T)` and the
-            // expression form are not mistaken for it. Aggregates answer undecidable.
-            if (n->typeName() != nullptr && n->children.size() == 4 && !n->Sizeof().empty())
-            {
-                int64_t bytes = 0;
-                if (compiler == nullptr
-                    || !compiler->TryGetScanTimeTypeSize(n->typeName()->getText(), bytes))
-                    return std::nullopt;
-                return InScannerInt32Range(bytes) ? std::optional<int64_t>(bytes) : std::nullopt;
-            }
-            // Any other `sizeof` measures its operand; folding the operand's VALUE would be wrong.
-            if (!n->Sizeof().empty()) return std::nullopt;
-            if (n->postfixExpression() != nullptr) return FoldCompileTimeIntLeaf(compiler, n->postfixExpression());
-            if (n->unaryOperator() != nullptr && n->castExpression() != nullptr)
-            {
-                auto v = FoldCompileTimeIntLeaf(compiler, n->castExpression());
-                if (!v) return std::nullopt;
-                std::string op = n->unaryOperator()->getText();
-                if (op == "!") return (*v == 0) ? (int64_t)1 : (int64_t)0;
-                if (op == "+") return *v;
-                int64_t out = 0;
-                if (op == "-")      { if (ScannerSubOverflow((int64_t)0, *v, &out)) return std::nullopt; }
-                else if (op == "~") out = ~*v;
-                else return std::nullopt;  // '&' / '*' are not integer constants
-                return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
-            }
-            return std::nullopt;      // sizeof/alignof/new/delete/move/operator
-        }
-        if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-        {
-            if (compiler != nullptr && n->primaryExpression() != nullptr
-                && n->primaryExpression()->genericIdentifier() != nullptr
-                && n->primaryExpression()->genericIdentifier()->Identifier() != nullptr
-                && n->primaryExpression()->genericIdentifier()->Identifier()->getText() == "offsetof"
-                && n->children.size() == 4 && n->argumentExpressionList().size() == 1
-                && compiler->GetScopedLocalOrArgument("offsetof").Storage == nullptr
-                && compiler->GetFunctionArgument("offsetof").GetValue() == nullptr
-                && compiler->GetMemberVariable("offsetof").Storage == nullptr
-                && compiler->GetGlobalVariableNV("offsetof").Storage == nullptr
-                && compiler->GetFunction("offsetof") == nullptr)
-            {
-                auto args = n->argumentExpressionList(0)->argumentNamedExpression();
-                if (args.size() == 2 && args[0]->assignmentExpression() != nullptr
-                    && args[1]->assignmentExpression() != nullptr)
-                {
-                    const std::string typeText = args[0]->assignmentExpression()->getText();
-                    const std::string pathText = args[1]->assignmentExpression()->getText();
-                    std::vector<std::string> path;
-                    size_t begin = 0;
-                    while (begin < pathText.size())
-                    {
-                        const size_t dot = pathText.find('.', begin);
-                        path.push_back(pathText.substr(begin,
-                            dot == std::string::npos ? std::string::npos : dot - begin));
-                        if (dot == std::string::npos) break;
-                        begin = dot + 1;
-                    }
-                    int64_t offset = 0;
-                    if (compiler->TryGetScanTimeFieldOffset(typeText, path, offset))
-                        return InScannerInt32Range(offset) ? std::optional<int64_t>(offset) : std::nullopt;
-                }
-            }
-            // Only a bare primary folds - a call, index or non-enum member access does not.
-            if (n->children.size() == 1) return FoldCompileTimeIntLeaf(compiler, n->primaryExpression());
-            // `Dir.Back`: an enum member is a compile-time constant, registered in both passes.
-            if (n->children.size() == 3 && n->Dot().size() == 1 && compiler != nullptr
-                && n->children[1] == n->Dot(0))
-            {
-                auto* prim = n->primaryExpression();
-                auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(n->children[2]);
-                auto* gid = prim != nullptr ? prim->genericIdentifier() : nullptr;
-                if (member != nullptr && gid != nullptr && gid->genericTypeParameters() == nullptr
-                    && gid->Identifier() != nullptr)
-                {
-                    int64_t ev = 0;
-                    if (compiler->TryGetEnumMemberInt(gid->Identifier()->getText(),
-                                                      member->getText(), ev))
-                        return InScannerInt32Range(ev) ? std::optional<int64_t>(ev) : std::nullopt;
-                }
-            }
-            // C++ enum members keep their fully qualified spelling in the global registry, so
-            // use that key for nested owners and unscoped namespace members.
-            if (compiler != nullptr)
-            {
-                auto global = compiler->GetGlobalVariableNV(n->getText());
-                if (global.Storage != nullptr && !global.TypeAndValue.EnumBacking.empty())
-                {
-                    auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(global.Storage);
-                    auto* ci = gv != nullptr && gv->hasInitializer()
-                        ? llvm::dyn_cast<llvm::ConstantInt>(gv->getInitializer()) : nullptr;
-                    if (ci != nullptr && ci->getBitWidth() <= 64)
-                        return InScannerInt32Range(ci->getSExtValue())
-                            ? std::optional<int64_t>(ci->getSExtValue()) : std::nullopt;
-                }
-            }
-            return std::nullopt;
-        }
-        if (auto* n = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
-        {
-            if (n->expression() != nullptr && n->children.size() == 3)
-                return FoldCompileTimeIntLeaf(compiler, n->expression());   // redundant parens
-            if (n->expression() != nullptr) return std::nullopt;  // nameof/typeof(expr)
-            if (auto* gid = n->genericIdentifier())
-                return FoldCompileTimeIdentifier(compiler, gid);
-            return ParseScannerIntegerLiteral(n->getText());
-        }
-        // A bare `genericIdentifier` node, which is what the generic-argument funnels hand us for
-        // `Buf<int, CAP>` - it never reaches this folder wrapped in a primaryExpression.
-        if (auto* gid = dynamic_cast<CFlatParser::GenericIdentifierContext*>(node))
-            return FoldCompileTimeIdentifier(compiler, gid);
-        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
-            return FoldCompileTimeInt(compiler, e);
-        return std::nullopt;
-    }
+std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
 // A const integer local folds only when its value is exactly representable in its own type.
-static bool ConstLocalFoldFits(llvm::IntegerType* type, int64_t value)
-{
-    if (type == nullptr || type->getBitWidth() < 2 || !InScannerInt32Range(value)) return false;
-    return type->getBitWidth() >= 32
-        || (value >= 0 && value < (int64_t(1) << (type->getBitWidth() - 1)));
-}
+bool ConstLocalFoldFits(llvm::IntegerType* type, int64_t value);
 
 /*
  * A pre-pass has no local frames, so a value generic argument naming a const integer local
@@ -1535,97 +442,26 @@ struct LexicalConstParserScope
     LexicalConstParserScope(const LexicalConstParserScope&) = delete;
     LexicalConstParserScope& operator=(const LexicalConstParserScope&) = delete;
 };
-static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d);
-static bool LexicalIsUnder(antlr4::tree::ParseTree* node, antlr4::tree::ParseTree* ancestor)
-{
-    for (; node != nullptr; node = node->parent)
-        if (node == ancestor) return true;
-    return false;
-}
+std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d);
+bool LexicalIsUnder(antlr4::tree::ParseTree* node, antlr4::tree::ParseTree* ancestor);
 // A generic type or value parameter of that name shadows any outer constant.
-static bool LexicalGenericParamNamed(CFlatParser::GenericTypeParametersContext* g, const std::string& name)
-{
-    if (g == nullptr || g->typeParameterList() == nullptr) return false;
-    for (auto* e : g->typeParameterList()->typeParameterEntry())
-    {
-        if (auto* v = e->valueParameterDeclaration(); v != nullptr && v->Identifier() != nullptr
-            && v->Identifier()->getText() == name)
-            return true;
-        if (e->typeSpecifier() != nullptr && e->typeSpecifier()->getText() == name) return true;
-    }
-    return false;
-}
+bool LexicalGenericParamNamed(CFlatParser::GenericTypeParametersContext* g, const std::string& name);
 /*
  * The last declarator of `list` named `name` visible at `use`. A use inside `owner` (the
  * declaration itself) sees only the declarators before the one holding it; a use in the
  * specifiers sees none. `self`: the declarator holding the use declares `name` (C++ point of
  * declaration), so the name is that unfoldable object, never an outer one.
  */
-static CFlatParser::InitDeclaratorContext* LexicalVisibleDeclarator(antlr4::tree::ParseTree* owner,
+CFlatParser::InitDeclaratorContext* LexicalVisibleDeclarator(antlr4::tree::ParseTree* owner,
     CFlatParser::InitDeclaratorListContext* list, const std::string& name, antlr4::tree::ParseTree* use,
-    bool* self)
-{
-    if (list == nullptr) return nullptr;
-    const bool inside = LexicalIsUnder(use, owner);
-    if (inside && !LexicalIsUnder(use, list)) return nullptr;
-    CFlatParser::InitDeclaratorContext* match = nullptr;
-    for (auto* init : list->initDeclarator())
-    {
-        const bool named = init->declarator() != nullptr && init->declarator()->directDeclarator() != nullptr
-            && getDirectDeclName(init->declarator()->directDeclarator()) == name;
-        if (inside && LexicalIsUnder(use, init))
-        {
-            if (named) *self = true;
-            break;
-        }
-        if (named) match = init;
-    }
-    return match;
-}
+    bool* self);
 // A block declaration that introduces a TYPE of that name (a local enum, a struct/union body in
 // the specifiers): the name is no value. Enumerators are scoped (`E.n`) and add no bare name.
-static bool LexicalDeclaresTypeNamed(CFlatParser::DeclarationContext* decl, const std::string& name)
-{
-    if (auto* en = decl->enumSpecifier(); en != nullptr && en->Identifier() != nullptr)
-        return en->Identifier()->getText() == name;
-    std::vector<antlr4::tree::ParseTree*> pending{ decl->declarationSpecifiers() };
-    while (!pending.empty())
-    {
-        auto* tree = pending.back();
-        pending.pop_back();
-        if (tree == nullptr) continue;
-        if (auto* su = dynamic_cast<CFlatParser::StructOrUnionSpecifierContext*>(tree);
-            su != nullptr && su->LeftBrace() != nullptr && su->genericIdentifier() != nullptr
-            && su->genericIdentifier()->Identifier() != nullptr
-            && su->genericIdentifier()->Identifier()->getText() == name)
-            return true;
-        for (auto* child : tree->children) pending.push_back(child);
-    }
-    return false;
-}
-static bool LexicalBlockHasPriorEnum(CFlatParser::BlockItemListContext* list,
-    CFlatParser::BlockItemContext* item, const std::string& name)
-{
-    if (list == nullptr || item == nullptr || name.empty()) return false;
-    for (auto* prior : list->blockItem())
-    {
-        if (prior == item) return false;
-        auto* decl = prior->declaration();
-        auto* en = decl != nullptr ? decl->enumSpecifier() : nullptr;
-        if (en != nullptr && en->Identifier() != nullptr && en->Identifier()->getText() == name)
-            return true;
-    }
-    return false;
-}
-static antlr4::tree::TerminalNode* LexicalDirectDeclaratorIdentifier(
-    CFlatParser::DirectDeclaratorContext* direct)
-{
-    if (direct == nullptr) return nullptr;
-    if (direct->Identifier() != nullptr) return direct->Identifier();
-    auto* nested = direct->declarator();
-    return nested != nullptr
-        ? LexicalDirectDeclaratorIdentifier(nested->directDeclarator()) : nullptr;
-}
+bool LexicalDeclaresTypeNamed(CFlatParser::DeclarationContext* decl, const std::string& name);
+bool LexicalBlockHasPriorEnum(CFlatParser::BlockItemListContext* list,
+    CFlatParser::BlockItemContext* item, const std::string& name);
+antlr4::tree::TerminalNode* LexicalDirectDeclaratorIdentifier(
+    CFlatParser::DirectDeclaratorContext* direct);
 enum class LexicalBlockBindingKind { None, Value, Type };
 struct LexicalBlockBinding
 {
@@ -1635,93 +471,14 @@ struct LexicalBlockBinding
     bool HasVisibleValue = false;
 };
 // The latest visible binding in one block item list; shared by const folding and value lookup.
-static LexicalBlockBinding FindLexicalBlockBinding(CFlatParser::BlockItemListContext* list,
-    antlr4::tree::ParseTree* use, const std::string& name)
-{
-    LexicalBlockBinding binding;
-    if (list == nullptr) return binding;
-    for (auto* item : list->blockItem())
-    {
-        auto* decl = item->declaration();
-        bool self = false;
-        auto* visible = decl != nullptr
-            ? LexicalVisibleDeclarator(decl, decl->initDeclaratorList(), name, use, &self) : nullptr;
-        if (self)
-        {
-            binding.Kind = LexicalBlockBindingKind::Value;
-            binding.Specifiers = nullptr;
-            binding.Declarator = nullptr;
-            binding.HasVisibleValue = true;
-            return binding;
-        }
-        if (visible != nullptr)
-        {
-            binding.Kind = LexicalBlockBindingKind::Value;
-            binding.Specifiers = decl->declarationSpecifiers();
-            binding.Declarator = visible;
-            binding.HasVisibleValue = true;
-        }
-        if (item == use) break;
-        if (decl != nullptr && LexicalDeclaresTypeNamed(decl, name))
-        {
-            binding.Kind = LexicalBlockBindingKind::Type;
-            binding.Specifiers = nullptr;
-            binding.Declarator = nullptr;
-        }
-        if (auto* destructure = item->destructuringDeclaration())
-            for (auto* entry : destructure->destructuringEntry())
-                if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
-                {
-                    binding.Kind = LexicalBlockBindingKind::Value;
-                    binding.Specifiers = nullptr;
-                    binding.Declarator = nullptr;
-                    binding.HasVisibleValue = true;
-                }
-        if (auto* alias = item->usingDeclaration(); alias != nullptr && alias->Identifier() != nullptr
-            && alias->Identifier()->getText() == name)
-        {
-            binding.Kind = LexicalBlockBindingKind::Type;
-            binding.Specifiers = nullptr;
-            binding.Declarator = nullptr;
-        }
-    }
-    return binding;
-}
-static bool LexicalFunctionHasParameter(CFlatParser::FunctionDefinitionContext* fn,
-    const std::string& name)
-{
-    auto* types = fn != nullptr ? fn->parameterTypeList() : nullptr;
-    auto* parameters = types != nullptr ? types->parameterList() : nullptr;
-    if (parameters == nullptr) return false;
-    for (auto* param : parameters->parameterDeclaration())
-        if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr
-            && getDirectDeclName(param->declarator()->directDeclarator()) == name)
-            return true;
-    return false;
-}
-static bool LexicalLambdaHasParameter(CFlatParser::LambdaExpressionContext* lambda,
-    const std::string& name)
-{
-    if (lambda == nullptr || lambda->lambdaParamList() == nullptr) return false;
-    for (auto* param : lambda->lambdaParamList()->lambdaParam())
-        if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
-            return true;
-    return false;
-}
-static bool LexicalBodyHasValueParameter(CFlatParser::BlockItemListContext* list,
-    const std::string& name)
-{
-    auto* compound = list != nullptr
-        ? dynamic_cast<CFlatParser::CompoundStatementContext*>(list->parent) : nullptr;
-    if (compound == nullptr) return false;
-    if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(compound->parent))
-        return LexicalFunctionHasParameter(fn, name);
-    auto* lambdaBody = dynamic_cast<CFlatParser::LambdaBodyContext*>(compound->parent);
-    return LexicalLambdaHasParameter(
-        lambdaBody != nullptr
-            ? dynamic_cast<CFlatParser::LambdaExpressionContext*>(lambdaBody->parent) : nullptr,
-        name);
-}
+LexicalBlockBinding FindLexicalBlockBinding(CFlatParser::BlockItemListContext* list,
+    antlr4::tree::ParseTree* use, const std::string& name);
+bool LexicalFunctionHasParameter(CFlatParser::FunctionDefinitionContext* fn,
+    const std::string& name);
+bool LexicalLambdaHasParameter(CFlatParser::LambdaExpressionContext* lambda,
+    const std::string& name);
+bool LexicalBodyHasValueParameter(CFlatParser::BlockItemListContext* list,
+    const std::string& name);
 enum class LexicalBindingEventKind
 {
     Block, FunctionParameter, GenericParameter, LambdaParameter, CaseBinding,
@@ -1798,74 +555,13 @@ static void WalkLexicalBindings(antlr4::tree::ParseTree* use, const std::string&
         }
     }
 }
-static bool LexicalLocalTypeShadowsValue(LLVMBackend* compiler, antlr4::tree::ParseTree* use,
-    const std::string& name)
-{
-    if (compiler == nullptr || !compiler->HasLexicalLocalTypeName(name)) return false;
-    bool shadows = false;
-    WalkLexicalBindings(use, name, [&](const LexicalBindingEvent& event) {
-        switch (event.Kind)
-        {
-        case LexicalBindingEventKind::Block:
-            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Type)
-            {
-                shadows = !event.BlockBinding.HasVisibleValue && !event.HasSameScopeParameter;
-                return true;
-            }
-            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Value)
-            {
-                shadows = false;
-                return true;
-            }
-            return false;
-        case LexicalBindingEventKind::FunctionParameter:
-        case LexicalBindingEventKind::LambdaParameter:
-        case LexicalBindingEventKind::CaseBinding:
-        case LexicalBindingEventKind::RangeBinding:
-        case LexicalBindingEventKind::ForDeclaration:
-            shadows = false;
-            return true;
-        case LexicalBindingEventKind::GenericParameter:
-            shadows = false;
-            return true;
-        }
-        return false;
-    });
-    return shadows;
-}
-static bool LexicalHasFunctionScope(antlr4::tree::ParseTree* node)
-{
-    for (; node != nullptr; node = node->parent)
-        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node) != nullptr
-            || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr
-            || dynamic_cast<CFlatParser::DestructorDefinitionContext*>(node) != nullptr)
-            return true;
-    return false;
-}
-static void RegisterLexicalLocalTypeName(LLVMBackend* compiler,
-    antlr4::tree::ParseTree* declaration, const std::string& name)
-{
-    if (compiler != nullptr && !name.empty() && LexicalHasFunctionScope(declaration))
-        compiler->RegisterLexicalLocalTypeName(name);
-}
-static void RegisterLexicalStructNamesInDeclaration(LLVMBackend* compiler,
-    CFlatParser::DeclarationContext* declaration)
-{
-    if (compiler == nullptr || declaration == nullptr || !LexicalHasFunctionScope(declaration)) return;
-    std::vector<antlr4::tree::ParseTree*> pending;
-    if (declaration->declarationSpecifiers() != nullptr)
-        pending.push_back(declaration->declarationSpecifiers());
-    while (!pending.empty())
-    {
-        auto* tree = pending.back();
-        pending.pop_back();
-        if (auto* su = dynamic_cast<CFlatParser::StructOrUnionSpecifierContext*>(tree);
-            su != nullptr && su->LeftBrace() != nullptr && su->genericIdentifier() != nullptr
-            && su->genericIdentifier()->Identifier() != nullptr)
-            compiler->RegisterLexicalLocalTypeName(su->genericIdentifier()->Identifier()->getText());
-        for (auto* child : tree->children) pending.push_back(child);
-    }
-}
+bool LexicalLocalTypeShadowsValue(LLVMBackend* compiler, antlr4::tree::ParseTree* use,
+    const std::string& name);
+bool LexicalHasFunctionScope(antlr4::tree::ParseTree* node);
+void RegisterLexicalLocalTypeName(LLVMBackend* compiler,
+    antlr4::tree::ParseTree* declaration, const std::string& name);
+void RegisterLexicalStructNamesInDeclaration(LLVMBackend* compiler,
+    CFlatParser::DeclarationContext* declaration);
 struct LexicalLocalTypeScope
 {
     LLVMBackend* Compiler;
@@ -1878,160 +574,28 @@ struct LexicalLocalTypeScope
         if (Compiler != nullptr) Compiler->PopLexicalLocalTypeScope();
     }
 };
-static std::optional<int64_t> FoldLexicalConstLocal(LLVMBackend* compiler, antlr4::tree::ParseTree* use,
-    const std::string& name, const LexicalConstTypeParser& parseType, bool* found = nullptr)
-{
-    if (found != nullptr) *found = false;
-    auto shadow = [&]() -> std::optional<int64_t> {
-        if (found != nullptr) *found = true;
-        return std::nullopt;
-    };
-    auto fold = [&](CFlatParser::DeclarationSpecifiersContext* specs,
-                    CFlatParser::InitDeclaratorContext* match) -> std::optional<int64_t> {
-        if (found != nullptr) *found = true;
-        auto* initializer = match->initializer();
-        if (specs == nullptr || initializer == nullptr || initializer->assignmentExpression() == nullptr)
-            return std::nullopt;
-        auto type = parseType(specs);
-        if (type.Pointer || type.ConstArraySize != 0 || !compiler->IsNativeConstObject(type))
-            return std::nullopt;
-        auto* intTy = llvm::dyn_cast_or_null<llvm::IntegerType>(compiler->GetType(type));
-        LexicalConstParserScope parserScope(&parseType);
-        auto folded = FoldCompileTimeInt(compiler, initializer->assignmentExpression());
-        if (!folded || !ConstLocalFoldFits(intTy, *folded)) return std::nullopt;
-        return folded;
-    };
-    std::optional<int64_t> result;
-    WalkLexicalBindings(use, name, [&](const LexicalBindingEvent& event) {
-        switch (event.Kind)
-        {
-        case LexicalBindingEventKind::Block:
-            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Type)
-            {
-                result = shadow();
-                return true;
-            }
-            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Value)
-            {
-                result = event.BlockBinding.Declarator != nullptr
-                    ? fold(event.BlockBinding.Specifiers, event.BlockBinding.Declarator)
-                    : shadow();
-                return true;
-            }
-            return false;
-        case LexicalBindingEventKind::ForDeclaration:
-            result = event.Self ? shadow() : fold(event.Specifiers, event.Declarator);
-            return true;
-        case LexicalBindingEventKind::FunctionParameter:
-        case LexicalBindingEventKind::GenericParameter:
-        case LexicalBindingEventKind::LambdaParameter:
-        case LexicalBindingEventKind::CaseBinding:
-        case LexicalBindingEventKind::RangeBinding:
-            result = shadow();
-            return true;
-        }
-        return false;
-    });
-    return result;
-}
+std::optional<int64_t> FoldLexicalConstLocal(LLVMBackend* compiler, antlr4::tree::ParseTree* use,
+    const std::string& name, const LexicalConstTypeParser& parseType, bool* found = nullptr);
 
 // A bare identifier that names a compile-time integer: a -D define or a platform builtin
 // (compileTimeMacros), or a file-scope `const` integer global the scanner seeded. Anything
 // generic, qualified or unknown is not constant.
-static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
-                                                        CFlatParser::GenericIdentifierContext* gid)
-{
-    if (compiler == nullptr || gid == nullptr) return std::nullopt;
-    if (gid->genericTypeParameters() != nullptr || gid->Identifier() == nullptr) return std::nullopt;
-    const std::string name = gid->Identifier()->getText();
-    if (auto local = compiler->GetScopedLocalOrArgument(name); local.Storage != nullptr)
-        return local.ConstFoldInt;
-    // Inside a lexical const initializer a name resolves in that declaration's own scope first.
-    if (activeLexicalConstTypeParser != nullptr)
-    {
-        bool lexicalBinding = false;
-        auto lexical = FoldLexicalConstLocal(compiler, gid, name, *activeLexicalConstTypeParser,
-                                             &lexicalBinding);
-        if (lexicalBinding) return lexical;
-    }
-    // An implicit-this field shadows a global constant of the same name.
-    if (compiler->FindImplicitThisField(name, nullptr, nullptr) != nullptr) return std::nullopt;
-    auto macro = compiler->GetCompileTimeMacro(name);
-    if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(macro.value); ci != nullptr && macro.type == "int")
-    {
-        int64_t mv = (int64_t)ci->getSExtValue();
-        return InScannerInt32Range(mv) ? std::optional<int64_t>(mv) : std::nullopt;
-    }
-    // Innermost enclosing namespace first (C++ lookup): a seeded "N.name" const folds to its own value,
-    // while a non-const global or function of that qualified name hides the file-scope const.
-    for (std::string scope = compiler->GetCurrentNamespace(); !scope.empty();)
-    {
-        const std::string key = scope + "." + name;
-        int64_t nsValue = 0;
-        if (compiler->TryGetConstGlobalInt(key, nsValue))
-            return InScannerInt32Range(nsValue) ? std::optional<int64_t>(nsValue) : std::nullopt;
-        if (compiler->GetGlobalVariableNV(key).Storage != nullptr || compiler->GetFunction(key))
-            return std::nullopt;
-        const size_t dot = scope.rfind('.');
-        scope = dot == std::string::npos ? std::string{} : scope.substr(0, dot);
-    }
-    int64_t cv = 0;
-    if (!compiler->TryGetConstGlobalInt(name, cv))
-    {
-        // Inside an array dimension only, a C macro or an unscoped imported enumerator (`enum { HE = 2 }`)
-        // folds like a constant, so `(DIMQ > 2) && (HE == 2) ? 2 : 1` is a constant size. Elsewhere it
-        // stays undecided, which keeps C++ null-pointer-constant classification unchanged.
-        if (!compiler->IsFoldingArrayDim()) return std::nullopt;
-        // A CFlat global this name resolves to from the current or an enclosing namespace (`N.Q` in
-        // `namespace N`) is the binding the macro would shadow; the emission path folds a const one.
-        if (compiler->ResolveQualifiedName(name) != name) return std::nullopt;
-        auto global = compiler->GetGlobalVariableNV(name);
-        auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(global.Storage);
-        auto* ci = gv != nullptr && gv->hasInitializer()
-            ? llvm::dyn_cast<llvm::ConstantInt>(gv->getInitializer()) : nullptr;
-        if (ci == nullptr || ci->getBitWidth() > 64)
-            return std::nullopt;
-        const std::string gvName(gv->getName());
-        if (!compiler->IsCMacroGlobal(gvName) && compiler->ImportedEnumeratorGlobals().count(gvName) == 0)
-            return std::nullopt;
-        // An unsigned macro keeps its zero-extended value (0xFFFFFFFFu is 4294967295, not -1).
-        // Returned unclamped so TryFoldArrayDim reports an oversized value as "exceeds the maximum".
-        if (global.TypeAndValue.IsUnsignedInteger() != -1)
-        {
-            const uint64_t z = ci->getZExtValue();
-            return z > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)z;
-        }
-        return ci->getSExtValue();
-    }
-    return InScannerInt32Range(cv) ? std::optional<int64_t>(cv) : std::nullopt;
-}
+std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
+                                                        CFlatParser::GenericIdentifierContext* gid);
 
 // True when a value is representable as codegen's default `int` (i32). Every value this folder
 // produces is kept inside this range, so no fold can silently differ from codegen by a 32-bit
 // wraparound - the alternative reproduces codegen's exact literal typing, which the folder
 // cannot see (suffixes, u32/long promotion), so out-of-range folds to nullopt instead.
-static bool InScannerInt32Range(int64_t v) {
-        return v >= (int64_t)INT32_MIN && v <= (int64_t)INT32_MAX;
-    }
+bool InScannerInt32Range(int64_t v);
 
 // Portable stand-ins for __builtin_*_overflow, which MSVC does not provide. Each computes in
 // unsigned (well-defined wraparound) and reports whether the signed result overflowed.
-static bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out) {
-        *out = (int64_t)((uint64_t)a + (uint64_t)b);
-        return ((a ^ *out) & (b ^ *out)) < 0;
-    }
+bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out);
 
-static bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out) {
-        *out = (int64_t)((uint64_t)a - (uint64_t)b);
-        return ((a ^ b) & (a ^ *out)) < 0;
-    }
+bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out);
 
-static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out) {
-        *out = (int64_t)((uint64_t)a * (uint64_t)b);
-        if (a == 0) return false;
-        if (a == -1 && b == INT64_MIN) return true;
-        return *out / a != b;
-    }
+bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out);
 
 // An integer literal this folder can type EXACTLY the way codegen does, else nullopt.
 // Deliberately narrow, because a literal typed differently from codegen is a silent
@@ -2042,54 +606,14 @@ static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out) {
 //   - a value outside i32 (0xFFFFFFFF, 0x80000000, 2147483648) is typed and wrapped by codegen
 //     in a way this folder cannot reproduce -> refuse
 // Refusing only makes the condition undecidable, which the if-const walk already handles safely.
-static std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn) {
-        if (textIn == "true") return (int64_t)1;
-        if (textIn == "false") return (int64_t)0;
-        std::string text = textIn;
-        if (!text.empty() && (text.back() == 'u' || text.back() == 'U'
-                           || text.back() == 'l' || text.back() == 'L'))
-            return std::nullopt;   // suffixed literal - codegen's type differs from ours
-        bool neg = false;
-        size_t pos = 0;
-        if (!text.empty() && text[0] == '-') { neg = true; pos = 1; }
-        if (pos >= text.size()) return std::nullopt;
-        int base = 10;
-        if (text.size() > pos + 1 && text[pos] == '0')
-        {
-            char c = text[pos + 1];
-            if (c == 'x' || c == 'X')      { base = 16; pos += 2; }
-            else if (c == 'b' || c == 'B') { base = 2;  pos += 2; }
-            else return std::nullopt;      // C octal (leading 0) - not folded here
-        }
-        if (pos >= text.size()) return std::nullopt;
-        uint64_t v = 0;
-        auto res = std::from_chars(text.data() + pos, text.data() + text.size(), v, base);
-        if (res.ec != std::errc() || res.ptr != text.data() + text.size()) return std::nullopt;
-        if (v > (uint64_t)INT32_MAX) return std::nullopt;
-        int64_t out = neg ? -(int64_t)v : (int64_t)v;
-        return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
-    }
+std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn);
 
 // Extract the plain identifier from a directDeclarator (handles both bare names and C-style array syntax).
-static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d)
-{
-    if (!d) return "";
-    // C-style array form: (Identifier | Move) '[' assignmentExpression ']'
-    if (d->assignmentExpression())
-        return d->Identifier() ? d->Identifier()->getText() : "move";
-    return d->getText();
-}
+std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d);
 
 // A parameter's C-style array suffix hangs on its declarator rather than its specifiers.
 // Keep this structural check available to both declaration-specifier parsers.
-static bool HasParameterArrayDeclarator(CFlatParser::DeclarationSpecifiersContext* specs)
-{
-    auto* param = specs != nullptr
-        ? dynamic_cast<CFlatParser::ParameterDeclarationContext*>(specs->parent) : nullptr;
-    if (param == nullptr || param->declarator() == nullptr) return false;
-    auto* direct = param->declarator()->directDeclarator();
-    return direct != nullptr && direct->assignmentExpression() != nullptr;
-}
+bool HasParameterArrayDeclarator(CFlatParser::DeclarationSpecifiersContext* specs);
 
 // Normalize a generic type argument for use in mangled names (e.g. "Employee*" -> "Employeeptr",
 // "int[]" -> "intview"). A type-arg string carries its reference kind as a suffix: "*" for a
@@ -2097,24 +621,13 @@ static bool HasParameterArrayDeclarator(CFlatParser::DeclarationSpecifiersContex
 // text so the mangled name stays a valid identifier.
 // True if a type-parameter entry carries the `unique` qualifier: a leading Identifier
 // (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "unique".
-static bool TypeArgHasUnique(CFlatParser::TypeParameterEntryContext* entry)
-{
-    return entry != nullptr && entry->Identifier() != nullptr
-        && entry->Identifier()->getText() == "unique";
-}
+bool TypeArgHasUnique(CFlatParser::TypeParameterEntryContext* entry);
 
 // A blessed core `unique<X>` substitution answers `is_copyable` as its former raw-pointer
 // spelling. The wrapper is transparent to this generic predicate; the interface arm stays a bare
 // interface name. Sole remaining caller is is_copyable; is_unique answers IsCoreUniqueType.
-static std::string LegacyUniqueSubstitutionSpelling(const LLVMBackend* compiler,
-                                                    const std::string& resolved)
-{
-    if (compiler == nullptr || !compiler->IsCoreUniqueType(resolved)) return resolved;
-    std::string pointee = MangledGenericArgument(*compiler, resolved);
-    if (compiler->IsInterfaceType(pointee))
-        return pointee;
-    return pointee + "*";
-}
+std::string LegacyUniqueSubstitutionSpelling(const LLVMBackend* compiler,
+                                                    const std::string& resolved);
 
 /*
  * The allocation alignment a core `unique<T, N>` DECLARES, read off its own ALIGN generic
@@ -2123,119 +636,37 @@ static std::string LegacyUniqueSubstitutionSpelling(const LLVMBackend* compiler,
  * TypeAndValue or only the sugar seeds the inbound allocation-alignment channel. Returns 0 when
  * the type is not a core unique, carries no second argument, or the argument is not a number.
  */
-static uint64_t CoreUniqueDeclaredAllocAlign(const LLVMBackend* compiler,
-                                             const std::string& typeName)
-{
-    if (compiler == nullptr || !compiler->IsCoreUniqueType(typeName)) return 0;
-    std::string alignArg = MangledGenericArgument(*compiler, typeName, 1);
-    if (!alignArg.empty() && alignArg.front() == '.') alignArg.erase(0, 1);
-    if (alignArg.empty()) return 0;
-    for (char c : alignArg)
-        if (c < '0' || c > '9') return 0;
-    return std::strtoull(alignArg.c_str(), nullptr, 10);
-}
+uint64_t CoreUniqueDeclaredAllocAlign(const LLVMBackend* compiler,
+                                             const std::string& typeName);
 
 // Shape the argument handed to unique<T>'s constructor: the pointer arm hands over the pointee
 // pointer, the interface arm hands over the interface VALUE (or an implementor pointer to box).
-static void ShapeCoreUniqueCtorArg(const LLVMBackend* compiler,
+void ShapeCoreUniqueCtorArg(const LLVMBackend* compiler,
                                    LLVMBackend::NamedVariable& ctorArg,
-                                   const std::string& uniqueTypeName, llvm::Value* value)
-{
-    const std::string pointee = MangledGenericArgument(*compiler, uniqueTypeName);
-    if (compiler != nullptr && compiler->IsInterfaceType(pointee))
-    {
-        bool fat = value != nullptr && value->getType()->isStructTy();
-        std::string argType = fat ? pointee : ctorArg.TypeAndValue.TypeName;
-        if (argType.empty()) argType = pointee;
-        ctorArg.TypeAndValue.TypeName = argType;
-        ctorArg.TypeAndValue.Pointer = !fat;
-        ctorArg.TypeAndValue.IsInterface = compiler->IsInterfaceType(argType);
-        ctorArg.TypeAndValue.IsInterfacePointer = false;
-    }
-    else
-    {
-        ctorArg.TypeAndValue.TypeName = pointee;
-        ctorArg.TypeAndValue.Pointer = true;
-    }
-    ctorArg.TypeAndValue.ElemPointer = false;
-    ctorArg.TypeAndValue.PointerDepth = 0;
-}
+                                   const std::string& uniqueTypeName, llvm::Value* value);
 
 // A function-pointer SIGNATURE keeps the raw pointee spelling a desugared `unique X*` element
 // had before the desugar, so a user lambda stays spelled `X*` and the indirect-call adaptation
 // borrows the wrapper into it. The interface arm has no pointer spelling and is left alone.
-static void CanonicalizeUniqueSigComponent(const LLVMBackend* compiler, std::string& typeName,
-                                           bool& pointer, int& pointerDepth)
-{
-    if (compiler == nullptr || pointer || !compiler->IsCoreUniqueType(typeName)) return;
-    std::string pointee = MangledGenericArgument(*compiler, typeName);
-    if (compiler->IsInterfaceType(pointee)) return;
-    typeName = pointee;
-    pointer = true;
-    pointerDepth = 1;
-}
+void CanonicalizeUniqueSigComponent(const LLVMBackend* compiler, std::string& typeName,
+                                           bool& pointer, int& pointerDepth);
 
 // True when `unique X*` / `unique IFace` in GENERIC-ARGUMENT position spells the core
 // `unique<X>` value. Unsupported forms are rejected before a type-argument spelling is mangled.
-static bool CanDesugarUniqueTypeArg(const LLVMBackend* compiler, const std::string& base,
+bool CanDesugarUniqueTypeArg(const LLVMBackend* compiler, const std::string& base,
                                     bool hasPointer, int pointerDepth, bool hasArrayView,
-                                    bool baseIsGenericInstantiation = false)
-{
-    if (compiler == nullptr || hasArrayView || base.empty() || base == "void") return false;
-    if (base.find('*') != std::string::npos || base.find('[') != std::string::npos) return false;
-    // The interface answer must be the SAME in both passes: interfaceTable is still empty during
-    // the forward scan, so the scan's own interface-definition set stands in for it there.
-    if (compiler->IsInterfaceTypeArgKey(base)) return !hasPointer;
-    if (!hasPointer || pointerDepth != 1) return false;
-    // IsTypeArgTypeKey also answers for a name the FORWARD SCAN has only seen, so the scanner's
-    // opaque shell is named the same as the instantiation the codegen pass builds. An unbound
-    // template parameter is in neither set and keeps the qualifier prefix.
-    // baseIsGenericInstantiation: the caller MANGLED this base itself from a nested generic spec,
-    // so no registry holds it yet - the other pass registers it before it asks. Without it the two
-    // passes disagreed on `unique dictionary<string, double>*`.
-    return compiler->IsKnownTypeName(base) || compiler->IsTypeArgTypeKey(base)
-        || baseIsGenericInstantiation;
-}
+                                    bool baseIsGenericInstantiation = false);
 
 // True when `name` is a type PARAMETER of a generic template (function, struct or class)
 // enclosing `node` - the `T` in `int take<T>(unique T* p)` while T is still unbound.
-static bool NamesEnclosingTypeParameter(antlr4::tree::ParseTree* node, const std::string& name)
-{
-    for (auto* cur = node; cur != nullptr; cur = cur->parent)
-    {
-        CFlatParser::GenericTypeParametersContext* generic = nullptr;
-        if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(cur))
-            generic = fn->genericTypeParameters();
-        else if (auto* sd = dynamic_cast<CFlatParser::StructDefinitionContext*>(cur))
-            generic = sd->genericTypeParameters();
-        else if (auto* cd = dynamic_cast<CFlatParser::ClassDefinitionContext*>(cur))
-            generic = cd->genericTypeParameters();
-        if (generic == nullptr || generic->typeParameterList() == nullptr) continue;
-        for (auto* entry : generic->typeParameterList()->typeParameterEntry())
-        {
-            if (entry->valueParameterDeclaration() != nullptr || entry->typeSpecifier() == nullptr)
-                continue;
-            auto* gid = entry->typeSpecifier()->genericIdentifier();
-            if (gid != nullptr && gid->Identifier() != nullptr
-                && gid->genericTypeParameters() == nullptr
-                && gid->Identifier()->getText() == name)
-                return true;
-        }
-    }
-    return false;
-}
+bool NamesEnclosingTypeParameter(antlr4::tree::ParseTree* node, const std::string& name);
 
 // A `unique T*` DECLARATION (parameter, return, local, field) whose pointee still names an UNBOUND
 // template type parameter must not desugar here: the queued unique<T> would carry the literal
 // parameter name and its body would fail on `using P = T*`. Defer to instantiation, where the
 // same specifiers are re-parsed with T bound - the deferral the explicit `unique<T>` spelling gets.
-static bool UniqueDeclPointeeIsUnbound(const LLVMBackend* compiler, antlr4::tree::ParseTree* node,
-                                       const std::string& name)
-{
-    if (compiler == nullptr || name.empty()) return false;
-    if (compiler->IsKnownTypeName(name) || compiler->IsTypeArgTypeKey(name)) return false;
-    return NamesEnclosingTypeParameter(node, name);
-}
+bool UniqueDeclPointeeIsUnbound(const LLVMBackend* compiler, antlr4::tree::ParseTree* node,
+                                       const std::string& name);
 
 // The `alias` borrow qualifier on a generic type argument is carried the same way as `unique`:
 // a leading "alias " prefix on the resolved type-arg string. It denotes a pure borrow element
@@ -2246,139 +677,43 @@ static const size_t kAliasQualifierPrefixLen = sizeof(kAliasQualifierPrefix) - 1
 
 // True if a type-parameter entry carries the `alias` qualifier: a leading Identifier
 // (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "alias".
-static bool TypeArgHasAlias(CFlatParser::TypeParameterEntryContext* entry)
-{
-    return entry != nullptr && entry->Identifier() != nullptr
-        && entry->Identifier()->getText() == "alias";
-}
+bool TypeArgHasAlias(CFlatParser::TypeParameterEntryContext* entry);
 
-static bool IsValueParameterDeclaration(CFlatParser::TypeParameterEntryContext* entry)
-{
-    return entry != nullptr && entry->valueParameterDeclaration() != nullptr;
-}
+bool IsValueParameterDeclaration(CFlatParser::TypeParameterEntryContext* entry);
 
-static std::string ValueParameterTypeSpelling(CFlatParser::TypeParameterEntryContext* entry)
-{
-    auto* decl = entry != nullptr ? entry->valueParameterDeclaration() : nullptr;
-    return decl != nullptr && decl->valueParameterType() != nullptr
-        ? decl->valueParameterType()->getText() : std::string{};
-}
+std::string ValueParameterTypeSpelling(CFlatParser::TypeParameterEntryContext* entry);
 
-static bool IsDecimalIntegerSpelling(const std::string& text)
-{
-    if (text.empty()) return false;
-    size_t start = text[0] == '-' ? 1 : 0;
-    if (start == text.size()) return false;
-    for (size_t i = start; i < text.size(); i++)
-        if (text[i] < '0' || text[i] > '9') return false;
-    return true;
-}
+bool IsDecimalIntegerSpelling(const std::string& text);
 
 // A generic VALUE argument is carried as a decimal spelling ("8", "-8"); this is the one place
 // it turns back into a number. Not a validity check - IsDecimalIntegerSpelling gates that.
-static int64_t ParseValueArg(const std::string& text)
-{
-    int64_t out = 0;
-    size_t start = (!text.empty() && text[0] == '-') ? 1 : 0;
-    auto res = std::from_chars(text.data() + start, text.data() + text.size(), out);
-    if (res.ec != std::errc() || res.ptr != text.data() + text.size()) return 0;
-    return start == 1 ? -out : out;
-}
+int64_t ParseValueArg(const std::string& text);
 
 // The value-producing side of an initializer/assignment, when it is a heap ARRAY allocation
 // (`new T[n]`). Recurses through parens, the assignment/conditional chain and the `?:`/`??`
 // arms so a joined allocation is found too; never descends into a call argument or a
 // condition, which are not the value. Pure DIAGNOSTIC: nothing about the representation is
 // decided here.
-static CFlatParser::NewExpressionContext* RawNewArrayValueOf(antlr4::tree::ParseTree* node)
-{
-    if (node == nullptr) return nullptr;
-    if (auto* newExpr = dynamic_cast<CFlatParser::NewExpressionContext*>(node))
-        return newExpr->assignmentExpression() != nullptr ? newExpr : nullptr;
-    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
-    {
-        if (conditional->Question() != nullptr)
-        {
-            if (auto* v = RawNewArrayValueOf(conditional->expression())) return v;
-            return RawNewArrayValueOf(conditional->conditionalExpression());
-        }
-        if (conditional->QuestionQuestion() != nullptr)
-        {
-            if (auto* v = RawNewArrayValueOf(conditional->logicalOrExpression())) return v;
-            return RawNewArrayValueOf(conditional->conditionalExpression());
-        }
-        return RawNewArrayValueOf(conditional->logicalOrExpression());
-    }
-    if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
-        return RawNewArrayValueOf(assignment->conditionalExpression());
-    if (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node))
-    {
-        // A single-child pass-through link in the expression chain (or a parenthesized
-        // expression) carries the same value; anything wider is not the value side.
-        if (ctx->children.size() == 1)
-            return RawNewArrayValueOf(ctx->children[0]);
-        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
-            primary != nullptr && primary->expression() != nullptr)
-            return RawNewArrayValueOf(primary->expression());
-    }
-    return nullptr;
-}
+CFlatParser::NewExpressionContext* RawNewArrayValueOf(antlr4::tree::ParseTree* node);
 
 // T250: true when the RHS IS an assignment, reached only through parentheses and single-child links.
 // A member access, cast or call around it consumes the value differently, so it never takes the slot.
-static bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node)
-{
-    if (node == nullptr) return false;
-    if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
-        assign != nullptr && assign->assignmentOperator() != nullptr)
-        return true;
-    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-        primary != nullptr)
-        return primary->expression() != nullptr && primary->children.size() == 3
-            && IsChainedAssignmentShape(primary->expression());
-    if (auto* ctxRule = dynamic_cast<antlr4::ParserRuleContext*>(node);
-        ctxRule != nullptr && ctxRule->children.size() == 1)
-        return IsChainedAssignmentShape(ctxRule->children[0]);
-    return false;
-}
+bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node);
 
 // Fill omitted TRAILING generic arguments from the template's declared defaults. Returns true
 // when every parameter now has an argument. Shared by the struct/class and function
 // instantiation paths so both agree with the canonical mangled name.
-static bool FillGenericValueDefaults(const LLVMBackend& compiler, const std::string& templateName,
-                                     size_t paramCount, std::vector<std::string>& typeArgs)
-{
-    const auto* defaults = GenericValueDefaultsFor(compiler, templateName);
-    if (defaults == nullptr) return typeArgs.size() >= paramCount;
-    while (typeArgs.size() < paramCount && typeArgs.size() < defaults->size()
-           && !(*defaults)[typeArgs.size()].empty())
-        typeArgs.push_back((*defaults)[typeArgs.size()]);
-    return typeArgs.size() >= paramCount;
-}
+bool FillGenericValueDefaults(const LLVMBackend& compiler, const std::string& templateName,
+                                     size_t paramCount, std::vector<std::string>& typeArgs);
 
 // True when the template declares at least one defaulted parameter, i.e. it opted into the
 // arity check that a template without defaults has never had.
-static bool TemplateHasGenericDefaults(const LLVMBackend& compiler, const std::string& templateName)
-{
-    const auto* defaults = GenericValueDefaultsFor(compiler, templateName);
-    if (defaults == nullptr) return false;
-    for (const auto& d : *defaults)
-        if (!d.empty()) return true;
-    return false;
-}
+bool TemplateHasGenericDefaults(const LLVMBackend& compiler, const std::string& templateName);
 
 // Strip a leading "alias " qualifier off a resolved type-arg string, returning whether it was
 // present. The bare base (e.g. "Circle*") remains so it resolves to the same LLVM type as the
 // unqualified spelling; the alias prefix only drives distinct monomorphization + borrow tagging.
-static bool StripAliasQualifier(std::string& name)
-{
-    if (name.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
-    {
-        name.erase(0, kAliasQualifierPrefixLen);
-        return true;
-    }
-    return false;
-}
+bool StripAliasQualifier(std::string& name);
 
 // Type parameter -> argument spelling of the instantiation being walked. An argument's pointee
 // const ("(const int)*") is kept beside the plain spelling, which every reader of the map sees;
@@ -2420,84 +755,36 @@ private:
 
 // Strip the leading `alias ` qualifier off a resolved type-arg string. It is a generic
 // instantiation marker, not part of the underlying LLVM type.
-static void StripOwnershipQualifiers(std::string& name)
-{
-    StripAliasQualifier(name);
-}
+void StripOwnershipQualifiers(std::string& name);
 
 // The type-mangling funnel owns primitive canonicalization for both generic identities and
 // overload symbol names, so one spelling cannot monomorphize differently from how it overloads.
 // `compiler` is REQUIRED (no default): it supplies the pure-rename `using` alias fold, and a site
 // that silently skipped it would mangle a name the other pass spells differently. Every current
 // call site reaches one; a nullptr is only correct where the string cannot name a source alias.
-static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string& typeName)
-{
-    if (compiler == nullptr) return typeName;
-    LLVMBackend::TypeAndValue type;
-    type.TypeName = typeName;
-    return MangleType(*compiler, type);
-}
+std::string MangleTypeArg(const LLVMBackend* compiler, const std::string& typeName);
 
-static std::string SpellFunctionParameterValueType(
-    const LLVMBackend& compiler, const LLVMBackend::TypeAndValue& type)
-{
-    std::string spelling = SpellType(compiler, type);
-    const int depth = type.ValuePointerDepth();
-    const uint8_t pointeeConst = static_cast<uint8_t>(type.PointeeConstMask());
-    int constDepth = 0;
-    while (constDepth < depth && (pointeeConst & (1u << constDepth)) != 0)
-        ++constDepth;
-    return JoinConstTypeArgument(spelling, constDepth);
-}
+std::string SpellFunctionParameterValueType(
+    const LLVMBackend& compiler, const LLVMBackend::TypeAndValue& type);
 
 // One `using` declaration considered as a mangling-visible PURE RENAME. Shared by the two
 // pre-scans (ForwardRefScanner::ScanGenericTypeUses and MainListener::ScanAndQueueGenericTypeUses)
 // so a body-scope alias binds to the same target in both. With an alias frame open the rename
 // lands in THAT frame, so it never displaces or outlives a file-scope alias of the same name.
 // `using X = const W*;`: whole-word const over every level of the aliased word (ApplyWholeWordConst).
-static uint8_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string& target, size_t suffixStars)
-{
-    const std::string resolved = compiler->ResolveTypeAlias(target);
-    size_t depth = suffixStars;
-    for (auto it = resolved.rbegin(); it != resolved.rend() && *it == '*'; ++it) ++depth;
-    return static_cast<uint8_t>((1u << (std::min<size_t>(depth, 6) + 1)) - 1u);
-}
+uint8_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string& target, size_t suffixStars);
 
-static std::vector<std::string> EnclosingAggregateNamesFromContext(
+std::vector<std::string> EnclosingAggregateNamesFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node);
-static std::string NamespaceNameFromContext(
+std::string NamespaceNameFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node);
-static bool IsUnparameterizedNamedTypeSpecifier(CFlatParser::TypeSpecifierContext* typeSpec);
-static std::string ResolveContextualTypeName(LLVMBackend* compiler,
+bool IsUnparameterizedNamedTypeSpecifier(CFlatParser::TypeSpecifierContext* typeSpec);
+std::string ResolveContextualTypeName(LLVMBackend* compiler,
     const std::string& spelled, const std::string& resolvedName,
     CFlatParser::TypeSpecifierContext* typeSpec,
     const std::vector<std::string>& aggregateScopes, const std::string& namespaceName);
 
-static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDeclarationContext* ctx)
-{
-    if (compiler == nullptr || ctx == nullptr) return;
-    if (ctx->Identifier() == nullptr) return;  // `using "name" = T;` keys on a string literal
-    // A pointer/array suffix means the alias is not a pure rename.
-    if (ctx->pointer() != nullptr || ctx->arrayTypeSuffix() != nullptr) return;
-    auto* typeSpec = ctx->typeSpecifier();
-    if (typeSpec == nullptr) return;
-    PrimitiveTypeError targetError;
-    std::string targetSpelling = CanonicalTypeSpecifierText(
-        typeSpec, ctx->multiWordTypeSuffix(), false, &targetError);
-    if (HasPrimitiveTypeError(targetError)) return;
-    std::string target = compiler->ResolveQualifiedName(targetSpelling);
-    if (IsUnparameterizedNamedTypeSpecifier(typeSpec))
-    {
-        const std::string contextual = ResolveContextualTypeName(compiler,
-            typeSpec->getText(), target, typeSpec,
-            EnclosingAggregateNamesFromContext(compiler, typeSpec),
-            NamespaceNameFromContext(compiler, typeSpec));
-        if (!contextual.empty()) target = contextual;
-    }
-    std::string alias = ctx->Identifier()->getText();
-    if (alias == target || !IsBareTypeName(target)) return;
-    compiler->RegisterManglingAlias(alias, target);
-}
+void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDeclarationContext* ctx);
 
 // Namespace-resolve a type-argument string that carries a reference-kind suffix ("Item*",
 // "Item[]"): only the bare core participates in the walk. For the two scanner paths that build the
@@ -2505,50 +792,15 @@ static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDec
 // LLVMBackend::ResolveTypeArgBaseName directly. No ownership-prefix handling: getText() has no
 // whitespace, so a `unique`/`alias` arg arrives as "uniqueItem*" and never reaches here as a
 // prefixed spelling (those two are routed through ResolveForwardTypeArg instead).
-static std::string ResolveTypeArgSpelling(const LLVMBackend* compiler, const std::string& arg)
-{
-    if (compiler == nullptr || arg.empty()) return arg;
-    bool isView = arg.ends_with("[]");
-    size_t end = isView ? arg.size() - 2 : arg.size();
-    int stars = 0;
-    while (end > 0 && arg[end - 1] == '*') { end--; stars++; }
-    if (end == 0) return arg;
-    std::string core = arg.substr(0, end);
-    std::string resolved = compiler->ResolveTypeArgBaseName(core);
-    if (FoldPointerAliasArg(compiler, resolved, stars))
-        return resolved + std::string(stars, '*') + (isView ? "[]" : "");
-    if (resolved == core) return arg;
-    return resolved + arg.substr(end);
-}
+std::string ResolveTypeArgSpelling(const LLVMBackend* compiler, const std::string& arg);
 
 // The generic instantiation written at `ts`, covering BOTH spellings: the bare `Box<int>`
 // (genericIdentifier) and the namespace-qualified `Windows.Foundation.IReference<int>`
 // (qualifiedGenericIdentifier). `base` receives the base name, dotted when it was written dotted.
 // Returns the <...> argument list, or nullptr when `ts` is not a generic instantiation (in which
 // case callers fall through to their plain-type path, which reads getText()).
-static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
-    CFlatParser::TypeSpecifierContext* ts, std::string& base)
-{
-    base.clear();
-    if (ts == nullptr) return nullptr;
-    if (auto* q = ts->qualifiedGenericIdentifier())
-    {
-        // The lexer token for a soft-keyword component such as `std.function` is Function,
-        // not Identifier, so reconstruct the qualified base from the text rather than dropping
-        // that component from the C++ template identity.
-        std::string text = q->getText();
-        size_t lt = text.find('<');
-        base = text.substr(0, lt == std::string::npos ? text.size() : lt);
-        return q->genericTypeParameters();
-    }
-    if (auto* g = ts->genericIdentifier())
-    {
-        if (g->Identifier() == nullptr) return nullptr;
-        base = g->Identifier()->getText();
-        return g->genericTypeParameters();
-    }
-    return nullptr;
-}
+CFlatParser::GenericTypeParametersContext* GenericSpecOf(
+    CFlatParser::TypeSpecifierContext* ts, std::string& base);
 
 struct EnclosingAggregateLookupScope
 {
@@ -2557,469 +809,88 @@ struct EnclosingAggregateLookupScope
     bool NameIsResolved = false;
 };
 
-static std::string NamespaceNameFromContext(
-    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    std::vector<CFlatParser::NamespaceDefinitionContext*> namespaces;
-    for (auto* parent = node; parent != nullptr; parent = parent->parent)
-        if (auto* ns = dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(parent))
-            namespaces.push_back(ns);
-    std::string name;
-    for (auto it = namespaces.rbegin(); it != namespaces.rend(); ++it)
-        for (auto* id : (*it)->Identifier())
-            name += (name.empty() ? "" : ".") + id->getText();
-    return name.empty() && compiler != nullptr ? compiler->GetCurrentNamespace() : name;
-}
-
-static bool IsUnparameterizedNamedTypeSpecifier(CFlatParser::TypeSpecifierContext* typeSpec)
-{
-    if (typeSpec == nullptr) return false;
-    if (auto* qualified = typeSpec->qualifiedGenericIdentifier(); qualified != nullptr)
-        return qualified->genericTypeParameters() == nullptr;
-    if (auto* generic = typeSpec->genericIdentifier(); generic != nullptr)
-        return generic->genericTypeParameters() == nullptr;
-    return false;
-}
-
-static std::vector<std::string> NamedTypePathFromContext(CFlatParser::TypeSpecifierContext* typeSpec)
-{
-    std::vector<std::string> path;
-    if (!IsUnparameterizedNamedTypeSpecifier(typeSpec)) return path;
-    if (auto* qualified = typeSpec->qualifiedGenericIdentifier())
-    {
-        path.push_back(qualified->Identifier()->getText());
-        for (auto* member : qualified->memberNameToken()) path.push_back(member->getText());
-    }
-    else if (auto* generic = typeSpec->genericIdentifier())
-        path.push_back(generic->Identifier()->getText());
-    return path;
-}
-
-static bool HasNestedAggregatePathInContext(antlr4::tree::ParseTree* useSite,
-    size_t aggregateIndex, const std::vector<std::string>& path)
-{
-    if (path.empty()) return false;
-    antlr4::tree::ParseTree* owner = nullptr;
-    for (auto* parent = useSite != nullptr ? useSite->parent : nullptr;
-         parent != nullptr; parent = parent->parent)
-    {
-        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) == nullptr
-            && dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) == nullptr)
-            continue;
-        if (aggregateIndex-- == 0)
-        {
-            owner = parent;
-            break;
-        }
-    }
-    if (owner == nullptr) return false;
-    auto hasPath = [&](auto&& self, antlr4::tree::ParseTree* aggregate, size_t part) -> bool
-    {
-        std::vector<CFlatParser::AggregateMemberContext*> members;
-        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(aggregate))
-            members = structure->aggregateMember();
-        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(aggregate))
-            members = classDefinition->aggregateMember();
-        for (auto* member : members)
-        {
-            if (part + 1 == path.size())
-                if (auto* alias = member->usingDeclaration(); alias != nullptr
-                    && alias->Identifier() != nullptr
-                    && alias->Identifier()->getText() == path[part])
-                    return true;
-            antlr4::tree::ParseTree* nested = member->structDefinition();
-            if (nested == nullptr) nested = member->classDefinition();
-            if (nested == nullptr) continue;
-            auto* direct = dynamic_cast<CFlatParser::StructDefinitionContext*>(nested);
-            auto* classDirect = dynamic_cast<CFlatParser::ClassDefinitionContext*>(nested);
-            const std::string nestedName = direct != nullptr
-                ? direct->directDeclarator()->getText() : classDirect->directDeclarator()->getText();
-            if (nestedName != path[part]) continue;
-            if (part + 1 == path.size() || self(self, nested, part + 1)) return true;
-        }
-        return false;
-    };
-    return hasPath(hasPath, owner, 0);
-}
-
-static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateTypeScopesFromContext(
+std::string NamespaceNameFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
-static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromContext(
-    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    if (compiler == nullptr) return {};
-    auto scopes = EnclosingAggregateTypeScopesFromContext(compiler, node);
-    if (!compiler->GetCurrentNamespace().empty())
-        scopes.push_back({ compiler->GetCurrentNamespace(), nullptr });
-    return scopes;
-}
+bool IsUnparameterizedNamedTypeSpecifier(CFlatParser::TypeSpecifierContext* typeSpec);
 
-static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateTypeScopesFromContext(
-    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    if (compiler == nullptr) return {};
-    std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> aggregates;
-    for (auto* parent = node != nullptr ? node->parent : nullptr;
-         parent != nullptr; parent = parent->parent)
-    {
-        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
-            aggregates.emplace_back(structure->directDeclarator()->getText(), structure);
-        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent))
-            aggregates.emplace_back(classDefinition->directDeclarator()->getText(), classDefinition);
-        else if (auto* programDefinition = dynamic_cast<CFlatParser::ProgramDefinitionContext*>(parent))
-            aggregates.emplace_back(programDefinition->directDeclarator()->getText(), programDefinition);
-    }
-    std::string scope = NamespaceNameFromContext(compiler, node);
-    std::vector<EnclosingAggregateLookupScope> scopes;
-    for (auto it = aggregates.rbegin(); it != aggregates.rend(); ++it)
-    {
-        scope += (scope.empty() ? "" : ".") + it->first;
-        scopes.push_back({ scope, it->second });
-    }
-    std::reverse(scopes.begin(), scopes.end());
-    return scopes;
-}
+std::vector<std::string> NamedTypePathFromContext(CFlatParser::TypeSpecifierContext* typeSpec);
 
-static std::vector<std::string> EnclosingAggregateNamesFromContext(
-    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    if (compiler == nullptr) return {};
-    const auto scopes = EnclosingAggregateTypeScopesFromContext(compiler, node);
-    std::vector<std::string> aggregateNames;
-    aggregateNames.reserve(scopes.size());
-    for (const auto& scope : scopes) aggregateNames.push_back(scope.Name);
-    return aggregateNames;
-}
+bool HasNestedAggregatePathInContext(antlr4::tree::ParseTree* useSite,
+    size_t aggregateIndex, const std::vector<std::string>& path);
 
-static std::string AggregateDefinitionName(antlr4::ParserRuleContext* definition)
-{
-    if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(definition))
-        return structure->directDeclarator()->getText();
-    if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(definition))
-        return classDefinition->directDeclarator()->getText();
-    if (auto* program = dynamic_cast<CFlatParser::ProgramDefinitionContext*>(definition))
-        return program->directDeclarator()->getText();
-    return {};
-}
+std::vector<EnclosingAggregateLookupScope> EnclosingAggregateTypeScopesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
-static std::string ResolveContextualTypeName(LLVMBackend* compiler,
+std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+
+std::vector<EnclosingAggregateLookupScope> EnclosingAggregateTypeScopesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+
+std::vector<std::string> EnclosingAggregateNamesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+
+std::string AggregateDefinitionName(antlr4::ParserRuleContext* definition);
+
+std::string ResolveContextualTypeName(LLVMBackend* compiler,
     const std::string& spelled, const std::string& resolvedName,
     CFlatParser::TypeSpecifierContext* typeSpec,
-    const std::vector<std::string>& aggregateScopes, const std::string& namespaceName)
-{
-    if (compiler == nullptr || spelled.empty()) return {};
-    auto isKnownType = [compiler](const std::string& candidate)
-    {
-        return compiler->IsKnownTypeName(candidate) || compiler->IsTypeArgTypeKey(candidate);
-    };
-    const auto typePath = NamedTypePathFromContext(typeSpec);
-    const auto contextScopes = EnclosingAggregateTypeScopesFromContext(compiler, typeSpec);
-    for (size_t i = 0; i < contextScopes.size(); i++)
-    {
-        if (i >= aggregateScopes.size()) break;
-        const std::string& candidateScope = aggregateScopes[i];
-        if (!candidateScope.empty())
-        {
-            const bool declaredInAggregate =
-                HasNestedAggregatePathInContext(typeSpec, i, typePath);
-            if (AggregateDefinitionName(contextScopes[i].Definition) == spelled)
-                return candidateScope;
-            const std::string candidate = candidateScope + "." + spelled;
-            const bool ambiguousScope = compiler->IsNamespace(candidateScope);
-            if ((!ambiguousScope || declaredInAggregate)
-                && (isKnownType(candidate) || declaredInAggregate))
-                return candidate;
-        }
-    }
-    const size_t memberDot = spelled.find('.');
-    if (memberDot != std::string::npos)
-    {
-        const std::string owner = spelled.substr(0, memberDot);
-        for (std::string scope = namespaceName; !scope.empty(); )
-        {
-            const std::string ownerCandidate = scope + "." + owner;
-            if (isKnownType(ownerCandidate))
-            {
-                const std::string candidate = scope + "." + spelled;
-                if (isKnownType(candidate)) return candidate;
-            }
-            const size_t dot = scope.rfind('.');
-            if (dot == std::string::npos) break;
-            scope.resize(dot);
-        }
-    }
-    if (isKnownType(resolvedName)) return {};
-    return {};
-}
+    const std::vector<std::string>& aggregateScopes, const std::string& namespaceName);
 
-static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesForCall(
-    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    return EnclosingAggregateScopesFromContext(compiler, node);
-}
+std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesForCall(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
-static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromName(
-    const std::string& scopeName)
-{
-    std::vector<EnclosingAggregateLookupScope> scopes;
-    std::string prefix;
-    size_t begin = 0;
-    while (begin < scopeName.size())
-    {
-        const size_t end = scopeName.find('.', begin);
-        const std::string part = scopeName.substr(begin,
-            end == std::string::npos ? std::string::npos : end - begin);
-        prefix += (prefix.empty() ? "" : ".") + part;
-        scopes.push_back({ prefix, nullptr });
-        if (end == std::string::npos) break;
-        begin = end + 1;
-    }
-    std::reverse(scopes.begin(), scopes.end());
-    return scopes;
-}
+std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromName(
+    const std::string& scopeName);
 
-static std::string EnclosingAggregateScopeFromContext(
-    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    const auto scopes = EnclosingAggregateScopesFromContext(compiler, node);
-    return scopes.empty() ? std::string{} : scopes.front().Name;
-}
+std::string EnclosingAggregateScopeFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
 // A function or destructor body is a complete-class context: every member of the enclosing
 // aggregate is visible there, declared later or not. Field types and signatures keep order.
-static bool IsCompleteClassBodyUse(antlr4::tree::ParseTree* node)
-{
-    for (auto* parent = node != nullptr ? node->parent : nullptr; parent != nullptr; parent = parent->parent)
-    {
-        if (dynamic_cast<CFlatParser::CompoundStatementContext*>(parent) != nullptr) return true;
-        if (dynamic_cast<CFlatParser::AggregateMemberContext*>(parent) != nullptr) return false;
-    }
-    return false;
-}
+bool IsCompleteClassBodyUse(antlr4::tree::ParseTree* node);
 
-static bool HasVisibleNonGenericAggregateName(
+bool HasVisibleNonGenericAggregateName(
     const EnclosingAggregateLookupScope& scope, const std::string& name,
-    antlr4::tree::ParseTree* useSite)
-{
-    auto* use = dynamic_cast<antlr4::ParserRuleContext*>(useSite);
-    if (scope.Definition == nullptr || use == nullptr || use->getStart() == nullptr) return false;
-    const size_t useToken = use->getStart()->getTokenIndex();
-    const bool completeClass = IsCompleteClassBodyUse(useSite);
-    auto matches = [&](antlr4::ParserRuleContext* definition,
-                       CFlatParser::DirectDeclaratorContext* declarator,
-                       bool isGeneric)
-    {
-        return definition != nullptr && definition->getStart() != nullptr && declarator != nullptr
-            && !isGeneric && declarator->getText() == name
-            && (completeClass || definition->getStart()->getTokenIndex() < useToken);
-    };
-    if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(scope.Definition))
-    {
-        for (auto* member : structure->aggregateMember())
-        {
-            if (auto* nested = member->structDefinition(); nested != nullptr
-                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
-                return true;
-            if (auto* nested = member->classDefinition(); nested != nullptr
-                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
-                return true;
-        }
-    }
-    else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(scope.Definition))
-    {
-        for (auto* member : classDefinition->aggregateMember())
-        {
-            if (auto* nested = member->structDefinition(); nested != nullptr
-                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
-                return true;
-            if (auto* nested = member->classDefinition(); nested != nullptr
-                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
-                return true;
-        }
-    }
-    return false;
-}
+    antlr4::tree::ParseTree* useSite);
 
-static bool HasEnclosingAggregateContext(antlr4::tree::ParseTree* node)
-{
-    for (auto* parent = node != nullptr ? node->parent : nullptr;
-         parent != nullptr; parent = parent->parent)
-        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) != nullptr
-            || dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) != nullptr)
-            return true;
-    return false;
-}
+bool HasEnclosingAggregateContext(antlr4::tree::ParseTree* node);
 
-static bool IsAggregateMemberDeclarationTypeUse(antlr4::tree::ParseTree* node)
-{
-    for (auto* parent = node != nullptr ? node->parent : nullptr;
-         parent != nullptr; parent = parent->parent)
-    {
-        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
-            return false;
-        if (auto* member = dynamic_cast<CFlatParser::AggregateMemberContext*>(parent))
-            return member->declaration() != nullptr;
-    }
-    return false;
-}
+bool IsAggregateMemberDeclarationTypeUse(antlr4::tree::ParseTree* node);
 
-static bool GenericTemplateDeclaredBeforeUse(
-    LLVMBackend* compiler, const std::string& base, antlr4::tree::ParseTree* useSite)
-{
-    auto* useContext = dynamic_cast<antlr4::ParserRuleContext*>(useSite);
-    if (compiler == nullptr || useContext == nullptr || useContext->getStart() == nullptr) return true;
-    auto* definition = compiler->GetGenericTemplateDefinitionContext(base);
-    return definition == nullptr || definition->getStart() == nullptr
-        || definition->getStart()->getTokenIndex() < useContext->getStart()->getTokenIndex();
-}
+bool GenericTemplateDeclaredBeforeUse(
+    LLVMBackend* compiler, const std::string& base, antlr4::tree::ParseTree* useSite);
 
-static bool GenericTemplateKeyNestedInScope(const std::string& key, const std::string& scope)
-{
-    return !scope.empty() && key.size() > scope.size()
-        && key.compare(0, scope.size(), scope) == 0 && key[scope.size()] == '.';
-}
+bool GenericTemplateKeyNestedInScope(const std::string& key, const std::string& scope);
 
-static bool GenericTemplateKeyNestedInAnyScope(
-    const std::string& key, const std::vector<EnclosingAggregateLookupScope>& scopes)
-{
-    for (const auto& scope : scopes)
-        if (GenericTemplateKeyNestedInScope(key, scope.Name)) return true;
-    return false;
-}
+bool GenericTemplateKeyNestedInAnyScope(
+    const std::string& key, const std::vector<EnclosingAggregateLookupScope>& scopes);
 
-static std::string ResolveGenericTemplateBaseAtScope(
+std::string ResolveGenericTemplateBaseAtScope(
     LLVMBackend* compiler, const std::string& spelledBase,
     const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
     antlr4::tree::ParseTree* useSite = nullptr, const std::string& lookupName = {},
-    bool* nonGenericRefusal = nullptr)
-{
-    if (compiler == nullptr || spelledBase.empty()) return spelledBase;
-    const std::string& lexicalName = lookupName.empty() ? spelledBase : lookupName;
-    const bool lexicalBareName = lexicalName.find('.') == std::string::npos;
-    const bool hasExactKey = compiler->IsGenericTemplateKey(spelledBase);
-    if (lexicalBareName)
-    {
-        for (const auto& scope : enclosingScopes)
-        {
-            const std::string nested = scope.Name + "." + lexicalName;
-            if (compiler->IsGenericTemplateKey(nested))
-            {
-                if (IsAggregateMemberDeclarationTypeUse(useSite)
-                    && !GenericTemplateDeclaredBeforeUse(compiler, nested, useSite))
-                {
-                    const std::string fallback = hasExactKey ? spelledBase
-                        : compiler->ResolveGenericBaseAlias(spelledBase);
-                    if (!compiler->IsGenericTemplateKey(fallback)
-                        || GenericTemplateKeyNestedInAnyScope(fallback, enclosingScopes)) return {};
-                    return fallback;
-                }
-                return nested;
-            }
-            if (HasVisibleNonGenericAggregateName(scope, lexicalName, useSite))
-            {
-                if (nonGenericRefusal != nullptr) *nonGenericRefusal = true;
-                return {};
-            }
-        }
-    }
-    if (compiler->HasCxxAliasTemplate(lexicalName)) return spelledBase;
-    if (compiler->IsGenericBaseAlias(lexicalName))
-        return compiler->ResolveGenericBaseAlias(lexicalName);
-    if (hasExactKey)
-    {
-        if (IsAggregateMemberDeclarationTypeUse(useSite)
-            && GenericTemplateKeyNestedInAnyScope(spelledBase, enclosingScopes)
-            && !GenericTemplateDeclaredBeforeUse(compiler, spelledBase, useSite)) return {};
-        return spelledBase;
-    }
-    const std::string base = compiler->ResolveGenericBaseAlias(spelledBase);
-    if (compiler->IsGenericTemplateKey(base))
-    {
-        if (IsAggregateMemberDeclarationTypeUse(useSite)
-            && GenericTemplateKeyNestedInAnyScope(base, enclosingScopes)
-            && !GenericTemplateDeclaredBeforeUse(compiler, base, useSite)) return {};
-        return base;
-    }
-    for (const auto& scope : enclosingScopes)
-    {
-        const std::string nested = scope.Name + "." + base;
-        if (compiler->IsGenericTemplateKey(nested))
-        {
-            if (IsAggregateMemberDeclarationTypeUse(useSite)
-                && !GenericTemplateDeclaredBeforeUse(compiler, nested, useSite))
-            {
-                const std::string fallback = compiler->ResolveGenericTemplateBase(base);
-                if (!compiler->IsGenericTemplateKey(fallback)
-                    || (GenericTemplateKeyNestedInAnyScope(fallback, enclosingScopes)
-                        && !GenericTemplateDeclaredBeforeUse(compiler, fallback, useSite))) return {};
-                return fallback;
-            }
-            return nested;
-        }
-        if (HasVisibleNonGenericAggregateName(scope, base, useSite))
-        {
-            if (nonGenericRefusal != nullptr) *nonGenericRefusal = true;
-            return {};
-        }
-    }
-    return compiler->ResolveGenericTemplateBase(base);
-}
+    bool* nonGenericRefusal = nullptr);
 
-static std::string ResolveGenericTemplateSpellingAtScope(
+std::string ResolveGenericTemplateSpellingAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
     const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
     antlr4::tree::ParseTree* useSite,
-    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr)
-{
-    if (compiler == nullptr || spelledBase.empty()) return spelledBase;
-    std::string base = ResolveGenericTemplateBaseAtScope(
-        compiler, spelledBase, enclosingScopes, useSite, lookupName, nonGenericRefusal);
-    if (base.empty() || base == spelledBase)
-    {
-        base = spelledBase;
-        compiler->ResolveGenericAliasSpelling(base, args, report);
-        base = ResolveGenericTemplateBaseAtScope(
-            compiler, base, enclosingScopes, useSite, lookupName, nonGenericRefusal);
-    }
-    else if (base == "unique" && compiler->IsGenericBaseAlias(spelledBase))
-        compiler->ResolveGenericAliasSpelling(base, args, report);
-    return base;
-}
+    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr);
 
-static std::vector<EnclosingAggregateLookupScope> EnclosingScopesForLegacyScope(
-    LLVMBackend* compiler, const std::string& scopeName, antlr4::tree::ParseTree* useSite)
-{
-    auto scopes = EnclosingAggregateScopesFromContext(compiler, useSite);
-    if (scopeName.empty()) return scopes;
-    // The legacy string names the scope being lowered (an instantiation may spell it differently
-    // from the template's parse tree); the parse tree only supplies each level's definition.
-    auto named = EnclosingAggregateScopesFromName(scopeName);
-    for (auto& scope : named)
-        for (const auto& candidate : scopes)
-            if (candidate.Name == scope.Name) { scope.Definition = candidate.Definition; break; }
-    return named;
-}
+std::vector<EnclosingAggregateLookupScope> EnclosingScopesForLegacyScope(
+    LLVMBackend* compiler, const std::string& scopeName, antlr4::tree::ParseTree* useSite);
 
-static std::string ResolveGenericTemplateBaseAtScope(
+std::string ResolveGenericTemplateBaseAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, const std::string& enclosingScope,
     antlr4::tree::ParseTree* useSite = nullptr, const std::string& lookupName = {},
-    bool* nonGenericRefusal = nullptr)
-{
-    return ResolveGenericTemplateBaseAtScope(compiler, spelledBase,
-        EnclosingScopesForLegacyScope(compiler, enclosingScope, useSite), useSite, lookupName,
-        nonGenericRefusal);
-}
+    bool* nonGenericRefusal = nullptr);
 
-static std::string ResolveGenericTemplateSpellingAtScope(
+std::string ResolveGenericTemplateSpellingAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
     const std::string& enclosingScope, antlr4::tree::ParseTree* useSite,
-    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr)
-{
-    return ResolveGenericTemplateSpellingAtScope(compiler, spelledBase, args,
-        EnclosingScopesForLegacyScope(compiler, enclosingScope, useSite), useSite, lookupName, report,
-        nonGenericRefusal);
-}
+    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr);
 
 using TypeNameArgumentResolver = std::function<std::string(CFlatParser::TypeParameterEntryContext*)>;
 using TypeNameMemberResolver = std::function<std::string(CFlatParser::MemberTypeSpecifierContext*)>;
@@ -3035,78 +906,14 @@ struct CanonicalTypeSpecifier
     bool IsGeneric = false;
 };
 
-static bool ResolveCanonicalTypeSpecifier(
+bool ResolveCanonicalTypeSpecifier(
     LLVMBackend* compiler, const std::vector<CFlatParser::TypeSpecifierContext*>& specs,
     const std::unordered_map<std::string, std::string>* substitutions,
     const TypeNameArgumentResolver& resolveTypeArg,
     const TypeNameMemberResolver& resolveMemberType,
     bool reportGenericAlias, CanonicalTypeSpecifier& out,
     PrimitiveTypeError* errorOut = nullptr,
-    const TypeNameTupleResolver& resolveTupleType = {})
-{
-    if (compiler == nullptr || specs.empty()) return false;
-    PrimitiveTypeError typeError;
-    if (specs.size() > 1)
-    {
-        std::vector<std::string> words;
-        for (auto* spec : specs) words.push_back(spec->getText());
-        if (!CanonicalizePrimitiveTypeWords(words, out.TypeName, typeError))
-        {
-            if (errorOut != nullptr) *errorOut = typeError;
-            return false;
-        }
-    }
-    else
-    {
-        auto* typeSpec = specs.front();
-        if (typeSpec == nullptr || typeSpec->typeName() != nullptr
-            || typeSpec->functionPointerSpecifier() != nullptr)
-            return false;
-
-        if (auto* tuple = typeSpec->tupleTypeSpecifier())
-        {
-            if (!resolveTupleType) return false;
-            out.TypeName = resolveTupleType(tuple);
-        }
-        else if (auto* generic = GenericSpecOf(typeSpec, out.GenericBase))
-        {
-            out.IsGeneric = true;
-            for (auto* entry : generic->typeParameterList()->typeParameterEntry())
-                out.GenericArgs.push_back(resolveTypeArg
-                    ? resolveTypeArg(entry) : entry->getText());
-            for (auto& arg : out.GenericArgs)
-                ResolveEnumTypeArgumentBase(arg, [compiler](const std::string& base) {
-                    return compiler->ResolveEnumTypeName(base);
-                });
-            const std::string spelledBase = out.GenericBase;
-            out.GenericBase = ResolveGenericTemplateSpellingAtScope(
-                compiler, spelledBase, out.GenericArgs,
-                EnclosingAggregateScopesFromContext(compiler, typeSpec), typeSpec,
-                spelledBase, reportGenericAlias);
-            compiler->CompleteCxxTemplateTypeArgs(out.GenericBase, out.GenericArgs);
-            out.TypeName = MangleGenericInstance(*compiler, out.GenericBase, out.GenericArgs);
-        }
-        else if (auto* memberType = typeSpec->memberTypeSpecifier())
-            out.TypeName = resolveMemberType ? resolveMemberType(memberType) : memberType->getText();
-        else
-        {
-            if (!CanonicalizePrimitiveTypeWords({ typeSpec->getText() }, out.TypeName, typeError))
-            {
-                if (errorOut != nullptr) *errorOut = typeError;
-                return false;
-            }
-        }
-    }
-
-    if (substitutions != nullptr)
-        if (auto it = substitutions->find(out.TypeName); it != substitutions->end())
-            out.TypeName = it->second;
-    out.TypeName = compiler->ResolveQualifiedName(out.TypeName);
-    out.ConstMask |= compiler->ResolveTypeAliasConstMask(out.TypeName);
-    out.TypeName = compiler->ResolveTypeAlias(out.TypeName);
-    out.PointerDepth = PeelAliasPointerStars(out.TypeName);
-    return true;
-}
+    const TypeNameTupleResolver& resolveTupleType = {});
 
 struct ConstTypeSyntax
 {
@@ -3116,370 +923,117 @@ struct ConstTypeSyntax
     bool IsArrayView = false;
 };
 
-static void ApplyConstMaskThroughDepth(uint8_t& mask, int depth)
-{
-    depth = std::clamp(depth, 0, 7);
-    mask = static_cast<uint8_t>((1u << (depth + 1)) - 1u);
-}
+void ApplyConstMaskThroughDepth(uint8_t& mask, int depth);
 
-static bool ResolveConstTypeSyntax(
+bool ResolveConstTypeSyntax(
     LLVMBackend* compiler, CFlatParser::TypeNameContext* ctx, ConstTypeSyntax& out,
     const std::unordered_map<std::string, std::string>* substitutions = nullptr,
     const TypeNameArgumentResolver& resolveTypeArg = {},
     const TypeNameMemberResolver& resolveMemberType = {},
-    const TypeNameTupleResolver& resolveTupleType = {})
-{
-    if (compiler == nullptr || ctx == nullptr) return false;
-    auto* spec = ctx->specifierQualifierList();
-    if (spec == nullptr || spec->typeSpecifier().empty()) return false;
-    auto specs = spec->typeSpecifier();
-    auto* typeSpec = specs.front();
-    if (auto* nested = typeSpec->typeName())
-    {
-        if (specs.size() != 1) return false;
-        if (!ResolveConstTypeSyntax(compiler, nested, out, substitutions,
-                resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
-        ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
-    }
-    else
-    {
-        CanonicalTypeSpecifier resolved;
-        if (!ResolveCanonicalTypeSpecifier(compiler, specs, substitutions, resolveTypeArg,
-                resolveMemberType, false, resolved, nullptr, resolveTupleType))
-            return false;
-        out.TypeName = resolved.TypeName;
-        out.ConstMask = resolved.ConstMask;
-        out.PointerDepth = resolved.PointerDepth;
-    }
+    const TypeNameTupleResolver& resolveTupleType = {});
 
-    if (auto* abstractDecl = ctx->abstractDeclarator())
-    {
-        if (abstractDecl->pointer() != nullptr)
-            out.PointerDepth += PointerDepthOf(abstractDecl->pointer());
-        if (auto* dims = ArrayDimsOf(abstractDecl); dims != nullptr
-            && dims->assignmentExpression().empty())
-            out.IsArrayView = true;
-    }
-    if (spec->typeQualifier() != nullptr && spec->typeQualifier()->getText() == "const")
-        ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
-    return true;
-}
-
-static bool ResolveConstTypeSpecifierSyntax(
+bool ResolveConstTypeSpecifierSyntax(
     LLVMBackend* compiler, CFlatParser::TypeSpecifierContext* typeSpec, ConstTypeSyntax& out,
     const std::unordered_map<std::string, std::string>* substitutions = nullptr,
     const TypeNameArgumentResolver& resolveTypeArg = {},
     const TypeNameMemberResolver& resolveMemberType = {},
-    const TypeNameTupleResolver& resolveTupleType = {})
-{
-    if (typeSpec == nullptr || typeSpec->typeName() == nullptr) return false;
-    if (!ResolveConstTypeSyntax(compiler, typeSpec->typeName(), out, substitutions,
-            resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
-    ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
-    return true;
-}
+    const TypeNameTupleResolver& resolveTupleType = {});
 
-static bool ResolveConstCastTypeSyntax(
+bool ResolveConstCastTypeSyntax(
     LLVMBackend* compiler, CFlatParser::CastTypeNameContext* ctx, ConstTypeSyntax& out,
     const std::unordered_map<std::string, std::string>* substitutions = nullptr,
     const TypeNameArgumentResolver& resolveTypeArg = {},
     const TypeNameMemberResolver& resolveMemberType = {},
-    const TypeNameTupleResolver& resolveTupleType = {})
-{
-    if (compiler == nullptr || ctx == nullptr || ctx->typeSpecifier().empty()) return false;
-    auto specs = ctx->typeSpecifier();
-    if (specs.size() == 1 && specs.front()->typeName() != nullptr)
-    {
-        if (!ResolveConstTypeSpecifierSyntax(compiler, specs.front(), out, substitutions,
-                resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
-    }
-    else
-    {
-        CanonicalTypeSpecifier resolved;
-        if (!ResolveCanonicalTypeSpecifier(compiler, specs, substitutions, resolveTypeArg,
-                resolveMemberType, false, resolved, nullptr, resolveTupleType))
-            return false;
-        out.ConstMask = resolved.ConstMask;
-        out.PointerDepth = resolved.PointerDepth;
-        out.TypeName = resolved.TypeName;
-    }
-    if (ctx->abstractDeclarator() != nullptr)
-    {
-        out.PointerDepth += PointerDepthOf(ctx->abstractDeclarator()->pointer());
-        if (auto* dims = ArrayDimsOf(ctx->abstractDeclarator()); dims != nullptr
-            && dims->assignmentExpression().empty())
-            out.IsArrayView = true;
-    }
-    if (ctx->typeQualifier() != nullptr && ctx->typeQualifier()->getText() == "const")
-        ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
-    return true;
-}
+    const TypeNameTupleResolver& resolveTupleType = {});
 
-static std::string ResolveCastTypeNameForScanner(
-    LLVMBackend* compiler, CFlatParser::CastTypeNameContext* castTypeName)
-{
-    ConstTypeSyntax shape;
-    return ResolveConstCastTypeSyntax(compiler, castTypeName, shape) ? shape.TypeName : std::string();
-}
+std::string ResolveCastTypeNameForScanner(
+    LLVMBackend* compiler, CFlatParser::CastTypeNameContext* castTypeName);
 
-static std::unordered_set<std::string> CollectFunctionLocalEnumNames(
-    CFlatParser::FunctionDefinitionContext* function)
-{
-    std::unordered_set<std::string> names;
-    if (function == nullptr || function->compoundStatement() == nullptr) return names;
-    std::function<void(antlr4::tree::ParseTree*)> visit = [&](antlr4::tree::ParseTree* node)
-    {
-        if (auto* enumSpec = dynamic_cast<CFlatParser::EnumSpecifierContext*>(node);
-            enumSpec != nullptr && enumSpec->Identifier() != nullptr)
-            names.insert(enumSpec->Identifier()->getText());
-        if (!node->children.empty())
-            for (auto* child : node->children) visit(child);
-    };
-    visit(function->compoundStatement());
-    return names;
-}
+std::unordered_set<std::string> CollectFunctionLocalEnumNames(
+    CFlatParser::FunctionDefinitionContext* function);
 
-static bool TypeArgumentNamesFunctionLocalEnum(
+bool TypeArgumentNamesFunctionLocalEnum(
     CFlatParser::TypeParameterEntryContext* entry,
     const std::unordered_set<std::string>& localEnumNames);
 
-static std::string SimpleTypeSpecifierName(CFlatParser::TypeSpecifierContext* typeSpec)
-{
-    if (typeSpec == nullptr) return {};
-    auto* generic = typeSpec->genericIdentifier();
-    if (generic == nullptr || generic->genericTypeParameters() != nullptr
-        || generic->Identifier() == nullptr)
-        return {};
-    return generic->Identifier()->getText();
-}
+std::string SimpleTypeSpecifierName(CFlatParser::TypeSpecifierContext* typeSpec);
 
-static bool TypeSpecifierNamesFunctionLocalEnum(
+bool TypeSpecifierNamesFunctionLocalEnum(
     CFlatParser::TypeSpecifierContext* typeSpec,
-    const std::unordered_set<std::string>& localEnumNames)
-{
-    if (typeSpec == nullptr) return false;
-    if (auto* typeName = typeSpec->typeName())
-        if (auto* spec = typeName->specifierQualifierList())
-            for (auto* nested : spec->typeSpecifier())
-                if (TypeSpecifierNamesFunctionLocalEnum(nested, localEnumNames)) return true;
-    if (auto* tuple = typeSpec->tupleTypeSpecifier())
-        for (auto* entry : tuple->tupleTypeEntry())
-            if (TypeSpecifierNamesFunctionLocalEnum(entry->typeSpecifier(), localEnumNames)) return true;
-    std::string nestedBase;
-    if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
-        for (auto* entry : nested->typeParameterList()->typeParameterEntry())
-            if (TypeArgumentNamesFunctionLocalEnum(entry, localEnumNames)) return true;
-    if (auto* memberType = typeSpec->memberTypeSpecifier())
-        if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
-            for (auto* entry : ownerParams->typeParameterList()->typeParameterEntry())
-                if (TypeArgumentNamesFunctionLocalEnum(entry, localEnumNames)) return true;
-    const std::string simpleName = SimpleTypeSpecifierName(typeSpec);
-    return !simpleName.empty() && localEnumNames.count(simpleName) != 0;
-}
+    const std::unordered_set<std::string>& localEnumNames);
 
-static bool TypeArgumentNamesFunctionLocalEnum(
+bool TypeArgumentNamesFunctionLocalEnum(
     CFlatParser::TypeParameterEntryContext* entry,
-    const std::unordered_set<std::string>& localEnumNames)
-{
-    return entry != nullptr
-        && TypeSpecifierNamesFunctionLocalEnum(entry->typeSpecifier(), localEnumNames);
-}
+    const std::unordered_set<std::string>& localEnumNames);
 
-static bool GenericArgumentsNameFunctionLocalEnum(
+bool GenericArgumentsNameFunctionLocalEnum(
     CFlatParser::GenericTypeParametersContext* params,
-    const std::unordered_set<std::string>* localEnumNames)
-{
-    if (params == nullptr || localEnumNames == nullptr || localEnumNames->empty()) return false;
-    for (auto* entry : params->typeParameterList()->typeParameterEntry())
-        if (TypeArgumentNamesFunctionLocalEnum(entry, *localEnumNames)) return true;
-    return false;
-}
+    const std::unordered_set<std::string>* localEnumNames);
 
-static bool TypeArgumentNeedsFunctionLocalEnumDeferral(
+bool TypeArgumentNeedsFunctionLocalEnumDeferral(
     CFlatParser::TypeParameterEntryContext* entry,
     const std::unordered_set<std::string>& localEnumNames,
     LLVMBackend* compiler,
     const std::unordered_set<std::string>* scannedNonLocalEnumNames,
     const std::unordered_set<std::string>* scannedTypeNames);
 
-static bool TypeSpecifierNeedsFunctionLocalEnumDeferral(
+bool TypeSpecifierNeedsFunctionLocalEnumDeferral(
     CFlatParser::TypeSpecifierContext* typeSpec,
     const std::unordered_set<std::string>& localEnumNames,
     LLVMBackend* compiler,
     const std::unordered_set<std::string>* scannedNonLocalEnumNames,
-    const std::unordered_set<std::string>* scannedTypeNames)
-{
-    if (typeSpec == nullptr || compiler == nullptr) return false;
-    if (auto* typeName = typeSpec->typeName())
-        if (auto* spec = typeName->specifierQualifierList())
-            for (auto* nested : spec->typeSpecifier())
-                if (TypeSpecifierNeedsFunctionLocalEnumDeferral(nested, localEnumNames, compiler,
-                        scannedNonLocalEnumNames, scannedTypeNames)) return true;
-    if (auto* tuple = typeSpec->tupleTypeSpecifier())
-        for (auto* tupleEntry : tuple->tupleTypeEntry())
-            if (TypeSpecifierNeedsFunctionLocalEnumDeferral(tupleEntry->typeSpecifier(),
-                    localEnumNames, compiler, scannedNonLocalEnumNames, scannedTypeNames)) return true;
-    std::string nestedBase;
-    if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
-        for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
-            if (TypeArgumentNeedsFunctionLocalEnumDeferral(nestedEntry, localEnumNames, compiler,
-                    scannedNonLocalEnumNames, scannedTypeNames))
-                return true;
-    if (auto* memberType = typeSpec->memberTypeSpecifier())
-        if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
-            for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
-                if (TypeArgumentNeedsFunctionLocalEnumDeferral(
-                        nestedEntry, localEnumNames, compiler,
-                        scannedNonLocalEnumNames, scannedTypeNames))
-                    return true;
+    const std::unordered_set<std::string>* scannedTypeNames);
 
-    const std::string spelling = SimpleTypeSpecifierName(typeSpec);
-    if (spelling.empty() || localEnumNames.count(spelling) == 0) return false;
-    const std::string resolved = compiler->ResolveTypeArgBaseName(spelling);
-    const std::string enumKey = compiler->ResolveEnumTypeName(spelling);
-    if (!enumKey.empty())
-        return enumKey.find('@') != std::string::npos || compiler->IsGenericLocalEnumKey(enumKey);
-    const std::string alias = compiler->ResolveTypeAlias(spelling);
-    if (alias.find('@') != std::string::npos || compiler->IsGenericLocalEnumKey(alias)) return true;
-    if (compiler->IsDataStructure(spelling) || compiler->IsDataStructure(resolved)
-        || compiler->HasInterface(spelling) || compiler->HasInterface(resolved)
-        || (!alias.empty() && alias != spelling && compiler->IsKnownTypeName(alias)))
-        return false;
-    const auto isScannedNonLocalType = [scannedNonLocalEnumNames, scannedTypeNames](
-        const std::string& candidate) {
-        return (scannedNonLocalEnumNames != nullptr
-                && scannedNonLocalEnumNames->count(candidate) != 0)
-            || (scannedTypeNames != nullptr && scannedTypeNames->count(candidate) != 0);
-    };
-    return compiler->FirstVisibleScopedKey(resolved.empty() ? spelling : resolved,
-        isScannedNonLocalType, ScopedLookupOptions{ .ResolveFirstComponentAlias = false }).empty();
-}
-
-static bool TypeArgumentNeedsFunctionLocalEnumDeferral(
+bool TypeArgumentNeedsFunctionLocalEnumDeferral(
     CFlatParser::TypeParameterEntryContext* entry,
     const std::unordered_set<std::string>& localEnumNames,
     LLVMBackend* compiler,
     const std::unordered_set<std::string>* scannedNonLocalEnumNames,
-    const std::unordered_set<std::string>* scannedTypeNames)
-{
-    return entry != nullptr
-        && TypeSpecifierNeedsFunctionLocalEnumDeferral(entry->typeSpecifier(), localEnumNames,
-            compiler, scannedNonLocalEnumNames, scannedTypeNames);
-}
+    const std::unordered_set<std::string>* scannedTypeNames);
 
-static bool GenericArgumentsNeedFunctionLocalEnumDeferral(
+bool GenericArgumentsNeedFunctionLocalEnumDeferral(
     CFlatParser::GenericTypeParametersContext* params,
     const std::unordered_set<std::string>* localEnumNames,
     LLVMBackend* compiler,
     const std::unordered_set<std::string>* scannedNonLocalEnumNames,
-    const std::unordered_set<std::string>* scannedTypeNames)
-{
-    if (params == nullptr || localEnumNames == nullptr || localEnumNames->empty()) return false;
-    for (auto* entry : params->typeParameterList()->typeParameterEntry())
-        if (TypeArgumentNeedsFunctionLocalEnumDeferral(entry, *localEnumNames, compiler,
-                scannedNonLocalEnumNames, scannedTypeNames))
-            return true;
-    return false;
-}
+    const std::unordered_set<std::string>* scannedTypeNames);
 
-static bool TypeArgumentUsesRegisteredLocalEnum(
+bool TypeArgumentUsesRegisteredLocalEnum(
     CFlatParser::TypeParameterEntryContext* entry,
     LLVMBackend* compiler,
     const std::unordered_map<std::string, std::string>* substitutions = nullptr);
 
-static bool TypeSpecifierUsesRegisteredLocalEnum(
+bool TypeSpecifierUsesRegisteredLocalEnum(
     CFlatParser::TypeSpecifierContext* typeSpec,
     LLVMBackend* compiler,
-    const std::unordered_map<std::string, std::string>* substitutions)
-{
-    if (typeSpec == nullptr || compiler == nullptr) return false;
-    if (auto* typeName = typeSpec->typeName())
-        if (auto* spec = typeName->specifierQualifierList())
-            for (auto* nested : spec->typeSpecifier())
-                if (TypeSpecifierUsesRegisteredLocalEnum(nested, compiler, substitutions)) return true;
-    if (auto* tuple = typeSpec->tupleTypeSpecifier())
-        for (auto* tupleEntry : tuple->tupleTypeEntry())
-            if (TypeSpecifierUsesRegisteredLocalEnum(tupleEntry->typeSpecifier(), compiler,
-                    substitutions)) return true;
-    std::string nestedBase;
-    if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
-        for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
-            if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions)) return true;
-    if (auto* memberType = typeSpec->memberTypeSpecifier())
-        if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
-            for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
-                if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions))
-                    return true;
+    const std::unordered_map<std::string, std::string>* substitutions);
 
-    std::string spelling = SimpleTypeSpecifierName(typeSpec);
-    if (spelling.empty()) return false;
-    if (substitutions != nullptr)
-        if (auto it = substitutions->find(spelling); it != substitutions->end()) spelling = it->second;
-    const std::string enumKey = compiler->ResolveEnumTypeName(spelling);
-    return !enumKey.empty() && compiler->IsGenericLocalEnumKey(enumKey);
-}
-
-static bool TypeArgumentUsesRegisteredLocalEnum(
+bool TypeArgumentUsesRegisteredLocalEnum(
     CFlatParser::TypeParameterEntryContext* entry,
     LLVMBackend* compiler,
-    const std::unordered_map<std::string, std::string>* substitutions)
-{
-    if (entry == nullptr || entry->typeSpecifier() == nullptr || compiler == nullptr) return false;
-    auto* typeSpec = entry->typeSpecifier();
-    std::string genericBase;
-    if (typeSpec->tupleTypeSpecifier() != nullptr || typeSpec->typeName() != nullptr
-        || GenericSpecOf(typeSpec, genericBase) != nullptr
-        || typeSpec->memberTypeSpecifier() != nullptr)
-        return TypeSpecifierUsesRegisteredLocalEnum(typeSpec, compiler, substitutions);
-    std::string spelling = CanonicalTemplateTypeArgument(entry);
-    if (substitutions != nullptr)
-        if (auto it = substitutions->find(spelling); it != substitutions->end()) spelling = it->second;
-    const std::string enumKey = compiler->ResolveEnumTypeName(spelling);
-    return !enumKey.empty() && compiler->IsGenericLocalEnumKey(enumKey);
-}
+    const std::unordered_map<std::string, std::string>* substitutions);
 
-static bool GenericArgumentsUseRegisteredLocalEnum(
+bool GenericArgumentsUseRegisteredLocalEnum(
     CFlatParser::GenericTypeParametersContext* params,
     LLVMBackend* compiler,
-    const std::unordered_map<std::string, std::string>* substitutions = nullptr)
-{
-    if (params == nullptr) return false;
-    for (auto* entry : params->typeParameterList()->typeParameterEntry())
-        if (TypeArgumentUsesRegisteredLocalEnum(entry, compiler, substitutions)) return true;
-    return false;
-}
+    const std::unordered_map<std::string, std::string>* substitutions = nullptr);
 
 // Build the symbol-safe encoded name for a closure type used as a generic argument (gap a).
 // Length-prefixed components keep it collision-free; the result contains only [A-Za-z0-9_].
 // The type model holds two pointer levels (Pointer + ElemPointer), so a written depth of 3+ can
 // only be clamped. Every spelling that counts stars rejects it with this one message family.
 static const int PointerDepthCap = 2;
-static std::string PointerDepthCapMessage(const std::string& subject, int depth)
-{
-    return std::format("{} produces pointer depth {}, but the type model caps at {} levels "
-                       "('*'/'**'); use fewer indirections", subject, depth, PointerDepthCap);
-}
+std::string PointerDepthCapMessage(const std::string& subject, int depth);
 
 // Reconcile a written '*' count with the pointer flag ResolveSigComponent* may have CHANGED - a
 // `string` component resolves to char* with no '*' written. The FLAG wins; the count only adds
 // precision when the two agree.
-static int ReconcilePointerDepth(bool pointer, int stars)
-{
-    if (!pointer) return 0;
-    return stars > 0 ? stars : 1;
-}
+int ReconcilePointerDepth(bool pointer, int stars);
 
 // Keep pointee const at `depth` levels. An alias result at depth 0 also keeps its referent's const
 // (the value itself); a pointer alias's referent is its pointee, already kept. By-value results drop
 // their top-level const.
-static int PointeeConstOfComponent(int mask, int depth, bool preserveAliasReferentConst = false)
-{
-    if (mask <= 0) return 0;
-    if (preserveAliasReferentConst && depth <= 0) return mask & 1;
-    const int constLevels = std::min(depth, 7);
-    if (constLevels <= 0) return 0;
-    return mask & ((1 << constLevels) - 1);
-}
+int PointeeConstOfComponent(int mask, int depth, bool preserveAliasReferentConst = false);
 
 // Each component folds its pointer DEPTH in via MangleTypeArg ("int*" -> ".p$int", "int**" ->
 // ".p$.p$int"); isThin selects the thin/fat prefix. Examples: Lambda<int(int)> ->
@@ -3487,17 +1041,12 @@ static int PointeeConstOfComponent(int mask, int depth, bool preserveAliasRefere
 // Lambda<list<string>()> -> "fatfn$.1$list$string". Both compiler passes MUST call this
 // identically. Depths are ints, so a caller that only knows "is a pointer" passes 0 or 1 and gets
 // the string this produced before depth existed.
-static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
+std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
     const std::string& ret, int retDepth,
     const std::vector<std::pair<std::string, int>>& params,
     int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr,
     const std::vector<bool>* paramArrayViews = nullptr,
-    const std::vector<bool>* paramAliases = nullptr, bool retAlias = false)
-{
-    if (compiler == nullptr) return ret;
-    return MangleClosureType(*compiler, isThin, ret, retDepth, params, retConstMask,
-        paramConstMasks, paramArrayViews, paramAliases, retAlias);
-}
+    const std::vector<bool>* paramAliases = nullptr, bool retAlias = false);
 
 
 
@@ -3507,62 +1056,14 @@ static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isT
 // order, so peel from the right until none remain. Returns the bare base type name in `name`.
 // `pointerDepth` is ACCUMULATED (one per star), not a flag: `C**` must stay distinguishable from
 // `C*` all the way to MangleTypeArg, which is what makes Box<C**> its own instantiation.
-static void PeelTypeArgSuffix(std::string& name, int& pointerDepth, bool& arrayView,
-    bool* aliasOut = nullptr, int* elemPointerDepth = nullptr)
-{
-    // The `alias` qualifier is a leading prefix; peel it before the suffix loop so the underlying
-    // type remains available to the resolver. It is re-added by callers that mangle alias args.
-    bool hadAlias = StripAliasQualifier(name);
-    if (aliasOut != nullptr) *aliasOut = hadAlias;
-    int stars = 0;
-    bool view = false;
-    for (;;)
-    {
-        if (name.size() >= 2 && name.compare(name.size() - 2, 2, "[]") == 0)
-        {
-            view = true;
-            name.erase(name.size() - 2);
-        }
-        else if (!name.empty() && name.back() == '*')
-        {
-            stars++;
-            name.pop_back();
-        }
-        else
-            break;
-    }
-    // "[]*" is rejected upstream, so every star sits LEFT of the brackets and decorates the
-    // ELEMENT: `int*[]` is a view of `int*`, not a deeper pointer.
-    // A view written by the CALLER (`T[]` with T bound to "int*") owns the peeled stars too.
-    if (view || arrayView)
-    {
-        arrayView = true;
-        if (pointerDepth < 1) pointerDepth = 1;
-        if (elemPointerDepth != nullptr) *elemPointerDepth += stars;
-    }
-    else
-        pointerDepth += stars;
-}
+void PeelTypeArgSuffix(std::string& name, int& pointerDepth, bool& arrayView,
+    bool* aliasOut = nullptr, int* elemPointerDepth = nullptr);
 
 // Strip a trailing fixed-array suffix ("[3]" / "[3][4]") off a resolved alias string into `dims`
 // (outer dimension first). The sizes were constant-folded into digit literals at registration,
 // so only `[<digits>]` is accepted. Returns true if any bracket was peeled. Call BEFORE
 // PeelAliasPointerStars so "int*[3]" yields dims {3} over a base "int*".
-static bool PeelAliasArrayDims(std::string& name, std::vector<uint64_t>& dims)
-{
-    std::vector<uint64_t> rev;  // collected inner-to-outer (rightmost bracket first)
-    while (!name.empty() && name.back() == ']')
-    {
-        size_t open = name.rfind('[');
-        if (open == std::string::npos) break;
-        std::string num = name.substr(open + 1, name.size() - open - 2);
-        if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos) break;
-        rev.push_back(std::strtoull(num.c_str(), nullptr, 10));
-        name.erase(open);
-    }
-    for (auto it = rev.rbegin(); it != rev.rend(); ++it) dims.push_back(*it);
-    return !dims.empty();
-}
+bool PeelAliasArrayDims(std::string& name, std::vector<uint64_t>& dims);
 
 // Struct/class bodies parse through the named `aggregateMember` rule (see CFlat.g4), so the
 // per-kind children (declarations, methods, ...) are nested one level under aggregateMember
@@ -3593,8 +1094,8 @@ static std::vector<Result*> MemberFilter(const std::vector<Member*>& members, Ge
 
 // Base-clause identifiers of a class or struct definition. Struct bases are recorded by the scan
 // and consumed by the C++-class path when that feature is enabled.
-inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::ClassDefinitionContext* ctx) { return ctx->baseSpecifier(); }
-inline std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext* ctx) { return ctx->baseSpecifier(); }
+std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::ClassDefinitionContext* ctx);
+std::vector<CFlatParser::BaseSpecifierContext*> BaseClauseIdentifiers(CFlatParser::StructDefinitionContext* ctx);
 
 template <typename TCtx>
 inline bool IsGeneratedCppStruct(TCtx* ctx)
@@ -3608,35 +1109,18 @@ inline bool IsGeneratedCppStruct(TCtx* ctx)
 
 // The dotted name a base-clause entry spells, without its generic type arguments:
 // `IS` -> "IS", `shapes.IS` -> "shapes.IS". Empty when the entry has no identifier.
-inline std::string BaseSpecifierName(CFlatParser::BaseSpecifierContext* spec)
-{
-    if (spec == nullptr) return {};
-    std::string name;
-    for (auto* id : spec->Identifier())
-        name += (name.empty() ? "" : ".") + id->getText();
-    return name;
-}
+std::string BaseSpecifierName(CFlatParser::BaseSpecifierContext* spec);
 
 /*
  * Every name a base-clause spelling could be registered under, appended to `out`. The resolver
  * answers one name once the interface is registered; during the forward scan an interface
  * declared later in the same namespace is not yet visible, so the enclosing-namespace
- * candidates are retained as deferred possibilities. The static conversion check must treat
+ * candidates are retained as deferred possibilities. The conversion check must treat
  * those candidates as uncertainty: a surplus candidate can set sawSourceImplementor and must not
  * become a false impossibility proof.
  */
-inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::string& namespaceName,
-                                          const std::string& spelled, std::vector<std::string>& out)
-{
-    if (spelled.empty()) return;
-    std::string resolved = compiler->ResolveInterfaceName(spelled);
-    out.push_back(resolved);
-    if (spelled.find('.') != std::string::npos || namespaceName.empty()) return;
-    // Every enclosing-namespace spelling, not just the first visible one - the bare spelling is
-    // deliberately left out, it is not a name the interface could be registered under here.
-    for (const auto& candidate : compiler->ScopedNameCandidatesIn(namespaceName, spelled))
-        if (candidate != resolved && candidate != spelled) out.push_back(candidate);
-}
+void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::string& namespaceName,
+                                          const std::string& spelled, std::vector<std::string>& out);
 
 // "path(line,col)" of a definition, used both as the IDENTITY key that tells a genuine
 // redefinition apart from the same definition being registered twice (forward scan then codegen
@@ -3648,76 +1132,26 @@ inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::stri
 // import resolution already canonicalizes every import target before this runs, so one file has
 // exactly one canonical path regardless of spelling. See ShortenDefSiteForDisplay() for the
 // user-facing form.
-inline std::string DefinitionSiteText(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx)
-{
-    if (compiler == nullptr || ctx == nullptr || ctx->getStart() == nullptr) return {};
-    return std::format("{}({},{})", compiler->DefinitionSitePath(),
-                       (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
-}
+std::string DefinitionSiteText(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx);
 
 // Source text of a parse subtree with runs of whitespace collapsed to one space, so a condition
 // reads as written instead of as getText()'s token concatenation. Length-bounded per condition;
 // the composed nesting chain is bounded again where the diagnostic assembles it.
-inline std::string CollapsedSourceText(antlr4::ParserRuleContext* ctx)
-{
-    if (ctx == nullptr) return {};
-    auto* startTok = ctx->getStart();
-    auto* stopTok = ctx->getStop();
-    if (startTok == nullptr || stopTok == nullptr) return {};
-    auto* input = startTok->getInputStream();
-    if (input == nullptr) return ctx->getText();
-    std::string raw = input->getText(
-        antlr4::misc::Interval(startTok->getStartIndex(), stopTok->getStopIndex()));
-    std::string out;
-    bool pendingSpace = false;
-    for (char c : raw)
-    {
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { pendingSpace = true; continue; }
-        if (pendingSpace && !out.empty()) out += ' ';
-        pendingSpace = false;
-        out += c;
-    }
-    if (out.empty()) return ctx->getText();
-    return TruncateDiagnosticText(std::move(out), kIfConstConditionTextLimit);
-}
+std::string CollapsedSourceText(antlr4::ParserRuleContext* ctx);
 
 // The `if const (...)` condition governing this node, if the node is itself an `if const` at file,
 // member, or interface scope. Empty when it is any other kind of node.
-inline std::string IfConstConditionText(antlr4::tree::ParseTree* node)
-{
-    if (auto* d = dynamic_cast<CFlatParser::IfConstDeclarationContext*>(node))
-        return CollapsedSourceText(d->expression());
-    if (auto* m = dynamic_cast<CFlatParser::IfConstMemberContext*>(node))
-        return CollapsedSourceText(m->expression());
-    if (auto* i = dynamic_cast<CFlatParser::IfConstInterfaceMemberContext*>(node))
-        return CollapsedSourceText(i->expression());
-    return {};
-}
+std::string IfConstConditionText(antlr4::tree::ParseTree* node);
 
 // True for the brace block of one `if const` arm. Both the then arm and a plain `else` arm are
 // children of the SAME `if const` node, so the arms can only be told apart by their order here.
 // A chained `else if const` is not a block - it is a nested node that carries its own condition.
-inline bool IsIfConstArmBlock(antlr4::tree::ParseTree* node)
-{
-    return dynamic_cast<CFlatParser::IfConstBlockContext*>(node) != nullptr
-        || dynamic_cast<CFlatParser::IfConstMemberBlockContext*>(node) != nullptr
-        || dynamic_cast<CFlatParser::IfConstInterfaceBlockContext*>(node) != nullptr;
-}
+bool IsIfConstArmBlock(antlr4::tree::ParseTree* node);
 
 // Dotted name of a namespace definition, used to qualify class names recorded from inside one.
-inline std::string NamespaceDefinitionName(CFlatParser::NamespaceDefinitionContext* ctx)
-{
-    std::string name;
-    for (auto* id : ctx->Identifier())
-        name += (name.empty() ? "" : ".") + id->getText();
-    return name;
-}
+std::string NamespaceDefinitionName(CFlatParser::NamespaceDefinitionContext* ctx);
 
-inline std::string JoinQualified(const std::string& outer, const std::string& inner)
-{
-    if (inner.empty()) return outer;
-    return outer.empty() ? inner : outer + "." + inner;
-}
+std::string JoinQualified(const std::string& outer, const std::string& inner);
 
 /*
  * A class inside an `if const` block is invisible to ForwardRefScanner - the taken branch is a
@@ -3729,77 +1163,11 @@ inline std::string JoinQualified(const std::string& outer, const std::string& in
  * of a chained `else if const`. No level is known to be untaken here - MainListener retracts or
  * peels the entry (RetractIfConstArmGuardedImpls) as it takes each one.
  */
-inline void MarkIfConstClassImplsUncertain(LLVMBackend* compiler, antlr4::tree::ParseTree* node,
+void MarkIfConstClassImplsUncertain(LLVMBackend* compiler, antlr4::tree::ParseTree* node,
                                            const std::string& namespaceName = {},
                                            const std::vector<std::string>& guardChain = {},
                                            const std::string& qualifier = {},
-                                           bool inGenericTemplate = false)
-{
-    if (compiler == nullptr || node == nullptr) return;
-    std::string scope = qualifier;
-    std::string nsScope = namespaceName;
-    if (auto* ns = dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(node))
-    {
-        scope = JoinQualified(scope, NamespaceDefinitionName(ns));
-        nsScope = JoinQualified(nsScope, NamespaceDefinitionName(ns));
-    }
-    bool childGeneric = inGenericTemplate;
-    if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
-    {
-        // Suppression takes EVERY candidate (a surplus one only weakens a proof), while blame keeps
-        // them grouped per base entry so the blame site can pick the one name each entry resolves to.
-        std::vector<std::vector<std::string>> named;
-        for (auto* spec : BaseClauseIdentifiers(cls))
-        {
-            std::string spelled = BaseSpecifierName(spec);
-            if (spelled.empty()) continue;
-            // Candidates come from the NAMESPACE-only scope: the resolver never walks class-name
-            // prefixes, so a class-rung candidate is a name the class could never register against.
-            std::vector<std::string> candidates;
-            AppendInterfaceNameCandidates(compiler, nsScope, spelled, candidates);
-            for (const auto& c : candidates)
-                compiler->RecordUncertainInterfaceImpl(c);
-            // Last component of a qualified spelling: SUPPRESSION only - resolving blame through
-            // it fabricates an implements-claim against an unrelated same-named interface.
-            if (auto dot = spelled.rfind('.'); dot != std::string::npos)
-                compiler->RecordUncertainInterfaceImpl(spelled.substr(dot + 1));
-            named.push_back(std::move(candidates));
-        }
-        // A class inside a generic TEMPLATE body is reconciled once per instantiation - zero times
-        // when the template is never used - and the peel below is not idempotent, so never blame it.
-        if (auto* dd = cls->directDeclarator())
-        {
-            scope = JoinQualified(scope, dd->getText());
-            if (!inGenericTemplate)
-                compiler->RecordIfConstGuardedInterfaceImpl(scope, guardChain, (const void*)cls,
-                                                            std::move(named));
-        }
-        if (cls->genericTypeParameters() != nullptr) childGeneric = true;
-    }
-    else if (auto* st = dynamic_cast<CFlatParser::StructDefinitionContext*>(node))
-    {
-        if (auto* dd = st->directDeclarator()) scope = JoinQualified(scope, dd->getText());
-        if (st->genericTypeParameters() != nullptr) childGeneric = true;
-    }
-
-    std::string cond = IfConstConditionText(node);
-    size_t armIndex = 0;
-    for (auto* child : node->children)
-    {
-        // APPEND, never replace: a class under `if const (A) { if const (B) { ... } }` sits under
-        // both arms, and dropping A would leave the message blaming a guard that may well hold.
-        std::vector<std::string> childChain = guardChain;
-        if (!cond.empty() && IsIfConstArmBlock(child))
-            childChain.push_back(armIndex++ == 0
-                ? std::format("an 'if const ({})' branch", cond)
-                : std::format("the else arm of an 'if const ({})'", cond));
-        // A chained `else if const` is a nested node, not an arm block, but it is still a LEVEL:
-        // reaching it means this node's own arm was rejected, and that fact must stay visible.
-        else if (!cond.empty() && !IfConstConditionText(child).empty())
-            childChain.push_back(std::format("the else path of an 'if const ({})'", cond));
-        MarkIfConstClassImplsUncertain(compiler, child, nsScope, childChain, scope, childGeneric);
-    }
-}
+                                           bool inGenericTemplate = false);
 
 /*
  * MainListener decided to TAKE this arm, so the diagnostic must never claim its classes are absent
@@ -3808,33 +1176,15 @@ inline void MarkIfConstClassImplsUncertain(LLVMBackend* compiler, antlr4::tree::
  * is retracted or peeled in turn when MainListener reaches it. Callers that descend into a chained
  * `else if const` pass nested=true, since taking the else PATH is one level and nothing more.
  */
-inline void RetractIfConstArmGuardedImpls(LLVMBackend* compiler, antlr4::tree::ParseTree* node,
-                                          bool nested = false)
-{
-    if (compiler == nullptr || node == nullptr) return;
-    if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
-    {
-        if (nested) compiler->PeelIfConstGuardedInterfaceImpl((const void*)cls);
-        else        compiler->RetractIfConstGuardedInterfaceImpl((const void*)cls);
-    }
-    for (auto* child : node->children)
-        RetractIfConstArmGuardedImpls(compiler, child,
-                                      nested || !IfConstConditionText(child).empty());
-}
+void RetractIfConstArmGuardedImpls(LLVMBackend* compiler, antlr4::tree::ParseTree* node,
+                                          bool nested = false);
 
 /*
  * The walk of this subtree was ABANDONED - LogError threw and an `expect_error` block swallowed it -
  * so no `if const` inside it was ever decided. Nothing here may be claimed untaken: drop every entry
  * outright rather than peel, since a peel would leave a front level the walk never even reached.
  */
-inline void ForgetIfConstGuardedImpls(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    if (compiler == nullptr || node == nullptr) return;
-    if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node))
-        compiler->RetractIfConstGuardedInterfaceImpl((const void*)cls);
-    for (auto* child : node->children)
-        ForgetIfConstGuardedImpls(compiler, child);
-}
+void ForgetIfConstGuardedImpls(LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
 // Interface bodies parse through the named `interfaceMember` rule, so methods and fields are nested
 // one level under it. Same macro shape as the aggregate flatteners: each pass gets its own copy so
@@ -3847,34 +1197,9 @@ inline void ForgetIfConstGuardedImpls(LLVMBackend* compiler, antlr4::tree::Parse
 // (the explicit SIMD type is the hardware-control escape hatch, so a non-power-of-2 that would
 // silently waste a lane is rejected rather than padded). Returns true and sets lanesOut on
 // success; otherwise sets errorOut and returns false.
-static bool TryParseSimdLaneCount(LLVMBackend* compiler,
+bool TryParseSimdLaneCount(LLVMBackend* compiler,
                                   CFlatParser::AssignmentExpressionContext* expr,
-                                  uint64_t& lanesOut, std::string& errorOut)
-{
-    auto folded = FoldCompileTimeInt(compiler, expr);
-    if (!folded)
-    {
-        const std::string text = expr != nullptr ? expr->getText() : "";
-        errorOut = std::format("simd lane count must be an integer literal (got '{}')", text);
-        return false;
-    }
-    // A value that FOLDED is a lane count, however unusable - 0 and negatives belong in the
-    // range diagnostic below, not in the "not an integer literal" one. Signed throughout so a
-    // negative cannot wrap into a huge unsigned and skip the hint.
-    int64_t v = *folded;
-    if (v < 2 || v > 64 || (v & (v - 1)) != 0)
-    {
-        int64_t up = 2; while (up < v && up < 64) up <<= 1;
-        int64_t down = (up > 2) ? (up >> 1) : 2;
-        if (down == up)
-            errorOut = std::format("simd lane count must be a power of 2 in [2,64] (got {}); did you mean simd<...,{}>?", v, up);
-        else
-            errorOut = std::format("simd lane count must be a power of 2 in [2,64] (got {}); did you mean simd<...,{}> or simd<...,{}>?", v, down, up);
-        return false;
-    }
-    lanesOut = v;
-    return true;
-}
+                                  uint64_t& lanesOut, std::string& errorOut);
 
 /*
  * Record the declarator's pointer depth and array dimensions onto a simd<T,N> declared type.
@@ -3883,69 +1208,20 @@ static bool TryParseSimdLaneCount(LLVMBackend* compiler,
  * silently lost its dimension (allocating one vector and turning `a[i]` into a LANE read).
  * Shared by BOTH ParseDeclarationSpecifiers copies (ForwardRefScanner and MainListener).
  */
-static void RecordSimdPointerAndDims(LLVMBackend::DeclTypeAndValue& declType,
-                                     CFlatParser::DeclarationSpecifierContext* declSpec)
-{
-    declType.Pointer = declSpec->pointer() != nullptr;
-    if (declType.Pointer && declSpec->pointer()->Star().size() >= 2)
-        declType.ElemPointer = true;
-    // An empty '[]' on a simd type is left alone: simd array views are unimplemented, and
-    // deducing one here would change a shape that currently compiles.
-    if (auto* dimSpec = ArrayDimsOf(declSpec))
-    {
-        auto dims = dimSpec->assignmentExpression();
-        if (!dims.empty())
-        {
-            declType.ArraySize = dims[0];
-            for (size_t di = 1; di < dims.size(); di++)
-                declType.ExtraArrayDims.push_back(dims[di]);
-        }
-    }
-}
+void RecordSimdPointerAndDims(LLVMBackend::DeclTypeAndValue& declType,
+                                     CFlatParser::DeclarationSpecifierContext* declSpec);
 
 // Extract function name from FunctionDefinitionContext (handles operator overloads).
-static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
-{
-    if (auto* opId = ctx->operatorFunctionId())
-        return ::getOperatorName(opId);
-    auto directDecl = ctx->directDeclarator();
-    return directDecl->getText();
-}
+std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx);
 
-static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx,
-                                   const LLVMBackend* compiler)
-{
-    if (auto* opId = ctx->operatorFunctionId())
-        return ::getOperatorName(opId, compiler);
-    return getFunctionName(ctx);
-}
+std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx,
+                                   const LLVMBackend* compiler);
 
 // Build a readable one-line signature for a function definition by slicing the source
 // from the function's start up to its body, then collapsing whitespace. Used for the
 // symbol index of generic-template methods, which would otherwise record only the bare
 // name (the monomorphized instance is what carries fully-resolved parameter types).
-static std::string getFunctionSignatureText(CFlatParser::FunctionDefinitionContext* ctx)
-{
-    auto* body = ctx->compoundStatement();
-    auto* startTok = ctx->getStart();
-    if (!body || !startTok) return getFunctionName(ctx);
-    auto* input = startTok->getInputStream();
-    size_t a = startTok->getStartIndex();
-    size_t b = body->getStart()->getStartIndex();
-    if (!input || b <= a) return getFunctionName(ctx);
-
-    std::string raw = input->getText(antlr4::misc::Interval(a, b - 1));
-    std::string out;
-    bool pendingSpace = false;
-    for (char c : raw)
-    {
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { pendingSpace = true; continue; }
-        if (pendingSpace && !out.empty()) out += ' ';
-        pendingSpace = false;
-        out += c;
-    }
-    return out.empty() ? getFunctionName(ctx) : out;
-}
+std::string getFunctionSignatureText(CFlatParser::FunctionDefinitionContext* ctx);
 
 // Extract the leading doc comment block above the given declaration's start token.
 // Tier 1 (preferred): contiguous /// or /** ... */ doc comments anchored to the declaration.
@@ -3953,165 +1229,10 @@ static std::string getFunctionSignatureText(CFlatParser::FunctionDefinitionConte
 // "Anchored" means no blank line between the comment block and the declaration, and no
 // blank line between adjacent comments in the chain.
 // Returns markdown-ready text with comment markers stripped, or empty string on no match.
-static std::string ExtractLeadingDoc(antlr4::BufferedTokenStream* tokens, antlr4::Token* declStart)
-{
-    if (!tokens || !declStart) return "";
-    size_t idx = declStart->getTokenIndex();
-    auto hidden = tokens->getHiddenTokensToLeft(idx);
-    if (hidden.empty()) return "";
-
-    struct Item { antlr4::Token* tok; int startLine; int endLine; bool isDoc; bool isLine; };
-    auto countNewlines = [](const std::string& s) {
-        int n = 0;
-        for (char c : s) if (c == '\n') ++n;
-        return n;
-    };
-    auto classify = [&](antlr4::Token* t) -> std::optional<Item> {
-        const std::string& text = t->getText();
-        if (text.size() < 2) return std::nullopt;
-        Item it{};
-        it.tok = t;
-        it.startLine = (int)t->getLine();
-        it.endLine = it.startLine + countNewlines(text);
-        if (text.starts_with("//"))
-        {
-            it.isLine = true;
-            // /// is a doc comment; //// or longer slash run is not.
-            it.isDoc = text.size() >= 3 && text[2] == '/' && (text.size() < 4 || text[3] != '/');
-            return it;
-        }
-        if (text.starts_with("/*"))
-        {
-            it.isLine = false;
-            // /** ... */ is a doc comment; bare /**/ is not.
-            it.isDoc = text.size() >= 3 && text[2] == '*' && text != "/**/";
-            return it;
-        }
-        return std::nullopt;
-    };
-
-    // Walk hidden tokens right-to-left and collect comments that chain up to the
-    // declaration with no blank line gap.
-    std::vector<Item> chain;
-    int nextExpectedEnd = (int)declStart->getLine() - 1;
-    for (auto it = hidden.rbegin(); it != hidden.rend(); ++it)
-    {
-        auto opt = classify(*it);
-        if (!opt) continue;
-        Item item = *opt;
-        if (item.endLine < nextExpectedEnd) break;     // blank-line gap broke the chain
-        if (item.endLine > nextExpectedEnd) continue;  // comment trailing other code on this line; skip
-        chain.push_back(item);
-        nextExpectedEnd = item.startLine - 1;
-    }
-    if (chain.empty()) return "";
-    std::reverse(chain.begin(), chain.end());
-
-    // Tier 1: keep only the trailing contiguous run of doc comments (closest to decl).
-    // Tier 2 (fallback): if no doc comments at all, keep the whole chain as plain.
-    bool anyDoc = false;
-    for (const auto& it : chain) if (it.isDoc) { anyDoc = true; break; }
-
-    std::vector<Item> selected;
-    if (anyDoc)
-    {
-        size_t first = chain.size();
-        for (size_t i = chain.size(); i-- > 0; )
-        {
-            if (!chain[i].isDoc) break;
-            first = i;
-        }
-        selected.assign(chain.begin() + first, chain.end());
-    }
-    else
-    {
-        selected = std::move(chain);
-    }
-
-    auto trimRight = [](std::string& s) {
-        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
-    };
-
-    std::vector<std::string> outLines;
-    for (const auto& it : selected)
-    {
-        const std::string& text = it.tok->getText();
-        if (it.isLine)
-        {
-            size_t off = it.isDoc ? 3 : 2;  // strip /// or //
-            std::string ln = (text.size() > off) ? text.substr(off) : std::string();
-            if (!ln.empty() && ln.front() == ' ') ln.erase(0, 1);
-            trimRight(ln);
-            outLines.push_back(ln);
-        }
-        else
-        {
-            // Strip leading /* or /** and trailing */.
-            size_t startOff = it.isDoc ? 3 : 2;
-            size_t endOff = (text.size() >= 2 && text.compare(text.size() - 2, 2, "*/") == 0) ? 2 : 0;
-            if (text.size() <= startOff + endOff) continue;
-            std::string body = text.substr(startOff, text.size() - startOff - endOff);
-            std::vector<std::string> lines;
-            std::string cur;
-            for (char c : body)
-            {
-                if (c == '\n') { lines.push_back(cur); cur.clear(); }
-                else cur.push_back(c);
-            }
-            lines.push_back(cur);
-            for (auto& ln : lines)
-            {
-                size_t j = 0;
-                while (j < ln.size() && (ln[j] == ' ' || ln[j] == '\t')) ++j;
-                if (j < ln.size() && ln[j] == '*')
-                {
-                    ++j;
-                    if (j < ln.size() && ln[j] == ' ') ++j;
-                }
-                std::string clean = (j < ln.size()) ? ln.substr(j) : std::string();
-                trimRight(clean);
-                outLines.push_back(clean);
-            }
-        }
-    }
-
-    // Drop decorative divider lines (e.g. "-----", "=====", box-drawing rules) so a
-    // description framed by dividers does not render as an oversized, contentless hover.
-    auto isSeparatorLine = [](const std::string& s) {
-        int visible = 0, sep = 0;
-        for (unsigned char c : s)
-        {
-            if (c == ' ' || c == '\t') continue;
-            ++visible;
-            if (std::isalnum(c)) return false;  // any real text -> keep the line
-            if (c == '-' || c == '=' || c == '_' || c == '~' || c == '*' || c == '#' || c >= 0x80) ++sep;
-        }
-        return visible >= 3 && sep >= 3;
-    };
-    std::erase_if(outLines, [&](const std::string& ln) { return isSeparatorLine(ln); });
-
-    while (!outLines.empty() && outLines.front().empty()) outLines.erase(outLines.begin());
-    while (!outLines.empty() && outLines.back().empty()) outLines.pop_back();
-    if (outLines.empty()) return "";
-
-    std::string result;
-    for (size_t i = 0; i < outLines.size(); ++i)
-    {
-        if (i > 0) result += '\n';
-        result += outLines[i];
-    }
-    return result;
-}
+std::string ExtractLeadingDoc(antlr4::BufferedTokenStream* tokens, antlr4::Token* declStart);
 
 // Check if a function definition has the 'static' storage class.
-static bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
-{
-    if (!func->declarationSpecifiers()) return false;
-    for (auto* ds : func->declarationSpecifiers()->declarationSpecifier())
-        if (ds->storageClassSpecifier() && ds->storageClassSpecifier()->Static() != nullptr)
-            return true;
-    return false;
-}
+bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func);
 
 /*
  * True when a parameter list is callable with ZERO arguments: every parameter carries an
@@ -4120,19 +1241,7 @@ static bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
  * synthetic one must not also be emitted. A null list means "no parameters at all" and is
  * NOT this case - callers test that separately.
  */
-static bool AllParametersDefaulted(CFlatParser::ParameterTypeListContext* paramTypeList)
-{
-    if (paramTypeList == nullptr) return false;
-    if (paramTypeList->Ellipsis() != nullptr) return false;
-    auto* list = paramTypeList->parameterList();
-    if (list == nullptr) return false;
-    auto decls = list->parameterDeclaration();
-    if (decls.empty()) return false;
-    for (auto* d : decls)
-        if (d->initializer() == nullptr)
-            return false;
-    return true;
-}
+bool AllParametersDefaulted(CFlatParser::ParameterTypeListContext* paramTypeList);
 
 // The source text of `node` with REDUNDANT PARENTHESES peeled off, so a parenthesized whole-value
 // source `(p)` / `((p))` records the bare name `p` and matches a parameter name. Only the
@@ -4143,48 +1252,8 @@ static bool AllParametersDefaulted(CFlatParser::ParameterTypeListContext* paramT
 // peeled target type's SPELLING is appended. The peel is unconditional here because the scanner
 // cannot resolve the operand's type; the CALLER makes it type-aware by demanding every recorded
 // spelling name the type it is matching against (see AllWrapperTypesName).
-inline std::string BareSourceText(antlr4::tree::ParseTree* node,
-                                  std::vector<std::string>* outWrapperTypes = nullptr)
-{
-    while (node != nullptr)
-    {
-        if (node->children.size() == 1)
-        {
-            node = node->children[0];
-            continue;
-        }
-        auto* prim = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-        // 3 children with a leading '(' is exactly `'(' expression ')'` - nameof/typeof/sizeof
-        // spell 4, and a tuple `(a, b)` is its own context reached as a single child.
-        if (prim != nullptr && prim->children.size() == 3 && prim->expression() != nullptr
-            && prim->children[0]->getText() == "(")
-        {
-            node = prim->expression();
-            continue;
-        }
-        if (outWrapperTypes != nullptr)
-        {
-            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
-                if (cast->castTypeName() != nullptr && cast->castExpression() != nullptr)
-                {
-                    outWrapperTypes->push_back(cast->castTypeName()->getText());
-                    node = cast->castExpression();
-                    continue;
-                }
-            // `x as T` - a single trailing operator, and it must be 'as' (an `is` yields a bool).
-            if (auto* tc = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node))
-                if (tc->typeSpecifier().size() == 1 && tc->children.size() == 3
-                    && tc->children[1]->getText() == "as" && tc->relationalExpression() != nullptr)
-                {
-                    outWrapperTypes->push_back(tc->typeSpecifier(0)->getText());
-                    node = tc->relationalExpression();
-                    continue;
-                }
-        }
-        break;
-    }
-    return node == nullptr ? std::string() : node->getText();
-}
+std::string BareSourceText(antlr4::tree::ParseTree* node,
+                                  std::vector<std::string>* outWrapperTypes = nullptr);
 
 // Bare consume-source names that were reached only by peeling a CAST / `as` wrapper, mapped to
 // every peeled wrapper type spelling. Kept apart from the plain name set so the wrapped spelling
@@ -4193,134 +1262,35 @@ using WrappedSourceNames = std::unordered_map<std::string, std::vector<std::stri
 
 // Split a generic argument list's inner text ("int,list<int>") at TOP-LEVEL commas only, so a
 // nested instantiation stays one argument. Whitespace-free input (a parse tree's getText()).
-inline std::vector<std::string> SplitTopLevelTypeArgs(const std::string& args)
-{
-    std::vector<std::string> out;
-    int depth = 0;
-    size_t start = 0;
-    for (size_t i = 0; i < args.size(); i++)
-    {
-        if (args[i] == '<') depth++;
-        else if (args[i] == '>') depth--;
-        else if (args[i] == ',' && depth == 0)
-        {
-            out.push_back(args.substr(start, i - start));
-            start = i + 1;
-        }
-    }
-    out.push_back(args.substr(start));
-    return out;
-}
+std::vector<std::string> SplitTopLevelTypeArgs(const std::string& args);
 
 // Canonical name for a TYPE SPELLING as written in a cast / `as`, so it can be compared with a
 // declaration's already-canonical TypeName. Mirrors the declaration path: namespace resolution,
 // then alias folding, and a generic instantiation through the MangleTypeArg funnel. Idempotent on
 // an already-canonical name, so BOTH sides of the comparison run through it.
-inline std::string CanonicalWrapperTypeName(const LLVMBackend* compiler, const std::string& spelled)
-{
-    if (compiler == nullptr || spelled.empty()) return spelled;
-    if (size_t lt = spelled.find('<');
-        lt != std::string::npos && lt > 0 && spelled.back() == '>')
-    {
-        std::string base = compiler->ResolveTypeAlias(
-            compiler->ResolveQualifiedName(spelled.substr(0, lt)));
-        std::vector<std::string> args;
-        for (const auto& arg : SplitTopLevelTypeArgs(spelled.substr(lt + 1, spelled.size() - lt - 2)))
-        {
-            if (!arg.empty() && arg.back() == '>' && arg.find('<') != std::string::npos)
-                args.push_back(CanonicalWrapperTypeName(compiler, arg));
-            else
-                args.push_back(MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, arg)));
-        }
-        compiler->ResolveGenericAliasSpelling(base, args);
-        return MangleGenericInstance(*compiler, base, args);
-    }
-    return compiler->ResolveManglingAlias(
-        compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(spelled)));
-}
+std::string CanonicalWrapperTypeName(const LLVMBackend* compiler, const std::string& spelled);
 
 // Every peeled wrapper names exactly `typeName`, so the whole wrapper chain is redundant and the
 // source is a whole-value consume of the bare name. Both sides are canonicalized first, so an
 // alias ("UB"), a namespace-relative spelling ("NBox" inside its own namespace) and a generic
 // instantiation ("Box<int>") each meet the declared type they name. A decorated target ("UBox*")
 // still does not match, which is the conservative direction (no new consume inferred).
-inline bool AllWrapperTypesName(const LLVMBackend* compiler,
+bool AllWrapperTypesName(const LLVMBackend* compiler,
                                 const std::vector<std::string>& wrapperTypes,
-                                const std::string& typeName)
-{
-    if (wrapperTypes.empty() || typeName.empty()) return false;
-    const std::string want = CanonicalWrapperTypeName(compiler, typeName);
-    for (const auto& t : wrapperTypes)
-        if (t != typeName && CanonicalWrapperTypeName(compiler, t) != want) return false;
-    return true;
-}
+                                const std::string& typeName);
 
 // Record one consume source: the plain set when only parentheses were peeled, the wrapped map
 // when a cast / `as` had to be peeled as well.
-inline void RecordConsumeSourceName(antlr4::tree::ParseTree* node,
+void RecordConsumeSourceName(antlr4::tree::ParseTree* node,
                                     std::unordered_set<std::string>& out,
-                                    WrappedSourceNames* wrapped)
-{
-    if (wrapped == nullptr)
-    {
-        out.insert(BareSourceText(node));
-        return;
-    }
-    std::vector<std::string> wrapperTypes;
-    std::string name = BareSourceText(node, &wrapperTypes);
-    if (wrapperTypes.empty())
-        out.insert(name);
-    else
-    {
-        auto& slot = (*wrapped)[name];
-        slot.insert(slot.end(), wrapperTypes.begin(), wrapperTypes.end());
-    }
-}
+                                    WrappedSourceNames* wrapped);
 
 // Detect functions that heap-allocate and return a new owned value. Core string
 // concatenation signatures and operator string(i32) allocate; user functions opt
 // in via 'move string' / 'move T*' / 'move <interface>'.
-static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
+bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
                                 CFlatParser::FunctionDefinitionContext* func,
-                                const std::vector<LLVMBackend::TypeAndValue>& allParams)
-{
-    if (returnType.TypeName == "string")
-    {
-        auto* opId = func != nullptr ? func->operatorFunctionId() : nullptr;
-        const bool isPlusOperator = opId != nullptr && opId->Plus() != nullptr;
-        const bool isStringConversion = opId != nullptr && opId->String() != nullptr;
-        const auto isStringValue = [](const LLVMBackend::TypeAndValue& p) {
-            return p.TypeName == "string" && !p.Pointer && !p.ElemPointer;
-        };
-        const auto isCString = [](const LLVMBackend::TypeAndValue& p) {
-            return p.TypeName == "char" && p.Pointer && !p.ElemPointer;
-        };
-        const auto isStringOperand = [&](const LLVMBackend::TypeAndValue& p) {
-            return isStringValue(p) || isCString(p);
-        };
-        const bool coreStringConcat = isPlusOperator && allParams.size() == 2
-            && ((isStringValue(allParams[0])
-                    && (isStringOperand(allParams[1])
-                        || (allParams[1].TypeName == "IString" && !allParams[1].Pointer)))
-                || (isCString(allParams[0]) && isStringOperand(allParams[1])));
-        if (coreStringConcat)
-            return true;
-        if (isStringConversion && allParams.size() == 1 && allParams[0].TypeName == "i32")
-            return true;
-        if (returnType.IsMove)
-            return true;
-        return false;
-    }
-    // 'move <interface>' transfers ownership of the boxed heap object to the caller (the
-    // caller is then responsible for 'delete'). An interface return type is not Pointer
-    // (its LLVM type is a { vtable, data } fat pointer), so it needs its own case.
-    if (returnType.IsMove && (returnType.Pointer || returnType.IsInterface))
-        return true;
-    // NOTE: a 'move S' struct-VALUE return is deliberately NOT returns-owned. The returned
-    // aggregate already carries its owning fields' bits, so the receiving local frees them;
-    // also registering it as an owned temp at the call site double-frees (e.g. list<T>.copy()).
-    return false;
-}
+                                const std::vector<LLVMBackend::TypeAndValue>& allParams);
 
 // Map a generated parser context type to its rule index, so a node-type test is an integer
 // compare instead of the RTTI hierarchy walk dynamic_cast performs on every tree node.
@@ -4371,194 +1341,25 @@ inline Ctx* AsRuleCtx(antlr4::tree::ParseTree* node)
 // A foreign C++ by-value parameter is a real object in the callee. Move only its own final
 // bare use; a shadowing local is a different slot. Loop and nested-lambda uses stay conservative.
 // Unknown or deleted copy constructors also keep the established copy diagnostic.
-inline bool IsLastUseOfForeignCxxParam(
+bool IsLastUseOfForeignCxxParam(
     LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
-    const LLVMBackend::NamedVariable& source, bool allowMoveOnlyReturn = false)
-{
-    if (compiler == nullptr || useCtx == nullptr || source.FieldName.size() != 0
-        || source.TypeAndValue.Pointer || source.TypeAndValue.IsAlias
-        || compiler->IsCoreUniqueType(source.TypeAndValue.TypeName)
-        || !(compiler->IsForeignNontrivialCxxClass(source.TypeAndValue.TypeName)
-             || compiler->HasForeignNontrivialCxxFieldForAnalysis(source.TypeAndValue.TypeName)))
-        return false;
-    if (compiler->IsForeignNontrivialCxxClass(source.TypeAndValue.TypeName))
-    {
-        if (const auto* info = compiler->GetCxxClassInfo(source.TypeAndValue.TypeName);
-            info == nullptr
-            || ((!info->hasCopyCtor || info->hasDeletedCopyCtor)
-                && !(allowMoveOnlyReturn
-                     && compiler->FindCxxMoveCtor(source.TypeAndValue.TypeName) != nullptr)))
-            return false;
-    }
-    else if (!compiler->IsCopyableTypeForAnalysis(source.TypeAndValue.TypeName)) return false;
-    const std::string name = source.CallerName.empty()
-        ? source.TypeAndValue.VariableName : source.CallerName;
-    if (name.empty() || !compiler->IsFunctionParameter(name) || useCtx->getText() != name)
-        return false;
-    const auto parameter = compiler->GetFunctionArgument(name);
-    if (parameter.Storage == nullptr || source.Storage != parameter.Storage)
-        return false;
-
-    CFlatParser::FunctionDefinitionContext* function = nullptr;
-    for (antlr4::tree::ParseTree* node = useCtx; node != nullptr; node = node->parent)
-    {
-        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
-            return false;
-        if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node))
-        {
-            function = fn;
-            break;
-        }
-    }
-    antlr4::tree::ParseTree* body = function != nullptr
-        ? static_cast<antlr4::tree::ParseTree*>(function->compoundStatement()) : nullptr;
-    if (body == nullptr) return false;
-
-    struct Occurrence
-    {
-        size_t token = 0;
-        bool inLoop = false;
-        bool inNestedLambda = false;
-    };
-    std::vector<Occurrence> occurrences;
-    // Declaration contexts supply lexical slot identity for later uses not visited yet.
-    auto isShadowedByLocal = [&](CFlatParser::PrimaryExpressionContext* primary) {
-        const size_t token = (size_t)primary->getStart()->getTokenIndex();
-        for (auto* parent = primary->parent; parent != nullptr && parent != body;
-             parent = parent->parent)
-        {
-            auto* block = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
-            if (block == nullptr || block->blockItemList() == nullptr) continue;
-            for (auto* item : block->blockItemList()->blockItem())
-            {
-                if (item->getStart() == nullptr
-                    || (size_t)item->getStart()->getTokenIndex() >= token)
-                    continue;
-                if (auto* declaration = item->declaration())
-                {
-                    if (declaration->initDeclaratorList() == nullptr) continue;
-                    for (auto* init : declaration->initDeclaratorList()->initDeclarator())
-                    {
-                        auto* declarator = init->declarator();
-                        auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-                        if (direct != nullptr && direct->Identifier() != nullptr
-                            && direct->Identifier()->getText() == name)
-                            return true;
-                    }
-                }
-                if (auto* destructuring = item->destructuringDeclaration())
-                    for (auto* entry : destructuring->destructuringEntry())
-                        if (entry->Identifier() != nullptr
-                            && entry->Identifier()->getText() == name)
-                            return true;
-            }
-        }
-        return false;
-    };
-    auto collect = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-        if (node == nullptr) return;
-        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
-        {
-            if (primary->genericIdentifier() != nullptr && primary->getText() == name)
-            {
-                if (isShadowedByLocal(primary)) return;
-                bool inLoop = false;
-                bool inNestedLambda = false;
-                for (auto* parent = primary->parent; parent != nullptr && parent != body;
-                     parent = parent->parent)
-                {
-                    if (dynamic_cast<CFlatParser::IterationStatementContext*>(parent) != nullptr)
-                        inLoop = true;
-                    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr)
-                        inNestedLambda = true;
-                }
-                occurrences.push_back({ (size_t)primary->getStart()->getTokenIndex(),
-                                        inLoop, inNestedLambda });
-            }
-            return;
-        }
-        for (auto* child : node->children) self(self, child);
-    };
-    collect(collect, body);
-
-    const size_t useToken = (size_t)useCtx->getStart()->getTokenIndex();
-    bool found = false;
-    for (const auto& occurrence : occurrences)
-    {
-        if (occurrence.token == useToken && !found)
-        {
-            found = true;
-            if (occurrence.inLoop || occurrence.inNestedLambda) return false;
-            continue;
-        }
-        if (occurrence.inNestedLambda) return false;
-        if (occurrence.token > useToken) return false;
-    }
-    return found;
-}
+    const LLVMBackend::NamedVariable& source, bool allowMoveOnlyReturn = false);
 
 // Evaluated in the active generic instance; -1 leaves both branches visible.
 using IfConstEvaluator = std::function<int(CFlatParser::ExpressionContext*)>;
 
 // Collect the 'return <expr>;' expressions a function body owns itself. A nested lambda's
 // returns belong to the lambda, so its subtree is skipped.
-static void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
+void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
                                         std::vector<CFlatParser::ExpressionContext*>& out,
-                                        const IfConstEvaluator& evalIfConst = {})
-{
-    if (node == nullptr) return;
-    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return;
-    if (auto* sel = AsRuleCtx<CFlatParser::SelectionStatementContext>(node);
-        sel != nullptr && sel->If() != nullptr && sel->Const() != nullptr && evalIfConst)
-    {
-        const int decision = evalIfConst(sel->expression());
-        if (decision >= 0)
-        {
-            auto branches = sel->statement();
-            const size_t index = decision == 1 ? 0 : 1;
-            if (index < branches.size())
-                CollectOwnReturnExpressions(branches[index], out, evalIfConst);
-            return;
-        }
-    }
-    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
-        if (jump->expression() != nullptr) out.push_back(jump->expression());
-    for (auto* child : node->children)
-        CollectOwnReturnExpressions(child, out, evalIfConst);
-}
+                                        const IfConstEvaluator& evalIfConst = {});
 
-static void CollectOwnReturnStatements(antlr4::tree::ParseTree* node,
-                                       std::vector<CFlatParser::JumpStatementContext*>& out)
-{
-    if (node == nullptr) return;
-    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return;
-    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
-        if (jump->Return() != nullptr) out.push_back(jump);
-    for (auto* child : node->children)
-        CollectOwnReturnStatements(child, out);
-}
+void CollectOwnReturnStatements(antlr4::tree::ParseTree* node,
+                                       std::vector<CFlatParser::JumpStatementContext*>& out);
 
-static bool HasNonAutomaticStorageClass(CFlatParser::DeclarationSpecifiersContext* declSpecs)
-{
-    if (declSpecs == nullptr) return false;
-    for (auto* spec : declSpecs->declarationSpecifier())
-        if (auto* storage = spec->storageClassSpecifier(); storage != nullptr)
-            if (storage->Static() != nullptr || storage->ThreadLocal() != nullptr
-                || storage->Extern() != nullptr)
-                return true;
-    return false;
-}
+bool HasNonAutomaticStorageClass(CFlatParser::DeclarationSpecifiersContext* declSpecs);
 
-static bool IsBareReturnIdentifier(const std::string& text)
-{
-    if (text.empty()) return false;
-    auto initial = [](unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; };
-    auto subsequent = [&](unsigned char c) { return initial(c) || (c >= '0' && c <= '9'); };
-    if (!initial(static_cast<unsigned char>(text.front()))) return false;
-    return std::all_of(text.begin() + 1, text.end(), [&](char c) {
-        return subsequent(static_cast<unsigned char>(c));
-    });
-}
+bool IsBareReturnIdentifier(const std::string& text);
 
 // Scope-resolved walk for the named-return candidates. Every plain automatic local is a candidate;
 // a scope maps each name to its candidate index, or to kNoCandidate for any other binding
@@ -4607,105 +1408,14 @@ struct NamedLocalReturnScan
     }
 };
 
-static void NamedLocalReturnVisit(antlr4::tree::ParseTree* node, NamedLocalReturnScan& scan)
-{
-    if (node == nullptr) return;
-    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return;
-    auto visitChildren = [&]() {
-        for (auto* child : node->children) NamedLocalReturnVisit(child, scan);
-    };
-    if (dynamic_cast<CFlatParser::CompoundStatementContext*>(node) != nullptr)
-    {
-        scan.scopes.emplace_back();
-        visitChildren();
-        scan.scopes.pop_back();
-        return;
-    }
-    if (auto* loop = AsRuleCtx<CFlatParser::IterationStatementContext>(node))
-    {
-        scan.scopes.emplace_back();
-        if (loop->In() != nullptr && loop->Identifier() != nullptr)
-            scan.Bind(loop->Identifier()->getText(), nullptr);
-        visitChildren();
-        scan.scopes.pop_back();
-        return;
-    }
-    if (auto* labeled = AsRuleCtx<CFlatParser::LabeledStatementContext>(node))
-    {
-        // A pattern arm binds its identifier; a plain label (starts with the identifier) does not.
-        scan.scopes.emplace_back();
-        if (labeled->Identifier() != nullptr
-            && labeled->getStart()->getType() != CFlatParser::Identifier)
-            scan.Bind(labeled->Identifier()->getText(), nullptr);
-        visitChildren();
-        scan.scopes.pop_back();
-        return;
-    }
-    if (auto* destructuring = dynamic_cast<CFlatParser::DestructuringDeclarationContext*>(node))
-    {
-        for (auto* entry : destructuring->destructuringEntry())
-            if (entry->Identifier() != nullptr) scan.Bind(entry->Identifier()->getText(), nullptr);
-        return;
-    }
-    if (auto* forDecl = dynamic_cast<CFlatParser::ForDeclarationContext*>(node))
-    {
-        if (forDecl->initDeclaratorList() != nullptr)
-            for (auto* init : forDecl->initDeclaratorList()->initDeclarator())
-                if (init->declarator() != nullptr)
-                    scan.Bind(getDirectDeclName(init->declarator()->directDeclarator()), nullptr);
-        return;
-    }
-    if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
-    {
-        const bool automatic = !HasNonAutomaticStorageClass(declaration->declarationSpecifiers());
-        if (declaration->initDeclaratorList() != nullptr)
-            for (auto* init : declaration->initDeclaratorList()->initDeclarator())
-                if (init->declarator() != nullptr && init->declarator()->directDeclarator() != nullptr)
-                    scan.Bind(getDirectDeclName(init->declarator()->directDeclarator()),
-                              automatic ? init->declarator()->directDeclarator() : nullptr);
-        return;
-    }
-    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
-    {
-        if (jump->Return() == nullptr) { visitChildren(); return; }
-        // Only a bare identifier (no cast or wrapper) names a local; anything else names none.
-        size_t named = NamedLocalReturnScan::kNoCandidate;
-        if (jump->expression() != nullptr && jump->compoundStatement() == nullptr)
-        {
-            std::vector<std::string> wrapperTypes;
-            const std::string returned = BareSourceText(jump->expression(), &wrapperTypes);
-            if (wrapperTypes.empty() && IsBareReturnIdentifier(returned))
-                named = scan.Resolve(returned);
-        }
-        scan.Return(named);
-        return;
-    }
-    visitChildren();
-}
+void NamedLocalReturnVisit(antlr4::tree::ParseTree* node, NamedLocalReturnScan& scan);
 
 // Pre-scan the function's returns before codegen (clang's NRVO rule): a local is built in the hidden
 // sret slot when every return statement inside its live range - after its declarator, in its
 // scope - names it. Several such locals may share the slot: their live ranges cannot overlap,
 // since a return inside both would have to name both. Returns in declaration order.
-static std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandidates(
-    CFlatParser::FunctionDefinitionContext* func)
-{
-    std::vector<CFlatParser::DirectDeclaratorContext*> out;
-    if (func == nullptr || func->compoundStatement() == nullptr
-        || func->compoundStatement()->blockItemList() == nullptr)
-        return out;
-
-    NamedLocalReturnScan scan;
-    scan.scopes.emplace_back();
-    if (func->parameterTypeList() != nullptr && func->parameterTypeList()->parameterList() != nullptr)
-        for (auto* param : func->parameterTypeList()->parameterList()->parameterDeclaration())
-            if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr)
-                scan.Bind(getDirectDeclName(param->declarator()->directDeclarator()), nullptr);
-    NamedLocalReturnVisit(func->compoundStatement(), scan);
-    for (const auto& candidate : scan.candidates)
-        if (candidate.named && !candidate.killed) out.push_back(candidate.declarator);
-    return out;
-}
+std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandidates(
+    CFlatParser::FunctionDefinitionContext* func);
 
 enum class ValueStructReturnKind { NotApplicable, AllBorrowedParam, Mixed };
 
@@ -4713,425 +1423,112 @@ enum class ValueStructReturnKind { NotApplicable, AllBorrowedParam, Mixed };
 // annotation: does every 'return' hand back a borrowed by-value parameter of the return type,
 // or do the paths disagree? The unique-ownership gate lives in the callers - a copyable struct
 // has nothing to duplicate, so mixed returns stay legal for it.
-static ValueStructReturnKind ClassifyValueStructReturns(
+ValueStructReturnKind ClassifyValueStructReturns(
     const LLVMBackend* compiler,
     CFlatParser::FunctionDefinitionContext* func,
     const LLVMBackend::DeclTypeAndValue& returnType,
     const std::vector<LLVMBackend::TypeAndValue>& allParams,
-    std::string* outBorrowedParamName)
-{
-    if (func == nullptr || func->compoundStatement() == nullptr) return ValueStructReturnKind::NotApplicable;
-    if (returnType.TypeName.empty() || returnType.Pointer || returnType.ElemPointer) return ValueStructReturnKind::NotApplicable;
-    if (returnType.IsMove || returnType.IsAlias) return ValueStructReturnKind::NotApplicable;
-
-    std::vector<CFlatParser::ExpressionContext*> returns;
-    CollectOwnReturnExpressions(func->compoundStatement(), returns);
-    if (returns.empty()) return ValueStructReturnKind::NotApplicable;
-
-    int borrowed = 0;
-    int other = 0;
-    for (auto* expr : returns)
-    {
-        // `return (p);` / `return (T)p;` hand back the same borrow `return p;` does. Peel the
-        // wrappers; a peeled CAST counts only when it names the return type itself (below).
-        std::vector<std::string> wrapperTypes;
-        const std::string text = BareSourceText(expr, &wrapperTypes);
-        if (!wrapperTypes.empty() && !AllWrapperTypesName(compiler, wrapperTypes, returnType.TypeName))
-        {
-            ++other;
-            continue;
-        }
-        bool isBorrowedParam = false;
-        for (const auto& p : allParams)
-        {
-            if (p.VariableName != text) continue;
-            if (p.TypeName != returnType.TypeName) continue;
-            if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias) continue;
-            // A param the body also consumes (`w += k; return w;`) is owned by the callee, so its
-            // return hands out that value; only a return-only sink is still a borrow here.
-            if (p.IsOwningSink && (!p.IsReturnInferredSink || p.IsWriteInferredSink)) continue;
-            isBorrowedParam = true;
-            if (outBorrowedParamName && outBorrowedParamName->empty()) *outBorrowedParamName = p.VariableName;
-            break;
-        }
-        if (isBorrowedParam) ++borrowed; else ++other;
-    }
-    if (borrowed == 0) return ValueStructReturnKind::NotApplicable;
-    return other == 0 ? ValueStructReturnKind::AllBorrowedParam : ValueStructReturnKind::Mixed;
-}
+    std::string* outBorrowedParamName);
 
 // Nodes that open a declaration scope: a name declared under one is visible only inside it.
-static bool IsDeclScopeNode(antlr4::tree::ParseTree* node)
-{
-    return AsRuleCtx<CFlatParser::CompoundStatementContext>(node) != nullptr
-        || AsRuleCtx<CFlatParser::IterationStatementContext>(node) != nullptr
-        || AsRuleCtx<CFlatParser::SelectionStatementContext>(node) != nullptr
-        || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node) != nullptr
-        || AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr
-        || AsRuleCtx<CFlatParser::ParameterDeclarationContext>(node) != nullptr
-        || AsRuleCtx<CFlatParser::StructDefinitionContext>(node) != nullptr
-        || AsRuleCtx<CFlatParser::ClassDefinitionContext>(node) != nullptr;
-}
+bool IsDeclScopeNode(antlr4::tree::ParseTree* node);
 
 // Implicit-this fields of a struct body: declarators outside every nested scope (method bodies,
 // parameter lists, nested aggregates). A field is visible across the whole struct, so no order test.
-static void CollectFieldNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out)
-{
-    if (node == nullptr) return;
-    if (auto* d = dynamic_cast<CFlatParser::DirectDeclaratorContext*>(node))
-        out.insert(getDirectDeclName(d));
-    for (auto* child : node->children)
-        if (!IsDeclScopeNode(child)) CollectFieldNames(child, out);
-}
+void CollectFieldNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out);
 
 // Locals a use can see: a declarator whose every enclosing scope also encloses the use, declared
 // before it. 'enclosing' holds the use's ancestors. A 'for (T x in ...)' variable is visible in its loop.
-static void CollectVisibleLocals(antlr4::tree::ParseTree* node,
+void CollectVisibleLocals(antlr4::tree::ParseTree* node,
                                  const std::unordered_set<antlr4::tree::ParseTree*>& enclosing,
-                                 size_t usePos, std::unordered_set<std::string>& out)
-{
-    if (node == nullptr) return;
-    if (auto* d = dynamic_cast<CFlatParser::DirectDeclaratorContext*>(node))
-    {
-        bool visible = d->getStart()->getTokenIndex() < usePos;
-        for (auto* p = d->parent; visible && p != nullptr; p = p->parent)
-            if (IsDeclScopeNode(p) && enclosing.count(p) == 0) visible = false;
-        if (visible) out.insert(getDirectDeclName(d));
-    }
-    if (auto* loop = AsRuleCtx<CFlatParser::IterationStatementContext>(node))
-        if (loop->Identifier() != nullptr && enclosing.count(loop) != 0)
-            out.insert(loop->Identifier()->getText());
-    for (auto* child : node->children)
-        CollectVisibleLocals(child, enclosing, usePos, out);
-}
+                                 size_t usePos, std::unordered_set<std::string>& out);
 
-static bool IsIdentifierText(const std::string& s)
-{
-    return !s.empty() && (std::isalpha(static_cast<unsigned char>(s[0])) || s[0] == '_')
-        && std::all_of(s.begin(), s.end(), [](char ch) {
-            return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_'; });
-}
+bool IsIdentifierText(const std::string& s);
 
 // The head of an 'a' or 'a.b.c' path; empty when the text is not such a path.
-static std::string DottedPathHead(const std::string& text)
-{
-    std::string head;
-    size_t start = 0;
-    for (size_t i = 0; i <= text.size(); ++i)
-    {
-        if (i < text.size() && text[i] != '.') continue;
-        const std::string segment = text.substr(start, i - start);
-        if (!IsIdentifierText(segment)) return {};
-        if (start == 0) head = segment;
-        start = i + 1;
-    }
-    return head;
-}
+std::string DottedPathHead(const std::string& text);
 
 // Parse-tree summary for the borrowed-GLOBAL refusal: does every own 'return' name a module
 // global at that return? A returned name, or the head of a dotted path (`return Ns.q;`), is a
 // global unless a parameter, an implicit-this field, or a local declared in an enclosing block
 // before the return binds it there. 'nullptr' is not one. A base struct can hide an inherited
 // field, so it yields no summary. Source-only, so definition order cannot matter.
-inline bool ReturnsOnlyModuleGlobals(CFlatParser::FunctionDefinitionContext* func,
+bool ReturnsOnlyModuleGlobals(CFlatParser::FunctionDefinitionContext* func,
                                      const std::vector<LLVMBackend::TypeAndValue>& allParams,
-                                     const IfConstEvaluator& evalIfConst = {})
-{
-    if (func == nullptr || func->compoundStatement() == nullptr) return false;
-    std::vector<CFlatParser::ExpressionContext*> returns;
-    CollectOwnReturnExpressions(func->compoundStatement(), returns, evalIfConst);
-    if (returns.empty()) return false;
+                                     const IfConstEvaluator& evalIfConst = {});
 
-    antlr4::tree::ParseTree* structNode = nullptr;
-    for (antlr4::tree::ParseTree* p = func->parent; p != nullptr; p = p->parent)
-    {
-        if (auto* s = dynamic_cast<CFlatParser::StructDefinitionContext*>(p))
-        {
-            if (!s->baseSpecifier().empty()) return false;
-            structNode = s;
-            break;
-        }
-        if (auto* c = dynamic_cast<CFlatParser::ClassDefinitionContext*>(p))
-        {
-            if (!c->baseSpecifier().empty()) return false;
-            structNode = c;
-            break;
-        }
-    }
-    std::unordered_set<std::string> bound;
-    if (structNode != nullptr) CollectFieldNames(structNode, bound);
-    for (const auto& p : allParams)
-        bound.insert(p.VariableName);
-    for (auto* expr : returns)
-    {
-        const std::string head = DottedPathHead(BareSourceText(expr));
-        if (head.empty() || head == "nullptr" || bound.count(head) != 0) return false;
-        std::unordered_set<antlr4::tree::ParseTree*> enclosing;
-        for (antlr4::tree::ParseTree* p = expr; p != nullptr; p = p->parent)
-            enclosing.insert(p);
-        std::unordered_set<std::string> locals;
-        CollectVisibleLocals(func, enclosing, expr->getStart()->getTokenIndex(), locals);
-        if (locals.count(head) != 0) return false;
-    }
-    return true;
-}
-
-static std::string DirectReturnIdentifier(CFlatParser::ExpressionContext* expr)
-{
-    antlr4::tree::ParseTree* node = expr;
-    while (node != nullptr)
-    {
-        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
-        {
-            if (primary->genericIdentifier() != nullptr && node->children.size() == 1
-                && primary->genericIdentifier()->genericTypeParameters() == nullptr)
-                return primary->genericIdentifier()->Identifier()->getText();
-            if (primary->expression() != nullptr)
-            {
-                node = primary->expression();
-                continue;
-            }
-            return {};
-        }
-        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
-            cast != nullptr && cast->castExpression() != nullptr)
-        {
-            node = cast->castExpression();
-            continue;
-        }
-        if (node->children.size() != 1) return {};
-        node = node->children[0];
-    }
-    return {};
-}
+std::string DirectReturnIdentifier(CFlatParser::ExpressionContext* expr);
 
 // True when a live return resolves to a non-move pointer parameter. Resolve only a bare identifier
 // expression (with transparent parens/casts), then let visible locals shadow parameters.
-inline int ReturnedPointerParameterIndex(
+int ReturnedPointerParameterIndex(
     CFlatParser::FunctionDefinitionContext* func,
     CFlatParser::ExpressionContext* expr,
-    const std::vector<LLVMBackend::TypeAndValue>& allParams)
-{
-    if (func == nullptr || expr == nullptr) return -1;
-    const std::string name = DirectReturnIdentifier(expr);
-    if (name.empty()) return -1;
-    std::unordered_set<antlr4::tree::ParseTree*> enclosing;
-    for (antlr4::tree::ParseTree* p = expr; p != nullptr; p = p->parent)
-        enclosing.insert(p);
-    std::unordered_set<std::string> locals;
-    CollectVisibleLocals(func, enclosing, expr->getStart()->getTokenIndex(), locals);
-    if (locals.count(name) != 0) return -1;
-    for (size_t i = 0; i < allParams.size(); ++i)
-        if (allParams[i].VariableName == name && allParams[i].Pointer
-            && !allParams[i].IsMove && !allParams[i].IsAlias)
-            return static_cast<int>(i);
-    return -1;
-}
+    const std::vector<LLVMBackend::TypeAndValue>& allParams);
 
-inline bool ReturnsParameterBorrow(CFlatParser::FunctionDefinitionContext* func,
+bool ReturnsParameterBorrow(CFlatParser::FunctionDefinitionContext* func,
                                    const std::vector<LLVMBackend::TypeAndValue>& allParams,
-                                   const IfConstEvaluator& evalIfConst = {})
-{
-    if (func == nullptr || func->compoundStatement() == nullptr) return false;
-    std::vector<CFlatParser::ExpressionContext*> returns;
-    CollectOwnReturnExpressions(func->compoundStatement(), returns, evalIfConst);
-    for (auto* expr : returns)
-        if (ReturnedPointerParameterIndex(func, expr, allParams) >= 0) return true;
-    return false;
-}
+                                   const IfConstEvaluator& evalIfConst = {});
 
-inline int ReturnsSingleParameterIndex(
+int ReturnsSingleParameterIndex(
     CFlatParser::FunctionDefinitionContext* func,
     const std::vector<LLVMBackend::TypeAndValue>& allParams,
-    const IfConstEvaluator& evalIfConst = {})
-{
-    if (func == nullptr || func->compoundStatement() == nullptr) return -1;
-    std::vector<CFlatParser::ExpressionContext*> returns;
-    CollectOwnReturnExpressions(func->compoundStatement(), returns, evalIfConst);
-    if (returns.empty()) return -1;
-    const int index = ReturnedPointerParameterIndex(func, returns.front(), allParams);
-    if (index < 0) return -1;
-    for (size_t i = 1; i < returns.size(); ++i)
-        if (ReturnedPointerParameterIndex(func, returns[i], allParams) != index)
-            return -1;
-    return index;
-}
+    const IfConstEvaluator& evalIfConst = {});
 
 // Set per-instance borrow summaries on the overload with this exact parameter list.
-inline void SetPointerBorrowReturnSummaries(
+void SetPointerBorrowReturnSummaries(
     std::vector<LLVMBackend::FunctionSymbol>& overloads,
     const std::vector<LLVMBackend::TypeAndValue>& allParams,
-    bool returnsGlobal, bool returnsParameter, int singleParameterIndex)
-{
-    for (auto& sym : overloads)
-        if (sym.ReturnType.Pointer && sym.Parameters.size() == allParams.size()
-            && std::equal(allParams.begin(), allParams.end(), sym.Parameters.begin(),
-                [](const auto& a, const auto& b) { return a.TypeName == b.TypeName && a.Pointer == b.Pointer; }))
-        {
-            sym.ReturnsGlobalBorrow = returnsGlobal;
-            sym.ReturnsParameterBorrow = returnsParameter;
-            sym.ReturnsSingleParameterIndex = singleParameterIndex;
-        }
-}
+    bool returnsGlobal, bool returnsParameter, int singleParameterIndex);
 
-inline bool UniquePointerSourceIsOwned(const LLVMBackend::NamedVariable& source)
-{
-    return source.IsOwning || source.IsNewAllocated;
-}
+bool UniquePointerSourceIsOwned(const LLVMBackend::NamedVariable& source);
 
 // Arrow-normalized form of a lock expression's source text: 'p->m' becomes 'p.m'. The mode
 // suffix (if any) is left in place - see NormalizeLockText for the canonical, suffix-free form.
-inline std::string ArrowNormalizeLockText(const std::string& text)
-{
-    std::string out;
-    out.reserve(text.size());
-    for (size_t i = 0; i < text.size(); )
-    {
-        if (text[i] == '-' && i + 1 < text.size() && text[i + 1] == '>')
-        {
-            out += '.';
-            i += 2;
-        }
-        else
-        {
-            out += text[i];
-            i++;
-        }
-    }
-    return out;
-}
+std::string ArrowNormalizeLockText(const std::string& text);
 
 // Canonical form of a lock expression's source text. Lock-set membership is compared as
 // strings, so 'p->m' and 'p.m' must canonicalize identically: arrow becomes dot, then the
 // trailing '.read' / '.write' / '.optimistic' mode suffix is stripped. Used by every lock
 // capture site (lock statement, lock clause, positional lock group) in BOTH passes so they agree.
-inline std::string NormalizeLockText(const std::string& text)
-{
-    std::string out = ArrowNormalizeLockText(text);
-    if (out.ends_with(".read"))
-        out.resize(out.size() - 5);
-    else if (out.ends_with(".write"))
-        out.resize(out.size() - 6);
-    else if (out.ends_with(".optimistic"))
-        out.resize(out.size() - 11);
-    return out;
-}
+std::string NormalizeLockText(const std::string& text);
 
 // True when a receiver spelling is a plain lock path: identifiers joined by '.', with optional
 // '[i]' subscripts. A call result or a computed receiver is not, and keeps the legacy key.
-inline bool IsSimpleLockPath(const std::string& text)
-{
-    if (text.empty()) return false;
-    unsigned char first = (unsigned char)text[0];
-    if (!(std::isalpha(first) || first == '_')) return false;
-    for (char c : text)
-    {
-        unsigned char u = (unsigned char)c;
-        if (!(std::isalnum(u) || c == '_' || c == '.' || c == '[' || c == ']')) return false;
-    }
-    return true;
-}
+bool IsSimpleLockPath(const std::string& text);
 
 // The canonical lock path an ARGUMENT (or receiver) spelling names: '&o.inner' -> 'o.inner',
 // 'p->inner' -> 'p.inner', 'arr[0]' -> 'arr[0]'. Empty when the spelling is not a plain path
 // (a call result, an arithmetic index) - the caller then keeps its legacy root key.
-inline std::string LockPathForOperandText(const std::string& operandText)
-{
-    std::string text = operandText;
-    if (!text.empty() && text.front() == '&') text.erase(0, 1);
-    text = ArrowNormalizeLockText(text);
-    return IsSimpleLockPath(text) ? text : std::string();
-}
+std::string LockPathForOperandText(const std::string& operandText);
 
 // The lock-set key a guarded field reached through `receiverPath` resolves to. `this` names the
 // receiver's own struct, whose guardian the method-body seeding records bare - see FindHeldGuard.
-inline std::string GuardKeyForPath(const std::string& receiverPath, const std::string& guard)
-{
-    if (receiverPath.empty() || receiverPath == "this") return guard;
-    return receiverPath + "." + guard;
-}
+std::string GuardKeyForPath(const std::string& receiverPath, const std::string& guard);
 
 // Returns "read", "write", "optimistic", or "" (exclusive) for a raw lock expression's text.
-inline std::string LockTextMode(const std::string& text)
-{
-    // Arrow-normalize first so 'p->rw.read' (and 'rw->read') still detect the mode suffix.
-    std::string dotted = ArrowNormalizeLockText(text);
-    if (dotted.ends_with(".read"))
-        return "read";
-    if (dotted.ends_with(".write"))
-        return "write";
-    if (dotted.ends_with(".optimistic"))
-        return "optimistic";
-    return "";
-}
+std::string LockTextMode(const std::string& text);
 
 // The held-mode a `.read` / `.write` / `.optimistic` suffix confers. "" and "write" are both
 // exclusive - the bare form `lock (m)` must never be demoted to Shared.
-inline LockMode LockModeFromSuffix(const std::string& mode)
-{
-    if (mode == "read")       return LockMode::Shared;
-    if (mode == "optimistic") return LockMode::Optimistic;
-    return LockMode::Exclusive;
-}
+LockMode LockModeFromSuffix(const std::string& mode);
 
 // The capability interface a mode suffix demands of the lock's type. IOptimisticLockable is a
 // CHECKING capability - it has no kCapabilities row because an optimistic read lowers to
 // nothing (it is a method call taking a lambda, not an acquire/release pair).
-inline const char* CapabilityForLockMode(const std::string& mode)
-{
-    if (mode == "read")       return "ISharedLockable";
-    if (mode == "optimistic") return "IOptimisticLockable";
-    return "ILockable";
-}
+const char* CapabilityForLockMode(const std::string& mode);
 
 using ReturnScanMemo = std::unordered_map<const antlr4::tree::ParseTree*, bool>;
 
 // True if executing `node` can RETURN from the enclosing function - a `return` (value,
 // return-block, or `return default`) that is not inside a nested lambda. `break`/`continue`
 // exit a loop, not the function, so they do not count (jump->Return() is null for them).
-inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node, ReturnScanMemo* memo = nullptr)
-{
-    if (node == nullptr) return false;
-    if (memo != nullptr)
-    {
-        auto it = memo->find(node);
-        if (it != memo->end()) return it->second;
-    }
-    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node))
-    {
-        if (memo != nullptr) (*memo)[node] = false;
-        return false;
-    }
-    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
-        if (jump->Return() != nullptr)
-        {
-            if (memo != nullptr) (*memo)[node] = true;
-            return true;
-        }
-    for (auto* child : node->children)
-        if (SubtreeContainsFunctionReturn(child, memo))
-        {
-            if (memo != nullptr) (*memo)[node] = true;
-            return true;
-        }
-    if (memo != nullptr) (*memo)[node] = false;
-    return false;
-}
+bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node, ReturnScanMemo* memo = nullptr);
 
 
-inline bool TryGetKnownIfConstBranch(CFlatParser::SelectionStatementContext* sel,
+bool TryGetKnownIfConstBranch(CFlatParser::SelectionStatementContext* sel,
                                      const IfConstEvaluator& evalIfConst,
-                                     antlr4::tree::ParseTree*& liveBranch)
-{
-    liveBranch = nullptr;
-    if (sel == nullptr || !evalIfConst || !sel->If() || !sel->Const()) return false;
-    const int taken = evalIfConst(sel->expression());
-    if (taken < 0) return false;
-    auto inner = sel->statement();
-    if (taken == 1 && inner.size() > 0) liveBranch = inner[0];
-    else if (taken == 0 && inner.size() > 1) liveBranch = inner[1];
-    return true;
-}
+                                     antlr4::tree::ParseTree*& liveBranch);
 
 // Collect names UNCONDITIONALLY moved by the function body: a top-level `move <bare-param>`
 // not nested inside any runtime conditional/loop/labeled construct, ternary, or lambda, AND not
@@ -5139,118 +1536,24 @@ inline bool TryGetKnownIfConstBranch(CFlatParser::SelectionStatementContext* sel
 // a conditional, nested, or possibly-skipped move must NOT mark a param a sink. An `if const`
 // whose condition is a compile-time constant for this instantiation is NOT runtime-conditional:
 // its live branch is straight-line code, so `evalIfConst` lets us descend into it.
-inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
+void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
                                            const IfConstEvaluator& evalIfConst = {},
-                                           ReturnScanMemo* returnScanMemo = nullptr)
-{
-    if (node == nullptr) return;
-    if (auto* sel = AsRuleCtx<CFlatParser::SelectionStatementContext>(node))
-    {
-        antlr4::tree::ParseTree* liveBranch = nullptr;
-        if (TryGetKnownIfConstBranch(sel, evalIfConst, liveBranch) && liveBranch != nullptr)
-            CollectUnconditionalMovedNames(liveBranch, out, evalIfConst, returnScanMemo);
-        // A runtime `if`/`switch` (or an undecidable if-const) is conditional - stop descending.
-        return;
-    }
-    // A move reached only through one of these executes conditionally (or in a captured
-    // scope), so it cannot make the parameter a sink - stop descending here.
-    if (AsRuleCtx<CFlatParser::IterationStatementContext>(node)
-        || AsRuleCtx<CFlatParser::LabeledStatementContext>(node)
-        || AsRuleCtx<CFlatParser::LambdaExpressionContext>(node))
-        return;
-    // A ternary `a ? b : c` (or `a ?? b`) makes its branches conditional.
-    if (auto* cond = AsRuleCtx<CFlatParser::ConditionalExpressionContext>(node))
-        if (cond->children.size() > 1) return;
-    if (auto* mv = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
-        if (auto* u = mv->unaryExpression())
-            out.insert(BareSourceText(u));
-    for (auto* child : node->children)
-    {
-        CollectUnconditionalMovedNames(child, out, evalIfConst, returnScanMemo);
-        // A statement that can return from the function makes every LATER sibling conditional,
-        // so a `move` after an early exit (e.g. `if (b) return; g = move v;`) is not a sink -
-        // consuming the caller there would leak on the not-moved path.
-        if (SubtreeContainsFunctionReturn(child, returnScanMemo)) break;
-    }
-}
+                                           ReturnScanMemo* returnScanMemo = nullptr);
 
 // Collect the bare source name of each POSITIONAL element of a brace list (`{ p, q }`). The
 // fixed-array lowering consumes an owning element source exactly as a slot store does
 // (ConsumeOwningBraceElementSource), so those names are consumed too. Named (`f = v`) and
 // dictionary (`k: v`) forms are skipped - neither reaches that arm.
-inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListContext* list,
+void CollectPositionalBraceElementNames(CFlatParser::InitializerListContext* list,
                                                std::unordered_set<std::string>& out,
-                                               WrappedSourceNames* wrapped = nullptr)
-{
-    if (list == nullptr) return;
-    for (auto* fi : list->fieldInit())
-        if (fi != nullptr && fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
-            RecordConsumeSourceName(fi->assignmentExpression(0), out, wrapped);
-}
+                                               WrappedSourceNames* wrapped = nullptr);
 
 // True when `name` at `use` names a LOCAL declared earlier in an enclosing block (or a `for`
 // header) of the same function / lambda body, not the parameter of that name. The consume scans
 // are name-based; the write / return triggers must not claim a shadowing local's use.
-inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std::string& name,
+bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std::string& name,
         const CFlatParser::LambdaExpressionContext* functionLambda = nullptr,
-        const antlr4::tree::ParseTree* stopAt = nullptr)
-{
-    auto* useCtx = dynamic_cast<antlr4::ParserRuleContext*>(use);
-    if (useCtx == nullptr || useCtx->getStart() == nullptr || name.empty()) return false;
-    const size_t token = (size_t)useCtx->getStart()->getTokenIndex();
-    auto declares = [&](CFlatParser::InitDeclaratorListContext* list) {
-        if (list == nullptr) return false;
-        for (auto* init : list->initDeclarator())
-        {
-            auto* declarator = init->declarator();
-            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-            if (direct != nullptr && direct->Identifier() != nullptr
-                && direct->Identifier()->getText() == name)
-                return true;
-        }
-        return false;
-    };
-    for (auto* parent = use->parent; parent != nullptr && parent != stopAt; parent = parent->parent)
-    {
-        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
-        {
-            if (lambda == functionLambda) break;
-            auto* params = lambda->lambdaParamList();
-            if (params != nullptr)
-                for (auto* param : params->lambdaParam())
-                    if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
-                        return true;
-            continue;
-        }
-        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
-            break;
-        if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
-        {
-            if (loop->Identifier() != nullptr && loop->Identifier()->getText() == name)
-                return true;
-            if (auto* cond = loop->forCondition())
-                if (cond->forDeclaration() != nullptr
-                    && declares(cond->forDeclaration()->initDeclaratorList()))
-                    return true;
-            continue;
-        }
-        auto* block = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
-        if (block == nullptr || block->blockItemList() == nullptr) continue;
-        for (auto* item : block->blockItemList()->blockItem())
-        {
-            if (item->getStart() == nullptr || (size_t)item->getStart()->getTokenIndex() >= token)
-                continue;
-            if (auto* declaration = item->declaration())
-                if (declares(declaration->initDeclaratorList()))
-                    return true;
-            if (auto* destructuring = item->destructuringDeclaration())
-                for (auto* entry : destructuring->destructuringEntry())
-                    if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
-                        return true;
-        }
-    }
-    return false;
-}
+        const antlr4::tree::ParseTree* stopAt = nullptr);
 
 // Collect bare source names CONSUMED by a plain store ANYWHERE in the body (at-least-one-path):
 // the RHS of a plain `=` assignment (`X = value`, incl. a slot store `_data[i] = value`), a decl
@@ -5260,591 +1563,62 @@ inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std
 // scope-exit drop makes a not-taken path sound. Lambdas / nested functions are a different scope
 // and are not descended into. The caller intersects with the param list; a non-bare RHS (`v.f`,
 // `v + 1`) never equals a param name, so it is naturally excluded (only a whole-value move counts).
-inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
+void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
                                       WrappedSourceNames* wrapped = nullptr,
                                       std::unordered_set<std::string>* returned = nullptr,
                                       WrappedSourceNames* returnedWrapped = nullptr,
                                       std::unordered_set<std::string>* written = nullptr,
                                       const CFlatParser::LambdaExpressionContext* functionLambda = nullptr,
                                       std::unordered_set<std::string>* explicitMoves = nullptr,
-                                      const IfConstEvaluator& evalIfConst = {})
-{
-    if (node == nullptr) return;
-    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
-    if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
-    if (auto* sel = AsRuleCtx<CFlatParser::SelectionStatementContext>(node))
-    {
-        antlr4::tree::ParseTree* liveBranch = nullptr;
-        if (TryGetKnownIfConstBranch(sel, evalIfConst, liveBranch))
-        {
-            if (liveBranch != nullptr)
-                CollectConsumedStoreNames(liveBranch, out, wrapped, returned, returnedWrapped, written,
-                                          functionLambda, explicitMoves, evalIfConst);
-            return;
-        }
-    }
-    if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
-        if (asn->assignmentOperator() != nullptr && asn->assignmentExpression() != nullptr)
-        {
-            if (asn->assignmentOperator()->getText() == "=")
-                RecordConsumeSourceName(asn->assignmentExpression(), out, wrapped);
-            // A store INTO the whole name (`w = v`, `w += k`) drops the value it held, so the body
-            // takes that value over exactly as `T t = w; t = v;` does. A shadowing local is not w.
-            if (asn->unaryExpression() != nullptr)
-            {
-                std::string dest = BareSourceText(asn->unaryExpression());
-                if (!NameShadowedByEnclosingLocal(asn, dest, functionLambda))
-                    (written != nullptr ? *written : out).insert(dest);
-            }
-        }
-    // `return w;` hands the whole value to the caller - the same consume as `T t = w; return t;`.
-    // Kept apart when asked: a unique-owning passthrough is an inferred 'alias' return instead.
-    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
-        if (jump->expression() != nullptr
-            && !NameShadowedByEnclosingLocal(jump, BareSourceText(jump->expression()), functionLambda))
-            RecordConsumeSourceName(jump->expression(), returned != nullptr ? *returned : out,
-                                    returned != nullptr ? returnedWrapped : wrapped);
-    // `construct_at(slot, value)` is the explicit raw-slot spelling of the same native
-    // owning sink as `_data[i] = value`; its second argument must participate in inference.
-    if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-        if (call->primaryExpression() != nullptr
-            && call->primaryExpression()->getText() == "construct_at"
-            && call->argumentExpressionList().size() == 1)
-        {
-            auto args = call->argumentExpressionList(0)->argumentNamedExpression();
-            if (args.size() == 2 && args[1]->assignmentExpression() != nullptr)
-                RecordConsumeSourceName(args[1]->assignmentExpression(), out, wrapped);
-        }
-    if (auto* init = AsRuleCtx<CFlatParser::InitDeclaratorContext>(node))
-    {
-        if (auto* iz = init->initializer(); iz != nullptr)
-        {
-            if (iz->assignmentExpression() != nullptr)
-                RecordConsumeSourceName(iz->assignmentExpression(), out, wrapped);
-            CollectPositionalBraceElementNames(iz->initializerList(), out, wrapped);
-        }
-        // `T[N] d { p };` - the brace-ctor alternative hangs the list off the declarator itself.
-        CollectPositionalBraceElementNames(init->initializerList(), out, wrapped);
-    }
-    if (auto* moved = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
-        if (auto* source = moved->unaryExpression())
-        {
-            std::string name = BareSourceText(source);
-            if (!NameShadowedByEnclosingLocal(moved, name, functionLambda))
-            {
-                out.insert(name);
-                if (explicitMoves != nullptr) explicitMoves->insert(name);
-            }
-        }
-    for (auto* child : node->children)
-        CollectConsumedStoreNames(child, out, wrapped, returned, returnedWrapped, written,
-                                  functionLambda, explicitMoves, evalIfConst);
-}
+                                      const IfConstEvaluator& evalIfConst = {});
 
 // Collect the bare names a body stores INTO as a whole (`w = v`, `w += k`). Lambdas and nested
 // functions are a different scope. Drives the copy-on-entry of a written copyable parameter.
-inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
+void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
                                               std::unordered_set<std::string>& out,
                                               bool skipLambdas = false,
-                                              const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
-{
-    if (node == nullptr) return;
-    if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
-    if (skipLambdas && AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
-    if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
-        if (asn->assignmentOperator() != nullptr && asn->unaryExpression() != nullptr)
-        {
-            std::string dest = BareSourceText(asn->unaryExpression());
-            if (!NameShadowedByEnclosingLocal(asn, dest, functionLambda))
-                out.insert(dest);
-        }
-    for (auto* child : node->children)
-        CollectWholeNameStoreDestinations(child, out, skipLambdas, functionLambda);
-}
+                                              const CFlatParser::LambdaExpressionContext* functionLambda = nullptr);
 
 // First character of a rule's source text without building the subtree string (getText()
 // concatenates token texts, so it starts with the first token's text).
-inline char FirstSourceChar(antlr4::ParserRuleContext* ctx)
-{
-    if (ctx == nullptr || ctx->getStart() == nullptr) return '\0';
-    const std::string first = ctx->getStart()->getText();
-    return first.empty() ? '\0' : first[0];
-}
+char FirstSourceChar(antlr4::ParserRuleContext* ctx);
 
-inline void CollectAddressAliasWholeNameStores(
+void CollectAddressAliasWholeNameStores(
         antlr4::tree::ParseTree* body,
         const std::vector<LLVMBackend::TypeAndValue>& params,
         std::unordered_set<std::string>& writtenNames,
         bool addressMayWrite = false,
-        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
-{
-    if (std::none_of(params.begin(), params.end(), [](const auto& p) { return !p.VariableName.empty(); }))
-        return;
-    struct AddressedParam { std::string name; size_t token; };
-    std::unordered_map<std::string, AddressedParam> pointerRoots;
-    auto collectAddressAliases = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-        if (node == nullptr) return;
-        if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
-        {
-            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
-            auto* value = init->initializer() != nullptr ? init->initializer()->assignmentExpression() : nullptr;
-            if (direct != nullptr && direct->Identifier() != nullptr && value != nullptr
-                && FirstSourceChar(value) == '&')
-            {
-                const std::string source = value->getText();
-                if (source.size() > 1 && source[0] == '&')
-                {
-                    const std::string target = source.substr(1);
-                    for (const auto& p : params)
-                        if (p.VariableName == target
-                            && !NameShadowedByEnclosingLocal(init, target, functionLambda))
-                            pointerRoots[direct->Identifier()->getText()] = {
-                                target, (size_t)init->getStart()->getTokenIndex() };
-                }
-            }
-        }
-        if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
-        {
-            auto* dest = asn->unaryExpression();
-            auto* value = asn->assignmentExpression();
-            if (dest != nullptr && value != nullptr && FirstSourceChar(value) == '&')
-            {
-                const std::string source = value->getText();
-                if (source.size() > 1 && source[0] == '&')
-                {
-                    const std::string target = source.substr(1);
-                    const std::string alias = BareSourceText(dest);
-                    for (const auto& p : params)
-                        if (p.VariableName == target && !alias.empty()
-                            && !NameShadowedByEnclosingLocal(asn, target, functionLambda))
-                            pointerRoots[alias] = {
-                                target, (size_t)asn->getStart()->getTokenIndex() };
-                }
-            }
-        }
-        for (auto* child : node->children) self(self, child);
-    };
-    collectAddressAliases(collectAddressAliases, body);
-    auto collectDerefWrites = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-        if (node == nullptr) return;
-        if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
-        {
-            auto* dest = asn->unaryExpression();
-            if (dest != nullptr && FirstSourceChar(dest) == '*')
-            {
-                const std::string text = dest->getText();
-                if (text.size() > 1 && text[0] == '*')
-                    if (auto it = pointerRoots.find(text.substr(1)); it != pointerRoots.end()
-                        && (size_t)asn->getStart()->getTokenIndex() > it->second.token)
-                        writtenNames.insert(it->second.name);
-            }
-        }
-        for (auto* child : node->children) self(self, child);
-    };
-    collectDerefWrites(collectDerefWrites, body);
-    if (!addressMayWrite) return;
-    // `&param...` that is the whole source of a local pointer alias is tracked by the alias
-    // passes (deref stores above, container mutators in the caller); any other `&param...` use
-    // escapes to code this pass cannot see, so it counts as a write.
-    auto isSimpleAliasVariable = [](CFlatParser::UnaryExpressionContext* target) {
-        if (target == nullptr || target->postfixExpression() == nullptr
-            || target->postfixExpression()->children.size() != 1) return false;
-        auto* primary = target->postfixExpression()->primaryExpression();
-        return primary != nullptr && primary->genericIdentifier() != nullptr
-            && primary->genericIdentifier()->Identifier() != nullptr
-            && primary->genericIdentifier()->genericTypeParameters() == nullptr;
-    };
-    auto isAliasSource = [&](CFlatParser::UnaryExpressionContext* unary) {
-        const size_t startToken = (size_t)unary->getStart()->getTokenIndex();
-        const size_t stopToken = (size_t)unary->getStop()->getTokenIndex();
-        for (auto* parent = unary->parent; parent != nullptr; parent = parent->parent)
-        {
-            if ((size_t)parent->getSourceInterval().a != startToken
-                || (size_t)parent->getSourceInterval().b != stopToken) return false;
-            if (dynamic_cast<CFlatParser::InitializerContext*>(parent) != nullptr)
-            {
-                auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(parent->parent);
-                auto* direct = init != nullptr && init->declarator() != nullptr
-                    ? init->declarator()->directDeclarator() : nullptr;
-                if (direct != nullptr && direct->Identifier() != nullptr
-                    && direct->assignmentExpression() == nullptr) return true;
-            }
-            if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent->parent))
-                if (asn->assignmentExpression() == parent
-                    && isSimpleAliasVariable(asn->unaryExpression())) return true;
-        }
-        return false;
-    };
-    auto collectAddressedParams = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-        if (node == nullptr) return;
-        if (auto* arg = dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node))
-        {
-            // A tracked alias handed to a callee may be written there.
-            std::string text = BareSourceText(arg);
-            if (!text.empty() && (text[0] == '*' || text[0] == '&')) text = text.substr(1);
-            if (auto it = pointerRoots.find(text); it != pointerRoots.end()
-                && (size_t)arg->getStart()->getTokenIndex() > it->second.token)
-                writtenNames.insert(it->second.name);
-        }
-        auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
-        if (unary != nullptr && FirstSourceChar(unary) == '&')
-        {
-            const std::string text = unary->getText();
-            if (!text.empty() && text[0] == '&' && !isAliasSource(unary))
-            {
-                for (const auto& p : params)
-                    if (!p.VariableName.empty()
-                        && text.size() > p.VariableName.size() + 1
-                        && text.compare(1, p.VariableName.size(), p.VariableName) == 0
-                        && (text[p.VariableName.size() + 1] == '.'
-                            || text[p.VariableName.size() + 1] == '>'
-                            || text[p.VariableName.size() + 1] == '[')
-                        && !NameShadowedByEnclosingLocal(unary, p.VariableName, functionLambda))
-                        writtenNames.insert(p.VariableName);
-                    else if (!p.VariableName.empty() && text == "&" + p.VariableName
-                        && !NameShadowedByEnclosingLocal(unary, p.VariableName, functionLambda))
-                        writtenNames.insert(p.VariableName);
-            }
-        }
-        for (auto* child : node->children) self(self, child);
-    };
-    collectAddressedParams(collectAddressedParams, body);
-}
+        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr);
 
 // A parameter shape that can carry an owning VALUE (a value struct or `string`). Excludes
 // borrows (pointers, interface values, array-views), function pointers, arrays, and params
 // already carrying a move/alias/unique qualifier. The definitive "type owns a resource" test
 // runs at the call site on the concrete (monomorphized) type, so this only rejects shapes
 // that can never be an owning sink.
-inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
-{
-    if (p.Pointer || p.ElemPointer) return false;
-    if (p.IsInterface || p.IsInterfacePointer) return false;
-    // A THIN C function pointer (function<...> / __c_fn_ptr, or an encoded cfn$...) owns NOTHING,
-    // so it can never be an owning sink. A FAT closure (Lambda<...> / __closure_fat_ptr, or an
-    // encoded fatfn$...) is an OWNING VALUE like string - it owns its captured env - so it IS
-    // sink-eligible: moved into the slot on insert, freed on teardown. The concrete
-    // owns-a-resource gate still runs at the call site on the monomorphized type.
-    if (p.IsThinFnPtr() || IsThinMangledClosure(p.TypeName)) return false;
-    if (p.IsArrayView || p.IsSimd) return false;
-    if (p.ConstArraySize > 0) return false;
-    if (p.IsMove || MangledBase(p.TypeName) == "unique"
-        || p.IsAlias) return false;
-    if (p.IsBorrowOfAliasElement) return false;
-    return true;
-}
+bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p);
 
-inline std::string SimpleIdentifierExpressionName(antlr4::tree::ParseTree* expression)
-{
-    auto* postfix = SolePostfixExpressionShape(expression);
-    if (postfix == nullptr || postfix->children.size() != 1) return {};
-    auto* primary = postfix->primaryExpression();
-    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-    if (primary == nullptr || primary->children.size() != 1 || generic == nullptr
-        || generic->genericTypeParameters() != nullptr || generic->Identifier() == nullptr)
-        return {};
-    return generic->Identifier()->getText();
-}
+std::string SimpleIdentifierExpressionName(antlr4::tree::ParseTree* expression);
 
-inline bool NameIsImplicitThisField(antlr4::tree::ParseTree* bodyRoot,
-        const std::string& name)
-{
-    if (bodyRoot == nullptr || name.empty()) return false;
-    antlr4::tree::ParseTree* aggregate = nullptr;
-    for (auto* parent = bodyRoot; parent != nullptr; parent = parent->parent)
-        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) != nullptr
-            || dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) != nullptr)
-        {
-            aggregate = parent;
-            break;
-        }
-    if (aggregate == nullptr) return false;
-    bool found = false;
-    auto scan = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-        if (found || node == nullptr) return;
-        if (node != aggregate
-            && (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)
-                || AsRuleCtx<CFlatParser::StructDefinitionContext>(node)
-                || AsRuleCtx<CFlatParser::ClassDefinitionContext>(node))) return;
-        if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
-            if (auto* list = declaration->initDeclaratorList())
-                for (auto* init : list->initDeclarator())
-                {
-                    auto* declarator = init->declarator();
-                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-                    if (direct != nullptr && direct->Identifier() != nullptr
-                        && direct->Identifier()->getText() == name)
-                    {
-                        found = true;
-                        return;
-                    }
-                }
-        for (auto* child : node->children) self(self, child);
-    };
-    scan(scan, aggregate);
-    return found;
-}
+bool NameIsImplicitThisField(antlr4::tree::ParseTree* bodyRoot,
+        const std::string& name);
 
-inline bool ViewFieldAliasProvesParam(antlr4::tree::ParseTree* bodyRoot,
+bool ViewFieldAliasProvesParam(antlr4::tree::ParseTree* bodyRoot,
         antlr4::tree::ParseTree* use, const std::string& aliasName,
         const LLVMBackend::TypeAndValue& param,
-        const CFlatParser::LambdaExpressionContext* functionLambda)
-{
-    if (bodyRoot == nullptr || use == nullptr || aliasName.empty()
-        || aliasName == param.VariableName
-        || !NameShadowedByEnclosingLocal(use, aliasName, functionLambda))
-        return false;
-    const size_t useToken = static_cast<size_t>(use->getSourceInterval().a);
-    std::vector<CFlatParser::InitDeclaratorContext*> declarations;
-    auto collectDeclarations = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-        if (node == nullptr) return;
-        if (node != bodyRoot
-            && (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)
-                || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node))) return;
-        if (auto* init = AsRuleCtx<CFlatParser::InitDeclaratorContext>(node))
-        {
-            auto* declarator = init->declarator();
-            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-            if (direct != nullptr && direct->Identifier() != nullptr
-                && direct->Identifier()->getText() == aliasName
-                && static_cast<size_t>(init->getStart()->getTokenIndex()) < useToken)
-                declarations.push_back(init);
-        }
-        for (auto* child : node->children) self(self, child);
-    };
-    collectDeclarations(collectDeclarations, bodyRoot);
-    if (declarations.size() != 1) return false;
-    auto* init = declarations.front();
-    auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(init->parent);
-    for (auto* parent = init->parent; declaration == nullptr && parent != nullptr;
-         parent = parent->parent)
-        declaration = dynamic_cast<CFlatParser::DeclarationContext*>(parent);
-    auto* specs = declaration != nullptr ? declaration->declarationSpecifiers() : nullptr;
-    bool pointerType = false;
-    if (specs != nullptr)
-        for (auto* spec : specs->declarationSpecifier())
-            pointerType = pointerType || (spec->typeSpecifier() != nullptr && spec->pointer() != nullptr);
-    auto* initializer = init->initializer();
-    auto* initialValue = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
-    if (!pointerType || SimpleIdentifierExpressionName(initialValue) != param.VariableName
-        || NameShadowedByEnclosingLocal(initialValue, param.VariableName, functionLambda))
-        return false;
+        const CFlatParser::LambdaExpressionContext* functionLambda);
 
-    bool everyStoreAgrees = true;
-    auto verifyStores = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-        if (!everyStoreAgrees || node == nullptr) return;
-        if (node != bodyRoot
-            && (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)
-                || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node))) return;
-        if (auto* assignment = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
-        {
-            auto* lhs = assignment->unaryExpression();
-            if (lhs != nullptr && SimpleIdentifierExpressionName(lhs) == aliasName
-                && assignment->assignmentOperator() != nullptr)
-            {
-                auto* rhs = assignment->assignmentExpression();
-                if (assignment->assignmentOperator()->getText() != "="
-                    || SimpleIdentifierExpressionName(rhs) != param.VariableName
-                    || NameShadowedByEnclosingLocal(rhs, param.VariableName, functionLambda))
-                    everyStoreAgrees = false;
-            }
-        }
-        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
-            if (unary->unaryOperator() != nullptr && unary->unaryOperator()->getText() == "&"
-                && SimpleIdentifierExpressionName(unary->castExpression()) == aliasName)
-                everyStoreAgrees = false;
-        for (auto* child : node->children) self(self, child);
-    };
-    verifyStores(verifyStores, bodyRoot);
-    return everyStoreAgrees;
-}
-
-inline std::string ViewFieldMovePath(CFlatParser::UnaryExpressionContext* source,
+std::string ViewFieldMovePath(CFlatParser::UnaryExpressionContext* source,
         antlr4::tree::ParseTree* bodyRoot,
         const LLVMBackend::TypeAndValue& param,
         const std::vector<LLVMBackend::TypeAndValue>& allParams,
-        const CFlatParser::LambdaExpressionContext* functionLambda)
-{
-    if (source == nullptr || !param.Pointer || param.VariableName.empty()) return {};
-    auto* postfix = SolePostfixExpressionShape(source);
-    auto* primary = postfix != nullptr ? postfix->primaryExpression() : nullptr;
-    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-    auto* root = generic != nullptr ? generic->Identifier() : nullptr;
-    if (primary == nullptr || primary->children.size() != 1 || generic == nullptr
-        || generic->genericTypeParameters() != nullptr || root == nullptr)
-        return {};
-    const std::string rootName = root->getText();
-    const bool isImplicitThisParam = param.VariableName == param.TypeName + "__";
-    const bool isImplicitThis = isImplicitThisParam && rootName == "this";
-    const bool isParam = rootName == param.VariableName
-        && !NameShadowedByEnclosingLocal(primary, param.VariableName, functionLambda);
-    const bool isParamAlias = rootName != param.VariableName
-        && ViewFieldAliasProvesParam(bodyRoot, primary, rootName, param, functionLambda);
-    const bool shadowsExplicitParam = std::any_of(allParams.begin(), allParams.end(),
-        [&](const auto& candidate) {
-            return candidate.VariableName == rootName
-                && candidate.VariableName != candidate.TypeName + "__";
-        });
-    const bool isImplicitThisField = isImplicitThisParam && rootName != "this"
-        && !shadowsExplicitParam
-        && !NameShadowedByEnclosingLocal(primary, rootName, functionLambda)
-        && NameIsImplicitThisField(bodyRoot, rootName);
-    if (!isImplicitThis && !isParam && !isParamAlias && !isImplicitThisField) return {};
+        const CFlatParser::LambdaExpressionContext* functionLambda);
 
-    std::string path = isImplicitThisField ? rootName : std::string{};
-    bool sawArrow = false;
-    for (size_t i = 1; i < postfix->children.size();)
-    {
-        auto* token = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
-        if (token == nullptr) return {};
-        const size_t tokenType = token->getSymbol()->getType();
-        if (tokenType == CFlatParser::Arrow || tokenType == CFlatParser::Dot)
-        {
-            if (i + 1 >= postfix->children.size()) return {};
-            auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i + 1]);
-            if (member == nullptr || (i + 2 < postfix->children.size()
-                && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(postfix->children[i + 2]) != nullptr))
-                return {};
-            if (tokenType == CFlatParser::Arrow)
-            {
-                if (sawArrow || !path.empty()) return {};
-                sawArrow = true;
-                path = member->getText();
-            }
-            else
-            {
-                if (!sawArrow && !isImplicitThisField) return {};
-                path += "." + member->getText();
-            }
-            i += 2;
-            continue;
-        }
-        if (tokenType == CFlatParser::LeftBracket)
-        {
-            if ((!sawArrow && !isImplicitThisField) || i + 2 >= postfix->children.size()) return {};
-            auto* indexExpression = dynamic_cast<CFlatParser::ExpressionContext*>(postfix->children[i + 1]);
-            auto* close = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i + 2]);
-            auto* indexPostfix = SolePostfixExpressionShape(indexExpression);
-            auto* indexPrimary = indexPostfix != nullptr
-                ? indexPostfix->primaryExpression() : nullptr;
-            auto* literal = indexPrimary != nullptr ? indexPrimary->Constant() : nullptr;
-            if (indexPostfix == nullptr || close == nullptr
-                || close->getSymbol()->getType() != CFlatParser::RightBracket)
-                return {};
-            if (indexPostfix->children.size() == 1 && indexPrimary != nullptr
-                && indexPrimary->children.size() == 1 && literal != nullptr)
-            {
-                const std::string digits = literal->getText();
-                uint64_t index = 0;
-                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), index);
-                if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size())
-                    path += "[" + std::to_string(index) + "]";
-                else path += "[*]";
-            }
-            else path += "[*]";
-            i += 3;
-            continue;
-        }
-        return {};
-    }
-    return sawArrow || isImplicitThisField ? path : std::string{};
-}
-
-inline void InferViewFieldMovePaths(antlr4::tree::ParseTree* node,
+void InferViewFieldMovePaths(antlr4::tree::ParseTree* node,
         antlr4::tree::ParseTree* bodyRoot,
         const LLVMBackend* compiler,
         std::vector<LLVMBackend::TypeAndValue>& allParams,
         const IfConstEvaluator& evalIfConst = {},
-        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
-{
-    if (node == nullptr) return;
-    if (auto* selection = AsRuleCtx<CFlatParser::SelectionStatementContext>(node))
-    {
-        antlr4::tree::ParseTree* liveBranch = nullptr;
-        if (TryGetKnownIfConstBranch(selection, evalIfConst, liveBranch))
-        {
-            if (liveBranch != nullptr)
-                InferViewFieldMovePaths(liveBranch, bodyRoot, compiler, allParams,
-                                        evalIfConst, functionLambda);
-            return;
-        }
-    }
-    if (node != bodyRoot
-        && (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)
-            || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)))
-        return;
-    if (auto* move = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
-        for (auto& param : allParams)
-        {
-            const std::string path = ViewFieldMovePath(
-                move->unaryExpression(), bodyRoot, param, allParams, functionLambda);
-            if (!path.empty()
-                && std::find(param.ViewFieldMovePaths.begin(), param.ViewFieldMovePaths.end(), path)
-                    == param.ViewFieldMovePaths.end())
-                param.ViewFieldMovePaths.push_back(path);
-        }
-    if (compiler != nullptr)
-        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
-            postfix != nullptr && postfix->children.size() == 4)
-        {
-            auto* primary = postfix->primaryExpression();
-            auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-            auto* name = generic != nullptr ? generic->Identifier() : nullptr;
-            auto* open = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[1]);
-            auto* args = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(postfix->children[2]);
-            auto* close = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[3]);
-            if (primary != nullptr && primary->children.size() == 1 && generic != nullptr
-                && generic->genericTypeParameters() == nullptr && name != nullptr
-                && open != nullptr && open->getSymbol()->getType() == CFlatParser::LeftParen
-                && args != nullptr && !args->argumentNamedExpression().empty()
-                && close != nullptr && close->getSymbol()->getType() == CFlatParser::RightParen)
-            {
-                const std::string calleeName = name->getText();
-                const bool shadowsParam = std::any_of(allParams.begin(), allParams.end(),
-                    [&](const auto& param) { return param.VariableName == calleeName; });
-                if (!shadowsParam
-                    && !NameShadowedByEnclosingLocal(primary, calleeName, functionLambda)
-                    && !NameIsImplicitThisField(bodyRoot, calleeName)
-                    && compiler->GetGlobalVariableNV(calleeName).Storage == nullptr)
-                {
-                    for (auto& callerParam : allParams)
-                    {
-                        if (!callerParam.Pointer || callerParam.VariableName.empty()) continue;
-                        for (size_t argumentIndex = 0;
-                             argumentIndex < args->argumentNamedExpression().size(); ++argumentIndex)
-                        {
-                            auto* argument = args->argumentNamedExpression(argumentIndex);
-                            if (argument == nullptr || argument->assignmentExpression() == nullptr)
-                                continue;
-                            auto* forwarded = argument->assignmentExpression();
-                            const std::string argName = SimpleIdentifierExpressionName(forwarded);
-                            const bool directParam = argName == callerParam.VariableName
-                                && !NameShadowedByEnclosingLocal(forwarded,
-                                    callerParam.VariableName, functionLambda);
-                            const bool localAlias = argName != callerParam.VariableName
-                                && ViewFieldAliasProvesParam(bodyRoot, forwarded, argName,
-                                    callerParam, functionLambda);
-                            if (!directParam && !localAlias) continue;
-                            const std::string namedParameter = argument->Identifier() != nullptr
-                                ? argument->Identifier()->getText() : std::string{};
-                            const auto calleeParams = compiler->FindCFlatViewFieldMoveParams(
-                                calleeName, callerParam.TypeName,
-                                args->argumentNamedExpression().size(), argumentIndex,
-                                namedParameter);
-                            for (const auto* calleeParam : calleeParams)
-                                for (const auto& path : calleeParam->ViewFieldMovePaths)
-                                    if (std::find(callerParam.ViewFieldMovePaths.begin(),
-                                                  callerParam.ViewFieldMovePaths.end(), path)
-                                        == callerParam.ViewFieldMovePaths.end())
-                                        callerParam.ViewFieldMovePaths.push_back(path);
-                        }
-                    }
-                }
-            }
-        }
-    for (auto* child : node->children)
-        InferViewFieldMovePaths(child, bodyRoot, compiler, allParams, evalIfConst, functionLambda);
-}
+        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr);
 
 // Owning-value move-sink inference: a plain by-value parameter is a synthesized sink (IsOwningSink)
 // so the caller's owning source is nulled at the call site. An unconditional top-level move consumes
@@ -5852,124 +1626,23 @@ inline void InferViewFieldMovePaths(antlr4::tree::ParseTree* node,
 // This also runs on generic-class instantiations against the monomorphized param list.
 // Body-taking core. A lambda literal has no FunctionDefinitionContext but is a function all the
 // same, so its parameter list runs the identical inference against its own body.
-inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
+void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
                                      antlr4::tree::ParseTree* body,
                                      std::vector<LLVMBackend::TypeAndValue>& allParams,
                                      const IfConstEvaluator& evalIfConst = {},
-                                     const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
-{
-    if (body == nullptr) return;
-    if (std::any_of(allParams.begin(), allParams.end(), [](const auto& p) {
-            return p.Pointer && !p.VariableName.empty(); }))
-        InferViewFieldMovePaths(body, body, compiler, allParams, evalIfConst, functionLambda);
-    // The scans only feed eligible parameters; a body with none (`main()`) skips them - their
-    // shadowing checks are quadratic in the statement count of a large function.
-    if (std::none_of(allParams.begin(), allParams.end(), [](const auto& p) {
-            return !p.VariableName.empty() && ParamIsOwningSinkEligible(p); }))
-        return;
-    std::unordered_set<std::string> movedNames;
-    ReturnScanMemo returnScanMemo;
-    CollectUnconditionalMovedNames(body, movedNames, evalIfConst, &returnScanMemo);
-    std::unordered_set<std::string> consumedNames;
-    WrappedSourceNames wrappedConsumed;
-    std::unordered_set<std::string> explicitMoves;
-    std::unordered_set<std::string> returnedNames;
-    WrappedSourceNames wrappedReturned;
-    std::unordered_set<std::string> writtenNames;
-    CollectConsumedStoreNames(body, consumedNames, &wrappedConsumed, &returnedNames, &wrappedReturned,
-                              &writtenNames, functionLambda, &explicitMoves, evalIfConst);
-    CollectWholeNameStoreDestinations(body, writtenNames, false, functionLambda);
-
-    CollectAddressAliasWholeNameStores(body, allParams, writtenNames, false, functionLambda);
-    for (auto& p : allParams)
-    {
-        if (p.VariableName.empty() || !ParamIsOwningSinkEligible(p)) continue;
-        // An imported C++ class param follows the C++ by-value rule (the caller copy- or
-        // move-constructs it), so a write or return in the body never consumes the caller.
-        const bool cxxClass = compiler != nullptr
-            && (compiler->IsCxxRecord(p.TypeName) || compiler->IsForeignNontrivialCxxClass(p.TypeName));
-        // A cast-wrapped source counts only when every peeled wrapper names the parameter's own
-        // type - a TYPE-CHANGING cast is not a whole-value consume of the parameter.
-        bool wrappedConsume = false;
-        if (auto it = wrappedConsumed.find(p.VariableName); it != wrappedConsumed.end())
-            wrappedConsume = AllWrapperTypesName(compiler, it->second, p.TypeName);
-        bool wrappedReturn = false;
-        if (auto it = wrappedReturned.find(p.VariableName); it != wrappedReturned.end())
-            wrappedReturn = AllWrapperTypesName(compiler, it->second, p.TypeName);
-        const bool returnsParam = returnedNames.count(p.VariableName) || wrappedReturn;
-        const bool isStringParam = compiler != nullptr
-            && compiler->ResolveTypeAlias(p.TypeName) == "string";
-        if (movedNames.count(p.VariableName))
-        {
-            p.IsOwningSink = true;
-            // An explicit string move consumes; copy-only string uses stay borrowed.
-            if (isStringParam) p.IsConsumeInferredSink = true;
-            if (returnsParam)
-            {
-                p.IsReturnInferredSink = true;
-                p.IsWriteInferredSink = true;
-                if (isStringParam) p.IsConsumeInferredSink = true;
-            }
-        }
-        else if (consumedNames.count(p.VariableName) || wrappedConsume)
-        {
-            p.IsOwningSink = true;
-            p.IsConsumeInferredSink = !isStringParam
-                || explicitMoves.count(p.VariableName) != 0;
-            if (returnsParam)
-            {
-                p.IsReturnInferredSink = true;
-                p.IsWriteInferredSink = true;
-            }
-        }
-        else if (cxxClass)
-            continue;
-        else if (writtenNames.count(p.VariableName))
-        {
-            // A whole write is structural consume for non-strings; strings copy on entry, so the
-            // caller keeps its buffer. Concrete copyability is decided at the call site.
-            p.IsOwningSink = true;
-            p.IsConsumeInferredSink = true;
-            p.IsWriteInferredSink = true;
-        }
-        else if (returnsParam)
-        {
-            // Only `return p` consumes it: OwningSinkConsumesConcrete leaves a unique-owning
-            // type to the inferred 'alias' return (ClassifyValueStructReturns) as before.
-            p.IsOwningSink = true;
-            p.IsConsumeInferredSink = true;
-            p.IsReturnInferredSink = true;
-        }
-    }
-}
+                                     const CFlatParser::LambdaExpressionContext* functionLambda = nullptr);
 
 // A declared `Lambda<...>` / `function<...>` spelling cannot express an INFERRED owning sink, so a
 // funcptr destination adopts the flags of the lambda literal (or funcptr value) it is bound to.
 // Union, never clear: over-approximating a sink leaks at worst, missing one double-frees, and a
 // destination rebound to a differently-inferred value must keep the stronger claim.
-inline void AdoptInferredParamSinks(LLVMBackend::TypeAndValue& dest,
-                                    const std::vector<LLVMBackend::TypeAndValue::FuncPtrParam>& src)
-{
-    if (dest.FuncPtrParams.size() != src.size()) return;
-    for (size_t i = 0; i < src.size(); i++)
-    {
-        auto& d = dest.FuncPtrParams[i];
-        if (d.AllocAlignValue == 0)
-            d.AllocAlignValue = src[i].AllocAlignValue;
-        d.IsOwningSink = d.IsOwningSink || src[i].IsOwningSink;
-        d.IsConsumeInferredSink = d.IsConsumeInferredSink || src[i].IsConsumeInferredSink;
-        d.IsReturnInferredSink = d.IsReturnInferredSink || src[i].IsReturnInferredSink;
-        d.IsWriteInferredSink = d.IsWriteInferredSink || src[i].IsWriteInferredSink;
-    }
-}
+void AdoptInferredParamSinks(LLVMBackend::TypeAndValue& dest,
+                                    const std::vector<LLVMBackend::TypeAndValue::FuncPtrParam>& src);
 
-inline void ApplyOwningSinkInference(const LLVMBackend* compiler,
+void ApplyOwningSinkInference(const LLVMBackend* compiler,
                                      CFlatParser::FunctionDefinitionContext* func,
                                      std::vector<LLVMBackend::TypeAndValue>& allParams,
-                                     const IfConstEvaluator& evalIfConst = {})
-{
-    ApplyOwningSinkInferenceToBody(compiler, func->compoundStatement(), allParams, evalIfConst);
-}
+                                     const IfConstEvaluator& evalIfConst = {});
 
 // True when the function declares a RETURN TYPE, which is what separates an ordinary member
 // from a constructor. Not the same as having declarationSpecifiers: per CFlat.g4:783 a ctor
@@ -6634,47 +2307,16 @@ private:
 
 // Record the receiver facts of a native method (`allParams[0]` is its synthesized `this`).
 // Returns the method's unique name, empty when it is not a native method with a body.
-inline std::string RecordReceiverScan(LLVMBackend* compiler, CFlatParser::FunctionDefinitionContext* func,
+std::string RecordReceiverScan(LLVMBackend* compiler, CFlatParser::FunctionDefinitionContext* func,
                                       const std::string& name, const LLVMBackend::DeclTypeAndValue& returnType,
                                       const std::vector<LLVMBackend::TypeAndValue>& allParams, bool varargs,
-                                      const IfConstEvaluator& eval = {})
-{
-    if (compiler == nullptr || func == nullptr || func->compoundStatement() == nullptr || allParams.empty())
-        return {};
-    const auto& self = allParams.front();
-    if (!self.Pointer || self.VariableName != self.TypeName + "__" || returnType.external) return {};
-    const std::string unique = compiler->ComputeMangledName(name, returnType, allParams, varargs);
-    auto facts = ReceiverScan(allParams, eval).Run(func->compoundStatement());
-    facts.Line = func->getStart()->getLine();
-    facts.Column = func->getStart()->getCharPositionInLine();
-    compiler->RecordReceiverScanFacts(unique, std::move(facts));
-    return unique;
-}
+                                      const IfConstEvaluator& eval = {});
 
-inline bool FunctionDeclaresReturnType(CFlatParser::FunctionDefinitionContext* func)
-{
-    auto* specs = func->declarationSpecifiers();
-    if (specs == nullptr) return false;
-    for (auto* spec : specs->declarationSpecifier())
-        if (spec->typeSpecifier() != nullptr) return true;
-    return false;
-}
+bool FunctionDeclaresReturnType(CFlatParser::FunctionDefinitionContext* func);
 
 // Render a parameter type list for a diagnostic, e.g. "int, string*". Types only:
 // parameter names are not part of a function signature.
-inline std::string DescribeParameterTypes(const std::vector<LLVMBackend::TypeAndValue>& params)
-{
-    std::string text;
-    for (const auto& p : params)
-    {
-        if (!text.empty()) text += ", ";
-        text += p.TypeName;
-        // An array-view param carries Pointer too, but spells as 'T[]', never 'T[]*'.
-        if (p.IsArrayView) text += "[]";
-        else if (p.Pointer) text += p.ElemPointer ? "**" : "*";
-    }
-    return text;
-}
+std::string DescribeParameterTypes(const std::vector<LLVMBackend::TypeAndValue>& params);
 
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
 // all function signatures and struct type shells before the main code-gen walk.
@@ -7699,52 +3341,16 @@ private:
     };
     std::vector<PendingCallVisibleLocal> pendingCallVisibleLocals_;
     const PendingCallVisibleLocal* FindPendingCallVisibleLocal(
-        LLVMBackend* backend, const std::string& name, antlr4::tree::ParseTree* use) const
+        LLVMBackend* backend, const std::string& name, antlr4::tree::ParseTree* use,
+        bool requireInitializer = false) const
     {
         if (backend == nullptr) return nullptr;
         const size_t visibleDepth = backend->FindVariableScopeDepth(name);
         for (auto it = pendingCallVisibleLocals_.rbegin(); it != pendingCallVisibleLocals_.rend(); ++it)
         {
             if (it->Name != name) continue;
-            if (it->Function == backend->currentFunction)
-            {
-                if (visibleDepth != SIZE_MAX && visibleDepth > it->ScopeDepth) continue;
-            }
-            else
-            {
-                bool inInitializer = false;
-                bool inLambda = false;
-                for (auto* node = use; node != nullptr; node = node->parent)
-                {
-                    if (node == it->Initializer)
-                    {
-                        inInitializer = true;
-                        break;
-                    }
-                    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
-                        inLambda = true;
-                }
-                if (!inInitializer || !inLambda
-                    || NameShadowedByEnclosingLocal(use, name, nullptr, it->Initializer))
-                    continue;
-            }
-            return &*it;
-        }
-        return nullptr;
-    }
-    const PendingCallVisibleLocal* FindPendingInitializerReadLocal(
-        LLVMBackend* backend, const std::string& name, antlr4::tree::ParseTree* use) const
-    {
-        while (use != nullptr && dynamic_cast<antlr4::ParserRuleContext*>(use) == nullptr)
-            use = use->parent;
-        if (backend == nullptr || use == nullptr) return nullptr;
-        const size_t visibleDepth = backend->FindVariableScopeDepth(name);
-        for (auto it = pendingCallVisibleLocals_.rbegin(); it != pendingCallVisibleLocals_.rend(); ++it)
-        {
-            if (it->Name != name) continue;
             bool inInitializer = false;
             bool inLambda = false;
-            bool shadowedByLambdaParameter = false;
             for (auto* node = use; node != nullptr; node = node->parent)
             {
                 if (node == it->Initializer)
@@ -7752,27 +3358,31 @@ private:
                     inInitializer = true;
                     break;
                 }
-                if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
-                {
+                if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
                     inLambda = true;
-                    if (auto* params = lambda->lambdaParamList())
-                        for (auto* param : params->lambdaParam())
-                            if (param->Identifier() != nullptr
-                                && param->Identifier()->getText() == name)
-                                shadowedByLambdaParameter = true;
-                }
             }
-            if (!inInitializer || shadowedByLambdaParameter) continue;
-            if (it->Function == backend->currentFunction)
+            const bool sameFunction = it->Function == backend->currentFunction;
+            if (requireInitializer)
+            {
+                if (!inInitializer || (!sameFunction && !inLambda)
+                    || (sameFunction && visibleDepth != SIZE_MAX && visibleDepth > it->ScopeDepth)
+                    || NameShadowedByEnclosingLocal(use, name, nullptr, it->Initializer)) continue;
+            }
+            else if (sameFunction)
             {
                 if (visibleDepth != SIZE_MAX && visibleDepth > it->ScopeDepth) continue;
             }
-            else if (!inLambda)
-                continue;
-            if (NameShadowedByEnclosingLocal(use, name, nullptr, it->Initializer)) continue;
+            else if (!inInitializer || !inLambda
+                || NameShadowedByEnclosingLocal(use, name, nullptr, it->Initializer)) continue;
             return &*it;
         }
         return nullptr;
+    }
+    const PendingCallVisibleLocal* FindPendingInitializerReadLocal(
+        LLVMBackend* backend, const std::string& name, antlr4::tree::ParseTree* use) const
+    {
+        while (use != nullptr && dynamic_cast<antlr4::ParserRuleContext*>(use) == nullptr) use = use->parent;
+        return FindPendingCallVisibleLocal(backend, name, use, true);
     }
     struct PendingCallVisibleLocalScope
     {
@@ -10858,6 +6468,13 @@ public:
                                                     ResultUse use = ResultUse::Value);
     bool IsCxxTemporaryPrvalue(const LLVMBackend::NamedVariable& value) const;
     void ClearCxxPrvalueProvenance(LLVMBackend::NamedVariable& value) const;
+    bool IsPointerLikeParent(const LLVMBackend::TypeAndValue& parent) const;
+    void PropagateParentConstToField(LLVMBackend::NamedVariable& field,
+        const LLVMBackend::TypeAndValue& parent,
+        const LLVMBackend::TypeAndValue& fieldType) const;
+    void PropagateCxxPrvalueSubobject(LLVMBackend::NamedVariable& field,
+        const LLVMBackend::NamedVariable& parent,
+        const LLVMBackend::TypeAndValue& fieldType, bool fieldIsPointer) const;
     // `sizeofs` = leading `sizeof` prefixes still to apply to the operand (0 = plain operand).
     LLVMBackend::NamedVariable ParseUnaryExpressionImpl(CFlatParser::UnaryExpressionContext* ctx,
                                                         ResultUse use, size_t sizeofs);

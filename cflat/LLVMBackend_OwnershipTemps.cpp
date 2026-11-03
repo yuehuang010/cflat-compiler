@@ -5050,18 +5050,16 @@ const llvm::Function* LLVMBackend::FunctionPointerTargetFromValue(const llvm::Va
     }
 
 bool LLVMBackend::FunctionPointerStorageDtorCall(const llvm::CallBase* call,
-        const llvm::AllocaInst* slot) const
+        const llvm::AllocaInst* slot, const llvm::Function* closureDtor) const
 {
         if (slot == nullptr || call == nullptr
             || slot->getAllocatedType() != GetClosureFatPtrType()) return false;
-        const auto closure = dataStructures.find("__closure_fat_ptr");
-        const llvm::Function* closureDtor = closure != dataStructures.end()
-            ? closure->second.Destructor : nullptr;
         return closureDtor != nullptr && call->getCalledFunction() == closureDtor
             && call->arg_size() == 1 && call->getArgOperand(0) == slot;
 }
 
-bool LLVMBackend::FunctionPointerStorageIsLoadStoreOnly(const llvm::AllocaInst* slot) const
+bool LLVMBackend::FunctionPointerStorageIsLoadStoreOnly(const llvm::AllocaInst* slot,
+        const llvm::Function* closureDtor) const
 {
         if (slot == nullptr) return false;
         for (const llvm::User* user : slot->users())
@@ -5074,7 +5072,7 @@ bool LLVMBackend::FunctionPointerStorageIsLoadStoreOnly(const llvm::AllocaInst* 
                 const llvm::Function* function = call->getCalledFunction();
                 if (function != nullptr && (function->getName().starts_with("llvm.dbg.")
                     || function->getName().starts_with("llvm.lifetime."))) continue;
-                if (FunctionPointerStorageDtorCall(call, slot)) continue;
+                if (FunctionPointerStorageDtorCall(call, slot, closureDtor)) continue;
             }
             return false;
         }
@@ -5085,8 +5083,11 @@ const llvm::Function* LLVMBackend::FunctionPointerTargetFromLocal(const llvm::Va
         int depth, const llvm::DominatorTree* dominatorTree) const
 {
         const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(storage);
+        const auto closure = dataStructures.find("__closure_fat_ptr");
+        const llvm::Function* closureDtor = closure != dataStructures.end()
+            ? closure->second.Destructor : nullptr;
         if (slot == nullptr || depth > kMaxRetainDepth
-            || !FunctionPointerStorageIsLoadStoreOnly(slot)
+            || !FunctionPointerStorageIsLoadStoreOnly(slot, closureDtor)
             || slot->getFunction() == nullptr) return nullptr;
         const llvm::StoreInst* targetStore = nullptr;
         std::vector<const llvm::LoadInst*> loads;
@@ -5157,7 +5158,11 @@ std::vector<const llvm::Function*> LLVMBackend::FunctionPointerTargetsFromStorag
 
         if (const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(storage))
         {
-            if (!FunctionPointerStorageIsLoadStoreOnly(slot) || slot->getFunction() == nullptr)
+            const auto closure = dataStructures.find("__closure_fat_ptr");
+            const llvm::Function* closureDtor = closure != dataStructures.end()
+                ? closure->second.Destructor : nullptr;
+            if (!FunctionPointerStorageIsLoadStoreOnly(slot, closureDtor)
+                || slot->getFunction() == nullptr)
             {
                 complete = false;
                 return targets;
@@ -5182,7 +5187,7 @@ std::vector<const llvm::Function*> LLVMBackend::FunctionPointerTargetsFromStorag
                     else ++loads;
                 }
                 else if (FunctionPointerStorageDtorCall(
-                    llvm::dyn_cast<llvm::CallBase>(user), slot))
+                    llvm::dyn_cast<llvm::CallBase>(user), slot, closureDtor))
                     continue;
                 else
                     complete = false;
@@ -8034,19 +8039,18 @@ LLVMBackend::OwnedTempMark LLVMBackend::MarkOwnedTemps() const
 void LLVMBackend::DropNonCxxOwnedTempsSince(const OwnedTempMark& mark)
 {
         // Keep only C++-holder struct temps; every other entry since `mark` is forgotten.
-        auto dropFrom = [](auto& list, size_t from, auto&& keep) {
-            size_t write = from;
-            for (size_t i = from; i < list.size(); ++i)
-                if (keep(list[i])) list[write++] = list[i];
-            list.erase(list.begin() + write, list.end());
-        };
-        auto none = [](const auto&) { return false; };
-        dropFrom(pendingOwnedStringTemps, mark.Strings, none);
-        dropFrom(pendingOwnedClosureTemps, mark.Closures, none);
-        dropFrom(pendingOwnedStructTemps, mark.Structs, [&](const PendingOwnedStructTemp& t) {
-            return HasCxxClassMember(t.TypeName); });
-        dropFrom(pendingOwnedPtrTemps, mark.Ptrs, none);
-        dropFrom(ownedNewTemps_, mark.NewPtrs, none);
+        pendingOwnedStringTemps.erase(pendingOwnedStringTemps.begin() + mark.Strings,
+            pendingOwnedStringTemps.end());
+        pendingOwnedClosureTemps.erase(pendingOwnedClosureTemps.begin() + mark.Closures,
+            pendingOwnedClosureTemps.end());
+        auto structTempsEnd = std::remove_if(pendingOwnedStructTemps.begin() + mark.Structs,
+            pendingOwnedStructTemps.end(), [&](const PendingOwnedStructTemp& temp) {
+                return !HasCxxClassMember(temp.TypeName);
+            });
+        pendingOwnedStructTemps.erase(structTempsEnd, pendingOwnedStructTemps.end());
+        pendingOwnedPtrTemps.erase(pendingOwnedPtrTemps.begin() + mark.Ptrs,
+            pendingOwnedPtrTemps.end());
+        ownedNewTemps_.erase(ownedNewTemps_.begin() + mark.NewPtrs, ownedNewTemps_.end());
     }
 
 bool LLVMBackend::AddressDerivesFromOwnedStructTempSince(const OwnedTempMark& mark,

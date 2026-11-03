@@ -721,7 +721,12 @@ class LLVMBackend
 {
 public:
     // Clang's same-class copy request for one class and constness (see RequestSameClassCopy).
-    struct SameClassCopyRequest { bool requested = false; std::string wrapperName; std::string pick; };
+    struct SameClassCopyRequest
+    {
+        bool requested = false;
+        std::string wrapperName;
+        cflat_cinterop::CtorPick pick = cflat_cinterop::CtorPick::Unknown;
+    };
     bool LastOptimizedViewWasIncremental() const;
     struct LineFrame
     {
@@ -2540,6 +2545,7 @@ public:
         bool IsDeleted = false;    // retained as a C++ overload candidate, rejected if selected
         bool IsCxxTemplateSpecialization = false;
         bool IsCxxConstructorForwardingWrapper = false;
+        cflat_cinterop::CtorPick CxxCtorPick = cflat_cinterop::CtorPick::Unknown;
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool CxxVolatile = false;  // volatile-qualified C++ member declaration
         bool CxxConst = false;     // const-qualified C++ instance member
@@ -4869,8 +4875,9 @@ private:
         bool resultBorrowsBraceList = false;
         // RawSig::braceListElementTypes (round-trips through the cache).
         std::vector<std::string> braceListElementSpellings;
-        // RawSig::calleeIdentity, including same-class ctor selection metadata (cached).
+        // RawSig::calleeIdentity and ctorPick round-trip through the header cache.
         std::string calleeIdentity;
+        cflat_cinterop::CtorPick ctorPick = cflat_cinterop::CtorPick::Unknown;
         // RawSig::paramBindKinds of a generated wrapper (round-trips through the cache).
         std::string paramBindKinds;
         // RawSig::conditionalArgumentKinds of a generated wrapper (round-trips through the cache).
@@ -6165,8 +6172,9 @@ private:
     const llvm::Function* FunctionPointerTargetFromLocal(const llvm::Value* storage,
         int depth = 0, const llvm::DominatorTree* dominatorTree = nullptr) const;
     bool FunctionPointerStorageDtorCall(const llvm::CallBase* call,
-        const llvm::AllocaInst* storage) const;
-    bool FunctionPointerStorageIsLoadStoreOnly(const llvm::AllocaInst* storage) const;
+        const llvm::AllocaInst* storage, const llvm::Function* closureDtor) const;
+    bool FunctionPointerStorageIsLoadStoreOnly(const llvm::AllocaInst* storage,
+        const llvm::Function* closureDtor) const;
     const llvm::Function* FunctionPointerTargetFromStorage(const llvm::Value* storage) const;
     std::vector<const llvm::Function*> FunctionPointerTargetsFromStorage(
         const llvm::Value* storage, bool& complete) const;
@@ -10720,6 +10728,31 @@ public:
             const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__ctor");
         return GetCxxClassInfo(typeName);
     }
+    bool FindUniqueByValueConvertingCtor(const std::string& resultName,
+                                         const std::string& sourceName) const
+    {
+        if (sourceName.empty() || sourceName == resultName) return false;
+        const auto* info = GetCxxClassInfoWithConstructors(resultName);
+        if (info == nullptr || info->hasCtorTemplate) return false;
+        const CxxClassInfo::Structor* matchingCtor = nullptr;
+        for (const auto& ctor : info->constructors)
+        {
+            if (ctor.isDeleted || ctor.access != cflat_cinterop::AccessPublic
+                || ctor.isCopyCtor || ctor.isMoveCtor || ctor.params.size() < 2
+                || ctor.params[1].IsCxxRef() || ctor.params[1].Pointer
+                || ctor.params[1].ElemPointer
+                || ResolveTypeAlias(ctor.params[1].TypeName) != sourceName)
+                continue;
+            bool defaults = true;
+            for (size_t i = 2; i < ctor.params.size(); ++i)
+                if (i >= ctor.defaultArgs.size() || ctor.defaultArgs[i].kind.empty())
+                    defaults = false;
+            if (!defaults) continue;
+            if (matchingCtor != nullptr) return false;
+            matchingCtor = &ctor;
+        }
+        return matchingCtor != nullptr;
+    }
     // Every member name CFlat saw on a C++ class or its bases - bound, refused or inaccessible.
     // Feeds the "no member of that name" diagnostic, which must never fall back to CFlat's own
     // same-named free functions (core's atomic<T> load/store were reported for std.atomic<int>).
@@ -12525,6 +12558,9 @@ public:
     bool RejectExternMoveCountFuncPtrBind(const std::string& functionName,
                                           const FunctionSymbol& sym,
                                           const TypeAndValue* destSig);
+    bool RejectFuncPtrBind(const std::string& functionName, const FunctionSymbol& sym,
+                           const TypeAndValue* moveDestSig, const TypeAndValue* aliasDestSig,
+                           bool aliasFirst = false, bool stopOnAliasResult = true);
 
     llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr,
@@ -14411,14 +14447,15 @@ public:
     // 302: dynamic initializer ownership is shared across import groups.
     // 303: initializer cache entries carry internal-linkage file identity and import order.
     // 308: remove the default-parameter wrapper marker; the mixed-conditional veto was its only reader.
-    // 309: same-class copy wrappers carry clang's copy/move pick in calleeIdentity (CTORTPL r2).
+    // 309: same-class copy wrappers carry clang's copy/move pick in a dedicated field (CTORTPL r2).
     // 310: only same-class (dst, source) wrappers carry that pick; converting wrappers keep theirs.
     // 311: by-value class defaults carry their scope + source text (direct default initializers).
     // 312: class-default text only when the bound expression re-reads to the same meaning.
     // 313: default initializers are verified against the bound default (identity), else refused.
     // 314: variable template explicit/partial specializations join the template's group; deleted-rvalue ctor requests.
-    static constexpr int kCHeaderCacheVersion = 315;
+    static constexpr int kCHeaderCacheVersion = 316;
     static std::string CompilerBuildStamp();
+    static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by
     // default; CFLAT_CACHE_BUILD_STAMP=0 opts out. The core bitcode metadata uses the same rule.

@@ -1,6 +1,5 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
-#include <functional>
 #include <limits>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
@@ -4256,7 +4255,7 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
             // A `?:` join with a string-literal arm (also through a nested `?:`) is a pointer
             // prvalue with no slot: clang refuses it. Incoming PHIs are followed, each once.
             llvm::SmallPtrSet<llvm::PHINode*, 4> visitedJoins;
-            std::function<bool(llvm::Value*)> reachesLiteralArm = [&](llvm::Value* value) -> bool {
+            auto reachesLiteralArm = [&](auto&& self, llvm::Value* value) -> bool {
                 if (value == nullptr) return false;
                 value = value->stripPointerCasts();
                 if (auto* armConst = llvm::dyn_cast<llvm::Constant>(value))
@@ -4264,10 +4263,11 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
                 auto* join = llvm::dyn_cast<llvm::PHINode>(value);
                 if (join == nullptr || !visitedJoins.insert(join).second) return false;
                 for (llvm::Value* incoming : join->incoming_values())
-                    if (reachesLiteralArm(incoming)) return true;
+                    if (self(self, incoming)) return true;
                 return false;
             };
-            const bool literalArmJoin = llvm::isa<llvm::PHINode>(arg.Primary) && reachesLiteralArm(arg.Primary);
+            const bool literalArmJoin = llvm::isa<llvm::PHINode>(arg.Primary)
+                && reachesLiteralArm(reachesLiteralArm, arg.Primary);
             // A pointer join with a prvalue arm (`x + 1`, a call) is marked by the ternary builder.
             const auto* armJoin = llvm::dyn_cast<llvm::PHINode>(arg.Primary);
             const bool prvalueArmJoin = armJoin != nullptr
@@ -4795,7 +4795,6 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
         NamedVariable receiverArg;
         receiverArg.TypeAndValue.TypeName = ifaceName;
         receiverArg.TypeAndValue.Pointer = true;
-        receiverArg.TypeAndValue.ConstMask = 0;
         receiverArg.TypeAndValue.IsInterface = true;
         receiverArg.TypeAndValue.IsInterfacePointer = true;
         receiverArg.TypeAndValue.VariableName = "this";

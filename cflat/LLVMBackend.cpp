@@ -488,7 +488,7 @@ bool LLVMBackend::IsOutputUpToDate(const std::string& outputPath,
             return false;
         // A CFLAT_CACHE_BUILD_STAMP token (a gate's commit id) keys the output like every cache entry.
         if (manifest.at("compiler").value("stamp", std::string{})
-                != (CacheBuildStampEnabled() ? CompilerBuildStamp() : std::string{}))
+                != EffectiveBuildStamp())
             return false;
 
         int64_t outputMtime = 0, outputSize = 0;
@@ -531,7 +531,7 @@ bool LLVMBackend::WriteDependencyManifest(const std::string& outputPath,
     manifest["format_version"] = 1;
     manifest["compiler"] = { {"path", compiler.string()},
                               {"mtime", compilerMtime}, {"size", compilerSize},
-                              {"stamp", CacheBuildStampEnabled() ? CompilerBuildStamp() : std::string{}} };
+                              {"stamp", EffectiveBuildStamp()} };
     manifest["output"] = { {"path", output.string()}, {"mtime", outputMtime} };
     manifest["args"] = normalizedArgs;
     manifest["inputs"] = nlohmann::json::array();
@@ -8136,6 +8136,8 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.IsCoreLibraryFunction) o["core"] = true;
     if (s.IsCInteropDeclaration) o["cinterop"] = true;
     if (s.IsCxxConstructorForwardingWrapper) o["cxxctorwrap"] = true;
+    if (s.CxxCtorPick != cflat_cinterop::CtorPick::Unknown)
+        o["cxxctorpick"] = static_cast<int>(s.CxxCtorPick);
     if (s.CxxRefQualifier != cflat_cinterop::CxxRefQualifierNone)
         o["cxxrq"] = s.CxxRefQualifier;
     if (s.CxxVolatile)  o["cxxvol"] = true;
@@ -9055,6 +9057,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("core")) sym.IsCoreLibraryFunction = *v;
             if (auto v = fo->getBoolean("cinterop")) sym.IsCInteropDeclaration = *v;
             if (auto v = fo->getBoolean("cxxctorwrap")) sym.IsCxxConstructorForwardingWrapper = *v;
+            if (auto v = fo->getInteger("cxxctorpick"))
+                sym.CxxCtorPick = static_cast<cflat_cinterop::CtorPick>(*v);
             if (auto v = fo->getInteger("cxxrq")) sym.CxxRefQualifier = (int)*v;
             if (auto v = fo->getBoolean("cxxvol")) sym.CxxVolatile = *v;
             if (auto v = fo->getBoolean("cxxconst")) sym.CxxConst = *v;

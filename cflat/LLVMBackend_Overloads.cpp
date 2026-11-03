@@ -4570,8 +4570,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // The rank flag is set only where the conversion rank is above identity, so an identity
                 // bind (`gi(i)` with `const int&` and `int`) is never a temporary.
                 int count = 0;
-                for (const CxxConversionRank& rank : RankCxxConversionSequences(
-                         r.pair->first, r.pair->second, candidates.size() > 1))
+                auto found = cxxRanks.find(r.pair);
+                if (found == cxxRanks.end())
+                {
+                    auto ranks = RankCxxConversionSequences(r.pair->first, r.pair->second,
+                                                             candidates.size() > 1);
+                    found = cxxRanks.emplace(r.pair, std::move(ranks)).first;
+                }
+                for (const CxxConversionRank& rank : found->second)
                     count += rank.constRefTemporary ? 1 : 0;
                 return count;
             });
@@ -6503,9 +6509,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (wrapperShape)
                 if (auto request = cxxDefaultWrapperRequests_.find(candidate.UniqueName);
                     request != cxxDefaultWrapperRequests_.end())
-                    for (const auto& entry : functionTable)
-                        for (const FunctionSymbol& s : entry.second)
-                            if (s.UniqueName == request->second.linkage) shown = s;
+                    if (const FunctionSymbol* s = FindFunctionSymbolByUniqueName(request->second.linkage))
+                        shown = *s;
             const FunctionSymbol& c = shown;
             std::string paramList;
             for (size_t i = 0; i < c.Parameters.size(); i++)
@@ -8600,17 +8605,6 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
                 // Check the selected overload: arg.Primary can still be the wrong first
                 // overload and may have an alias ABI the destination overload does not.
-                if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
-                    if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
-                        if (RejectExternMoveCountFuncPtrBind(
-                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName,
-                                *fnSym, &*candParamItr))
-                            return nullptr;
-                if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
-                    if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
-                        if (RejectAliasParamFuncPtrBind(
-                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym, &*candParamItr))
-                            return nullptr;
                 // A named function must bind to the callback's complete ABI even when its
                 // expression already carries function-pointer type metadata.
                 if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val);
@@ -8620,6 +8614,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     {
                         const std::string bindingName = arg.CallerName.empty()
                             ? fnSym->UniqueName : arg.CallerName;
+                        if (RejectFuncPtrBind(bindingName, *fnSym, &*candParamItr,
+                                              &*candParamItr))
+                            return nullptr;
                         const TypeAndValue actualSig = FuncPtrSigOfSymbol(*fnSym);
                         std::string bindMismatch = DescribeFuncPtrBindMismatch(
                             bindingName, actualSig, *candParamItr,
@@ -10314,6 +10311,21 @@ bool LLVMBackend::RejectExternMoveCountFuncPtrBind(const std::string& functionNa
         return false;
     }
 
+bool LLVMBackend::RejectFuncPtrBind(const std::string& functionName, const FunctionSymbol& sym,
+                                    const TypeAndValue* moveDestSig,
+                                    const TypeAndValue* aliasDestSig, bool aliasFirst,
+                                    bool stopOnAliasResult)
+{
+        if (aliasFirst)
+        {
+            const bool aliasRejected = RejectAliasParamFuncPtrBind(functionName, sym, aliasDestSig);
+            if (aliasRejected && stopOnAliasResult) return true;
+            return RejectExternMoveCountFuncPtrBind(functionName, sym, moveDestSig);
+        }
+        if (RejectExternMoveCountFuncPtrBind(functionName, sym, moveDestSig)) return true;
+        return RejectAliasParamFuncPtrBind(functionName, sym, aliasDestSig) && stopOnAliasResult;
+}
+
 llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int expectedParamCount,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams,
                                           const TypeAndValue* destSig,
@@ -10401,9 +10413,9 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
         auto chosen = [&](const FunctionSymbol* sym) -> llvm::Function* {
             if (bindingFuncPtr && sym->IsCxx && sym->IsDeleted)
                 LogError("clang: attempt to use a deleted function");
-            if (bindingFuncPtr) RejectAliasParamFuncPtrBind(functionName, *sym, destSig);
-            if (bindingFuncPtr
-                && RejectExternMoveCountFuncPtrBind(functionName, *sym, destSig))
+            if (bindingFuncPtr && RejectFuncPtrBind(functionName, *sym, destSig, destSig,
+                                                     /*aliasFirst*/ true,
+                                                     /*stopOnAliasResult*/ false))
                 return nullptr;
             // Taking the address is as unsafe as calling it - the eventual indirect call has
             // no landing pad either.

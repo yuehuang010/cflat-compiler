@@ -199,6 +199,7 @@ namespace cflat_cinterop
     // clang-independent extraction record and in the backend caches.
     enum CxxRefQualifier { CxxRefQualifierNone = 0, CxxRefQualifierLValue = 1,
                            CxxRefQualifierRValue = 2 };
+    enum class CtorPick : uint8_t { Unknown = 0, CopyOrMove = 1, Other = 2 };
 
     // A C function signature. Types are canonical C spellings (e.g. "int", "unsigned long long",
     // "struct Point *", "int (*)(int, int)") so the backend's string-based mapper consumes them
@@ -224,8 +225,9 @@ namespace cflat_cinterop
         std::vector<std::string> braceListElementTypes;
         // Generated wrappers only: the callee that receives a literal's decayed pointer temporary
         // or a reference-to-pointer parameter. Same-class ctor wrappers also store Clang's
-        // selected copy/move-vs-other constructor kind here for the trivial-copy fast path.
+        // selected copy/move-vs-other constructor kind is recorded separately below.
         std::string calleeIdentity;
+        CtorPick ctorPick = CtorPick::Unknown;
         // Generated wrappers only: per wrapper parameter, how the callee clang SELECTED binds it
         // (WrapperParameterBindKinds): '.' unused, 'v'/'r' by value / reference, 'V'/'R' the same
         // for a pointer slot the wrapper dereferences (the callee reads the caller's storage).
