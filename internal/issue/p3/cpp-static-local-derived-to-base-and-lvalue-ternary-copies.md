@@ -5,7 +5,7 @@ cflat vs clang). T226 fixed the lvalue copy and the non-ternary derived slice. T
 `move` alias, the derived/mixed ternary arms into a base local or static (clang counts, legs 93015-93024).
 T233 round 2 fixed the xvalue (`move d`) derived arms, mixed lvalue/xvalue/prvalue arms of one derived
 class, `static T g = move *p`, and the moved-source refusal for a second static `move a` (legs
-93025-93035). T231 fixed the call-argument double slice `takeb(D(3))`. TERNBASE (bab3eb63) fixed the
+93025-93035). T231 fixed the call-argument double slice `takeb(D(3))`. TERNBASE (af28ab81) fixed the
 derived/base lvalue join. TERNMOVE fixed the nested-field arm `rv.mkH2(1).h.d`.
 
 Still open:
