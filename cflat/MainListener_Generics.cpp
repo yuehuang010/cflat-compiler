@@ -1362,6 +1362,10 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
                 fpSpec->multiWordTypeSuffix(), aliasReturn, &tv.FuncPtrReturnAliasSpelling);
+            if (!retPtr)
+                if (const auto* nested = compilerLLVM->GetEncodedClosureType(tv.FuncPtrReturnTypeName))
+                    tv.FuncPtrReturnFunctionType =
+                        std::make_shared<LLVMBackend::TypeAndValue>(*nested);
             tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
             tv.FuncPtrReturnOwned = returnQualifierText == "move";
@@ -1384,6 +1388,10 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     p.TypeName = ResolveSigComponentConstCodegen(
                         param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix(),
                             false, &p.AliasSpelling);
+                    if (!pPtr)
+                        if (const auto* nested = compilerLLVM->GetEncodedClosureType(p.TypeName))
+                            p.FunctionTypeSignature =
+                                std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
                     if (p.PointerDepth > PointerDepthCap)
                         LogErrorContext(param, PointerDepthCapMessage(

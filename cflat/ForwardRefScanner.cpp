@@ -240,19 +240,16 @@ std::vector<CFlatParser::InterfaceMemberContext*> ForwardRefScanner::ResolveInte
 bool ForwardRefScanner::IsLocalDeclarationSpecifiers(
     CFlatParser::DeclarationSpecifiersContext* declSpecs) const
 {
-        bool insideFunction = false;
         for (auto* parent = declSpecs->parent; parent != nullptr; parent = parent->parent)
         {
+            if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+                return declSpecs->parent != parent;
             if (dynamic_cast<CFlatParser::AggregateMemberContext*>(parent) != nullptr)
                 return false;
             if (dynamic_cast<CFlatParser::ParameterDeclarationContext*>(parent) != nullptr)
                 return false;
-            if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
-                insideFunction = true;
         }
-        // The function's own return declarationSpecifiers is a direct child, not a local.
-        return insideFunction
-            && dynamic_cast<CFlatParser::FunctionDefinitionContext*>(declSpecs->parent) == nullptr;
+        return false;
     }
 
 LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs) {
@@ -478,8 +475,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             // pointer can take it; the main pass reports the fat-closure case.
                             if (fpDims.empty() && declType.IsThinFnPtr())
                             {
-                                declType.IsArrayView = true;
-                                declType.Pointer = true;
+                                SetFunctionPointerArrayViewShape(declType);
                             }
                         }
                         break;
@@ -614,8 +610,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             declType.ExtraArrayDims.push_back(fpDims[di]);
                         if (fpDims.empty() && declType.IsThinFnPtr())
                         {
-                            declType.IsArrayView = true;
-                            declType.Pointer = true;
+                            SetFunctionPointerArrayViewShape(declType);
                         }
                     }
                     break;
@@ -998,6 +993,113 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
             ? rawFuncName : std::string();
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs,
                                             returnsOwned, isMethod, returnType.CallConv, linkageName);
+        if (!returnType.external && func->compoundStatement() != nullptr)
+        {
+            const std::string uniqueName = compiler->ComputeMangledName(
+                name, returnType, allParams, varargs);
+            std::unordered_map<std::string, size_t> viewParams;
+            for (size_t i = 0; i < allParams.size(); ++i)
+                if (allParams[i].IsArrayView && !allParams[i].VariableName.empty())
+                    viewParams.emplace(allParams[i].VariableName, i);
+
+            auto directIdentifier = [](CFlatParser::ExpressionContext* expression) -> std::string {
+                antlr4::tree::ParseTree* node = expression;
+                while (node != nullptr
+                    && dynamic_cast<CFlatParser::UnaryExpressionContext*>(node) == nullptr)
+                {
+                    if (node->children.size() != 1) return {};
+                    node = node->children.front();
+                }
+                auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+                if (unary == nullptr || unary->unaryOperator() != nullptr
+                    || unary->postfixExpression() == nullptr
+                    || unary->postfixExpression()->children.size() != 1)
+                    return {};
+                auto* primary = unary->postfixExpression()->primaryExpression();
+                if (primary == nullptr || primary->children.size() != 1
+                    || primary->genericIdentifier() == nullptr
+                    || primary->genericIdentifier()->Identifier() == nullptr
+                    || primary->genericIdentifier()->genericTypeParameters() != nullptr)
+                    return {};
+                return primary->genericIdentifier()->Identifier()->getText();
+            };
+            auto isWithin = [](antlr4::tree::ParseTree* node, antlr4::tree::ParseTree* ancestor) {
+                for (auto* current = node; current != nullptr; current = current->parent)
+                    if (current == ancestor) return true;
+                return false;
+            };
+            auto visibleParameter = [&](CFlatParser::IterationStatementContext* loop,
+                                        const std::string& parameterName) {
+                for (antlr4::tree::ParseTree* ancestor = loop->parent;
+                     ancestor != nullptr && ancestor != func; ancestor = ancestor->parent)
+                {
+                    if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(ancestor))
+                        if (lambda->lambdaParamList() != nullptr)
+                            for (auto* param : lambda->lambdaParamList()->lambdaParam())
+                                if (param->Identifier() != nullptr
+                                    && param->Identifier()->getText() == parameterName)
+                                    return false;
+                    if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(ancestor))
+                    {
+                        auto* items = compound->blockItemList();
+                        const size_t itemCount = items != nullptr ? items->blockItem().size() : 0;
+                        size_t currentIndex = itemCount;
+                        for (size_t i = 0; i < itemCount; ++i)
+                            if (isWithin(loop, items->blockItem()[i]))
+                            {
+                                currentIndex = i;
+                                break;
+                            }
+                        for (size_t i = 0; i < currentIndex; ++i)
+                        {
+                            auto* declaration = items->blockItem()[i]->declaration();
+                            if (declaration == nullptr || declaration->initDeclaratorList() == nullptr)
+                                continue;
+                            for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                                if (init->declarator() != nullptr
+                                    && init->declarator()->directDeclarator() != nullptr
+                                    && getDirectDeclName(init->declarator()->directDeclarator())
+                                        == parameterName)
+                                    return false;
+                        }
+                    }
+                    if (auto* parentLoop = dynamic_cast<CFlatParser::IterationStatementContext*>(ancestor))
+                    {
+                        if (parentLoop->In() != nullptr && parentLoop->Identifier() != nullptr
+                            && parentLoop->Identifier()->getText() == parameterName
+                            && parentLoop->statement() != nullptr
+                            && isWithin(loop, parentLoop->statement()))
+                            return false;
+                        if (parentLoop->forCondition() != nullptr
+                            && parentLoop->forCondition()->forDeclaration() != nullptr)
+                        {
+                            auto* declaration = parentLoop->forCondition()->forDeclaration();
+                            if (declaration->initDeclaratorList() != nullptr)
+                                for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                                    if (init->declarator() != nullptr
+                                        && init->declarator()->directDeclarator() != nullptr
+                                        && getDirectDeclName(init->declarator()->directDeclarator())
+                                            == parameterName)
+                                        return false;
+                        }
+                    }
+                }
+                return true;
+            };
+            auto scanLoops = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                if (node == nullptr) return;
+                if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(node);
+                    loop != nullptr && loop->In() != nullptr && loop->expression() != nullptr)
+                {
+                    const std::string collection = directIdentifier(loop->expression());
+                    if (auto it = viewParams.find(collection); it != viewParams.end()
+                        && visibleParameter(loop, collection))
+                        compiler->RequireArrayViewCountParameter(uniqueName, it->second);
+                }
+                for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+            };
+            scanLoops(scanLoops, func->compoundStatement());
+        }
         if (!returnType.external
             && std::any_of(allParams.begin(), allParams.end(), [](const auto& param) {
                 return param.Pointer && !param.VariableName.empty();
@@ -1402,6 +1504,1145 @@ void ForwardRefScanner::FinalizeViewFieldMoveInference()
         }
         if (!changed) break;
     }
+}
+
+namespace
+{
+// Rule index per context class. CFlat.g4 has no labeled alternatives, so one
+// index names exactly one generated class; the scan avoids dynamic_cast.
+template <class Ctx> struct RuleIndexOf;
+#define CFLAT_RULE_INDEX_OF(Ctx, Rule) \
+    template <> struct RuleIndexOf<CFlatParser::Ctx> \
+    { static constexpr size_t value = CFlatParser::Rule; }
+CFLAT_RULE_INDEX_OF(ExpectErrorDeclarationContext, RuleExpectErrorDeclaration);
+CFLAT_RULE_INDEX_OF(FunctionDefinitionContext, RuleFunctionDefinition);
+CFLAT_RULE_INDEX_OF(AggregateMemberContext, RuleAggregateMember);
+CFLAT_RULE_INDEX_OF(DeclarationContext, RuleDeclaration);
+CFLAT_RULE_INDEX_OF(CastExpressionContext, RuleCastExpression);
+CFLAT_RULE_INDEX_OF(PostfixExpressionContext, RulePostfixExpression);
+CFLAT_RULE_INDEX_OF(NewExpressionContext, RuleNewExpression);
+CFLAT_RULE_INDEX_OF(PrimaryExpressionContext, RulePrimaryExpression);
+CFLAT_RULE_INDEX_OF(MemberNameTokenContext, RuleMemberNameToken);
+CFLAT_RULE_INDEX_OF(NamespaceDefinitionContext, RuleNamespaceDefinition);
+CFLAT_RULE_INDEX_OF(JumpStatementContext, RuleJumpStatement);
+CFLAT_RULE_INDEX_OF(LambdaExpressionContext, RuleLambdaExpression);
+CFLAT_RULE_INDEX_OF(CompoundStatementContext, RuleCompoundStatement);
+CFLAT_RULE_INDEX_OF(IterationStatementContext, RuleIterationStatement);
+CFLAT_RULE_INDEX_OF(StructDefinitionContext, RuleStructDefinition);
+CFLAT_RULE_INDEX_OF(ClassDefinitionContext, RuleClassDefinition);
+CFLAT_RULE_INDEX_OF(AssignmentExpressionContext, RuleAssignmentExpression);
+CFLAT_RULE_INDEX_OF(InitDeclaratorContext, RuleInitDeclarator);
+#undef CFLAT_RULE_INDEX_OF
+
+// Same result as dynamic_cast<Ctx*>(node) for CFlat rule contexts.
+template <class Ctx>
+Ctx* AsRule(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr || !antlr4::RuleContext::is(*node)) return nullptr;
+    return static_cast<const antlr4::RuleContext*>(node)->getRuleIndex()
+        == RuleIndexOf<Ctx>::value ? static_cast<Ctx*>(node) : nullptr;
+}
+} // namespace
+
+LLVM_ATTRIBUTE_NOINLINE void ForwardRefScanner::CollectGlobalArrayViewNonInitializerStores(
+        CFlatParser::TranslationUnitContext* tu, bool allowUnresolvedGlobals)
+{
+    if (tu == nullptr || compilerLLVM == nullptr) return;
+    if (compilerLLVM->HasGlobalArrayViewStoreScan(tu))
+        return;
+    compilerLLVM->MarkGlobalArrayViewStoreScan(tu);
+    std::unordered_set<std::string> names;
+    std::unordered_set<std::string> unknownLengthNames;
+    std::unordered_set<std::string> staticUnknownLengthStores;
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        staticUnknownLengthFieldStores;
+    std::unordered_map<std::string, std::unordered_set<std::string>> globalUnknownLengthFieldStores;
+    std::unordered_map<std::string, std::unordered_set<std::string>> unknownPersistentFieldTypes;
+    std::vector<std::pair<std::string, std::string>> globalStoreEdges;
+    std::vector<std::pair<std::string, std::string>> staticGlobalStoreEdges;
+    struct StaticAggregateRoot
+    {
+        std::string Declarator;
+        std::string Name;
+        std::string TypeName;
+    };
+    std::vector<StaticAggregateRoot> staticAggregateRoots;
+    std::vector<std::pair<std::string, std::string>> globalAggregateRoots;
+    std::unordered_set<std::string> globalNames;
+    for (const auto& [globalName, _] : compilerLLVM->globalNamedVariable)
+    {
+        globalNames.insert(globalName);
+        const size_t separator = globalName.rfind('.');
+        if (separator != std::string::npos)
+            globalNames.insert(globalName.substr(separator + 1));
+    }
+    for (const std::string& globalName : compilerLLVM->GlobalArrayViewKnownGlobalNames())
+    {
+        globalNames.insert(globalName);
+        const size_t separator = globalName.rfind('.');
+        if (separator != std::string::npos)
+            globalNames.insert(globalName.substr(separator + 1));
+    }
+    auto declaredTypeName = [&](CFlatParser::DeclarationSpecifiersContext* specs) {
+        if (specs == nullptr) return std::string();
+        std::string typeName = ParseDeclarationSpecifiers(specs).TypeName;
+        if (!typeName.empty()) return compilerLLVM->ResolveTypeAlias(
+            compilerLLVM->ResolveQualifiedName(typeName));
+        for (auto* spec : specs->declarationSpecifier())
+            if (spec->typeSpecifier() != nullptr)
+            {
+                PrimitiveTypeError error;
+                typeName = CanonicalTypeSpecifierText(spec->typeSpecifier(), nullptr, false,
+                    &error);
+                if (!HasPrimitiveTypeError(error) && !typeName.empty())
+                    return compilerLLVM->ResolveTypeAlias(
+                        compilerLLVM->ResolveQualifiedName(typeName));
+            }
+        return std::string();
+    };
+    auto collectGlobalNames = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr
+            || AsRule<CFlatParser::ExpectErrorDeclarationContext>(node) != nullptr
+            || AsRule<CFlatParser::FunctionDefinitionContext>(node) != nullptr
+            || AsRule<CFlatParser::AggregateMemberContext>(node) != nullptr)
+            return;
+        if (auto* declaration = AsRule<CFlatParser::DeclarationContext>(node))
+        {
+            auto* list = declaration->initDeclaratorList();
+            if (list != nullptr)
+            {
+                std::string aggregateType;
+                if (declaration->declarationSpecifiers() != nullptr)
+                    aggregateType = declaredTypeName(declaration->declarationSpecifiers());
+                for (auto* init : list->initDeclarator())
+                    if (init->declarator() != nullptr
+                        && init->declarator()->directDeclarator() != nullptr)
+                        if (std::string name = getDirectDeclName(
+                                init->declarator()->directDeclarator());
+                            !name.empty())
+                        {
+                            globalNames.insert(name);
+                            if (!aggregateType.empty())
+                                globalAggregateRoots.emplace_back(name, aggregateType);
+                        }
+            }
+            return;
+        }
+        for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+    };
+    collectGlobalNames(collectGlobalNames, tu);
+
+    auto isWithin = [](antlr4::tree::ParseTree* node, antlr4::tree::ParseTree* ancestor) {
+        for (auto* current = node; current != nullptr; current = current->parent)
+            if (current == ancestor) return true;
+        return false;
+    };
+    auto directIdentifier = [](CFlatParser::UnaryExpressionContext* lhs) -> std::string {
+        if (lhs == nullptr || lhs->postfixExpression() == nullptr) return {};
+        auto* postfix = lhs->postfixExpression();
+        if (postfix->children.size() != 1 || postfix->primaryExpression() == nullptr) return {};
+        auto* primary = postfix->primaryExpression();
+        if (primary->children.size() != 1 || primary->genericIdentifier() == nullptr
+            || primary->genericIdentifier()->Identifier() == nullptr
+            || primary->genericIdentifier()->genericTypeParameters() != nullptr)
+            return {};
+        return primary->genericIdentifier()->Identifier()->getText();
+    };
+    auto directPathTarget = [](CFlatParser::UnaryExpressionContext* lhs) -> std::string {
+        if (lhs == nullptr || lhs->unaryOperator() != nullptr || lhs->postfixExpression() == nullptr)
+            return {};
+        auto* postfix = lhs->postfixExpression();
+        if (postfix->primaryExpression() == nullptr) return {};
+        auto* identifier = postfix->primaryExpression()->genericIdentifier();
+        if (identifier == nullptr || identifier->genericTypeParameters() != nullptr
+            || identifier->Identifier() == nullptr)
+            return {};
+
+        std::string path = identifier->Identifier()->getText();
+        bool wantMember = false;
+        for (size_t i = 1; i < postfix->children.size(); ++i)
+        {
+            auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+            if (terminal != nullptr)
+            {
+                const std::string token = terminal->getText();
+                if (token == "." || token == "->")
+                {
+                    if (wantMember) return {};
+                    wantMember = true;
+                }
+                else return {};
+                continue;
+            }
+            if (auto* member = AsRule<CFlatParser::MemberNameTokenContext>(postfix->children[i]))
+            {
+                if (!wantMember) return {};
+                path += "." + member->getText();
+                wantMember = false;
+                continue;
+            }
+            return {};
+        }
+        return wantMember ? std::string() : path;
+    };
+    auto containsArrayViewCast = [](antlr4::tree::ParseTree* expression) {
+        bool found = false;
+        auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr || found) return;
+            if (auto* cast = AsRule<CFlatParser::CastExpressionContext>(node);
+                cast != nullptr && cast->castTypeName() != nullptr
+                && cast->castTypeName()->abstractDeclarator() != nullptr)
+            {
+                auto* abstract = cast->castTypeName()->abstractDeclarator();
+                auto* suffix = abstract->arrayTypeSuffix();
+                if (suffix != nullptr && suffix->arrayPtrSuffix() == nullptr
+                    && suffix->arrayDimSpec() != nullptr
+                    && std::ranges::all_of(suffix->arrayDimSpec()->assignmentExpression(),
+                        [](auto* dimension) { return dimension == nullptr; }))
+                    found = true;
+            }
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        visit(visit, expression);
+        return found;
+    };
+    auto containsCallExpression = [](antlr4::tree::ParseTree* expression) {
+        bool found = false;
+        auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr || found) return;
+            if (auto* postfix = AsRule<CFlatParser::PostfixExpressionContext>(node);
+                postfix != nullptr && !postfix->LeftParen().empty())
+                found = true;
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        visit(visit, expression);
+        return found;
+    };
+    auto containsNewArrayExpression = [](antlr4::tree::ParseTree* expression) {
+        bool found = false;
+        auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr || found) return;
+            if (auto* allocation = AsRule<CFlatParser::NewExpressionContext>(node);
+                allocation != nullptr && allocation->LeftBracket() != nullptr)
+                found = true;
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        visit(visit, expression);
+        return found;
+    };
+    auto simplePrimaryExpression = [](antlr4::tree::ParseTree* expression)
+        -> CFlatParser::PrimaryExpressionContext* {
+        auto* node = expression;
+        while (node != nullptr
+            && AsRule<CFlatParser::PrimaryExpressionContext>(node) == nullptr)
+        {
+            if (node->children.size() != 1) return nullptr;
+            node = node->children.front();
+        }
+        return AsRule<CFlatParser::PrimaryExpressionContext>(node);
+    };
+    auto simpleIdentifierExpression = [&](antlr4::tree::ParseTree* expression) -> std::string {
+        auto* primary = simplePrimaryExpression(expression);
+        if (primary == nullptr || primary->children.size() != 1
+            || primary->genericIdentifier() == nullptr
+            || primary->genericIdentifier()->Identifier() == nullptr
+            || primary->genericIdentifier()->genericTypeParameters() != nullptr)
+            return {};
+        return primary->genericIdentifier()->Identifier()->getText();
+    };
+    auto simpleMemberPathExpression = [&](antlr4::tree::ParseTree* expression) -> std::string {
+        auto* node = expression;
+        while (node != nullptr
+            && AsRule<CFlatParser::PostfixExpressionContext>(node) == nullptr)
+        {
+            if (node->children.size() != 1) return {};
+            node = node->children.front();
+        }
+        auto* postfix = AsRule<CFlatParser::PostfixExpressionContext>(node);
+        if (postfix == nullptr || postfix->primaryExpression() == nullptr
+            || postfix->primaryExpression()->children.size() != 1
+            || postfix->primaryExpression()->genericIdentifier() == nullptr
+            || postfix->primaryExpression()->genericIdentifier()->Identifier() == nullptr
+            || postfix->primaryExpression()->genericIdentifier()->genericTypeParameters() != nullptr)
+            return {};
+        std::string path = postfix->primaryExpression()->genericIdentifier()->Identifier()->getText();
+        bool wantMember = false;
+        for (size_t i = 1; i < postfix->children.size(); ++i)
+        {
+            if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]))
+            {
+                if (wantMember || (terminal->getText() != "." && terminal->getText() != "->"))
+                    return {};
+                wantMember = true;
+                continue;
+            }
+            if (auto* member = AsRule<CFlatParser::MemberNameTokenContext>(postfix->children[i]))
+            {
+                if (!wantMember) return {};
+                path += "." + member->getText();
+                wantMember = false;
+                continue;
+            }
+            return {};
+        }
+        return wantMember || path.find('.') == std::string::npos ? std::string() : path;
+    };
+    auto isDefaultOrNullExpression = [&](antlr4::tree::ParseTree* expression) {
+        auto* primary = simplePrimaryExpression(expression);
+        return primary != nullptr
+            && (primary->Default() != nullptr || primary->NullPtrConstant() != nullptr);
+    };
+    auto enclosingNamespaceName = [](antlr4::tree::ParseTree* node) {
+        std::vector<std::vector<std::string>> parts;
+        for (auto* parent = node != nullptr ? node->parent : nullptr;
+             parent != nullptr; parent = parent->parent)
+            if (auto* scope = AsRule<CFlatParser::NamespaceDefinitionContext>(parent))
+            {
+                std::vector<std::string> names;
+                for (auto* identifier : scope->Identifier())
+                    names.push_back(identifier->getText());
+                if (!names.empty()) parts.push_back(std::move(names));
+            }
+        std::string qualified;
+        for (auto group = parts.rbegin(); group != parts.rend(); ++group)
+            for (const std::string& part : *group)
+            {
+                if (!qualified.empty()) qualified += ".";
+                qualified += part;
+            }
+        return qualified;
+    };
+    std::unordered_map<std::string, bool> knownArrayViewReturnFunctions;
+    auto collectKnownViewReturns = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* function = AsRule<CFlatParser::FunctionDefinitionContext>(node))
+        {
+            if (function->compoundStatement() == nullptr) return;
+            const std::string rawName = getFunctionName(function, compilerLLVM);
+            if (rawName.empty()) return;
+            const std::string namespaceName = enclosingNamespaceName(function);
+            const std::string functionName = namespaceName.empty()
+                ? rawName : namespaceName + "." + rawName;
+            const size_t parameterCount = function->parameterTypeList() != nullptr
+                && function->parameterTypeList()->parameterList() != nullptr
+                ? function->parameterTypeList()->parameterList()->parameterDeclaration().size() : 0;
+            std::unordered_set<std::string> parameterNames;
+            if (function->parameterTypeList() != nullptr
+                && function->parameterTypeList()->parameterList() != nullptr)
+                for (auto* parameter : function->parameterTypeList()->parameterList()
+                        ->parameterDeclaration())
+                    if (parameter != nullptr && parameter->declarator() != nullptr
+                        && parameter->declarator()->directDeclarator() != nullptr)
+                        if (std::string name = getDirectDeclName(
+                                parameter->declarator()->directDeclarator());
+                            !name.empty()) parameterNames.insert(std::move(name));
+            bool sawReturn = false;
+            bool known = !containsArrayViewCast(function->compoundStatement())
+                && !containsCallExpression(function->compoundStatement());
+            auto inspectReturns = [&](auto&& inspect, antlr4::tree::ParseTree* body) -> void {
+                if (body == nullptr) return;
+                if (auto* jump = AsRule<CFlatParser::JumpStatementContext>(body);
+                    jump != nullptr && jump->Return() != nullptr)
+                {
+                    sawReturn = true;
+                    if (jump->expression() != nullptr)
+                    {
+                        auto* expression = jump->expression();
+                        const std::string returnedIdentifier =
+                            simpleIdentifierExpression(expression);
+                        known = known && (!returnedIdentifier.empty()
+                                && !parameterNames.contains(returnedIdentifier)
+                            || containsNewArrayExpression(expression)
+                            || isDefaultOrNullExpression(expression));
+                    }
+                    else if (jump->returnBraceInitializer() == nullptr
+                        && jump->Default() == nullptr)
+                        known = false;
+                }
+                for (antlr4::tree::ParseTree* child : body->children) inspect(inspect, child);
+            };
+            inspectReturns(inspectReturns, function->compoundStatement());
+            if (!sawReturn) known = false;
+            const std::string key = std::format("{}#{}", functionName, parameterCount);
+            auto [entry, inserted] = knownArrayViewReturnFunctions.try_emplace(key, known);
+            if (!inserted) entry->second = entry->second && known;
+            return;
+        }
+        for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+    };
+    collectKnownViewReturns(collectKnownViewReturns, tu);
+    auto declaredNames = [&](CFlatParser::DeclarationContext* declaration,
+                             std::unordered_set<std::string>& out) {
+        if (declaration == nullptr || declaration->declarationSpecifiers() == nullptr
+            || !IsLocalDeclarationSpecifiers(declaration->declarationSpecifiers())
+            || declaration->initDeclaratorList() == nullptr)
+            return;
+        for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+            if (init->declarator() != nullptr && init->declarator()->directDeclarator() != nullptr)
+                if (std::string local = getDirectDeclName(init->declarator()->directDeclarator());
+                    !local.empty()) out.insert(std::move(local));
+    };
+    struct CompoundScopeInfo
+    {
+        std::unordered_map<std::string, size_t> DeclarationItem;
+        std::unordered_map<std::string, const void*> LocalDeclarator;
+        std::unordered_map<std::string, std::string> StaticDeclarator;
+        std::unordered_map<antlr4::tree::ParseTree*, size_t> ItemIndex;
+        std::vector<bool> ReturnBeforeItem;
+    };
+    using CompoundScopeTable = std::unordered_map<
+        CFlatParser::CompoundStatementContext*, CompoundScopeInfo>;
+    auto shadowsAt = [&](CFlatParser::FunctionDefinitionContext* function,
+                         CFlatParser::AssignmentExpressionContext* assignment,
+                         const std::string& name,
+                         const std::unordered_set<std::string>& functionParameters,
+                         const std::unordered_set<std::string>& implicitThisFields,
+                         const CompoundScopeTable& compoundScopes) {
+        if (functionParameters.contains(name) || implicitThisFields.contains(name)) return true;
+
+        for (antlr4::tree::ParseTree* ancestor = assignment->parent;
+             ancestor != nullptr && ancestor != function; ancestor = ancestor->parent)
+        {
+            if (auto* lambda = AsRule<CFlatParser::LambdaExpressionContext>(ancestor))
+                if (lambda->lambdaParamList() != nullptr)
+                    for (auto* parameter : lambda->lambdaParamList()->lambdaParam())
+                        if (parameter->Identifier() != nullptr
+                            && parameter->Identifier()->getText() == name)
+                            return true;
+            if (auto* compound = AsRule<CFlatParser::CompoundStatementContext>(ancestor))
+            {
+                auto scope = compoundScopes.find(compound);
+                if (scope != compoundScopes.end())
+                {
+                    auto childItem = scope->second.ItemIndex.find(assignment);
+                    auto declaration = scope->second.DeclarationItem.find(name);
+                    if (childItem != scope->second.ItemIndex.end()
+                        && declaration != scope->second.DeclarationItem.end()
+                        && declaration->second < childItem->second)
+                        return true;
+                }
+            }
+            if (auto* loop = AsRule<CFlatParser::IterationStatementContext>(ancestor))
+            {
+                if (loop->In() != nullptr && loop->Identifier() != nullptr
+                    && loop->Identifier()->getText() == name
+                    && loop->statement() != nullptr && isWithin(assignment, loop->statement()))
+                    return true;
+                if (loop->forCondition() != nullptr
+                    && loop->forCondition()->forDeclaration() != nullptr)
+                {
+                    auto* declaration = loop->forCondition()->forDeclaration();
+                    if (declaration->initDeclaratorList() != nullptr)
+                    {
+                        std::unordered_set<std::string> locals;
+                        for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                            if (init->declarator() != nullptr
+                                && init->declarator()->directDeclarator() != nullptr)
+                                if (std::string local = getDirectDeclName(
+                                        init->declarator()->directDeclarator());
+                                    !local.empty()) locals.insert(std::move(local));
+                        if (locals.contains(name)) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    auto staticBindingAt = [&](CFlatParser::FunctionDefinitionContext* function,
+                               CFlatParser::AssignmentExpressionContext* assignment,
+                               const std::string& name,
+                               const std::unordered_set<std::string>& functionParameters,
+                               const CompoundScopeTable& compoundScopes) -> std::string {
+        if (name.empty() || functionParameters.contains(name)) return {};
+
+        for (antlr4::tree::ParseTree* ancestor = assignment->parent;
+             ancestor != nullptr && ancestor != function; ancestor = ancestor->parent)
+        {
+            if (auto* lambda = AsRule<CFlatParser::LambdaExpressionContext>(ancestor))
+                if (lambda->lambdaParamList() != nullptr)
+                    for (auto* parameter : lambda->lambdaParamList()->lambdaParam())
+                        if (parameter->Identifier() != nullptr
+                            && parameter->Identifier()->getText() == name)
+                            return {};
+            if (auto* compound = AsRule<CFlatParser::CompoundStatementContext>(ancestor))
+            {
+                auto scope = compoundScopes.find(compound);
+                if (scope != compoundScopes.end())
+                {
+                    auto childItem = scope->second.ItemIndex.find(assignment);
+                    auto declaration = scope->second.DeclarationItem.find(name);
+                    if (childItem != scope->second.ItemIndex.end()
+                        && declaration != scope->second.DeclarationItem.end()
+                        && declaration->second < childItem->second)
+                    {
+                        auto declarator = scope->second.StaticDeclarator.find(name);
+                        return declarator == scope->second.StaticDeclarator.end()
+                            ? std::string() : declarator->second;
+                    }
+                }
+            }
+            if (auto* loop = AsRule<CFlatParser::IterationStatementContext>(ancestor))
+            {
+                if (loop->In() != nullptr && loop->Identifier() != nullptr
+                    && loop->Identifier()->getText() == name
+                    && loop->statement() != nullptr && isWithin(assignment, loop->statement()))
+                    return {};
+                if (loop->forCondition() != nullptr
+                    && loop->forCondition()->forDeclaration() != nullptr)
+                {
+                    auto* declaration = loop->forCondition()->forDeclaration();
+                    if (declaration->initDeclaratorList() != nullptr)
+                        for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                            if (init->declarator() != nullptr
+                                && init->declarator()->directDeclarator() != nullptr
+                                && getDirectDeclName(init->declarator()->directDeclarator()) == name)
+                                return {};
+                }
+            }
+        }
+        return {};
+    };
+
+    struct LocalBinding
+    {
+        const void* Declarator = nullptr;
+        bool IsParameter = false;
+    };
+    auto localBindingAt = [&](CFlatParser::FunctionDefinitionContext* function,
+                              antlr4::tree::ParseTree* site, const std::string& name,
+                              const std::unordered_set<std::string>& functionParameters,
+                              const CompoundScopeTable& compoundScopes) -> LocalBinding {
+        if (name.empty()) return {};
+        for (antlr4::tree::ParseTree* ancestor = site; ancestor != nullptr && ancestor != function;
+             ancestor = ancestor->parent)
+        {
+            if (auto* lambda = AsRule<CFlatParser::LambdaExpressionContext>(ancestor))
+                if (lambda->lambdaParamList() != nullptr)
+                    for (auto* parameter : lambda->lambdaParamList()->lambdaParam())
+                        if (parameter->Identifier() != nullptr
+                            && parameter->Identifier()->getText() == name)
+                            return LocalBinding{ nullptr, true };
+            if (auto* compound = AsRule<CFlatParser::CompoundStatementContext>(ancestor))
+            {
+                auto scope = compoundScopes.find(compound);
+                if (scope != compoundScopes.end())
+                {
+                    auto childItem = scope->second.ItemIndex.find(site);
+                    auto declaration = scope->second.DeclarationItem.find(name);
+                    if (childItem != scope->second.ItemIndex.end()
+                        && declaration != scope->second.DeclarationItem.end()
+                        && declaration->second < childItem->second)
+                    {
+                        auto local = scope->second.LocalDeclarator.find(name);
+                        return LocalBinding{ local == scope->second.LocalDeclarator.end()
+                            ? nullptr : local->second, false };
+                    }
+                }
+            }
+            if (auto* loop = AsRule<CFlatParser::IterationStatementContext>(ancestor))
+                if (loop->In() != nullptr && loop->Identifier() != nullptr
+                    && loop->Identifier()->getText() == name && loop->statement() != nullptr
+                    && isWithin(site, loop->statement()))
+                    return LocalBinding{ nullptr, true };
+        }
+        return functionParameters.contains(name) ? LocalBinding{ nullptr, true } : LocalBinding{};
+    };
+
+    auto scanFunction = [&](CFlatParser::FunctionDefinitionContext* function) {
+        if (function == nullptr || function->compoundStatement() == nullptr) return;
+        std::unordered_set<std::string> functionParameters;
+        auto* parameterList = function->parameterTypeList() != nullptr
+            ? function->parameterTypeList()->parameterList() : nullptr;
+        if (parameterList != nullptr)
+            for (auto* parameter : parameterList->parameterDeclaration())
+                if (parameter != nullptr && parameter->declarator() != nullptr
+                    && parameter->declarator()->directDeclarator() != nullptr)
+                    if (std::string name = getDirectDeclName(
+                            parameter->declarator()->directDeclarator());
+                        !name.empty()) functionParameters.insert(std::move(name));
+
+        std::unordered_set<std::string> implicitThisFields;
+        std::string implicitThisType;
+        if (!isFunctionStatic(function))
+            for (antlr4::tree::ParseTree* owner = function->parent;
+                 owner != nullptr; owner = owner->parent)
+            {
+                if (auto* definition = AsRule<CFlatParser::StructDefinitionContext>(owner))
+                {
+                    CollectFieldNames(definition, implicitThisFields);
+                    implicitThisType = getDirectDeclName(definition->directDeclarator());
+                    break;
+                }
+                if (auto* definition = AsRule<CFlatParser::ClassDefinitionContext>(owner))
+                {
+                    CollectFieldNames(definition, implicitThisFields);
+                    implicitThisType = getDirectDeclName(definition->directDeclarator());
+                    break;
+                }
+            }
+
+        std::unordered_set<std::string> candidateLocals;
+        std::unordered_set<std::string> candidateStatics;
+        std::vector<CFlatParser::AssignmentExpressionContext*> candidateAssignments;
+        auto collectCandidates = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr) return;
+            if (auto* declaration = AsRule<CFlatParser::DeclarationContext>(node))
+            {
+                bool isStatic = false;
+                if (auto* specs = declaration->declarationSpecifiers())
+                    for (auto* spec : specs->declarationSpecifier())
+                        if (auto* storage = spec->storageClassSpecifier();
+                            storage != nullptr && storage->Static() != nullptr)
+                            isStatic = true;
+                if (auto* list = declaration->initDeclaratorList())
+                    for (auto* init : list->initDeclarator())
+                        if (init->declarator() != nullptr
+                            && init->declarator()->directDeclarator() != nullptr)
+                            if (std::string name = getDirectDeclName(
+                                    init->declarator()->directDeclarator());
+                                !name.empty())
+                            {
+                                candidateLocals.insert(name);
+                                if (isStatic) candidateStatics.insert(std::move(name));
+                            }
+            }
+            if (auto* assignment = AsRule<CFlatParser::AssignmentExpressionContext>(node);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                candidateAssignments.push_back(assignment);
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        collectCandidates(collectCandidates, function->compoundStatement());
+        bool hasPersistentStore = false;
+        for (auto* assignment : candidateAssignments)
+        {
+            const std::string path = directPathTarget(assignment->unaryExpression());
+            if (const size_t separator = path.find('.'); separator != std::string::npos)
+            {
+                const std::string root = path.substr(0, separator);
+                if (candidateStatics.contains(root) || globalNames.contains(root)
+                    || functionParameters.contains(root) || implicitThisFields.contains(root)
+                    || (allowUnresolvedGlobals && !candidateLocals.contains(root)))
+                {
+                    hasPersistentStore = true;
+                    break;
+                }
+                continue;
+            }
+            const std::string name = directIdentifier(assignment->unaryExpression());
+            if (!name.empty() && (candidateStatics.contains(name) || globalNames.contains(name)
+                    || implicitThisFields.contains(name)
+                    || (allowUnresolvedGlobals && !candidateLocals.contains(name)
+                        && !functionParameters.contains(name))))
+            {
+                hasPersistentStore = true;
+                break;
+            }
+        }
+        if (!hasPersistentStore) return;
+
+        std::unordered_map<std::string, std::string> parameterTypes;
+        if (parameterList != nullptr)
+            for (auto* parameter : parameterList->parameterDeclaration())
+                if (parameter != nullptr && parameter->declarationSpecifiers() != nullptr
+                    && parameter->declarator() != nullptr
+                    && parameter->declarator()->directDeclarator() != nullptr)
+                {
+                    const std::string name = getDirectDeclName(
+                        parameter->declarator()->directDeclarator());
+                    if (name.empty()) continue;
+                    std::string aggregateType;
+                    for (auto* spec : parameter->declarationSpecifiers()->declarationSpecifier())
+                        if (spec->typeSpecifier() != nullptr)
+                        {
+                            PrimitiveTypeError error;
+                            std::string typeName = CanonicalTypeSpecifierText(
+                                spec->typeSpecifier(), nullptr, false, &error);
+                            if (HasPrimitiveTypeError(error)) break;
+                            typeName = compilerLLVM->ResolveQualifiedName(typeName);
+                            typeName = compilerLLVM->ResolveTypeAlias(typeName);
+                            if (!typeName.empty())
+                                aggregateType = std::move(typeName);
+                            break;
+                        }
+                    if (!aggregateType.empty()) parameterTypes[name] = std::move(aggregateType);
+                }
+
+        CompoundScopeTable compoundScopes;
+        auto indexCompoundScopes = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr) return;
+            if (auto* compound = AsRule<CFlatParser::CompoundStatementContext>(node))
+            {
+                CompoundScopeInfo info;
+                auto* items = compound->blockItemList();
+                if (items != nullptr)
+                {
+                    auto mapItemNodes = [&](auto&& mapSelf, antlr4::tree::ParseTree* child,
+                                            size_t itemIndex) -> void {
+                        if (child == nullptr) return;
+                        if (AsRule<CFlatParser::AssignmentExpressionContext>(child) != nullptr
+                            || AsRule<CFlatParser::InitDeclaratorContext>(child) != nullptr
+                            || AsRule<CFlatParser::PostfixExpressionContext>(child) != nullptr)
+                            info.ItemIndex.try_emplace(child, itemIndex);
+                        for (antlr4::tree::ParseTree* descendant : child->children)
+                            mapSelf(mapSelf, descendant, itemIndex);
+                    };
+                    bool sawReturn = false;
+                    for (size_t i = 0; i < items->blockItem().size(); ++i)
+                    {
+                        auto* item = items->blockItem()[i];
+                        info.ReturnBeforeItem.push_back(sawReturn);
+                        mapItemNodes(mapItemNodes, item, i);
+                        auto* statement = item->statement();
+                        if (statement != nullptr && statement->jumpStatement() != nullptr
+                            && statement->jumpStatement()->Return() != nullptr)
+                            sawReturn = true;
+                        if (item->declaration() == nullptr) continue;
+                        std::unordered_set<std::string> locals;
+                        declaredNames(item->declaration(), locals);
+                        for (const std::string& local : locals)
+                            info.DeclarationItem.try_emplace(local, i);
+                        auto* specs = item->declaration()->declarationSpecifiers();
+                        bool isStatic = false;
+                        if (specs != nullptr)
+                            for (auto* spec : specs->declarationSpecifier())
+                                if (auto* storage = spec->storageClassSpecifier();
+                                    storage != nullptr && storage->Static() != nullptr)
+                                    isStatic = true;
+                        auto* list = item->declaration()->initDeclaratorList();
+                        if (list != nullptr)
+                            for (auto* init : list->initDeclarator())
+                                if (init->declarator() != nullptr
+                                    && init->declarator()->directDeclarator() != nullptr)
+                                    if (std::string local = getDirectDeclName(
+                                            init->declarator()->directDeclarator());
+                                        !local.empty())
+                                    {
+                                        info.LocalDeclarator.try_emplace(local, init->getStart());
+                                        if (isStatic)
+                                        {
+                                            info.StaticDeclarator.try_emplace(local,
+                                                compilerLLVM->StaticArrayViewDeclaratorKey(
+                                                    init->getStart()));
+                                            if (specs != nullptr)
+                                            {
+                                                const std::string typeName = declaredTypeName(specs);
+                                                if (!typeName.empty())
+                                                    staticAggregateRoots.push_back({
+                                                        compilerLLVM->StaticArrayViewDeclaratorKey(
+                                                            init->getStart()),
+                                                        local, typeName });
+                                            }
+                                        }
+                                    }
+                    }
+                }
+                compoundScopes.emplace(compound, std::move(info));
+            }
+            for (antlr4::tree::ParseTree* child : node->children)
+                self(self, child);
+        };
+        indexCompoundScopes(indexCompoundScopes, function->compoundStatement());
+        auto directCallHasKnownLength = [&](antlr4::tree::ParseTree* expression)
+            -> std::optional<bool> {
+            auto* node = expression;
+            while (node != nullptr
+                && AsRule<CFlatParser::PostfixExpressionContext>(node) == nullptr)
+            {
+                if (node->children.size() != 1) return std::nullopt;
+                node = node->children.front();
+            }
+            auto* call = AsRule<CFlatParser::PostfixExpressionContext>(node);
+            if (call == nullptr || call->LeftParen().size() != 1
+                || call->primaryExpression() == nullptr)
+                return std::nullopt;
+            auto* primary = call->primaryExpression();
+            std::string calleeName;
+            bool methodCall = false;
+            if (call->children.size() == 4 && primary->children.size() == 1
+                && primary->genericIdentifier() != nullptr
+                && primary->genericIdentifier()->Identifier() != nullptr
+                && primary->genericIdentifier()->genericTypeParameters() == nullptr)
+                calleeName = primary->genericIdentifier()->Identifier()->getText();
+            else if (call->children.size() == 6 && primary->children.size() == 1
+                && primary->genericIdentifier() != nullptr
+                && primary->genericIdentifier()->Identifier() != nullptr
+                && primary->genericIdentifier()->genericTypeParameters() == nullptr
+                && dynamic_cast<antlr4::tree::TerminalNode*>(call->children[1]) != nullptr
+                && (call->children[1]->getText() == "."
+                    || call->children[1]->getText() == "->")
+                && AsRule<CFlatParser::MemberNameTokenContext>(call->children[2]) != nullptr
+                && call->children[3]->getText() == "(")
+            {
+                calleeName = call->children[2]->getText();
+                methodCall = true;
+            }
+            else return false;
+
+            if (calleeName.empty()) return false;
+            if (!methodCall)
+            {
+                const LocalBinding calleeBinding = localBindingAt(function, call, calleeName,
+                    functionParameters, compoundScopes);
+                if (calleeBinding.Declarator != nullptr || calleeBinding.IsParameter
+                    || implicitThisFields.contains(calleeName)
+                    || globalNames.contains(calleeName))
+                    return false;
+            }
+            const std::string qualifiedName = enclosingNamespaceName(function).empty()
+                ? calleeName : enclosingNamespaceName(function) + "." + calleeName;
+            if (!methodCall && globalNames.contains(qualifiedName))
+                return false;
+
+            const auto argumentLists = call->argumentExpressionList();
+            const size_t argumentCount = argumentLists.empty() || argumentLists.front() == nullptr
+                ? 0 : argumentLists.front()->argumentNamedExpression().size();
+            const std::string qualifiedKey = std::format("{}#{}", qualifiedName, argumentCount);
+            auto summary = knownArrayViewReturnFunctions.find(qualifiedKey);
+            if (summary == knownArrayViewReturnFunctions.end())
+            {
+                const std::string unqualifiedKey = std::format("{}#{}", calleeName, argumentCount);
+                summary = knownArrayViewReturnFunctions.find(unqualifiedKey);
+            }
+            return summary != knownArrayViewReturnFunctions.end() && summary->second;
+        };
+        std::unordered_map<antlr4::tree::ParseTree*, bool> unknownCallResults;
+        auto containsUnknownLengthCall = [&](antlr4::tree::ParseTree* expression) {
+            auto visitCalls = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
+                if (node == nullptr) return false;
+                if (auto cached = unknownCallResults.find(node);
+                    cached != unknownCallResults.end()) return cached->second;
+                bool unknown = false;
+                if (auto* postfix = AsRule<CFlatParser::PostfixExpressionContext>(node);
+                    postfix != nullptr && !postfix->LeftParen().empty())
+                {
+                    const auto known = directCallHasKnownLength(postfix);
+                    unknown = !known.has_value() || !*known;
+                }
+                for (antlr4::tree::ParseTree* child : node->children)
+                    unknown = self(self, child) || unknown;
+                unknownCallResults.emplace(node, unknown);
+                return unknown;
+            };
+            return visitCalls(visitCalls, expression);
+        };
+        auto assignmentAfterReturn = [&](CFlatParser::AssignmentExpressionContext* assignment) {
+            for (antlr4::tree::ParseTree* ancestor = assignment->parent;
+                 ancestor != nullptr && ancestor != function; ancestor = ancestor->parent)
+                if (auto* compound = AsRule<CFlatParser::CompoundStatementContext>(ancestor))
+                {
+                    auto scope = compoundScopes.find(compound);
+                    if (scope == compoundScopes.end()) continue;
+                    auto item = scope->second.ItemIndex.find(assignment);
+                    if (item != scope->second.ItemIndex.end()
+                        && item->second < scope->second.ReturnBeforeItem.size()
+                        && scope->second.ReturnBeforeItem[item->second]) return true;
+                }
+            return false;
+        };
+        std::unordered_set<const void*> unknownLocalViews;
+        std::vector<std::pair<const void*, const void*>> localCopyEdges;
+        auto collectLocalUnknowns = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr) return;
+            if (auto* declaration = AsRule<CFlatParser::DeclarationContext>(node);
+                declaration != nullptr && declaration->initDeclaratorList() != nullptr)
+                for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                    if (init->initializer() != nullptr
+                        && init->initializer()->assignmentExpression() != nullptr)
+                    {
+                        auto* expression = init->initializer()->assignmentExpression();
+                        const auto knownCall = directCallHasKnownLength(expression);
+                        if (containsArrayViewCast(expression)
+                            || containsUnknownLengthCall(expression)
+                            || (simpleIdentifierExpression(expression).empty()
+                                && !containsNewArrayExpression(expression)
+                                && !isDefaultOrNullExpression(expression)
+                                && !knownCall.value_or(false)))
+                            unknownLocalViews.insert(init->getStart());
+                        const std::string sourceName =
+                            simpleIdentifierExpression(expression);
+                        if (!sourceName.empty())
+                        {
+                            const LocalBinding sourceBinding = localBindingAt(function, init,
+                                sourceName, functionParameters, compoundScopes);
+                            if (sourceBinding.Declarator != nullptr)
+                                localCopyEdges.emplace_back(init->getStart(),
+                                    sourceBinding.Declarator);
+                            else if (!sourceBinding.IsParameter
+                                && (globalNames.contains(sourceName)
+                                    || globalNames.contains(
+                                        compilerLLVM->ResolveQualifiedName(sourceName)))
+                                && (unknownLengthNames.contains(sourceName)
+                                    || unknownLengthNames.contains(
+                                        compilerLLVM->ResolveQualifiedName(sourceName)))
+                                && !isDefaultOrNullExpression(expression))
+                                unknownLocalViews.insert(init->getStart());
+                        }
+                    }
+            if (auto* assignment = AsRule<CFlatParser::AssignmentExpressionContext>(node);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr
+                && !assignmentAfterReturn(assignment)
+                && assignment->assignmentOperator()->getStart()->getType() == CFlatParser::Assign)
+            {
+                const std::string target = directIdentifier(assignment->unaryExpression());
+                const LocalBinding targetBinding = localBindingAt(function, assignment, target,
+                    functionParameters, compoundScopes);
+                if (targetBinding.Declarator != nullptr)
+                {
+                    auto* expression = assignment->assignmentExpression();
+                    const auto knownCall = directCallHasKnownLength(expression);
+                    if (containsArrayViewCast(expression)
+                        || containsUnknownLengthCall(expression))
+                        unknownLocalViews.insert(targetBinding.Declarator);
+                    else if (std::string source = simpleIdentifierExpression(expression);
+                             !source.empty())
+                    {
+                        const LocalBinding sourceBinding = localBindingAt(function, assignment,
+                            source, functionParameters, compoundScopes);
+                        if (sourceBinding.Declarator != nullptr)
+                            localCopyEdges.emplace_back(targetBinding.Declarator,
+                                sourceBinding.Declarator);
+                    }
+                    else if (!containsNewArrayExpression(expression)
+                        && !isDefaultOrNullExpression(expression)
+                        && !knownCall.value_or(false))
+                        unknownLocalViews.insert(targetBinding.Declarator);
+                }
+            }
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        collectLocalUnknowns(collectLocalUnknowns, function->compoundStatement());
+        bool localChanged = true;
+        while (localChanged)
+        {
+            localChanged = false;
+            for (const auto& [target, source] : localCopyEdges)
+                if (unknownLocalViews.contains(source))
+                    localChanged = unknownLocalViews.insert(target).second || localChanged;
+        }
+        std::unordered_set<std::string> functionStaticNames;
+        for (const auto& [_, scope] : compoundScopes)
+            for (const auto& entry : scope.StaticDeclarator)
+                functionStaticNames.insert(entry.first);
+        std::unordered_map<const void*, std::unordered_set<std::string>> knownLocalFieldStores;
+        std::unordered_map<const void*, std::unordered_set<std::string>> unknownLocalFieldStores;
+
+        auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr) return;
+            if (auto* assignment = AsRule<CFlatParser::AssignmentExpressionContext>(node);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr)
+            {
+                if (assignmentAfterReturn(assignment))
+                {
+                    for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+                    return;
+                }
+                const std::string name = directIdentifier(assignment->unaryExpression());
+                const std::string path = directPathTarget(assignment->unaryExpression());
+                const bool shadowed = !name.empty()
+                    && shadowsAt(function, assignment, name, functionParameters,
+                        implicitThisFields, compoundScopes);
+                const size_t pathSeparator = path.find('.');
+                const bool simpleAssign = assignment->assignmentOperator()->getStart()->getType()
+                    == CFlatParser::Assign;
+                const std::string fieldRoot = pathSeparator == std::string::npos
+                    ? std::string() : path.substr(0, pathSeparator);
+                const std::string staticDeclarator = !name.empty()
+                    && functionStaticNames.contains(name)
+                    ? staticBindingAt(function, assignment, name, functionParameters, compoundScopes)
+                    : std::string();
+                const std::string staticFieldDeclarator = !fieldRoot.empty()
+                    && functionStaticNames.contains(fieldRoot)
+                    ? staticBindingAt(function, assignment, fieldRoot, functionParameters,
+                        compoundScopes) : std::string();
+                const bool globalDirectTarget = !name.empty()
+                    && (globalNames.contains(name) || allowUnresolvedGlobals)
+                    && !shadowed;
+                const LocalBinding fieldRootBinding = fieldRoot.empty()
+                    ? LocalBinding{} : localBindingAt(function, assignment, fieldRoot,
+                        functionParameters, compoundScopes);
+                const bool unresolvedGlobalFieldTarget = allowUnresolvedGlobals
+                    && !fieldRoot.empty() && fieldRootBinding.Declarator == nullptr
+                    && !fieldRootBinding.IsParameter && implicitThisType.empty()
+                    && !shadowsAt(function, assignment, fieldRoot, functionParameters,
+                        implicitThisFields, compoundScopes);
+                const bool globalFieldTarget = !fieldRoot.empty()
+                    && (globalNames.contains(fieldRoot) || unresolvedGlobalFieldTarget)
+                    && !shadowsAt(function, assignment, fieldRoot, functionParameters,
+                        implicitThisFields, compoundScopes);
+                const bool hasUnknownLengthCast = simpleAssign
+                    && (!staticDeclarator.empty() || !staticFieldDeclarator.empty()
+                        || globalDirectTarget || globalFieldTarget)
+                    && containsArrayViewCast(assignment->assignmentExpression());
+                const std::string sourceName = simpleIdentifierExpression(
+                    assignment->assignmentExpression());
+                const std::string sourcePath = simpleMemberPathExpression(
+                    assignment->assignmentExpression());
+                const LocalBinding sourceBinding = localBindingAt(function, assignment,
+                    sourceName, functionParameters, compoundScopes);
+                const bool hasUnknownLocalSource = sourceBinding.Declarator != nullptr
+                    && unknownLocalViews.contains(sourceBinding.Declarator);
+                const std::string qualifiedSource = sourceName.empty()
+                    ? std::string() : compilerLLVM->ResolveQualifiedName(sourceName);
+                const bool hasUnknownGlobalSource = !sourceBinding.IsParameter
+                    && sourceBinding.Declarator == nullptr
+                    && (globalNames.contains(sourceName)
+                        || globalNames.contains(qualifiedSource))
+                    && (unknownLengthNames.contains(sourceName)
+                        || unknownLengthNames.contains(qualifiedSource));
+                const bool unresolvedGlobalSource = allowUnresolvedGlobals
+                    && !sourceName.empty() && sourceBinding.Declarator == nullptr
+                    && !sourceBinding.IsParameter
+                    && !shadowsAt(function, assignment, sourceName, functionParameters,
+                        implicitThisFields, compoundScopes);
+                const bool rhsNewArray = containsNewArrayExpression(
+                    assignment->assignmentExpression());
+                const auto knownCall = directCallHasKnownLength(
+                    assignment->assignmentExpression());
+                const bool sourceIsKnownIdentifier = !sourceName.empty()
+                    && (sourceBinding.Declarator != nullptr || sourceBinding.IsParameter
+                        || implicitThisFields.contains(sourceName)
+                        || globalNames.contains(sourceName)
+                        || globalNames.contains(qualifiedSource)
+                        || unresolvedGlobalSource);
+                bool knownLocalFieldSource = false;
+                const size_t sourcePathSeparator = sourcePath.find('.');
+                if (sourcePathSeparator != std::string::npos)
+                {
+                    const LocalBinding sourceRootBinding = localBindingAt(function, assignment,
+                        sourcePath.substr(0, sourcePathSeparator), functionParameters,
+                        compoundScopes);
+                    if (sourceRootBinding.Declarator != nullptr)
+                    {
+                        const std::string sourceField = sourcePath.substr(sourcePathSeparator + 1);
+                        const auto knownFields = knownLocalFieldStores.find(
+                            sourceRootBinding.Declarator);
+                        const auto unknownFields = unknownLocalFieldStores.find(
+                            sourceRootBinding.Declarator);
+                        knownLocalFieldSource = knownFields != knownLocalFieldStores.end()
+                            && knownFields->second.contains(sourceField)
+                            && (unknownFields == unknownLocalFieldStores.end()
+                                || !unknownFields->second.contains(sourceField));
+                    }
+                }
+                const bool hasUnknownLengthSource = simpleAssign
+                    && (hasUnknownLengthCast
+                        || containsUnknownLengthCall(assignment->assignmentExpression())
+                        || hasUnknownLocalSource || hasUnknownGlobalSource
+                        || (!sourceIsKnownIdentifier && !knownLocalFieldSource && !rhsNewArray
+                            && !isDefaultOrNullExpression(
+                                assignment->assignmentExpression())
+                            && !knownCall.value_or(false)));
+                if (simpleAssign && pathSeparator != std::string::npos
+                    && staticFieldDeclarator.empty() && !globalFieldTarget)
+                {
+                    const LocalBinding targetRootBinding = localBindingAt(function, assignment,
+                        fieldRoot, functionParameters, compoundScopes);
+                    if (targetRootBinding.Declarator != nullptr)
+                    {
+                        const std::string targetField = path.substr(pathSeparator + 1);
+                        if (hasUnknownLengthSource)
+                            unknownLocalFieldStores[targetRootBinding.Declarator].insert(targetField);
+                        else if (sourceIsKnownIdentifier || knownLocalFieldSource || rhsNewArray
+                            || isDefaultOrNullExpression(assignment->assignmentExpression())
+                            || knownCall.value_or(false))
+                            knownLocalFieldStores[targetRootBinding.Declarator].insert(targetField);
+                    }
+                }
+                if (hasUnknownLengthSource && !staticDeclarator.empty())
+                    staticUnknownLengthStores.insert(staticDeclarator);
+                if (hasUnknownLengthSource && !staticFieldDeclarator.empty())
+                    staticUnknownLengthFieldStores[staticFieldDeclarator].insert(
+                        path.substr(pathSeparator + 1));
+                if (hasUnknownLengthSource && globalFieldTarget)
+                    globalUnknownLengthFieldStores[fieldRoot].insert(
+                        path.substr(pathSeparator + 1));
+                if (hasUnknownLengthSource && pathSeparator != std::string::npos
+                    && staticFieldDeclarator.empty() && !globalFieldTarget)
+                {
+                    const LocalBinding rootBinding = localBindingAt(function, assignment,
+                        fieldRoot, functionParameters, compoundScopes);
+                    std::string fieldOwnerType;
+                    if (rootBinding.IsParameter)
+                    {
+                        if (auto parameterType = parameterTypes.find(fieldRoot);
+                            parameterType != parameterTypes.end())
+                            fieldOwnerType = parameterType->second;
+                    }
+                    else if (!implicitThisType.empty() && !globalNames.contains(fieldRoot)
+                        && !shadowsAt(function, assignment, fieldRoot, functionParameters,
+                            implicitThisFields, compoundScopes))
+                        fieldOwnerType = implicitThisType;
+                    if (!fieldOwnerType.empty())
+                    {
+                        unknownPersistentFieldTypes[fieldOwnerType].insert(
+                            path.substr(pathSeparator + 1));
+                    }
+                }
+                if (globalDirectTarget)
+                {
+                    names.insert(name);
+                    const std::string qualified = compilerLLVM->ResolveQualifiedName(name);
+                    names.insert(qualified);
+                    if (hasUnknownLengthSource)
+                    {
+                        unknownLengthNames.insert(name);
+                        unknownLengthNames.insert(qualified);
+                    }
+                    else if (!sourceName.empty()
+                        && (globalNames.contains(sourceName)
+                            || globalNames.contains(qualifiedSource)
+                            || unresolvedGlobalSource))
+                        globalStoreEdges.emplace_back(qualified, qualifiedSource);
+                }
+                else if (!staticDeclarator.empty()
+                    && !hasUnknownLengthSource
+                    && !sourceName.empty()
+                    && (globalNames.contains(sourceName)
+                        || globalNames.contains(qualifiedSource)
+                        || unresolvedGlobalSource))
+                    staticGlobalStoreEdges.emplace_back(staticDeclarator, qualifiedSource);
+            }
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        visit(visit, function->compoundStatement());
+    };
+
+    auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr) return;
+        if (auto* function = AsRule<CFlatParser::FunctionDefinitionContext>(node))
+        {
+            scanFunction(function);
+            return;
+        }
+        for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+    };
+    visit(visit, tu);
+    for (const auto& [globalName, type] : compilerLLVM->globalVariableTypes)
+        if (auto fields = unknownPersistentFieldTypes.find(type.TypeName);
+            fields != unknownPersistentFieldTypes.end())
+            globalUnknownLengthFieldStores[globalName].insert(
+                fields->second.begin(), fields->second.end());
+    for (const auto& [globalName, typeName] : globalAggregateRoots)
+        if (auto fields = unknownPersistentFieldTypes.find(typeName);
+            fields != unknownPersistentFieldTypes.end())
+            globalUnknownLengthFieldStores[globalName].insert(
+                fields->second.begin(), fields->second.end());
+    for (const StaticAggregateRoot& root : staticAggregateRoots)
+        if (auto fields = unknownPersistentFieldTypes.find(root.TypeName);
+            fields != unknownPersistentFieldTypes.end())
+            staticUnknownLengthFieldStores[root.Declarator].insert(
+                fields->second.begin(), fields->second.end());
+    compilerLLVM->SetGlobalArrayViewNonInitializerStores(std::move(names));
+    compilerLLVM->SetGlobalArrayViewUnknownLengthStores(std::move(unknownLengthNames));
+    compilerLLVM->SetStaticArrayViewUnknownLengthStoreDeclarators(
+        std::move(staticUnknownLengthStores));
+    compilerLLVM->SetStaticArrayViewUnknownLengthFieldStorePaths(
+        std::move(staticUnknownLengthFieldStores));
+    compilerLLVM->SetGlobalArrayViewUnknownLengthFieldStorePaths(
+        globalUnknownLengthFieldStores);
+    compilerLLVM->AddGlobalArrayViewStoreEdges(std::move(globalStoreEdges),
+        std::move(staticGlobalStoreEdges));
 }
 
 void ForwardRefScanner::SeedConstIntGlobals(CFlatParser::TranslationUnitContext* tu)
@@ -1984,7 +3225,10 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
             std::string cxxError;
             compilerLLVM->TryRequestCxxType(result, {}, result, cxxError);
         }
-        return compilerLLVM->ResolveTypeAlias(result);
+        result = compilerLLVM->ResolveTypeAlias(result);
+        if (const auto* functionAlias = compilerLLVM->FindOrRequestFunctionTypeAlias(result))
+            return MainListener::EncodeClosureFromSig(compilerLLVM, *functionAlias);
+        return result;
     }
 
 std::string ForwardRefScanner::ResolveSigComponentConstScanner(
@@ -2009,7 +3253,10 @@ std::string ForwardRefScanner::ResolveSigComponentConstScanner(
             stars += shape.PointerDepth;
             outPointer = stars > 0;
             constMask = PointeeConstOfComponent(shape.ConstMask, stars, preserveAliasReferentConst);
-            return SignatureComponentAliasBase(compilerLLVM, shape.TypeName);
+            std::string name = SignatureComponentAliasBase(compilerLLVM, shape.TypeName);
+            if (const auto* functionAlias = compilerLLVM->FindOrRequestFunctionTypeAlias(name))
+                return MainListener::EncodeClosureFromSig(compilerLLVM, *functionAlias);
+            return name;
         }
         // A member alias (`A<int>.CP`) keeps its stars and its const mask: both come from the owner.
         uint8_t memberMask = 0;
@@ -2130,6 +3377,10 @@ std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(
         std::string retAliasSpelling;
         sig.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(fnSpec->typeSpecifier(), retPtr,
             retStars, retConst, fnSpec->multiWordTypeSuffix(), false, &retAliasSpelling);
+        if (!retPtr)
+            if (const auto* nested = compilerLLVM->GetEncodedClosureType(sig.FuncPtrReturnTypeName))
+                sig.FuncPtrReturnFunctionType =
+                    std::make_shared<LLVMBackend::TypeAndValue>(*nested);
         sig.FuncPtrReturnAliasSpelling = retAliasSpelling;
         sig.FuncPtrReturnConstMask = retConst;
         sig.FuncPtrReturnPointer = retPtr;
@@ -2147,6 +3398,10 @@ std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(
                 int pConst = 0;
                 p.TypeName = ResolveSigComponentConstScanner(param->typeSpecifier(), pPtr,
                     pStars, pConst, param->multiWordTypeSuffix(), false, &p.AliasSpelling);
+                if (!pPtr)
+                    if (const auto* nested = compilerLLVM->GetEncodedClosureType(p.TypeName))
+                        p.FunctionTypeSignature =
+                            std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                 p.ConstMask = pConst;
                 p.Pointer = pPtr;
                 p.IsArrayView = pIsArrayView;
@@ -2775,6 +4030,10 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
                 fpSpec->multiWordTypeSuffix(), aliasReturn, &tv.FuncPtrReturnAliasSpelling);
+            if (!retPtr)
+                if (const auto* nested = compilerLLVM->GetEncodedClosureType(tv.FuncPtrReturnTypeName))
+                    tv.FuncPtrReturnFunctionType =
+                        std::make_shared<LLVMBackend::TypeAndValue>(*nested);
             tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
             tv.FuncPtrReturnOwned = returnQualifierText == "move";
@@ -2794,6 +4053,10 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
                     p.TypeName = ResolveSigComponentConstScanner(
                         param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix(),
                             false, &p.AliasSpelling);
+                    if (!pPtr)
+                        if (const auto* nested = compilerLLVM->GetEncodedClosureType(p.TypeName))
+                            p.FunctionTypeSignature =
+                                std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                     p.ConstMask = pConst;
                     p.Pointer  = pPtr;
                     p.IsArrayView = pIsArrayView;
@@ -2869,6 +4132,28 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         {
             compiler->RegisterFunctionTypeAlias(alias, BuildFuncPtrAliasType(fpSpec));
             return;
+        }
+        std::string functionTypeBase;
+        if (typeSpec != nullptr && ctx->pointer() == nullptr && ArrayDimsOf(ctx) == nullptr
+            && typeSpec->memberTypeSpecifier() == nullptr
+            && GenericSpecOf(typeSpec, functionTypeBase) == nullptr)
+        {
+            std::string functionTypeName = CanonicalTypeSpecifierText(
+                typeSpec, ctx->multiWordTypeSuffix(), false);
+            const LLVMBackend::TypeAndValue* functionType = nullptr;
+            for (int depth = 0; depth < 16; ++depth)
+            {
+                if ((functionType = compiler->FindFunctionTypeAlias(functionTypeName)) != nullptr)
+                    break;
+                std::string resolved = compiler->ResolveTypeAlias(functionTypeName);
+                if (resolved == functionTypeName) break;
+                functionTypeName = std::move(resolved);
+            }
+            if (functionType != nullptr)
+            {
+                compiler->RegisterFunctionTypeAlias(alias, *functionType);
+                return;
+            }
         }
         PrimitiveTypeError canonicalError;
         std::string target;
@@ -3441,6 +4726,12 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
                         compilerLLVM->LogError("typedef function declarators are not supported");
                     if (id != nullptr)
                     {
+                        if (type.IsFunctionPointer && !type.Pointer && !type.IsArrayView
+                            && !type.FuncPtrReturnTypeName.empty())
+                        {
+                            compilerLLVM->RegisterFunctionTypeAlias(id->getText(), type);
+                            continue;
+                        }
                         std::string baseName;
                         auto* lastSpec = LastDeclarationTypeSpecifier(specs->declarationSpecifier());
                         auto* typeSpec = lastSpec != nullptr ? lastSpec->typeSpecifier() : nullptr;

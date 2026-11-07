@@ -12,6 +12,7 @@ import "array.cb";
 import "bucket_allocator.cb";
 import "cruntime.cb";
 import "application.cb";
+import "staticview_import_store.cb";
 
 struct T74NativeDefault { int value = 31; };
 T74NativeDefault[2] t74NativeDefault;
@@ -1317,6 +1318,16 @@ int[] g_gviewMultiA = { 91, 92 }, g_gviewMultiB = { 93, 94 };
 int[2] g_gviewSource2 = { 1, 2 };
 int[4] g_gviewSource4 = { 3, 4, 5, 6 };
 int[] g_gviewRebind = { 7, 8 };
+int[] g_gviewDeleteOrder = { 1, 2 };
+int g_gviewDeleteOrderFrees = 0;
+int[] gviewShadowCounted = { 4, 5, 6 };
+struct GViewImplicitShadowHolder {
+    int[] gviewShadowCounted = default;
+    void setRaw(int* raw) { gviewShadowCounted = (int[])raw; }
+};
+struct GViewHolder { int[] values = default; };
+struct GViewOuterHolder { GViewHolder inner = default; };
+GViewHolder g_gviewFieldHolder = default;
 
 const int g_gviewSignK = 4;
 const u32 g_gviewKU32 = 4294967295;
@@ -1354,9 +1365,47 @@ int gviewReadValues(int[] values)
     return values[0] * 100 + values[1] * 10 + values[2];
 }
 
+int gviewReadFirst(int[] values) { return values[0]; }
+
 int gviewReadStringLengths(string[] values)
 {
     return values[0].length() * 10 + values[1].length();
+}
+
+int gviewCountAndSum(int[] values)
+{
+    int count = 0;
+    int sum = 0;
+    for (int value in values) { count++; sum += value; }
+    return count * 100 + sum;
+}
+
+int gviewCountNested(GViewOuterPod[] values)
+{
+    int count = 0;
+    for (GViewOuterPod value in values) count++;
+    return count;
+}
+
+int[] gviewReturnView(int[] values) { return values; }
+void gviewSetGlobalView(int[] values) { g_gviewRebind = values; }
+int[] gviewPickGlobalView() { return g_gviewSource4; }
+void gviewDeleteOrder() { delete[_] g_gviewDeleteOrder; g_gviewDeleteOrderFrees++; }
+
+int gviewDeleteHeapAcceptSet()
+{
+    int[] values = new int[3];
+    values[0] = 1; values[1] = 2; values[2] = 3;
+    int result = values[0] * 100 + values[1] * 10 + values[2];
+    delete[_] values;
+    return result;
+}
+
+int gviewDeleteMovedParamAcceptSet(move int[] values)
+{
+    int result = values[0] * 10 + values[1];
+    delete[_] values;
+    return result;
 }
 
 struct StringRow { string name = default; };
@@ -1825,6 +1874,36 @@ int testStringBuilder()
     return passed;
 }
 
+// A function value carries a view parameter's hidden count: the indirect call passes it.
+int brCountView(int[] values)
+{
+    int count = 0;
+    for (int value in values) count++;
+    return count;
+}
+int brApplyView(function<int(int[])> fp, int[] values) { return fp(values); }
+int brSumTwoViews(int[] a, int[] b)
+{
+    int sum = 0;
+    for (int x in a) sum += x;
+    for (int y in b) sum += y * 10;
+    return sum;
+}
+int brApplyTwoViews(function<int(int[], int[])> fp, int[] a, int[] b) { return fp(a, b); }
+
+interface BrCountIface
+{
+    int count(int[] values);
+    int first(int k, int[] values);
+};
+class BrCountImpl : BrCountIface
+{
+    int count(int[] values) { int n = 0; for (int value in values) n++; return n; }
+    int first(int k, int[] values) { return values[0] * 10 + k; }
+};
+
+struct BrViewField { int[] values = default; };
+
 int testStringView()
 {
     int passed = 0;
@@ -1889,6 +1968,76 @@ int testStringView()
     passed += Test("gview accept local string length", localStringView[1].length(), 4);
     int[] localIntView = { 4, 5, 6 };
     passed += Test("gview accept local inferred pass", gviewReadValues(localIntView), 456);
+    passed += Test("local brace view count and sum", gviewCountAndSum(localIntView), 315);
+    int* unknownExtent = (int*)malloc(4);
+    unknownExtent[0] = 17;
+    int[] unknownExtentView = (int[])unknownExtent;
+    passed += Test("view index-only callee accepts unknown extent",
+        gviewReadFirst(unknownExtentView), 17);
+    free(unknownExtent);
+    int[] localTwoView = { 4, 5 };
+    passed += Test("known conditional view call carries selected count",
+        gviewCountAndSum(false ? localIntView : localTwoView), 209);
+    int[] localConditionalView = false ? localIntView : localTwoView;
+    passed += Test("known conditional view local keeps count",
+        gviewCountAndSum(localConditionalView), 209);
+    int[] localNullView = default;
+    int[] localCoalescedView = localNullView ?? localIntView;
+    passed += Test("known coalesced view local keeps count",
+        gviewCountAndSum(localCoalescedView), 315);
+    GViewImplicitShadowHolder shadowHolder = default;
+    int[1] shadowRaw = { 9 };
+    shadowHolder.setRaw(&shadowRaw[0]);
+    passed += Test("implicit-this field store does not hide same-named global view",
+        gviewCountAndSum(gviewShadowCounted), 315);
+    int[] localViewCopy = localIntView;
+    passed += Test("local brace view declaration copy keeps count", gviewCountAndSum(localViewCopy), 315);
+    int[] localViewAssigned = default;
+    localViewAssigned = localIntView;
+    passed += Test("local brace view assignment keeps count", gviewCountAndSum(localViewAssigned), 315);
+    int[] localViewReturned = gviewReturnView(localIntView);
+    passed += Test("local brace view parameter and return keep count",
+        gviewCountAndSum(localViewReturned), 315);
+    GViewHolder localViewHolder = default;
+    localViewHolder.values = localIntView;
+    passed += Test("local brace view count through a field initializer",
+        gviewCountAndSum(localViewHolder.values), 315);
+    GViewHolder* heapViewHolder = new GViewHolder();
+    heapViewHolder->values = localIntView;
+    passed += Test("local pointer root keeps direct heap-field view count",
+        gviewCountAndSum(heapViewHolder->values), 315);
+    delete heapViewHolder;
+    GViewOuterHolder nestedViewHolder = default;
+    nestedViewHolder.inner.values = localIntView;
+    passed += Test("local brace view count through a nested field initializer",
+        gviewCountAndSum(nestedViewHolder.inner.values), 315);
+    g_gviewFieldHolder.values = localIntView;
+    passed += Test("local brace view count through a global field",
+        gviewCountAndSum(g_gviewFieldHolder.values), 315);
+
+    GViewPoint[] localNestedView = {
+        { x = 7, y = 8 }, { x = 9, y = 10 }
+    };
+    int localNestedViewCount = 0;
+    for (GViewPoint value in localNestedView) localNestedViewCount++;
+    passed += Test("local nested brace view count and values",
+        localNestedViewCount * 1000 + localNestedView[0].x * 10 + localNestedView[1].y, 2080);
+    passed += Test("global nested struct view count", gviewCountNested(g_gviewNestedPod), 1);
+
+    gviewSetGlobalView(localIntView);
+    passed += Test("global view rebind from a view parameter keeps count",
+        gviewCountAndSum(g_gviewRebind), 315);
+    g_gviewRebind = gviewPickGlobalView();
+    passed += Test("global view rebind from a view return keeps count",
+        gviewCountAndSum(g_gviewRebind), 418);
+    g_gviewRebind = g_gviewSource2;
+
+    passed += Test("array-view delete accept-set: heap allocation",
+        gviewDeleteHeapAcceptSet(), 123);
+    int[] movedHeapView = new int[2];
+    movedHeapView[0] = 3; movedHeapView[1] = 4;
+    passed += Test("array-view delete accept-set: moved heap parameter",
+        gviewDeleteMovedParamAcceptSet(move movedHeapView), 34);
     passed += Test("gview accept counted global pass", gviewReadValues(g_gviewCountedInts), 456);
 
     passed += Test("global string view element 0", g_gviewStrings[0], "AAPL");
@@ -1897,6 +2046,11 @@ int testStringView()
     passed += Test("global int view element 0", g_gviewInts[0], 10);
     passed += Test("global int view element 2", g_gviewInts[2], 30);
     passed += Test("global int view passed", gviewReadValues(g_gviewInts), 1230);
+    g_gviewDeleteOrder = new int[3];
+    g_gviewDeleteOrder[0] = 9;
+    gviewDeleteOrder();
+    passed += Test("global delete follows a module-wide heap rebind",
+        g_gviewDeleteOrderFrees, 1);
     int gviewCount = 0;
     int gviewSum = 0;
     for (int value in g_gviewInts) { gviewCount++; gviewSum += value; }
@@ -1940,6 +2094,44 @@ int testStringView()
     for (int value in g_gviewRebind) gviewRebindCount++;
     gviewRebindResult += gviewRebindCount;
     passed += Test("global view rebind updates foreach length", gviewRebindResult, 2420);
+
+    int[] brThree = {1, 2, 3};
+    int[] brTwo = {4, 5};
+    passed += Test("brview function value call carries count", brApplyView(brCountView, brThree), 3);
+    passed += Test("brview function value two views carry counts",
+        brApplyTwoViews(brSumTwoViews, brTwo, brThree), 69);
+    BrCountImpl brImpl;
+    BrCountIface brIface = brImpl;
+    passed += Test("brview interface call carries count", brIface.count(brThree), 3);
+    int* brRaw = (int*)malloc(4);
+    brRaw[0] = 7;
+    int[] brRawView = (int[])brRaw;
+    passed += Test("brview interface index-only view unknown extent", brIface.first(2, brRawView), 72);
+    free(brRaw);
+    BrViewField brHolder = default;
+    brHolder.values = brThree;
+    int[] brCopy = brHolder.values;
+    int brCopyCount = 0;
+    for (int value in brCopy) brCopyCount++;
+    passed += Test("brview declaration copy from field keeps count", brCopyCount, 3);
+    int[] brFour = {1, 2, 3, 4};
+    BrViewField* brHeap = new BrViewField();
+    brHeap->values = brFour;
+    int[] brArrowCopy = brHeap->values;
+    int brArrowCount = 0;
+    for (int value in brArrowCopy) brArrowCount++;
+    passed += Test("brview declaration copy from heap field keeps count", brArrowCount, 4);
+    delete brHeap;
+    int brLoopTotal = 0;
+    int brLoopK = 0;
+    while (brLoopK < 2)
+    {
+        int n = 0;
+        for (int value in brHolder.values) n++;
+        brLoopTotal += n;
+        brLoopK++;
+    }
+    passed += Test("brview field view loop without rebind keeps count", brLoopTotal, 6);
 
     return passed;
 }
@@ -3481,6 +3673,184 @@ int runRawCountStaticView(int choose)
     int sum = 0;
     for (int value in view) { count++; sum += value; }
     return count * 100 + sum;
+}
+
+int[] gStaticViewAcceptThree = {1, 2, 3};
+int[] gStaticViewAcceptTwo = {7, 8};
+int[] gStaticViewAcceptTarget = {1, 2, 3};
+
+class StaticViewKnownReturn
+{
+    int[] get() { return svR3KnownWide; }
+};
+
+struct GlobalViewFieldHolder
+{
+    int[] view = default;
+};
+GlobalViewFieldHolder gGlobalViewField = default;
+
+int staticViewLength(int[] values)
+{
+    int count = 0;
+    for (int value in values) count++;
+    return count;
+}
+
+int staticViewCountReader(int[] values)
+{
+    int count = 0;
+    for (int value in values) count++;
+    return count;
+}
+
+struct StaticViewFieldHolder
+{
+    int[] view = default;
+};
+
+int staticViewPackReaders(int[] values)
+{
+    int foreachCount = 0;
+    for (int value in values) foreachCount++;
+    return foreachCount * 100 + staticViewLength(values) * 10
+        + staticViewCountReader(values);
+}
+
+int runStaticViewFieldKnown(int rebind, int second)
+{
+    static StaticViewFieldHolder holder = default;
+    if (second == 0) holder.view = gStaticViewAcceptThree;
+    int result = staticViewPackReaders(holder.view);
+    if (rebind != 0 && second == 0) holder.view = gStaticViewAcceptTwo;
+    return result;
+}
+
+int runGlobalViewFieldKnown(int rebind, int second)
+{
+    if (second == 0) gGlobalViewField.view = gStaticViewAcceptThree;
+    int result = staticViewPackReaders(gGlobalViewField.view);
+    if (rebind != 0 && second == 0) gGlobalViewField.view = gStaticViewAcceptTwo;
+    return result;
+}
+
+int runStaticViewFromGlobal(int rebind, int second)
+{
+    static int[] view = gStaticViewAcceptThree;
+    if (second == 0) view = gStaticViewAcceptThree;
+    int result = staticViewPackReaders(view);
+    if (rebind != 0 && second == 0) view = gStaticViewAcceptTwo;
+    return result;
+}
+
+int runStaticViewFromParam(int[] values, int rebind, int second)
+{
+    static int[] view = values;
+    int result = staticViewPackReaders(view);
+    if (rebind != 0 && second == 0) view = gStaticViewAcceptTwo;
+    return result;
+}
+
+int runStaticViewParamRebind(int[] values, int second)
+{
+    static int[] view = gStaticViewAcceptThree;
+    int result = staticViewPackReaders(view);
+    if (second == 0) view = values;
+    return result;
+}
+
+class StaticViewMethodAccept
+{
+    int run(int second)
+    {
+        static int[] view = gStaticViewAcceptThree;
+        int count = 0;
+        for (int value in view) count++;
+        return count;
+    }
+};
+
+int runStaticViewNoInitAccept(int second)
+{
+    static int[] view;
+    if (second == 0) view = gStaticViewAcceptThree;
+    int count = 0;
+    for (int value in view) count++;
+    return count;
+}
+
+int runStaticViewDeadStoreAccept(int* raw)
+{
+    static int[] view = gStaticViewAcceptThree;
+    int count = 0;
+    for (int value in view) count++;
+    return count;
+    view = (int[])raw;
+}
+
+int staticViewGlobalReaders()
+{
+    return staticViewPackReaders(gStaticViewAcceptTarget);
+}
+
+void setStaticViewGlobalFromParam(int[] values)
+{
+    gStaticViewAcceptTarget = values;
+}
+
+int runStaticViewWithShadowedRawStore(int* raw)
+{
+    static int[] view = gStaticViewAcceptThree;
+    {
+        int[] view = gStaticViewAcceptTwo;
+        view = (int[])raw;
+    }
+    int count = 0;
+    for (int value in view) count++;
+    return count;
+}
+
+int runStaticViewWithDistinctRawStore(int* raw)
+{
+    static int[] view = gStaticViewAcceptThree;
+    {
+        int[] other = gStaticViewAcceptTwo;
+        other = (int[])raw;
+    }
+    int count = 0;
+    for (int value in view) count++;
+    return count;
+}
+
+int runStaticViewImportedGlobalCopy()
+{
+    int before = svR3KnownShortCount();
+    svR3KnownShort = svR3KnownWide;
+    int after = svR3KnownShortCount();
+    return before * 10 + after;
+}
+
+int runStaticViewLocalFieldSource()
+{
+    StaticViewFieldHolder holder = default;
+    holder.view = svR3KnownWide;
+    gStaticViewAcceptTarget = gStaticViewAcceptThree;
+    int before = staticViewGlobalReaders();
+    gStaticViewAcceptTarget = holder.view;
+    int after = staticViewGlobalReaders();
+    gStaticViewAcceptTarget = gStaticViewAcceptThree;
+    return before * 1000 + after;
+}
+
+int runStaticViewKnownMethodSource()
+{
+    StaticViewKnownReturn holder = default;
+    gStaticViewAcceptTarget = gStaticViewAcceptThree;
+    int before = staticViewGlobalReaders();
+    gStaticViewAcceptTarget = holder.get();
+    int after = staticViewGlobalReaders();
+    gStaticViewAcceptTarget = gStaticViewAcceptThree;
+    return before * 1000 + after;
 }
 
 int runRawCountJoinDecl(int choose)
@@ -5301,6 +5671,50 @@ int testRawArrayRuntimeCount()
     int staticViewSecond = runRawCountStaticView(0);
     passed += Test("raw count static view rebind persists",
                    staticViewFirst * 1000 + staticViewSecond, 315315);
+    StaticViewMethodAccept staticViewMethod;
+    passed += Test("static view method keeps known count",
+        staticViewMethod.run(0) * 10 + staticViewMethod.run(1), 33);
+    passed += Test("static view without initializer keeps known count",
+        runStaticViewNoInitAccept(0) * 10 + runStaticViewNoInitAccept(1), 33);
+    passed += Test("unreachable raw store does not poison static view",
+        runStaticViewDeadStoreAccept(nullptr), 3);
+
+    passed += Test("static array view keeps count from global view",
+        runStaticViewFromGlobal(0, 0) * 1000 + runStaticViewFromGlobal(0, 1), 333333);
+    passed += Test("static array view known global rebind keeps count",
+        runStaticViewFromGlobal(1, 0) * 1000 + runStaticViewFromGlobal(1, 1), 333222);
+    int[4] staticViewKnownParam = {1, 2, 3, 4};
+    passed += Test("static array view keeps count from known parameter",
+        runStaticViewFromParam(staticViewKnownParam, 0, 0) * 1000
+            + runStaticViewFromParam(staticViewKnownParam, 0, 1), 444444);
+    passed += Test("static array view known rebind after parameter init keeps count",
+        runStaticViewFromParam(staticViewKnownParam, 1, 0) * 1000
+            + runStaticViewFromParam(staticViewKnownParam, 1, 1), 444222);
+    passed += Test("static array view known parameter rebind keeps count",
+        runStaticViewParamRebind(staticViewKnownParam, 0) * 1000
+            + runStaticViewParamRebind(staticViewKnownParam, 1), 333444);
+    passed += Test("static array view field known rebind keeps count",
+        runStaticViewFieldKnown(1, 0) * 1000 + runStaticViewFieldKnown(0, 1), 333222);
+    passed += Test("global array view field known rebind keeps count",
+        runGlobalViewFieldKnown(1, 0) * 1000 + runGlobalViewFieldKnown(0, 1), 333222);
+    passed += Test("imported known globals retain their array view counts",
+        runStaticViewImportedGlobalCopy(), 34);
+    passed += Test("local struct field keeps a known array view count",
+        runStaticViewLocalFieldSource(), 333444);
+    passed += Test("known method return keeps an array view count",
+        runStaticViewKnownMethodSource(), 333444);
+    passed += Test("global array view count without stores",
+        staticViewGlobalReaders(), 333);
+    gStaticViewAcceptTarget = gStaticViewAcceptTwo;
+    passed += Test("global array view count after known global rebind",
+        staticViewGlobalReaders(), 222);
+    setStaticViewGlobalFromParam(staticViewKnownParam);
+    passed += Test("global array view count after known parameter store",
+        staticViewGlobalReaders(), 444);
+    passed += Test("inner raw-cast view shadow does not poison static view",
+        runStaticViewWithShadowedRawStore(nullptr), 3);
+    passed += Test("distinct local raw-cast view does not poison static view",
+        runStaticViewWithDistinctRawStore(nullptr), 3);
 
     resetRawCountState();
     int zeroMoveSourceNull = 0;
@@ -5907,12 +6321,12 @@ extern int main()
     r = testStringInterpolation(); passed += r; total += 10;
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 24;
-    r = testStringView();       passed += r; total += 46;
+    r = testStringView();       passed += r; total += 73;
     r = testStringAPI();        passed += r; total += 136;
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 126;
+    r = testRawArrayRuntimeCount(); passed += r; total += 144;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 89;

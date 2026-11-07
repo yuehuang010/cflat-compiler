@@ -1,0 +1,7 @@
+import "staticview_import_store.cb";
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svR3InstantiateImportedGeneric(int* raw) {
+        return svR3ImportedGenericStatic<int>(raw, 0);
+    }
+}

@@ -442,12 +442,25 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
             // otherwise deferred until a context consumes it. Explicit casts need the same
             // char* source shape as a local so conversion overloads rank it correctly.
             auto* castStringConstant = llvm::dyn_cast_or_null<llvm::Constant>(namedVar.Primary);
-            if ((namedVar.IsStringLiteral || compiler->IsStringLiteralConstant(castStringConstant))
-                && namedVar.TypeAndValue.TypeName.empty())
+            if (namedVar.TypeAndValue.TypeName.empty() && namedVar.Primary != nullptr)
             {
-                namedVar.TypeAndValue.TypeName = "char";
-                namedVar.TypeAndValue.Pointer = true;
-                namedVar.TypeAndValue.PointerDepth = 1;
+                auto* primaryType = namedVar.Primary->getType();
+                if ((namedVar.IsStringLiteral || compiler->IsStringLiteralConstant(castStringConstant))
+                    && primaryType->isPointerTy())
+                {
+                    namedVar.TypeAndValue.TypeName = "char";
+                    namedVar.TypeAndValue.Pointer = true;
+                    namedVar.TypeAndValue.PointerDepth = 1;
+                }
+                else if (compiler->ResolveTypeAlias(destTypeName.TypeName)
+                            == compiler->ResolveTypeAlias("string")
+                    && !destTypeName.Pointer && !destTypeName.IsArrayView
+                    && primaryType == compiler->GetType(destTypeName))
+                {
+                    // Interpolation lowers to a string value, while pooled literals lower to char*.
+                    // Preserve the value type so an identity cast does not seek operator string(char*).
+                    namedVar.TypeAndValue = destTypeName;
+                }
             }
 
             // `(void)expr` DISCARDS the operand's value and keeps only its side effects - C's
@@ -483,7 +496,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
             if (operatorTargetSpelling.empty()) operatorTargetSpelling = destTypeName.TypeName;
             std::string opName = "operator " + operatorTargetSpelling;
             bool isSpecialConversion = destTypeName.TypeName == "string";
-            if (isSpecialConversion && !destTypeName.Pointer && !destTypeName.IsArrayView
+            if (isSpecialConversion && !redundantCastOfSource
+                && !destTypeName.Pointer && !destTypeName.IsArrayView
                 && compiler->GetFunction(opName) != nullptr)
             {
                 auto argNV = namedVar;
@@ -513,7 +527,10 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                     return namedVar;
                 }
 
-                auto result = compiler->CreateOverloadedFunctionCall(opName, { argNV });
+                auto* literalValue = llvm::dyn_cast_or_null<llvm::Constant>(argNV.Primary);
+                auto result = compiler->IsStringLiteralConstant(literalValue)
+                    ? compiler->CoerceCharPointerToString(argNV.Primary)
+                    : compiler->CreateOverloadedFunctionCall(opName, { argNV });
                 namedVar.Primary = result;
                 namedVar.Storage = nullptr;
                 namedVar.TypeAndValue = destTypeName;
@@ -824,13 +841,33 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 compiler->RegisterDataValueCodeCast(namedVar.Primary);
             if (redundantCast)
             {
-                namedVar.Storage = redundantStorage;
-                // Keep the OPERAND's canonical type name: the cast's spelling can be
-                // namespace-relative, and a later consume arm compares it with a declared type's.
-                namedVar.TypeAndValue.TypeName = redundantCastSource.TypeAndValue.TypeName;
-                namedVar.TypeAndValue.VariableName = redundantCastSource.TypeAndValue.VariableName;
-                namedVar.TypeAndValue.ParentVariableName = redundantCastSource.TypeAndValue.ParentVariableName;
-                AdoptWrapperProvenance(namedVar, redundantCastSource);
+                auto castTypeAndValue = namedVar.TypeAndValue;
+                auto* castPrimary = namedVar.Primary;
+                const auto operandTypeName = redundantCastSource.TypeAndValue.TypeName;
+                const auto operandVariableName = redundantCastSource.TypeAndValue.VariableName;
+                const auto operandParentName = redundantCastSource.TypeAndValue.ParentVariableName;
+                const bool operandIsMove = redundantCastSource.TypeAndValue.IsMove;
+                const bool operandIsAlias = redundantCastSource.TypeAndValue.IsAlias;
+                const bool redundantStringTemp = !redundantCastSource.TypeAndValue.Pointer
+                    && compiler->ResolveTypeAlias(operandTypeName) == "string"
+                    && (redundantCastSource.IsParenthesizedProducedTemp
+                        || (redundantCastSource.IsOwningString
+                            && redundantCastSource.CallerName.empty())
+                        || compiler->IsOwnedTempValue(redundantCastSource)
+                        || (redundantCastSource.FromOwningTempField
+                            && redundantCastSource.OwningTempParent));
+                // A same-type cast is transparent: restore the complete operand binding so field,
+                // parent, and ownership provenance reach consumers exactly as on the bare operand.
+                // Keep the cast's type qualifiers, which may intentionally remove const.
+                namedVar = std::move(redundantCastSource);
+                namedVar.Primary = castPrimary;
+                namedVar.Storage = redundantStringTemp ? nullptr : redundantCastStorage;
+                namedVar.TypeAndValue = std::move(castTypeAndValue);
+                namedVar.TypeAndValue.TypeName = operandTypeName;
+                namedVar.TypeAndValue.VariableName = operandVariableName;
+                namedVar.TypeAndValue.ParentVariableName = operandParentName;
+                namedVar.TypeAndValue.IsMove = operandIsMove;
+                namedVar.TypeAndValue.IsAlias = operandIsAlias;
             }
             if (!destTypeName.Pointer && namedVar.Primary != nullptr
                 && (namedVar.Primary->getType()->isIntegerTy()

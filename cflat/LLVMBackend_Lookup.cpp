@@ -126,6 +126,21 @@ bool LLVMBackend::ReshapeFixedArrayAsView(LLVMBackend::TypeAndValue& typeAndValu
         return true;
 }
 
+// Spells a function-value view's element as 'function<...>', with '*' for its element star.
+static std::string SpellFunctionValueElement(const LLVMBackend& compiler,
+                                             const LLVMBackend::TypeAndValue& view)
+{
+    LLVMBackend::TypeAndValue element = view;
+    element.IsArrayView = false;
+    element.ConstArraySize = 0;
+    element.AliasArraySize = 0;
+    element.Pointer = false;
+    element.ElemPointer = false;
+    element.PointerDepth = 0;
+    return std::format("function<{}>{}", compiler.FuncPtrSpellingOf(element),
+                       view.ElemPointer ? "*" : "");
+}
+
 /*
  * A view SOURCE indexes by its ELEMENT, so binding it to a destination whose element differs
  * strides and loads with the wrong shape (silent garbage, or a raw verifier failure when the
@@ -159,7 +174,17 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
             srcElement = src.TypeName + (src.ElemPointer ? "*" : "");
             return true;
         }
-        if (dest.IsFunctionPointer || src.IsFunctionPointer) return false;
+        // A function-value view indexes by its element star alone; its signature is ranked elsewhere.
+        // A function-value parameter may carry only its encoded `cfn$...` name, not the flag.
+        const bool destFn = dest.IsFunctionPointer || IsThinMangledClosure(dest.TypeName);
+        const bool srcFn = src.IsFunctionPointer || IsThinMangledClosure(src.TypeName);
+        if (destFn && srcFn && dest.IsArrayView && dest.ElemPointer != src.ElemPointer)
+        {
+            destElement = SpellFunctionValueElement(*this, dest);
+            srcElement = SpellFunctionValueElement(*this, src);
+            return true;
+        }
+        if (destFn || srcFn) return false;
         // 'void*' is the universal address destination - it never indexes by an element.
         if (dest.TypeName == "void") return false;
 

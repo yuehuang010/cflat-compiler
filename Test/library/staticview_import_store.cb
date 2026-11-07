@@ -1,0 +1,36 @@
+int[] svR2ImportedGlobal = {1, 2, 3};
+
+int svR2ImportedReader()
+{
+    int count = 0;
+    for (int value in svR2ImportedGlobal) count++;
+    return count;
+}
+
+int[] svR3KnownShort = {1, 2, 3};
+int[] svR3KnownWide = {1, 2, 3, 4};
+
+int svR3KnownShortCount()
+{
+    int count = 0;
+    for (int value in svR3KnownShort) count++;
+    return count;
+}
+
+int[] svR3ImportedClosureGlobal = {1, 2, 3};
+
+int svR3ImportedClosureReader()
+{
+    int count = 0;
+    for (int value in svR3ImportedClosureGlobal) count++;
+    return count;
+}
+
+int svR3ImportedGenericStatic<T>(int* raw, T second)
+{
+    static int[] view = svR3KnownShort;
+    int count = 0;
+    for (int value in view) count++;
+    if (second == 0) view = (int[])raw;
+    return count;
+}

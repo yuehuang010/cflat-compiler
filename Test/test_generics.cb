@@ -6845,6 +6845,60 @@ bool testGenericValueParameterShadowsOuterNames()
     return result;
 }
 
+namespace N
+{
+    int sm() { return 1; }
+    int g() { return 5; }
+}
+namespace Q { int sm() { return 4; } }
+struct TParamqualTarget { static int sm() { return 9; } };
+int TParamqualGlobal = 3;
+
+namespace TParamqualTypeScope
+{
+    struct T { static int sm() { return 1; } };
+    int tparamqualGlobalTypeShadow<T>() { return T.sm(); }
+    struct TParamqualStructShadow<T> { int call() { return T.sm(); } };
+}
+
+int tparamqualFunction<X>() { return X.sm(); }
+int tparamqualNamespaceShadow<N>() { return N.sm(); }
+int tparamqualGlobalVarShadow<TParamqualGlobal>() { return TParamqualGlobal.sm(); }
+int tparamqualValueParam<int N>() { return N.g(); }
+int tparamqualNamespaceControl<X>() { return Q.sm() + X.sm(); }
+
+struct TParamqualGenericMethod<X> { int call() { return X.sm(); } };
+struct TParamqualMemberTemplate<X> { int call<U>() { return U.sm(); } };
+struct TParamqualInner<X> { int call() { return X.sm(); } };
+int tparamqualNested<T>()
+{
+    TParamqualInner<T> inner = default;
+    return inner.call();
+}
+
+bool testTypeParameterQualifierResolution()
+{
+    bool result = true;
+    TParamqualGenericMethod<TParamqualTarget> method = default;
+    TParamqualTypeScope.TParamqualStructShadow<TParamqualTarget> shadow = default;
+    TParamqualMemberTemplate<int> memberTemplate = default;
+    result &= Test("tparamqual function method", tparamqualFunction<TParamqualTarget>(), 9);
+    result &= Test("tparamqual struct method", method.call(), 9);
+    result &= Test("tparamqual struct type shadow", shadow.call(), 9);
+    result &= Test("tparamqual member template", memberTemplate.call<TParamqualTarget>(), 9);
+    result &= Test("tparamqual nested instantiation", tparamqualNested<TParamqualTarget>(), 9);
+    result &= Test("tparamqual namespace shadow", tparamqualNamespaceShadow<TParamqualTarget>(), 9);
+    result &= Test("tparamqual type shadow",
+        TParamqualTypeScope.tparamqualGlobalTypeShadow<TParamqualTarget>(), 9);
+    result &= Test("tparamqual global variable shadow", tparamqualGlobalVarShadow<TParamqualTarget>(), 9);
+    result &= Test("tparamqual concrete type control", TParamqualTarget.sm(), 9);
+    result &= Test("tparamqual namespace control", N.sm(), 1);
+    result &= Test("tparamqual generic namespace control",
+        tparamqualNamespaceControl<TParamqualTarget>(), 13);
+    result &= Test("tparamqual value parameter control", tparamqualValueParam<7>(), 5);
+    return result;
+}
+
 int testGenericValueDefaults()
 {
     int result = 1;
@@ -7861,6 +7915,7 @@ extern int main()
     total++; passed += testGenericStructs();
     total++; passed += testGenericValueDefaults();
     total++; passed += testGenericValueParameterShadowsOuterNames();
+    total++; passed += testTypeParameterQualifierResolution();
     total++; passed += testInterface()                   ? 1 : 0;
     total++; passed += testGenericInterface()            ? 1 : 0;
     total++; passed += testReturnListFreeFunc()          ? 1 : 0;

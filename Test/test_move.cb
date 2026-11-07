@@ -3884,6 +3884,278 @@ int testUniqueLocalReassignMove()
 int movePlain(string s)      { return (int)s.length(); }
 int moveOwns(move string s)  { return (int)s.length(); }
 
+int mppDtorCount = 0;
+int mppAllocCount = 0;
+int mppFreeCount = 0;
+struct MPPD { int value = 0; ~MPPD() { mppDtorCount = mppDtorCount + 1; } };
+struct MPPStringBox { string value = default; };
+struct MPPUniqueBox { unique<MPPD> value = default; };
+struct MPPStoreHolder { string value = default; };
+struct MPPDB { int value = 0; ~MPPDB() { mppDtorCount = mppDtorCount + 1; } };
+int mpcastDtorCount = 0;
+struct MPCastD { int value = 0; ~MPCastD() { if (value != 0) mpcastDtorCount = mpcastDtorCount + 1; } };
+struct MPCastSB { string value = default; };
+struct MPCastSB2 { MPCastD value = default; };
+string mppStoredString = default;
+MPPStoreHolder mppStoredHolder = default;
+MPPStringBox mppStoredBox = default;
+void mppAuditAlloc(void* p, u64 size) { if (p != nullptr) mppAllocCount = mppAllocCount + 1; }
+void mppAuditFree(void* p) { if (p != nullptr) mppFreeCount = mppFreeCount + 1; }
+string mppStoreLiteral() { string s = "abcdefghijklmnopqrstuvwxyz0123456789"; return s; }
+
+int mpcastReadSB(MPCastSB* value) { return (int)value->value.length(); }
+MPCastSB mpcastLocalSBBare() { MPCastSB x = default; x.value = "abc".copy(); return x; }
+MPCastSB mpcastLocalSBCast() { MPCastSB x = default; x.value = "abc".copy(); return (MPCastSB)x; }
+MPCastSB mpcastLocalSBDParen() { MPCastSB x = default; x.value = "abc".copy(); return ((MPCastSB)x); }
+MPCastSB2 mpcastLocalSB2Bare() { MPCastSB2 x = default; x.value.value = 7; return x; }
+MPCastSB2 mpcastLocalSB2Cast() { MPCastSB2 x = default; x.value.value = 7; return (MPCastSB2)x; }
+MPCastSB2 mpcastLocalSB2DParen() { MPCastSB2 x = default; x.value.value = 7; return ((MPCastSB2)x); }
+string mpcastMoveStringCall(move string x) { return string(x); }
+string mpcastLocalStringCall() { string x = "abc".copy(); return string(x); }
+string mpcastMoveStringDParen(move string x) { return ((string)x); }
+string mpcastLocalStringDParen() { string x = "abc".copy(); return ((string)x); }
+unique<MPCastD> mpcastMoveUniqueCall(move unique<MPCastD> x) { return unique<MPCastD>(x); }
+unique<MPCastD> mpcastLocalUniqueCall() { unique<MPCastD> x = new MPCastD(); x->value = 7; return unique<MPCastD>(x); }
+unique<MPCastD> mpcastMoveUniqueBare(move unique<MPCastD> x) { return x; }
+unique<MPCastD> mpcastLocalUniqueBare() { unique<MPCastD> x = new MPCastD(); x->value = 7; return x; }
+MPCastSB mpcastMoveSBBare(move MPCastSB x) { return x; }
+MPCastSB mpcastMoveSBCast(move MPCastSB x) { return (MPCastSB)x; }
+MPCastSB mpcastMoveSBDParen(move MPCastSB x) { return ((MPCastSB)x); }
+MPCastSB mpcastMoveSBCastAssign(move MPCastSB x, move MPCastSB y) { return (MPCastSB)(x = y); }
+MPCastSB2 mpcastMoveSB2Bare(move MPCastSB2 x) { return x; }
+MPCastSB2 mpcastMoveSB2Cast(move MPCastSB2 x) { return (MPCastSB2)x; }
+MPCastSB2 mpcastMoveSB2DParen(move MPCastSB2 x) { return ((MPCastSB2)x); }
+T mpcastMoveGenericBare<T>(move T x) { return x; }
+T mpcastMoveGenericCast<T>(move T x) { return (T)x; }
+T mpcastMoveGenericDParen<T>(move T x) { return ((T)x); }
+T mpcastLocalGenericBare<T>(move T seed) { T x = seed; return x; }
+T mpcastLocalGenericCast<T>(move T seed) { T x = seed; return (T)x; }
+T mpcastLocalGenericDParen<T>(move T seed) { T x = seed; return ((T)x); }
+unique<MPCastD> mpcastMoveUniqueCast(move unique<MPCastD> x) { return (unique<MPCastD>)x; }
+unique<MPCastD> mpcastMoveUniqueDParen(move unique<MPCastD> x) { return ((unique<MPCastD>)x); }
+unique<MPCastD> mpcastLocalUniqueCast() { unique<MPCastD> x = new MPCastD(); x->value = 7; return (unique<MPCastD>)x; }
+unique<MPCastD> mpcastLocalUniqueDParen() { unique<MPCastD> x = new MPCastD(); x->value = 7; return ((unique<MPCastD>)x); }
+int mpcastCopyStringParam(move string x) { string y = (string)x; return (int)(y.length() * 10 + x.length()); }
+int mpcastCopyStringLocal() { string x = "abc".copy(); string y = (string)x; return (int)(y.length() * 10 + x.length()); }
+int mpcastCopySBParam(move MPCastSB x) { MPCastSB y = (MPCastSB)x; return mpcastReadSB(&y) * 10 + mpcastReadSB(&x); }
+int mpcastCopySBLocal() { MPCastSB x = default; x.value = "abc".copy(); MPCastSB y = (MPCastSB)x; return mpcastReadSB(&y) * 10 + mpcastReadSB(&x); }
+int mpcastCopySB2Param(move MPCastSB2 x) { MPCastSB2 y = (MPCastSB2)x; return y.value.value * 10 + x.value.value; }
+int mpcastCopySB2Local() { MPCastSB2 x = default; x.value.value = 7; MPCastSB2 y = (MPCastSB2)x; return y.value.value * 10 + x.value.value; }
+int mpcastCopyGenericParam<T>(move T x) { T y = (T)x; return mpcastReadSB(&y) * 10 + mpcastReadSB(&x); }
+int mpcastCopyGenericLocal<T>(move T seed) { T x = seed; T y = (T)x; return mpcastReadSB(&y) * 10 + mpcastReadSB(&x); }
+
+string mppReturnStringParen(move string p) { return (p); }
+string mppReturnStringDParen(move string p) { return ((p)); }
+MPPStringBox mppReturnStringBoxParen(move MPPStringBox p) { return (p); }
+MPPStringBox mppReturnStringBoxDParen(move MPPStringBox p) { return ((p)); }
+MPPUniqueBox mppReturnUniqueBoxParen(move MPPUniqueBox p) { return (p); }
+MPPUniqueBox mppReturnUniqueBoxDParen(move MPPUniqueBox p) { return ((p)); }
+unique<MPPD> mppReturnUniqueParen(move unique<MPPD> p) { return (p); }
+unique<MPPD> mppReturnUniqueDParen(move unique<MPPD> p) { return ((p)); }
+unique<MPPD> mppReturnLocalUniqueParen()
+{
+    unique<MPPD> p = unique<MPPD>(new MPPD());
+    p->value = 3;
+    return (p);
+}
+unique<MPPD> mppReturnLocalUniqueDParen()
+{
+    unique<MPPD> p = unique<MPPD>(new MPPD());
+    p->value = 3;
+    return ((p));
+}
+
+int mppCopyString(move string p)
+{
+    string t = p;
+    return (int)t.length() * 10 + (int)p.length();
+}
+int mppCopyStringParen(move string p)
+{
+    string t = (p);
+    return (int)t.length() * 10 + (int)p.length();
+}
+int mppCopyStringBox(move MPPStringBox p)
+{
+    MPPStringBox t = p;
+    return (int)t.value.length() * 10 + (int)p.value.length();
+}
+int mppCopyStringBoxParen(move MPPStringBox p)
+{
+    MPPStringBox t = (p);
+    return (int)t.value.length() * 10 + (int)p.value.length();
+}
+int mppAssignString(move string p)
+{
+    string t = default;
+    t = p;
+    return (int)t.length() * 10 + (int)p.length();
+}
+int mppAssignStringBox(move MPPStringBox p)
+{
+    MPPStringBox t = default;
+    t = p;
+    return (int)t.value.length() * 10 + (int)p.value.length();
+}
+
+// Owning-local twins own their buffer (.copy()): a move string param owns its buffer too, since
+// the call site heap-copies a non-owned argument.
+int mppMoveStoreGlobalString(move string p)
+{
+    mppStoredString = p;
+    return (int)p.length() * 100 + (int)mppStoredString.length();
+}
+int mppLocalStoreGlobalString()
+{
+    string p = mppStoreLiteral().copy();
+    mppStoredString = p;
+    int result = (int)p.length() * 100 + (int)mppStoredString.length();
+    mppStoredString = default;
+    return result;
+}
+int mppMoveStorePointerField(move string p, MPPStoreHolder* h)
+{
+    h->value = p;
+    return (int)p.length() * 100 + (int)h->value.length();
+}
+int mppLocalStorePointerField(MPPStoreHolder* h)
+{
+    string p = mppStoreLiteral().copy();
+    h->value = p;
+    return (int)p.length() * 100 + (int)h->value.length();
+}
+int mppMoveStoreLocalField(move string p)
+{
+    MPPStoreHolder h = default;
+    h.value = p;
+    return (int)p.length() * 100 + (int)h.value.length();
+}
+int mppLocalStoreLocalField()
+{
+    string p = mppStoreLiteral().copy();
+    MPPStoreHolder h = default;
+    h.value = p;
+    return (int)p.length() * 100 + (int)h.value.length();
+}
+int mppMoveStoreGlobalField(move string p)
+{
+    mppStoredHolder.value = p;
+    return (int)p.length() * 100 + (int)mppStoredHolder.value.length();
+}
+int mppLocalStoreGlobalField()
+{
+    string p = mppStoreLiteral().copy();
+    mppStoredHolder.value = p;
+    int result = (int)p.length() * 100 + (int)mppStoredHolder.value.length();
+    mppStoredHolder.value = default;
+    return result;
+}
+int mppMoveStoreGlobalBox(move MPPStringBox p)
+{
+    mppStoredBox = p;
+    return (int)p.value.length() * 100 + (int)mppStoredBox.value.length();
+}
+int mppLocalStoreGlobalBox()
+{
+    MPPStringBox p = default;
+    p.value = mppStoreLiteral();
+    mppStoredBox = p;
+    int result = (int)p.value.length() * 100 + (int)mppStoredBox.value.length();
+    mppStoredBox = default;
+    return result;
+}
+int mppSinkDB(move MPPDB p) { return p.value; }
+int mppMoveDBSink(move MPPDB p) { return mppSinkDB(p); }
+int mppLocalDBSink()
+{
+    MPPDB p = default;
+    p.value = 3;
+    return mppSinkDB(p);
+}
+// Owning-local twins of the DB sink/copy helpers. The caller of a move parameter owns the moved-from
+// source, and its destructor runs on the zero-filled value, so the twin owns that source too.
+int mppLocalDBSinkMoved()
+{
+    MPPDB src = default;
+    src.value = 3;
+    MPPDB p = move src;
+    return mppSinkDB(p);
+}
+int mppLocalDBCopyMoved()
+{
+    MPPDB src = default;
+    src.value = 3;
+    MPPDB p = move src;
+    MPPDB t = p;
+    return t.value + p.value;
+}
+int mppMoveDBCopy(move MPPDB p)
+{
+    MPPDB t = p;
+    return t.value + p.value;
+}
+int mppLocalDBCopy()
+{
+    MPPDB p = default;
+    p.value = 3;
+    MPPDB t = p;
+    return t.value + p.value;
+}
+int mppMoveListAdd(move string p, list<string>* values)
+{
+    values->add(p);
+    return (int)p.length();
+}
+int mppLocalListAdd(list<string>* values)
+{
+    string p = mppStoreLiteral().copy();
+    values->add(p);
+    return (int)p.length();
+}
+int mppMoveLambdaCapture(move string p)
+{
+    Lambda<int()> captured = () => { return (int)p.length(); };
+    return captured();
+}
+int mppLocalLambdaCapture()
+{
+    string p = mppStoreLiteral().copy();
+    Lambda<int()> captured = () => { return (int)p.length(); };
+    return captured();
+}
+string mppMoveTernaryReturn(move string p, int c) { return c != 0 ? p : p; }
+string mppLocalTernaryReturn(int c)
+{
+    string p = mppStoreLiteral().copy();
+    return c != 0 ? p : p;
+}
+string mppMoveCastReturn(move string p) { return (string)p; }
+string mppLocalCastReturn()
+{
+    string p = mppStoreLiteral().copy();
+    return (string)p;
+}
+
+expect_error("use of moved variable 'p'") {
+    int mppUniqueFieldCopyUse(move MPPUniqueBox p) {
+        MPPUniqueBox t = p;
+        return t.value->value * 10 + p.value->value;
+    }
+}
+expect_error("use of moved variable 'p'") {
+    int mppUniqueFieldCopyParenUse(move MPPUniqueBox p) {
+        MPPUniqueBox t = (p);
+        return t.value->value * 10 + p.value->value;
+    }
+}
+expect_error("use of moved variable 'p'") {
+    int mppUniqueFieldAssignUse(move MPPUniqueBox p) {
+        MPPUniqueBox t = default;
+        t = p;
+        return t.value->value * 10 + p.value->value;
+    }
+}
+
 int ovlPick(string s)        { return 1; }
 int ovlPick(move string s)   { return 2; }
 
@@ -3914,6 +4186,568 @@ int testValueMoveArgDeferred()
         string d = "fgh" + "ij";
         passed += Test("value_move_ovl_explicit_move_owns", ovlPick(move d), 2);
     }
+
+    return passed;
+}
+
+// Round 4: a non-owned string (char buffer copy, literal) passed to a move string parameter is
+// heap-copied at the call, so the callee's stored element is independent of the source buffer.
+list<string> mppViewList;
+void mppViewPut(move string p) { mppViewList.add(move p); }
+int mppViewRun()
+{
+    char* cp = new char[8];
+    cp[0] = 65; cp[1] = 66; cp[2] = 0;
+    string s = cp;
+    mppViewPut(move s);
+    cp[0] = 90;
+    int r = (int)mppViewList.get(0).data()[0];
+    delete[] cp;
+    mppViewList = default;
+    return r;
+}
+int mppLitSink(move string p) { return (int)p.length(); }
+int mppLitRun()
+{
+    string s = "abc";
+    return mppLitSink(move s);
+}
+
+int testMoveParamParenAndCopy()
+{
+    int passed = 0;
+    int value = 0;
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "cat".copy(); string result = mppReturnStringParen(move source); value = (int)result.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_string_paren_value", value, 3);
+    passed += Test("mparam_return_string_paren_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "cat".copy(); string result = mppReturnStringDParen(move source); value = (int)result.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_string_dparen_value", value, 3);
+    passed += Test("mparam_return_string_dparen_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPStringBox source = default; source.value = "cat".copy(); MPPStringBox result = mppReturnStringBoxParen(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_string_field_paren_value", value, 3);
+    passed += Test("mparam_return_string_field_paren_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPStringBox source = default; source.value = "cat".copy(); MPPStringBox result = mppReturnStringBoxDParen(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_string_field_dparen_value", value, 3);
+    passed += Test("mparam_return_string_field_dparen_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPUniqueBox source = default; source.value = unique<MPPD>(new MPPD()); source.value->value = 3; MPPUniqueBox result = mppReturnUniqueBoxParen(move source); value = result.value->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_unique_field_paren_value", value, 3);
+    passed += Test("mparam_return_unique_field_paren_dtor", mppDtorCount, 1);
+    passed += Test("mparam_return_unique_field_paren_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPUniqueBox source = default; source.value = unique<MPPD>(new MPPD()); source.value->value = 3; MPPUniqueBox result = mppReturnUniqueBoxDParen(move source); value = result.value->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_unique_field_dparen_value", value, 3);
+    passed += Test("mparam_return_unique_field_dparen_dtor", mppDtorCount, 1);
+    passed += Test("mparam_return_unique_field_dparen_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPPD> source = unique<MPPD>(new MPPD()); source->value = 3; unique<MPPD> result = mppReturnUniqueParen(move source); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_unique_paren_value", value, 3);
+    passed += Test("mparam_return_unique_paren_dtor", mppDtorCount, 1);
+    passed += Test("mparam_return_unique_paren_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPPD> source = unique<MPPD>(new MPPD()); source->value = 3; unique<MPPD> result = mppReturnUniqueDParen(move source); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_return_unique_dparen_value", value, 3);
+    passed += Test("mparam_return_unique_dparen_dtor", mppDtorCount, 1);
+    passed += Test("mparam_return_unique_dparen_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPPD> result = mppReturnLocalUniqueParen(); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("local_return_unique_paren_value", value, 3);
+    passed += Test("local_return_unique_paren_dtor", mppDtorCount, 1);
+    passed += Test("local_return_unique_paren_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPPD> result = mppReturnLocalUniqueDParen(); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("local_return_unique_dparen_value", value, 3);
+    passed += Test("local_return_unique_dparen_dtor", mppDtorCount, 1);
+    passed += Test("local_return_unique_dparen_alloc_free", mppAllocCount * 10 + mppFreeCount, 11);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "cat".copy(); value = mppCopyString(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_copy_string_value", value, 33);
+    passed += Test("mparam_copy_string_alloc_free", mppAllocCount * 10 + mppFreeCount, 22);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "cat".copy(); value = mppCopyStringParen(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_copy_string_paren_value", value, 33);
+    passed += Test("mparam_copy_string_paren_alloc_free", mppAllocCount * 10 + mppFreeCount, 22);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPStringBox source = default; source.value = "cat".copy(); value = mppCopyStringBox(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_copy_string_field_value", value, 33);
+    passed += Test("mparam_copy_string_field_alloc_free", mppAllocCount * 10 + mppFreeCount, 22);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPStringBox source = default; source.value = "cat".copy(); value = mppCopyStringBoxParen(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_copy_string_field_paren_value", value, 33);
+    passed += Test("mparam_copy_string_field_paren_alloc_free", mppAllocCount * 10 + mppFreeCount, 22);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "cat".copy(); value = mppAssignString(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_assign_string_value", value, 33);
+    passed += Test("mparam_assign_string_alloc_free", mppAllocCount * 10 + mppFreeCount, 22);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPStringBox source = default; source.value = "cat".copy(); value = mppAssignStringBox(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_assign_string_field_value", value, 33);
+    passed += Test("mparam_assign_string_field_alloc_free", mppAllocCount * 10 + mppFreeCount, 22);
+
+    int moveValue = 0;
+    int localValue = 0;
+    int moveAudit = 0;
+    int localAudit = 0;
+    int moveBalanced = 0;
+    int localBalanced = 0;
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = mppStoreLiteral(); moveValue = mppMoveStoreGlobalString(move source); }
+    mppStoredString = default;
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    localValue = mppLocalStoreGlobalString();
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_global_string_store_value", moveValue, 3636);
+    passed += Test("mparam_global_string_store_local_parity", moveValue, localValue);
+    passed += Test("mparam_global_string_store_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_global_string_store_no_leak", moveBalanced + localBalanced, 2);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    moveValue = mppViewRun();
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_view_list_add_value", moveValue, 65);
+    passed += Test("mparam_view_list_add_no_leak", mppAllocCount == mppFreeCount ? 1 : 0, 1);
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    moveValue = mppLitRun();
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_literal_sink_value", moveValue, 3);
+    passed += Test("mparam_literal_sink_no_leak", mppAllocCount == mppFreeCount ? 1 : 0, 1);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPStoreHolder h = default; string source = mppStoreLiteral();
+      moveValue = mppMoveStorePointerField(move source, &h) + (int)h.value.length(); }
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    { MPPStoreHolder h = default;
+      localValue = mppLocalStorePointerField(&h) + (int)h.value.length(); }
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_pointer_field_store_value", moveValue, 3672);
+    passed += Test("mparam_pointer_field_store_local_parity", moveValue, localValue);
+    passed += Test("mparam_pointer_field_store_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_pointer_field_store_no_leak", moveBalanced + localBalanced, 2);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = mppStoreLiteral(); moveValue = mppMoveStoreLocalField(move source); }
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    localValue = mppLocalStoreLocalField();
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_local_field_store_value", moveValue, 3636);
+    passed += Test("mparam_local_field_store_local_parity", moveValue, localValue);
+    passed += Test("mparam_local_field_store_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_local_field_store_no_leak", moveBalanced + localBalanced, 2);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = mppStoreLiteral(); moveValue = mppMoveStoreGlobalField(move source); }
+    mppStoredHolder.value = default;
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    localValue = mppLocalStoreGlobalField();
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_global_field_store_value", moveValue, 3636);
+    passed += Test("mparam_global_field_store_local_parity", moveValue, localValue);
+    passed += Test("mparam_global_field_store_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_global_field_store_no_leak", moveBalanced + localBalanced, 2);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPPStringBox source = default; source.value = mppStoreLiteral();
+      moveValue = mppMoveStoreGlobalBox(move source); }
+    mppStoredBox = default;
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    localValue = mppLocalStoreGlobalBox();
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_global_struct_store_value", moveValue, 3636);
+    passed += Test("mparam_global_struct_store_local_parity", moveValue, localValue);
+    passed += Test("mparam_global_struct_store_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_global_struct_store_no_leak", moveBalanced + localBalanced, 2);
+
+    mppDtorCount = 0;
+    { MPPDB source = default; source.value = 3; value = mppMoveDBSink(move source); }
+    int moveDtors = mppDtorCount;
+    mppDtorCount = 0;
+    int localDBValue = mppLocalDBSinkMoved();
+    int localDtors = mppDtorCount;
+    passed += Test("mparam_DB_sink_value_parity", value, localDBValue);
+    passed += Test("mparam_DB_sink_dtor_parity", moveDtors, localDtors);
+
+    mppDtorCount = 0;
+    { MPPDB source = default; source.value = 3; value = mppMoveDBCopy(move source); }
+    moveDtors = mppDtorCount;
+    mppDtorCount = 0;
+    localDBValue = mppLocalDBCopyMoved();
+    localDtors = mppDtorCount;
+    passed += Test("mparam_DB_copy_value_parity", value, localDBValue);
+    passed += Test("mparam_DB_copy_dtor_parity", moveDtors, localDtors);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { list<string> values; string source = mppStoreLiteral();
+      moveValue = mppMoveListAdd(move source, &values) + values.count() + (int)values.get(0).length(); }
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    { list<string> values;
+      localValue = mppLocalListAdd(&values) + values.count() + (int)values.get(0).length(); }
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_list_add_value_parity", moveValue, localValue);
+    passed += Test("mparam_list_add_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_list_add_no_leak", moveBalanced + localBalanced, 2);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = mppStoreLiteral(); moveValue = mppMoveLambdaCapture(move source); }
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    localValue = mppLocalLambdaCapture();
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_lambda_capture_value_parity", moveValue, localValue);
+    passed += Test("mparam_lambda_capture_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_lambda_capture_no_leak", moveBalanced + localBalanced, 2);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = mppStoreLiteral(); string result = mppMoveTernaryReturn(move source, 1);
+      moveValue = (int)result.length(); }
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    { string result = mppLocalTernaryReturn(1); localValue = (int)result.length(); }
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_ternary_return_value_parity", moveValue, localValue);
+    passed += Test("mparam_ternary_return_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_ternary_return_no_leak", moveBalanced + localBalanced, 2);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = mppStoreLiteral(); string result = mppMoveCastReturn(move source);
+      moveValue = (int)result.length(); }
+    moveAudit = mppAllocCount * 10 + mppFreeCount;
+    moveBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    mppAllocCount = 0; mppFreeCount = 0;
+    { string result = mppLocalCastReturn(); localValue = (int)result.length(); }
+    localAudit = mppAllocCount * 10 + mppFreeCount;
+    localBalanced = mppAllocCount == mppFreeCount ? 1 : 0;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mparam_cast_return_value_parity", moveValue, localValue);
+    passed += Test("mparam_cast_return_audit_parity", moveAudit, localAudit);
+    passed += Test("mparam_cast_return_no_leak", moveBalanced + localBalanced, 2);
+
+    return passed;
+}
+
+int testMpcastAcceptSet()
+{
+    int passed = 0;
+    int value = 0;
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "abc".copy(); string result = mpcastMoveStringCall(move source); value = (int)result.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept string param T(x)", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string result = mpcastLocalStringCall(); value = (int)result.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept string local T(x)", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "abc".copy(); string result = mpcastMoveStringDParen(move source); value = (int)result.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept string param dparen cast", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string result = mpcastLocalStringDParen(); value = (int)result.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept string local dparen cast", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastMoveSBBare(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept SB param bare", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB result = mpcastLocalSBBare(); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept SB local bare", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB result = mpcastLocalSBCast(); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept SB local cast", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB result = mpcastLocalSBDParen(); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept SB local dparen", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0;
+    { MPCastSB2 source = default; source.value.value = 7; MPCastSB2 result = mpcastMoveSB2Bare(move source); value = result.value.value; }
+    passed += Test("mpcast accept SB2 param bare value and dtor", value == 7 && mpcastDtorCount == 1, true);
+
+    mpcastDtorCount = 0;
+    { MPCastSB2 result = mpcastLocalSB2Bare(); value = result.value.value; }
+    passed += Test("mpcast accept SB2 local bare value and dtor", value == 7 && mpcastDtorCount == 1, true);
+
+    mpcastDtorCount = 0;
+    { MPCastSB2 result = mpcastLocalSB2Cast(); value = result.value.value; }
+    passed += Test("mpcast accept SB2 local cast value and dtor", value == 7 && mpcastDtorCount == 1, true);
+
+    mpcastDtorCount = 0;
+    { MPCastSB2 result = mpcastLocalSB2DParen(); value = result.value.value; }
+    passed += Test("mpcast accept SB2 local dparen value and dtor", value == 7 && mpcastDtorCount == 1, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> source = new MPCastD(); source->value = 7; unique<MPCastD> result = mpcastMoveUniqueBare(move source); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept unique param bare value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> result = mpcastLocalUniqueBare(); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept unique local bare value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> source = new MPCastD(); source->value = 7; unique<MPCastD> result = mpcastMoveUniqueCall(move source); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept unique param T(x) value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> result = mpcastLocalUniqueCall(); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept unique local T(x) value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastMoveGenericBare<MPCastSB>(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept generic param bare", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastLocalGenericBare<MPCastSB>(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept generic local bare", value == 3 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastLocalGenericCast<MPCastSB>(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept generic local cast", value == 3 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastLocalGenericDParen<MPCastSB>(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept generic local dparen", value == 3 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); value = mpcastCopySBParam(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept SB param cast-copy use source", value == 33 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    value = mpcastCopySBLocal();
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept SB local cast-copy use source", value == 33 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { string source = "abc".copy(); value = mpcastCopyStringParam(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept string param cast-copy use source", value == 33 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    value = mpcastCopyStringLocal();
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept string local cast-copy use source", value == 33 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mpcastDtorCount = 0;
+    { MPCastSB2 source = default; source.value.value = 7; value = mpcastCopySB2Param(move source); }
+    passed += Test("mpcast accept SB2 param cast-copy use source", value == 77 && mpcastDtorCount == 2, true);
+
+    mpcastDtorCount = 0;
+    value = mpcastCopySB2Local();
+    passed += Test("mpcast accept SB2 local cast-copy use source", value == 77 && mpcastDtorCount == 2, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); value = mpcastCopyGenericParam<MPCastSB>(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept generic param cast-copy use source", value == 33 && mppAllocCount * 10 + mppFreeCount == 22, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); value = mpcastCopyGenericLocal<MPCastSB>(move source); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast accept generic local cast-copy use source", value == 33 && mppAllocCount * 10 + mppFreeCount == 33, true);
+
+    return passed;
+}
+
+int testMpcastIdentityCastReturns()
+{
+    int passed = 0;
+    int value = 0;
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastMoveSBCast(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return SB param cast value and free", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastMoveSBDParen(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return SB param dparen value and free", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0;
+    { MPCastSB2 source = default; source.value.value = 7; MPCastSB2 result = mpcastMoveSB2Cast(move source); value = result.value.value; }
+    passed += Test("mpcast return SB2 param cast value and dtor", value == 7 && mpcastDtorCount == 1, true);
+
+    mpcastDtorCount = 0;
+    { MPCastSB2 source = default; source.value.value = 7; MPCastSB2 result = mpcastMoveSB2DParen(move source); value = result.value.value; }
+    passed += Test("mpcast return SB2 param dparen value and dtor", value == 7 && mpcastDtorCount == 1, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> source = new MPCastD(); source->value = 7; unique<MPCastD> result = mpcastMoveUniqueCast(move source); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return unique param cast value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> source = new MPCastD(); source->value = 7; unique<MPCastD> result = mpcastMoveUniqueDParen(move source); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return unique param dparen value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> result = mpcastLocalUniqueCast(); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return unique local cast value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mpcastDtorCount = 0; mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { unique<MPCastD> result = mpcastLocalUniqueDParen(); value = result->value; }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return unique local dparen value dtor free", value == 7 && mpcastDtorCount == 1 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastMoveGenericCast<MPCastSB>(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return generic param cast value and free", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB source = default; source.value = "abc".copy(); MPCastSB result = mpcastMoveGenericDParen<MPCastSB>(move source); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return generic param dparen value and free", value == 3 && mppAllocCount * 10 + mppFreeCount == 11, true);
+
+    mppAllocCount = 0; mppFreeCount = 0;
+    __alloc_audit_hook = mppAuditAlloc; __free_audit_hook = mppAuditFree;
+    { MPCastSB a = default; a.value = "abc".copy(); MPCastSB b = default; b.value = "xy".copy(); MPCastSB result = mpcastMoveSBCastAssign(move a, move b); value = (int)result.value.length(); }
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    passed += Test("mpcast return cast of param assignment value and balanced", value == 2 && mppAllocCount == mppFreeCount, true);
 
     return passed;
 }
@@ -14210,6 +15044,455 @@ int testTempUniqueFieldBorrowAccepts()
     return passed;
 }
 
+int tempfldsinkDtors = 0;
+int tempfldsinkObserved = 0;
+
+struct TempfldsinkBox { string name = default; };
+struct TempfldsinkNested { TempfldsinkBox inner = default; };
+move string tempfldsinkSeedString() { return "leaf".copy(); }
+TempfldsinkBox tempfldsinkMakeBox()
+{
+    TempfldsinkBox box = default;
+    box.name = tempfldsinkSeedString();
+    return box;
+}
+TempfldsinkNested tempfldsinkMakeNested()
+{
+    TempfldsinkNested box = default;
+    box.inner.name = tempfldsinkSeedString();
+    return box;
+}
+
+struct TempfldsinkResource
+{
+    int id = 0;
+    TempfldsinkResource(int value) { id = value; }
+    ~TempfldsinkResource() { if (id != 0) tempfldsinkDtors = tempfldsinkDtors + 1; }
+};
+struct TempfldsinkResourceArray { TempfldsinkResource items[2]; };
+TempfldsinkResourceArray tempfldsinkMakeResourceArray()
+{
+    TempfldsinkResourceArray box = default;
+    box.items[0] = TempfldsinkResource(7);
+    box.items[1] = TempfldsinkResource(8);
+    return box;
+}
+TempfldsinkResource tempfldsinkReturnResourceArrayElement()
+{
+    return tempfldsinkMakeResourceArray().items[1];
+}
+int tempfldsinkReturnedResourceArrayValue()
+{
+    TempfldsinkResource value = tempfldsinkReturnResourceArrayElement();
+    return value.id;
+}
+move TempfldsinkResource tempfldsinkSeedResource() { return TempfldsinkResource(17); }
+struct TempfldsinkValueBox { TempfldsinkResource value = default; };
+struct TempfldsinkValueNested { TempfldsinkValueBox inner = default; };
+TempfldsinkValueBox tempfldsinkMakeValueBox()
+{
+    TempfldsinkValueBox box = default;
+    box.value = tempfldsinkSeedResource();
+    return box;
+}
+TempfldsinkValueNested tempfldsinkMakeValueNested()
+{
+    TempfldsinkValueNested box = default;
+    box.inner.value = tempfldsinkSeedResource();
+    return box;
+}
+
+struct TempfldsinkUniqueBox { unique<TempfldsinkResource> value = default; };
+struct TempfldsinkUniqueNested { TempfldsinkUniqueBox inner = default; };
+move unique<TempfldsinkResource> tempfldsinkSeedUnique()
+{
+    return unique<TempfldsinkResource>(new TempfldsinkResource(17));
+}
+TempfldsinkUniqueBox tempfldsinkMakeUniqueBox()
+{
+    TempfldsinkUniqueBox box = default;
+    box.value = tempfldsinkSeedUnique();
+    return box;
+}
+TempfldsinkUniqueNested tempfldsinkMakeUniqueNested()
+{
+    TempfldsinkUniqueNested box = default;
+    box.inner.value = tempfldsinkSeedUnique();
+    return box;
+}
+
+struct TempfldsinkGeneric<T> { T field = default; };
+TempfldsinkGeneric<T> tempfldsinkMakeGeneric<T>(move T value)
+{
+    TempfldsinkGeneric<T> box = default;
+    box.field = move value;
+    return box;
+}
+struct TempfldsinkFactory
+{
+    TempfldsinkBox makeBox() { return tempfldsinkMakeBox(); }
+    TempfldsinkValueBox makeValueBox() { return tempfldsinkMakeValueBox(); }
+    TempfldsinkUniqueBox makeUniqueBox() { return tempfldsinkMakeUniqueBox(); }
+};
+TempfldsinkFactory tempfldsinkFactory = default;
+
+struct TempfldsinkArrayBox { string arr[2]; };
+TempfldsinkArrayBox tempfldsinkMakeArrayBox()
+{
+    TempfldsinkArrayBox box = default;
+    box.arr[0] = tempfldsinkSeedString();
+    box.arr[1] = tempfldsinkSeedString();
+    return box;
+}
+int tempfldsinkArrayDecl0() { string value = tempfldsinkMakeArrayBox().arr[0]; return (int)value.length(); }
+int tempfldsinkArrayDecl1() { string value = tempfldsinkMakeArrayBox().arr[1]; return (int)value.length(); }
+int tempfldsinkArrayDeclDynamic() { int i = 1; string value = tempfldsinkMakeArrayBox().arr[i]; return (int)value.length(); }
+int tempfldsinkArrayAssign0() { string value = default; value = tempfldsinkMakeArrayBox().arr[0]; return (int)value.length(); }
+int tempfldsinkArrayAssign1() { string value = default; value = tempfldsinkMakeArrayBox().arr[1]; return (int)value.length(); }
+int tempfldsinkArrayAssignDynamic() { int i = 1; string value = default; value = tempfldsinkMakeArrayBox().arr[i]; return (int)value.length(); }
+int tempfldsinkArraySink0() { tempfldsinkStringSink(tempfldsinkMakeArrayBox().arr[0]); return tempfldsinkObserved; }
+int tempfldsinkArraySink1() { tempfldsinkStringSink(tempfldsinkMakeArrayBox().arr[1]); return tempfldsinkObserved; }
+int tempfldsinkArraySinkDynamic() { int i = 1; tempfldsinkStringSink(tempfldsinkMakeArrayBox().arr[i]); return tempfldsinkObserved; }
+string tempfldsinkArrayReturn0() { return tempfldsinkMakeArrayBox().arr[0]; }
+string tempfldsinkArrayReturn1() { return tempfldsinkMakeArrayBox().arr[1]; }
+string tempfldsinkArrayReturnDynamic() { int i = 1; return tempfldsinkMakeArrayBox().arr[i]; }
+int tempfldsinkArrayReturned0() { string value = tempfldsinkArrayReturn0(); return (int)value.length(); }
+int tempfldsinkArrayReturned1() { string value = tempfldsinkArrayReturn1(); return (int)value.length(); }
+int tempfldsinkArrayReturnedDynamic() { string value = tempfldsinkArrayReturnDynamic(); return (int)value.length(); }
+
+struct TempfldsinkPairBox { string name = default; string other = default; };
+TempfldsinkPairBox tempfldsinkMakePairBox()
+{
+    TempfldsinkPairBox box = default;
+    box.name = tempfldsinkSeedString();
+    box.other = tempfldsinkSeedString();
+    return box;
+}
+TempfldsinkPairBox tempfldsinkMakePairBoxAlt()
+{
+    TempfldsinkPairBox box = default;
+    box.name = "horse".copy();
+    box.other = "x".copy();
+    return box;
+}
+struct TempfldsinkPairNested { TempfldsinkPairBox inner = default; string tail = default; };
+TempfldsinkPairNested tempfldsinkMakePairNested()
+{
+    TempfldsinkPairNested box = default;
+    box.inner = tempfldsinkMakePairBox();
+    box.tail = "t".copy();
+    return box;
+}
+struct TempfldsinkPairArrayBox { TempfldsinkPairBox cs[2]; };
+TempfldsinkPairArrayBox tempfldsinkMakePairArrayBox()
+{
+    TempfldsinkPairArrayBox box = default;
+    box.cs[0].name = "cat".copy();
+    box.cs[0].other = "dogs".copy();
+    box.cs[1].name = "lion".copy();
+    box.cs[1].other = "tiger".copy();
+    return box;
+}
+int tempfldsinkPairNestedDecl()
+{
+    string value = (tempfldsinkMakePairNested()).inner.name;
+    return (int)value.length();
+}
+int tempfldsinkPairNestedSink()
+{
+    tempfldsinkStringSink((tempfldsinkMakePairNested()).inner.other);
+    return tempfldsinkObserved;
+}
+int tempfldsinkPairArrayFieldDecl()
+{
+    string value = tempfldsinkMakePairArrayBox().cs[1].name;
+    return (int)value.length();
+}
+int tempfldsinkPairArrayFieldSink()
+{
+    tempfldsinkStringSink(tempfldsinkMakePairArrayBox().cs[1].name);
+    return tempfldsinkObserved;
+}
+int tempfldsinkPairArrayFieldAssign()
+{
+    string value = default;
+    value = tempfldsinkMakePairArrayBox().cs[1].name;
+    return (int)value.length();
+}
+int tempfldsinkPairArrayElementDecl()
+{
+    TempfldsinkPairBox value = tempfldsinkMakePairArrayBox().cs[1];
+    return (int)value.name.length();
+}
+TempfldsinkPairBox tempfldsinkPairArrayReturnElement()
+{
+    return tempfldsinkMakePairArrayBox().cs[1];
+}
+int tempfldsinkPairArrayReturnedElement()
+{
+    TempfldsinkPairBox value = tempfldsinkPairArrayReturnElement();
+    return (int)value.name.length();
+}
+int tempfldsinkPairTernaryParenSink(bool useAlt)
+{
+    tempfldsinkStringSink((useAlt
+        ? tempfldsinkMakePairBoxAlt()
+        : tempfldsinkMakePairBox()).name);
+    return tempfldsinkObserved;
+}
+int tempfldsinkPairDeclBare() { string value = tempfldsinkMakePairBox().name; return (int)value.length(); }
+int tempfldsinkPairDeclParen() { string value = (tempfldsinkMakePairBox()).name; return (int)value.length(); }
+int tempfldsinkPairAssignBare() { string value = default; value = tempfldsinkMakePairBox().name; return (int)value.length(); }
+int tempfldsinkPairAssignParen() { string value = default; value = (tempfldsinkMakePairBox()).name; return (int)value.length(); }
+int tempfldsinkPairSinkBare() { tempfldsinkStringSink(tempfldsinkMakePairBox().name); return tempfldsinkObserved; }
+int tempfldsinkPairSinkParen() { tempfldsinkStringSink((tempfldsinkMakePairBox()).name); return tempfldsinkObserved; }
+int tempfldsinkPairBorrowBare() { tempfldsinkObserved = 0; tempfldsinkStringBorrow(tempfldsinkMakePairBox().name); return tempfldsinkObserved; }
+int tempfldsinkPairBorrowParen() { tempfldsinkObserved = 0; tempfldsinkStringBorrow((tempfldsinkMakePairBox()).name); return tempfldsinkObserved; }
+string tempfldsinkPairReturnBare() { return tempfldsinkMakePairBox().name; }
+string tempfldsinkPairReturnParen() { return (tempfldsinkMakePairBox()).name; }
+int tempfldsinkPairReturnedBare() { string value = tempfldsinkPairReturnBare(); return (int)value.length(); }
+int tempfldsinkPairReturnedParen() { string value = tempfldsinkPairReturnParen(); return (int)value.length(); }
+int tempfldsinkPairTupleBare() { tempfldsinkStringTupleSink((tempfldsinkMakePairBox().name, 1)); return tempfldsinkObserved; }
+int tempfldsinkPairTupleParen() { tempfldsinkStringTupleSink(((tempfldsinkMakePairBox()).name, 1)); return tempfldsinkObserved; }
+
+void tempfldsinkStringSink(move string value) { tempfldsinkObserved = value.length(); }
+void tempfldsinkStringBorrow(string value) { tempfldsinkObserved = value.length(); }
+void tempfldsinkStringTupleSink(move (string, int) value)
+{
+    tempfldsinkObserved = value.item_0.length() + value.item_1;
+}
+void tempfldsinkValueSink(move TempfldsinkResource value)
+{
+    tempfldsinkObserved = value.id;
+}
+void tempfldsinkValueTupleSink(move (TempfldsinkResource, int) value)
+{
+    tempfldsinkObserved = value.item_0.id + value.item_1;
+}
+void tempfldsinkUniqueTupleSink(move (unique<TempfldsinkResource>, int) value)
+{
+    tempfldsinkObserved = value.item_0->id + value.item_1;
+}
+
+int testTempFieldMoveSink()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 heapBaseline = (i64)HeapAudit.reportLeaks();
+
+    tempfldsinkStringSink(tempfldsinkMakeBox().name);
+    passed += Test("tempfldsink string call sink", tempfldsinkObserved, 4);
+    tempfldsinkStringSink(tempfldsinkMakeNested().inner.name);
+    passed += Test("tempfldsink string nested sink", tempfldsinkObserved, 4);
+    tempfldsinkStringSink(tempfldsinkFactory.makeBox().name);
+    passed += Test("tempfldsink string method sink", tempfldsinkObserved, 4);
+    tempfldsinkStringSink(tempfldsinkMakeGeneric<string>(tempfldsinkSeedString()).field);
+    passed += Test("tempfldsink string generic sink", tempfldsinkObserved, 4);
+
+    tempfldsinkStringTupleSink((tempfldsinkMakeBox().name, 1));
+    passed += Test("tempfldsink string call tuple", tempfldsinkObserved, 5);
+    tempfldsinkStringTupleSink((tempfldsinkMakeNested().inner.name, 1));
+    passed += Test("tempfldsink string nested tuple", tempfldsinkObserved, 5);
+    tempfldsinkStringTupleSink((tempfldsinkFactory.makeBox().name, 1));
+    passed += Test("tempfldsink string method tuple", tempfldsinkObserved, 5);
+    tempfldsinkStringTupleSink((tempfldsinkMakeGeneric<string>(tempfldsinkSeedString()).field, 1));
+    passed += Test("tempfldsink string generic tuple", tempfldsinkObserved, 5);
+    passed += Test("tempfldsink string sinks free all buffers",
+        (i64)HeapAudit.reportLeaks() - heapBaseline, (i64)0);
+
+    i64 tempfldsinkRound2Base = 0;
+    int tempfldsinkRound2Value = 0;
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayDecl0();
+    passed += Test("tempfldsink array decl index 0 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayDecl1();
+    passed += Test("tempfldsink array decl index 1 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayDeclDynamic();
+    passed += Test("tempfldsink array decl dynamic value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayAssign0();
+    passed += Test("tempfldsink array assign index 0 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayAssign1();
+    passed += Test("tempfldsink array assign index 1 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayAssignDynamic();
+    passed += Test("tempfldsink array assign dynamic value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArraySink0();
+    passed += Test("tempfldsink array sink index 0 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArraySink1();
+    passed += Test("tempfldsink array sink index 1 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArraySinkDynamic();
+    passed += Test("tempfldsink array sink dynamic value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayReturned0();
+    passed += Test("tempfldsink array return index 0 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayReturned1();
+    passed += Test("tempfldsink array return index 1 value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound2Value = tempfldsinkArrayReturnedDynamic();
+    passed += Test("tempfldsink array return dynamic value and cleanup",
+        tempfldsinkRound2Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base), 40);
+
+    int tempfldsinkBareValue = 0;
+    int tempfldsinkParenValue = 0;
+    i64 tempfldsinkBareLeaks = 0;
+    i64 tempfldsinkParenLeaks = 0;
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkBareValue = tempfldsinkPairDeclBare();
+    tempfldsinkBareLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base;
+    tempfldsinkParenValue = tempfldsinkPairDeclParen();
+    tempfldsinkParenLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base - tempfldsinkBareLeaks;
+    passed += Test("tempfldsink paren decl matches bare value and cleanup",
+        tempfldsinkBareValue * 1000 + tempfldsinkParenValue * 100
+            + (int)tempfldsinkBareLeaks * 10 + (int)tempfldsinkParenLeaks, 4400);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkBareValue = tempfldsinkPairAssignBare();
+    tempfldsinkBareLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base;
+    tempfldsinkParenValue = tempfldsinkPairAssignParen();
+    tempfldsinkParenLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base - tempfldsinkBareLeaks;
+    passed += Test("tempfldsink paren assign matches bare value and cleanup",
+        tempfldsinkBareValue * 1000 + tempfldsinkParenValue * 100
+            + (int)tempfldsinkBareLeaks * 10 + (int)tempfldsinkParenLeaks, 4400);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkBareValue = tempfldsinkPairSinkBare();
+    tempfldsinkBareLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base;
+    tempfldsinkParenValue = tempfldsinkPairSinkParen();
+    tempfldsinkParenLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base - tempfldsinkBareLeaks;
+    passed += Test("tempfldsink paren sink matches bare value and cleanup",
+        tempfldsinkBareValue * 1000 + tempfldsinkParenValue * 100
+            + (int)tempfldsinkBareLeaks * 10 + (int)tempfldsinkParenLeaks, 4400);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkBareValue = tempfldsinkPairBorrowBare();
+    tempfldsinkBareLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base;
+    tempfldsinkParenValue = tempfldsinkPairBorrowParen();
+    tempfldsinkParenLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base - tempfldsinkBareLeaks;
+    passed += Test("tempfldsink paren borrow matches bare value and cleanup",
+        tempfldsinkBareValue * 1000 + tempfldsinkParenValue * 100
+            + (int)tempfldsinkBareLeaks * 10 + (int)tempfldsinkParenLeaks, 4400);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkBareValue = tempfldsinkPairReturnedBare();
+    tempfldsinkBareLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base;
+    tempfldsinkParenValue = tempfldsinkPairReturnedParen();
+    tempfldsinkParenLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base - tempfldsinkBareLeaks;
+    passed += Test("tempfldsink paren return matches bare value and cleanup",
+        tempfldsinkBareValue * 1000 + tempfldsinkParenValue * 100
+            + (int)tempfldsinkBareLeaks * 10 + (int)tempfldsinkParenLeaks, 4400);
+    tempfldsinkRound2Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkBareValue = tempfldsinkPairTupleBare();
+    tempfldsinkBareLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base;
+    tempfldsinkParenValue = tempfldsinkPairTupleParen();
+    tempfldsinkParenLeaks = (i64)HeapAudit.reportLeaks() - tempfldsinkRound2Base - tempfldsinkBareLeaks;
+    passed += Test("tempfldsink paren tuple matches bare value and cleanup",
+        tempfldsinkBareValue * 1000 + tempfldsinkParenValue * 100
+            + (int)tempfldsinkBareLeaks * 10 + (int)tempfldsinkParenLeaks, 5500);
+
+    tempfldsinkDtors = 0;
+    tempfldsinkValueSink(tempfldsinkMakeValueBox().value);
+    passed += Test("tempfldsink value call sink", tempfldsinkObserved * 10 + tempfldsinkDtors, 171);
+    tempfldsinkDtors = 0;
+    tempfldsinkValueSink(tempfldsinkMakeValueNested().inner.value);
+    passed += Test("tempfldsink value nested sink", tempfldsinkObserved * 10 + tempfldsinkDtors, 171);
+    tempfldsinkDtors = 0;
+    tempfldsinkValueSink(tempfldsinkFactory.makeValueBox().value);
+    passed += Test("tempfldsink value method sink", tempfldsinkObserved * 10 + tempfldsinkDtors, 171);
+    tempfldsinkDtors = 0;
+    tempfldsinkValueSink(tempfldsinkMakeGeneric<TempfldsinkResource>(tempfldsinkSeedResource()).field);
+    passed += Test("tempfldsink value generic sink", tempfldsinkObserved * 10 + tempfldsinkDtors, 171);
+
+    tempfldsinkDtors = 0;
+    tempfldsinkValueTupleSink((tempfldsinkMakeValueBox().value, 1));
+    passed += Test("tempfldsink value call tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+    tempfldsinkDtors = 0;
+    tempfldsinkValueTupleSink((tempfldsinkMakeValueNested().inner.value, 1));
+    passed += Test("tempfldsink value nested tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+    tempfldsinkDtors = 0;
+    tempfldsinkValueTupleSink((tempfldsinkFactory.makeValueBox().value, 1));
+    passed += Test("tempfldsink value method tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+    tempfldsinkDtors = 0;
+    tempfldsinkValueTupleSink((tempfldsinkMakeGeneric<TempfldsinkResource>(tempfldsinkSeedResource()).field, 1));
+    passed += Test("tempfldsink value generic tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+
+    tempfldsinkDtors = 0;
+    tempfldsinkUniqueTupleSink((tempfldsinkMakeUniqueBox().value, 1));
+    passed += Test("tempfldsink unique call tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+    tempfldsinkDtors = 0;
+    tempfldsinkUniqueTupleSink((tempfldsinkMakeUniqueNested().inner.value, 1));
+    passed += Test("tempfldsink unique nested tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+    tempfldsinkDtors = 0;
+    tempfldsinkUniqueTupleSink((tempfldsinkFactory.makeUniqueBox().value, 1));
+    passed += Test("tempfldsink unique method tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+    tempfldsinkDtors = 0;
+    tempfldsinkUniqueTupleSink((tempfldsinkMakeGeneric<unique<TempfldsinkResource>>(tempfldsinkSeedUnique()).field, 1));
+    passed += Test("tempfldsink unique generic tuple", tempfldsinkObserved * 10 + tempfldsinkDtors, 181);
+
+    i64 tempfldsinkRound3Base = 0;
+    int tempfldsinkRound3Value = 0;
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairNestedDecl();
+    passed += Test("tempfldsink nested paren field decl value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairNestedSink();
+    passed += Test("tempfldsink nested paren field sink value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairArrayFieldDecl();
+    passed += Test("tempfldsink struct array field decl value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairArrayFieldSink();
+    passed += Test("tempfldsink struct array field sink value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairArrayFieldAssign();
+    passed += Test("tempfldsink struct array field assign value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairArrayElementDecl();
+    passed += Test("tempfldsink struct array element decl value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairArrayReturnedElement();
+    passed += Test("tempfldsink struct array element return value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+
+    tempfldsinkDtors = 0;
+    tempfldsinkRound3Value = tempfldsinkReturnedResourceArrayValue();
+    passed += Test("tempfldsink resource array return value and dtors",
+        tempfldsinkRound3Value * 10 + tempfldsinkDtors, 82);
+
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairTernaryParenSink(false);
+    passed += Test("tempfldsink ternary paren sink false arm value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 40);
+    tempfldsinkRound3Base = (i64)HeapAudit.reportLeaks();
+    tempfldsinkRound3Value = tempfldsinkPairTernaryParenSink(true);
+    passed += Test("tempfldsink ternary paren sink true arm value and no leak",
+        tempfldsinkRound3Value * 10 + (int)((i64)HeapAudit.reportLeaks() - tempfldsinkRound3Base), 50);
+
+    return passed;
+}
+
 int testDiscardMoveReturningCall()
 {
     int passed = 0;
@@ -18623,6 +19906,13 @@ extern int main()
     passed += testValueMoveArgDeferred();
     total += 5;
 
+    passed += testMoveParamParenAndCopy();
+    passed += testMpcastAcceptSet();
+    passed += testMpcastIdentityCastReturns();
+    total += 78;
+    total += 28;
+    total += 11;
+
     passed += testPtrMoveOverloadIdentity();
     total += 13;
 
@@ -18673,6 +19963,9 @@ extern int main()
 
     passed += testTempUniqueFieldBorrowAccepts();
     total += 134;
+
+    passed += testTempFieldMoveSink();
+    total += 49;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
@@ -19133,7 +20426,8 @@ extern int main()
     passed += testT364NativeOperatorReturnFacts();
     passed += testMix9ReleaseReturn();
     passed += uqrawAcceptLegs();
-    total += 94; // UQRAW and TUPSAFE accept-set legs (uqrawAcceptLegs)
+    total += 152; // UQRAW, TUPSAFE and MVSINKSLOT accept-set legs (uqrawAcceptLegs)
+    total += 28; // MVSLOTLEFT round 2 element and sibling-path legs
     total += 4; // release() results returned as bare pointers (heap-array gate)
     total += 97; // mvfield legs and four CALLEEREF accept-set legs
     passed += testT523ByrefClosureRebind();
@@ -25942,6 +27236,246 @@ int uqrawValueTakeTuple((UqrawLiveBox, int) t) { return t.item_1; }
 int uqrawValueTakeNested(((UqrawLiveBox, int), int) t) { return t.item_0.item_1 + t.item_1; }
 int uqrawMoveParamValueSlot(move UqrawLiveBox b) { return uqrawValueTakeTuple((b, 3)); }
 int uqrawMoveParamValueNested(move UqrawLiveBox b) { return uqrawValueTakeNested(((b, 5), 2)); }
+int uqrawMvsLiveFlatSink(move (UqrawLiveBox, int) t) { return t.item_0.v; }
+int uqrawMvsLiveBorrowSink((UqrawLiveBox, int) t) { return t.item_0.v; }
+int uqrawMvsLiveNestedSink(move ((UqrawLiveBox, int), int) t) { return t.item_0.item_0.v; }
+int uqrawMvsLiveScalarSink(move UqrawLiveBox t) { return t.v; }
+int uqrawMvsLiveMoveParamFlat(move UqrawLiveBox x) { return uqrawMvsLiveFlatSink((x, 7)); }
+int uqrawMvsLiveMoveParamBorrow(move UqrawLiveBox x) { return uqrawMvsLiveBorrowSink((x, 7)); }
+int uqrawMvsLiveMoveParamNested(move UqrawLiveBox x) { return uqrawMvsLiveNestedSink(((x, 7), 8)); }
+int uqrawMvsLiveMoveParamScalar(move UqrawLiveBox x) { return uqrawMvsLiveScalarSink(x); }
+int uqrawMvsLiveLocalFlat() { UqrawLiveBox x = default; x.v = 6; return uqrawMvsLiveFlatSink((x, 7)); }
+int uqrawMvsLiveLocalBorrow() { UqrawLiveBox x = default; x.v = 6; return uqrawMvsLiveBorrowSink((x, 7)); }
+int uqrawMvsLiveLocalNested() { UqrawLiveBox x = default; x.v = 6; return uqrawMvsLiveNestedSink(((x, 7), 8)); }
+int uqrawMvsLiveLocalScalar() { UqrawLiveBox x = default; x.v = 6; return uqrawMvsLiveScalarSink(x); }
+int uqrawMvsLiveExplicitFlat(move UqrawLiveBox x) { return uqrawMvsLiveFlatSink((move x, 7)); }
+int uqrawMvsLiveExplicitBorrow(move UqrawLiveBox x) { return uqrawMvsLiveBorrowSink((move x, 7)); }
+int uqrawMvsLiveExplicitNested(move UqrawLiveBox x) { return uqrawMvsLiveNestedSink(((move x, 7), 8)); }
+int uqrawMvsLiveExplicitScalar(move UqrawLiveBox x) { return uqrawMvsLiveScalarSink(move x); }
+int uqrawMvsHolderFlatSink(move (UqrawValueHolder, int) t) { return t.item_0.u->v; }
+int uqrawMvsHolderBorrowSink((UqrawValueHolder, int) t) { return t.item_0.u->v; }
+int uqrawMvsHolderNestedSink(move ((UqrawValueHolder, int), int) t) { return t.item_0.item_0.u->v; }
+int uqrawMvsHolderScalarSink(move UqrawValueHolder t) { return t.u->v; }
+int uqrawMvsHolderMoveParamFlat(move UqrawValueHolder x) { return uqrawMvsHolderFlatSink((x, 7)); }
+int uqrawMvsHolderMoveParamBorrow(move UqrawValueHolder x) { return uqrawMvsHolderBorrowSink((x, 7)); }
+int uqrawMvsHolderMoveParamNested(move UqrawValueHolder x) { return uqrawMvsHolderNestedSink(((x, 7), 8)); }
+int uqrawMvsHolderMoveParamScalar(move UqrawValueHolder x) { return uqrawMvsHolderScalarSink(x); }
+int uqrawMvsHolderLocalFlat() { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; return uqrawMvsHolderFlatSink((x, 7)); }
+int uqrawMvsHolderLocalBorrow() { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; return uqrawMvsHolderBorrowSink((x, 7)); }
+int uqrawMvsHolderLocalNested() { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; return uqrawMvsHolderNestedSink(((x, 7), 8)); }
+int uqrawMvsHolderLocalScalar() { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; return uqrawMvsHolderScalarSink(x); }
+int uqrawMvsHolderExplicitFlat(move UqrawValueHolder x) { return uqrawMvsHolderFlatSink((move x, 7)); }
+int uqrawMvsHolderExplicitBorrow(move UqrawValueHolder x) { return uqrawMvsHolderBorrowSink((move x, 7)); }
+int uqrawMvsHolderExplicitNested(move UqrawValueHolder x) { return uqrawMvsHolderNestedSink(((move x, 7), 8)); }
+int uqrawMvsHolderExplicitScalar(move UqrawValueHolder x) { return uqrawMvsHolderScalarSink(move x); }
+int uqrawMvsUniqueFlatSink(move (unique<UqrawBox>, int) t) { return t.item_0->v; }
+int uqrawMvsUniqueBorrowSink((unique<UqrawBox>, int) t) { return t.item_0->v; }
+int uqrawMvsUniqueNestedSink(move ((unique<UqrawBox>, int), int) t) { return t.item_0.item_0->v; }
+int uqrawMvsUniqueScalarSink(move unique<UqrawBox> t) { return t->v; }
+int uqrawMvsUniqueMoveParamFlat(move unique<UqrawBox> x) { return uqrawMvsUniqueFlatSink((x, 7)); }
+int uqrawMvsUniqueMoveParamBorrow(move unique<UqrawBox> x) { return uqrawMvsUniqueBorrowSink((x, 7)); }
+int uqrawMvsUniqueMoveParamNested(move unique<UqrawBox> x) { return uqrawMvsUniqueNestedSink(((x, 7), 8)); }
+int uqrawMvsUniqueMoveParamScalar(move unique<UqrawBox> x) { return uqrawMvsUniqueScalarSink(x); }
+int uqrawMvsUniqueLocalFlat() { unique<UqrawBox> x = new UqrawBox(); x->v = 6; return uqrawMvsUniqueFlatSink((x, 7)); }
+int uqrawMvsUniqueLocalBorrow() { unique<UqrawBox> x = new UqrawBox(); x->v = 6; return uqrawMvsUniqueBorrowSink((x, 7)); }
+int uqrawMvsUniqueLocalNested() { unique<UqrawBox> x = new UqrawBox(); x->v = 6; return uqrawMvsUniqueNestedSink(((x, 7), 8)); }
+int uqrawMvsUniqueLocalScalar() { unique<UqrawBox> x = new UqrawBox(); x->v = 6; return uqrawMvsUniqueScalarSink(x); }
+int uqrawMvsUniqueExplicitFlat(move unique<UqrawBox> x) { return uqrawMvsUniqueFlatSink((move x, 7)); }
+int uqrawMvsUniqueExplicitBorrow(move unique<UqrawBox> x) { return uqrawMvsUniqueBorrowSink((move x, 7)); }
+int uqrawMvsUniqueExplicitNested(move unique<UqrawBox> x) { return uqrawMvsUniqueNestedSink(((move x, 7), 8)); }
+int uqrawMvsUniqueExplicitScalar(move unique<UqrawBox> x) { return uqrawMvsUniqueScalarSink(move x); }
+int uqrawMvsUniqueByvalueFlat(unique<UqrawBox> x) { return uqrawMvsUniqueFlatSink((x, 7)); }
+int uqrawMvsUniqueByvalueBorrow(unique<UqrawBox> x) { return uqrawMvsUniqueBorrowSink((x, 7)); }
+int uqrawMvsUniqueByvalueNested(unique<UqrawBox> x) { return uqrawMvsUniqueNestedSink(((x, 7), 8)); }
+int uqrawMvsUniqueByvalueScalar(unique<UqrawBox> x) { return uqrawMvsUniqueScalarSink(x); }
+struct UqrawMvsHolderOuter { UqrawValueHolder h = default; };
+struct UqrawMvsHolderNested { UqrawMvsHolderOuter outer = default; };
+struct UqrawMvsHolderPair { UqrawValueHolder left = default; UqrawValueHolder right = default; };
+struct UqrawMvsHolderArrayOwner { UqrawValueHolder[2] hs = default; };
+struct UqrawMvsArrayLeaf { UqrawValueHolder f = default; };
+struct UqrawMvsArrayOwner { UqrawMvsArrayLeaf[2] hs = default; };
+int uqrawMvsHolderIndexCalls = 0;
+int uqrawMvsHolderIndexOnce()
+{
+    uqrawMvsHolderIndexCalls = uqrawMvsHolderIndexCalls + 1;
+    return uqrawMvsHolderIndexCalls - 1;
+}
+int uqrawMvsHolderPairScalarSink(move UqrawValueHolder a, move UqrawValueHolder b)
+{
+    return a.u->v * 10 + b.u->v;
+}
+int uqrawMvsHolderPairTupleSink(move (UqrawValueHolder, UqrawValueHolder) t)
+{
+    return t.item_0.u->v * 10 + t.item_1.u->v;
+}
+int uqrawMvsHolderLocalScalarFn()
+{
+    UqrawValueHolder x = default;
+    x.u = new UqrawBox();
+    x.u->v = 6;
+    function<int(move UqrawValueHolder)> fp = uqrawMvsHolderScalarSink;
+    return fp(x);
+}
+int uqrawMvsHolderLocalFieldScalar()
+{
+    UqrawMvsHolderOuter x = default;
+    x.h.u = new UqrawBox();
+    x.h.u->v = 6;
+    return uqrawMvsHolderScalarSink(x.h);
+}
+int uqrawMvsHolderLocalFieldScalarFn()
+{
+    UqrawMvsHolderOuter x = default;
+    x.h.u = new UqrawBox();
+    x.h.u->v = 6;
+    function<int(move UqrawValueHolder)> fp = uqrawMvsHolderScalarSink;
+    return fp(x.h);
+}
+int uqrawMvsHolderNestedFieldScalar()
+{
+    UqrawMvsHolderNested x = default;
+    x.outer.h.u = new UqrawBox();
+    x.outer.h.u->v = 6;
+    return uqrawMvsHolderScalarSink(x.outer.h);
+}
+int uqrawMvsHolderNestedFieldScalarFn()
+{
+    UqrawMvsHolderNested x = default;
+    x.outer.h.u = new UqrawBox();
+    x.outer.h.u->v = 6;
+    function<int(move UqrawValueHolder)> fp = uqrawMvsHolderScalarSink;
+    return fp(x.outer.h);
+}
+int uqrawMvsHolderTernaryLocalScalar()
+{
+    UqrawValueHolder a = default;
+    UqrawValueHolder b = default;
+    a.u = new UqrawBox();
+    b.u = new UqrawBox();
+    a.u->v = 4;
+    b.u->v = 6;
+    bool c = true;
+    return uqrawMvsHolderScalarSink(c ? a : b);
+}
+int uqrawMvsHolderTernaryLocalScalarFn()
+{
+    UqrawValueHolder a = default;
+    UqrawValueHolder b = default;
+    a.u = new UqrawBox();
+    b.u = new UqrawBox();
+    a.u->v = 4;
+    b.u->v = 6;
+    bool c = true;
+    function<int(move UqrawValueHolder)> fp = uqrawMvsHolderScalarSink;
+    return fp(c ? a : b);
+}
+int uqrawMvsHolderTernaryFieldScalar()
+{
+    UqrawMvsHolderOuter a = default;
+    UqrawMvsHolderOuter b = default;
+    a.h.u = new UqrawBox();
+    b.h.u = new UqrawBox();
+    a.h.u->v = 4;
+    b.h.u->v = 6;
+    bool c = true;
+    return uqrawMvsHolderScalarSink(c ? a.h : b.h);
+}
+int uqrawMvsHolderTernaryFieldScalarFn()
+{
+    UqrawMvsHolderOuter a = default;
+    UqrawMvsHolderOuter b = default;
+    a.h.u = new UqrawBox();
+    b.h.u = new UqrawBox();
+    a.h.u->v = 4;
+    b.h.u->v = 6;
+    bool c = true;
+    function<int(move UqrawValueHolder)> fp = uqrawMvsHolderScalarSink;
+    return fp(c ? a.h : b.h);
+}
+int uqrawMvsHolderLocalFlatFn()
+{
+    UqrawValueHolder x = default;
+    x.u = new UqrawBox();
+    x.u->v = 6;
+    function<int(move (UqrawValueHolder, int))> fp = uqrawMvsHolderFlatSink;
+    return fp((x, 7));
+}
+int uqrawMvsHolderLocalFieldFlat()
+{
+    UqrawMvsHolderOuter x = default;
+    x.h.u = new UqrawBox();
+    x.h.u->v = 6;
+    return uqrawMvsHolderFlatSink((x.h, 7));
+}
+int uqrawMvsHolderLocalFieldFlatFn()
+{
+    UqrawMvsHolderOuter x = default;
+    x.h.u = new UqrawBox();
+    x.h.u->v = 6;
+    function<int(move (UqrawValueHolder, int))> fp = uqrawMvsHolderFlatSink;
+    return fp((x.h, 7));
+}
+int uqrawMvsHolderNestedFieldFlat()
+{
+    UqrawMvsHolderNested x = default;
+    x.outer.h.u = new UqrawBox();
+    x.outer.h.u->v = 6;
+    return uqrawMvsHolderFlatSink((x.outer.h, 7));
+}
+int uqrawMvsHolderNestedFieldFlatFn()
+{
+    UqrawMvsHolderNested x = default;
+    x.outer.h.u = new UqrawBox();
+    x.outer.h.u->v = 6;
+    function<int(move (UqrawValueHolder, int))> fp = uqrawMvsHolderFlatSink;
+    return fp((x.outer.h, 7));
+}
+int uqrawMvsHolderTernaryLocalFlat()
+{
+    UqrawValueHolder a = default;
+    UqrawValueHolder b = default;
+    a.u = new UqrawBox();
+    b.u = new UqrawBox();
+    a.u->v = 4;
+    b.u->v = 6;
+    bool c = true;
+    return uqrawMvsHolderFlatSink((c ? a : b, 7));
+}
+int uqrawMvsHolderTernaryLocalFlatFn()
+{
+    UqrawValueHolder a = default;
+    UqrawValueHolder b = default;
+    a.u = new UqrawBox();
+    b.u = new UqrawBox();
+    a.u->v = 4;
+    b.u->v = 6;
+    bool c = true;
+    function<int(move (UqrawValueHolder, int))> fp = uqrawMvsHolderFlatSink;
+    return fp((c ? a : b, 7));
+}
+int uqrawMvsHolderTernaryFieldFlat()
+{
+    UqrawMvsHolderOuter a = default;
+    UqrawMvsHolderOuter b = default;
+    a.h.u = new UqrawBox();
+    b.h.u = new UqrawBox();
+    a.h.u->v = 4;
+    b.h.u->v = 6;
+    bool c = true;
+    return uqrawMvsHolderFlatSink((c ? a.h : b.h, 7));
+}
+int uqrawMvsHolderTernaryFieldFlatFn()
+{
+    UqrawMvsHolderOuter a = default;
+    UqrawMvsHolderOuter b = default;
+    a.h.u = new UqrawBox();
+    b.h.u = new UqrawBox();
+    a.h.u->v = 4;
+    b.h.u->v = 6;
+    bool c = true;
+    function<int(move (UqrawValueHolder, int))> fp = uqrawMvsHolderFlatSink;
+    return fp((c ? a.h : b.h, 7));
+}
 // TUPSAFE r9: a declared move unique param takes the same tuple-declaration transfer a scalar decl does.
 int uqrawMoveParamDeclTuple(move unique<UqrawBox> u)
 {
@@ -26411,6 +27945,182 @@ int uqrawAcceptLegs()
         passed += Test("tupsafe value move param nested value", uqrawMoveParamValueNested(move boxNested), 7);
     }
     passed += Test("tupsafe value move param nested dtor once", uqrawLiveDtors, 1);
+    // MVSINKSLOT: every owning tuple-slot spelling matches its scalar sink in value and destroys once.
+    int mvsResult = 0;
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveMoveParamFlat(move x); }
+    passed += Test("mvsinkslot live moveparam flat value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveMoveParamBorrow(move x); }
+    passed += Test("mvsinkslot live moveparam borrow value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveMoveParamNested(move x); }
+    passed += Test("mvsinkslot live moveparam nested value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveMoveParamScalar(move x); }
+    passed += Test("mvsinkslot live moveparam scalar value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    mvsResult = uqrawMvsLiveLocalFlat();
+    passed += Test("mvsinkslot live local flat value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    mvsResult = uqrawMvsLiveLocalBorrow();
+    passed += Test("mvsinkslot live local borrow value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    mvsResult = uqrawMvsLiveLocalNested();
+    passed += Test("mvsinkslot live local nested value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    mvsResult = uqrawMvsLiveLocalScalar();
+    passed += Test("mvsinkslot live local scalar value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveExplicitFlat(move x); }
+    passed += Test("mvsinkslot live explicit flat value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveExplicitBorrow(move x); }
+    passed += Test("mvsinkslot live explicit borrow value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveExplicitNested(move x); }
+    passed += Test("mvsinkslot live explicit nested value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawLiveDtors = 0;
+    { UqrawLiveBox x = default; x.v = 6; mvsResult = uqrawMvsLiveExplicitScalar(move x); }
+    passed += Test("mvsinkslot live explicit scalar value+dtor", mvsResult * 10 + uqrawLiveDtors, 61);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderMoveParamFlat(move x); }
+    passed += Test("mvsinkslot holder moveparam flat value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderMoveParamBorrow(move x); }
+    passed += Test("mvsinkslot holder moveparam borrow value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderMoveParamNested(move x); }
+    passed += Test("mvsinkslot holder moveparam nested value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderMoveParamScalar(move x); }
+    passed += Test("mvsinkslot holder moveparam scalar value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalFlat();
+    passed += Test("mvsinkslot holder local flat value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalBorrow();
+    passed += Test("mvsinkslot holder local borrow value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalNested();
+    passed += Test("mvsinkslot holder local nested value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalScalar();
+    passed += Test("mvsinkslot holder local scalar value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalScalarFn();
+    passed += Test("mvslotleft accept local scalar function value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalFieldScalar();
+    passed += Test("mvslotleft accept local field scalar+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalFieldScalarFn();
+    passed += Test("mvslotleft accept local field scalar function value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderNestedFieldScalar();
+    passed += Test("mvslotleft accept nested field scalar+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderNestedFieldScalarFn();
+    passed += Test("mvslotleft accept nested field scalar function value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryLocalScalar();
+    passed += Test("mvslotleft accept ternary local scalar+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryLocalScalarFn();
+    passed += Test("mvslotleft accept ternary local scalar function value+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryFieldScalar();
+    passed += Test("mvslotleft accept ternary field scalar+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryFieldScalarFn();
+    passed += Test("mvslotleft accept ternary field scalar function value+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalFlatFn();
+    passed += Test("mvslotleft tuple local function value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalFieldFlat();
+    passed += Test("mvslotleft tuple local field+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderLocalFieldFlatFn();
+    passed += Test("mvslotleft tuple local field function value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderNestedFieldFlat();
+    passed += Test("mvslotleft tuple nested field+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderNestedFieldFlatFn();
+    passed += Test("mvslotleft tuple nested field function value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryLocalFlat();
+    passed += Test("mvslotleft tuple ternary local+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryLocalFlatFn();
+    passed += Test("mvslotleft tuple ternary local function value+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryFieldFlat();
+    passed += Test("mvslotleft tuple ternary field+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsHolderTernaryFieldFlatFn();
+    passed += Test("mvslotleft tuple ternary field function value+dtors", mvsResult * 10 + uqrawDtors, 42);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderExplicitFlat(move x); }
+    passed += Test("mvsinkslot holder explicit flat value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderExplicitBorrow(move x); }
+    passed += Test("mvsinkslot holder explicit borrow value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderExplicitNested(move x); }
+    passed += Test("mvsinkslot holder explicit nested value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { UqrawValueHolder x = default; x.u = new UqrawBox(); x.u->v = 6; mvsResult = uqrawMvsHolderExplicitScalar(move x); }
+    passed += Test("mvsinkslot holder explicit scalar value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueMoveParamFlat(move x); }
+    passed += Test("mvsinkslot unique moveparam flat value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueMoveParamBorrow(move x); }
+    passed += Test("mvsinkslot unique moveparam borrow value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueMoveParamNested(move x); }
+    passed += Test("mvsinkslot unique moveparam nested value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueMoveParamScalar(move x); }
+    passed += Test("mvsinkslot unique moveparam scalar value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsUniqueLocalFlat();
+    passed += Test("mvsinkslot unique local flat value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsUniqueLocalBorrow();
+    passed += Test("mvsinkslot unique local borrow value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsUniqueLocalNested();
+    passed += Test("mvsinkslot unique local nested value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    mvsResult = uqrawMvsUniqueLocalScalar();
+    passed += Test("mvsinkslot unique local scalar value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueExplicitFlat(move x); }
+    passed += Test("mvsinkslot unique explicit flat value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueExplicitBorrow(move x); }
+    passed += Test("mvsinkslot unique explicit borrow value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueExplicitNested(move x); }
+    passed += Test("mvsinkslot unique explicit nested value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueExplicitScalar(move x); }
+    passed += Test("mvsinkslot unique explicit scalar value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueByvalueFlat(x); }
+    passed += Test("mvsinkslot unique byvalue flat value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueByvalueBorrow(x); }
+    passed += Test("mvsinkslot unique byvalue borrow value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueByvalueNested(x); }
+    passed += Test("mvsinkslot unique byvalue nested value+dtor", mvsResult * 10 + uqrawDtors, 61);
+    uqrawDtors = 0;
+    { unique<UqrawBox> x = new UqrawBox(); x->v = 6; mvsResult = uqrawMvsUniqueByvalueScalar(x); }
+    passed += Test("mvsinkslot unique byvalue scalar value+dtor", mvsResult * 10 + uqrawDtors, 61);
     // TUPSAFE r9: a unique move param in a tuple declaration (flat and nested) transfers once.
     uqrawDtors = 0;
     {
@@ -26431,5 +28141,235 @@ int uqrawAcceptLegs()
         unique<UqrawBox> spare = uqrawMk(4);
         uqrawTakeNested(((uqrawGlobalOwner, 7), spare));
     }
+
+    // MVSLOTLEFT r2 checks array element transfer, single index evaluation, and path overlap.
+    HeapAudit.enable();
+    i64 mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    int mvslotR2Result = 0;
+    int mvslotR2NullCount = 0;
+    uqrawDtors = 0;
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(6);
+        arr[0].u->v = 6;
+        mvslotR2Result = uqrawMvsHolderFlatSink((arr[0], 7));
+        mvslotR2NullCount = arr[0].u.get() == nullptr ? 1 : 0;
+    }
+    passed += Test("mvslotleft r2 tuple array element value and null",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 611);
+    passed += Test("mvslotleft r2 tuple array element heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(6);
+        arr[0].u->v = 6;
+        mvslotR2Result = uqrawMvsHolderScalarSink(arr[0]);
+        mvslotR2NullCount = arr[0].u.get() == nullptr ? 1 : 0;
+    }
+    passed += Test("mvslotleft r2 scalar array element twin value and null",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 611);
+    passed += Test("mvslotleft r2 scalar array element twin heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawMvsHolderArrayOwner x = default;
+        x.hs[1].u = uqrawMk(7);
+        x.hs[1].u->v = 7;
+        mvslotR2Result = uqrawMvsHolderFlatSink((x.hs[1], 7));
+        mvslotR2NullCount = x.hs[1].u.get() == nullptr ? 1 : 0;
+    }
+    passed += Test("mvslotleft r2 tuple field array element value and null",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 711);
+    passed += Test("mvslotleft r2 tuple field array element heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawMvsHolderArrayOwner x = default;
+        x.hs[1].u = uqrawMk(7);
+        x.hs[1].u->v = 7;
+        mvslotR2Result = uqrawMvsHolderScalarSink(x.hs[1]);
+        mvslotR2NullCount = x.hs[1].u.get() == nullptr ? 1 : 0;
+    }
+    passed += Test("mvslotleft r2 scalar field array element twin value and null",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 711);
+    passed += Test("mvslotleft r2 scalar field array element twin heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawMvsArrayOwner x = default;
+        x.hs[1].f.u = uqrawMk(7);
+        x.hs[1].f.u->v = 7;
+        int i = 1;
+        mvslotR2Result = uqrawMvsHolderFlatSink((x.hs[i].f, 7));
+        mvslotR2NullCount = x.hs[1].f.u.get() == nullptr ? 1 : 0;
+    }
+    passed += Test("mvslotleft r2 tuple nested dynamic element value and null",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 711);
+    passed += Test("mvslotleft r2 tuple nested dynamic element heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawMvsArrayOwner x = default;
+        x.hs[1].f.u = uqrawMk(7);
+        x.hs[1].f.u->v = 7;
+        int i = 1;
+        mvslotR2Result = uqrawMvsHolderScalarSink(x.hs[i].f);
+        mvslotR2NullCount = x.hs[1].f.u.get() == nullptr ? 1 : 0;
+    }
+    passed += Test("mvslotleft r2 scalar nested dynamic element twin value and null",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 711);
+    passed += Test("mvslotleft r2 scalar nested dynamic element twin heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(5);
+        arr[1].u = uqrawMk(2);
+        arr[0].u->v = 5;
+        arr[1].u->v = 2;
+        mvslotR2Result = uqrawMvsHolderPairTupleSink((arr[0], arr[1]));
+        mvslotR2NullCount = (arr[0].u.get() == nullptr ? 1 : 0)
+            + (arr[1].u.get() == nullptr ? 1 : 0);
+    }
+    passed += Test("mvslotleft r2 tuple distinct constant elements value null dtors",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 5222);
+    passed += Test("mvslotleft r2 tuple distinct constant elements heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(5);
+        arr[1].u = uqrawMk(2);
+        arr[0].u->v = 5;
+        arr[1].u->v = 2;
+        mvslotR2Result = uqrawMvsHolderPairScalarSink(arr[0], arr[1]);
+        mvslotR2NullCount = (arr[0].u.get() == nullptr ? 1 : 0)
+            + (arr[1].u.get() == nullptr ? 1 : 0);
+    }
+    passed += Test("mvslotleft r2 scalar distinct constant elements twin value null dtors",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 5222);
+    passed += Test("mvslotleft r2 scalar distinct constant elements twin heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(5);
+        arr[1].u = uqrawMk(2);
+        arr[0].u->v = 5;
+        arr[1].u->v = 2;
+        int i = 0;
+        int j = 1;
+        mvslotR2Result = uqrawMvsHolderPairTupleSink((arr[i], arr[j]));
+        mvslotR2NullCount = 0;
+    }
+    passed += Test("mvslotleft r2 tuple distinct dynamic elements value dtors",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 5202);
+    passed += Test("mvslotleft r2 tuple distinct dynamic elements heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(5);
+        arr[1].u = uqrawMk(2);
+        arr[0].u->v = 5;
+        arr[1].u->v = 2;
+        int i = 0;
+        int j = 1;
+        mvslotR2Result = uqrawMvsHolderPairScalarSink(arr[i], arr[j]);
+        mvslotR2NullCount = 0;
+    }
+    passed += Test("mvslotleft r2 scalar distinct dynamic elements twin value dtors",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 5202);
+    passed += Test("mvslotleft r2 scalar distinct dynamic elements twin heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    uqrawMvsHolderIndexCalls = 0;
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(6);
+        arr[1].u = uqrawMk(8);
+        arr[0].u->v = 6;
+        arr[1].u->v = 8;
+        mvslotR2Result = uqrawMvsHolderFlatSink((arr[uqrawMvsHolderIndexOnce()], 7));
+        mvslotR2NullCount = 0;
+    }
+    passed += Test("mvslotleft r2 tuple side effect index once value dtors",
+        uqrawMvsHolderIndexCalls * 1000 + mvslotR2Result * 100
+            + mvslotR2NullCount * 10 + uqrawDtors, 1602);
+    passed += Test("mvslotleft r2 tuple side effect index heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    uqrawMvsHolderIndexCalls = 0;
+    {
+        UqrawValueHolder[2] arr = default;
+        arr[0].u = uqrawMk(6);
+        arr[1].u = uqrawMk(8);
+        arr[0].u->v = 6;
+        arr[1].u->v = 8;
+        mvslotR2Result = uqrawMvsHolderScalarSink(arr[uqrawMvsHolderIndexOnce()]);
+        mvslotR2NullCount = 0;
+    }
+    passed += Test("mvslotleft r2 scalar side effect index twin value dtors",
+        uqrawMvsHolderIndexCalls * 1000 + mvslotR2Result * 100
+            + mvslotR2NullCount * 10 + uqrawDtors, 1602);
+    passed += Test("mvslotleft r2 scalar side effect index twin heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawMvsHolderPair o = default;
+        o.left.u = uqrawMk(3);
+        o.right.u = uqrawMk(4);
+        o.left.u->v = 3;
+        o.right.u->v = 4;
+        mvslotR2Result = uqrawMvsHolderPairTupleSink((o.left, o.right));
+        mvslotR2NullCount = (o.left.u.get() == nullptr ? 1 : 0)
+            + (o.right.u.get() == nullptr ? 1 : 0);
+    }
+    passed += Test("mvslotleft r2 tuple sibling fields value null dtors",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 3422);
+    passed += Test("mvslotleft r2 tuple sibling fields heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+
+    uqrawDtors = 0;
+    mvslotR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        UqrawMvsHolderPair o = default;
+        o.left.u = uqrawMk(3);
+        o.right.u = uqrawMk(4);
+        o.left.u->v = 3;
+        o.right.u->v = 4;
+        mvslotR2Result = uqrawMvsHolderPairScalarSink(o.left, o.right);
+        mvslotR2NullCount = (o.left.u.get() == nullptr ? 1 : 0)
+            + (o.right.u.get() == nullptr ? 1 : 0);
+    }
+    passed += Test("mvslotleft r2 scalar sibling fields twin value null dtors",
+        mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 3422);
+    passed += Test("mvslotleft r2 scalar sibling fields twin heap",
+        (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
     return passed;
 }

@@ -225,6 +225,19 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
             typeValue.GuardedBy = pendingGlobalGuardedBy;
 
         globalNamedVariable[typeValue.VariableName] = gVar;
+        if (typeValue.IsArrayView && !externalDecl)
+        {
+            auto* lengthTy = builder->getInt64Ty();
+            auto* lengthGlobal = new llvm::GlobalVariable(*module, lengthTy, false,
+                llvm::GlobalValue::InternalLinkage, builder->getInt64(-1),
+                gVar->getName() + ".raw_array_count");
+            if (threadLocal)
+                lengthGlobal->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);
+            gVar->setMetadata("cflat.array-view.length",
+                llvm::MDNode::get(*context, llvm::ValueAsMetadata::get(lengthGlobal)));
+            gVar->setMetadata("cflat.array-view.length-known",
+                llvm::MDNode::get(*context, llvm::MDString::get(*context, "0")));
+        }
 
         // q11 ruling point 4: a global / `static` owner is NEVER destructed - its lifetime cannot
         // be proven, so no exit-time teardown is synthesized. Core globals, externs and

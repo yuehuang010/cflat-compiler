@@ -1155,6 +1155,8 @@ std::string MainListener::ResolveSigComponentCodegen(
             const std::string resolved = Compiler(ts)->ResolveTypeAlias(name);
             if (Compiler(ts)->IsCxxRecord(resolved)) return resolved;
         }
+        if (const auto* functionAlias = Compiler(ts)->FindOrRequestFunctionTypeAlias(name))
+            return EncodeClosureFromSig(Compiler(ts), *functionAlias);
         return name;
     }
 
@@ -1176,6 +1178,8 @@ std::string MainListener::ResolveSigComponentConstCodegen(
             stars += nested.ValuePointerDepth();
             outPointer = stars > 0;
             constMask = PointeeConstOfComponent(nested.ConstMask, stars, preserveAliasReferentConst);
+            if (nested.IsFunctionPointer && !nested.FuncPtrReturnTypeName.empty())
+                return EncodeClosureFromSig(Compiler(ts), nested);
             return SignatureComponentAliasBase(Compiler(ts), nested.TypeName);
         }
         // A member alias (`A<int>.CP`) keeps its stars and its const mask: both come from the owner.
@@ -1377,6 +1381,10 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
         std::string retAliasSpelling;
         sig.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(fnSpec->typeSpecifier(), retPtr,
             retStars, retConst, fnSpec->multiWordTypeSuffix(), false, &retAliasSpelling);
+        if (!retPtr)
+            if (const auto* nested = Compiler(fnSpec)->GetEncodedClosureType(sig.FuncPtrReturnTypeName))
+                sig.FuncPtrReturnFunctionType =
+                    std::make_shared<LLVMBackend::TypeAndValue>(*nested);
         sig.FuncPtrReturnAliasSpelling = retAliasSpelling;
         sig.FuncPtrReturnConstMask = retConst;
         sig.FuncPtrReturnPointer = retPtr;
@@ -1396,6 +1404,10 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
                 int pConst = 0;
                 p.TypeName = ResolveSigComponentConstCodegen(param->typeSpecifier(), pPtr,
                     pStars, pConst, param->multiWordTypeSuffix(), false, &p.AliasSpelling);
+                if (!pPtr)
+                    if (const auto* nested = Compiler(fnSpec)->GetEncodedClosureType(p.TypeName))
+                        p.FunctionTypeSignature =
+                            std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                 p.ConstMask = pConst;
                 p.Pointer = pPtr;
                 p.IsArrayView = pIsArrayView;
@@ -1801,8 +1813,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                     "array-view '[]' is not supported on closure type '{}'; "
                                     "use a fixed size '{}[N]' instead",
                                     typeSpec->getText(), typeSpec->getText()));
-                            declType.IsArrayView = true;
-                            declType.Pointer = true;
+                            SetFunctionPointerArrayViewShape(declType);
                         }
                     }
                     break;
@@ -1997,8 +2008,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                     "array-view '[]' is not supported on closure type '{}'; "
                                     "use a fixed size '{}[N]' instead",
                                     typeSpec->getText(), typeSpec->getText()));
-                            declType.IsArrayView = true;
-                            declType.Pointer = true;
+                            SetFunctionPointerArrayViewShape(declType);
                         }
                     }
                     break;
@@ -3803,6 +3813,14 @@ llvm::Constant* MainListener::SplatConstantOverFixedArray(llvm::Constant* elemCo
         return llvm::ConstantArray::get(arrTy, elems);
     }
 
+LLVM_ATTRIBUTE_NOINLINE llvm::Value* MainListener::DefaultValueOfType(
+        const LLVMBackend::TypeAndValue& type, antlr4::ParserRuleContext* expressionContext)
+{
+        LLVMBackend::DeclTypeAndValue declType;
+        static_cast<LLVMBackend::TypeAndValue&>(declType) = type;
+        return GenerateDefaultValue(declType, expressionContext);
+}
+
 llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue,
         antlr4::ParserRuleContext* expressionContext) {
         auto* compiler = Compiler();
@@ -4429,6 +4447,33 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                                 + SpellTypeForSymbolDump(*compiler, functionType), {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
             return;
+        }
+
+        std::string genericBase;
+        if (typeSpec != nullptr && ctx->pointer() == nullptr && ArrayDimsOf(ctx) == nullptr
+            && GenericSpecOf(typeSpec, genericBase) == nullptr && typeSpec->memberTypeSpecifier() == nullptr)
+        {
+            std::string functionTypeName = CanonicalTypeSpecifierText(
+                typeSpec, ctx->multiWordTypeSuffix(), false);
+            const LLVMBackend::TypeAndValue* functionType = nullptr;
+            for (int depth = 0; depth < 16; ++depth)
+            {
+                if ((functionType = compiler->FindFunctionTypeAlias(functionTypeName)) != nullptr)
+                    break;
+                std::string resolved = compiler->ResolveTypeAlias(functionTypeName);
+                if (resolved == functionTypeName) break;
+                functionTypeName = std::move(resolved);
+            }
+            if (functionType != nullptr)
+            {
+                compiler->RegisterFunctionTypeAlias(alias, *functionType);
+                if (auto* s = compiler->GetSymbolSink())
+                    s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
+                                (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                                "using " + alias + " = " + SpellTypeForSymbolDump(*compiler, *functionType), {},
+                                ExtractLeadingDoc(GetTokens(), ctx->getStart()));
+                return;
+            }
         }
 
         PrimitiveTypeError canonicalError;
@@ -9496,6 +9541,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         LogErrorContext(declarator, "typedef function declarators are not supported");
                     if (id != nullptr)
                     {
+                        if (type.IsFunctionPointer && !type.Pointer && !type.IsArrayView
+                            && !type.FuncPtrReturnTypeName.empty())
+                        {
+                            compiler->RegisterFunctionTypeAlias(id->getText(), type);
+                            continue;
+                        }
                         auto* lastSpec = LastDeclarationTypeSpecifier(declSpec->declarationSpecifier());
                         auto* typeSpec = lastSpec != nullptr ? lastSpec->typeSpecifier() : nullptr;
                         std::string baseName;
@@ -10244,6 +10295,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcPtrCopyIsRawNewArray = false;
                 bool srcPointsToBorrowedByValueParam = false;
                 llvm::Value* srcRawArrayLength = nullptr;
+                bool srcRawArrayLengthKnown = false;
+                bool srcRawArrayLengthAvailable = false;
+                std::vector<size_t> srcRawArrayLengthSourceParams;
                 // True when the initializer reads an element of a user `T[]` VIEW. The GEP has a
                 // container slot's single-index shape, so only this provenance separates them.
                 bool srcIsViewElem = false;
@@ -10269,9 +10323,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // Implied move of a `move`-temp's owning field (`string s = makeToken().text`): the temp
                 // owns the field, so the local adopts it and the source field in the temp is zeroed.
                 bool srcMovableTempField = false;
+                bool srcTernaryTempAlreadyRegistered = false;
                 llvm::Value* srcMoveTempStructAlloca = nullptr;
                 llvm::Type* srcMoveTempStructType = nullptr;
-                unsigned srcMoveTempFieldIndex = 0;
+                llvm::Value* srcMoveTempFieldIndex = nullptr;
                 auto initializer = initDecl->initializer();
                 if (initializer == nullptr && initDecl->LeftBrace() == nullptr
                     && !typeAndValue.external && compiler->IsNativeConstObject(typeAndValue))
@@ -11475,6 +11530,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcMoveTempStructAlloca = rightNV.MoveTempStructAlloca;
                                 srcMoveTempStructType = rightNV.MoveTempStructType;
                                 srcMoveTempFieldIndex = rightNV.MoveTempFieldIndex;
+                                srcTernaryTempAlreadyRegistered = rightNV.TernaryTempAlreadyRegistered;
                                 // Binding an owning field of a NON-move (alias) temp to a local REJECTED: its
                                 // buffer is owned elsewhere and would be freed out from under the local.
                                 // A `string` field instead binds by IMPLICIT COPY (see the ruling on
@@ -11726,7 +11782,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcUnionFieldType = rightNV.UnionFieldType;
                                 srcBaseType = rightNV.BaseType;
                                 srcPrimary = rightNV.Primary;
-                                srcIsMove = rightNV.TypeAndValue.IsMove;
+                                srcIsMove = rightNV.TypeAndValue.IsMove || srcMovableTempField;
                                 // Borrow of an element the owning container frees (list<unique X*>
                                 // .get). Capture it so the local is tagged for the delete check.
                                 bool coreUniqueElementBorrow = srcCoreUniqueElementBorrow
@@ -11807,8 +11863,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // pointer local carry the fact forward.
                                 srcPointsToBorrowedByValueParam =
                                     rightNV.PointsToBorrowedByValueParam;
-                                srcRawArrayLength = rhsIsWholeRawArrayBinding
+                                // A view source carries its count from any slot (field, element), as the
+                                // assignment form does; a pointer copy of a field stays one slot.
+                                srcRawArrayLength = rhsIsWholeRawArrayBinding || rightNV.TypeAndValue.IsArrayView
                                     ? compiler->LoadRawArrayLength(rightNV) : nullptr;
+                                const auto* rawCount = compiler->FindRawArrayResult(rightNV.Primary);
+                                const LLVMBackend::RawArrayLengthState rightState =
+                                    compiler->RawArrayLengthStateOf(rightNV);
+                                srcRawArrayLengthKnown = rightState.Known
+                                    || (rawCount != nullptr && rawCount->CountKnown);
+                                srcRawArrayLengthAvailable = srcRawArrayLengthKnown
+                                    || rightState.Available || rawCount != nullptr;
+                                srcRawArrayLengthSourceParams = rightState.SourceParams;
                                 const auto* encodedRhsSignature = rightNV.TypeAndValue.Pointer
                                     ? nullptr : compiler->GetEncodedClosureType(rightNV.TypeAndValue.TypeName);
                                 rhsFnSig = rightNV.TypeAndValue;
@@ -12995,6 +13061,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
                         typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly,
                         srcIsUnsigned);
+                    if (global_scope)
+                        compiler->ApplyGlobalArrayViewFieldUnknownLengthStores(name);
                     auto* globalBraceList = initializer != nullptr
                         ? initializer->initializerList() : barebraceList;
                     const bool globalReferenceBraceInitializer = !externDeclOnly
@@ -13221,6 +13289,24 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto alloc = compiler->CreateLocalVariable(typeAndValue,
                         right ? right->getType() : nullptr, arraySize, line,
                         typeAndValue.UserAlignValue, localTargetStorage);
+                    if (!global_scope && isStaticLocal)
+                        compiler->ApplyStaticArrayViewFieldUnknownLengthStores(
+                            compiler->StaticArrayViewDeclaratorKey(initDecl->getStart()), name);
+                    if (!global_scope && alloc != nullptr && typeAndValue.Pointer
+                        && !typeAndValue.IsArrayView && !typeAndValue.IsFunctionPointer
+                        && haveInitializerSourceNV && initializerSourceNV.Storage != nullptr
+                        && initializerSourceNV.TypeAndValue.Pointer
+                        && !initializerSourceNV.TypeAndValue.IsArrayView
+                        && !initializerSourceNV.TypeAndValue.IsFunctionPointer)
+                    {
+                        compiler->MarkArrayViewFieldRootAliased(initializerSourceNV.Storage);
+                        compiler->MarkArrayViewFieldRootAliased(alloc);
+                    }
+                    else if (!global_scope && alloc != nullptr && typeAndValue.Pointer
+                        && !typeAndValue.IsArrayView && !typeAndValue.IsFunctionPointer
+                        && haveInitializerSourceNV
+                        && compiler->IsBorrowedAddressValue(initializerSourceNV.Primary))
+                        compiler->MarkArrayViewFieldRootAliased(alloc);
                     if (haveInitializerSourceNV && !initializerSourceNV.CxxArithIdentity.empty()
                         && typeAndValue.TypeName == initializerSourceNV.CxxArithIdentity)
                         compiler->GetOrCreateStackVariable(name).CxxArithIdentity =
@@ -13360,10 +13446,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         compiler->SetViewOfFixedArrayStorage(name, boundFromFixedArray, srcDesc);
                         auto& viewNV = compiler->GetOrCreateStackVariable(name);
                         if (boundFromFixedArray)
+                        {
                             compiler->StoreRawArrayLength(
                                 viewNV, compiler->builder->getInt64(srcConstArraySize));
+                            compiler->SetRawArrayLengthStateForStorage(viewNV.Storage,
+                                LLVMBackend::RawArrayLengthState{ true, true, {} });
+                        }
                         else if (srcIsArrayView || compiler->IsRawArrayResult(srcPrimary))
+                        {
                             compiler->StoreRawArrayLength(viewNV, srcRawArrayLength);
+                            compiler->SetRawArrayLengthStateForStorage(viewNV.Storage,
+                                LLVMBackend::RawArrayLengthState{ srcRawArrayLengthKnown,
+                                    srcRawArrayLengthAvailable, srcRawArrayLengthSourceParams });
+                        }
                         viewNV.OwningStructName = srcFieldPathNV.OwningStructName;
                         viewNV.FieldName = srcFieldPathNV.FieldName;
                         viewNV.MovePathKey = srcFieldPathNV.MovePathKey;
@@ -13374,6 +13469,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             srcFieldPathNV.RootIsBorrowedByValueParam;
                         viewNV.RootIsAliasBorrowLocal = srcFieldPathNV.RootIsAliasBorrowLocal;
                     }
+                    if (typeAndValue.IsArrayView && isStaticLocal
+                        && compiler->StaticArrayViewHasUnknownLengthStore(
+                            compiler->StaticArrayViewDeclaratorKey(initDecl->getStart())))
+                        compiler->MarkStaticArrayViewLengthUnknownForStorage(
+                            compiler->GetOrCreateStackVariable(name).Storage);
 
                     // Declaration leg of the borrowed-box tag: `right` is the fat value this local
                     // is about to receive. See TagInterfaceBoxProvenance.
@@ -14042,10 +14142,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // zero the source in the temp and mark a string local owning (not a borrow).
                         if (srcMovableTempField)
                         {
-                            auto* srcGep = compiler->builder->CreateStructGEP(
-                                srcMoveTempStructType, srcMoveTempStructAlloca, srcMoveTempFieldIndex, "movedfld");
-                            compiler->builder->CreateStore(
-                                llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+                            compiler->ClearMovableTempField(srcMoveTempStructType,
+                                srcMoveTempStructAlloca, srcMoveTempFieldIndex, right->getType(),
+                                srcTernaryTempAlreadyRegistered);
                             if (typeAndValue.TypeName == "string")
                                 compiler->GetOrCreateStackVariable(name).IsOwningString = true;
                         }
@@ -14235,13 +14334,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                         // Record `new T[n]` provenance on a raw `T*` local: a DIRECT new-array
                         // initializer, or a plain copy of an already-tagged pointer local. A `T[]`
-                        // view bound from a counted `move T*` CALL result records it too, so the
-                        // count that crossed the return drives its scope-exit / delete path.
+                        // view bound from a counted raw-new or owning CALL result records it too,
+                        // so the returned count drives its scope-exit / delete path.
                         auto* initNewArr = initializer && initializer->assignmentExpression()
                             ? AsDirectNew(initializer->assignmentExpression()) : nullptr;
                         const bool viewFromCountedCall = typeAndValue.IsArrayView
-                            && initNewArr == nullptr && srcPtrCopyIsRawNewArray
-                            && srcRawArrayLength != nullptr;
+                            && initNewArr == nullptr && srcRawArrayLength != nullptr
+                            && (srcPtrCopyIsRawNewArray || compiler->lastCallReturnsOwned);
                         if (typeAndValue.Pointer && (!typeAndValue.IsArrayView || viewFromCountedCall))
                         {
                             bool isRawArray = (initNewArr != nullptr
@@ -14260,7 +14359,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                         // Propagate pointer ownership: if the RHS was a move-returning pointer call,
                         // mark this local as owning so it is freed on scope exit.
-                        if (typeAndValue.Pointer && compiler->lastCallReturnsOwned)
+                        if (typeAndValue.Pointer && compiler->lastCallReturnsOwned
+                            && (!typeAndValue.IsArrayView || viewFromCountedCall))
                         {
                             // Ruling 2026-10-31: a `unique T*` call result bound to a raw local is never
                             // freed by it; refuse and steer to a unique local or .release().
@@ -14828,7 +14928,8 @@ bool MainListener::IsImplicitCopyableStringTemp(const LLVMBackend::NamedVariable
     }
 
 bool MainListener::AdoptImplicitStringTempCopy(LLVMBackend::NamedVariable& nv, llvm::Value*& value,
-                                               antlr4::ParserRuleContext* ctx) {
+                                               antlr4::ParserRuleContext* ctx,
+                                               bool forceCopy) {
         auto* compiler = Compiler(ctx);
         if (compiler == nullptr || value == nullptr) return false;
         // By REPRESENTATION, not by spelling: a temp field's NamedVariable can carry the declared
@@ -14836,6 +14937,37 @@ bool MainListener::AdoptImplicitStringTempCopy(LLVMBackend::NamedVariable& nv, l
         auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
         if (strTy == nullptr || value->getType() != strTy) return false;
         if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove) return false;
+        if (IsMoveArgumentStorage(compiler, nv) && !forceCopy)
+        {
+            // A move parameter's static owner bit is conservative. An owning local can still hold
+            // a borrowed literal, so copy only when this particular string value owns its buffer.
+            auto* rawLen = compiler->builder->CreateExtractValue(value, { 1u }, "move.str.len");
+            auto* isOwned = compiler->builder->CreateICmpNE(
+                compiler->builder->CreateAnd(rawLen, compiler->builder->getInt32(0x80000000),
+                    "move.str.owned.bit"), compiler->builder->getInt32(0), "move.str.is.owned");
+            auto* function = compiler->builder->GetInsertBlock()->getParent();
+            auto* copyBlock = llvm::BasicBlock::Create(*compiler->context, "move.str.copy", function);
+            auto* borrowBlock = llvm::BasicBlock::Create(*compiler->context, "move.str.borrow", function);
+            auto* mergeBlock = llvm::BasicBlock::Create(*compiler->context, "move.str.merge", function);
+            compiler->builder->CreateCondBr(isOwned, copyBlock, borrowBlock);
+
+            compiler->builder->SetInsertPoint(copyBlock);
+            auto* ownedCopy = compiler->EmitOwnedStringDeepCopy(value);
+            auto* copyEnd = compiler->builder->GetInsertBlock();
+            compiler->builder->CreateBr(mergeBlock);
+
+            compiler->builder->SetInsertPoint(borrowBlock);
+            auto* borrowedValue = compiler->ClearStringOwnedBit(value);
+            auto* borrowEnd = compiler->builder->GetInsertBlock();
+            compiler->builder->CreateBr(mergeBlock);
+
+            compiler->builder->SetInsertPoint(mergeBlock);
+            auto* localValue = compiler->builder->CreatePHI(strTy, 2, "move.str.local");
+            localValue->addIncoming(ownedCopy, copyEnd);
+            localValue->addIncoming(borrowedValue, borrowEnd);
+            value = localValue;
+            return true;
+        }
         auto* copied = compiler->EmitOwnedStringDeepCopy(value);
         if (copied == value) return false;   // no 'operator new' in this module - keep the reject
         value = copied;
@@ -16992,7 +17124,7 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
             compilerLLVM->RegisterTempFieldValue(nv.Primary);
         if (const auto* raw = compilerLLVM->FindRawArrayResult(nv.Primary))
         {
-            nv.AllocatedByRawNewArray = !raw->IsArrayView;
+            nv.AllocatedByRawNewArray = !raw->IsArrayView || raw->Owns;
             nv.RawArrayLength = raw->Count;
             nv.AllocAlignment = raw->AllocAlign;
             nv.IsOwning = compilerLLVM->RawArrayResultMayOwn(nv.Primary);

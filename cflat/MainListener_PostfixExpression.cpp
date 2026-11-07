@@ -226,6 +226,14 @@ static CFlatParser::PostfixExpressionContext* DirectPostfixArgument(
     return nullptr;
 }
 
+bool MainListener::IsMoveArgumentStorage(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& variable)
+{
+    if (compiler == nullptr || variable.Storage == nullptr) return false;
+    const auto* argument = compiler->FindStackArgumentByStorage(variable.Storage);
+    return argument != nullptr && argument->TypeAndValue.IsMove;
+}
+
 // r4 sink isolation: true when the call is an operand of a binary/unary/cast/?: rule.
 static bool CallUnderOperatorAncestor(antlr4::tree::ParseTree* call)
 {
@@ -3413,6 +3421,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
                 }
                 NormalizeCxxRvalueReferenceArgument(ctx, parsed);
+                if (parsed.TypeAndValue.Pointer && !parsed.TypeAndValue.IsArrayView
+                    && !parsed.TypeAndValue.IsFunctionPointer && parsed.Storage != nullptr)
+                    backend->MarkArrayViewFieldRootAliased(parsed.Storage);
                 return parsed;
             };
 
@@ -5194,14 +5205,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 structVar.Storage = spill;
                             }
 
-                            // A lowered produced temp read by field access (`(k ? move h1 : h2).c.v`)
-                            // has no owner but this statement: destroy its spill at statement end.
+                            // A produced temp read by field access owns its spill through this statement.
                             if (structVar.IsParenthesizedProducedTemp && structVar.Storage != nullptr
+                                && fieldIndex < dataStructure.StructFields.size()
                                 && !structVar.TernaryTempAlreadyRegistered && !structVar.FromOwningTempField
-                                && !structVar.TypeAndValue.Pointer
-                                && Compiler(ctx)->IsLoweredCFlatOnlyStruct(structVar.TypeAndValue.TypeName))
-                                Compiler(ctx)->RegisterOwnedStructTemp(structVar.Storage,
-                                    structVar.TypeAndValue.TypeName);
+                                && !structVar.TypeAndValue.Pointer && !structVar.TypeAndValue.IsAlias
+                                && Compiler(ctx)->IsOwningValueType(structVar.TypeAndValue.TypeName)
+                                && !Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName)
+                                && !Compiler(ctx)->IsOwnedStructTempSince(
+                                    LLVMBackend::OwnedTempMark{}, structVar.Storage))
+                                Compiler(ctx)->RegisterOwnedStructTemp(
+                                    structVar.Storage, structVar.TypeAndValue.TypeName);
                             // Keep a lowered call result addressable so `move call().field` moves
                             // from the field slot instead of extracting and copying its bytes.
                             if (structVar.Storage == nullptr && structVar.Primary != nullptr
@@ -5402,18 +5416,34 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         llvm::Value* parentTempStorage = nullptr;
                                         if (parentOwnsTemp && !structVar.FromOwningTempField)
                                         {
-                                            auto* tempAlloca = Compiler(ctx)->AllocaAtEntry(structVar.BaseType, nullptr, "owntemp");
-                                            Compiler(ctx)->builder->CreateStore(structVar.Primary, tempAlloca);
-                                            Compiler(ctx)->RegisterOwnedStructTemp(tempAlloca, parentType);
-                                            parentTempStorage = tempAlloca;
+                                            if (structVar.IsParenthesizedProducedTemp
+                                                && structVar.Storage != nullptr
+                                                && !Compiler(ctx)->IsCxxRecord(parentType))
+                                            {
+                                                // Parentheses already spilled this produced value; use and own that same slot.
+                                                parentTempStorage = structVar.Storage;
+                                                if (!structVar.TernaryTempAlreadyRegistered
+                                                    && !Compiler(ctx)->IsOwnedStructTempSince(
+                                                        LLVMBackend::OwnedTempMark{}, parentTempStorage))
+                                                    Compiler(ctx)->RegisterOwnedStructTemp(
+                                                        parentTempStorage, parentType);
+                                            }
+                                            else
+                                            {
+                                                auto* tempAlloca = Compiler(ctx)->AllocaAtEntry(
+                                                    structVar.BaseType, nullptr, "owntemp");
+                                                Compiler(ctx)->builder->CreateStore(structVar.Primary, tempAlloca);
+                                                Compiler(ctx)->RegisterOwnedStructTemp(tempAlloca, parentType);
+                                                parentTempStorage = tempAlloca;
+                                            }
                                             // The temp owns this field: let a persist site move it out (store + zero
                                             // the source) rather than reject. Only an owning field can be moved.
                                             if (Compiler(ctx)->IsOwningValueType(fieldType.TypeName))
                                             {
                                                 namedVar.MovableTempField = true;
-                                                namedVar.MoveTempStructAlloca = tempAlloca;
+                                                namedVar.MoveTempStructAlloca = parentTempStorage;
                                                 namedVar.MoveTempStructType = structVar.BaseType;
-                                                namedVar.MoveTempFieldIndex = fieldIndex;
+                                                namedVar.MoveTempFieldIndex = Compiler(ctx)->builder->getInt32(fieldIndex);
                                             }
                                         }
                                         if (parentIsOwningTemp || structVar.FromOwningTempField)
@@ -5455,6 +5485,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && Compiler(ctx)->IsOwningValueType(
                                             structVar.TypeAndValue.TypeName)
                                         && Compiler(ctx)->IsOwnedTempValue(structVar);
+                                    if (parentIsOwnedStructTemp
+                                        && structVar.IsParenthesizedProducedTemp
+                                        && !dataStructure.IsUnion
+                                        && !Compiler(ctx)->IsCxxRecord(
+                                            structVar.TypeAndValue.TypeName)
+                                        && !Compiler(ctx)->IsCxxRecord(fieldType.TypeName))
+                                    {
+                                        namedVar.FromOwningTempField = true;
+                                        namedVar.OwningTempParent = true;
+                                        if (!fieldType.Pointer && !fieldType.ElemPointer
+                                            && Compiler(ctx)->IsOwningValueType(fieldType.TypeName))
+                                        {
+                                            namedVar.MovableTempField = true;
+                                            namedVar.MoveTempStructAlloca = structVar.Storage;
+                                            namedVar.MoveTempStructType = structVar.BaseType;
+                                            namedVar.MoveTempFieldIndex = Compiler(ctx)->builder->getInt32(fieldIndex);
+                                        }
+                                    }
                                     // Ternary-of-temps spill is unregistered (arms own the temps); tag the field
                                     // so the keep-alive walk reaches the arm temps.
                                     const bool ternaryArmTempParent = !parentIsOwnedStructTemp
@@ -5481,6 +5529,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         namedVar.FromOwningTempField = true;
                                         namedVar.OwningTempParent = true;
+                                        if (!dataStructure.IsUnion && !fieldType.Pointer
+                                            && !fieldType.ElemPointer
+                                            && !Compiler(ctx)->IsCxxRecord(
+                                                structVar.TypeAndValue.TypeName)
+                                            && !Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
+                                            && Compiler(ctx)->IsOwningValueType(fieldType.TypeName))
+                                        {
+                                            namedVar.MovableTempField = true;
+                                            namedVar.MoveTempStructAlloca = structVar.Storage;
+                                            namedVar.MoveTempStructType = structVar.BaseType;
+                                            namedVar.MoveTempFieldIndex =
+                                                Compiler(ctx)->builder->getInt32(fieldIndex);
+                                        }
                                         if (fieldType.Pointer && !fieldType.IsUnique)
                                         {
                                             Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
@@ -5493,6 +5554,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
                                         }
                                     }
+                                    if (structVar.MovableTempField && !dataStructure.IsUnion
+                                        && !fieldType.Pointer && !fieldType.ElemPointer
+                                        && Compiler(ctx)->IsOwningValueType(fieldType.TypeName))
+                                        ComposeMovableTempField(ctx, structVar, namedVar, structVar.BaseType,
+                                            Compiler(ctx)->builder->getInt32(fieldIndex));
                                     namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
                                         && IsBondedClosureContainer(Compiler(ctx), fieldType);
@@ -5634,6 +5700,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         Compiler(ctx)->RegisterUniqueFieldRead(
                                             namedVar.Primary, namedVar.Storage,
                                             Compiler(ctx)->UniqueFieldNullKey(namedVar));
+                                    if (namedVar.TypeAndValue.IsArrayView)
+                                        Compiler(ctx)->AttachArrayViewFieldLengthStorage(namedVar);
                                 }
                             }
                             else if (LLVMBackend::NamedVariable anonNV;
@@ -6177,6 +6245,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 || Compiler(ctx)->GetLocalVariable(idName).Storage != nullptr
                                 || Compiler(ctx)->GetFunctionArgument(idName).GetValue() != nullptr
                                 || Compiler(ctx)->HasMemberVariable(idName);
+                            auto typeSubstitution = activeTypeSubstitutions.end();
+                            if (followedByDot && !localOrMemberVariable
+                                && !activeTypeSubstitutions.empty())
+                                typeSubstitution = activeTypeSubstitutions.find(idName);
+                            const bool genericTypeParameter =
+                                typeSubstitution != activeTypeSubstitutions.end();
                             const bool globalVariable =
                                 Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
                             const std::string qualifiedName =
@@ -6250,7 +6324,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                 }
                             }
-                            if (!namesEnclosingMethod
+                            if (genericTypeParameter)
+                            {
+                                std::string concreteType = typeSubstitution->second;
+                                StripOwnershipQualifiers(concreteType);
+                                namespaceContext = Compiler(ctx)->ResolveTypeAlias(concreteType);
+                                namedVar = {};
+                                structVar = {};
+                                interfaceVar = {};
+                            }
+                            else if (!namesEnclosingMethod
                                 && (Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
                                 && (!nameIsVariable || localTypeMember) && !defaultedCxxBaseAlias)
                             {
@@ -6520,7 +6603,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // Parentheses change the spelling, never the value: hand the ownership
                             // arms the SAME provenance the bare operand would have carried.
                             if (prevPrimary->expression() != nullptr)
+                            {
                                 AdoptWrapperProvenance(namedVar, lastParenExprNamed);
+                                namedVar.RootIsBorrowedThisField =
+                                    lastParenExprNamed.RootIsBorrowedThisField;
+                                namedVar.ThisFieldPath = lastParenExprNamed.ThisFieldPath;
+                            }
                             // Restore the owning-temp provenance only when the inner expression
                             // carried it, so no other parenthesized shape gains names it lacked.
                             if (prevPrimary->expression() != nullptr && lastParenExprFromOwningTempField)
@@ -7060,6 +7148,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elemPtr = Compiler(ctx)->builder->Insert(
                                     llvm::GetElementPtrInst::CreateInBounds(
                                         arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr"));
+                            if (namedVar.MovableTempField)
+                                ComposeMovableTempField(ctx, namedVar, namedVar, arrTy, rvalue);
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
@@ -10174,7 +10264,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     && argNV.TypeAndValue.TypeName.empty()
                                                     && argNV.Primary != nullptr
                                                     && argNV.Primary->getType()->isPointerTy());
-                                            if (param.Pointer && param.PointerDepth > 1
+                                            // A view parameter checks its element like a direct call (`fn*[]` into `fn[]`).
+                                            if (argExpectedDest.IsArrayView && RejectArrayViewElementMismatch(namedArgument, argExpectedDest, argNV))
+                                                nullFunctionValuePointerArg();
+                                            else if (param.Pointer && param.PointerDepth > 1
                                                 && !argNV.TypeAndValue.Pointer && !nullPointerValue)
                                                 rejectFunctionValuePointerArg();
                                             else if (param.Pointer && param.PointerDepth <= 1)
@@ -13083,6 +13176,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CxxEarlyCopyDecision = argNV.CxxEarlyCopyDecision;
                                     argVar.CxxEarlyCopySlot = argNV.CxxEarlyCopySlot;
                                     argVar.CxxEarlyCopyJoin = argNV.CxxEarlyCopyJoin;
+                                    argVar.FromOwningTempField = argNV.FromOwningTempField;
+                                    argVar.OwningTempParent = argNV.OwningTempParent;
+                                    argVar.MovableTempField = argNV.MovableTempField;
+                                    argVar.MoveTempStructAlloca = argNV.MoveTempStructAlloca;
+                                    argVar.MoveTempStructType = argNV.MoveTempStructType;
+                                    argVar.MoveTempFieldIndex = argNV.MoveTempFieldIndex;
 
                                     if (argName)
                                         argVar.TypeAndValue.VariableName = argName->getText();
@@ -16099,6 +16198,12 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             {
                 LLVMBackend::DeclTypeAndValue p;
                 auto* functionPointerType = param->typeSpecifier()->functionPointerSpecifier();
+                auto* namedType = param->typeSpecifier()->genericIdentifier();
+                const auto* functionTypeAlias = namedType != nullptr
+                    && namedType->genericTypeParameters() == nullptr
+                    && !compiler->NativeTypeShadowsFunctionAlias(namedType->Identifier()->getText())
+                    ? compiler->FindOrRequestFunctionTypeAlias(namedType->Identifier()->getText())
+                    : nullptr;
                 if (functionPointerType != nullptr)
                 {
                     bool pointer = param->pointer() != nullptr;
@@ -16117,6 +16222,13 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     }
                     else
                         p.TypeName = encodedName;
+                }
+                else if (functionTypeAlias != nullptr)
+                {
+                    static_cast<LLVMBackend::TypeAndValue&>(p) = *functionTypeAlias;
+                    p.Pointer = param->pointer() != nullptr;
+                    p.PointerDepth = PointerDepthOf(param->pointer());
+                    p.ElemPointer = p.PointerDepth >= 2;
                 }
                 else
                 {
@@ -17584,6 +17696,63 @@ struct StringFragmentAnchorScope
 
 // Kept out of the recursive ParsePostfixExpression frame: a NamedVariable local there costs
 // stack headroom on deeply nested expressions.
+LLVM_ATTRIBUTE_NOINLINE void MainListener::ComposeMovableTempField(
+    CFlatParser::PostfixExpressionContext* ctx,
+    const LLVMBackend::NamedVariable& source,
+    LLVMBackend::NamedVariable& result,
+    llvm::Type* accessedType,
+    llvm::Value* fieldIndex)
+{
+        if (!source.MovableTempField) return;
+        auto* backend = Compiler(ctx);
+        llvm::Type* parentType = source.MoveTempStructType;
+        llvm::Value* parentStorage = source.MoveTempStructAlloca;
+        llvm::Value* parentIndex = source.MoveTempFieldIndex;
+        if (parentType == nullptr || parentStorage == nullptr || parentIndex == nullptr
+            || accessedType == nullptr || fieldIndex == nullptr)
+        {
+            backend->LogError("internal compiler error: movable temporary field has invalid parent metadata");
+            return;
+        }
+
+        llvm::Value* accessedStorage = nullptr;
+        if (auto* parentStruct = llvm::dyn_cast<llvm::StructType>(parentType))
+        {
+            auto* constantIndex = llvm::dyn_cast<llvm::ConstantInt>(parentIndex);
+            if (constantIndex == nullptr || constantIndex->getZExtValue() >= parentStruct->getNumElements()
+                || parentStruct->getElementType(static_cast<unsigned>(constantIndex->getZExtValue())) != accessedType)
+            {
+                backend->LogError("internal compiler error: movable temporary field type does not match its struct slot");
+                return;
+            }
+            accessedStorage = backend->builder->CreateStructGEP(
+                parentStruct, parentStorage, static_cast<unsigned>(constantIndex->getZExtValue()),
+                "movedfld.parent");
+        }
+        else if (auto* parentArray = llvm::dyn_cast<llvm::ArrayType>(parentType))
+        {
+            if (parentArray->getElementType() != accessedType)
+            {
+                backend->LogError("internal compiler error: movable temporary field type does not match its array element");
+                return;
+            }
+            accessedStorage = backend->builder->CreateGEP(parentArray, parentStorage,
+                { backend->builder->getInt32(0), parentIndex }, "movedfld.parent");
+        }
+        else
+        {
+            backend->LogError("internal compiler error: movable temporary parent is neither a struct nor an array");
+            return;
+        }
+
+        result.MovableTempField = true;
+        result.MoveTempStructAlloca = accessedStorage;
+        result.MoveTempStructType = accessedType;
+        result.MoveTempFieldIndex = fieldIndex;
+}
+
+// Kept out of the recursive ParsePostfixExpression frame: a NamedVariable local there costs
+// stack headroom on deeply nested expressions.
 LLVM_ATTRIBUTE_NOINLINE void MainListener::CarryStringViewConstructionBorrow(
     CFlatParser::PostfixExpressionContext* ctx, LLVMBackend::NamedVariable& namedVar)
 {
@@ -17736,30 +17905,36 @@ LLVMBackend::NamedVariable MainListener::ParseStringFunctionalConstruction(
 
             bool hasStringOperator = false;
             const std::string sourceType = compiler->ResolveTypeAlias(type.TypeName);
-            if (auto it = compiler->functionTable.find("operator string");
-                it != compiler->functionTable.end())
+            const bool sameTypeIdentity = scalarShape && !sourceType.empty()
+                && sourceType == compiler->ResolveTypeAlias("string");
+            if (!sameTypeIdentity)
             {
-                for (const auto& candidate : it->second)
+                if (auto it = compiler->functionTable.find("operator string");
+                    it != compiler->functionTable.end())
                 {
-                    if (candidate.IsMethod || candidate.Parameters.size() != 1) continue;
-                    const auto& parameter = candidate.Parameters[0];
-                    const std::string parameterType = compiler->ResolveTypeAlias(parameter.TypeName);
-                    if (sourceType == parameterType && type.Pointer == parameter.Pointer
-                        && type.IsArrayView == parameter.IsArrayView
-                        && type.ElemPointer == parameter.ElemPointer)
+                    for (const auto& candidate : it->second)
                     {
-                        hasStringOperator = true;
-                        break;
-                    }
-                    if (parameter.IsInterface && !type.Pointer && !type.IsArrayView
-                        && compiler->TypeImplementsInterface(sourceType, parameterType))
-                    {
-                        hasStringOperator = true;
-                        break;
+                        if (candidate.IsMethod || candidate.Parameters.size() != 1) continue;
+                        const auto& parameter = candidate.Parameters[0];
+                        const std::string parameterType = compiler->ResolveTypeAlias(parameter.TypeName);
+                        if (sourceType == parameterType && type.Pointer == parameter.Pointer
+                            && type.IsArrayView == parameter.IsArrayView
+                            && type.ElemPointer == parameter.ElemPointer)
+                        {
+                            hasStringOperator = true;
+                            break;
+                        }
+                        if (parameter.IsInterface && !type.Pointer && !type.IsArrayView
+                            && compiler->TypeImplementsInterface(sourceType, parameterType))
+                        {
+                            hasStringOperator = true;
+                            break;
+                        }
                     }
                 }
             }
-            if (!stringLiteralArgument && !isCharPointerLike(probe) && !hasStringOperator)
+            if (!stringLiteralArgument && !sourceType.empty() && !isCharPointerLike(probe)
+                && !hasStringOperator && !sameTypeIdentity)
             {
                 LogErrorContext(ctx, "string(expr) requires an argument accepted by '(string)expr'; "
                     + workingForms);
@@ -18617,6 +18792,15 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         namedVar = compiler->GetScopedLocalOrArgument(name);
         if (namedVar.Storage != nullptr || namedVar.Primary != nullptr)
         {
+            // A move argument is an owning local for expression consumers. Its parameter entry
+            // retains the scope-exit cleanup facts; this read carries ordinary lvalue facts.
+            if (namedVar.Storage != nullptr && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && !compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && IsMoveArgumentStorage(compiler, namedVar))
+            {
+                namedVar.TypeAndValue.IsMove = false;
+            }
             namedVar.IdentifierLine = (int)node->getSymbol()->getLine();
             namedVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
             return namedVar;

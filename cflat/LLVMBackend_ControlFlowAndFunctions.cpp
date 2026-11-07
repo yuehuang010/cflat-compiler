@@ -667,6 +667,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         lastCxxRetValue_ = nullptr;
         lastLoweredRetTemp_ = nullptr;
         lastLoweredRetValue_ = nullptr;
+        // The callee is any bindable function, so its count requirement is the union over them.
+        if (argNVs != nullptr)
+            RequireKnownFuncPtrViewArguments(funcPtrType, *argNVs);
         const llvm::Function* ownershipTarget = nullptr;
         if (checkUnknownTempLifetime)
         {
@@ -890,7 +893,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             for (const auto& p : funcPtrType.FuncPtrParams)
             {
                 TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-                pTV.IsAlias = p.IsAlias;
+                pTV.IsAlias = p.IsAlias; pTV.IsArrayView = p.IsArrayView;
                 // An alias closure param takes its caller slot by address, as the callee declares it.
                 paramTypes.push_back((ParameterIsAliasByPointer(pTV) || (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
                         || HasForeignNontrivialCxxField(p.TypeName))))
@@ -934,6 +937,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                     pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
                     pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
                     pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+                    pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
                     if (ParameterCarriesRawArrayCount(pTV))
                     {
                         llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
@@ -960,6 +964,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
                 pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
                 pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+                pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
                 extParams.emplace_back((unsigned)(abiArgs.size() - 1), pTV);
                 if (ParameterCarriesRawArrayCount(pTV))
                 {
@@ -1068,7 +1073,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 value = retTy->isVoidTy() ? nullptr : result;
             if (cxxSretReturn) publishIndirectSretValue(retTV, value);
             recordOpaqueReturn(result);
-            RegisterRawArrayCallResult(value, rawReturnCountSlot);
+            RegisterRawArrayCallResult(value, rawReturnCountSlot,
+                                       retTV.AllocAlignValue, retTV.IsArrayView, retTV.IsMove);
             return value;
         }
 
@@ -1089,6 +1095,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         for (const auto& p : funcPtrType.FuncPtrParams)
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
+            pTV.IsArrayView = p.IsArrayView;
             paramTypes.push_back(!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
                     || HasForeignNontrivialCxxField(p.TypeName))
                 ? cflat_llvm::PointerTo(GetType(pTV)) : GetType(pTV));
@@ -1130,6 +1137,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
                 pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
                 pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+                pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
                 if (ParameterCarriesRawArrayCount(pTV))
                 {
                     llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
@@ -1156,6 +1164,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
             pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
             pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+            pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
             if (ParameterCarriesRawArrayCount(pTV))
             {
                 llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
@@ -1193,7 +1202,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             : (retTy->isVoidTy() ? nullptr : result);
         if (cxxSretReturn) publishIndirectSretValue(retTV, value);
         recordOpaqueReturn(result);
-        RegisterRawArrayCallResult(value, rawReturnCountSlot);
+        RegisterRawArrayCallResult(value, rawReturnCountSlot,
+                                   retTV.AllocAlignValue, retTV.IsArrayView, retTV.IsMove);
         return value;
     }
 
@@ -2999,6 +3009,7 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
             pTV.IsMove = p.IsMove;
+            pTV.IsArrayView = p.IsArrayView;
             if (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
                 || HasForeignNontrivialCxxField(p.TypeName)))
                 paramTypes.push_back(cflat_llvm::PointerTo(GetType(pTV)));
@@ -3030,19 +3041,25 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
 
 bool LLVMBackend::ParameterCarriesRawArrayCount(const TypeAndValue& param) const
 {
-        return param.Pointer && param.IsMove;
+        return param.Pointer && (param.IsMove || param.IsArrayView);
     }
 
 bool LLVMBackend::ReturnCarriesRawArrayCount(const TypeAndValue& returnType) const
 {
-        return returnType.Pointer && returnType.IsMove;
+        return returnType.Pointer && (returnType.IsMove || returnType.IsArrayView);
     }
 
 llvm::Value* LLVMBackend::RawArrayCountArgument(const NamedVariable& arg)
 {
-        if (!arg.FieldName.empty() || !arg.OwningStructName.empty() || arg.IsElementAccess)
+        if (arg.TypeAndValue.ConstArraySize > 0 && !arg.TypeAndValue.IsArrayView)
+            return builder->getInt64(arg.TypeAndValue.ConstArraySize);
+        const bool hasCountSource = arg.RawArrayLengthStorage != nullptr
+            || arg.RawArrayLength != nullptr || RawArrayCountOf(arg.Primary) != nullptr;
+        if (!hasCountSource
+            && (!arg.FieldName.empty() || !arg.OwningStructName.empty() || arg.IsElementAccess))
             return builder->getInt64(-1);
-        if (arg.Storage != nullptr && !llvm::isa<llvm::AllocaInst>(arg.Storage)
+        if (!hasCountSource && arg.Storage != nullptr
+            && !llvm::isa<llvm::AllocaInst>(arg.Storage)
             && !llvm::isa<llvm::GlobalVariable>(arg.Storage))
             return builder->getInt64(-1);
         llvm::Value* count = LoadRawArrayLength(arg);
@@ -3057,12 +3074,12 @@ llvm::Value* LLVMBackend::CreateRawArrayReturnCountSlot()
     }
 
 void LLVMBackend::RegisterRawArrayCallResult(llvm::Value* result, llvm::Value* countSlot,
-                                             uint64_t allocAlign)
+                                             uint64_t allocAlign, bool isArrayView, bool owns)
 {
         if (result == nullptr || countSlot == nullptr) return;
         RegisterRawArrayResult(result,
             builder->CreateLoad(builder->getInt64Ty(), countSlot, "raw_array_return_count"),
-            allocAlign);
+            allocAlign, owns, nullptr, isArrayView);
     }
 
 llvm::Argument* LLVMBackend::CurrentRawArrayReturnCountArgument() const

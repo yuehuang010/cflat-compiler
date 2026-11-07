@@ -744,6 +744,17 @@ std::string LoopSimpleAssignmentTarget(CFlatParser::UnaryExpressionContext* unar
         return name;
 }
 
+// A plain name or a member path (`v`, `h.v`, `h->v`) as an assignment target; no index, no call.
+// LoopSimpleAssignmentTarget takes only the bare name, so the field targets need this wider form.
+std::string LoopAssignedPathTarget(CFlatParser::UnaryExpressionContext* unary)
+{
+        if (unary == nullptr || unary->unaryOperator() != nullptr || unary->postfixExpression() == nullptr)
+            return {};
+        bool isCall = false;
+        const std::string path = LoopSimplePostfixName(unary->postfixExpression(), isCall);
+        return isCall ? std::string() : path;
+}
+
 std::string LoopDeclaredName(CFlatParser::DeclaratorContext* declarator)
 {
         if (declarator == nullptr || declarator->directDeclarator() == nullptr) return {};
@@ -938,6 +949,69 @@ std::unordered_set<std::string> FindLoopViewRebindTargets(CFlatParser::Iteration
 static void NoteLoopBodyViewAssignments(LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop)
 {
     compiler->NoteLoopViewAssignments(FindLoopViewRebindTargets(loop));
+}
+
+// A field view target (`h.v`, also `h->v`): its count lives in the field length slot, keyed by the
+// root variable and the path text the codegen assigns. Kept out of the recursive walk's frame.
+LLVM_ATTRIBUTE_NOINLINE static void InvalidateLoopFieldViewLength(LLVMBackend* compiler,
+        const std::string& path, size_t dot)
+{
+        LLVMBackend::NamedVariable field;
+        field.TypeAndValue.IsArrayView = true;
+        field.FieldPathRoot = path.substr(0, dot);
+        field.FieldPathText = path;
+        compiler->SetArrayViewFieldLengthKnown(field, false);
+}
+
+static void InvalidateLoopViewsBoundToRawCasts(
+        LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop)
+{
+    if (compiler == nullptr || loop == nullptr) return;
+    auto isArrayViewCast = [](CFlatParser::AssignmentExpressionContext* expression) {
+        bool found = false;
+        auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr || found) return;
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+                cast != nullptr && cast->castTypeName() != nullptr
+                && cast->castTypeName()->abstractDeclarator() != nullptr)
+            {
+                auto* abstract = cast->castTypeName()->abstractDeclarator();
+                auto* suffix = abstract->arrayTypeSuffix();
+                if (suffix != nullptr && suffix->arrayPtrSuffix() == nullptr
+                    && suffix->arrayDimSpec() != nullptr
+                    && std::ranges::all_of(suffix->arrayDimSpec()->assignmentExpression(),
+                        [](auto* dimension) { return dimension == nullptr; }))
+                    found = true;
+            }
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        visit(visit, expression);
+        return found;
+    };
+    auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (node == nullptr || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+            return;
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+            assignment != nullptr && assignment->assignmentOperator() != nullptr
+            && assignment->assignmentOperator()->getStart()->getType() == CFlatParser::Assign)
+        {
+            const std::string name = LoopAssignedPathTarget(assignment->unaryExpression());
+            if (!name.empty() && isArrayViewCast(assignment->assignmentExpression()))
+            {
+                const size_t dot = name.find('.');
+                if (dot == std::string::npos)
+                {
+                    auto target = compiler->GetScopedLocalOrArgument(name);
+                    if (target.TypeAndValue.IsArrayView)
+                        compiler->SetRawArrayLengthState(name, false, false, {});
+                }
+                else
+                    InvalidateLoopFieldViewLength(compiler, name, dot);
+            }
+        }
+        for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+    };
+    visit(visit, loop);
 }
 
 void MainListener::MarkLoopBackEdgeCxxConstPointers(
@@ -1649,6 +1723,54 @@ static std::pair<std::string, std::string> DeferredInterfaceReturnTexts(LLVMBack
             "('return t;' from a 'move' function) or a heap object", SpellType(compiler, interfaceType));
         return { std::move(frame), std::move(alias) };
     }
+
+LLVM_ATTRIBUTE_NOINLINE static bool IsNamedIdentityCastOperand(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node,
+    const LLVMBackend::NamedVariable& value)
+{
+    // The cast target must be exactly the storage owner's type (identity cast).
+    auto isIdentity = [&]() {
+        if (value.Storage == nullptr) return false;
+        const auto* source = compiler->FindVariableByStorage(value.Storage);
+        return source != nullptr
+            && compiler->ResolveTypeAlias(source->TypeAndValue.TypeName)
+                == compiler->ResolveTypeAlias(value.TypeAndValue.TypeName)
+            && source->TypeAndValue.Pointer == value.TypeAndValue.Pointer
+            && source->TypeAndValue.ElemPointer == value.TypeAndValue.ElemPointer
+            && source->TypeAndValue.IsArrayView == value.TypeAndValue.IsArrayView
+            && source->TypeAndValue.ConstMask == value.TypeAndValue.ConstMask;
+    };
+    bool sawCast = false;
+    while (node != nullptr)
+    {
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        {
+            if (primary->expression() != nullptr && primary->children.size() == 3)
+            {
+                node = primary->expression();
+                continue;
+            }
+            if (primary->genericIdentifier() != nullptr && primary->children.size() == 1)
+                return !sawCast || isIdentity();
+        }
+        // `(T)(local = rhs)`: the assignment's value is its destination, like `(local = rhs)`.
+        if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+            assign != nullptr && assign->assignmentOperator() != nullptr)
+            return sawCast && isIdentity();
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+            cast != nullptr && cast->castTypeName() != nullptr
+                && cast->castExpression() != nullptr)
+        {
+            sawCast = true;
+            node = cast->castExpression();
+            continue;
+        }
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (ctx == nullptr || ctx->children.size() != 1) return false;
+        node = ctx->children[0];
+    }
+    return false;
+}
 
 /*
  * The whole `return <expr>;` lowering: ownership classification, the escape / dangle
@@ -2659,14 +2781,15 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // A raw heap array handed back through a bare `T*` / `T[]` return loses its element count
         // at the boundary (only `move T*` carries one), so the caller can never free it correctly.
         // `alias T*` is the documented hand-managed spelling and stays legal.
+        const auto* rawReturn = compiler->FindRawArrayResult(returnNV.Primary);
         if (returnNV.TypeAndValue.Pointer
             && compiler->currentFunctionReturnTV.Pointer
             && !compiler->currentFunctionReturnTV.IsAlias
-            && !compiler->ReturnCarriesRawArrayCount(compiler->currentFunctionReturnTV)
+            && !compiler->currentFunctionReturnTV.IsMove
             && !compiler->IsCoreUniqueReleaseResult(returnNV.Primary)
             && !returnNV.IsCoreUniqueRelease
             && (compiler->HasRawNewArrayProvenance(returnNV)
-                || compiler->FindRawArrayResult(returnNV.Primary) != nullptr))
+                || (rawReturn != nullptr && !rawReturn->IsArrayView)))
         {
             std::string sourceName = returnNV.CallerName.empty()
                 ? returnNV.TypeAndValue.VariableName : returnNV.CallerName;
@@ -2808,17 +2931,33 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
         }
 
-        // Implicit move on `return <local>;` (C++-style, narrow). Triggers only when the
-        // return expression is a BARE IDENTIFIER naming a local (or by-value parameter)
-        // whose owning value-struct type matches the function's return type; then it is
-        // treated exactly as `return move <local>;` - snapshot the value, zero the source
-        // so its scope-exit destructor is a no-op, and hand ownership to the caller. A
-        // borrowing local (alias / borrowed field / borrowed by-value param) is excluded so
-        // the alias path still wins and no second owner is created (which would double-free).
-        if (assignExpr != nullptr)
+        // Implicit move from a whole local owning value return. Resolve the source by the
+        // return operand's storage so `(local = rhs)` follows the same path as `local`.
+        // Borrowing locals and borrowed by-value parameters stay excluded.
+        const bool returnsNamedLvalue = assignExpr != nullptr
+            && TopLevelMoveExpression(assignExpr) == nullptr
+            && (IsNamedIdentityCastOperand(compiler, assignExpr, returnNV)
+                || SoleAssignmentExpression(assignExpr) != nullptr);
+        if (returnsNamedLvalue)
         {
-            std::string retName = retText;
-            LLVMBackend::NamedVariable localNV = compiler->GetScopedLocalOrArgument(retName);
+            LLVMBackend::NamedVariable localNV;
+            std::string retName;
+            if (returnNV.Storage != nullptr)
+                for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                {
+                    auto findStorage = [&](const auto& bindings) {
+                        for (const auto& [name, binding] : bindings)
+                            if (binding.Storage == returnNV.Storage)
+                            {
+                                localNV = binding;
+                                retName = name;
+                                return true;
+                            }
+                        return false;
+                    };
+                    if (findStorage(frame.functionArgument) || findStorage(frame.namedVariable))
+                        break;
+                }
             bool movableLocalReturn =
                 !retName.empty()
                 && !localNV.TypeAndValue.TypeName.empty()
@@ -3733,13 +3872,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // A `move`-temp OWNS the field: move it out as the return value (Phase B).
             // Keep the owned bit (ownership transfers to the caller) and zero the source
             // field so the temp's full-dtor (FlushOwnedStructTemps below) skips it. Works
-            // for a string field (clears its owned bit) or an owning struct field (the
-            // aggregate-zero recursively clears every owning subfield's owned bit). An
-            // ALIAS temp (plain accessor) is still rejected - you cannot move out of a borrow.
+            // for string, struct, and array-element fields. An ALIAS temp is still rejected.
             // POINTER fields are excluded here as at the two sibling implied-move sites:
             // the aggregate-zero store below emits IR that crashes codegen on one.
             if (returnNV.MovableTempField && right != nullptr
                 && !returnNV.TypeAndValue.Pointer
+                && !(llvm::isa<llvm::ArrayType>(returnNV.MoveTempStructType)
+                    && returnNV.TypeAndValue.TypeName == "string")
                 && right->getType() == returnNV.BaseType)
             {
                 clearReturnedStringBorrowBit = false;
@@ -3748,11 +3887,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 // to the caller, so its owning-field bits must stay set, not be
                 // cleared as a borrow - clearing would orphan the buffer (leak).
                 clearReturnedStructBorrowBits = false;
-                auto* srcGep = compiler->builder->CreateStructGEP(
-                    returnNV.MoveTempStructType, returnNV.MoveTempStructAlloca,
-                    returnNV.MoveTempFieldIndex, "movedfld");
-                compiler->builder->CreateStore(
-                    llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+                compiler->ClearMovableTempField(returnNV.MoveTempStructType,
+                    returnNV.MoveTempStructAlloca, returnNV.MoveTempFieldIndex, right->getType(),
+                    returnNV.TernaryTempAlreadyRegistered);
             }
             // A `string` field is returned by IMPLICIT COPY instead (see
             // AdoptImplicitStringTempCopy); the reject stays for every other owning type.
@@ -4418,6 +4555,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         {
             llvm::Value* count = compiler->LoadRawArrayLength(returnNV);
             if (count == nullptr) count = compiler->RawArrayCountOf(right);
+            if (count == nullptr && returnNV.TypeAndValue.ConstArraySize > 0
+                && !returnNV.TypeAndValue.IsArrayView)
+                count = compiler->builder->getInt64(returnNV.TypeAndValue.ConstArraySize);
             compiler->builder->CreateStore(
                 count != nullptr
                     ? compiler->Upconvert(count, compiler->builder->getInt64Ty())
@@ -4861,6 +5001,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 auto innerStatement = iterationStatement->statement();
                 MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
                 NoteLoopBodyViewAssignments(compiler, iterationStatement);
+                InvalidateLoopViewsBoundToRawCasts(compiler, iterationStatement);
 
                 auto blockInner = compiler->CreateBasicBlock("doWhileInner");
                 auto blockCondition = compiler->CreateBasicBlock("doWhileCondition");
@@ -4903,6 +5044,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 auto innerStatement = iterationStatement->statement();
                 MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
                 NoteLoopBodyViewAssignments(compiler, iterationStatement);
+                InvalidateLoopViewsBoundToRawCasts(compiler, iterationStatement);
 
                 auto blockCondition = compiler->CreateBasicBlock("whileCondition");
                 auto blockInner = compiler->CreateBasicBlock("whileInner");
@@ -5013,6 +5155,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                         compiler, LLVMBackend::OwnFlagLoopFrame | LLVMBackend::OwnFlagLoopIncrementFrame);
                     MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
                     NoteLoopBodyViewAssignments(compiler, iterationStatement);
+                    InvalidateLoopViewsBoundToRawCasts(compiler, iterationStatement);
 
                     compiler->CreateBlockBreak(blockCondition, false);
 
@@ -5086,6 +5229,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     auto bodyStmt    = iterationStatement->statement();
                     MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
                     NoteLoopBodyViewAssignments(compiler, iterationStatement);
+                    InvalidateLoopViewsBoundToRawCasts(compiler, iterationStatement);
 
                     std::string varName = varNameTok->getText();
 
@@ -5805,9 +5949,20 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     else if (isArrayView)
                     {
                         countVal = compiler->LoadRawArrayLength(collNV);
-                        if (countVal == nullptr)
-                            LogErrorContext(iterationStatement,
-                                "cannot range-for over an array view whose length is unknown");
+                        const LLVMBackend::RawArrayLengthState collState =
+                            compiler->RawArrayLengthStateOf(collNV);
+                        if (countVal == nullptr || !collState.Known)
+                        {
+                            if (countVal != nullptr && collState.Available
+                                && !collState.SourceParams.empty())
+                            {
+                                for (size_t index : collState.SourceParams)
+                                    compiler->RequireCurrentFunctionArrayViewCountParameter(index);
+                            }
+                            else
+                                LogErrorContext(iterationStatement,
+                                    "cannot range-for over an array view whose length is unknown");
+                        }
                         if (countVal != nullptr && countVal->getType() != compiler->builder->getInt32Ty())
                             countVal = compiler->builder->CreateIntCast(
                                 countVal, compiler->builder->getInt32Ty(), false, "viewcount");

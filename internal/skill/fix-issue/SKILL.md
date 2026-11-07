@@ -171,8 +171,8 @@ compiler):**
 **Phase B - Fix and test to the matrix:**
 
 - Fix ALL cells that share the root cause, not just the filed spelling. If a
-  cell genuinely needs separate work, say so explicitly per cell (it may become
-  a new issue file).
+  cell genuinely needs separate work, say so explicitly per cell (the main session
+  decides; on a p3/p4 it is not filed - see Step 3 "No new issue file").
 - **Audit every COPY of the predicate you are changing, and report per-site.**
   Before reporting, grep for every site that asks the same question the fixed
   predicate asks - the same field comparison, the same flag test, the same
@@ -287,7 +287,7 @@ right tool for a rule change and the wrong tool for a lowering or text fix: on a
 spends the round finding pre-existing siblings that then get filed, and the tracker grows
 while the fix waits. Tell the reviewer what kind of change it is reviewing and, for a small one,
 that findings outside the changed rule are to be fixed in place if one-site or reported in one
-line for the queue, not probed further.
+line, not probed further (reported, not filed - see "No new issue file" below).
 **The reviewer is always the other model family from the implementer** (maintainer,
 2026-10-01): a Codex implementer gets the opus agent for every round, an opus implementer
 gets the codex CLI. When an escalation changes the implementer, the reviewer flips with it.
@@ -422,8 +422,14 @@ Reviewer-applied fixes and their verification rounds count against the same
   false claims in a tracked record follow the non-trivial path above.
 - **Classify every finding** (ruling 2026-10-05): REGRESSION (master right, branch wrong),
   INCOMPLETE (the change's own claimed shape still wrong), or PRE-EXISTING (master equally
-  wrong, adjacent shape). Only the first two go back to the branch. PRE-EXISTING is filed as an
-  issue and does not block landing, unless it is a one-site twin of the fix.
+  wrong, adjacent shape). Only the first two go back to the branch. PRE-EXISTING does not block
+  landing, unless it is a one-site twin of the fix.
+- **No new issue file from a p3/p4 landing** (maintainer ruling 2026-10-25, restated 2026-11-03),
+  whatever the finding's class. INCOMPLETE goes back to the implementer (escalation ladder). A
+  PRE-EXISTING finding in the fix's area joins the next round's scope; an unrelated one is noted in
+  one line in the box resume log, never filed. New files are allowed only for (a) a design/ruling
+  blocker, or (b) the residue of a p2 landing split out as a p3. Box 10 broke this (26 filed vs 23
+  closed) by filing every PRE-EXISTING review finding.
 - Repeat until the review has no blocking finding. No fixed round cap: escalate on RECURRENCE,
   not round count. A finding that survives one fix round -> the main session adds a fix sketch
   (sites, direction) to the next brief, same implementer; or escalates to opus if the root

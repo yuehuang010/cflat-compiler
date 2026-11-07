@@ -3497,11 +3497,355 @@ bool LLVMBackend::NullExplicitFunctionMoveToValue(const TypeAndValue& param, con
         return true;
 }
 
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::CheckDuplicateMoveParamSources(
+        const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args)
+{
+        struct SourceIdentity
+        {
+            const llvm::Value* Storage = nullptr;
+            std::string Path;
+            std::string Subject;
+        };
+        std::vector<SourceIdentity> consumed;
+        auto isPathPrefix = [](const std::string& prefix, const std::string& path) {
+            return path.size() > prefix.size()
+                && path.compare(0, prefix.size(), prefix) == 0
+                && (path[prefix.size()] == '.' || path[prefix.size()] == '[');
+        };
+        auto pathsOverlap = [&](const std::string& left, const std::string& right) {
+            return left == right || left.empty() || right.empty()
+                || isPathPrefix(left, right) || isPathPrefix(right, left);
+        };
+        auto addSource = [&](std::vector<SourceIdentity>& target, const llvm::Value* storage,
+                const std::string& path, const std::string& subject, bool conditionalArm) {
+            if (storage == nullptr) return;
+            for (const auto& prior : target)
+                if (prior.Storage == storage && pathsOverlap(prior.Path, path))
+                {
+                    if (conditionalArm) return;
+                    const std::string& outerSubject = path.size() < prior.Path.size()
+                        ? subject : prior.Subject;
+                    LogError(std::format("use of moved variable '{}'", outerSubject));
+                }
+            target.push_back({ storage, path, subject });
+        };
+        auto isTrackedSource = [&](const NamedVariable& value) {
+            if (value.IsBorrowed || value.IsBorrowedOwningValue || value.IsAliasBorrow
+                || value.BorrowsOwnedString || value.BorrowsOwnedElement
+                || value.TypeAndValue.IsAlias)
+                return false;
+            const auto& type = value.HasOriginalArgumentType
+                ? value.OriginalArgumentType : value.TypeAndValue;
+            if (type.Pointer)
+                return value.IsOwning || value.IsOwningString || value.IsOwningStruct
+                    || IsVariableOwning(value.CallerName)
+                    || IsVariableOwningString(value.CallerName)
+                    || IsCoreUniqueType(type.TypeName);
+            if (type.TypeName.empty()) return false;
+            llvm::Type* valueType = GetType(type);
+            return IsOwningValueType(type.TypeName) || IsCoreUniqueType(type.TypeName)
+                || (valueType != nullptr && valueType->isStructTy());
+        };
+        auto resolvedStorage = [&](const std::string& root, const llvm::Value* fallback) {
+            if (!root.empty())
+                if (llvm::Value* storage = FindVariableStorage(root).Storage)
+                    return static_cast<const llvm::Value*>(storage);
+            return fallback;
+        };
+        auto subjectFor = [&](const NamedVariable& value, const std::string& path) {
+            if (!value.FieldPathText.empty()) return value.FieldPathText;
+            std::string subject = !value.CallerName.empty()
+                ? value.CallerName : value.TypeAndValue.VariableName;
+            if (!path.empty() && subject.find('.') == std::string::npos)
+                subject += (path.front() == '[' ? "" : ".") + path;
+            return subject.empty() ? SpellType(*this, value.TypeAndValue) : subject;
+        };
+        for (size_t i = 0; i < params.size() && i < args.size(); ++i)
+        {
+            if (!params[i].IsMove && (params[i].Pointer || params[i].IsAlias
+                || !IsCoreUniqueType(params[i].TypeName)))
+                continue;
+            auto collect = [&](auto&& self, const NamedVariable& value) -> void {
+                if (value.IsTupleLiteral)
+                {
+                    for (const auto& element : value.TupleLiteralElements)
+                        self(self, element);
+                    return;
+                }
+                if (!isTrackedSource(value)) return;
+                if (!value.ConditionalMoveSources.empty())
+                {
+                    std::vector<SourceIdentity> alternatives;
+                    for (const auto& source : value.ConditionalMoveSources)
+                    {
+                        if (!source.MoveParamSinkArgument || source.BorrowedPointer
+                            || source.MovePathHasDynamicIndex)
+                            continue;
+                        const std::string path = !source.MovePathKey.empty()
+                            ? source.MovePathKey : source.FieldName;
+                        std::string subject = source.CallerName;
+                        if (!path.empty()) subject += (path.front() == '[' ? "" : ".") + path;
+                        const llvm::Value* storage = resolvedStorage(source.CallerName,
+                            source.Storage);
+                        addSource(alternatives, storage, path, subject, true);
+                    }
+                    for (const auto& source : alternatives)
+                        addSource(consumed, source.Storage, source.Path, source.Subject, false);
+                    return;
+                }
+                if (value.MovePathHasDynamicIndex) return;
+                const std::string path = FieldMoveKey(value);
+                const std::string root = !value.FieldPathRoot.empty()
+                    ? value.FieldPathRoot : value.CallerName;
+                const llvm::Value* storage = resolvedStorage(root, value.Storage);
+                addSource(consumed, storage, path, subjectFor(value, path), false);
+            };
+            collect(collect, args[i]);
+        }
+}
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::CheckConditionalMoveParamDiagnostics(
+        const std::string& functionName, const TypeAndValue& param,
+        const NamedVariable& arg)
+{
+        const auto borrowedArm = std::find_if(arg.ConditionalMoveSources.begin(),
+            arg.ConditionalMoveSources.end(), [](const auto& source) {
+                return source.MoveParamSinkArgument && source.BorrowedPointer;
+            });
+        const bool paramIsMoveSink = param.IsMove
+            || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName));
+        if (paramIsMoveSink && borrowedArm != arg.ConditionalMoveSources.end())
+        {
+            const bool directBorrowParam = IsFunctionParameter(borrowedArm->CallerName);
+            const std::string borrowOrigin = borrowedArm->BorrowedOrigin;
+            const bool copiedBorrow = !directBorrowParam && !borrowOrigin.empty()
+                && IsFunctionParameter(borrowOrigin);
+            if (borrowedArm->BorrowedFromOwningLocal)
+                LogOwningLocalCopyMoveSinkError(borrowedArm->CallerName, borrowOrigin,
+                    param.VariableName, SpellFunctionSymbol(*this, functionName));
+            else if (directBorrowParam || copiedBorrow)
+            {
+                const std::string sourceDescription = directBorrowParam
+                    ? std::format("borrowed parameter '{}'", borrowedArm->CallerName)
+                    : std::format("borrowed pointer '{}' (copied from parameter '{}')",
+                        borrowedArm->CallerName.empty() ? borrowOrigin : borrowedArm->CallerName,
+                        borrowOrigin);
+                const std::string declaredName = directBorrowParam
+                    ? borrowedArm->CallerName : borrowOrigin;
+                LogBorrowedPointerMoveSinkError(sourceDescription, param.VariableName,
+                    SpellFunctionSymbol(*this, functionName), declaredName);
+            }
+        }
+        const auto deferred = std::find_if(arg.ConditionalMoveSources.begin(),
+            arg.ConditionalMoveSources.end(), [](const auto& source) {
+                return !source.DeferredDiagnostic.empty();
+            });
+        if (deferred != arg.ConditionalMoveSources.end())
+            LogErrorMessage("{}", { deferred->DeferredDiagnostic });
+}
+
+LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::ApplyConditionalMoveParamSourceTransfer(
+        const NamedVariable& arg, bool isOwningSink, bool paramIsMove,
+        bool explicitFunctionMove, bool beforeCall)
+{
+        bool anyMoveParamCallArm = false;
+        for (const auto& source : arg.ConditionalMoveSources)
+            anyMoveParamCallArm = anyMoveParamCallArm
+                || (source.MoveParamSinkArgument && !source.BorrowedPointer);
+        if (arg.ConditionalMoveSources.empty()
+            || !(isOwningSink || (paramIsMove && anyMoveParamCallArm)))
+            return false;
+        if (beforeCall)
+            for (const auto& source : arg.ConditionalMoveSources)
+            {
+                if (!source.IsExplicitMove && !arg.IsExplicitMove
+                    && !source.BorrowedPointer && !source.CallerName.empty()
+                    && (isOwningSink || (paramIsMove && source.MoveParamSinkArgument)))
+                {
+                    NamedVariable sourceValue;
+                    sourceValue.TypeAndValue = arg.TypeAndValue;
+                    sourceValue.Storage = source.Storage;
+                    sourceValue.CallerName = source.CallerName;
+                    sourceValue.FieldPathRoot = source.CallerName;
+                    sourceValue.FieldName = source.FieldName;
+                    sourceValue.MovePathKey = source.MovePathKey;
+                    sourceValue.MovePathHasDynamicIndex = source.MovePathHasDynamicIndex;
+                    sourceValue.IsElementAccess = source.IsElementAccess;
+                    sourceValue.IsStaticLocal = arg.IsStaticLocal;
+                    sourceValue.FieldPathHasPointerDereference = arg.FieldPathHasPointerDereference;
+                    sourceValue.FieldPathPointerFrameLocal = arg.FieldPathPointerFrameLocal;
+                    sourceValue.RootIsBorrowedByValueParam = arg.RootIsBorrowedByValueParam;
+                    sourceValue.RootIsAliasBorrowLocal = arg.RootIsAliasBorrowLocal;
+                    sourceValue.PointsToBorrowedByValueParam = arg.PointsToBorrowedByValueParam;
+                    sourceValue.IsBorrowed = arg.IsBorrowed;
+                    sourceValue.BorrowedOrigin = arg.BorrowedOrigin;
+                    sourceValue.IsUniqueFieldAlias = arg.IsUniqueFieldAlias;
+                    const llvm::Value* sourceRoot = source.Storage;
+                    for (int hop = 0; sourceRoot != nullptr && hop < 8; ++hop)
+                    {
+                        if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(sourceRoot))
+                        { sourceRoot = gep->getPointerOperand(); continue; }
+                        if (auto* bitcast = llvm::dyn_cast<llvm::BitCastOperator>(sourceRoot))
+                        { sourceRoot = bitcast->getOperand(0); continue; }
+                        break;
+                    }
+                    if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(sourceRoot))
+                    {
+                        const std::string localName = FindVariableNameByStorage(global);
+                        const NamedVariable* rootBinding = FindVariableByStorage(global);
+                        sourceValue.CallerName = localName.empty()
+                            ? global->getName().str() : localName;
+                        sourceValue.FieldPathRoot = sourceValue.CallerName;
+                        if (rootBinding != nullptr)
+                            sourceValue.IsStaticLocal = rootBinding->IsStaticLocal;
+                    }
+                    if (std::string error = ImplicitOutlivingOwnerConsumeError(sourceValue, false);
+                        !error.empty())
+                        LogError(error);
+                }
+            }
+        const bool nullsThisFieldArm = std::any_of(arg.ConditionalMoveSources.begin(),
+            arg.ConditionalMoveSources.end(), [&](const auto& source) {
+                return source.RootIsBorrowedThisField
+                    && (isOwningSink || (source.MoveParamSinkArgument && !source.BorrowedPointer));
+            });
+        if (beforeCall && nullsThisFieldArm)
+        {
+            const std::string error = ImplicitThisFieldConsumeError(arg, false);
+            if (!error.empty())
+            {
+                if (arg.SourceExpressionContext != nullptr && contextualErrorReporter)
+                    contextualErrorReporter(arg.SourceExpressionContext, error);
+                else
+                    LogError(error);
+                return true;
+            }
+        }
+        for (const auto& source : arg.ConditionalMoveSources)
+        {
+            if (!isOwningSink
+                && (!source.MoveParamSinkArgument || source.BorrowedPointer))
+                continue;
+            if (beforeCall)
+            {
+                if (source.Storage == nullptr || source.ValueType == nullptr
+                    || source.ArmBlock == nullptr
+                    || cflat_llvm::GetTerminatorOrNull(source.ArmBlock) == nullptr)
+                    continue;
+                auto savedIP = builder->saveIP();
+                builder->SetInsertPoint(source.ArmBlock->getTerminator());
+                builder->CreateStore(llvm::Constant::getNullValue(source.ValueType), source.Storage);
+                if (!source.NullKey.empty()) RecordNullSet(source.NullKey);
+                if (source.PointeeMove) RecordNullSet(source.CallerName, true);
+                builder->restoreIP(savedIP);
+            }
+            else if (!source.CallerName.empty())
+            {
+                if (explicitFunctionMove) continue;
+                if (!source.MovePathHasDynamicIndex && !source.MovePathKey.empty())
+                    MarkVariableFieldMoved(source.CallerName, source.MovePathKey);
+                else if (!source.FieldName.empty())
+                    MarkVariableFieldMoved(source.CallerName, source.FieldName);
+                else if (!source.IsElementAccess)
+                    MarkVariableMoved(source.CallerName, source.PointeeMove);
+            }
+        }
+        return true;
+}
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::ApplyMoveParamTupleTransfer(
+        const std::string& functionName, const TypeAndValue& param,
+        const NamedVariable& value, bool beforeCall)
+{
+        if (value.IsTupleLiteral)
+        {
+            llvm::Type* tupleStorageType = value.Storage != nullptr
+                && !value.TypeAndValue.TypeName.empty()
+                ? GetType(value.TypeAndValue) : nullptr;
+            if (beforeCall && tupleStorageType != nullptr && tupleStorageType->isStructTy())
+                ZeroMovedSource(value.Storage, tupleStorageType);
+            for (const auto& element : value.TupleLiteralElements)
+                ApplyMoveParamTupleTransfer(functionName, param, element, beforeCall);
+            return;
+        }
+        if (value.MovableTempField && !value.TypeAndValue.Pointer
+            && value.MoveTempStructType != nullptr && value.MoveTempStructAlloca != nullptr)
+        {
+            if (beforeCall)
+                ClearMovableTempField(value.MoveTempStructType, value.MoveTempStructAlloca,
+                    value.MoveTempFieldIndex, GetType(value.TypeAndValue),
+                    value.TernaryTempAlreadyRegistered);
+            return;
+        }
+        if (!value.ConditionalMoveSources.empty())
+        {
+            if (beforeCall)
+                CheckConditionalMoveParamDiagnostics(functionName, param, value);
+            if (beforeCall)
+            {
+                if (std::string error = ImplicitOutlivingOwnerConsumeError(value, false);
+                    !error.empty())
+                    LogError(error);
+            }
+            ApplyConditionalMoveParamSourceTransfer(value, false, param.IsMove,
+                value.IsExplicitMove, beforeCall);
+            return;
+        }
+        if (value.TypeAndValue.Pointer || value.IsBorrowedOwningValue || value.IsBorrowed
+            || value.TernaryTempAlreadyRegistered || value.FromOwningTempField)
+            return;
+        const std::string typeName = ResolveTypeAlias(value.TypeAndValue.TypeName);
+        const bool isOwning = IsOwningValueType(typeName) || IsCoreUniqueType(typeName);
+        llvm::Type* valueType = typeName.empty() ? nullptr : GetType(value.TypeAndValue);
+        const bool isStruct = valueType != nullptr && valueType->isStructTy();
+        if (!isOwning && !isStruct) return;
+        const std::string sourceName = !value.CallerName.empty()
+            ? value.CallerName
+            : (!value.FieldPathRoot.empty() ? value.FieldPathRoot
+                : value.TypeAndValue.VariableName);
+        const std::string movePath = FieldMoveKey(value);
+        if (beforeCall)
+        {
+            if (isOwning)
+            {
+                if (std::string error = ImplicitThisFieldConsumeError(value, false);
+                    !error.empty())
+                {
+                    if (value.SourceExpressionContext != nullptr && contextualErrorReporter)
+                        contextualErrorReporter(value.SourceExpressionContext, error);
+                    else
+                        LogError(error);
+                }
+                if (!IsCoreUniqueType(typeName))
+                    if (std::string error = ImplicitOutlivingOwnerConsumeError(value, false);
+                        !error.empty())
+                        LogError(error);
+            }
+            llvm::Value* storage = value.Storage;
+            if (storage == nullptr && movePath.empty() && !value.IsElementAccess
+                && !sourceName.empty())
+                storage = FindVariableStorage(sourceName).Storage;
+            if (storage != nullptr && isStruct)
+                ZeroMovedSource(storage, valueType);
+        }
+        else if (!value.DeferMovedMark && !sourceName.empty())
+        {
+            if (!movePath.empty())
+                MarkVariableFieldMoved(sourceName, movePath);
+            else if (!value.IsElementAccess)
+                MarkVariableMoved(sourceName, value.PointeeMove);
+        }
+}
+
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign, bool calleeIsMethod, bool beforeCall, bool calleeIsCxx)
 {
-        if (beforeCall) RegisterOwnedStringRvalueArguments(args);
+        if (beforeCall)
+        {
+            CheckDuplicateMoveParamSources(params, args);
+            RegisterOwnedStringRvalueArguments(args);
+        }
         auto argumentType = [&](const NamedVariable& arg) -> const TypeAndValue& {
             return arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue;
         };
@@ -3527,6 +3871,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         };
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
+            if (params[i].IsMove && !params[i].Pointer && !params[i].IsAlias
+                && args[i].IsTupleLiteral)
+                ApplyMoveParamTupleTransfer(functionName, params[i], args[i], beforeCall);
             const auto& movedArgType = argumentType(args[i]);
             const bool explicitFunctionMove = args[i].IsExplicitMove
                 && isFunctionValue(movedArgType);
@@ -3573,45 +3920,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 && args[i].FieldName.empty() && args[i].OwningStructName.empty();
             if (sourceName.empty() && movePath.empty())
                 sourceName = args[i].TypeAndValue.VariableName;
-            const bool paramIsMoveSink = params[i].IsMove
-                || (!params[i].Pointer && !params[i].IsAlias
-                    && IsCoreUniqueType(params[i].TypeName));
             if (beforeCall)
-            {
-                const auto borrowedArm = std::find_if(args[i].ConditionalMoveSources.begin(),
-                    args[i].ConditionalMoveSources.end(), [](const auto& source) {
-                        return source.MoveParamSinkArgument && source.BorrowedPointer;
-                    });
-                if (paramIsMoveSink && borrowedArm != args[i].ConditionalMoveSources.end())
-                {
-                    const bool directBorrowParam = IsFunctionParameter(borrowedArm->CallerName);
-                    const std::string borrowOrigin = borrowedArm->BorrowedOrigin;
-                    const bool copiedBorrow = !directBorrowParam && !borrowOrigin.empty()
-                        && IsFunctionParameter(borrowOrigin);
-                    if (borrowedArm->BorrowedFromOwningLocal)
-                        LogOwningLocalCopyMoveSinkError(borrowedArm->CallerName, borrowOrigin,
-                            params[i].VariableName, SpellFunctionSymbol(*this, functionName));
-                    else if (directBorrowParam || copiedBorrow)
-                    {
-                        const std::string sourceDescription = directBorrowParam
-                            ? std::format("borrowed parameter '{}'", borrowedArm->CallerName)
-                            : std::format("borrowed pointer '{}' (copied from parameter '{}')",
-                                borrowedArm->CallerName.empty() ? borrowOrigin : borrowedArm->CallerName,
-                                borrowOrigin);
-                        const std::string declaredName = directBorrowParam
-                            ? borrowedArm->CallerName : borrowOrigin;
-                        LogBorrowedPointerMoveSinkError(sourceDescription,
-                            params[i].VariableName, SpellFunctionSymbol(*this, functionName),
-                            declaredName);
-                    }
-                }
-                const auto deferred = std::find_if(args[i].ConditionalMoveSources.begin(),
-                    args[i].ConditionalMoveSources.end(), [](const auto& source) {
-                        return !source.DeferredDiagnostic.empty();
-                    });
-                if (deferred != args[i].ConditionalMoveSources.end())
-                    LogErrorMessage("{}", { deferred->DeferredDiagnostic });
-            }
+                CheckConditionalMoveParamDiagnostics(functionName, params[i], args[i]);
             if (params[i].IsRvalueRef && args[i].IsExplicitMove)
             {
                 // C++ move construction consumes the source only at compile time. The moved-from
@@ -3698,6 +4008,29 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 || (!params[i].Pointer && !params[i].IsAlias
                         && IsCoreUniqueType(params[i].TypeName))
                 || sinkConsumes || forcedOperatorConsume);
+            if (paramConsumesOwningValue && args[i].IsTupleLiteral)
+            {
+                auto findBorrowedTupleParam = [&](auto&& self, const NamedVariable& value) -> std::string {
+                    if (value.IsBorrowedOwningValue
+                        || (!value.CallerName.empty()
+                            && IsVariableBorrowedOwningValue(value.CallerName)))
+                        return !value.CallerName.empty() ? value.CallerName
+                            : value.TypeAndValue.VariableName;
+                    if (!value.IsTupleLiteral) return {};
+                    for (const auto& element : value.TupleLiteralElements)
+                        if (std::string source = self(self, element); !source.empty())
+                            return source;
+                    return {};
+                };
+                if (std::string borrowedSource = findBorrowedTupleParam(findBorrowedTupleParam, args[i]);
+                    !borrowedSource.empty())
+                    LogError(std::format(
+                        "call to '{}': parameter '{}' takes over the value and frees it later, but "
+                        "this function only uses it ('{}' is a parameter that takes a copy, so the "
+                        "calling code keeps ownership). Accept the parameter as a parameter that "
+                        "takes over the value (move it in the body), or pass a copy with 'copy()'.",
+                        SpellFunctionSymbol(*this, functionName), params[i].VariableName, borrowedSource));
+            }
             if (paramConsumesOwningValue
                 && IsVariableBorrowedOwningValue(sourceName))
             {
@@ -3861,58 +4194,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
                 }
 
-                // Only sources collected from a call argument feed the declared move-param path.
-                // Assignment joins keep their existing source-ledger behavior.
-                bool anyMoveParamCallArm = false;
-                for (const auto& source : args[i].ConditionalMoveSources)
-                    anyMoveParamCallArm = anyMoveParamCallArm
-                        || (source.MoveParamSinkArgument && !source.BorrowedPointer);
-                if (!args[i].ConditionalMoveSources.empty()
-                    && (isOwningSink || (params[i].IsMove && anyMoveParamCallArm)))
-                {
-                    const bool nullsThisFieldArm = std::any_of(
-                        args[i].ConditionalMoveSources.begin(), args[i].ConditionalMoveSources.end(),
-                        [&](const auto& source) {
-                            return source.RootIsBorrowedThisField
-                                && (isOwningSink
-                                    || (source.MoveParamSinkArgument && !source.BorrowedPointer));
-                        });
-                    if (beforeCall && nullsThisFieldArm && reportThisFieldConsume(args[i]))
-                        continue;
-                    for (const auto& source : args[i].ConditionalMoveSources)
-                    {
-                        if (!isOwningSink
-                            && (!source.MoveParamSinkArgument || source.BorrowedPointer))
-                            continue;
-                        if (beforeCall)
-                        {
-                            if (source.Storage == nullptr || source.ValueType == nullptr
-                                || source.ArmBlock == nullptr
-                                || cflat_llvm::GetTerminatorOrNull(source.ArmBlock) == nullptr)
-                                continue;
-                            auto savedIP = builder->saveIP();
-                            builder->SetInsertPoint(source.ArmBlock->getTerminator());
-                            builder->CreateStore(llvm::Constant::getNullValue(source.ValueType),
-                                                 source.Storage);
-                            if (!source.NullKey.empty()) RecordNullSet(source.NullKey);
-                            if (source.PointeeMove)
-                                RecordNullSet(source.CallerName, true);
-                            builder->restoreIP(savedIP);
-                        }
-                        else if (!source.CallerName.empty())
-                        {
-                            if (explicitFunctionMove)
-                                continue;
-                            if (!source.MovePathHasDynamicIndex && !source.MovePathKey.empty())
-                                MarkVariableFieldMoved(source.CallerName, source.MovePathKey);
-                            else if (!source.FieldName.empty())
-                                MarkVariableFieldMoved(source.CallerName, source.FieldName);
-                            else if (!source.IsElementAccess)
-                                MarkVariableMoved(source.CallerName, source.PointeeMove);
-                        }
-                    }
+                if (ApplyConditionalMoveParamSourceTransfer(args[i], isOwningSink,
+                    params[i].IsMove, explicitFunctionMove, beforeCall))
                     continue;
-                }
 
                 if (beforeCall)
                 {
@@ -3920,6 +4204,17 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     // argument. Do not clear the wrapper before that release call runs.
                     if (foreignCxxPointerSink && !args[i].TypeAndValue.Pointer)
                         continue;
+                    // A movable owning field has no standalone Storage; clear its recorded parent
+                    // slot so the temporary's full-expression cleanup skips the transferred field.
+                    if (args[i].MovableTempField && !args[i].TypeAndValue.Pointer
+                        && args[i].MoveTempStructType != nullptr
+                        && args[i].MoveTempStructAlloca != nullptr)
+                    {
+                        ClearMovableTempField(args[i].MoveTempStructType,
+                            args[i].MoveTempStructAlloca, args[i].MoveTempFieldIndex,
+                            GetType(args[i].TypeAndValue), args[i].TernaryTempAlreadyRegistered);
+                        continue;
+                    }
                     // The source slot is cleared below: that is the consume a this-field refuses.
                     const bool nullsFatData = params[i].IsFatInterfaceValue()
                         && args[i].TypeAndValue.IsFatInterfaceValue()
@@ -3983,7 +4278,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         {
                             builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), srcStorage);
                         }
-                        else if (srcBaseTy == nullptr && params[i].TypeName != "string")
+                        else if (srcBaseTy == nullptr && params[i].TypeName != "string"
+                            && !args[i].IsTupleLiteral)
                         {
                             LogErrorMessage(
                                 "call to '{}': 'move' argument {} has no resolved type, so its source "
@@ -5579,6 +5875,11 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             if (param.IsArrayView
                 && RejectArrayViewParamBinding(nv, param, ifaceName + "." + methodName))
                 return nullptr;
+            // The direct-call count check, applied to the union of the implementors' requirements.
+            if (param.IsArrayView && InterfaceImplRequiresArrayViewCount(ifaceName, *methodInfo, i))
+                RequireKnownArrayViewCount(nv,
+                    param.VariableName.empty() ? std::to_string(i + 1) : param.VariableName,
+                    ifaceName + "." + methodName, nullptr);
 
             if (IsImplicitPrimitiveToPointer(param, nv, nv.Primary))
             {
@@ -5720,7 +6021,9 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 lastCxxRetValue_ = resultValue;
         }
         RegisterRawArrayCallResult(callResult, rawReturnCountSlot,
-                                   methodInfo->ReturnType.AllocAlignValue);
+                                   methodInfo->ReturnType.AllocAlignValue,
+                                   methodInfo->ReturnType.IsArrayView,
+                                   methodInfo->ReturnType.IsMove);
         std::vector<llvm::Value*> aliasCallArgs;
         aliasCallArgs.reserve(methodInfo->Parameters.size());
         for (size_t i = 0; i < methodInfo->Parameters.size(); ++i)

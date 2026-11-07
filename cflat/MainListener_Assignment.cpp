@@ -350,7 +350,10 @@ bool MainListener::IsWholeCxxCallArgumentShape(
 
 LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use) {
-        auto result = ParseAssignmentExpressionNamedBody(ctx, use);
+        // Parentheses around a complete RHS are transparent, just as in declaration
+        // initialization. Parse the same inner tree so ownership and value-category facts survive.
+        auto* expression = UnwrapInitializerParens(ctx);
+        auto result = ParseAssignmentExpressionNamedBody(expression, use);
         // Direct call arguments are resolved against the selected parameter below. Other uses
         // consume a value, so detach an owning conditional read before it reaches a plain store.
         bool directCallArgument = false;
@@ -378,10 +381,10 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             break;
         }
         if (!directCallArgument && use != ResultUse::Discard)
-            MaterializeNullConditionalOwningValue(result, ctx);
+            MaterializeNullConditionalOwningValue(result, expression);
         // T483: only a `move` written directly over a call is a call-result move. A `?:` of moves
         // (T249) joins its own temp, so its arguments must not take the direct-call transfer.
-        if (auto* moveSite = ctx != nullptr ? TopLevelMoveExpression(ctx) : nullptr)
+        if (auto* moveSite = expression != nullptr ? TopLevelMoveExpression(expression) : nullptr)
         {
             auto* operand = moveSite->unaryExpression() != nullptr
                 ? moveSite->unaryExpression()->postfixExpression() : nullptr;
@@ -3801,7 +3804,11 @@ bool MainListener::RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx
                                      const LLVMBackend::NamedVariable& rhsNV) {
         std::string destElement;
         std::string srcElement;
-        if (!Compiler()->ArrayViewElementMismatch(target, rhsNV.TypeAndValue, destElement, srcElement))
+        // The function-value flag lives on the original argument; a loaded view does not carry it.
+        auto source = rhsNV.TypeAndValue;
+        if (rhsNV.HasOriginalArgumentType && rhsNV.OriginalArgumentType.IsFunctionPointer)
+            source.IsFunctionPointer = true;
+        if (!Compiler()->ArrayViewElementMismatch(target, source, destElement, srcElement))
             return false;
         if (target.IsArrayView)
             LogErrorContext(ctx, Compiler()->LocalizeMessage(
@@ -4384,6 +4391,37 @@ bool MainListener::IsDeclaredPointerSubscriptString(
         // An unproven `(*pp)[i]` can be borrowed; its copy sites apply owned-array exceptions.
         return !rawNewArrayTarget && (pointerBindingProvesLocalElement || parenthesizedPointerDeref);
     }
+
+LLVM_ATTRIBUTE_NOINLINE void MainListener::UpdateAssignmentStackCharBufferBorrow(
+        LLVMBackend::NamedVariable* result,
+        const LLVMBackend::NamedVariable& destination,
+        const LLVMBackend::NamedVariable* source,
+        std::string_view assignmentOperator) {
+        if (assignmentOperator == "=")
+        {
+            if (result == nullptr || destination.TypeAndValue.Pointer
+                || (!NamedVarIsString(destination) && !NamedVarIsStringView(destination)))
+                return;
+            if (source != nullptr && source->StackCharBufferBorrow)
+                CarryStackCharBufferBorrow(*result, *source);
+            else
+            {
+                result->StackCharBufferBorrow = false;
+                result->StackCharBufferSource.clear();
+                result->StackCharBufferScopeDepth = 0;
+            }
+            return;
+        }
+        if (assignmentOperator != "+=" || destination.TypeAndValue.Pointer
+            || !NamedVarIsString(destination))
+            return;
+        if (result != nullptr)
+        {
+            result->StackCharBufferBorrow = false;
+            result->StackCharBufferSource.clear();
+            result->StackCharBufferScopeDepth = 0;
+        }
+}
 
 llvm::Value* MainListener::ParseAssignmentExpression(
         CFlatParser::AssignmentExpressionContext* ctx,
@@ -5834,7 +5872,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         }
                     }
 
-                    const bool sourceIsTemporary = rhsTemp != nullptr || xvalueSource;
+                    const bool sourceIsTemporary = rhsTemp != nullptr || xvalueSource || rhsNV.IsRvalue;
                     // An addressable, non-temporary source outlives this statement: an lvalue.
                     const bool sourceIsLvalue = !useMove && !sourceIsTemporary
                         && rhsNV.Storage != nullptr && !rhsNV.IsRvalue;
@@ -5854,7 +5892,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         if (result == nullptr && info->hasCopyAssign)
                             result = lvalueReceiverAssignment(
                                 info->copyAssignOverloads, info->copyAssign,
-                                sourceIsLvalue ? (rhsNV.TypeAndValue.IsConstObject() ? 1 : 0) : -1);
+                                sourceIsLvalue ? (rhsNV.TypeAndValue.IsConstObject() ? 1 : 0)
+                                    : (sourceIsTemporary ? 1 : -1));
                         if (result == nullptr && !useMove && !sourceIsTemporary
                             && info->hasMoveAssign && !sourceIsLvalue)
                             result = lvalueReceiverAssignment(
@@ -6397,6 +6436,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     compiler->SwitchToBlock(coalesceResume);
                     resultValue = derefLoad();
                 }
+                // Reload non-pointer assignment results after the store; preserve the stored
+                // operand for unique-field witnessing, pointer provenance, and bitfield results.
+                llvm::Value* storedValue = resultValue;
+                if (assignmentResult != nullptr && coalesceResume == nullptr
+                    && !namedVar.BitfieldStorage && !namedVar.TypeAndValue.Pointer)
+                    resultValue = derefLoad();
                 if (assignmentResult != nullptr)
                 {
                     // The stored owner now belongs to the LHS; the assignment rvalue is only an alias.
@@ -6411,7 +6456,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     assignmentResult->IsUniqueFieldAssignmentResult =
                         (uniqueFieldAssignmentResultProduced
                             || (assignmentRhsValue != nullptr
-                                && resultValue == assignmentRhsValue))
+                                && storedValue == assignmentRhsValue))
                         && coalesceResume == nullptr;
                     // An owning struct destination is named too: `T x = (w += 2)` / `return (w = y)`
                     // then consume `w` exactly as `T x = w` does, instead of adopting its bytes twice.
@@ -6452,6 +6497,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         }
                     }
                 }
+                if (!namedVar.TypeAndValue.Pointer
+                    && (NamedVarIsString(namedVar) || NamedVarIsStringView(namedVar))
+                    && ((assignmentOp->getText() == "=" && assignmentResult != nullptr)
+                        || assignmentOp->getText() == "+="))
+                    UpdateAssignmentStackCharBufferBorrow(
+                        assignmentResult, namedVar, storeSource,
+                        assignmentOp->getText());
+                if (assignmentOp->getText() == "+=" && NamedVarIsString(namedVar)
+                    && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                    && llvm::isa<llvm::AllocaInst>(destination))
+                    compiler->SetStackCharBufferBorrow(namedVar.CallerName, false, {}, 0);
                 return resultValue;
             };
 
@@ -6524,6 +6580,27 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
+            // A move argument is read without IsMove (ParseIdentifier). A string argument arrives
+            // owned (LowerByValueArg), so a global/field/deref store transfers it; a deref always does.
+            if (operatorText == "=" && destination != nullptr && isDerefStorage()
+                && !llvm::isa<llvm::GetElementPtrInst>(destination)
+                && IsMoveArgumentStorage(compiler, rightNV))
+                rightNV.TypeAndValue.IsMove = true;
+            if (operatorText == "=" && destination != rightNV.Storage
+                && rightNV.Storage != nullptr && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.IsFunctionPointer
+                && rightNV.TypeAndValue.Pointer && !rightNV.TypeAndValue.IsArrayView
+                && !rightNV.TypeAndValue.IsFunctionPointer)
+            {
+                compiler->MarkArrayViewFieldRootAliased(rightNV.Storage);
+                if (namedVar.FieldName.empty())
+                    compiler->MarkArrayViewFieldRootAliased(destination);
+            }
+            else if (operatorText == "=" && destination != nullptr
+                && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsArrayView
+                && !namedVar.TypeAndValue.IsFunctionPointer
+                && compiler->IsBorrowedAddressValue(rightNV.Primary))
+                compiler->MarkArrayViewFieldRootAliased(destination);
             storeSource = &rightNV;
             if (!namedVar.TypeAndValue.IsFunctionPointer && rightNV.GenericFunctionValue
                 && rightNV.Primary == nullptr && !rightNV.CallerName.empty())
@@ -9467,6 +9544,30 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
             }
 
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsStructField && NamedVarIsString(namedVar)
+                && rightNV.TypeAndValue.TypeName == "string"
+                && IsMoveArgumentStorage(compiler, rightNV)
+                && !rightStringImplicitCopied)
+                rightStringImplicitCopied = AdoptImplicitStringTempCopy(
+                    rightNV, right, ctx,
+                    (namedVar.FieldPathThroughPointer || namedVar.FieldPathHasPointerDereference)
+                        && !namedVar.FieldPathPointerFrameLocal);
+
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && assignedExpr != nullptr && IsDefaultOnlyExpression(assignedExpr, false)
+                && destIsStructField && NamedVarIsString(namedVar)
+                && right->getType() == llvm::StructType::getTypeByName(*compiler->context, "string"))
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor("string"))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                auto* resetValue = llvm::ConstantAggregateZero::get(right->getType());
+                compiler->builder->CreateStore(resetValue, destination);
+                compiler->RearmConditionalDropFlag(namedVar);
+                RetireAliasBorrowOnRebind(compiler, namedVar, assignmentBlock);
+                return finishStore(resetValue);
+            }
+
             // Implied move of a `move`-temp's owning field (`dest = makeToken().text`): the temp OWNS it,
             // so free dest's old value, store the field, and zero the source so the temp dtor skips it.
             // POINTER fields are excluded: this branch was written for owning VALUE types, and on a
@@ -9486,10 +9587,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         compiler->DropValue(namedVar);
                 compiler->builder->CreateStore(right, destination);
                 RetireAliasBorrowOnRebind(compiler, namedVar, assignmentBlock);
-                auto* srcGep = compiler->builder->CreateStructGEP(
-                    rightNV.MoveTempStructType, rightNV.MoveTempStructAlloca, rightNV.MoveTempFieldIndex, "movedfld");
-                compiler->builder->CreateStore(
-                    llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+                compiler->ClearMovableTempField(rightNV.MoveTempStructType,
+                    rightNV.MoveTempStructAlloca, rightNV.MoveTempFieldIndex, right->getType(),
+                    rightNV.TernaryTempAlreadyRegistered);
                 return finishStore(right);
             }
 
@@ -9705,6 +9805,32 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             {
                 right = compiler->EmitOwnedStringDeepCopy(right);
                 rightStringImplicitCopied = true;
+            }
+            if (operatorText == "=" && right != nullptr && right->getType()->isStructTy()
+                && assignedExpr != nullptr && IsDefaultOnlyExpression(assignedExpr, false)
+                && !destIsStructField && namedVar.FieldName.empty()
+                && !namedVar.TypeAndValue.Pointer
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && compiler->ResolveTypeAlias(rightNV.TypeAndValue.TypeName)
+                    == compiler->ResolveTypeAlias(namedVar.TypeAndValue.TypeName)
+                && (NamedVarIsString(namedVar)
+                    || compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)))
+            {
+                emitOwningDestinationDrop();
+                // A struct's `default` is its field defaults, not zero (`int n = 3`).
+                auto* resetValue = NamedVarIsString(namedVar)
+                    ? static_cast<llvm::Value*>(llvm::ConstantAggregateZero::get(right->getType()))
+                    : DefaultValueOfType(namedVar.TypeAndValue, ctx);
+                compiler->builder->CreateStore(resetValue, destination);
+                compiler->RearmConditionalDropFlag(namedVar);
+                RetireAliasBorrowOnRebind(compiler, namedVar, assignmentBlock);
+                if (!namedVar.CallerName.empty())
+                {
+                    compiler->MarkVariableUnmoved(namedVar.CallerName);
+                    compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                }
+                return finishStore(resetValue);
             }
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && !namedVar.TypeAndValue.IsInterface
@@ -10592,6 +10718,35 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 else
                     globalViewCount = compiler->LoadRawArrayLength(rightNV);
                 compiler->StoreRawArrayLength(namedVar, globalViewCount);
+            }
+
+            if (operatorText == "=" && namedVar.TypeAndValue.IsArrayView && right != nullptr)
+            {
+                const bool rhsIsFixedArray = rightNV.TypeAndValue.ConstArraySize > 0
+                    && !rightNV.TypeAndValue.IsArrayView;
+                llvm::Value* count = rhsIsFixedArray
+                    ? static_cast<llvm::Value*>(compiler->builder->getInt64(
+                        rightNV.TypeAndValue.ConstArraySize))
+                    : compiler->LoadRawArrayLength(rightNV);
+                compiler->StoreRawArrayLength(namedVar, count);
+                const auto* rawResult = compiler->FindRawArrayResult(rightNV.Primary);
+                const LLVMBackend::RawArrayLengthState rightState =
+                    compiler->RawArrayLengthStateOf(rightNV);
+                compiler->RequirePersistentArrayViewStoreCount(
+                    namedVar, rightState.SourceParams);
+                const bool known = rhsIsFixedArray || rightState.Known
+                    || (rawResult != nullptr && rawResult->CountKnown);
+                const bool available = known || rightState.Available
+                    || rawResult != nullptr;
+                if (namedVar.FieldName.empty() && !namedVar.RootIsBorrowedThisField)
+                    compiler->SetViewOfFixedArrayStorage(namedVar.CallerName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.CallerName, false);
+                if (compiler->HasArrayViewFieldLengthKey(namedVar))
+                    compiler->SetArrayViewFieldLengthKnown(namedVar, known);
+                else if (namedVar.FieldName.empty() && !namedVar.RootIsBorrowedThisField)
+                    compiler->SetRawArrayLengthState(namedVar.CallerName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.CallerName,
+                        known, available, rightState.SourceParams);
             }
 
             /*

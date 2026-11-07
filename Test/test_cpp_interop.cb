@@ -2420,6 +2420,7 @@ t135.T136List[2] t136GlobalOuter = {};
 t135.DefList[2] t136GlobalDefOuter = {};
 // T136 ORDER: foreign C++ globals keep clang declaration order. Native defaults are local.
 import cpp "library/cpp_t136_order.hpp";
+struct ParenAssignCppHolder { cppcp.CV value = cppcp.CV(0); };
 struct T136Ord { int v; T136Ord() { v = t136ord.mark(); } };
 t136ord.Stamp t136OrdBefore = default;
 t136ord.Stamp t136OrdAfter = default;
@@ -4223,6 +4224,38 @@ extern int main()
     cppcp.CV cpNy = cppcp.CV(0);
     cpNy = cpNx;
     if (cpNy.v != 17) return 54993;
+    // A C++ prvalue cannot bind to operator=(CV&); parentheses keep the const-CV& choice.
+    cppcp.CV parenAssignCvLocal = cppcp.CV(0);
+    ParenAssignCppHolder parenAssignCvHolder = default;
+    cppcp.CV* parenAssignCvPointer = &parenAssignCvLocal;
+    cppcp.CV[1] parenAssignCvArray = { cppcp.CV(0) };
+    for (int spelling = 0; spelling < 3; spelling++)
+    {
+        if (spelling == 0)
+        {
+            parenAssignCvLocal = cppcp.CV(7);
+            parenAssignCvHolder.value = cppcp.CV(7);
+            (*parenAssignCvPointer) = cppcp.CV(7);
+            parenAssignCvArray[0] = cppcp.CV(7);
+        }
+        else if (spelling == 1)
+        {
+            parenAssignCvLocal = (cppcp.CV(7));
+            parenAssignCvHolder.value = (cppcp.CV(7));
+            (*parenAssignCvPointer) = (cppcp.CV(7));
+            parenAssignCvArray[0] = (cppcp.CV(7));
+        }
+        else
+        {
+            parenAssignCvLocal = ((cppcp.CV(7)));
+            parenAssignCvHolder.value = ((cppcp.CV(7)));
+            (*parenAssignCvPointer) = ((cppcp.CV(7)));
+            parenAssignCvArray[0] = ((cppcp.CV(7)));
+        }
+        if (parenAssignCvLocal.v != 27 || parenAssignCvHolder.value.v != 27
+            || parenAssignCvPointer->v != 27 || parenAssignCvArray[0].v != 27)
+            return 55003 + spelling;
+    }
     // Address-of preserves lvalues through fields, references, pointers, arrays and joins.
     cppi.RefCell addrTempLocal = default;
     addrTempLocal.v = 4;

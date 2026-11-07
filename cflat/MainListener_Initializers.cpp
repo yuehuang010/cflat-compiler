@@ -1259,12 +1259,9 @@ bool MainListener::EmitOneFieldInit(
         // The implied move decided above; emitted here because zeroing needs the loaded value's
         // type, and it must land after the read so the copy still sees the live buffer.
         if (braceMoveTempField && val->getType()->isStructTy())
-        {
-            auto* srcGep = compiler->builder->CreateStructGEP(
-                rightNV.MoveTempStructType, rightNV.MoveTempStructAlloca,
-                rightNV.MoveTempFieldIndex, "movedfld");
-            compiler->builder->CreateStore(llvm::ConstantAggregateZero::get(val->getType()), srcGep);
-        }
+            compiler->ClearMovableTempField(rightNV.MoveTempStructType,
+                rightNV.MoveTempStructAlloca, rightNV.MoveTempFieldIndex, val->getType(),
+                rightNV.TernaryTempAlreadyRegistered);
 
         // The brace-init leg of the 2026-08-10 implicit-move ruling, kept in lockstep with the `=`
         // path. The destination slot is freshly constructed here, so only the source is nulled.
@@ -5439,14 +5436,21 @@ void MainListener::EmitGlobalArrayViewInferredInit(
         }
 
         auto* lengthTy = compiler->builder->getInt64Ty();
-        auto* lengthGlobal = new llvm::GlobalVariable(*compiler->module, lengthTy, false,
-            llvm::GlobalValue::InternalLinkage,
-            llvm::ConstantInt::get(lengthTy, elements.size()),
-            UniqueHiddenGlobalName(compiler, "length"));
+        auto* lengthGlobal = llvm::dyn_cast_or_null<llvm::GlobalVariable>(
+            compiler->GetGlobalVariableNV(name).RawArrayLengthStorage);
+        if (lengthGlobal == nullptr)
+            lengthGlobal = new llvm::GlobalVariable(*compiler->module, lengthTy, false,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantInt::get(lengthTy, elements.size()),
+                UniqueHiddenGlobalName(compiler, "length"));
+        else
+            lengthGlobal->setInitializer(llvm::ConstantInt::get(lengthTy, elements.size()));
         if (threadLocal)
             lengthGlobal->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);
         viewGlobal->setMetadata("cflat.array-view.length",
             llvm::MDNode::get(*compiler->context, llvm::ValueAsMetadata::get(lengthGlobal)));
+        compiler->SetRawArrayLengthKnown(name, true);
+        compiler->SetViewOfFixedArrayStorage(name, true, "brace initializer backing storage");
 
         if (auto* sink = compiler->GetSymbolSink())
         {
@@ -5846,7 +5850,6 @@ void MainListener::EmitArrayViewInferredInit(
         std::vector<CFlatParser::FieldInitContext*> elements;
         if (initList != nullptr)
             elements = initList->fieldInit();
-
         if (elements.empty())
         {
             compiler->LogError(std::format(
@@ -5858,7 +5861,8 @@ void MainListener::EmitArrayViewInferredInit(
         // Every element must be positional (no `field =` or `key: value`).
         for (auto* fi : elements)
         {
-            if (fi->Identifier() != nullptr || fi->assignmentExpression().size() != 1)
+            if (fi->Identifier() != nullptr
+                || (fi->assignmentExpression().size() != 1 && !FieldInitIsBraceElement(fi)))
             {
                 LogErrorContext(fi, std::format(
                     "'{}' uses a positional initializer list; named or 'key: value' elements are not allowed",
@@ -5884,6 +5888,22 @@ void MainListener::EmitArrayViewInferredInit(
         for (size_t i = 0; i < elements.size(); i++)
         {
             auto* fi = elements[i];
+            llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
+            auto* elemPtr = compiler->builder->CreateInBoundsGEP(
+                arrTy, backing, { zero, idx }, "arrview_elem");
+            if (FieldInitIsBraceElement(fi))
+            {
+                auto* elemStructTy = llvm::dyn_cast<llvm::StructType>(elemTy);
+                if (elemStructTy == nullptr)
+                {
+                    LogErrorContext(fi, std::format(
+                        "nested brace initializer elements of '{}' require a struct element type",
+                        SpellType(*compiler, tv)));
+                    continue;
+                }
+                EmitBraceElementIntoFixedSlot(elemPtr, elemStructTy, elemTV.TypeName, fi);
+                continue;
+            }
             LLVMBackend::NamedVariable nv;
             {
                 DeclExpectedTypeScope elementExpectedScope(&declExpectedType, elemTV, true);
@@ -5946,8 +5966,6 @@ void MainListener::EmitArrayViewInferredInit(
             if (!elemTV.Pointer && compiler->IsInterfaceType(elemTV.TypeName))
                 val = CoerceInitValueToInterface(nv, val, elemTV.TypeName, fi);
 
-            llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
-            auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, backing, { zero, idx }, "arrview_elem");
             compiler->CreateAssignment(val, elemPtr,
                 nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy, elemTV.IsUnsignedInteger() != -1);
         }
@@ -5957,6 +5975,11 @@ void MainListener::EmitArrayViewInferredInit(
         allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
         auto* elem0 = compiler->builder->CreateInBoundsGEP(arrTy, backing, { zero, zero }, "arrview_data");
         compiler->builder->CreateStore(elem0, alloc);
+        auto& view = compiler->GetOrCreateStackVariable(name);
+        compiler->StoreRawArrayLength(view, compiler->builder->getInt64(n));
+        compiler->SetRawArrayLengthStateForStorage(view.Storage,
+            LLVMBackend::RawArrayLengthState{ true, true, {} });
+        compiler->SetViewOfFixedArrayStorage(name, true, "brace initializer backing storage");
     }
 
 bool MainListener::TryEmitContainerInitializer(

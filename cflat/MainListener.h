@@ -43,6 +43,15 @@
 #include "TypeMangling.h"
 #include "LspSymbolIndex.h"
 
+// Preserve the written star as an element pointer before Pointer becomes the view pointer.
+LLVM_ATTRIBUTE_NOINLINE static void SetFunctionPointerArrayViewShape(
+    LLVMBackend::TypeAndValue& type)
+{
+    type.ElemPointer = type.ElemPointer || type.Pointer;
+    type.IsArrayView = true;
+    type.Pointer = true;
+}
+
 std::string FlexibleArrayMemberLengthError(const LLVMBackend::TypeAndValue& type);
 
 // Every postfix expression that IS the operand of `sizeof` / `&`: the outer one and each
@@ -67,7 +76,7 @@ struct FlexibleArrayKeepScope
 // Parentheses around a whole initializer add nothing (`C x = (f(a));` is `C x = f(a);`): peel
 // `( expression )` primaries reached through single-child rules only. A call with a suffix, or any
 // operator above the parens, stops the peel. Shape only, never the text of the expression (T272).
-CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
+LLVM_ATTRIBUTE_NOINLINE CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
     CFlatParser::AssignmentExpressionContext* assign);
 
 CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
@@ -2695,6 +2704,8 @@ public:
     ForwardRefScanner(LLVMBackend* compiler);
     void SetTokens(antlr4::BufferedTokenStream* t);
     void FinalizeViewFieldMoveInference();
+    void CollectGlobalArrayViewNonInitializerStores(CFlatParser::TranslationUnitContext* tu,
+                                                      bool allowUnresolvedGlobals = false);
 
     // Reject statically integral operands of pointer casts before code generation. The scanner
     // uses folded semantic constants and explicit scalar cast types, never source-text matching.
@@ -4026,6 +4037,9 @@ private:
     //   - everything else: zero-initializes.
     llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue,
         antlr4::ParserRuleContext* expressionContext = nullptr);
+    // Out-of-line so a recursive assignment frame does not grow by the DeclTypeAndValue copy.
+    LLVM_ATTRIBUTE_NOINLINE llvm::Value* DefaultValueOfType(const LLVMBackend::TypeAndValue& type,
+        antlr4::ParserRuleContext* expressionContext);
     bool EmitNontrivialCxxDefaultAt(llvm::Value* destination,
                                    const LLVMBackend::DeclTypeAndValue& typeValue);
     // Default-constructs CFlat struct typeName. When its constructor returns via C++ sret (it has
@@ -4927,7 +4941,8 @@ public:
      * no downstream reject fires and no second copy is emitted.
      */
     bool AdoptImplicitStringTempCopy(LLVMBackend::NamedVariable& nv, llvm::Value*& value,
-                                     antlr4::ParserRuleContext* ctx);
+                                     antlr4::ParserRuleContext* ctx,
+                                     bool forceCopy = false);
 
     /*
      * The whole-ELEMENT sibling of the temp-FIELD case above: `fields.get(0)` / `fields[0]` on a
@@ -5196,6 +5211,8 @@ public:
      */
     static bool SourceIsDanglingAliasBorrow(LLVMBackend* compiler,
                                             const LLVMBackend::NamedVariable& nv);
+    static bool IsMoveArgumentStorage(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& nv);
 
     bool IsProgramLifetimeStorage(const LLVMBackend::NamedVariable& nv) const;
     static bool PointsIntoStackFrame(llvm::Value* value);
@@ -5381,9 +5398,17 @@ public:
     bool NamedVarIsStringView(const LLVMBackend::NamedVariable& nv);
     void CarryStringViewConstructionBorrow(CFlatParser::PostfixExpressionContext* ctx,
                                            LLVMBackend::NamedVariable& namedVar);
+    void ComposeMovableTempField(CFlatParser::PostfixExpressionContext* ctx,
+        const LLVMBackend::NamedVariable& source, LLVMBackend::NamedVariable& result,
+        llvm::Type* accessedType, llvm::Value* fieldIndex);
     void CarryStackCharBufferBorrow(LLVMBackend::NamedVariable& destination,
                                     const LLVMBackend::NamedVariable& source,
                                     llvm::Value* sourcePointer = nullptr);
+    void UpdateAssignmentStackCharBufferBorrow(
+        LLVMBackend::NamedVariable* result,
+        const LLVMBackend::NamedVariable& destination,
+        const LLVMBackend::NamedVariable* source,
+        std::string_view assignmentOperator);
     static bool IsStackCharBufferBorrow(const LLVMBackend::NamedVariable& nv);
     static bool StackCharBufferOutlives(const LLVMBackend::NamedVariable& source,
                                         const LLVMBackend::NamedVariable& destination);
@@ -6027,6 +6052,49 @@ public:
         bool collapseLvalueArms,
         bool collapseLvalueSink,
         int& ownedCallArms);
+    struct TernaryArrayCountState
+    {
+        llvm::Value* Count = nullptr;
+        bool Known = false;
+        bool Available = false;
+        std::vector<size_t> SourceParams;
+    };
+    struct TernaryArrayJoinState
+    {
+        bool IsView = false;
+        bool IsFixed = false;
+        bool ViewMayOwn = false;
+        bool TrueViewMayOwn = false;
+        bool FalseViewMayOwn = false;
+        bool ViewAlwaysOwns = false;
+        TernaryArrayCountState TrueCount;
+        TernaryArrayCountState FalseCount;
+        llvm::Value* TrueViewOwns = nullptr;
+        llvm::Value* FalseViewOwns = nullptr;
+    };
+    TernaryArrayCountState GetTernaryArrayCountState(llvm::Value* value,
+        llvm::Value* storage, const LLVMBackend::TypedValue& shape);
+    std::unique_ptr<TernaryArrayJoinState> PrepareTernaryArrayJoinState(
+        llvm::Value* trueValue, llvm::Value* falseValue,
+        llvm::Value* trueStorage, llvm::Value* falseStorage,
+        const LLVMBackend::TypedValue& trueShape,
+        const LLVMBackend::TypedValue& falseShape,
+        const std::function<void()>& atTrue, const std::function<void()>& atFalse);
+    void RegisterSelectArrayViewJoin(bool expectedIsView, llvm::Value* selectValue,
+        llvm::Value* selectCond, llvm::Value* trueValue, llvm::Value* falseValue,
+        const LLVMBackend::TypedValue& trueShape,
+        const LLVMBackend::TypedValue& falseShape);
+    const LLVMBackend::NamedVariable* TernaryArrayCountSource(llvm::Value* storage,
+        bool includeGlobals);
+    llvm::Value* TernaryArrayArmCount(llvm::Value* value, llvm::Value* storage,
+        const LLVMBackend::TypedValue& shape);
+    bool TernaryArrayArmCountKnown(llvm::Value* value, llvm::Value* storage,
+        const LLVMBackend::TypedValue& shape);
+    void AppendTernaryArrayArmCountSources(llvm::Value* value, llvm::Value* storage,
+        std::vector<size_t>& out);
+    llvm::Value* TernaryArrayArmRuntimeOwns(llvm::Value* value);
+    bool TernaryArmIsView(llvm::Value* value, const LLVMBackend::TypedValue& shape);
+    bool TernaryArmMayOwn(llvm::Value* value);
 
     LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx,
                                                         ResultUse use = ResultUse::Value);
@@ -7515,6 +7583,8 @@ public:
     // A '?:' arm parsed for its value, keeping the arm's signedness for the join (see the
     // definition; the fallback is plain ParseExpression).
     LLVMBackend::TypedValue ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseTernaryMoveArm(CFlatParser::MoveExpressionContext* moveCtx,
+                                                antlr4::ParserRuleContext* armCtx);
 
     bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx,
                                  bool allowParentheses = true) const;

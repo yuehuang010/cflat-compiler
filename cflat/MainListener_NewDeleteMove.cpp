@@ -1233,8 +1233,10 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                     ? std::string("a stack or global fixed array")
                     : std::format("'{}', a stack or global fixed array", namedVar.ViewOfFixedArraySourceName);
                 LogErrorContext(ctx, std::format(
-                    "cannot delete array-view '{}' - it was bound from {}, not a heap allocation; "
-                    "'delete' would hand free() a non-heap address. Only a view from 'new {}[n]' "
+                    "cannot delete array-view '{}' - it was bound from {}. That source is fixed "
+                    "backing storage, not a heap allocation, so 'delete' would hand free() a "
+                    "non-heap address. "
+                    "Only a view from 'new {}[n]' "
                     "can be deleted.",
                     name, boundFrom, SpellType(*compiler, namedVar.TypeAndValue)));
                 return {};
@@ -2169,6 +2171,12 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         // borrowed-by-value-parameter reject guard read.
         dst.OwningStructName = src.OwningStructName;
         dst.FieldName        = src.FieldName;
+        dst.FromOwningTempField = src.FromOwningTempField;
+        dst.OwningTempParent = src.OwningTempParent;
+        dst.MovableTempField = src.MovableTempField;
+        dst.MoveTempStructAlloca = src.MoveTempStructAlloca;
+        dst.MoveTempStructType = src.MoveTempStructType;
+        dst.MoveTempFieldIndex = src.MoveTempFieldIndex;
         dst.MovePathKey      = src.MovePathKey;
         dst.MovePathHasDynamicIndex = src.MovePathHasDynamicIndex;
         dst.FieldPathText    = src.FieldPathText;
@@ -2897,6 +2905,9 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
                 result.TypeAndValue.IsMove = true;
+                result.StackCharBufferBorrow = argNV.StackCharBufferBorrow;
+                result.StackCharBufferSource = argNV.StackCharBufferSource;
+                result.StackCharBufferScopeDepth = argNV.StackCharBufferScopeDepth;
                 result.IsExplicitMove = true;
                 result.IsAliasBorrow = argNV.IsAliasBorrow;
                 result.IsViewElement = argNV.IsViewElement;

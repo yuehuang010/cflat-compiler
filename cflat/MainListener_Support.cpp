@@ -33,7 +33,7 @@ std::vector<antlr4::ParserRuleContext*> DirectOperandPostfixes(antlr4::tree::Par
     }
     return layers;
 }
-CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
+LLVM_ATTRIBUTE_NOINLINE CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
     CFlatParser::AssignmentExpressionContext* assign)
 {
     while (assign != nullptr)

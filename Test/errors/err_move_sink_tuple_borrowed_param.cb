@@ -1,0 +1,211 @@
+import "unique.cb";
+int borrowedTupleDtors = 0;
+struct BorrowedTupleD { int v = 0; ~BorrowedTupleD() { borrowedTupleDtors = borrowedTupleDtors + 1; } };
+struct BorrowedTupleHolder { unique<BorrowedTupleD> item = default; };
+int borrowedTupleTakeFlat(move (BorrowedTupleD, int) t) { return t.item_1; }
+int borrowedTupleTakeNested(move ((BorrowedTupleD, int), int) t) { return t.item_0.item_1; }
+int borrowedHolderTakeFlat(move (BorrowedTupleHolder, int) t) { return t.item_1; }
+int borrowedHolderTakeNested(move ((BorrowedTupleHolder, int), int) t) { return t.item_0.item_1; }
+
+expect_error("parameter 't' takes over the value and frees it later, but this function only uses it") {
+    int borrowedTupleDtorFlat(BorrowedTupleD x) { return borrowedTupleTakeFlat((x, 1)); }
+}
+expect_error("parameter 't' takes over the value and frees it later, but this function only uses it") {
+    int borrowedTupleDtorNested(BorrowedTupleD x) { return borrowedTupleTakeNested(((x, 1), 2)); }
+}
+expect_error("parameter 't' takes over the value and frees it later, but this function only uses it") {
+    int borrowedTupleHolderFlat(BorrowedTupleHolder x) { return borrowedHolderTakeFlat((x, 1)); }
+}
+expect_error("parameter 't' takes over the value and frees it later, but this function only uses it") {
+    int borrowedTupleHolderNested(BorrowedTupleHolder x) { return borrowedHolderTakeNested(((x, 1), 2)); }
+}
+
+// A value read into a move-sink tuple slot is moved: a later read of the local is refused as in the scalar sink.
+expect_error("use of moved variable 'h'") {
+    int borrowedTupleUseAfterLocal() { BorrowedTupleHolder h = default; int r = borrowedHolderTakeFlat((h, 1)); if (h.item == nullptr) r = r + 1; return r; }
+}
+// A static local is never re-initialized: a tuple slot may not empty it, as a scalar sink may not.
+expect_error("cannot consume owning value 's' out of storage that outlives this function") {
+    int borrowedTupleStaticLocal() { static BorrowedTupleHolder s = default; return borrowedHolderTakeFlat((s, 1)); }
+}
+
+struct MvslotD { int v = 0; };
+struct MvslotH { unique<MvslotD> u = default; };
+struct MvslotO { MvslotH h = default; };
+struct MvslotTrivial { int a = 0; };
+MvslotO mvslotGlobal = default;
+int mvslotTake(move (MvslotH, int) t) { return t.item_0.u->v + t.item_1; }
+int mvslotTakeScalar(move MvslotH h) { return h.u->v; }
+int mvslotPairScalar(move MvslotH a, move MvslotH b) { return a.u->v + b.u->v; }
+int mvslotPairTuple(move (MvslotH, MvslotH) t) { return t.item_0.u->v + t.item_1.u->v; }
+int mvslotTrivialTake(move (MvslotTrivial, int) t) { return t.item_0.a + t.item_1; }
+int mvslotTrivialTakeScalar(move MvslotTrivial t) { return t.a; }
+
+expect_error("cannot consume owning value 'mvslotGlobal.h' out of storage that outlives this function") {
+    int mvslotGlobalTupleDirect() { mvslotGlobal.h.u = new MvslotD(); return mvslotTake((mvslotGlobal.h, 1)); }
+}
+expect_error("cannot consume owning value 'mvslotGlobal.h' out of storage that outlives this function") {
+    int mvslotGlobalTupleFunctionValue()
+    {
+        mvslotGlobal.h.u = new MvslotD();
+        function<int(move (MvslotH, int))> fp = mvslotTake;
+        return fp((mvslotGlobal.h, 1));
+    }
+}
+expect_error("cannot consume owning field 'h' out of the borrowed receiver 'this'") {
+    struct MvslotThisDirect { MvslotH h = default; int run() { return mvslotTake((h, 1)); } };
+}
+expect_error("cannot consume owning field 'h' out of the borrowed receiver 'this'") {
+    struct MvslotThisFunctionValue
+    {
+        MvslotH h = default;
+        int run() { function<int(move (MvslotH, int))> fp = mvslotTake; return fp((h, 1)); }
+    };
+}
+expect_error("use of moved variable 'x'") {
+    int mvslotTrivialTupleDirect()
+    {
+        MvslotTrivial x = default;
+        x.a = 6;
+        int r = mvslotTrivialTake((x, 1));
+        return x.a + r;
+    }
+}
+expect_error("use of moved variable 'x'") {
+    int mvslotTrivialTupleFunctionValue()
+    {
+        MvslotTrivial x = default;
+        x.a = 6;
+        function<int(move (MvslotTrivial, int))> fp = mvslotTrivialTake;
+        int r = fp((x, 1));
+        return x.a + r;
+    }
+}
+expect_error("use of moved variable 'h'") {
+    int mvslotPairScalarDirect()
+    {
+        MvslotH h = default;
+        h.u = new MvslotD();
+        return mvslotPairScalar(h, h);
+    }
+}
+expect_error("use of moved variable 'h'") {
+    int mvslotPairScalarFunctionValue()
+    {
+        MvslotH h = default;
+        h.u = new MvslotD();
+        function<int(move MvslotH, move MvslotH)> fp = mvslotPairScalar;
+        return fp(h, h);
+    }
+}
+expect_error("use of moved variable 'h'") {
+    int mvslotPairTupleDirect()
+    {
+        MvslotH h = default;
+        h.u = new MvslotD();
+        return mvslotPairTuple((h, h));
+    }
+}
+expect_error("use of moved variable 'h'") {
+    int mvslotPairTupleFunctionValue()
+    {
+        MvslotH h = default;
+        h.u = new MvslotD();
+        function<int(move (MvslotH, MvslotH))> fp = mvslotPairTuple;
+        return fp((h, h));
+    }
+}
+int mvslotPairWholeFieldScalar(move MvslotO a, move MvslotH b) { return a.h.u->v + b.u->v; }
+int mvslotPairWholeFieldTuple(move (MvslotO, MvslotH) t) { return t.item_0.h.u->v + t.item_1.u->v; }
+int mvslotPairFieldWholeScalar(move MvslotH a, move MvslotO b) { return a.u->v + b.h.u->v; }
+int mvslotPairNestedField(move MvslotH a, move unique<MvslotD> b) { return a.u->v + b->v; }
+
+expect_error("use of moved variable 'o'") {
+    int mvslotWholeFieldScalar()
+    {
+        MvslotO o = default;
+        o.h.u = new MvslotD();
+        return mvslotPairWholeFieldScalar(o, o.h);
+    }
+}
+expect_error("use of moved variable 'o'") {
+    int mvslotWholeFieldTuple()
+    {
+        MvslotO o = default;
+        o.h.u = new MvslotD();
+        return mvslotPairWholeFieldTuple((o, o.h));
+    }
+}
+expect_error("use of moved variable 'o'") {
+    int mvslotFieldWholeScalar()
+    {
+        MvslotO o = default;
+        o.h.u = new MvslotD();
+        return mvslotPairFieldWholeScalar(o.h, o);
+    }
+}
+expect_error("use of moved variable 'o.h'") {
+    int mvslotNestedFieldOverlap()
+    {
+        MvslotO o = default;
+        o.h.u = new MvslotD();
+        return mvslotPairNestedField(o.h, o.h.u);
+    }
+}
+expect_error("cannot consume owning value 'mvslotGlobal.h' out of storage that outlives this function") {
+    int mvslotGlobalTernaryScalar()
+    {
+        MvslotH local = default;
+        local.u = new MvslotD();
+        bool c = false;
+        return mvslotTakeScalar(c ? mvslotGlobal.h : local);
+    }
+}
+expect_error("cannot consume owning value 'mvslotGlobal.h' out of storage that outlives this function") {
+    int mvslotGlobalTernaryTuple()
+    {
+        MvslotH local = default;
+        local.u = new MvslotD();
+        bool c = false;
+        return mvslotTake((c ? mvslotGlobal.h : local, 1));
+    }
+}
+expect_error("cannot consume owning value 's.h' out of storage that outlives this function") {
+    int mvslotStaticTernaryScalar()
+    {
+        static MvslotO s = default;
+        s.h.u = new MvslotD();
+        MvslotH local = default;
+        local.u = new MvslotD();
+        bool c = false;
+        return mvslotTakeScalar(c ? s.h : local);
+    }
+}
+expect_error("cannot consume owning value 's.h' out of storage that outlives this function") {
+    int mvslotStaticTernaryTuple()
+    {
+        static MvslotO s = default;
+        s.h.u = new MvslotD();
+        MvslotH local = default;
+        local.u = new MvslotD();
+        bool c = false;
+        return mvslotTake((c ? s.h : local, 1));
+    }
+}
+// The same element twice in one call names the element like the sequential twin: 'arr[0]'.
+expect_error("use of moved variable 'arr[0]'") {
+    int mvslotElementTwiceScalar()
+    {
+        MvslotH[2] arr = default;
+        arr[0].u = new MvslotD();
+        return mvslotPairScalar(arr[0], arr[0]);
+    }
+}
+expect_error("use of moved variable 'arr[0]'") {
+    int mvslotElementTwiceTuple()
+    {
+        MvslotH[2] arr = default;
+        arr[0].u = new MvslotD();
+        return mvslotPairTuple((arr[0], arr[0]));
+    }
+}

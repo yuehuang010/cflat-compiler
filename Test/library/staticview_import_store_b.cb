@@ -1,0 +1,6 @@
+import "staticview_import_store.cb";
+
+void svR3StoreImportedClosureGlobal(int* raw)
+{
+    svR3ImportedClosureGlobal = (int[])raw;
+}

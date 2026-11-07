@@ -7192,7 +7192,9 @@ bool LLVMBackend::IsOwnedNewTemp(llvm::Value* value) const
 
 void LLVMBackend::RegisterRawArrayResult(llvm::Value* value, llvm::Value* count,
                                          uint64_t allocAlign, bool owns,
-                                         llvm::Value* runtimeOwns, bool isArrayView)
+                                         llvm::Value* runtimeOwns, bool isArrayView,
+                                         bool countKnown,
+                                         std::vector<size_t> countSourceParams)
 {
         if (value == nullptr || !value->getType()->isPointerTy()
             || (count == nullptr && !owns && runtimeOwns == nullptr)) return;
@@ -7204,9 +7206,15 @@ void LLVMBackend::RegisterRawArrayResult(llvm::Value* value, llvm::Value* count,
                 entry.Owns = entry.Owns || owns;
                 if (runtimeOwns != nullptr) entry.RuntimeOwns = runtimeOwns;
                 entry.IsArrayView = entry.IsArrayView || isArrayView;
+                entry.CountKnown = entry.CountKnown && countKnown;
+                for (size_t index : countSourceParams)
+                    if (std::find(entry.CountSourceParams.begin(), entry.CountSourceParams.end(), index)
+                        == entry.CountSourceParams.end())
+                        entry.CountSourceParams.push_back(index);
                 return;
             }
-        rawArrayResults_.push_back({ value, count, allocAlign, owns, runtimeOwns, isArrayView });
+        rawArrayResults_.push_back({ value, count, allocAlign, owns, runtimeOwns, isArrayView,
+                                     countKnown, std::move(countSourceParams) });
     }
 
 const LLVMBackend::RawArrayResult* LLVMBackend::FindRawArrayResult(llvm::Value* value) const

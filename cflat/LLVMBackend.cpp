@@ -1850,6 +1850,7 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
     auto sourceLines = ReadFileToLines(stream);
 
     antlr4::ANTLRInputStream input(stream);
+    input.name = filename;  // per-file token source name (declarator keys)
     CFlatLexer lexer(&input);
     antlr4::CommonTokenStream tokens(&lexer);
     CFlatParser parser(&tokens);
@@ -2615,6 +2616,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         auto sourceLines = ReadFileToLines(stream);
 
         antlr4::ANTLRInputStream input(stream);
+        input.name = filename;
         CFlatLexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
         CFlatParser parser(&tokens);
@@ -2766,6 +2768,105 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
 
         ValidateIsolatedParseTree(computeUnit);
+
+        // Parse the .cb import closure first so persistent stores in later imports are known
+        // before any imported function emits IR.
+        if (auto* tu = computeUnit->translationUnit())
+        {
+            struct ImportedViewTree
+            {
+                CachedParseTree* Tree;
+                std::string NamespaceName;
+            };
+            std::vector<ImportedViewTree> importedTrees;
+            std::unordered_set<std::string> scannedImportScopes;
+            auto scanImportClosure = [&](auto&& self, const std::string& importingPath,
+                                         CFlatParser::TranslationUnitContext* parentTu,
+                                         const std::string& parentNamespace) -> void {
+                if (parentTu == nullptr) return;
+                NamespaceScope parentScope(this, parentNamespace);
+                SourceOrderedImportCursor imports(this, parentTu->externalDeclaration());
+                while (auto importSite = imports.Next())
+                {
+                    for (const std::string& importFilename :
+                         ImportFilenames(importSite->declaration))
+                    {
+                        if (LowerExtension(importFilename) != ".cb") continue;
+                        std::string canonicalPath;
+                        if (!ResolveImportPath(importingPath, importFilename,
+                                canonicalPath, true))
+                            continue;
+                        if (importedFiles.contains(canonicalPath)) continue;
+                        const std::string scopeKey = canonicalPath + "#"
+                            + importSite->namespaceName;
+                        if (!scannedImportScopes.insert(scopeKey).second) continue;
+                        CachedParseTree* importedTree = GetOrParseFile(canonicalPath,
+                            importFilename, IsCoreSourcePath(canonicalPath));
+                        if (importedTree == nullptr || importedTree->unit == nullptr) continue;
+                        auto* importedTu = importedTree->unit->translationUnit();
+                        if (importedTu == nullptr) continue;
+                        importedTrees.push_back({ importedTree, importSite->namespaceName });
+                        self(self, canonicalPath, importedTu, importSite->namespaceName);
+                    }
+                }
+            };
+            const std::string rootNamespace = GetCurrentNamespace();
+            scanImportClosure(scanImportClosure, filename, tu, rootNamespace);
+
+            std::unordered_set<std::string> closureGlobalNames;
+            auto collectGlobalNames = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                if (node == nullptr
+                    || dynamic_cast<CFlatParser::ExpectErrorDeclarationContext*>(node) != nullptr
+                    || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node) != nullptr
+                    || dynamic_cast<CFlatParser::AggregateMemberContext*>(node) != nullptr)
+                    return;
+                if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+                {
+                    auto* list = declaration->initDeclaratorList();
+                    if (list != nullptr)
+                        for (auto* init : list->initDeclarator())
+                            if (init->declarator() != nullptr
+                                && init->declarator()->directDeclarator() != nullptr)
+                                if (std::string name = getDirectDeclName(
+                                        init->declarator()->directDeclarator());
+                                    !name.empty())
+                                {
+                                    closureGlobalNames.insert(name);
+                                    closureGlobalNames.insert(ResolveQualifiedName(name));
+                                }
+                    return;
+                }
+                for (antlr4::tree::ParseTree* child : node->children)
+                    self(self, child);
+            };
+            {
+                NamespaceScope rootScope(this, rootNamespace);
+                collectGlobalNames(collectGlobalNames, tu);
+            }
+            for (const ImportedViewTree& imported : importedTrees)
+            {
+                NamespaceScope importScope(this, imported.NamespaceName);
+                collectGlobalNames(collectGlobalNames,
+                    imported.Tree->unit->translationUnit());
+            }
+            AddGlobalArrayViewKnownGlobalNames(std::move(closureGlobalNames));
+
+            {
+                NamespaceScope rootScope(this, rootNamespace);
+                ForwardRefScanner scanner(this);
+                scanner.SetTokens(&tokens);
+                scanner.CollectGlobalArrayViewNonInitializerStores(tu, true);
+            }
+            for (const ImportedViewTree& imported : importedTrees)
+            {
+                NamespaceScope importScope(this, imported.NamespaceName);
+                ForwardRefScanner scanner(this);
+                scanner.SetTokens(imported.Tree->tokens.get());
+                scanner.CollectGlobalArrayViewNonInitializerStores(
+                    imported.Tree->unit->translationUnit(), true);
+            }
+            FinalizeGlobalArrayViewStoreEdges();
+        }
 
         // Process all top-level imports before scanning the main file so that
         // imported symbols are available to ForwardRefScanner.
@@ -2932,6 +3033,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
                 scanner.FinalizeViewFieldMoveInference();
+                scanner.CollectGlobalArrayViewNonInitializerStores(tu);
             }
         }
 
@@ -3524,6 +3626,7 @@ std::shared_ptr<LLVMBackend::CachedParseTree> LLVMBackend::ParseFileForCache(con
     auto sourceLines = ReadFileToLines(stream);  // also rewinds the stream to the start
 
     entry->input  = std::make_unique<antlr4::ANTLRInputStream>(stream);
+    entry->input->name = canonicalPath;  // per-file token source name (declarator keys)
     entry->lexer  = std::make_unique<CFlatLexer>(entry->input.get());
     entry->tokens = std::make_unique<antlr4::CommonTokenStream>(entry->lexer.get());
     entry->parser = std::make_unique<CFlatParser>(entry->tokens.get());
@@ -4098,6 +4201,13 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     auto* parserPtr   = tree->parser.get();
     auto* tokensPtr   = tree->tokens.get();
 
+    if (auto* tu = computeUnit->translationUnit())
+    {
+        ForwardRefScanner scanner(this);
+        scanner.SetTokens(tokensPtr);
+        scanner.CollectGlobalArrayViewNonInitializerStores(tu, true);
+    }
+
     // Recursively process nested imports before scanning this file's declarations
     if (auto* tu = computeUnit->translationUnit())
     {
@@ -4233,6 +4343,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
                 scanner.FinalizeViewFieldMoveInference();
+                scanner.CollectGlobalArrayViewNonInitializerStores(tu);
             }
         }
 
@@ -5081,6 +5192,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         auto analyzeSourceLines = ReadFileToLines(stream);
 
         antlr4::ANTLRInputStream input(stream);
+        input.name = filePath;
         CFlatLexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
         CFlatParser parser(&tokens);
@@ -5221,6 +5333,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
                 scanner.FinalizeViewFieldMoveInference();
+                scanner.CollectGlobalArrayViewNonInitializerStores(tu);
             }
         }
 
@@ -5329,8 +5442,25 @@ void LLVMBackend::DiscardOptimizedViewState()
 
 void LLVMBackend::ResetForReanalysis()
 {
+    movedStateMergeStack_.reset();
     scanTimeGlobalVariableTypes_.clear();
     scanTimeVariableTypeScopes_.clear();
+    arrayViewFieldLengths_.clear();
+    escapedGlobalArrayViewRoots_.clear();
+    globalArrayViewNonInitializerStores_.clear();
+    globalArrayViewUnknownLengthStores_.clear();
+    globalArrayViewStoreScans_.clear();
+    globalArrayViewKnownGlobalNames_.clear();
+    globalArrayViewStoreEdges_.clear();
+    staticArrayViewGlobalStoreEdges_.clear();
+    staticArrayViewUnknownLengthStoreDeclarators_.clear();
+    staticArrayViewUnknownLengthStorages_.clear();
+    staticArrayViewUnknownLengthFieldStorePaths_.clear();
+    globalArrayViewUnknownLengthFieldStorePaths_.clear();
+    arrayViewFieldUnknownLengthStores_.clear();
+    arrayViewCountParamRequirements_.clear();
+    rawArrayLengthStates_.clear();
+    arrayViewFieldRootAliased_.clear();
     deferredOwnedElementDeletes_.clear();
     openDeferredLoops_.clear();
     JoinCHeaderDiskCacheWriters();

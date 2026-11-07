@@ -1,0 +1,3 @@
+expect_error("cannot range-for over an array view whose length is unknown");
+import "staticview_import_store.cb";
+import "staticview_import_store_b.cb";

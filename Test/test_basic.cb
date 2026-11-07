@@ -3031,8 +3031,396 @@ string strctorReturnBorrowedString(string value) { return value; }
 int strctorObserveBorrowedString(string value) { return value.length(); }
 struct StrctorStackByteMember { char[4] bytes = default; };
 struct StrctorStringHolder { string s = default; };
+struct StrcastIdentityBox { int value = 0; };
+struct StrcastOwningTempBox { string name = default; };
+struct StrcastImplicitThisBox
+{
+    string name = default;
+    bool castCopyIndependent()
+    {
+        string t = (string)(name);
+        return t.length() == 3 && t.data() != name.data();
+    }
+    bool functionalCopyIndependent()
+    {
+        string t = string(name);
+        return t.length() == 3 && t.data() != name.data();
+    }
+};
+int strcastFieldAllocCount = 0;
+int strcastFieldFreeCount = 0;
+void strcastCountAlloc(void* ptr, u64 size)
+{
+    if (ptr != nullptr) strcastFieldAllocCount++;
+}
+void strcastCountFree(void* ptr)
+{
+    if (ptr != nullptr) strcastFieldFreeCount++;
+}
+int chainStructAllocCount = 0;
+int chainStructFreeCount = 0;
+void chainStructCountAlloc(void* ptr, u64 size)
+{
+    if (ptr != nullptr) chainStructAllocCount++;
+}
+void chainStructCountFree(void* ptr)
+{
+    if (ptr != nullptr) chainStructFreeCount++;
+}
+struct ChainStructOwner { string name = default; };
+move ChainStructOwner chainStructMakeOwner()
+{
+    ChainStructOwner value = default;
+    value.name = "cat".copy();
+    return move value;
+}
+int chainStructOwnerCase(int rhs, int consumer)
+{
+    chainStructAllocCount = 0; chainStructFreeCount = 0;
+    __alloc_audit_hook = chainStructCountAlloc;
+    __free_audit_hook = chainStructCountFree;
+    int value = 0;
+    {
+        if (rhs == 0)
+        {
+            ChainStructOwner a = default;
+            if (consumer == 0)
+            {
+                ChainStructOwner c = a = chainStructMakeOwner();
+                value = c.name.length() * 10 + a.name.length();
+            }
+            else
+            {
+                ChainStructOwner x = default;
+                x = (a = chainStructMakeOwner());
+                value = x.name.length() * 10 + a.name.length();
+            }
+        }
+        else
+        {
+            ChainStructOwner b = chainStructMakeOwner();
+            ChainStructOwner a = default;
+            if (consumer == 0)
+            {
+                ChainStructOwner c = a = b;
+                value = c.name.length() * 10 + a.name.length();
+            }
+            else
+            {
+                ChainStructOwner x = default;
+                x = (a = b);
+                value = x.name.length() * 10 + a.name.length();
+            }
+        }
+    }
+    int allocs = chainStructAllocCount;
+    int frees = chainStructFreeCount;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    return value * 100 + allocs * 10 + frees;
+}
+move string chainStructMakeString() { return "cat".copy(); }
+move string chainStructStringReturnCall()
+{
+    string a = default;
+    return a = chainStructMakeString();
+}
+move string chainStructStringReturnMove()
+{
+    string a = default;
+    string b = chainStructMakeString();
+    return a = move b;
+}
+move string chainStructStringReturnNamed()
+{
+    string a = default;
+    string b = chainStructMakeString();
+    return a = b;
+}
+int chainStructStringReturnCase(int rhs)
+{
+    chainStructAllocCount = 0; chainStructFreeCount = 0;
+    __alloc_audit_hook = chainStructCountAlloc;
+    __free_audit_hook = chainStructCountFree;
+    int length = 0;
+    {
+        string value = default;
+        if (rhs == 0) value = chainStructStringReturnCall();
+        else if (rhs == 1) value = chainStructStringReturnMove();
+        else value = chainStructStringReturnNamed();
+        length = value.length();
+    }
+    int allocs = chainStructAllocCount;
+    int frees = chainStructFreeCount;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    return length * 100 + allocs * 10 + frees;
+}
+int chainStructValueDtorCount = 0;
+struct ChainStructDtor
+{
+    int value = default;
+    ~ChainStructDtor() { chainStructValueDtorCount++; }
+};
+move ChainStructDtor chainStructMakeDtor()
+{
+    ChainStructDtor value = default;
+    value.value = 5;
+    return move value;
+}
+int chainStructDtorCase(int rhs, int consumer)
+{
+    chainStructValueDtorCount = 0;
+    int value = 0;
+    {
+        if (rhs == 0)
+        {
+            ChainStructDtor a = default;
+            if (consumer == 0)
+            {
+                ChainStructDtor c = a = chainStructMakeDtor();
+                value = c.value * 10 + a.value;
+            }
+            else
+            {
+                ChainStructDtor x = default;
+                x = (a = chainStructMakeDtor());
+                value = x.value * 10 + a.value;
+            }
+        }
+        else if (rhs == 1)
+        {
+            ChainStructDtor b = chainStructMakeDtor();
+            ChainStructDtor a = default;
+            if (consumer == 0)
+            {
+                ChainStructDtor c = a = b;
+                value = c.value * 10 + a.value;
+            }
+            else
+            {
+                ChainStructDtor x = default;
+                x = (a = b);
+                value = x.value * 10 + a.value;
+            }
+        }
+        else
+        {
+            ChainStructDtor a = default;
+            if (consumer == 0)
+            {
+                ChainStructDtor c = a = ChainStructDtor();
+                value = c.value * 10 + a.value;
+            }
+            else
+            {
+                ChainStructDtor x = default;
+                x = (a = ChainStructDtor());
+                value = x.value * 10 + a.value;
+            }
+        }
+    }
+    return value * 10 + chainStructValueDtorCount;
+}
+int chainStructPayloadDtorCount = 0;
+struct ChainStructPayload
+{
+    int value = default;
+    ~ChainStructPayload() { chainStructPayloadDtorCount++; }
+};
+unique<ChainStructPayload> chainStructMakeUnique()
+{
+    unique<ChainStructPayload> value = new ChainStructPayload();
+    value->value = 5;
+    return move value;
+}
+move unique<ChainStructPayload> chainStructUniqueReturnMove()
+{
+    unique<ChainStructPayload> b = chainStructMakeUnique();
+    unique<ChainStructPayload> a = default;
+    return a = move b;
+}
+move unique<ChainStructPayload> chainStructUniqueReturnNamed()
+{
+    unique<ChainStructPayload> b = chainStructMakeUnique();
+    unique<ChainStructPayload> a = default;
+    return a = b;
+}
+int chainStructUniqueReturnCase(int rhs)
+{
+    chainStructPayloadDtorCount = 0;
+    int value = 0;
+    if (rhs == 0)
+    {
+        {
+            unique<ChainStructPayload> result = chainStructUniqueReturnMove();
+            value = result->value;
+        }
+    }
+    else
+    {
+        {
+            unique<ChainStructPayload> result = chainStructUniqueReturnNamed();
+            value = result->value;
+        }
+    }
+    return value * 10 + chainStructPayloadDtorCount;
+}
+int chainStructStringDecl()
+{
+    chainStructAllocCount = 0; chainStructFreeCount = 0;
+    __alloc_audit_hook = chainStructCountAlloc;
+    __free_audit_hook = chainStructCountFree;
+    int value = 0;
+    {
+        string s1 = default;
+        string s2 = s1 = chainStructMakeString();
+        value = s2.length() * 10 + s1.length();
+    }
+    int allocs = chainStructAllocCount;
+    int frees = chainStructFreeCount;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    return value * 100 + allocs * 10 + frees;
+}
+string chainStructParenAssignGlobal = default;
+int chainStructParenStringAssign(int destination, int spelling)
+{
+    chainStructAllocCount = 0; chainStructFreeCount = 0;
+    if (destination == 4) chainStructParenAssignGlobal = default;
+    __alloc_audit_hook = chainStructCountAlloc;
+    __free_audit_hook = chainStructCountFree;
+    int value = 0;
+    {
+        string local = default;
+        ChainStructOwner holder = default;
+        string* pointer = &local;
+        string[1] values = default;
+        if (spelling == 0)
+        {
+            if (destination == 0) local = chainStructMakeString();
+            else if (destination == 1) holder.name = chainStructMakeString();
+            else if (destination == 2) (*pointer) = chainStructMakeString();
+            else if (destination == 3) values[0] = chainStructMakeString();
+            else chainStructParenAssignGlobal = chainStructMakeString();
+        }
+        else if (spelling == 1)
+        {
+            if (destination == 0) local = (chainStructMakeString());
+            else if (destination == 1) holder.name = (chainStructMakeString());
+            else if (destination == 2) (*pointer) = (chainStructMakeString());
+            else if (destination == 3) values[0] = (chainStructMakeString());
+            else chainStructParenAssignGlobal = (chainStructMakeString());
+        }
+        else
+        {
+            if (destination == 0) local = ((chainStructMakeString()));
+            else if (destination == 1) holder.name = ((chainStructMakeString()));
+            else if (destination == 2) (*pointer) = ((chainStructMakeString()));
+            else if (destination == 3) values[0] = ((chainStructMakeString()));
+            else chainStructParenAssignGlobal = ((chainStructMakeString()));
+        }
+        if (destination == 0 || destination == 2) value = local.length();
+        else if (destination == 1) value = holder.name.length();
+        else if (destination == 3) value = values[0].length();
+        else value = chainStructParenAssignGlobal.length();
+    }
+    if (destination == 4) chainStructParenAssignGlobal = default;
+    int allocs = chainStructAllocCount;
+    int frees = chainStructFreeCount;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    return value * 100000 + allocs * 1000 + frees * 10;
+}
+int chainStructParenOwnerAssign(int source, int spelling)
+{
+    chainStructAllocCount = 0; chainStructFreeCount = 0;
+    __alloc_audit_hook = chainStructCountAlloc;
+    __free_audit_hook = chainStructCountFree;
+    int value = 0;
+    {
+        ChainStructOwner target = default;
+        ChainStructOwner named = default;
+        if (source == 2 || source == 3) named = chainStructMakeOwner();
+        if (spelling == 0)
+        {
+            if (source == 0) target = chainStructMakeOwner();
+            else if (source == 1) target = true ? chainStructMakeOwner() : chainStructMakeOwner();
+            else if (source == 2) target = named;
+            else target = move named;
+        }
+        else if (spelling == 1)
+        {
+            if (source == 0) target = (chainStructMakeOwner());
+            else if (source == 1) target = (true ? chainStructMakeOwner() : chainStructMakeOwner());
+            else if (source == 2) target = (named);
+            else target = (move named);
+        }
+        else
+        {
+            if (source == 0) target = ((chainStructMakeOwner()));
+            else if (source == 1) target = ((true ? chainStructMakeOwner() : chainStructMakeOwner()));
+            else if (source == 2) target = ((named));
+            else target = ((move named));
+        }
+        value = target.name.length();
+    }
+    int allocs = chainStructAllocCount;
+    int frees = chainStructFreeCount;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    return value * 100000 + allocs * 1000 + frees * 10;
+}
+int chainStructParenUniqueAssign(int spelling)
+{
+    chainStructPayloadDtorCount = 0;
+    int value = 0;
+    {
+        unique<ChainStructPayload> target = default;
+        if (spelling == 0) target = chainStructMakeUnique();
+        else if (spelling == 1) target = (chainStructMakeUnique());
+        else target = ((chainStructMakeUnique()));
+        value = target->value;
+    }
+    return value * 10 + chainStructPayloadDtorCount;
+}
+int chainStructParenDtorAssign(int spelling)
+{
+    chainStructValueDtorCount = 0;
+    int value = 0;
+    {
+        ChainStructDtor target = default;
+        if (spelling == 0) target = chainStructMakeDtor();
+        else if (spelling == 1) target = (chainStructMakeDtor());
+        else target = ((chainStructMakeDtor()));
+        value = target.value;
+    }
+    return value * 10 + chainStructValueDtorCount;
+}
+int chainStructParenStringCompound(int spelling)
+{
+    chainStructAllocCount = 0; chainStructFreeCount = 0;
+    __alloc_audit_hook = chainStructCountAlloc;
+    __free_audit_hook = chainStructCountFree;
+    int value = 0;
+    {
+        string target = "a".copy();
+        if (spelling == 0) target += chainStructMakeString();
+        else if (spelling == 1) target += (chainStructMakeString());
+        else target += ((chainStructMakeString()));
+        value = target.length();
+    }
+    int allocs = chainStructAllocCount;
+    int frees = chainStructFreeCount;
+    __alloc_audit_hook = nullptr; __free_audit_hook = nullptr;
+    return value * 100000 + allocs * 1000 + frees * 10;
+}
 char[4] strctorGlobalBorrowBytes = {'c', 'a', 't', 0};
 string strctorGlobalBorrowSlot = default;
+string strctorBorrowFlowGlobal = default;
+struct StrctorBorrowFlowHolder { string s = default; };
+char* strctorAssignHeapPointer = nullptr;
+string strcastGlobalBare = "abc";
+string strcastGlobalCast = (string)"abc";
+string strcastGlobalFunctional = string("abc");
+const string strcastConstGlobalBare = "abc";
+const string strcastConstGlobalCast = (string)"abc";
+const string strcastConstGlobalFunctional = string("abc");
 
 string strctorParamCastReturn(char* p) { return (string)p; }
 string strctorParamParenCastReturn(char* p) { return (string)(p); }
@@ -3041,6 +3429,215 @@ string strctorParamLengthReturn(char* p) { return string(p, 3); }
 string_view strctorParamViewReturn(char* p) { return string_view(p, 3); }
 string strctorParamAddressReturn(char* p) { return (string)&p[0]; }
 string strctorParamTernaryReturn(char* p) { bool c = true; return c ? (string)p : "x"; }
+string_view strctorAssignmentParamView(char* p)
+{
+    string_view value = default;
+    return value = string_view(p, 3);
+}
+string_view strctorAssignmentGlobalView()
+{
+    string_view value = default;
+    return value = string_view(strctorGlobalBorrowBytes, 3);
+}
+string_view strctorAssignmentHeapView()
+{
+    strctorAssignHeapPointer = new char[4];
+    strctorAssignHeapPointer[0] = 'c'; strctorAssignHeapPointer[1] = 'a';
+    strctorAssignHeapPointer[2] = 't'; strctorAssignHeapPointer[3] = 0;
+    string_view value = default;
+    return value = string_view(strctorAssignHeapPointer, 3);
+}
+string_view strctorAssignmentLiteralView()
+{
+    string_view value = default;
+    return value = string_view("lit", 3);
+}
+string strctorAssignmentRebindLiteralReturn()
+{
+    char[8] bytes = {'b', 'u', 'f', 0};
+    string value = (string)bytes;
+    return value = (string)"ok";
+}
+int strctorAssignmentSameFrameView()
+{
+    char[4] bytes = {'s', 'a', 'm', 0};
+    string_view value = default;
+    string_view assigned = (value = string_view(bytes, 3));
+    return assigned.length() * 100 + (int)assigned.data()[0];
+}
+int strctorAssignmentCompoundStackLeft()
+{
+    char[4] bytes = {'b', 'a', 's', 0};
+    string value = (string)bytes;
+    string result = (value += "e");
+    return result.length() * 100 + (int)result.data()[0]
+        + (int)result.data()[result.length() - 1];
+}
+string strctorAssignmentCompoundStackReturn()
+{
+    char[4] bytes = {'b', 'a', 's', 0};
+    string value = (string)bytes;
+    return value += "e";
+}
+string strctorAssignmentCompoundStackRight()
+{
+    char[4] bytes = {'h', 'i', 0, 0};
+    string value = "x";
+    return value += (string)bytes;
+}
+string strctorBorrowFlowReturnStraight()
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    s += "x";
+    return s;
+}
+string strctorBorrowFlowReturnIfElse(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c != 0) s += "x";
+    else s += "y";
+    return s;
+}
+string strctorBorrowFlowReturnElseIf(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c == 0) s += "a";
+    else if (c == 1) s += "b";
+    else s += "c";
+    return s;
+}
+string strctorBorrowFlowReturnSwitch(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    switch (c)
+    {
+        case 0: s += "x";
+        case 1: s += "x";
+        default: s += "x";
+    }
+    return s;
+}
+string strctorBorrowFlowReturnDoWhile(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    do { s += "x"; c--; } while (c > 1);
+    return s;
+}
+string strctorBorrowFlowReturnEarly(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c != 0) return "early";
+    s += "x";
+    return s;
+}
+void strctorBorrowFlowGlobalStraight()
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    s += "x";
+    strctorBorrowFlowGlobal = s;
+}
+void strctorBorrowFlowGlobalIfElse(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c != 0) s += "x";
+    else s += "y";
+    strctorBorrowFlowGlobal = s;
+}
+void strctorBorrowFlowGlobalElseIf(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c == 0) s += "a";
+    else if (c == 1) s += "b";
+    else s += "c";
+    strctorBorrowFlowGlobal = s;
+}
+void strctorBorrowFlowGlobalSwitch(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    switch (c)
+    {
+        case 0: s += "x";
+        case 1: s += "x";
+        default: s += "x";
+    }
+    strctorBorrowFlowGlobal = s;
+}
+void strctorBorrowFlowGlobalDoWhile(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    do { s += "x"; c--; } while (c > 1);
+    strctorBorrowFlowGlobal = s;
+}
+void strctorBorrowFlowGlobalEarly(int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c != 0) { strctorBorrowFlowGlobal = "early"; return; }
+    s += "x";
+    strctorBorrowFlowGlobal = s;
+}
+void strctorBorrowFlowFieldStraight(StrctorBorrowFlowHolder* holder)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    s += "x";
+    holder->s = s;
+}
+void strctorBorrowFlowFieldIfElse(StrctorBorrowFlowHolder* holder, int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c != 0) s += "x";
+    else s += "y";
+    holder->s = s;
+}
+void strctorBorrowFlowFieldElseIf(StrctorBorrowFlowHolder* holder, int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c == 0) s += "a";
+    else if (c == 1) s += "b";
+    else s += "c";
+    holder->s = s;
+}
+void strctorBorrowFlowFieldSwitch(StrctorBorrowFlowHolder* holder, int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    switch (c)
+    {
+        case 0: s += "x";
+        case 1: s += "x";
+        default: s += "x";
+    }
+    holder->s = s;
+}
+void strctorBorrowFlowFieldDoWhile(StrctorBorrowFlowHolder* holder, int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    do { s += "x"; c--; } while (c > 1);
+    holder->s = s;
+}
+void strctorBorrowFlowFieldEarly(StrctorBorrowFlowHolder* holder, int c)
+{
+    char[8] buf = {'b', 0};
+    string s = (string)buf;
+    if (c != 0) { holder->s = "early"; return; }
+    s += "x";
+    holder->s = s;
+}
 string_view strctorUserFnView(char* scratch, i32 n)
 {
     return string_view(&strctorGlobalBorrowBytes[0], n);
@@ -3111,6 +3708,462 @@ void strctorLocalArrayTernaryOut(string* out)
     char[4] bytes = {'c', 'a', 't', 0};
     *out = true ? (string)bytes : "x";
 }
+string strctorDynamicLocalArrayTernaryReturn(bool choose)
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    string fallback = "x";
+    return choose ? (string)bytes : fallback;
+}
+string strctorDynamicLocalArrayFunctionalTernaryReturn(bool choose)
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    string fallback = "x";
+    return choose ? string(bytes) : fallback;
+}
+string strctorDynamicLocalArrayNamedTernaryReturn(bool choose)
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    string borrowed = (string)bytes;
+    string fallback = "x";
+    return choose ? borrowed : fallback;
+}
+string strctorDynamicLocalArrayAssignmentTernaryReturn(bool choose)
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    string value = default;
+    string fallback = "x";
+    return choose ? (value = (string)bytes) : fallback;
+}
+string strctorDynamicLocalArrayNestedTernaryReturn(bool choose)
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    string fallback = "x";
+    return choose ? (choose ? (string)bytes : fallback) : fallback;
+}
+int strctorMovedBorrowTernarySameFrame(bool choose)
+{
+    char[4] bytes = {'s', 'a', 'm', 0};
+    string borrowed = (string)bytes;
+    string owned = "o" + "k";
+    string value = choose ? move borrowed : move owned;
+    return value.length() * 1000 + (int)value.data()[0] * 10
+        + ((value._len & (i32)0x80000000) != 0);
+}
+
+int strcastIdentityRoute(string value) { return 101; }
+int strcastIdentityRoute(string_view value) { return 202; }
+
+bool strcastSameStringResult(string* expected, string* actual)
+{
+    return expected->length() == 3 && actual->length() == 3
+        && strcmp(expected->data(), actual->data()) == 0
+        && (expected->_len < 0) == (actual->_len < 0);
+}
+
+bool strcastSameStringSource(string* expected, string* actual)
+{
+    return expected->length() == actual->length()
+        && (expected->_len < 0) == (actual->_len < 0)
+        && (expected->length() == 0
+            || expected->data()[0] == actual->data()[0]);
+}
+
+bool strcastParamLocalCast(string plainSource, string castSource)
+{
+    string plain = plainSource;
+    string actual = (string)castSource;
+    return Test("strcast param local cast value and ownership",
+                strcastSameStringResult(&plain, &actual), true) != 0;
+}
+bool strcastParamLocalFunctional(string plainSource, string castSource)
+{
+    string plain = plainSource;
+    string actual = string(castSource);
+    return Test("strcast param local functional value and ownership",
+                strcastSameStringResult(&plain, &actual), true) != 0;
+}
+bool strcastParamAssignCast(string plainSource, string castSource)
+{
+    string plain = "old"; plain = plainSource;
+    string actual = "old"; actual = (string)castSource;
+    return Test("strcast param assignment cast value and ownership",
+                strcastSameStringResult(&plain, &actual), true) != 0;
+}
+bool strcastParamAssignFunctional(string plainSource, string castSource)
+{
+    string plain = "old"; plain = plainSource;
+    string actual = "old"; actual = string(castSource);
+    return Test("strcast param assignment functional value and ownership",
+                strcastSameStringResult(&plain, &actual), true) != 0;
+}
+bool strcastParamCallCast(string plainSource, string castSource)
+{
+    int plain = strcastIdentityRoute(plainSource);
+    int actual = strcastIdentityRoute((string)castSource);
+    return (Test("strcast param plain call overload", plain, 101) != 0)
+        && (Test("strcast param call cast overload", actual, 101) != 0);
+}
+bool strcastParamCallFunctional(string plainSource, string castSource)
+{
+    int plain = strcastIdentityRoute(plainSource);
+    int actual = strcastIdentityRoute(string(castSource));
+    return (Test("strcast param plain functional overload", plain, 101) != 0)
+        && (Test("strcast param call functional overload", actual, 101) != 0);
+}
+
+string strcastIdentityCallValue() { return string("cat").copy(); }
+StrcastOwningTempBox strcastOwningTempBoxValue()
+{
+    StrcastOwningTempBox box = default;
+    box.name = string("cat").copy();
+    return box;
+}
+string strcastReturnLocal(int form)
+{
+    string source = string("cat").copy();
+    if (form == 1) return (string)source;
+    if (form == 2) return string(source);
+    return source;
+}
+string strcastReturnParam(string source, int form)
+{
+    if (form == 1) return (string)source;
+    if (form == 2) return string(source);
+    return source;
+}
+string strcastReturnField(int form)
+{
+    StrctorStringHolder holder = default;
+    holder.s = string("cat").copy();
+    if (form == 1) return (string)holder.s;
+    if (form == 2) return string(holder.s);
+    return holder.s;
+}
+string strcastReturnCall(int form)
+{
+    if (form == 1) return (string)strcastIdentityCallValue();
+    if (form == 2) return string(strcastIdentityCallValue());
+    return strcastIdentityCallValue();
+}
+string strcastReturnLiteral(int form)
+{
+    if (form == 1) return (string)"cat";
+    if (form == 2) return string("cat");
+    return "cat";
+}
+
+bool strcastTestLocalPositions()
+{
+    bool result = true;
+    string plainSource = string("cat").copy();
+    string castSource = string("cat").copy();
+    string plainLocal = plainSource;
+    string castLocal = (string)castSource;
+    result &= Test("strcast local declaration cast value and ownership",
+                   strcastSameStringResult(&plainLocal, &castLocal), true);
+    result &= Test("strcast local declaration cast source state",
+                   strcastSameStringSource(&plainSource, &castSource), true);
+
+    string plainFunctionalSource = string("cat").copy();
+    string functionalSource = string("cat").copy();
+    string plainFunctionalLocal = plainFunctionalSource;
+    string functionalLocal = string(functionalSource);
+    result &= Test("strcast local declaration functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalLocal, &functionalLocal), true);
+    result &= Test("strcast local declaration functional source state",
+                   strcastSameStringSource(&plainFunctionalSource, &functionalSource), true);
+
+    string plainAssignSource = string("cat").copy();
+    string castAssignSource = string("cat").copy();
+    string plainAssigned = "old"; plainAssigned = plainAssignSource;
+    string castAssigned = "old"; castAssigned = (string)castAssignSource;
+    result &= Test("strcast local assignment cast value and ownership",
+                   strcastSameStringResult(&plainAssigned, &castAssigned), true);
+    result &= Test("strcast local assignment cast source state",
+                   strcastSameStringSource(&plainAssignSource, &castAssignSource), true);
+
+    string plainFunctionalAssignSource = string("cat").copy();
+    string functionalAssignSource = string("cat").copy();
+    string plainFunctionalAssigned = "old"; plainFunctionalAssigned = plainFunctionalAssignSource;
+    string functionalAssigned = "old"; functionalAssigned = string(functionalAssignSource);
+    result &= Test("strcast local assignment functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalAssigned, &functionalAssigned), true);
+    result &= Test("strcast local assignment functional source state",
+                   strcastSameStringSource(&plainFunctionalAssignSource, &functionalAssignSource), true);
+
+    string plainCallSource = string("cat").copy();
+    string castCallSource = string("cat").copy();
+    result &= Test("strcast local call argument cast overload",
+                   strcastIdentityRoute((string)castCallSource) == 101
+                       && strcastIdentityRoute(plainCallSource) == 101, true);
+    result &= Test("strcast local call argument cast source state",
+                   strcastSameStringSource(&plainCallSource, &castCallSource), true);
+
+    string plainFunctionalCallSource = string("cat").copy();
+    string functionalCallSource = string("cat").copy();
+    result &= Test("strcast local call argument functional overload",
+                   strcastIdentityRoute(string(functionalCallSource)) == 101
+                       && strcastIdentityRoute(plainFunctionalCallSource) == 101, true);
+    result &= Test("strcast local call argument functional source state",
+                   strcastSameStringSource(&plainFunctionalCallSource, &functionalCallSource), true);
+    return result;
+}
+
+bool strcastTestFieldPositions()
+{
+    bool result = true;
+    StrctorStringHolder plainHolder = default;
+    StrctorStringHolder castHolder = default;
+    plainHolder.s = string("cat").copy();
+    castHolder.s = string("cat").copy();
+    string plainLocal = plainHolder.s;
+    string castLocal = (string)castHolder.s;
+    result &= Test("strcast field local declaration cast value and ownership",
+                   strcastSameStringResult(&plainLocal, &castLocal), true);
+
+    StrctorStringHolder plainFunctionalHolder = default;
+    StrctorStringHolder functionalHolder = default;
+    plainFunctionalHolder.s = string("cat").copy();
+    functionalHolder.s = string("cat").copy();
+    string plainFunctionalLocal = plainFunctionalHolder.s;
+    string functionalLocal = string(functionalHolder.s);
+    result &= Test("strcast field local declaration functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalLocal, &functionalLocal), true);
+
+    StrctorStringHolder plainAssignHolder = default;
+    StrctorStringHolder castAssignHolder = default;
+    plainAssignHolder.s = string("cat").copy();
+    castAssignHolder.s = string("cat").copy();
+    string plainAssigned = "old"; plainAssigned = plainAssignHolder.s;
+    string castAssigned = "old"; castAssigned = (string)castAssignHolder.s;
+    result &= Test("strcast field assignment cast value and ownership",
+                   strcastSameStringResult(&plainAssigned, &castAssigned), true);
+
+    StrctorStringHolder plainFunctionalAssignHolder = default;
+    StrctorStringHolder functionalAssignHolder = default;
+    plainFunctionalAssignHolder.s = string("cat").copy();
+    functionalAssignHolder.s = string("cat").copy();
+    string plainFunctionalAssigned = "old";
+    plainFunctionalAssigned = plainFunctionalAssignHolder.s;
+    string functionalAssigned = "old";
+    functionalAssigned = string(functionalAssignHolder.s);
+    result &= Test("strcast field assignment functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalAssigned, &functionalAssigned), true);
+
+    StrctorStringHolder plainCallHolder = default;
+    StrctorStringHolder castCallHolder = default;
+    plainCallHolder.s = string("cat").copy();
+    castCallHolder.s = string("cat").copy();
+    result &= Test("strcast field call argument cast overload",
+                   strcastIdentityRoute((string)castCallHolder.s) == 101
+                       && strcastIdentityRoute(plainCallHolder.s) == 101, true);
+
+    StrctorStringHolder plainFunctionalCallHolder = default;
+    StrctorStringHolder functionalCallHolder = default;
+    plainFunctionalCallHolder.s = string("cat").copy();
+    functionalCallHolder.s = string("cat").copy();
+    result &= Test("strcast field call argument functional overload",
+                   strcastIdentityRoute(string(functionalCallHolder.s)) == 101
+                       && strcastIdentityRoute(plainFunctionalCallHolder.s) == 101, true);
+    return result;
+}
+
+bool strcastTestReturnedCallPositions()
+{
+    bool result = true;
+    string plainLocal = strcastIdentityCallValue();
+    string castLocal = (string)strcastIdentityCallValue();
+    result &= Test("strcast returned call local declaration cast value and ownership",
+                   strcastSameStringResult(&plainLocal, &castLocal), true);
+    string plainFunctionalLocal = strcastIdentityCallValue();
+    string functionalLocal = string(strcastIdentityCallValue());
+    result &= Test("strcast returned call local declaration functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalLocal, &functionalLocal), true);
+
+    string plainAssigned = "old"; plainAssigned = strcastIdentityCallValue();
+    string castAssigned = "old"; castAssigned = (string)strcastIdentityCallValue();
+    result &= Test("strcast returned call assignment cast value and ownership",
+                   strcastSameStringResult(&plainAssigned, &castAssigned), true);
+    string plainFunctionalAssigned = "old";
+    plainFunctionalAssigned = strcastIdentityCallValue();
+    string functionalAssigned = "old";
+    functionalAssigned = string(strcastIdentityCallValue());
+    result &= Test("strcast returned call assignment functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalAssigned, &functionalAssigned), true);
+
+    result &= Test("strcast returned call argument cast overload",
+                   strcastIdentityRoute((string)strcastIdentityCallValue()) == 101
+                       && strcastIdentityRoute(strcastIdentityCallValue()) == 101, true);
+    result &= Test("strcast returned call argument functional overload",
+                   strcastIdentityRoute(string(strcastIdentityCallValue())) == 101
+                       && strcastIdentityRoute(strcastIdentityCallValue()) == 101, true);
+    return result;
+}
+
+bool strcastTestTemporaryCastAllocationCounts()
+{
+    bool result = true;
+    strcastFieldAllocCount = 0;
+    strcastFieldFreeCount = 0;
+    __alloc_audit_hook = strcastCountAlloc;
+    __free_audit_hook = strcastCountFree;
+    {
+        string callCast = (string)(strcastIdentityCallValue());
+    }
+    bool callCastBalanced = strcastFieldAllocCount == 1 && strcastFieldFreeCount == 1;
+    strcastFieldAllocCount = 0;
+    strcastFieldFreeCount = 0;
+    {
+        string callFunctional = string(strcastIdentityCallValue());
+    }
+    bool callFunctionalBalanced = strcastFieldAllocCount == 1 && strcastFieldFreeCount == 1;
+    strcastFieldAllocCount = 0;
+    strcastFieldFreeCount = 0;
+    {
+        string tempFieldCast = (string)(strcastOwningTempBoxValue().name);
+    }
+    bool tempFieldBalanced = strcastFieldAllocCount == 1 && strcastFieldFreeCount == 1;
+    __alloc_audit_hook = nullptr;
+    __free_audit_hook = nullptr;
+    result &= Test("strcast parenthesized call cast adopts one owned buffer",
+                   callCastBalanced, true);
+    result &= Test("strcast functional call cast adopts one owned buffer",
+                   callFunctionalBalanced, true);
+    result &= Test("strcast owning-temp field cast moves one owned buffer",
+                   tempFieldBalanced, true);
+    return result;
+}
+
+bool strcastTestLiteralPositions()
+{
+    bool result = true;
+    string plainLocal = "cat";
+    string castLocal = (string)"cat";
+    result &= Test("strcast literal local declaration cast value and ownership",
+                   strcastSameStringResult(&plainLocal, &castLocal), true);
+    string plainFunctionalLocal = "cat";
+    string functionalLocal = string("cat");
+    result &= Test("strcast literal local declaration functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalLocal, &functionalLocal), true);
+
+    string plainAssigned = "old"; plainAssigned = "cat";
+    string castAssigned = "old"; castAssigned = (string)"cat";
+    result &= Test("strcast literal assignment cast value and ownership",
+                   strcastSameStringResult(&plainAssigned, &castAssigned), true);
+    string plainFunctionalAssigned = "old"; plainFunctionalAssigned = "cat";
+    string functionalAssigned = "old"; functionalAssigned = string("cat");
+    result &= Test("strcast literal assignment functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalAssigned, &functionalAssigned), true);
+
+    result &= Test("strcast literal call argument cast overload",
+                   strcastIdentityRoute((string)"cat") == 101
+                       && strcastIdentityRoute("cat") == 101, true);
+    result &= Test("strcast literal call argument functional overload",
+                   strcastIdentityRoute(string("cat")) == 101
+                       && strcastIdentityRoute("cat") == 101, true);
+    return result;
+}
+
+bool strcastTestBorrowPositions()
+{
+    bool result = true;
+    char[4] bytes = {'c', 'a', 't', 0};
+    string plainSource = string(bytes);
+    string castSource = string(bytes);
+    string plainLocal = plainSource;
+    string castLocal = (string)castSource;
+    result &= Test("strcast borrowed local declaration cast value and ownership",
+                   strcastSameStringResult(&plainLocal, &castLocal), true);
+    result &= Test("strcast borrowed local declaration cast source state",
+                   strcastSameStringSource(&plainSource, &castSource), true);
+    result &= Test("strcast borrowed cast preserves pointer and borrow",
+                   ((string)castSource).data() == castSource.data()
+                       && !(((string)castSource)._len < 0), true);
+
+    string plainFunctionalSource = string(bytes);
+    string functionalSource = string(bytes);
+    string plainFunctionalLocal = plainFunctionalSource;
+    string functionalLocal = string(functionalSource);
+    result &= Test("strcast borrowed local declaration functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalLocal, &functionalLocal), true);
+    result &= Test("strcast borrowed local declaration functional source state",
+                   strcastSameStringSource(&plainFunctionalSource, &functionalSource), true);
+    result &= Test("strcast borrowed functional preserves pointer and borrow",
+                   string(functionalSource).data() == functionalSource.data()
+                       && !(string(functionalSource)._len < 0), true);
+
+    string plainAssignSource = string(bytes);
+    string castAssignSource = string(bytes);
+    string plainAssigned = "old"; plainAssigned = plainAssignSource;
+    string castAssigned = "old"; castAssigned = (string)castAssignSource;
+    result &= Test("strcast borrowed assignment cast value and ownership",
+                   strcastSameStringResult(&plainAssigned, &castAssigned), true);
+    string plainFunctionalAssignSource = string(bytes);
+    string functionalAssignSource = string(bytes);
+    string plainFunctionalAssigned = "old";
+    plainFunctionalAssigned = plainFunctionalAssignSource;
+    string functionalAssigned = "old";
+    functionalAssigned = string(functionalAssignSource);
+    result &= Test("strcast borrowed assignment functional value and ownership",
+                   strcastSameStringResult(&plainFunctionalAssigned, &functionalAssigned), true);
+
+    string plainCallSource = string(bytes);
+    string castCallSource = string(bytes);
+    result &= Test("strcast borrowed call argument cast overload",
+                   strcastIdentityRoute((string)castCallSource) == 101
+                       && strcastIdentityRoute(plainCallSource) == 101, true);
+    string plainFunctionalCallSource = string(bytes);
+    string functionalCallSource = string(bytes);
+    result &= Test("strcast borrowed call argument functional overload",
+                   strcastIdentityRoute(string(functionalCallSource)) == 101
+                       && strcastIdentityRoute(plainFunctionalCallSource) == 101, true);
+    return result;
+}
+
+bool strcastTestReturnPositions()
+{
+    bool result = true;
+    string localPlain = strcastReturnLocal(0);
+    string localCast = strcastReturnLocal(1);
+    string localFunctional = strcastReturnLocal(2);
+    result &= Test("strcast local return cast value and ownership",
+                   strcastSameStringResult(&localPlain, &localCast), true);
+    result &= Test("strcast local return functional value and ownership",
+                   strcastSameStringResult(&localPlain, &localFunctional), true);
+
+    string paramPlain = strcastReturnParam(string("cat").copy(), 0);
+    string paramCast = strcastReturnParam(string("cat").copy(), 1);
+    string paramFunctional = strcastReturnParam(string("cat").copy(), 2);
+    result &= Test("strcast param return cast value and ownership",
+                   strcastSameStringResult(&paramPlain, &paramCast), true);
+    result &= Test("strcast param return functional value and ownership",
+                   strcastSameStringResult(&paramPlain, &paramFunctional), true);
+
+    string fieldPlain = strcastReturnField(0);
+    string fieldCast = strcastReturnField(1);
+    string fieldFunctional = strcastReturnField(2);
+    result &= Test("strcast field return cast value and ownership",
+                   strcastSameStringResult(&fieldPlain, &fieldCast), true);
+    result &= Test("strcast field return functional value and ownership",
+                   strcastSameStringResult(&fieldPlain, &fieldFunctional), true);
+
+    string callPlain = strcastReturnCall(0);
+    string callCast = strcastReturnCall(1);
+    string callFunctional = strcastReturnCall(2);
+    result &= Test("strcast returned call return cast value and ownership",
+                   strcastSameStringResult(&callPlain, &callCast), true);
+    result &= Test("strcast returned call return functional value and ownership",
+                   strcastSameStringResult(&callPlain, &callFunctional), true);
+
+    string literalPlain = strcastReturnLiteral(0);
+    string literalCast = strcastReturnLiteral(1);
+    string literalFunctional = strcastReturnLiteral(2);
+    result &= Test("strcast literal return cast value and ownership",
+                   strcastSameStringResult(&literalPlain, &literalCast), true);
+    result &= Test("strcast literal return functional value and ownership",
+                   strcastSameStringResult(&literalPlain, &literalFunctional), true);
+    return result;
+}
 
 bool testStringType()
 {
@@ -3152,6 +4205,81 @@ bool testStringType()
     string_view strctorView = string_view(strctorPtr, 2);
     result &= Test("strctor string_view i32 value and length",
                    strctorView.length() == 2 && strctorView.data() == strctorPtr, true);
+
+    // STRCAST accept-set: these identity casts already worked before the string fix.
+    int strcastIntSource = 17;
+    result &= Test("strcast identity int value", (int)strcastIntSource, 17);
+    StrcastIdentityBox strcastBoxSource = { value = 31 };
+    StrcastIdentityBox strcastBoxCopy = (StrcastIdentityBox)strcastBoxSource;
+    result &= Test("strcast identity struct value", strcastBoxCopy.value, 31);
+    string_view strcastViewSource = string_view(strctorPtr, 3);
+    string_view strcastViewCopy = (string_view)strcastViewSource;
+    result &= Test("strcast identity view value and borrow",
+                   strcastViewCopy.length() == 3 && strcastViewCopy.data() == strctorPtr, true);
+
+    string strcastConcatSource = string("ab").copy();
+    string strcastConcatPlain = strcastConcatSource + "c";
+    string strcastConcatCast = (string)(strcastConcatSource + "c");
+    string strcastConcatFunctional = string(strcastConcatSource + "c");
+    result &= Test("strcast functional concat matches cast value and ownership",
+                   strcastConcatPlain == strcastConcatCast
+                       && strcastConcatPlain == strcastConcatFunctional
+                       && strcastSameStringResult(&strcastConcatCast, &strcastConcatFunctional), true);
+
+    int x = 3;
+    string strcastInterpPlain = "a{x}";
+    string strcastInterpCast = (string)"a{x}";
+    string strcastInterpFunctional = string("a{x}");
+    result &= Test("strcast local interpolated cast matches bare literal",
+                   strcastInterpPlain == strcastInterpCast
+                       && strcastInterpPlain.length() == 2, true);
+    result &= Test("strcast local interpolated functional form matches bare literal",
+                   strcastInterpPlain == strcastInterpFunctional
+                       && strcastInterpPlain.length() == 2, true);
+
+    result &= strcastTestLocalPositions();
+    result &= strcastParamLocalCast(string("cat").copy(), string("cat").copy());
+    result &= strcastParamLocalFunctional(string("cat").copy(), string("cat").copy());
+    result &= strcastParamAssignCast(string("cat").copy(), string("cat").copy());
+    result &= strcastParamAssignFunctional(string("cat").copy(), string("cat").copy());
+    result &= strcastParamCallCast(string("cat").copy(), string("cat").copy());
+    result &= strcastParamCallFunctional(string("cat").copy(), string("cat").copy());
+    result &= strcastTestFieldPositions();
+    strcastFieldAllocCount = 0;
+    strcastFieldFreeCount = 0;
+    __alloc_audit_hook = strcastCountAlloc;
+    __free_audit_hook = strcastCountFree;
+    {
+        StrcastImplicitThisBox strcastImplicitCastBox = default;
+        strcastImplicitCastBox.name = string("cat").copy();
+        result &= Test("strcast implicit-this parenthesized identity cast value and destruction",
+                       strcastImplicitCastBox.castCopyIndependent(), true);
+        StrcastImplicitThisBox strcastImplicitFunctionalBox = default;
+        strcastImplicitFunctionalBox.name = string("cat").copy();
+        result &= Test("strcast implicit-this functional identity cast value and destruction",
+                       strcastImplicitFunctionalBox.functionalCopyIndependent(), true);
+    }
+    __alloc_audit_hook = nullptr;
+    __free_audit_hook = nullptr;
+    result &= Test("strcast implicit-this identity casts allocate and free four buffers",
+                   strcastFieldAllocCount == 4 && strcastFieldFreeCount == 4, true);
+    result &= strcastTestTemporaryCastAllocationCounts();
+    result &= strcastTestReturnedCallPositions();
+    result &= strcastTestLiteralPositions();
+    result &= strcastTestBorrowPositions();
+    result &= strcastTestReturnPositions();
+    result &= Test("strcast global literal cast folds like bare literal",
+                   strcastGlobalCast == strcastGlobalBare
+                       && strcastGlobalCast.length() == 3, true);
+    result &= Test("strcast global literal functional form folds like bare literal",
+                   strcastGlobalFunctional == strcastGlobalBare
+                       && strcastGlobalFunctional.length() == 3, true);
+    result &= Test("strcast const global literal cast folds like bare literal",
+                   strcastConstGlobalCast == strcastConstGlobalBare
+                       && strcastConstGlobalCast.length() == 3, true);
+    result &= Test("strcast const global literal functional form folds like bare literal",
+                   strcastConstGlobalFunctional == strcastConstGlobalBare
+                       && strcastConstGlobalFunctional.length() == 3, true);
 
     string strctorOne = string(strctorPtr);
     result &= Test("strctor one-arg equals cast form",
@@ -3288,6 +4416,263 @@ bool testStringType()
                    strctorMemberView.length() == 3
                        && strctorMemberView.data() == &strctorMember.bytes[0], true);
 
+    string_view fromAssignmentParam = strctorAssignmentParamView(strctorCallerPtr);
+    result &= Test("strctor assignment param root value and identity",
+                   fromAssignmentParam.length() == 3
+                       && fromAssignmentParam.data() == strctorCallerPtr
+                       && fromAssignmentParam.data()[0] == 'c', true);
+    string_view fromAssignmentGlobal = strctorAssignmentGlobalView();
+    result &= Test("strctor assignment global root value and identity",
+                   fromAssignmentGlobal.length() == 3
+                       && fromAssignmentGlobal.data() == &strctorGlobalBorrowBytes[0], true);
+    string_view fromAssignmentHeap = strctorAssignmentHeapView();
+    result &= Test("strctor assignment heap root value and identity",
+                   fromAssignmentHeap.length() == 3
+                       && fromAssignmentHeap.data() == strctorAssignHeapPointer
+                       && fromAssignmentHeap.data()[2] == 't', true);
+    delete[] strctorAssignHeapPointer;
+    strctorAssignHeapPointer = nullptr;
+    string_view fromAssignmentLiteral = strctorAssignmentLiteralView();
+    result &= Test("strctor assignment literal root value",
+                   fromAssignmentLiteral.length() == 3
+                       && fromAssignmentLiteral.data()[0] == 'l'
+                       && fromAssignmentLiteral.data()[2] == 't', true);
+    string assignmentRebindLiteral = strctorAssignmentRebindLiteralReturn();
+    result &= Test("strctor assignment literal clears prior stack borrow",
+                   assignmentRebindLiteral == "ok"
+                       && assignmentRebindLiteral.length() == 2, true);
+    result &= Test("strctor assignment same-frame result value",
+                   strctorAssignmentSameFrameView(), 415);
+    int assignmentCompoundLeft = strctorAssignmentCompoundStackLeft();
+    result &= Test("strctor string compound assignment over stack value owns result",
+                   assignmentCompoundLeft, 599);
+    string assignmentCompoundReturn = strctorAssignmentCompoundStackReturn();
+    result &= Test("strctor string compound assignment return owns result",
+                   assignmentCompoundReturn == "base"
+                       && (assignmentCompoundReturn._len & (i32)0x80000000) != 0, true);
+    string assignmentCompoundRight = strctorAssignmentCompoundStackRight();
+    result &= Test("strctor string compound assignment with stack RHS owns result",
+                   assignmentCompoundRight == "xhi"
+                       && (assignmentCompoundRight._len & (i32)0x80000000) != 0, true);
+
+    string borrowFlowStraight = strctorBorrowFlowReturnStraight();
+    result &= Test("strctor borrowflow += straight return value and owner",
+                   borrowFlowStraight == "bx" && borrowFlowStraight.length() == 2
+                       && (borrowFlowStraight._len & (i32)0x80000000) != 0, true);
+    string borrowFlowIfThen = strctorBorrowFlowReturnIfElse(1);
+    string borrowFlowIfElse = strctorBorrowFlowReturnIfElse(0);
+    result &= Test("strctor borrowflow += if else return values and owners",
+                   borrowFlowIfThen == "bx" && borrowFlowIfElse == "by"
+                       && (borrowFlowIfThen._len & (i32)0x80000000) != 0
+                       && (borrowFlowIfElse._len & (i32)0x80000000) != 0, true);
+    string borrowFlowElseIf0 = strctorBorrowFlowReturnElseIf(0);
+    string borrowFlowElseIf1 = strctorBorrowFlowReturnElseIf(1);
+    string borrowFlowElseIf2 = strctorBorrowFlowReturnElseIf(2);
+    result &= Test("strctor borrowflow += else if return values and owners",
+                   borrowFlowElseIf0 == "ba" && borrowFlowElseIf1 == "bb"
+                       && borrowFlowElseIf2 == "bc"
+                       && (borrowFlowElseIf0._len & (i32)0x80000000) != 0
+                       && (borrowFlowElseIf1._len & (i32)0x80000000) != 0
+                       && (borrowFlowElseIf2._len & (i32)0x80000000) != 0, true);
+    string borrowFlowSwitch0 = strctorBorrowFlowReturnSwitch(0);
+    string borrowFlowSwitch1 = strctorBorrowFlowReturnSwitch(1);
+    string borrowFlowSwitch2 = strctorBorrowFlowReturnSwitch(2);
+    result &= Test("strctor borrowflow += switch fallthrough return values and owners",
+                   borrowFlowSwitch0 == "bxxx" && borrowFlowSwitch1 == "bxx"
+                       && borrowFlowSwitch2 == "bx"
+                       && (borrowFlowSwitch0._len & (i32)0x80000000) != 0
+                       && (borrowFlowSwitch1._len & (i32)0x80000000) != 0
+                       && (borrowFlowSwitch2._len & (i32)0x80000000) != 0, true);
+    string borrowFlowDo2 = strctorBorrowFlowReturnDoWhile(2);
+    string borrowFlowDo3 = strctorBorrowFlowReturnDoWhile(3);
+    result &= Test("strctor borrowflow += do while return values and owners",
+                   borrowFlowDo2 == "bx" && borrowFlowDo3 == "bxx"
+                       && (borrowFlowDo2._len & (i32)0x80000000) != 0
+                       && (borrowFlowDo3._len & (i32)0x80000000) != 0, true);
+    string borrowFlowEarly0 = strctorBorrowFlowReturnEarly(0);
+    string borrowFlowEarly1 = strctorBorrowFlowReturnEarly(1);
+    result &= Test("strctor borrowflow += early return paths preserve values",
+                   borrowFlowEarly0 == "bx" && borrowFlowEarly1 == "early"
+                       && (borrowFlowEarly0._len & (i32)0x80000000) != 0, true);
+
+    strctorBorrowFlowGlobalStraight();
+    bool borrowFlowGlobalStraightOk = strctorBorrowFlowGlobal == "bx"
+        && strctorBorrowFlowGlobal.length() == 2
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalIfElse(1);
+    bool borrowFlowGlobalIfThenOk = strctorBorrowFlowGlobal == "bx"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalIfElse(0);
+    bool borrowFlowGlobalIfElseOk = strctorBorrowFlowGlobal == "by"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    result &= Test("strctor borrowflow += global store values and owners",
+                   borrowFlowGlobalStraightOk && borrowFlowGlobalIfThenOk
+                       && borrowFlowGlobalIfElseOk, true);
+    strctorBorrowFlowGlobalElseIf(0);
+    bool borrowFlowGlobalElseIf0Ok = strctorBorrowFlowGlobal == "ba"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalElseIf(1);
+    bool borrowFlowGlobalElseIf1Ok = strctorBorrowFlowGlobal == "bb"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalElseIf(2);
+    bool borrowFlowGlobalElseIf2Ok = strctorBorrowFlowGlobal == "bc"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    result &= Test("strctor borrowflow += else if global values and owners",
+                   borrowFlowGlobalElseIf0Ok && borrowFlowGlobalElseIf1Ok
+                       && borrowFlowGlobalElseIf2Ok, true);
+    strctorBorrowFlowGlobalSwitch(0);
+    bool borrowFlowGlobalSwitch0Ok = strctorBorrowFlowGlobal == "bxxx"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalSwitch(1);
+    bool borrowFlowGlobalSwitch1Ok = strctorBorrowFlowGlobal == "bxx"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalSwitch(2);
+    bool borrowFlowGlobalSwitch2Ok = strctorBorrowFlowGlobal == "bx"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    result &= Test("strctor borrowflow += switch global values and owners",
+                   borrowFlowGlobalSwitch0Ok && borrowFlowGlobalSwitch1Ok
+                       && borrowFlowGlobalSwitch2Ok, true);
+    strctorBorrowFlowGlobalDoWhile(2);
+    bool borrowFlowGlobalDo2Ok = strctorBorrowFlowGlobal == "bx"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalDoWhile(3);
+    bool borrowFlowGlobalDo3Ok = strctorBorrowFlowGlobal == "bxx"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    result &= Test("strctor borrowflow += do while global values and owners",
+                   borrowFlowGlobalDo2Ok && borrowFlowGlobalDo3Ok, true);
+    strctorBorrowFlowGlobalEarly(0);
+    bool borrowFlowGlobalEarly0Ok = strctorBorrowFlowGlobal == "bx"
+        && (strctorBorrowFlowGlobal._len & (i32)0x80000000) != 0;
+    strctorBorrowFlowGlobal = default;
+    strctorBorrowFlowGlobalEarly(1);
+    bool borrowFlowGlobalEarly1Ok = strctorBorrowFlowGlobal == "early";
+    strctorBorrowFlowGlobal = default;
+    result &= Test("strctor borrowflow += early return global values and owners",
+                   borrowFlowGlobalEarly0Ok && borrowFlowGlobalEarly1Ok, true);
+
+    StrctorBorrowFlowHolder borrowFlowHolder = default;
+    strctorBorrowFlowFieldStraight(&borrowFlowHolder);
+    bool borrowFlowFieldStraightOk = borrowFlowHolder.s == "bx"
+        && borrowFlowHolder.s.length() == 2
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldIfElse(&borrowFlowHolder, 1);
+    bool borrowFlowFieldIfThenOk = borrowFlowHolder.s == "bx"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldIfElse(&borrowFlowHolder, 0);
+    bool borrowFlowFieldIfElseOk = borrowFlowHolder.s == "by"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    result &= Test("strctor borrowflow += field store values and owners",
+                   borrowFlowFieldStraightOk && borrowFlowFieldIfThenOk
+                       && borrowFlowFieldIfElseOk, true);
+    strctorBorrowFlowFieldElseIf(&borrowFlowHolder, 0);
+    bool borrowFlowFieldElseIf0Ok = borrowFlowHolder.s == "ba"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldElseIf(&borrowFlowHolder, 1);
+    bool borrowFlowFieldElseIf1Ok = borrowFlowHolder.s == "bb"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldElseIf(&borrowFlowHolder, 2);
+    bool borrowFlowFieldElseIf2Ok = borrowFlowHolder.s == "bc"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    result &= Test("strctor borrowflow += else if field values and owners",
+                   borrowFlowFieldElseIf0Ok && borrowFlowFieldElseIf1Ok
+                       && borrowFlowFieldElseIf2Ok, true);
+    strctorBorrowFlowFieldSwitch(&borrowFlowHolder, 0);
+    bool borrowFlowFieldSwitch0Ok = borrowFlowHolder.s == "bxxx"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldSwitch(&borrowFlowHolder, 1);
+    bool borrowFlowFieldSwitch1Ok = borrowFlowHolder.s == "bxx"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldSwitch(&borrowFlowHolder, 2);
+    bool borrowFlowFieldSwitch2Ok = borrowFlowHolder.s == "bx"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    result &= Test("strctor borrowflow += switch field values and owners",
+                   borrowFlowFieldSwitch0Ok && borrowFlowFieldSwitch1Ok
+                       && borrowFlowFieldSwitch2Ok, true);
+    strctorBorrowFlowFieldDoWhile(&borrowFlowHolder, 2);
+    bool borrowFlowFieldDo2Ok = borrowFlowHolder.s == "bx"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldDoWhile(&borrowFlowHolder, 3);
+    bool borrowFlowFieldDo3Ok = borrowFlowHolder.s == "bxx"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    result &= Test("strctor borrowflow += do while field values and owners",
+                   borrowFlowFieldDo2Ok && borrowFlowFieldDo3Ok, true);
+    strctorBorrowFlowFieldEarly(&borrowFlowHolder, 0);
+    bool borrowFlowFieldEarly0Ok = borrowFlowHolder.s == "bx"
+        && (borrowFlowHolder.s._len & (i32)0x80000000) != 0;
+    borrowFlowHolder.s = default;
+    strctorBorrowFlowFieldEarly(&borrowFlowHolder, 1);
+    bool borrowFlowFieldEarly1Ok = borrowFlowHolder.s == "early";
+    borrowFlowHolder.s = default;
+    result &= Test("strctor borrowflow += early return field values and owners",
+                   borrowFlowFieldEarly0Ok && borrowFlowFieldEarly1Ok, true);
+
+    // The assignment value is the destination after the store, for every owner consumer.
+    result &= Test("chainstruct string chained declaration allocation/free", chainStructStringDecl(), 3322);
+    result &= Test("chainstruct owning struct call declaration", chainStructOwnerCase(0, 0), 3322);
+    result &= Test("chainstruct owning struct call assignment", chainStructOwnerCase(0, 1), 3322);
+    result &= Test("chainstruct owning struct named declaration", chainStructOwnerCase(1, 0), 3333);
+    result &= Test("chainstruct owning struct named assignment", chainStructOwnerCase(1, 1), 3333);
+    result &= Test("chainstruct string call return allocation/free", chainStructStringReturnCase(0), 311);
+    result &= Test("chainstruct string move return allocation/free", chainStructStringReturnCase(1), 311);
+    result &= Test("chainstruct string named return allocation/free", chainStructStringReturnCase(2), 322);
+    result &= Test("chainstruct dtor call declaration count", chainStructDtorCase(0, 0), 554);
+    result &= Test("chainstruct dtor call assignment count", chainStructDtorCase(0, 1), 555);
+    result &= Test("chainstruct dtor named declaration count", chainStructDtorCase(1, 0), 555);
+    result &= Test("chainstruct dtor named assignment count", chainStructDtorCase(1, 1), 556);
+    result &= Test("chainstruct dtor literal declaration count", chainStructDtorCase(2, 0), 3);
+    result &= Test("chainstruct dtor literal assignment count", chainStructDtorCase(2, 1), 4);
+    result &= Test("chainstruct unique move return dtor count", chainStructUniqueReturnCase(0), 51);
+    result &= Test("chainstruct unique named return dtor count", chainStructUniqueReturnCase(1), 51);
+    bool parenStringAssignMatches = true;
+    for (int destination = 0; destination < 5; destination++)
+        for (int spelling = 0; spelling < 3; spelling++)
+            parenStringAssignMatches = parenStringAssignMatches
+                && chainStructParenStringAssign(destination, spelling) == 301010;
+    result &= Test("parenthesized owned string assignment across destinations",
+                   parenStringAssignMatches, true);
+    bool parenOwnerAssignMatches = true;
+    for (int source = 0; source < 4; source++)
+        for (int spelling = 0; spelling < 3; spelling++)
+            parenOwnerAssignMatches = parenOwnerAssignMatches
+                && chainStructParenOwnerAssign(source, spelling)
+                    == (source == 2 ? 302020 : 301010);
+    result &= Test("parenthesized owning struct assignment source values",
+                   parenOwnerAssignMatches, true);
+    result &= Test("parenthesized unique result assignment destructor count",
+                   chainStructParenUniqueAssign(0) == 51
+                       && chainStructParenUniqueAssign(1) == 51
+                       && chainStructParenUniqueAssign(2) == 51, true);
+    result &= Test("parenthesized value-dtor result assignment count",
+                   chainStructParenDtorAssign(0) == 53
+                       && chainStructParenDtorAssign(1) == 53
+                       && chainStructParenDtorAssign(2) == 53, true);
+    result &= Test("parenthesized compound assignment operands stay transparent",
+                   chainStructParenStringCompound(0) == 403030
+                       && chainStructParenStringCompound(1) == 403030
+                       && chainStructParenStringCompound(2) == 403030, true);
+
     char* strctorHeapBorrowBytes = new char[4];
     strctorHeapBorrowBytes[0] = 'c'; strctorHeapBorrowBytes[1] = 'a';
     strctorHeapBorrowBytes[2] = 't'; strctorHeapBorrowBytes[3] = 0;
@@ -3327,6 +4712,30 @@ bool testStringType()
     result &= Test("strctor local stack ternary out parameter owns its value",
                    strctorTernaryOut == "cat"
                        && (strctorTernaryOut._len & (i32)0x80000000) != 0, true);
+    string dynamicCastTernary = strctorDynamicLocalArrayTernaryReturn(true);
+    result &= Test("strctor dynamic cast ternary return copies stack value",
+                   dynamicCastTernary == "cat" && dynamicCastTernary.length() == 3
+                       && (dynamicCastTernary._len & (i32)0x80000000) != 0, true);
+    string dynamicFunctionalTernary = strctorDynamicLocalArrayFunctionalTernaryReturn(true);
+    result &= Test("strctor dynamic functional ternary return copies stack value",
+                   dynamicFunctionalTernary == "cat" && dynamicFunctionalTernary.length() == 3
+                       && (dynamicFunctionalTernary._len & (i32)0x80000000) != 0, true);
+    string dynamicNamedTernary = strctorDynamicLocalArrayNamedTernaryReturn(true);
+    result &= Test("strctor dynamic named ternary return copies stack value",
+                   dynamicNamedTernary == "cat" && dynamicNamedTernary.length() == 3
+                       && (dynamicNamedTernary._len & (i32)0x80000000) != 0, true);
+    string dynamicAssignmentTernary = strctorDynamicLocalArrayAssignmentTernaryReturn(true);
+    result &= Test("strctor dynamic assignment ternary return copies stack value",
+                   dynamicAssignmentTernary == "cat" && dynamicAssignmentTernary.length() == 3
+                       && (dynamicAssignmentTernary._len & (i32)0x80000000) != 0, true);
+    string dynamicNestedTernary = strctorDynamicLocalArrayNestedTernaryReturn(true);
+    result &= Test("strctor dynamic nested ternary return copies stack value",
+                   dynamicNestedTernary == "cat" && dynamicNestedTernary.length() == 3
+                       && (dynamicNestedTernary._len & (i32)0x80000000) != 0, true);
+    result &= Test("strctor moved stack borrow stays borrowed in same frame",
+                   strctorMovedBorrowTernarySameFrame(true), 4150);
+    result &= Test("strctor moved heap value stays owned in same frame",
+                   strctorMovedBorrowTernarySameFrame(false), 3111);
 
     return result;
 }
@@ -7169,6 +8578,7 @@ extern int main()
     total++; passed += testParenLvalueStore()              ? 1 : 0;
     total++; passed += testPostfixInDeclaration()          ? 1 : 0;
     total++; passed += testPostfixConditional()            ? 1 : 0;
+    total++; passed += testBorrowflowShortCircuitOwned()   ? 1 : 0;
     total++; passed += testPostfixGenericInstantiation()   ? 1 : 0;
     total++; passed += testGenericAddressValues()          ? 1 : 0;
     total++; passed += testOffsetofIntrinsic() ? 1 : 0;
@@ -9706,6 +11116,34 @@ bool testPostfixConditional()
     { int c = 1; PfaQ* q = nullptr; q?.get((c++)); int d = c; result &= Test("pfc_null_cond_p", d, 1); }
     { int c = 1; PfaQ* q = nullptr; int r = q?.get(c++); int d = c; result &= Test("pfc_null_cond_decl", d * 10 + r, 10); }
     { int c = 1; PfaQ qq; qq.v = 10; PfaQ* q = &qq; int r = q?.get(c++); int d = c; result &= Test("pfc_null_cond_taken", d * 100 + r, 211); }
+    return result;
+}
+
+string tBorrowflowShortCircuitOwnedAnd(int c)
+{
+    string s = "a";
+    bool k = c > 0 && (s = "x").length() > 0;
+    return s;
+}
+
+string tBorrowflowShortCircuitOwnedOr(int c)
+{
+    string s = "b";
+    bool k = c > 0 || (s = "y").length() > 0;
+    return s;
+}
+
+bool testBorrowflowShortCircuitOwned()
+{
+    bool result = true;
+    string andSkip = tBorrowflowShortCircuitOwnedAnd(0);
+    string andTake = tBorrowflowShortCircuitOwnedAnd(1);
+    string orSkip = tBorrowflowShortCircuitOwnedOr(1);
+    string orTake = tBorrowflowShortCircuitOwnedOr(0);
+    result &= Test("borrowflow_sc_and_skip_owned", andSkip, "a");
+    result &= Test("borrowflow_sc_and_take_owned", andTake, "x");
+    result &= Test("borrowflow_sc_or_skip_owned", orSkip, "b");
+    result &= Test("borrowflow_sc_or_take_owned", orTake, "y");
     return result;
 }
 

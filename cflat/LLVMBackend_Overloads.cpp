@@ -26,6 +26,7 @@
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TimeProfiler.h>
 #include <llvm/Support/JSON.h>
+#include <cstdint>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticHandler.h>
 #pragma warning(pop)
@@ -42,6 +43,18 @@
 #include <map>
 #include <set>
 #include <charconv>
+
+// A function-value array's element star: a view records it in ElemPointer, a fixed array in Pointer.
+LLVM_ATTRIBUTE_NOINLINE static bool FunctionPointerViewElementPointerMismatch(
+    const LLVMBackend::TypeAndValue& argument, const LLVMBackend::TypeAndValue& parameter)
+{
+    if (!argument.IsFunctionPointer || !parameter.IsFunctionPointer || !parameter.IsArrayView
+        || !(argument.IsArrayView || argument.ConstArraySize > 0 || argument.AliasArraySize > 0))
+        return false;
+    return (argument.IsArrayView ? argument.ElemPointer
+                                 : argument.Pointer || argument.ElemPointer)
+        != parameter.ElemPointer;
+}
 
 static antlr4::tree::TerminalNode* RightmostTerminal(antlr4::tree::ParseTree* node)
 {
@@ -3050,6 +3063,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // proof. Only at equal shape - a shape mismatch stays score-1 bindable.
                     const TypeAndValue& functionPointerArgument = arg.HasOriginalArgumentType
                         ? arg.OriginalArgumentType : arg.TypeAndValue;
+                    // 'FN[]' and 'FN*[]' share a shape; each overload takes only its own element star.
+                    // A lone candidate lets the call-site element gate state the reason.
+                    if (result == 0 && candidates.size() > 1
+                        && FunctionPointerViewElementPointerMismatch(functionPointerArgument, *candidateParamItr))
+                        result = -1;
                     bool callbackSignatureDiffers = false;
                     bool callbackConstDiffers = false;
                     if (result == 0)
@@ -5393,6 +5411,9 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
 
         rejected |= RejectValueIntoArrayViewParam(argTV, param);
 
+        // The function-value flag lives on the original argument; the loaded view does not carry it.
+        if (arg.HasOriginalArgumentType && arg.OriginalArgumentType.IsFunctionPointer)
+            argTV.IsFunctionPointer = true;
         if (ArrayViewElementMismatch(param, argTV, destElement, srcElement))
         {
             LogErrorMessage(
@@ -6567,6 +6588,23 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
         }
+        for (const NamedVariable& arg : matched)
+            if (arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsArrayView
+                && !arg.TypeAndValue.IsFunctionPointer && arg.Storage != nullptr)
+                MarkArrayViewFieldRootAliased(arg.Storage);
+
+        if (!candidate.IsCxx)
+            if (const auto* required = ArrayViewCountParameters(candidate.UniqueName))
+                for (size_t index : *required)
+                {
+                    if (index >= matched.size() || index >= candidate.Parameters.size()
+                        || !candidate.Parameters[index].IsArrayView)
+                        continue;
+                    RequireKnownArrayViewCount(matched[index],
+                        candidate.Parameters[index].VariableName.empty()
+                            ? std::to_string(index + 1) : candidate.Parameters[index].VariableName,
+                        shownFunctionName, receiverCallSite);
+                }
         const std::string inheritedOwner = matched.empty() ? std::string()
             : CxxInheritedMemberOwner(matched.front().TypeAndValue.TypeName, candidate);
         if (!inheritedOwner.empty()
@@ -10109,7 +10147,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         RegisterRawArrayCallResult(result, rawReturnCountSlot,
-                                   candidate.ReturnType.AllocAlignValue);
+                                   candidate.ReturnType.AllocAlignValue,
+                                   candidate.ReturnType.IsArrayView,
+                                   candidate.ReturnsOwned);
 
         // Runs before ApplyMoveParamTransfer, whose UnregisterOwnedPtrTemp still has the
         // last word for a sink parameter.
@@ -10197,7 +10237,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         lastAllocAlignment = 0;
         // A unique pointer or core unique return owns like `move`.
         lastCallReturnsOwned = uniqueFieldBorrow == nullptr
-            && (candidate.ReturnsOwned
+            && ((candidate.ReturnsOwned
+                    && (!candidate.ReturnType.IsArrayView || candidate.ReturnType.IsMove))
                 || aliasStringTempMayOwn
                 || (!resultIsAlias && candidate.ReturnType.Pointer
                     && candidate.ReturnType.IsUnique)
@@ -10608,6 +10649,74 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
                 if (sym.Parameters[i].IsMove != (*expectedParams)[i].IsMove) return false;
             return true;
         };
+
+        // Rank a named overload set as a call with arguments of the destination signature.
+        // Only one unique exact winner narrows the binding candidates; conversions and ties keep
+        // the existing ambiguity behavior.
+        if (destSig != nullptr && !destSig->FuncPtrReturnTypeName.empty())
+        {
+            std::vector<NamedVariable> expectedArguments;
+            expectedArguments.reserve(destSig->FuncPtrParams.size());
+            for (const auto& param : destSig->FuncPtrParams)
+            {
+                TypeAndValue argumentType;
+                if (param.FunctionTypeSignature)
+                    argumentType = *param.FunctionTypeSignature;
+                else
+                    argumentType.TypeName = param.TypeName;
+                argumentType.Pointer = param.Pointer;
+                argumentType.IsArrayView = param.IsArrayView;
+                argumentType.PointerDepth = param.PointerDepth;
+                argumentType.ElemPointer = param.Pointer && param.PointerDepth >= 2;
+                argumentType.ConstMask = param.ConstMask < 0
+                    ? 0 : static_cast<uint8_t>(param.ConstMask);
+                NamedVariable argument;
+                argument.TypeAndValue = argumentType;
+                argument.BaseType = GetType(argumentType);
+                argument.OriginalArgumentType = argumentType;
+                argument.HasOriginalArgumentType = true;
+                argument.InferSourceTypeName = argumentType.TypeName;
+                expectedArguments.push_back(std::move(argument));
+            }
+
+            std::vector<const FunctionSymbol*> exactMatches;
+            for (const auto* sym : overloads)
+            {
+                if (sym->IsMethod || !moveFlagsMatch(*sym)
+                    || sym->Parameters.size() != expectedArguments.size()
+                    || (expectedParamCount >= 0
+                        && static_cast<int>(sym->Parameters.size()) != expectedParamCount))
+                    continue;
+                bool exactParameterTypes = true;
+                for (size_t i = 0; i < expectedArguments.size(); ++i)
+                {
+                    const TypeAndValue& expectedType = expectedArguments[i].TypeAndValue;
+                    const TypeAndValue& candidateType = sym->Parameters[i];
+                    if (expectedType.ToUniqueString(*this) != candidateType.ToUniqueString(*this)
+                        || expectedType.Pointer != candidateType.Pointer
+                        || expectedType.IsArrayView != candidateType.IsArrayView
+                        || expectedType.ValuePointerDepth() != candidateType.ValuePointerDepth()
+                        || expectedType.ConstMask != candidateType.ConstMask
+                        || expectedType.IsAlias != candidateType.IsAlias)
+                    {
+                        exactParameterTypes = false;
+                        break;
+                    }
+                }
+                if (!exactParameterTypes) continue;
+                auto matchedArguments = MatchFunction(expectedArguments, sym->Parameters,
+                    sym->Variadic, true, &sym->DefaultArguments);
+                if (matchedArguments.size() != expectedArguments.size()) continue;
+                std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> oneCandidate = {
+                    { std::move(matchedArguments), *sym }
+                };
+                bool exact = false;
+                ComputeOverloadFunction(oneCandidate, nullptr, nullptr, &exact);
+                if (exact) exactMatches.push_back(sym);
+            }
+            if (exactMatches.size() == 1)
+                viable = { exactMatches.front() };
+        }
 
         if (destSig != nullptr && !destSig->FuncPtrReturnTypeName.empty())
         {
@@ -11427,6 +11536,570 @@ void LLVMBackend::SetViewOfFixedArrayStorage(const std::string& name, bool value
                 return;
             }
         }
+        auto global = globalNamedVariable.find(name);
+        if (global != globalNamedVariable.end())
+        {
+            if (globalArrayViewNonInitializerStores_.contains(name)) value = false;
+            if (value)
+                global->second->setMetadata("cflat.array-view.fixed",
+                    llvm::MDNode::get(*context, llvm::MDString::get(*context, sourceName)));
+            else
+                global->second->setMetadata("cflat.array-view.fixed", nullptr);
+        }
+    }
+
+void LLVMBackend::SetRawArrayLengthKnown(const std::string& name, bool known)
+{
+        if (name.empty()) return;
+        if (auto* binding = FindStackBindingByName(name))
+        {
+            if (binding->Storage != nullptr)
+                rawArrayLengthStates_[binding->Storage].Known = known;
+            return;
+        }
+        auto global = globalNamedVariable.find(name);
+        if (global != globalNamedVariable.end())
+        {
+            if (globalArrayViewUnknownLengthStores_.contains(name)) known = false;
+            global->second->setMetadata("cflat.array-view.length-known",
+                llvm::MDNode::get(*context, llvm::MDString::get(*context, known ? "1" : "0")));
+        }
+    }
+
+void LLVMBackend::SetRawArrayLengthState(const std::string& name, bool known, bool available,
+        const std::vector<size_t>& sourceParams)
+{
+        if (name.empty()) return;
+        if (auto* binding = FindStackBindingByName(name))
+        {
+            SetRawArrayLengthStateForStorage(binding->Storage,
+                RawArrayLengthState{ known, available, sourceParams });
+            return;
+        }
+        SetRawArrayLengthKnown(name, known);
+    }
+
+void LLVMBackend::SetRawArrayLengthStateForStorage(const llvm::Value* storage,
+        const RawArrayLengthState& state)
+{
+        if (storage != nullptr)
+        {
+            RawArrayLengthState effective = state;
+            if (staticArrayViewUnknownLengthStorages_.contains(storage))
+            {
+                effective.Known = false;
+                effective.Available = false;
+                effective.SourceParams.clear();
+            }
+            rawArrayLengthStates_[storage] = std::move(effective);
+        }
+    }
+
+LLVMBackend::NamedVariable* LLVMBackend::FindStackBindingByName(const std::string& name)
+{
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                return &it->second;
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                return &it->second;
+        }
+        return nullptr;
+    }
+
+void LLVMBackend::SetGlobalArrayViewNonInitializerStores(std::unordered_set<std::string> names)
+{
+        globalArrayViewNonInitializerStores_.insert(names.begin(), names.end());
+    }
+
+void LLVMBackend::SetGlobalArrayViewUnknownLengthStores(std::unordered_set<std::string> names)
+{
+        globalArrayViewUnknownLengthStores_.insert(names.begin(), names.end());
+    }
+
+bool LLVMBackend::HasGlobalArrayViewStoreScan(const void* translationUnit) const
+{
+        return globalArrayViewStoreScans_.contains(std::format("{}#{}",
+            reinterpret_cast<std::uintptr_t>(translationUnit), currentNamespace_));
+}
+
+void LLVMBackend::MarkGlobalArrayViewStoreScan(const void* translationUnit)
+{
+        globalArrayViewStoreScans_.insert(std::format("{}#{}",
+            reinterpret_cast<std::uintptr_t>(translationUnit), currentNamespace_));
+}
+
+void LLVMBackend::AddGlobalArrayViewKnownGlobalNames(std::unordered_set<std::string> names)
+{
+        globalArrayViewKnownGlobalNames_.insert(names.begin(), names.end());
+}
+
+const std::unordered_set<std::string>& LLVMBackend::GlobalArrayViewKnownGlobalNames() const
+{
+        return globalArrayViewKnownGlobalNames_;
+}
+
+void LLVMBackend::AddGlobalArrayViewStoreEdges(
+    std::vector<std::pair<std::string, std::string>> globalEdges,
+    std::vector<std::pair<std::string, std::string>> staticEdges)
+{
+        globalArrayViewStoreEdges_.insert(globalArrayViewStoreEdges_.end(),
+            std::make_move_iterator(globalEdges.begin()), std::make_move_iterator(globalEdges.end()));
+        staticArrayViewGlobalStoreEdges_.insert(staticArrayViewGlobalStoreEdges_.end(),
+            std::make_move_iterator(staticEdges.begin()), std::make_move_iterator(staticEdges.end()));
+}
+
+void LLVMBackend::FinalizeGlobalArrayViewStoreEdges()
+{
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (const auto& [target, source] : globalArrayViewStoreEdges_)
+                if (globalArrayViewUnknownLengthStores_.contains(source)
+                    || globalArrayViewUnknownLengthStores_.contains(ResolveQualifiedName(source)))
+                    changed = globalArrayViewUnknownLengthStores_.insert(target).second || changed;
+            for (const auto& [declarator, source] : staticArrayViewGlobalStoreEdges_)
+                if (globalArrayViewUnknownLengthStores_.contains(source)
+                    || globalArrayViewUnknownLengthStores_.contains(ResolveQualifiedName(source)))
+                    changed = staticArrayViewUnknownLengthStoreDeclarators_.insert(declarator).second
+                        || changed;
+        }
+}
+
+std::string LLVMBackend::StaticArrayViewDeclaratorKey(const antlr4::Token* token) const
+{
+        if (token == nullptr) return {};
+        auto* tokenSource = token->getTokenSource();
+        const std::string source = tokenSource != nullptr
+            ? tokenSource->getSourceName()
+            : (currentSourceFilePath_.empty() ? sourceFileName : currentSourceFilePath_);
+        return std::format("{}:{}:{}", source, token->getLine(),
+            token->getCharPositionInLine());
+}
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::SetStaticArrayViewUnknownLengthStoreDeclarators(
+        std::unordered_set<std::string> declarators)
+{
+        staticArrayViewUnknownLengthStoreDeclarators_.insert(
+            declarators.begin(), declarators.end());
+    }
+
+LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::StaticArrayViewHasUnknownLengthStore(
+        const std::string& declaratorKey) const
+{
+        return !declaratorKey.empty()
+            && staticArrayViewUnknownLengthStoreDeclarators_.contains(declaratorKey);
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::MarkStaticArrayViewLengthUnknownForStorage(
+        const llvm::Value* storage)
+{
+        if (storage == nullptr) return;
+        staticArrayViewUnknownLengthStorages_.insert(storage);
+        SetRawArrayLengthStateForStorage(storage, RawArrayLengthState{ false, false, {} });
+}
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::SetStaticArrayViewUnknownLengthFieldStorePaths(
+        std::unordered_map<std::string, std::unordered_set<std::string>> paths)
+{
+        for (auto& [declarator, fields] : paths)
+        {
+            auto& stored = staticArrayViewUnknownLengthFieldStorePaths_[declarator];
+            stored.insert(fields.begin(), fields.end());
+        }
+    }
+
+LLVM_ATTRIBUTE_NOINLINE const std::unordered_set<std::string>*
+LLVMBackend::StaticArrayViewUnknownLengthFieldStorePaths(const std::string& declaratorKey) const
+{
+        auto it = staticArrayViewUnknownLengthFieldStorePaths_.find(declaratorKey);
+        return it == staticArrayViewUnknownLengthFieldStorePaths_.end() ? nullptr : &it->second;
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::ApplyStaticArrayViewFieldUnknownLengthStores(
+        const std::string& declaratorKey, const std::string& rootName)
+{
+        if (declaratorKey.empty() || rootName.empty()) return;
+        const auto* paths = StaticArrayViewUnknownLengthFieldStorePaths(declaratorKey);
+        if (paths == nullptr) return;
+        for (const std::string& path : *paths)
+        {
+            NamedVariable field;
+            field.TypeAndValue.IsArrayView = true;
+            field.FieldPathRoot = rootName;
+            field.FieldPathText = rootName + "." + path;
+            MarkArrayViewFieldLengthUnknownDueToStore(field);
+        }
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::SetGlobalArrayViewUnknownLengthFieldStorePaths(
+        const std::unordered_map<std::string, std::unordered_set<std::string>>& paths)
+{
+        for (const auto& [rootName, fields] : paths)
+        {
+            auto& stored = globalArrayViewUnknownLengthFieldStorePaths_[rootName];
+            stored.insert(fields.begin(), fields.end());
+            if (globalNamedVariable.contains(rootName))
+                ApplyGlobalArrayViewFieldUnknownLengthStores(rootName);
+        }
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::ApplyGlobalArrayViewFieldUnknownLengthStores(
+        const std::string& rootName)
+{
+        auto it = globalArrayViewUnknownLengthFieldStorePaths_.find(rootName);
+        if (it == globalArrayViewUnknownLengthFieldStorePaths_.end()) return;
+        for (const std::string& path : it->second)
+        {
+            NamedVariable field;
+            field.TypeAndValue.IsArrayView = true;
+            field.FieldPathRoot = rootName;
+            field.FieldPathText = rootName + "." + path;
+            MarkArrayViewFieldLengthUnknownDueToStore(field);
+        }
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::MarkArrayViewFieldLengthUnknownDueToStore(
+        const NamedVariable& namedVar)
+{
+        if (!HasArrayViewFieldLengthKey(namedVar)) return;
+        llvm::Value* rootStorage = nullptr;
+        const std::string key = ArrayViewFieldLengthKeyOf(namedVar, rootStorage);
+        if (key.empty()) return;
+        arrayViewFieldUnknownLengthStores_.insert(key);
+        if (auto it = arrayViewFieldLengths_.find(key); it != arrayViewFieldLengths_.end())
+            it->second.Known = false;
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::RequirePersistentArrayViewStoreCount(
+        const NamedVariable& destination, const std::vector<size_t>& sourceParams)
+{
+        if (!destination.TypeAndValue.IsArrayView) return;
+        bool persistent = llvm::isa_and_nonnull<llvm::GlobalVariable>(destination.Storage);
+        if (!persistent && HasArrayViewFieldLengthKey(destination))
+        {
+            llvm::Value* rootStorage = nullptr;
+            ArrayViewFieldLengthKeyOf(destination, rootStorage);
+            persistent = llvm::isa_and_nonnull<llvm::GlobalVariable>(rootStorage);
+            if (!persistent)
+                if (const auto* root = FindStackVariableByStorage(rootStorage);
+                    root != nullptr && root->IsStaticLocal)
+                    persistent = true;
+        }
+        if (!persistent) return;
+        for (size_t index : sourceParams)
+            RequireCurrentFunctionArrayViewCountParameter(index);
+    }
+
+void LLVMBackend::RequireArrayViewCountParameter(const std::string& uniqueName, size_t index)
+{
+        if (uniqueName.empty()) return;
+        arrayViewCountParamRequirements_[uniqueName].insert(index);
+    }
+
+void LLVMBackend::RequireCurrentFunctionArrayViewCountParameter(size_t index)
+{
+        if (currentFunction == nullptr) return;
+        for (const auto& [_, overloads] : functionTable)
+            for (const auto& symbol : overloads)
+                if (symbol.Function == currentFunction && index < symbol.Parameters.size())
+                {
+                    RequireArrayViewCountParameter(symbol.UniqueName, index);
+                    return;
+                }
+    }
+
+void LLVMBackend::MarkCurrentFunctionArrayViewCountParameter(const NamedVariable& parameter)
+{
+        if (currentFunction == nullptr || parameter.TypeAndValue.VariableName.empty()) return;
+        for (const auto& [_, overloads] : functionTable)
+            for (const auto& symbol : overloads)
+            {
+                if (symbol.Function != currentFunction) continue;
+                for (size_t i = 0; i < symbol.Parameters.size(); ++i)
+                    if (symbol.Parameters[i].VariableName == parameter.TypeAndValue.VariableName)
+                    {
+                        RequireArrayViewCountParameter(symbol.UniqueName, i);
+                        return;
+                    }
+            }
+    }
+
+/*
+ * Refuses an array-view argument of unknown length when the callee reads that parameter's count.
+ * Shared by the direct-call door and the interface-dispatch door, so both spell it identically.
+ */
+void LLVMBackend::RequireKnownArrayViewCount(const NamedVariable& arg, const std::string& parameterName,
+        const std::string& shownFunctionName, const void* receiverCallSite)
+{
+    const RawArrayLengthState argState = RawArrayLengthStateOf(arg);
+    bool countKnown = argState.Known
+        || (arg.TypeAndValue.ConstArraySize > 0
+            && !arg.TypeAndValue.IsArrayView);
+    bool countAvailable = argState.Available;
+    bool trustedGlobalCount = false;
+    std::vector<size_t> sourceParams = argState.SourceParams;
+    if (const auto* raw = FindRawArrayResult(arg.Primary); raw != nullptr)
+    {
+        countKnown = countKnown || raw->CountKnown;
+        countAvailable = countAvailable || raw->Count != nullptr;
+        for (size_t sourceIndex : raw->CountSourceParams)
+            if (std::find(sourceParams.begin(), sourceParams.end(), sourceIndex)
+                == sourceParams.end())
+                sourceParams.push_back(sourceIndex);
+    }
+    if (!arg.FieldPathText.empty())
+    {
+        NamedVariable field = arg;
+        AttachArrayViewFieldLengthStorage(field);
+        const RawArrayLengthState fieldState = RawArrayLengthStateOf(field);
+        countKnown = countKnown || fieldState.Known;
+        countAvailable = countAvailable || fieldState.Available;
+    }
+    const NamedVariable* source = arg.Storage != nullptr
+        ? FindVariableByStorage(arg.Storage) : nullptr;
+    const std::string sourceName = !arg.CallerName.empty()
+        ? arg.CallerName : arg.TypeAndValue.VariableName;
+    if (source == nullptr && !sourceName.empty())
+        source = FindLiveNamedVariable(sourceName);
+    if (source != nullptr && source->TypeAndValue.IsArrayView)
+    {
+        const RawArrayLengthState sourceState = RawArrayLengthStateOf(*source);
+        countKnown = countKnown || sourceState.Known;
+        countAvailable = countAvailable || sourceState.Available;
+        for (size_t sourceIndex : sourceState.SourceParams)
+            if (std::find(sourceParams.begin(), sourceParams.end(), sourceIndex)
+                == sourceParams.end())
+                sourceParams.push_back(sourceIndex);
+    }
+    if (source == nullptr || !source->TypeAndValue.IsArrayView)
+    {
+        std::string globalName = sourceName;
+        NamedVariable global = globalName.empty()
+            ? NamedVariable{} : GetGlobalVariableNV(globalName);
+        if (global.Storage == nullptr && arg.Storage != nullptr)
+            for (const auto& [name, storage] : globalNamedVariable)
+                if (storage == arg.Storage)
+                {
+                    globalName = name;
+                    global = GetGlobalVariableNV(name);
+                    break;
+                }
+        if (global.TypeAndValue.IsArrayView)
+        {
+            const RawArrayLengthState globalState = RawArrayLengthStateOf(global);
+            countKnown = countKnown || globalState.Known;
+            countAvailable = countAvailable || globalState.Available;
+            trustedGlobalCount = globalState.Available
+                && !globalArrayViewUnknownLengthStores_.contains(globalName);
+            for (size_t sourceIndex : globalState.SourceParams)
+                if (std::find(sourceParams.begin(), sourceParams.end(), sourceIndex)
+                    == sourceParams.end())
+                    sourceParams.push_back(sourceIndex);
+        }
+    }
+    if (countKnown || trustedGlobalCount) return;
+    if (countAvailable && !sourceParams.empty())
+    {
+        for (size_t sourceIndex : sourceParams)
+            RequireCurrentFunctionArrayViewCountParameter(sourceIndex);
+        return;
+    }
+    const std::string message = std::format(
+        "cannot pass an array view with unknown length to parameter '{}' of '{}'",
+        parameterName, shownFunctionName);
+    if (receiverCallSite != nullptr)
+    {
+        auto* site = static_cast<const antlr4::tree::TerminalNode*>(receiverCallSite);
+        SetSourceLocation(site->getSymbol()->getLine(),
+                          site->getSymbol()->getCharPositionInLine());
+    }
+    LogError(message);
+}
+
+/*
+ * A call through a function value has no known callee: any function bindable to the value's type
+ * that reads view parameter 'index' of its count makes an unknown-length argument there unsafe.
+ */
+bool LLVMBackend::FuncPtrTypeRequiresArrayViewCount(const TypeAndValue& funcPtrType,
+        size_t index) const
+{
+        for (const auto& [name, overloads] : functionTable)
+            for (const auto& symbol : overloads)
+            {
+                // Free functions only: a method's requirement index counts 'this'.
+                const auto* required = ArrayViewCountParameters(symbol.UniqueName);
+                if (required == nullptr || !required->contains(index)) continue;
+                if (DescribeFuncPtrBindMismatch(name, FuncPtrSigOfSymbol(symbol), funcPtrType).empty())
+                    return true;
+            }
+        return false;
+}
+
+void LLVMBackend::RequireKnownFuncPtrViewArguments(const TypeAndValue& funcPtrType,
+        const std::vector<NamedVariable>& argNVs)
+{
+        for (size_t i = 0; i < funcPtrType.FuncPtrParams.size() && i < argNVs.size(); ++i)
+            if (funcPtrType.FuncPtrParams[i].IsArrayView
+                && FuncPtrTypeRequiresArrayViewCount(funcPtrType, i))
+                RequireKnownArrayViewCount(argNVs[i], std::to_string(i + 1), "a function value",
+                                           nullptr);
+}
+
+/*
+ * An interface method has no body, so its count requirement is the union over the implementors
+ * the vtable slot may dispatch to. Index 0 of an implementor's parameters is 'this'.
+ */
+bool LLVMBackend::InterfaceImplRequiresArrayViewCount(const std::string& ifaceName,
+        const InterfaceMethod& method, size_t index) const
+{
+        std::vector<std::string> implementors;
+        // No proof of the implementor set is no proof that none reads the count: refuse.
+        if (!EnumerateInterfaceImplementors(ifaceName, implementors, true)) return true;
+        for (const auto& structName : implementors)
+        {
+            const llvm::Function* impl = LookupInterfaceMethodImpl(structName, method);
+            if (impl == nullptr) continue;
+            for (const auto& [_, overloads] : functionTable)
+                for (const auto& symbol : overloads)
+                    if (symbol.Function == impl)
+                        if (const auto* required = ArrayViewCountParameters(symbol.UniqueName);
+                            required != nullptr && required->contains(index + 1))
+                            return true;
+        }
+        return false;
+}
+
+const std::unordered_set<size_t>* LLVMBackend::ArrayViewCountParameters(
+        const std::string& uniqueName) const
+{
+        auto it = arrayViewCountParamRequirements_.find(uniqueName);
+        return it == arrayViewCountParamRequirements_.end() ? nullptr : &it->second;
+    }
+
+bool LLVMBackend::HasArrayViewFieldLengthKey(const NamedVariable& namedVar) const
+{
+        // A view LOCAL copied from a field keeps the field path for provenance, but its own alloca holds
+        // its own count; only a field access (address computed into the struct) uses the field's slot.
+        return namedVar.TypeAndValue.IsArrayView && !namedVar.FieldPathText.empty()
+            && !llvm::isa_and_nonnull<llvm::AllocaInst>(namedVar.Storage);
+    }
+
+std::string LLVMBackend::ArrayViewFieldLengthKeyOf(const NamedVariable& namedVar,
+        llvm::Value*& rootStorage) const
+{
+        rootStorage = nullptr;
+        if (!namedVar.FieldPathRoot.empty())
+        {
+            rootStorage = FindVariableStorage(namedVar.FieldPathRoot).Storage;
+            if (rootStorage == nullptr)
+                rootStorage = GetGlobalVariableNV(namedVar.FieldPathRoot).Storage;
+        }
+        const void* rootIdentity = rootStorage != nullptr
+            ? static_cast<const void*>(rootStorage)
+            : currentFunction != nullptr
+                ? static_cast<const void*>(currentFunction)
+                : static_cast<const void*>(module.get());
+        return std::to_string(reinterpret_cast<std::uintptr_t>(rootIdentity))
+            + "|" + namedVar.FieldPathText;
+    }
+
+bool LLVMBackend::ArrayViewFieldReusableKnown(const NamedVariable& namedVar, llvm::Value* rootStorage)
+{
+        bool reusableKnown = !namedVar.MovePathHasDynamicIndex;
+        if (auto* globalRoot = llvm::dyn_cast_or_null<llvm::GlobalVariable>(rootStorage))
+            reusableKnown = reusableKnown && !namedVar.FieldPathThroughPointer
+                && !namedVar.FieldPathHasPointerDereference
+                && !escapedGlobalArrayViewRoots_.contains(globalRoot);
+        else if (rootStorage != nullptr && llvm::isa<llvm::AllocaInst>(rootStorage))
+        {
+            auto* localRoot = FindStackVariableByStorage(rootStorage);
+            const bool namedPointerRoot = localRoot != nullptr
+                && localRoot->TypeAndValue.Pointer && !localRoot->TypeAndValue.ElemPointer
+                && !arrayViewFieldRootAliased_.contains(rootStorage)
+                && FindStackArgumentByStorage(rootStorage) == nullptr;
+            const bool pointerPathSafe = (!namedVar.FieldPathThroughPointer
+                && !namedVar.FieldPathHasPointerDereference) || namedPointerRoot;
+            reusableKnown = reusableKnown && localRoot != nullptr
+                && !localRoot->AddressEscaped && pointerPathSafe;
+        }
+        else
+            reusableKnown = false;
+        return reusableKnown;
+    }
+
+LLVMBackend::RawArrayLengthState LLVMBackend::RawArrayLengthStateOf(const NamedVariable& namedVar)
+{
+        // A raw array result carries its own count facts (the expression-result path).
+        if (const auto* raw = FindRawArrayResult(namedVar.Primary); raw != nullptr)
+            return RawArrayLengthState{ raw->CountKnown, raw->Count != nullptr,
+                raw->CountSourceParams };
+        if (HasArrayViewFieldLengthKey(namedVar))
+        {
+            llvm::Value* rootStorage = nullptr;
+            const std::string key = ArrayViewFieldLengthKeyOf(namedVar, rootStorage);
+            bool known = false;
+            if (auto it = arrayViewFieldLengths_.find(key); it != arrayViewFieldLengths_.end())
+                known = it->second.Known && ArrayViewFieldReusableKnown(namedVar, rootStorage);
+            return RawArrayLengthState{ known, true, {} };
+        }
+        if (namedVar.Storage == nullptr) return {};
+        // Globals keep their facts as metadata on the GlobalVariable, unless a stack binding owns it (static local).
+        if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(namedVar.Storage);
+            global != nullptr && FindStackVariableByStorage(global) == nullptr
+            && FindStackArgumentByStorage(global) == nullptr)
+        {
+            RawArrayLengthState state;
+            if (auto* length = global->getMetadata("cflat.array-view.length");
+                length != nullptr && length->getNumOperands() == 1)
+                if (llvm::dyn_cast<llvm::ValueAsMetadata>(length->getOperand(0)) != nullptr)
+                    state.Available = true;
+            if (auto* known = global->getMetadata("cflat.array-view.length-known");
+                known != nullptr && known->getNumOperands() == 1)
+                if (auto* value = llvm::dyn_cast<llvm::MDString>(known->getOperand(0));
+                    value != nullptr)
+                    state.Known = value->getString() == "1";
+            return state;
+        }
+        if (auto it = rawArrayLengthStates_.find(namedVar.Storage); it != rawArrayLengthStates_.end())
+            return it->second;
+        return {};
+    }
+
+void LLVMBackend::AttachArrayViewFieldLengthStorage(NamedVariable& namedVar)
+{
+        if (!HasArrayViewFieldLengthKey(namedVar)) return;
+        llvm::Value* rootStorage = nullptr;
+        const std::string key = ArrayViewFieldLengthKeyOf(namedVar, rootStorage);
+        auto [it, inserted] = arrayViewFieldLengths_.try_emplace(key);
+        if (inserted)
+        {
+            auto* i64Ty = builder->getInt64Ty();
+            if (llvm::isa_and_nonnull<llvm::GlobalVariable>(rootStorage))
+            {
+                it->second.Storage = new llvm::GlobalVariable(*module, i64Ty, false,
+                    llvm::GlobalValue::InternalLinkage, builder->getInt64(-1),
+                    "__cflat_array_view_field_length");
+            }
+            else
+            {
+                it->second.Storage = AllocaAtEntry(i64Ty, nullptr, "array_view_field_length");
+                builder->CreateStore(builder->getInt64(-1), it->second.Storage);
+            }
+        }
+        if (!ArrayViewFieldReusableKnown(namedVar, rootStorage)) it->second.Known = false;
+        namedVar.RawArrayLengthStorage = it->second.Storage;
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::SetArrayViewFieldLengthKnown(
+        const NamedVariable& namedVar, bool known)
+{
+        if (!HasArrayViewFieldLengthKey(namedVar)) return;
+        llvm::Value* rootStorage = nullptr;
+        const std::string key = ArrayViewFieldLengthKeyOf(namedVar, rootStorage);
+        if (auto it = arrayViewFieldLengths_.find(key); it != arrayViewFieldLengths_.end())
+            it->second.Known = known && !arrayViewFieldUnknownLengthStores_.contains(key);
     }
 
 void LLVMBackend::SetInterfaceBoxIsBorrowed(const std::string& name, bool borrowed,
@@ -11833,6 +12506,25 @@ void LLVMBackend::MarkVariableAddressEscaped(const std::string& name)
                 return;
             }
         }
+        if (auto global = globalNamedVariable.find(name); global != globalNamedVariable.end())
+            escapedGlobalArrayViewRoots_.insert(global->second);
+    }
+
+void LLVMBackend::MarkArrayViewFieldRootAliased(llvm::Value* storage)
+{
+        if (storage == nullptr) return;
+        if (FindStackVariableByStorage(storage) != nullptr)
+        {
+            arrayViewFieldRootAliased_.insert(storage);
+            return;
+        }
+        if (FindStackArgumentByStorage(storage) != nullptr)
+        {
+            arrayViewFieldRootAliased_.insert(storage);
+            return;
+        }
+        if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(storage))
+            escapedGlobalArrayViewRoots_.insert(global);
     }
 
 bool LLVMBackend::IsExplicitlyMovedNullHere(const NamedVariable& nv) const

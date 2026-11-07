@@ -1952,6 +1952,7 @@ public:
         // Null-state key for a joined unique-field call-sink arm.
         std::string NullKey;
         bool PointeeMove = false;
+        bool IsExplicitMove = false;
     };
 
     // One element-borrow event of a local in one block (see NamedVariable::OwnedElementEvents).
@@ -1960,6 +1961,15 @@ public:
         llvm::BasicBlock* Block = nullptr;
         llvm::Function* Function = nullptr;
         bool Borrow = false; // true: the fact is set here; false: overwritten with a non-element value
+    };
+
+    // Array-view length facts of one stack binding. Kept in side tables keyed by the binding's
+    // storage (see RawArrayLengthStateOf) so NamedVariable stays small: it sits in every parse frame.
+    struct RawArrayLengthState
+    {
+        bool Known = false;
+        bool Available = false;
+        std::vector<size_t> SourceParams;
     };
 
     struct NamedVariable
@@ -2387,9 +2397,9 @@ public:
         // Parent was a `move`-return temp (the temp OWNS this field): a persist site may MOVE the field
         // out (store + zero the source) instead of forcing `.copy()`. An alias temp leaves these unset.
         bool MovableTempField = false;
-        llvm::Value* MoveTempStructAlloca = nullptr;  // the spilled `owntemp` holding the parent struct
-        llvm::Type*  MoveTempStructType = nullptr;    // the parent struct's LLVM type, for the field GEP
-        unsigned     MoveTempFieldIndex = 0;          // this field's index within the parent struct
+        llvm::Value* MoveTempStructAlloca = nullptr;  // storage for the parent aggregate
+        llvm::Type*  MoveTempStructType = nullptr;    // struct or array type of the parent aggregate
+        llvm::Value* MoveTempFieldIndex = nullptr;    // constant struct field or possibly dynamic array index
         // Bitfield access: non-null BitfieldStorage means this is a bitfield view onto a storage word.
         // Reads compute shift+mask; writes do a read-modify-write on BitfieldStorage.
         llvm::Value* BitfieldStorage = nullptr;   // GEP'd pointer to the storage word
@@ -2887,6 +2897,8 @@ public:
         bool Owns = false;
         llvm::Value* RuntimeOwns = nullptr;
         bool IsArrayView = false;
+        bool CountKnown = true;
+        std::vector<size_t> CountSourceParams;
     };
     std::vector<RawArrayResult> rawArrayResults_;
 
@@ -4257,6 +4269,32 @@ private:
     nulldf::NoReturnSet provenNoReturn_;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
+    struct ArrayViewFieldLength
+    {
+        llvm::Value* Storage = nullptr;
+        bool Known = false;
+    };
+    std::unordered_map<std::string, ArrayViewFieldLength> arrayViewFieldLengths_;
+    // Length facts of stack-binding array views, keyed by the binding's Storage.
+    std::unordered_map<const llvm::Value*, RawArrayLengthState> rawArrayLengthStates_;
+    // Storages whose binding another pointer may write fields through (was NamedVariable state).
+    std::unordered_set<const llvm::Value*> arrayViewFieldRootAliased_;
+    std::unordered_set<llvm::GlobalVariable*> escapedGlobalArrayViewRoots_;
+    std::unordered_set<std::string> globalArrayViewNonInitializerStores_;
+    std::unordered_set<std::string> globalArrayViewUnknownLengthStores_;
+    std::unordered_set<std::string> globalArrayViewStoreScans_;
+    std::unordered_set<std::string> globalArrayViewKnownGlobalNames_;
+    std::vector<std::pair<std::string, std::string>> globalArrayViewStoreEdges_;
+    std::vector<std::pair<std::string, std::string>> staticArrayViewGlobalStoreEdges_;
+    // Static declarators with an unknown-count store in their function body.
+    std::unordered_set<std::string> staticArrayViewUnknownLengthStoreDeclarators_;
+    std::unordered_set<const llvm::Value*> staticArrayViewUnknownLengthStorages_;
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        staticArrayViewUnknownLengthFieldStorePaths_;
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        globalArrayViewUnknownLengthFieldStorePaths_;
+    std::unordered_set<std::string> arrayViewFieldUnknownLengthStores_;
+    std::unordered_map<std::string, std::unordered_set<size_t>> arrayViewCountParamRequirements_;
     // Module-level liveness for C++ globals explicitly released by a move. Keyed by the LLVM
     // global symbol so imported declarations share the same flag.
     std::unordered_map<std::string, llvm::GlobalVariable*> globalCxxLiveFlags_;
@@ -6604,7 +6642,8 @@ private:
     void RegisterRawArrayResult(llvm::Value* value, llvm::Value* count,
                                 uint64_t allocAlign = 0, bool owns = true,
                                 llvm::Value* runtimeOwns = nullptr,
-                                bool isArrayView = false);
+                                bool isArrayView = false, bool countKnown = true,
+                                std::vector<size_t> countSourceParams = {});
     const RawArrayResult* FindRawArrayResult(llvm::Value* value) const;
     bool IsRawArrayResult(llvm::Value* value) const;
     bool RawArrayResultOwns(llvm::Value* value) const;
@@ -7213,6 +7252,10 @@ private:
     // Zero-fills a by-value move source over its whole allocation (padding included); its
     // destructor still runs at its normal time on that zero state (ruling 2026-10-31).
     void ZeroMovedSource(llvm::Value* storage, llvm::Type* type);
+    // Clear one owning field in the spilled parent of a movable temporary field.
+    void ClearMovableTempField(llvm::Type* parentType, llvm::Value* parentStorage,
+                               llvm::Value* fieldIndex, llvm::Type* fieldType,
+                               bool clearConditionalOwners = false);
     // An `extern` definition with a CFlat body follows the C ABI: the callee owns (and destroys)
     // each owning by-value param, so a call hands the argument over exactly like a `move` param.
     bool CFlatExternOwnsByValueParam(const TypeAndValue& p);
@@ -9931,6 +9974,17 @@ public:
                                                bool sourceIsMove) const;
     bool IsFunctionValueType(const TypeAndValue& type) const;
     bool NullExplicitFunctionMoveToValue(const TypeAndValue& param, const NamedVariable& arg);
+    LLVM_ATTRIBUTE_NOINLINE void CheckDuplicateMoveParamSources(
+        const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args);
+    LLVM_ATTRIBUTE_NOINLINE void CheckConditionalMoveParamDiagnostics(
+        const std::string& functionName, const TypeAndValue& param,
+        const NamedVariable& arg);
+    LLVM_ATTRIBUTE_NOINLINE bool ApplyConditionalMoveParamSourceTransfer(
+        const NamedVariable& arg, bool isOwningSink, bool paramIsMove,
+        bool explicitFunctionMove, bool beforeCall);
+    LLVM_ATTRIBUTE_NOINLINE void ApplyMoveParamTupleTransfer(
+        const std::string& functionName, const TypeAndValue& param,
+        const NamedVariable& value, bool beforeCall);
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign = true, bool calleeIsMethod = false, bool beforeCall = false,
@@ -12888,6 +12942,55 @@ public:
     // path, so it is cleared for good rather than recomputed from the new RHS - proven-reject
     // only, never proven-accept from a later assignment.
     void SetViewOfFixedArrayStorage(const std::string& name, bool value, const std::string& sourceName = {});
+    void SetRawArrayLengthKnown(const std::string& name, bool known);
+    void SetRawArrayLengthState(const std::string& name, bool known, bool available,
+                                const std::vector<size_t>& sourceParams = {});
+    void SetGlobalArrayViewNonInitializerStores(std::unordered_set<std::string> names);
+    void SetGlobalArrayViewUnknownLengthStores(std::unordered_set<std::string> names);
+    bool HasGlobalArrayViewStoreScan(const void* translationUnit) const;
+    void MarkGlobalArrayViewStoreScan(const void* translationUnit);
+    void AddGlobalArrayViewKnownGlobalNames(std::unordered_set<std::string> names);
+    const std::unordered_set<std::string>& GlobalArrayViewKnownGlobalNames() const;
+    void AddGlobalArrayViewStoreEdges(
+        std::vector<std::pair<std::string, std::string>> globalEdges,
+        std::vector<std::pair<std::string, std::string>> staticEdges);
+    void FinalizeGlobalArrayViewStoreEdges();
+    std::string StaticArrayViewDeclaratorKey(const antlr4::Token* token) const;
+    void SetStaticArrayViewUnknownLengthStoreDeclarators(std::unordered_set<std::string> declarators);
+    bool StaticArrayViewHasUnknownLengthStore(const std::string& declaratorKey) const;
+    void MarkStaticArrayViewLengthUnknownForStorage(const llvm::Value* storage);
+    void SetStaticArrayViewUnknownLengthFieldStorePaths(
+        std::unordered_map<std::string, std::unordered_set<std::string>> paths);
+    const std::unordered_set<std::string>* StaticArrayViewUnknownLengthFieldStorePaths(
+        const std::string& declaratorKey) const;
+    void ApplyStaticArrayViewFieldUnknownLengthStores(const std::string& declaratorKey,
+                                                       const std::string& rootName);
+    void SetGlobalArrayViewUnknownLengthFieldStorePaths(
+        const std::unordered_map<std::string, std::unordered_set<std::string>>& paths);
+    void ApplyGlobalArrayViewFieldUnknownLengthStores(const std::string& rootName);
+    void MarkArrayViewFieldLengthUnknownDueToStore(const NamedVariable& namedVar);
+    void RequirePersistentArrayViewStoreCount(const NamedVariable& destination,
+                                               const std::vector<size_t>& sourceParams);
+    void RequireArrayViewCountParameter(const std::string& uniqueName, size_t index);
+    void RequireCurrentFunctionArrayViewCountParameter(size_t index);
+    void MarkCurrentFunctionArrayViewCountParameter(const NamedVariable& parameter);
+    const std::unordered_set<size_t>* ArrayViewCountParameters(const std::string& uniqueName) const;
+    void RequireKnownArrayViewCount(const NamedVariable& arg, const std::string& parameterName,
+                                    const std::string& shownFunctionName, const void* receiverCallSite);
+    bool InterfaceImplRequiresArrayViewCount(const std::string& ifaceName,
+                                             const InterfaceMethod& method, size_t index) const;
+    bool FuncPtrTypeRequiresArrayViewCount(const TypeAndValue& funcPtrType, size_t index) const;
+    void RequireKnownFuncPtrViewArguments(const TypeAndValue& funcPtrType,
+                                          const std::vector<NamedVariable>& argNVs);
+    void AttachArrayViewFieldLengthStorage(NamedVariable& namedVar);
+    void SetArrayViewFieldLengthKnown(const NamedVariable& namedVar, bool known);
+    // Effective length facts of an NV: raw result, then field path, then the binding's side-table entry.
+    RawArrayLengthState RawArrayLengthStateOf(const NamedVariable& namedVar);
+    void SetRawArrayLengthStateForStorage(const llvm::Value* storage, const RawArrayLengthState& state);
+    bool HasArrayViewFieldLengthKey(const NamedVariable& namedVar) const;
+    std::string ArrayViewFieldLengthKeyOf(const NamedVariable& namedVar, llvm::Value*& rootStorage) const;
+    bool ArrayViewFieldReusableKnown(const NamedVariable& namedVar, llvm::Value* rootStorage);
+    NamedVariable* FindStackBindingByName(const std::string& name);
 
     /*
      * Record at a BINDING SITE whether an interface local now holds a box the frame only BORROWS
@@ -12982,6 +13085,7 @@ public:
     // '&name' escaped the address - latch off the deref guard permanently (see AddressEscaped
     // on NamedVariable): the pointee may be rewritten through the escaped pointer from here on.
     void MarkVariableAddressEscaped(const std::string& name);
+    void MarkArrayViewFieldRootAliased(llvm::Value* storage);
 
     // The full explicit-move-null deref predicate: fires only for a DEREFERENCE in the SAME
     // block the move was recorded in (never across a branch/merge/loop back-edge - see
@@ -13274,10 +13378,33 @@ public:
     // move tracking sound across if/else branches).
     struct MovedStateSnapshot
     {
+        struct StackCharBufferBorrowState
+        {
+            bool borrowed = false;
+            std::string source;
+            size_t scopeDepth = 0;
+        };
+        struct VariableStateKey
+        {
+            const llvm::Value* storage = nullptr;
+            std::string fallbackName;
+
+            bool operator<(const VariableStateKey& other) const
+            {
+                if (storage != other.storage)
+                    return std::less<const llvm::Value*>{}(storage, other.storage);
+                return fallbackName < other.fallbackName;
+            }
+        };
+        struct VariableState
+        {
+            std::unordered_set<std::string> movedFields;
+            StackCharBufferBorrowState stackCharBufferBorrow;
+        };
         std::map<std::string, bool> moved;
         std::map<std::string, bool> pointeeMoved;
         std::map<std::string, llvm::BasicBlock*> pointeeMoveBlocks;
-        std::map<std::string, std::unordered_set<std::string>> movedFields;
+        std::map<VariableStateKey, VariableState> variableStates;
     };
 
     struct OwnFlagJoinSnapshot
@@ -13318,6 +13445,11 @@ public:
     // ORs a snapshot into the LIVE state: a variable (or field) moved in the snapshot becomes
     // moved now. Used to fold each break/continue path's moves back in at loop exit.
     void MergeMovedStateInto(const MovedStateSnapshot& state);
+
+    // Scope short-circuit joins outside recursive parser frames.
+    void PushMovedStateMergeSnapshot();
+    void MergeMovedStateMergeSnapshot();
+    void DiscardMovedStateMergeSnapshot();
 
     // Merges two post-branch states: a variable (or field) is moved if it was moved in either branch.
     void MergeMovedStates(const MovedStateSnapshot& thenState,
@@ -13528,7 +13660,8 @@ public:
     llvm::Value* RawArrayCountArgument(const NamedVariable& arg);
     llvm::Value* CreateRawArrayReturnCountSlot();
     void RegisterRawArrayCallResult(llvm::Value* result, llvm::Value* countSlot,
-                                    uint64_t allocAlign = 0);
+                                    uint64_t allocAlign = 0, bool isArrayView = false,
+                                    bool owns = false);
     llvm::Argument* CurrentRawArrayReturnCountArgument() const;
 
     // Returns true if value is a load from an owning alloca in any live scope.
@@ -15193,6 +15326,8 @@ public:
     CFlatParser::FunctionDefinitionContext*  MaterializeGenericFunction(const std::string& name);
 
 private:
+    std::unique_ptr<std::vector<MovedStateSnapshot>> movedStateMergeStack_;
+
     // Parse one lazily-stored template's source and patch its context pointer into `map` in
     // place. The key already exists (inserted with a null value at cache load) so .count/.find
     // existence checks stay valid; assigning the value does not invalidate other iterators.

@@ -1047,7 +1047,20 @@ std::string SpellType(const LLVMBackend& compiler,
 std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
                                    const LLVMBackend::TypeAndValue& type)
 {
-    const std::string spelling = SpellType(compiler, type);
+    auto spell = [&](const LLVMBackend::TypeAndValue& value) {
+        const bool hasFunctionSignature = value.IsFunctionPointer
+            && !value.FuncPtrReturnTypeName.empty();
+        if (!hasFunctionSignature) return SpellType(compiler, value);
+        std::string result = (value.IsThinFnPtr() ? "function<" : "Lambda<")
+            + compiler.FuncPtrSpellingOf(value) + ">";
+        // Same star rule as SpellType: a view prints only its element stars before `[]`.
+        if (value.IsArrayView)
+            result += std::string(value.ElemPointer ? "*" : "") + "[]";
+        else if (value.Pointer)
+            result += std::string(std::max(value.ValuePointerDepth(), 1), '*');
+        return result;
+    };
+    const std::string spelling = spell(type);
     const int depth = type.IsArrayView ? (type.ElemPointer ? 1 : 0) : type.ValuePointerDepth();
     const uint8_t mask = type.ConstMask;
     int constLevel = -1;
@@ -1068,7 +1081,7 @@ std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
         inner.ElemPointer = constLevel >= 2;
         inner.PointerDepth = constLevel;
     }
-    return "(const " + SpellType(compiler, inner) + ")"
+    return "(const " + spell(inner) + ")"
         + std::string(static_cast<size_t>(depth - constLevel), '*');
 }
 

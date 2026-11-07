@@ -465,6 +465,10 @@ def main():
     if macos_dir.is_dir():
         extra_args = extra_args + ["-i", str(macos_dir)]
 
+    # Test/*.cb import helper modules from Test/library, as test.sh passes `-i Test/library`.
+    test_lib_dir = (REPO_ROOT / "Test" / "library").resolve()
+    extra_args = extra_args + ["-i", str(test_lib_dir)]
+
     ok = run_bulk(exe, extra_args, show_timings, include_win32_demo=win32_dir is not None)
     sys.exit(0 if ok else 1)
 

@@ -69,9 +69,9 @@ once per box.
 
 ## In flight
 
-None. Parked worktrees (branch kept, not landing as is): `fix/t345-ctorlambda` (p3/ctor-lambda-this-closure-relocation),
-`fix/t348-autoconst` (p3/native-auto-copy-drops-transitive-const), `fix/t396-viewalias` (mixed owned/borrowed view field
-moved through an alias), `fix/t415-heaparrmove` (raw heap-array move). Rebase or drop before reuse.
+None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as is): `fix/t345-ctorlambda`
+(p3/ctor-lambda-this-closure-relocation), `fix/t348-autoconst` (p3/native-auto-copy-drops-transitive-const),
+`fix/t396-viewalias` (mixed owned/borrowed view field moved through an alias). Rebase or drop before reuse.
 
 ## Partly landed - residue open
 
@@ -99,11 +99,7 @@ moved through an alias), `fix/t415-heaparrmove` (raw heap-array move). Rebase or
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| B-VIEWLEN | p3/brace-array-view-length-lost-foreach-zero | view length slot | brace view foreach runs 0 times (length -1) |
-| B-ASSIGNBORROW | p3/assignment-expression-drops-stack-buffer-borrow | assignment result provenance | silent dangle: `return v = string_view(buf, 2);` accepted |
-| B-STRCAST | p3/string-cast-identity-and-global-init | (string) cast lowering + global folder | `(string)s` refused; global `(string)"abc"` not folded |
-| B-TPARAMQUAL | p3/type-param-static-member-call-qualifier | generic `.` qualifier lookup | `T.sm()` with T a type param "Undefined variable T."; namespace T beats the param |
-| B-MVSINKSLOT | p3/value-struct-move-param-in-move-sink-tuple-slot | tuple slot move-sink transfer | value-struct move param in `kmv((h, 1))` double destroy (rc 133) |
+| B-MOVEVIEW | p3/move-of-array-view-aborts | view move semantics | `int[] b = move a;` + foreach aborts 134 (needs ruling) |
 | - | p3/cpp-using-declaration-member-access-gaps | C++ record flattening + member lookup | `using` re-exposure through a base, two same-named base fields, shadow + using, method using, virtual base: refused, clang accepts; T99 reviews 2-4, pre-existing |
 | - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | global/function name collisions, anonymous/inline-namespace enums, comma, `auto&&`, deref macros, C errno/INT_MAX; T98 reviews 1-2, pre-existing |
 | - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | non-const trivially-copyable lvalue copy-init skips U&& template (unnamed-enum half landed 2026-10-30) |
@@ -136,7 +132,6 @@ moved through an alias), `fix/t415-heaparrmove` (raw heap-array move). Rebase or
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| C-DELVIEW | p3/delete-of-brace-array-view-aborts | delete operand check | `delete` of a brace view compiles, aborts 134 |
 | - | p3/cpp-operator-template-set-ambiguity-without-drop-accepted | C++ operator ranking | free-only ambiguous operator template set with no dropped candidate accepted (clang ambiguous); int*/void*/template no-drop case (T85 reviews 3-4, pre-existing) |
 | - | p3/constref-byvalue-constructor-overload-ambiguity-accepted + p3/cpp-brace-overload-ambiguity-leftovers-after-t314 | C++ call / brace-arg ranking | `fw(const WV&)` + `fw(WV)` and brace-argument ties: clang ambiguous, CFlat picks |
 | - | p3/cxx-charptr-lvalue-binds-const-charptr-ref + p3/postfix-arm-ternary-binds-slot-and-literal-at-char-ptr-ref | `const char*&` binding | char* lvalue and string-literal arms bind (clang refuses) |
@@ -218,7 +213,6 @@ moved through an alias), `fix/t415-heaparrmove` (raw heap-array move). Rebase or
 |-----|----------|-------|
 | L-TUPLE | p3/tuple-leftovers-after-tuplit + p3/tuple-alias-and-element-type-gaps | ruled 2026-11-01; aliases, function-type / pointer / generic elements |
 | L-GENERIC | p3/generic-template-one-slot-silent-replace + p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | RULED 2026-10-31 (overload sets); instantiation as value; ctor deduction (ruled 2026-10-13) |
-| L-FNTYPE2 | p3/function-type-alias-inside-function-signature + p3/function-value-binding-misc-after-fntype | function-type alias as a signature component; `<c_fn_ptr>` in symbol-dump; enum exact-match overload bind |
 | L-TYPEDEFSCOPE | p3/block-scope-typedef-leaks-past-block | silent wrong type: block typedef shadows the global after the block |
 | L-NS | p3/namespace-nontemplate-vs-global-template-lookup | global generic beats a same-named namespace non-template |
 | L-PERF | p3/nested-ternary-compile-time | ~2x per `?:` level |

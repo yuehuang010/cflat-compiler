@@ -1,0 +1,5 @@
+expect_error("cannot range-for over an array view whose length is unknown");
+import "staticview_import_store.cb";
+void svR2StoreImportedGlobal(int* raw) {
+    svR2ImportedGlobal = (int[])raw;
+}

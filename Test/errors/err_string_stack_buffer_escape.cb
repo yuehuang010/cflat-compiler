@@ -5,6 +5,7 @@ import "list.cb";
 
 struct StackStringHolder { string s = default; };
 string gStackString = default;
+string stackBorrowFlowMake() { return "owned"; }
 
 expect_error("cannot store a string borrowed from stack buffer 'buf'") {
     void stackStringFieldThroughPointer() {
@@ -59,6 +60,54 @@ expect_error("cannot store a string borrowed from stack buffer 'buf'") {
             char[16] buf = "inner";
             outer = &buf[0];
         }
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string ternaryMovedStackReturnTrue(bool choose) {
+        char[8] buf = {'h', 'i', 0};
+        string borrowed = (string)buf;
+        string owned = "o" + "k";
+        return choose ? move borrowed : move owned;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string ternaryMovedStackReturnFalse(bool choose) {
+        char[8] buf = {'h', 'i', 0};
+        string borrowed = (string)buf;
+        string owned = "o" + "k";
+        return choose ? move owned : move borrowed;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string movedStackReturn() {
+        char[8] buf = {'h', 'i', 0};
+        string borrowed = (string)buf;
+        return move borrowed;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void ternaryMovedStackGlobalStore(bool choose) {
+        char[8] buf = {'h', 'i', 0};
+        string borrowed = (string)buf;
+        string owned = "o" + "k";
+        gStackString = choose ? move borrowed : move owned;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void ternaryMovedStackFieldStore(StackStringHolder* holder, bool choose) {
+        char[8] buf = {'h', 'i', 0};
+        string borrowed = (string)buf;
+        string owned = "o" + "k";
+        holder->s = choose ? move borrowed : move owned;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void ternaryMovedStackOutParameter(string* out, bool choose) {
+        char[8] buf = {'h', 'i', 0};
+        string borrowed = (string)buf;
+        string owned = "o" + "k";
+        *out = choose ? move borrowed : move owned;
     }
 }
 
@@ -329,6 +378,85 @@ expect_error("cannot store a string borrowed from stack buffer") {
     }
 }
 
+// Assignment expressions carry the borrow of the value stored by the inner assignment.
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_assignment_view_return() {
+        char[8] buf = {'h', 'i', 0}; string_view value = default;
+        return value = string_view(buf, 2);
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_assignment_cast_return() {
+        char[8] buf = {'h', 'i', 0}; string value = default;
+        return value = (string)buf;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_assignment_constructor_return() {
+        char[8] buf = {'h', 'i', 0}; string value = default;
+        return value = string(buf);
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_assignment_named_return() {
+        char[8] buf = {'h', 'i', 0};
+        string_view source = string_view(buf, 2); string_view value = default;
+        return value = source;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_assignment_initializer_then_return() {
+        char[8] buf = {'h', 'i', 0}; string_view inner = default;
+        string_view saved = inner = string_view(buf, 2);
+        return saved;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_assignment_chained_return() {
+        char[8] buf = {'h', 'i', 0};
+        string_view first = default; string_view second = default;
+        return first = second = string_view(buf, 2);
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_assignment_local_field() {
+        char[8] buf = {'h', 'i', 0}; string_view value = default;
+        StackStringViewHolder holder = default;
+        return holder.s = value = string_view(buf, 2);
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_assignment_brace_field_init() {
+        char[8] buf = {'h', 'i', 0}; string_view inner = default;
+        StackStringViewHolder holder = { s = inner = string_view(buf, 2) };
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_assignment_inner_to_outer_local() {
+        string_view outer = default;
+        { char[8] buf = {'h', 'i', 0}; string_view inner = default;
+          outer = inner = string_view(buf, 2); }
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_assignment_global_store() {
+        char[8] buf = {'h', 'i', 0}; string_view value = default;
+        gStackStringView = value = string_view(buf, 2);
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_assignment_out_parameter(string_view* output) {
+        char[8] buf = {'h', 'i', 0}; string_view value = default;
+        *output = value = string_view(buf, 2);
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_assignment_long_lived_field(StackStringViewHolder* holder) {
+        char[8] buf = {'h', 'i', 0}; string_view value = default;
+        holder->s = value = string_view(buf, 2);
+    }
+}
+
 
 // Brace initialization shares the same field escape gate as assignment.
 expect_error("cannot store a string borrowed from stack buffer") {
@@ -348,3 +476,562 @@ expect_error("cannot store a string borrowed from stack buffer") {
 }
 
 extern int main() { return 0; }
+
+// Same-type cast wrappers keep the borrow fact until the ordinary return gate runs.
+expect_error("cannot store a string borrowed from stack buffer 'bytes'") {
+    string stackStringIdentityCastReturn() {
+        char[4] bytes = {'c', 'a', 't', 0};
+        string borrowed = string(bytes);
+        return (string)borrowed;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'bytes'") {
+    string stackStringIdentityFunctionalReturn() {
+        char[4] bytes = {'c', 'a', 't', 0};
+        string borrowed = string(bytes);
+        return string(borrowed);
+    }
+}
+
+// Flow-sensitive assignment joins retain any stack-buffer borrow that reaches an escape.
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_if_no_else_assign_literal_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = "owned"; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_no_else_assign_literal_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = "owned"; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_no_else_assign_literal_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = "owned"; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_if_no_else_assign_default_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = default; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_no_else_assign_default_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = default; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_no_else_assign_default_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = default; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_if_no_else_assign_mk_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = stackBorrowFlowMake(); }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_no_else_assign_mk_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = stackBorrowFlowMake(); }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_no_else_assign_mk_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = stackBorrowFlowMake(); }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_if_else_one_clears_assign_literal_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = "owned"; } else { }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_else_one_clears_assign_literal_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = "owned"; } else { }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_else_one_clears_assign_literal_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = "owned"; } else { }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_if_else_one_clears_assign_default_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = default; } else { }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_else_one_clears_assign_default_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = default; } else { }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_else_one_clears_assign_default_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = default; } else { }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_if_else_one_clears_assign_mk_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = stackBorrowFlowMake(); } else { }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_else_one_clears_assign_mk_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = stackBorrowFlowMake(); } else { }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_if_else_one_clears_assign_mk_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        if (c != 0) { s = stackBorrowFlowMake(); } else { }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_while_zero_trip_assign_literal_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = "owned"; break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_while_zero_trip_assign_literal_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = "owned"; break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_while_zero_trip_assign_literal_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = "owned"; break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_while_zero_trip_assign_default_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = default; break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_while_zero_trip_assign_default_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = default; break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_while_zero_trip_assign_default_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = default; break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_while_zero_trip_assign_mk_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = stackBorrowFlowMake(); break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_while_zero_trip_assign_mk_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = stackBorrowFlowMake(); break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_while_zero_trip_assign_mk_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { s = stackBorrowFlowMake(); break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_for_zero_trip_assign_literal_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = "owned"; break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_for_zero_trip_assign_literal_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = "owned"; break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_for_zero_trip_assign_literal_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = "owned"; break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_for_zero_trip_assign_default_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = default; break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_for_zero_trip_assign_default_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = default; break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_for_zero_trip_assign_default_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = default; break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_for_zero_trip_assign_mk_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = stackBorrowFlowMake(); break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_for_zero_trip_assign_mk_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = stackBorrowFlowMake(); break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_for_zero_trip_assign_mk_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        for (int i = 0; i < c; i++) { s = stackBorrowFlowMake(); break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_break_continue_assign_literal_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = "owned"; break; } i++; continue; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_break_continue_assign_literal_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = "owned"; break; } i++; continue; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_break_continue_assign_literal_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = "owned"; break; } i++; continue; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_break_continue_assign_default_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = default; break; } i++; continue; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_break_continue_assign_default_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = default; break; } i++; continue; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_break_continue_assign_default_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = default; break; } i++; continue; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_break_continue_assign_mk_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = stackBorrowFlowMake(); break; } i++; continue; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_break_continue_assign_mk_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = stackBorrowFlowMake(); break; } i++; continue; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_break_continue_assign_mk_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        int i = 0; while (i < 2) { if (c > 0) { s = stackBorrowFlowMake(); break; } i++; continue; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_nested_loops_assign_literal_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = "owned"; break; } break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_nested_loops_assign_literal_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = "owned"; break; } break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_nested_loops_assign_literal_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = "owned"; break; } break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_nested_loops_assign_default_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = default; break; } break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_nested_loops_assign_default_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = default; break; } break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_nested_loops_assign_default_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = default; break; } break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_nested_loops_assign_mk_return_s(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = stackBorrowFlowMake(); break; } break; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_nested_loops_assign_mk_store_global(int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = stackBorrowFlowMake(); break; } break; }
+        gStackString = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_nested_loops_assign_mk_store_field_param(StackStringHolder* holder, int c) {
+        char[8] buf = {'h', 'i', 0};
+        string s = (string)buf;
+        while (c > 0) { for (int i = 0; i < c; i++) { s = stackBorrowFlowMake(); break; } break; }
+        holder->s = s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_r2_shortcircuit_and(int c) {
+        char[8] buf = {'b', 0};
+        string s = (string)buf;
+        if (c > 0 && (s = "x").length() > 0) { c = 2; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_r2_shortcircuit_or(int c) {
+        char[8] buf = {'b', 0};
+        string s = (string)buf;
+        if (c > 0 || (s = "x").length() > 0) { c = 2; }
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_r2_shortcircuit_bool_init(int c) {
+        char[8] buf = {'b', 0};
+        string s = (string)buf;
+        bool k = c > 0 && (s = "x").length() > 0;
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_r2_shortcircuit_nested_and(int a, int b) {
+        char[8] buf = {'b', 0};
+        string s = (string)buf;
+        bool k = a > 0 && b > 0 && (s = "x").length() > 0;
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string borrowflow_r2_shortcircuit_nested_or_and(int a, int c) {
+        char[8] buf = {'b', 0};
+        string s = (string)buf;
+        bool k = (a > 0 || (s = "x").length() > 0) && c > 0;
+        return s;
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void borrowflow_r2_shortcircuit_global_store(int c) {
+        char[8] buf = {'b', 0};
+        string s = (string)buf;
+        bool k = c > 0 && (s = stackBorrowFlowMake()).length() > 0;
+        gStackString = s;
+    }
+}

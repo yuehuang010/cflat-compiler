@@ -94,3 +94,721 @@ struct DeclInitFieldHolder {
     void kill() { delete[_] v; }
 };
 void declInitFieldOk() { int[3] a; DeclInitFieldHolder h; h.takeIt(a); h.kill(); }
+
+// Brace lists own stack backing storage for local views and static backing storage for globals.
+expect_error("cannot delete array-view 'v' - it was bound from 'brace initializer backing storage'") {
+    void deleteBraceLocalView() { int[] v = {1, 2}; delete[_] v; }
+}
+
+int[] gBraceViewForDelete = {3, 4};
+expect_error("cannot delete array-view 'gBraceViewForDelete' - it was bound from 'brace initializer backing storage'") {
+    void deleteBraceGlobalView() { delete[_] gBraceViewForDelete; }
+}
+
+// A raw pointer cast has no statically available extent, so range-for must diagnose it.
+expect_error("cannot range-for over an array view whose length is unknown") {
+    void rangeForUnknownRawView(int* raw) {
+        int[] view = (int[])raw;
+        for (int item in view) item += 1;
+    }
+}
+
+// A field's hidden count cannot outlive a write through another alias to the root.
+struct BrViewAliasHolder { int[] values = default; };
+expect_error("cannot range-for over an array view whose length is unknown") {
+    void brViewFieldAliasWrite() {
+        int[] five = {1, 2, 3, 4, 5};
+        int[] two = {7, 8};
+        BrViewAliasHolder holder = default;
+        holder.values = five;
+        BrViewAliasHolder* alias = &holder;
+        alias->values = two;
+        for (int value in holder.values) value += 1;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    void brViewFieldWriteCallee(BrViewAliasHolder* holder, int[] value) {
+        holder->values = value;
+    }
+    void brViewFieldAliasCallee() {
+        int[] five = {1, 2, 3, 4, 5};
+        int[] two = {7, 8};
+        BrViewAliasHolder holder = default;
+        holder.values = five;
+        brViewFieldWriteCallee(&holder, two);
+        for (int value in holder.values) value += 1;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    void brViewFieldDynamicIndex() {
+        int[] five = {1, 2, 3, 4, 5};
+        int[] two = {7, 8};
+        BrViewAliasHolder[2] holders;
+        int index = 0;
+        holders[index].values = two;
+        index = 1;
+        holders[index].values = five;
+        index = 0;
+        for (int value in holders[index].values) value += 1;
+    }
+}
+
+// A callee that iterates its view requires a real hidden count from every caller.
+expect_error("cannot pass an array view with unknown length") {
+    int brViewCountRequired(int[] values) {
+        int count = 0;
+        for (int value in values) count++;
+        return count;
+    }
+    int brViewUnknownArgument(int* raw) { return brViewCountRequired((int[])raw); }
+}
+
+// The first iteration is compiled before the loop's later raw rebind executes at runtime.
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int brViewLoopRawRebind(int* raw) {
+        int[] original = {1, 2, 3};
+        int[] view = original;
+        int count = 0;
+        int iteration = 0;
+        while (iteration < 2) {
+            for (int value in view) count++;
+            view = (int[])raw;
+            iteration++;
+        }
+        return count;
+    }
+}
+
+// Module-wide stores decide a global view's count before any function body is emitted.
+int[] brViewGlobalRaw = {1, 2, 3};
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int brViewGlobalUseBeforeWriter() {
+        int count = 0;
+        for (int value in brViewGlobalRaw) count++;
+        return count;
+    }
+    void brViewGlobalSetRaw(int* raw) { brViewGlobalRaw = (int[])raw; }
+}
+
+// A copied pointer can write the same heap field through a different root name.
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int brViewPointerRootAlias() {
+        int[] five = {1, 2, 3, 4, 5};
+        int[] two = {7, 8};
+        BrViewAliasHolder* owner = new BrViewAliasHolder();
+        owner->values = five;
+        BrViewAliasHolder* alias = owner;
+        alias->values = two;
+        int count = 0;
+        for (int value in owner->values) count++;
+        return count;
+    }
+}
+
+// A function value's count requirement is the union over every function bindable to its type.
+int brFnCountReader(int[] values) { int n = 0; for (int value in values) n++; return n; }
+expect_error("cannot pass an array view with unknown length") {
+    int brFnUnknownCall(int* raw) {
+        function<int(int[])> fp = brFnCountReader;
+        return fp((int[])raw);
+    }
+}
+
+// An interface method's requirement is the union over its implementors.
+interface BrUnknownIface { int count(int[] values); };
+class BrUnknownImpl : BrUnknownIface { int count(int[] values) { int n = 0; for (int value in values) n++; return n; } };
+expect_error("cannot pass an array view with unknown length") {
+    int brIfaceUnknownCall(int* raw) {
+        BrUnknownImpl impl;
+        BrUnknownIface iface = impl;
+        return iface.count((int[])raw);
+    }
+}
+
+// A declaration copy from a field view carries the field's count: an unknown one is refused.
+struct BrDeclFieldHolder { int[] values = default; };
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int brDeclFieldUnknown(int* raw) {
+        BrDeclFieldHolder h = default;
+        h.values = (int[])raw;
+        int[] w = h.values;
+        int n = 0;
+        for (int x in w) n++;
+        return n;
+    }
+}
+
+// A loop that rebinds a field view to a raw cast is refused on its first iteration's read.
+struct BrLoopFieldHolder { int[] values = default; };
+struct BrLoopFieldOuter { BrLoopFieldHolder inner = default; };
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int brFieldLoopRebindArrow(int* raw) {
+        BrLoopFieldHolder* h = new BrLoopFieldHolder();
+        int[] a = {1, 2, 3};
+        h->values = a;
+        int k = 0;
+        int total = 0;
+        while (k < 2) { int n = 0; for (int x in h->values) n++; total += n; h->values = (int[])raw; k++; }
+        return total;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int brFieldLoopRebindNested(int* raw) {
+        BrLoopFieldOuter o = default;
+        int[] a = {1, 2, 3};
+        o.inner.values = a;
+        int k = 0;
+        int total = 0;
+        while (k < 2) { int n = 0; for (int x in o.inner.values) n++; total += n; o.inner.values = (int[])raw; k++; }
+        return total;
+    }
+}
+
+// The copy owns its own count: rebinding the source field afterwards does not make it known.
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int brDeclFieldUnknownThenRebind(int* raw) {
+        BrDeclFieldHolder h = default;
+        int[] a = {1, 2, 3};
+        h.values = (int[])raw;
+        int[] w = h.values;
+        h.values = a;
+        int n = 0;
+        for (int x in w) n++;
+        return n;
+    }
+}
+
+// STATICVIEW persistent-count regressions
+int[] svErrStaticBase = {1, 2, 3};
+int[] svErrGlobalTarget = {1, 2, 3};
+int svErrViewLength(int[] values) { int n = 0; for (int value in values) n++; return n; }
+int svErrCountReader(int[] values) { int n = 0; for (int value in values) n++; return n; }
+
+// A later raw-cast store poisons every earlier static-view count read.
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticGlobalRawDirectForeach(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = 0; for (int item in view) result++;
+        view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticGlobalRawDirectLength(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = svErrViewLength(view);
+        view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticGlobalRawDirectCountreader(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = svErrCountReader(view);
+        view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticGlobalRawBranchForeach(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = 0; for (int item in view) result++;
+        if (raw != nullptr) view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticGlobalRawBranchLength(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = svErrViewLength(view);
+        if (raw != nullptr) view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticGlobalRawBranchCountreader(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = svErrCountReader(view);
+        if (raw != nullptr) view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticGlobalRawLoopForeach(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = 0; for (int item in view) result++;
+        int i = 0; while (i < 1) { view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticGlobalRawLoopLength(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = svErrViewLength(view);
+        int i = 0; while (i < 1) { view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticGlobalRawLoopCountreader(int* raw) {
+        static int[] view = svErrStaticBase;
+        int result = svErrCountReader(view);
+        int i = 0; while (i < 1) { view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticParamRawDirectForeach(int* raw, int[] values) {
+        static int[] view = values;
+        int result = 0; for (int item in view) result++;
+        view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticParamRawDirectLength(int* raw, int[] values) {
+        static int[] view = values;
+        int result = svErrViewLength(view);
+        view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticParamRawDirectCountreader(int* raw, int[] values) {
+        static int[] view = values;
+        int result = svErrCountReader(view);
+        view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticParamRawBranchForeach(int* raw, int[] values) {
+        static int[] view = values;
+        int result = 0; for (int item in view) result++;
+        if (raw != nullptr) view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticParamRawBranchLength(int* raw, int[] values) {
+        static int[] view = values;
+        int result = svErrViewLength(view);
+        if (raw != nullptr) view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticParamRawBranchCountreader(int* raw, int[] values) {
+        static int[] view = values;
+        int result = svErrCountReader(view);
+        if (raw != nullptr) view = (int[])raw;
+        return result;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticParamRawLoopForeach(int* raw, int[] values) {
+        static int[] view = values;
+        int result = 0; for (int item in view) result++;
+        int i = 0; while (i < 1) { view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticParamRawLoopLength(int* raw, int[] values) {
+        static int[] view = values;
+        int result = svErrViewLength(view);
+        int i = 0; while (i < 1) { view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticParamRawLoopCountreader(int* raw, int[] values) {
+        static int[] view = values;
+        int result = svErrCountReader(view);
+        int i = 0; while (i < 1) { view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+// Unknown parameter counts cannot be stored in persistent views.
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticUnknownParamForeachWriter(int[] values) {
+        static int[] view = svErrStaticBase;
+        int result = 0; for (int item in view) result++;
+        view = values;
+        return 0;
+    }
+    int svErrStaticUnknownParamForeachCaller(int* raw) { return svErrStaticUnknownParamForeachWriter((int[])raw); }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticUnknownParamLengthWriter(int[] values) {
+        static int[] view = svErrStaticBase;
+        int result = svErrViewLength(view);
+        view = values;
+        return 0;
+    }
+    int svErrStaticUnknownParamLengthCaller(int* raw) { return svErrStaticUnknownParamLengthWriter((int[])raw); }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticUnknownParamCountreaderWriter(int[] values) {
+        static int[] view = svErrStaticBase;
+        int result = svErrCountReader(view);
+        view = values;
+        return 0;
+    }
+    int svErrStaticUnknownParamCountreaderCaller(int* raw) { return svErrStaticUnknownParamCountreaderWriter((int[])raw); }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalUnknownParamForeachRead() { int n = 0; for (int item in svErrGlobalTarget) n++; return n; }
+    void svErrGlobalUnknownParamForeachWriter(int[] values) { svErrGlobalTarget = values; }
+    int svErrGlobalUnknownParamForeachCaller(int* raw) { svErrGlobalUnknownParamForeachWriter((int[])raw); return svErrGlobalUnknownParamForeachRead(); }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalUnknownParamLengthRead() { return svErrViewLength(svErrGlobalTarget); }
+    void svErrGlobalUnknownParamLengthWriter(int[] values) { svErrGlobalTarget = values; }
+    int svErrGlobalUnknownParamLengthCaller(int* raw) { svErrGlobalUnknownParamLengthWriter((int[])raw); return svErrGlobalUnknownParamLengthRead(); }
+}
+
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalUnknownParamCountreaderRead() { return svErrCountReader(svErrGlobalTarget); }
+    void svErrGlobalUnknownParamCountreaderWriter(int[] values) { svErrGlobalTarget = values; }
+    int svErrGlobalUnknownParamCountreaderCaller(int* raw) { svErrGlobalUnknownParamCountreaderWriter((int[])raw); return svErrGlobalUnknownParamCountreaderRead(); }
+}
+
+// A raw-cast write to a static struct field makes every read in the function unknown-count.
+struct SvErrStaticFieldHolder { int[] view = default; };
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticFieldRawForeach(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = 0; for (int item in holder.view) result++;
+        if (second == 0) holder.view = (int[])raw;
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticFieldRawLength(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = svErrViewLength(holder.view);
+        if (second == 0) holder.view = (int[])raw;
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticFieldRawCountReader(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = svErrCountReader(holder.view);
+        if (second == 0) holder.view = (int[])raw;
+        return result;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticFieldBranchForeach(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = 0; for (int item in holder.view) result++;
+        if (second == 0) { if (raw != nullptr) holder.view = (int[])raw; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticFieldBranchLength(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = svErrViewLength(holder.view);
+        if (second == 0) { if (raw != nullptr) holder.view = (int[])raw; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticFieldBranchCountReader(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = svErrCountReader(holder.view);
+        if (second == 0) { if (raw != nullptr) holder.view = (int[])raw; }
+        return result;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrStaticFieldLoopForeach(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = 0; for (int item in holder.view) result++;
+        int i = 0; while (i < 1) { holder.view = (int[])raw; i++; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticFieldLoopLength(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = svErrViewLength(holder.view);
+        int i = 0; while (i < 1) { holder.view = (int[])raw; i++; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrStaticFieldLoopCountReader(int* raw, int second) {
+        static SvErrStaticFieldHolder holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int result = svErrCountReader(holder.view);
+        int i = 0; while (i < 1) { holder.view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+// A raw-cast write to a global struct field is unknown at every module read.
+struct SvErrGlobalFieldHolder { int[] view = default; };
+SvErrGlobalFieldHolder svErrGlobalFieldTarget = default;
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrGlobalFieldRawForeach(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = 0; for (int item in svErrGlobalFieldTarget.view) result++;
+        if (second == 0) svErrGlobalFieldTarget.view = (int[])raw;
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalFieldRawLength(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = svErrViewLength(svErrGlobalFieldTarget.view);
+        if (second == 0) svErrGlobalFieldTarget.view = (int[])raw;
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalFieldRawCountReader(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = svErrCountReader(svErrGlobalFieldTarget.view);
+        if (second == 0) svErrGlobalFieldTarget.view = (int[])raw;
+        return result;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrGlobalFieldBranchForeach(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = 0; for (int item in svErrGlobalFieldTarget.view) result++;
+        if (second == 0) { if (raw != nullptr) svErrGlobalFieldTarget.view = (int[])raw; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalFieldBranchLength(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = svErrViewLength(svErrGlobalFieldTarget.view);
+        if (second == 0) { if (raw != nullptr) svErrGlobalFieldTarget.view = (int[])raw; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalFieldBranchCountReader(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = svErrCountReader(svErrGlobalFieldTarget.view);
+        if (second == 0) { if (raw != nullptr) svErrGlobalFieldTarget.view = (int[])raw; }
+        return result;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svErrGlobalFieldLoopForeach(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = 0; for (int item in svErrGlobalFieldTarget.view) result++;
+        int i = 0; while (i < 1) { svErrGlobalFieldTarget.view = (int[])raw; i++; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalFieldLoopLength(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = svErrViewLength(svErrGlobalFieldTarget.view);
+        int i = 0; while (i < 1) { svErrGlobalFieldTarget.view = (int[])raw; i++; }
+        return result;
+    }
+}
+expect_error("cannot pass an array view with unknown length") {
+    int svErrGlobalFieldLoopCountReader(int* raw, int second) {
+        if (second == 0) svErrGlobalFieldTarget.view = svErrStaticBase;
+        int result = svErrCountReader(svErrGlobalFieldTarget.view);
+        int i = 0; while (i < 1) { svErrGlobalFieldTarget.view = (int[])raw; i++; }
+        return result;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svR2StaticNoInit(int* raw, int second) {
+        static int[] view;
+        if (second == 0) view = svErrStaticBase;
+        int count = 0;
+        for (int value in view) count++;
+        if (second == 0) view = (int[])raw;
+        return count;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svR2StaticDefaultInit(int* raw, int second) {
+        static int[] view = default;
+        if (second == 0) view = svErrStaticBase;
+        int count = 0;
+        for (int value in view) count++;
+        if (second == 0) view = (int[])raw;
+        return count;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    class SvR2MethodBox {
+        int run(int* raw, int second) {
+            static int[] view = svErrStaticBase;
+            int count = 0;
+            for (int value in view) count++;
+            if (second == 0) view = (int[])raw;
+            return count;
+        }
+    };
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svR2ViaUnknownLocal(int* raw, int second) {
+        static int[] view = svErrStaticBase;
+        int[] local = (int[])raw;
+        int count = 0;
+        for (int value in view) count++;
+        if (second == 0) view = local;
+        return count;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svR2ViaNestedUnknownLocal(int* raw, int second) {
+        static int[] view = svErrStaticBase;
+        int count = 0;
+        for (int value in view) count++;
+        if (second == 0) {
+            int[] local = (int[])raw;
+            view = local;
+        }
+        return count;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int[] svR2MakeUnknownView(int* raw) { return (int[])raw; }
+    int svR2StaticFromReturn(int* raw, int second) {
+        static int[] view = svErrStaticBase;
+        int count = 0;
+        for (int value in view) count++;
+        if (second == 0) view = svR2MakeUnknownView(raw);
+        return count;
+    }
+}
+int[] svR2GlobalFromReturn = {1, 2, 3};
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int[] svR2MakeGlobalUnknownView(int* raw) { return (int[])raw; }
+    void svR2StoreGlobalFromReturn(int* raw) {
+        svR2GlobalFromReturn = svR2MakeGlobalUnknownView(raw);
+    }
+    int svR2ReadGlobalFromReturn() {
+        int count = 0;
+        for (int value in svR2GlobalFromReturn) count++;
+        return count;
+    }
+}
+int[] svR2GlobalOrderView = {1, 2, 3};
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svR2GlobalOrderReader() {
+        int count = 0;
+        for (int value in svR2GlobalOrderView) count++;
+        return count;
+    }
+    void svR2GlobalOrderWriter(int* raw) {
+        int[] local = (int[])raw;
+        svR2GlobalOrderView = local;
+    }
+}
+struct SvR2GlobalField { int[] view = default; };
+SvR2GlobalField svR2GlobalField = default;
+expect_error("cannot range-for over an array view whose length is unknown") {
+    void svR2StoreThroughPointer(SvR2GlobalField* holder, int* raw) {
+        holder->view = (int[])raw;
+    }
+    int svR2ReadThroughPointer(int* raw) {
+        svR2GlobalField.view = svErrStaticBase;
+        svR2StoreThroughPointer(&svR2GlobalField, raw);
+        int count = 0;
+        for (int value in svR2GlobalField.view) count++;
+        return count;
+    }
+}
+expect_error("cannot range-for over an array view whose length is unknown") {
+    class SvR2ThisField {
+        int[] view = default;
+        void set(int* raw) { this.view = (int[])raw; }
+    };
+    int svR2ReadThisField(int* raw, int second) {
+        static SvR2ThisField holder = default;
+        if (second == 0) holder.view = svErrStaticBase;
+        int count = 0;
+        for (int value in holder.view) count++;
+        if (second == 0) holder.set(raw);
+        return count;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int svR3DeclarationCopyChain(int* raw, int second) {
+        static int[] view = svErrStaticBase;
+        int[] local = (int[])raw;
+        int[] copy = local;
+        int count = 0;
+        for (int value in view) count++;
+        if (second == 0) view = copy;
+        return count;
+    }
+}
+
+int[] svR3UnknownGlobal = {1, 2, 3};
+expect_error("cannot range-for over an array view whose length is unknown") {
+    void svR3SpoilUnknownGlobal(int* raw) {
+        svR3UnknownGlobal = (int[])raw;
+    }
+    int svR3LocalFromUnknownGlobal(int* raw, int second) {
+        static int[] view = svErrStaticBase;
+        int count = 0;
+        for (int value in view) count++;
+        int[] local = svR3UnknownGlobal;
+        if (second == 0) view = local;
+        return count;
+    }
+}
+
+expect_error("cannot range-for over an array view whose length is unknown") {
+    int[] svR3IdentityView(int[] value) { return value; }
+    int svR3StoreIdentityResult(int* raw, int second) {
+        static int[] view = svErrStaticBase;
+        int[] local = (int[])raw;
+        int count = 0;
+        for (int value in view) count++;
+        if (second == 0) view = svR3IdentityView(local);
+        return count;
+    }
+}

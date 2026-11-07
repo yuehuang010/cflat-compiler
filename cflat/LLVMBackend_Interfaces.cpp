@@ -408,7 +408,16 @@ bool LLVMBackend::NativeTypeShadowsFunctionAlias(const std::string& name) const
 const LLVMBackend::TypeAndValue* LLVMBackend::FindOrRequestFunctionTypeAlias(
     const std::string& name)
 {
-        if (const TypeAndValue* found = FindFunctionTypeAlias(name)) return found;
+        std::string aliasName = name;
+        // A plain alias can name a function-type alias. Follow that chain before treating the
+        // spelling as a possible imported C++ typedef.
+        for (int depth = 0; depth < 16; ++depth)
+        {
+            if (const TypeAndValue* found = FindFunctionTypeAlias(aliasName)) return found;
+            std::string resolved = ResolveTypeAlias(aliasName);
+            if (resolved == aliasName) break;
+            aliasName = std::move(resolved);
+        }
         if (!HasCxxImportGroup() || name.find('.') == std::string::npos
             || name.find_first_of("<>$*[ ") != std::string::npos || IsKnownTypeName(name))
             return nullptr;

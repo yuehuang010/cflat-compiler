@@ -1,6 +1,238 @@
 #include <algorithm>
 #include "MainListener.h"
 
+const LLVMBackend::NamedVariable* MainListener::TernaryArrayCountSource(
+        llvm::Value* storage, bool includeGlobals)
+{
+        const LLVMBackend::NamedVariable* source = storage != nullptr
+            ? compilerLLVM->FindStackVariableByStorage(storage) : nullptr;
+        if (source == nullptr && storage != nullptr)
+            source = compilerLLVM->FindStackArgumentByStorage(storage);
+        if (source == nullptr && includeGlobals && storage != nullptr)
+            source = compilerLLVM->FindVariableByStorage(storage);
+        return source;
+    }
+
+llvm::Value* MainListener::TernaryArrayArmCount(llvm::Value* value,
+        llvm::Value* storage, const LLVMBackend::TypedValue& shape)
+{
+        auto* i64Ty = compilerLLVM->builder->getInt64Ty();
+        if (const auto* raw = compilerLLVM->FindRawArrayResult(value);
+            raw != nullptr && raw->Count != nullptr)
+            return compilerLLVM->Upconvert(raw->Count, i64Ty);
+        const auto* source = TernaryArrayCountSource(storage, false);
+        if (source != nullptr && source->TypeAndValue.ConstArraySize > 0)
+            return compilerLLVM->builder->getInt64(source->TypeAndValue.ConstArraySize);
+        if (source != nullptr && source->TypeAndValue.IsArrayView)
+            if (auto* count = compilerLLVM->LoadRawArrayLength(*source))
+                return compilerLLVM->Upconvert(count, i64Ty);
+        if (shape.hasSourceType && shape.sourceType.ConstArraySize > 0)
+            return compilerLLVM->builder->getInt64(shape.sourceType.ConstArraySize);
+        return compilerLLVM->builder->getInt64(-1);
+    }
+
+bool MainListener::TernaryArrayArmCountKnown(llvm::Value* value,
+        llvm::Value* storage, const LLVMBackend::TypedValue& shape)
+{
+        if (const auto* raw = compilerLLVM->FindRawArrayResult(value); raw != nullptr)
+            return raw->CountKnown;
+        const auto* source = TernaryArrayCountSource(storage, true);
+        if (source != nullptr)
+            return source->TypeAndValue.ConstArraySize > 0
+                || compilerLLVM->RawArrayLengthStateOf(*source).Known;
+        if (shape.hasSourceType && shape.sourceType.ConstArraySize > 0) return true;
+        if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+            constant != nullptr && constant->isNullValue()) return true;
+        return false;
+    }
+
+void MainListener::AppendTernaryArrayArmCountSources(llvm::Value* value,
+        llvm::Value* storage, std::vector<size_t>& out)
+{
+        std::vector<size_t> sources;
+        if (const auto* raw = compilerLLVM->FindRawArrayResult(value); raw != nullptr)
+            sources = raw->CountSourceParams;
+        else if (const auto* source = TernaryArrayCountSource(storage, true))
+            sources = compilerLLVM->RawArrayLengthStateOf(*source).SourceParams;
+        for (size_t index : sources)
+            if (std::find(out.begin(), out.end(), index) == out.end()) out.push_back(index);
+    }
+
+llvm::Value* MainListener::TernaryArrayArmRuntimeOwns(llvm::Value* value)
+{
+        if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+            constant != nullptr && constant->isNullValue())
+            return compilerLLVM->builder->getInt1(false);
+        if (const auto* raw = compilerLLVM->FindRawArrayResult(value); raw != nullptr)
+        {
+            if (raw->RuntimeOwns != nullptr) return raw->RuntimeOwns;
+            return compilerLLVM->builder->getInt1(raw->Owns);
+        }
+        return compilerLLVM->builder->getInt1(compilerLLVM->TernaryArmJoinsOwning(value));
+    }
+
+bool MainListener::TernaryArmIsView(llvm::Value* value,
+        const LLVMBackend::TypedValue& shape)
+{
+        if (const auto* raw = compilerLLVM->FindRawArrayResult(value);
+            raw != nullptr && !raw->IsArrayView) return false;
+        return shape.isArrayView || (shape.hasSourceType && shape.sourceType.IsArrayView);
+    }
+
+bool MainListener::TernaryArmMayOwn(llvm::Value* value)
+{
+        if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+            constant != nullptr && constant->isNullValue()) return false;
+        return compilerLLVM->IsRawArrayResult(value)
+            ? compilerLLVM->RawArrayResultMayOwn(value)
+            : compilerLLVM->TernaryArmJoinsOwning(value);
+    }
+
+MainListener::TernaryArrayCountState MainListener::GetTernaryArrayCountState(
+        llvm::Value* value, llvm::Value* storage, const LLVMBackend::TypedValue& shape)
+{
+        TernaryArrayCountState state;
+        auto* nullValue = llvm::dyn_cast_or_null<llvm::Constant>(value);
+        if ((nullValue != nullptr && nullValue->isNullValue())
+            || JoinArmIsProvablyNull(value)
+            || (shape.hasSourceType && shape.sourceType.IsCxxNullptrT))
+        {
+            state.Count = compilerLLVM->builder->getInt64(0);
+            state.Known = true;
+            state.Available = true;
+            return state;
+        }
+        if (const auto* raw = compilerLLVM->FindRawArrayResult(value); raw != nullptr)
+        {
+            state.Count = raw->Count;
+            state.Known = raw->CountKnown;
+            state.Available = raw->Count != nullptr;
+            state.SourceParams = raw->CountSourceParams;
+            return state;
+        }
+        const auto* source = storage != nullptr
+            ? compilerLLVM->FindVariableByStorage(storage) : nullptr;
+        if (source != nullptr && source->TypeAndValue.ConstArraySize > 0
+            && !source->TypeAndValue.IsArrayView)
+        {
+            state.Count = compilerLLVM->builder->getInt64(
+                source->TypeAndValue.ConstArraySize);
+            state.Known = true;
+            state.Available = true;
+            return state;
+        }
+        if (source != nullptr && source->TypeAndValue.IsArrayView)
+        {
+            state.Count = compilerLLVM->LoadRawArrayLength(*source);
+            const auto sourceState = compilerLLVM->RawArrayLengthStateOf(*source);
+            state.Known = sourceState.Known;
+            state.Available = state.Count != nullptr;
+            state.SourceParams = sourceState.SourceParams;
+            return state;
+        }
+        if (shape.hasSourceType && shape.sourceType.ConstArraySize > 0
+            && !shape.sourceType.IsArrayView)
+        {
+            state.Count = compilerLLVM->builder->getInt64(shape.sourceType.ConstArraySize);
+            state.Known = true;
+            state.Available = true;
+        }
+        return state;
+    }
+
+std::unique_ptr<MainListener::TernaryArrayJoinState> MainListener::PrepareTernaryArrayJoinState(
+        llvm::Value* trueValue, llvm::Value* falseValue,
+        llvm::Value* trueStorage, llvm::Value* falseStorage,
+        const LLVMBackend::TypedValue& trueShape,
+        const LLVMBackend::TypedValue& falseShape,
+        const std::function<void()>& atTrue, const std::function<void()>& atFalse)
+{
+        const bool trueRawArray = compilerLLVM->IsRawArrayResult(trueValue);
+        const bool falseRawArray = compilerLLVM->IsRawArrayResult(falseValue);
+        auto state = std::make_unique<TernaryArrayJoinState>();
+        state->IsView = TernaryArmIsView(trueValue, trueShape)
+            || TernaryArmIsView(falseValue, falseShape);
+        auto trueSourceType = InferTernaryArmType(trueShape);
+        auto falseSourceType = InferTernaryArmType(falseShape);
+        state->IsFixed = !state->IsView && trueSourceType.ConstArraySize > 0
+            && falseSourceType.ConstArraySize > 0 && !trueRawArray && !falseRawArray;
+        if (state->IsView)
+        {
+            state->TrueViewMayOwn = TernaryArmMayOwn(trueValue);
+            state->FalseViewMayOwn = TernaryArmMayOwn(falseValue);
+            state->ViewMayOwn = state->TrueViewMayOwn || state->FalseViewMayOwn;
+        }
+        const bool rawArrayJoin = state->IsView || state->IsFixed
+            || ((trueRawArray || falseRawArray)
+                && compilerLLVM->TernaryArmJoinsOwning(trueValue)
+                && compilerLLVM->TernaryArmJoinsOwning(falseValue));
+        if (!rawArrayJoin) return nullptr;
+
+        atTrue();
+        state->TrueCount.Count = TernaryArrayArmCount(trueValue,
+            trueStorage != nullptr ? trueStorage : trueShape.receiverStorage, trueShape);
+        state->TrueCount.Known = TernaryArrayArmCountKnown(trueValue,
+            trueStorage != nullptr ? trueStorage : trueShape.receiverStorage, trueShape);
+        state->TrueCount.Available = true;
+        AppendTernaryArrayArmCountSources(trueValue,
+            trueStorage != nullptr ? trueStorage : trueShape.receiverStorage,
+            state->TrueCount.SourceParams);
+        if (state->IsView)
+            state->TrueViewOwns = TernaryArrayArmRuntimeOwns(trueValue);
+
+        atFalse();
+        state->FalseCount.Count = TernaryArrayArmCount(falseValue,
+            falseStorage != nullptr ? falseStorage : falseShape.receiverStorage, falseShape);
+        state->FalseCount.Known = TernaryArrayArmCountKnown(falseValue,
+            falseStorage != nullptr ? falseStorage : falseShape.receiverStorage, falseShape);
+        state->FalseCount.Available = true;
+        AppendTernaryArrayArmCountSources(falseValue,
+            falseStorage != nullptr ? falseStorage : falseShape.receiverStorage,
+            state->TrueCount.SourceParams);
+        if (state->IsView)
+            state->FalseViewOwns = TernaryArrayArmRuntimeOwns(falseValue);
+        if (state->IsView)
+            state->ViewAlwaysOwns = state->TrueViewMayOwn && state->FalseViewMayOwn
+                && compilerLLVM->TernaryArmJoinsOwning(trueValue)
+                && compilerLLVM->TernaryArmJoinsOwning(falseValue);
+        return state;
+    }
+
+void MainListener::RegisterSelectArrayViewJoin(bool expectedIsView, llvm::Value* selectValue,
+        llvm::Value* selectCond, llvm::Value* trueValue, llvm::Value* falseValue,
+        const LLVMBackend::TypedValue& trueShape,
+        const LLVMBackend::TypedValue& falseShape)
+{
+        if (selectValue == nullptr || !selectValue->getType()->isPointerTy()) return;
+        auto trueType = InferTernaryArmType(trueShape);
+        auto falseType = InferTernaryArmType(falseShape);
+        const bool viewArrayJoin = expectedIsView || trueShape.isArrayView || falseShape.isArrayView
+            || trueType.IsArrayView || falseType.IsArrayView;
+        if (!viewArrayJoin) return;
+
+        auto trueStorage = trueShape.receiverStorage != nullptr
+            ? trueShape.receiverStorage : trueShape.storage;
+        auto falseStorage = falseShape.receiverStorage != nullptr
+            ? falseShape.receiverStorage : falseShape.storage;
+        auto trueCount = GetTernaryArrayCountState(trueValue, trueStorage, trueShape);
+        auto falseCount = GetTernaryArrayCountState(falseValue, falseStorage, falseShape);
+        auto* trueCountValue = trueCount.Count != nullptr
+            ? compilerLLVM->Upconvert(trueCount.Count, compilerLLVM->builder->getInt64Ty())
+            : static_cast<llvm::Value*>(compilerLLVM->builder->getInt64(-1));
+        auto* falseCountValue = falseCount.Count != nullptr
+            ? compilerLLVM->Upconvert(falseCount.Count, compilerLLVM->builder->getInt64Ty())
+            : static_cast<llvm::Value*>(compilerLLVM->builder->getInt64(-1));
+        auto* selectedCount = compilerLLVM->CreateSelect(
+            selectCond, falseCountValue, trueCountValue);
+        for (size_t index : falseCount.SourceParams)
+            if (std::find(trueCount.SourceParams.begin(), trueCount.SourceParams.end(), index)
+                == trueCount.SourceParams.end())
+                trueCount.SourceParams.push_back(index);
+        compilerLLVM->RegisterRawArrayResult(selectValue, selectedCount, 0, false,
+            nullptr, true, trueCount.Known && falseCount.Known,
+            std::move(trueCount.SourceParams));
+    }
+
 /*
  * A parameter list reads its types from declarationSpecifiers alone and never evaluates a
  * fixed dimension, so `T[N] p` would silently become a scalar `T p` - the body then indexes a

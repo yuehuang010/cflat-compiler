@@ -117,7 +117,9 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
             && SRetArgIndex(*abiRecipe) == 0 && llvmArgIt != fn->arg_end())
             ++llvmArgIt;
         size_t abiParamIndex = 0;
-        for (; itr_nameArg != arguments.end() && llvmArgIt != fn->arg_end(); ++itr_nameArg)
+        size_t functionParamIndex = 0;
+        for (; itr_nameArg != arguments.end() && llvmArgIt != fn->arg_end();
+             ++itr_nameArg, ++functionParamIndex)
         {
             if (abiRecipe != nullptr && abiParamIndex == 1 && SRetArgIndex(*abiRecipe) == 1)
                 ++llvmArgIt;   // the hidden sret slot sits behind `this`
@@ -254,6 +256,10 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     ? static_cast<llvm::Value*>(rawArrayCountArg)
                     : static_cast<llvm::Value*>(builder->getInt64(-1)),
                     namedVar.RawArrayLengthStorage);
+                RawArrayLengthState lengthState{ !itr_nameArg->IsArrayView, true, {} };
+                if (itr_nameArg->IsArrayView)
+                    lengthState.SourceParams.push_back(functionParamIndex);
+                SetRawArrayLengthStateForStorage(namedVar.Storage, lengthState);
                 namedVar.AllocatedByRawNewArray = true;
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
@@ -366,6 +372,16 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 {
                     namedVar.IsBorrowed = true;
                     namedVar.BorrowedOrigin = itr_nameArg->VariableName;
+                }
+                if (itr_nameArg->IsArrayView && rawArrayCountArg != nullptr)
+                {
+                    namedVar.RawArrayLengthStorage = AllocaAtEntry(
+                        builder->getInt64Ty(), nullptr,
+                        itr_nameArg->VariableName + ".raw_array_count");
+                    builder->CreateStore(rawArrayCountArg, namedVar.RawArrayLengthStorage);
+                    RawArrayLengthState lengthState{ false, true, {} };
+                    lengthState.SourceParams.push_back(functionParamIndex);
+                    SetRawArrayLengthStateForStorage(namedVar.Storage, lengthState);
                 }
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
@@ -2053,6 +2069,77 @@ void LLVMBackend::ZeroMovedSource(llvm::Value* storage, llvm::Type* type)
         if (size == 0) return;
         builder->CreateMemSet(storage, builder->getInt8(0), builder->getInt64(size), llvm::Align(1));
     }
+
+void LLVMBackend::ClearMovableTempField(llvm::Type* parentType, llvm::Value* parentStorage,
+        llvm::Value* fieldIndex, llvm::Type* fieldType, bool clearConditionalOwners)
+{
+        if (builder == nullptr || parentStorage == nullptr || fieldType == nullptr) return;
+        if (fieldIndex == nullptr)
+        {
+            LogError("internal compiler error: movable temporary field has invalid index metadata");
+            return;
+        }
+        auto clearAt = [&](llvm::Value* storage) {
+            llvm::Value* sourceField = nullptr;
+            if (auto* parentStruct = llvm::dyn_cast_or_null<llvm::StructType>(parentType))
+            {
+                auto* constantIndex = llvm::dyn_cast<llvm::ConstantInt>(fieldIndex);
+                if (constantIndex == nullptr || constantIndex->getZExtValue() >= parentStruct->getNumElements()
+                    || parentStruct->getElementType(static_cast<unsigned>(constantIndex->getZExtValue())) != fieldType)
+                {
+                    LogError("internal compiler error: movable temporary field type does not match its struct slot");
+                    return;
+                }
+                sourceField = builder->CreateStructGEP(
+                    parentStruct, storage, static_cast<unsigned>(constantIndex->getZExtValue()), "movedfld");
+            }
+            else if (auto* parentArray = llvm::dyn_cast_or_null<llvm::ArrayType>(parentType))
+            {
+                if (parentArray->getElementType() != fieldType)
+                {
+                    LogError("internal compiler error: movable temporary field type does not match its array element");
+                    return;
+                }
+                sourceField = builder->CreateGEP(parentArray, storage,
+                    { builder->getInt32(0), fieldIndex }, "movedfld");
+            }
+            else
+            {
+                LogError("internal compiler error: movable temporary parent is neither a struct nor an array");
+                return;
+            }
+            builder->CreateStore(llvm::Constant::getNullValue(fieldType), sourceField);
+        };
+
+        clearAt(parentStorage);
+        if (!clearConditionalOwners) return;
+
+        std::vector<llvm::GetElementPtrInst*> parentPath;
+        llvm::Value* rootStorage = parentStorage;
+        while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(rootStorage))
+        {
+            parentPath.push_back(gep);
+            rootStorage = gep->getPointerOperand();
+        }
+        auto* rootAlloca = llvm::dyn_cast<llvm::AllocaInst>(rootStorage);
+        if (rootAlloca == nullptr) return;
+        for (llvm::Value* owner : FindPendingStructTempOwnersOf(rootStorage))
+        {
+            auto* ownerAlloca = llvm::dyn_cast<llvm::AllocaInst>(owner);
+            if (ownerAlloca == nullptr || ownerAlloca == rootAlloca
+                || ownerAlloca->getAllocatedType() != rootAlloca->getAllocatedType())
+                continue;
+            llvm::Value* mappedStorage = ownerAlloca;
+            for (auto it = parentPath.rbegin(); it != parentPath.rend(); ++it)
+            {
+                std::vector<llvm::Value*> indices;
+                for (llvm::Value* index : (*it)->indices()) indices.push_back(index);
+                mappedStorage = builder->CreateGEP((*it)->getSourceElementType(), mappedStorage,
+                    indices, "movedfld.parent");
+            }
+            clearAt(mappedStorage);
+        }
+}
 
 bool LLVMBackend::CFlatExternOwnsByValueParam(const TypeAndValue& p)
 {

@@ -1245,6 +1245,27 @@ void LLVMBackend::MarkVariableOwningString(const std::string& name)
         }
     }
 
+LLVM_ATTRIBUTE_NOINLINE void MergeStackCharBufferBorrowState(
+    LLVMBackend::NamedVariable& variable,
+    const LLVMBackend::MovedStateSnapshot::StackCharBufferBorrowState& first,
+    const LLVMBackend::MovedStateSnapshot::StackCharBufferBorrowState& second)
+{
+        const LLVMBackend::MovedStateSnapshot::StackCharBufferBorrowState* borrowed = nullptr;
+        if (first.borrowed) borrowed = &first;
+        if (second.borrowed && (borrowed == nullptr
+            || second.scopeDepth > borrowed->scopeDepth))
+            borrowed = &second;
+        variable.StackCharBufferBorrow = borrowed != nullptr;
+        variable.StackCharBufferSource = borrowed != nullptr ? borrowed->source : std::string();
+        variable.StackCharBufferScopeDepth = borrowed != nullptr ? borrowed->scopeDepth : 0;
+    }
+
+LLVM_ATTRIBUTE_NOINLINE LLVMBackend::MovedStateSnapshot::VariableStateKey MakeMovedStateKey(
+    const LLVMBackend::NamedVariable& variable, const std::string& name)
+{
+        return {variable.Storage, variable.Storage == nullptr ? name : std::string()};
+    }
+
 LLVMBackend::MovedStateSnapshot LLVMBackend::SaveMovedState() const
 {
         MovedStateSnapshot state;
@@ -1255,14 +1276,22 @@ LLVMBackend::MovedStateSnapshot LLVMBackend::SaveMovedState() const
                 state.moved[name] = nv.IsMoved;
                 state.pointeeMoved[name] = nv.PointeeMove;
                 state.pointeeMoveBlocks[name] = nv.PointeeMoveBlock;
-                state.movedFields[name] = nv.MovedFields;
+                auto& variableState = state.variableStates[MakeMovedStateKey(nv, name)];
+                variableState.movedFields = nv.MovedFields;
+                if (nv.StackCharBufferBorrow)
+                    variableState.stackCharBufferBorrow = {
+                        true, nv.StackCharBufferSource, nv.StackCharBufferScopeDepth};
             }
             for (const auto& [name, nv] : frame.namedVariable)
             {
                 state.moved[name] = nv.IsMoved;
                 state.pointeeMoved[name] = nv.PointeeMove;
                 state.pointeeMoveBlocks[name] = nv.PointeeMoveBlock;
-                state.movedFields[name] = nv.MovedFields;
+                auto& variableState = state.variableStates[MakeMovedStateKey(nv, name)];
+                variableState.movedFields = nv.MovedFields;
+                if (nv.StackCharBufferBorrow)
+                    variableState.stackCharBufferBorrow = {
+                        true, nv.StackCharBufferSource, nv.StackCharBufferScopeDepth};
             }
         }
         return state;
@@ -1277,8 +1306,23 @@ void LLVMBackend::RestoreMovedState(const MovedStateSnapshot& state)
                 nv.PointeeMove = it->second;
             if (auto it = state.pointeeMoveBlocks.find(name); it != state.pointeeMoveBlocks.end())
                 nv.PointeeMoveBlock = it->second;
-            if (auto it = state.movedFields.find(name); it != state.movedFields.end())
-                nv.MovedFields = it->second;
+            if (auto it = state.variableStates.find(MakeMovedStateKey(nv, name));
+                it != state.variableStates.end())
+            {
+                nv.MovedFields = it->second.movedFields;
+                if (it->second.stackCharBufferBorrow.borrowed)
+                {
+                    nv.StackCharBufferBorrow = true;
+                    nv.StackCharBufferSource = it->second.stackCharBufferBorrow.source;
+                    nv.StackCharBufferScopeDepth = it->second.stackCharBufferBorrow.scopeDepth;
+                }
+                else if (nv.StackCharBufferBorrow)
+                {
+                    nv.StackCharBufferBorrow = false;
+                    nv.StackCharBufferSource.clear();
+                    nv.StackCharBufferScopeDepth = 0;
+                }
+            }
         };
         for (auto& frame : stackNamedVariable)
         {
@@ -1314,14 +1358,46 @@ void LLVMBackend::MergeMovedStateInto(const MovedStateSnapshot& state)
                         nv.PointeeMoveBlock = otherPointeeBlock;
                 }
             }
-            if (auto it = state.movedFields.find(name); it != state.movedFields.end())
-                nv.MovedFields = movedf::MergeFieldPaths(nv.MovedFields, it->second);
+            if (auto it = state.variableStates.find(MakeMovedStateKey(nv, name));
+                it != state.variableStates.end())
+            {
+                nv.MovedFields = movedf::MergeFieldPaths(
+                    nv.MovedFields, it->second.movedFields);
+                if (it->second.stackCharBufferBorrow.borrowed)
+                {
+                    const MovedStateSnapshot::StackCharBufferBorrowState current{
+                        nv.StackCharBufferBorrow, nv.StackCharBufferSource,
+                        nv.StackCharBufferScopeDepth};
+                    MergeStackCharBufferBorrowState(
+                        nv, current, it->second.stackCharBufferBorrow);
+                }
+            }
         };
         for (auto& frame : stackNamedVariable)
         {
             for (auto& [name, nv] : frame.functionArgument) mergeOne(name, nv);
             for (auto& [name, nv] : frame.namedVariable) mergeOne(name, nv);
         }
+    }
+
+void LLVMBackend::PushMovedStateMergeSnapshot()
+{
+        if (!movedStateMergeStack_)
+            movedStateMergeStack_ = std::make_unique<std::vector<MovedStateSnapshot>>();
+        movedStateMergeStack_->push_back(SaveMovedState());
+    }
+
+void LLVMBackend::MergeMovedStateMergeSnapshot()
+{
+        if (!movedStateMergeStack_ || movedStateMergeStack_->empty()) return;
+        MergeMovedStateInto(movedStateMergeStack_->back());
+        movedStateMergeStack_->pop_back();
+    }
+
+void LLVMBackend::DiscardMovedStateMergeSnapshot()
+{
+        if (movedStateMergeStack_ && !movedStateMergeStack_->empty())
+            movedStateMergeStack_->pop_back();
     }
 
 void LLVMBackend::MergeMovedStates(const MovedStateSnapshot& thenState,
@@ -1363,10 +1439,25 @@ void LLVMBackend::MergeMovedStates(const MovedStateSnapshot& thenState,
                 nv.PointeeMove = false;
                 nv.PointeeMoveBlock = nullptr;
             }
-            auto tf = thenState.movedFields.find(name);
-            auto ef = elseState.movedFields.find(name);
-            if (tf != thenState.movedFields.end() && ef != elseState.movedFields.end())
-                nv.MovedFields = movedf::MergeFieldPaths(tf->second, ef->second);
+            auto tf = thenState.variableStates.find(MakeMovedStateKey(nv, name));
+            auto ef = elseState.variableStates.find(MakeMovedStateKey(nv, name));
+            if (tf != thenState.variableStates.end()
+                && ef != elseState.variableStates.end())
+            {
+                nv.MovedFields = movedf::MergeFieldPaths(
+                    tf->second.movedFields, ef->second.movedFields);
+                if (tf->second.stackCharBufferBorrow.borrowed
+                    || ef->second.stackCharBufferBorrow.borrowed)
+                    MergeStackCharBufferBorrowState(
+                        nv, tf->second.stackCharBufferBorrow,
+                        ef->second.stackCharBufferBorrow);
+                else if (nv.StackCharBufferBorrow)
+                {
+                    nv.StackCharBufferBorrow = false;
+                    nv.StackCharBufferSource.clear();
+                    nv.StackCharBufferScopeDepth = 0;
+                }
+            }
         };
         for (auto& frame : stackNamedVariable)
         {
@@ -1405,6 +1496,14 @@ LLVMBackend::NamedVariable LLVMBackend::GetGlobalVariableNV(const std::string& n
             if (auto* value = llvm::dyn_cast<llvm::ValueAsMetadata>(length->getOperand(0));
                 value != nullptr)
                 nv.RawArrayLengthStorage = value->getValue();
+        if (auto* fixed = gIt->second->getMetadata("cflat.array-view.fixed");
+            fixed != nullptr && fixed->getNumOperands() == 1)
+            if (auto* value = llvm::dyn_cast<llvm::MDString>(fixed->getOperand(0));
+                value != nullptr)
+            {
+                nv.ViewOfFixedArrayStorage = true;
+                nv.ViewOfFixedArraySourceName = value->getString().str();
+            }
 
         return nv;
     }
@@ -3008,8 +3107,11 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                         }
                         for (auto& [varName, nv] : frame.functionArgument)
                         {
-                            if (nv.Storage == srcAlloca && nv.IsOwningString
-                                && nv.TypeAndValue.IsConsumeInferredSink
+                            // A declared `move string` param owns its buffer (the call site
+                            // copies a non-owned argument), so `return (string)p` moves it too.
+                            if (nv.Storage == srcAlloca && !nv.TypeAndValue.Pointer
+                                && ((nv.IsOwningString && nv.TypeAndValue.IsConsumeInferredSink)
+                                    || nv.TypeAndValue.IsMove)
                                 && ResolveTypeAlias(nv.TypeAndValue.TypeName) == "string")
                             {
                                 ownedStringReturnVar = &nv;

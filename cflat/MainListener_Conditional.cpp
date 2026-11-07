@@ -4,6 +4,33 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include "MainListener_ExpressionsShared.h"
+
+namespace {
+class ShortCircuitMovedStateScope
+{
+public:
+    explicit ShortCircuitMovedStateScope(LLVMBackend* compiler) : compiler_(compiler)
+    {
+        compiler_->PushMovedStateMergeSnapshot();
+    }
+
+    ~ShortCircuitMovedStateScope()
+    {
+        if (compiler_ != nullptr) compiler_->DiscardMovedStateMergeSnapshot();
+    }
+
+    void Merge()
+    {
+        if (compiler_ == nullptr) return;
+        compiler_->MergeMovedStateMergeSnapshot();
+        compiler_ = nullptr;
+    }
+
+private:
+    LLVMBackend* compiler_;
+};
+}
+
 llvm::Value* MainListener::BoxTernaryThinArmToInterface(llvm::Value* thinValue, const std::string& interfaceName,
                                               std::string& armFailure) {
         auto* compiler = compilerLLVM;
@@ -112,6 +139,16 @@ static void JoinConditionalStackCharBufferBorrow(LLVMBackend::TypedValue& result
         falseArm.stackCharBufferBorrow ? falseArm.stackCharBufferScopeDepth : 0);
 }
 
+// A `move x` ternary arm: the moved value, carrying any stack-buffer borrow of a nested ?:.
+LLVM_ATTRIBUTE_NOINLINE LLVMBackend::TypedValue MainListener::ParseTernaryMoveArm(
+        CFlatParser::MoveExpressionContext* moveCtx, antlr4::ParserRuleContext* armCtx) {
+        auto named = ParseMoveExpression(moveCtx);
+        auto value = TypedValueOfNamedOperand(named, armCtx);
+        ProcessPlusPlus();
+        CarryNestedTernaryBorrow(Compiler(armCtx), value);
+        return value;
+}
+
 // A ternary arm parsed for its VALUE. Same lowering as ParseExpression (which forwards a
 // non-assignment expression straight to ParseConditionalExpression), but it keeps the arm's
 // signedness so the join can zero-extend an unsigned arm instead of sign-extending it.
@@ -119,6 +156,9 @@ LLVM_ATTRIBUTE_NOINLINE LLVMBackend::TypedValue MainListener::ParseTernaryArmExp
         CFlatParser::ExpressionContext* ctx) {
         auto* assignCtx = ctx->assignmentExpression();
         auto* bareIdentifier = BareIdentifierInExpression(ctx);
+        if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr)
+            if (auto* move = TopLevelMoveExpression(ctx))
+                return ParseTernaryMoveArm(move, ctx);
         if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr
             && assignCtx->conditionalExpression() != nullptr
             && bareIdentifier == nullptr)
@@ -1740,6 +1780,7 @@ bool MainListener::CollectOwningLocalPointerArm(const LLVMBackend::TypedValue& s
         return false;
     out.push_back({ storage, value->getType(), armBlock, sourceName, std::string(), false, true });
     out.back().MoveParamSinkArgument = inCallArgument_;
+    out.back().IsExplicitMove = shape.isExplicitMove;
     return true;
 }
 
@@ -1777,6 +1818,7 @@ bool MainListener::CollectBorrowedPointerArm(const LLVMBackend::TypedValue& shap
         recorded.BorrowedPointer = true;
         recorded.BorrowedOrigin = source->OwningLocalOrigin;
         recorded.BorrowedFromOwningLocal = true;
+        recorded.IsExplicitMove = shape.isExplicitMove;
         return true;
     }
     if (!(source->IsBorrowed || source->IsAliasBorrow || source->TypeAndValue.IsAlias
@@ -1788,6 +1830,7 @@ bool MainListener::CollectBorrowedPointerArm(const LLVMBackend::TypedValue& shap
     recorded.MoveParamSinkArgument = true;
     recorded.BorrowedPointer = true;
     recorded.BorrowedOrigin = directBorrowParam ? sourceName : source->BorrowedOrigin;
+    recorded.IsExplicitMove = shape.isExplicitMove;
     return true;
 }
 
@@ -2128,6 +2171,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     auto named = ParseIdentifier(identifier);
                     return TypedValueOfNamedOperand(named, arm);
                 }
+            if (auto* move = TopLevelMoveExpression(arm))
+                return ParseTernaryMoveArm(move, arm);
             auto value = ParseConditionalExpression(arm, nestedArmUse(arm));
             CarryNestedTernaryBorrow(compiler, value);
             if (isFunctionValueDestination(destination) && value.value != nullptr
@@ -4565,89 +4610,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (!falseOwnedString) { atFalse(); falseValue = AdoptTernaryStringArm(compiler, falseValue, falseOwnedString); }
             ownedString = trueOwnedString && falseOwnedString;
         }
-        bool trueRawArray = compiler->IsRawArrayResult(trueValue);
-        bool falseRawArray = compiler->IsRawArrayResult(falseValue);
-        auto isViewArm = [&](llvm::Value* value, const LLVMBackend::TypedValue& shape) {
-            if (const auto* raw = compiler->FindRawArrayResult(value);
-                raw != nullptr && !raw->IsArrayView) return false;
-            return shape.isArrayView
-                || (shape.hasSourceType && shape.sourceType.IsArrayView);
-        };
-        const bool viewArrayJoin = outerExpected.IsArrayView
-            || isViewArm(trueValue, trueShape) || isViewArm(falseValue, falseShape);
-        auto armMayOwn = [&](llvm::Value* value) {
-            if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
-                constant != nullptr && constant->isNullValue()) return false;
-            return compiler->IsRawArrayResult(value)
-                ? compiler->RawArrayResultMayOwn(value)
-                : compiler->TernaryArmJoinsOwning(value);
-        };
-        bool trueViewArmMayOwn = false;
-        bool falseViewArmMayOwn = false;
-        bool viewJoinMayOwn = false;
-        if (viewArrayJoin)
-        {
-            trueViewArmMayOwn = armMayOwn(trueValue);
-            falseViewArmMayOwn = armMayOwn(falseValue);
-            viewJoinMayOwn = trueViewArmMayOwn || falseViewArmMayOwn;
-        }
-        bool rawArrayJoin = viewArrayJoin ? viewJoinMayOwn
-            : ((trueRawArray || falseRawArray)
-                && compiler->TernaryArmJoinsOwning(trueValue)
-                && compiler->TernaryArmJoinsOwning(falseValue));
-        llvm::Value* trueRawCount = nullptr;
-        llvm::Value* falseRawCount = nullptr;
-        llvm::Value* trueViewOwns = nullptr;
-        llvm::Value* falseViewOwns = nullptr;
-        bool viewJoinAlwaysOwns = false;
-        if (rawArrayJoin)
-        {
-            auto* i64Ty = compiler->builder->getInt64Ty();
-            auto armCount = [&](llvm::Value* value, llvm::Value* storage,
-                                const LLVMBackend::TypedValue& shape) {
-                if (const auto* raw = compiler->FindRawArrayResult(value);
-                    raw != nullptr && raw->Count != nullptr)
-                    return compiler->Upconvert(raw->Count, i64Ty);
-                LLVMBackend::NamedVariable* source = storage != nullptr
-                    ? compiler->FindStackVariableByStorage(storage) : nullptr;
-                if (source == nullptr && storage != nullptr)
-                    source = compiler->FindStackArgumentByStorage(storage);
-                if (source != nullptr && source->TypeAndValue.ConstArraySize > 0)
-                    return static_cast<llvm::Value*>(compiler->builder->getInt64(
-                        source->TypeAndValue.ConstArraySize));
-                if (source != nullptr && source->TypeAndValue.IsArrayView)
-                    if (auto* count = compiler->LoadRawArrayLength(*source))
-                        return compiler->Upconvert(count, i64Ty);
-                if (shape.hasSourceType && shape.sourceType.ConstArraySize > 0)
-                    return static_cast<llvm::Value*>(compiler->builder->getInt64(
-                        shape.sourceType.ConstArraySize));
-                return static_cast<llvm::Value*>(compiler->builder->getInt64(-1));
-            };
-            auto armRuntimeOwns = [&](llvm::Value* value) {
-                if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
-                    constant != nullptr && constant->isNullValue())
-                    return static_cast<llvm::Value*>(compiler->builder->getInt1(false));
-                if (const auto* raw = compiler->FindRawArrayResult(value); raw != nullptr)
-                {
-                    if (raw->RuntimeOwns != nullptr) return raw->RuntimeOwns;
-                    return static_cast<llvm::Value*>(compiler->builder->getInt1(raw->Owns));
-                }
-                return static_cast<llvm::Value*>(compiler->builder->getInt1(
-                    compiler->TernaryArmJoinsOwning(value)));
-            };
-            atTrue();
-            trueRawCount = armCount(trueValue, trueStorage, trueShape);
-            if (viewArrayJoin) trueViewOwns = armRuntimeOwns(trueValue);
-            atFalse();
-            falseRawCount = armCount(falseValue, falseStorage, falseShape);
-            if (viewArrayJoin) falseViewOwns = armRuntimeOwns(falseValue);
-            if (viewArrayJoin)
-            {
-                viewJoinAlwaysOwns = trueViewArmMayOwn && falseViewArmMayOwn
-                    && compiler->TernaryArmJoinsOwning(trueValue)
-                    && compiler->TernaryArmJoinsOwning(falseValue);
-            }
-        }
+        std::unique_ptr<TernaryArrayJoinState> rawJoinData;
+        rawJoinData = PrepareTernaryArrayJoinState(
+            trueValue, falseValue, trueStorage, falseStorage, trueShape, falseShape,
+            atTrue, atFalse);
+        const bool rawArrayJoin = rawJoinData != nullptr;
         // A named function arm becomes its thin pointer BEFORE the join: after the PHI the Function
         // (and so its signature) is gone. The function's own signature is the arm's type here.
         atTrue();
@@ -4921,8 +4888,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         {
             auto* countPhi = compiler->builder->CreatePHI(
                 compiler->builder->getInt64Ty(), 2, "raw_array_count_join");
-            countPhi->addIncoming(trueRawCount, trueEnd);
-            countPhi->addIncoming(falseRawCount, falseEnd);
+            countPhi->addIncoming(rawJoinData->TrueCount.Count, trueEnd);
+            countPhi->addIncoming(rawJoinData->FalseCount.Count, falseEnd);
             auto allocAlignOf = [&](llvm::Value* value) {
                 if (const auto* raw = compiler->FindRawArrayResult(value))
                     return raw->AllocAlign;
@@ -4936,26 +4903,36 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             };
             uint64_t trueAlign = allocAlignOf(trueValue);
             uint64_t falseAlign = allocAlignOf(falseValue);
-            if (viewArrayJoin ? (viewJoinAlwaysOwns && !isNull(trueValue)
+            if (rawJoinData->IsView ? (rawJoinData->ViewAlwaysOwns && !isNull(trueValue)
                     && !isNull(falseValue) && trueAlign != falseAlign)
                 : (!isNull(trueValue) && !isNull(falseValue) && trueAlign != falseAlign))
                 LogErrorContext(ctx, "cannot join owning pointer allocations with different "
                     "alignment; use the same 'alignas' on every allocating arm");
-            uint64_t commonAlign = viewArrayJoin
-                ? (trueViewArmMayOwn ? trueAlign : falseAlign)
+            uint64_t commonAlign = rawJoinData->IsView
+                ? (rawJoinData->TrueViewMayOwn ? trueAlign : falseAlign)
                 : (isNull(trueValue) ? falseAlign : trueAlign);
-            if (viewArrayJoin)
+            if (rawJoinData->IsView)
             {
-                if (viewJoinMayOwn)
+                if (rawJoinData->ViewMayOwn)
                 {
                     auto* ownsPhi = compiler->builder->CreatePHI(
                         compiler->builder->getInt1Ty(), 2, "view_ternary_owns");
-                    ownsPhi->addIncoming(trueViewOwns, trueEnd);
-                    ownsPhi->addIncoming(falseViewOwns, falseEnd);
+                    ownsPhi->addIncoming(rawJoinData->TrueViewOwns, trueEnd);
+                    ownsPhi->addIncoming(rawJoinData->FalseViewOwns, falseEnd);
                     compiler->RegisterRawArrayResult(
-                        phi, countPhi, commonAlign, viewJoinAlwaysOwns, ownsPhi, true);
+                        phi, countPhi, commonAlign, rawJoinData->ViewAlwaysOwns, ownsPhi, true,
+                        rawJoinData->TrueCount.Known && rawJoinData->FalseCount.Known,
+                        rawJoinData->TrueCount.SourceParams);
                 }
+                else
+                    compiler->RegisterRawArrayResult(phi, countPhi, commonAlign, false,
+                        nullptr, true, rawJoinData->TrueCount.Known
+                            && rawJoinData->FalseCount.Known, rawJoinData->TrueCount.SourceParams);
             }
+            else if (rawJoinData->IsFixed)
+                compiler->RegisterRawArrayResult(phi, countPhi, 0, false, nullptr, false,
+                    rawJoinData->TrueCount.Known && rawJoinData->FalseCount.Known,
+                    rawJoinData->TrueCount.SourceParams);
             else
                 compiler->RegisterRawArrayResult(phi, countPhi, commonAlign);
         }
@@ -4970,6 +4947,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
             compiler->lastCallReturnsOwned = true;
             LLVMBackend::TypedValue result{ phi, true };
+            // Arm copies into owned storage do not carry the source stack borrow through the join.
+            if (!bothArmsMoved)
+            {
+                if (trueOwnedString) trueShape.stackCharBufferBorrow = false;
+                if (falseOwnedString) falseShape.stackCharBufferBorrow = false;
+            }
+            JoinConditionalStackCharBufferBorrow(result, trueShape, falseShape);
             result.isAlias = (trueAlias || falseAlias) && !cxxRefBorrowJoin;
             result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
             result.receiverStorage = cxxLvalueStorageJoin;
@@ -5343,6 +5327,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         shape.sourceMovePathHasDynamicIndex;
                     result.conditionalMoveSources.back().PointeeMove = shape.sourceIsPointeeMove;
                     result.conditionalMoveSources.back().MoveParamSinkArgument = true;
+                    result.conditionalMoveSources.back().IsExplicitMove = shape.isExplicitMove;
                     markThisSources(result.conditionalMoveSources.size() - 1);
                     return;
                 }
@@ -5358,6 +5343,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 shape.sourceMovePathHasDynamicIndex;
             result.conditionalMoveSources.back().PointeeMove = shape.sourceIsPointeeMove;
             result.conditionalMoveSources.back().MoveParamSinkArgument = inCallArgument_;
+            result.conditionalMoveSources.back().IsExplicitMove = shape.isExplicitMove;
             markThisSources(result.conditionalMoveSources.size() - 1);
         };
         collectConditionalMoveSources(trueShape, trueValue, trueStorage, trueEnd,
@@ -5425,6 +5411,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     auto named = ParseIdentifier(identifier);
                     return TypedValueOfNamedOperand(named, arm);
                 }
+            if (auto* move = TopLevelMoveExpression(arm))
+                return ParseTernaryMoveArm(move, arm);
             auto value = ParseConditionalExpression(arm, use);
             CarryNestedTernaryBorrow(compiler, value);
             if (isFunctionValueDestination(destination) && value.value != nullptr
@@ -5679,6 +5667,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             }
             auto* resultAlloca = compiler->CreateAlloca(resultType);
             auto* rawCountAlloca = compiler->CreateAlloca(compiler->builder->getInt64Ty());
+            TernaryArrayCountState lhsCount;
+            TernaryArrayCountState rhsCount;
 
             auto* nullBlock = compiler->CreateBasicBlock("nullcoal_null");
             auto* notNullBlock = compiler->CreateBasicBlock("nullcoal_notnull");
@@ -5739,9 +5729,10 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             // A struct-join field lhs (an interface field, an explicit move) is still cleared here.
             if (lhsUniqueFieldRead && !rawUniqueJoin)
                 clearUniqueFieldRead(lhs, lhsStorage);
+            lhsCount = GetTernaryArrayCountState(lhs, lhsStorage, lhsTv);
             compiler->builder->CreateStore(
-                compiler->IsRawArrayResult(lhs)
-                    ? compiler->Upconvert(compiler->RawArrayCountOf(lhs), compiler->builder->getInt64Ty())
+                lhsCount.Available && lhsCount.Count != nullptr
+                    ? compiler->Upconvert(lhsCount.Count, compiler->builder->getInt64Ty())
                     : compiler->builder->getInt64(-1),
                 rawCountAlloca);
             auto* lhsBr = compiler->CreateJump(resumeBlock);
@@ -5947,9 +5938,10 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 compiler->CreateAssignment(rhs, resultAlloca);
                 if (rhsOwnsFallback)
                     compiler->builder->CreateStore(rhs, fallbackOwner.Slot);
+                rhsCount = GetTernaryArrayCountState(rhs, rhsStorage, rhsShape);
                 compiler->builder->CreateStore(
-                    compiler->IsRawArrayResult(rhs)
-                        ? compiler->Upconvert(compiler->RawArrayCountOf(rhs), compiler->builder->getInt64Ty())
+                    rhsCount.Available && rhsCount.Count != nullptr
+                        ? compiler->Upconvert(rhsCount.Count, compiler->builder->getInt64Ty())
                         : compiler->builder->getInt64(-1),
                     rawCountAlloca);
                 rhsPostfix.Flush();
@@ -6010,7 +6002,19 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         || compiler->IsRawArrayResult(rhs))
                     && compiler->TernaryArmJoinsOwning(lhs)
                     && compiler->TernaryArmJoinsOwning(rhs);
-                if (rawJoin)
+                auto lhsJoinType = InferTernaryArmType(lhsTv);
+                auto rhsJoinType = InferTernaryArmType(rhsShape);
+                auto isNullArm = [](llvm::Value* value,
+                                    const LLVMBackend::TypedValue& shape) {
+                    auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+                    return (constant != nullptr && constant->isNullValue())
+                        || (shape.hasSourceType && shape.sourceType.IsCxxNullptrT);
+                };
+                const bool viewArrayJoin = resultAlloca->getAllocatedType()->isPointerTy()
+                    && ((lhsJoinType.IsArrayView
+                            && (rhsJoinType.IsArrayView || isNullArm(rhs, rhsShape)))
+                        || (rhsJoinType.IsArrayView && isNullArm(lhs, lhsTv)));
+                if (rawJoin || viewArrayJoin)
                 {
                     auto allocAlignOf = [&](llvm::Value* value) {
                         if (const auto* raw = compiler->FindRawArrayResult(value))
@@ -6021,18 +6025,33 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     };
                     uint64_t lhsAlign = allocAlignOf(lhs);
                     uint64_t rhsAlign = allocAlignOf(rhs);
-                    auto* lhsConstant = llvm::dyn_cast_or_null<llvm::Constant>(lhs);
-                    bool lhsIsNull = lhsConstant != nullptr && lhsConstant->isNullValue();
-                    if (!lhsIsNull && lhsAlign != rhsAlign)
+                    bool lhsIsNull = isNullArm(lhs, lhsTv);
+                    if (rawJoin && !lhsIsNull && lhsAlign != rhsAlign)
                         LogErrorContext(ctx, "cannot join owning pointer allocations with different "
                             "alignment; use the same 'alignas' on every allocating arm");
-                    compiler->RegisterRawArrayResult(
-                        joined, compiler->builder->CreateLoad(
-                            compiler->builder->getInt64Ty(), rawCountAlloca,
-                            "raw_array_count_join"),
-                        lhsIsNull ? rhsAlign : lhsAlign);
-                    compiler->PropagateTernaryOwnership(
-                        lhs, rhs, joined, uniquePointerDestination);
+                    if (viewArrayJoin)
+                    {
+                        std::vector<size_t> countSources = lhsCount.SourceParams;
+                        for (size_t index : rhsCount.SourceParams)
+                            if (std::find(countSources.begin(), countSources.end(), index)
+                                == countSources.end())
+                                countSources.push_back(index);
+                        compiler->RegisterRawArrayResult(joined,
+                            compiler->builder->CreateLoad(compiler->builder->getInt64Ty(),
+                                rawCountAlloca, "raw_array_count_join"),
+                            lhsIsNull ? rhsAlign : lhsAlign, false, nullptr, true,
+                            lhsCount.Known && rhsCount.Known, std::move(countSources));
+                    }
+                    if (rawJoin)
+                    {
+                        compiler->RegisterRawArrayResult(
+                            joined, compiler->builder->CreateLoad(
+                                compiler->builder->getInt64Ty(), rawCountAlloca,
+                                "raw_array_count_join"),
+                            lhsIsNull ? rhsAlign : lhsAlign);
+                        compiler->PropagateTernaryOwnership(
+                            lhs, rhs, joined, uniquePointerDestination);
+                    }
                 }
             }
             // A blessed unique<X> join is a one-slot STRUCT, so the pointer-shaped ledgering
@@ -6109,6 +6128,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     result.conditionalMoveSources.push_back({ storage, value->getType(), armBlock,
                         sourceName, shape.sourceFieldName, false });
                     result.conditionalMoveSources.back().MoveParamSinkArgument = true;
+                    result.conditionalMoveSources.back().IsExplicitMove = shape.isExplicitMove;
                     markThisSources(result.conditionalMoveSources.size() - 1);
                 };
                 collectMoveSinkArm(lhsTv, lhs, lhsStorage, lhsBr->getParent());
@@ -6359,6 +6379,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 EnsureOperatorBoolForValue(condTv.value);
                 auto* selectCond = compiler->CoerceToBoolCondition(condTv.value);
                 auto* selectValue = compiler->CreateSelect(selectCond, falseValue, trueValue);
+                RegisterSelectArrayViewJoin(outerExpected.IsArrayView, selectValue, selectCond,
+                    trueValue, falseValue, trueShape, falseShape);
 
                 // Owning-string ternary: a branch that reads an owning string FIELD or a named
                 // owning local (`cond ? this.name : "-"`) yields a struct whose OWNED bit rides
@@ -6547,11 +6569,13 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
 
                     compiler->InitializeBlock(falseBlock, false);
                     OwnershipControlScope shortCircuitControlScope(compiler);
+                    ShortCircuitMovedStateScope preRhsMovedState(compiler);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     BranchPostfixScope rhsPostfix(this);  // runs only when the left side is false
                     llvm::Value* right = ParseCxxFoldOperand(compiler, [&] {
                         return ParseLogicalAndExpression(logicCtx, ResultUse::Value).value;
                     });
+                    preRhsMovedState.Merge();
                     EnsureOperatorBoolForValue(right);
                     right = compiler->CoerceToBoolCondition(right);
                     rhsPostfix.Flush();
@@ -6633,11 +6657,13 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
 
                     compiler->InitializeBlock(trueBlock, false);
                     OwnershipControlScope shortCircuitControlScope(compiler);
+                    ShortCircuitMovedStateScope preRhsMovedState(compiler);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     BranchPostfixScope rhsPostfix(this);  // runs only when the left side is true
                     llvm::Value* right = ParseCxxFoldOperand(compiler, [&] {
                         return ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value).value;
                     });
+                    preRhsMovedState.Merge();
                     EnsureOperatorBoolForValue(right);
                     right = compiler->CoerceToBoolCondition(right);
                     rhsPostfix.Flush();

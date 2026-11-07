@@ -8024,6 +8024,93 @@ bool testFntypeSignatureRegressions()
     return result;
 }
 
+using Fntype2FunctionAlias = function<int(int)>;
+using Fntype2FunctionAlias2 = Fntype2FunctionAlias;
+typedef function<int(int)> Fntype2FunctionTypedef;
+typedef Fntype2FunctionAlias Fntype2FunctionTypedef2;
+
+int fntype2Target(int x) { return x + 11; }
+int fntype2Outer(Fntype2FunctionAlias fn) { return fn(41); }
+Fntype2FunctionAlias fntype2Get(int x) { return fntype2Target; }
+int fntype2Generic<T>(function<int(T)> fn, T value) { return fn(value); }
+struct Fntype2FunctionBox { Fntype2FunctionAlias callback = default; };
+
+enum Fntype2Color : int { Fntype2Red = 1 };
+int fntype2Pick(Fntype2Color color) { return 101; }
+int fntype2Pick(int color) { return 202; }
+function<int(Fntype2Color)> fntype2PickColor = fntype2Pick;
+function<int(int)> fntype2PickInt = fntype2Pick;
+
+bool testFntype2FunctionAliases()
+{
+    bool result = true;
+    Fntype2FunctionAlias local = fntype2Target;
+    result &= Test("fntype2 alias local", local(41), 52);
+
+    Fntype2FunctionBox box = default;
+    box.callback = fntype2Target;
+    result &= Test("fntype2 alias field", box.callback(41), 52);
+
+    function<int(Fntype2FunctionAlias)> usingBinding = fntype2Outer;
+    function<int(Fntype2FunctionAlias2)> chainedBinding = fntype2Outer;
+    function<int(Fntype2FunctionTypedef)> typedefBinding = fntype2Outer;
+    function<int(Fntype2FunctionTypedef2)> typedefChainedBinding = fntype2Outer;
+    result &= Test("fntype2 using alias signature binding", usingBinding(fntype2Target), 52);
+    result &= Test("fntype2 alias-of-alias signature binding", chainedBinding(fntype2Target), 52);
+    result &= Test("fntype2 typedef alias signature binding", typedefBinding(fntype2Target), 52);
+    result &= Test("fntype2 typedef alias-of-alias signature binding",
+        typedefChainedBinding(fntype2Target), 52);
+
+    Lambda<int(Fntype2FunctionAlias)> lambda = (Fntype2FunctionAlias fn) => fn(41);
+    Lambda<int(Fntype2FunctionTypedef)> typedefLambda =
+        (Fntype2FunctionTypedef fn) => fn(41);
+    function<int(Fntype2FunctionAlias)> lambdaBinding =
+        (Fntype2FunctionAlias fn) => fn(41);
+    result &= Test("fntype2 alias inside Lambda signature", lambda(fntype2Target), 52);
+    result &= Test("fntype2 typedef alias inside Lambda signature",
+        typedefLambda(fntype2Target), 52);
+    result &= Test("fntype2 lambda function-value binding", lambdaBinding(fntype2Target), 52);
+
+    function<Fntype2FunctionAlias(int)> returned = fntype2Get;
+    function<Fntype2FunctionTypedef(int)> typedefReturned = fntype2Get;
+    result &= Test("fntype2 using alias return component", returned(0)(41), 52);
+    result &= Test("fntype2 typedef alias return component", typedefReturned(0)(41), 52);
+    result &= Test("fntype2 generic-substituted alias",
+        fntype2Generic<Fntype2FunctionAlias>(fntype2Outer, fntype2Target), 52);
+    return result;
+}
+
+bool testFntype2ExactOverloadBinding()
+{
+    bool result = true;
+    result &= Test("fntype2 exact enum overload binding",
+        fntype2PickColor(Fntype2Color.Fntype2Red), 101);
+    result &= Test("fntype2 exact int overload binding", fntype2PickInt(1), 202);
+    return result;
+}
+
+// A function-value view's element star is part of its type: 'FN[]' and 'FN*[]' mangle, print and
+// overload apart, and each call picks its own arm.
+int fnvsIncrement(int x) { return x + 3; }
+int fnvsValueView(function<int(int)>[] values) { return values[0](1); }
+int fnvsPointerView(function<int(int)>*[] values) { return (*values[0])(2); }
+int fnvsPick(function<int(int)>[] values) { return 10 + values[0](1); }
+int fnvsPick(function<int(int)>*[] values) { return 20 + (*values[0])(1); }
+
+bool testFnviewstarPointerViewElement()
+{
+    bool result = true;
+    function<int(int)> fn = fnvsIncrement;
+    function<int(int)>* p = &fn;
+    function<int(int)>[1] values = { fnvsIncrement };
+    function<int(int)>*[1] pointers = { p };
+    result &= Test("fnviewstar value view call", fnvsValueView(values), 4);
+    result &= Test("fnviewstar pointer view call", fnvsPointerView(pointers), 5);
+    result &= Test("fnviewstar overload value view picks [] arm", fnvsPick(values), 14);
+    result &= Test("fnviewstar overload pointer view picks *[] arm", fnvsPick(pointers), 24);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -8284,6 +8371,9 @@ extern int main(int argc, char** argv)
     total++; passed += testT512NamedClosureReturnSlots() ? 1 : 0;
     total++; passed += testFntypeAliasAcceptSet() ? 1 : 0;
     total++; passed += testFntypeSignatureRegressions() ? 1 : 0;
+    total++; passed += testFntype2FunctionAliases() ? 1 : 0;
+    total++; passed += testFntype2ExactOverloadBinding() ? 1 : 0;
+    total++; passed += testFnviewstarPointerViewElement() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

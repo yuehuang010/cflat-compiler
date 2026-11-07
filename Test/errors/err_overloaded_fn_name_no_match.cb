@@ -8,6 +8,10 @@ int n65DerefOverload(int value) { return value; }
 int n65DerefOverload(double value) { return 50; }
 int n65AutoOverload(int value) { return value; }
 int n65AutoOverload(float value) { return (int)value; }
+enum Fntype2AmbA : int { Fntype2AmbAValue = 1 };
+enum Fntype2AmbB : int { Fntype2AmbBValue = 2 };
+int fntype2Amb(Fntype2AmbA value) { return 1; }
+int fntype2Amb(Fntype2AmbB value) { return 2; }
 
 expect_error("no overload of 'n65NoMatch' matches function type 'void(double)'") {
     struct N65FieldNoMatch { function<void(double)> callback = n65NoMatch; };
@@ -54,6 +58,9 @@ extern int main()
     }
     expect_error("no overload of 'n65NoMatch' matches function type 'void(double)'") {
         function<void(double)>[] callbacks = { n65NoMatch };
+    }
+    expect_error("ambiguous overload of") {
+        function<int(int)> callback = fntype2Amb;
     }
     return 0;
 }
