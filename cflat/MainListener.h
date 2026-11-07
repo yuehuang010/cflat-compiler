@@ -122,6 +122,9 @@ bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContext* spec
 
 std::string ImportProgramAlias(CFlatParser::ImportDeclarationContext* imp);
 
+std::string GenericFunctionTemplateSignature(
+    CFlatParser::FunctionDefinitionContext* function, LLVMBackend* compiler);
+
 std::string ImportNamespace(CFlatParser::ImportDeclarationContext* imp);
 
 template <typename Fn>
@@ -3559,7 +3562,7 @@ private:
     std::unordered_map<std::string, std::vector<std::string>>&                  genericInterfaceValueParams;
     std::unordered_set<std::string>&                                            instantiatedInterfaces;
 
-    std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>&   genericFunctionTemplates;
+    std::unordered_map<std::string, std::vector<CFlatParser::FunctionDefinitionContext*>>& genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericFunctionTypeParams;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericFunctionValueParams;
     std::unordered_set<std::string>&                                            instantiatedGenericFunctions;
@@ -4266,7 +4269,8 @@ public:
 
     // Instantiate a generic function template with concrete type arguments.
     // Returns the mangled name of the instantiated function, or empty string on failure.
-    std::string InstantiateGenericFunction(const std::string& baseName, const std::vector<std::string>& typeArgs);
+    std::string InstantiateGenericFunction(const std::string& baseName,
+        const std::vector<std::string>& typeArgs, size_t candidateIndex = 0);
 
     // Infer the type arguments for a generic function template from the receiver's
     // interface type name (e.g. "Container__int" -> T="int") and instantiate it.
@@ -4279,11 +4283,23 @@ public:
                                                const std::vector<LLVMBackend::NamedVariable>& args,
                                                CFlatParser::ArgumentExpressionListContext* argList = nullptr,
                                                std::vector<std::string>* deducedParameterTypes = nullptr,
-                                               bool instantiate = true);
+                                               bool instantiate = true,
+                                               std::string* refusal = nullptr);
+    std::string TryInferAndInstantiateFromArgsCandidate(const std::string& funcName,
+        size_t candidateIndex, const std::vector<LLVMBackend::NamedVariable>& args,
+        CFlatParser::ArgumentExpressionListContext* argList,
+        std::vector<std::string>* deducedParameterTypes,
+        std::vector<std::string>* deducedTypeArgs, bool instantiate,
+        std::vector<LLVMBackend::TypeAndValue>* deducedParameterValues = nullptr,
+        bool rejectDeductionConflicts = false);
+    std::string TryInferAndInstantiateFromFuncPtrCandidate(const std::string& funcName,
+        size_t candidateIndex, const LLVMBackend::TypeAndValue& destSig,
+        std::string& refusal);
 
     // Infer a bare function template's arguments from a function-pointer destination.
     std::string TryInferAndInstantiateFromFuncPtr(const std::string& funcName,
-        const LLVMBackend::TypeAndValue& destSig, std::string& refusal);
+        const LLVMBackend::TypeAndValue& destSig, std::string& refusal,
+        const std::vector<size_t>* allowedCandidateIndices = nullptr);
 
     std::vector<size_t> DeduceGenericFunctionCallbackCandidates(
         const std::string& funcName,
@@ -4850,6 +4866,8 @@ public:
     // Only covers the shapes OwnsDroppableResource recognizes (string, owning value struct); a
     // `unique T*` / unique-interface / closure global is NOT released here.
     void ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const std::string& name);
+    void ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx,
+                                const LLVMBackend::NamedVariable& global);
 
     // Recover ownership of a local/temp that was `move`d out of a container element slot. The slot
     // read demoted the element's `unique`-ness (a plain read hands out a borrow), so its TRUE
@@ -7657,6 +7675,10 @@ public:
         antlr4::tree::ParseTree* node);
 
     llvm::Value* ParseExpression(CFlatParser::ExpressionContext* ctx);
+    llvm::Value* ParseConditionExpression(CFlatParser::ExpressionContext* ctx);
+    // The one bool conversion of every condition position (C++ class operator bool on the object).
+    llvm::Value* ConvertConditionToBool(const LLVMBackend::TypedValue& tv);
+    llvm::Value* ConvertConditionToBool(llvm::Value* value);
 
     // A '?:' arm parsed for its value, keeping the arm's signedness for the join (see the
     // definition; the fallback is plain ParseExpression).

@@ -1513,6 +1513,10 @@ std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeNa
                 if (!floatingSource || param.TypeName == "bool" || param.IsInteger() == -1)
                     continue;
             }
+            // An integer null constant bound to a scalar reference is the zero of the referent: no narrowing.
+            if (best->ctor->params[i + 1].Pointer && !param.Pointer && param.IsInteger() != -1
+                && IsNullPointerConstantArgument(argVars[i], true))
+                continue;
             const ScalarArgConversion conv = ClassifyScalarArgConversion(argVars[i], param);
             if (conv != ScalarArgConversion::Narrow && conv != ScalarArgConversion::EnumMismatch)
                 continue;
@@ -2989,6 +2993,66 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             RequestCxxSignatureTypes(raw);
             CSigEntry mapped;
             if (!MapRawSig(raw, mapped)) continue;
+            // Signature demand normally needs only a declaration. A by-value nested class of a
+            // class-template specialization needs its owner's definition before it can be mapped.
+            if (stored.sourceBindRefusal.empty()
+                && (mapped.bindRefusal.find("return type '") != std::string::npos
+                    || mapped.bindRefusal.find("has unsupported C++ type '") != std::string::npos))
+            {
+                std::set<std::string> requestedOwners;
+                bool requestedDefinition = false;
+                auto requestNestedTypeDefinition = [&](const std::string& spelling) {
+                    std::string valueSpelling = spelling;
+                    while (!valueSpelling.empty()
+                           && std::isspace(static_cast<unsigned char>(valueSpelling.back())))
+                        valueSpelling.pop_back();
+                    if (valueSpelling.empty() || valueSpelling.back() == '*'
+                        || valueSpelling.back() == '&')
+                        return;
+                    const size_t open = valueSpelling.find('<');
+                    if (open == std::string::npos) return;
+                    int depth = 0;
+                    size_t close = std::string::npos;
+                    for (size_t i = open; i < valueSpelling.size(); ++i)
+                    {
+                        if (valueSpelling[i] == '<') ++depth;
+                        else if (valueSpelling[i] == '>' && --depth == 0)
+                        {
+                            close = i;
+                            break;
+                        }
+                    }
+                    if (close == std::string::npos
+                        || valueSpelling.compare(close + 1, 2, "::") != 0)
+                        return;
+                    while (valueSpelling.starts_with("const ")
+                           || valueSpelling.starts_with("volatile ")
+                           || valueSpelling.starts_with("class ")
+                           || valueSpelling.starts_with("struct ")
+                           || valueSpelling.starts_with("union "))
+                    {
+                        const size_t space = valueSpelling.find(' ');
+                        valueSpelling.erase(0, space + 1);
+                    }
+                    const std::string identity = CanonicalCxxForeignIdentity(valueSpelling);
+                    if (identity.empty() || !requestedOwners.insert(identity).second)
+                        return;
+                    std::string requestError;
+                    if (RequestCxxForeignType(identity, valueSpelling, requestError,
+                                              /*needDefinitions*/ true,
+                                              /*explicitInstantiation*/ true))
+                        requestedDefinition = true;
+                };
+                requestNestedTypeDefinition(raw.retType);
+                for (const std::string& spelling : raw.paramTypes)
+                    requestNestedTypeDefinition(spelling);
+                if (requestedDefinition)
+                {
+                    RequestCxxSignatureTypes(raw);
+                    CSigEntry rebound;
+                    if (MapRawSig(raw, rebound)) mapped = std::move(rebound);
+                }
+            }
             // A signature that is still unmappable keeps the wording of the refusal recorded at
             // import time: that one was built from the extractor's own parameter names, which a
             // remap from the stored spellings cannot reproduce.
@@ -3492,8 +3556,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 if (!bindRequestClass(classSpelling))
                     return fail(std::format("'{}' has no bindable C++ class type '{}'",
                                             cxxSpelling, classSpelling));
-                if (!bitcode.empty() && symbolSink_ == nullptr) AdoptCxxCompanionBitcode(bitcode);
             }
+            if (!bitcode.empty() && symbolSink_ == nullptr) AdoptCxxCompanionBitcode(bitcode);
             g.name = cflatName;
             g.qualifiedName = cflatName;
             g.type.VariableName = cflatName;
@@ -3723,8 +3787,11 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                                                      std::move(positive), /*allowDisk*/ true, nullptr);
                             return bindRequestEnumerator(rg.ctype, rg.constantValue);
                         }
-                        // A class-typed constant carries its symbol, never a folded value.
-                        const bool classConstant = !rg.isCompileTimeConstant && !rg.linkageName.empty();
+                        const bool hasObjectStorage = !rg.isCompileTimeConstant
+                            && !rg.linkageName.empty();
+                        // A class-typed object needs its record registered before its global;
+                        // scalar variable-template storage uses the same request result directly.
+                        const bool classConstant = hasObjectStorage && rg.isCxxClassObject;
                         if (classConstant && !bindRequestClass(rg.ctype))
                             return fail(std::format("'{}' has no bindable C++ class type '{}'",
                                                     cxxSpelling, rg.ctype));
@@ -3741,7 +3808,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                         }
                         // Header-owned storage (inline / constexpr): the definitions stage of
                         // this same request emits it, so a use links to the one real object.
-                        if (classConstant && rg.isCxxConstexpr)
+                        if (hasObjectStorage && rg.isCxxConstexpr)
                         {
                             llvm::TimeTraceScope stage2("CxxRequestStage2", cxxSpelling);
                             cflat_cinterop::ExtractResult emitted;

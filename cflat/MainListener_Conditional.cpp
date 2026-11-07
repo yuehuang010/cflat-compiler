@@ -4,6 +4,7 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include "MainListener_ExpressionsShared.h"
+#include "CxxSpelling.h"
 
 namespace {
 class ShortCircuitMovedStateScope
@@ -683,8 +684,7 @@ bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx
                 condPostfix->Flush();
                 condPostfix.reset();
                 if (condTv.value == nullptr) { ok = false; return {}; }
-                EnsureOperatorBoolForValue(condTv.value);
-                auto* condition = compiler->CoerceToBoolCondition(condTv.value);
+                auto* condition = compiler->CoerceToBoolCondition(ConvertConditionToBool(condTv));
                 compiler->FlushOwnedTempsSince(mark, nullptr, nullptr);
                 auto* trueBlock = compiler->CreateBasicBlock("cxx_ternary_sel_true");
                 auto* falseBlock = compiler->CreateBasicBlock("cxx_ternary_sel_false");
@@ -2578,9 +2578,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         auto* falseBlock  = compiler->CreateBasicBlock("ternary_false");
         auto* resumeBlock = compiler->CreateBasicBlock("ternary_resume");
 
-        EnsureOperatorBoolForValue(condTv.value);
         // Coerces a non-bool condition to i1; leaves the insert point in trueBlock.
-        compiler->CreateConditionJump(condTv.value, trueBlock, falseBlock);
+        compiler->CreateConditionJump(ConvertConditionToBool(condTv), trueBlock, falseBlock);
         // The block holding the branch dominates both arms AND the resume block - the one place
         // an arm's owning struct temp can be zeroed so it can outlive the arm (FinishTernaryArm).
         auto* branchBlock = trueBlock->getSinglePredecessor();
@@ -5083,6 +5082,18 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         result.arithNarrowWidth = LLVMBackend::ArithResultNarrowWidth(trueShape, falseShape);
         JoinTernaryPointerShape(result, trueShape, falseShape);
         JoinTernaryClassPointee(result, trueShape, falseShape);
+        // Same-class C++ arms: the joined object is const when either arm's object is (clang: a
+        // const arm makes the conditional a const lvalue), so a later conversion reads that const.
+        if (cxxRecordJoin && trueShape.hasSourceType && falseShape.hasSourceType
+            && !trueShape.sourceType.Pointer && !falseShape.sourceType.Pointer
+            && trueShape.sourceType.TypeName == falseShape.sourceType.TypeName
+            && (CxxTernaryArmConst(trueShape.sourceType) || CxxTernaryArmConst(falseShape.sourceType)))
+        {
+            result.sourceType = LLVMBackend::TypeAndValue{ .TypeName = trueShape.sourceType.TypeName };
+            result.sourceType.ConstMask = 1u;
+            result.sourceTypeName = result.sourceType.TypeName;
+            result.hasSourceType = true;
+        }
         auto trueType = trueShape.hasSourceType ? trueShape.sourceType : InferTernaryArmType(trueValue);
         auto falseType = falseShape.hasSourceType ? falseShape.sourceType : InferTernaryArmType(falseValue);
         auto recoverFunctionNameType = [&](const LLVMBackend::TypedValue& shape,
@@ -6436,8 +6447,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
                 // LLVM's select requires an i1 condition; a non-bool CFlat condition
                 // (int, char, pointer, float) must be lowered the same way if/while do.
-                EnsureOperatorBoolForValue(condTv.value);
-                auto* selectCond = compiler->CoerceToBoolCondition(condTv.value);
+                auto* selectCond = compiler->CoerceToBoolCondition(ConvertConditionToBool(condTv));
                 auto* selectValue = compiler->CreateSelect(selectCond, falseValue, trueValue);
                 RegisterSelectArrayViewJoin(outerExpected.IsArrayView, selectValue, selectCond,
                     trueValue, falseValue, trueShape, falseShape);
@@ -6550,11 +6560,10 @@ LLVMBackend::TypedValue MainListener::TryClassLogicalOperatorChain(
             {
                 // Past the first call the accumulator is the operator's own result (a bool for
                 // the usual C++ spelling), so the rest of the chain is the ordinary reduction.
-                EnsureOperatorBoolForValue(accumulator);
-                accumulator = compiler->CoerceToBoolCondition(accumulator);
-                llvm::Value* right = rv.value;
-                EnsureOperatorBoolForValue(right);
-                right = compiler->CoerceToBoolCondition(right);
+                accumulator = compiler->CoerceToBoolCondition(
+                    accumulator == first.value ? ConvertConditionToBool(first)
+                                               : ConvertConditionToBool(accumulator));
+                llvm::Value* right = compiler->CoerceToBoolCondition(ConvertConditionToBool(rv));
                 accumulator = compiler->CreateOperation(
                     op == "&&" ? LLVMBackend::Operation::LogicalAnd
                                : LLVMBackend::Operation::LogicalOr, accumulator, right);
@@ -6616,9 +6625,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
             {
                 if (left == nullptr)
                 {
-                    left = firstOperand.value;
-                    EnsureOperatorBoolForValue(left);
-                    left = compiler->CoerceToBoolCondition(left);
+                    left = compiler->CoerceToBoolCondition(ConvertConditionToBool(firstOperand));
                     compiler->CreateAssignment(left, resultStorage);
                 }
                 else
@@ -6632,12 +6639,11 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
                     ShortCircuitMovedStateScope preRhsMovedState(compiler);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     BranchPostfixScope rhsPostfix(this);  // runs only when the left side is false
-                    llvm::Value* right = ParseCxxFoldOperand(compiler, [&] {
-                        return ParseLogicalAndExpression(logicCtx, ResultUse::Value).value;
+                    auto rightOperand = ParseCxxFoldOperand(compiler, [&] {
+                        return ParseLogicalAndExpression(logicCtx, ResultUse::Value);
                     });
                     preRhsMovedState.Merge();
-                    EnsureOperatorBoolForValue(right);
-                    right = compiler->CoerceToBoolCondition(right);
+                    llvm::Value* right = compiler->CoerceToBoolCondition(ConvertConditionToBool(rightOperand));
                     rhsPostfix.Flush();
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalOr, left, right);
                     // The short-circuit block does not dominate resumeOR, so the end-of-statement
@@ -6704,9 +6710,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
             {
                 if (left == nullptr)
                 {
-                    left = firstOperand.value;
-                    EnsureOperatorBoolForValue(left);
-                    left = compiler->CoerceToBoolCondition(left);
+                    left = compiler->CoerceToBoolCondition(ConvertConditionToBool(firstOperand));
                     compiler->CreateAssignment(left, resultStorage);
                 }
                 else
@@ -6720,12 +6724,11 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
                     ShortCircuitMovedStateScope preRhsMovedState(compiler);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     BranchPostfixScope rhsPostfix(this);  // runs only when the left side is true
-                    llvm::Value* right = ParseCxxFoldOperand(compiler, [&] {
-                        return ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value).value;
+                    auto rightOperand = ParseCxxFoldOperand(compiler, [&] {
+                        return ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value);
                     });
                     preRhsMovedState.Merge();
-                    EnsureOperatorBoolForValue(right);
-                    right = compiler->CoerceToBoolCondition(right);
+                    llvm::Value* right = compiler->CoerceToBoolCondition(ConvertConditionToBool(rightOperand));
                     rhsPostfix.Flush();
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
                     // The short-circuit block does not dominate resumeAND, so the end-of-statement
@@ -6768,6 +6771,10 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
             compiler->RegisterOwnedPtrTemp(lv.value);
         llvm::Value* acc = lv.value;
         LLVMBackend::TypedValue arithRunning = lv;
+        std::string accumulatorCxxArithIdentity = CxxScalarOperandIdentity(
+            compiler, lv.cxxArithIdentity, lv.sourceTypeName, lv.value);
+        if (accumulatorCxxArithIdentity.empty())
+            accumulatorCxxArithIdentity = CxxLiteralOperandIdentity(exclusiveCtxs[0]);
         llvm::Value* accumulatorStorage = lv.receiverStorage;
         bool accumulatorIsRvalue = lv.isRvalue;
         llvm::Type* accumulatorRefType = nullptr;
@@ -6815,15 +6822,24 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                     CarryCxxOperatorResult(ctx, overload, i + 1 < exclusiveCtxs.size(), acc,
                                            accumulatorStorage, accumulatorIsRvalue,
                                            accumulatorRefType, accumulatorSourceTypeName);
+                    accumulatorCxxArithIdentity.clear();
                     lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
                 }
                 else
                 {
+                    const std::string leftIdentity = accumulatorCxxArithIdentity;
+                    std::string rightIdentity = CxxScalarOperandIdentity(
+                        compiler, rv.cxxArithIdentity, rv.sourceTypeName, rv.value);
+                    if (rightIdentity.empty()) rightIdentity = CxxLiteralOperandIdentity(exclusiveCtxs[i]);
                     bool resultUnsigned = BinaryJoinIsUnsigned(
                         lv.isUnsigned, BinaryOperandBits(acc), rv.isUnsigned, BinaryOperandBits(rv.value));
                     const LLVMBackend::TypedValue arithLhs = ArithRunningOperand(arithRunning, acc);
                     acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    accumulatorCxxArithIdentity = acc != nullptr
+                        ? ScalarArithmeticResultName(compiler, leftIdentity, rightIdentity,
+                                                     acc->getType())
+                        : std::string();
                     arithRunning = ArithComputedOperand(acc, LLVMBackend::ArithResultNarrowWidth(arithLhs, rv));
                     accumulatorStorage = nullptr;
                     accumulatorIsRvalue = true;
@@ -6844,6 +6860,7 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                 && !accumulatorSourceTypeName.empty();
             result.storage = result.isAlias ? accumulatorStorage : nullptr;
             result.sourceTypeName = accumulatorSourceTypeName;
+            result.cxxArithIdentity = accumulatorCxxArithIdentity;
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }
@@ -6871,6 +6888,10 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             LLVMBackend::TypedValue arithRunning = lv;
+            std::string accumulatorCxxArithIdentity = CxxScalarOperandIdentity(
+                compiler, lv.cxxArithIdentity, lv.sourceTypeName, lv.value);
+            if (accumulatorCxxArithIdentity.empty())
+                accumulatorCxxArithIdentity = CxxLiteralOperandIdentity(andCtxs[0]);
             llvm::Value* accumulatorStorage = lv.receiverStorage;
             bool accumulatorIsRvalue = lv.isRvalue;
             llvm::Type* accumulatorRefType = nullptr;
@@ -6918,15 +6939,24 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                     CarryCxxOperatorResult(ctx, overload, i + 1 < andCtxs.size(), acc,
                                            accumulatorStorage, accumulatorIsRvalue,
                                            accumulatorRefType, accumulatorSourceTypeName);
+                    accumulatorCxxArithIdentity.clear();
                     lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
                 }
                 else
                 {
+                    const std::string leftIdentity = accumulatorCxxArithIdentity;
+                    std::string rightIdentity = CxxScalarOperandIdentity(
+                        compiler, rv.cxxArithIdentity, rv.sourceTypeName, rv.value);
+                    if (rightIdentity.empty()) rightIdentity = CxxLiteralOperandIdentity(andCtxs[i]);
                     bool resultUnsigned = BinaryJoinIsUnsigned(
                         lv.isUnsigned, BinaryOperandBits(acc), rv.isUnsigned, BinaryOperandBits(rv.value));
                     const LLVMBackend::TypedValue arithLhs = ArithRunningOperand(arithRunning, acc);
                     acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    accumulatorCxxArithIdentity = acc != nullptr
+                        ? ScalarArithmeticResultName(compiler, leftIdentity, rightIdentity,
+                                                     acc->getType())
+                        : std::string();
                     arithRunning = ArithComputedOperand(acc, LLVMBackend::ArithResultNarrowWidth(arithLhs, rv));
                     accumulatorStorage = nullptr;
                     accumulatorIsRvalue = true;
@@ -6947,6 +6977,7 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                 && !accumulatorSourceTypeName.empty();
             result.storage = result.isAlias ? accumulatorStorage : nullptr;
             result.sourceTypeName = accumulatorSourceTypeName;
+            result.cxxArithIdentity = accumulatorCxxArithIdentity;
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }

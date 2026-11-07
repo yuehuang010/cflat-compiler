@@ -4750,6 +4750,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
                 auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+                if (explicitMoveDiscard && rhsNV.Storage != nullptr
+                    && llvm::isa<llvm::GlobalVariable>(rhsNV.Storage)
+                    && !rhsNV.TypeAndValue.Pointer
+                    && (compiler->IsForeignNontrivialCxxClass(rhsNV.TypeAndValue.TypeName)
+                        || compiler->HasForeignNontrivialCxxField(rhsNV.TypeAndValue.TypeName)))
+                {
+                    ReleaseOwningGlobalNow(unaryCtx, rhsNV);
+                    return nullptr;
+                }
                 // The discarded owning result is dropped here, never bound: a stale owned-call flag
                 // must not reach the next pointer declaration or assignment (T199 r2).
                 compiler->lastCallReturnsOwned = false;
@@ -5133,7 +5142,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (!methodName.empty())
                 {
                     if (compiler->IsCxxRecord(prvalueTypeName))
+                    {
                         compiler->EnsureCxxMemberProjected(prvalueTypeName, methodName);
+                        // An out-of-line template member is refused "no definition" until requested,
+                        // as a member call requests it on use: request it before the lookup below.
+                        if (const auto* refused = compiler->GetCxxClassInfo(prvalueTypeName);
+                            refused != nullptr && refused->refusedMembers.count(methodName) != 0)
+                            compiler->TryBindRefusedCxxMember(prvalueTypeName, methodName);
+                    }
                     if (const auto* info = compiler->GetCxxClassInfo(prvalueTypeName))
                         userDeclared = std::any_of(info->directMethods.begin(),
                             info->directMethods.end(), [&](const auto& method) {
@@ -6148,6 +6164,32 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 moveConstSource, assignment, srcName, refusal))
                             LogErrorContext(ctx, refusal);
                     };
+                    llvm::Value* conditionalAssignmentResultLiveFlag = nullptr;
+                    const bool byValueAssignmentResult = op != nullptr
+                        && op->params.size() == 2 && !op->isDefaultCtor
+                        && !op->isCopyCtor && !op->isMoveCtor
+                        && !op->ret.Pointer && !op->ret.ElemPointer
+                        && !op->ret.IsAlias && !op->ret.IsRvalueRef
+                        && compiler->ResolveTypeAlias(op->ret.TypeName)
+                            == compiler->ResolveTypeAlias(tn);
+                    if ((destinationGlobalConditional || destinationConditional)
+                        && byValueAssignmentResult)
+                    {
+                        conditionalAssignmentResultLiveFlag = compiler->AllocaAtEntry(
+                            compiler->builder->getInt1Ty(), nullptr,
+                            "cxx.assign.result.live");
+                        auto* entry = &compiler->currentFunction->getEntryBlock();
+                        {
+                            llvm::IRBuilderBase::InsertPointGuard guard(*compiler->builder);
+                            compiler->builder->SetInsertPoint(entry,
+                                std::next(llvm::cast<llvm::AllocaInst>(
+                                    conditionalAssignmentResultLiveFlag)->getIterator()));
+                            compiler->builder->CreateStore(compiler->builder->getInt1(false),
+                                conditionalAssignmentResultLiveFlag);
+                        }
+                        compiler->builder->CreateStore(compiler->builder->getInt1(false),
+                            conditionalAssignmentResultLiveFlag);
+                    }
                     auto emitConstruct = [&]() {
                         if (xvalueSource) return emitXvalue(false);
                         if (moveTransfer
@@ -6211,7 +6253,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             byValueSource.push_back(std::move(sourceVar));
                         }
                         compiler->EmitCxxStructorCall(tn, *op, destination, { source },
-                            byValueSource.empty() ? nullptr : &byValueSource);
+                            byValueSource.empty() ? nullptr : &byValueSource,
+                            /*assignmentOperator*/ true,
+                            conditionalAssignmentResultLiveFlag);
                     };
 
                     if (destinationGlobalConditional)
@@ -8964,21 +9008,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 const auto& opResultType = compiler->lastCallReturnType;
                 if (right != nullptr && right->getType()->isPointerTy()
                     && opResultType.IsAlias && !opResultType.IsRvalueRef
-                    && !opResultType.TypeName.empty()
-                    && compiler->IsCxxRecord(opResultType.TypeName))
+                    && !opResultType.TypeName.empty())
                 {
                     auto valueType = opResultType;
                     valueType.Pointer = false;
                     valueType.PointerDepth = 0;
                     valueType.ElemPointer = false;
                     auto* llvmValueType = compiler->GetType(valueType);
-                    if (llvmValueType != nullptr && llvmValueType->isStructTy())
+                    if (llvmValueType != nullptr && !llvmValueType->isVoidTy())
                     {
                         auto* resultValue = compiler->CreateLoad(llvmValueType, right);
                         *assignmentResult = {};
                         assignmentResult->TypeAndValue = opResultType;
                         assignmentResult->TypeAndValue.VariableName.clear();
                         assignmentResult->Primary = right;
+                        assignmentResult->BaseType = llvmValueType;
                         PrepareAliasCallResult(unaryCtx, *assignmentResult, false);
                         return resultValue;
                     }

@@ -3,39 +3,10 @@
 
 namespace
 {
-std::string GenericMemberTemplateSignature(CFlatParser::FunctionDefinitionContext* func)
+std::string GenericMemberTemplateSignature(CFlatParser::FunctionDefinitionContext* func,
+                                           LLVMBackend* compiler)
 {
-    const auto entries = func->genericTypeParameters()->typeParameterList()->typeParameterEntry();
-    std::string signature = std::to_string(entries.size()) + "<";
-    if (func->declarationSpecifiers() != nullptr)
-        signature += "return:" + func->declarationSpecifiers()->getText() + ";";
-    if (func->parameterTypeList() != nullptr
-        && func->parameterTypeList()->parameterList() != nullptr)
-        for (auto* param : func->parameterTypeList()->parameterList()->parameterDeclaration())
-            signature += param->declarationSpecifiers()->getText() + ",";
-    size_t position = 0;
-    for (auto* entry : entries)
-    {
-        if (entry->valueParameterDeclaration() != nullptr) continue;
-        const std::string name = entry->getText();
-        size_t at = 0;
-        while ((at = signature.find(name, at)) != std::string::npos)
-        {
-            const auto isIdent = [](char c) { return (c >= 'a' && c <= 'z')
-                || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
-            const bool left = at == 0 || !isIdent(signature[at - 1]);
-            const bool right = at + name.size() == signature.size()
-                || !isIdent(signature[at + name.size()]);
-            if (left && right)
-            {
-                signature.replace(at, name.size(), "#" + std::to_string(position));
-                at += 2;
-            }
-            else at += name.size();
-        }
-        ++position;
-    }
-    return signature;
+    return GenericFunctionTemplateSignature(func, compiler);
 }
 
 struct AggregateTypeScopeGuard
@@ -1916,23 +1887,39 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         "generic definition needs at least one type parameter");
                 RefuseConstTemplateParameters(func->genericTypeParameters());
                 const std::string key = structName + "." + getFunctionName(func);
-                Compiler()->RecordGenericTemplateOrigin(key, GenericMemberTemplateSignature(func),
+                const std::string signature = GenericMemberTemplateSignature(func, compiler);
+                const std::string scopeIdentity = "aggregate:" + structName;
+                Compiler()->RecordGenericTemplateOrigin(key, signature, scopeIdentity,
                     func->getStart()->getLine(), func->getStart()->getCharPositionInLine());
-                genericFunctionTemplates[key] = func;
-                Compiler()->gts.genericTemplateNamespace[key] = Compiler()->GetCurrentNamespace();
+                const size_t candidateIndex = Compiler()->gts.RegisterGenericFunctionTemplate(key, func);
+                const std::string candidateKey =
+                    GenericTemplateState::GenericFunctionCandidateKey(key, candidateIndex);
+                Compiler()->gts.genericTemplateNamespace[candidateKey] = Compiler()->GetCurrentNamespace();
+                if (candidateIndex == 0)
+                    Compiler()->gts.genericTemplateNamespace[key] = Compiler()->GetCurrentNamespace();
                 std::vector<std::string> valueParams;
                 std::vector<std::string> valueDefaults;
                 auto typeParams = ParseGenericTypeParameters(
                     func->genericTypeParameters(), &valueParams, &valueDefaults);
-                genericFunctionTypeParams[key] = std::move(typeParams);
-                genericFunctionValueParams[key] = std::move(valueParams);
-                Compiler()->gts.genericFunctionValueDefaults[key] = std::move(valueDefaults);
-                genericFunctionConstraints[key] = ParseWhereClause(func->whereClause());
+                genericFunctionTypeParams[candidateKey] = typeParams;
+                genericFunctionValueParams[candidateKey] = valueParams;
+                Compiler()->gts.genericFunctionValueDefaults[candidateKey] = valueDefaults;
+                genericFunctionConstraints[candidateKey] = ParseWhereClause(func->whereClause());
+                if (candidateIndex == 0)
+                {
+                    genericFunctionTypeParams[key] = typeParams;
+                    genericFunctionValueParams[key] = valueParams;
+                    Compiler()->gts.genericFunctionValueDefaults[key] = valueDefaults;
+                    genericFunctionConstraints[key] = ParseWhereClause(func->whereClause());
+                }
                 const auto entries = func->genericTypeParameters()->typeParameterList()
                     ->typeParameterEntry();
                 const bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
-                Compiler()->gts.genericFunctionPackIndex[key] = hasPack
-                    ? genericFunctionTypeParams[key].size() - 1 : std::string::npos;
+                Compiler()->gts.genericFunctionPackIndex[candidateKey] = hasPack
+                    ? typeParams.size() - 1 : std::string::npos;
+                if (candidateIndex == 0)
+                    Compiler()->gts.genericFunctionPackIndex[key] = hasPack
+                        ? typeParams.size() - 1 : std::string::npos;
             }
         }
 
@@ -3010,8 +2997,70 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 }
             for (const auto& [owner, name] : inheritedUsing)
                 source += "    using " + owner + "::" + name + ";\n";
-            source += "    alignas(" + std::to_string(cxxFieldAlign) + ") unsigned char __cflat_fields["
+            // C++ view of the CFlat storage (nslookup): a union of the byte block and a struct over the
+            // same bytes. Primitive fields are declared by name at their CFlat offsets so a C++ base
+            // template reads `self.value`; every other byte stays an opaque blob. Size and offset unchanged.
+            static const std::set<std::string> viewPrimitives = {
+                "bool", "char", "i8", "u8", "i16", "u16", "short", "i32", "int", "u32", "uint",
+                "i64", "u64", "long", "ulong", "float", "double" };
+            static const std::set<std::string> viewReserved = {
+                "new", "delete", "class", "template", "this", "operator", "private", "public",
+                "protected", "friend", "virtual", "explicit", "namespace", "typename", "using",
+                "typeid", "try", "catch", "throw", "export", "mutable", "true", "false", "nullptr",
+                "and", "or", "not", "xor", "decltype", "constexpr", "noexcept", "static_assert",
+                "thread_local", "alignof", "alignas", "union", "struct", "auto", "inline", "typedef",
+                "register", "signed", "unsigned", "volatile", "extern", "static", "sizeof", "default",
+                "char8_t", "char16_t", "char32_t", "wchar_t", "concept", "requires", "co_await",
+                "co_return", "co_yield", "consteval", "constinit", "reinterpret_cast", "static_cast",
+                "const_cast", "dynamic_cast", "asm", "goto", "switch", "case", "break", "continue",
+                "do", "while", "for", "if", "else", "return", "enum", "const", "short", "int", "long",
+                "float", "double", "char", "void", "bool" };
+            const llvm::StructLayout* literalLayout = compiler->module->getDataLayout().getStructLayout(literalType);
+            std::string viewBody;
+            bool anyViewField = false;
+            uint64_t viewCursor = 0;
+            int viewGap = 0;
+            auto appendGap = [&](uint64_t bytes) {
+                if (bytes == 0) return;
+                viewBody += "            unsigned char __cflat_gap" + std::to_string(viewGap++)
+                    + "[" + std::to_string(bytes) + "];\n";
+            };
+            for (size_t i = 0; i < declList.size(); ++i)
+            {
+                const auto& field = declList[i];
+                const uint64_t offset = literalLayout->getElementOffset((unsigned)i);
+                const uint64_t size = compiler->module->getDataLayout().getTypeAllocSize(compiler->GetType(field));
+                appendGap(offset - viewCursor);
+                viewCursor = offset;
+                std::string spelling;
+                if (!field.IsPadding && !field.VariableName.empty() && viewPrimitives.count(field.TypeName) != 0
+                    && viewReserved.count(field.VariableName) == 0 && field.ValuePointerDepth() == 0
+                    && field.ConstArraySize == 0 && !field.IsBitfield && !field.IsConstObject()
+                    && !field.IsArrayView && !field.IsRvalueRef
+                    && compiler->CxxSpellingForCflatType(field.TypeName, spelling))
+                {
+                    // An imported macro of the same name (errno, EOF, stdout) would rewrite the member,
+                    // so under that macro the field stays an opaque blob of the same size and offset.
+                    viewBody += "#if defined(" + field.VariableName + ")\n";
+                    viewBody += "            alignas(" + std::to_string(compiler->module->getDataLayout()
+                        .getABITypeAlign(compiler->GetType(field)).value()) + ") unsigned char __cflat_gap"
+                        + std::to_string(viewGap++) + "[" + std::to_string(size) + "];\n";
+                    viewBody += "#else\n";
+                    viewBody += "            " + spelling + " " + field.VariableName + ";\n";
+                    viewBody += "#endif\n";
+                    anyViewField = true;
+                }
+                else
+                    appendGap(size);
+                viewCursor += size;
+            }
+            appendGap(literalLayout->getSizeInBytes() - viewCursor);
+            source += "    union {\n";
+            source += "        alignas(" + std::to_string(cxxFieldAlign) + ") unsigned char __cflat_fields["
                    + std::to_string(std::max<uint64_t>(1, fieldBytes)) + "];\n";
+            if (anyViewField)
+                source += "        struct {\n" + viewBody + "        };\n";
+            source += "    };\n";
             if (hasGeneratedNoArgCtor)
                 source += "    " + shortName + "() { __cflat_ctor_" + shortName + "_0(this); }\n";
             for (const auto& ctor : constructors)
@@ -5972,23 +6021,39 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                         "generic definition needs at least one type parameter");
                 RefuseConstTemplateParameters(func->genericTypeParameters());
                 const std::string key = structName + "." + getFunctionName(func);
-                Compiler()->RecordGenericTemplateOrigin(key, GenericMemberTemplateSignature(func),
+                const std::string signature = GenericMemberTemplateSignature(func, compiler);
+                const std::string scopeIdentity = "aggregate:" + structName;
+                Compiler()->RecordGenericTemplateOrigin(key, signature, scopeIdentity,
                     func->getStart()->getLine(), func->getStart()->getCharPositionInLine());
-                genericFunctionTemplates[key] = func;
-                Compiler()->gts.genericTemplateNamespace[key] = Compiler()->GetCurrentNamespace();
+                const size_t candidateIndex = Compiler()->gts.RegisterGenericFunctionTemplate(key, func);
+                const std::string candidateKey =
+                    GenericTemplateState::GenericFunctionCandidateKey(key, candidateIndex);
+                Compiler()->gts.genericTemplateNamespace[candidateKey] = Compiler()->GetCurrentNamespace();
+                if (candidateIndex == 0)
+                    Compiler()->gts.genericTemplateNamespace[key] = Compiler()->GetCurrentNamespace();
                 std::vector<std::string> valueParams;
                 std::vector<std::string> valueDefaults;
                 auto typeParams = ParseGenericTypeParameters(
                     func->genericTypeParameters(), &valueParams, &valueDefaults);
-                genericFunctionTypeParams[key] = std::move(typeParams);
-                genericFunctionValueParams[key] = std::move(valueParams);
-                Compiler()->gts.genericFunctionValueDefaults[key] = std::move(valueDefaults);
-                genericFunctionConstraints[key] = ParseWhereClause(func->whereClause());
+                genericFunctionTypeParams[candidateKey] = typeParams;
+                genericFunctionValueParams[candidateKey] = valueParams;
+                Compiler()->gts.genericFunctionValueDefaults[candidateKey] = valueDefaults;
+                genericFunctionConstraints[candidateKey] = ParseWhereClause(func->whereClause());
+                if (candidateIndex == 0)
+                {
+                    genericFunctionTypeParams[key] = typeParams;
+                    genericFunctionValueParams[key] = valueParams;
+                    Compiler()->gts.genericFunctionValueDefaults[key] = valueDefaults;
+                    genericFunctionConstraints[key] = ParseWhereClause(func->whereClause());
+                }
                 const auto entries = func->genericTypeParameters()->typeParameterList()
                     ->typeParameterEntry();
                 const bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
-                Compiler()->gts.genericFunctionPackIndex[key] = hasPack
-                    ? genericFunctionTypeParams[key].size() - 1 : std::string::npos;
+                Compiler()->gts.genericFunctionPackIndex[candidateKey] = hasPack
+                    ? typeParams.size() - 1 : std::string::npos;
+                if (candidateIndex == 0)
+                    Compiler()->gts.genericFunctionPackIndex[key] = hasPack
+                        ? typeParams.size() - 1 : std::string::npos;
             }
         }
 

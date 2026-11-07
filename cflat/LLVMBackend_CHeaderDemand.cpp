@@ -97,7 +97,9 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<std::pair<std::string, std::string>>* outClassUsings,
                              std::vector<std::string>* outClassTemplateSpecializations,
                              std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates,
-                             std::vector<cflat_cinterop::RawDynamicInitializer>* outDynamicInitializers)
+                             std::vector<cflat_cinterop::RawDynamicInitializer>* outDynamicInitializers,
+                             std::vector<std::pair<std::string, std::string>>*
+                                 outVariableTemplateDependencies)
 {
         if (headerPaths.empty()) return false;
         if (outHeaderFailure) *outHeaderFailure = false;
@@ -382,6 +384,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         if (outClassTemplates) *outClassTemplates = raw.classTemplates;
         if (outClassTemplateNames) *outClassTemplateNames = raw.classTemplateNames;
         if (outVariableTemplateNames) *outVariableTemplateNames = raw.variableTemplateNames;
+        if (outVariableTemplateDependencies)
+            *outVariableTemplateDependencies = raw.variableTemplateDependencies;
         if (outClassTemplateSpecializations)
             *outClassTemplateSpecializations = raw.classTemplateSpecializations;
         if (outUsingDirectives) *outUsingDirectives = raw.usingDirectives;

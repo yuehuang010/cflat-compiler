@@ -98,3 +98,40 @@ struct RefResult { operator const int&() const { return refValue; } };
 inline std::atomic<int> atomicValue{37};
 inline std::atomic<int>& atomicRef() { return atomicValue; }
 }
+
+namespace t105 {
+inline int convopHit = 0;
+struct ExplicitBoolInt {
+    explicit operator bool() { convopHit = 1; return true; }
+    operator int() { convopHit = 2; return 42; }
+};
+struct CvY {
+    operator bool() { convopHit = 1; return false; }
+    operator int() const { convopHit = 2; return 1; }
+};
+inline const CvY& cvY(const CvY& y) { return y; }
+struct CvRank {
+    operator long() { convopHit = 1; return 5; }
+    operator int() const { convopHit = 2; return 6; }
+};
+inline CvRank makeCvRank() { return CvRank{}; }
+struct CvBoolY {
+    operator bool() { convopHit = 1; return false; }
+    operator int() const { convopHit = 2; return 1; }
+};
+inline const CvBoolY& cvBoolY(const CvBoolY& y) { return y; }
+struct CvBoolZ {
+    operator bool() { convopHit = 1; return false; }
+    operator bool() const { convopHit = 2; return true; }
+};
+inline const CvBoolZ& cvBoolZ(const CvBoolZ& z) { return z; }
+struct CvPairBase {
+    operator int() { convopHit = 1; return 3; }
+    operator int() const { convopHit = 2; return 7; }
+};
+struct CvPairDerived : CvPairBase {};
+inline const CvPairDerived& cvPairDerived(const CvPairDerived& d) { return d; }
+struct PB { int value = 19; operator W() const { ++W::op; return W{value + 1}; } };
+struct PD : PB {};
+inline PD makePD() { return PD{}; }
+}

@@ -46,6 +46,65 @@ public:
     inline AssignRouteDeleted& operator=(int) = delete;
     int v_ = 0;
 };
+
+class AssignRouteRank
+{
+public:
+    static inline int int_assigns = 0;
+    static inline int double_assigns = 0;
+    inline AssignRouteRank& operator=(int x) noexcept
+    { v_ = x; ++int_assigns; return *this; }
+    inline AssignRouteRank& operator=(double x) noexcept
+    { v_ = (int)x + 10; ++double_assigns; return *this; }
+    int v_ = 0;
+};
+
+class AssignRouteDeletedDouble
+{
+public:
+    static inline int double_assigns = 0;
+    inline AssignRouteDeletedDouble& operator=(int) = delete;
+    inline AssignRouteDeletedDouble& operator=(double x) noexcept
+    { v_ = (int)x + 10; ++double_assigns; return *this; }
+    int v_ = 0;
+};
+
+class AssignRouteIntOnly
+{
+public:
+    inline AssignRouteIntOnly& operator=(int x) noexcept { v_ = x; return *this; }
+    int v_ = 0;
+};
+
+class AssignRouteLongDouble
+{
+public:
+    inline AssignRouteLongDouble& operator=(long x) noexcept { v_ = (int)x; return *this; }
+    inline AssignRouteLongDouble& operator=(double x) noexcept { v_ = (int)x + 10; return *this; }
+    int v_ = 0;
+};
+
+class AssignRouteFloatDouble
+{
+public:
+    inline AssignRouteFloatDouble& operator=(float x) noexcept { v_ = (int)x; return *this; }
+    inline AssignRouteFloatDouble& operator=(double x) noexcept { v_ = (int)x + 10; return *this; }
+    int v_ = 0;
+};
+
+struct AssignRouteUsingBase
+{
+    inline AssignRouteUsingBase& operator=(int) noexcept { k_ = 1; return *this; }
+    int k_ = 0;
+};
+
+struct AssignRouteUsingDerived : AssignRouteUsingBase
+{
+    using AssignRouteUsingBase::operator=;
+    inline AssignRouteUsingDerived& operator=(double) noexcept { k_ = 2; return *this; }
+    inline AssignRouteUsingDerived& operator=(long long) noexcept { k_ = 3; return *this; }
+};
+
 inline AssignRouteTrivialBoth assignRouteTrivialBothNamespaceGlobal{};
 inline AssignRouteImplicitCopy assignRouteImplicitCopyNamespaceGlobal{};
 inline AssignRouteLong assignRouteLongNamespaceGlobal{};
@@ -123,6 +182,42 @@ public:
     int v_;
 };
 inline AssignRouteByValue assignRouteByValueGlobal{};
+
+class AssignRouteChain
+{
+public:
+    static inline int copies = 0, dtors = 0;
+    static inline void reset() noexcept { copies = dtors = 0; }
+    inline AssignRouteChain() noexcept : v_(0) {}
+    inline AssignRouteChain(int value) noexcept : v_(value) {}
+    inline AssignRouteChain(const AssignRouteChain& other) noexcept : v_(other.v_)
+    { ++copies; }
+    inline ~AssignRouteChain() noexcept { ++dtors; }
+    inline AssignRouteChain operator=(int value) noexcept
+    { v_ = value; return *this; }
+    inline AssignRouteChain operator=(const AssignRouteChain& other) noexcept
+    { v_ = other.v_; return AssignRouteChain(v_); }
+    int v_;
+};
+inline AssignRouteChain assignRouteChainGlobalX{};
+inline AssignRouteChain assignRouteChainGlobalY{};
+inline AssignRouteChain assignRouteChainMoveGlobal{};
+
+// A class holding a nontrivial C++ field: `_ = move` releases the holder's field.
+class AssignRouteHolder
+{
+public:
+    AssignRouteChain chain;
+};
+inline AssignRouteHolder assignRouteHolderGlobal{};
+
+class AssignRouteScalarRef
+{
+public:
+    static inline int calls = 0;
+    inline int& operator+=(int value) noexcept { v_ += value; ++calls; return v_; }
+    int v_ = 0;
+};
 
 // operator=(int) whose result is a separate object, not the receiver (by value and by T&).
 class AssignRouteOther

@@ -1092,8 +1092,13 @@ bool LLVMBackend::CxxCtorSetRequiresNarrowing(const std::string& typeName,
             bool refused = false;
             for (size_t i = 0; i < argVars->size() && !refused; ++i)
             {
-                const ScalarArgConversion conv = ClassifyScalarArgConversion((*argVars)[i],
-                    ScalarArgumentReferent(ctor.params[i + 1]));
+                // An integer null constant bound to a scalar reference is the zero of its referent in any
+                // width: it does not narrow (clang binds `int&&` to `0UL`).
+                const TypeAndValue referent = ScalarArgumentReferent(ctor.params[i + 1]);
+                if (ctor.params[i + 1].Pointer && !referent.Pointer && referent.IsInteger() != -1
+                    && IsNullPointerConstantArgument((*argVars)[i], true))
+                    continue;
+                const ScalarArgConversion conv = ClassifyScalarArgConversion((*argVars)[i], referent);
                 refused = conv == ScalarArgConversion::Narrow || conv == ScalarArgConversion::EnumMismatch;
             }
             if (!refused) return false;
@@ -4044,6 +4049,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (candidate.IsCxx && result < 0 && scalarConv == ScalarArgConversion::Widen
                     && !candidateParamItr->Pointer && candidateParamItr->TypeName != "bool")
                     result = 1;
+                // A null pointer constant binds a C++ `const T&` / `T&&` scalar referent (clang materializes
+                // a temporary); must run after the narrowing refusal above.
+                TypeAndValue scalarReferenceType;
+                scalarReferenceType.TypeName = CxxScalarNameOfSpelling(cxxParamSpelling);
+                if (candidate.IsCxx && result < 0 && (cxxConstReference || cxxRvalueReference)
+                    && scalarReferenceType.IsInteger() != -1
+                    && IsNullPointerConstantArgument(arg, true))
+                {
+                    result = 1;
+                    constRefReferentArm = true;
+                    constRefReferentIdentity = IntegerParameterIdentity(scalarReferenceType);
+                }
 
                 const auto& originalArgType = arg.HasOriginalArgumentType
                     ? arg.OriginalArgumentType : arg.TypeAndValue;

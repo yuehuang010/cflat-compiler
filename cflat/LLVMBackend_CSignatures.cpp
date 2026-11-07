@@ -979,6 +979,9 @@ static bool CxxDefaultWrapperCallAmbiguous(const Overload& self,
                 || !sameShape(*other) || other->paramTypes.size() < kept
                 || other->defaultArgs.size() != other->paramTypes.size())
                 continue;
+            // Equal parameter lists with distinct linkage identify constrained twins. The
+            // forwarding call below lets Clang apply their constraint ordering.
+            if (other->paramTypes == self.paramTypes) continue;
             bool viable = true;
             for (size_t i = 0; i < kept && viable; ++i)
                 viable = other->paramTypes[i] == self.paramTypes[i];
@@ -1114,10 +1117,34 @@ static std::string BuildCxxDefaultWrappers(
                     continue;
                 const bool instance = member.kind == cflat_cinterop::RawCxxMember::Instance;
                 const std::string target = instance ? owner : owner + "::" + member.name;
+                const auto sameDefaults = [](const auto& a, const auto& b) {
+                    if (a.size() != b.size()) return false;
+                    for (size_t i = 0; i < a.size(); ++i)
+                        if (a[i].kind != b[i].kind || a[i].value != b[i].value) return false;
+                    return true;
+                };
+                const bool constrainedTwin = std::any_of(
+                    memberOverloads[member.name].begin(), memberOverloads[member.name].end(),
+                    [&](const cflat_cinterop::RawCxxMember* other) {
+                        return other != &member && other->kind == member.kind
+                            && other->paramTypes == member.paramTypes
+                            && other->retType == member.retType
+                            && other->isConst == member.isConst
+                            && other->isVolatile == member.isVolatile
+                            && other->refQualifier == member.refQualifier
+                            && (other->linkageName != member.linkageName
+                                || other->line != member.line || other->col != member.col
+                                || !sameDefaults(other->defaultArgs, member.defaultArgs));
+                    });
                 for (size_t n = 0; n < member.paramTypes.size(); ++n)
                 {
-                    if (member.defaultArgs[n].kind == "unsupported"
-                        || !HasNonConstDefaultSuffix(member.defaultArgs, n))
+                    bool defaultSuffix = n < member.defaultArgs.size();
+                    for (size_t i = n; defaultSuffix && i < member.defaultArgs.size(); ++i)
+                        defaultSuffix = !member.defaultArgs[i].kind.empty();
+                    if (!defaultSuffix
+                        || (!constrainedTwin
+                            && (member.defaultArgs[n].kind == "unsupported"
+                                || !HasNonConstDefaultSuffix(member.defaultArgs, n))))
                         continue;
                     if (!requestedWrapper.empty()
                         && CxxDefaultWrapperName(member.linkageName, n) != requestedWrapper) continue;
@@ -1138,6 +1165,14 @@ static std::string BuildCxxDefaultWrappers(
                                   member.paramTypes, n, target, instance, member.name,
                                   member.isConst, member.isNoexcept, member.refQualifier);
                 }
+                // Only the requested forwarder: a rival twin's forwarder that clang rejects
+                // (unordered constraints) must not sink an unrelated arity's request.
+                const std::string forwarder = CxxDefaultWrapperName(member.linkageName,
+                                                                    member.paramTypes.size());
+                if (constrainedTwin && (requestedWrapper.empty() || forwarder == requestedWrapper))
+                    appendWrapper(forwarder, member.retType, member.paramTypes,
+                                  member.paramTypes.size(), target, instance, member.name,
+                                  member.isConst, member.isNoexcept, member.refQualifier);
             }
         }
         return source;
@@ -1749,6 +1784,7 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         e.isFloatConstant = r.isFloatConstant;
         e.floatValue = r.floatValue;
         e.isCxxConstexpr = r.isCxxConstexpr;
+        e.isCxxClassObject = r.isCxxClassObject;
         e.file = r.file;
         e.isInternalLinkage = r.isInternalLinkage;
         e.constInitHash = r.constInitHash;

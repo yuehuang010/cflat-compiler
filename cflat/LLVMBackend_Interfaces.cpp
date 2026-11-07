@@ -1002,9 +1002,21 @@ bool LLVMBackend::AnyGenericTypeTemplateNamed(const std::string& spelledBase) co
 
 bool LLVMBackend::IsGenericFunctionKeyInNamespace(const std::string& key, const std::string& ns) const
 {
-        if (gts.genericFunctionTemplates.count(key) == 0) return false;
-        auto it = gts.genericTemplateNamespace.find(key);
-        return it != gts.genericTemplateNamespace.end() && it->second == ns;
+        auto matchesNamespace = [&](const std::string& candidateKey) {
+            auto it = gts.genericTemplateNamespace.find(candidateKey);
+            return it != gts.genericTemplateNamespace.end() && it->second == ns;
+        };
+        if (gts.genericFunctionTemplates.count(key) != 0)
+            return matchesNamespace(key);
+        const size_t separator = key.rfind('\x1f');
+        if (separator == std::string::npos) return false;
+        const std::string baseName = key.substr(0, separator);
+        auto templates = gts.genericFunctionTemplates.find(baseName);
+        if (templates == gts.genericFunctionTemplates.end()) return false;
+        for (size_t index = 0; index < templates->second.size(); ++index)
+            if (GenericTemplateState::GenericFunctionCandidateKey(baseName, index) == key)
+                return matchesNamespace(key);
+        return false;
     }
 
 std::string LLVMBackend::ResolveGenericFunctionBase(const std::string& base) const

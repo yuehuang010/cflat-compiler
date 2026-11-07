@@ -4785,7 +4785,12 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
             return arg.Storage;
         llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
         value = ConvertCxxOperatorFloatOperand(value, arg, param);
-        value = LowerByValueArg(value, param, arg);
+        // An integer null constant of another width (`0UL` into `const int&`) is the zero of the
+        // referent: the narrowing refusal is for values, and zero is the same in every width.
+        if (IsNullPointerConstantArgument(arg, true) && paramTy != nullptr && paramTy->isIntegerTy())
+            value = llvm::ConstantInt::get(paramTy, 0);
+        else
+            value = LowerByValueArg(value, param, arg);
         if (value == nullptr)
             return llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(paramTy));
         auto* temp = AllocaAtEntry(paramTy, nullptr, "aliasarg");
@@ -4805,12 +4810,20 @@ llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const Type
 {
         // nullptr_t itself is a pointer-sized value. A reference needs an address to a slot
         // containing that value; the null pointer value is never the reference address.
-        if (cxxCallee && param.IsCxxNullptrT && IsCxxNullTypedArgument(arg))
+        const bool nullTypedArgument = IsCxxNullTypedArgument(arg);
+        const bool nullIntegerArgument = IsNullPointerConstantArgument(arg, true);
+        if (cxxCallee && param.IsCxxNullptrT
+            && (nullTypedArgument || nullIntegerArgument))
         {
-            if (arg.Storage != nullptr && IsCxxRvalueReferenceArgument(arg))
+            if (nullTypedArgument && arg.Storage != nullptr
+                && IsCxxRvalueReferenceArgument(arg))
                 return arg.Storage;
             llvm::Type* valueType = GetType(param);
-            llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+            llvm::Value* value = nullptr;
+            if (nullIntegerArgument && valueType != nullptr && valueType->isPointerTy())
+                value = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(valueType));
+            else if (!nullIntegerArgument)
+                value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
             if (valueType != nullptr && value != nullptr && value->getType() == valueType)
             {
                 auto* temporary = AllocaAtEntry(valueType, nullptr, "cxx.nullptr.rrefarg");

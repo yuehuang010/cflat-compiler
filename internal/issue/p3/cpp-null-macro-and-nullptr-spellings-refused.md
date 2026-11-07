@@ -1,53 +1,25 @@
-# NULL / nullptr macros (and nullptr into std::function) are refused at C++ call sites
+# Function-like zero macros refused as null pointer constants at C++ call sites
 
-Summary: clang++ -std=c++20 accepts each of these as a null pointer; cflat reports "no overload".
-Pre-existing on master; found by the T52 reviews (2026-10-06).
+Summary: the NULL / nullptr / `((void*)0)` / cast macro spellings, `nullptr` into a by-value
+`std::function`, pointer-ref ctors, `D(0)`, `K + 0`, `if const (Z0 == 0)` and explicit `tdp<int>(0)`
+all match clang (T52, T103, T296, NULLCTOR 2026-11-05). What is left, each accepted by clang++ -std=c++20:
 
-- `#define Z nullptr` into `int*`.
-- A C header's `#define CN NULL` (`((void*)0)`) into a C++ `int*` param.
-- `nullptr` into a by-value `std::function<int()>` param (clang: empty function).
+- Function-like `ID(0)` / `ID(ZERO)` into `lp(int*)`: "no overload" after macro-function
+  evaluation (clang 5).
+- Zero-arg `MZ()` into `lp(int*)`: `MZ` is undefined in CFlat (clang 5).
+- `K(PID(ZERO))` with only `K(int*)`: the argument arrives as `i64` (clang 5).
 
-Repros: scratch/repro_keep/t52_rev/rev2_t52_p/ (oracle.sh runs the clang++ twin) and rev_t52_p/.
+Fix direction: give a function-like macro whose expansion is an integer literal zero the same
+CMacroEntry.ilz identity as an object-like zero macro (identity, never spelling).
+Probes: scratch/repro_keep/t52_rev/rev7_t52_p/; NULLCTOR matrix rows in the fix/nullctor report.
 
-Fix direction: T52 marks integer-literal-zero macros (CMacroEntry.ilz) as null pointer constants;
-extend the macro classifier to `__null` / `nullptr` / `((void*)0)` bodies with the same identity
-(never spelling) rule. std::function: the converting-ctor path must offer `nullptr_t` sources.
+## Known divergences (pre-existing, not acceptance gaps)
 
-## T103 status (2026-10-10)
-
-The T103 macro spelling legs now pass in `Test/test_cpp_interop.cb`, including the C header's
-`((void*)0)` macro. `nullptr` into a by-value `std::function<int()>` remains unsupported; its
-fixture leg was removed after three ranking-path attempts, so this issue remains active.
-T103 round 2 (2026-10-10): the `cppcr.NpMutRef(nullptr)` regression is fixed (the variadic wrapper
-spelled a nullptr argument as `std.nullptr_t`, which let clang bind it to `nullptr_t&`; that spelling
-was removed from `RequestCxxVariadicConstructor`). Literal-0 pointer admission was dropped (see the
-p2 `cpp-null-constant-ambiguous-ctor-accepted` file).
-
-Also (T52 round 6, 2026-10-06): a C++ CONSTRUCTOR taking `int*&&` or `int* const&` refuses a zero
-macro (`C(ZERO)`, `D(Z0)`); free functions accept it after T52, clang accepts both.
-
-Also (T52 review 7, 2026-10-06; literal 0 behaves the same, so these are not macro-only): function-like
-`ID(0)` / `ID(ZERO)` and zero-arg `MZ()` at a C++ int* param, `if const (Z0 == 0)`, a C++ ctor taking
-`int*` called with `0`, `operator+(int*)` with `0`, `tdp<int>(0)` - compare each with clang++
--std=c++20. Probes: scratch/repro_keep/t52_rev/rev7_t52_p/.
-
-## After T68 review 1 (2026-10-07, pre-existing, master same)
-
-(T296 2026-10-16: the system NULL at int* and the cast macro ((int*)0) are fixed; the NULL
-leg in Test/test_cpp_interop.cb is a guard, it already passed on master.)
-- Const-pointee cast macros (`((const int*)0)`) stay refused at `int*`: the typed pointer does not carry the
-  const pointee (clang accepts them at `const int*`).
-
-- Class with only `D(int*)`: `D(0)` refused (clang 30), while implicit `takeD(0)` works.
+- Const-pointee cast macros (`((const int*)0)`) stay refused at `int*`; clang also rejects (typed pointer).
 - `o + 0` with `operator+(Op, int*)` and `operator+(Op, long)`: clang ambiguous, CFlat picks int* (40).
-- Probes: scratch/repro_keep/t68_rev/.
+  Probes: scratch/repro_keep/t68_rev/.
 
-## Note 2026-10-16 (Windows close gate)
-On LLP64 a `((int*)0)` macro at a C++ `long*` param is accepted (CFlat `long` = target width, so the int pointee matches);
-clang-cl refuses. T296 leg retargeted to `long long*` (distinct on both ABIs). Whether CFlat should keep C++ `long` distinct from
-`int` on Windows at C++ pointer params is open (L = target long ruling covers CFlat-side spelling only).
-
-RULED 2026-10-31 (maintainer), the 2026-10-16 note: ALIAS EVERYWHERE. CFlat's identity rule holds at C++ parameters and template
-arguments too: on LLP64 `long` is `int`, so `((int*)0)` / an `int*` into a C++ `long*` parameter is ACCEPTED and deduction may give
-`int` where clang-cl gives `long`. Reason: the alternative is a program that compiles on macOS/Linux and fails on Windows. Divergence
-from clang-cl accepted by design. Test consequence: none; the T296 leg stays on `long long*` (distinct on both ABIs).
+RULED 2026-10-31 (maintainer), LLP64: ALIAS EVERYWHERE. CFlat's identity rule holds at C++ parameters and
+template arguments: on LLP64 `long` is `int`, so `((int*)0)` / an `int*` into a C++ `long*` parameter is
+ACCEPTED and deduction may give `int` where clang-cl gives `long`. Divergence from clang-cl accepted by
+design; the T296 leg stays on `long long*` (distinct on both ABIs).

@@ -2865,6 +2865,7 @@ nlohmann::json LLVMBackend::GlobalToJson(const CGlobalEntry& g)
                 j["cv"] = g.constantValue;
         }
         if (g.isCxxConstexpr) j["cxce"] = true;
+        if (g.isCxxClassObject) j["cxco"] = true;
         if (!g.bindRefusal.empty()) j["br"] = g.bindRefusal;
         if (!g.file.empty()) j["fl"] = g.file;
         if (g.isInternalLinkage) j["il"] = true;
@@ -2891,6 +2892,7 @@ LLVMBackend::CGlobalEntry LLVMBackend::GlobalFromJson(const SjVal& j)
         }
         g.constantValue = j.value("cv", (int64_t)0);
         g.isCxxConstexpr = j.value("cxce", false);
+        g.isCxxClassObject = j.value("cxco", false);
         g.bindRefusal = j.value("br", std::string{});
         g.file = j.value("fl", std::string{});
         g.isInternalLinkage = j.value("il", false);
@@ -3816,6 +3818,11 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                 entry.classTemplateNames = j["classTemplateNames"].to_string_vector();
             if (j.contains("variableTemplateNames"))
                 entry.variableTemplateNames = j["variableTemplateNames"].to_string_vector();
+            if (j.contains("variableTemplateDependencies"))
+                for (const auto& dependency : j["variableTemplateDependencies"])
+                    entry.variableTemplateDependencies.emplace_back(
+                        dependency.value("owner", std::string{}),
+                        dependency.value("dependency", std::string{}));
             if (j.contains("classTemplateSpecializations"))
                 entry.classTemplateSpecializations = j["classTemplateSpecializations"].to_string_vector();
             if (j.contains("cxxGroupNamespaces"))
@@ -4276,6 +4283,13 @@ void LLVMBackend::WriteCHeaderDiskCache(
         j["classTemplates"] = std::move(classTemplates);
         j["classTemplateNames"] = entry.classTemplateNames;
         j["variableTemplateNames"] = entry.variableTemplateNames;
+        if (!entry.variableTemplateDependencies.empty())
+        {
+            nlohmann::json dependencies = nlohmann::json::array();
+            for (const auto& [owner, dependency] : entry.variableTemplateDependencies)
+                dependencies.push_back({ { "owner", owner }, { "dependency", dependency } });
+            j["variableTemplateDependencies"] = std::move(dependencies);
+        }
         j["classTemplateSpecializations"] = entry.classTemplateSpecializations;
         if (!entry.cxxGroupNamespaces.empty()) j["cxxGroupNamespaces"] = entry.cxxGroupNamespaces;
         nlohmann::json enums = nlohmann::json::array();

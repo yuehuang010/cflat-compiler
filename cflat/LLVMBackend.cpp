@@ -4498,10 +4498,18 @@ void LLVMBackend::ProcessPendingMacroSources()
                     valueDefaults.push_back("");
                 }
             }
-            gts.genericFunctionTemplates[name] = func;
-            gts.genericFunctionTypeParams[name] = typeParams;
-            gts.genericFunctionValueParams[name] = valueParams;
-            gts.genericFunctionValueDefaults[name] = valueDefaults;
+            const size_t candidateIndex = gts.RegisterGenericFunctionTemplate(name, func);
+            const std::string candidateKey =
+                GenericTemplateState::GenericFunctionCandidateKey(name, candidateIndex);
+            gts.genericFunctionTypeParams[candidateKey] = typeParams;
+            gts.genericFunctionValueParams[candidateKey] = valueParams;
+            gts.genericFunctionValueDefaults[candidateKey] = valueDefaults;
+            if (candidateIndex == 0)
+            {
+                gts.genericFunctionTypeParams[name] = typeParams;
+                gts.genericFunctionValueParams[name] = valueParams;
+                gts.genericFunctionValueDefaults[name] = valueDefaults;
+            }
             ++registered;
         }
         if (verbose)
@@ -8883,14 +8891,79 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
                               nullptr,
                               "generic_interfaces");
 
-    // Generic function templates
-    serializeGenericTemplates(gts.genericFunctionTemplates,
-                              gts.genericFunctionTypeParams,
-                              gts.genericFunctionValueParams,
-                              gts.genericFunctionValueDefaults,
-                              gts.genericFunctionPackIndex,
-                              &gts.genericFunctionConstraints,
-                              "generic_functions");
+    // Function templates are an overload set per source-level name; each record keeps its index
+    // so the lazy materializer can restore the same candidate-specific metadata key.
+    {
+        llvm::json::Array arr;
+        for (const auto& [name, overloads] : gts.genericFunctionTemplates)
+            for (size_t index = 0; index < overloads.size(); ++index)
+            {
+                const std::string candidateKey =
+                    GenericTemplateState::GenericFunctionCandidateKey(name, index);
+                std::string source;
+                if (auto* ctx = overloads[index])
+                {
+                    auto* start = ctx->getStart();
+                    auto* stop = ctx->getStop();
+                    antlr4::misc::Interval interval(start->getStartIndex(), stop->getStopIndex());
+                    source = start->getInputStream()->getText(interval);
+                }
+                else if (auto it = gts.lazyTemplateSource.find(candidateKey);
+                         it != gts.lazyTemplateSource.end())
+                    source = it->second;
+                if (source.empty()) continue;
+
+                llvm::json::Object record;
+                record["name"] = name;
+                record["candidate_index"] = static_cast<int64_t>(index);
+                record["source"] = source;
+                llvm::json::Array typeParams;
+                if (auto it = gts.genericFunctionTypeParams.find(candidateKey);
+                    it != gts.genericFunctionTypeParams.end())
+                    for (const auto& value : it->second) typeParams.push_back(value);
+                else if (index == 0)
+                    if (auto it = gts.genericFunctionTypeParams.find(name);
+                        it != gts.genericFunctionTypeParams.end())
+                        for (const auto& value : it->second) typeParams.push_back(value);
+                record["type_params"] = std::move(typeParams);
+                auto serializeStrings = [&](const auto& map, llvm::StringRef field) {
+                    llvm::json::Array values;
+                    auto it = map.find(candidateKey);
+                    if (it == map.end() && index == 0) it = map.find(name);
+                    if (it != map.end())
+                        for (const auto& value : it->second) values.push_back(value);
+                    record[field] = std::move(values);
+                };
+                serializeStrings(gts.genericFunctionValueParams, "value_param_types");
+                serializeStrings(gts.genericFunctionValueDefaults, "value_param_defaults");
+                if (auto it = gts.genericFunctionPackIndex.find(candidateKey);
+                    it != gts.genericFunctionPackIndex.end())
+                    record["pack_index"] = static_cast<int64_t>(it->second);
+                else if (index == 0)
+                    if (auto it = gts.genericFunctionPackIndex.find(name);
+                        it != gts.genericFunctionPackIndex.end())
+                        record["pack_index"] = static_cast<int64_t>(it->second);
+                if (auto it = gts.genericFunctionConstraints.find(candidateKey);
+                    it != gts.genericFunctionConstraints.end())
+                    record["constraints"] = SerializeConstraints(it->second);
+                else if (index == 0)
+                    if (auto it = gts.genericFunctionConstraints.find(name);
+                        it != gts.genericFunctionConstraints.end())
+                        record["constraints"] = SerializeConstraints(it->second);
+                if (auto it = gts.genericTemplateNamespace.find(candidateKey);
+                    it != gts.genericTemplateNamespace.end() && !it->second.empty())
+                    record["decl_ns"] = it->second;
+                else if (index == 0)
+                    if (auto it = gts.genericTemplateNamespace.find(name);
+                        it != gts.genericTemplateNamespace.end() && !it->second.empty())
+                        record["decl_ns"] = it->second;
+                if (gts.coreGenericTemplates.count(candidateKey) != 0
+                    || (index == 0 && gts.coreGenericTemplates.count(name) != 0))
+                    record["core"] = true;
+                arr.push_back(std::move(record));
+            }
+        root["generic_functions"] = std::move(arr);
+    }
 
     // instantiatedGenerics / instantiatedInterfaces / instantiatedGenericFunctions
     {
@@ -9559,10 +9632,70 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
         gts.genericInterfaceValueParams, gts.genericInterfaceValueDefaults,
         ifaceConstraintsDummy, gts.genericInterfacePackIndex);
 
-    registerLazyTemplates("generic_functions",
-        gts.genericFunctionTemplates, gts.genericFunctionTypeParams,
-        gts.genericFunctionValueParams, gts.genericFunctionValueDefaults,
-        gts.genericFunctionConstraints, gts.genericFunctionPackIndex);
+    if (auto* arr = root->getArray("generic_functions"))
+        for (auto& elem : *arr)
+        {
+            auto* record = elem.getAsObject();
+            if (record == nullptr) continue;
+            auto nameValue = record->getString("name");
+            auto sourceValue = record->getString("source");
+            if (!nameValue || !sourceValue) continue;
+            const std::string name = nameValue->str();
+            const int64_t rawIndex = record->getInteger("candidate_index").value_or(0);
+            if (rawIndex < 0 || rawIndex > 1024) continue;
+            const size_t index = static_cast<size_t>(rawIndex);
+            auto& overloads = gts.genericFunctionTemplates[name];
+            if (overloads.size() <= index) overloads.resize(index + 1, nullptr);
+            const std::string candidateKey =
+                GenericTemplateState::GenericFunctionCandidateKey(name, index);
+            overloads[index] = nullptr;
+
+            std::vector<std::string> typeParams;
+            if (auto* values = record->getArray("type_params"))
+                for (auto& value : *values)
+                    if (auto text = value.getAsString()) typeParams.push_back(text->str());
+            gts.genericFunctionTypeParams[candidateKey] = typeParams;
+            if (index == 0) gts.genericFunctionTypeParams[name] = typeParams;
+
+            auto readStringArray = [&](llvm::StringRef field) {
+                std::vector<std::string> values;
+                if (auto* array = record->getArray(field))
+                    for (auto& value : *array)
+                        if (auto text = value.getAsString()) values.push_back(text->str());
+                return values;
+            };
+            auto valueParams = readStringArray("value_param_types");
+            auto valueDefaults = readStringArray("value_param_defaults");
+            gts.genericFunctionValueParams[candidateKey] = valueParams;
+            gts.genericFunctionValueDefaults[candidateKey] = valueDefaults;
+            if (index == 0)
+            {
+                gts.genericFunctionValueParams[name] = valueParams;
+                gts.genericFunctionValueDefaults[name] = valueDefaults;
+            }
+            if (auto* constraints = record->getObject("constraints"))
+            {
+                auto parsed = DeserializeConstraints(constraints);
+                gts.genericFunctionConstraints[candidateKey] = parsed;
+                if (index == 0) gts.genericFunctionConstraints[name] = std::move(parsed);
+            }
+            if (auto value = record->getInteger("pack_index"))
+            {
+                gts.genericFunctionPackIndex[candidateKey] = static_cast<size_t>(*value);
+                if (index == 0) gts.genericFunctionPackIndex[name] = static_cast<size_t>(*value);
+            }
+            if (auto ns = record->getString("decl_ns"))
+            {
+                gts.genericTemplateNamespace[candidateKey] = ns->str();
+                if (index == 0) gts.genericTemplateNamespace[name] = ns->str();
+            }
+            if (auto core = record->getBoolean("core"); core && *core)
+            {
+                gts.coreGenericTemplates.insert(candidateKey);
+                gts.coreGenericTemplates.insert(name);
+            }
+            gts.lazyTemplateSource[candidateKey] = sourceValue->str();
+        }
 
     } // end CoreDes:GenericRegister
 
@@ -9652,14 +9785,41 @@ CFlatParser::InterfaceDefinitionContext* LLVMBackend::MaterializeGenericInterfac
         });
 }
 
-CFlatParser::FunctionDefinitionContext* LLVMBackend::MaterializeGenericFunction(const std::string& name)
+CFlatParser::FunctionDefinitionContext* LLVMBackend::MaterializeGenericFunction(
+        const std::string& name, size_t index)
 {
-    return MaterializeGenericTemplate(gts.genericFunctionTemplates, name,
-        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::FunctionDefinitionContext* {
-            if (!cu || !cu->translationUnit()) return nullptr;
-            for (auto* decl : cu->translationUnit()->externalDeclaration())
-                if (auto* fd = decl->functionDefinition())
-                    if (fd->genericTypeParameters()) return fd;
-            return nullptr;
-        });
+    auto templates = gts.genericFunctionTemplates.find(name);
+    if (templates == gts.genericFunctionTemplates.end() || index >= templates->second.size())
+        return nullptr;
+    if (templates->second[index] != nullptr) return templates->second[index];
+    const std::string candidateKey = GenericTemplateState::GenericFunctionCandidateKey(name, index);
+    auto source = gts.lazyTemplateSource.find(candidateKey);
+    if (source == gts.lazyTemplateSource.end()) return nullptr;
+
+    llvm::TimeTraceScope materializeScope("GenericMaterialize", name);
+    SyntheticParseState state;
+    state.label = "cached:" + name;
+    state.input = std::make_unique<antlr4::ANTLRInputStream>(source->second);
+    state.lexer = std::make_unique<CFlatLexer>(state.input.get());
+    state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
+    state.parser = std::make_unique<CFlatParser>(state.tokens.get());
+    state.parser->removeErrorListeners();
+    auto localizeMessage = MakeDiagnosticLocalizer();
+    state.parser->setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
+    state.tokens->fill();
+    auto* unit = state.parser->compilationUnit();
+    NormalizeForInitTree(*state.parser, unit);
+    CFlatParser::FunctionDefinitionContext* context = nullptr;
+    if (unit != nullptr && unit->translationUnit() != nullptr)
+        for (auto* declaration : unit->translationUnit()->externalDeclaration())
+            if (auto* function = declaration->functionDefinition();
+                function != nullptr && function->genericTypeParameters() != nullptr)
+            {
+                context = function;
+                break;
+            }
+    templates->second[index] = context;
+    syntheticParseStates_.push_back(std::move(state));
+    gts.lazyTemplateSource.erase(source);
+    return context;
 }

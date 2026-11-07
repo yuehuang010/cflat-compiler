@@ -343,6 +343,7 @@ import cpp "library/cpp_interop_poly.cpp";
 // duplicate-definition (ODR merge) check.
 import cpp "library/cpp_interop_inline.h";
 import cpp "library/cpp_interop_inline_again.h";
+
 import cpp "library/cpp_interop_vdtor_unused_accept.h";
 import cpp "library/cpp_vdtor_opdelete_template.h";
 import cpp "library/cpp_inline_static_a.hpp";
@@ -582,6 +583,8 @@ import cpp "library/c_macro_helpers.h";
 import cpp "cstdint";
 import cpp "library/t8_declorder.hpp";
 import cpp "library/t12_msvc_shapes.hpp";
+import cpp "library/cpp_interop_nested_free.hpp";
+import cpp "library/cpp_interop_outline_proxy.hpp";
 import cpp "library/t15_friendptr.hpp";
 import cpp "library/cpp_namespace_class_constants.hpp";
 import cpp "library/cpp_var_template_views.hpp";
@@ -1543,6 +1546,17 @@ cpprefgate.C* RgGlobalStructByValue() { return &cpprefgate.value_ref(RgGlobalStr
 (const cpprefgate.C)* RgGlobalConstRef() { return &cpprefgate.const_ref(RgGlobalStruct); }
 cpprefgate.C* RgHeap(cpprefgate.Hold* h) { return h.member(); }
 cpprefgate.C* RgHeapAmp(cpprefgate.Hold* h) { return &h.member(); }
+cpprefgate.C* RgIndirectHeapHolder(cpprefgate.DoublePointerHolder* h) { return &h.get(); }
+alias cpprefgate.C* RgHeapDoublePointer() {
+    cpprefgate.C** holder = cpprefgate.heap_double_pointer_holder();
+    return &cpprefgate.double_pointer_ref(holder);
+}
+cpprefgate.C RgValueDoublePointer() {
+    cpprefgate.C local = { v = 89 };
+    cpprefgate.C* localPointer = &local;
+    cpprefgate.C** holder = &localPointer;
+    return cpprefgate.double_pointer_ref(holder);
+}
 cpprefgate.C* RgParam(cpprefgate.C* p) { return cpprefgate.local_ref(*p); }
 cpprefgate.C* RgParamAmp(cpprefgate.C* p) { return &cpprefgate.local_ref(*p); }
 cpprefgate.C* RgTernary(bool choose) {
@@ -4221,6 +4235,9 @@ namespace RootCxxEscape
 int T235TupleDtorCount = 0;
 // A C++ alias template used through a file-scope alias: the same pack expansion, spelled differently.
 using VarAliasProj = alnv.Proj<int, char>;
+// CONVOP cell 1, return position: the ternary is CFlat code, so the const-receiver pick is CFlat's (clang 1, hit 2).
+int convopReturnTernary(t105.CvBoolY* p) { return t105.cvBoolY(*p) ? 1 : 3; }
+
 extern int main()
 {
     // The root C++ namespace must win over the same-named nested CFlat namespace.
@@ -6783,6 +6800,7 @@ extern int main()
         || cpi_t52.lp(ALIASZERO) != 5 || cpi_t52.lp(PARENZERO) != 5 || cpi_t52.lp(0L) != 5
         || cpi_t52.lp(HEXZERO) != 5 || cpi_t52.lp((Z0)) != 5
         || cpi_t52.lp(((Z0))) != 5 || cpi_t52.lp(p: ((Z0))) != 5) return 5201;
+    if (cpi_t52.tdp<int>(0) != 15) return 5206;
     std.nullptr_t t52Null = nullptr;
     if (cpi_t52.pref(0) != 27 || cpi_t52.pref(nullptr) != 27 || cpi_t52.pref(ZERO) != 27
         || cpi_t52.pref(p: 0) != 27 || cpi_t52.pref(p: ZERO) != 27
@@ -6797,6 +6815,7 @@ extern int main()
         || cpi_t52.nref(p: ZERO) != 31)
         return 5202;
     int t52Lvalue = 1;
+    if (cpi_t52.irr(ZERO) != 40) return 5207;
     if (cpi_t52.fwd(Z0) != 90 || cpi_t52.fwd(ZERO) != 90 || cpi_t52.fwd(t52Lvalue) != 81) return 5203;
     if (cpi_t52.tk(0) != 5 || cpi_t52.tk(ZERO) != 5 || cpi_t52.tk(k: (Z0)) != 5) return 5205;
     // A local or parameter that shadows a zero macro is an ordinary int lvalue, never a null constant.
@@ -6808,6 +6827,7 @@ extern int main()
     bool t98C = true;
     if (cpi_t98.ov(T98_N5) != 205 || cpi_t98.ov(t98C ? T98_N5 : T98_N5) != 205) return 98901;
     if (cpi_t98.irr(T98_N5) != 45 || cpi_t98.cref(T98_N5) != 6) return 98902;
+    if (cpi_t98.cref(ZERO) != 1 || cpi_t98.cref(0UL) != 1 || cpi_t98.irr(ZERO) != 40) return 98913;
     if (cpi_t98.fwd(T98_N5) != 95 || cpi_t98.fwd(t98C ? T98_N5 : T98_N5) != 95) return 98903;
     if (cpi_t98.fwd(t98C ? T98_N5 : Z0) != 95 || T98_N5 + 1 != 6) return 98904;
     {
@@ -6871,6 +6891,7 @@ extern int main()
         if (cpp_t111.nref_r(nullptr) != 123 || cpp_t111.nref_r_address(nullptr) == 0
             || cpp_t111.nref_r_address(move t111Null) == 0)
             return 11105;
+        if (cpp_t111.nref_r(0) != 123 || cpp_t111.nref_r_address(0) == 0) return 11106;
     }
     // T42: a converting-ctor temporary binds C++ `const X&` / `X&&` (clang++ oracle values).
     char[2] t42CpBuf = "A";
@@ -7026,8 +7047,17 @@ extern int main()
     {
         cflat_t22.DefaultOnLoser<int> t22DefLoser = default;
         if (t22DefLoser.pick() != 11) return 9527;
+        if (t22DefLoser.pick(5) != 25) return 9528;
+        cflat_t22.DefaultBoth<int> t22DefBoth = default;
+        if (t22DefBoth.pick() != 22 || t22DefBoth.pick(5) != 25) return 9529;
+        cflat_t22.DefaultConstrained<int> t22DefConstrained = default;
+        if (t22DefConstrained.pick() != 23 || t22DefConstrained.pick(4) != 24) return 9532;
+        if (cflat_t22.StaticDefaultOnLoser<int>.pick(5) != 25) return 9533;
         cflat_t22.DefaultPrefix<int> t22Prefix = default;
         if (t22Prefix.pick() != 13) return 9530;
+        if (t22Prefix.pick(4) != 27 || t22Prefix.pick(4, 4) != 28) return 9534;
+        cflat_t22.UnorderedDefault<int> t22Unordered = default;
+        if (t22Unordered.pick() != 11) return 9535;
     }
     cflat_t22.InstanceF t22InstanceF = default;
     if (t22InstanceF.f(1) != 2) return 9531;
@@ -7898,6 +7928,117 @@ extern int main()
         || t27ptr.integer_arith_kind(t58AutoShort) != 1
         || t27ptr.integer_arith_kind(t58AutoChar) != 1
         || t27ptr.integer_arith_kind(t58AutoNative) != 1) return 27070;
+    // SRCTYPE: each C++ call form sees the clang arithmetic result type and value.
+    char t58SrcChar = 1; short t58SrcShort = 1; u8 t58SrcUchar = 1; u16 t58SrcUshort = 1;
+    bool t58SrcBool = true; long t58SrcLong = 1; long t58SrcLong2 = 3;
+    ulong t58SrcUlong = 6; int t58SrcInt = 1;
+    t27ptr.ArithmeticMember t58SrcMember = default;
+    if (t27ptr.arithmetic_value(t58SrcChar + t58SrcChar) != 102
+        || t27ptr.arithmetic_value_ref(t58SrcChar + t58SrcChar) != 102
+        || t27ptr.arithmetic_value_const(t58SrcChar + t58SrcChar) != 102
+        || t27ptr.ArithmeticCtor(t58SrcChar + t58SrcChar).get() != 102
+        || t58SrcMember.value(t58SrcChar + t58SrcChar) != 102) return 27071;
+    if (t27ptr.arithmetic_value(t58SrcShort * t58SrcShort) != 101
+        || t27ptr.arithmetic_value_ref(t58SrcShort * t58SrcShort) != 101
+        || t27ptr.arithmetic_value_const(t58SrcShort * t58SrcShort) != 101
+        || t27ptr.ArithmeticCtor(t58SrcShort * t58SrcShort).get() != 101
+        || t58SrcMember.value(t58SrcShort * t58SrcShort) != 101) return 27072;
+    if (t27ptr.arithmetic_value(t58SrcUchar + t58SrcUchar) != 102
+        || t27ptr.arithmetic_value_ref(t58SrcUchar + t58SrcUchar) != 102
+        || t27ptr.arithmetic_value_const(t58SrcUchar + t58SrcUchar) != 102
+        || t27ptr.ArithmeticCtor(t58SrcUchar + t58SrcUchar).get() != 102
+        || t58SrcMember.value(t58SrcUchar + t58SrcUchar) != 102) return 27073;
+    if (t27ptr.arithmetic_value(t58SrcUshort * 1) != 101
+        || t27ptr.arithmetic_value_ref(t58SrcUshort * 1) != 101
+        || t27ptr.arithmetic_value_const(t58SrcUshort * 1) != 101
+        || t27ptr.ArithmeticCtor(t58SrcUshort * 1).get() != 101
+        || t58SrcMember.value(t58SrcUshort * 1) != 101) return 27074;
+    if (t27ptr.arithmetic_value(t58SrcBool + t58SrcBool) != 102
+        || t27ptr.arithmetic_value_ref(t58SrcBool + t58SrcBool) != 102
+        || t27ptr.arithmetic_value_const(t58SrcBool + t58SrcBool) != 102
+        || t27ptr.ArithmeticCtor(t58SrcBool + t58SrcBool).get() != 102
+        || t58SrcMember.value(t58SrcBool + t58SrcBool) != 102) return 27075;
+    if (t27ptr.arithmetic_value(-t58SrcChar) != 99
+        || t27ptr.arithmetic_value_ref(-t58SrcChar) != 99
+        || t27ptr.arithmetic_value_const(-t58SrcChar) != 99
+        || t27ptr.ArithmeticCtor(-t58SrcChar).get() != 99
+        || t58SrcMember.value(-t58SrcChar) != 99) return 27076;
+    if (t27ptr.arithmetic_value(~t58SrcShort) != 98
+        || t27ptr.arithmetic_value_ref(~t58SrcShort) != 98
+        || t27ptr.arithmetic_value_const(~t58SrcShort) != 98
+        || t27ptr.ArithmeticCtor(~t58SrcShort).get() != 98
+        || t58SrcMember.value(~t58SrcShort) != 98) return 27077;
+    if (t27ptr.arithmetic_value(t58SrcBool ? t58SrcLong : t58SrcLong2) != 301
+        || t27ptr.arithmetic_value_ref(t58SrcBool ? t58SrcLong : t58SrcLong2) != 2301
+        || t27ptr.arithmetic_value_const(t58SrcBool ? t58SrcLong : t58SrcLong2) != 301
+        || t27ptr.ArithmeticCtor(t58SrcBool ? t58SrcLong : t58SrcLong2).get() != 301
+        || t58SrcMember.value(t58SrcBool ? t58SrcLong : t58SrcLong2) != 301) return 27078;
+    if (t27ptr.arithmetic_value(t58SrcLong << 1) != 302
+        || t27ptr.arithmetic_value_ref(t58SrcLong << 1) != 302
+        || t27ptr.arithmetic_value_const(t58SrcLong << 1) != 302
+        || t27ptr.ArithmeticCtor(t58SrcLong << 1).get() != 302
+        || t58SrcMember.value(t58SrcLong << 1) != 302) return 27079;
+    if (t27ptr.arithmetic_value(t58SrcLong & t58SrcUlong) != 400
+        || t27ptr.arithmetic_value_ref(t58SrcLong & t58SrcUlong) != 400
+        || t27ptr.arithmetic_value_const(t58SrcLong & t58SrcUlong) != 400
+        || t27ptr.ArithmeticCtor(t58SrcLong & t58SrcUlong).get() != 400
+        || t58SrcMember.value(t58SrcLong & t58SrcUlong) != 400) return 27080;
+    if (t27ptr.arithmetic_value(t58SrcUlong | 1) != 407
+        || t27ptr.arithmetic_value_ref(t58SrcUlong | 1) != 407
+        || t27ptr.arithmetic_value_const(t58SrcUlong | 1) != 407
+        || t27ptr.ArithmeticCtor(t58SrcUlong | 1).get() != 407
+        || t58SrcMember.value(t58SrcUlong | 1) != 407) return 27081;
+    if (t27ptr.arithmetic_value(t58SrcLong ^ t58SrcLong2) != 302
+        || t27ptr.arithmetic_value_ref(t58SrcLong ^ t58SrcLong2) != 302
+        || t27ptr.arithmetic_value_const(t58SrcLong ^ t58SrcLong2) != 302
+        || t27ptr.ArithmeticCtor(t58SrcLong ^ t58SrcLong2).get() != 302
+        || t58SrcMember.value(t58SrcLong ^ t58SrcLong2) != 302) return 27082;
+    if (t27ptr.arithmetic_value(t58SrcInt >> 1) != 100
+        || t27ptr.arithmetic_value_ref(t58SrcInt >> 1) != 100
+        || t27ptr.arithmetic_value_const(t58SrcInt >> 1) != 100
+        || t27ptr.ArithmeticCtor(t58SrcInt >> 1).get() != 100
+        || t58SrcMember.value(t58SrcInt >> 1) != 100) return 27083;
+    if (t27ptr.arithmetic_value(t58SrcLong + 1.0) != 602
+        || t27ptr.arithmetic_value_ref(t58SrcLong + 1.0) != 602
+        || t27ptr.arithmetic_value_const(t58SrcLong + 1.0) != 602
+        || t27ptr.ArithmeticCtor(t58SrcLong + 1.0).get() != 602
+        || t58SrcMember.value(t58SrcLong + 1.0) != 602) return 27084;
+    if const (__WINDOWS__)
+    {
+        if (t27ptr.arithmetic_value(sizeof(long) + 1) != 1405
+            || t27ptr.arithmetic_value_ref(sizeof(long) + 1) != 1405
+            || t27ptr.arithmetic_value_const(sizeof(long) + 1) != 1405
+            || t27ptr.ArithmeticCtor(sizeof(long) + 1).get() != 1405
+            || t58SrcMember.value(sizeof(long) + 1) != 1405) return 27085;
+        if (t27ptr.arithmetic_value(sizeof(t58SrcLong) + 1) != 1405
+            || t27ptr.arithmetic_value(sizeof(t58SrcLong + 1) + 1) != 1405
+            || t27ptr.arithmetic_value(alignof(long) + 1) != 1405) return 27086;
+    }
+    else
+    {
+        if (t27ptr.arithmetic_value(sizeof(long) + 1) != 409
+            || t27ptr.arithmetic_value_ref(sizeof(long) + 1) != 409
+            || t27ptr.arithmetic_value_const(sizeof(long) + 1) != 409
+            || t27ptr.ArithmeticCtor(sizeof(long) + 1).get() != 409
+            || t58SrcMember.value(sizeof(long) + 1) != 409) return 27085;
+        if (t27ptr.arithmetic_value(sizeof(t58SrcLong) + 1) != 409
+            || t27ptr.arithmetic_value(sizeof(t58SrcLong + 1) + 1) != 409
+            || t27ptr.arithmetic_value(alignof(long) + 1) != 409) return 27086;
+    }
+    if (t27ptr.arithmetic_value(t58SrcChar << 1) != 102
+        || t27ptr.arithmetic_value(t58SrcUchar & t58SrcUchar) != 101) return 27087;
+    t27ptr.ArithmeticX t58SrcX = default;
+    t27ptr.ArithmeticIntX t58SrcIntX = default;
+    t27ptr.ArithmeticDoubleX t58SrcDoubleX = default;
+    if (t58SrcLong - t58SrcX != 701 || t58SrcUlong - t58SrcX != 806
+        || t58SrcX * t58SrcLong != 901 || t58SrcX * t58SrcUlong != 1006
+        || t58SrcX * (t58SrcLong + 1) != 902
+        || t58SrcX * (t58SrcUlong + 1) != 1007
+        || t58SrcIntX * (t58SrcInt + 1) != 2002
+        || t58SrcDoubleX * (t58SrcLong + 1.0) != 3002) return 27088;
+    expect_error("ambiguous call to 't27ptr.operator*': no candidate ranks better than the others") {
+        long t58SrcAmbiguous = t58SrcX * (t58SrcInt + 1);
+    }
     // T439: constant-folded comparisons keep bool for C++ template deduction.
     if (t27ptr.bool_kind(1e3 > 1) != 1 || t27ptr.bool_kind(1e3 == 1) != 1
         || t27ptr.bool_kind(1e3 != 1) != 1) return 43901;
@@ -10137,6 +10278,92 @@ extern int main()
             return 31706;
         if (t105.pointerOnly(std.move(pointerSource)) != 73 || pointerSource.value != 31)
             return 31707;
+    }
+
+    // CONVOP: explicit bool is not an intermediate conversion for these casts.
+    {
+        t105.ExplicitBoolInt source = default;
+        t105.convopHit = 0; long a = (long)source;
+        if (a != 42 || t105.convopHit != 2) return 31708;
+        t105.convopHit = 0; i64 b = (i64)source;
+        if (b != 42 || t105.convopHit != 2) return 31709;
+        t105.convopHit = 0; char c = (char)source;
+        if (c != 42 || t105.convopHit != 2) return 31710;
+        t105.convopHit = 0; double d = (double)source;
+        if (d != 42 || t105.convopHit != 2) return 31711;
+        t105.convopHit = 0; float e = (float)source;
+        if (e != 42 || t105.convopHit != 2) return 31712;
+        t105.convopHit = 0; bool f = (bool)source;
+        if (!f || t105.convopHit != 1) return 31713;
+
+        // Cell 6: a ternary of two const V& arms keeps const; the const operator int runs (clang 1/2, 12 = 1*10+2).
+        t105.CvY cvy = default;
+        t105.convopHit = 0; bool tbool = true ? t105.cvY(cvy) : t105.cvY(cvy);
+        if (!tbool || t105.convopHit != 2) return 31753;
+        t105.convopHit = 0; int tint = (int)(false ? t105.cvY(cvy) : t105.cvY(cvy));
+        if (tint != 1 || t105.convopHit != 2) return 31754;
+
+        // Cell 7: the non-const operator long binds the implicit object before the return conversion (clang 5/1).
+        t105.CvRank rk = default; t105.convopHit = 0; int rkLvalue = rk;
+        if (rkLvalue != 5 || t105.convopHit != 1) return 31755;
+        t105.convopHit = 0; int rkPrvalue = t105.makeCvRank();
+        if (rkPrvalue != 5 || t105.convopHit != 1) return 31756;
+
+        // Cell 1: an `if` on a const receiver skips the non-const operator bool (clang: 10 then 12, hit 2).
+        t105.CvBoolY cby = default; int cbr = 0;
+        t105.convopHit = 0; if (t105.cvBoolY(cby)) { cbr = 10; } else { cbr = 20; }
+        if (cbr != 10 || t105.convopHit != 2) return 31766;
+        t105.CvBoolZ cbz = default;
+        t105.convopHit = 0; if (t105.cvBoolZ(cbz)) { cbr += 2; }
+        if (cbr != 12 || t105.convopHit != 2) return 31786;
+
+        // Cell 1 in every condition position: a const BY through `const BY&` takes the const operator int
+        // (clang 12 for each form: value 1 or 3 from the condition, hit 2). One leg per position.
+        {
+            t105.CvBoolY pos = default;
+            int posR = 0;
+            t105.convopHit = 0; while (t105.cvBoolY(pos)) { posR = 1; break; }
+            if (posR != 1 || t105.convopHit != 2) return 31831;
+            int dwI = 0;
+            t105.convopHit = 0; do { dwI = dwI + 1; if (dwI == 2) { break; } } while (t105.cvBoolY(pos));
+            if (dwI != 2 || t105.convopHit != 2) return 31832;
+            int forI = 0;
+            t105.convopHit = 0; for (; t105.cvBoolY(pos); ) { forI = forI + 1; break; }
+            if (forI != 1 || t105.convopHit != 2) return 31833;
+            t105.convopHit = 0; bool notB = !t105.cvBoolY(pos);
+            if (notB || t105.convopHit != 2) return 31834;
+            t105.convopHit = 0; bool andB = t105.cvBoolY(pos) && true;
+            if (!andB || t105.convopHit != 2) return 31835;
+            t105.convopHit = 0; bool orB = t105.cvBoolY(pos) || false;
+            if (!orB || t105.convopHit != 2) return 31836;
+            t105.convopHit = 0; int ternI = t105.cvBoolY(pos) ? 1 : 3;
+            if (ternI != 1 || t105.convopHit != 2) return 31837;
+            t105.convopHit = 0; int retI = convopReturnTernary(&pos);
+            if (retI != 1 || t105.convopHit != 2) return 31838;
+        }
+
+        // Const derived receiver, conversion pair in the BASE: the const operator int runs (clang 72 each form).
+        t105.CvPairDerived cpd = default;
+        t105.convopHit = 0; int cpdInt = t105.cvPairDerived(cpd);
+        if (cpdInt != 7 || t105.convopHit != 2) return 31787;
+        t105.convopHit = 0; long cpdLong = t105.cvPairDerived(cpd);
+        if (cpdLong != 7 || t105.convopHit != 2) return 31788;
+        t105.convopHit = 0; int cpdCast = (int)t105.cvPairDerived(cpd);
+        if (cpdCast != 7 || t105.convopHit != 2) return 31789;
+
+        // Cell 4: operator W inherited from a base class (clang 20, one op, one ctor, no copy).
+        t105.PD inh = t105.makePD(); t105.resetW(); t105.W inhW = inh;
+        if (inhW.value != 20 || t105.wOps() != 1 || t105.wCtors() != 1 || t105.wCopies() != 0) return 31757;
+
+        // Cell 5: explicit (W)p, clang counts 37 1 1 0 0 0 and one dtor after the scope.
+        t105.resetW();
+        {
+            t105.P castSrc = t105.makeP();
+            t105.W castW = (t105.W)castSrc;
+            if (castW.value != 37 || t105.wOps() != 1 || t105.wCtors() != 1
+                || t105.wCopies() != 0 || t105.wAssigns() != 0) return 31758;
+        }
+        if (t105.wDtors() != 1) return 31759;
     }
 
     // Multiword C++ operator spellings must match CFlat destinations in implicit and cast paths.
@@ -14938,6 +15165,16 @@ extern int main()
         delete scalar;
     }
     {
+        cppcr.ScalarRRef* scalar = new cppcr.ScalarRRef(ZERO);
+        if (scalar.seen != 1) return 3150;
+        delete scalar;
+    }
+    {
+        cppcr.ConstIntRef* constRef = new cppcr.ConstIntRef(ZERO);
+        if (constRef.seen != 0) return 3151;
+        delete constRef;
+    }
+    {
         int x = 4;
         cppcr.ScalarRRef* scalar = new cppcr.ScalarRRef(x + 1);
         if (scalar.seen != 6) return 3094;
@@ -17430,6 +17667,15 @@ extern int main()
     cpprefgate.C* rgMember = RgHeap(rgHeap);
     rgMember.v = 37;
     if (rgHeap.c.v != 37 || RgHeapAmp(rgHeap) != rgMember) return 3561;
+    cpprefgate.DoublePointerHolder* rgIndirectHeap = new cpprefgate.DoublePointerHolder();
+    rgIndirectHeap.pp = &RgGlobalPointer;
+    cpprefgate.C* rgIndirectHeapResult = RgIndirectHeapHolder(rgIndirectHeap);
+    if (rgIndirectHeapResult != &cpprefgate.cell() || rgIndirectHeapResult.v != 31) return 3570;
+    delete rgIndirectHeap;
+    cpprefgate.C* rgHeapDoublePointer = RgHeapDoublePointer();
+    if (rgHeapDoublePointer == nullptr || rgHeapDoublePointer.v != 83) return 3571;
+    cpprefgate.C rgValueDoublePointer = RgValueDoublePointer();
+    if (rgValueDoublePointer.v != 89) return 3572;
     cpprefgate.C rgParamCell = { v = 41 };
     if (RgParam(&rgParamCell) != &rgParamCell || RgParamAmp(&rgParamCell) != &rgParamCell)
         return 3562;
@@ -21200,6 +21446,77 @@ extern int main()
     t102Converted = 5;
     if (t102a.convert_assign_value(t102Converted) != 5
         || t102a.convert_assign_ctor_count() != 2) return 3289;
+    // Assignment routing accept-set: exact int and double winners remain callable.
+    cppas.AssignRouteRank t102Rank = default;
+    t102Rank = 1.0;
+    if (t102Rank.v_ != 11 || cppas.AssignRouteRank.double_assigns != 1
+        || cppas.AssignRouteRank.int_assigns != 0) return 3290;
+    cppas.AssignRouteDeletedDouble t102DeletedDouble = default;
+    t102DeletedDouble = 1.0;
+    if (t102DeletedDouble.v_ != 11 || cppas.AssignRouteDeletedDouble.double_assigns != 1)
+        return 3291;
+    cppas.AssignRouteIntOnly t102IntOnly = default;
+    t102IntOnly = 1;
+    if (t102IntOnly.v_ != 1) return 3292;
+    cppas.AssignRouteRank.int_assigns = 0;
+    cppas.AssignRouteRank.double_assigns = 0;
+    cppas.AssignRouteRank t102IntRank = default;
+    t102IntRank = 1;
+    if (t102IntRank.v_ != 1 || cppas.AssignRouteRank.int_assigns != 1
+        || cppas.AssignRouteRank.double_assigns != 0) return 3296;
+    {
+        cppas.AssignRouteChain assignChainX = default;
+        cppas.AssignRouteChain assignChainY = default;
+        cppas.AssignRouteChain.reset();
+        assignChainX = (assignChainY = 5);
+        if (assignChainX.v_ != 5 || assignChainY.v_ != 5
+            || cppas.AssignRouteChain.copies != 1 || cppas.AssignRouteChain.dtors != 2)
+            return 100201;
+    }
+    cppas.AssignRouteChain.reset();
+    cppas.assignRouteChainGlobalX = (cppas.assignRouteChainGlobalY = 7);
+    if (cppas.assignRouteChainGlobalX.v_ != 7 || cppas.assignRouteChainGlobalY.v_ != 7
+        || cppas.AssignRouteChain.copies != 1 || cppas.AssignRouteChain.dtors != 2)
+        return 100202;
+    {
+        cppas.AssignRouteScalarRef refTarget = default;
+        refTarget.v_ = 3;
+        cppas.AssignRouteScalarRef* refPtr = &refTarget;
+        cppas.AssignRouteScalarRef.calls = 0;
+        int refResult = *refPtr += 1;
+        if (refResult != 4 || refTarget.v_ != 4 || cppas.AssignRouteScalarRef.calls != 1)
+            return 100203;
+        (*refPtr += 1) = 9;
+        if (refTarget.v_ != 9 || cppas.AssignRouteScalarRef.calls != 2) return 100204;
+    }
+    // `C b = (arr[i] = v)`: the element's by-value result is built in place in b (clang: copy 1, no move).
+    {
+        cppas.AssignRouteChain[2] assignElemArr = default;
+        cppas.AssignRouteChain.reset();
+        {
+            cppas.AssignRouteChain assignElemOut = (assignElemArr[1] = 10);
+            if (assignElemOut.v_ != 10 || assignElemArr[1].v_ != 10
+                || cppas.AssignRouteChain.copies != 1 || cppas.AssignRouteChain.dtors != 0)
+                return 100205;
+        }
+        if (cppas.AssignRouteChain.dtors != 1) return 100206;
+    }
+    // `_ = move g;` on a namespace global (and a holder's field) runs the dtor once, now.
+    cppas.AssignRouteChain.reset();
+    _ = move cppas.assignRouteChainMoveGlobal;
+    if (cppas.AssignRouteChain.dtors != 1) return 100207;
+    cppas.AssignRouteChain.reset();
+    _ = move cppas.assignRouteHolderGlobal;
+    if (cppas.AssignRouteChain.dtors != 1) return 100208;
+    // A using-declared base operator=(int) is exact for `1` against derived (double) / (long long):
+    // clang picks the base member, not an ambiguity.
+    {
+        cppas.AssignRouteUsingDerived assignUsing = default;
+        assignUsing = 1;
+        if (assignUsing.k_ != 1) return 100209;
+        assignUsing = 1.5;
+        if (assignUsing.k_ != 2) return 100210;
+    }
     // T317: an unnamed `new T[n]` source converts through the implicit converting constructor taking
     // const int*, as the spelled `NX(new int[3])` does, in assignment, declaration, call and return.
     {
@@ -22034,6 +22351,71 @@ int LoweredUserDtorAssignLegs(int argc)
     int t12CvArg = 0;
     int t12CvCall = t12Cv(0); int t12CvIndex = t12Cv[&t12CvArg];
     if (t12CvCall != 7 || t12CvIndex != 7) return 31785;
+    // NESTPROXY: a free function returning or taking a nested member class of a class template
+    // specialization by value binds without the enclosing type used first (direct call, local,
+    // by-value pass, namespace and global functions); a non-template owner is the control.
+    if (nfree.freeMake(9).twice() != 18 || nfree.lastWhich != 3) return 40801;
+    nfree.Box<3>.Item nfreeLocal = nfree.freeMake(9);
+    if (nfreeLocal.twice() != 18 || nfree.lastWhich != 3) return 40802;
+    if (nfree.consumeItem(nfree.freeMake(9)) != 18 || nfree.lastWhich != 30) return 40803;
+    if (nfrGlobalMake(6).twice() != 12 || nfree.lastWhich != 4) return 40804;
+    nfree.Box<4>.Item nfrGlobalLocal = nfrGlobalMake(6);
+    if (nfrGlobalLocal.twice() != 12 || nfree.lastWhich != 4) return 40805;
+    if (nfrGlobalConsume(nfrGlobalMake(6)) != 12 || nfree.lastWhich != 40) return 40806;
+    if (nfrPlainMake(3).twice() != 6 || nfree.lastWhich != 5) return 40807;
+    nfree.Box<3>.Item nfreeParam = default;
+    if (nfree.consumeItem(nfreeParam) != 0 || nfree.lastWhich != 30) return 40808;
+    nfree.Box<3> nfreeBox = default;
+    if (nfree.consumeItem(nfreeBox.memberMake(8)) != 16 || nfree.lastWhich != 30) return 40809;
+    nfree.Box<4>.Item nfrGlobalParam = default;
+    if (nfrGlobalConsume(nfrGlobalParam) != 0 || nfree.lastWhich != 40) return 40810;
+    // NESTPROXY: an out-of-line template operator= on a proxy returned by value (operator(), unary
+    // operator*, operator[], a named method) routes to that operator=, as the inline form does.
+    outp.Bits<8> outpCall = default;
+    outpCall(2) = true;
+    if (outpCall.word != 4 || outpCall.access != 1 || outpCall.op != 10) return 40811;
+    outp.Bits<8> outpCallInt = default;
+    outpCallInt(3) = 7;
+    if (outpCallInt.word != 8 || outpCallInt.access != 1 || outpCallInt.op != 20) return 40812;
+    outp.Bits<8> outpDeref = default;
+    *outpDeref = true;
+    if (outpDeref.word != 1 || outpDeref.access != 2 || outpDeref.op != 10) return 40813;
+    outp.Bits<8> outpDerefInt = default;
+    *outpDerefInt = 7;
+    if (outpDerefInt.word != 1 || outpDerefInt.access != 2 || outpDerefInt.op != 20) return 40814;
+    outp.Bits<8> outpIndex = default;
+    outpIndex[3] = true;
+    if (outpIndex.word != 8 || outpIndex.access != 3 || outpIndex.op != 10) return 40815;
+    outp.Bits<8> outpMethod = default;
+    outpMethod.at(4) = 1;
+    if (outpMethod.word != 16 || outpMethod.access != 4 || outpMethod.op != 20) return 40816;
+    outp.Bits<8> outpCompound = default;
+    outpCompound(2) |= true;
+    if (outpCompound.word != 4 || outpCompound.access != 1 || outpCompound.op != 30) return 40817;
+    // A proxy with no operator= stays refused, with the same message.
+    expect_error("Left side of assignment is not an addressable lvalue.") {
+        outp.NoAssignBits<8> outpNoAssign = default;
+        outpNoAssign(2) = true;
+    }
+    // NESTPROXY r3: a by-value proxy local in the same scope must not leave an out-of-line operator=
+    // body dormant; the named-lvalue assignment to such a local goes through the same retry.
+    outp.Bits<8> outpLocalCall = default;
+    outp.Ref<8> outpLocalRef = outpLocalCall(3);
+    outpLocalCall(2) = true;
+    if (outpLocalCall.word != 4 || outpLocalCall.access != 1 || outpLocalCall.op != 10) return 40818;
+    outp.Bits<8> outpLocalDeref = default;
+    outp.Ref<8> outpLocalDerefRef = *outpLocalDeref;
+    *outpLocalDeref = true;
+    if (outpLocalDeref.word != 1 || outpLocalDeref.access != 2 || outpLocalDeref.op != 10) return 40819;
+    outp.Bits<8> outpLocalNamed = default;
+    outpLocalNamed(2) = true;
+    outp.Ref<8> outpLocalNamedRef = outpLocalNamed(3);
+    outpLocalNamedRef = true;
+    if (outpLocalNamed.word != 12 || outpLocalNamed.access != 1 || outpLocalNamed.op != 10) return 40820;
+    outp.Bits<8> outpNamedLvalue = default;
+    outp.Ref<8> outpNamedRef = outpNamedLvalue(2);
+    outpNamedRef = true;
+    if (outpNamedLvalue.word != 4 || outpNamedLvalue.access != 1 || outpNamedLvalue.op != 10) return 40821;
     // T15: rejecting a pointer-to-W(int) friend conversion keeps viable scalar and pointer overloads.
     t15.W t15W = t15.W(1);
     short t15Short = 1;
@@ -22113,6 +22495,18 @@ int LoweredUserDtorAssignLegs(int argc)
     int cppfixX = cppfix.X<char>; int cppfixXPrim = cppfix.X<int>;
     if (cppfixV != 5 || cppfixVPrim != 3 || cppfixWPtr != 7 || cppfixWPrim != 1
         || cppfixX != 21 || cppfixXPrim != 20) return 43604;
+    // Mutable variable templates bind the specialization's real C++ object.
+    if (cppfix.R<int> != 4 || cppfix.R<long> != 9) return 43605;
+    if (cppfix.S<int> != 2 || cppfix.S<long> != 8) return 43606;
+    cppfix.R<long> = 7;
+    if (cppfix.R<long> != 7 || cppfix.r_long_value() != 7) return 43607;
+    if (&cppfix.R<long> != cppfix.r_long_address()) return 43608;
+    if (cppfix.K<int> != 20) return 43611;
+    if (cppfix.AV<long> != 105) return 43612;
+    if (cppfix.AV<int> != 103) return 43613;
+    cppfix.Q<long> = 4;
+    if (cppfix.q_long_value() * 10 + cppfix.Q<int> != 41) return 43614;
+    if (cppfix_dep.AV<long> - 100 != 15) return 43615;
     // T33: a class-typed variable template is the real C++ object: range-for over STATIC
     // begin/end (views::empty<T>), `v<T>.member()` (not a class template), address identity.
     int vtvSum = 0;
@@ -24206,6 +24600,11 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T518TrivialAbi8() != 170212) return 51836;
     if (T518TrivialAbi16() != 170212) return 51837;
     if (T518AnonymousSpecialization() != 28053806) return 51838;
+    // SRCTYPE round 2: unscoped C++ enums promote by their registered C++ type.
+    if (srctypeEnumPromotionRound2() != 0) return 27089;
+    // SRCTYPE round 4: identity-only sources reach free operators and C++ templates (clang oracle).
+    int srctypeR4 = srctypeRound4Legs();
+    if (srctypeR4 != 0) return srctypeR4;
     return 0;
 }
 
@@ -25041,3 +25440,66 @@ void T249DeclPairParen(bool k, int* o)
     T249ReadCounts(o);
 }
 t317rawarr.NX T317MakeNx() { return new int[3]; }
+
+int srctypeEnumPromotionRound2()
+{
+    t27ptr.T58Plain e = t27ptr.T58A;
+    t27ptr.T58Long le = t27ptr.T58LA;
+    t27ptr.T58ULong ue = t27ptr.T58UA;
+    if (t27ptr.arithmetic_value(t27ptr.T58A | t27ptr.T58B) != 103) return 1;
+    if (t27ptr.arithmetic_value(le | 1) != 301) return 2;
+    if (t27ptr.arithmetic_value(ue | 1) != 401) return 3;
+    if (t27ptr.arithmetic_value(e << 2) != 104) return 4;
+    if (t27ptr.arithmetic_value(le >> 1) != 300) return 5;
+    return 0;
+}
+
+// SRCTYPE round 4: free C++ operators take the sizeof / bitwise identity of their operand.
+// Expected values are clang++ -std=c++20 results for the same expressions.
+int srctypeRound4Legs()
+{
+    t27ptr.ArithmeticX x = default;
+    ulong ul = 6; long l = 3; uint u = 6; long l2 = 5; char ch = 3; bool bo = true;
+    t27ptr.T58Long le = t27ptr.T58LA;
+    t27ptr.T58Plain e = t27ptr.T58A;
+    long op4 = (ul | 1) - x;
+    if (op4 != 807) return 27301;
+    long op5 = sizeof(int) - x;
+    if (op5 != 804) return 27302;
+    long op7 = x * sizeof(int);
+    if (op7 != 1004) return 27303;
+    // Auto locals keep the C++ identity of their source when they reach a C++ template.
+    auto q1 = sizeof(int);
+    if (t27ptr.arithmetic_value(q1) != 404) return 27304;
+    auto q2 = l << 1;
+    if (t27ptr.arithmetic_value(q2) != 306) return 27305;
+    auto q3 = u ^ l;
+    if (t27ptr.arithmetic_value(q3) != 305) return 27306;
+    auto q4 = l & ul;
+    if (t27ptr.arithmetic_value(q4) != 402) return 27307;
+    auto q5 = sizeof(long) + 1;
+    if (t27ptr.arithmetic_value(q5) != 409) return 27308;
+    auto q6 = ul | 1;
+    if (t27ptr.arithmetic_value(q6) != 407) return 27309;
+    auto q7 = l + 1;
+    if (t27ptr.arithmetic_value(q7) != 304) return 27310;
+    auto q8 = ch + ch;
+    if (t27ptr.arithmetic_value(q8) != 106) return 27311;
+    auto q9 = bo ? l : l2;
+    if (t27ptr.arithmetic_value(q9) != 303) return 27312;
+    auto q10 = le | 1;
+    if (t27ptr.arithmetic_value(q10) != 301) return 27313;
+    auto q11 = e << 2;
+    if (t27ptr.arithmetic_value(q11) != 104) return 27314;
+    auto q12 = alignof(long);
+    if (t27ptr.arithmetic_value(q12) != 408) return 27315;
+    // SRCTYPE round 5: the same locals bind a C++ `T&&` as the identity lvalue (clang oracle).
+    auto r1 = sizeof(int);
+    if (t27ptr.arithmetic_value_ref(r1) != 2404) return 27316;
+    auto r2 = l << 1;
+    if (t27ptr.arithmetic_value_ref(r2) != 2306) return 27317;
+    auto r3 = u ^ l;
+    if (t27ptr.arithmetic_value_ref(r3) != 2305) return 27318;
+    if (t27ptr.arithmetic_bump_ref(r1) != 2405 || r1 != 5) return 27319;
+    return 0;
+}

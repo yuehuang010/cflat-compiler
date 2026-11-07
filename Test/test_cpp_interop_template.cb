@@ -194,6 +194,8 @@ cppfop.FoldRef d5_return_temporary_fold(cppfop.FoldRef* a, cppfop.FoldRef* b,
 // instantiation path emitted the bodies. The libc++ checks need no fixture at all - the
 // libc++ headers are the fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h";
+import cpp "library/cpp_interop_crtp_field.h";
+import cpp "cerrno";
 import cpp "library/cpp_interop_unique_deleter.hpp";
 import cpp "library/cpp_interop_fnptr.h";
 import cpp "library/t373_generic_fnptr.hpp";
@@ -421,6 +423,16 @@ int veciter_direct_array_param(std.array<int, 4> value)
     int value = default;
 };
 int crtp_peek_handle(cppi_crtp.WeakHandle<CrtpSelfHandles>* handle) { return handle->get()->value; }
+// nslookup: a CRTP base's member templates read and write the derived class's field by name
+// (`self.value` inside the base). The generated declaration carries the primitive field.
+[cpp] struct CrtpFieldSelf : cppi_crtpf.Base<CrtpFieldSelf> { int value = default; };
+// nslookup r4: fields named after imported macros (errno from <cerrno>, EOF and stdout from <cstdio>)
+// stay opaque in C++, so the C++ base reads `value` and CFlat round-trips the macro-named fields.
+[cpp] struct CrtpMacroFieldMix : cppi_crtpf.Base<CrtpMacroFieldMix> { int errno = default; int value = default; int EOF = default; int stdout = default; };
+// nslookup r4: the macro-named field is the only aligned member (`char c` is alignment 1). clang: a CRTP
+// class is 24 bytes with c at 20 (the 16-byte weak base); the same fields without a base are 8 with c at 4.
+[cpp] struct CrtpMacroAlign : cppi_crtpf.Base<CrtpMacroAlign> { int errno = default; char c = default; };
+[cpp] struct MacroAlignPlain { int errno = default; char c = default; };
 
 // A C++ alias template in a FILE-SCOPE CFlat signature: the parameter and return types are
 // resolved by the ForwardRefScanner copy of the declaration path, not by the codegen copy.
@@ -2813,6 +2825,47 @@ extern int main()
             if (cppi_crtp.live_handle_count() != crtpLiveBefore + 3)          return 2233;
         }
         if (cppi_crtp.live_handle_count() != crtpLiveBefore)                 return 2234;
+        // nslookup: the CRTP base reads and writes the derived fields (value 61/73/83/89, count 3).
+        {
+            std.shared_ptr<CrtpFieldSelf> fieldOwner = std.make_shared<CrtpFieldSelf>();
+            fieldOwner->value = 61;
+            std.vector<std.shared_ptr<CrtpFieldSelf>> fieldVec = fieldOwner->makev();
+            auto fieldAutoVec = fieldOwner->makev();
+            std.map<int, CrtpFieldSelf> fieldMap = fieldOwner->makem();
+            auto fieldAutoMap = fieldOwner->makem();
+            std.pair<CrtpFieldSelf, CrtpFieldSelf> fieldPair = fieldOwner->makep();
+            auto fieldAutoPair = fieldOwner->makep();
+            if (fieldVec[0]->value != 61 || fieldAutoVec[0]->value != 61)      return 2242;
+            if (fieldMap[2].value != 73 || fieldAutoMap[2].value != 73)        return 2243;
+            if (fieldPair.first.value != 83 || fieldAutoPair.second.value != 89) return 2244;
+            if (fieldOwner.use_count() != 3)                                   return 2245;
+        }
+        // nslookup r4: macro-named fields round-trip from CFlat; the C++ base still reaches `value`.
+        {
+            CrtpMacroFieldMix macroOwner = default;
+            macroOwner.errno = 7;
+            macroOwner.EOF = -1;
+            macroOwner.stdout = 9;
+            std.map<int, CrtpMacroFieldMix> macroMap = macroOwner.makem();
+            if (macroMap[2].value != 73)                                     return 2246;
+            macroMap[2].errno = 11;
+            macroMap[2].EOF = -2;
+            macroMap[2].stdout = 13;
+            if (macroMap[2].errno != 11 || macroMap[2].EOF != -2 || macroMap[2].stdout != 13) return 2247;
+            if (macroOwner.errno != 7 || macroOwner.EOF != -1 || macroOwner.stdout != 9) return 2248;
+        }
+        {
+            std.shared_ptr<CrtpMacroAlign> alignOwner = std.make_shared<CrtpMacroAlign>();
+            alignOwner->errno = 5;
+            alignOwner->c = 44;
+            if (alignOwner->self_size() != 24 || alignOwner->c_offset() != 20) return 2249;
+            if (alignOwner->c != 44 || alignOwner->errno != 5)               return 2250;
+            MacroAlignPlain plainAlign = default;
+            plainAlign.c = 45;
+            plainAlign.errno = 6;
+            if (cppi_crtpf.cxx_size_of<MacroAlignPlain>() != 8 || cppi_crtpf.cxx_c_offset<MacroAlignPlain>() != 4) return 2251;
+            if (plainAlign.c != 45 || plainAlign.errno != 6)                 return 2252;
+        }
         std.weak_ptr<CrtpEsfOwned> esfWeak = default;
         {
             std.shared_ptr<CrtpEsfOwned> esfOwner = std.make_shared<CrtpEsfOwned>();

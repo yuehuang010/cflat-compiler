@@ -1279,22 +1279,66 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
             std::vector<size_t> requestDeps = deps;
             std::vector<size_t> specializationGroups;
             const auto& owner = cxxImportGroups_[order[k]];
-            for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
-            {
-                if (i == order[k] || cxxImportGroups_[i].defines != owner.defines) continue;
-                const bool specializesTemplate = std::any_of(
-                    cxxImportGroups_[i].specializedTemplates.begin(),
-                    cxxImportGroups_[i].specializedTemplates.end(), [&](std::string name) {
+            auto specializes = [&](size_t index, const std::string& templateName) {
+                return std::any_of(
+                    cxxImportGroups_[index].specializedTemplates.begin(),
+                    cxxImportGroups_[index].specializedTemplates.end(), [&](std::string name) {
                         size_t pos = 0;
                         while ((pos = name.find('.', pos)) != std::string::npos)
                         { name.replace(pos, 1, "::"); pos += 2; }
-                        return name == cxxBase;
+                        return name == templateName;
                     });
-                if (specializesTemplate)
+            };
+            auto addSpecializationGroup = [&](size_t index) {
+                if (std::find(requestDeps.begin(), requestDeps.end(), index) == requestDeps.end())
+                    requestDeps.push_back(index);
+                if (std::find(specializationGroups.begin(), specializationGroups.end(), index)
+                    == specializationGroups.end())
+                    specializationGroups.push_back(index);
+            };
+            for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
+            {
+                if (i == order[k] || cxxImportGroups_[i].defines != owner.defines) continue;
+                if (specializes(i, cxxBase)) addSpecializationGroup(i);
+            }
+            std::string ownerDot = cxxBase;
+            size_t ownerPos = 0;
+            while ((ownerPos = ownerDot.find("::", ownerPos)) != std::string::npos)
+            { ownerDot.replace(ownerPos, 2, "."); ++ownerPos; }
+            std::unordered_set<std::string> visitedVariableTemplates;
+            std::vector<std::string> variableTemplateWorklist;
+            std::vector<std::string> variableTemplateClosure;
+            if (auto dependencies = owner.variableTemplateDependencies.find(ownerDot);
+                dependencies != owner.variableTemplateDependencies.end())
+                for (const std::string& dependency : dependencies->second)
+                    if (visitedVariableTemplates.insert(dependency).second)
+                        variableTemplateWorklist.push_back(dependency);
+            while (!variableTemplateWorklist.empty())
+            {
+                const std::string dependency = std::move(variableTemplateWorklist.back());
+                variableTemplateWorklist.pop_back();
+                variableTemplateClosure.push_back(dependency);
+                for (const CxxImportGroup& group : cxxImportGroups_)
                 {
-                    requestDeps.push_back(i);
-                    specializationGroups.push_back(i);
+                    if (group.defines != owner.defines) continue;
+                    if (auto dependencies = group.variableTemplateDependencies.find(dependency);
+                        dependencies != group.variableTemplateDependencies.end())
+                        for (const std::string& transitive : dependencies->second)
+                            if (visitedVariableTemplates.insert(transitive).second)
+                                variableTemplateWorklist.push_back(transitive);
                 }
+            }
+            for (const std::string& dependency : variableTemplateClosure)
+            {
+                std::string dependencyCxx = dependency;
+                size_t dependencyPos = 0;
+                while ((dependencyPos = dependencyCxx.find('.', dependencyPos))
+                       != std::string::npos)
+                { dependencyCxx.replace(dependencyPos, 1, "::"); dependencyPos += 2; }
+                for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
+                    if (i != order[k] && cxxImportGroups_[i].defines == owner.defines
+                        && specializes(i, dependencyCxx))
+                        addSpecializationGroup(i);
             }
             if (activeCxxRequestGroup_ == nullptr
                 && CxxTemplateDefineMismatch(cxxBase, spelling, cflatName, order[k], deps, error))
@@ -3448,8 +3492,12 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
 
                     std::vector<CRecordFieldEntry> prefixRecords;
                     prefixRecords.reserve(clangFields.size());
+                    // The C++ view of the CFlat bytes (anonymous union at the block offset) is not
+                    // base storage: its members sit at the block and CFlat fields are laid out below.
                     for (const auto& f : clangFields)
-                        if (f.name != "__cflat_fields") prefixRecords.push_back(f);
+                        if (f.name != "__cflat_fields"
+                            && !((f.isAnonymousMember || f.isPromoted) && f.offsetBytes >= blockOffset))
+                            prefixRecords.push_back(f);
                     std::vector<DeclTypeAndValue> prefixFields;
                     for (const auto& f : prefixRecords)
                         if (!mapClangField(f, prefixFields)) ok = false;
@@ -5327,6 +5375,42 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         if (!r.isCxx) return;
         const bool metadataOnly = memberFilter == "__metadata";
         StoreCxxRecordEntry(r.name, r);
+        std::vector<bool> constrainedTwinMembers(r.members.size(), false);
+        auto hasDefaults = [](const cflat_cinterop::RawCxxMember& member) {
+            return std::any_of(member.defaultArgs.begin(), member.defaultArgs.end(),
+                [](const cflat_cinterop::RawDefaultArg& arg) { return !arg.kind.empty(); });
+        };
+        auto sameDefaults = [](const auto& a, const auto& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i].kind != b[i].kind || a[i].value != b[i].value) return false;
+            return true;
+        };
+        for (size_t i = 0; i < r.members.size(); ++i)
+        {
+            const auto& a = r.members[i];
+            if ((a.kind != cflat_cinterop::RawCxxMember::Instance
+                    && a.kind != cflat_cinterop::RawCxxMember::StaticMethod)
+                || a.isDeleted || a.variadic || a.linkageName.empty()
+                || a.defaultArgs.size() != a.paramTypes.size()) continue;
+            for (size_t j = i + 1; j < r.members.size(); ++j)
+            {
+                const auto& b = r.members[j];
+                if (a.kind != b.kind || a.name != b.name || a.paramTypes != b.paramTypes
+                    || a.retType != b.retType || a.isConst != b.isConst
+                    || a.isVolatile != b.isVolatile || a.refQualifier != b.refQualifier
+                    || a.isNoexcept != b.isNoexcept || a.isDeleted || b.isDeleted
+                    || b.variadic || b.linkageName.empty()
+                    || b.defaultArgs.size() != b.paramTypes.size()
+                    || (a.access != cflat_cinterop::AccessPublic
+                        || b.access != cflat_cinterop::AccessPublic)
+                    || (a.linkageName == b.linkageName && a.line == b.line
+                        && a.col == b.col && sameDefaults(a.defaultArgs, b.defaultArgs))
+                    || (!hasDefaults(a) && !hasDefaults(b))) continue;
+                constrainedTwinMembers[i] = true;
+                constrainedTwinMembers[j] = true;
+            }
+        }
         for (const auto& member : r.members)
             if ((member.kind == cflat_cinterop::RawCxxMember::Instance
                     || member.kind == cflat_cinterop::RawCxxMember::StaticMethod)
@@ -5537,6 +5621,29 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (m.variadic) key += "|va";
             return key;
         };
+        using TwinWrapperKey = std::pair<std::string, size_t>;
+        std::map<TwinWrapperKey, size_t> twinWrapperSourceByArity;
+        auto hasDefaultSuffix = [](const Member& member, size_t first) {
+            if (first >= member.defaultArgs.size()) return false;
+            for (size_t i = first; i < member.defaultArgs.size(); ++i)
+                if (member.defaultArgs[i].kind.empty()) return false;
+            return true;
+        };
+        for (size_t i = 0; i < r.members.size(); ++i)
+        {
+            if (!constrainedTwinMembers[i]) continue;
+            const Member& member = r.members[i];
+            const std::string key = cflatSigKey(member);
+            for (size_t n = 0; n < member.paramTypes.size(); ++n)
+                if (hasDefaultSuffix(member, n))
+                    twinWrapperSourceByArity.try_emplace({ key, n }, i);
+            twinWrapperSourceByArity.try_emplace({ key, member.paramTypes.size() }, i);
+        }
+        for (const auto& [key, i] : twinWrapperSourceByArity)
+        {
+            const Member& member = r.members[i];
+            RememberCxxDefaultWrapper(r.name, member.linkageName, key.second, true);
+        }
         auto directMethodKey = [](const Member& m) {
             std::string key = m.name + "|" + m.retType + (m.isConst ? "|const" : "|mut")
                 + (m.isVolatile ? "|volatile" : "")
@@ -5685,6 +5792,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // Settled BEFORE the refusal checks so a private, deleted or otherwise unbindable
             // conversion is recorded under the same key the cast site will ask for.
             const std::string cflatName = memberRegName(m);
+            const bool constrainedTwin = constrainedTwinMembers[i];
             if (memberFilter == "__copy_move_ctor" && m.kind == Member::Constructor
                 && !m.isCopyCtor && !m.isMoveCtor)
                 continue;
@@ -5853,7 +5961,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     const Member& kept = r.members[it->second];
                     cvOverloadTwin = (m.isConst != kept.isConst
                         || m.isVolatile != kept.isVolatile);
-                    if (!cvOverloadTwin)
+                    if (!cvOverloadTwin && !constrainedTwin)
                         continue;
                 }
             }
@@ -6036,13 +6144,24 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // outside the class, so only public members are eligible and const receivers retain
             // their declared constness in the wrapper's C++ parameter.
             const auto registerDefaultArityWrapper = [&](const std::vector<TypeAndValue>& prefix,
-                                                         size_t n) -> bool
+                                                         size_t n, bool forTwin) -> bool
             {
                 if (m.variadic || m.linkageName.empty()
                     || m.defaultArgs.size() != m.paramTypes.size()) return false;
                 if (m.kind != Member::Instance && m.kind != Member::StaticMethod) return false;
-                if (n >= m.defaultArgs.size() || m.defaultArgs[n].kind == "unsupported") return false;
-                if (!HasNonConstDefaultSuffix(m.defaultArgs, n)) return false;
+                const bool fullArity = n == m.paramTypes.size();
+                if (n > m.defaultArgs.size() || (fullArity && !forTwin)) return false;
+                if (!fullArity)
+                {
+                    if (n >= m.defaultArgs.size()) return false;
+                    if (forTwin)
+                    {
+                        for (size_t p = n; p < m.defaultArgs.size(); ++p)
+                            if (m.defaultArgs[p].kind.empty()) return false;
+                    }
+                    else if (m.defaultArgs[n].kind == "unsupported"
+                             || !HasNonConstDefaultSuffix(m.defaultArgs, n)) return false;
+                }
                 const bool havePlan = m.abi.valid && m.abi.params.size() == m.paramTypes.size();
                 const auto canWrap = [&](const TypeAndValue& t) {
                     return havePlan || t.Pointer || !dataStructures.count(t.TypeName);
@@ -6117,7 +6236,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
              */
             if (!paramsOk)
             {
-                if (!registerDefaultArityWrapper(params, unmappableParam)) continue;
+                if (!registerDefaultArityWrapper(params, unmappableParam, false)) continue;
                 if (m.kind == Member::Instance) info.instanceMethodNames.push_back(cflatName);
                 else if (m.kind == Member::StaticMethod
                          && std::find(info.staticMethodNames.begin(), info.staticMethodNames.end(),
@@ -6126,6 +6245,37 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (info.memberAccess.find(cflatName) == info.memberAccess.end())
                     info.memberAccess[cflatName] = m.access;
                 continue;
+            }
+
+            bool twinForwarderBound = false;
+            std::string twinForwarderLinkage;
+            if (constrainedTwin)
+            {
+                const std::string twinKey = cflatSigKey(m);
+                bool defaultWrappersBound = true;
+                for (size_t n = 0; n < params.size(); ++n)
+                {
+                    auto source = twinWrapperSourceByArity.find({ twinKey, n });
+                    if (source == twinWrapperSourceByArity.end() || source->second != i) continue;
+                    std::vector<TypeAndValue> prefix(params.begin(), params.begin() + n);
+                    if (!registerDefaultArityWrapper(prefix, n, true))
+                    {
+                        refuse("has a constrained overload whose default wrapper could not be bound");
+                        defaultWrappersBound = false;
+                        break;
+                    }
+                }
+                if (!defaultWrappersBound) continue;
+                auto fullSource = twinWrapperSourceByArity.find({ twinKey, params.size() });
+                if (fullSource == twinWrapperSourceByArity.end() || fullSource->second != i)
+                    continue;
+                if (!registerDefaultArityWrapper(params, params.size(), true))
+                {
+                    refuse("has a constrained overload whose full-arity wrapper could not be bound");
+                    continue;
+                }
+                twinForwarderBound = true;
+                twinForwarderLinkage = CxxDefaultWrapperName(m.linkageName, params.size());
             }
 
             if (isStructor || m.isCopyAssign || m.isMoveAssign)
@@ -6196,8 +6346,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
 
             std::string abiMismatch;
-            const std::string registrationLinkage = m.linkageName.empty() && m.isDeleted
+            const std::string registrationLinkage = twinForwarderBound
+                ? twinForwarderLinkage
+                : m.linkageName.empty() && m.isDeleted
                 ? std::format("__cflat_deleted_{}_{}", r.name, i) : m.linkageName;
+            if (!twinForwarderBound)
             {
                 CInteropDeclarationScope declaringFile(*this, m.file.empty() ? fileForLsp : m.file);
                 CxxAbiPlanScope abiPlan(*this, m.isDeleted ? nullptr : &m.abi, &abiMismatch);
@@ -6216,7 +6369,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     {
                         sym.IsCInteropDeclaration = true;
                         sym.IsCxxTemplateSpecialization = m.isTemplateSpecialization;
-                        sym.DefaultArguments = m.defaultArgs;
+                        if (twinForwarderBound) sym.DefaultArguments.clear();
+                        else sym.DefaultArguments = m.defaultArgs;
                         sym.CxxRefQualifier = m.refQualifier;
                         sym.CxxVolatile = m.isVolatile;
                         sym.CxxConst = m.isConst;
@@ -6225,11 +6379,12 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // receiver-prefixed overload backed by a C++ forwarding body. The generated body is
             // outside the class, so only public members are eligible and const receivers retain
             // their declared constness in the wrapper's C++ parameter.
-            for (size_t n = 0; n < params.size(); ++n)
-            {
-                std::vector<TypeAndValue> prefix(params.begin(), params.begin() + n);
-                registerDefaultArityWrapper(prefix, n);
-            }
+            if (!constrainedTwin)
+                for (size_t n = 0; n < params.size(); ++n)
+                {
+                    std::vector<TypeAndValue> prefix(params.begin(), params.begin() + n);
+                    registerDefaultArityWrapper(prefix, n, false);
+                }
             // A virtual member is called through the receiver's vptr at this slot; the
             // declaration above exists only to carry clang's arrangement and LLVM type.
             if (m.kind == Member::Instance && m.isVirtual)
@@ -6605,7 +6760,9 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             const std::string previousBodyRequest = cxxMemberBodyRequest_;
             std::optional<std::string> previousRequest;
             const bool hadDefinition = cxxForeignDefinitions_.count(typeName) != 0;
-            if (!UseCxxIncrementalRequests())
+            // An earlier definitions request (a by-value local) leaves an operator= body dormant:
+            // force that body in incremental mode too.
+            if (!UseCxxIncrementalRequests() || memberName == "operator=")
             {
                 if (auto request = cxxForeignRequests_.find(typeName);
                     request != cxxForeignRequests_.end())
@@ -8783,6 +8940,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<cflat_cinterop::RawClassTemplate> hitClassTemplates;
         std::vector<std::string> hitClassTemplateNames;
         std::vector<std::string> hitVariableTemplateNames;
+        std::vector<std::pair<std::string, std::string>> hitVariableTemplateDependencies;
         std::vector<std::string> hitClassTemplateSpecializations;
         std::vector<std::string> hitGroupNamespaces;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> hitFunctionPointerAbis;
@@ -8818,6 +8976,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitClassTemplates = entry.classTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
                     hitVariableTemplateNames = entry.variableTemplateNames;
+                    hitVariableTemplateDependencies = entry.variableTemplateDependencies;
                     hitClassTemplateSpecializations = entry.classTemplateSpecializations;
                     hitGroupNamespaces = entry.cxxGroupNamespaces;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
@@ -8844,6 +9003,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitClassTemplates = entry.classTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
                     hitVariableTemplateNames = entry.variableTemplateNames;
+                    hitVariableTemplateDependencies = entry.variableTemplateDependencies;
                     hitClassTemplateSpecializations = entry.classTemplateSpecializations;
                     hitGroupNamespaces = entry.cxxGroupNamespaces;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
@@ -8883,8 +9043,12 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, hitDepPaths);
             if (cppMode) RememberCxxGroupClosureContent(cxxGroupIndex, hitDeps);
             if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
+            {
                 cxxImportGroups_[cxxGroupIndex].specializedTemplates.insert(
                     hitClassTemplateSpecializations.begin(), hitClassTemplateSpecializations.end());
+                for (const auto& [owner, dependency] : hitVariableTemplateDependencies)
+                    cxxImportGroups_[cxxGroupIndex].variableTemplateDependencies[owner].insert(dependency);
+            }
             replayCxxGroupNamespaces(hitGroupNamespaces);
             // The C++ definitions this header needed were emitted on the cold run; relink the very
             // same bitcode instead of running CodeGen again.
@@ -9029,6 +9193,9 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                         cxxImportGroups_[cxxGroupIndex].specializedTemplates.insert(
                             diskEntry.classTemplateSpecializations.begin(),
                             diskEntry.classTemplateSpecializations.end());
+                        for (const auto& [owner, dependency] : diskEntry.variableTemplateDependencies)
+                            cxxImportGroups_[cxxGroupIndex].variableTemplateDependencies[owner].insert(
+                                dependency);
                     }
                     { llvm::TimeTraceScope chrStep("CHR:PublishCxxGroupNames"); PublishCxxGroupNames(activeCxxRequestGroup_->primary, diskEntry.records); }
                 }
@@ -9105,6 +9272,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<cflat_cinterop::RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
         std::vector<std::string> variableTemplateNames;
+        std::vector<std::pair<std::string, std::string>> variableTemplateDependencies;
         std::vector<std::string> classTemplateSpecializations;
         std::vector<std::pair<std::string, std::string>> usingDirectives;
         std::vector<std::pair<std::string, std::string>> namespaceAliases;
@@ -9149,7 +9317,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      &usingDirectives, &namespaceAliases, &classTemplateNames,
                                      &variableTemplateNames,
                                      &classUsings, &classTemplateSpecializations, &classTemplates,
-                                     &dynamicInitializers))
+                                     &dynamicInitializers, &variableTemplateDependencies))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg, cppMode);
@@ -9189,8 +9357,12 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             cxxClassTemplateParameters_[classTemplate.name] = classTemplate;
         if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, includes);
         if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
+        {
             cxxImportGroups_[cxxGroupIndex].specializedTemplates.insert(
                 classTemplateSpecializations.begin(), classTemplateSpecializations.end());
+            for (const auto& [owner, dependency] : variableTemplateDependencies)
+                cxxImportGroups_[cxxGroupIndex].variableTemplateDependencies[owner].insert(dependency);
+        }
         std::vector<std::string> seededGroupNamespaces;
         if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
         {
@@ -9213,6 +9385,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.classTemplates = classTemplates;
             entry.classTemplateNames = classTemplateNames;
             entry.variableTemplateNames = variableTemplateNames;
+            entry.variableTemplateDependencies = variableTemplateDependencies;
             entry.classTemplateSpecializations = classTemplateSpecializations;
             entry.cxxGroupNamespaces = seededGroupNamespaces;
             entry.enums = enums;

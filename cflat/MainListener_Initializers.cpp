@@ -535,6 +535,15 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
         refusal.clear();
         if (destination.Storage == nullptr || destination.BaseType == nullptr) return nullptr;
         const std::string opName = "operator=";
+        // An out-of-line template operator= is refused "no definition" until requested (as the
+        // prvalue gate in ParseAssignmentExpression does): request it before the lookup below.
+        if (compiler->IsCxxRecord(typeName))
+        {
+            compiler->EnsureCxxMemberProjected(typeName, opName);
+            if (const auto* refusedInfo = compiler->GetCxxClassInfo(typeName);
+                refusedInfo != nullptr && refusedInfo->refusedMembers.count(opName) != 0)
+                compiler->TryBindRefusedCxxMember(typeName, opName);
+        }
         const std::string resolved = compiler->ResolveTypeAlias(typeName);
         LLVMBackend::NamedVariable source = rhsNV;
         auto* right = LoadNamedVariable(source);
@@ -542,6 +551,11 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
         LLVMBackend::NamedVariable probeArg = rhsNV;
         probeArg.Primary = right;
         if (probeArg.BaseType == nullptr) probeArg.BaseType = right->getType();
+        if (probeArg.LiteralIdentity.empty())
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(ctx);
+                assignment != nullptr && assignment->assignmentExpression() != nullptr)
+                probeArg.LiteralIdentity = CxxLiteralOperandIdentity(
+                    assignment->assignmentExpression());
         // The source's own type; an unnamed literal carries it only in the lowered type.
         LLVMBackend::TypeAndValue sourceType = probeArg.TypeAndValue;
         if (sourceType.TypeName.empty() && !sourceType.Pointer && probeArg.BaseType != nullptr)
@@ -584,10 +598,16 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
             std::set<std::string> declaredLinkages;
             if (auto record = compiler->cxxRecordEntries_.find(typeName);
                 record != compiler->cxxRecordEntries_.end())
-                for (const auto& member : record->second.members)
-                    if (member.name == opName && !member.isImplicit && !member.isDeleted
-                        && member.bindRefusal.empty())
-                        declaredLinkages.insert(member.linkageName);
+                for (size_t i = 0; i < record->second.members.size(); ++i)
+                {
+                    const auto& member = record->second.members[i];
+                    if (member.name != opName || member.isImplicit || !member.bindRefusal.empty())
+                        continue;
+                    const std::string linkage = member.linkageName.empty() && member.isDeleted
+                        ? std::format("__cflat_deleted_{}_{}", typeName, i)
+                        : member.linkageName;
+                    if (!linkage.empty()) declaredLinkages.insert(linkage);
+                }
             auto candidates = compiler->functionTable.find(opName);
             if (candidates == compiler->functionTable.end()) return found;
             for (const auto& candidate : candidates->second)
@@ -595,7 +615,8 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
                 const bool isTemplate = candidate.UniqueName.starts_with("__cflat_tpl_");
                 if (!candidate.IsCxx || !isThisClass(candidate) || candidate.Parameters.size() != 2
                     || isTemplate != templates
-                    || (!isTemplate && declaredLinkages.count(candidate.UniqueName) == 0)
+                    || (!isTemplate && declaredLinkages.count(candidate.UniqueName) == 0
+                        && !(candidate.IsDeleted && arithmetic(candidate.Parameters[1])))
                     || compiler->ResolveTypeAlias(candidate.Parameters[1].TypeName) == resolved
                     || (classParameter(candidate.Parameters[1])
                         && !exactParameter(candidate.Parameters[1])))
@@ -776,6 +797,83 @@ llvm::Value* MainListener::TryDirectCxxAssignOperator(
                 templateInstantiated = !instantiated.empty();
                 if (templateInstantiated)
                     if (auto* result = speculate(instantiated)) return result;
+            }
+        }
+        if (!templateInstantiated && !nonTemplates.empty() && arithmetic(sourceType)
+            && std::all_of(nonTemplates.begin(), nonTemplates.end(), [&](const auto& candidate) {
+                return candidate.Parameters.size() == 2
+                    && arithmetic(candidate.Parameters[1])
+                    && !candidate.Parameters[1].Pointer;
+            }))
+        {
+            LLVMBackend::NamedVariable objectArg;
+            objectArg.Primary = compiler->CreateLoad(destination.BaseType, destination.Storage);
+            objectArg.Storage = destination.Storage;
+            objectArg.BaseType = objectArg.Primary->getType();
+            objectArg.TypeAndValue = destination.TypeAndValue;
+            objectArg.TypeAndValue.Pointer = false;
+            objectArg.TypeAndValue.PointerDepth = 0;
+            objectArg.TypeAndValue.ElemPointer = false;
+
+            struct RankedAssign
+            {
+                const LLVMBackend::FunctionSymbol* candidate;
+                std::vector<LLVMBackend::CxxConversionRank> ranks;
+            };
+            std::vector<RankedAssign> ranked;
+            bool fullyRanked = true;
+            for (const auto& candidate : nonTemplates)
+            {
+                auto ranks = compiler->RankCxxConversionSequences(
+                    { objectArg, probeArg }, candidate);
+                if (ranks.size() != 2 || ranks[0].rank == LLVMBackend::kCxxNonViableRank
+                    || ranks[1].rank < 0
+                    || ranks[1].rank == LLVMBackend::kCxxNonViableRank)
+                {
+                    fullyRanked = false;
+                    break;
+                }
+                ranked.push_back({ &candidate, std::move(ranks) });
+            }
+            if (fullyRanked)
+            {
+                std::vector<const RankedAssign*> winners;
+                for (const auto& candidate : ranked)
+                {
+                    bool beaten = false;
+                    for (const auto& other : ranked)
+                    {
+                        bool crossing = false;
+                        if (&candidate != &other
+                            && compiler->CompareCxxConversionRanks(
+                                other.ranks, candidate.ranks, crossing) == -1 && !crossing)
+                        {
+                            beaten = true;
+                            break;
+                        }
+                    }
+                    // A using-declared base operator= is listed once per route; one function, one winner.
+                    if (!beaten && std::none_of(winners.begin(), winners.end(), [&](const RankedAssign* w) {
+                            return w->candidate->UniqueName == candidate.candidate->UniqueName;
+                        }))
+                        winners.push_back(&candidate);
+                }
+                if (winners.size() == 1)
+                {
+                    if (winners.front()->candidate->IsDeleted)
+                    {
+                        refusal = "clang: overload resolution selected deleted operator '='";
+                        return nullptr;
+                    }
+                    if (auto* result = speculate({ winners.front()->candidate->UniqueName }))
+                        return result;
+                }
+                // Two equally ranked winners (`1` to int or double): clang's ambiguity, not a pick.
+                else if (winners.size() > 1)
+                {
+                    refusal = "clang: use of overloaded operator '=' is ambiguous";
+                    return nullptr;
+                }
             }
         }
         if (!nonTemplates.empty())

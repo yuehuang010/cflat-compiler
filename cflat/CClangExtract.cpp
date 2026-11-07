@@ -3225,6 +3225,56 @@ namespace cflat_cinterop
                 const std::string name = CxxQualifiedName(vtd->getTemplatedDecl());
                 if (!name.empty() && st.emittedVariableTemplateNames.insert(name).second)
                     st.out.variableTemplateNames.push_back(name);
+                const Expr* initializer = vtd->getTemplatedDecl()->getInit();
+                if (name.empty() || initializer == nullptr) return true;
+                struct DependencyVisitor : RecursiveASTVisitor<DependencyVisitor>
+                {
+                    const std::string& ownerName;
+                    std::vector<std::string>& dependencies;
+
+                    DependencyVisitor(const std::string& owner,
+                                      std::vector<std::string>& found)
+                        : ownerName(owner), dependencies(found) {}
+
+                    void Add(const NamedDecl* declaration)
+                    {
+                        const VarTemplateDecl* variableTemplate =
+                            llvm::dyn_cast_or_null<VarTemplateDecl>(declaration);
+                        if (const auto* specialization =
+                                llvm::dyn_cast_or_null<VarTemplateSpecializationDecl>(declaration))
+                            variableTemplate = specialization->getSpecializedTemplate();
+                        if (variableTemplate == nullptr) return;
+                        const std::string dependency =
+                            CxxQualifiedName(variableTemplate->getTemplatedDecl());
+                        if (!dependency.empty() && dependency != ownerName
+                            && std::find(dependencies.begin(), dependencies.end(), dependency)
+                                   == dependencies.end())
+                            dependencies.push_back(dependency);
+                    }
+
+                    bool VisitDeclRefExpr(DeclRefExpr* expression)
+                    {
+                        Add(expression->getDecl());
+                        return true;
+                    }
+
+                    bool VisitUnresolvedLookupExpr(UnresolvedLookupExpr* expression)
+                    {
+                        for (NamedDecl* candidate : expression->decls()) Add(candidate);
+                        return true;
+                    }
+                };
+                std::vector<std::string> dependencies;
+                DependencyVisitor dependencyVisitor(name, dependencies);
+                dependencyVisitor.TraverseStmt(const_cast<Expr*>(initializer));
+                for (const std::string& dependency : dependencies)
+                {
+                    const auto edge = std::pair{ name, dependency };
+                    if (std::find(st.out.variableTemplateDependencies.begin(),
+                                  st.out.variableTemplateDependencies.end(), edge)
+                        == st.out.variableTemplateDependencies.end())
+                        st.out.variableTemplateDependencies.push_back(edge);
+                }
                 return true;
             }
 
@@ -4888,15 +4938,25 @@ namespace cflat_cinterop
                     // A bitfield or a transparent anonymous member inside a hierarchy would need
                     // the bitfield packer and the synthetic-record path to agree on absolute
                     // offsets; neither is wired for that, so refuse instead of mislaying it out.
-                    if (f->isBitField() || f->getDeclName().isEmpty()) return false;
+                    // The C++ view of a [cpp] struct's CFlat bytes is an anonymous union over
+                    // __cflat_fields (nslookup): flatten it to the block alone, at the union's offset.
+                    // Its typed view members are C++-only; CFlat lays out its own fields.
+                    const FieldDecl* named = f;
+                    if (isOutermost && f->getDeclName().isEmpty() && !f->isBitField())
+                        if (const auto* viewType = f->getType()->getAs<RecordType>())
+                            if (const RecordDecl* view = viewType->getDecl()->getDefinition();
+                                view != nullptr && view->isUnion())
+                                for (const FieldDecl* m : view->fields())
+                                    if (m->getName() == "__cflat_fields") named = m;
+                    if (named == f && (f->isBitField() || f->getDeclName().isEmpty())) return false;
                     RawField rf;
-                    rf.name = f->getNameAsString();
-                    rf.ctype = CanonicalSpelling(ctx, f->getType());
-                    rf.isZeroSize = f->isZeroSize(ctx);
-                    rf.isConst = f->getType().isConstQualified();
-                    rf.isMutable = f->isMutable();
+                    rf.name = named->getNameAsString();
+                    rf.ctype = CanonicalSpelling(ctx, named->getType());
+                    rf.isZeroSize = named->isZeroSize(ctx);
+                    rf.isConst = named->getType().isConstQualified();
+                    rf.isMutable = named->isMutable();
                     rf.offsetBytes = baseOff + layout.getFieldOffset(idx) / 8;
-                    RecordRawFieldLayout(f->getType(), rf);
+                    RecordRawFieldLayout(named->getType(), rf);
                     rf.access = MapAccess(f->getAccess());
                     rf.inherited = !isOutermost;
                     // Shadowed by a more derived field of the same name: keep the storage, give it
@@ -5461,6 +5521,7 @@ namespace cflat_cinterop
                 g.qualifiedName = marker;
                 g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                 g.isConst = vd->getType().isConstQualified() || vd->isConstexpr();
+                g.isCxxClassObject = true;
                 g.isDllImport = def == nullptr && vd->hasAttr<DLLImportAttr>();
                 LocOfRaw(vd, g.file, g.line, g.col);
                 const std::string originalLinkage = CxxLinkageName(ctx, vd);
@@ -5511,18 +5572,27 @@ namespace cflat_cinterop
                 const bool mutableClassObject = !vd->getType().isConstQualified()
                     && !vd->isConstexpr() && !vd->getType()->isDependentType()
                     && vd->getType().getCanonicalType()->getAsCXXRecordDecl() != nullptr;
+                const auto* variableTemplateSpecialization =
+                    llvm::dyn_cast<VarTemplateSpecializationDecl>(vd);
+                const bool mutableVariable = !vd->getType().isConstQualified() && !vd->isConstexpr();
+                const bool mutableScalarTemplate = mutableVariable
+                    && variableTemplateSpecialization != nullptr
+                    && !vd->getType()->isDependentType()
+                    && vd->getType().getCanonicalType()->getAsCXXRecordDecl() == nullptr;
                 const VarDecl* definition = vd->getDefinition();
+                if (variableTemplateSpecialization != nullptr && definition == nullptr
+                    && variableTemplateSpecialization->getSpecializationKind()
+                        == TSK_ImplicitInstantiation && st.ci != nullptr && st.ci->hasSema())
+                {
+                    st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);
+                    definition = vd->getDefinition();
+                }
                 if (vd->isStaticDataMember())
                 {
-                    if (mutableClassObject && definition == nullptr && st.ci != nullptr
-                        && st.ci->hasSema()
-                        && vd->getTemplateSpecializationKind() == TSK_ImplicitInstantiation)
-                    {
-                        st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);
-                        definition = vd->getDefinition();
-                    }
                     if (mutableClassObject && definition != nullptr)
                         PublishRequestedClassConstant(vd, definition, marker);
+                    else if (mutableScalarTemplate && definition != nullptr)
+                        HarvestCxxNamespaceVar(vd, marker);
                     return;
                 }
                 // A mutable namespace-scope class object with a header definition is an object,
@@ -5530,6 +5600,11 @@ namespace cflat_cinterop
                 if (mutableClassObject && definition != nullptr)
                 {
                     PublishRequestedClassConstant(vd, definition, marker);
+                    return;
+                }
+                if (mutableScalarTemplate)
+                {
+                    if (definition != nullptr) HarvestCxxNamespaceVar(vd, marker);
                     return;
                 }
                 // A non-const `extern` class object the library exports (std::cout): an lvalue
@@ -5546,7 +5621,7 @@ namespace cflat_cinterop
                 }
                 if (!vd->getType().isConstQualified() && !vd->isConstexpr()) return;
                 if (vd->getAnyInitializer() == nullptr && st.ci != nullptr && st.ci->hasSema()
-                    && llvm::isa<VarTemplateSpecializationDecl>(vd))
+                    && variableTemplateSpecialization != nullptr && definition == nullptr)
                     st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);
                 const VarDecl* def = vd->getDefinition();
                 const Expr* init = def != nullptr ? def->getInit() : vd->getAnyInitializer();
@@ -6126,7 +6201,7 @@ namespace cflat_cinterop
              *     storage is emitted locally and promoted to weak_odr after codegen.
              * Returns true (continue traversal) unconditionally.
              */
-            bool HarvestCxxNamespaceVar(VarDecl* vd)
+            bool HarvestCxxNamespaceVar(VarDecl* vd, const std::string& requestedName = {})
             {
                 if (vd->getIdentifier() == nullptr) return true;
                 if (vd->getType()->isFunctionType()) return true;   // not a data symbol
@@ -6151,7 +6226,9 @@ namespace cflat_cinterop
                                 definition, CxxLinkageName(ctx, definition));
                     }
                 }
-                const std::string qualified = CxxQualifiedName(vd);
+                const bool requestedSpecialization = !requestedName.empty();
+                const std::string qualified = requestedSpecialization ? requestedName
+                                                                        : CxxQualifiedName(vd);
                 auto skipVar = [&](const char* why) {
                     if (st.req.verbose)
                         std::cout << "[verbose]   C++ namespace variable " << qualified
@@ -6166,8 +6243,9 @@ namespace cflat_cinterop
                 }
                 // A variable template's pattern (or a specialization of it) is no object of its
                 // own name; `ns.v<T>` binds the specialization on use (decltype request).
-                if (vd->getDescribedVarTemplate() != nullptr
-                    || llvm::isa<VarTemplateSpecializationDecl>(vd))
+                if (!requestedSpecialization
+                    && (vd->getDescribedVarTemplate() != nullptr
+                        || llvm::isa<VarTemplateSpecializationDecl>(vd)))
                 { skipVar("it is a variable template, bound per specialization on use"); return true; }
                 // A thread_local object is reached through a TLS access sequence, not a plain
                 // load of its symbol, so binding it would link wrong or not at all.
@@ -6178,9 +6256,18 @@ namespace cflat_cinterop
                 const VarDecl* def = vd->getDefinition();
                 const Expr* init = def != nullptr ? def->getInit() : vd->getAnyInitializer();
                 const bool isConst = vd->getType().isConstQualified() || vd->isConstexpr();
+                const auto* variableSpecialization =
+                    llvm::dyn_cast<VarTemplateSpecializationDecl>(vd);
+                const bool companionOwnsSpecialization = requestedSpecialization
+                    && variableSpecialization != nullptr
+                    && variableSpecialization->getSpecializationKind()
+                        == TSK_ExplicitSpecialization
+                    && def != nullptr && vd->hasExternalFormalLinkage()
+                    && vd->getStorageClass() != SC_Static
+                    && !vd->isInline() && !def->isInline();
 
                 RawGlobalVar g;
-                g.name = vd->getNameAsString();
+                g.name = requestedSpecialization ? requestedName : vd->getNameAsString();
                 g.qualifiedName = qualified;
                 g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                 g.isConst = isConst;
@@ -6220,16 +6307,17 @@ namespace cflat_cinterop
 
                 // Anything else needs a real symbol. Decide who provides it.
                 // `extern int g; inline int g = 3;` marks only the definition inline.
-                const bool headerOnly = vd->isInline() || (def != nullptr && def->isInline())
-                    || vd->isConstexpr()
-                    || !vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static;
+                const bool headerOnly = !companionOwnsSpecialization
+                    && (requestedSpecialization || vd->isInline()
+                        || (def != nullptr && def->isInline()) || vd->isConstexpr()
+                        || !vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static);
                 const bool canEmit = st.req.RecordsDefinitionDemand()
                                   || st.req.assumeInlineDefinitions;
                 if (headerOnly)
                 {
                     if (def == nullptr || (init == nullptr && def->hasConstantInitialization()))
                     { skipVar("no definition to emit and no library symbol to bind"); return true; }
-                    if (!canEmit)
+                    if (!canEmit && !requestedSpecialization)
                     { skipVar("its initializer lives in the header, so it has no library symbol"); return true; }
                     if (def->getType()->isDependentType()
                         || def->getDeclContext()->isDependentContext())
@@ -6242,6 +6330,7 @@ namespace cflat_cinterop
                     g.linkageName = internalStorage
                         ? StaticCxxGlobalAlias(st.req.cxxImportGroupKey, originalLinkage)
                         : originalLinkage;
+                    if (requestedSpecialization) g.isCxxConstexpr = true;
                     if (internalStorage && st.req.demandPlan != nullptr)
                         st.req.demandPlan->renamed[g.linkageName] = originalLinkage;
                     // Value identity of a const object: two groups' copies of one declaration

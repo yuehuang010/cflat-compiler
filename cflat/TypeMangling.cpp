@@ -76,8 +76,12 @@ struct TypeManglingAccess
     }
 
     static std::optional<size_t> GenericArity(const LLVMBackend& compiler,
-                                              std::string_view base)
+                                              std::string_view base,
+                                              std::string_view text, size_t position)
     {
+        // A materialized generic function overload carries its selected candidate's arity hint.
+        // Prefer that exact spelling before the name-keyed candidate-zero fallback below.
+        if (auto selected = KnownMangledArity(compiler, text, position)) return selected;
         std::string key(base);
         if (auto it = compiler.gts.genericStructTypeParams.find(key);
             it != compiler.gts.genericStructTypeParams.end())
@@ -502,9 +506,7 @@ TypeParseCandidates ComputeMangledCandidates(const LLVMBackend& compiler,
     TypeSpelling simple;
     simple.base = CanonicalPrimitiveTypeName(token);
     simple.canonicalPrimitive = simple.base;
-    auto arity = TypeManglingAccess::KnownMangledArity(compiler, text, basePosition);
-    if (!arity)
-        arity = TypeManglingAccess::GenericArity(compiler, token);
+    auto arity = TypeManglingAccess::GenericArity(compiler, token, text, basePosition);
     if (!arity && token == "tuple")
         arity = TypeManglingAccess::TupleArity(compiler, text, position);
     if (arity)

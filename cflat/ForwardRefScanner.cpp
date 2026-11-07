@@ -3829,8 +3829,12 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                     if (!fn.empty())
                     {
                         std::string key = QualifyName(QualifyName(ns, typePath), fn);
-                        compiler->gts.genericFunctionTemplates[key] = fd;
-                        compiler->gts.genericTemplateNamespace[key] = ns;
+                        const size_t candidateIndex =
+                            compiler->gts.RegisterGenericFunctionTemplate(key, fd);
+                        const std::string candidateKey =
+                            GenericTemplateState::GenericFunctionCandidateKey(key, candidateIndex);
+                        compiler->gts.genericTemplateNamespace[candidateKey] = ns;
+                        if (candidateIndex == 0) compiler->gts.genericTemplateNamespace[key] = ns;
                         std::vector<std::string> params;
                         std::vector<std::string> valueParams;
                         std::vector<std::string> valueDefaults;
@@ -3858,9 +3862,15 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                                 valueDefaults.push_back("");
                             }
                         }
-                        compiler->gts.genericFunctionTypeParams[key] = params;
-                        compiler->gts.genericFunctionValueParams[key] = valueParams;
-                        compiler->gts.genericFunctionValueDefaults[key] = valueDefaults;
+                        compiler->gts.genericFunctionTypeParams[candidateKey] = params;
+                        compiler->gts.genericFunctionValueParams[candidateKey] = valueParams;
+                        compiler->gts.genericFunctionValueDefaults[candidateKey] = valueDefaults;
+                        if (candidateIndex == 0)
+                        {
+                            compiler->gts.genericFunctionTypeParams[key] = params;
+                            compiler->gts.genericFunctionValueParams[key] = valueParams;
+                            compiler->gts.genericFunctionValueDefaults[key] = valueDefaults;
+                        }
                         std::unordered_map<std::string, std::vector<std::string>> constraints;
                         if (auto* where = fd->whereClause(); where != nullptr)
                         {
@@ -3873,12 +3883,17 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                                     constraints[typeParam->getText()].push_back(target->getText());
                             }
                         }
-                        compiler->gts.genericFunctionConstraints[key] = std::move(constraints);
+                        compiler->gts.genericFunctionConstraints[candidateKey] = constraints;
+                        if (candidateIndex == 0)
+                            compiler->gts.genericFunctionConstraints[key] = std::move(constraints);
                         bool hasPack = !params.empty()
                             && !gp->typeParameterList()->typeParameterEntry().empty()
                             && gp->typeParameterList()->typeParameterEntry().back()->Ellipsis() != nullptr;
-                        compiler->gts.genericFunctionPackIndex[key] =
+                        compiler->gts.genericFunctionPackIndex[candidateKey] =
                             hasPack ? params.size() - 1 : std::string::npos;
+                        if (candidateIndex == 0)
+                            compiler->gts.genericFunctionPackIndex[key] =
+                                hasPack ? params.size() - 1 : std::string::npos;
                     }
                 }
                 break;

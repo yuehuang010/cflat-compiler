@@ -1,0 +1,29 @@
+import cpp "cpp_interop_assign.h";
+
+extern int main()
+{
+    // Equally ranked winners (long / double, float / double) for an int source: clang refuses.
+    expect_error("use of overloaded operator '=' is ambiguous") {
+        cppas.AssignRouteLongDouble longDouble = default;
+        longDouble = 1;
+    }
+    expect_error("use of overloaded operator '=' is ambiguous") {
+        cppas.AssignRouteFloatDouble floatDouble = default;
+        floatDouble = 1;
+    }
+    // Unsigned and long sources: int and double both need a conversion, so clang says ambiguous.
+    expect_error("use of overloaded operator '=' is ambiguous") {
+        cppas.AssignRouteRank rankUnsigned = default;
+        rankUnsigned = 1U;
+    }
+    expect_error("use of overloaded operator '=' is ambiguous") {
+        cppas.AssignRouteRank rankLong = default;
+        rankLong = 1L;
+    }
+    // Deleted int and double: a long source is ambiguous, not a pick of the deleted operator.
+    expect_error("use of overloaded operator '=' is ambiguous") {
+        cppas.AssignRouteDeletedDouble deletedLong = default;
+        deletedLong = 1L;
+    }
+    return 0;
+}

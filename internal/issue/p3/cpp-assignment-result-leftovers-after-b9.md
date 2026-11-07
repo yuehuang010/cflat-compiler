@@ -1,24 +1,10 @@
-# C++ assignment result as a value: leftovers after B9
+# C++ assignment result as a value: by-design B9 rulings
 
-Summary: from the B9 review (2026-09-29). Probes and clang oracles are in scratch/repro_keep/b9rv/; `rt1.cb` is the P2.
-- One extra copy but no leak: a parenthesized ternary declaration, and `C b = (arr[1] = 10)`. Master was the same or worse; for the array element it leaked.
-- Pre-existing, unrelated, same on master:
-  - `a = rv.mkR(4).get();` into a C++ class fails with "Call arguments (0)".
-  - `(a -= 1);` with a free by-value operator and `(a += 1);` on a move-only class are refused as a discarded owning value.
-  - Passing `mkR(5)` by value moves it instead of eliding.
-Also carried over from the B9 report, out of scope: a global destination; a trivial class with a by-value `operator=(int)`; an unparenthesized brace-list element; native designated field init and a CFlat lambda returning a local, both of which copy more than clang.
+## Summary
 
-From the B18 review (2026-09-29; scratch/repro_keep/b18rv/). B18 routes a parenthesized ternary through the ternary path only when an arm is an assignment. Other forms keep the call/convert path. Still open:
-- A parenthesized ternary of prvalue-call arms, `T b = (f ? mk(1) : mk(2));`, gives 2 copies and 2 dtors; clang elides to 0/0.
-- The bare spelling `W b = f ? 1 : 2;`, with scalar arms and a converting ctor `W(int)`, is refused; the parenthesized form works.
-- A bare nested mixed ternary, `N b = f ? (g ? xa : mk(2)) : xb;`, is refused. The parenthesized form works, with one extra copy for `(f ? xa : (g ? xb : mk(2)))`.
+The B9 array-element result case (`C b = (arr[1] = 10)`) is fixed: the selected by-value result is built in place in `b`, so copy=1, move=0, expression dtor=0, end dtor=1, as clang. Only the out-of-scope rulings below remain; they are by design or need a ruling, not active defects.
 
-(The paren-ternary P2 landed in 1955bd95, B18.)
+## Prior out-of-scope rulings
 
-
-## T102 status (2026-10-10)
-
-Open. Parenthesized ternary/call result and assignment count cases were not changed. The focused converting-constructor assignment was attempted under cpp-assign-operator-route-leftovers.md, but the full interop test exited 140; that item remains open.
-- (uconstop review 1, 2026-11-01, master same) a C++ `int& operator+=` (scalar REFERENCE result) through a pointer: `int r = *p += 1` ->
-  "cannot convert value of type 'IR' to 'int'" (clang 22), `(*p += 1) = 9` -> "cannot store a single scalar value into struct storage"
-  (clang 9); the T& branch in MainListener_Assignment.cpp (~8592) treats every reference result as the destination object.
+- B9 `a = (mkR(4)).get()`, discarded `-=`, move-only discarded `+=`, by-value parameter elision, brace-list element order, global destination, trivial by-value `operator=(int)`, native designated field initialization, and a CFlat lambda returning a local.
+- B18 ternary and parenthesized-call rows from the former entry were measured as matching clang and are no longer active here.

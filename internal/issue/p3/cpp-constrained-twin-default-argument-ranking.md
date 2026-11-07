@@ -1,51 +1,29 @@
-# C++ constrained twins with default arguments rank wrong (pre-existing)
+# C++ constrained twins with defaults share an MSVC linkage name
 
 ## Summary
-Two same-signature C++ members that differ only by a trailing requires-clause, where EITHER
-has a default argument, are bound as one CFlat overload: RegisterCxxClassMembers
-(LLVMBackend_CInterop.cpp, `instanceBySig`) dedupes by CFlat signature and keeps the first
-declared. clang picks the more constrained twin whenever both are viable; CFlat calls the
-first. Same on master 33866560 and after T22 (T22 prunes the less constrained twin ONLY when
-neither twin has a default argument and both agree on the ellipsis).
 
-## Repro (Test/library/cpp_t22_constrained_members.hpp shapes; clang++ -std=c++20 oracle)
-```cpp
-template<class T> struct P {
-    int pick(int x = 1) { return x + 10; }
-    int pick(int x) requires std::integral<T> { return x + 20; }   // P<long>.pick(5): clang 25, CFlat 15
-};
-// int pick(int x = 1) / int pick(int x = 2) requires ...  -> pick(): clang 22, CFlat 11
-// int pick(int x) / int pick(int x = 3) requires ...      -> pick(): clang 23, CFlat "no overload"; pick(4): 24 vs 14
-// static twins as the first shape                         -> S<long>.pick(5): clang 25, CFlat "cannot choose";
-// MSVC ABI only: P<int>.pick() returns 21 (clang-cl 11) and the two-parameter pick() 23 (13):
-//   the shared symbol gets the constrained twin's body.
-//   MSVC ABI only: S<int>.pick() refused ("no overload"): the twins share one linkage name, so
-//   the second registration merges into the first FunctionSymbol and its (empty) defaults win
-// pick(int a = 1, int b = 2) / pick(int a, int b = 3) requires -> pick(4): 27 vs 16, pick(4, 4): 28 vs 18
-```
-Legs that already match clang on Itanium live in Test/test_cpp_interop.cb 9527/9530, guarded
-off Windows (default
-omitted, only the unconstrained twin viable). Also scratch repro (T22 worktree):
-scratch/rev_t22_round3_msvc_winner.{hpp,cb,sh} (`f(int a=1,int b=2)` vs constrained
-`f(int a,int b=next())`: p.f(4) 27, p.f(4,4) 28 in clang; CFlat returns 1).
+The Itanium cases for constrained member twins with default arguments are fixed and covered
+by T22 legs in `Test/test_cpp_interop.cb`. The remaining known gap is MSVC ABI behavior:
+clang-cl gives same-mangled-name constrained twins one emitted body, so the body choice can
+depend on which arity the program uses. This Darwin worktree cannot compile or run those cases.
+
+## Repro (Windows / clang-cl)
+
+In `Test/library/cpp_t22_constrained_members.hpp`, `P<T>::pick(int = 1)` and the constrained
+`P<T>::pick(int)` share one MSVC symbol. For `P<int>.pick()`, clang-cl emits the constrained
+body (21) while the Itanium oracle selects the unconstrained default (11). The two-parameter
+case has the same shared-symbol issue. Static twins can also be refused when their wrappers
+collide. The issue repros and clang-cl command were preserved in the original issue history;
+this worktree has no Windows toolchain to re-run them.
 
 ## Root cause
-The CFlat overload set has no notion of the constraint ordering, and the signature dedupe
-leaves only one of the twins. Itanium on LLVM 23 mangles the constraint (distinct symbols);
-MSVC does not (both twins share one symbol name).
+
+MSVC does not encode the requires-clause in the member linkage name. Wrapper registration and
+demand extraction therefore cannot distinguish two bodies by linkage name alone, while
+Itanium gives each constrained declaration a separate symbol.
 
 ## Fix direction
-Each twin needs its own viable arity domain: the less constrained one is callable only for
-argument counts the more constrained one cannot accept. A T22 attempt (reverted, round 3/3b)
-bound the loser through default-argument wrappers only and filtered the demand pass on MSVC.
-Pitfalls found by review of that attempt:
-- CxxDefaultWrapperCallAmbiguous counts a retained loser whose trailing defaults cover the
-  wrapper's arity: the WINNER's nonconstant-default wrapper (`f(int a, int b = next())`) was
-  falsely "ambiguous ... without its default arguments". The arity domain must apply to the
-  wrapper ambiguity check too (receiver slot included).
-- Under MSVC both twins share a linkage name and so a wrapper-name prefix: classifying a
-  demanded wrapper as the loser's by prefix alone mistook the winner's own wrapper. Decode the
-  wrapper arity and compare it with the loser's domain.
-- Under MSVC a program using both twins of ONE instantiation cannot compile in clang either
-  ("definition with same mangled name"); the demand pass must pick the body by which arities
-  the program uses, and refuse the combination.
+
+On Windows, retain the per-arity candidate domain and select the body from the used arity;
+detect and report combinations that clang-cl itself rejects for duplicate mangled definitions.
+Add Windows-only regression coverage before closing this issue.

@@ -1,0 +1,115 @@
+import cpp "cpp_interop_refgate.h";
+
+cpprefgate.C* rgGlobalPointer = nullptr;
+
+expect_error("double_pointer_ref(lpp)") {
+    cpprefgate.C* RefglobLocalCopy() {
+        cpprefgate.C local = { v = 103 };
+        rgGlobalPointer = &local;
+        cpprefgate.C** lpp = &rgGlobalPointer;
+        return &cpprefgate.double_pointer_ref(lpp);
+    }
+}
+
+expect_error("double_pointer_ref(ptrParameter)") {
+    cpprefgate.C* RefglobParameter(cpprefgate.C** ptrParameter) {
+        cpprefgate.C local = { v = 107 };
+        rgGlobalPointer = &local;
+        return &cpprefgate.double_pointer_ref(ptrParameter);
+    }
+}
+
+expect_error("double_pointer_ref(indirectField)") {
+    struct RefglobReceiver {
+        cpprefgate.C** indirectField = default;
+        cpprefgate.C* get() { return &cpprefgate.double_pointer_ref(indirectField); }
+    };
+    RefglobReceiver rgGlobalReceiver = default;
+    cpprefgate.C* RefglobGlobalReceiver() {
+        cpprefgate.C local = { v = 109 };
+        rgGlobalPointer = &local;
+        rgGlobalReceiver.indirectField = &rgGlobalPointer;
+        return rgGlobalReceiver.get();
+    }
+}
+
+expect_error("double_pointer_ref(fromCall)") {
+    cpprefgate.C* RefglobCallResult() {
+        cpprefgate.C local = { v = 113 };
+        rgGlobalPointer = &local;
+        cpprefgate.C** lpp = &rgGlobalPointer;
+        cpprefgate.C** fromCall = cpprefgate.pass_double_pointer(lpp);
+        return &cpprefgate.double_pointer_ref(fromCall);
+    }
+}
+
+expect_error("double_pointer_ref(choose?left:right)") {
+    cpprefgate.C* RefglobTernary(bool choose) {
+        cpprefgate.C local = { v = 127 };
+        rgGlobalPointer = &local;
+        cpprefgate.C** left = &rgGlobalPointer;
+        cpprefgate.C** right = &rgGlobalPointer;
+        return &cpprefgate.double_pointer_ref(choose ? left : right);
+    }
+}
+
+expect_error("double_pointer_ref(&hb.p)") {
+    struct RefglobHeapParamHolder { cpprefgate.C* p = default; };
+    cpprefgate.C* RefglobHeapParam(RefglobHeapParamHolder* hb) {
+        return &cpprefgate.double_pointer_ref(&hb.p);
+    }
+}
+
+expect_error("double_pointer_ref(holder)") {
+    cpprefgate.C* RefglobArgumentProducer() {
+        cpprefgate.C** holder = cpprefgate.pass_double_pointer(
+            cpprefgate.heap_double_pointer_holder());
+        return &cpprefgate.double_pointer_ref(holder);
+    }
+}
+
+expect_error("double_pointer_ref(GetH())") {
+    cpprefgate.C** GetH() { return cpprefgate.heap_double_pointer_holder(); }
+    cpprefgate.C* RefglobCflatProducer() {
+        return &cpprefgate.double_pointer_ref(GetH());
+    }
+}
+
+expect_error("double_pointer_ref(f)") {
+    struct RefglobHeapMethod {
+        cpprefgate.C** f = default;
+        cpprefgate.C* get() { return &cpprefgate.double_pointer_ref(f); }
+    };
+    cpprefgate.C* RefglobHeapMethodUse() {
+        RefglobHeapMethod* receiver = new RefglobHeapMethod();
+        receiver.f = cpprefgate.heap_double_pointer_holder();
+        return receiver.get();
+    }
+}
+
+expect_error("double_pointer_ref(cpprefgate.heap_double_pointer_holder())") {
+    cpprefgate.C* RefglobInlineProducer() {
+        return &cpprefgate.double_pointer_ref(cpprefgate.heap_double_pointer_holder());
+    }
+}
+
+expect_error("double_pointer_ref(h)") {
+    cpprefgate.C* RefglobCarveoutDangle() {
+        cpprefgate.C** h = cpprefgate.heap_double_pointer_holder();
+        cpprefgate.C local = { v = 5 };
+        *h = &local;
+        return &cpprefgate.double_pointer_ref(h);
+    }
+}
+
+// A global C** chain is still refused: its stored C* can be rewritten to a local anywhere.
+cpprefgate.C RefglobChainObject = default;
+cpprefgate.C* RefglobChainCell = &RefglobChainObject;
+cpprefgate.C** RefglobChain = &RefglobChainCell;
+expect_error("double_pointer_ref(RefglobChain)") {
+    cpprefgate.C* RefglobAliasStoreChain() {
+        cpprefgate.C local = { v = 5 };
+        *RefglobChain = &local;
+        return &cpprefgate.double_pointer_ref(RefglobChain);
+    }
+}

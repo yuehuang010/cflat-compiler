@@ -1814,6 +1814,109 @@ struct InterfaceOps
     }
 };
 
+T genovlAcceptSingle<T>(T value) { return value + 10; }
+struct GenovlAcceptMember { T keep<T>(T value) { return value + 10; } };
+struct GenovlAcceptBox<V> { T keep<T>(T value) { return value + 10; } };
+namespace GenovlAcceptNs { T keep<T>(T value) { return value + 10; } }
+int genovlAcceptMixed(int value) { return value + 10; }
+T genovlAcceptMixed<T>(T value) { return value + 20; }
+
+bool testGenericOverloadAcceptSet()
+{
+    bool result = true;
+    result &= Test("genovl_accept_inferred", genovlAcceptSingle(7), 17);
+    result &= Test("genovl_accept_explicit", genovlAcceptSingle<int>(8), 18);
+    function<int(int)> single = genovlAcceptSingle<int>;
+    result &= Test("genovl_accept_value", single(9), 19);
+    GenovlAcceptMember member;
+    result &= Test("genovl_accept_member", member.keep(10), 20);
+    GenovlAcceptBox<int> box;
+    result &= Test("genovl_accept_generic_owner_member", box.keep(11), 21);
+    result &= Test("genovl_accept_namespace", GenovlAcceptNs.keep(12), 22);
+    result &= Test("genovl_accept_mixed_exact", genovlAcceptMixed(1), 11);
+    result &= Test("genovl_accept_mixed_generic", (int)genovlAcceptMixed(1.0), 21);
+    return result;
+}
+
+T genovlTwo<T>(T value) { return value + 10; }
+T genovlTwo<T>(T left, T right) { return left + right + 20; }
+T genovlPv<T>(T value) { return value + 10; }
+T genovlPv<T>(T* value) { return *value + 20; }
+T genovlPvReverse<T>(T* value) { return *value + 20; }
+T genovlPvReverse<T>(T value) { return value + 10; }
+int genovlRankDouble<T>(T first, int second) { return 1; }
+int genovlRankDouble<T>(T first, T second) { return 2; }
+int genovlRankPromotion<T>(T first, int second) { return 61; }
+int genovlRankPromotion<T>(T first, long second) { return 62; }
+T genovlExplicit<T>(T value) { return value + 10; }
+T genovlExplicit<T, U>(T left, U right) { return left + right + 20; }
+T genovlValue<T>(T value) { return value + 10; }
+T genovlValue<T>(T left, T right) { return left + right + 20; }
+int genovlCStringParam<T>(T value, const char* label) { return (int)value; }
+
+struct GenovlOverloadMember
+{
+    T apply<T>(T value) { return value + 10; }
+    T apply<T>(T left, T right) { return left + right + 20; }
+};
+
+struct GenovlOverloadBox<V>
+{
+    T apply<T>(T value) { return value + 10; }
+    T apply<T>(T left, T right) { return left + right + 20; }
+};
+
+namespace GenovlScope
+{
+    T same<T>(T value) { return value + 10; }
+}
+
+struct GenovlScope
+{
+    T same<T>(T left, T right) { return left + right + 20; }
+};
+
+bool testGenericFunctionOverloads()
+{
+    bool result = true;
+    result &= Test("genovl_arity_inferred_one", genovlTwo(3), 13);
+    result &= Test("genovl_arity_inferred_two", genovlTwo(3, 4), 27);
+    result &= Test("genovl_arity_explicit_one", genovlTwo<int>(3), 13);
+    result &= Test("genovl_arity_explicit_two", genovlTwo<int>(3, 4), 27);
+    result &= Test("genovl_shape_value", genovlPv(5), 15);
+    int pointed = 3;
+    result &= Test("genovl_shape_pointer", genovlPv(&pointed), 23);
+    result &= Test("genovl_shape_reverse_value", genovlPvReverse(5), 15);
+    result &= Test("genovl_shape_reverse_pointer", genovlPvReverse(&pointed), 23);
+    function<int(int*)> pointerValue = genovlPvReverse<int>;
+    function<int(int)> scalarValue = genovlPvReverse<int>;
+    result &= Test("genovl_shape_reverse_function_pointer", pointerValue(&pointed), 23);
+    result &= Test("genovl_shape_reverse_function_value", scalarValue(5), 15);
+    result &= Test("genovl_conversion_exact_over_conversion",
+        genovlRankDouble(1.0, 2.0), 2);
+    short promotionArg = 2;
+    result &= Test("genovl_conversion_promotion_over_conversion",
+        genovlRankPromotion(1.0, promotionArg), 61);
+    result &= Test("genovl_explicit_type_arity_one", genovlExplicit<int>(1), 11);
+    result &= Test("genovl_explicit_type_arity_two", genovlExplicit<int, i64>(1, 2), 23);
+    result &= Test("genovl_string_pointer_argument", genovlCStringParam(4, "label"), 4);
+    GenovlOverloadMember member;
+    result &= Test("genovl_member_one", member.apply(3), 13);
+    result &= Test("genovl_member_two", member.apply(3, 4), 27);
+    GenovlOverloadBox<int> box;
+    result &= Test("genovl_generic_owner_member_one", box.apply(3), 13);
+    result &= Test("genovl_generic_owner_member_two", box.apply(3, 4), 27);
+    function<int(int)> one = genovlValue<int>;
+    function<int(int, int)> two = genovlValue<int>;
+    result &= Test("genovl_value_target_one", one(3), 13);
+    result &= Test("genovl_value_target_two", two(3, 4), 27);
+    result &= Test("genovl_value_explicit_call", genovlValue<int>(3), 13);
+    GenovlScope scope;
+    result &= Test("genovl_namespace_struct_key_collision",
+        GenovlScope.same(1) + scope.same(1, 2), 34);
+    return result;
+}
+
 bool testTemplateFunctions()
 {
     bool result = true;
@@ -8211,6 +8314,8 @@ extern int main()
     total++; passed += testConstViewInstantiation()      ? 1 : 0;
     total++; passed += testIntrinsicMemberNames()        ? 1 : 0;
     total++; passed += testTemplateFunctions()           ? 1 : 0;
+    total++; passed += testGenericOverloadAcceptSet()    ? 1 : 0;
+    total++; passed += testGenericFunctionOverloads()   ? 1 : 0;
     total++; passed += testNewPrimitiveInitializers()    ? 1 : 0;
     total++; passed += testGenericInstanceMethods()      ? 1 : 0;
     total++; passed += testT517BareGenericMethodScope()   ? 1 : 0;

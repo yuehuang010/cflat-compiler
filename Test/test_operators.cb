@@ -489,9 +489,33 @@ struct DixHolder { DixNode*[2][2] p = default; };
 int dixPlusTen(int x) { return x + 10; }
 int dixTimesTen(int x) { return x * 10; }
 int*[2][2] dixGlobalPointers;
+int srctypeTag(i64 value) { return 5; }
+int srctypeTag(u64 value) { return 6; }
 
 extern int main()
 {
+    long srctypeLong = 3; ulong srctypeULong = 6; uint srctypeUInt = 6;
+    int srctypePassed = 0;
+    auto srctypeSize = sizeof(int);
+    auto srctypeShift = srctypeLong << 1;
+    auto srctypeXor = srctypeUInt ^ srctypeLong;
+    auto srctypeAnd = srctypeLong & srctypeULong;
+    srctypePassed += Test("native auto sizeof type and value", typeof(srctypeSize), "i64");
+    srctypePassed += Test("native auto sizeof comparison", srctypeSize - 8 < 0 ? 1 : 0, 1);
+    srctypePassed += Test("native auto sizeof overload", srctypeTag(srctypeSize), 5);
+    srctypePassed += Test("native auto shift type", typeof(srctypeShift), "i64");
+    srctypePassed += Test("native auto shift value", srctypeShift, 6);
+    srctypePassed += Test("native auto xor type", typeof(srctypeXor), "i64");
+    srctypePassed += Test("native auto xor value", srctypeXor, 5);
+    srctypePassed += Test("native auto and type", typeof(srctypeAnd), "u64");
+    srctypePassed += Test("native auto and value", srctypeAnd, 2);
+    srctypePassed += Test("native auto unsigned overload", srctypeTag(srctypeAnd), 6);
+    auto srctypeParen = (srctypeLong + 1);
+    auto srctypeParen2 = ((srctypeLong * 2));
+    srctypePassed += Test("native auto paren additive type", typeof(srctypeParen), "long");
+    srctypePassed += Test("native auto paren multiplicative type", typeof(srctypeParen2), "long");
+    srctypePassed += Test("native auto paren value", (int)(srctypeParen + srctypeParen2), 10);
+
     float postfixFloat = 1.5f;
     float postfixOldFloat = postfixFloat++;
     double postfixDouble = 2.5;
@@ -1186,7 +1210,7 @@ extern int main()
         && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5
         && narrowPromoPassed == 46 && i128Passed == 29
         && reversedPassed == 3 && sizeofUnevalPassed == 67
-        && boolFpPassed == 20 && arithResultPassed == 18 && callArgNarrowPassed == 12 && userLibcAtollWins()) ? 0 : 1;
+        && boolFpPassed == 20 && arithResultPassed == 18 && callArgNarrowPassed == 12 && srctypePassed == 13 && userLibcAtollWins()) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness

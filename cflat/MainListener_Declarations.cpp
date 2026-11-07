@@ -5592,52 +5592,39 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             std::vector<std::string> valueDefaults;
             auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
                                                          &valueDefaults);
-            // Normalize parameter types from the parse tree so nested `List<T>` shapes are
-            // positional too; parsed TypeAndValue names preserve only top-level parameters.
-            std::string signature = std::to_string(typeParams.size()) + "<";
-            if (func->declarationSpecifiers() != nullptr)
-                signature += "return:" + func->declarationSpecifiers()->getText() + ";";
-            if (paramTypeList != nullptr && paramTypeList->parameterList() != nullptr)
-                for (auto* param : paramTypeList->parameterList()->parameterDeclaration())
-                    signature += param->declarationSpecifiers()->getText() + ",";
-            for (size_t i = 0; i < typeParams.size(); ++i)
-            {
-                if (i >= valueParams.size() || !valueParams[i].empty()) continue;
-                const std::string& typeName = typeParams[i];
-                size_t at = 0;
-                while ((at = signature.find(typeName, at)) != std::string::npos)
-                {
-                    const auto isIdent = [](char c) { return (c >= 'a' && c <= 'z')
-                        || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
-                    const bool left = at == 0 || !isIdent(signature[at - 1]);
-                    const bool right = at + typeName.size() == signature.size()
-                        || !isIdent(signature[at + typeName.size()]);
-                    if (left && right)
-                    {
-                        signature.replace(at, typeName.size(), "#" + std::to_string(i));
-                        at += 2;
-                    }
-                    else at += typeName.size();
-                }
-            }
-            compiler->RecordGenericTemplateOrigin(name, signature, line,
+            const std::string signature = GenericFunctionTemplateSignature(func, compiler);
+            const std::string scopeIdentity = "namespace:" + namespaceName;
+            compiler->RecordGenericTemplateOrigin(name, signature, scopeIdentity, line,
                 func->getStart()->getCharPositionInLine());
-            genericFunctionTemplates[name] = func;
+            const size_t candidateIndex = compiler->gts.RegisterGenericFunctionTemplate(name, func);
+            const std::string candidateKey =
+                GenericTemplateState::GenericFunctionCandidateKey(name, candidateIndex);
             if (compiler->CurrentSourceIsCoreLibrary())
+            {
+                compiler->gts.coreGenericTemplates.insert(candidateKey);
                 compiler->gts.coreGenericTemplates.insert(name);
-            else
-                compiler->gts.coreGenericTemplates.erase(name);
+            }
             compiler->RecordExplicitCoreFunction(name, true);
             // Record the declaring namespace, never re-derive it from the key: a call site's bare
             // spelling resolves through it (ResolveGenericFunctionBase) and the body is lowered in it.
-            Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
-            genericFunctionTypeParams[name] = typeParams;
-            compilerLLVM->gts.genericFunctionValueParams[name] = valueParams;
-            compilerLLVM->gts.genericFunctionValueDefaults[name] = valueDefaults;
-            genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
+            Compiler()->gts.genericTemplateNamespace[candidateKey] = namespaceName;
+            if (candidateIndex == 0) Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
+            genericFunctionTypeParams[candidateKey] = typeParams;
+            compilerLLVM->gts.genericFunctionValueParams[candidateKey] = valueParams;
+            compilerLLVM->gts.genericFunctionValueDefaults[candidateKey] = valueDefaults;
+            genericFunctionConstraints[candidateKey] = ParseWhereClause(func->whereClause());
+            if (candidateIndex == 0)
+            {
+                genericFunctionTypeParams[name] = typeParams;
+                compilerLLVM->gts.genericFunctionValueParams[name] = valueParams;
+                compilerLLVM->gts.genericFunctionValueDefaults[name] = valueDefaults;
+                genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
+            }
             auto entries = func->genericTypeParameters()->typeParameterList()->typeParameterEntry();
             bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
-            genericFunctionPackIndex[name] = hasPack ? typeParams.size() - 1 : std::string::npos;
+            genericFunctionPackIndex[candidateKey] = hasPack ? typeParams.size() - 1 : std::string::npos;
+            if (candidateIndex == 0)
+                genericFunctionPackIndex[name] = hasPack ? typeParams.size() - 1 : std::string::npos;
             return;
         }
 
@@ -8700,11 +8687,29 @@ cxx_dtor_ready:
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
                 auto elementOwnedTempMark = compiler->MarkOwnedTemps();
+                // A sole assignment shows the slot to its own operator call only, so the
+                // result is built in place (`C b = (arr[i] = v)`, clang elides it).
+                const bool armedAssign = !declType.Pointer && compiler->IsCxxRecord(typeName)
+                    && SoleAssignmentExpression(assign) != nullptr;
+                if (armedAssign)
+                {
+                    compiler->pendingCxxSretDest_ = slot;
+                    compiler->pendingCxxSretTypeName_ = typeName;
+                }
                 auto sourceNV = [&] {
                     CxxCallArgumentScope cxxDeclSourceScope(inCxxCallArgument_,
                         !declType.Pointer && compiler->IsCxxRecord(typeName));
                     return ParseAssignmentExpressionNamed(assign);
                 }();
+                const bool assignConsumed = armedAssign && compiler->pendingCxxSretDest_ == nullptr;
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+                if (assignConsumed)
+                {
+                    compiler->lastCxxRetTemp_ = nullptr;
+                    compiler->lastCxxRetValue_ = nullptr;
+                    return true;
+                }
                 if (sourceNV.IsElementAccess && sourceNV.Storage != nullptr
                     && !sourceNV.TypeAndValue.Pointer
                     && sourceNV.TypeAndValue.TypeName == typeName)
@@ -9212,6 +9217,13 @@ void MainListener::ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const 
         auto* compiler = Compiler(ctx);
         compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
         auto nv = compiler->GetGlobalVariableNV(name);
+        ReleaseOwningGlobalNow(ctx, nv);
+    }
+
+void MainListener::ReleaseOwningGlobalNow(
+        antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& nv) {
+        auto* compiler = Compiler(ctx);
+        compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
         if (nv.Storage == nullptr)
             return;
         if (!compiler->OwnsDroppableResource(nv))
@@ -9636,6 +9648,45 @@ bool MainListener::FoldApplicationLiteral(antlr4::ParserRuleContext* ctx, const 
 
     if (!ValidateApplicationIcons(ctx, out)) return false;
     return true;
+}
+
+// T58 rule for `auto`: the C++ identity becomes the local's CFlat type only when the initializer's
+// top operator is + - * / % and the identity has the native type's signedness. Walks single-child rules.
+static bool AutoIdentityIsExpressionType(antlr4::tree::ParseTree* init, const std::string& identity,
+                                         const std::string& nativeName)
+{
+    antlr4::tree::ParseTree* node = init;
+    for (;;)
+    {
+        while (node != nullptr && node->children.size() == 1) node = node->children[0];
+        // `(expr)`: classify the parenthesized expression, as master's identity did.
+        auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+        if (primary == nullptr || primary->children.size() != 3
+            || primary->children[0]->getText() != "(" || primary->children[2]->getText() != ")")
+            break;
+        node = primary->children[1];
+    }
+    if (node == nullptr || node->children.size() <= 1) return false;
+    if (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node) == nullptr
+        && dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node) == nullptr)
+        return false;
+    LLVMBackend::TypeAndValue id;
+    id.TypeName = identity;
+    LLVMBackend::TypeAndValue nat;
+    nat.TypeName = nativeName;
+    return (id.IsUnsignedInteger() != -1) == (nat.IsUnsignedInteger() != -1);
+}
+
+// An `auto` local keeps its CFlat integer type but stores the C++ identity when the widths agree.
+static bool IdentityHasNativeIntegerType(LLVMBackend* compiler, const std::string& identity,
+                                         llvm::Value* value)
+{
+    LLVMBackend::TypeAndValue probe;
+    probe.TypeName = identity;
+    probe.Pointer = false;
+    probe.ElemPointer = false;
+    llvm::Type* type = compiler->GetType(probe);
+    return value != nullptr && type == value->getType() && type->isIntegerTy();
 }
 
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName) {
@@ -10327,6 +10378,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool haveInterfaceSourceNV = false;
                 LLVMBackend::NamedVariable initializerSourceNV;
                 bool haveInitializerSourceNV = false;
+                // True when an `auto` local took the native initializer type (not the C++ identity).
+                bool autoNativeInitType = false;
                 bool closureInitKnownFree = false;
                 bool closureInitAdapted = false;
                 bool srcIsUnsigned = false;
@@ -12949,7 +13002,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 }
                 else if (typeAndValue.TypeName == "auto" && right != nullptr
                     && haveInitializerSourceNV
-                    && !initializerSourceNV.CxxArithIdentity.empty())
+                    && !initializerSourceNV.CxxArithIdentity.empty()
+                    && AutoIdentityIsExpressionType(
+                        initDecl->initializer() != nullptr
+                            ? initDecl->initializer()->assignmentExpression() : nullptr,
+                        initializerSourceNV.CxxArithIdentity, srcInferredTypeName))
                 {
                     LLVMBackend::TypeAndValue probe = typeAndValue;
                     probe.TypeName = initializerSourceNV.CxxArithIdentity;
@@ -12975,6 +13032,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (compiler->GetType(probe) == right->getType())
                     {
                         typeAndValue.TypeName = srcInferredTypeName;
+                        autoNativeInitType = true;
                         typeAndValue.Pointer = srcInferredPointer;
                         typeAndValue.PointerDepth = srcInferredPointerDepth;
                         typeAndValue.ElemPointer = typeAndValue.Pointer
@@ -13467,7 +13525,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && compiler->IsBorrowedAddressValue(initializerSourceNV.Primary))
                         compiler->MarkArrayViewFieldRootAliased(alloc);
                     if (haveInitializerSourceNV && !initializerSourceNV.CxxArithIdentity.empty()
-                        && typeAndValue.TypeName == initializerSourceNV.CxxArithIdentity)
+                        && (typeAndValue.TypeName == initializerSourceNV.CxxArithIdentity
+                            || (autoNativeInitType && IdentityHasNativeIntegerType(
+                                compiler, initializerSourceNV.CxxArithIdentity, right))))
                         compiler->GetOrCreateStackVariable(name).CxxArithIdentity =
                             initializerSourceNV.CxxArithIdentity;
                     if (pendingAddressStorage != nullptr && alloc != nullptr
@@ -14231,7 +14291,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (cxxAggregate && scalarDestination)
                                     hasImplicitConversion = !compiler->CxxConversionOperatorTo(
                                         sourceType.TypeName, typeAndValue, false, nullptr,
-                                        &ambiguousConversion, &ambiguousConversionCandidates).empty();
+                                        &ambiguousConversion, &ambiguousConversionCandidates,
+                                        &sourceType).empty();
                                 if (ambiguousConversion)
                                     compiler->ReportAmbiguousCxxConversion(
                                         sourceType.TypeName, typeAndValue,
@@ -16035,7 +16096,13 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
         std::vector<CFlatParser::FunctionDefinitionContext*> overloads;
         const std::string genericMethodKey = GenericMethodTemplateKey(type, method);
         if (!genericMethodKey.empty())
-            overloads.push_back(genericFunctionTemplates.at(genericMethodKey));
+        {
+            auto templates = genericFunctionTemplates.find(genericMethodKey);
+            if (templates != genericFunctionTemplates.end())
+                for (size_t i = 0; i < templates->second.size(); ++i)
+                    if (auto* context = compiler->MaterializeGenericFunction(genericMethodKey, i))
+                        overloads.push_back(context);
+        }
         auto isOwnMethod = [&](const std::string& name) {
             auto bodies = compiler->gts.structMethodBodies.find(type);
             return (bodies != compiler->gts.structMethodBodies.end() && bodies->second.contains(name))

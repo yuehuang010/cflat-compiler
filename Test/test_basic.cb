@@ -9077,28 +9077,37 @@ int testAliasTempCflatLifetime()
 }
 
 int strNullArgLength(string x) { return x.length(); }
-int strIsNullish(string x) { return x == nullptr ? 1 : 0; }
 
-// A null char* or nullptr operand wraps as the empty string (operator string(const char*)).
+// A null char* converts to an empty string through operator string(const char*).
 bool testStringNullCharPtr()
 {
     bool result = true;
 
     string s = "a";
-    int eqNull = s == nullptr ? 1 : 0;
-    result &= Test("str_eq_nullptr_nonempty", eqNull, 0);
-    int neNull = s != nullptr ? 1 : 0;
-    result &= Test("str_ne_nullptr_nonempty", neNull, 1);
-    int nullLhs = nullptr == s ? 1 : 0;
-    result &= Test("str_nullptr_eq_lhs_nonempty", nullLhs, 0);
-    int nullLhsNe = nullptr != s ? 1 : 0;
-    result &= Test("str_nullptr_ne_lhs_nonempty", nullLhsNe, 1);
+    string* stringPtr = nullptr;
+    result &= Test("strptr_eq_nullptr_rhs", stringPtr == nullptr, true);
+    result &= Test("strptr_eq_nullptr_lhs", nullptr == stringPtr, true);
+    result &= Test("strptr_ne_nullptr_rhs", stringPtr != nullptr, false);
+    result &= Test("strptr_ne_nullptr_lhs", nullptr != stringPtr, false);
 
-    string e = "";
-    int emptyEq = e == nullptr ? 1 : 0;
-    result &= Test("str_eq_nullptr_empty", emptyEq, 1);
-    result &= Test("str_param_nullptr_nonempty", strIsNullish(s), 0);
-    result &= Test("str_param_nullptr_empty", strIsNullish(e), 1);
+    result &= Test("str_literal_eq_nullptr_rhs", "x" == nullptr, false);
+    result &= Test("str_literal_eq_nullptr_lhs", nullptr == "x", false);
+    result &= Test("str_literal_ne_nullptr_rhs", "x" != nullptr, true);
+    result &= Test("str_literal_ne_nullptr_lhs", nullptr != "x", true);
+
+    char* nullCharPtr = nullptr;
+    string emptyForNullCompare = "";
+    string nonemptyForNullCompare = "x";
+    result &= Test("str_eq_runtime_null_charptr_empty", emptyForNullCompare == nullCharPtr, true);
+    result &= Test("str_ne_runtime_null_charptr_empty", emptyForNullCompare != nullCharPtr, false);
+    result &= Test("str_eq_runtime_null_charptr_nonempty", nonemptyForNullCompare == nullCharPtr, false);
+    result &= Test("str_ne_runtime_null_charptr_nonempty", nonemptyForNullCompare != nullCharPtr, true);
+
+    char* typedNull = (char*)nullptr;
+    result &= Test("str_eq_typed_null_charptr_empty", emptyForNullCompare == typedNull, true);
+    result &= Test("str_ne_typed_null_charptr_empty", emptyForNullCompare != typedNull, false);
+    result &= Test("str_eq_typed_null_charptr_nonempty", nonemptyForNullCompare == typedNull, false);
+    result &= Test("str_ne_typed_null_charptr_nonempty", nonemptyForNullCompare != typedNull, true);
 
     char* p = nullptr;
     string d = p;

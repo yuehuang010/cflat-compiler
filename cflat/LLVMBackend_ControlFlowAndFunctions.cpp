@@ -3225,37 +3225,14 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
     }
 
 void LLVMBackend::RecordGenericTemplateOrigin(const std::string& name, const std::string& signature,
-        size_t line, size_t column)
+        const std::string& scopeIdentity, size_t line, size_t column)
 {
-        // Keep the first origin for each template name. Until lookup stores overload sets, any
-        // later shape would otherwise replace it silently.
-        const std::string key = name + "(" + signature + ")";
+        const std::string key = scopeIdentity + ":" + name + "(" + signature + ")";
         FunctionBodyOrigin origin { SourceFileLeaf(sourceFileName), line, column, false, false };
         auto it = genericTemplateOrigin_.find(key);
         if (it != genericTemplateOrigin_.end())
         {
             DiagnoseDuplicateBodyOrigin(name, key, it->second, line, column, false, false);
-            return;
-        }
-        const std::string prefix = name + "(";
-        for (const auto& [firstKey, first] : genericTemplateOrigin_)
-        {
-            if (!firstKey.starts_with(prefix)) continue;
-            const std::string currentFile = SourceFileLeaf(sourceFileName);
-            if (first.file == currentFile && first.line == line && first.column == column) return;
-            std::string displayName = SpellFunctionSymbol(*this, name);
-            const size_t memberSeparator = displayName.rfind('.');
-            const size_t genericOpen = displayName.find('<');
-            const size_t genericClose = displayName.rfind('>');
-            if (memberSeparator != std::string::npos && genericOpen < memberSeparator
-                && genericClose != std::string::npos && genericClose > memberSeparator)
-            {
-                displayName.insert(memberSeparator, ">");
-                displayName.erase(genericClose + 1, 1);
-            }
-            LogError(std::format("generic template overloading is not supported yet: redefinition of '{}' - "
-                "a template with a different parameter shape is already defined at {}({})",
-                displayName, first.file, first.line));
             return;
         }
         genericTemplateOrigin_[key] = std::move(origin);
@@ -3283,10 +3260,19 @@ void LLVMBackend::DiagnoseDuplicateBodyOrigin(const std::string& functionName,
                   std::to_string(first.line) });
             return;
         }
+        std::string displayName = SpellFunctionSymbol(*this, functionName);
+        if (const size_t dot = functionName.rfind('.'); dot != std::string::npos)
+        {
+            TypeAndValue ownerType;
+            ownerType.TypeName = functionName.substr(0, dot);
+            const std::string ownerName = SpellType(*this, ownerType);
+            if (ownerName != ownerType.TypeName)
+                displayName = ownerName + functionName.substr(dot);
+        }
         LogErrorMessage("redefinition of '{}' - the same overload is already defined at "
             "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
             "'i32' name the same type) are one overload, not two.",
-            { SpellFunctionSymbol(*this, functionName), firstFile, std::to_string(first.line) });
+            { displayName, firstFile, std::to_string(first.line) });
     }
 
 bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType,

@@ -203,6 +203,10 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             LLVMBackend::TypedValue arithRunning = lv;
+            std::string accumulatorCxxArithIdentity = CxxScalarOperandIdentity(
+                compiler, lv.cxxArithIdentity, lv.sourceTypeName, lv.value);
+            if (accumulatorCxxArithIdentity.empty())
+                accumulatorCxxArithIdentity = CxxLiteralOperandIdentity(nextCtxs[0]);
             llvm::Value* accumulatorStorage = lv.receiverStorage;
             bool accumulatorIsRvalue = lv.isRvalue;
             llvm::Type* accumulatorRefType = nullptr;
@@ -250,15 +254,24 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                     CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), acc,
                                            accumulatorStorage, accumulatorIsRvalue,
                                            accumulatorRefType, accumulatorSourceTypeName);
+                    accumulatorCxxArithIdentity.clear();
                     lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
                 }
                 else
                 {
+                    const std::string leftIdentity = accumulatorCxxArithIdentity;
+                    std::string rightIdentity = CxxScalarOperandIdentity(
+                        compiler, rv.cxxArithIdentity, rv.sourceTypeName, rv.value);
+                    if (rightIdentity.empty()) rightIdentity = CxxLiteralOperandIdentity(nextCtxs[i]);
                     bool resultUnsigned = BinaryJoinIsUnsigned(
                         lv.isUnsigned, BinaryOperandBits(acc), rv.isUnsigned, BinaryOperandBits(rv.value));
                     const LLVMBackend::TypedValue arithLhs = ArithRunningOperand(arithRunning, acc);
                     acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    accumulatorCxxArithIdentity = acc != nullptr
+                        ? ScalarArithmeticResultName(compiler, leftIdentity, rightIdentity,
+                                                     acc->getType())
+                        : std::string();
                     arithRunning = ArithComputedOperand(acc, LLVMBackend::ArithResultNarrowWidth(arithLhs, rv));
                     accumulatorStorage = nullptr;
                     accumulatorIsRvalue = true;
@@ -279,6 +292,7 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                 && !accumulatorSourceTypeName.empty();
             result.storage = result.isAlias ? accumulatorStorage : nullptr;
             result.sourceTypeName = accumulatorSourceTypeName;
+            result.cxxArithIdentity = accumulatorCxxArithIdentity;
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }
@@ -2085,6 +2099,12 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
         ShiftPairResult result;
         result.value = { compiler->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned),
                          leftPromotedUnsigned };
+        std::string leftIdentity = CxxScalarOperandIdentity(
+            compiler, lv.cxxArithIdentity, lv.sourceTypeName, lv.value);
+        if (leftIdentity.empty()) leftIdentity = lhs.literalType;
+        if (!leftIdentity.empty() && result.value.value != nullptr)
+            result.value.cxxArithIdentity = ScalarArithmeticResultName(
+                compiler, leftIdentity, {}, result.value.value->getType());
         // C 6.5.7: the count is ignored; the result is a narrow int only for a runtime narrow left operand.
         if (lv.value != nullptr && !llvm::isa<llvm::Constant>(lv.value))
             result.value.arithNarrowWidth = static_cast<uint8_t>(LLVMBackend::ArithOperandNarrowWidth(lv));
@@ -2256,6 +2276,9 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             llvm::Type* lhsRefType = nullptr;
             std::string lhsSourceTypeName = lv.sourceTypeName;
             std::string lhsArithIdentity = lv.cxxArithIdentity;
+            if (lhsArithIdentity.empty())
+                lhsArithIdentity = CxxScalarOperandIdentity(
+                    Compiler(ctx), {}, lv.sourceTypeName, lv.value);
             std::string lhsNativeArithmeticTypeName;
             std::string leftLiteralIdentity = CxxLiteralOperandIdentity(nextCtxs[0]);
             bool lu = lv.isUnsigned;
@@ -4144,6 +4167,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         // A C++ right operand keeps the left literal as the `char*` a C++ free operator is
         // declared over; wrapping it would offer only CFlat 'string' candidates.
         bool lhsStringLiteral = false;
+        const bool equalityComparison = op == "==" || op == "!=";
+        const bool lhsIsBareNullptr = lhsPointerDepth == 0
+            && llvm::isa<llvm::ConstantPointerNull>(lvalue);
+        const bool rhsIsBareNullptr = rhsPointerDepth == 0
+            && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(rvalue);
 
         // If the LHS is a string literal (ptr to global constant), wrap it
         // as a %string struct so operator+(string, ...) can match.
@@ -4153,15 +4181,31 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             {
                 if (compiler->stringLiteralLenByPtr.count(c))
                 {
+                    // Preserve raw pointer comparison for a string literal and bare nullptr.
                     if (isCxxRecordValue(rvalue))
                         lhsStringLiteral = true;
-                    else
+                    else if (!(equalityComparison && rhsIsBareNullptr))
                         lvalue = compiler->WrapStringLiteralAsString(lvalue);
                 }
             }
         }
 
         auto* ty = lvalue->getType();
+        auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        const bool lhsIsStringValue = stringTy != nullptr && ty == stringTy;
+        const bool rhsIsStringValue = stringTy != nullptr && rvalue != nullptr
+            && rvalue->getType() == stringTy;
+        const bool anyComparison = equalityComparison
+            || op == "<" || op == ">" || op == "<=" || op == ">=";
+        if (anyComparison
+            && ((lhsIsStringValue && rhsIsBareNullptr)
+                || (rhsIsStringValue && lhsIsBareNullptr)))
+        {
+            LogErrorContext(ctx,
+                "a 'string' is a value type and cannot be compared to nullptr; "
+                "compare with an empty string or use .length()");
+            return nullptr;
+        }
         /*
          * A right operand that is a pointer no depth describes (`T(*)[N]` from an array of
          * arrays, depth -1) or with no identity at all must never satisfy a C++ `U*` parameter of
@@ -4338,10 +4382,23 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             auto operands = collectOperatorOperandRules();
             auto setLiteralIdentity = [&](LLVMBackend::NamedVariable& arg, size_t side) {
                 arg.CxxArithIdentity = side == 0 ? lhsArithIdentity : rhsArithIdentity;
-                if (operands.size() != 2 || side >= operands.size()) return;
-                arg.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
-                    operands[side]->getText(), &arg.LiteralIdentitySuffixed);
-                arg.LiteralSigned = LLVMBackend::LiteralTextHasSign(operands[side]->getText());
+                if (arg.CxxArithIdentity.empty())
+                {
+                    const std::string& sourceTypeName = side == 0 ? lhsTypeName : rhsTypeName;
+                    llvm::Value* value = side == 0 ? lvalue : rvalue;
+                    arg.CxxArithIdentity = CxxScalarOperandIdentity(
+                        compiler, {}, sourceTypeName, value);
+                }
+                if (operands.size() == 2 && side < operands.size())
+                {
+                    arg.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
+                        operands[side]->getText(), &arg.LiteralIdentitySuffixed);
+                    arg.LiteralSigned = LLVMBackend::LiteralTextHasSign(operands[side]->getText());
+                }
+                if (arg.LiteralIdentity.empty() && !arg.CxxArithIdentity.empty()
+                    && arg.BaseType != nullptr
+                    && (arg.BaseType->isIntegerTy() || arg.BaseType->isFloatingPointTy()))
+                    arg.TypeAndValue.TypeName = arg.CxxArithIdentity;
             };
             auto isFat = [](const std::string& typeName) {
                 return typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr";
@@ -5644,32 +5701,6 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue,
                     lhsCxxPointeeConst, lhsObjectCv, rhsObjectCv);
             }
-            // `nullptr == s` on string only: wrap the null lhs as the empty string and re-enter.
-            // Other structs keep the pointer-vs-struct diagnostic.
-            if (rvalue && llvm::isa<llvm::ConstantPointerNull>(lvalue)
-                && rvalue->getType() == llvm::StructType::getTypeByName(*compiler->context, "string")
-                && compiler->GetFunction("operator string"))
-            {
-                LLVMBackend::TypeAndValue savedReturnType = compiler->lastCallReturnType;
-                bool savedReturnsOwned = compiler->lastCallReturnsOwned;
-                LLVMBackend::NamedVariable nullNV;
-                nullNV.Primary = lvalue;
-                nullNV.BaseType = lvalue->getType();
-                nullNV.TypeAndValue.TypeName = "char";
-                nullNV.TypeAndValue.Pointer = true;
-                llvm::Value* wrapped = compiler->CreateOverloadedFunctionCall("operator string", { nullNV });
-                compiler->lastCallReturnType = savedReturnType;
-                compiler->lastCallReturnsOwned = savedReturnsOwned;
-                if (wrapped == nullptr) return nullptr;
-                return TryBinaryOperatorOverload(
-                    wrapped, op, rvalue, ctx, lhsElemType,
-                    rhsPointerDepth, rhsElemPointer, lhsStorage, rhsStorage, reportMissing,
-                    allowReversed, lhsIsRvalue, rhsIsRvalue, lhsTypeName, rhsTypeName,
-                    lhsPointerDepth, lhsElemPointer,
-                    {}, {}, false, {}, {}, false, {}, {}, rhsCxxPointeeConst, lhsArithIdentity, rhsArithIdentity, rhsExplicitMove, lhsExplicitMove,
-                    lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue,
-                    lhsCxxPointeeConst, lhsObjectCv, rhsObjectCv);
-            }
             bool triedCxxComparisonRewrites = false;
             if (isCxxRecordValue(rvalue))
             {
@@ -6591,7 +6622,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
             std::string lhsSourceTypeName = firstNV.TypeAndValue.TypeName;
             int firstPointerDepth = 0;
             bool firstElemPointer = false;
-            std::string lhsArithIdentity = firstNV.CxxArithIdentity;
+            std::string lhsArithIdentity = CxxScalarOperandIdentity(
+                Compiler(ctx), firstNV.CxxArithIdentity, firstNV.TypeAndValue.TypeName, lvalue);
             std::string lhsNativeArithmeticTypeName;
             std::string leftLiteralIdentity = CxxLiteralOperandIdentity(nextCtxs[0]);
             bool unsignedStorage = false;

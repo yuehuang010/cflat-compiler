@@ -17,26 +17,73 @@ expect_error("redefinition of 'dupNested'") {
     U dupNested<U>(DupList<U>* value) { return value->value; }
 }
 
-expect_error("generic template overloading is not supported yet") {
-    T diffShape<T>(T value) { return value; }
-    T diffShape<T>(T value, T other) { return value + other; }
-}
+T diffShape<T>(T value) { return value; }
+T diffShape<T>(T value, T other) { return value + other; }
 
-expect_error("generic template overloading is not supported yet: redefinition of 'ptrReturn'") {
+expect_error("redefinition of 'ptrReturn'") {
     T* ptrReturn<T>(T value) { return nullptr; }
     T ptrReturn<T>(T value) { return value; }
 }
 
-expect_error("generic template overloading is not supported yet: redefinition of 'ptrParam'") {
-    T ptrParam<T>(T* value) { return *value; }
-    T ptrParam<T>(T value) { return value; }
-}
+T ptrParam<T>(T* value) { return *value; }
+T ptrParam<T>(T value) { return value; }
 
-expect_error("generic template overloading is not supported yet: redefinition of 'ArrayMember<int>.f'") {
+expect_error("redefinition of 'ArrayMember<int>.f'") {
     struct ArrayMember<T>
     {
         U f<U>(T[] value) { return value[0]; }
         U f<U>(T* value) { return value[0]; }
     };
     ArrayMember<int> instance;
+}
+
+expect_error("ambiguous generic function value 'amb' for destination") {
+    int amb<T, U>(T* left, U right) { return 31; }
+    int amb<T, U>(T left, U* right) { return 32; }
+    function<int(int*, int*)> callback = amb;
+}
+
+expect_error("ambiguous call to 'ambCallRound2': candidates 'ambCallRound2<T, U>(T*, U)' and 'ambCallRound2<T, U>(T, U*)'") {
+    int ambCallRound2<T, U>(T* left, U right) { return 31; }
+    int ambCallRound2<T, U>(T left, U* right) { return 32; }
+    int call() { int a = 1; int b = 2; return ambCallRound2(&a, &b); }
+}
+
+expect_error("no overload of 'nvCallRound2' matches the given arguments; candidates: 'nvCallRound2<T>(T)' and 'nvCallRound2<T>(T, T)'") {
+    T nvCallRound2<T>(T first) { return first; }
+    T nvCallRound2<T>(T first, T second) { return first + second; }
+    int call() { return nvCallRound2(1, 2, 3); }
+}
+
+expect_error("ambiguous call to 'qRound2': candidates 'qRound2<T>(T, int)' and 'qRound2<T>(T, T)'") {
+    int qRound2<T>(T first, int second) { return 1; }
+    int qRound2<T>(T first, T second) { return 2; }
+    int call() { return qRound2(1, 2); }
+}
+
+expect_error("no overload of 'deduceConflictRound2' matches the given arguments") {
+    int deduceConflictRound2<T>(T first, T second) { return 1; }
+    int deduceConflictRound2<T>(T* first, T second) { return 2; }
+    int call() { return deduceConflictRound2(1, 2.0); }
+}
+
+expect_error("no overload of 'nvSingleArityRound2<int>' matches the given arguments") {
+    T nvSingleArityRound2<T>(T first, T second) { return first + second; }
+    int call() { return nvSingleArityRound2(1, 2, 3); }
+}
+
+expect_error("use '&x' to take an address") {
+    T nvSinglePtrRound2<T>(T* value) { return *value; }
+    int call() { return nvSinglePtrRound2(5); }
+}
+
+expect_error("redefinition of 'adAliasRound2'") {
+    int adAliasRound2<T>(T first, int second) { return 1; }
+    int adAliasRound2<T>(T first, i32 second) { return 2; }
+}
+
+expect_error("candidates 'ambValueRound2<T, U>(T*, U)' and 'ambValueRound2<T, U>(T, U*)'") {
+    int ambValueRound2<T, U>(T* left, U right) { return 31; }
+    int ambValueRound2<T, U>(T left, U* right) { return 32; }
+    function<int(int*, int*)> callback = ambValueRound2;
 }

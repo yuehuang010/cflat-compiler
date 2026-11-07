@@ -650,6 +650,8 @@ namespace cflat_cinterop
         bool isFloatConstant = false;
         double floatValue = 0.0;
         bool isCxxConstexpr = false;
+        // Request-only marker: the object has a C++ record type and needs class binding first.
+        bool isCxxClassObject = false;
         bool isInternalLinkage = false;  // C++ internal linkage: one object per import group
         uint64_t constInitHash = 0;      // internal const object: hash of its evaluated value
         // decltype request of an ENUMERATOR (ns::format_first_only, ios_base::beg): ctype names
@@ -869,6 +871,7 @@ namespace cflat_cinterop
         std::vector<RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
         std::vector<std::string> variableTemplateNames;
+        std::vector<std::pair<std::string, std::string>> variableTemplateDependencies;
         std::vector<std::string> classTemplateSpecializations;
         std::vector<RawEnum> enums;
         std::vector<RawRecord> records;

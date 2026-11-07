@@ -354,7 +354,7 @@ struct GenericTemplateState
     // Deriving it with rfind('.') made a nested template's body resolve its bare names against a
     // same-named NAMESPACE and silently return that namespace's type.
     std::unordered_map<std::string, std::string>                                genericTemplateNamespace;
-    std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>    genericFunctionTemplates;
+    std::unordered_map<std::string, std::vector<CFlatParser::FunctionDefinitionContext*>> genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionTypeParams;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionValueParams;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionValueDefaults;
@@ -383,6 +383,21 @@ struct GenericTemplateState
     // core generic monomorphized in a user file is still core. Part of the --init round-trip
     // ("core" flag per template): a warm cache never re-reads the core sources.
     std::unordered_set<std::string>                                             coreGenericTemplates;
+
+    static std::string GenericFunctionCandidateKey(const std::string& name, size_t index)
+    {
+        return name + "\x1f" + std::to_string(index);
+    }
+
+    size_t RegisterGenericFunctionTemplate(const std::string& name,
+            CFlatParser::FunctionDefinitionContext* context)
+    {
+        auto& overloads = genericFunctionTemplates[name];
+        auto it = std::find(overloads.begin(), overloads.end(), context);
+        if (it != overloads.end()) return static_cast<size_t>(it - overloads.begin());
+        overloads.push_back(context);
+        return overloads.size() - 1;
+    }
 
     void Clear() { *this = GenericTemplateState{}; }
 };
@@ -4689,6 +4704,8 @@ private:
         std::unordered_set<std::string> namespaces;
         std::unordered_set<std::string> publishedNames;
         std::unordered_set<std::string> specializedTemplates;
+        std::unordered_map<std::string, std::unordered_set<std::string>>
+            variableTemplateDependencies;
         // Own headers plus their transitive includes, normalized: what a probe may claim to own.
         std::unordered_set<std::string> reachableFiles;
         unsigned headerParseCount = 0;
@@ -5291,6 +5308,7 @@ private:
         bool isFloatConstant = false;
         double floatValue = 0.0;
         bool isCxxConstexpr = false;
+        bool isCxxClassObject = false;
         // Refusal saved with the header record so incomplete/unsupported arrays survive cache hits.
         std::string bindRefusal;
         // Declaring header; with line/col it tells one declaration reached through two import
@@ -5485,6 +5503,7 @@ private:
         std::vector<cflat_cinterop::RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
         std::vector<std::string> variableTemplateNames;
+        std::vector<std::pair<std::string, std::string>> variableTemplateDependencies;
         std::vector<std::string> classTemplateSpecializations;
         // Namespace leads a C++ header extraction seeded into its import group (signature
         // spellings, included headers). A hit replays them: they order owner-group candidates.
@@ -5554,6 +5573,7 @@ private:
         return entry.sigs.size() + entry.functionTemplates.size() + entry.classTemplates.size()
              + entry.classTemplateNames.size()
              + entry.variableTemplateNames.size()
+             + entry.variableTemplateDependencies.size()
              + entry.classTemplateSpecializations.size()
              + entry.cxxGroupNamespaces.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
@@ -8540,7 +8560,9 @@ private:
                              std::vector<std::pair<std::string, std::string>>* outClassUsings = nullptr,
                              std::vector<std::string>* outClassTemplateSpecializations = nullptr,
                              std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates = nullptr,
-                             std::vector<cflat_cinterop::RawDynamicInitializer>* outDynamicInitializers = nullptr);
+                             std::vector<cflat_cinterop::RawDynamicInitializer>* outDynamicInitializers = nullptr,
+                             std::vector<std::pair<std::string, std::string>>*
+                                 outVariableTemplateDependencies = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -11616,7 +11638,8 @@ public:
                                         bool allowExplicit,
                                         bool* needsStandardConversion = nullptr,
                                         bool* ambiguous = nullptr,
-                                        std::vector<std::string>* ambiguousCandidates = nullptr) const;
+                                        std::vector<std::string>* ambiguousCandidates = nullptr,
+                                        const TypeAndValue* receiver = nullptr) const;
     std::string ScoreCxxConversionOperatorArgument(const NamedVariable& arg,
                                                    const TypeAndValue& param,
                                                    bool preserveAmbiguous,
@@ -11733,7 +11756,9 @@ public:
     // move-CONSTRUCTED into the caller-owned temp clang expects, never byte-copied.
     bool EmitCxxStructorCall(const std::string& typeName, const CxxClassInfo::Structor& st,
                              llvm::Value* slot, const std::vector<llvm::Value*>& extraArgs,
-                             const std::vector<NamedVariable>* extraArgVars = nullptr);
+                             const std::vector<NamedVariable>* extraArgVars = nullptr,
+                             bool assignmentOperator = false,
+                             llvm::Value* assignmentResultLiveFlag = nullptr);
     void RejectLiteralZeroCxxConstructorFunctionSlotArgs(
         const std::string& typeName, const std::vector<NamedVariable>& args,
         const std::vector<llvm::Value*>& values) const;
@@ -12234,9 +12259,9 @@ public:
     void DiagnoseDuplicateBodyOrigin(const std::string& functionName, const std::string& mangledName,
         const FunctionBodyOrigin& first, size_t line, size_t column,
         bool isMethod, bool isConstMethod) const;
-    // A generic function template keeps one slot per name; a second definition is a duplicate.
+    // Record a generic function declaration; only an identical signature in the same declaration scope duplicates.
     void RecordGenericTemplateOrigin(const std::string& name, const std::string& signature,
-        size_t line, size_t column);
+        const std::string& scopeIdentity, size_t line, size_t column);
 
     /*
      * Is this overload slot already occupied by a BODY? Answers the exact question
@@ -14949,7 +14974,7 @@ public:
     // 314: variable template explicit/partial specializations join the template's group; deleted-rvalue ctor requests.
     // 317: C anonymous-member fields use an unspellable marker; inline aggregate fields retain default-construction metadata.
     // 318: default numeric values retain their declared parameter conversion in extracted metadata.
-    static constexpr int kCHeaderCacheVersion = 319;
+    static constexpr int kCHeaderCacheVersion = 320;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
@@ -15408,7 +15433,8 @@ public:
     CFlatParser::StructDefinitionContext*    MaterializeGenericStruct(const std::string& name);
     CFlatParser::ClassDefinitionContext*     MaterializeGenericClass(const std::string& name);
     CFlatParser::InterfaceDefinitionContext* MaterializeGenericInterface(const std::string& name);
-    CFlatParser::FunctionDefinitionContext*  MaterializeGenericFunction(const std::string& name);
+    CFlatParser::FunctionDefinitionContext*  MaterializeGenericFunction(const std::string& name,
+                                                                         size_t index = 0);
 
 private:
     std::unique_ptr<std::vector<MovedStateSnapshot>> movedStateMergeStack_;

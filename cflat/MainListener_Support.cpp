@@ -1,5 +1,122 @@
 #include "MainListener.h"
 
+std::string GenericFunctionTemplateSignature(
+        CFlatParser::FunctionDefinitionContext* function, LLVMBackend* compiler)
+{
+    if (function == nullptr || function->genericTypeParameters() == nullptr) return {};
+    auto entries = function->genericTypeParameters()->typeParameterList()->typeParameterEntry();
+    std::string signature = std::to_string(entries.size()) + "<";
+    std::vector<std::string> parameterNames;
+    parameterNames.reserve(entries.size());
+    for (auto* entry : entries)
+    {
+        if (auto* value = entry->valueParameterDeclaration())
+        {
+            signature += "V;";
+            parameterNames.push_back(value->Identifier()->getText());
+        }
+        else
+        {
+            signature += "T;";
+            parameterNames.push_back(entry->typeSpecifier() != nullptr
+                ? entry->typeSpecifier()->getText() : entry->getText());
+        }
+    }
+    signature += ">";
+    auto replaceTypeToken = [](std::string& shape, const std::string& from,
+                               const std::string& to)
+    {
+        if (from.empty() || from == to) return;
+        const auto isIdent = [](char c) { return (c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+        size_t at = 0;
+        while ((at = shape.find(from, at)) != std::string::npos)
+        {
+            const bool left = at == 0 || !isIdent(shape[at - 1]);
+            const bool right = at + from.size() == shape.size()
+                || !isIdent(shape[at + from.size()]);
+            if (left && right)
+            {
+                shape.replace(at, from.size(), to);
+                at += to.size();
+            }
+            else at += from.size();
+        }
+    };
+    if (function->trailingConst() != nullptr) signature += "const;";
+    if (auto* list = function->parameterTypeList(); list != nullptr && list->parameterList() != nullptr)
+        for (auto* parameter : list->parameterList()->parameterDeclaration())
+        {
+            auto* specs = parameter->declarationSpecifiers();
+            std::string shape = specs != nullptr ? specs->getText() : std::string{};
+            if (compiler != nullptr && specs != nullptr)
+            {
+                std::function<void(antlr4::tree::ParseTree*)> resolveAliases =
+                    [&](antlr4::tree::ParseTree* node)
+                {
+                    if (auto* generic = dynamic_cast<CFlatParser::GenericIdentifierContext*>(node);
+                        generic != nullptr && generic->Identifier() != nullptr)
+                    {
+                        const std::string name = generic->Identifier()->getText();
+                        if (std::find(parameterNames.begin(), parameterNames.end(), name)
+                            == parameterNames.end())
+                            replaceTypeToken(shape, name, CanonicalPrimitiveTypeName(
+                                compiler->ResolveTypeAlias(name)));
+                    }
+                    else if (auto* qualified =
+                        dynamic_cast<CFlatParser::QualifiedGenericIdentifierContext*>(node);
+                        qualified != nullptr)
+                    {
+                        const std::string name = qualified->getText();
+                        replaceTypeToken(shape, name, CanonicalPrimitiveTypeName(
+                            compiler->ResolveTypeAlias(name)));
+                    }
+                    else if (auto* type = dynamic_cast<CFlatParser::TypeSpecifierContext*>(node);
+                        type != nullptr && type->genericIdentifier() == nullptr
+                            && type->qualifiedGenericIdentifier() == nullptr
+                            && type->tupleTypeSpecifier() == nullptr
+                            && type->functionPointerSpecifier() == nullptr)
+                    {
+                        const std::string name = type->getText();
+                        replaceTypeToken(shape, name, CanonicalPrimitiveTypeName(
+                            compiler->ResolveTypeAlias(name)));
+                    }
+                    for (auto* child : node->children) resolveAliases(child);
+                };
+                resolveAliases(specs);
+            }
+            if (specs != nullptr)
+                for (auto* spec : specs->declarationSpecifier())
+                    if (spec->arrayTypeSuffix() != nullptr
+                        && spec->arrayTypeSuffix()->getText() == "[]")
+                    {
+                        const size_t array = shape.rfind("[]");
+                        if (array != std::string::npos) shape.replace(array, 2, "*");
+                    }
+            for (size_t i = 0; i < parameterNames.size(); ++i)
+            {
+                const auto& name = parameterNames[i];
+                size_t at = 0;
+                while ((at = shape.find(name, at)) != std::string::npos)
+                {
+                    const auto isIdent = [](char c) { return (c >= 'a' && c <= 'z')
+                        || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+                    const bool left = at == 0 || !isIdent(shape[at - 1]);
+                    const bool right = at + name.size() == shape.size()
+                        || !isIdent(shape[at + name.size()]);
+                    if (left && right)
+                    {
+                        shape.replace(at, name.size(), "#" + std::to_string(i));
+                        at += 2;
+                    }
+                    else at += name.size();
+                }
+            }
+            signature += shape + ",";
+        }
+    return signature;
+}
+
 std::string FlexibleArrayMemberLengthError(const LLVMBackend::TypeAndValue& type)
 {
     if (!type.IsFlexibleArrayMember) return {};

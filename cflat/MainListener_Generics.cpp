@@ -254,10 +254,19 @@ std::string MainListener::GenericMemberTemplateOwner(
         size_t dot = baseName.rfind('.');
         if (dot == std::string::npos || tmplCtx == nullptr) return {};
         std::string owner = baseName.substr(0, dot);
+        size_t candidateIndex = 0;
+        if (auto it = genericFunctionTemplates.find(baseName); it != genericFunctionTemplates.end())
+        {
+            auto context = std::find(it->second.begin(), it->second.end(), tmplCtx);
+            if (context != it->second.end())
+                candidateIndex = static_cast<size_t>(context - it->second.begin());
+        }
+        const std::string candidateKey =
+            GenericTemplateState::GenericFunctionCandidateKey(baseName, candidateIndex);
         // Struct nesting and namespace nesting share ONE dotted key space, so the prefix alone
         // cannot say which this is. The RECORDED declaring namespace can: when it equals the
         // prefix, "Ov.f" is a FREE template in `namespace Ov`, never a method on `struct Ov`.
-        if (Compiler()->IsGenericFunctionKeyInNamespace(baseName, owner))
+        if (Compiler()->IsGenericFunctionKeyInNamespace(candidateKey, owner))
             return {};
         return Compiler()->IsDataStructure(owner) ? owner : std::string{};
     }
@@ -337,7 +346,15 @@ std::string MainListener::GenericMethodTemplateKey(const std::string& receiverTy
         if (receiverType.empty() || methodName.empty())
             return {};
         std::string key = receiverType + "." + methodName;
-        return genericFunctionTemplates.count(key) ? key : std::string{};
+        auto templates = genericFunctionTemplates.find(key);
+        if (templates == genericFunctionTemplates.end()) return {};
+        for (size_t index = 0; index < templates->second.size(); ++index)
+        {
+            auto* context = compilerLLVM->MaterializeGenericFunction(key, index);
+            if (context != nullptr && GenericMemberTemplateOwner(key, context) == receiverType)
+                return key;
+        }
+        return {};
     }
 
 static bool IsFollowedByToken(CFlatParser::PostfixExpressionContext* ctx, antlr4::tree::ParseTree* child,
@@ -368,7 +385,7 @@ bool MainListener::IsFollowedByCall(CFlatParser::PostfixExpressionContext* ctx, 
     }
 
 std::string MainListener::InstantiateGenericFunction(const std::string& baseName,
-                                                    const std::vector<std::string>& spelledArgs) {
+        const std::vector<std::string>& spelledArgs, size_t candidateIndex) {
         if (StackBytesRemaining() < kMinStackHeadroomBytes)
             Compiler()->LogError("generic instantiation is nested too deeply; split it into named temporaries");
         std::vector<std::string> typeArgs = spelledArgs;
@@ -378,8 +395,18 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             && !compilerLLVM->IsCInteropLongDoubleSupported())
             compilerLLVM->LogError(compilerLLVM->CInteropLongDoubleRefusal());
         std::string mangledName = MangledGenericName(baseName, typeArgs);
-        FillGenericValueDefaults(*Compiler(), baseName,
-                                 genericFunctionTypeParams[baseName].size(), typeArgs);
+        auto templateIt = genericFunctionTemplates.find(baseName);
+        if (templateIt == genericFunctionTemplates.end()
+            || candidateIndex >= templateIt->second.size()) return {};
+        const std::string candidateKey =
+            GenericTemplateState::GenericFunctionCandidateKey(baseName, candidateIndex);
+        const auto typeParamsIt = genericFunctionTypeParams.find(candidateKey);
+        const auto& typeParams = typeParamsIt != genericFunctionTypeParams.end()
+            ? typeParamsIt->second : genericFunctionTypeParams[baseName];
+        FillGenericValueDefaults(*Compiler(), candidateKey, typeParams.size(), typeArgs);
+        if (templateIt->second.size() > 1)
+            mangledName += "__genovl" + std::to_string(candidateIndex);
+        compilerLLVM->gts.mangledArityHints[mangledName] = typeArgs.size();
         if (instantiatedGenericFunctions.count(mangledName)) return mangledName;
         instantiatedGenericFunctions.insert(mangledName);
         ActiveEnumSpecializationScope enumSpecializationScope(
@@ -388,9 +415,7 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
                 ? mangledName : std::string{});
         LocalEnumScopeParkGuard localEnumScopeGuard(&compilerLLVM->activeLocalEnumScopes_);
 
-        auto templateIt = genericFunctionTemplates.find(baseName);
-        if (templateIt == genericFunctionTemplates.end()) return {};
-        auto* tmplCtx = compilerLLVM->MaterializeGenericFunction(baseName);
+        auto* tmplCtx = compilerLLVM->MaterializeGenericFunction(baseName, candidateIndex);
         if (!tmplCtx) return {};
 
         // Generic FUNCTIONS do not go through pendingInstantiations, so publish the same origin
@@ -420,17 +445,18 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
 
         // The body is re-walked long after the declaring namespace's scope closed, so install it:
         // without this a sibling name inside the body resolves globally (or not at all).
-        TemplateNamespaceScope nsScope(compilerLLVM, baseName);
+        TemplateNamespaceScope nsScope(compilerLLVM, candidateKey);
 
-        const auto& typeParams = genericFunctionTypeParams[baseName];
-        auto packIt = genericFunctionPackIndex.find(baseName);
+        auto packIt = genericFunctionPackIndex.find(candidateKey);
+        if (packIt == genericFunctionPackIndex.end() && candidateIndex == 0)
+            packIt = genericFunctionPackIndex.find(baseName);
         size_t packIdx = packIt != genericFunctionPackIndex.end()
             ? packIt->second : std::string::npos;
         if ((packIdx == std::string::npos && typeParams.size() != typeArgs.size())
             || (packIdx != std::string::npos && typeArgs.size() < packIdx))
             return {};
 
-        if (!CheckConstraints(baseName, typeParams, typeArgs, genericFunctionConstraints, tmplCtx))
+        if (!CheckConstraints(candidateKey, typeParams, typeArgs, genericFunctionConstraints, tmplCtx))
             return {};
 
         auto savedSubst = activeTypeSubstitutions;
@@ -443,7 +469,11 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         activePackSubstitutions.clear();
         const std::string genericMemberOwner = GenericMemberTemplateOwner(baseName, tmplCtx);
         BindGenericOwnerSubstitutions(genericMemberOwner, valueMacros);
-        const auto& valueParams = genericFunctionValueParams[baseName];
+        auto valueParamsIt = genericFunctionValueParams.find(candidateKey);
+        if (valueParamsIt == genericFunctionValueParams.end() && candidateIndex == 0)
+            valueParamsIt = genericFunctionValueParams.find(baseName);
+        const auto& valueParams = valueParamsIt != genericFunctionValueParams.end()
+            ? valueParamsIt->second : genericFunctionValueParams[baseName];
         if (!ValidateGenericArgumentKinds(baseName, typeParams, valueParams, typeArgs))
         {
             activeTypeSubstitutions = savedSubst;
@@ -553,10 +583,10 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             if (!ownerStruct.empty())
             {
                 LLVMBackend::AliasScopeGuard aggregateAliasScope(instCompiler, ownerStruct);
-                ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
+                ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, candidateKey));
             }
             else
-                ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
+                ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, candidateKey));
         }
         catch (...)
         {
@@ -606,42 +636,41 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
 std::string MainListener::InferAndInstantiateGenericFunction(const std::string& funcName, const std::string& receiverType) {
         auto templateIt = genericFunctionTemplates.find(funcName);
         if (templateIt == genericFunctionTemplates.end()) return {};
-
-        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName);
-        if (!funcCtx) return {};
-        const auto& typeParams = genericFunctionTypeParams[funcName];
-
-        auto* paramTypeList = funcCtx->parameterTypeList();
-        if (!paramTypeList || !paramTypeList->parameterList()) return {};
-
-        auto paramDecls = paramTypeList->parameterList()->parameterDeclaration();
-        if (paramDecls.empty()) return {};
-
-        // Examine the first parameter's type specifier to determine the base interface name
-        for (auto* declSpec : paramDecls[0]->declarationSpecifiers()->declarationSpecifier())
+        for (size_t index = 0; index < templateIt->second.size(); ++index)
         {
-            auto* typeSpec = declSpec->typeSpecifier();
-            if (!typeSpec || !typeSpec->genericIdentifier()) continue;
-
-            auto* genId = typeSpec->genericIdentifier();
-            if (!genId->Identifier()) continue;
-
-            std::string baseName = genId->Identifier()->getText();
-            TypeSpelling receiverSpelling;
-            if (MangledBase(receiverType) != baseName
-                || !DemangleType(*Compiler(), receiverType, receiverSpelling)
-                || receiverSpelling.args.size() != typeParams.size())
+            auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName, index);
+            if (funcCtx == nullptr || funcCtx->parameterTypeList() == nullptr
+                || funcCtx->parameterTypeList()->parameterList() == nullptr)
                 continue;
-            std::vector<std::string> typeArgs;
-            for (const auto& arg : receiverSpelling.args)
-                typeArgs.push_back(MangleType(*Compiler(), arg));
-            return InstantiateGenericFunction(funcName, typeArgs);
+            const std::string candidateKey =
+                GenericTemplateState::GenericFunctionCandidateKey(funcName, index);
+            auto typeParams = genericFunctionTypeParams.find(candidateKey);
+            if (typeParams == genericFunctionTypeParams.end() && index == 0)
+                typeParams = genericFunctionTypeParams.find(funcName);
+            if (typeParams == genericFunctionTypeParams.end()) continue;
+            auto paramDecls = funcCtx->parameterTypeList()->parameterList()->parameterDeclaration();
+            if (paramDecls.empty()) continue;
+            for (auto* declSpec : paramDecls[0]->declarationSpecifiers()->declarationSpecifier())
+            {
+                auto* typeSpec = declSpec->typeSpecifier();
+                if (!typeSpec || !typeSpec->genericIdentifier()) continue;
+                auto* genId = typeSpec->genericIdentifier();
+                if (!genId->Identifier()) continue;
+                std::string interfaceName = genId->Identifier()->getText();
+                TypeSpelling receiverSpelling;
+                if (MangledBase(receiverType) != interfaceName
+                    || !DemangleType(*Compiler(), receiverType, receiverSpelling)
+                    || receiverSpelling.args.size() != typeParams->second.size())
+                    continue;
+                std::vector<std::string> typeArgs;
+                for (const auto& arg : receiverSpelling.args)
+                    typeArgs.push_back(MangleType(*Compiler(), arg));
+                return InstantiateGenericFunction(funcName, typeArgs, index);
+            }
         }
         return {};
     }
 
-// Bit width of a literal's default type (a LiteralIdentity spelling); 0 for any other name. Two
-// literal arguments that disagree keep the wider one: first(5000000000, 2) infers long, not int.
 static unsigned LiteralDefaultBits(const std::string& name)
 {
         if (name == "char" || name == "bool") return 8;
@@ -885,17 +914,28 @@ static CFlatParser::TupleTypeSpecifierContext* ParameterTupleSpecifier(
     return nullptr;
 }
 
-std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& funcName,
+std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::string& funcName,
+                                               size_t candidateIndex,
                                                const std::vector<LLVMBackend::NamedVariable>& args,
                                                CFlatParser::ArgumentExpressionListContext* argList,
                                                std::vector<std::string>* deducedParameterTypes,
-                                               bool instantiate) {
+                                               std::vector<std::string>* deducedTypeArgs,
+                                               bool instantiate,
+                                               std::vector<LLVMBackend::TypeAndValue>* deducedParameterValues,
+                                               bool rejectDeductionConflicts) {
         auto templateIt = genericFunctionTemplates.find(funcName);
-        if (templateIt == genericFunctionTemplates.end()) return {};
+        if (templateIt == genericFunctionTemplates.end()
+            || candidateIndex >= templateIt->second.size()) return {};
 
-        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName);
+        const std::string candidateKey =
+            GenericTemplateState::GenericFunctionCandidateKey(funcName, candidateIndex);
+        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName, candidateIndex);
         if (!funcCtx) return {};
-        const auto& typeParams = genericFunctionTypeParams[funcName];
+        auto typeParamsIt = genericFunctionTypeParams.find(candidateKey);
+        if (typeParamsIt == genericFunctionTypeParams.end() && candidateIndex == 0)
+            typeParamsIt = genericFunctionTypeParams.find(funcName);
+        if (typeParamsIt == genericFunctionTypeParams.end()) return {};
+        const auto& typeParams = typeParamsIt->second;
         if (typeParams.empty()) return {};
 
         auto* paramTypeList = funcCtx->parameterTypeList();
@@ -909,11 +949,13 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         // True while a binding came from an unsuffixed literal's default type (not a declared name).
         std::unordered_map<std::string, bool> literalBinding;
         std::vector<CFlatParser::ArgumentNamedExpressionContext*> argumentExpressions;
+        bool deductionConflict = false;
         if (argList != nullptr) argumentExpressions = argList->argumentNamedExpression();
         const size_t argumentOffset = args.size() >= argumentExpressions.size()
             ? args.size() - argumentExpressions.size() : 0;
         for (size_t i = 0; i < paramDecls.size() && i < args.size(); i++)
         {
+            if (deductionConflict) break;
             // A tuple parameter '(int, U)' binds each bare type-parameter element from the matching
             // element of a tuple argument (`h((1, 2))` binds U = int), before any LLVM-type fallback.
             if (auto* paramTuple = ParameterTupleSpecifier(paramDecls[i]))
@@ -1143,6 +1185,17 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                     declaredBinding[tp] = declared;
                     literalBinding[tp] = fromLiteral;
                 }
+                else if (declared && !declaredBinding[tp]
+                    && literalBinding[tp] && prev->second != argType)
+                {
+                    if (rejectDeductionConflicts)
+                    {
+                        deductionConflict = true;
+                        break;
+                    }
+                    prev->second = argType;
+                    declaredBinding[tp] = true;
+                }
                 else if (declared && !declaredBinding[tp])
                 {
                     prev->second = argType;   // a declared spelling replaces the fallback
@@ -1150,26 +1203,45 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 }
                 else if (declared && declaredBinding[tp] && prev->second != argType)
                 {
-                    // Two declared arguments disagree. Keep the LAST one (pre-fix behaviour) so
-                    // the call still reports the detailed overload mismatch, not "not known".
+                    if (rejectDeductionConflicts)
+                    {
+                        deductionConflict = true;
+                        break;
+                    }
                     prev->second = argType;
                 }
                 else if (!declared && !declaredBinding[tp])
                 {
-                    // Two literal defaults keep the wider type; any other fallback: last one wins.
-                    const bool keepWider = fromLiteral && literalBinding[tp]
-                        && LiteralDefaultBits(prev->second) > LiteralDefaultBits(argType);
-                    if (!keepWider)
+                    if (prev->second != argType)
                     {
-                        prev->second = argType;
-                        literalBinding[tp] = fromLiteral;
+                        if (rejectDeductionConflicts)
+                        {
+                            deductionConflict = true;
+                            break;
+                        }
+                        const bool keepWider = fromLiteral && literalBinding[tp]
+                            && LiteralDefaultBits(prev->second) > LiteralDefaultBits(argType);
+                        if (!keepWider)
+                        {
+                            prev->second = argType;
+                            literalBinding[tp] = fromLiteral;
+                        }
+                    }
+                    else literalBinding[tp] = literalBinding[tp] || fromLiteral;
+                }
+                else if (prev->second != argType)
+                {
+                    if (rejectDeductionConflicts)
+                    {
+                        deductionConflict = true;
+                        break;
                     }
                 }
                 break;
             }
         }
 
-        if (inferred.size() != typeParams.size()) return {};
+        if (deductionConflict || inferred.size() != typeParams.size()) return {};
 
         std::vector<std::string> typeArgs;
         for (const auto& tp : typeParams)
@@ -1178,33 +1250,459 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             if (it == inferred.end()) return {};
             typeArgs.push_back(it->second);
         }
-        if (deducedParameterTypes != nullptr)
+        if (deducedParameterTypes != nullptr || deducedParameterValues != nullptr)
         {
-            deducedParameterTypes->clear();
-            deducedParameterTypes->reserve(paramDecls.size());
+            if (deducedParameterTypes != nullptr)
+            {
+                deducedParameterTypes->clear();
+                deducedParameterTypes->reserve(paramDecls.size());
+            }
+            if (deducedParameterValues != nullptr)
+            {
+                deducedParameterValues->clear();
+                deducedParameterValues->reserve(paramDecls.size());
+            }
+            GenericValueMacroScope ownerValueMacros(compilerLLVM);
+            ownerValueMacros.Park(activeValueSubstitutions);
             llvm::SaveAndRestore savedSubstitutions(activeTypeSubstitutions);
+            llvm::SaveAndRestore savedValueSubstitutions(activeValueSubstitutions);
+            llvm::SaveAndRestore savedPackSubstitutions(activePackSubstitutions);
+            BindGenericOwnerSubstitutions(GenericMemberTemplateOwner(funcName, funcCtx), ownerValueMacros);
             for (const auto& tp : typeParams)
                 activeTypeSubstitutions.Bind(tp, inferred.at(tp));
             for (auto* declaration : paramDecls)
             {
                 const auto parameterType = ParseDeclarationSpecifiers(
                     declaration->declarationSpecifiers());
-                deducedParameterTypes->push_back(
-                    SpellFunctionParameterValueType(*compilerLLVM, parameterType));
+                if (deducedParameterTypes != nullptr)
+                    deducedParameterTypes->push_back(
+                        SpellFunctionParameterValueType(*compilerLLVM, parameterType));
+                if (deducedParameterValues != nullptr)
+                    deducedParameterValues->push_back(parameterType);
             }
         }
+        if (deducedTypeArgs != nullptr) *deducedTypeArgs = typeArgs;
         if (!instantiate) return {};
-        return InstantiateGenericFunction(funcName, typeArgs);
+        return InstantiateGenericFunction(funcName, typeArgs, candidateIndex);
     }
 
-std::string MainListener::TryInferAndInstantiateFromFuncPtr(const std::string& funcName,
+struct GenericTemplateTypePattern
+{
+        std::string base;
+        bool parameter = false;
+        bool valid = true;
+        bool arrayView = false;
+        bool isConst = false;
+        int pointerDepth = 0;
+        std::vector<GenericTemplateTypePattern> arguments;
+};
+
+static std::vector<std::string> GenericFunctionTypeParameterNames(
+        CFlatParser::FunctionDefinitionContext* context)
+{
+        std::vector<std::string> names;
+        if (context == nullptr || context->genericTypeParameters() == nullptr) return names;
+        for (auto* entry : context->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+        {
+            auto* type = entry->typeSpecifier();
+            auto* generic = type != nullptr ? type->genericIdentifier() : nullptr;
+            if (generic != nullptr && generic->Identifier() != nullptr
+                && generic->genericTypeParameters() == nullptr
+                && entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr)
+                names.push_back(generic->Identifier()->getText());
+        }
+        return names;
+}
+
+static GenericTemplateTypePattern GenericTemplatePatternOfType(
+        CFlatParser::TypeSpecifierContext* type, const std::vector<std::string>& typeParams,
+        LLVMBackend* compiler)
+{
+        GenericTemplateTypePattern pattern;
+        if (type == nullptr)
+        {
+            pattern.valid = false;
+            return pattern;
+        }
+        auto addArguments = [&](CFlatParser::GenericTypeParametersContext* args)
+        {
+            if (args == nullptr) return;
+            for (auto* entry : args->typeParameterList()->typeParameterEntry())
+            {
+                if (entry->typeSpecifier() == nullptr)
+                {
+                    pattern.valid = false;
+                    continue;
+                }
+                auto child = GenericTemplatePatternOfType(entry->typeSpecifier(), typeParams, compiler);
+                child.pointerDepth += PointerDepthOf(entry->pointer());
+                child.arrayView = entry->arrayTypeSuffix() != nullptr
+                    && entry->arrayTypeSuffix()->getText() == "[]";
+                pattern.valid &= child.valid;
+                pattern.arguments.push_back(std::move(child));
+            }
+        };
+        if (auto* generic = type->genericIdentifier(); generic != nullptr
+            && generic->Identifier() != nullptr)
+        {
+            pattern.base = generic->Identifier()->getText();
+            if (generic->genericTypeParameters() == nullptr
+                && std::find(typeParams.begin(), typeParams.end(), pattern.base) != typeParams.end())
+                pattern.parameter = true;
+            else
+            {
+                pattern.base = compiler->ResolveTypeAlias(pattern.base);
+                addArguments(generic->genericTypeParameters());
+            }
+        }
+        else if (auto* qualified = type->qualifiedGenericIdentifier(); qualified != nullptr)
+        {
+            pattern.base = compiler->ResolveTypeAlias(qualified->getText());
+            addArguments(qualified->genericTypeParameters());
+        }
+        else if (auto* tuple = type->tupleTypeSpecifier(); tuple != nullptr)
+        {
+            pattern.base = "tuple";
+            for (auto* entry : tuple->tupleTypeEntry())
+            {
+                auto child = GenericTemplatePatternOfType(entry->typeSpecifier(), typeParams, compiler);
+                child.pointerDepth += PointerDepthOf(entry->pointer());
+                child.arrayView = entry->arrayTypeSuffix() != nullptr
+                    && entry->arrayTypeSuffix()->getText() == "[]";
+                pattern.valid &= child.valid;
+                pattern.arguments.push_back(std::move(child));
+            }
+            if (tuple->tupleTypePackEntry() != nullptr) pattern.valid = false;
+        }
+        else if (type->functionPointerSpecifier() != nullptr)
+        {
+            pattern.valid = false;
+        }
+        else
+            pattern.base = compiler->ResolveTypeAlias(type->getText());
+        if (pattern.base.empty()) pattern.valid = false;
+        return pattern;
+}
+
+static std::vector<GenericTemplateTypePattern> GenericFunctionParameterPatterns(
+        CFlatParser::FunctionDefinitionContext* context, LLVMBackend* compiler)
+{
+        std::vector<GenericTemplateTypePattern> patterns;
+        if (context == nullptr || context->parameterTypeList() == nullptr
+            || context->parameterTypeList()->parameterList() == nullptr) return patterns;
+        const auto typeParams = GenericFunctionTypeParameterNames(context);
+        for (auto* parameter : context->parameterTypeList()->parameterList()->parameterDeclaration())
+        {
+            GenericTemplateTypePattern pattern;
+            bool foundType = false;
+            for (auto* spec : parameter->declarationSpecifiers()->declarationSpecifier())
+            {
+                if (spec->typeSpecifier() == nullptr) continue;
+                pattern = GenericTemplatePatternOfType(spec->typeSpecifier(), typeParams, compiler);
+                pattern.pointerDepth += PointerDepthOf(spec->pointer());
+                pattern.arrayView = spec->arrayTypeSuffix() != nullptr
+                    && spec->arrayTypeSuffix()->getText() == "[]";
+                pattern.isConst = spec->typeQualifier() != nullptr
+                    && spec->typeQualifier()->Const() != nullptr;
+                foundType = true;
+                break;
+            }
+            pattern.valid &= foundType;
+            patterns.push_back(std::move(pattern));
+        }
+        return patterns;
+}
+
+static GenericTemplateTypePattern MakeRigidTemplatePattern(
+        GenericTemplateTypePattern pattern, const std::vector<std::string>& typeParams)
+{
+        if (pattern.parameter)
+        {
+            auto it = std::find(typeParams.begin(), typeParams.end(), pattern.base);
+            pattern.base = "@template-parameter-" + std::to_string(
+                static_cast<size_t>(it - typeParams.begin()));
+            pattern.parameter = false;
+        }
+        for (auto& child : pattern.arguments)
+            child = MakeRigidTemplatePattern(std::move(child), typeParams);
+        return pattern;
+}
+
+static bool SameGenericTemplatePattern(const GenericTemplateTypePattern& left,
+                                       const GenericTemplateTypePattern& right)
+{
+        if (left.base != right.base || left.parameter != right.parameter
+            || left.pointerDepth != right.pointerDepth || left.arrayView != right.arrayView
+            || left.isConst != right.isConst || left.arguments.size() != right.arguments.size())
+            return false;
+        for (size_t i = 0; i < left.arguments.size(); ++i)
+            if (!SameGenericTemplatePattern(left.arguments[i], right.arguments[i])) return false;
+        return true;
+}
+
+static bool DeduceGenericTemplatePattern(const GenericTemplateTypePattern& pattern,
+        const GenericTemplateTypePattern& argument,
+        std::unordered_map<std::string, GenericTemplateTypePattern>& deductions)
+{
+        if (!pattern.valid || !argument.valid || argument.pointerDepth < pattern.pointerDepth
+            || argument.arrayView != pattern.arrayView || argument.isConst != pattern.isConst)
+            return false;
+        if (pattern.parameter)
+        {
+            GenericTemplateTypePattern deduced = argument;
+            deduced.pointerDepth -= pattern.pointerDepth;
+            auto [it, inserted] = deductions.emplace(pattern.base, deduced);
+            return inserted || SameGenericTemplatePattern(it->second, deduced);
+        }
+        if (pattern.pointerDepth != argument.pointerDepth || pattern.base != argument.base
+            || pattern.arguments.size() != argument.arguments.size()) return false;
+        for (size_t i = 0; i < pattern.arguments.size(); ++i)
+            if (!DeduceGenericTemplatePattern(pattern.arguments[i], argument.arguments[i], deductions))
+                return false;
+        return true;
+}
+
+static bool CanDeduceGenericFunctionTemplate(
+        const std::vector<GenericTemplateTypePattern>& target,
+        const std::vector<GenericTemplateTypePattern>& source)
+{
+        if (target.size() != source.size()) return false;
+        std::unordered_map<std::string, GenericTemplateTypePattern> deductions;
+        for (size_t i = 0; i < target.size(); ++i)
+            if (!DeduceGenericTemplatePattern(target[i], source[i], deductions)) return false;
+        return true;
+}
+
+static bool GenericFunctionTemplateMoreSpecialized(
+        CFlatParser::FunctionDefinitionContext* candidate,
+        CFlatParser::FunctionDefinitionContext* other, LLVMBackend* compiler)
+{
+        auto* candidateList = candidate != nullptr ? candidate->parameterTypeList() : nullptr;
+        auto* otherList = other != nullptr ? other->parameterTypeList() : nullptr;
+        if (candidateList == nullptr || otherList == nullptr
+            || candidateList->Ellipsis() != otherList->Ellipsis()) return false;
+        auto candidatePatterns = GenericFunctionParameterPatterns(candidate, compiler);
+        auto otherPatterns = GenericFunctionParameterPatterns(other, compiler);
+        if (candidatePatterns.size() != otherPatterns.size()
+            || std::any_of(candidatePatterns.begin(), candidatePatterns.end(),
+                [](const auto& pattern) { return !pattern.valid; })
+            || std::any_of(otherPatterns.begin(), otherPatterns.end(),
+                [](const auto& pattern) { return !pattern.valid; })) return false;
+        auto candidateParams = GenericFunctionTypeParameterNames(candidate);
+        auto otherParams = GenericFunctionTypeParameterNames(other);
+        auto rigidCandidate = candidatePatterns;
+        auto rigidOther = otherPatterns;
+        for (auto& pattern : rigidCandidate)
+            pattern = MakeRigidTemplatePattern(std::move(pattern), candidateParams);
+        for (auto& pattern : rigidOther)
+            pattern = MakeRigidTemplatePattern(std::move(pattern), otherParams);
+        return CanDeduceGenericFunctionTemplate(otherPatterns, rigidCandidate)
+            && !CanDeduceGenericFunctionTemplate(candidatePatterns, rigidOther);
+}
+
+static std::string GenericFunctionCandidateDescription(
+    const std::string& baseName, CFlatParser::FunctionDefinitionContext* context);
+
+std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& funcName,
+        const std::vector<LLVMBackend::NamedVariable>& args,
+        CFlatParser::ArgumentExpressionListContext* argList,
+        std::vector<std::string>* deducedParameterTypes, bool instantiate,
+        std::string* refusal)
+{
+        if (refusal != nullptr) refusal->clear();
+        auto templates = genericFunctionTemplates.find(funcName);
+        if (templates == genericFunctionTemplates.end()) return {};
+        if (templates->second.size() == 1)
+        {
+            std::vector<std::string> typeArgs;
+            std::string mangled = TryInferAndInstantiateFromArgsCandidate(funcName, 0, args,
+                argList, deducedParameterTypes, &typeArgs, instantiate);
+            if (instantiate && mangled.empty() && refusal != nullptr)
+                *refusal = std::format("no overload of '{}' matches the given arguments; candidates: '{}'",
+                    funcName, GenericFunctionCandidateDescription(funcName,
+                        compilerLLVM->MaterializeGenericFunction(funcName, 0)));
+            return mangled;
+        }
+        struct Candidate
+        {
+            size_t index;
+            std::vector<std::string> typeArgs;
+            std::vector<std::string> parameterTypes;
+            std::vector<LLVMBackend::TypeAndValue> parameterValues;
+            std::vector<LLVMBackend::CxxConversionRank> conversionRanks;
+            CFlatParser::FunctionDefinitionContext* context;
+        };
+        std::vector<Candidate> viable;
+        std::vector<std::string> allCandidates;
+        for (size_t index = 0; index < templates->second.size(); ++index)
+        {
+            auto* context = compilerLLVM->MaterializeGenericFunction(funcName, index);
+            if (context == nullptr) continue;
+            allCandidates.push_back(GenericFunctionCandidateDescription(funcName, context));
+            auto* list = context->parameterTypeList();
+            auto declarations = list != nullptr && list->parameterList() != nullptr
+                ? list->parameterList()->parameterDeclaration()
+                : std::vector<CFlatParser::ParameterDeclarationContext*>{};
+            const bool variadic = list != nullptr && list->Ellipsis() != nullptr;
+            if ((!variadic && args.size() > declarations.size())
+                || (variadic && args.size() < declarations.size()))
+                continue;
+            bool defaultsCoverMissing = true;
+            for (size_t i = args.size(); i < declarations.size(); ++i)
+                if (declarations[i]->initializer() == nullptr) defaultsCoverMissing = false;
+            if (!defaultsCoverMissing) continue;
+
+            Candidate candidate{ index, {}, {}, {}, {}, context };
+            TryInferAndInstantiateFromArgsCandidate(funcName, index, args, argList,
+                &candidate.parameterTypes, &candidate.typeArgs, false,
+                &candidate.parameterValues, true);
+            if (candidate.typeArgs.empty()) continue;
+            bool pointerShapesMatch = true;
+            for (size_t i = 0; i < args.size() && i < declarations.size(); ++i)
+            {
+                size_t patternPointerDepth = 0;
+                for (auto* specifier : declarations[i]->declarationSpecifiers()->declarationSpecifier())
+                    if (specifier->typeSpecifier() != nullptr)
+                    {
+                        patternPointerDepth = PointerDepthOf(specifier->pointer());
+                        break;
+                    }
+                if (patternPointerDepth == 0) continue;
+                const auto& argumentType = args[i].TypeAndValue;
+                size_t argumentDepth = argumentType.Pointer
+                    ? static_cast<size_t>(std::max(argumentType.PointerDepth, 1)) : 0;
+                if (args[i].IsStringLiteral)
+                    argumentDepth = std::max(argumentDepth, size_t{1});
+                const bool arrayDecay = argumentType.IsArrayView || argumentType.ConstArraySize > 0;
+                const bool nullPointer = argumentType.TypeName == "nullptr_t"
+                    || argumentType.TypeName == "nullptr";
+                if (patternPointerDepth > argumentDepth && !arrayDecay && !nullPointer)
+                {
+                    pointerShapesMatch = false;
+                    break;
+                }
+            }
+            if (!pointerShapesMatch) continue;
+
+            LLVMBackend::FunctionSymbol rankCandidate;
+            rankCandidate.Function = nullptr;
+            rankCandidate.Variadic = variadic;
+            const size_t fixedArguments = std::min(args.size(), candidate.parameterValues.size());
+            rankCandidate.Parameters.assign(candidate.parameterValues.begin(),
+                candidate.parameterValues.begin() + fixedArguments);
+            auto matched = compilerLLVM->MatchFunction(args, rankCandidate.Parameters,
+                rankCandidate.Variadic, true);
+            if (matched.size() != args.size()) continue;
+            candidate.conversionRanks = compilerLLVM->RankCxxConversionSequences(args, rankCandidate);
+            candidate.conversionRanks.resize(args.size());
+            bool conversionViable = true;
+            for (size_t i = 0; i < candidate.conversionRanks.size(); ++i)
+            {
+                auto& rank = candidate.conversionRanks[i];
+                if (i >= rankCandidate.Parameters.size())
+                {
+                    rank.rank = LLVMBackend::kCxxEllipsisRank;
+                    rank.cxxViable = true;
+                    continue;
+                }
+                if (rank.rank == LLVMBackend::kCxxNonViableRank)
+                {
+                    conversionViable = false;
+                    break;
+                }
+                if (rank.rank < 0)
+                {
+                    const std::string sourceType = !args[i].TypeAndValue.TypeName.empty()
+                        ? args[i].TypeAndValue.TypeName
+                        : !args[i].LiteralIdentity.empty() ? args[i].LiteralIdentity
+                        : args[i].InferSourceTypeName;
+                    const std::string targetType = candidate.parameterTypes[i];
+                    rank.rank = !sourceType.empty() && !targetType.empty()
+                        && compilerLLVM->ResolveTypeAlias(sourceType)
+                            == compilerLLVM->ResolveTypeAlias(targetType) ? 0 : 2;
+                }
+                rank.cxxViable = true;
+            }
+            if (!conversionViable) continue;
+            viable.push_back(std::move(candidate));
+        }
+        auto candidateList = [&](const std::vector<std::string>& names)
+        {
+            std::string list;
+            for (size_t i = 0; i < names.size(); ++i)
+                list += (i == 0 ? "'" : " and '") + names[i] + "'";
+            return list;
+        };
+        if (viable.empty())
+        {
+            if (refusal != nullptr)
+                *refusal = std::format("no overload of '{}' matches the given arguments; candidates: {}",
+                    funcName, candidateList(allCandidates));
+            return {};
+        }
+        std::vector<bool> dominated(viable.size(), false);
+        for (size_t i = 0; i < viable.size(); ++i)
+            for (size_t j = 0; j < viable.size(); ++j)
+            {
+                if (i == j || dominated[j]) continue;
+                bool crossing = false;
+                if (compilerLLVM->CompareCxxConversionRanks(viable[i].conversionRanks,
+                        viable[j].conversionRanks, crossing) == -1 && !crossing)
+                    dominated[j] = true;
+            }
+        std::vector<size_t> best;
+        for (size_t i = 0; i < viable.size(); ++i)
+            if (!dominated[i]) best.push_back(i);
+        if (best.size() > 1)
+        {
+            std::vector<bool> partiallyDominated(best.size(), false);
+            for (size_t i = 0; i < best.size(); ++i)
+                for (size_t j = 0; j < best.size(); ++j)
+                    if (i != j && !partiallyDominated[j]
+                        && GenericFunctionTemplateMoreSpecialized(viable[best[i]].context,
+                            viable[best[j]].context, compilerLLVM))
+                        partiallyDominated[j] = true;
+            std::vector<size_t> ordered;
+            for (size_t i = 0; i < best.size(); ++i)
+                if (!partiallyDominated[i]) ordered.push_back(best[i]);
+            best = std::move(ordered);
+        }
+        if (best.size() != 1)
+        {
+            if (refusal != nullptr)
+            {
+                std::vector<std::string> bestNames;
+                for (size_t index : best)
+                    bestNames.push_back(GenericFunctionCandidateDescription(funcName,
+                        viable[index].context));
+                *refusal = std::format("ambiguous call to '{}': candidates {}",
+                    funcName, candidateList(bestNames));
+            }
+            return {};
+        }
+        const Candidate& selected = viable[best.front()];
+        if (deducedParameterTypes != nullptr)
+            *deducedParameterTypes = selected.parameterTypes;
+        if (!instantiate) return {};
+        return InstantiateGenericFunction(funcName, selected.typeArgs, selected.index);
+}
+
+std::string MainListener::TryInferAndInstantiateFromFuncPtrCandidate(
+        const std::string& funcName, size_t candidateIndex,
         const LLVMBackend::TypeAndValue& destSig, std::string& refusal)
 {
         auto templateIt = genericFunctionTemplates.find(funcName);
-        if (templateIt == genericFunctionTemplates.end()) return {};
-        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName);
+        if (templateIt == genericFunctionTemplates.end()
+            || candidateIndex >= templateIt->second.size()) return {};
+        const std::string candidateKey =
+            GenericTemplateState::GenericFunctionCandidateKey(funcName, candidateIndex);
+        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName, candidateIndex);
         if (funcCtx == nullptr) return {};
-        const auto& typeParams = genericFunctionTypeParams[funcName];
+        auto typeParamsIt = genericFunctionTypeParams.find(candidateKey);
+        if (typeParamsIt == genericFunctionTypeParams.end() && candidateIndex == 0)
+            typeParamsIt = genericFunctionTypeParams.find(funcName);
+        if (typeParamsIt == genericFunctionTypeParams.end()) return {};
+        const auto& typeParams = typeParamsIt->second;
         if (typeParams.empty()) return {};
 
         LLVMBackend::TypeAndValue destReturn;
@@ -1306,7 +1804,121 @@ std::string MainListener::TryInferAndInstantiateFromFuncPtr(const std::string& f
         std::vector<std::string> typeArgs;
         for (const auto& param : typeParams)
             typeArgs.push_back(inferred.at(param));
-        return InstantiateGenericFunction(funcName, typeArgs);
+        return InstantiateGenericFunction(funcName, typeArgs, candidateIndex);
+}
+
+// Original source text of a rule, so `const T*` keeps its spaces (getText() glues tokens).
+static std::string GenericFunctionCandidateSourceText(antlr4::ParserRuleContext* ctx)
+{
+        if (ctx == nullptr || ctx->getStart() == nullptr || ctx->getStop() == nullptr
+            || ctx->getStop()->getStopIndex() < ctx->getStart()->getStartIndex())
+            return ctx != nullptr ? ctx->getText() : std::string();
+        return ctx->getStart()->getInputStream()->getText(antlr4::misc::Interval(
+            ctx->getStart()->getStartIndex(), ctx->getStop()->getStopIndex()));
+}
+
+static std::string GenericFunctionCandidateDescription(
+        const std::string& baseName, CFlatParser::FunctionDefinitionContext* context)
+{
+        if (context == nullptr) return baseName;
+        std::string description = baseName;
+        if (context->genericTypeParameters() != nullptr)
+            description += GenericFunctionCandidateSourceText(context->genericTypeParameters());
+        description += "(";
+        if (context->parameterTypeList() != nullptr
+            && context->parameterTypeList()->parameterList() != nullptr)
+        {
+            auto parameters = context->parameterTypeList()->parameterList()->parameterDeclaration();
+            for (size_t i = 0; i < parameters.size(); ++i)
+            {
+                if (i != 0) description += ", ";
+                description += GenericFunctionCandidateSourceText(parameters[i]->declarationSpecifiers());
+            }
+        }
+        description += ")";
+        return description;
+}
+
+std::string MainListener::TryInferAndInstantiateFromFuncPtr(const std::string& funcName,
+        const LLVMBackend::TypeAndValue& destSig, std::string& refusal,
+        const std::vector<size_t>* allowedCandidateIndices)
+{
+        auto templates = genericFunctionTemplates.find(funcName);
+        if (templates == genericFunctionTemplates.end()) return {};
+        struct Candidate
+        {
+            size_t index;
+            std::string mangled;
+            CFlatParser::FunctionDefinitionContext* context;
+        };
+        std::vector<Candidate> viable;
+        std::vector<std::string> refusals;
+        std::vector<std::string> considered;
+        for (size_t index = 0; index < templates->second.size(); ++index)
+        {
+            if (allowedCandidateIndices != nullptr
+                && std::find(allowedCandidateIndices->begin(), allowedCandidateIndices->end(), index)
+                    == allowedCandidateIndices->end())
+                continue;
+            auto* context = compilerLLVM->MaterializeGenericFunction(funcName, index);
+            if (context == nullptr) continue;
+            considered.push_back(GenericFunctionCandidateDescription(funcName, context));
+            std::string candidateRefusal;
+            std::string mangled = TryInferAndInstantiateFromFuncPtrCandidate(
+                funcName, index, destSig, candidateRefusal);
+            if (mangled.empty())
+            {
+                if (!candidateRefusal.empty()) refusals.push_back(candidateRefusal);
+                continue;
+            }
+            auto instantiated = compilerLLVM->functionTable.find(
+                compilerLLVM->ResolveQualifiedName(mangled));
+            if (instantiated == compilerLLVM->functionTable.end()) continue;
+            const bool bindable = std::any_of(instantiated->second.begin(),
+                instantiated->second.end(), [&](const auto& symbol) {
+                    return !symbol.IsMethod
+                        && compilerLLVM->DescribeFuncPtrBindMismatch(mangled,
+                            compilerLLVM->FuncPtrSigOfSymbol(symbol), destSig,
+                            /*compareReturnOwnership*/ true).empty();
+                });
+            if (bindable)
+                viable.push_back({ index, std::move(mangled), context });
+        }
+        if (viable.empty())
+        {
+            std::string candidates;
+            for (size_t i = 0; i < considered.size(); ++i)
+                candidates += (i == 0 ? "'" : " and '") + considered[i] + "'";
+            refusal = std::format("no viable generic function value '{}' for destination '{}': candidates {}",
+                funcName, compilerLLVM->FuncPtrSpellingOf(destSig), candidates);
+            if (!refusals.empty()) refusal += "; " + refusals.front();
+            return {};
+        }
+        std::vector<bool> dominated(viable.size(), false);
+        for (size_t i = 0; i < viable.size(); ++i)
+            for (size_t j = 0; j < viable.size(); ++j)
+                if (i != j && !dominated[j]
+                    && GenericFunctionTemplateMoreSpecialized(viable[i].context,
+                        viable[j].context, compilerLLVM))
+                    dominated[j] = true;
+        std::vector<const Candidate*> best;
+        for (size_t i = 0; i < viable.size(); ++i)
+            if (!dominated[i]) best.push_back(&viable[i]);
+        if (best.size() > 1)
+        {
+            std::string names;
+            for (size_t i = 0; i < best.size(); ++i)
+            {
+                if (i != 0) names += " and ";
+                names += "'" + GenericFunctionCandidateDescription(funcName,
+                    best[i]->context) + "'";
+            }
+            refusal = std::format(
+                "ambiguous generic function value '{}' for destination '{}': candidates {}",
+                funcName, compilerLLVM->FuncPtrSpellingOf(destSig), names);
+            return {};
+        }
+        return best.front()->mangled;
     }
 
 std::vector<size_t> MainListener::DeduceGenericFunctionCallbackCandidates(

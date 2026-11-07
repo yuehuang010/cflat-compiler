@@ -3189,8 +3189,16 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                             && parameterIndex < sym->Parameters.size()
                             && (sym->Parameters[parameterIndex].IsCxxRefToPointer
                                 || sym->Parameters[parameterIndex].ValuePointerDepth() >= 2);
-                        if (!argumentRootedInFrame(arg, 0)
-                            && !(indirectPointerParameter && argumentComesFromGlobal(arg)))
+                        const bool pointerToPointerParameter = !isReceiver
+                            && parameterIndex < sym->Parameters.size()
+                            && !sym->Parameters[parameterIndex].IsCxxRefToPointer
+                            && sym->Parameters[parameterIndex].ValuePointerDepth() >= 2;
+                        // A C** holder's stored C* can be rewritten anywhere: never proven, fail closed.
+                        const bool frameRootedArgument = argumentRootedInFrame(arg, 0)
+                            || pointerToPointerParameter;
+                        const bool globalIndirectPointerException = indirectPointerParameter
+                            && !pointerToPointerParameter && argumentComesFromGlobal(arg);
+                        if (!frameRootedArgument && !globalIndirectPointerException)
                             continue;
                         const std::string role = isReceiver ? "receiver"
                             : std::format("argument #{}", i - (sym->IsMethod ? 1 : 0));
@@ -5027,7 +5035,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 compiler->CreateContinueCall();
 
                 compiler->InitializeBlock(blockCondition, false);
-                auto condition = ParseExpression(expression);
+                auto condition = ParseConditionExpression(expression);
                 condition = compiler->CoerceToBoolCondition(condition);
                 // Free owned-string temps produced inside the condition (e.g. `do {...} while
                 // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
@@ -5062,7 +5070,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 compiler->CreateBlockBreak(blockCondition, false);
 
                 compiler->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
-                auto condition = ParseExpression(expression);
+                auto condition = ParseConditionExpression(expression);
                 condition = compiler->CoerceToBoolCondition(condition);
                 // Free owned-string temps from the condition in the condition block (see do-while).
                 // Runs each iteration after the guard is evaluated.
@@ -5170,7 +5178,10 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
 
                     // Condition
                     compiler->InitializeBlock(blockCondition, false);
-                    auto condition = ParseAssignmentExpression(compareCtx);
+                    auto* compareCond = compareCtx->conditionalExpression();
+                    auto condition = compareCond != nullptr
+                        ? ConvertConditionToBool(ParseConditionalExpression(compareCond))
+                        : ParseAssignmentExpression(compareCtx);
                     condition = compiler->CoerceToBoolCondition(condition);
                     // Free owned-string temps from the condition in the condition block (see do-while).
                     compiler->FlushOwnedTemps();
@@ -6197,7 +6208,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 compiler->CreateBlockBreak(blockCondition, false);
 
                 compiler->InitializeBlock(blockCondition, true, nullptr, nullptr, blockFalse);
-                auto condition = ParseExpression(expression);
+                auto condition = ParseConditionExpression(expression);
                 condition = compiler->CoerceToBoolCondition(condition);
                 // Free owned-string temps produced inside the condition (e.g. `if (s.toString()
                 // == x)`) here, while still in the condition block. The block-item flush runs in

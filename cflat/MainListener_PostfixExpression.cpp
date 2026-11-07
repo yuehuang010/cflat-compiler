@@ -6063,7 +6063,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (!methodTemplate.empty())
                                 {
                                     const bool isStaticMethod =
-                                        isFunctionStatic(genericFunctionTemplates[methodTemplate]);
+                                        isFunctionStatic(Compiler(ctx)->MaterializeGenericFunction(methodTemplate));
                                     if (isStaticMethod || !thisVar.TypeAndValue.TypeName.empty())
                                     {
                                         gfKey = methodTemplate;
@@ -6086,43 +6086,111 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // ParseDeclaration can resolve the correct function pointer.
                             if (isGenericFunc)
                             {
-                                const auto& typeParams = Compiler(ctx)->gts.genericFunctionTypeParams[gfKey];
-                                auto packIt = Compiler(ctx)->gts.genericFunctionPackIndex.find(gfKey);
-                                size_t packIdx = packIt != Compiler(ctx)->gts.genericFunctionPackIndex.end()
-                                    ? packIt->second : std::string::npos;
-                                // Omitted TRAILING value arguments come from the declared defaults
-                                // before the arity is judged.
-                                if (packIdx == std::string::npos)
-                                    FillGenericValueDefaults(*Compiler(ctx), gfKey,
-                                                             typeParams.size(), typeArgs);
-                                bool wrongArity = packIdx == std::string::npos
-                                    ? typeParams.size() != typeArgs.size()
-                                    : typeArgs.size() < packIdx;
-                                if (isFollowedByCall && wrongArity)
-                                    LogErrorContext(prevPrimary, std::format(
-                                        "generic function '{}' expects {} type argument(s), but the call provides {}",
-                                        baseName, typeParams.size(), typeArgs.size()));
-                                // A value (`dbl<int, int>` as a function value) has no call to judge it by:
-                                // refuse the wrong count here and never instantiate the wrong arity.
-                                if (!isFollowedByCall && wrongArity)
+                                auto* compiler = Compiler(ctx);
+                                auto templates = genericFunctionTemplates.find(gfKey);
+                                std::vector<std::pair<size_t, std::vector<std::string>>> candidates;
+                                if (templates != genericFunctionTemplates.end())
+                                    for (size_t index = 0; index < templates->second.size(); ++index)
+                                    {
+                                        const std::string candidateKey =
+                                            GenericTemplateState::GenericFunctionCandidateKey(gfKey, index);
+                                        auto params = compiler->gts.genericFunctionTypeParams.find(candidateKey);
+                                        if (params == compiler->gts.genericFunctionTypeParams.end() && index == 0)
+                                            params = compiler->gts.genericFunctionTypeParams.find(gfKey);
+                                        if (params == compiler->gts.genericFunctionTypeParams.end()) continue;
+                                        auto argsForCandidate = typeArgs;
+                                        auto packIt = compiler->gts.genericFunctionPackIndex.find(candidateKey);
+                                        if (packIt == compiler->gts.genericFunctionPackIndex.end() && index == 0)
+                                            packIt = compiler->gts.genericFunctionPackIndex.find(gfKey);
+                                        const size_t packIdx = packIt != compiler->gts.genericFunctionPackIndex.end()
+                                            ? packIt->second : std::string::npos;
+                                        if (packIdx == std::string::npos)
+                                            FillGenericValueDefaults(*compiler, candidateKey,
+                                                                     params->second.size(), argsForCandidate);
+                                        const bool wrongArity = packIdx == std::string::npos
+                                            ? params->second.size() != argsForCandidate.size()
+                                            : argsForCandidate.size() < packIdx;
+                                        if (!wrongArity)
+                                            candidates.emplace_back(index, std::move(argsForCandidate));
+                                    }
+                                if (candidates.empty())
                                 {
+                                    if (templates != compiler->gts.genericFunctionTemplates.end()
+                                        && templates->second.size() == 1)
+                                    {
+                                        const std::string candidateKey =
+                                            GenericTemplateState::GenericFunctionCandidateKey(gfKey, 0);
+                                        auto params = compiler->gts.genericFunctionTypeParams.find(candidateKey);
+                                        if (params == compiler->gts.genericFunctionTypeParams.end())
+                                            params = compiler->gts.genericFunctionTypeParams.find(gfKey);
+                                        if (params != compiler->gts.genericFunctionTypeParams.end())
+                                        {
+                                            if (isFollowedByCall)
+                                                LogErrorContext(prevPrimary, std::format(
+                                                    "generic function '{}' expects {} type argument(s), but the call provides {}",
+                                                    baseName, params->second.size(), typeArgs.size()));
+                                            LogErrorContext(prevPrimary, std::format(
+                                                "'{}' did not instantiate the generic function template '{}', so it has no value; "
+                                                "check the number and spelling of its type arguments.",
+                                                prevPrimary->getText(), baseName));
+                                        }
+                                    }
                                     LogErrorContext(prevPrimary, std::format(
-                                        "'{}' did not instantiate the generic function template '{}', so it has no value; "
-                                        "check the number and spelling of its type arguments.",
-                                        prevPrimary->getText(), baseName));
-                                    primaryIdentifier = mangledName;
+                                        "no overload of generic function '{}' accepts {} type argument(s)",
+                                        baseName, typeArgs.size()));
+                                }
+                                size_t selectedIndex = candidates.front().first;
+                                std::vector<std::string> selectedArgs = candidates.front().second;
+                                std::string instantiatedName;
+                                if (candidates.size() > 1 && isFollowedByCall)
+                                {
+                                    // Keep overload choice until argument types are available to the
+                                    // generic call resolver. This is needed for equal template arity
+                                    // with different function parameter shapes.
+                                    primaryIdentifier = gfKey;
+                                    callDisplayName = prevPrimary->getText();
                                     namedVar = {};
+                                    namedVar.CallerName = gfKey;
                                     break;
                                 }
-                                mangledName = MangledGenericName(gfKey, typeArgs);
-                                InstantiateGenericFunction(gfKey, typeArgs);
+                                if (candidates.size() > 1 && !isFollowedByCall)
+                                {
+                                    LLVMBackend::TypeAndValue functionDestination = declExpectedType;
+                                    if (functionDestination.FuncPtrReturnTypeName.empty()
+                                        && !functionDestination.Pointer)
+                                        if (const auto* encoded = compiler->GetEncodedClosureType(
+                                                functionDestination.TypeName))
+                                            functionDestination = *encoded;
+                                    if (!functionDestination.FuncPtrReturnTypeName.empty())
+                                    {
+                                        std::vector<size_t> allowed;
+                                        for (const auto& candidate : candidates)
+                                            allowed.push_back(candidate.first);
+                                        std::string refusal;
+                                        instantiatedName = TryInferAndInstantiateFromFuncPtr(
+                                            gfKey, functionDestination, refusal, &allowed);
+                                        if (instantiatedName.empty() && !refusal.empty())
+                                            LogErrorContext(prevPrimary, refusal);
+                                    }
+                                    else
+                                        LogErrorContext(prevPrimary, std::format(
+                                            "generic function value '{}' needs a function type to select among overloads",
+                                            baseName));
+                                }
+                                if (candidates.size() == 1)
+                                    instantiatedName = InstantiateGenericFunction(
+                                        gfKey, selectedArgs, selectedIndex);
+                                if (instantiatedName.empty())
+                                    LogErrorContext(prevPrimary, std::format(
+                                        "could not instantiate generic function '{}'", baseName));
+                                mangledName = instantiatedName;
                                 primaryIdentifier = mangledName;
                                 callDisplayName = prevPrimary->getText();
                                 namedVar = {};
                                 namedVar.CallerName = mangledName;
                                 // Named as a VALUE (`dbl<int>`): a C++ callable target may decay it to a
                                 // function pointer (LowerNonCapturingClosureForCxx re-validates it).
-                                namedVar.GenericFunctionValue = !isFollowedByCall && !wrongArity;
+                                namedVar.GenericFunctionValue = !isFollowedByCall;
                                 break;
                             }
                             // An instantiated generic type used as a static-member qualifier
@@ -7622,33 +7690,96 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
                                 typeArgs.push_back(ResolveTypeArgEntry(entry));
                             }
-                            auto typeParamsIt = genericFunctionTypeParams.find(templateName);
-                            if (typeParamsIt != genericFunctionTypeParams.end())
+                            auto* compiler = Compiler(ctx);
+                            auto templates = genericFunctionTemplates.find(templateName);
+                            std::vector<std::pair<size_t, std::vector<std::string>>> candidates;
+                            if (templates != genericFunctionTemplates.end())
+                                for (size_t index = 0; index < templates->second.size(); ++index)
+                                {
+                                    const std::string candidateKey =
+                                        GenericTemplateState::GenericFunctionCandidateKey(templateName, index);
+                                    auto params = compiler->gts.genericFunctionTypeParams.find(candidateKey);
+                                    if (params == compiler->gts.genericFunctionTypeParams.end() && index == 0)
+                                        params = compiler->gts.genericFunctionTypeParams.find(templateName);
+                                    if (params == compiler->gts.genericFunctionTypeParams.end()) continue;
+                                    auto argsForCandidate = typeArgs;
+                                    auto packIt = compiler->gts.genericFunctionPackIndex.find(candidateKey);
+                                    if (packIt == compiler->gts.genericFunctionPackIndex.end() && index == 0)
+                                        packIt = compiler->gts.genericFunctionPackIndex.find(templateName);
+                                    const size_t packIdx = packIt != compiler->gts.genericFunctionPackIndex.end()
+                                        ? packIt->second : std::string::npos;
+                                    if (packIdx == std::string::npos)
+                                        FillGenericValueDefaults(*compiler, candidateKey,
+                                                                 params->second.size(), argsForCandidate);
+                                    const bool wrongArity = packIdx == std::string::npos
+                                        ? params->second.size() != argsForCandidate.size()
+                                        : argsForCandidate.size() < packIdx;
+                                    if (!wrongArity)
+                                        candidates.emplace_back(index, std::move(argsForCandidate));
+                                }
+                            if (candidates.empty())
                             {
-                                FillGenericValueDefaults(*Compiler(ctx), templateName,
-                                                         typeParamsIt->second.size(), typeArgs);
-                                auto packIt = Compiler(ctx)->gts.genericFunctionPackIndex.find(templateName);
-                                const size_t packIdx = packIt != Compiler(ctx)->gts.genericFunctionPackIndex.end()
-                                    ? packIt->second : std::string::npos;
-                                const bool wrongArity = packIdx == std::string::npos
-                                    ? typeParamsIt->second.size() != typeArgs.size()
-                                    : typeArgs.size() < packIdx;
-                                const std::string genericDisplayName = [&] {
-                                    const size_t dot = primaryIdentifier.rfind('.');
-                                    return dot == std::string::npos
-                                        ? primaryIdentifier : primaryIdentifier.substr(dot + 1);
-                                }();
-                                if (IsFollowedByCall(ctx, genParams) && wrongArity)
-                                    LogErrorContext(genParams, std::format(
-                                        "generic function '{}' expects {} type argument(s), but the call provides {}",
-                                        genericDisplayName, typeParamsIt->second.size(), typeArgs.size()));
-                                if (!IsFollowedByCall(ctx, genParams) && wrongArity)
-                                    LogErrorContext(genParams, std::format(
-                                        "'{}' did not instantiate the generic function template '{}', so it has no value; "
-                                        "check the number and spelling of its type arguments.",
-                                        primaryIdentifier + genParams->getText(), genericDisplayName));
+                                if (templates != compiler->gts.genericFunctionTemplates.end()
+                                    && templates->second.size() == 1)
+                                {
+                                    const std::string candidateKey =
+                                        GenericTemplateState::GenericFunctionCandidateKey(templateName, 0);
+                                    auto params = compiler->gts.genericFunctionTypeParams.find(candidateKey);
+                                    if (params == compiler->gts.genericFunctionTypeParams.end())
+                                        params = compiler->gts.genericFunctionTypeParams.find(templateName);
+                                    if (params != compiler->gts.genericFunctionTypeParams.end())
+                                    {
+                                        const size_t dot = primaryIdentifier.rfind('.');
+                                        const std::string genericDisplayName = dot == std::string::npos
+                                            ? primaryIdentifier : primaryIdentifier.substr(dot + 1);
+                                        if (IsFollowedByCall(ctx, genParams))
+                                            LogErrorContext(genParams, std::format(
+                                                "generic function '{}' expects {} type argument(s), but the call provides {}",
+                                                genericDisplayName, params->second.size(), typeArgs.size()));
+                                        LogErrorContext(genParams, std::format(
+                                            "'{}' did not instantiate the generic function template '{}', so it has no value; "
+                                            "check the number and spelling of its type arguments.",
+                                            primaryIdentifier + genParams->getText(), genericDisplayName));
+                                    }
+                                }
+                                LogErrorContext(genParams, std::format(
+                                    "no overload of generic function '{}' accepts {} type argument(s)",
+                                    primaryIdentifier, typeArgs.size()));
                             }
-                            std::string mangled = InstantiateGenericFunction(templateName, typeArgs);
+                            std::string mangled;
+                            if (candidates.size() == 1)
+                                mangled = InstantiateGenericFunction(templateName,
+                                    candidates.front().second, candidates.front().first);
+                            else if (IsFollowedByCall(ctx, genParams))
+                            {
+                                // Argument inference at the call site selects among same-arity
+                                // templates after their actual parameter types are known.
+                                mangled = templateName;
+                            }
+                            else
+                            {
+                                LLVMBackend::TypeAndValue functionDestination = declExpectedType;
+                                if (functionDestination.FuncPtrReturnTypeName.empty()
+                                    && !functionDestination.Pointer)
+                                    if (const auto* encoded = compiler->GetEncodedClosureType(
+                                            functionDestination.TypeName))
+                                        functionDestination = *encoded;
+                                if (!functionDestination.FuncPtrReturnTypeName.empty())
+                                {
+                                    std::vector<size_t> allowed;
+                                    for (const auto& candidate : candidates)
+                                        allowed.push_back(candidate.first);
+                                    std::string refusal;
+                                    mangled = TryInferAndInstantiateFromFuncPtr(
+                                        templateName, functionDestination, refusal, &allowed);
+                                    if (mangled.empty() && !refusal.empty())
+                                        LogErrorContext(genParams, refusal);
+                                }
+                                else
+                                    LogErrorContext(genParams, std::format(
+                                        "generic function value '{}' needs a function type to select among overloads",
+                                        primaryIdentifier));
+                            }
                             if (!mangled.empty())
                             {
                                 primaryIdentifier = mangled;
@@ -15104,7 +15235,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                 }
                                 const bool staticMethod = !methodTemplate.empty()
-                                    && isFunctionStatic(genericFunctionTemplates[methodTemplate]);
+                                    && isFunctionStatic(Compiler(primaryCtx)->MaterializeGenericFunction(methodTemplate));
                                 if (bareImplicitCall && implicitCallReceiver.GetValue() == nullptr
                                     && !staticMethod)
                                     implicitReceiverGenericMethod = false;
@@ -15183,6 +15314,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                 }
                                 bool attemptedFreeGenericInference = false;
+                                std::string genericCallRefusal;
                                 const bool hasExplicitReceiverGenericMethod = !methodTemplate.empty()
                                     && !implicitReceiverGenericMethod
                                     && !receiverHasExactPlainMethod
@@ -15202,7 +15334,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (!staticMethod)
                                         explicitArgs.erase(explicitArgs.begin());
                                     auto inst = TryInferAndInstantiateFromArgs(
-                                        methodTemplate, explicitArgs, inferenceArgList);
+                                        methodTemplate, explicitArgs, inferenceArgList,
+                                        nullptr, true, &genericCallRefusal);
                                     if (!inst.empty())
                                         adoptGenericInstance(inst);
                                 }
@@ -15211,7 +15344,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     resolvedFuncName = methodTemplate;
                                     auto inst = TryInferAndInstantiateFromArgs(
-                                        methodTemplate, arguments, inferenceArgList);
+                                        methodTemplate, arguments, inferenceArgList,
+                                        nullptr, true, &genericCallRefusal);
                                     if (!inst.empty())
                                     {
                                         adoptGenericInstance(inst);
@@ -15230,7 +15364,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (resolvedFuncName == functionName)
                                     {
                                         auto inst = TryInferAndInstantiateFromArgs(
-                                            gfName, arguments, inferenceArgList);
+                                            gfName, arguments, inferenceArgList, nullptr, true,
+                                            &genericCallRefusal);
                                         if (!inst.empty()) resolvedFuncName = inst;
                                         else
                                             if (functionArgCounter < argumentList.size())
@@ -15269,6 +15404,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     arguments.insert(arguments.begin(), implicitCallReceiver);
                                     implicitCallReceiver = {};
+                                }
+                                if (!genericCallRefusal.empty())
+                                {
+                                    auto* compiler = Compiler(primaryCtx);
+                                    const std::string overloadKey =
+                                        compiler->ResolveQualifiedName(gfName);
+                                    auto concrete = compiler->functionTable.find(overloadKey);
+                                    if (concrete == compiler->functionTable.end())
+                                        concrete = compiler->functionTable.find(gfName);
+                                    if (concrete == compiler->functionTable.end()
+                                        || concrete->second.empty())
+                                        LogErrorContext(primaryCtx, genericCallRefusal);
                                 }
                                 requestCxxTemplate(resolvedFuncName);
                                 callArgumentPostfix.Flush();
@@ -16255,7 +16402,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                             {
                                                 const std::string method = GenericMethodTemplateKey(owner, name);
                                                 ownerInstanceMethodCall = !method.empty()
-                                                    && !isFunctionStatic(genericFunctionTemplates[method]);
+                                                    && !isFunctionStatic(compilerLLVM->MaterializeGenericFunction(method));
                                             }
                                         }
                                         break;
@@ -19043,7 +19190,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 const std::string methodTemplate = GenericMethodTemplateKey(methodOwner, name);
                 if (!methodTemplate.empty()
                     && (thisVar.GetValue() != nullptr
-                        || isFunctionStatic(genericFunctionTemplates[methodTemplate])))
+                        || isFunctionStatic(compiler->MaterializeGenericFunction(methodTemplate))))
                     return {};
             }
         }
@@ -19763,6 +19910,61 @@ void MainListener::EnsureOperatorBoolForValue(llvm::Value* value) {
         }
         else
             TryInferAndInstantiateFromArgs("operator bool", { arg });
+}
+
+/*
+ * Condition of `if`. A C++ class converts to bool here while its TypeAndValue (the receiver's
+ * const) is still known: a const receiver skips the non-const operator bool and takes the const
+ * one or a standard conversion, as clang's contextual conversion does. Any other value takes the
+ * ParseExpression path unchanged.
+ */
+llvm::Value* MainListener::ParseConditionExpression(CFlatParser::ExpressionContext* ctx) {
+        auto* assignCtx = ctx->assignmentExpression();
+        auto* condCtx = assignCtx != nullptr ? assignCtx->conditionalExpression() : nullptr;
+        // A plain condition is ParseAssignmentExpression's conditional branch, so keep its TypedValue.
+        if (condCtx == nullptr) return ParseExpression(ctx);
+        auto tv = ParseConditionalExpression(condCtx);
+        ProcessPlusPlus();
+        return ConvertConditionToBool(tv);
+}
+
+/*
+ * The one bool conversion every condition position shares (if, while, do, for, ?:, && ||, !).
+ * A C++ class converts through its bool-capable conversion on the object, with the operand's
+ * TypeAndValue (receiver const) still known; any other value takes the value path.
+ */
+llvm::Value* MainListener::ConvertConditionToBool(llvm::Value* value) {
+        LLVMBackend::TypedValue tv;
+        tv.value = value;
+        return ConvertConditionToBool(tv);
+}
+
+llvm::Value* MainListener::ConvertConditionToBool(const LLVMBackend::TypedValue& tv) {
+        llvm::Value* left = tv.value;
+        LLVMBackend::NamedVariable operand;
+        operand.Primary = left;
+        if (tv.hasSourceType) operand.TypeAndValue = tv.sourceType;
+        // A C++ class reference (`const Y&`) lowers to its address: the object is the storage.
+        const bool cxxClassOperand = left != nullptr && !operand.TypeAndValue.Pointer
+            && !operand.TypeAndValue.ElemPointer && Compiler()->IsCxxRecord(operand.TypeAndValue.TypeName);
+        const bool cxxClassValue = cxxClassOperand && left->getType()->isStructTy();
+        const bool cxxClassRef = cxxClassOperand && left->getType()->isPointerTy()
+            && operand.TypeAndValue.IsCxxRef();
+        if (cxxClassValue || cxxClassRef)
+        {
+            LLVMBackend::TypeAndValue boolDest;
+            boolDest.TypeName = "bool";
+            auto converted = operand;
+            // The operator runs on the object: a value's address is recovered from its load (as the
+            // value-level entry does), so a self-pointing operator bool sees the original object.
+            converted.BaseType = left->getType();
+            if (cxxClassRef) { converted.Primary = nullptr; converted.Storage = left; }
+            else converted.Storage = Compiler()->StorageOfLoadedCxxObject(left);
+            if (Compiler()->ApplyCxxConversionOperator(converted, boolDest, true))
+                return converted.Primary;
+        }
+        EnsureOperatorBoolForValue(left);
+        return left;
 }
 
 llvm::Value* MainListener::ParseExpression(CFlatParser::ExpressionContext* ctx) {

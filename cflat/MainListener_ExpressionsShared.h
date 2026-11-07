@@ -270,6 +270,35 @@ inline bool IsCflatArithmeticName(const std::string& name)
         "long", "i64", "ulong", "u64", "float", "double" };
     return names.count(name) != 0;
 }
+inline std::string CxxScalarOperandIdentity(LLVMBackend* compiler,
+                                            const std::string& identity,
+                                            const std::string& sourceTypeName,
+                                            llvm::Value* value)
+{
+    if (!identity.empty()) return identity;
+    if (compiler == nullptr || value == nullptr
+        || value->getType()->isPointerTy() || value->getType()->isStructTy())
+        return std::string();
+    // Imported unscoped enumerators carry their enum type on the value. Check that
+    // representation first, then use clang's registered integral promotion type.
+    const std::string promotedEnum = compiler->CxxEnumPromotedTypeName(sourceTypeName);
+    if (!promotedEnum.empty())
+    {
+        LLVMBackend::TypeAndValue enumType;
+        enumType.TypeName = sourceTypeName;
+        llvm::Type* declaredType = compiler->GetType(enumType, nullptr, false);
+        return declaredType == value->getType() && declaredType->isIntegerTy()
+            ? promotedEnum : std::string();
+    }
+    if (!IsCflatArithmeticName(sourceTypeName)) return std::string();
+    LLVMBackend::TypeAndValue sourceType;
+    sourceType.TypeName = sourceTypeName;
+    llvm::Type* declaredType = compiler->GetType(sourceType, nullptr, false);
+    if (declaredType == value->getType()
+        && (declaredType->isIntegerTy() || declaredType->isFloatingPointTy()))
+        return sourceTypeName;
+    return std::string();
+}
 inline std::string ScalarTypeNameForValue(llvm::Type* type)
 {
     if (type == nullptr) return std::string();

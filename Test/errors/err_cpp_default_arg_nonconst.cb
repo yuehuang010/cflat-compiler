@@ -1,4 +1,5 @@
 import cpp "cpp_interop_basic.h";
+import cpp "cpp_t22_constrained_members.hpp";
 
 extern int main()
 {
@@ -16,6 +17,14 @@ extern int main()
     cppi.DefaultRankTemplateOnly box = cppi.DefaultRankTemplateOnly();
     expect_error("ambiguous call to 'rank'") {
         box.rank(value);
+    }
+    // Unordered constrained twins: a call that selects the full-arity forwarder is clang's ambiguity.
+    if const (!__WINDOWS__)
+    {
+        expect_error("clang: call to member function 'pick' is ambiguous") {
+            cflat_t22.UnorderedDefault<int> unordered = default;
+            int selected = unordered.pick(5);
+        }
     }
     return 0;
 }

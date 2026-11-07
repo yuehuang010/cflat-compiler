@@ -8636,6 +8636,7 @@ void LLVMBackend::EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp)
         builder->CreateCondBr(flag, liveBB, afterBB);
         builder->SetInsertPoint(liveBB);
         destroy();
+        builder->CreateStore(builder->getInt1(false), temp.LiveFlag);
         builder->CreateBr(afterBB);
         builder->SetInsertPoint(afterBB);
     }

@@ -1167,6 +1167,11 @@ LLVMBackend::NamedVariable MainListener::SizeOrAlignOfType(const LLVMBackend::Ty
         LLVMBackend::NamedVariable namedVar;
         namedVar.Primary = result;
         namedVar.TypeAndValue.TypeName = "i64";
+#if defined(_WIN32)
+        namedVar.CxxArithIdentity = "u64";
+#else
+        namedVar.CxxArithIdentity = "ulong";
+#endif
         return namedVar;
     }
 
@@ -2804,8 +2809,23 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 }
                 else
                 {
-                    EnsureOperatorBoolForValue(newValue);
-                    if (newValue != nullptr && compiler->HasOperatorBoolForType(newValue->getType()))
+                    // The shared condition conversion (a C++ class converts on the object, const
+                    // receiver honored); a class that did not convert keeps the old branches below.
+                    LLVMBackend::TypedValue operand;
+                    operand.value = newValue;
+                    operand.sourceType = namedVar.TypeAndValue;
+                    operand.hasSourceType = true;
+                    const bool classOperand = newValue != nullptr && !namedVar.TypeAndValue.Pointer
+                        && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName);
+                    newValue = ConvertConditionToBool(operand);
+                    if (classOperand && newValue != nullptr && !newValue->getType()->isStructTy())
+                    {
+                        namedVar.Primary = compiler->CreateLogicalNot(
+                            compiler->CoerceToBoolCondition(newValue));
+                        namedVar.TypeAndValue = {};
+                        namedVar.TypeAndValue.TypeName = "bool";
+                    }
+                    else if (newValue != nullptr && compiler->HasOperatorBoolForType(newValue->getType()))
                     {
                         namedVar.Primary = compiler->CreateLogicalNot(
                             compiler->CoerceToBoolCondition(newValue));
@@ -3441,6 +3461,11 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 LLVMBackend::NamedVariable namedVar;
                 namedVar.Primary = result;
                 namedVar.TypeAndValue.TypeName = "i64";
+#if defined(_WIN32)
+                namedVar.CxxArithIdentity = "u64";
+#else
+                namedVar.CxxArithIdentity = "ulong";
+#endif
                 namedVar.Storage = nullptr;
                 return namedVar;
             }

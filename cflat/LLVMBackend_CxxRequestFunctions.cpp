@@ -2415,6 +2415,21 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 arguments[i].Storage = nullptr;
                 arguments[i].CallerName.clear();
             }
+            /*
+             * A scalar lvalue whose C++ identity lowers to its own machine type (`auto a =
+             * sizeof(int)`, an i64 slot that C++ sees as `unsigned long`) IS that object, so a
+             * reference deduced as the identity binds the caller's slot under the identity name.
+             */
+            if (provenLvalue && !classArgument && !decayedArray && !arg.TypeAndValue.Pointer
+                && (anyReference || forwardingPosition) && !braceForArgument(i))
+                if (std::string arith = CxxArithIdentityForArgument(arg, arg.BaseType);
+                    !arith.empty() && arith != arg.TypeAndValue.TypeName
+                    && ResolveEnumTypeName(arg.TypeAndValue.TypeName).empty())
+                {
+                    if (!arguments[i].TypeAndValue.TypeName.empty())
+                        arguments[i].TypeAndValue.TypeName = arith;
+                    arguments[i].InferSourceTypeName = arith;
+                }
             // A proven lvalue with no recorded slot (`ref()` of a `T&` result): the loaded address.
             if (bindsCallerLvalue && !classArgument && arguments[i].Storage == nullptr)
                 if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arg.Primary))
@@ -2725,6 +2740,13 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             if (inlineStringLiteral)
                 literalCallArguments.emplace_back(callArguments.size() - 1,
                                                   std::move(literalSpelling));
+            else if (IsNullPointerConstantArgument(arg, true))
+            {
+                const std::string& identity = arg.IsCxxMacroGlobal
+                    ? arg.TypeAndValue.TypeName : arg.LiteralIdentity;
+                if (std::string zero = CxxZeroLiteralSpelling(identity); !zero.empty())
+                    literalCallArguments.emplace_back(callArguments.size() - 1, std::move(zero));
+            }
         }
 
         std::vector<std::string> cxxExplicitArgs;
@@ -2968,12 +2990,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         }
         std::vector<std::string> boundCalls = callArguments;
         /*
-         * Clang is the oracle for a string literal argument: it is forwarded as `const char *`
-         * first, so every call that instantiates that way deduces exactly as before. Only when
-         * that fails (a consteval format-string constructor, a `const char (&)[N]` parameter) is
-         * the literal itself spelled into the call, in its own wrapper keyed on the literal text.
-         * If that fails too, retain the forwarded diagnostic unless the actual literal call
-         * reaches a deployment availability error hidden by the forwarding consteval error.
+         * First try the ordinary forwarded argument. If clang cannot bind it, retry string and
+         * integer-null literals with their original source category in a separately keyed wrapper.
          */
         if (!wrapped && !literalCallArguments.empty())
         {

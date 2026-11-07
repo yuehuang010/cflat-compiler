@@ -1,29 +1,23 @@
-# C++ conversion-operator receiver and class-result leftovers
+# C++ conversion-operator receiver leftovers
 
-Status: active. The scalar conversion ranking fix in B15 resolves declaration initialization for `long` (exact beats bool-to-long), `int` (bool promotion wins), and preserves bool-context selection. Local, global-source, const-reference-result, temporary, and ternary-source probes were compared against clang++ at -O0/-O2.
-
-Class-result item resolved in T105. A non-explicit `operator W()` now copy-initializes `W` locals
-and assignments through clang's copy-initialization wrapper. T105 checks value 37, one conversion,
-one constructor, no copies, one assignment, and exact destructor totals for both forms.
+Status: active. Landed: scalar ranking for `long`, `int` and bool context; explicit `operator bool` casts to long, i64,
+char, double, float select `operator int()`; class-result copy-init (T105); receiver cv for `operator bool`,
+`operator int()` and ternary arms; the `const` operator bool on a const receiver in every condition position (`if`,
+`while`, `do`, `for`, `?:`, `&&`, `||`, `!`, `return c ? a : b`); const receiver of a derived class whose base declares
+a const/non-const conversion pair.
 
 Still open:
 
-- `const Z&` selecting a non-const `operator bool` remains deferred to B20 const-receiver work.
-- `template<class U> operator U()` is refused for all recorded destinations and positions.
-- With `explicit operator bool()` and `operator int()`, explicit casts to `long`, `i64`, `char`, `double`, and `float` are refused although clang selects `operator int()`.
+- T122 (pre-existing on master; class V with `operator int(); operator int() const;`): a template conversion
+  `template<class U> operator U() const` next to a non-template `operator int()` on a const receiver. Clang picks the
+  template (7). Since T122 CFlat refuses it (the raw "Argument mismatch detail" text was replaced by CONVOP, 2026-11-05: now
+  "cannot convert value of type 'N.TT' to 'int'"; master before T122 silently picked the non-const non-template, 1).
+  Closes when template conversions are instantiated.
+- `template<class U> operator U()` is refused for every destination and position (int, long, double, class W; declaration
+  init, assignment, call argument, explicit cast, bool context). Measured on a non-const `T` with only the template:
+  clang uses the template (42) for each; CFlat reports "cannot convert value of type 'T' to 'int'" (or "no 'operator
+  long' defined" for the cast form). Needs a clang wrapper for the conversion-operator template at the destination type
+  (new clang requests; count them when landed), registration the scalar/class lookup sees, and the template-vs-
+  non-template tie-break.
 
-See `scratch/b15_matrix.md` and the probe corpus in `scratch/b15_matrix/` for measured results. The full class-result matrix remains incomplete.
-
-T105 review 1 (pre-existing, reproduce on master and e4fb27c9a):
-- Inherited `operator W()` (struct PD : PB, PB declares it): `W w = pd` is refused; clang gives value 37, one operator call, one ctor, no copy. `HasImplicitClassConversionOperator` (LLVMBackend_CInterop.cpp ~28360) scans only the class's own members. Repro scratch/repro_keep/t105/c_w_inh.cb.
-- Explicit `(W)p` makes one extra copy + dtor (37 1 1 1 0 1 vs clang 37 1 1 0 0 0); earlier "explicit-cast support is not a remaining fix" checked value and op count only. Repro scratch/repro_keep/t105/c_w_cast.cb.
-
-T122 review 2 (2026-10-11, pre-existing on master; class V with `operator int(); operator int() const;`):
-- `(int)(true ? rv.cr(o) : rv.cr(o))` with both arms `const V&`: CFlat 1, clang 2 - the ternary
-  result drops const, so the non-const conversion is picked.
-- `operator long(); operator int() const;` converted to int from a non-const lvalue or prvalue:
-  CFlat 2, clang 1 - clang ranks the implicit object binding before the return-type conversion.
-- Template conversion next to a non-template `operator int()` on a const receiver: since T122 it is
-  refused with the raw "Argument mismatch detail (single resolved candidate: operator int)" (master
-  silently picked the non-const non-template, 1); clang picks the template (7). Replace the raw text
-  when template conversions are instantiated.
+Legs: Test/test_cpp_interop.cb CONVOP block; header Test/library/cpp_t105_conversion_operators.hpp.

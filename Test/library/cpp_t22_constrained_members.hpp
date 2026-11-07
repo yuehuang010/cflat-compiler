@@ -26,6 +26,13 @@ struct IntSpan {
     const int* begin() const { return first; }
     const int* end() const { return last; }
 };
+template<class T> concept UnorderedU1 = sizeof(T) >= 2;
+template<class T> concept UnorderedU2 = sizeof(T) <= 8;
+template<class T>
+struct UnorderedDefault {
+    int pick(int x = 1) requires UnorderedU1<T> { return x + 10; }
+    int pick(int x) requires UnorderedU2<T> { return x + 20; }
+};
 // reverse_view: an unconstrained begin() and a constrained one with the same signature.
 template<class R>
 struct Pick {
@@ -91,6 +98,21 @@ template<class T>
 struct DefaultPrefix {
     int pick(int a = 1, int b = 2) { return a + b + 10; }
     int pick(int a, int b = 3) requires std::integral<T> { return a + b + 20; }
+};
+template<class T>
+struct DefaultBoth {
+    int pick(int x = 1) { return x + 10; }
+    int pick(int x = 2) requires std::integral<T> { return x + 20; }
+};
+template<class T>
+struct DefaultConstrained {
+    int pick(int x) { return x + 10; }
+    int pick(int x = 3) requires std::integral<T> { return x + 20; }
+};
+template<class T>
+struct StaticDefaultOnLoser {
+    static int pick(int x = 1) { return x + 10; }
+    static int pick(int x) requires std::integral<T> { return x + 20; }
 };
 // An instance f of another class must not hide cppi_entity::Mixed's static f(int) through
 // an object (the static-or-instance selection took the first method's `this` of any class).

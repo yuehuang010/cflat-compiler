@@ -132,7 +132,9 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                       const CxxClassInfo::Structor& selected,
                                       llvm::Value* slot,
                                       const std::vector<llvm::Value*>& extraArgs,
-                                      const std::vector<NamedVariable>* extraArgVars)
+                                      const std::vector<NamedVariable>* extraArgVars,
+                                      bool assignmentOperator,
+                                      llvm::Value* assignmentResultLiveFlag)
 {
         if (slot == nullptr) return false;
         const CxxClassInfo::Structor st = selected;
@@ -184,6 +186,15 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
         AbiRecipe recipe;
         llvm::Function* fn = GetOrCreateCxxStructor(typeName, st, recipe);
         if (fn == nullptr) return false;
+        const bool byValueAssignmentResult = assignmentOperator
+            && recipe.retSlot.kind == AbiSlot::SRetReturn
+            && st.params.size() == 2 && !st.isDefaultCtor && !st.isCopyCtor && !st.isMoveCtor
+            && !st.ret.Pointer && !st.ret.ElemPointer && !st.ret.IsAlias && !st.ret.IsRvalueRef
+            && ResolveTypeAlias(st.ret.TypeName) == ResolveTypeAlias(typeName);
+        llvm::Value* assignmentResultTemp = nullptr;
+        if (byValueAssignmentResult)
+            assignmentResultTemp = AllocaAtEntry(recipe.retSlot.structTy, nullptr,
+                "cxx.assign.result", recipe.retSlot.align);
         std::vector<llvm::Value*> args;
         args.reserve(callArgs->size() + 1);
         args.push_back(slot);                       // 'this'
@@ -551,11 +562,21 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
         // A constructor or assignment without noexcept can throw into this frame's cleanup.
         const bool mayUnwind = CalleeMayUnwind(sym);
         if (recipe.hasLowering)
-            EmitAbiLoweredCall(sym, args, /*sretDest*/ nullptr,
+            EmitAbiLoweredCall(sym, args, assignmentResultTemp,
                                indirectArgAddrs.empty() ? nullptr : &indirectArgAddrs,
                                nullptr, nullptr, mayUnwind);
         else
             CreateFunctionCall(fn, args, mayUnwind, sym.HasCFlatDefinition());
+        if (assignmentResultTemp != nullptr)
+        {
+            if (assignmentResultLiveFlag != nullptr && currentFunction != nullptr)
+                pendingOwnedStructTemps.push_back({ assignmentResultTemp, typeName,
+                    &currentFunction->getEntryBlock(), assignmentResultLiveFlag });
+            else
+                RegisterOwnedStructTemp(assignmentResultTemp, typeName);
+            if (assignmentResultLiveFlag != nullptr)
+                builder->CreateStore(builder->getInt1(true), assignmentResultLiveFlag);
+        }
         if (callArgVars != nullptr && !callArgVars->empty())
         {
             NamedVariable self;
@@ -1487,7 +1508,14 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     { ok = false; break; }
                     namedFunctionMatches = true;
                 }
-                const bool compatibleArg = namedFunctionMatches || compatible(want, got);
+                // A null pointer constant binds a scalar `const T&` / `T&&` parameter (clang materializes
+                // the referent). Identity-proven, so the numeric gate below does not apply; `T&` never does.
+                const bool nullScalarReference = argVars != nullptr && i < argVars->size()
+                    && want.Pointer && (want.IsRvalueRef || want.CxxConstRef())
+                    && !want.ElemPointer && !want.IsCxxRefToPointer && want.IsInteger() != -1
+                    && !got.Pointer && IsNullPointerConstantArgument((*argVars)[i], true);
+                const bool compatibleArg = namedFunctionMatches || nullScalarReference
+                    || compatible(want, got);
                 if (!copyRef && !scalarRvalueRef && !compatibleArg)
                 {
                     // An integer <-> floating argument is refused as a CALL here, but C++ still
@@ -5015,7 +5043,8 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                                                  bool allowExplicit,
                                                  bool* needsStandardConversion,
                                                  bool* ambiguous,
-                                                 std::vector<std::string>* ambiguousCandidates) const
+                                                 std::vector<std::string>* ambiguousCandidates,
+                                                 const TypeAndValue* receiver) const
 {
         if (needsStandardConversion != nullptr) *needsStandardConversion = false;
         if (ambiguous != nullptr) *ambiguous = false;
@@ -5098,40 +5127,43 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                     if (!shapeMatches) continue;
                     result.push_back(member.name);
                     result.push_back(sourceTypeName + "." + member.name);
+                    // A const member registers under its const twin name; a const receiver
+                    // reaches it only through this name (listed last: non-const wins otherwise).
+                    result.push_back(CxxConstTwinName(member.name));
                 }
+            // An INHERITED pair has no own member here, but its const twin is cloned onto this
+            // class under the bare spelling; list it unconditionally (a miss costs one lookup).
+            result.push_back(CxxConstTwinName("operator " + cflatSpelling));
             return result;
         };
 
-        auto usable = [&](const std::string& opName, std::string& returnTypeName) {
-            // "<Type>.operator <spelling>" keeps its spelling, which may hold dots ("t104.X").
-            const size_t qualifier = opName.find(".operator ");
-            if (info != nullptr && !allowExplicit
-                && info->explicitConversions.count(qualifier == std::string::npos
-                        ? opName : opName.substr(qualifier + 1)) != 0)
-                return false;
-            auto it = functionTable.find(opName);
-            if (it == functionTable.end()) return false;
-            for (const auto& candidate : it->second)
-            {
-                if (candidate.Parameters.size() != 1) continue;
+        // clang ranks the implicit object parameter BEFORE the return conversion. A const
+        // receiver binds only const member conversions; a non-const one prefers a non-const
+        // member (rank 0) over a const one (rank 1). CFlat-native sources have no receiver cv.
+        const bool receiverKnown = receiver != nullptr && IsCxxRecord(sourceTypeName);
+        const bool receiverConst = receiverKnown
+            && (receiver->IsConstObject() || receiver->CxxConstRef());
+        // One candidate's return type; false when its shape cannot reach dest.
+        auto fits = [&](const auto& candidate, std::string& returnTypeName) {
+                if (candidate.Parameters.size() != 1) return false;
                 const auto& p = candidate.Parameters[0];
                 // A C++ member conversion carries a 'this' receiver, so a registered C++ record
                 // accepts the pointer shape; the call path adjusts the receiver.
                 if ((p.Pointer && !IsCxxRecord(sourceTypeName)) || p.ElemPointer
                     || p.TypeName != sourceTypeName)
-                    continue;
+                    return false;
                 const auto& ret = candidate.ReturnType;
                 if (classReferenceTarget)
                 {
                     // A const referent (`operator const X&`) never binds a mutable X& or X&&.
-                    if (ret.CxxConstRef() && !dest.CxxConstRef()) continue;
+                    if (ret.CxxConstRef() && !dest.CxxConstRef()) return false;
                     if (ret.TypeName == dest.TypeName && !ret.ElemPointer
                         && ret.IsAlias)
                     {
                         returnTypeName = ret.TypeName;
                         return true;
                     }
-                    continue;
+                    return false;
                 }
                 bool referenceResult = ret.IsAlias;
                 if (candidate.IsCxx)
@@ -5145,14 +5177,46 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                         == CanonicalPrimitiveTypeName(ResolveTypeAlias(dest.TypeName));
                 if ((!scalarReference && ret.Pointer != dest.Pointer) || ret.ElemPointer
                     || ret.IsArrayView || (!dest.Pointer && !scalarReference && !ret.IsPrimitive()))
-                    continue;
+                    return false;
                 if (dest.Pointer
                     && CanonicalPrimitiveTypeName(ResolveTypeAlias(ret.TypeName))
-                        != CanonicalPrimitiveTypeName(ResolveTypeAlias(dest.TypeName))) continue;
+                        != CanonicalPrimitiveTypeName(ResolveTypeAlias(dest.TypeName))) return false;
                 returnTypeName = ret.TypeName;
                 return true;
+        };
+        auto usable = [&](const std::string& opName, std::string& returnTypeName,
+                          int* receiverRank = nullptr) {
+            // "<Type>.operator <spelling>" keeps its spelling, which may hold dots ("t104.X").
+            const size_t qualifier = opName.find(".operator ");
+            if (info != nullptr && !allowExplicit
+                && info->explicitConversions.count(qualifier == std::string::npos
+                        ? opName : opName.substr(qualifier + 1)) != 0)
+                return false;
+            auto it = functionTable.find(opName);
+            if (it == functionTable.end()) return false;
+            bool found = false;
+            int bestRank = 2;
+            for (const auto& candidate : it->second)
+            {
+                std::string name;
+                if (!fits(candidate, name)) continue;
+                int rank = 0;
+                if (receiverKnown)
+                {
+                    const bool thisConst = candidate.CxxConst;
+                    if (receiverConst && !thisConst) continue;
+                    rank = !receiverConst && thisConst ? 1 : 0;
+                }
+                if (!found || rank < bestRank)
+                {
+                    found = true;
+                    bestRank = rank;
+                    returnTypeName = name;
+                }
+                if (bestRank == 0) break;
             }
-            return false;
+            if (found && receiverRank != nullptr) *receiverRank = bestRank;
+            return found;
         };
 
         // Built-in spellings of ONE C++ type (i32 = int, i16 = short, uint = u32) are the same type.
@@ -5162,13 +5226,20 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         const std::string resolvedDestType = canonical(dest.TypeName);
         // Exactness is CFlat type identity after alias resolution, not LLVM representation.
         std::string returnTypeName;
+        int exactReceiverRank = 0;
+        std::string exactName;
         for (const std::string& name : candidateNames(dest.TypeName))
-            if (usable(name, returnTypeName))
+            if (usable(name, returnTypeName, &exactReceiverRank))
             {
                 if (classReferenceTarget) return name;
                 if (canonical(returnTypeName) == resolvedDestType)
-                    return name;
+                {
+                    exactName = name;
+                    break;
+                }
             }
+        if (!exactName.empty() && (exactReceiverRank == 0 || classReferenceTarget || dest.Pointer))
+            return exactName;
 
         if (classReferenceTarget) return {};
         // Pointer conversions are exact here. Their standard pointer conversions need a richer
@@ -5181,8 +5252,9 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
          * candidate, so TWO of them is an ambiguity (clang rejects `double d = bt;` when the
          * class declares both `operator int` and `operator bool`) - collect, never take first.
          */
-        if (info == nullptr) return {};
-        std::vector<std::pair<std::string, int>> viable;
+        if (info == nullptr) return exactName;
+        struct StandardViable { std::string name; int rank; int receiverRank; };
+        std::vector<StandardViable> viable;
         std::set<std::string> tried;
         for (const std::string& spelling : ScalarConversionSpellings())
         {
@@ -5190,7 +5262,13 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
             for (const std::string& name : candidateNames(spelling))
             {
                 if (!tried.insert(name).second) continue;
-                if (!usable(name, returnTypeName)) continue;
+                int candidateReceiverRank = 0;
+                if (!usable(name, returnTypeName, &candidateReceiverRank)) continue;
+                // Explicit conversion functions cannot supply an intermediate scalar for a cast.
+                const size_t qualifier = name.find(".operator ");
+                if (info->explicitConversions.count(qualifier == std::string::npos
+                        ? name : name.substr(qualifier + 1)) != 0)
+                    continue;
                 int rank = 2;
                 const std::string resolvedReturnType = canonical(returnTypeName);
                 if (resolvedReturnType == resolvedDestType)
@@ -5203,25 +5281,30 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                     rank = 1;
                 else if (resolvedReturnType == "float" && resolvedDestType == "double")
                     rank = 1;
-                viable.emplace_back(name, rank);
+                viable.push_back({ name, rank, candidateReceiverRank });
                 break;   // the two spellings of ONE operator are the same candidate
             }
         }
-        if (viable.empty()) return {};
+        // Receiver binding ranks first (clang): a worse-binding candidate never competes with a
+        // better-binding one, so a plain exact match (rank 0 receiver) is the only choice left.
+        if (std::any_of(viable.begin(), viable.end(),
+                [](const StandardViable& v) { return v.receiverRank == 0; }))
+            std::erase_if(viable, [](const StandardViable& v) { return v.receiverRank != 0; });
+        else if (!exactName.empty())
+            return exactName;   // the exact match is the only candidate that binds
+        if (viable.empty()) return exactName;
         const int bestRank = std::min_element(viable.begin(), viable.end(),
-            [](const auto& a, const auto& b) { return a.second < b.second; })->second;
-        viable.erase(std::remove_if(viable.begin(), viable.end(), [bestRank](const auto& v) {
-            return v.second != bestRank;
-        }), viable.end());
+            [](const auto& a, const auto& b) { return a.rank < b.rank; })->rank;
+        std::erase_if(viable, [bestRank](const StandardViable& v) { return v.rank != bestRank; });
         if (viable.size() > 1)
         {
             if (ambiguous != nullptr) *ambiguous = true;
             if (ambiguousCandidates != nullptr)
-                for (const auto& candidate : viable) ambiguousCandidates->push_back(candidate.first);
+                for (const auto& candidate : viable) ambiguousCandidates->push_back(candidate.name);
             return {};
         }
         if (needsStandardConversion != nullptr) *needsStandardConversion = true;
-        return viable.front().first;
+        return viable.front().name;
 }
 
 /*
@@ -5261,7 +5344,7 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
         std::vector<std::string> ambiguousCandidates;
         const std::string opName = CxxConversionOperatorTo(sourceTypeName, dest, allowExplicit,
                                                            &needsStandard, &ambiguous,
-                                                           &ambiguousCandidates);
+                                                           &ambiguousCandidates, &nv.TypeAndValue);
         // A materialization site is the one place the ambiguity can be reported; the ranking
         // predicate shares this lookup and must stay silent (LogError throws).
         if (ambiguous) ReportAmbiguousCxxConversion(sourceTypeName, dest, ambiguousCandidates);
@@ -5410,7 +5493,8 @@ std::string LLVMBackend::ScoreCxxConversionOperatorArgument(const NamedVariable&
         std::vector<std::string> ambiguousCandidates;
         const std::string opName = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
                                                            false, &needsStandardConversion,
-                                                           &ambiguous, &ambiguousCandidates);
+                                                           &ambiguous, &ambiguousCandidates,
+                                                           &arg.TypeAndValue);
         if (ambiguous)
         {
             if (!preserveAmbiguous) return {};

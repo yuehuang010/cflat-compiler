@@ -185,6 +185,88 @@ expect_error("no overload of 'operator==' matches operands 'pointer' and 'NullCm
     }
 }
 
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_lt_rhs_local()
+    {
+        string value = "x";
+        return value < nullptr ? 1 : 0;
+    }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_ge_lhs_local()
+    {
+        string value = "x";
+        return nullptr >= value ? 1 : 0;
+    }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_eq_rhs_local()
+    {
+        string value = "x";
+        return value == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_eq_lhs_local()
+    {
+        string value = "x";
+        return nullptr == value ? 1 : 0;
+    }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_ne_rhs_local()
+    {
+        string value = "x";
+        return value != nullptr ? 1 : 0;
+    }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_ne_lhs_local()
+    {
+        string value = "x";
+        return nullptr != value ? 1 : 0;
+    }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strIsNullish(string value) { return value == nullptr ? 1 : 0; }
+}
+
+struct StrNullFieldHolder { string value = "x"; };
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_field()
+    {
+        StrNullFieldHolder holder = default;
+        return holder.value == nullptr ? 1 : 0;
+    }
+}
+
+string strNullCallResult() { return "x"; }
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_call_result()
+    {
+        return strNullCallResult() != nullptr ? 1 : 0;
+    }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_generic<T>(T value) { return value == nullptr ? 1 : 0; }
+    int strnull_generic_trigger() { return strnull_generic<string>("x"); }
+}
+
+expect_error("a 'string' is a value type and cannot be compared to nullptr") {
+    int strnull_parenthesized_null()
+    {
+        string value = "x";
+        return (nullptr) != value ? 1 : 0;
+    }
+}
+
 // A failed declaration inside expect_error must not leave a dead shell that shadows the valid
 // outer type in the same namespace.
 namespace ExpectOuter { struct ExpectItem { int value = 9; }; }

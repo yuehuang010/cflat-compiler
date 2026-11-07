@@ -21,6 +21,7 @@ inline int av(int (&a)[2]) { ++a[0]; return a[0]; }
 inline int fr(int (&)(int[2])) { return 15; }
 inline int nested(std::array<int, 2>&) { return 16; }
 inline int lp(int* p) { return p == nullptr ? 5 : 6; }
+template <class T> inline int tdp(T* p) { return p == nullptr ? 15 : 16; }
 inline int pref(int* const& p) { return p == nullptr ? 27 : 28; }
 inline int prvalue(int*&& p) { return p == nullptr ? 29 : 30; }
 inline int nref(const std::nullptr_t& p) { return p == nullptr ? 31 : 32; }
