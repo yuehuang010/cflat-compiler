@@ -8,7 +8,8 @@ legs 3350-3366 of Test/test_cpp_interop.cb):
 1. (fixed 2026-09-25, a31f4a72 + 843a9f8c) `(new T(x))->m()` is freed when the linked body of `m`
    provably does not retain `this`, in any function including returns and generic instantiations,
    and on the unwind path. Virtual / unlinked / escaping methods keep the bounded leak. Remaining
-   dangling-address shapes live in p2/address-of-new-temp-member-dangles.md.
+   dangling-address shapes were meant for a p2 file that was never created (none in git history,
+   checked 2026-11-06); re-probe them before relying on this list.
 2. (not reproduced 2026-09-24: a CFlat struct field `unique CppClass*` assigned `new CppClass(...)` twice
    compiles with exact counts; re-probe the original shape before working on it)
 3. (fixed 767ae268) runtime-count delete of a polymorphic C++ raw pointer.

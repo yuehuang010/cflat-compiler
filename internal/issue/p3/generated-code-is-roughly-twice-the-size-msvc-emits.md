@@ -25,8 +25,9 @@ Reading, and it is a careful one - the reporter's own conclusions, worth keeping
   MSVC's 3,584 (13,312 once the STL is touched). CFlat's fixed runtime is genuinely SMALLER. The
   extra `.text` in a real app is generated code.
 - The `.data` gain and `.rsrc` loss are the same 6,960 bytes moving: the app icon is an
-  `RT_GROUP_ICON` resource in C++ and a `u8[]` array in CFlat, because of
-  [[no-resource-embedding-or-resource-compiler]]. Discount both from the comparison.
+  `RT_GROUP_ICON` resource in C++ and a `u8[]` array in CFlat, because CFlat had no resource
+  embedding when this was measured. Discount both from the comparison. Embedding has since landed
+  (`internal/plan/resource-embedding.md`, 2026-09-03); re-measure with an embedded icon.
 - On the headline number CFlat wins once deployment is equalized: 112 KB vs C++ `/MT`'s 246 KB for
   the CLI, with no VC++ redistributable. **This issue is only about the `.text` ratio**, not about
   binary size overall, which is fine.

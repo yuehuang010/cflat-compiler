@@ -61,6 +61,9 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 Empty since box 5 (2026-10-27): p1 = 0, p2 = 0 after R16 (05a00f1af). Last rows landed: R21, R22, R7 (T521), R16, and
 p2 generic-unique-arg-pointer-spelling (05a00f1af). Run the Windows gate on the master tip once per box.
 
+Open: p2/expect-error-leg-lints (filed 2026-11-06, test-infra tech debt, not a compiler defect: lint the
+test-leg authoring rules in test.sh / test.bat).
+
 ## In flight
 
 | Run | Branch | Issue(s) | Notes |
@@ -140,7 +143,6 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 |-----|----------|------|-------|
 | G2 | p3/cpp-wrapper-request-group-omits-type-dependencies + p3/cpp-candidate-tier-differs-cold-vs-warm | batch | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor. After G1 |
 | G3 | p3/cpp-check-mode-cannot-repopulate-type-request-cache | full | design: --check writing the cache |
-| G4 | p3/cpp-noinc-mode-std-map-lookup-fails | full | root cause not established; investigation first |
 
 ### H - coverage only (no known defect)
 
@@ -155,7 +157,6 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | P1 | plan converting-constructors (`internal/plan/converting-constructors.md`) | ruled 2026-09-26; eigen_05; absorbs D-row converting-ctor-raw-array + expression-template-to-cflat-byvalue-param. Largest item, own staging |
 | P2 | plan cflat-struct-nontrivial-cxx-fields (`internal/plan/cflat-struct-nontrivial-cxx-fields.md`) | ruled A 2026-09-27. Phase 0 (stopgap refusal) is small and can go early; phases 1-4 one per branch. Absorbs p3/cpp-typed-local-extra-copy-from-param-and-ctor-arms |
 | P3 | p3/cpp-std-header-survey-refresh | re-run the std header L0/L1 survey on macOS and Windows to refresh the gap list; untouched headers need a CFlat-surface ruling |
-| P5 | p3/debug-assert-setvisibility-cross-target-elf | cross-target (-p win64) only; fold into p3/cross-target-compile-gaps work |
 | P4 | virtual-base layout (item 2 of p3/cpp-inherited-member-access-and-virtual-base-diagnostics) | refused today ("layout cannot be reproduced", CInterop ~14229); needs a plan |
 
 ### New or rewritten 2026-09-29 (leftovers from landed rows; group at the next queue build)
@@ -167,7 +168,6 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | N10 | p3/cpp-brace-argument-backing-remaining-shapes | Brace-list backing: optional constructor parameter case remains | NEW 2026-09-29 |
 | N12 | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator receiver and class-result leftovers | NEW 2026-09-29 |
 | N13 | p3/cpp-ctor-expression-position-const-ref-copies-lvalue | C++ ctor in expression position - remaining `const T&` copies and enum `T&&` refusal | NEW 2026-09-29 |
-| N14 | p3/cpp-ctor-ranking-leftovers | P3 C++ constructor ranking leftovers after C6 round 2 | NEW 2026-09-29 |
 | N15 | p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | C++ header default-wrapper batch chunk stores a stripped prefix (latent replay failure) | NEW 2026-09-29 |
 | N22 | p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | C++ template constructor deduction - enum lvalue and arithmetic rvalue deduce the wrong T | NEW 2026-09-29 |
 | N23 | p3/cpp-unary-operator-leftovers-after-d7 | Unary operator leftovers after D7+C3 | NEW 2026-09-29 |
@@ -233,22 +233,18 @@ The A-H sections above stay the per-issue record; schedule from this table.
 | 14 | CONVOP | M/H | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator call path (u) | D2/D3, OPUNARY | no |
 | 15 | ASSIGN | M/H | p3/cpp-assign-operator-route-leftovers, p3/cpp-assignment-result-leftovers-after-b9, p3/cpp-nested-member-class-free-return-and-call-result-assign | C++ assignment route + class-result receivers (u) | T92 in flight (operator=(T)) | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | REFBIND pair, CTOR-VIABILITY | no |
-| 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-viability-not-clang-selected, p3/cpp-ctor-ranking-leftovers, p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM | no |
+| 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-viability-not-clang-selected, p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM | no |
 | 20 | FNWRAP | L/H | p3/cpp-forwarded-closure-refusals-after-t525, p3/cpp-capturing-closure-to-std-function | wrapper-frame slot for fnptr/closure into C++ T&& (RequestCxxFunctionTemplate) | ELIDE (P2 plan) | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, TOPSTMT | no |
 | 25 | CONSTTWIN | M/H | p3/cpp-const-twin-overloads-collapse, p3/cpp-constrained-twin-default-argument-ranking | RegisterCxxClassMembers (~22175) dedupe keeps the non-const twin | CONSTPOINTEE pair | no |
 | 26 | SRCTYPE | L/H | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls, p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | source type not propagated into C++ call construction (CxxArithIdentity) | T92 in flight - after it lands | no |
 | 27 | CACHE-KEY | L/H | p3/cpp-wrapper-request-group-omits-type-dependencies, p3/cpp-wrapper-request-misses-template-argument-headers, p3/cpp-candidate-tier-differs-cold-vs-warm | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; partial patch scratch/repro_keep/t70_groupfix.patch | G2, CACHE-VALID | no |
-| 28 | BORROW-PROV | L/H | p2/delete-borrow-via-named-local, p3/consolidate-named-variable-borrow-provenance | borrow provenance of named variables through helpers (silent UAF) | MOVEPARAM; design first | no |
+| 28 | BORROW-PROV | L/H | p3/consolidate-named-variable-borrow-provenance | borrow provenance of named variables through helpers (silent UAF) | MOVEPARAM; design first | no |
 
 Pairs (take together when scheduled): CONSTPOINTEE = p3/cpp-callback-pointee-const-ranking-gaps (typed-null half closed by C05B);
-CASTWRAP = p3/cpp-const-char-pointer-explicit-class-cast-refused + p3/cpp-fixed-char-array-explicit-class-cast-refused;
-REFBIND = p2/cpp-pointer-reference-ctor-param-binds-temporary + p3/cpp-ternary-of-pointer-lvalues-at-reference-param-binds-copy (same symptom, different sites - one run, two fixes);
-VIEWJOIN = p3/owning-view-ternary-mixed-arm-flag + p3/raw-pointer-join-into-array-view-param-accepted.
-Cheap singletons (S, risk L): p3/test-err-discover-command-line-overflow, p3/os-abstraction-process-cb-not-converted, p3/native-brace-init-no-narrowing-check,
-p3/pointer-to-number-diagnostic-hint-leftovers, p3/view-element-gate-diagnostic-gaps. Full singleton list with C/R: scratch/issue_groups_2026-10-10.md section 2.
+Cheap singletons (S, risk L): p3/os-abstraction-process-cb-not-converted, p3/view-element-gate-diagnostic-gaps. Full singleton list with C/R: scratch/issue_groups_2026-10-10.md section 2.
 Overload/ctor selection family (never two at once): NULLCTOR, NULLPTR-T, PTRRANK, CTOR-VIABILITY, CTOR-BRACE, CONSTTWIN, CONSTPOINTEE.
-Stale references found by the regroup: the std_full table names p3/static-auto-prvalue-and-copy-initializer-storage, which has no issue file (fixed or never filed - verify);
+Stale references found by the regroup: the std_full table named a static-auto prvalue / copy-initializer storage issue that was never filed (no file in git history, checked 2026-11-06);
 A3's "after A1" condition is met (A1 landed 2026-09-29).
 
 ### Parked - needs a maintainer ruling before any work

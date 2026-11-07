@@ -19,4 +19,4 @@ Other:
 - Ctor `S(A&... rest, int a, int b)` (non-final reference pack): 1111 vs clang 1011 (T416 keeps the
   conservative slot rule; see fix-issue-lessons digest T416).
 - By-value class temp through the free wrapper moves once more than clang (1010020 vs 1000010) - also listed
-  in p2/cpp-ternary-default-arm-unbound-callee-wrong-arm.md.
+  in the ternary default-arm wrong-arm p2 issue, which closed in cb5c3eb6 (2026-10-29).
