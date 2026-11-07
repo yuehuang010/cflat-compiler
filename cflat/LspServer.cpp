@@ -382,6 +382,131 @@ inline std::string findEnclosingTypeName(const std::string& text, int line, int 
     return "";
 }
 
+std::string findEnclosingNamespaceName(const std::string& text, int line, int character)
+{
+    size_t offset = 0;
+    int curLine = 0;
+    while (curLine < line && offset < text.size())
+    {
+        if (text[offset] == '\n') ++curLine;
+        ++offset;
+    }
+    offset += static_cast<size_t>(character);
+    if (offset > text.size()) offset = text.size();
+
+    std::vector<bool> namespaceBraces;
+    std::vector<std::string> priorNamespaces;
+    std::string currentNamespace;
+    std::string pendingNamespace;
+    std::string word;
+    bool expectNamespaceName = false;
+    bool collectingNamespaceName = false;
+    auto flushWord = [&]() {
+        if (word.empty()) return;
+        if (word == "namespace")
+        {
+            expectNamespaceName = true;
+            collectingNamespaceName = false;
+            pendingNamespace.clear();
+        }
+        else if (expectNamespaceName)
+        {
+            pendingNamespace = word;
+            expectNamespaceName = false;
+            collectingNamespaceName = true;
+        }
+        else if (collectingNamespaceName)
+            pendingNamespace += word;
+        word.clear();
+    };
+
+    for (size_t i = 0; i < offset; ++i)
+    {
+        const char c = text[i];
+        if (c == '/' && i + 1 < offset && text[i + 1] == '/')
+        {
+            flushWord();
+            while (i < offset && text[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < offset && text[i + 1] == '*')
+        {
+            flushWord();
+            i += 2;
+            while (i + 1 < offset && !(text[i] == '*' && text[i + 1] == '/')) ++i;
+            ++i;
+            continue;
+        }
+        if (c == 'r')
+        {
+            size_t afterRaw = i;
+            if (SkipRawStringSpelling(text, afterRaw))
+            {
+                flushWord();
+                i = afterRaw;
+                continue;
+            }
+        }
+        if (c == '"' || c == '\'')
+        {
+            flushWord();
+            const char quote = c;
+            ++i;
+            while (i < offset && text[i] != quote)
+            {
+                if (text[i] == '\\') ++i;
+                ++i;
+            }
+            continue;
+        }
+        if (isWordChar(c)) { word.push_back(c); continue; }
+
+        flushWord();
+        if (c == '.' && collectingNamespaceName)
+            pendingNamespace += '.';
+        else if (c == '{')
+        {
+            const bool opensNamespace = collectingNamespaceName && !pendingNamespace.empty();
+            namespaceBraces.push_back(opensNamespace);
+            if (opensNamespace)
+            {
+                priorNamespaces.push_back(currentNamespace);
+                currentNamespace += currentNamespace.empty() ? pendingNamespace : "." + pendingNamespace;
+            }
+            pendingNamespace.clear();
+            collectingNamespaceName = false;
+            expectNamespaceName = false;
+        }
+        else if (c == '}')
+        {
+            if (!namespaceBraces.empty())
+            {
+                if (namespaceBraces.back())
+                {
+                    currentNamespace = std::move(priorNamespaces.back());
+                    priorNamespaces.pop_back();
+                }
+                namespaceBraces.pop_back();
+            }
+            pendingNamespace.clear();
+            collectingNamespaceName = false;
+            expectNamespaceName = false;
+        }
+        else if (c == ';' || c == '=')
+        {
+            pendingNamespace.clear();
+            collectingNamespaceName = false;
+            expectNamespaceName = false;
+        }
+        else if (!std::isspace(static_cast<unsigned char>(c)) && collectingNamespaceName)
+        {
+            pendingNamespace.clear();
+            collectingNamespaceName = false;
+        }
+    }
+    return currentNamespace;
+}
+
 struct OpenDocument
 {
     std::string uri;
@@ -1188,7 +1313,8 @@ private:
         // Namespace or type path (no variable head): "Math.square", "os.windows._SystemInfo".
         std::string joined;
         for (size_t i = 0; i < segs.size(); ++i) { if (i) joined += '.'; joined += segs[i]; }
-        return index->Lookup(joined + "." + word);
+        return LookupEnclosingNamespaceMember(index,
+            findEnclosingNamespaceName(text, line, character), joined + "." + word);
     }
 
     // Resolve a bare word as a member accessed via implicit 'this' inside a method,
@@ -3041,6 +3167,11 @@ private:
 };
 
 } // anonymous namespace
+
+std::string FindEnclosingNamespaceName(const std::string& text, int line, int character)
+{
+    return findEnclosingNamespaceName(text, line, character);
+}
 
 int RunLspServer(int argc, char* argv[])
 {

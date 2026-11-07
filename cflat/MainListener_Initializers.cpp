@@ -43,18 +43,45 @@ std::string MainListener::ParseTupleTypeSpecifier(
                 if (HasPrimitiveTypeError(argError))
                     LogErrorContext(entry, LocalizePrimitiveTypeError(compiler, argError));
                 auto* typeSpec = entry->typeSpecifier();
-                if (typeSpec != nullptr && typeSpec->genericIdentifier() != nullptr
+                // Silent during the body pre-scan: the expect_error armed after it must catch the report.
+                if (memberTypeSilentDepth_ == 0 && typeSpec != nullptr
+                    && typeSpec->genericIdentifier() != nullptr
                     && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr
-                    && !MentionsSignatureTypeParam(argName) && !compiler->IsKnownTypeName(argName)
-                    && !compiler->IsTypeArgTypeKey(argName))
+                    && !MentionsSignatureTypeParam(argName)
+                    && !TupleElementEntryNamesType(compiler, entry, argName))
                     LogErrorContext(entry, compiler->LocalizeMessage(
-                        "unknown type '{}'", { argName }));
+                        "unknown type '{}'", { TupleElementBaseName(argName) }));
                 typeArgs.push_back(std::move(argName));
             }
         }
         std::string tupleName = MangledGenericName("tuple", typeArgs);
         tupleTypeArgs[tupleName] = typeArgs;
-        EnsureTupleInstantiated(tupleName);
+        // A silent pre-scan must not instantiate a tuple holding an unknown element, nested ones
+        // included: the shell fails at the next statement. The main pass reports it at its token.
+        std::function<bool(CFlatParser::TupleTypeSpecifierContext*)> holdsUnknownElement =
+            [&](CFlatParser::TupleTypeSpecifierContext* owner) {
+                if (owner->tupleTypePackEntry() != nullptr) return false;
+                auto ownerContext = TupleTypeElementContext(owner);
+                for (auto* entry : owner->tupleTypeEntry())
+                {
+                    auto* typeSpec = entry->typeSpecifier();
+                    if (typeSpec != nullptr && typeSpec->tupleTypeSpecifier() != nullptr)
+                    {
+                        if (holdsUnknownElement(typeSpec->tupleTypeSpecifier())) return true;
+                        continue;
+                    }
+                    PrimitiveTypeError argError;
+                    const std::string argName = ResolveTupleTypeElementArgName(ownerContext, entry, &argError);
+                    if (typeSpec != nullptr && typeSpec->genericIdentifier() != nullptr
+                        && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr
+                        && !MentionsSignatureTypeParam(argName)
+                        && !TupleElementEntryNamesType(compiler, entry, argName))
+                        return true;
+                }
+                return false;
+            };
+        if (memberTypeSilentDepth_ == 0 || !holdsUnknownElement(tupleSpec))
+            EnsureTupleInstantiated(tupleName);
         return tupleName;
     }
 
@@ -198,8 +225,10 @@ std::string MainListener::ParseTypeSpecifierName(
                 name, defaultedAliasType, defaultedAliasError))
             return defaultedAliasType;
         if (!defaultedAliasError.empty()) LogCxxErrorContext(ctx, defaultedAliasError);
-        std::string resolvedName = Compiler(ctx)->ResolveQualifiedName(name, wasSubstituted);
-        if (!wasSubstituted && IsUnparameterizedNamedTypeSpecifier(ctx))
+        std::string resolvedName = ResolveQualifiedTypeSpecifierName(
+            Compiler(ctx), ctx, name, wasSubstituted);
+        if (!wasSubstituted && !IsGlobalScopeQualifiedType(ctx)
+            && IsUnparameterizedNamedTypeSpecifier(ctx))
         {
             const auto aggregateScopes = EnclosingAggregateScopesForType(ctx);
             const std::string contextual = ResolveContextualTypeName(Compiler(ctx),
@@ -2552,8 +2581,7 @@ void MainListener::RejectNewPointerSlotDepthMismatch(
         auto* compiler = Compiler(ctx);
         if (!sourceNV.IsOwning && !compiler->IsOwnedNewTemp(sourceNV.Primary)) return;
         const int sourceDepth = source.PointerDepth > 0 ? source.PointerDepth : 2;
-        const int targetDepth = target.PointerDepth > 0 ? target.PointerDepth
-            : (target.ElemPointer ? 2 : 1);
+        const int targetDepth = target.ValuePointerDepth();
         if (sourceDepth == targetDepth || source.TypeName != target.TypeName) return;
         LogErrorContext(ctx, std::format("cannot convert '{}' to '{}' implicitly: the pointer depths differ",
             SpellType(*compiler, source), SpellType(*compiler, target)));
@@ -4392,7 +4420,7 @@ std::string MainListener::DescribeInitializerPath(const std::string& callerName,
     }
 
 int MainListener::FixedArrayElementStars(const LLVMBackend::TypeAndValue& tv) {
-        return (tv.Pointer ? 1 : 0) + (tv.ElemPointer ? 1 : 0);
+        return tv.ValuePointerDepth();
     }
 
 std::string MainListener::DescribeArrayShape(const LLVMBackend::TypeAndValue& tv) const {
@@ -4424,7 +4452,8 @@ void MainListener::EmitFixedArrayValueCopy(antlr4::ParserRuleContext* ctx,
                                  llvm::Value* destAlloc, llvm::ArrayType* destArrTy,
                                  llvm::Value* srcPtr,
                                  const std::string& srcTypeName, bool srcPointer,
-                                 bool srcElemPointer, uint64_t srcConstArraySize,
+                                 bool srcElemPointer, int srcPointerDepth,
+                                 uint64_t srcConstArraySize,
                                  const std::vector<uint64_t>& srcInnerDims) {
         auto* compiler = Compiler(ctx);
         std::string destText = DescribeArrayShape(destTV);
@@ -4443,7 +4472,8 @@ void MainListener::EmitFixedArrayValueCopy(antlr4::ParserRuleContext* ctx,
         }
 
         int destStars = FixedArrayElementStars(destTV);
-        int srcStars = (srcPointer ? 1 : 0) + (srcElemPointer ? 1 : 0);
+        int srcStars = srcPointerDepth > 0 ? srcPointerDepth
+            : (srcElemPointer ? 2 : (srcPointer ? 1 : 0));
         LLVMBackend::TypeAndValue srcBase;
         srcBase.TypeName = srcTypeName;
         const std::string srcSpelling = SpellType(*compiler, srcBase);

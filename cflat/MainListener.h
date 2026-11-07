@@ -364,6 +364,16 @@ std::string ResolveTupleTypeElementArgName(
     CFlatParser::TupleTypeEntryContext* entry,
     PrimitiveTypeError* errorOut = nullptr);
 
+// True when a tuple element names a type. Judged by the parse-tree shape (simd<...> and
+// function<...>/Lambda<...> are type keywords) or by the resolved spelling's base after the
+// pointer and view suffixes are peeled (`int*` -> `int`), or a function-type alias. The pre-scans
+// use it to decide whether a parenthesized sugar is a tuple type; a bare identifier pair `(a, b)`
+// names no type and stays out, so a `*` suffix never turns an expression into a type.
+bool TupleElementEntryNamesType(const LLVMBackend* compiler,
+    CFlatParser::TupleTypeEntryContext* entry, const std::string& argName);
+// The element's spelled base for a diagnostic: `Nope*` -> `Nope`, as a plain `Nope* p;` reports it.
+std::string TupleElementBaseName(std::string argName);
+
 std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId);
 
 std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId,
@@ -797,7 +807,7 @@ std::string SpellFunctionParameterValueType(
 // so a body-scope alias binds to the same target in both. With an alias frame open the rename
 // lands in THAT frame, so it never displaces or outlives a file-scope alias of the same name.
 // `using X = const W*;`: whole-word const over every level of the aliased word (ApplyWholeWordConst).
-uint8_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string& target, size_t suffixStars);
+uint32_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string& target, size_t suffixStars);
 
 std::vector<std::string> EnclosingAggregateNamesFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node);
@@ -827,12 +837,22 @@ std::string ResolveTypeArgSpelling(const LLVMBackend* compiler, const std::strin
 CFlatParser::GenericTypeParametersContext* GenericSpecOf(
     CFlatParser::TypeSpecifierContext* ts, std::string& base);
 
+bool IsGlobalScopeQualifiedType(CFlatParser::TypeSpecifierContext* typeSpec);
+std::string RootQualifiedTypeSpelling(CFlatParser::TypeSpecifierContext* typeSpec);
+std::string ResolveQualifiedTypeSpecifierName(
+    LLVMBackend* compiler, CFlatParser::TypeSpecifierContext* typeSpec,
+    const std::string& spelling = {}, bool resolveFromRoot = false);
+
 struct EnclosingAggregateLookupScope
 {
     std::string Name;
     antlr4::ParserRuleContext* Definition = nullptr;
     bool NameIsResolved = false;
 };
+
+// Why a generic spelling resolved to no template: a non-template type of an enclosing aggregate,
+// or of an enclosing namespace (the two get different diagnostics).
+enum class NonGenericRefusal { None, EnclosingAggregate, EnclosingNamespace };
 
 std::string NamespaceNameFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node);
@@ -880,6 +900,11 @@ bool HasVisibleNonGenericAggregateName(
     const EnclosingAggregateLookupScope& scope, const std::string& name,
     antlr4::tree::ParseTree* useSite);
 
+// True when a non-template type `name` in the use's namespace chain (innermost first, declared
+// before the use) hides a generic template of that name further out.
+bool NonGenericNamespaceTypeHides(LLVMBackend* compiler, antlr4::tree::ParseTree* useSite,
+    const std::string& name);
+
 bool HasEnclosingAggregateContext(antlr4::tree::ParseTree* node);
 
 bool IsAggregateMemberDeclarationTypeUse(antlr4::tree::ParseTree* node);
@@ -896,13 +921,13 @@ std::string ResolveGenericTemplateBaseAtScope(
     LLVMBackend* compiler, const std::string& spelledBase,
     const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
     antlr4::tree::ParseTree* useSite = nullptr, const std::string& lookupName = {},
-    bool* nonGenericRefusal = nullptr);
+    NonGenericRefusal* nonGenericRefusal = nullptr);
 
 std::string ResolveGenericTemplateSpellingAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
     const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
     antlr4::tree::ParseTree* useSite,
-    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr);
+    const std::string& lookupName, bool report, NonGenericRefusal* nonGenericRefusal = nullptr);
 
 std::vector<EnclosingAggregateLookupScope> EnclosingScopesForLegacyScope(
     LLVMBackend* compiler, const std::string& scopeName, antlr4::tree::ParseTree* useSite);
@@ -910,12 +935,12 @@ std::vector<EnclosingAggregateLookupScope> EnclosingScopesForLegacyScope(
 std::string ResolveGenericTemplateBaseAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, const std::string& enclosingScope,
     antlr4::tree::ParseTree* useSite = nullptr, const std::string& lookupName = {},
-    bool* nonGenericRefusal = nullptr);
+    NonGenericRefusal* nonGenericRefusal = nullptr);
 
 std::string ResolveGenericTemplateSpellingAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
     const std::string& enclosingScope, antlr4::tree::ParseTree* useSite,
-    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr);
+    const std::string& lookupName, bool report, NonGenericRefusal* nonGenericRefusal = nullptr);
 
 using TypeNameArgumentResolver = std::function<std::string(CFlatParser::TypeParameterEntryContext*)>;
 using TypeNameMemberResolver = std::function<std::string(CFlatParser::MemberTypeSpecifierContext*)>;
@@ -928,7 +953,7 @@ struct CanonicalTypeSpecifier
     std::string GenericBase;
     std::vector<std::string> GenericArgs;
     int PointerDepth = 0;
-    uint8_t ConstMask = 0;
+    uint32_t ConstMask = 0;
     bool IsGeneric = false;
 };
 
@@ -946,11 +971,11 @@ struct ConstTypeSyntax
 {
     std::string TypeName;
     int PointerDepth = 0;
-    uint8_t ConstMask = 0;
+    uint32_t ConstMask = 0;
     bool IsArrayView = false;
 };
 
-void ApplyConstMaskThroughDepth(uint8_t& mask, int depth);
+void ApplyConstMaskThroughDepth(uint32_t& mask, int depth);
 
 bool ResolveConstTypeSyntax(
     LLVMBackend* compiler, CFlatParser::TypeNameContext* ctx, ConstTypeSyntax& out,
@@ -1048,12 +1073,17 @@ bool GenericArgumentsUseRegisteredLocalEnum(
     LLVMBackend* compiler,
     const std::unordered_map<std::string, std::string>* substitutions = nullptr);
 
-// Build the symbol-safe encoded name for a closure type used as a generic argument (gap a).
-// Length-prefixed components keep it collision-free; the result contains only [A-Za-z0-9_].
-// The type model holds two pointer levels (Pointer + ElemPointer), so a written depth of 3+ can
-// only be clamped. Every spelling that counts stars rejects it with this one message family.
-static const int PointerDepthCap = 2;
-std::string PointerDepthCapMessage(const std::string& subject, int depth);
+// Declarators, `new` results and casts carry up to 31 pointer levels (ConstMask bit per level).
+static const int MaxDeclaratorPointerDepth = 31;
+
+// Count of contiguous const levels from the base (bit 0 = pointee of the first '*'), capped at the
+// declarator depth limit. A spelled `(const E)` argument joins as this many levels.
+inline int ContiguousLowConstLevels(uint32_t mask)
+{
+    int depth = 0;
+    while (depth < MaxDeclaratorPointerDepth && (mask & (uint32_t{ 1 } << depth)) != 0) ++depth;
+    return depth;
+}
 
 // Reconcile a written '*' count with the pointer flag ResolveSigComponent* may have CHANGED - a
 // `string` component resolves to char* with no '*' written. The FLAG wins; the count only adds
@@ -1063,7 +1093,7 @@ int ReconcilePointerDepth(bool pointer, int stars);
 // Keep pointee const at `depth` levels. An alias result at depth 0 also keeps its referent's const
 // (the value itself); a pointer alias's referent is its pointee, already kept. By-value results drop
 // their top-level const.
-int PointeeConstOfComponent(int mask, int depth, bool preserveAliasReferentConst = false);
+uint32_t PointeeConstOfComponent(uint32_t mask, int depth, bool preserveAliasReferentConst = false);
 
 // Each component folds its pointer DEPTH in via MangleTypeArg ("int*" -> ".p$int", "int**" ->
 // ".p$.p$int"); isThin selects the thin/fat prefix. Examples: Lambda<int(int)> ->
@@ -1074,7 +1104,7 @@ int PointeeConstOfComponent(int mask, int depth, bool preserveAliasReferentConst
 std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
     const std::string& ret, int retDepth,
     const std::vector<std::pair<std::string, int>>& params,
-    int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr,
+    int64_t retConstMask = -1, const std::vector<int64_t>* paramConstMasks = nullptr,
     const std::vector<bool>* paramArrayViews = nullptr,
     const std::vector<bool>* paramAliases = nullptr, bool retAlias = false);
 
@@ -1368,6 +1398,17 @@ inline Ctx* AsRuleCtx(antlr4::tree::ParseTree* node)
         return nullptr;
     auto* rule = static_cast<antlr4::RuleContext*>(node);
     return rule->getRuleIndex() == RuleIndexOf<Ctx>::value ? static_cast<Ctx*>(rule) : nullptr;
+}
+
+// A block that is an arm of a statement-level `if const` splices into the enclosing scope like
+// `#if`, so a `using` / typedef in the taken arm binds for the rest of the body (both passes).
+inline bool IsStatementIfConstArm(antlr4::tree::ParseTree* compound)
+{
+    auto* statement = compound != nullptr
+        ? dynamic_cast<CFlatParser::StatementContext*>(compound->parent) : nullptr;
+    auto* selection = statement != nullptr
+        ? dynamic_cast<CFlatParser::SelectionStatementContext*>(statement->parent) : nullptr;
+    return selection != nullptr && selection->If() != nullptr && selection->Const() != nullptr;
 }
 
 // A foreign C++ by-value parameter is a real object in the callee. Move only its own final
@@ -2737,6 +2778,7 @@ public:
      * which is what both passes did before this existed.
      */
     void PreRegisterRenameAliases(antlr4::RuleContext* ctx);
+    void PreRegisterConditionalAliases(CFlatParser::IfConstDeclarationContext* ctx);
 
     // Seed file-scope const integer globals into the scanner's compile-time macro set.
     void SeedConstIntGlobals(CFlatParser::TranslationUnitContext* tu);
@@ -2758,7 +2800,7 @@ public:
     // Resolve a function signature component; pointer aliases become a base name plus depth.
     // This is the scanner twin of the main pass copy.
     std::string ResolveSigComponentConstScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
-        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
+        int& stars, uint32_t& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
         bool preserveAliasReferentConst = false, std::string* aliasSpelling = nullptr);
 
     /*
@@ -2855,10 +2897,11 @@ public:
         const std::unordered_set<std::string>* localEnumNames = nullptr);
     std::string ResolveGenericTemplateBaseAtUse(LLVMBackend* compiler,
         const std::string& spelledBase, antlr4::tree::ParseTree* useSite,
-        const std::string& lookupName = {});
+        const std::string& lookupName = {}, NonGenericRefusal* refusal = nullptr);
     std::string ResolveGenericTemplateSpellingAtUse(LLVMBackend* compiler,
         const std::string& spelledBase, std::vector<std::string>& args,
-        antlr4::tree::ParseTree* useSite, const std::string& lookupName, bool report);
+        antlr4::tree::ParseTree* useSite, const std::string& lookupName, bool report,
+        NonGenericRefusal* refusal = nullptr);
 
     // Build the function-pointer TypeAndValue for a `function<R(Args)>` spec - the resolved form
     // a `using Cb = function<R(Args)>;` alias stores and that ParseDeclarationSpecifiers expands.
@@ -2866,14 +2909,14 @@ public:
     LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
 
     bool RegisterGenericAlias(const std::string& alias, CFlatParser::TypeSpecifierContext* typeSpec,
-        const std::string& parsedSpelling, const std::string& suffix, uint8_t constMask,
+        const std::string& parsedSpelling, const std::string& suffix, uint32_t constMask,
         bool genericDerived, antlr4::ParserRuleContext* ctx,
         CFlatParser::GenericTypeParametersContext* genericCtx);
     void ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
     // `Spec<args>.name` in type position: the member type's spelling, or the written text when
     // the scan cannot resolve it yet (the main pass reports).
     std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx,
-        uint8_t* constMask = nullptr);
+        uint32_t* constMask = nullptr);
     // Collects the `using` members of the CFlat generic instantiation `owner` (template `base`,
     // arguments `args`) as a provisional frame, binding the template parameters textually.
     bool ScanTemplateAggregateAliases(const std::string& owner, const std::string& base,
@@ -2899,6 +2942,8 @@ public:
     void ScanAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx);
 
     void ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
+    void PreRegisterEnums(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
+    void PreRegisterGlobals(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
 
     // Prepare all forward-scanned [winrt] classes before the main code-generation walk.
     void PrepareWinrtClasses(antlr4::RuleContext* ctx, const std::string& namespaceName = {});
@@ -3890,7 +3935,8 @@ private:
     // Recursively resolve a typeParameterEntry to its mangled string,
     // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
     std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry,
-                                    bool pointerOnly = false);
+                                    bool pointerOnly = false,
+                                    bool* outUnresolvedTypeArgument = nullptr);
     LLVM_ATTRIBUTE_NOINLINE void ResolveDefaultedCxxAliasTypeArgument(
         CFlatParser::TypeParameterEntryContext* entry, std::string& typeName);
     LLVM_ATTRIBUTE_NOINLINE int ResolveDefaultedCxxAliasQualifier(
@@ -3919,7 +3965,8 @@ private:
             p.IsPointeeConst = true;
     }
     std::string ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry,
-                                       bool pointerOnly = false);
+                                       bool pointerOnly = false,
+                                       bool* outUnresolvedTypeArgument = nullptr);
 
     // Queue a generic instantiation for a known template (dedup via instantiatedGenerics).
     // For struct/class templates the struct shell + default-ctor declaration are created
@@ -3957,14 +4004,14 @@ private:
     // Resolve a type in a function-pointer signature position (return or param) the way an ordinary
     // type position resolves: apply active substitutions, and if it names a generic instantiation
     // (e.g. list<string>) mangle it + queue the instantiation. A nested closure encodes recursively.
-    // A trailing '*' from a substitution folds into outPointer. Non-generic scalar types stay
+    // Trailing '*'s from a substitution contribute to the exact signature depth. Non-generic scalar types stay
     // byte-identical to the pre-existing raw-getText() behavior (no alias resolution added).
     std::string ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
-                                           CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
+        int& stars, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
     // Resolve a function signature component; pointer aliases become a base name plus depth.
     // This is the main pass twin of the scanner copy.
     std::string ResolveSigComponentConstCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
-        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
+        int& stars, uint32_t& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
         bool preserveAliasReferentConst = false, std::string* aliasSpelling = nullptr);
 
     /*
@@ -4248,7 +4295,7 @@ public:
     LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
 
     bool RegisterGenericAlias(const std::string& alias, CFlatParser::TypeSpecifierContext* typeSpec,
-        const std::string& parsedSpelling, const std::string& suffix, uint8_t constMask,
+        const std::string& parsedSpelling, const std::string& suffix, uint32_t constMask,
         bool genericDerived, bool pointerOnly, int displayPointerDepth, antlr4::ParserRuleContext* ctx,
         CFlatParser::GenericTypeParametersContext* genericCtx, bool emitSymbol,
         bool isTypedef = false);
@@ -4256,7 +4303,7 @@ public:
     // `Spec<args>.name[.name...]` in type position: instantiates the owner and returns the
     // member type's spelling; reports a name that is not a member type of the owner.
     std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx,
-        uint8_t* constMask = nullptr);
+        uint32_t* constMask = nullptr);
     // The shared walk: instantiate `base<ownerArgs>`, then resolve each member in turn. Returns ""
     // when a member is not a member type (reported only when `report`).
     std::string ResolveMemberTypeChain(
@@ -6626,6 +6673,7 @@ public:
 
     LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx,
         bool allowSizedArray = false, antlr4::ParserRuleContext* useSite = nullptr);
+    void ValidateDeclaratorPointerDepth(antlr4::ParserRuleContext* site, int depth);
     LLVMBackend::TypeAndValue ParseCastTypeName(CFlatParser::CastTypeNameContext* ctx,
         bool allowSizedArray = false, antlr4::ParserRuleContext* useSite = nullptr);
     LLVMBackend::TypeAndValue ParseTypeNameParts(
@@ -7143,7 +7191,8 @@ public:
                                  llvm::Value* destAlloc, llvm::ArrayType* destArrTy,
                                  llvm::Value* srcPtr,
                                  const std::string& srcTypeName, bool srcPointer,
-                                 bool srcElemPointer, uint64_t srcConstArraySize,
+                                 bool srcElemPointer, int srcPointerDepth,
+                                 uint64_t srcConstArraySize,
                                  const std::vector<uint64_t>& srcInnerDims);
 
     /*
@@ -7253,7 +7302,7 @@ public:
         CFlatParser::InitializerListContext* initList);
 
     LLVMBackend::NamedVariable ParseNewExpression(CFlatParser::NewExpressionContext* ctx);
-    std::string NewExpressionElementTypeName(CFlatParser::NewExpressionContext* ctx);
+    std::string NewExpressionElementTypeName(CFlatParser::NewExpressionContext* ctx, uint32_t* aliasConstMask = nullptr);
 
     // True when the pointee TYPE's own alignment (`struct alignas(64) T`) already routes `new` and
     // `delete` to the aligned pair. Mirrors the free site's recovery in EmitOwningPtrCleanup and the
@@ -7713,6 +7762,10 @@ public:
     // Process all pending generic instantiations that were queued during parsing.
     // This is called when it's safe to emit code (e.g., after a declaration completes).
     void ProcessPendingInstantiations();
+    // Scoped expect_error recovery: count the queued records before a block; on a swallowed error,
+    // drop only the records above that count (and their instantiatedGenerics marks).
+    std::unordered_map<std::string, size_t> MarkPendingInstantiations() const;
+    void DropPendingInstantiationsSince(const std::unordered_map<std::string, size_t>& mark);
 
     // Pre-declare a generic instantiation's member function signatures so that
     // cross-references resolve to a declaration before any method body is emitted.

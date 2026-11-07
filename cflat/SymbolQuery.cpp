@@ -304,6 +304,7 @@ struct SymbolLineToken
     std::string receiver;
     std::string member;
     bool hasMember = false;
+    bool isGlobalQualified = false;
     size_t start = 0;
     size_t end = 0;
 };
@@ -396,10 +397,32 @@ static std::vector<SymbolLineToken> ScanSymbolLine(
         }
 
         SymbolLineToken token;
-        const size_t start = pos++;
+        const size_t initialStart = pos++;
         while (pos < line.size() && IsIdentifierChar(line[pos])) ++pos;
-        token.path = line.substr(start, pos - start);
-        token.start = start;
+        std::string initialName = line.substr(initialStart, pos - initialStart);
+        size_t qualifierEnd = pos;
+        while (qualifierEnd < line.size() && std::isspace((unsigned char)line[qualifierEnd]))
+            ++qualifierEnd;
+        if (initialName == "global" && qualifierEnd + 1 < line.size()
+            && line[qualifierEnd] == ':' && line[qualifierEnd + 1] == ':')
+        {
+            pos = qualifierEnd + 2;
+            while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+            if (pos < line.size() && IsIdentifierStart(line[pos]))
+            {
+                token.isGlobalQualified = true;
+                initialName.clear();
+                const size_t rootStart = pos++;
+                while (pos < line.size() && IsIdentifierChar(line[pos])) ++pos;
+                initialName = line.substr(rootStart, pos - rootStart);
+                token.start = rootStart;
+            }
+            else
+                pos = initialStart + 6;
+        }
+        else
+            token.start = initialStart;
+        token.path = initialName;
         token.member = token.path;
         token.receiver = token.path;
 
@@ -432,6 +455,7 @@ static std::vector<SymbolLineToken> ScanSymbolLine(
             token.path += "." + line.substr(memberStart, pos - memberStart);
             token.member = line.substr(memberStart, pos - memberStart);
             token.hasMember = true;
+            token.start = memberStart;
             (void)arrow;
         }
         token.end = pos;
@@ -1012,8 +1036,20 @@ static bool ReadSourceLines(const std::string& path, std::vector<std::string>& l
     return true;
 }
 
+static std::string JoinSourceLines(const std::vector<std::string>& lines)
+{
+    std::string text;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        if (i != 0) text += '\n';
+        text += lines[i];
+    }
+    return text;
+}
+
 static void DumpSymbolLine(const LspSymbolIndex& index,
                            const std::vector<std::string>& sourceLines,
+                           const std::string& sourceText,
                            size_t lineNumber, bool& firstLine,
                            const std::string& preferredFile,
                            int scopeStartLine, int scopeEndLine,
@@ -1036,7 +1072,17 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
     {
         const SymbolDef* def = index.LookupResolvedCall(
             preferredFile, (int)lineNumber, (int)token.start);
-        if (!def) def = index.Lookup(token.path);
+        if (!def)
+        {
+            if (token.isGlobalQualified)
+                def = index.Lookup(token.path);
+            else
+                def = LookupEnclosingNamespaceMember(
+                    &index,
+                    FindEnclosingNamespaceName(sourceText, (int)lineNumber - 1,
+                                               (int)token.start),
+                    token.path);
+        }
         if (preferredFunction && lineNumber == (size_t)preferredFunction->line)
         {
             const std::string preferredName = SymbolDisplayName(*preferredFunction);
@@ -1326,6 +1372,7 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
 
     bool firstLine = true;
     std::vector<std::string> inputLines;
+    std::string inputText;
     bool inputLinesRead = false;
     std::vector<std::vector<SymbolLineToken>> inputLineTokens;
     for (const auto& selector : selectors)
@@ -1340,6 +1387,7 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
                     return 1;
                 }
                 inputLinesRead = true;
+                inputText = JoinSourceLines(inputLines);
                 inputLineTokens = ScanSymbolLines(inputLines);
             }
             for (size_t lineNumber = selector.firstLine;; ++lineNumber)
@@ -1347,7 +1395,7 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
                 const std::vector<SymbolLineToken> emptyTokens;
                 const auto& lineTokens = lineNumber <= inputLineTokens.size()
                     ? inputLineTokens[lineNumber - 1] : emptyTokens;
-                DumpSymbolLine(index, inputLines, lineNumber, firstLine,
+                DumpSymbolLine(index, inputLines, inputText, lineNumber, firstLine,
                                std::filesystem::absolute(*source).string(), 0, 0, lineTokens);
                 if (lineNumber == selector.lastLine) break;
             }
@@ -1377,12 +1425,13 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
             return 1;
         }
         const auto functionLineTokens = ScanSymbolLines(functionLines);
+        const std::string functionText = JoinSourceLines(functionLines);
         for (size_t lineNumber = startLine;; ++lineNumber)
         {
             const std::vector<SymbolLineToken> emptyTokens;
             const auto& lineTokens = lineNumber <= functionLineTokens.size()
                 ? functionLineTokens[lineNumber - 1] : emptyTokens;
-            DumpSymbolLine(index, functionLines, lineNumber, firstLine, def->file,
+            DumpSymbolLine(index, functionLines, functionText, lineNumber, firstLine, def->file,
                            (int)startLine, (int)endLine, lineTokens, def);
             if (lineNumber == endLine) break;
         }

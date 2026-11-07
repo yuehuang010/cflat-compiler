@@ -502,3 +502,9 @@ expect_error("cannot pass a raw pointer 'long*' as array-view parameter 'v' ('in
     int rjrTake(int[] v) { return v == nullptr ? 0 : v[0]; }
     int rjrCall(int c) { long a = 1; long* l = &a; return rjrTake(c != 0 ? l : nullptr); }
 }
+
+// A direct `new T[n]` argument names its element in the diagnostic, not the generic stand-in.
+expect_error("cannot pass an array view of 'int*' as parameter 'p' of 'ptake'") {
+    int ptake(int* p) { return 0; }
+    int ptakeCall() { return ptake(new int*[1]); }
+}

@@ -128,3 +128,7 @@ private:
     std::unordered_map<std::string, std::vector<VariableInfo>> variableLocations_;
     std::vector<UnusedCandidate> candidates_;
 };
+
+const SymbolDef* LookupEnclosingNamespaceMember(
+    const LspSymbolIndex* index, std::string fromNamespace, const std::string& memberPath);
+std::string FindEnclosingNamespaceName(const std::string& text, int line, int character);

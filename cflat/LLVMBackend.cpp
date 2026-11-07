@@ -3026,10 +3026,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 // set no matter where the `using` sits in the file.
                 scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterEnums(decl);
+                for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 // Second pass: register non-generic struct shells and function signatures.
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterGlobals(decl);
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
                 scanner.FinalizeViewFieldMoveInference();
@@ -4337,9 +4341,13 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 // Type aliases first (see the main-file scan for why).
                 scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterEnums(decl);
+                for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterGlobals(decl);
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
                 scanner.FinalizeViewFieldMoveInference();
@@ -5327,9 +5335,13 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 // set no matter where the `using` sits in the file.
                 scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterEnums(decl);
+                for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterGlobals(decl);
                 scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
                 scanner.FinalizeViewFieldMoveInference();
@@ -7980,7 +7992,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("p"))  s.Pointer = *v;
     if (auto v = o.getBoolean("ep")) s.ElemPointer = *v;
     if (auto v = o.getInteger("pd")) s.PointerDepth = static_cast<int>(*v);
-    if (auto v = o.getInteger("cm")) s.ConstMask = static_cast<uint8_t>(*v);
+    if (auto v = o.getInteger("cm")) s.ConstMask = static_cast<uint32_t>(*v);
     if (auto v = o.getBoolean("if")) s.IsInterface = *v;
     if (auto v = o.getBoolean("ifp"))s.IsInterfacePointer = *v;
     if (auto v = o.getBoolean("nl")) s.IsNullable = *v;
@@ -8028,7 +8040,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
         if (s.FuncPtrReturnPointer) s.FuncPtrReturnPointerDepth = 1;
         if (auto v = o.getInteger("fprd")) s.FuncPtrReturnPointerDepth = static_cast<int>(*v);
         if (auto v = o.getString("fprk")) s.FuncPtrReturnResolvedKey = v->str();
-        if (auto v = o.getInteger("fprc")) s.FuncPtrReturnConstMask = static_cast<int>(*v);
+        if (auto v = o.getInteger("fprc")) s.FuncPtrReturnConstMask = static_cast<int64_t>(*v);
         if (auto* fps = o.getArray("fpp"))
             for (auto& elem : *fps)
                 if (auto* po = elem.getAsObject())
@@ -8050,7 +8062,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
-                    if (auto v = po->getInteger("cm")) p.ConstMask = static_cast<int>(*v);
+                    if (auto v = po->getInteger("cm")) p.ConstMask = static_cast<int64_t>(*v);
                     if (auto v = po->getString("as")) p.AliasSpelling = v->str();
                     if (auto* nested = po->getObject("fts"))
                         p.FunctionTypeSignature = std::make_shared<LLVMBackend::SerializedTav>(
@@ -9128,7 +9140,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* obj = root->getObject("type_alias_const_masks"))
         for (auto& kv : *obj)
             if (auto v = kv.second.getAsInteger())
-                typeAliasConstMasks[kv.first.str()] = static_cast<uint8_t>(*v);
+                typeAliasConstMasks[kv.first.str()] = static_cast<uint32_t>(*v);
     if (auto* arr = root->getArray("cxx_nullptr_t_aliases"))
         for (auto& elem : *arr)
             if (auto v = elem.getAsString()) cxxNullptrTAliases_.insert(v->str());

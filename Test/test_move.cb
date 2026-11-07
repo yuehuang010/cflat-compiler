@@ -19461,6 +19461,308 @@ unique Resource* fe2FieldMake(int id)
     return move p;
 }
 
+int moveviewTestSink(move int[] p)
+{
+    int n = 0;
+    for (int x in p) n += x;
+    return n;
+}
+
+int[] moveviewGlobalSource = default;
+int[2] moveviewBorrowedFixed = {11, 12};
+int[] moveviewBorrowedGlobal = default;
+int[] moveviewAssignmentGlobal = default;
+
+int moveviewTestGlobalMove()
+{
+    moveviewGlobalSource = new int[3];
+    moveviewGlobalSource[1] = 9;
+    int[] first = move moveviewGlobalSource;
+    moveviewGlobalSource = new int[2];
+    moveviewGlobalSource[0] = 4;
+    int[] second = move moveviewGlobalSource;
+    return first[1] * 10 + second[0];
+}
+
+int moveviewTestStaticMove()
+{
+    static int[] source;
+    if (source == nullptr) source = new int[3];
+    source[0] = 5;
+    int[] value = move source;
+    return value[0];
+}
+
+int moveviewTestBorrowedGlobalMove()
+{
+    moveviewBorrowedGlobal = moveviewBorrowedFixed;
+    int[] value = move moveviewBorrowedGlobal;
+    return value[0] * 10 + moveviewBorrowedFixed[1];
+}
+
+int moveviewTestDiamondSink(int choice)
+{
+    int k = 0;
+    int[] value = new int[3];
+    value[0] = 1; value[1] = 2; value[2] = 3;
+    if (choice > 0) k++;
+    if (choice > 1) k++;
+    if (choice > 2) k++;
+    if (choice > 3) k++;
+    if (choice > 4) k++;
+    if (choice > 5) k++;
+    if (choice > 6) k++;
+    if (choice > 7) k++;
+    if (choice > 8) k++;
+    if (choice > 9) k++;
+    if (choice > 10) k++;
+    if (choice > 11) k++;
+    if (choice > 12) k++;
+    if (choice > 13) k++;
+    if (choice > 14) k++;
+    if (choice > 15) k++;
+    if (choice > 16) k++;
+    if (choice > 17) k++;
+    if (choice > 18) k++;
+    if (choice > 19) k++;
+    if (choice > 20) k++;
+    if (choice > 21) k++;
+    if (choice > 22) k++;
+    if (choice > 23) k++;
+    if (choice > 24) k++;
+    if (choice > 25) k++;
+    if (choice > 26) k++;
+    if (choice > 27) k++;
+    if (choice > 28) k++;
+    if (choice > 29) k++;
+    return moveviewTestSink(move value) * 100 + k;
+}
+
+int moveviewTestHeapLocal()
+{
+    int[] a = new int[3];
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    int[] b = move a;
+    int n = 0;
+    for (int x in a) n += 100;
+    for (int x in b) n += 10;
+    return n;
+}
+
+int moveviewTestHeapSink()
+{
+    int[] a = new int[3];
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    int n = moveviewTestSink(move a);
+    for (int x in a) n += 100;
+    return n;
+}
+
+int moveviewTestBorrowedParam(int[] p)
+{
+    int[] d = move p;
+    int n = 0;
+    for (int x in p) n += 100;
+    for (int x in d) n++;
+    return n;
+}
+
+int moveviewTestConditionalLocal(bool useHeap)
+{
+    int[3] storage = {1, 2, 3};
+    int[] a = storage;
+    if (useHeap) {
+        a = new int[3];
+        a[0] = 1; a[1] = 2; a[2] = 3;
+    }
+    int[] b = move a;
+    int n = 0;
+    for (int x in a) n += 100;
+    for (int x in b) n++;
+    return n;
+}
+
+int moveviewTestHeapReassign()
+{
+    int[] a = new int[3];
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    int[] b = move a;
+    a = new int[1];
+    a[0] = 9;
+    int n = 0;
+    for (int x in a) n += x;
+    for (int x in b) n += x * 10;
+    return n;
+}
+
+int moveviewTestMoveParamSink(move int[] p)
+{
+    return moveviewTestSink(move p);
+}
+
+int moveviewTestParamSinkCaller()
+{
+    int[] a = new int[3];
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    int n = moveviewTestMoveParamSink(move a);
+    for (int x in a) n += 100;
+    return n;
+}
+
+int moveviewTestConditionalHeapSink(bool replace)
+{
+    int[] a = new int[3];
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    if (replace) {
+        a = new int[3];
+        a[0] = 1; a[1] = 2; a[2] = 3;
+    }
+    int n = moveviewTestSink(move a);
+    for (int x in a) n += 100;
+    return n;
+}
+
+int testMoveViewFrozenAcceptSet()
+{
+    int passed = 0;
+    bool printOnPassWas = printOnPass;
+    printOnPass = true;
+    passed += Test("moveview_accept_heap_local", moveviewTestHeapLocal(), 30);
+    passed += Test("moveview_accept_heap_sink", moveviewTestHeapSink(), 6);
+    {
+        int[] caller = new int[3];
+        caller[0] = 1; caller[1] = 2; caller[2] = 3;
+        int borrowedResult = moveviewTestBorrowedParam(caller)
+            + moveviewTestBorrowedParam(caller);
+        int callerSum = 0;
+        for (int x in caller) callerSum += x;
+        passed += Test("moveview_accept_borrowed_param", borrowedResult * 10 + callerSum, 66);
+    }
+    passed += Test("moveview_accept_conditional_local",
+        moveviewTestConditionalLocal(false) * 10 + moveviewTestConditionalLocal(true), 33);
+    passed += Test("moveview_accept_heap_reassign", moveviewTestHeapReassign(), 69);
+    passed += Test("moveview_accept_move_param_sink", moveviewTestParamSinkCaller(), 6);
+    passed += Test("moveview_accept_conditional_heap_sink",
+        moveviewTestConditionalHeapSink(false) * 10
+            + moveviewTestConditionalHeapSink(true), 66);
+    printOnPass = printOnPassWas;
+    return passed;
+}
+
+int testMoveViewGlobalStorage()
+{
+    int passed = 0;
+    bool printOnPassWas = printOnPass;
+    printOnPass = true;
+    HeapAudit.enable();
+    i64 moveviewHeapBase = (i64)HeapAudit.reportLeaks();
+    passed += Test("moveview_global_move_value", moveviewTestGlobalMove(), 94);
+    passed += Test("moveview_global_move_heap",
+        (i64)HeapAudit.reportLeaks() - moveviewHeapBase, (i64)0);
+    moveviewHeapBase = (i64)HeapAudit.reportLeaks();
+    passed += Test("moveview_static_move_value",
+        moveviewTestStaticMove() * 10 + moveviewTestStaticMove(), 55);
+    passed += Test("moveview_static_move_heap",
+        (i64)HeapAudit.reportLeaks() - moveviewHeapBase, (i64)0);
+    moveviewHeapBase = (i64)HeapAudit.reportLeaks();
+    passed += Test("moveview_borrowed_global_move", moveviewTestBorrowedGlobalMove(), 122);
+    passed += Test("moveview_borrowed_global_heap",
+        (i64)HeapAudit.reportLeaks() - moveviewHeapBase, (i64)0);
+    passed += Test("moveview_30_diamond_sink", moveviewTestDiamondSink(30), 630);
+    printOnPass = printOnPassWas;
+    return passed;
+}
+
+int moveviewTestBraceLocal()
+{
+    int[] a = {1, 2, 3};
+    int[] b = move a;
+    int n = 0;
+    for (int x in a) n++;
+    for (int x in b) n += 10;
+    return n;
+}
+
+int moveviewTestFixedLocal()
+{
+    int[3] storage = {1, 2, 3};
+    int[] a = storage;
+    int[] b = move a;
+    int n = 0;
+    for (int x in a) n++;
+    for (int x in b) n += 10;
+    return n;
+}
+
+int moveviewTestFrameReassign()
+{
+    int[3] storage = {1, 2, 3};
+    int[] a = storage;
+    int[] b = move a;
+    a = new int[1];
+    a[0] = 9;
+    int n = 0;
+    for (int x in a) n += x;
+    for (int x in b) n += x * 10;
+    return n;
+}
+
+int moveviewTestFrameAssignment()
+{
+    int[3] storage = {1, 2, 3};
+    int[] a = storage;
+    int[] v = new int[2];
+    v = move a;
+    int n = 0;
+    for (int x in a) n++;
+    for (int x in v) n += 10;
+    return n;
+}
+
+int moveviewTestGlobalFrameAssignment()
+{
+    int[3] storage = {1, 2, 3};
+    int[] a = storage;
+    moveviewAssignmentGlobal = move a;
+    int[] v = move moveviewAssignmentGlobal;
+    return v[0] * 100 + v[1] * 10 + v[2];
+}
+
+int moveviewTestHeapAssignment()
+{
+    int[] w = new int[3];
+    w[0] = 1; w[1] = 2; w[2] = 3;
+    int[] v = new int[2];
+    v = move w;
+    int n = 0;
+    for (int x in w) n += 100;
+    for (int x in v) n += x * 10;
+    return n * 10 + (w == nullptr ? 1 : 0);
+}
+
+int testMoveViewAssignmentOwnership()
+{
+    int passed = 0;
+    bool printOnPassWas = printOnPass;
+    printOnPass = true;
+    HeapAudit.enable();
+    i64 moveviewAssignHeapBase = (i64)HeapAudit.reportLeaks();
+    passed += Test("moveview_assign_frame_value", moveviewTestFrameAssignment(), 30);
+    passed += Test("moveview_assign_frame_heap",
+        (i64)HeapAudit.reportLeaks() - moveviewAssignHeapBase, (i64)0);
+    moveviewAssignHeapBase = (i64)HeapAudit.reportLeaks();
+    passed += Test("moveview_assign_global_frame_value",
+        moveviewTestGlobalFrameAssignment(), 123);
+    passed += Test("moveview_assign_global_frame_heap",
+        (i64)HeapAudit.reportLeaks() - moveviewAssignHeapBase, (i64)0);
+    moveviewAssignHeapBase = (i64)HeapAudit.reportLeaks();
+    passed += Test("moveview_assign_heap_value", moveviewTestHeapAssignment(), 601);
+    passed += Test("moveview_assign_heap_old_buffer_and_owner_once",
+        (i64)HeapAudit.reportLeaks() - moveviewAssignHeapBase, (i64)0);
+    printOnPass = printOnPassWas;
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -19468,6 +19770,13 @@ extern int main()
     total += 12;
     passed += testT488MemberDestructionOrder();
     total += 8;
+
+    passed += testMoveViewFrozenAcceptSet();
+    total += 7;
+    passed += Test("moveview_brace_local", moveviewTestBraceLocal(), 30);
+    passed += Test("moveview_fixed_local", moveviewTestFixedLocal(), 30);
+    passed += Test("moveview_frame_reassign", moveviewTestFrameReassign(), 69);
+    total += 3;
 
     T425AddrBox t425Addr = default;
     t425Addr.xs.add(13);
@@ -19951,6 +20260,11 @@ extern int main()
 
     passed += testBucketAExpressionOwnership();
     total += 109;
+
+    passed += testMoveViewGlobalStorage();
+    total += 7;
+    passed += testMoveViewAssignmentOwnership();
+    total += 6;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

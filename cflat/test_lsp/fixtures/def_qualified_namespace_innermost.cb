@@ -1,0 +1,10 @@
+// $cursor line=4 col=17
+// $expect definition line=2
+namespace B { int f() { return 90; } }
+namespace A {
+    namespace B { int f() { return 10; } }
+    int g() {
+        return B.f();
+    }
+}
+extern int main() { return A.g(); }

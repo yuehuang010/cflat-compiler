@@ -186,6 +186,30 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         }
 
         llvm::GlobalVariable* gVar = nullptr;
+        {
+            auto it = globalNamedVariable.find(typeValue.VariableName);
+            if (it != globalNamedVariable.end() && it->second->getValueType() == destinationType
+                && ((externalDecl && it->second->getMetadata("cflat.forward_external"))
+                    || (!externalDecl && it->second->getMetadata("cflat.forward_definition"))))
+            {
+                gVar = it->second;
+                if (!externalDecl)
+                {
+                    gVar->setInitializer(initValue);
+                    gVar->setMetadata("cflat.forward_definition", nullptr);
+                }
+            }
+        }
+        if (!externalDecl && gVar == nullptr)
+        {
+            auto* declared = module->getNamedGlobal(symbolName);
+            if (declared != nullptr && declared->getMetadata("cflat.forward_external")
+                && declared->isDeclaration() && declared->getValueType() == destinationType)
+            {
+                gVar = declared;
+                gVar->setInitializer(initValue);
+            }
+        }
         // A C++ companion may already carry the definition of an inline template static. Reuse
         // that exact symbol instead of creating LLVM's suffixed duplicate (count.3), which would
         // split CFlat reads from C++ member functions that reference the unsuffixed symbol.
@@ -225,7 +249,7 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
             typeValue.GuardedBy = pendingGlobalGuardedBy;
 
         globalNamedVariable[typeValue.VariableName] = gVar;
-        if (typeValue.IsArrayView && !externalDecl)
+        if (typeValue.IsArrayView && !externalDecl && !gVar->getMetadata("cflat.array-view.length"))
         {
             auto* lengthTy = builder->getInt64Ty();
             auto* lengthGlobal = new llvm::GlobalVariable(*module, lengthTy, false,
@@ -760,7 +784,7 @@ bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
             if (calledType == nullptr || !calledType->IsFunctionPointer
                 || calledType->FuncPtrReturnConstMask <= 0)
                 return false;
-            const int mask = calledType->FuncPtrReturnConstMask;
+            const uint32_t mask = static_cast<uint32_t>(calledType->FuncPtrReturnConstMask);
             return calledType->FuncPtrReturnPointer
                 ? IsCxxRecord(calledType->FuncPtrReturnTypeName) && (mask & 1) != 0
                 : calledType->FuncPtrReturnAlias && (mask & 1) != 0;

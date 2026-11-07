@@ -56,6 +56,21 @@ expect_error("generic method 'm'") {
     };
 }
 
+// A generic request queued inside a scoped block must not outlive the error the block swallowed:
+// the leftover record drained at the struct's flush and reported the same name again.
+struct ExpErrLeftBad<T> { int q = expErrLeftoverMissing; };
+struct ExpErrLeftHolder
+{
+    int run()
+    {
+        expect_error("Undefined variable expErrLeftoverFoo.") {
+            ExpErrLeftBad<ExpErrLeftHolder>* leftover = nullptr;
+            int x = expErrLeftoverFoo;
+        }
+        return 0;
+    }
+};
+
 struct EivBareBadMethod<T> { int bad() { return eivBareMethodUndefinedName; } };
 int eivBareMethod()
 {

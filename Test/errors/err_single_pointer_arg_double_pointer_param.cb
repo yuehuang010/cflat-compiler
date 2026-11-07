@@ -12,13 +12,6 @@ class SpCircle { int r = 0; };
 
 int spByPtrPtr(SpCircle** c) { return 3000 + (*c)->r; }
 
-// A 'T***' PARAMETER used to compile (clamped to 'T**' with no diagnostic), which is what made
-// the note understate a triple pointer. It is now refused where the stars are written, so this
-// declaration is a file-scope expectation instead of a callable helper.
-expect_error("declared type 'SpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
-    int spByTriple(SpCircle*** c) { return 4000; }
-}
-
 class SpBox { int take(SpCircle** c) { return 3000 + (*c)->r; } };
 
 class SpWrap { SpCircle** pp = nullptr; SpWrap(SpCircle** p) { pp = p; } };
@@ -61,9 +54,6 @@ extern int main()
         SpCircle** pp = &a;
         int r = spByPtrPtr(*pp);
     }
-
-    // 'T*' into 'T***' no longer needs a scorer answer at all: the parameter cannot be declared
-    // (file-scope leg above), so the mismatch is refused one stage earlier, at the written stars.
 
     // A METHOD call scores through the same scorer, with 'this' occupying parameter 0 - so the
     // note names parameter 1. Pins that the index is the PARAMETER index, not the argument index.

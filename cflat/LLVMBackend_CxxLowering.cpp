@@ -1379,8 +1379,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     if (!blocked && !softRefused && !c.needsLocalDefinition
                         && referenceRejection.empty())
                     {
-                        const int sourceMask = got.PointeeConstMask();
-                        const int targetMask = want.PointeeConstMask();
+                        const uint32_t sourceMask = got.PointeeConstMask();
+                        const uint32_t targetMask = want.PointeeConstMask();
                         const bool addsConst = sourceMask != targetMask
                             && (sourceMask | targetMask) == targetMask;
                         referenceRejection = addsConst

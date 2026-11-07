@@ -3887,3 +3887,81 @@ template<class T> int operator-(const T&) { return 6; }
 // A const C& call result: the mutable `C&` free is refused, the template binds (clang: 6).
 inline const R3S& r3ConstRef(R3S& x) { return x; }
 }
+
+namespace opun {
+struct K { int v; };
+inline const K& cref(K& x) { return x; }
+inline int operator+=(K&, int) { return 11; }
+template<class T> int operator+=(T&, int) { return 21; }
+struct Z {};
+struct Q { int v; };
+inline const Q& qref(Q& x) { return x; }
+template<class Z> int operator-=(Z&, int) { return 61; }
+struct Tf { int operator+(int) { return 11; } };
+template<class T> int operator+(K&, T) { return 99; }
+}
+namespace opun_named {
+struct Z {};
+struct Q { int v; };
+inline const Q& qref(Q& x) { return x; }
+template<class Z> int operator+=(Z&, int) { return 61; }
+}
+
+namespace opun_axes {
+struct A { int v; };
+inline const A& cref(A& a) { return a; }
+inline int operator-=(A&, int) { return 11; }
+inline int operator*=(A&, int) { return 12; }
+inline int operator<<=(A&, int) { return 13; }
+inline int operator+(A&, int) { return 14; }
+template<class T> int operator-=(T&, int) { return 21; }
+template<class T> int operator*=(T&, int) { return 22; }
+template<class T> int operator<<=(T&, int) { return 23; }
+template<class T> int operator+(T&, int) { return 24; }
+struct B { int operator+=(int) { return 31; } };
+inline const B& bref(B& b) { return b; }
+template<class T> int operator+=(T&, int) { return 32; }
+struct Dual { int operator+(int) { return 41; } int operator+(double) { return 42; } };
+}
+namespace opun_forward {
+struct Z;
+struct Q {};
+inline const Q& qref(Q& q) { return q; }
+template<class Z> int operator+=(Z&, int) { return 61; }
+template<class Z> int operator-=(Z&, int) { return 62; }
+template<class Z> int operator+(Z&, int) { return 63; }
+}
+// OPUNARY r2: a global-scope class with no free operator template, so clang decides a floating RHS alone.
+struct TfG { int operator+(int) { return 11; } };
+struct OpunHold {};
+struct ShG { int operator<<(int x) { return x; } };
+namespace opfl {
+struct Bool1 { int operator+(bool b) { return b ? 5 : 6; } };
+struct CRef { int operator+(const int& x) { return x; } };
+struct Mut { int operator+(int& x) { return x; } };
+struct Ch { int operator+(char c) { return c; } };
+struct Un { int operator+(unsigned u) { return (int)u; } };
+struct Sh { int operator+(short x) { return x; } };
+struct Ll { int operator+(long long x) { return (int)x; } };
+struct Mn { int operator-(int x) { return x; } };
+struct Cmp { int operator+=(int x) { return x; } };
+struct Df { int operator+(float f) { return (int)f; } };
+struct Amb { int operator+(int) { return 1; } int operator+(long) { return 2; } };
+struct FI { int operator+(int) { return 1; } int operator+(float) { return 2; } };
+struct Fr {};
+inline int operator+(Fr&, int x) { return x; }
+inline int operator+(int x, Fr&) { return x + 100; }
+}
+namespace opfc {
+struct FI1 {};
+inline int operator-(FI1&, const int& x) { return x; }
+struct FB1 {};
+inline int operator-(FB1&, const bool& x) { return x ? 7 : 6; }
+struct FF1 {};
+inline int operator-(FF1&, const float& x) { return (int)x; }
+struct FC1 {};
+inline int operator-=(FC1&, const int& x) { return x; }
+}
+namespace opfu {
+struct IU { int operator+(int x) { return x; } int operator+(unsigned int x) { return 2; } };
+}

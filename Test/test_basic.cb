@@ -2050,9 +2050,102 @@ namespace T206Vla
     int local() { int[T206FileK] a = default; return (int)sizeof(a); }
 }
 
+namespace QoAcceptRoot { int fn() { return 90; } int value = 80; enum E : int { item = 70 }; }
+namespace QoAcceptOuter
+{
+    namespace QoAcceptRoot { int fn() { return 10; } int value = 20; enum E : int { item = 30 }; }
+    int call() { return QoAcceptRoot.fn(); }
+    int globalValue() { return QoAcceptRoot.value; }
+    int enumValue() { return (int)QoAcceptRoot.E.item; }
+    int rootCall() { return global::QoAcceptRoot.fn(); }
+    int rootValue() { return global::QoAcceptRoot.value; }
+    int rootEnum() { return (int)global::QoAcceptRoot.E.item; }
+}
+
+namespace QoLateUse
+{
+    int callRoot() { return QoLateRoot.fn(); }
+    int globalValue() { return QoLateRoot.value; }
+    int enumValue() { return (int)QoLateRoot.E.item; }
+    int enumArgument(QoLateRoot.E value) { return (int)value; }
+    int arrayValue() { return QoLateRoot.values[1]; }
+    int staticValue() { return QoLateRoot.hidden; }
+    int pointerValue() { return *QoLateRoot.pointer; }
+    int viewValue() { return QoLateRoot.view[0]; }
+    int externValue() { return QoLateRoot.qoExternValue; }
+    int externFunction() { return QoLateRoot.abs(-12); }
+    int staticMethod() { return QoLateRoot.S.run(); }
+    int overload() { return QoLateRoot.pick(2); }
+    int generic() { return QoLateRoot.gen<int>(2); }
+    int nested() { return QoLateParent.Child.fn(); }
+    int rooted() { return global::QoLateRoot.fn(); }
+    struct Caller { int method() { return QoLateRoot.fn(); } };
+}
+namespace QoLateSibling
+{
+    namespace Use { int call() { return Target.fn(); } }
+    namespace Target { int fn() { return 22; } }
+}
+namespace QoLateRoot
+{
+    int fn() { return 20; }
+    int value = 3;
+    int[2] values = {4, 5};
+    static int hidden = 13;
+    int* pointer = &value;
+    int[] view = values;
+    extern int qoExternValue;
+    extern int abs(int x);
+    struct S { static int run() { return 23; } };
+    enum E : int { item = 7 };
+    int pick(int x) { return x + 10; }
+    int pick(double x) { return 90; }
+    int gen<T>(T x) { return x + 10; }
+}
+int qoExternValue = 19;
+namespace QoLateParent.Child { int fn() { return 21; } }
+import "test_helper.cb" as QoLateAlias;
+namespace QoLateAliasUse
+{
+    int call() { return QoLateAlias.Test("q", 1, 1); }
+    namespace QoLateAlias { int Test(const char* name, int x, int y) { return 10; } }
+}
+namespace QoLateCollisionUse
+{
+    int call() { return QoLateCollision.fn(); }
+    namespace QoLateCollision { int fn() { return 11; } }
+}
+namespace QoLateCollision { int fn() { return 90; } }
+
 bool testNamespace()
 {
     bool result = true;
+    result &= Test("qualorder_accept_inner_function", QoAcceptOuter.call(), 10);
+    result &= Test("qualorder_accept_inner_global", QoAcceptOuter.globalValue(), 20);
+    result &= Test("qualorder_accept_inner_enum", QoAcceptOuter.enumValue(), 30);
+    result &= Test("qualorder_accept_root_function", QoAcceptOuter.rootCall(), 90);
+    result &= Test("qualorder_accept_root_global", QoAcceptOuter.rootValue(), 80);
+    result &= Test("qualorder_root_enum", QoAcceptOuter.rootEnum(), 70);
+    result &= Test("qualorder_late_function", QoLateUse.callRoot(), 20);
+    result &= Test("qualorder_late_global", QoLateUse.globalValue(), 3);
+    result &= Test("qualorder_late_enum", QoLateUse.enumValue(), 7);
+    result &= Test("qualorder_late_enum_signature", QoLateUse.enumArgument(QoLateRoot.E.item), 7);
+    result &= Test("qualorder_late_global_array", QoLateUse.arrayValue(), 5);
+    result &= Test("qualorder_late_static_global", QoLateUse.staticValue(), 13);
+    result &= Test("qualorder_late_pointer_global", QoLateUse.pointerValue(), 3);
+    result &= Test("qualorder_late_view_global", QoLateUse.viewValue(), 4);
+    result &= Test("qualorder_late_extern_global", QoLateUse.externValue(), 19);
+    result &= Test("qualorder_late_extern_function", QoLateUse.externFunction(), 12);
+    result &= Test("qualorder_late_static_method", QoLateUse.staticMethod(), 23);
+    result &= Test("qualorder_late_overload", QoLateUse.overload(), 12);
+    result &= Test("qualorder_late_generic", QoLateUse.generic(), 12);
+    result &= Test("qualorder_late_nested", QoLateUse.nested(), 21);
+    result &= Test("qualorder_late_rooted", QoLateUse.rooted(), 20);
+    result &= Test("qualorder_late_sibling", QoLateSibling.Use.call(), 22);
+    result &= Test("qualorder_late_alias_collision", QoLateAliasUse.call(), 10);
+    result &= Test("qualorder_both_late_collision", QoLateCollisionUse.call(), 11);
+    QoLateUse.Caller qoLateCaller = default;
+    result &= Test("qualorder_late_method", qoLateCaller.method(), 20);
     // T187: bare namespace variable beats the same-named global function and global variable.
     result &= Test("ns_var_over_global_fn", T187Ns.readVar(), 8);
     result &= Test("ns_var_over_global_fn_ternary", T187Ns.tern(1) * 10 + T187Ns.tern(0), 84);
@@ -2202,29 +2295,112 @@ namespace ShadowOther2
     int aliasedPlainStruct() { ShadowIN2.ShadowPt2 p; p.a = 4; p.b = 3; return p.a + p.b; }
 }
 
-namespace B { struct Late { int pick() { return 20; } }; }
+namespace B {}
+struct QualifiedLookupEnumBox<T> { T item = default; };
+namespace QualifiedLookupEnumA
+{
+    int enumGenericPick()
+    {
+        QualifiedLookupEnumBox<B.LateTone> box = default;
+        box.item = B.LateTone.Shade;
+        return (int)box.item;
+    }
+    namespace B { enum LateTone : int { Shade = 10 }; }
+}
+namespace B
+{
+    struct Late { int pick() { return 20; } };
+    struct L { int a = 0; int b = 0; int pick() { return 20; } };
+    interface I { int root(); };
+    int qualifiedLookupFunction() { return 90; }
+    int qualifiedLookupGlobal = 90;
+    int r3QualifiedGlobal = 90;
+    int X = 90;
+    enum LateTone : int { Shade = 90 };
+    enum Tone : int { Shade = 90 };
+}
 namespace A
 {
     namespace B
     {
         struct Late { int pick() { return 10; } };
+        struct L { int pick() { return 10; } };
+        interface I { int local(); };
         struct Box<T> { T item = default; };
+        int r3p<T>(T value) { return 10; }
+        int qualifiedLookupFunction() { return 10; }
+        int qualifiedLookupGlobal = 10;
+        enum Tone : int { Shade = 10 };
     }
     struct QualifiedHolder { B.Late value = default; };
     B.Late qualifiedPass(B.Late value) { return value; }
     int qualifiedLocalPick() { B.Late value; return value.pick(); }
     int qualifiedParameterReturnPick() { return qualifiedPass(B.Late()).pick(); }
     int qualifiedGenericPick() { B.Box<B.Late> value; return value.item.pick(); }
+    int qualifiedFunctionPick() { return B.qualifiedLookupFunction(); }
+    int qualifiedGlobalPick() { return B.qualifiedLookupGlobal; }
+    int qualifiedEnumPick() { return B.Tone.Shade; }
+    int qualifiedRootPick() { return global::B.qualifiedLookupFunction(); }
     (B.Late, int) qualifiedTupleValue() { B.Late value; return (value, 4); }
     int qualifiedFieldPick() { QualifiedHolder value; return value.value.pick(); }
+    namespace C
+    {
+        int qualifiedParentScopePick() { B.Late value; return value.pick(); }
+    }
     namespace Inner
     {
+        namespace B { struct Late { int pick() { return 5; } }; }
         int qualifiedNestedScopePick() { B.Late value; return value.pick(); }
     }
 }
+
+struct R3GlobalTypeBox<T> { T value = default; };
+struct R3InnerGlobalValue { int X = 10; };
+struct R3RootGlobalValue { int X = 90; };
+R3RootGlobalValue R3RootHead;
+namespace R3Holder { R3InnerGlobalValue B; int r3InnerGlobalVariableVsNamespacePick() { return B.X; } }
+namespace A
+{
+    class R3InterfaceImpl : B.I { int local() { return 10; } };
+    int r3QualifiedInterfacePick() { unique B.I value = new R3InterfaceImpl(); return value.local(); }
+    int r3QualifiedGenericFunctionPick() { return B.r3p<int>(1) + B.r3p(2); }
+    int r3GlobalTypePositions()
+    {
+        global::B.L direct = default;
+        R3GlobalTypeBox<global::B.L> boxed = default;
+        boxed.value = global::B.L();
+        return direct.pick() + boxed.value.pick() + global::B.L().pick();
+    }
+    int r4GlobalNew()
+    {
+        global::B.L* p = new global::B.L();
+        int value = p->pick();
+        delete p;
+        return value;
+    }
+    int r4GlobalNewAuto()
+    {
+        auto p = new global::B.L();
+        return p.pick();
+    }
+    int r4GlobalCast()
+    {
+        global::B.L value = default;
+        void* erased = &value;
+        global::B.L* p = (global::B.L*)erased;
+        return p->pick();
+    }
+    int r4GlobalSizeof() { return (int)sizeof(global::B.L); }
+    int r4GlobalArraySizeof() { return (int)sizeof(global::B.L[3]); }
+    int r4GlobalAlignof() { return (int)alignof(global::B.L); }
+    namespace R3RootHead { int X = 70; }
+    int r3RootGlobalVariableVsNamespacePick() { return R3RootHead.X; }
+    namespace R3ImportAlias { int Test(const char* name, int actual, int expected) { return 100; } }
+    int r3ImportAliasVsNamespacePick() { return R3ImportAlias.Test("r3", 1, 1); }
+}
 namespace QualifiedSibling { int qualifiedFallbackPick() { B.Late value; return value.pick(); } }
 int qualifiedTuplePick() {
-    (B.Late, int) value = A.qualifiedTupleValue();
+    (A.B.Late, int) value = A.qualifiedTupleValue();
     return value.item_0.pick() + value.item_1;
 }
 
@@ -2258,14 +2434,37 @@ bool testNamespaceTypeShadowing()
     result &= Test("ns_alias_reaches_generic_base", ShadowOther2.aliasedGenericBase(), 9);
     result &= Test("ns_alias_reaches_plain_struct", ShadowOther2.aliasedPlainStruct(), 7);
     result &= Test("ns_real_namespace_outranks_alias", shadowRealNamespaceOutranksAlias(), 1);
-    result &= Test("qualified_type_rooted_local_wins", A.qualifiedLocalPick(), 20);
-    result &= Test("qualified_type_rooted_parameter_return_wins", A.qualifiedParameterReturnPick(), 20);
-    result &= Test("qualified_type_rooted_tuple_wins", qualifiedTuplePick(), 24);
-    result &= Test("qualified_type_rooted_generic_arg_wins", A.qualifiedGenericPick(), 20);
-    result &= Test("qualified_type_rooted_field_wins", A.qualifiedFieldPick(), 20);
-    result &= Test("qualified_type_rooted_nested_scope_wins", A.Inner.qualifiedNestedScopePick(), 20);
+    result &= Test("qualified_type_inner_scope_wins", A.qualifiedLocalPick(), 10);
+    result &= Test("qualified_type_parameter_return_inner_scope_wins", A.qualifiedParameterReturnPick(), 10);
+    result &= Test("qualified_type_tuple_inner_scope_wins", qualifiedTuplePick(), 14);
+    result &= Test("qualified_type_generic_arg_inner_scope_wins", A.qualifiedGenericPick(), 10);
+    result &= Test("qualified_type_field_inner_scope_wins", A.qualifiedFieldPick(), 10);
+    result &= Test("qualified_type_nested_scope_innermost_wins", A.Inner.qualifiedNestedScopePick(), 5);
+    result &= Test("qualified_type_parent_scope_fallback", A.C.qualifiedParentScopePick(), 10);
+    result &= Test("qualified_function_inner_scope_wins", A.qualifiedFunctionPick(), 10);
+    result &= Test("qualified_global_inner_scope_wins", A.qualifiedGlobalPick(), 10);
+    result &= Test("qualified_enum_inner_scope_wins", A.qualifiedEnumPick(), 10);
+    result &= Test("qualified_enum_generic_arg_scanned_scope_wins", QualifiedLookupEnumA.enumGenericPick(), 10);
+    result &= Test("qualified_global_escape_keeps_root", A.qualifiedRootPick(), 90);
     result &= Test("qualified_type_sibling_fallback_pick", QualifiedSibling.qualifiedFallbackPick(), 20);
     result &= Test("qualified_type_enclosing_fallbacks", QualifiedFallback.run(), 30);
+    result &= Test("qualified_interface_inner_scope_wins", A.r3QualifiedInterfacePick(), 10);
+    result &= Test("qualified_generic_function_inner_scope_wins",
+        A.r3QualifiedGenericFunctionPick(), 20);
+    result &= Test("qualified_global_type_positions_escape_shadow",
+        A.r3GlobalTypePositions(), 60);
+    result &= Test("qualified_global_new_type_escapes_shadow", A.r4GlobalNew(), 20);
+    result &= Test("qualified_global_new_auto_type_escapes_shadow", A.r4GlobalNewAuto(), 20);
+    result &= Test("qualified_global_cast_type_escapes_shadow", A.r4GlobalCast(), 20);
+    result &= Test("qualified_global_sizeof_type_escapes_shadow", A.r4GlobalSizeof(), 8);
+    result &= Test("qualified_global_sizeof_array_type_escapes_shadow",
+        A.r4GlobalArraySizeof(), 24);
+    result &= Test("qualified_global_alignof_type_escapes_shadow", A.r4GlobalAlignof(), 4);
+    result &= Test("qualified_first_global_variable_scope_order",
+        R3Holder.r3InnerGlobalVariableVsNamespacePick() * 100
+            + A.r3RootGlobalVariableVsNamespacePick(), 1070);
+    result &= Test("qualified_namespace_outranks_import_alias",
+        A.r3ImportAliasVsNamespacePick(), 100);
     return result;
 }
 
@@ -5756,6 +5955,122 @@ class PdVec { int k = 0;
               int operator+(PdCircle* o) { return 100 + o->r; }
               int operator+(PdCircle** o) { return 200 + (*o)->r; } };
 
+// NEWDEPTH carrier fixtures: pointer depth is part of the value type at every level.
+using NdUsingP2 = int**;
+using NdUsingP3 = int***;
+using NdUsingP4 = int****;
+using NdUsingStarP3 = NdUsingP2*;
+using NdUsingStarP4 = NdUsingStarP3*;
+typedef int** NdTypedefP2;
+typedef int*** NdTypedefP3;
+typedef int**** NdTypedefP4;
+int*** ndGlobalP3 = nullptr;
+int**** ndGlobalP4 = nullptr;
+class NdDepthHolder { int*** p3 = nullptr; int**** p4 = nullptr; };
+class NdDepthBox<T> { T value = default; void Set(T v) { value = v; } T Get() { return value; } };
+int ndReadP3(int*** p) { return ***p; }
+int ndReadP4(int**** p) { return ****p; }
+int*** ndForwardP3(int*** p) { return p; }
+int**** ndForwardP4(int**** p) { return p; }
+function<int(int***)> ndReturnFnP3() { return ndReadP3; }
+function<int(int****)> ndReturnFnP4() { return ndReadP4; }
+int ndApplyFnP3(function<int(int***)> inner) { return inner(ndGlobalP3); }
+
+bool testNewDepthPointerCarrier()
+{
+    bool result = true;
+    int value = 11;
+    int* p = &value;
+    int** pp = &p;
+    int*** ppp = &pp;
+    int**** pppp = &ppp;
+    auto autoP3 = &pp;
+    auto autoP4 = &ppp;
+
+    result &= Test("nd_depth3_read", ***ppp, 11);
+    result &= Test("nd_address_of_auto_depth3", ndReadP3(autoP3), 11);
+    ***ppp = 12;
+    result &= Test("nd_depth3_write", value, 12);
+    result &= Test("nd_depth4_read", ****pppp, 12);
+    result &= Test("nd_address_of_auto_depth4", ndReadP4(autoP4), 12);
+    ****pppp = 13;
+    result &= Test("nd_depth4_write", value, 13);
+
+    ndGlobalP3 = ndForwardP3(ppp);
+    ndGlobalP4 = ndForwardP4(pppp);
+    result &= Test("nd_global_param_return_depth3", ndReadP3(ndGlobalP3), 13);
+    result &= Test("nd_global_param_return_depth4", ndReadP4(ndGlobalP4), 13);
+    NdDepthHolder holder = default;
+    holder.p3 = ndGlobalP3;
+    holder.p4 = ndGlobalP4;
+    result &= Test("nd_field_depth3", ndReadP3(holder.p3), 13);
+    result &= Test("nd_field_depth4", ndReadP4(holder.p4), 13);
+
+    NdUsingP3 usingP3 = ppp;
+    NdUsingP4 usingP4 = pppp;
+    NdUsingStarP3 usingStarP3 = &pp;
+    NdUsingStarP4 usingStarP4 = &usingStarP3;
+    NdTypedefP2 typedefP2 = pp;
+    NdTypedefP2* typedefStarP3 = &typedefP2;
+    NdTypedefP3 typedefP3 = ppp;
+    NdTypedefP4 typedefP4 = pppp;
+    result &= Test("nd_using_alias_depth3", ndReadP3(usingP3), 13);
+    result &= Test("nd_using_alias_depth4", ndReadP4(usingP4), 13);
+    result &= Test("nd_using_alias_plus_star_depth3", ndReadP3(usingStarP3), 13);
+    result &= Test("nd_using_alias_plus_star_depth4", ndReadP4(usingStarP4), 13);
+    result &= Test("nd_typedef_alias_depth3", ndReadP3(typedefP3), 13);
+    result &= Test("nd_typedef_alias_depth4", ndReadP4(typedefP4), 13);
+    result &= Test("nd_typedef_alias_plus_star_depth3", ndReadP3(typedefStarP3), 13);
+
+    NdDepthBox<int***> box = default;
+    box.Set(ppp);
+    result &= Test("nd_generic_type_argument_depth3", ndReadP3(box.Get()), 13);
+    NdDepthBox<int****> box4 = default;
+    box4.Set(pppp);
+    result &= Test("nd_generic_type_argument_depth4", ndReadP4(box4.Get()), 13);
+    list<int***> pointerList;
+    result &= Test("nd_list_type_argument_depth3", pointerList.count(), 0);
+
+    function<int(int***)> fn3 = ndReadP3;
+    function<int(int****)> fn4 = ndReadP4;
+    function<int(int***)> returnedFn3 = ndReturnFnP3();
+    function<int(int****)> returnedFn4 = ndReturnFnP4();
+    result &= Test("nd_function_pointer_parameter_depth3", fn3(ppp), 13);
+    result &= Test("nd_function_pointer_parameter_depth4", fn4(pppp), 13);
+    result &= Test("nd_function_pointer_return_depth3", returnedFn3(ppp), 13);
+    result &= Test("nd_function_pointer_return_depth4", returnedFn4(pppp), 13);
+    int*** cast3 = (int***)ppp;
+    int**** cast4 = (int****)pppp;
+    result &= Test("nd_cast_depth3", ndReadP3(cast3), 13);
+    result &= Test("nd_cast_depth4", ndReadP4(cast4), 13);
+    function<int(function<int(int***)>)> nestedFn = ndApplyFnP3;
+    result &= Test("nd_nested_function_pointer_depth3", nestedFn(fn3), 13);
+
+    int** slots3[2] = default;
+    slots3[0] = pp;
+    slots3[1] = pp;
+    int*** cursor3 = slots3;
+    int*** next3 = cursor3 + 1;
+    result &= Test("nd_depth3_index", **(cursor3[1]), 13);
+    result &= Test("nd_depth3_add_one", **(next3[0]), 13);
+    int*** slots4[2] = default;
+    slots4[0] = ppp;
+    slots4[1] = ppp;
+    int**** cursor4 = slots4;
+    int**** next4 = cursor4 + 1;
+    result &= Test("nd_depth4_index", ***(cursor4[1]), 13);
+    result &= Test("nd_depth4_add_one", ***(next4[0]), 13);
+
+    const int constValue = 19;
+    const int* constP1 = &constValue;
+    const int** constP2 = &constP1;
+    const int*** constP3 = &constP2;
+    const int**** constP4 = &constP3;
+    result &= Test("nd_const_depth3_read", ***constP3, 19);
+    result &= Test("nd_const_depth4_read", ****constP4, 19);
+    return result;
+}
+
 // Integer overloads rank by IDENTITY (ruling 2026-09-10): identity-exact, then promotion, then
 // conversion; a tie is an error (Test/errors/err_overload_ambiguous_tie.cb). Each set is declared
 // twice in OPPOSITE orders and every leg asserts both - the order-independence IS the assertion.
@@ -5777,9 +6092,109 @@ int oiSufA(u64 x)  { return 2; }
 // A lone 'wchar' parameter still takes a 'c16' (a same-width conversion on Windows).
 int oiWide(wchar x) { return 7; }
 
+// Allocation results retain their substituted and aliased pointer depth.
+int nd2pick(int* p) { return 1; }
+int nd2pick(int** p) { return 2; }
+int nd2pick(int*** p) { return 3; }
+int nd2pick(int**** p) { return 4; }
+int nd2pick(int***** p) { return 5; }
+int nd2generic<T>(T v) { auto p = new T(v); int r = nd2pick(p); if (*p != v) r = -1; delete p; return r; }
+int nd2genericStar<T>(T v) { auto p = new T*; *p = &v; int r = nd2pick(p); if (**p != v) r = -1; delete p; return r; }
+struct Nd2Box<T> { int run(T v) { auto p = new T(v); int r = nd2pick(p); if (*p != v) r = -1; delete p; return r; } };
+int nd2Five<T>(T v) {
+ auto a = new T(v); int r = nd2pick(a); if (*a != v) r = -100; delete a;
+ auto b = new T; *b = v; r += nd2pick(b); if (*b != v) r = -100; delete b;
+ T[] c = new T[2]; c[0] = v; r += nd2pick(&c[0]); if (c[0] != v) r = -100; delete[] c;
+ auto d = new T*; *d = &v; r += nd2pick(d); if (**d != v) r = -100; delete d;
+ T*[] e = new T*[2]; e[0] = &v; r += nd2pick(&e[0]); if (*e[0] != v) r = -100; delete[] e;
+ return r;
+}
+struct Nd2Five<T> { int run(T v) {
+ auto a = new T(v); int r = nd2pick(a); if (*a != v) r = -100; delete a;
+ auto b = new T; *b = v; r += nd2pick(b); if (*b != v) r = -100; delete b;
+ T[] c = new T[2]; c[0] = v; r += nd2pick(&c[0]); if (c[0] != v) r = -100; delete[] c;
+ auto d = new T*; *d = &v; r += nd2pick(d); if (**d != v) r = -100; delete d;
+ T*[] e = new T*[2]; e[0] = &v; r += nd2pick(&e[0]); if (*e[0] != v) r = -100; delete[] e;
+ return r;
+} };
+using Nd2ConstPointer = (const int)*;
+int nd2ConstGeneric<T>(T p) {
+ auto q = new T(p);
+ expect_error("const") { **q = 9; }
+ int r = **q; delete q; return r;
+}
+using Nd2PP = int**;
+using PP = int*;
+namespace Nd2Ns { using PP = int**; }
+// Round 2: a depth-2 element keeps its const below the top level through raw, view and auto forms.
+using R2Cp = (const int)*;
+using R2Cpp = (const int*)*;
+int nd2R2RawBind() {
+    int x = 4; int y = 5; R2Cp cp = &x; R2Cp cq = &y;
+    R2Cp** a = new R2Cp*[2]; a[0] = &cp; *a[0] = cq; int r = **a[0]; delete[] a; return r;
+}
+int nd2R2DeclView() {
+    int x = 4; int y = 5; R2Cp cp = &x; R2Cp cq = &y;
+    R2Cp*[] e = new R2Cp*[2]; e[0] = &cp; *e[0] = cq; int r = **e[0]; delete[] e; return r;
+}
+int nd2R2WholeAlias() {
+    int x = 4; int* p = &x; int* q = &x;
+    (const int*)* pp = &p; (const int*)* qq = &q;
+    R2Cpp* r = new R2Cpp[2]; r[0] = pp; *r = qq; int v = **r[0]; delete[] r; return v;
+}
+int nd2R2AutoGetPtr() {
+    int x = 4; R2Cp cp = &x;
+    auto a = new R2Cp*[2];
+    R2Cp** b = a.getPtr(0); b[0] = &cp; return **b[0];
+}
+// Inline `(const T)` / `const(T)` as the new type: the parenthesized const is the base level.
+int nd2R2ParenScalar() {
+    int x = 4; int* px = &x;
+    (const int)** q = new (const int)*(px); int r = **q; delete q; return r;
+}
+int nd2R2ParenArray() {
+    int x = 4; (const int)* px = &x;
+    (const int)**[] e = new (const int)**[2]; e[0] = &px; int r = **e[0]; delete[] e; return r;
+}
+
+int nd2Allocations() {
+ int x = 17; int* p = &x; int** pp = &p; int*** ppp = &pp;
+ Nd2ConstPointer cp = &x; auto cq = new Nd2ConstPointer(cp);
+ expect_error("const") { **cq = 9; }
+ if (**cq != 17 || nd2ConstGeneric<(const int)*>(cp) != 17) return 0; delete cq;
+ Nd2ConstPointer[] ca = new Nd2ConstPointer[2]; ca[0] = cp;
+ expect_error("const") { *ca[0] = 9; }
+ if (*ca[0] != 17) return 0; delete[] ca;
+ if (nd2generic<int**>(pp) != 3 || nd2generic<int***>(ppp) != 4) return 0;
+ if (nd2genericStar<int*>(p) != 3 || nd2genericStar<int**>(pp) != 4) return 0;
+ Nd2Box<int**> b = default; if (b.run(pp) != 3) return 0;
+ Nd2Five<int> f0 = default; Nd2Five<int*> f1 = default;
+ Nd2Five<int**> f2 = default; Nd2Five<int***> f3 = default;
+ if (nd2Five<int>(x) != 7 || nd2Five<int*>(p) != 12 || nd2Five<int**>(pp) != 17 || nd2Five<int***>(ppp) != 22) return 0;
+ if (f0.run(x) != 7 || f1.run(p) != 12 || f2.run(pp) != 17 || f3.run(ppp) != 22) return 0;
+ auto q = new Nd2PP(pp); if (nd2pick(q) != 3 || ***q != 17) return 0; delete q;
+ auto t = new Nd2Ns.PP(pp); if (nd2pick(t) != 3 || ***t != 17) return 0; delete t;
+ auto shallowAlias = new PP(p); if (nd2pick(shallowAlias) != 2 || **shallowAlias != 17) return 0; delete shallowAlias;
+ auto direct = new int**; *direct = pp;
+ if (nd2pick(direct) != 3 || ***direct != 17) return 0; delete direct;
+ auto aliasStar = new Nd2PP*(&pp);
+ if (nd2pick(aliasStar) != 4 || ****aliasStar != 17) return 0; delete aliasStar;
+ int*** raw = new int**[2]; raw[0] = pp; if (nd2pick(raw) != 3 || ***raw != 17) return 0; delete[] raw;
+ int**** raw4 = new int***[2]; raw4[0] = ppp;
+ if (nd2pick(raw4) != 4 || ****raw4 != 17) return 0; delete[] raw4;
+ return 1;
+}
+
 bool testOverloadResolution()
 {
     bool result = true;
+    result &= Test("newdepth2_allocations", nd2Allocations(), 1);
+    result &= Test("newdepth2_r2_depth2_const_raw_bind", nd2R2RawBind(), 5);
+    result &= Test("newdepth2_r2_depth2_const_decl_view", nd2R2DeclView(), 5);
+    result &= Test("newdepth2_r2_depth2_const_whole_alias", nd2R2WholeAlias(), 4);
+    result &= Test("newdepth2_r2_depth2_const_auto_getptr", nd2R2AutoGetPtr(), 4);
+    result &= Test("newdepth2_r2_paren_const_new_scalar", nd2R2ParenScalar(), 4);
+    result &= Test("newdepth2_r2_paren_const_new_array", nd2R2ParenArray(), 4);
 
     bool flag = false;
     result &= Test("free fn beats method this", readBack(&flag), 7);
@@ -5961,6 +6376,50 @@ bool testOverloadResolution()
     PdHold pdH = default;
     pdH.p = pdA;
     result &= Test("pd_addrof_ptr_field_into_ptrptr_param", pdByPtrPtr(&pdH.p), 1003);
+
+    // Const qualification stays intact through pointer chains deeper than eight levels.
+    int ndValue = 5;
+    int* nd1 = &ndValue;
+    int** nd2 = &nd1;
+    int*** nd3 = &nd2;
+    int**** nd4 = &nd3;
+    int***** nd5 = &nd4;
+    int****** nd6 = &nd5;
+    int******* nd7 = &nd6;
+    int******** nd8 = &nd7;
+    result &= Test("newdepth_d8_chain_value", ********nd8, 5);
+    int********* nd9 = &nd8;
+    *********nd9 = 9;
+    const int********* nd9Const = nd9;
+    result &= Test("newdepth_d9_const_conversion_value",
+        ndValue + *********nd9Const, 18);
+    int********** nd10 = &nd9;
+    int*********** nd11 = &nd10;
+    int************ nd12 = &nd11;
+    int************* nd13 = &nd12;
+    int************** nd14 = &nd13;
+    int*************** nd15 = &nd14;
+    int**************** nd16 = &nd15;
+    int***************** nd17 = &nd16;
+    int****************** nd18 = &nd17;
+    int******************* nd19 = &nd18;
+    int******************** nd20 = &nd19;
+    int********************* nd21 = &nd20;
+    int********************** nd22 = &nd21;
+    int*********************** nd23 = &nd22;
+    int************************ nd24 = &nd23;
+    int************************* nd25 = &nd24;
+    int************************** nd26 = &nd25;
+    int*************************** nd27 = &nd26;
+    int**************************** nd28 = &nd27;
+    int***************************** nd29 = &nd28;
+    int****************************** nd30 = &nd29;
+    int******************************* nd31 = &nd30;
+    // At depth 31 the nested const leaves the outer pointer assignable, as in clang++.
+    (const int******************************)* nd31Const = nd31;
+    nd31Const = nd31;
+    result &= Test("newdepth_d31_nested_const_mutable_top_value",
+        ndValue + *******************************nd31Const, 18);
 
     // Integer identity ranking, each leg in both declaration orders (oiPickA / oiPickB).
     int oiInt = 1;
@@ -7025,6 +7484,133 @@ MyInt  primitiveAliasAdd(MyInt a, MyInt b) { return a + b; }
 MyU32  primitiveAliasU32(MyU32 a, MyU32 b) { return a + b; }
 MyI64  primitiveAliasI64(MyI64 a, MyI64 b) { return a + b; }
 
+typedef int TDScopeTypedefAlias;
+using TDScopeUsingAlias = int;
+typedef int TDScopeNestedAlias;
+typedef int TDScopeIfAlias;
+typedef int TDScopeForAlias;
+typedef int TDScopeForInitAlias;
+typedef int TDScopeSwitchAlias;
+typedef int TDScopeStructAlias;
+using TDScopeCallbackAlias = function<int(int)>;
+int tdscopePick(int value) { return 1; }
+int tdscopePick(double value) { return 2; }
+int tdscopePick(char value) { return 3; }
+
+struct TDScopeBox<T> { T value = default; };
+using TDScopeOuterArgAlias = double;
+struct TDScopeOuterArgBox<T> { T value = default; };
+int tdscopeOuterArgPick(double value) { return 1; }
+int tdscopeOuterArgPick(char value) { return 2; }
+struct TDScopeAliasOwner
+{
+    using TDScopeStructAlias = double;
+    TDScopeStructAlias member = 1.5;
+};
+
+int tdscopeGenericBlock<T>(T input)
+{
+    {
+        typedef double TDScopeGenericLocal;
+        TDScopeGenericLocal value = 1.5;
+        function<int(TDScopeGenericLocal)> selected = tdscopePick;
+        return (int)input + (int)(value * 10) + selected(1);
+    }
+}
+
+int tdscopeOuterAliasGenericArgLeg()
+{
+    { using TDScopeOuterArgAlias = char; }
+    TDScopeOuterArgBox<TDScopeOuterArgAlias> box = default;
+    box.value = (TDScopeOuterArgAlias)2.5;
+    function<int(TDScopeOuterArgAlias)> selected = tdscopeOuterArgPick;
+    return (int)(box.value * 10.0) + selected(box.value);
+}
+
+int tdscopeIfAliasLeg()
+{
+    int inside = 0;
+    if (true)
+    {
+        typedef double TDScopeIfAlias;
+        TDScopeIfAlias value = 1.5;
+        function<int(TDScopeIfAlias)> selected = tdscopePick;
+        inside = (int)(value * 10) + selected(1);
+    }
+    TDScopeIfAlias restored = 1;
+    function<int(TDScopeIfAlias)> after = tdscopePick;
+    return inside + (int)(restored * 100) + after(1);
+}
+
+int tdscopeForAliasLeg()
+{
+    int inside = 0;
+    for (int i = 0; i < 1; i++)
+    {
+        typedef double TDScopeForAlias;
+        TDScopeForAlias value = 1.5;
+        function<int(TDScopeForAlias)> selected = tdscopePick;
+        inside = (int)(value * 10) + selected(1);
+    }
+    TDScopeForAlias restored = 1;
+    function<int(TDScopeForAlias)> after = tdscopePick;
+    return inside + (int)(restored * 100) + after(1);
+}
+
+int tdscopeForInitAliasLeg()
+{
+    int loopValue = 0;
+    for (typedef double TDScopeForInitAlias; loopValue < 1; loopValue++)
+    {
+        TDScopeForInitAlias value = 1.5;
+        function<int(TDScopeForInitAlias)> selected = tdscopePick;
+        loopValue = (int)(value * 10) + selected(1);
+    }
+    TDScopeForInitAlias restored = 1;
+    function<int(TDScopeForInitAlias)> after = tdscopePick;
+    return loopValue + (int)(restored * 100) + after(1);
+}
+
+int tdscopeSwitchAliasLeg()
+{
+    int inside = 0;
+    switch (1)
+    {
+        case 1:
+        {
+            typedef double TDScopeSwitchAlias;
+            TDScopeSwitchAlias value = 1.5;
+            function<int(TDScopeSwitchAlias)> selected = tdscopePick;
+            inside = (int)(value * 10) + selected(1);
+            break;
+        }
+        default: break;
+    }
+    TDScopeSwitchAlias restored = 1;
+    function<int(TDScopeSwitchAlias)> after = tdscopePick;
+    return inside + (int)(restored * 100) + after(1);
+}
+
+int tdscopeFunctionTypeAliasLeg()
+{
+    int inside = 0;
+    {
+        using TDScopeCallbackAlias = function<int(double)>;
+        TDScopeCallbackAlias selected = tdscopePick;
+        inside = selected(1);
+    }
+    TDScopeCallbackAlias restored = tdscopePick;
+    return inside * 10 + restored(1);
+}
+
+int tdscopeStructAliasLeg()
+{
+    TDScopeAliasOwner.TDScopeStructAlias memberType = 1.5;
+    TDScopeStructAlias global = 1;
+    function<int(TDScopeStructAlias)> selected = tdscopePick;
+    return (int)(memberType * 10) + (int)(global * 100) + selected(1);
+}
+
 bool testPrimitiveTypeAlias()
 {
     bool result = true;
@@ -7052,6 +7638,74 @@ bool testPrimitiveTypeAlias()
     LocalU8 byte = 255;
     result &= Test("local_alias_u8",      byte,                    255);
 
+    return result;
+}
+
+bool testBlockScopeTypeAliases()
+{
+    bool result = true;
+    int typedefResult = 0;
+    {
+        typedef double TDScopeTypedefAlias;
+        TDScopeTypedefAlias value = 1.5;
+        function<int(TDScopeTypedefAlias)> selected = tdscopePick;
+        typedefResult = (int)(value * 10) + selected(1);
+    }
+    TDScopeTypedefAlias typedefRestored = 1;
+    function<int(TDScopeTypedefAlias)> typedefAfter = tdscopePick;
+    typedefResult += (int)(typedefRestored * 100) + typedefAfter(1);
+    result &= Test("tdscope_typedef_block_restore", typedefResult, 118);
+
+    int usingResult = 0;
+    {
+        using TDScopeUsingAlias = double;
+        TDScopeUsingAlias value = 1.5;
+        function<int(TDScopeUsingAlias)> selected = tdscopePick;
+        usingResult = (int)(value * 10) + selected(1);
+    }
+    TDScopeUsingAlias usingRestored = 1;
+    function<int(TDScopeUsingAlias)> usingAfter = tdscopePick;
+    usingResult += (int)(usingRestored * 100) + usingAfter(1);
+    result &= Test("tdscope_using_block_restore", usingResult, 118);
+
+    int nestedResult = 0;
+    {
+        typedef double TDScopeNestedAlias;
+        TDScopeNestedAlias outer = 1;
+        function<int(TDScopeNestedAlias)> outerFn = tdscopePick;
+        nestedResult += (int)(outer * 10) + outerFn(0);
+        {
+            typedef char TDScopeNestedAlias;
+            TDScopeNestedAlias inner = 1;
+            function<int(TDScopeNestedAlias)> innerFn = tdscopePick;
+            nestedResult += (int)inner * 10 + innerFn(0);
+        }
+        TDScopeNestedAlias restored = 1;
+        function<int(TDScopeNestedAlias)> restoredFn = tdscopePick;
+        nestedResult += (int)(restored * 100) + restoredFn(0);
+    }
+    TDScopeNestedAlias global = 1;
+    function<int(TDScopeNestedAlias)> globalFn = tdscopePick;
+    nestedResult += (int)global + globalFn(0);
+    result &= Test("tdscope_nested_block_restore", nestedResult, 129);
+
+    result &= Test("tdscope_if_body_restore", tdscopeIfAliasLeg(), 118);
+    result &= Test("tdscope_for_body_restore", tdscopeForAliasLeg(), 118);
+    result &= Test("tdscope_for_init_restore", tdscopeForInitAliasLeg(), 119);
+    result &= Test("tdscope_switch_body_restore", tdscopeSwitchAliasLeg(), 118);
+    result &= Test("tdscope_function_type_alias_restore", tdscopeFunctionTypeAliasLeg(), 21);
+    result &= Test("tdscope_generic_body_alias", tdscopeGenericBlock<int>(2), 19);
+    result &= Test("tdscope_outer_alias_generic_arg", tdscopeOuterAliasGenericArgLeg(), 26);
+
+    TDScopeBox<int> box = default;
+    {
+        using TDScopeIntBox = TDScopeBox<int>;
+        TDScopeIntBox inside = default;
+        inside.value = 7;
+        box = inside;
+    }
+    result &= Test("tdscope_generic_specialization_alias_inside", box.value, 7);
+    result &= Test("tdscope_struct_alias_unchanged", tdscopeStructAliasLeg(), 116);
     return result;
 }
 
@@ -8422,6 +9076,50 @@ int testAliasTempCflatLifetime()
     return value * 100 + aliasTempCflatDtorOrder;
 }
 
+int strNullArgLength(string x) { return x.length(); }
+int strIsNullish(string x) { return x == nullptr ? 1 : 0; }
+
+// A null char* or nullptr operand wraps as the empty string (operator string(const char*)).
+bool testStringNullCharPtr()
+{
+    bool result = true;
+
+    string s = "a";
+    int eqNull = s == nullptr ? 1 : 0;
+    result &= Test("str_eq_nullptr_nonempty", eqNull, 0);
+    int neNull = s != nullptr ? 1 : 0;
+    result &= Test("str_ne_nullptr_nonempty", neNull, 1);
+    int nullLhs = nullptr == s ? 1 : 0;
+    result &= Test("str_nullptr_eq_lhs_nonempty", nullLhs, 0);
+    int nullLhsNe = nullptr != s ? 1 : 0;
+    result &= Test("str_nullptr_ne_lhs_nonempty", nullLhsNe, 1);
+
+    string e = "";
+    int emptyEq = e == nullptr ? 1 : 0;
+    result &= Test("str_eq_nullptr_empty", emptyEq, 1);
+    result &= Test("str_param_nullptr_nonempty", strIsNullish(s), 0);
+    result &= Test("str_param_nullptr_empty", strIsNullish(e), 1);
+
+    char* p = nullptr;
+    string d = p;
+    result &= Test("str_null_charptr_decl_len", d.length(), 0);
+    string a = "x";
+    a = p;
+    result &= Test("str_null_charptr_assign_len", a.length(), 0);
+    result &= Test("str_null_charptr_arg_len", strNullArgLength(p), 0);
+
+    char* q = new char[3];
+    q[0] = 'h';
+    q[1] = 'i';
+    q[2] = 0;
+    string t = q;
+    result &= Test("str_charptr_len", t.length(), 2);
+    result &= Test("str_charptr_data", t.data(), "hi");
+    result &= Test("str_charptr_arg_len", strNullArgLength(q), 2);
+    delete[] q;
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -8522,6 +9220,7 @@ extern int main()
     total++; passed += testNewArrayConstructor()            ? 1 : 0;
     total++; passed += testNewAssignNoOwnershipLeak()       ? 1 : 0;
     total++; passed += testStringType()                  ? 1 : 0;
+    total++; passed += testStringNullCharPtr()           ? 1 : 0;
     total++; passed += testChainedFieldUFCS()            ? 1 : 0;
     total++; passed += testStringLiteral()               ? 1 : 0;
     total++; passed += testFormatString()                ? 1 : 0;
@@ -8533,12 +9232,14 @@ extern int main()
     total++; passed += testStructWithString()            ? 1 : 0;
     total++; passed += testBraceEscapes()                ? 1 : 0;
     total++; passed += testOverloadResolution()          ? 1 : 0;
+    total++; passed += testNewDepthPointerCarrier()      ? 1 : 0;
     total++; passed += testStatic()                      ? 1 : 0;
     total++; passed += testCast()                        ? 1 : 0;
     total++; passed += testFloatFold()                    ? 1 : 0;
     total++; passed += testNullableTypes()               ? 1 : 0;
     total++; passed += testPointerArithmetic()           ? 1 : 0;
     total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
+    total++; passed += testBlockScopeTypeAliases()       ? 1 : 0;
     total++; passed += testPointerTypeAlias()            ? 1 : 0;
     total++; passed += testPointerScalarAcceptSet()      ? 1 : 0;
     total++; passed += testArrayTypeAlias()              ? 1 : 0;
@@ -13914,3 +14615,5 @@ bool testCountofSemantics()
             + (int)alignof(sizeofRowPointers2[1]), 2488);
     return result;
 }
+
+import "test_helper.cb" as R3ImportAlias;

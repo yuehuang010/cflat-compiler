@@ -1586,7 +1586,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         // ConstMask is part of the C++ callable's return type, including a reference referent.
         if (!cxxBoundary)
         {
-            int mask = CSpellingPointeeConstMask(retSpelling, retTV.ValuePointerDepth());
+            uint32_t mask = CSpellingPointeeConstMask(retSpelling, retTV.ValuePointerDepth());
             out.FuncPtrReturnConstMask = mask != 0 ? mask : retTV.PointeeConstMask();
         }
         else
@@ -1655,7 +1655,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             fp.IsPointeeConst = ptv.Pointer && parameterSpelling.starts_with("const ");
             if (!cxxBoundary)
             {
-                int mask = CSpellingPointeeConstMask(parameterSpelling, ptv.ValuePointerDepth());
+                uint32_t mask = CSpellingPointeeConstMask(parameterSpelling, ptv.ValuePointerDepth());
                 fp.ConstMask = mask != 0 ? mask : ptv.PointeeConstMask();
             }
             else if (fp.Pointer)
@@ -1663,7 +1663,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
                 const int valueDepth = fp.PointerDepth - (cxxPointerReference ? 1 : 0);
                 fp.ConstMask = CxxSpellingPointeeConstMask(parameterSpelling, valueDepth);
                 if (cxxPointerReference && CxxParamIsConstRefToPointer(parameterSpelling))
-                    fp.ConstMask |= 1 << fp.PointerDepth;
+                    fp.ConstMask |= static_cast<int64_t>(LLVMBackend::TypeAndValue::ConstBitAt(fp.PointerDepth));
             }
             if (cxxBoundary && ((cxxClassLvalueReference && !cxxPointerReference)
                 || (fp.IsRvalueRef && !cxxPointerReference)))

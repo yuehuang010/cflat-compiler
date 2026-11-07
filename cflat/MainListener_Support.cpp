@@ -475,7 +475,8 @@ std::vector<std::string> CollectDeclarationTypeSpecifierWords(
     {
         auto* typeSpec = declSpec->typeSpecifier();
         if (typeSpec == nullptr) continue;
-        const std::string text = typeSpec->getText();
+        const std::string rootSpelling = RootQualifiedTypeSpelling(typeSpec);
+        const std::string text = rootSpelling.empty() ? typeSpec->getText() : rootSpelling;
         if (IsSoftKeywordTypeSpecifier(text)) continue;
         words.push_back(text);
     }
@@ -599,11 +600,40 @@ std::vector<std::string> TypeSpecifierWords(
     CFlatParser::MultiWordTypeSuffixContext* suffix)
 {
     std::vector<std::string> words;
-    if (typeSpec != nullptr) words.push_back(typeSpec->getText());
+    if (typeSpec != nullptr)
+    {
+        const std::string rootSpelling = RootQualifiedTypeSpelling(typeSpec);
+        words.push_back(rootSpelling.empty() ? typeSpec->getText() : rootSpelling);
+    }
     if (suffix != nullptr)
         for (auto* part : suffix->multiWordPrimitiveSpecifier())
             words.push_back(part->getText());
     return words;
+}
+bool IsGlobalScopeQualifiedType(CFlatParser::TypeSpecifierContext* typeSpec)
+{
+    auto* root = typeSpec != nullptr ? typeSpec->rootQualifiedTypeName() : nullptr;
+    return root != nullptr && !root->Identifier().empty()
+        && root->Identifier().front()->getText() == "global";
+}
+std::string RootQualifiedTypeSpelling(CFlatParser::TypeSpecifierContext* typeSpec)
+{
+    auto* root = typeSpec != nullptr ? typeSpec->rootQualifiedTypeName() : nullptr;
+    if (root == nullptr || root->Identifier().size() < 2) return {};
+    std::string name = root->Identifier()[1]->getText();
+    for (auto* member : root->memberNameToken()) name += "." + member->getText();
+    return name;
+}
+std::string ResolveQualifiedTypeSpecifierName(
+    LLVMBackend* compiler, CFlatParser::TypeSpecifierContext* typeSpec,
+    const std::string& spelling, bool resolveFromRoot)
+{
+    if (compiler == nullptr) return spelling;
+    const bool forceRoot = resolveFromRoot || IsGlobalScopeQualifiedType(typeSpec);
+    std::string name = spelling;
+    if (name.empty() && typeSpec != nullptr)
+        name = forceRoot ? RootQualifiedTypeSpelling(typeSpec) : typeSpec->getText();
+    return compiler->ResolveQualifiedName(name, forceRoot);
 }
 std::string CanonicalTypeSpecifierText(
     CFlatParser::TypeSpecifierContext* typeSpec,
@@ -709,6 +739,37 @@ bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, int& st
     stars += aliasStars;
     return true;
 }
+std::string TupleElementBaseName(std::string argName)
+{
+    while (argName.ends_with("*") || argName.ends_with("[]"))
+        argName.resize(argName.size() - (argName.back() == '*' ? 1 : 2));
+    return argName;
+}
+bool TupleElementEntryNamesType(const LLVMBackend* compiler,
+    CFlatParser::TupleTypeEntryContext* entry, const std::string& argName)
+{
+    if (auto* typeSpec = entry != nullptr ? entry->typeSpecifier() : nullptr; typeSpec != nullptr)
+    {
+        if (typeSpec->simdTypeSpecifier() != nullptr) return true;
+        // `function<R(Args)>` / `Lambda<R(Args)>` carry their signature; a bare `function` does not.
+        if (auto* fp = typeSpec->functionPointerSpecifier(); fp != nullptr && fp->typeSpecifier() != nullptr)
+            return true;
+        // A function-type alias element: the resolved argName is already its encoded closure.
+        if (typeSpec->tupleTypeSpecifier() == nullptr)
+        {
+            PrimitiveTypeError spellError;
+            const std::string spelled = CanonicalTypeSpecifierText(
+                typeSpec, entry->multiWordTypeSuffix(), false, &spellError);
+            if (compiler->FindFunctionTypeAlias(spelled) != nullptr) return true;
+        }
+    }
+    if (compiler->FindFunctionTypeAlias(argName) != nullptr) return true;
+    if (compiler->IsKnownTypeName(argName) || compiler->IsTypeArgTypeKey(argName)) return true;
+    std::string base = argName;
+    while (base.ends_with("*") || base.ends_with("[]"))
+        base.resize(base.size() - (base.back() == '*' ? 1 : 2));
+    return compiler->IsKnownTypeName(base) || compiler->IsTypeArgTypeKey(base);
+}
 std::string ResolveTupleTypeElementArgName(
     const TupleTypeElementResolveContext& context,
     CFlatParser::TupleTypeEntryContext* entry,
@@ -736,6 +797,11 @@ std::string ResolveTupleTypeElementArgName(
             argName = context.ResolveType(typeSpec, entry->multiWordTypeSuffix());
         else
             argName = std::move(writtenName);
+        // A function-type alias element (using Fn = function<int(int)>) keys like its spelled
+        // signature, as a generic type argument does, so the instance field is the closure type.
+        if (!substituted)
+            if (auto* fit = compiler->FindFunctionTypeAlias(argName); fit != nullptr)
+                argName = MainListener::EncodeClosureFromSig(compiler, *fit);
     }
     else
         argName = std::move(writtenName);
@@ -2147,12 +2213,33 @@ CFlatParser::NewExpressionContext* RawNewArrayValueOf(antlr4::tree::ParseTree* n
     }
     return nullptr;
 }
-std::string MainListener::NewExpressionElementTypeName(CFlatParser::NewExpressionContext* ctx)
+std::string MainListener::NewExpressionElementTypeName(CFlatParser::NewExpressionContext* ctx,
+    uint32_t* aliasConstMask)
 {
     if (ctx == nullptr) return {};
-    std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
+    std::string typeName;
+    uint32_t mask = 0;
+    if (auto* typeSpec = ctx->typeSpecifier(); typeSpec != nullptr && typeSpec->typeName() != nullptr)
+    {
+        // Inline `(const T)` / `const(T)`: the same whole-word resolution as a cast or declaration.
+        auto nested = ParseTypeName(typeSpec->typeName(), false, ctx);
+        nested.ApplyWholeWordConst();
+        typeName = nested.TypeName + std::string(nested.ValuePointerDepth(), '*');
+        mask = nested.ConstMask;
+    }
+    else
+    {
+        typeName = ParseTypeSpecifierName(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
+        mask = Compiler(ctx)->ResolveTypeAliasConstMask(typeName)
+            | LLVMBackend::TypeAndValue::ConstBitsBelow(
+                SubstitutedConstDepth(ctx->typeSpecifier(), ctx->multiWordTypeSuffix()));
+        typeName = Compiler(ctx)->ResolveTypeAlias(typeName);
+    }
+    if (aliasConstMask != nullptr) *aliasConstMask = mask;
     if (ctx->pointer() != nullptr)
         typeName.append(ctx->pointer()->Star().size(), '*');
+    if (aliasConstMask == nullptr)
+        return JoinConstTypeArgument(typeName, ContiguousLowConstLevels(mask));
     return typeName;
 }
 bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node)
@@ -2213,18 +2300,18 @@ std::string SpellFunctionParameterValueType(
 {
     std::string spelling = SpellType(compiler, type);
     const int depth = type.ValuePointerDepth();
-    const uint8_t pointeeConst = static_cast<uint8_t>(type.PointeeConstMask());
+    const uint32_t pointeeConst = static_cast<uint32_t>(type.PointeeConstMask());
     int constDepth = 0;
     while (constDepth < depth && (pointeeConst & (1u << constDepth)) != 0)
         ++constDepth;
     return JoinConstTypeArgument(spelling, constDepth);
 }
-uint8_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string& target, size_t suffixStars)
+uint32_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string& target, size_t suffixStars)
 {
     const std::string resolved = compiler->ResolveTypeAlias(target);
     size_t depth = suffixStars;
     for (auto it = resolved.rbegin(); it != resolved.rend() && *it == '*'; ++it) ++depth;
-    return static_cast<uint8_t>((1u << (std::min<size_t>(depth, 6) + 1)) - 1u);
+    return LLVMBackend::TypeAndValue::ConstBitsThrough(static_cast<int>(depth));
 }
 void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDeclarationContext* ctx)
 {
@@ -2305,6 +2392,7 @@ std::string NamespaceNameFromContext(
 bool IsUnparameterizedNamedTypeSpecifier(CFlatParser::TypeSpecifierContext* typeSpec)
 {
     if (typeSpec == nullptr) return false;
+    if (typeSpec->rootQualifiedTypeName() != nullptr) return true;
     if (auto* qualified = typeSpec->qualifiedGenericIdentifier(); qualified != nullptr)
         return qualified->genericTypeParameters() == nullptr;
     if (auto* generic = typeSpec->genericIdentifier(); generic != nullptr)
@@ -2322,6 +2410,18 @@ std::vector<std::string> NamedTypePathFromContext(CFlatParser::TypeSpecifierCont
     }
     else if (auto* generic = typeSpec->genericIdentifier())
         path.push_back(generic->Identifier()->getText());
+    else if (typeSpec->rootQualifiedTypeName() != nullptr)
+    {
+        std::string name = RootQualifiedTypeSpelling(typeSpec);
+        size_t start = 0;
+        while (start <= name.size())
+        {
+            const size_t dot = name.find('.', start);
+            path.push_back(name.substr(start, dot == std::string::npos ? dot : dot - start));
+            if (dot == std::string::npos) break;
+            start = dot + 1;
+        }
+    }
     return path;
 }
 namespace
@@ -2566,6 +2666,25 @@ bool HasVisibleNonGenericAggregateName(
     }
     return false;
 }
+// Namespace-scope analogue of HasVisibleNonGenericAggregateName. A non-template type `name` declared
+// directly in the use's namespace or an enclosing one hides a generic template of that name further
+// out, wherever it is declared in the file (CFlat namespace lookup is order-independent, as QUALORDER).
+// Walks the namespace chain innermost first.
+bool NonGenericNamespaceTypeHides(LLVMBackend* compiler, antlr4::tree::ParseTree* useSite,
+    const std::string& name)
+{
+    if (compiler == nullptr || name.empty() || name.find('.') != std::string::npos) return false;
+    std::string ns = NamespaceNameFromContext(compiler, useSite);
+    while (!ns.empty())
+    {
+        const std::string key = ns + "." + name;
+        if (compiler->IsGenericTemplateKey(key)) return false;
+        if (compiler->IsNonGenericNamespaceTypeKey(key)) return true;
+        const size_t dot = ns.rfind('.');
+        ns = dot == std::string::npos ? std::string{} : ns.substr(0, dot);
+    }
+    return false;
+}
 bool HasEnclosingAggregateContext(antlr4::tree::ParseTree* node)
 {
     for (auto* parent = node != nullptr ? node->parent : nullptr;
@@ -2612,7 +2731,7 @@ std::string ResolveGenericTemplateBaseAtScope(
     LLVMBackend* compiler, const std::string& spelledBase,
     const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
     antlr4::tree::ParseTree* useSite, const std::string& lookupName,
-    bool* nonGenericRefusal)
+    NonGenericRefusal* nonGenericRefusal)
 {
     if (compiler == nullptr || spelledBase.empty()) return spelledBase;
     const std::string& lexicalName = lookupName.empty() ? spelledBase : lookupName;
@@ -2638,10 +2757,23 @@ std::string ResolveGenericTemplateBaseAtScope(
             }
             if (HasVisibleNonGenericAggregateName(scope, lexicalName, useSite))
             {
-                if (nonGenericRefusal != nullptr) *nonGenericRefusal = true;
+                if (nonGenericRefusal != nullptr) *nonGenericRefusal = NonGenericRefusal::EnclosingAggregate;
+                return {};
+            }
+            // Namespace entry: the check walks the whole chain, so it runs HERE, before an outer
+            // namespace's template is returned by a later loop entry.
+            if (scope.Definition == nullptr && lexicalBareName
+                && NonGenericNamespaceTypeHides(compiler, useSite, lexicalName))
+            {
+                if (nonGenericRefusal != nullptr) *nonGenericRefusal = NonGenericRefusal::EnclosingNamespace;
                 return {};
             }
         }
+    }
+    if (lexicalBareName && NonGenericNamespaceTypeHides(compiler, useSite, lexicalName))
+    {
+        if (nonGenericRefusal != nullptr) *nonGenericRefusal = NonGenericRefusal::EnclosingNamespace;
+        return {};
     }
     if (compiler->HasCxxAliasTemplate(lexicalName)) return spelledBase;
     if (compiler->IsGenericBaseAlias(lexicalName))
@@ -2679,7 +2811,7 @@ std::string ResolveGenericTemplateBaseAtScope(
         }
         if (HasVisibleNonGenericAggregateName(scope, base, useSite))
         {
-            if (nonGenericRefusal != nullptr) *nonGenericRefusal = true;
+            if (nonGenericRefusal != nullptr) *nonGenericRefusal = NonGenericRefusal::EnclosingAggregate;
             return {};
         }
     }
@@ -2689,7 +2821,7 @@ std::string ResolveGenericTemplateSpellingAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
     const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
     antlr4::tree::ParseTree* useSite,
-    const std::string& lookupName, bool report, bool* nonGenericRefusal)
+    const std::string& lookupName, bool report, NonGenericRefusal* nonGenericRefusal)
 {
     if (compiler == nullptr || spelledBase.empty()) return spelledBase;
     std::string base = ResolveGenericTemplateBaseAtScope(
@@ -2721,7 +2853,7 @@ std::vector<EnclosingAggregateLookupScope> EnclosingScopesForLegacyScope(
 std::string ResolveGenericTemplateBaseAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, const std::string& enclosingScope,
     antlr4::tree::ParseTree* useSite, const std::string& lookupName,
-    bool* nonGenericRefusal)
+    NonGenericRefusal* nonGenericRefusal)
 {
     return ResolveGenericTemplateBaseAtScope(compiler, spelledBase,
         EnclosingScopesForLegacyScope(compiler, enclosingScope, useSite), useSite, lookupName,
@@ -2730,7 +2862,7 @@ std::string ResolveGenericTemplateBaseAtScope(
 std::string ResolveGenericTemplateSpellingAtScope(
     LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
     const std::string& enclosingScope, antlr4::tree::ParseTree* useSite,
-    const std::string& lookupName, bool report, bool* nonGenericRefusal)
+    const std::string& lookupName, bool report, NonGenericRefusal* nonGenericRefusal)
 {
     return ResolveGenericTemplateSpellingAtScope(compiler, spelledBase, args,
         EnclosingScopesForLegacyScope(compiler, enclosingScope, useSite), useSite, lookupName, report,
@@ -2782,7 +2914,9 @@ bool ResolveCanonicalTypeSpecifier(
             || typeSpec->functionPointerSpecifier() != nullptr)
             return false;
 
-        if (auto* tuple = typeSpec->tupleTypeSpecifier())
+        if (typeSpec->rootQualifiedTypeName() != nullptr)
+            out.TypeName = RootQualifiedTypeSpelling(typeSpec);
+        else if (auto* tuple = typeSpec->tupleTypeSpecifier())
         {
             if (!resolveTupleType) return false;
             out.TypeName = resolveTupleType(tuple);
@@ -2820,7 +2954,8 @@ bool ResolveCanonicalTypeSpecifier(
     if (substitutions != nullptr)
         if (auto it = substitutions->find(out.TypeName); it != substitutions->end())
             out.TypeName = it->second;
-    out.TypeName = compiler->ResolveQualifiedName(out.TypeName);
+    out.TypeName = ResolveQualifiedTypeSpecifierName(compiler,
+        specs.size() == 1 ? specs.front() : nullptr, out.TypeName);
     out.ConstMask |= compiler->ResolveTypeAliasConstMask(out.TypeName);
     out.TypeName = compiler->ResolveTypeAlias(out.TypeName);
     ResolveDefaultedCxxAliasTypeName(compiler, out.TypeName,
@@ -2828,10 +2963,10 @@ bool ResolveCanonicalTypeSpecifier(
     out.PointerDepth = PeelAliasPointerStars(out.TypeName);
     return true;
 }
-void ApplyConstMaskThroughDepth(uint8_t& mask, int depth)
+void ApplyConstMaskThroughDepth(uint32_t& mask, int depth)
 {
-    depth = std::clamp(depth, 0, 7);
-    mask = static_cast<uint8_t>((1u << (depth + 1)) - 1u);
+    depth = std::clamp(depth, 0, 32);
+    mask = LLVMBackend::TypeAndValue::ConstBitsThrough(depth);
 }
 bool ResolveConstTypeSyntax(
     LLVMBackend* compiler, CFlatParser::TypeNameContext* ctx, ConstTypeSyntax& out,
@@ -3137,28 +3272,27 @@ bool GenericArgumentsUseRegisteredLocalEnum(
         if (TypeArgumentUsesRegisteredLocalEnum(entry, compiler, substitutions)) return true;
     return false;
 }
-std::string PointerDepthCapMessage(const std::string& subject, int depth)
+void MainListener::ValidateDeclaratorPointerDepth(antlr4::ParserRuleContext* site, int depth)
 {
-    return std::format("{} produces pointer depth {}, but the type model caps at {} levels "
-                       "('*'/'**'); use fewer indirections", subject, depth, PointerDepthCap);
+    if (depth > MaxDeclaratorPointerDepth)
+        LogErrorContext(site, std::format("pointer depth {} exceeds the supported {} levels",
+            depth, MaxDeclaratorPointerDepth));
 }
 int ReconcilePointerDepth(bool pointer, int stars)
 {
     if (!pointer) return 0;
     return stars > 0 ? stars : 1;
 }
-int PointeeConstOfComponent(int mask, int depth, bool preserveAliasReferentConst)
+uint32_t PointeeConstOfComponent(uint32_t mask, int depth, bool preserveAliasReferentConst)
 {
-    if (mask <= 0) return 0;
+    if (mask == 0) return 0;
     if (preserveAliasReferentConst && depth <= 0) return mask & 1;
-    const int constLevels = std::min(depth, 7);
-    if (constLevels <= 0) return 0;
-    return mask & ((1 << constLevels) - 1);
+    return mask & LLVMBackend::TypeAndValue::ConstBitsBelow(depth);
 }
 std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
     const std::string& ret, int retDepth,
     const std::vector<std::pair<std::string, int>>& params,
-    int retConstMask, const std::vector<int>* paramConstMasks,
+    int64_t retConstMask, const std::vector<int64_t>* paramConstMasks,
     const std::vector<bool>* paramArrayViews,
     const std::vector<bool>* paramAliases, bool retAlias)
 {
@@ -5238,7 +5372,7 @@ std::string DescribeParameterTypes(const std::vector<LLVMBackend::TypeAndValue>&
         text += p.TypeName;
         // An array-view param carries Pointer too, but spells as 'T[]', never 'T[]*'.
         if (p.IsArrayView) text += "[]";
-        else if (p.Pointer) text += p.ElemPointer ? "**" : "*";
+        else if (p.Pointer) text += std::string(p.ValuePointerDepth(), '*');
     }
     return text;
 }

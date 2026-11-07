@@ -1,0 +1,26 @@
+// A tuple local whose element names an unknown type reports that type once, at the element:
+// the same text as a plain `Nope* p;`, not the opaque-shell "is incomplete" error.
+
+expect_error("type 'Nope'") {
+    int sigParam((int, Nope) t) { return 0; }
+}
+expect_error("type 'Nope'") {
+    int sigPtrParam((int, Nope*) t) { return 0; }
+}
+expect_error("type 'Nope'") {
+    (int, Nope) sigRet() { return default; }
+}
+expect_error("type 'Nope'") {
+    int sigNested((int, (int, Nope*)) t) { return 0; }
+}
+expect_error("type 'Nope'") {
+    struct SigHolder { int v; int m((int, Nope) t) { return 0; } };
+}
+
+extern int main()
+{
+    expect_error("type 'Nope'") { (int, Nope*) t = default; }
+    expect_error("type 'Nope'") { (int, Nope) t = default; }
+    expect_error("type 'Nope'") { (int, (int, Nope*)) t = default; }
+    return 0;
+}

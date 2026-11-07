@@ -13,6 +13,8 @@
 class DpCircle { int r = 0; };
 
 int dpByPtr(DpCircle* c) { return 2000 + c->r; }
+int dpDepth2(DpCircle** p) { return p == nullptr ? 0 : 1; }
+int dpDepth3(DpCircle*** p) { return p == nullptr ? 0 : 1; }
 
 class DpBox { int take(DpCircle* c) { return 2000 + c->r; } };
 
@@ -39,35 +41,6 @@ class DpIfaceImpl : DpIface { int take(DpCircle* c) { return 5000 + c->r; } };
 // DpGBox<DpCircle**> are distinct instantiations and each substituted 'T x' is judgeable.
 class DpGBox<T> { T v = default; int put(T x) { v = x; return 1; } T get() { return v; } };
 
-// The type-argument spelling COUNTS stars now, so it joins the 3-star cap like every other
-// spelling that does. It used to collapse to DpGBox<DpCircle*> and compile.
-expect_error("generic type argument 'DpCircle***' produces pointer depth 3, but the type model caps at 2 levels") {
-    DpGBox<DpCircle***> dpTripleArg = default;
-}
-
-// The 3-star cap applies to every spelling that counts WRITTEN stars, not only a local
-// declarator: a parameter, a struct field, a function-type signature component and a `using`
-// alias RHS. The declarator spellings share one guard at the head of ParseDeclarationSpecifiers;
-// the function-type parameter has its own, because its stars ride the signature, not a declarator.
-expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
-    int dpTriple(DpCircle*** c) { return 0; }
-}
-expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
-    class DpTripleHolder { DpCircle*** ppp = nullptr; };
-}
-expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
-    DpCircle*** dpTripleRet() { return nullptr; }
-}
-    expect_error("function type parameter 'DpCircle**' produces pointer depth 3, but the type model caps at 2 levels") {
-    int dpTakesFn(function<int(DpCircle***)> f) { return 0; }
-}
-// An ALIAS reaching the same depth was already refused at its USE site; it now shares the one
-// message family, and the alias DECLARATION is refused too rather than only a use that may
-// never be written.
-expect_error("using alias 'DpCP3' = 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
-    using DpCP3 = DpCircle***;
-}
-
 extern int main()
 {
     // Declared 'T**' local: the filed repro. The depth note names both types and both remedies.
@@ -90,28 +63,6 @@ extern int main()
         DpHolder h = default;
         h.pp = &a;
         int r = dpByPtr(h.pp);
-    }
-
-    // 'T***' is no longer a spellable type at all: the declarator is refused where it is WRITTEN,
-    // before any call scores. That closes the old residue where 'T***' into 'T**' was invisible
-    // (the clamped declarator was byte-identical to a correct 'T**' argument).
-    expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
-        DpCircle* a = new DpCircle();
-        DpCircle** pp = &a;
-        DpCircle*** ppp = &pp;
-        int r = dpByPtr(ppp);
-    }
-
-    // A CAST spelling counts the same written stars, so it is refused at the cast.
-    expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
-        DpCircle* a = new DpCircle();
-        DpCircle** pp = &a;
-        DpCircle*** ppp = (DpCircle***)pp;
-    }
-
-    // FOUR stars report the real written depth, not a clamped 3.
-    expect_error("declared type 'DpCircle' produces pointer depth 4, but the type model caps at 2 levels") {
-        DpCircle**** q = nullptr;
     }
 
     // A METHOD call scores through the same scorer, with 'this' occupying parameter 0 - so the
@@ -238,28 +189,97 @@ extern int main()
         int r = dpL(pp);
     }
 
-    // ---- A depth-3 VALUE needs no declarator ----
-    // '&' over an operand already PROVEN at the cap would produce a 'T***' value, which the
-    // two-level model cannot represent. Refused where it is produced, exactly as a written
-    // 'T***' is refused at its declarator - so no use site has to judge a clamped lie.
-    expect_error("address-of 'pp' produces pointer depth 3, but the type model caps at 2 levels") {
-        DpCircle* a = new DpCircle();
-        DpCircle** pp = &a;
-        int r = dpByPtrPtr3(&pp);
+    // Exact depths above the former cap still use the ordinary mismatch diagnostic.
+    expect_error("parameter 0 'p' has type 'DpCircle**' and the argument has type 'DpCircle***'") {
+        DpCircle value = default;
+        DpCircle* p = &value;
+        DpCircle** pp = &p;
+        DpCircle*** ppp = &pp;
+        int r = dpDepth2(ppp);
     }
-    // The INITIALIZER form of the same value: it never reaches a call at all.
-    expect_error("address-of 'pp' produces pointer depth 3, but the type model caps at 2 levels") {
-        DpCircle* a = new DpCircle();
-        DpCircle** pp = &a;
-        DpCircle** q = &pp;
+    expect_error("parameter 0 'p' has type 'DpCircle***' and the argument has type 'DpCircle**'") {
+        DpCircle value = default;
+        DpCircle* p = &value;
+        DpCircle** pp = &p;
+        DpCircle*** ppp = &pp;
+        int r = dpDepth3(pp);
     }
-    // And over a 'T**' FIELD, whose depth rides the field type. Names the field, not the object.
-    expect_error("address-of 'h.pp' produces pointer depth 3, but the type model caps at 2 levels") {
-        DpCircle* a = new DpCircle();
-        DpHolder h = default;
-        h.pp = &a;
-        DpCircle** q = &h.pp;
+
+    // Whole-word const at depth eight includes the declared pointer itself.
+    expect_error("cannot assign to 'c8': it is declared const") {
+        int x = 5;
+        int* p1 = &x;
+        int** p2 = &p1;
+        int*** p3 = &p2;
+        int**** p4 = &p3;
+        int***** p5 = &p4;
+        int****** p6 = &p5;
+        int******* p7 = &p6;
+        int******** p8 = &p7;
+        const int******** c8 = p8;
+        c8 = nullptr;
     }
 
     return 0;
 }
+
+    // Depth 31 is still representable, but the innermost const conversion remains unsafe.
+    expect_error("conversion discards const") {
+        int rejectDepth31InnerConst() {
+            int x = 5;
+            int* p1 = &x;
+            int** p2 = &p1;
+            int*** p3 = &p2;
+            int**** p4 = &p3;
+            int***** p5 = &p4;
+            int****** p6 = &p5;
+            int******* p7 = &p6;
+            int******** p8 = &p7;
+            int********* p9 = &p8;
+            int********** p10 = &p9;
+            int*********** p11 = &p10;
+            int************ p12 = &p11;
+            int************* p13 = &p12;
+            int************** p14 = &p13;
+            int*************** p15 = &p14;
+            int**************** p16 = &p15;
+            int***************** p17 = &p16;
+            int****************** p18 = &p17;
+            int******************* p19 = &p18;
+            int******************** p20 = &p19;
+            int********************* p21 = &p20;
+            int********************** p22 = &p21;
+            int*********************** p23 = &p22;
+            int************************ p24 = &p23;
+            int************************* p25 = &p24;
+            int************************** p26 = &p25;
+            int*************************** p27 = &p26;
+            int**************************** p28 = &p27;
+            int***************************** p29 = &p28;
+            int****************************** p30 = &p29;
+            int******************************* p31 = &p30;
+            (const int)******************************* c = p31;
+            return x;
+        }
+    }
+
+    // The cast type-name path must reject a depth it cannot represent in ConstMask.
+    expect_error("pointer depth 33 exceeds the supported 31 levels") {
+        int castDepth33() {
+            void* v = nullptr;
+            auto z = (int********************************* )v;
+            return 0;
+        }
+    }
+
+    // sizeof(type-name) uses the same depth check as a cast type-name.
+    expect_error("pointer depth 33 exceeds the supported 31 levels") {
+        int sizeofDepth33() {
+            return (int)sizeof(int*********************************);
+        }
+    }
+
+    // Pointer declarations above the supported depth fail at the declaration.
+    expect_error("pointer depth 32 exceeds the supported 31 levels") {
+        int ******************************** tooDeep;
+    }

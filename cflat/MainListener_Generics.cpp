@@ -1094,7 +1094,7 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         if (paramStars == 0 && !argView && argStars == 1)
                         {
                             std::string constName;
-                            const uint8_t levels = compilerLLVM->StoredConstLevels(
+                            const uint32_t levels = compilerLLVM->StoredConstLevels(
                                 compilerLLVM->ArgumentPointerValue(args[i]), constName);
                             if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
                         }
@@ -1102,17 +1102,17 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         else if (paramStars == 0 && !paramView && argView && argStars == 0)
                         {
                             std::string constName;
-                            const uint8_t levels = compilerLLVM->StoredConstLevels(
+                            const uint32_t levels = compilerLLVM->StoredConstLevels(
                                 compilerLLVM->ArgumentPointerValue(args[i]), constName);
                             if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
                         }
                         // `T*` drops one pointer level, but T can itself be a const base type.
-                        else if (paramStars > 0 && paramStars <= 8 && argStars == 0)
+                        else if (paramStars > 0 && paramStars <= 31 && argStars == 0)
                         {
                             std::string constName;
-                            const uint8_t levels = compilerLLVM->StoredConstLevels(
+                            const uint32_t levels = compilerLLVM->StoredConstLevels(
                                 compilerLLVM->ArgumentPointerValue(args[i]), constName);
-                            const uint8_t baseConstBit = static_cast<uint8_t>(1u << (paramStars - 1));
+                            const uint32_t baseConstBit = uint32_t{ 1 } << (paramStars - 1);
                             if ((levels & baseConstBit) != 0)
                                 argType = "(const " + argType + ")";
                         }
@@ -1211,10 +1211,10 @@ std::string MainListener::TryInferAndInstantiateFromFuncPtr(const std::string& f
         std::vector<LLVMBackend::TypeAndValue> destParams;
         compilerLLVM->UnpackFuncPtrSignature(destSig, destReturn, destParams);
         if (destSig.FuncPtrReturnConstMask >= 0)
-            destReturn.ConstMask = static_cast<uint8_t>(destSig.FuncPtrReturnConstMask);
+            destReturn.ConstMask = static_cast<uint32_t>(destSig.FuncPtrReturnConstMask);
         for (size_t i = 0; i < destParams.size() && i < destSig.FuncPtrParams.size(); ++i)
             if (destSig.FuncPtrParams[i].ConstMask >= 0)
-                destParams[i].ConstMask = static_cast<uint8_t>(destSig.FuncPtrParams[i].ConstMask);
+                destParams[i].ConstMask = static_cast<uint32_t>(destSig.FuncPtrParams[i].ConstMask);
             else if (destSig.FuncPtrParams[i].IsPointeeConst)
                 destParams[i].ConstMask = 1;
         auto* paramList = funcCtx->parameterTypeList();
@@ -1358,7 +1358,7 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     LogErrorContext(returnQualifier, "function return qualifier must be 'move' or 'alias'");
             }
             const bool aliasReturn = returnQualifierText == "alias";
-            int retConst = 0;
+            uint32_t retConst = 0;
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
                 fpSpec->multiWordTypeSuffix(), aliasReturn, &tv.FuncPtrReturnAliasSpelling);
@@ -1384,7 +1384,7 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     int pStars = PointerDepthOf(param->pointer()) + (pIsArrayView ? 1 : 0);
                     ValidateConstAfterPointerStar(param->pointer(),
                         SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
-                    int pConst = 0;
+                    uint32_t pConst = 0;
                     p.TypeName = ResolveSigComponentConstCodegen(
                         param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix(),
                             false, &p.AliasSpelling);
@@ -1393,9 +1393,6 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                             p.FunctionTypeSignature =
                                 std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
-                    if (p.PointerDepth > PointerDepthCap)
-                        LogErrorContext(param, PointerDepthCapMessage(
-                            std::format("function type parameter '{}'", p.TypeName), p.PointerDepth));
                     p.ConstMask = pConst;
                     p.Pointer  = pPtr;
                     p.IsArrayView = pIsArrayView;
@@ -1677,6 +1674,39 @@ void MainListener::QueuePendingInstantiation(const std::string& templateName,
         PrepareDeferredCoreUniqueLayout(record);
         pendingInstantiations.push_back(std::move(record));
     }
+
+std::unordered_map<std::string, size_t> MainListener::MarkPendingInstantiations() const
+{
+        std::unordered_map<std::string, size_t> counts;
+        for (const auto& pending : pendingInstantiations)
+            ++counts[pending.mangledName];
+        return counts;
+}
+
+void MainListener::DropPendingInstantiationsSince(const std::unordered_map<std::string, size_t>& mark)
+{
+        // A swallowed diagnostic already answered what the scope queued; a record left queued
+        // drains later and reports that same error again.
+        std::unordered_map<std::string, size_t> keptCount;
+        std::vector<PendingInstantiation> kept;
+        std::vector<std::string> dropped;
+        for (auto& pending : pendingInstantiations)
+        {
+            auto counted = mark.find(pending.mangledName);
+            if (counted != mark.end() && keptCount[pending.mangledName] < counted->second)
+            {
+                ++keptCount[pending.mangledName];
+                kept.push_back(std::move(pending));
+            }
+            else
+                dropped.push_back(pending.mangledName);
+        }
+        pendingInstantiations = std::move(kept);
+        // Clear the mark only when no record of that name stays queued.
+        for (const auto& name : dropped)
+            if (keptCount.count(name) == 0)
+                instantiatedGenerics.erase(name);
+}
 
 void MainListener::ProcessPendingInstantiations() {
         while (!pendingInstantiations.empty())

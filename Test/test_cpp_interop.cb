@@ -2401,6 +2401,9 @@ struct T492CountHost { cppt492.Counted item = default; };
 struct T36Holder { int* p = nullptr; };
 int* t36Global = nullptr;
 int t36ParamKind(int* p) { return t27ptr.kind(p + 1); }
+T t439CflatIdentity<T>(T value) { return value; }
+int t439CflatPick(float value) { return 2; }
+int t439CflatPick(double value) { return 3; }
 
 t54.Sink t54ReturnPlain() { return T54_ID(t54.PlainValue); }
 t54.Sink t54ReturnScoped() { return T54_ID(t54.Scoped.ScopedValue); }
@@ -4208,9 +4211,21 @@ int tmcFieldArm(bool f)
     return t.item != nullptr ? t.item->id : -1;
 }
 
+namespace RootCxxEscape
+{
+    namespace cppi { int cpp_std() { return -1; } }
+    int r4RootCxxNamespacePick() { return global::cppi.cpp_std() > 0 ? 7 : 99; }
+    int r4InnerCxxNamespacePick() { return cppi.cpp_std(); }   // innermost-first: nested CFlat cppi
+}
+
 int T235TupleDtorCount = 0;
+// A C++ alias template used through a file-scope alias: the same pack expansion, spelled differently.
+using VarAliasProj = alnv.Proj<int, char>;
 extern int main()
 {
+    // The root C++ namespace must win over the same-named nested CFlat namespace.
+    if (RootCxxEscape.r4RootCxxNamespacePick() != 7) return 39008;
+    if (RootCxxEscape.r4InnerCxxNamespacePick() != -1) return 39010;
     if (floatFoldInteropBits(ff_cppdefaults.round_float()) != 0x5d800001) return 97001;
     if (floatFoldInteropBits(ff_cppdefaults.negative_float()) != 0xdd800001) return 97002;
     if (floatFoldInteropBits(ff_cppdefaults.unsigned_float()) != 0x5f000001) return 97003;
@@ -4252,6 +4267,51 @@ extern int main()
     alnv.Tup<char, long> expandedAliasPack = default;
     if (classTrailingPack.size() != 2 || alnv.class_pack_pick(classTrailingPack) != 31) return 54004;
     if (expandedAliasPack.size() != 2 || alnv.expanded_alias_pick(expandedAliasPack) != 32) return 54005;
+    // A template-id pattern expands per element (Box<T>...), also nested and after a fixed parameter;
+    // sizeof...(pack) counts the elements; a non-type pack expands too. Zero-element uses are checked.
+    alnv.Proj<int, char> projPack = default;
+    alnv.Proj<> projNone = default;
+    alnv.Mix<int, char> mixPack = default;
+    alnv.Mix<> mixNone = default;
+    alnv.SzOnly<int, char> szPack = default;
+    alnv.SzOnly<> szNone = default;
+    alnv.HeadProj<int, char, long> headProj = default;
+    alnv.HeadProj<int> headProjNone = default;
+    alnv.HeadSz<int, char, long> headSz = default;
+    alnv.Tags<1, 3> tagsPack = default;
+    alnv.NSz<4, 5> nszPack = default;
+    alnv.PChain<int, char> chainPack = default;
+    alnv.PFixed<int, char, long> fixedPack = default;
+    VarAliasProj varAliasPack = default;
+    if (projPack.size() != 2 || alnv.proj_pick(projPack) != 41) return 54025;
+    if (projNone.size() != 0 || alnv.proj_empty_pick(projNone) != 42) return 54026;
+    if (alnv.mix_pick(mixPack) != 43) return 54027;
+    if (alnv.mix_empty_pick(mixNone) != 50) return 54028;
+    if (alnv.sz_pick(szPack) != 44) return 54029;
+    if (alnv.sz_empty_pick(szNone) != 45) return 54030;
+    if (alnv.head_proj_pick(headProj) != 47) return 54031;
+    if (alnv.head_empty_pick(headProjNone) != 51) return 54032;
+    if (alnv.sz_pick(headSz) != 44) return 54033;
+    if (alnv.tags_pick(tagsPack) != 49) return 54034;
+    if (alnv.sz_pick(nszPack) != 44) return 54035;
+    if (alnv.fixed_pick(chainPack) != 46 || alnv.fixed_pick(fixedPack) != 46) return 54036;
+    if (varAliasPack.size() != 2 || alnv.proj_pick(varAliasPack) != 41) return 54038;
+    // Round 2 shapes: the pattern before "..." is the whole argument (pointer, reference, expression,
+    // typename-qualified, nested in a template-id); sizeof...(pack) inside a top-level expansion; an
+    // expansion nested in another expands its inner pack over every element first.
+    alnv.PtrList<int, char> ptrList = default;
+    alnv.PtrNest<int, char> ptrNest = default;
+    alnv.TypenameList<int, char> typenameList = default;
+    alnv.TwoExp<int, char> twoExp = default;
+    alnv.NestValid<int, char> nestValid = default;
+    alnv.SizeofIn<int, char> sizeofIn = default;
+    if (ptrList.size() != 2 || alnv.ptr_pick(ptrList) != 61) return 54039;
+    if (alnv.cref_pick(alnv.cref_make()) != 62) return 54040;
+    if (alnv.ptrnest_pick(ptrNest) != 63) return 54041;
+    if (typenameList.size() != 2 || alnv.typename_pick(typenameList) != 65) return 54043;
+    if (alnv.twoexp_pick(twoExp) != 66) return 54044;
+    if (nestValid.size() != 2 || alnv.nestvalid_pick(nestValid) != 67) return 54045;
+    if (alnv.sizeofin_pick(sizeofIn) != 68) return 54046;
     // Mixed-access sets: the PUBLIC overload is selected and runs. A protected selection is refused
     // in Test/errors/err_cpp_mixed_access_overload.cb.
     mixacc.M mixM = mixacc.M();
@@ -4807,6 +4867,64 @@ extern int main()
     mix17r3.R3S r3Source = default;
     if (-mix17r3.r3VolRef(r3Source) != 6) return 15018;
     if (-mix17r3.r3ConstRef(r3Source) != 6) return 15019;
+    // C++ free templates survive a cv-refused non-template; mutable picks the non-template.
+    opun.K opunK = default;
+    if ((opun.cref(opunK) += 1) != 21 || (opunK += 1) != 11) return 15020;
+    opun_axes.A opunA = default;
+    if ((opun_axes.cref(opunA) -= 1) != 21 || (opunA -= 1) != 11) return 15021;
+    if ((opun_axes.cref(opunA) *= 1) != 22 || (opunA *= 1) != 12) return 15022;
+    if ((opun_axes.cref(opunA) <<= 1) != 23 || (opunA <<= 1) != 13) return 15023;
+    if (opun_axes.cref(opunA) + 1 != 24 || opunA + 1 != 14) return 15024;
+    opun_axes.B opunB = default;
+    if ((opun_axes.bref(opunB) += 1) != 32 || (opunB += 1) != 31) return 15025;
+    opun_forward.Q opunQ = default;
+    if ((opun_forward.qref(opunQ) += 1) != 61 || (opun_forward.qref(opunQ) -= 1) != 62
+        || opun_forward.qref(opunQ) + 1 != 63) return 15026;
+    opun.Tf opunTf = default;
+    if (opunTf + 1.5 != 11 || opunTf + 1.5f != 11) return 15027;
+    opun_axes.Dual opunDual = default;
+    if (opunDual + 1.5 != 42 || opunDual + 1.5f != 42) return 15028;
+    // A refused template must not hide the viable const-reference ordinary free overload.
+    cppfopun.FRPair opunPair = default; opunPair.v = 4;
+    if (cppfopun.mkFRPair(3) + opunPair != 3004) return 15029;
+    // OPUNARY r2 (clang++ -std=c++20 oracle): a floating RHS is a Conversion to an arithmetic parameter.
+    opfl.Bool1 opfBool = default;
+    if (opfBool + 1.5 != 5) return 15030;
+    opfl.CRef opfCRef = default;
+    double opfD = 2.5;
+    if (opfCRef + 2.5 != 2 || opfCRef + opfD != 2) return 15031;
+    opfl.Ch opfCh = default;
+    if (opfCh + 66.7 != 66) return 15032;
+    opfl.Un opfUn = default;
+    if (opfUn + 3.9 != 3) return 15033;
+    opfl.Sh opfSh = default;
+    if (opfSh + 5.5 != 5) return 15034;
+    opfl.Ll opfLl = default;
+    if (opfLl + 9.9 != 9) return 15035;
+    opfl.Mn opfMn = default;
+    if (opfMn - 3.5 != 3) return 15036;
+    ShG shG = default;
+    if ((shG << 6.5) != 6) return 15037;
+    opfl.Cmp opfCmp = default;
+    if ((opfCmp += 2.5) != 2) return 15038;
+    opfl.Fr opfFr = default;
+    if (opfFr + 2.5 != 2 || 2.5 + opfFr != 102) return 15039;
+    opfl.Df opfDf = default;
+    if (opfDf + opfD != 2) return 15040;
+    TfG tfG = default;
+    if (tfG + 1.5 != 11 || tfG + opfD != 11) return 15041;
+    // OPUNARY r3: a free `const T&` operator parameter takes a floating operand as its referent.
+    opfc.FI1 opfcI = default;
+    if (opfcI - 9.9 != 9) return 15042;
+    double opfcD = 9.9;
+    if (opfcI - opfcD != 9) return 15043;
+    opfc.FB1 opfcB = default;
+    if (opfcB - 9.9 != 7 || opfcB - 0.0 != 6) return 15044;
+    opfc.FF1 opfcF = default;
+    if (opfcF - 9.9 != 9) return 15045;
+    opfc.FC1 opfcC = default;
+    if ((opfcC -= 2.5) != 2) return 15046;
+
     // T275 (clang++ -std=c++20 oracle: 1 7 1 8 9): rvalue receiver member beats the `S&` free; xvalue receivers.
     if (-t275.rvalueMemberRefFreeMake() != 1) return 27501;
     t275.XvalueNot t275XvNot = default;
@@ -7786,6 +7904,25 @@ extern int main()
     if (t27ptr.bool_pick(1e3 > 1) != 1 || t27ptr.bool_pick(1e3 == 1) != 1
         || t27ptr.bool_pick(1e3 != 1) != 1) return 43902;
     if (!(1e3 > 1) || (1e3 == 1) || !(1e3 != 1)) return 43903;
+    // T439: C++ template deduction sees the unsuffixed literal's double in arithmetic (clang: all 3).
+    int t439I = 2;
+    float t439F = 2.0f;
+    if (t27ptr.arith_kind(t439I + 1.0) != 3 || t27ptr.arith_kind(t439F + 1.0) != 3
+        || t27ptr.arith_kind((1.0)) != 3 || t27ptr.arith_kind(-1.0 * t439I) != 3) return 43904;
+    // Parenthesized unary negation used to lose the literal identity before this template call.
+    if (t27ptr.arith_kind(-(1e3)) != 3 || t27ptr.arith_kind(-(1e3) + 1) != 3) return 43905;
+    if (t27ptr.arith_kind(t439F) != 2 || t27ptr.arith_kind(1.0f + t439I) != 2
+        || t27ptr.integer_arith_kind(t439I + 1) != 1) return 43906;
+    // C++ bridge overload ranking is unchanged and matches clang for these expressions (double).
+    if (t27ptr.pick_arith(t439I + 1.0) != 3 || t27ptr.pick_arith(t439F + 1.0) != 3)
+        return 43908;
+    // The overloaded class operator returns float; the unsuffixed operand does not change deduction.
+    t27ptr.FloatAdd t439FloatAdd = default;
+    if (t27ptr.arith_kind(t439FloatAdd + 1.0) != 2) return 43909;
+    // CFlat native arithmetic and generic deduction keep their existing source types.
+    if (t439CflatPick(t439F + 1.0) != 2
+        || t439CflatPick(t439CflatIdentity(t439F + 1.0)) != 2
+        || t439CflatPick(t439CflatIdentity(1.0)) != 3) return 43907;
     // T276: an unscoped enum element of a brace list is spelled by its promoted type (clang
     // oracle: ee/const/mixed/Lee/Lconst/Ecode/ACe 1); a fixed narrow enum keeps its own identity.
     t276.E t276E = t276.E.e1;

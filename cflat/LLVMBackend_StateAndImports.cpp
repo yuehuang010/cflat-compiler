@@ -1353,6 +1353,8 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
             return;
         }
         std::string resolvedBacking = ResolveTypeAlias(backingType);
+        if (resolvedBacking == backingType)
+            resolvedBacking = ResolveManglingAlias(backingType);
         std::string ns = namespaceName.empty() ? currentNamespace_ : namespaceName;
         std::string scopedName = (enumName.empty() || ns.empty()) ? enumName : ns + "." + enumName;
         // A local enum belongs to its lexical block in the active function. The generic
@@ -1490,20 +1492,15 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
             if (enumBackingTypes.count(local) != 0) return local;
         }
         // Two hops at most: the written spelling, then one `using D = Dir;` alias step. Dotted
-        // spellings try the rooted name before enclosing-namespace prefixes.
+        // spellings use the same innermost-enclosing-scope order as bare names.
         std::string cur = spelled;
         for (int hop = 0; hop < 2; hop++)
         {
             if (const std::string enumKey = FirstVisibleScopedKey(cur,
-                    [this](const std::string& c) { return enumBackingTypes.count(c) != 0; });
+                    [this](const std::string& c) { return enumBackingTypes.count(c) != 0; },
+                    ScopedLookupOptions{ .PrefixDottedNames = true });
                 !enumKey.empty())
                 return enumKey;
-            if (cur.find('.') != std::string::npos)
-                if (const std::string enumKey = FirstVisibleScopedKey(cur,
-                        [this](const std::string& c) { return enumBackingTypes.count(c) != 0; },
-                        ScopedLookupOptions{ .PrefixDottedNames = true });
-                    !enumKey.empty())
-                    return enumKey;
             std::string aliased = ResolveTypeAlias(cur);
             if (aliased == cur) break;
             cur = aliased;
@@ -1520,9 +1517,6 @@ std::string LLVMBackend::ResolveScannedEnumTypeName(const std::string& spelled) 
         auto isScannedEnum = [this](const std::string& candidate) {
             return gts.scannedNonLocalEnumNames.count(candidate) != 0;
         };
-        if (std::string key = FirstVisibleScopedKey(spelled, isScannedEnum,
-                ScopedLookupOptions{ .ResolveFirstComponentAlias = false }); !key.empty())
-            return key;
         return FirstVisibleScopedKey(spelled,
             isScannedEnum, ScopedLookupOptions{ .PrefixDottedNames = true,
                                                 .ResolveFirstComponentAlias = false });
@@ -1772,16 +1766,19 @@ std::vector<std::string> LLVMBackend::ScopedNameCandidatesIn(const std::string& 
             }
         }
 
-        // Verbatim spelling outranks the alias hop: a real namespace named like an alias wins,
-        // the same order struct lookup uses, so both pre-scans queue one canonical key.
-        add(name);
-        if (opts.ResolveFirstComponentAlias && name.find('.') != std::string::npos)
+        if (!opts.EnclosingOnly)
         {
-            auto dot = name.find('.');
-            std::string first = name.substr(0, dot);
-            std::string rest = name.substr(dot + 1);
-            std::string resolvedFirst = ResolveNamespace(first);
-            add(resolvedFirst + "." + rest);
+            // Verbatim spelling outranks the alias hop: a real namespace named like an alias wins,
+            // the same order struct lookup uses, so both pre-scans queue one canonical key.
+            add(name);
+            if (opts.ResolveFirstComponentAlias && name.find('.') != std::string::npos)
+            {
+                auto dot = name.find('.');
+                std::string first = name.substr(0, dot);
+                std::string rest = name.substr(dot + 1);
+                std::string resolvedFirst = ResolveNamespace(first);
+                add(resolvedFirst + "." + rest);
+            }
         }
         return candidates;
     }
@@ -1790,7 +1787,8 @@ std::string LLVMBackend::ResolveInterfaceName(const std::string& spelled) const
 {
         std::string name = ResolveTypeAlias(spelled);
         if (std::string key = FirstVisibleScopedKey(name,
-                [this](const std::string& c) { return interfaceTable.count(c) != 0; });
+                [this](const std::string& c) { return interfaceTable.count(c) != 0; },
+                ScopedLookupOptions{ .PrefixDottedNames = true });
             !key.empty())
             return key;
         std::string qualified = ResolveTypeAlias(ResolveQualifiedName(name));
@@ -1830,11 +1828,6 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
                 return key;
         }
 
-        if (dataStructures.count(name) || interfaceTable.count(name) || functionTable.count(name)
-            || cxxRecordEntries_.count(name) || cxxClasses_.count(name)
-            || cxxCflatToCxxSpelling_.count(name))
-            return name;
-
         auto dotPos = name.rfind('.');
         if (dotPos == std::string::npos)
             return name;
@@ -1847,7 +1840,7 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
             auto firstDot = nsPrefix.find('.');
             std::string firstComp = firstDot == std::string::npos ? nsPrefix : nsPrefix.substr(0, firstDot);
             std::string restComp  = firstDot == std::string::npos ? std::string{} : nsPrefix.substr(firstDot + 1);
-            std::string resolvedFirst = ResolveNamespace(firstComp);
+            std::string resolvedFirst = ResolveNamespace(firstComp, forceRoot);
             if (resolvedFirst != firstComp)
                 nsPrefix = restComp.empty() ? resolvedFirst : resolvedFirst + "." + restComp;
         }
@@ -1873,21 +1866,71 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
             if (!rewrote) break;
         }
 
-        // "$global$:<alias>" sentinel: file-scoped import alias (import "x.cb" as Alias).
-        // Resolve to unqualified lastName only if it was contributed by that file.
+        const std::string qualified = nsPrefix + "." + lastName;
+        const auto isKnownQualified = [this, &isPublishedCxxName](const std::string& candidate) {
+            return dataStructures.count(candidate) != 0
+                || interfaceTable.count(candidate) != 0
+                || functionTable.count(candidate) != 0
+                || cxxRecordEntries_.count(candidate) != 0
+                || cxxClasses_.count(candidate) != 0
+                || cxxCflatToCxxSpelling_.count(candidate) != 0
+                || isPublishedCxxName(candidate)
+                || cxxFunctionSignatures_.count(candidate) != 0
+                || [&] {
+                    const size_t dot = candidate.rfind('.');
+                    return dot != std::string::npos
+                        && IsGenericFunctionKeyInNamespace(candidate, candidate.substr(0, dot));
+                }()
+                || globalNamedVariable.count(candidate) != 0
+                || HasCxxFunctionTemplate(candidate)
+                || gts.scannedTypeNames.count(candidate) != 0
+                || gts.scannedNonLocalEnumNames.count(candidate) != 0
+                || AnyGenericTypeTemplateNamed(candidate)
+                || ResolveTypeAlias(candidate) != candidate
+                || enumBackingTypes.count(candidate) != 0;
+        };
+
+        // Qualified names first search enclosing namespaces from the innermost outward. Keep
+        // root candidates out of this pass so using-directives retain their C++ lookup position.
+        if (!forceRoot)
+        {
+            if (std::string relative = FirstVisibleScopedKey(name, isKnownQualified,
+                    ScopedLookupOptions{ .EnclosingOnly = true, .PrefixDottedNames = true });
+                !relative.empty())
+                return relative;
+
+            // A file alias is a root candidate, so an enclosing namespace member is tested first.
+            if (nsPrefix.starts_with("$global$:"))
+            {
+                const std::string aliasName = nsPrefix.substr(9);
+                if (IsImportAliasMember(aliasName, lastName)) return lastName;
+                return name;
+            }
+
+            // Enclosing-scope directives precede root lookup; exact members still hide directives
+            // attached to the qualified namespace itself.
+            if (!currentNamespace_.empty())
+            {
+                const std::string relativeQualified = currentNamespace_ + "." + name;
+                const std::string relativeThrough = ResolveThroughUsingDirectives(
+                    relativeQualified, isKnownQualified);
+                if (relativeThrough != relativeQualified) return relativeThrough;
+            }
+            const std::string through = ResolveThroughUsingDirectives(qualified, isKnownQualified);
+            if (through != qualified) return through;
+        }
+
+        // Root-scope file alias lookup follows the enclosing-namespace pass above.
         if (nsPrefix.starts_with("$global$:"))
         {
-            std::string aliasName = nsPrefix.substr(9);
-            if (IsImportAliasMember(aliasName, lastName))
-                return lastName;
+            const std::string aliasName = nsPrefix.substr(9);
+            if (IsImportAliasMember(aliasName, lastName)) return lastName;
             return name;
         }
 
-        // Walk up from the (possibly expanded) prefix toward the root. The BARE last component is
-        // deliberately not a candidate here: a qualified spelling never falls back to a global of
-        // the same tail name, it stays unresolved and is reported verbatim.
-        // C++ qualified lookup never reaches an enclosing namespace: under a C++-rooted prefix an
-        // outer C++ entity is no candidate (`std.views.istream` must not find `std.istream`).
+        // Now try the canonical root spelling and its namespace-prefix fallback. A qualified
+        // spelling never falls back to a global of the same tail name.
+        if (isKnownQualified(qualified)) return qualified;
         const bool cxxRootedPrefix = IsCxxNamespace(nsPrefix);
         const std::string exactKey = nsPrefix + "." + lastName;
         const auto isCxxEntity = [&](const std::string& c) {
@@ -1902,45 +1945,6 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
         }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
         if (!key.empty()) return key;
 
-        const std::string qualified = nsPrefix + "." + lastName;
-        const auto isKnownQualified = [this, &isPublishedCxxName](const std::string& candidate) {
-            return dataStructures.count(candidate) != 0
-                || interfaceTable.count(candidate) != 0
-                || functionTable.count(candidate) != 0
-                || cxxRecordEntries_.count(candidate) != 0
-                || cxxClasses_.count(candidate) != 0
-                || cxxCflatToCxxSpelling_.count(candidate) != 0
-                || isPublishedCxxName(candidate)
-                || cxxFunctionSignatures_.count(candidate) != 0
-                || globalNamedVariable.count(candidate) != 0
-                || HasCxxFunctionTemplate(candidate)
-                || ResolveTypeAlias(candidate) != candidate
-                || !ResolveEnumTypeName(candidate).empty();
-        };
-        const std::string through = ResolveThroughUsingDirectives(qualified, isKnownQualified);
-        if (through != qualified || isKnownQualified(qualified)) return through;
-
-        if (!forceRoot && !currentNamespace_.empty() && name.find('.') != std::string::npos)
-        {
-            const std::string relativeType = FirstVisibleScopedKey(name,
-                [this, &isPublishedCxxName](const std::string& candidate) {
-                    return dataStructures.count(candidate) != 0
-                        || interfaceTable.count(candidate) != 0
-                        || functionTable.count(candidate) != 0
-                        || globalNamedVariable.count(candidate) != 0
-                        || enumBackingTypes.count(candidate) != 0
-                        || gts.scannedTypeNames.count(candidate) != 0
-                        || ResolveTypeAlias(candidate) != candidate
-                        || AnyGenericTypeTemplateNamed(candidate)
-                        || HasCxxFunctionTemplate(candidate)
-                        || cxxFunctionSignatures_.count(candidate) != 0
-                        || cxxRecordEntries_.count(candidate) != 0
-                        || cxxClasses_.count(candidate) != 0
-                        || cxxCflatToCxxSpelling_.count(candidate) != 0
-                        || isPublishedCxxName(candidate);
-                }, ScopedLookupOptions{ .PrefixDottedNames = true });
-            if (!relativeType.empty()) return relativeType;
-        }
         return name;
 }
 
@@ -2508,7 +2512,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxRefToPointer = j.value("crp", false);
         s.CxxRefLevel = static_cast<int8_t>(j.value("cxr", -1));
         s.IsCxxPointeeVolatile = j.value("cpv", false);
-        s.ConstMask = static_cast<uint8_t>(j.value("cm", 0));
+        s.ConstMask = static_cast<uint32_t>(j.value("cm", 0));
         s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxMutableField = j.value("cmf", false);
         s.IsOwningSink = j.value("osk", false);
@@ -2536,7 +2540,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
             s.FuncPtrVariadic = j.value("fpv", false);
             s.FuncPtrReturnPointerDepth = j.value("fprd", s.FuncPtrReturnPointerDepth);
             s.FuncPtrReturnResolvedKey = j.value("fprk", std::string{});
-            s.FuncPtrReturnConstMask = j.value("fprc", -1);
+            s.FuncPtrReturnConstMask = j.value("fprc", int64_t{-1});
             if (j.contains("fpp"))
                 for (const auto& pj : j["fpp"])
                 {
@@ -2555,7 +2559,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.IsPointeeConst = pj.value("pc", false);
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});
-                    p.ConstMask = pj.value("cm", -1);
+                    p.ConstMask = pj.value("cm", int64_t{-1});
                     p.AliasSpelling = pj.value("as", std::string{});
                     s.FuncPtrParams.push_back(std::move(p));
                 }

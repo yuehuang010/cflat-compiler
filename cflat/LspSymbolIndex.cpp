@@ -135,6 +135,21 @@ const SymbolDef* LspSymbolIndex::Lookup(const std::string& name) const
     return nullptr;
 }
 
+const SymbolDef* LookupEnclosingNamespaceMember(
+    const LspSymbolIndex* index, std::string fromNamespace, const std::string& memberPath)
+{
+    if (index == nullptr) return nullptr;
+    while (!fromNamespace.empty())
+    {
+        if (const SymbolDef* symbol = index->Lookup(fromNamespace + "." + memberPath))
+            return symbol;
+        const size_t dot = fromNamespace.rfind('.');
+        if (dot == std::string::npos) break;
+        fromNamespace.resize(dot);
+    }
+    return index->Lookup(memberPath);
+}
+
 std::vector<const SymbolDef*> LspSymbolIndex::LookupPrefix(const std::string& prefix) const
 {
     std::vector<const SymbolDef*> results;

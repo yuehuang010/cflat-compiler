@@ -839,6 +839,7 @@ struct InlineCostBreakdownSink;
 struct ScopedLookupOptions
 {
     bool ForceRoot = false;
+    bool EnclosingOnly = false;
     bool PrefixDottedNames = false;
     bool ResolveFirstComponentAlias = true;
 };
@@ -1056,15 +1057,13 @@ public:
         std::string TypeName;
         std::string VariableName;
         bool Pointer = false;
-        bool ElemPointer = false; // true when this is T** (pointer to pointer), e.g. T* field where T is a pointer type
-        // The '*' count POSITIVELY recorded for this value; 0 means NOT RECORDED, never "depth 0"
-        // (same convention as FuncPtrParam::PointerDepth). The model caps at 2, and a declarator
-        // OVER the cap records 0 - a clamped 2 stepped down by '*' would falsely prove depth 1.
+        bool ElemPointer = false; // legacy shape bit; derived from PointerDepth >= 2 for data pointers
+        // Exact '*' count positively recorded for this value; 0 means NOT RECORDED, never "depth 0".
         // Written at five producers only: both ParseDeclarationSpecifiers declarator branches, and
         // the '&' (+1), '*' (-1) and pointer-subscript (-1) steps over an ALREADY-RECORDED depth.
         // A new producer that CHANGES depth must step it too, or it falsely proves the old one.
         int PointerDepth = 0;
-        uint8_t ConstMask = 0;
+        uint32_t ConstMask = 0;
         bool IsInterface = false;
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         // True when this type IS one bare interface fat value ({vtable,data} by value). DERIVED,
@@ -1181,7 +1180,7 @@ public:
         std::string FuncPtrReturnResolvedKey;
         // Pointee const of the return (FuncPtrParam::ConstMask for a parameter), bottom-relative like
         // ConstMask, top level excluded. -1 = NOT RECORDED (C++, WinRT): it proves no difference.
-        int FuncPtrReturnConstMask = -1;
+        int64_t FuncPtrReturnConstMask = -1;
         struct FuncPtrParam
         {
             std::string TypeName;
@@ -1204,7 +1203,7 @@ public:
             bool IsPointeeConst = false;  // spelled `const T*` (a C++ signature: ConstMask is -1)
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
-            int ConstMask = -1;     // -1 = not recorded; see FuncPtrReturnConstMask
+            int64_t ConstMask = -1; // -1 = not recorded; see FuncPtrReturnConstMask
             // Diagnostic spelling of a named pointer alias param ("" = none). TypeName/Pointer
             // hold the resolved base and depth; printing uses this spelling plus its written stars.
             std::string AliasSpelling;
@@ -1405,45 +1404,74 @@ public:
         }
 
         // '*' count this VALUE carries, for copying into a signature component's PointerDepth.
-        // The model caps at 2, so that is the ceiling here.
         int ValuePointerDepth() const
         {
-            return (ElemPointer || PointerDepth >= 2) ? 2 : (Pointer ? 1 : 0);
+            // A view's PointerDepth is its element depth; the view itself is one level above it.
+            if (IsArrayView && PointerDepth >= 2) return PointerDepth + 1;
+            if (ElemPointer && PointerDepth < 2) return 2;
+            if (PointerDepth > 0) return PointerDepth;
+            return Pointer ? 1 : 0;
+        }
+
+        int ElementPointerDepth() const
+        {
+            if (PointerDepth > 0) return PointerDepth;
+            return ElemPointer ? 1 : 0;
         }
 
         void ApplyWholeWordConst()
         {
             const int depth = ValuePointerDepth();
-            ConstMask = static_cast<uint8_t>((1u << (depth + 1)) - 1u);
+            ConstMask = depth >= 31 ? ~uint32_t{ 0 }
+                                    : (uint32_t{ 1 } << (depth + 1)) - 1u;
         }
 
         // The declared object is the value's top pointer level; a view's element is one level below.
         bool IsConstObject() const
         {
             const int depth = ValuePointerDepth();
-            return ((ConstMask >> depth) & 1u) != 0;
+            return (ConstMask & ConstBitAt(depth)) != 0;
+        }
+
+        static uint32_t ConstBitsThrough(int depth)
+        {
+            if (depth < 0) return 0;
+            if (depth >= 31) return ~uint32_t{ 0 };
+            return (uint32_t{ 1 } << (depth + 1)) - 1u;
+        }
+
+        static uint32_t ConstBitsBelow(int depth)
+        {
+            if (depth <= 0) return 0;
+            if (depth >= 32) return ~uint32_t{ 0 };
+            return (uint32_t{ 1 } << depth) - 1u;
+        }
+
+        static uint32_t ConstBitAt(int depth)
+        {
+            return depth >= 0 && depth < 32 ? uint32_t{ 1 } << depth : 0;
         }
 
         // Pointee levels for pointer components. A view's element const is read by
         // FunctionParamConstMask because its outer view pointer is not part of the element type.
-        int PointeeConstMask() const
+        uint32_t PointeeConstMask() const
         {
             const int depth = ValuePointerDepth();
             if (IsArrayView || depth <= 0) return 0;
-            return ConstMask & ((1 << depth) - 1);
+            return ConstMask & ConstBitsBelow(depth);
         }
 
-        int FunctionParamConstMask() const
+        uint32_t FunctionParamConstMask() const
         {
             const int depth = ValuePointerDepth();
             if (depth <= 0) return 0;
-            return ConstMask & ((1 << depth) - 1);
+            return ConstMask & ConstBitsBelow(depth);
         }
 
         // A function type stores pointer pointee const, or the ConstMask of a reference result.
-        int FunctionReturnConstMask() const
+        uint32_t FunctionReturnConstMask() const
         {
-            return IsCxxRef() ? static_cast<int>(ConstMask) : PointeeConstMask();
+            return IsCxxRef() ? ConstMask : PointeeConstMask();
         }
 
         // The ConstMask level of a C++ reference's referent: a `const T&` modelled as a pointer to T
@@ -1461,16 +1489,19 @@ public:
             if (CxxRefLevel < 0) CxxRefLevel = static_cast<int8_t>(CxxReferentLevel());
         }
         // `const T&`, `const T&&`, `T *const &`: a C++ reference whose referent is const.
-        bool CxxConstRef() const { return IsCxxRef() && ((ConstMask >> CxxRefLevel) & 1u) != 0; }
+        bool CxxConstRef() const
+        {
+            return IsCxxRef() && CxxRefLevel < 32 && ((ConstMask >> CxxRefLevel) & 1u) != 0;
+        }
         void SetCxxConstRef(bool isConst)
         {
             if (isConst)
             {
                 MarkCxxRef();
-                ConstMask |= static_cast<uint8_t>(1u << CxxRefLevel);
+                if (CxxRefLevel < 32) ConstMask |= uint32_t{ 1 } << CxxRefLevel;
             }
-            else if (IsCxxRef())
-                ConstMask &= static_cast<uint8_t>(~(1u << CxxRefLevel));
+            else if (IsCxxRef() && CxxRefLevel < 32)
+                ConstMask &= ~(uint32_t{ 1 } << CxxRefLevel);
         }
         // Bit 0 is a reference's own referent, not a pointee: a `const T&` object or alias shape.
         // A plain pointer taken from it (`&ref`) keeps its bit 0 as the pointee.
@@ -1500,24 +1531,48 @@ public:
             if (isConst)
                 ConstMask |= 1u;
             else if (!CxxRefOwnsBit0())
-                ConstMask &= static_cast<uint8_t>(~1u);
+                ConstMask &= ~uint32_t{ 1 };
         }
 
-        // A plain `T**` value, proven either by the ElemPointer bit or by a recorded depth >= 2
-        // (which is how an inline `&x` over a `T*` proves itself). Both readings hold only when
-        // nothing else on the type claims depth for an ELEMENT (array/view/simd) or a fat shape.
+        int ProvenPointerDepth() const
+        {
+            if (!Pointer || !DepthIsAboutThisValue()) return 0;
+            if (ElemPointer && PointerDepth < 2) return 2;
+            if (PointerDepth > 0) return PointerDepth;
+            return 1;
+        }
+
+        int ProvenDecayedPointerDepth() const
+        {
+            if (ConstArraySize <= 0 || !Pointer || IsArrayView || IsSimd
+                || IsInterface || IsInterfacePointer || IsFunctionPointer || TypeName == "void")
+                return 0;
+            const int elementDepth = PointerDepth > 0 ? PointerDepth : (ElemPointer ? 2 : 1);
+            return elementDepth + 1;
+        }
+
+        int EffectiveProvenPointerDepth() const
+        {
+            const int decayedDepth = ProvenDecayedPointerDepth();
+            return decayedDepth > 0 ? decayedDepth : ProvenPointerDepth();
+        }
+
+        bool IsProvenPointerDepth(int depth) const
+        {
+            return depth > 0 && ProvenPointerDepth() == depth;
+        }
+
+        // A plain `T**` value. Other depths must not be folded into this shape.
         bool IsProvenDoublePointer() const
         {
-            return Pointer && (ElemPointer || PointerDepth >= 2)
-                && DepthIsAboutThisValue();
+            return IsProvenPointerDepth(2);
         }
 
         // A POSITIVELY recorded depth-1 pointer. Unlike !ElemPointer (which is "not recorded"),
         // PointerDepth == 1 is a claim, so this is the proof the reverse-direction gate needs.
         bool IsProvenSinglePointerDepth() const
         {
-            return Pointer && PointerDepth == 1 && !ElemPointer
-                && TypeName != "void" && DepthIsAboutThisValue();
+            return IsProvenPointerDepth(1) && PointerDepth == 1 && TypeName != "void";
         }
 
         /*
@@ -1529,9 +1584,7 @@ public:
          */
         bool IsProvenDecayedDoublePointer() const
         {
-            return ConstArraySize > 0 && Pointer && !ElemPointer && !IsArrayView && !IsSimd
-                && !IsInterface && !IsInterfacePointer && !IsFunctionPointer
-                && TypeName != "void";
+            return ProvenDecayedPointerDepth() == 2;
         }
 
         /*
@@ -1543,21 +1596,24 @@ public:
          */
         bool PointerDepthRefuses(const TypeAndValue& other) const
         {
-            if ((IsProvenDoublePointer() || IsProvenDecayedDoublePointer())
-                && other.IsProvenSinglePointer())
-                return true;
-
-            // The mirror: a POSITIVELY depth-1 argument does not bind a proven `T**` parameter.
-            // Both sides must be proven, so an unrecorded depth (0) still accepts.
-            return IsProvenSinglePointerDepth() && other.IsProvenDoublePointer();
+            const int argumentDepth = ProvenDecayedPointerDepth() > 0
+                ? ProvenDecayedPointerDepth() : ProvenPointerDepth();
+            const int parameterDepth = other.ProvenPointerDepth();
+            if (argumentDepth == 0 || parameterDepth == 0 || argumentDepth == parameterDepth)
+                return false;
+            // An unrecorded single pointer does not prove a shallower argument.
+            if (argumentDepth == 1 && PointerDepth == 0 && parameterDepth > 1)
+                return false;
+            // Any object pointer can convert to void*, regardless of its source depth.
+            if (other.TypeName == "void" && parameterDepth == 1) return false;
+            return true;
         }
 
         // A plain `T*` value. `void*` is excluded because every pointer converts to it: without
         // that the overload dump claimed a `T**` cannot reach a `void*` param, which is false.
         bool IsProvenSinglePointer() const
         {
-            return Pointer && !ElemPointer
-                && TypeName != "void" && DepthIsAboutThisValue();
+            return IsProvenPointerDepth(1) && TypeName != "void";
         }
 
         bool DepthIsAboutThisValue() const
@@ -1586,7 +1642,7 @@ public:
     struct AliasScopeFrame
     {
         std::unordered_map<std::string, std::string> typeAliases;
-        std::unordered_map<std::string, uint8_t> typeAliasConstMasks;
+        std::unordered_map<std::string, uint32_t> typeAliasConstMasks;
         std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
         std::unordered_set<std::string> genericDerivedTypeAliases;
     };
@@ -1610,7 +1666,7 @@ public:
         bool Pointer = false;
         bool ElemPointer = false;
         int PointerDepth = 0;
-        uint8_t ConstMask = 0;
+        uint32_t ConstMask = 0;
         bool IsInterface = false;
         bool IsInterfacePointer = false;
         bool IsNullable = false;
@@ -1650,7 +1706,7 @@ public:
         bool FuncPtrNoPrototype = false;
         int FuncPtrReturnPointerDepth = 0;
         std::string FuncPtrReturnResolvedKey;
-        int FuncPtrReturnConstMask = -1;
+        int64_t FuncPtrReturnConstMask = -1;
         struct FuncPtrParam
         {
             std::string TypeName;
@@ -1668,7 +1724,7 @@ public:
             bool IsPointeeConst = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
-            int ConstMask = -1;
+            int64_t ConstMask = -1;
             std::string AliasSpelling;  // "" = none; see TypeAndValue::FuncPtrParam
             std::shared_ptr<SerializedTav> FunctionTypeSignature;
         };
@@ -2330,6 +2386,8 @@ public:
         bool IsUnresolvedGenericFunctionTemplate = false;
         bool DeferMovedMark = false;     // operator lowering applies the move after result formation
         bool ForceOperatorConsume = false;
+        // Binary operator operands permit C++ floating-to-integer value conversion.
+        bool CxxOperatorFloatToInteger = false;
         std::vector<ConditionalMoveSource> ConditionalMoveSources;
         // Canonical lock path of the argument spelling ('&o.inner' -> 'o.inner'), empty when the
         // spelling is not a plain path. Read only by CheckCallSiteLocks; not cached by --init.
@@ -4356,7 +4414,7 @@ private:
     // redefinition. Transient per compile, never serialized.
     std::unordered_map<std::string, std::unordered_set<std::string>> enumDeclSites_;
     std::unordered_map<std::string, std::string> typeAliases;
-    std::unordered_map<std::string, uint8_t> typeAliasConstMasks;
+    std::unordered_map<std::string, uint32_t> typeAliasConstMasks;
     // C++ aliases of std::nullptr_t (std.nullptr_t, `using Nil = std::nullptr_t`): typeAliases
     // spells them void*, this keeps their identity for IsCxxNullptrT. Cleared with typeAliases.
     std::unordered_set<std::string> cxxNullptrTAliases_;
@@ -5904,6 +5962,7 @@ private:
                                 llvm::Value* rawArrayLength = nullptr);
     void SetVariableOwnFlagValue(const std::string& varName, bool mayOwn, llvm::Value* value,
                                  bool runtimeCanBeFalse, bool updateRuntimeFlag = true);
+    void SetArrayViewOwnFlagFromRawArrayResult(const std::string& varName, llvm::Value* value);
     bool IsOutsideOwnFlagControlPath(const NamedVariable& namedVar) const;
     // A jump or case label leaves the innermost frame of targetKinds: joins recorded inside it move to
     // its parent path, so only a store after that construct can clear them.
@@ -8841,12 +8900,12 @@ public:
     static bool IsPrimitiveTypeName(const std::string& name);
 
     void RegisterTypeAlias(const std::string& alias, const std::string& target,
-                           uint8_t constMask = 0, bool genericDerived = false);
+                           uint32_t constMask = 0, bool genericDerived = false);
     void RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target);
 
     std::string ResolveTypeAlias(const std::string& name) const;
     bool IsGenericDerivedTypeAlias(const std::string& name) const;
-    uint8_t ResolveTypeAliasConstMask(const std::string& name) const;
+    uint32_t ResolveTypeAliasConstMask(const std::string& name) const;
     /*
      * `Owner.name` in type position: the member type `name` of record `owner` - a CFlat
      * aggregate's `using` alias or nested aggregate, or a C++ record's member typedef / nested
@@ -9001,6 +9060,9 @@ public:
     // The single definition of "the generic template key space" - both the routing predicates and
     // the use-site base resolution below consult it, so they cannot drift apart.
     bool IsGenericTemplateKey(const std::string& key) const;
+    // A NON-template type registered under the qualified `key` (struct/class, interface, enum,
+    // alias). C++ foreign names are not counted. Feeds NonGenericNamespaceTypeHides.
+    bool IsNonGenericNamespaceTypeKey(const std::string& key) const;
     antlr4::ParserRuleContext* GetGenericTemplateDefinitionContext(const std::string& key) const;
 
     /*
@@ -9069,13 +9131,10 @@ public:
      * Enclosing-namespace chain, INNERMOST FIRST, accepting only a candidate that names a type.
      * Callers must not apply it to an already-substituted argument.
      *
-     * A spelling that ALREADY contains a dot is returned untouched, which is where this differs
-     * from ResolveGenericTemplateBase. Ordinary type lookup resolves a dotted name from the top
-     * (`ResolveQualifiedName` only walks outward for a name with NO dot), so relatively resolving
-     * one here made a single spelling mean two types in one scope: `B.Item` as a plain local named
-     * the top-level B.Item while `Box<B.Item>` named A.B.Item. For a template BASE there is no
-     * second lookup to disagree with - the mangled name IS the identity - which is why the base
-     * walk is deliberately left unguarded.
+     * Dotted names use qualified lookup's same innermost-enclosing-scope order before root lookup,
+     * so `B.Item` and `Box<B.Item>` bind the same way inside namespace A. Unlike a generic template
+     * BASE, the argument still has to resolve to a registered type; a same-named function or global
+     * never hijacks the type argument.
      */
     std::string ResolveTypeArgBaseName(const std::string& base) const;
 
@@ -12378,7 +12437,7 @@ public:
         bool Known = false;
         bool IsArrayView = false;
         bool IsAlias = false;       // by-address ABI identity: an alias param or return
-        int ConstMask = -1;
+        int64_t ConstMask = -1;
         std::string Canon;          // "i32", "f64", "p:v", "s", "p:s", ...
         // Scalar pointer pointees erase signedness but keep target-long identity apart from fixed-width integers.
         std::string ScalarPointeeClass;
@@ -12455,9 +12514,9 @@ public:
      */
     FuncPtrComponent FuncPtrComponentOf(const std::string& typeName, bool pointer,
         int pointerDepth = 0, const std::string& resolvedKey = "",
-        bool isArrayView = false, int constMask = -1, bool isAlias = false) const;
+        bool isArrayView = false, int64_t constMask = -1, bool isAlias = false) const;
     FuncPtrComponent FuncPtrFunctionTypeComponentOf(const TypeAndValue& signature, bool pointer,
-        int pointerDepth, bool isArrayView, int constMask, bool isAlias) const;
+        int pointerDepth, bool isArrayView, int64_t constMask, bool isAlias) const;
     FuncPtrComponent FuncPtrComponentOf(const TypeAndValue::FuncPtrParam& param) const;
 
     /*
@@ -12779,6 +12838,9 @@ public:
                                              const TypeAndValue& param) const;
     static int RankIntegerConversion(const std::string& argIdentity, const std::string& paramIdentity,
                                      bool cxxCandidate = false);
+    // C++ binary-operator floating RHS converted for a parameter the operator rule admits (Overloads.cpp).
+    llvm::Value* ConvertCxxOperatorFloatOperand(llvm::Value* value, const NamedVariable& arg,
+                                                const TypeAndValue& param);
 
     // How a call site's arguments bind to declared parameter slots (see ComputeArgumentPositions).
     struct ArgumentBinding
@@ -13604,9 +13666,7 @@ public:
     }
     /*
      * Pointee-const relation of a C++ record (or same-primitive) pointer argument to a C++ pointer
-     * parameter at the innermost ConstMask level (TypeAndValue::PointeeConst). Single level: same
-     * class or derived-to-base. Pointer-to-pointer: same class only; C++ forbids adding or
-     * dropping the inner const there.
+     * parameter at the innermost ConstMask level (TypeAndValue::PointeeConst).
      */
     enum class CxxPointeeConstRelation { Unrelated, Same, Adds, Drops };
     static CxxPointeeConstRelation CxxPointeeConstRelationOf(const TypeAndValue& from, bool toConst)
@@ -13622,9 +13682,10 @@ public:
     CxxPointeeConstRelation CxxRecordPointeeConstRelation(const TypeAndValue& from,
                                                           const TypeAndValue& to) const
     {
-        if (!from.Pointer || !to.Pointer || from.ElemPointer != to.ElemPointer
+        if (!from.Pointer || !to.Pointer
+            || from.ValuePointerDepth() != to.ValuePointerDepth()
             || from.IsFunctionPointer || to.IsFunctionPointer || from.IsArrayView || to.IsArrayView
-            || from.PointerDepth > 2 || to.PointerDepth > 2)
+            )
             return CxxPointeeConstRelation::Unrelated;
         /*
          * A primitive pointee (`const char*` from c_str()) relates to a primitive parameter. Its
@@ -14007,13 +14068,13 @@ public:
     bool PointerValuePointeeConst(const llvm::Value* pointer, std::string& name, int depth = 0) const;
     // Top-relative const levels (bit 0 = the first level reached): behind a pointer value, of the
     // object stored at an address (bit 0 = that object), and behind a declared pointer type.
-    uint8_t ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth = 0) const;
-    uint8_t StoredConstLevels(const llvm::Value* address, std::string& name, int depth = 0) const;
+    uint32_t ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth = 0) const;
+    uint32_t StoredConstLevels(const llvm::Value* address, std::string& name, int depth = 0) const;
     bool IsStringLiteralGlobal(const llvm::Value* value) const;
     bool LiteralMismatchesPointee(const llvm::Value* value, const TypeAndValue& source,
         const TypeAndValue& target, int depth, int guard = 0) const;
-    uint8_t DeclaredPointeeConstLevels(const TypeAndValue& tv) const;
-    static bool QualificationDiscardsConst(uint8_t source, uint8_t target, int depth);
+    uint32_t DeclaredPointeeConstLevels(const TypeAndValue& tv) const;
+    static bool QualificationDiscardsConst(uint32_t source, uint32_t target, int depth);
     llvm::Value* ArgumentPointerValue(const NamedVariable& arg) const;
     // A C header parameter's ConstMask holds its exact spelled levels (`int *const *`), not filled.
     static bool ParameterHasExactLevels(const FunctionSymbol& candidate, const TypeAndValue& param)
@@ -14480,6 +14541,7 @@ public:
     std::string FirstVisibleScopedKey(const std::string& name, Pred pred,
                                       ScopedLookupOptions opts = {}) const
     {
+        if (opts.EnclosingOnly && ScopedLookupIsRootOnly(opts)) return {};
         if (ScopedLookupIsRootOnly(opts))
         {
             if (pred(name)) return name;
@@ -14510,6 +14572,7 @@ public:
     const typename MapT::mapped_type* FindFirstVisibleScoped(const MapT& map, const std::string& name,
                                                              ScopedLookupOptions opts = {}) const
     {
+        if (opts.EnclosingOnly && ScopedLookupIsRootOnly(opts)) return nullptr;
         if (ScopedLookupIsRootOnly(opts))
         {
             auto it = map.find(name);

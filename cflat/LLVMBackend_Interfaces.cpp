@@ -192,7 +192,7 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
     }
 
 void LLVMBackend::RegisterTypeAlias(const std::string& alias, const std::string& target,
-                                    uint8_t constMask, bool genericDerived)
+                                    uint32_t constMask, bool genericDerived)
 {
         if (!aliasScopeStack_.empty())
         {
@@ -274,12 +274,12 @@ bool LLVMBackend::IsGenericDerivedTypeAlias(const std::string& name) const
         return false;
     }
 
-uint8_t LLVMBackend::ResolveTypeAliasConstMask(const std::string& name) const
+uint32_t LLVMBackend::ResolveTypeAliasConstMask(const std::string& name) const
 {
         for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
             if (auto it = frame.typeAliasConstMasks.find(name); it != frame.typeAliasConstMasks.end())
                 return it->second;
-        if (const uint8_t* found = FindFirstVisibleScoped(typeAliasConstMasks, name)) return *found;
+        if (const uint32_t* found = FindFirstVisibleScoped(typeAliasConstMasks, name)) return *found;
         if (!aggregateAliasScopes_.empty())
             if (size_t dot = name.rfind('.'); dot != std::string::npos && dot > 0 && dot + 1 < name.size()
                 && aggregateAliasMemberNames_.count(name.substr(dot + 1)) != 0)
@@ -597,19 +597,6 @@ namespace
         return out;
     }
 
-    // True when a pattern argument spells `name...` as a whole identifier, directly or nested
-    // ("Seq<I...>", "TypeList<T...>"). Only a parameter pack can be expanded that way.
-    bool SpellsPackExpansion(const std::string& text, const std::string& name)
-    {
-        for (size_t at = 0; (at = text.find(name, at)) != std::string::npos; at += name.size())
-        {
-            const bool leftOk = at == 0
-                || (std::isalnum((unsigned char)text[at - 1]) == 0 && text[at - 1] != '_');
-            if (leftOk && text.compare(at + name.size(), 3, "...") == 0) return true;
-        }
-        return false;
-    }
-
     // Whole-identifier containment, so `TT` does not match `T`.
     bool MentionsIdentifier(const std::string& text, const std::string& name)
     {
@@ -623,6 +610,155 @@ namespace
             if (leftOk && rightOk) return true;
         }
         return false;
+    }
+
+    // Start of the template argument that the "..." at `ellipsis` expands: scanning back to the
+    // enclosing `<`, `(` or `,` at the same nesting, so `T*`, `const T&`, `Box<T>`, `(I > 1)` and
+    // `typename W<T>::type` are each one pattern. Angle brackets inside parentheses do not count.
+    // npos when unbalanced.
+    size_t PackPatternStart(const std::string& text, size_t ellipsis, size_t floor)
+    {
+        int parens = 0;
+        int angles = 0;
+        size_t p = ellipsis;
+        while (p > floor)
+        {
+            const char c = text[p - 1];
+            if (c == ')' || c == ']') ++parens;
+            else if (c == '(' || c == '[')
+            {
+                if (parens == 0) break;
+                --parens;
+            }
+            else if (parens == 0 && c == '>') ++angles;
+            else if (parens == 0 && c == '<')
+            {
+                if (angles == 0) break;
+                --angles;
+            }
+            else if (parens == 0 && c == ',' && angles == 0) break;
+            --p;
+        }
+        if (parens != 0 || angles != 0) return std::string::npos;
+        while (p < ellipsis && text[p] == ' ') ++p;
+        return p;
+    }
+
+
+    // Brings a substituted pattern piece to the spelling CFlat reads for a C++ template argument:
+    // clang prints "T *" and "const T &" and writes "typename" before a dependent type, while CFlat
+    // spells "T*", "const T&" and "W<T>.type". An integer expression ("(I + 1)") is left as written,
+    // so CFlat refuses it with the message a non-pack alias gets.
+    bool IsIntegerExpressionText(const std::string& text)
+    {
+        if (text.find_first_of("()+-/%!~^|?=") != std::string::npos) return true;
+        return text.find("<<") != std::string::npos || text.find(">>") != std::string::npos
+            || text.find("&&") != std::string::npos;
+    }
+
+    std::string CxxArgSpellingText(std::string text)
+    {
+        for (size_t at = 0; (at = text.find("typename ", at)) != std::string::npos;)
+        {
+            if (at == 0 || (std::isalnum((unsigned char)text[at - 1]) == 0 && text[at - 1] != '_'))
+                text.erase(at, 9);
+            else
+                at += 9;
+        }
+        if (IsIntegerExpressionText(text)) return text;
+        for (size_t at = 1; at < text.size(); ++at)
+        {
+            if (text[at - 1] == ' ' && (text[at] == '*' || text[at] == '&'))
+                text.erase(--at, 1);
+        }
+        return text;
+    }
+
+    // True when a pattern argument uses the pack `name`: `name...`, `Box<name>...`, `T*...`,
+    // a pattern nested in another one, or `sizeof...(name)`. Only a parameter pack can be so used.
+    bool SpellsPackExpansion(const std::string& text, const std::string& name)
+    {
+        if (text.find("sizeof...(" + name + ")") != std::string::npos) return true;
+        for (size_t at = 0; (at = text.find("...", at)) != std::string::npos; at += 3)
+        {
+            const size_t start = PackPatternStart(text, at, 0);
+            if (start != std::string::npos
+                && MentionsIdentifier(text.substr(start, at - start), name))
+                return true;
+        }
+        return false;
+    }
+
+    // A whole top-level pattern argument that is `pattern...` where the pattern uses the pack
+    // ("Box<T>...", "T*..."). Its elements are separate template arguments.
+    bool IsTopLevelPackExpansion(const std::string& arg, const std::string& name)
+    {
+        if (arg.size() <= 3 || arg.compare(arg.size() - 3, 3, "...") != 0) return false;
+        const size_t ellipsis = arg.size() - 3;
+        const size_t start = PackPatternStart(arg, ellipsis, 0);
+        return start != std::string::npos && start == arg.find_first_not_of(' ')
+            && MentionsIdentifier(arg.substr(start, ellipsis - start), name);
+    }
+
+    // The pack expansions in `text` whose pattern uses `pack`, as [start, ellipsis) pairs in text
+    // order. An expansion nested inside another is dropped: the outer one covers it.
+    std::vector<std::pair<size_t, size_t>> PackExpansionSpans(const std::string& text,
+                                                              const std::string& pack)
+    {
+        std::vector<std::pair<size_t, size_t>> spans;
+        for (size_t at = 0; (at = text.find("...", at)) != std::string::npos; at += 3)
+        {
+            const size_t start = PackPatternStart(text, at, 0);
+            if (start != std::string::npos
+                && MentionsIdentifier(text.substr(start, at - start), pack))
+                spans.emplace_back(start, at);
+        }
+        std::sort(spans.begin(), spans.end(), [](const auto& a, const auto& b) {
+            return a.first != b.first ? a.first < b.first : a.second > b.second;
+        });
+        std::vector<std::pair<size_t, size_t>> outer;
+        size_t covered = 0;
+        for (const auto& span : spans)
+        {
+            if (!outer.empty() && span.first < covered) continue;
+            outer.push_back(span);
+            covered = span.second + 3;
+        }
+        return outer;
+    }
+
+    // Expands every pack expansion in `text` whose pattern uses `pack`: one copy of the pattern
+    // per element, joined by ", ". An expansion nested in another is expanded first, over every
+    // element, and the outer pattern is then copied per element. sizeof...(pack) becomes the
+    // element count. Other parameters are left for SubstituteAliasParams.
+    std::string ExpandPackPattern(const std::string& text, const std::string& pack,
+                                  const std::vector<std::string>& elements,
+                                  const std::unordered_map<std::string, std::string>& binding)
+    {
+        std::string sized = text;
+        const std::string sizeofText = "sizeof...(" + pack + ")";
+        const std::string count = std::to_string(elements.size());
+        for (size_t at = 0; (at = sized.find(sizeofText, at)) != std::string::npos;
+             at += count.size())
+            sized.replace(at, sizeofText.size(), count);
+        std::string out;
+        size_t pos = 0;
+        for (const auto& [start, ellipsis] : PackExpansionSpans(sized, pack))
+        {
+            out += sized.substr(pos, start - pos);
+            const std::string pattern = ExpandPackPattern(
+                sized.substr(start, ellipsis - start), pack, elements, binding);
+            for (size_t e = 0; e < elements.size(); ++e)
+            {
+                if (e > 0) out += ", ";
+                auto local = binding;
+                local[pack] = elements[e];
+                out += CxxArgSpellingText(SubstituteAliasParams(pattern, local));
+            }
+            pos = ellipsis + 3;
+        }
+        out += sized.substr(pos);
+        return out;
     }
 }
 
@@ -733,14 +869,41 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
             std::vector<std::string> substituted;
             for (size_t i = 0; i < keep; ++i)
             {
-                if (packParam && pattern->args[i] == pattern->params.back() + "...")
+                const std::string& patternArg = pattern->args[i];
+                if (packParam && patternArg == pattern->params.back() + "...")
                 {
                     substituted.insert(substituted.end(), packArgs.begin(), packArgs.end());
                     continue;
                 }
-                auto bound = binding.find(pattern->args[i]);
-                substituted.push_back(bound != binding.end()
-                    ? bound->second : SubstituteAliasParams(pattern->args[i], binding));
+                // A top-level "Box<T>...": one template argument per pack element.
+                if (packParam && IsTopLevelPackExpansion(patternArg, pattern->params.back()))
+                {
+                    const std::string piece = ExpandPackPattern(
+                        patternArg.substr(0, patternArg.size() - 3), pattern->params.back(),
+                        packArgs, binding);
+                    for (const std::string& element : packArgs)
+                    {
+                        auto local = binding;
+                        local[pattern->params.back()] = element;
+                        substituted.push_back(CxxArgSpellingText(SubstituteAliasParams(piece, local)));
+                    }
+                    continue;
+                }
+                auto bound = binding.find(patternArg);
+                if (bound != binding.end())
+                {
+                    substituted.push_back(bound->second);
+                    continue;
+                }
+                if (!packParam)
+                {
+                    substituted.push_back(SubstituteAliasParams(patternArg, binding));
+                    continue;
+                }
+                // Nested uses ("Pair<H, TypeList<Box<T>...>>", "sizeof...(T)") expand in text.
+                substituted.push_back(CxxArgSpellingText(SubstituteAliasParams(
+                    ExpandPackPattern(patternArg, pattern->params.back(), packArgs, binding),
+                    binding)));
             }
             base = pattern->targetBase;
             args = std::move(substituted);
@@ -770,6 +933,16 @@ void LLVMBackend::ResolveGenericAliasSpelling(std::string& base, std::vector<std
             base = "std.unique_ptr";
             args[0] = ResolveTypeAlias(args[0]);
         }
+    }
+
+bool LLVMBackend::IsNonGenericNamespaceTypeKey(const std::string& key) const
+{
+        if (IsCxxRecord(key) || IsCxxForeignTypeRegistered(key)) return false;
+        // A declaration the name scan could not key (an `if const` arm) may be a template: not proven.
+        if (gts.scannedGenericStructNamesUncertain.count(key) != 0) return false;
+        return dataStructures.count(key) != 0 || interfaceTable.count(key) != 0
+            || gts.scannedTypeNames.count(key) != 0 || gts.scannedEnumNames.count(key) != 0
+            || enumBackingTypes.count(key) != 0 || ResolveTypeAlias(key) != key;
     }
 
 bool LLVMBackend::IsGenericTemplateKey(const std::string& key) const
@@ -837,14 +1010,14 @@ bool LLVMBackend::IsGenericFunctionKeyInNamespace(const std::string& key, const 
 std::string LLVMBackend::ResolveGenericFunctionBase(const std::string& base) const
 {
         if (base.empty() || currentNamespace_.empty()) return base;
-        if (base.find('.') != std::string::npos) return base;
         // The predicate reads the candidate's own namespace prefix: only a template DECLARED in
         // that namespace answers, so a struct method key of the same shape never does.
         std::string key = FirstVisibleScopedKey(base, [this](const std::string& c) {
             auto dot = c.rfind('.');
             if (dot == std::string::npos) return false;
             return IsGenericFunctionKeyInNamespace(c, c.substr(0, dot));
-        }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+        }, ScopedLookupOptions{ .PrefixDottedNames = true,
+                                .ResolveFirstComponentAlias = false });
         return key.empty() ? base : key;
     }
 
@@ -862,11 +1035,8 @@ std::string LLVMBackend::ResolveTypeArgBaseName(const std::string& base) const
         if (base.empty() || currentNamespace_.empty()) return base;
         auto isTypeArg = [this](const std::string& c) { return IsTypeArgTypeKey(c); };
         std::string key = FirstVisibleScopedKey(base, isTypeArg,
-            ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
-        if (key.empty() && base.find('.') != std::string::npos)
-            key = FirstVisibleScopedKey(base, isTypeArg,
-                ScopedLookupOptions{ .PrefixDottedNames = true,
-                                     .ResolveFirstComponentAlias = false });
+            ScopedLookupOptions{ .PrefixDottedNames = true,
+                                 .ResolveFirstComponentAlias = false });
         return key.empty() ? base : key;
     }
 
@@ -1237,7 +1407,7 @@ void LLVMBackend::UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue&
             tv.IsRvalueRef = p.IsRvalueRef;
             tv.IsAlias = p.IsAlias;
             tv.IsCxxRefToPointer = p.IsCxxRefToPointer;
-            if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint8_t>(p.ConstMask);
+            if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint32_t>(p.ConstMask);
             if (p.IsCxxRefToPointer)
                 tv.CxxRefLevel = static_cast<int8_t>(p.PointerDepth);
             else if ((p.IsAlias || p.IsRvalueRef) && IsCxxRecord(p.TypeName))

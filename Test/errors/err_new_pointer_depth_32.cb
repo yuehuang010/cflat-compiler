@@ -1,0 +1,6 @@
+extern int main()
+{
+    expect_error("produces pointer depth 32, exceeding the limit of 31") {
+        auto p = new int*******************************;
+    }
+}

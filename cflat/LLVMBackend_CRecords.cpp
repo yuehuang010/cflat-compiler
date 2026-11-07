@@ -315,7 +315,7 @@ bool LLVMBackend::CompleteCxxTemplateTypeArgs(const std::string& baseName,
                 if (defaultType.IsFunctionPointer)
                 {
                     std::vector<std::pair<std::string, int>> fnParams;
-                    std::vector<int> fnParamConsts;
+                    std::vector<int64_t> fnParamConsts;
                     std::vector<bool> fnParamAliases;
                     for (const auto& fnParam : defaultType.FuncPtrParams)
                     {
@@ -3596,8 +3596,9 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 if (!r.isCxx && !tv.IsFunctionPointer && !tv.IsArrayView)
                 {
                     const int depth = tv.ValuePointerDepth();
-                    const uint8_t mask = static_cast<uint8_t>(CSpellingPointeeConstMask(elemSpelling, depth)
-                        | (f.isConst && !f.isMutable ? (1u << depth) : 0u));
+                    const uint32_t mask = CSpellingPointeeConstMask(elemSpelling, depth)
+                        | (f.isConst && !f.isMutable
+                            ? LLVMBackend::TypeAndValue::ConstBitAt(depth) : 0u);
                     if (mask != 0 && (mask & (mask + 1u)) == 0) tv.ConstMask = mask;
                 }
                 if (r.isCxx && CxxSpellingHasVolatileTarget(f.ctype))

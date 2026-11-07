@@ -3406,7 +3406,9 @@ on LLP64 and 64-bit on LP64); an `L` value too large for 32-bit `long` uses `i64
 - **Generic deduction is the exception.** A generic `T` deduced from an unsuffixed literal takes
   the C++ default type: `int` (or `long` when the value does not fit), `double` for a floating
   literal. So `first(7, 2)` deduces `T = int` and `first(300, 2)` compiles. Two literals that need
-  different types widen to the larger one.
+  different types widen to the larger one. C++ function-template deduction also uses `double`
+  for built-in arithmetic expressions containing an unsuffixed floating literal, even when CFlat
+  computes the expression as `float`.
 - **Floating point**: a no-suffix decimal is `float` (f32) when it round-trips through
   float without loss of precision, otherwise `double` (f64). So `1.5` and `100.0` are
   `float`, while `0.1` and `3.141592653589793` (which lose precision in float) are

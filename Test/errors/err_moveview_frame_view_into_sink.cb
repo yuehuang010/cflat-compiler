@@ -1,0 +1,27 @@
+int moveviewFrameSink(move int[] values)
+{
+    int n = 0;
+    for (int x in values) n += x;
+    return n;
+}
+
+extern int main()
+{
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int[] values = {1, 2, 3};
+        moveviewFrameSink(move values);
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int[3] storage = {1, 2, 3};
+        int[] values = storage;
+        moveviewFrameSink(move values);
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int[3] storage = {1, 2, 3};
+        int[] values = storage;
+        moveviewFrameSink(move values);
+        values = new int[1];
+        values[0] = 9;
+    }
+    return 0;
+}

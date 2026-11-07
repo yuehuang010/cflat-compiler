@@ -101,6 +101,63 @@ int test_sizeof_two_type_args()
     return (int)sizeof(SizeofPair<int, float>) == 8 ? 0 : 1;
 }
 
+expect_error("unknown type 'TDScopeBlockTypedef'") {
+    int blockTypedefDoesNotEscape() {
+        { typedef double TDScopeBlockTypedef; }
+        TDScopeBlockTypedef value = 1;
+        return 0;
+    }
+}
+
+expect_error("unknown type 'TDScopeBlockUsing'") {
+    int blockUsingDoesNotEscape() {
+        { using TDScopeBlockUsing = double; }
+        TDScopeBlockUsing value = 1;
+        return 0;
+    }
+}
+
+expect_error("unknown type 'TDScopeLocalBox'") {
+    struct TDScopeErrorBox<T> { T value = default; };
+    int genericAliasDoesNotEscape() {
+        {
+            using TDScopeLocalBox = TDScopeErrorBox<int>;
+            TDScopeLocalBox value = default;
+        }
+        TDScopeLocalBox value = default;
+        return 0;
+    }
+}
+
+// A plain nested block's alias does not reach a later generic argument (ruled 2026-11-04).
+expect_error("unknown type 'TDScopeArgAlias'") {
+    struct TDScopeArgBox<T> { T value = default; };
+    int blockAliasGenericArgDoesNotEscape() {
+        { using TDScopeArgAlias = double; }
+        TDScopeArgBox<TDScopeArgAlias> b = default;
+        return 0;
+    }
+}
+
+// The unknown argument is diagnosed even when its generic template is defined later.
+int blockAliasGenericArgBeforeTemplateDoesNotEscape() {
+    { using TDScopeForwardArgAlias = double; }
+    expect_error("unknown type 'TDScopeForwardArgAlias'");
+    TDScopeForwardArgBox<TDScopeForwardArgAlias> b = default;
+    return 0;
+}
+struct TDScopeForwardArgBox<T> { T value = default; };
+
+// Nested arguments also report their unresolved leaf before a later template layout is used.
+int blockAliasNestedGenericArgBeforeTemplateDoesNotEscape() {
+    { using TDScopeNestedForwardAlias = double; }
+    expect_error("unknown type 'TDScopeNestedForwardAlias'");
+    TDScopeNestedForwardOuter<TDScopeNestedForwardInner<TDScopeNestedForwardAlias>> b = default;
+    return 0;
+}
+struct TDScopeNestedForwardInner<T> { T value = default; };
+struct TDScopeNestedForwardOuter<T> { T value = default; };
+
 // A discarded tuple-of-comparisons is read as a TYPE by 'sizeof'; the message must quote
 // what was written, not the mangled name the type lookup built from it.
 extern int main()

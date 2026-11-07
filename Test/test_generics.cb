@@ -2856,6 +2856,119 @@ bool testT433TupleTypeResolution()
     return result;
 }
 
+// Tuple aliases and tuple element shapes (run tupalias): a `using` alias of a tuple at file,
+// namespace and block scope, typed as local / parameter / return / field, alias of an alias,
+// pointer / function-type / alias-of-function / alias-of-pointer elements, nested tuples,
+// generic `(T, int)` arguments with deduction and explicit T.
+struct TalFoo { int v = default; };
+using TalPair = (int, TalFoo);
+using TalPairAlias = TalPair;
+using TalPtrPair = (int, TalFoo*);
+using TalFn = function<int(int)>;
+using TalPtr = TalFoo*;
+struct TalHolder { TalPair p = default; int k = default; };
+namespace TalNs { using Pair = (int, TalFoo); }
+int talForwardBody() { TalLater fl = default; fl.item_0 = 2; fl.item_1.v = 3; return fl.item_0 * 10 + fl.item_1.v; }
+using TalLater = (int, TalFoo);
+int talTwice(int x) { return x * 2; }
+int talSumPair(TalPair p) { return p.item_0 * 10 + p.item_1.v; }
+TalPair talMakePair(int a) { TalPair t = default; t.item_0 = a; t.item_1.v = a + 1; return t; }
+int talFirst<T>((T, int) t) { return t.item_1; }
+int talDeepSum(((int, TalFoo*), int) t) { return t.item_0.item_0 + t.item_1; }
+
+bool testTupleAliasAndElementShapes()
+{
+    bool result = true;
+
+    TalPair t = default;
+    t.item_0 = 3; t.item_1.v = 4;
+    result &= Test("tal_alias_local", t.item_0 + t.item_1.v, 7);
+    result &= Test("tal_alias_forward_body", talForwardBody(), 23);
+    result &= Test("tal_alias_sizeof", (int)sizeof(TalPair), 8);
+    result &= Test("tal_alias_param", talSumPair(t), 34);
+    TalPair made = talMakePair(5);
+    result &= Test("tal_alias_return", made.item_0 * 10 + made.item_1.v, 56);
+    (int da, TalFoo db) = talMakePair(6);
+    result &= Test("tal_alias_destructure", da * 10 + db.v, 67);
+
+    TalHolder h = default;
+    h.p.item_0 = 2; h.p.item_1.v = 9; h.k = 1;
+    result &= Test("tal_alias_field", h.p.item_0 * 10 + h.p.item_1.v + h.k, 30);
+
+    TalPairAlias pa = default;
+    pa.item_0 = 8; pa.item_1.v = 1;
+    result &= Test("tal_alias_of_alias", pa.item_0 + pa.item_1.v, 9);
+
+    TalNs.Pair np = default;
+    np.item_0 = 4; np.item_1.v = 5;
+    result &= Test("tal_namespace_alias", np.item_0 + np.item_1.v, 9);
+
+    using TalBlock = (int, TalFoo);
+    TalBlock bl = default;
+    bl.item_0 = 6; bl.item_1.v = 7;
+    result &= Test("tal_block_alias", bl.item_0 + bl.item_1.v, 13);
+
+    (int, TalFoo*) pe = default;
+    pe.item_0 = 2;
+    pe.item_1 = new TalFoo;
+    pe.item_1->v = 5;
+    result &= Test("tal_pointer_elem_rw", pe.item_0 + pe.item_1->v, 7);
+    TalFoo* peOwned = move pe.item_1;
+    delete peOwned;
+
+    (int*, int) ip = default;
+    int target = 9;
+    ip.item_0 = &target;
+    ip.item_1 = 1;
+    *ip.item_0 = *ip.item_0 + ip.item_1;
+    result &= Test("tal_int_pointer_elem", target, 10);
+
+    TalPtrPair tp = default;
+    tp.item_0 = 6;
+    tp.item_1 = new TalFoo;
+    tp.item_1->v = 4;
+    result &= Test("tal_alias_pointer_pair", tp.item_0 + tp.item_1->v, 10);
+    TalFoo* tpOwned = move tp.item_1;
+    delete tpOwned;
+
+    TalPtr aliasPtr = new TalFoo;
+    aliasPtr->v = 3;
+    (int, TalPtr) ap = default;
+    ap.item_0 = 1;
+    ap.item_1 = aliasPtr;
+    result &= Test("tal_alias_of_pointer_elem", ap.item_0 + ap.item_1->v, 4);
+    TalFoo* apOwned = move ap.item_1;
+    delete apOwned;
+
+    (int, function<int(int)>) fp = default;
+    fp.item_0 = 3;
+    fp.item_1 = talTwice;
+    result &= Test("tal_fn_elem", fp.item_1(fp.item_0), 6);
+
+    (int, TalFn) fa = default;
+    fa.item_0 = 4;
+    fa.item_1 = talTwice;
+    result &= Test("tal_fn_alias_elem", fa.item_1(fa.item_0), 8);
+
+    ((int, TalFoo*), int) nested = default;
+    nested.item_0.item_0 = 2;
+    nested.item_0.item_1 = new TalFoo;
+    nested.item_0.item_1->v = 3;
+    nested.item_1 = 4;
+    result &= Test("tal_nested_elem", talDeepSum(nested), 6);
+    TalFoo* nestedOwned = move nested.item_0.item_1;
+    delete nestedOwned;
+
+    (TalFoo*, int) gptr = default;
+    gptr.item_0 = new TalFoo;
+    gptr.item_1 = 11;
+    result &= Test("tal_generic_deduce_ptr", talFirst(gptr), 11);
+    result &= Test("tal_generic_explicit_ptr", talFirst<TalFoo*>(gptr), 11);
+    TalFoo* gptrOwned = move gptr.item_0;
+    delete gptrOwned;
+    return result;
+}
+
 bool testTupleTypeSyntax()
 {
     bool result = true;
@@ -4383,15 +4496,6 @@ int fnAliasIfConstPlatformArm()
     return (int)b.value;           // double keeps 16777217; float rounds it to 16777216
 }
 
-// A plain nested block behaves the same way - no per-block alias frame.
-int fnAliasNestedBlockLeak()
-{
-    { using FnAliasBlock = double; }
-    FnAliasBox<FnAliasBlock> b = default;
-    b.value = 2.5;
-    return (int)(b.value * 2.0);   // 5
-}
-
 // Leaves the scan-time folder must decide, or neither arm's alias binds and the later
 // `FnAliasBox<...>` fails with "cannot find the type". Each returns 16777217 through the double
 // arm and 16777216 through the float one, so a wrong arm is a wrong VALUE, not a compile error.
@@ -4472,9 +4576,8 @@ bool testFunctionScopeAliasAsGenericArgument()
     result &= Test("fn_scope_alias_file_scope", fnAliasShadowOuter(), 6);
     result &= Test("fn_scope_alias_shadows_file", fnAliasShadowInner(), 5);
 
-    // An `if const` arm's alias, and a nested block's, reach the rest of the body.
+    // An `if const` arm's alias reaches the rest of the body (conditional compilation).
     result &= Test("fn_scope_alias_if_const_taken_arm", fnAliasIfConstTakenArm(), 5);
-    result &= Test("fn_scope_alias_nested_block_leak", fnAliasNestedBlockLeak(), 5);
 
     // Scan-time folder leaves: sizeof, a truncating cast, an enum member.
     result &= Test("fn_scope_alias_if_const_sizeof_arm", fnAliasIfConstSizeofArm(), 16777217);
@@ -5323,9 +5426,7 @@ bool testGnNsTaDifferingLayouts()
     return result;
 }
 
-// Leg 13: a DOTTED argument spelling must mean the same type as a plain dotted local in the
-// same scope. Ordinary lookup resolves a dotted name from the top, so the argument walk must
-// not relatively resolve one either (pinned with the non-generic control).
+// Leg 13: a dotted argument and a plain dotted local use the same enclosing-scope lookup.
 struct Ta13Box<T> { T t = default; int Get() { return t.v; } };
 namespace Ta13B { struct Item { int v = 9; }; }
 namespace Ta13A
@@ -5338,8 +5439,8 @@ namespace Ta13A
 bool testGnNsTaDottedArgIsNotRelative()
 {
     bool result = true;
-    result &= Test("ta_dotted_arg_same_as_local", Ta13A.split(), 909);
-    result &= Test("ta_dotted_arg_control", Ta13A.ctrl(), 9);
+    result &= Test("ta_dotted_arg_same_as_local", Ta13A.split(), 707);
+    result &= Test("ta_dotted_arg_control", Ta13A.ctrl(), 7);
     return result;
 }
 
@@ -6332,9 +6433,40 @@ int gvpNewStarRead<T>(T a, T b)
     return *r;
 }
 
+int nd2Const9<T>(T********* p) { return is_const(T); }
+int nd2Const30<T>(T****************************** p) { return is_const(T); }
+int nd2Const31<T>(T******************************* p) { return is_const(T); }
+int nd2Array<T>(T value) { auto a = new T[2]; a.set(0, value); return a.get(0) == value ? 1 : 0; }
+// Round 2: explicit depth-2 const type arguments keep their const; the generic view and raw forms
+// write through a depth-2 const element.
+int nd2R2Explicit<T>(T v) { return **v; }
+int nd2R2ExplicitPP() { int x = 4; int* px = &x; (const int*)* q = &px; return nd2R2Explicit<(const int*)*>(q); }
+int nd2R2ExplicitC() { int x = 4; (const int)* px = &x; (const int)** q = &px; return nd2R2Explicit<(const int)**>(q); }
+int nd2R2GenView<T>(T v, T w) { T*[] e = new T*[2]; e[0] = &v; *e[0] = w; int r = **e[0]; delete[] e; return r; }
+int nd2R2GenRaw<T>(T v, T w) { T** e = new T*[2]; e[0] = &v; *e[0] = w; int r = **e[0]; delete[] e; return r; }
+int nd2R2GenViewCall() { int x = 4; int y = 5; (const int)* a = &x; (const int)* b = &y; return nd2R2GenView<(const int)*>(a, b); }
+int nd2R2GenRawCall() { int x = 4; int y = 5; (const int)* a = &x; (const int)* b = &y; return nd2R2GenRaw<(const int)*>(a, b); }
+
 bool testGnViewOfPointersArg()
 {
     bool result = true;
+
+    int nd2Value = 19; int* nd2P = &nd2Value; int** nd2PP = &nd2P;
+    int*** nd2PPP = &nd2PP;
+    list<int***> nd2List = default; nd2List.add(nd2PPP);
+    result &= Test("newdepth2_list_depth3", ***nd2List[0], 19);
+    result &= Test("newdepth2_auto_array_pp", nd2Array<int**>(nd2PP), 1);
+    result &= Test("newdepth2_auto_array_ppp", nd2Array<int***>(nd2PPP), 1);
+    (const int)********* nd2C9 = nullptr;
+    (const int)****************************** nd2C30 = nullptr;
+    (const int)******************************* nd2C31 = nullptr;
+    result &= Test("newdepth2_deduce_const9", nd2Const9(nd2C9), 1);
+    result &= Test("newdepth2_deduce_const30", nd2Const30(nd2C30), 1);
+    result &= Test("newdepth2_deduce_const31", nd2Const31(nd2C31), 1);
+    result &= Test("newdepth2_r2_explicit_depth2_const", nd2R2ExplicitPP(), 4);
+    result &= Test("newdepth2_r2_explicit_depth2_const_base", nd2R2ExplicitC(), 4);
+    result &= Test("newdepth2_r2_generic_view_depth2_write", nd2R2GenViewCall(), 5);
+    result &= Test("newdepth2_r2_generic_raw_depth2_write", nd2R2GenRawCall(), 5);
 
     int one = 1; int two = 2; int three = 3;
     int*[3] cells; cells[0] = &one; cells[1] = &two; cells[2] = &three;
@@ -7907,6 +8039,139 @@ bool testGenns2NestedSizeofUsesType()
     return result;
 }
 
+// =============================================================
+// Namespace non-template vs global generic template (innermost-first, as C++). A non-template
+// LnsItem declared in the use's namespace or an enclosing one BEFORE the use hides the global
+// template LnsItem<T>; refusals live in Test/errors/err_namespace_nontemplate_hides_template.cb.
+// These legs are the accept set: each value matches clang++ -std=c++20 on the same program.
+// =============================================================
+struct LnsItem<T> { T v = default; int Tag() { return 200; } };
+struct LnsVec<T> { T v = default; int Tag() { return 300; } };
+struct LnsBox<T> { T b = default; LnsItem<int> f = default; };
+using LnsIntItem = LnsItem<int>;
+
+namespace LnsShadowInner
+{
+    struct LnsItem<T> { T v = default; int Tag() { return 100; } };
+    int f() { LnsItem<int> a = default; a.v = 5; return a.Tag() * 100 + a.v; }   // 10005
+}
+namespace LnsShadowBare
+{
+    struct LnsItem { int w = default; };
+    int f() { LnsItem a = default; a.w = 7; return a.w; }   // 7
+    struct LnsHolder { int g() { LnsItem a = default; a.w = 2; return a.w; } };   // 2
+}
+namespace LnsShadowOther { struct LnsItem { int w = default; }; }
+namespace LnsShadowSibling
+{
+    int f() { LnsItem<int> a = default; a.v = 6; return a.v; }   // 6: a sibling does not enclose
+}
+namespace LnsShadowNest
+{
+    struct LnsItem<T> { T v = default; int Tag() { return 100; } };
+    namespace Inner { int f() { LnsItem<int> a = default; a.v = 5; return a.Tag() * 100 + a.v; } }   // 10005
+}
+namespace LnsShadowAlias
+{
+    struct LnsItem { int w = default; };
+    int f() { LnsIntItem a = default; a.v = 5; return a.v; }   // 5: the root alias is spelled at the root
+}
+namespace LnsShadowGenFn
+{
+    T g<T>(T x) { LnsItem<T> a = default; a.v = x; return a.v; }   // 4: no LnsItem here
+}
+namespace LnsShadowAliasTpl
+{
+    using LnsItem = LnsVec;
+    int f() { LnsItem<int> a = default; a.v = 5; return a.Tag() + a.v; }   // 305: a generic alias is the template
+}
+int lnsBoxFieldValue() { LnsBox<int> bx = default; bx.f.v = 4; return bx.f.v; }   // 4: body names the root template
+
+bool testLnsNamespaceShadow()
+{
+    bool result = true;
+    result &= Test("lns_inner_generic_wins", LnsShadowInner.f(), 10005);
+    result &= Test("lns_inner_nontemplate_bare", LnsShadowBare.f(), 7);
+    LnsShadowBare.LnsHolder holder = default;
+    result &= Test("lns_inner_nontemplate_in_method", holder.g(), 2);
+    result &= Test("lns_sibling_global_template", LnsShadowSibling.f(), 6);
+    result &= Test("lns_nested_inner_generic_wins", LnsShadowNest.Inner.f(), 10005);
+    result &= Test("lns_global_alias_inside_ns", LnsShadowAlias.f(), 5);
+    result &= Test("lns_generic_fn_global_template", LnsShadowGenFn.g(4), 4);
+    result &= Test("lns_generic_base_alias_inner", LnsShadowAliasTpl.f(), 305);
+    result &= Test("lns_global_template_in_body", lnsBoxFieldValue(), 4);
+    return result;
+}
+
+int tdpRuns = 0;
+struct TdpItem { int v = default; ~TdpItem() { tdpRuns++; } };
+TdpItem tdpMake() { TdpItem d = default; d.v = 7; return d; }
+int tdpTakeParam((TdpItem, int) t) { return t.item_1; }
+
+struct TlcUnused { int k = 0; TlcUnused((int, int) x) { } };
+struct TlcUse { int k = 0; TlcUse((int, int) x) { k = x.item_1; } };
+
+// Inline tuple parameter types in lambda literals (tuple, pointer, alias, struct element)
+// and by-value tuple parameters holding a destructor-bearing struct (dtor exactly once).
+bool testTupleLambdaParamsAndDtors()
+{
+    bool result = true;
+
+    Lambda<int(int, (int,int))> tl = (int x, (int,int) t) => x + t.item_0;
+    result &= Test("tlam_inline_tuple_param", tl(1, (2,3)), 3);
+    Lambda<int((int,int)*)> tp = ((int,int)* t) => t->item_1;
+    (int,int) pv = (5,6);
+    result &= Test("tlam_inline_tuple_pointer_param", tp(&pv), 6);
+    Lambda<(int,int)(int, (int,int))> tr = (int x, (int,int) t) => (t.item_0 + x, t.item_1);
+    (int,int) tres = tr(1, (2,3));
+    result &= Test("tlam_inline_tuple_return", tres.item_0 * 10 + tres.item_1, 33);
+    Lambda<int(int, (int,int))> tb = (int x, (int,int) t) => { return x + t.item_0 + t.item_1; };
+    result &= Test("tlam_inline_tuple_block_body", tb(1, (2,3)), 6);
+    TalFoo tf = default;
+    tf.v = 5;
+    Lambda<int(TalPair, int)> ta = (TalPair t, int k) => t.item_0 * k + t.item_1.v;
+    result &= Test("tlam_tuple_alias_param", ta((2, tf), 3), 11);
+    Lambda<int((TalFoo,int))> ts = ((TalFoo,int) t) => t.item_0.v + t.item_1;
+    result &= Test("tlam_struct_element_param", ts((tf, 4)), 9);
+
+    tdpRuns = 0;
+    {
+        int r = tdpTakeParam((tdpMake(), 4));
+        result &= Test("tdp_call_literal_value", r, 4);
+    }
+    result &= Test("tdp_call_literal_dtor_once", tdpRuns, 1);
+    tdpRuns = 0;
+    {
+        int r = tdpTakeParam((tdpMake(), 4)) + tdpTakeParam((tdpMake(), 5));
+        result &= Test("tdp_two_literals_value", r, 9);
+    }
+    result &= Test("tdp_two_literals_dtor_twice", tdpRuns, 2);
+    tdpRuns = 0;
+    {
+        Lambda<int((TdpItem,int))> tdl = ((TdpItem,int) t) => 1;
+        int r = tdl((tdpMake(), 4));
+        result &= Test("tdp_lambda_param_value", r, 1);
+    }
+    result &= Test("tdp_lambda_param_dtor_once", tdpRuns, 1);
+
+    // Pointer depth 2 on a lambda parameter, tuple and plain.
+    (int, int) pp = (6, 7);
+    (int, int)* ppp = &pp;
+    Lambda<int((int, int)**)> tpp = ((int, int)** t) => (*t)->item_1;
+    result &= Test("tlam_tuple_ptr_ptr_param", tpp(&ppp), 7);
+    int pq = 8;
+    int* ppq = &pq;
+    Lambda<int(int**)> ipp = (int** p) => **p;
+    result &= Test("tlam_int_ptr_ptr_param", ipp(&ppq), 8);
+
+    // A constructor with a tuple parameter, used and unused.
+    TlcUnused cu = TlcUnused((1, 2));
+    result &= Test("tctor_unused_tuple_param", cu.k, 0);
+    TlcUse cuse = TlcUse((1, 2));
+    result &= Test("tctor_used_tuple_param", cuse.k, 2);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -7972,6 +8237,8 @@ extern int main()
     total++; passed += testTupleReturnAndDestructure()   ? 1 : 0;
     total++; passed += testNestedTupleTypeResolution()   ? 1 : 0;
     total++; passed += testT433TupleTypeResolution()     ? 1 : 0;
+    total++; passed += testTupleAliasAndElementShapes()  ? 1 : 0;
+    total++; passed += testTupleLambdaParamsAndDtors()   ? 1 : 0;
     total++; passed += testTupleArrayView()              ? 1 : 0;
     total++; passed += testITuple()                      ? 1 : 0;
     total++; passed += testImplicitStringLiteral()        ? 1 : 0;
@@ -8026,6 +8293,7 @@ extern int main()
     total++; passed += testGnNsTwoInstantiationsLive()          ? 1 : 0;
     total++; passed += testGnNsMultiTypeArg()                   ? 1 : 0;
     total++; passed += testGnNsNonPrimitiveTypeArg()            ? 1 : 0;
+    total++; passed += testLnsNamespaceShadow()                 ? 1 : 0;
     total++; passed += testGnNsPointerTypeArg()                 ? 1 : 0;
     total++; passed += testGnNsInnerScopeWins()                 ? 1 : 0;
     total++; passed += testGnNsNestedInStructNotNamespace()     ? 1 : 0;

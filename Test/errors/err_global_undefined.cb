@@ -19,4 +19,14 @@ namespace GA {
     }
 }
 
+namespace QoFallbackTarget { int missing() { return 90; } }
+namespace QoFallbackOwner {
+    namespace QoFallbackTarget { int other() { return 10; } }
+    int rejectMissingMember()
+    {
+        expect_error("'missing' is not a member of namespace 'QoFallbackOwner.QoFallbackTarget'");
+        return QoFallbackTarget.missing();
+    }
+}
+
 extern int main() { return N.useUndefined() + GA.useNestedAsRoot(); }

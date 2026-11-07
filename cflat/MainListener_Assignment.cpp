@@ -6988,6 +6988,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     || compiler->IsOwnedNewTemp(rightNV.Primary)
                     || compiler->RawArrayResultOwns(rightNV.Primary)
                     || compiler->IsMovedOutPtrValue(rightNV.Primary));
+            const bool assignmentMovesArrayViewWithOwnState = namedVar.TypeAndValue.IsArrayView
+                && rightNV.TypeAndValue.IsArrayView
+                && rightNV.IsExplicitMove
+                && compiler->FindRawArrayResult(rightNV.Primary) != nullptr;
             bool assignmentAdoptsOwnedSource = false;
             // Reassignment / field store into an array-view: `a = rawIntPtr;` or `s.view = p;`
             // would launder a raw pointer into the noalias contract - reject (decay is one-way).
@@ -11173,6 +11177,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && (!destinationHadBorrowProvenance
                     || (storeRetiredBorrow && existingDestination != nullptr
                         && !existingDestination->BorrowsOwnedElement))
+                && !assignmentMovesArrayViewWithOwnState
                 && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                 && (llvm::isa<llvm::AllocaInst>(destination)
@@ -11196,6 +11201,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             else if (operatorText == "="
                 && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty()))
                 && destinationHadBorrowProvenance && !storeRetiredBorrow
+                && !assignmentMovesArrayViewWithOwnState
                 && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                 && (llvm::isa<llvm::AllocaInst>(destination)
@@ -11227,11 +11233,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 const bool viewStoreTransfersOwnership = !assignmentBorrowsOwningLocal
                     && !movedBorrowedNonLocalView
                     && !compiler->IsMovedBorrowedPtrValue(rightNV.Primary)
-                    && (srcIsOwnedPtrRhs
-                        || assignmentAdoptsOwnedSource
-                        || (storeNulledSource && rightNV.FieldName.empty())
-                        || (rightNV.IsOwning && !rightNV.OwnFlagMayBeFalse)
-                        || movedOwnedNonLocalView);
+                    && (assignmentMovesArrayViewWithOwnState
+                        ? compiler->RawArrayResultMayOwn(rightNV.Primary)
+                        : (srcIsOwnedPtrRhs
+                            || assignmentAdoptsOwnedSource
+                            || (storeNulledSource && rightNV.FieldName.empty())
+                            || (rightNV.IsOwning && !rightNV.OwnFlagMayBeFalse)
+                            || movedOwnedNonLocalView));
                 compiler->TrackNonLocalViewAssignment(destination, rightNV.Primary,
                     sourceStorage, viewStoreTransfersOwnership,
                     compiler->NonLocalElementPathKey(namedVar), movedBorrowedNonLocalView,
@@ -11241,18 +11249,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                 && llvm::isa<llvm::AllocaInst>(destination))
                 if (const auto* raw = compiler->FindRawArrayResult(rightNV.Primary);
-                    raw != nullptr && compiler->RawArrayResultMayOwn(rightNV.Primary))
+                    raw != nullptr && (compiler->RawArrayResultMayOwn(rightNV.Primary)
+                        || assignmentMovesArrayViewWithOwnState))
                 {
-                    llvm::Value* runtimeOwns = raw->RuntimeOwns;
-                    bool runtimeCanBeFalse = !raw->Owns;
-                    if (runtimeOwns == nullptr)
-                        runtimeOwns = compiler->builder->getInt1(raw->Owns);
-                    else if (const auto* constant =
-                        llvm::dyn_cast<llvm::ConstantInt>(runtimeOwns))
-                        runtimeCanBeFalse = constant->isZero();
-                    compiler->SetVariableOwnFlagValue(
-                        namedVar.CallerName, true, runtimeOwns, runtimeCanBeFalse,
-                        raw->RuntimeOwns != nullptr);
+                    compiler->SetArrayViewOwnFlagFromRawArrayResult(
+                        namedVar.CallerName, rightNV.Primary);
                     compiler->ConsumeOwnedNewTemp(rightNV.Primary);
                 }
             // A plain view copy of an owning local is borrowed even when it replaces an owned

@@ -1,0 +1,205 @@
+// A non-template type declared in a namespace hides a same-named global generic template when the
+// spelling with arguments is used inside that namespace (innermost-first, as C++). Each refused
+// spelling is one expect_error block. Accept cells live in Test/test_generics.cb (testLnsNamespaceShadow).
+
+struct Item<T> { T v = default; };
+struct Holder<T> { T v = default; };
+
+namespace LnsErrLocal
+{
+    struct Item { int w = default; };
+    int f()
+    {
+        expect_error("'Item' is not a generic type") {
+            Item<int> a = default;
+        }
+        return 0;
+    }
+}
+namespace LnsErrMethod
+{
+    struct Item { int w = default; };
+    struct S
+    {
+        int f()
+        {
+            expect_error("'Item' is not a generic type") {
+                Item<int> a = default;
+            }
+            return 0;
+        }
+    };
+}
+namespace LnsErrNested
+{
+    struct Item { int w = default; };
+    namespace LnsErrNestedInner
+    {
+        int f()
+        {
+            expect_error("'Item' is not a generic type") {
+                Item<int> a = default;
+            }
+            return 0;
+        }
+    }
+}
+namespace LnsErrAlias
+{
+    using Item = int;
+    int f()
+    {
+        expect_error("'Item' is not a generic type") {
+            Item<int> a = default;
+        }
+        return 0;
+    }
+}
+namespace LnsErrIface
+{
+    interface Item { int Get(); };
+    int f()
+    {
+        expect_error("'Item' is not a generic type") {
+            Item<int> a = default;
+        }
+        return 0;
+    }
+}
+namespace LnsErrEnum
+{
+    enum Item : int { A = 3, B = 4 };
+    int f()
+    {
+        expect_error("'Item' is not a generic type") {
+            Item<int> a = default;
+        }
+        return 0;
+    }
+}
+namespace LnsErrNew
+{
+    struct Item { int w = default; };
+    int f()
+    {
+        expect_error("'Item' is not a generic type") {
+            Item<int>* p = new Item<int>;
+        }
+        return 0;
+    }
+}
+namespace LnsErrCast
+{
+    struct Item { int w = default; };
+    int f()
+    {
+        int x = 0;
+        expect_error("'Item' is not a generic type") {
+            Item<int>* p = (Item<int>*)&x;
+        }
+        return 0;
+    }
+}
+namespace LnsErrSizeof
+{
+    struct Item { int w = default; };
+    int f()
+    {
+        expect_error("'Item' is not a generic function") {
+            return sizeof(Item<int>);
+        }
+        return 0;
+    }
+}
+namespace LnsErrGenFn
+{
+    struct Item { int w = default; };
+    int g<T>(T x) { Item<int> a = default; return 0; }
+    int h()
+    {
+        expect_error("'Item' is not a generic type") {
+            return g(1);
+        }
+        return 0;
+    }
+}
+namespace LnsErrIfaceParam
+{
+    interface Item { int Get(); };
+    expect_error("'Item' is not a generic type") {
+        int use(Item<int> x) { return 0; }
+    }
+}
+namespace LnsErrParam
+{
+    struct Item { int w = default; };
+    expect_error("'Item' is not a generic type") {
+        int take(Item<int> x) { return 0; }
+    }
+}
+namespace LnsErrField
+{
+    struct Item { int w = default; };
+    expect_error("'Item' is not a generic type") {
+        struct Carrier { Item<int> f = default; };
+    }
+}
+namespace LnsErrGlobal
+{
+    struct Item { int w = default; };
+    expect_error("'Item' is not a generic type");
+    Item<int> gv = default;
+}
+// The generic-argument site runs in the ForwardRefScanner pre-pass, before a block-scoped
+// expect_error is armed, so it uses a bare file-scope expectation (armed for the imports too).
+expect_error("'Item' is not a generic type");
+namespace LnsErrNestedArg
+{
+    struct Item { int w = default; };
+    int f()
+    {
+        Holder<Item<int>> b = default;
+        return 0;
+    }
+}
+namespace LnsErrNestedAggregate
+{
+    struct Outer
+    {
+        struct Item { int w = default; };
+        int f()
+        {
+            expect_error("names a non-generic type in the enclosing aggregate; template arguments are not allowed") {
+                Item<int> a = default;
+            }
+            return 0;
+        }
+    };
+}
+// Declaration order does not matter: a non-template declared LATER in the same namespace, or in a
+// later reopening of it, hides the template just the same (CFlat namespace lookup is order-independent).
+namespace LnsErrLater
+{
+    int f()
+    {
+        expect_error("'Item' is not a generic type") {
+            Item<int> a = default;
+        }
+        return 0;
+    }
+    struct Item { int w = default; };
+}
+namespace LnsErrReopen
+{
+    int f()
+    {
+        expect_error("'Item' is not a generic type") {
+            Item<int> a = default;
+        }
+        return 0;
+    }
+}
+namespace LnsErrReopen
+{
+    struct Item { int w = default; };
+}

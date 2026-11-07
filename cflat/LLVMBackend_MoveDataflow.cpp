@@ -74,7 +74,7 @@ namespace
 
     struct ConstLevelResult
     {
-        uint8_t Levels = 0;
+        uint32_t Levels = 0;
         std::string Name;
     };
 
@@ -2424,34 +2424,45 @@ namespace
 {
     // Top-relative const levels of a declared type: bit 0 = the declared object, bit k = the
     // k-th level reached through it. Spelled masks are downward closed, so a set bit fills deeper.
-    uint8_t DeclaredTopLevels(const LLVMBackend::TypeAndValue& tv)
+    uint32_t DeclaredTopLevels(const LLVMBackend::TypeAndValue& tv)
     {
-        uint8_t levels = 0;
+        uint32_t levels = 0;
         const int depth = tv.ValuePointerDepth();
-        for (int j = 0; j <= depth; ++j)
-            if (((tv.ConstMask >> (depth - j)) & 1u) != 0) levels |= static_cast<uint8_t>(1u << j);
+        for (int j = 0; j < 32 && j <= depth; ++j)
+        {
+            const int bit = depth - j;
+            if (bit < 32 && ((tv.ConstMask >> bit) & 1u) != 0)
+                levels |= uint32_t{ 1 } << j;
+        }
         // A mask that is not downward closed is a C/C++ spelling (`R* const*`): shallow, exact.
-        const uint8_t spelled = static_cast<uint8_t>(tv.ConstMask & ((2u << depth) - 1u));
+        const uint32_t spelled = tv.ConstMask & LLVMBackend::TypeAndValue::ConstBitsThrough(depth);
         if ((spelled & (spelled + 1u)) != 0) return levels;
-        for (int j = 0; j < 8; ++j)
-            if (((levels >> j) & 1u) != 0) return static_cast<uint8_t>(0xFFu << j);
+        for (int j = 0; j < 32; ++j)
+            if (((levels >> j) & 1u) != 0) return ~uint32_t{ 0 } << j;
         return 0;
     }
 
     // C/C++ (shallow) const: exactly the levels spelled, never filled (`int* const` leaves *p writable).
-    uint8_t ExactTopLevels(const LLVMBackend::TypeAndValue& tv)
+    uint32_t ExactTopLevels(const LLVMBackend::TypeAndValue& tv)
     {
-        uint8_t levels = 0;
+        uint32_t levels = 0;
         const int depth = tv.ValuePointerDepth();
-        for (int j = 0; j <= depth; ++j)
-            if (((tv.ConstMask >> (depth - j)) & 1u) != 0) levels |= static_cast<uint8_t>(1u << j);
+        for (int j = 0; j < 32 && j <= depth; ++j)
+        {
+            const int bit = depth - j;
+            if (bit < 32 && ((tv.ConstMask >> bit) & 1u) != 0)
+                levels |= uint32_t{ 1 } << j;
+        }
         return levels;
     }
 
-    uint8_t LevelsBelow(uint8_t levels) { return static_cast<uint8_t>((levels >> 1) | (levels & 0x80u)); }
+    uint32_t LevelsBelow(uint32_t levels)
+    {
+        return (levels >> 1) | (levels & 0x80000000u);
+    }
 }
 
-uint8_t LLVMBackend::DeclaredPointeeConstLevels(const TypeAndValue& tv) const
+uint32_t LLVMBackend::DeclaredPointeeConstLevels(const TypeAndValue& tv) const
 {
         return LevelsBelow(DeclaredTopLevels(tv));
 }
@@ -2507,7 +2518,7 @@ bool LLVMBackend::IsStringLiteralGlobal(const llvm::Value* value) const
  * a const write cause on the address makes everything behind it const (transitive, R11);
  * otherwise a declared slot gives its spelled levels, and a computed address its value's.
  */
-uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& name, int depth) const
+uint32_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& name, int depth) const
 {
         ConstAnalysisScope queryScope(this);
         auto& query = queryScope.Query();
@@ -2519,7 +2530,7 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
             return it->second.Levels;
         }
         if (!query.ActiveLevels.insert(key).second) return 0;
-        auto compute = [&]() -> uint8_t {
+        auto compute = [&]() -> uint32_t {
         if (IsStringLiteralGlobal(address)) return ValueConstLevels(address, name, depth + 1);
         if (auto* inst = llvm::dyn_cast<llvm::Instruction>(address);
             inst != nullptr && inst->getMetadata("cflat.const.cast") != nullptr)
@@ -2531,11 +2542,11 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
             if (!cause.CxxShallow && cause.Kind == ConstWriteCause::CauseKind::ThroughPointer
                 && !llvm::isa<llvm::GEPOperator>(address))
                 return ValueConstLevels(address, name, depth + 1);
-            if (!cause.CxxShallow) return 0xFF;
+            if (!cause.CxxShallow) return ~uint32_t{ 0 };
             // Shallow C++ const: the slot itself, and what its own declaration spells below it.
             std::string slotName;
             const auto* tv = DeclaredConstSlot(address, slotName);
-            return static_cast<uint8_t>(1u | (tv != nullptr ? ExactTopLevels(*tv) : 0u));
+            return 1u | (tv != nullptr ? ExactTopLevels(*tv) : 0u);
         }
         // Storage inside a const C/C++ header global (the object, an element or a field): shallow const.
         if (llvm::isa<llvm::GlobalVariable>(address) || llvm::isa<llvm::GEPOperator>(address))
@@ -2545,7 +2556,7 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
                 name = global->getName().str();
                 std::string slotName;
                 const auto* tv = DeclaredConstSlot(address, slotName);
-                return static_cast<uint8_t>(1u | (tv != nullptr ? ExactTopLevels(*tv) : 0u));
+                return 1u | (tv != nullptr ? ExactTopLevels(*tv) : 0u);
             }
         if (llvm::isa<llvm::AllocaInst>(address) || llvm::isa<llvm::GlobalVariable>(address)
             || llvm::isa<llvm::GEPOperator>(address))
@@ -2568,13 +2579,13 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
                         only = store;
                     }
                 if (only == nullptr || !only->getValueOperand()->getType()->isPointerTy()) return 0;
-                return static_cast<uint8_t>(StoredConstLevels(only->getValueOperand(), name, depth + 1) << 1);
+                return StoredConstLevels(only->getValueOperand(), name, depth + 1) << 1;
             }
             if (!llvm::isa<llvm::GEPOperator>(address)) return 0;
         }
         return ValueConstLevels(address, name, depth + 1);
         };
-        const uint8_t levels = compute();
+        const uint32_t levels = compute();
         query.ActiveLevels.erase(key);
         query.Levels.emplace(std::move(key), ConstLevelResult{ levels, name });
         return levels;
@@ -2585,7 +2596,7 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
  * expression that produced it: an explicit cast or member-access receiver stamp, the slot it was
  * loaded from, a call's return type, pointer arithmetic over a pointer, or any arm of a join.
  */
-uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth) const
+uint32_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth) const
 {
         ConstAnalysisScope queryScope(this);
         auto& query = queryScope.Query();
@@ -2597,24 +2608,24 @@ uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& n
             return it->second.Levels;
         }
         if (!query.ActiveLevels.insert(key).second) return 0;
-        auto compute = [&]() -> uint8_t {
+        auto compute = [&]() -> uint32_t {
         // A string literal is a `(const char)*` (R11): its characters are read-only.
         if (IsStringLiteralGlobal(pointer))
         {
             name = "string literal";
-            return 0xFF;
+            return ~uint32_t{ 0 };
         }
         if (auto* inst = llvm::dyn_cast<llvm::Instruction>(pointer))
         {
             if (const llvm::MDNode* md = inst->getMetadata("cflat.const.cast"))
             {
-                uint8_t levels = 0;
+                uint32_t levels = 0;
                 if (md->getNumOperands() == 2)
                 {
                     if (auto* text = llvm::dyn_cast<llvm::MDString>(md->getOperand(0)))
                         name = text->getString().str();
                     if (auto* c = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md->getOperand(1)))
-                        levels = static_cast<uint8_t>(c->getZExtValue());
+                        levels = static_cast<uint32_t>(c->getZExtValue());
                 }
                 return levels;
             }
@@ -2624,7 +2635,7 @@ uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& n
                 if (md->getNumOperands() == 1)
                     if (auto* text = llvm::dyn_cast<llvm::MDString>(md->getOperand(0)))
                         name = text->getString().str();
-                return 0xFF;
+                return ~uint32_t{ 0 };
             }
         }
         if (auto* load = llvm::dyn_cast<llvm::LoadInst>(pointer))
@@ -2633,7 +2644,7 @@ uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& n
         {
             const auto* symbol = FindSymbolForFunction(call->getCalledFunction());
             if (symbol == nullptr) return 0;
-            const uint8_t levels = DeclaredPointeeConstLevels(symbol->ReturnType);
+            const uint32_t levels = DeclaredPointeeConstLevels(symbol->ReturnType);
             if (levels == 0) return 0;
             name = call->getCalledFunction()->getName().str();
             if (std::string spelled = SpellFunctionSymbol(*this, name); !spelled.empty()) name = spelled;
@@ -2649,11 +2660,11 @@ uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& n
         // A join is const where either arm is (C++: the composite pointer type).
         if (auto* phi = llvm::dyn_cast<llvm::PHINode>(pointer))
         {
-            uint8_t levels = 0;
+            uint32_t levels = 0;
             for (const llvm::Value* arm : phi->incoming_values())
             {
                 std::string armName;
-                const uint8_t armLevels = StoredConstLevels(arm, armName, depth + 1);
+                const uint32_t armLevels = StoredConstLevels(arm, armName, depth + 1);
                 if (armLevels != 0 && levels == 0) name = armName;
                 levels |= armLevels;
             }
@@ -2662,10 +2673,10 @@ uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& n
         if (auto* select = llvm::dyn_cast<llvm::SelectInst>(pointer))
         {
             std::string trueName, falseName;
-            const uint8_t t = StoredConstLevels(select->getTrueValue(), trueName, depth + 1);
-            const uint8_t f = StoredConstLevels(select->getFalseValue(), falseName, depth + 1);
+            const uint32_t t = StoredConstLevels(select->getTrueValue(), trueName, depth + 1);
+            const uint32_t f = StoredConstLevels(select->getFalseValue(), falseName, depth + 1);
             name = t != 0 ? trueName : falseName;
-            return static_cast<uint8_t>(t | f);
+            return t | f;
         }
         // Pointer arithmetic and element addressing over a pointer keep its qualification.
         if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(pointer))
@@ -2676,7 +2687,7 @@ uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& n
         }
         return 0;
         };
-        const uint8_t levels = compute();
+        const uint32_t levels = compute();
         query.ActiveLevels.erase(key);
         query.Levels.emplace(std::move(key), ConstLevelResult{ levels, name });
         return levels;
@@ -2692,7 +2703,7 @@ bool LLVMBackend::PointerValuePointeeConst(const llvm::Value* pointer, std::stri
  * must be const in the target, and a target that adds const below the first level needs every
  * level above it const too (`int** -> (const int)**` is refused, `-> (const int*)*` is not).
  */
-bool LLVMBackend::QualificationDiscardsConst(uint8_t source, uint8_t target, int depth)
+bool LLVMBackend::QualificationDiscardsConst(uint32_t source, uint32_t target, int depth)
 {
         for (int j = 0; j < depth; ++j)
         {
@@ -2724,19 +2735,20 @@ bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAn
             || target.CxxConstRef()
             || (IsCxxRecord(source.TypeName) && !source.Pointer && source.ConstArraySize == 0))
             return false;
-        const int depth = target.IsArrayView ? (target.ElemPointer ? 2 : 1) : target.ValuePointerDepth();
+        const int depth = target.IsArrayView ? target.ElementPointerDepth() + 1
+                                             : target.ValuePointerDepth();
         if (depth <= 0) return false;
         // A literal (or a join of literals) into a pointer to another element type is a type
         // mismatch, reported as one; `u8"x"` is a `c8` literal.
         if (LiteralMismatchesPointee(value, source, target, depth)) return false;
         std::string name;
-        const uint8_t from = StoredConstLevels(value, name);
-        uint8_t to = 0;
+        const uint32_t from = StoredConstLevels(value, name);
+        uint32_t to = 0;
         if (exactTargetLevels)
         {
             // Exact top-relative pointee levels: bit j = ConstMask bit (depth - 1 - j), no fill.
             for (int j = 0; j < depth; ++j)
-                if (((target.ConstMask >> (depth - 1 - j)) & 1u) != 0) to |= static_cast<uint8_t>(1u << j);
+                if (((target.ConstMask >> (depth - 1 - j)) & 1u) != 0) to |= uint32_t{ 1 } << j;
         }
         else
             to = DeclaredPointeeConstLevels(target);
@@ -2750,7 +2762,7 @@ bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAn
             // Shown as a view of the source's element qualification.
             shown.ConstMask = 0;
             for (int j = 0; j < depth; ++j)
-                if (((from >> j) & 1u) != 0) shown.ConstMask |= static_cast<uint8_t>(1u << (depth - 1 - j));
+                if (((from >> j) & 1u) != 0) shown.ConstMask |= uint32_t{ 1 } << (depth - 1 - j);
         }
         else if (!shown.Pointer || shown.ValuePointerDepth() != depth)
         {
@@ -2766,14 +2778,14 @@ bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAn
         {
             shown.ConstMask = 0;
             for (int j = 0; j < depth; ++j)
-                if (((from >> j) & 1u) != 0) shown.ConstMask |= static_cast<uint8_t>(1u << (depth - 1 - j));
+                if (((from >> j) & 1u) != 0) shown.ConstMask |= uint32_t{ 1 } << (depth - 1 - j);
         }
         sourceSpelled = SpellTypeForSymbolDump(*this, shown);
         TypeAndValue declared = target;
         declared.DiagnosticTypeName.clear();
         targetSpelled = SpellTypeForSymbolDump(*this, declared);
         // A C level set no CFlat spelling covers (`int *const *`): spell it the C way.
-        const uint8_t pointeeMask = static_cast<uint8_t>(target.ConstMask & ((1u << depth) - 1u));
+        const uint32_t pointeeMask = target.ConstMask & TypeAndValue::ConstBitsBelow(depth);
         if (exactTargetLevels && (pointeeMask & (pointeeMask + 1u)) != 0)
         {
             TypeAndValue base = target;
@@ -2816,12 +2828,13 @@ llvm::Value* LLVMBackend::MarkCastQualification(llvm::Value* pointer, const Type
         if (pointer == nullptr || !pointer->getType()->isPointerTy()) return pointer;
         auto* inst = llvm::dyn_cast<llvm::Instruction>(pointer);
         // Storage itself (a slot, a global, a parameter) is shared by every use: stamp a copy.
-        const uint8_t levels = DeclaredPointeeConstLevels(tv);
+        const uint32_t levels = DeclaredPointeeConstLevels(tv);
         if (inst == nullptr || llvm::isa<llvm::AllocaInst>(inst))
         {
             std::string current;
-            const int depth = tv.IsArrayView ? (tv.ElemPointer ? 2 : 1) : tv.ValuePointerDepth();
-            const uint8_t depthMask = static_cast<uint8_t>((1u << depth) - 1u);
+            const int depth = tv.IsArrayView ? tv.ElementPointerDepth() + 1
+                                             : tv.ValuePointerDepth();
+            const uint32_t depthMask = TypeAndValue::ConstBitsBelow(depth);
             if (builder->GetInsertBlock() == nullptr
                 || ((StoredConstLevels(pointer, current) ^ levels) & depthMask) == 0)
                 return pointer;
@@ -3378,20 +3391,20 @@ namespace
         if (tv.IsArrayView)
         {
             e.IsArrayView = false;
-            e.Pointer = tv.ElemPointer;
-            e.PointerDepth = tv.ElemPointer ? 1 : 0;
+            e.Pointer = tv.ElementPointerDepth() > 0;
+            e.PointerDepth = tv.ElementPointerDepth();
         }
-        else if (tv.ElemPointer || tv.PointerDepth >= 2)
+        else if (tv.ValuePointerDepth() >= 2)
         {
             e.Pointer = true;
-            e.PointerDepth = tv.PointerDepth >= 2 ? tv.PointerDepth - 1 : 1;
+            e.PointerDepth = tv.ValuePointerDepth() - 1;
         }
         else
         {
             e.Pointer = false;
             e.PointerDepth = 0;
         }
-        e.ElemPointer = false;
+        e.ElemPointer = e.Pointer && e.PointerDepth >= 2;
         return e;
     }
 
@@ -3627,9 +3640,9 @@ bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
             {
                 TypeAndValue e = w.Type;
                 e.ConstArraySize = 0;
-                e.Pointer = w.Type.ElemPointer;
-                e.PointerDepth = w.Type.ElemPointer ? 1 : 0;
-                e.ElemPointer = false;
+                e.Pointer = w.Type.ValuePointerDepth() > 0;
+                e.PointerDepth = w.Type.ValuePointerDepth();
+                e.ElemPointer = e.Pointer && e.PointerDepth >= 2;
                 w.Type = e;
                 continue;
             }

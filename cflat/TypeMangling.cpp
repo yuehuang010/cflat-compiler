@@ -630,7 +630,7 @@ std::string MangleTypeArgument(const LLVMBackend& compiler, std::string_view typ
 
 // Pointee const depth of a function-type component for its ".c<N>$" marker: the contiguous
 // levels from the innermost pointee (the only masks a whole-word spelling produces).
-static int FunctionComponentConstDepth(int constMask, bool pointer, int pointerDepth)
+static int FunctionComponentConstDepth(int64_t constMask, bool pointer, int pointerDepth)
 {
     if (constMask <= 0 || !pointer) return 0;
     const int depth = std::max(pointerDepth, 1);
@@ -641,7 +641,7 @@ static int FunctionComponentConstDepth(int constMask, bool pointer, int pointerD
 
 std::string MangleFunctionComponent(const LLVMBackend& compiler, std::string_view name,
                                     bool pointer, int pointerDepth, bool alias = false,
-                                    int constMask = -1, bool isArrayView = false)
+                                    int64_t constMask = -1, bool isArrayView = false)
 {
     LLVMBackend::TypeAndValue component;
     component.TypeName = name.empty() ? "void" : MangleTypeArgument(compiler, name);
@@ -935,7 +935,7 @@ std::string MangleGenericInstance(const LLVMBackend& compiler, std::string_view 
 std::string MangleClosureType(const LLVMBackend& compiler, bool isThin,
                               const std::string& ret, int retDepth,
                               const std::vector<std::pair<std::string, int>>& params,
-                              int retConstMask, const std::vector<int>* paramConstMasks,
+                              int64_t retConstMask, const std::vector<int64_t>* paramConstMasks,
                               const std::vector<bool>* paramArrayViews,
                               const std::vector<bool>* paramAliases,
                               bool retAlias)
@@ -971,7 +971,7 @@ std::string MangleType(const LLVMBackend& compiler,
     {
         // On a view, pointerDepth is the ELEMENT's depth: `int*[]` keys apart from `int[]`.
         spelling.view = true;
-        spelling.pointerDepth = type.ElemPointer ? 1 : 0;
+        spelling.pointerDepth = type.ElementPointerDepth();
     }
     else if (type.Pointer)
         spelling.pointerDepth = type.ValuePointerDepth();
@@ -1037,7 +1037,7 @@ std::string SpellType(const LLVMBackend& compiler,
     {
         // Element stars print inside the brackets-free part: `int*[]`, not `int[]`.
         spelling.view = true;
-        spelling.pointerDepth = type.ElemPointer ? 1 : 0;
+        spelling.pointerDepth = type.ElementPointerDepth();
     }
     else if (type.Pointer)
         spelling.pointerDepth = type.ValuePointerDepth();
@@ -1061,12 +1061,12 @@ std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
         return result;
     };
     const std::string spelling = spell(type);
-    const int depth = type.IsArrayView ? (type.ElemPointer ? 1 : 0) : type.ValuePointerDepth();
-    const uint8_t mask = type.ConstMask;
+    const int depth = type.IsArrayView ? type.ElementPointerDepth() : type.ValuePointerDepth();
+    const uint32_t mask = type.ConstMask;
     int constLevel = -1;
-    for (int i = 0; i <= depth; ++i)
+    for (int i = 0; i < 32 && i <= depth; ++i)
     {
-        if ((mask & (1u << i)) == 0) break;
+        if ((mask & LLVMBackend::TypeAndValue::ConstBitAt(i)) == 0) break;
         constLevel = i;
     }
     if (constLevel < 0) return spelling;

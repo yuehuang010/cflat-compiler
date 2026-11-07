@@ -6,6 +6,53 @@
 #include "CxxSpelling.h"
 #include "LLVMBackend_CInteropShared.h"
 #include "MainListener_ExpressionsShared.h"
+// Call an operator template without non-template overloads rejected for operand cv/category.
+template <typename Table>
+static llvm::Value* CallOperatorWithoutExcluded(
+    Table& functionTable, LLVMBackend* compiler, const std::string& lookupName, const std::string& callee,
+    const std::vector<LLVMBackend::NamedVariable>& args, const std::set<std::string>& excludedLinkages)
+{
+    std::vector<std::string> names{ lookupName };
+    if (callee != lookupName) names.push_back(callee);
+    std::vector<std::pair<std::string, std::vector<LLVMBackend::FunctionSymbol>>> saved;
+    if (!excludedLinkages.empty())
+        for (const auto& name : names)
+            if (auto table = functionTable.find(name); table != functionTable.end())
+            {
+                saved.emplace_back(name, table->second);
+                std::erase_if(table->second, [&](const LLVMBackend::FunctionSymbol& candidate) {
+                    return excludedLinkages.count(candidate.UniqueName) != 0;
+                });
+            }
+    auto restoreTables = [&]() {
+        for (auto& [name, original] : saved)
+        {
+            auto restore = functionTable.find(name);
+            if (restore == functionTable.end()) continue;
+            auto afterCall = std::move(restore->second);
+            restore->second = original;
+            for (auto& appended : afterCall)
+                if (std::none_of(restore->second.begin(), restore->second.end(),
+                    [&](const LLVMBackend::FunctionSymbol& existing) {
+                        return existing.UniqueName == appended.UniqueName;
+                    }))
+                    restore->second.push_back(std::move(appended));
+        }
+    };
+    llvm::Value* result = nullptr;
+    try
+    {
+        result = compiler->CreateOverloadedFunctionCall(callee, args, true);
+    }
+    catch (...)
+    {
+        restoreTables();
+        throw;
+    }
+    restoreTables();
+    return result;
+}
+
 bool MainListener::CastTypeNameNamesValue(CFlatParser::CastTypeNameContext* typeName) {
         if (typeName == nullptr || typeName->typeQualifier() != nullptr
             || typeName->abstractDeclarator() != nullptr || typeName->typeSpecifier().size() != 1)
@@ -3584,50 +3631,6 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
         std::set<std::string> excludedLinkages = cvRejectedLinkages;
         if (operandIsConst || operandIsRvalue)
             excludedLinkages.insert(mutableReferenceLinkages.begin(), mutableReferenceLinkages.end());
-        // Calls `callee` with the excluded non-template frees removed from every table it can
-        // dispatch over (the operator's free table and the callee's own), then restores them.
-        auto callWithoutExcluded = [&](const std::string& callee,
-                                       const std::vector<LLVMBackend::NamedVariable>& args) -> llvm::Value* {
-            std::vector<std::string> names{ lookupName };
-            if (callee != lookupName) names.push_back(callee);
-            std::vector<std::pair<std::string, std::vector<LLVMBackend::FunctionSymbol>>> saved;
-            if (!excludedLinkages.empty())
-                for (const auto& name : names)
-                    if (auto table = compiler->functionTable.find(name); table != compiler->functionTable.end())
-                    {
-                        saved.emplace_back(name, table->second);
-                        std::erase_if(table->second, [&](const LLVMBackend::FunctionSymbol& candidate) {
-                            return excludedLinkages.count(candidate.UniqueName) != 0;
-                        });
-                    }
-            auto restoreTables = [&]() {
-                for (auto& [name, original] : saved)
-                {
-                    auto restore = compiler->functionTable.find(name);
-                    if (restore == compiler->functionTable.end()) continue;
-                    auto afterCall = std::move(restore->second);
-                    restore->second = original;
-                    for (auto& appended : afterCall)
-                        if (std::none_of(restore->second.begin(), restore->second.end(),
-                            [&](const LLVMBackend::FunctionSymbol& existing) {
-                                return existing.UniqueName == appended.UniqueName;
-                            }))
-                            restore->second.push_back(std::move(appended));
-                }
-            };
-            llvm::Value* result = nullptr;
-            try
-            {
-                result = compiler->CreateOverloadedFunctionCall(callee, args, true);
-            }
-            catch (...)
-            {
-                restoreTables();
-                throw;
-            }
-            restoreTables();
-            return result;
-        };
         // The namespace may still declare the operator as a function TEMPLATE over the operand's
         // class template: instantiate one for THIS operand through the same generated-wrapper path
         // an ordinary C++ template call uses. nullptr = no template binds (nothing was emitted).
@@ -3657,7 +3660,7 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
                 || registeredName.empty())
                 return nullptr;
             FlushCallPostfix();
-            llvm::Value* result = callWithoutExcluded(registeredName, templateArgs);
+            llvm::Value* result = CallOperatorWithoutExcluded(compiler->functionTable, compiler, lookupName, registeredName, templateArgs, excludedLinkages);
             if (result != nullptr) TrackOwnedStringOperatorResult(compiler, result);
             return result;
         };
@@ -3706,7 +3709,7 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
         FlushCallPostfix();
         llvm::Value* result = nullptr;
         if (excludedLinkages.empty() || compiler->functionTable.count(lookupName) != 0)
-            result = callWithoutExcluded(lookupName, { arg });
+            result = CallOperatorWithoutExcluded(compiler->functionTable, compiler, lookupName, lookupName, { arg }, excludedLinkages);
         if (result != nullptr) TrackOwnedStringOperatorResult(compiler, result);
         return result;
     }
@@ -4314,6 +4317,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         operands.push_back(rule);
             return operands;
         };
+        std::set<std::string> binaryExcludedLinkages;
+        std::string binaryExcludedTable;
         auto tryFreeOperator = [&](bool adlOnly = false, bool clangDecides = false,
                                    bool memberFreeRanking = false) -> llvm::Value* {
             if (ctx != nullptr && ctx == cxxAdlAmbiguousCtx_) return nullptr;
@@ -4507,6 +4512,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                                                          registeredName, templateError, op)
                     || registeredName.empty())
                 {
+                    if (!binaryExcludedLinkages.empty()) return nullptr;
                     if (llvm::Value* converted = tryBoolComparisonConversion()) return converted;
                     // A failed free-template request does not prove the class receiver is unbindable:
                     // member candidates remain in the complete compound-assignment lookup.
@@ -4532,8 +4538,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     return nullptr;
                 }
                 FlushCallPostfix();
-                llvm::Value* result = compiler->CreateOverloadedFunctionCall(
-                    registeredName, templateArgs, true);
+                llvm::Value* result = CallOperatorWithoutExcluded(
+                    compiler->functionTable, compiler, binaryExcludedTable.empty() ? registeredName : binaryExcludedTable,
+                    registeredName, templateArgs, binaryExcludedLinkages);
                 if (result != nullptr) TrackOwnedStringOperatorResult(compiler, result);
                 return result;
             };
@@ -4928,6 +4935,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                                               rhsPointerDepth, rhsCxxNullptrT);
                 setLiteralIdentity(leftArg, 0);
                 setLiteralIdentity(rightArg, 1);
+                // The floating operand rule (C++ binary operator scalar parameters) applies to both sides.
+                leftArg.CxxOperatorFloatToInteger = true;
+                rightArg.CxxOperatorFloatToInteger = true;
                 // A const prvalue / xvalue keeps its cv in ConstMask bit 0: the object of a value
                 // shape, the referent of the address a reference parameter receives.
                 auto keepObjectConst = [](LLVMBackend::NamedVariable& arg, int objectCv) {
@@ -5114,6 +5124,18 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                             }))
                             restore->second.push_back(std::move(appended));
                 };
+                binaryExcludedLinkages.clear();
+                binaryExcludedTable = lookupName;
+                for (const auto& candidate : compiler->cxxFilteredOperatorCandidates_)
+                    binaryExcludedLinkages.insert(candidate.UniqueName);
+                if (!binaryExcludedLinkages.empty() && compiler->HasCxxFunctionTemplate(sourceName))
+                {
+                    llvm::Value* templated = nullptr;
+                    try { templated = callOperatorTemplate(sourceName); }
+                    catch (...) { restoreConstCandidates(); binaryExcludedLinkages.clear(); throw; }
+                    binaryExcludedLinkages.clear();
+                    if (templated != nullptr) { restoreConstCandidates(); return templated; }
+                }
                 llvm::Value* result = nullptr;
                 try
                 {
@@ -5622,6 +5644,32 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue,
                     lhsCxxPointeeConst, lhsObjectCv, rhsObjectCv);
             }
+            // `nullptr == s` on string only: wrap the null lhs as the empty string and re-enter.
+            // Other structs keep the pointer-vs-struct diagnostic.
+            if (rvalue && llvm::isa<llvm::ConstantPointerNull>(lvalue)
+                && rvalue->getType() == llvm::StructType::getTypeByName(*compiler->context, "string")
+                && compiler->GetFunction("operator string"))
+            {
+                LLVMBackend::TypeAndValue savedReturnType = compiler->lastCallReturnType;
+                bool savedReturnsOwned = compiler->lastCallReturnsOwned;
+                LLVMBackend::NamedVariable nullNV;
+                nullNV.Primary = lvalue;
+                nullNV.BaseType = lvalue->getType();
+                nullNV.TypeAndValue.TypeName = "char";
+                nullNV.TypeAndValue.Pointer = true;
+                llvm::Value* wrapped = compiler->CreateOverloadedFunctionCall("operator string", { nullNV });
+                compiler->lastCallReturnType = savedReturnType;
+                compiler->lastCallReturnsOwned = savedReturnsOwned;
+                if (wrapped == nullptr) return nullptr;
+                return TryBinaryOperatorOverload(
+                    wrapped, op, rvalue, ctx, lhsElemType,
+                    rhsPointerDepth, rhsElemPointer, lhsStorage, rhsStorage, reportMissing,
+                    allowReversed, lhsIsRvalue, rhsIsRvalue, lhsTypeName, rhsTypeName,
+                    lhsPointerDepth, lhsElemPointer,
+                    {}, {}, false, {}, {}, false, {}, {}, rhsCxxPointeeConst, lhsArithIdentity, rhsArithIdentity, rhsExplicitMove, lhsExplicitMove,
+                    lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue,
+                    lhsCxxPointeeConst, lhsObjectCv, rhsObjectCv);
+            }
             bool triedCxxComparisonRewrites = false;
             if (isCxxRecordValue(rvalue))
             {
@@ -5936,6 +5984,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             LLVMBackend::NamedVariable rightNV;
             rightNV.Primary  = rvalue;
             rightNV.BaseType = rvalue ? rvalue->getType() : nullptr;
+            rightNV.CxxOperatorFloatToInteger = true;
             rightNV.CxxArithIdentity = rhsArithIdentity;
             std::vector<antlr4::ParserRuleContext*> operandContexts;
             for (auto* child : ctx->children)

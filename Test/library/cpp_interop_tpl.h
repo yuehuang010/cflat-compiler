@@ -2119,6 +2119,53 @@ namespace alnv
     template <class H, class... T> using Front = Pair<H, TypeList<T...>>;  // fixed, then pack
     template <class T> struct Single { T v; Single() noexcept : v() {} };
     template <class T> using SingleAlias = Single<T>;                // no pack: unchanged
+    // Pack expansion inside a template-id pattern, sizeof...(pack) alone, a fixed parameter before
+    // the pack, a non-type pack, and a pack the target never expands.
+    template <class T> struct PBox { T v; PBox() noexcept : v() {} };
+    template <unsigned long N> struct PVal { static constexpr unsigned long value = N; PVal() noexcept {} };
+    template <unsigned long N> struct PTag { PTag() noexcept {} };
+    template <class... T> using Proj = TypeList<PBox<T>...>;         // Box<T>... per element
+    template <class... T> using Mix = Pair<TypeList<T...>, TypeList<PBox<T>...>>;
+    template <class... T> using SzOnly = PVal<sizeof...(T)>;        // sizeof...(T) alone
+    template <class... T> using PFixed = Single<int>;               // pack never expanded
+    template <class... T> using PChain = PFixed<T...>;              // pack handed to an alias
+    template <class H, class... T> using HeadProj = Pair<H, TypeList<PBox<T>...>>;
+    template <class H, class... T> using HeadSz = PVal<sizeof...(T)>;
+    template <unsigned long... I> using Tags = TypeList<PTag<I>...>; // non-type pack
+    template <unsigned long... I> using NSz = PVal<sizeof...(I)>;
+    inline int proj_pick(const TypeList<PBox<int>, PBox<char>>&) noexcept { return 41; }
+    inline int proj_empty_pick(const TypeList<>&) noexcept { return 42; }
+    inline int mix_pick(const Pair<TypeList<int, char>, TypeList<PBox<int>, PBox<char>>>&) noexcept { return 43; }
+    inline int sz_pick(const PVal<2>&) noexcept { return 44; }
+    inline int sz_empty_pick(const PVal<0>&) noexcept { return 45; }
+    inline int fixed_pick(const Single<int>&) noexcept { return 46; }
+    inline int head_proj_pick(const Pair<int, TypeList<PBox<char>, PBox<long>>>&) noexcept { return 47; }
+    inline int tags_pick(const TypeList<PTag<1>, PTag<3>>&) noexcept { return 49; }
+    inline int mix_empty_pick(const Pair<TypeList<>, TypeList<>>&) noexcept { return 50; }
+    inline int head_empty_pick(const Pair<int, TypeList<>>&) noexcept { return 51; }
+    // Round 2 shapes: a pattern that is a pointer, a reference, an expression, or typename-qualified;
+    // a pattern nested inside a template-id; sizeof...(pack) in a top-level expansion; an expansion
+    // nested in another (the inner pack expands first).
+    template <class... T> using PtrList = TypeList<T*...>;
+    template <class... T> using CrefList = TypeList<const T&...>;
+    template <class... T> using PtrNest = Pair<int, TypeList<T*...>>;
+    template <unsigned long... I> using PlusSeq = Seq<(I + 1)...>;
+    template <unsigned long... I> using DivSeq = Seq<((I - 5) / 3)...>;
+    template <class T> struct TyWrap { using type = T; };
+    template <class... T> using TypenameList = TypeList<typename TyWrap<T>::type...>;
+    template <class... T> using TwoExp = Pair<TypeList<PBox<T>...>, TypeList<T*...>>;
+    template <class... T> using NestValid = TypeList<Pair<TypeList<T...>, T>...>;
+    template <class... T> using SizeofIn = TypeList<Pair<T, PVal<sizeof...(T)>>...>;
+    inline int ptr_pick(const TypeList<int*, char*>&) noexcept { return 61; }
+    inline int cref_pick(const TypeList<const int&, const char&>&) noexcept { return 62; }
+    // CFlat cannot spell a reference template argument by name, so the reference shape is produced
+    // by a C++ factory and only passed back to C++.
+    inline CrefList<int, char> cref_make() noexcept { return CrefList<int, char>(); }
+    inline int ptrnest_pick(const Pair<int, TypeList<int*, char*>>&) noexcept { return 63; }
+    inline int typename_pick(const TypeList<int, char>&) noexcept { return 65; }
+    inline int twoexp_pick(const Pair<TypeList<PBox<int>, PBox<char>>, TypeList<int*, char*>>&) noexcept { return 66; }
+    inline int nestvalid_pick(const TypeList<Pair<TypeList<int, char>, int>, Pair<TypeList<int, char>, char>>&) noexcept { return 67; }
+    inline int sizeofin_pick(const TypeList<Pair<int, PVal<2>>, Pair<char, PVal<2>>>&) noexcept { return 68; }
 }
 inline int alna_take_nbdef(const alna::NBdef<int>& b) noexcept { return b.v + 1; }
 

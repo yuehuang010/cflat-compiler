@@ -1,5 +1,7 @@
 import cpp "cpp_interop_basic.h";
 
+int opfl_ufcs(OpunHold* h, char* s) { return 1; }
+
 extern int main()
 {
 expect_error("binds no free overload") {
@@ -14,5 +16,31 @@ expect_error("binds no free overload") {
 
 expect_error("binds no free overload") {
     int constRvBadResult = -mix17.constRvBadMake();
+}
+// OPUNARY r2: a floating RHS is a Conversion, so two integer/float operator candidates tie (clang: ambiguous).
+expect_error("ambiguous call to 'operator+'") {
+    opfl.Amb opfAmb = default;
+    int opfAmbResult = opfAmb + 1.5;
+}
+
+expect_error("ambiguous call to 'operator+'") {
+    opfl.FI opfFI = default;
+    int opfFIResult = opfFI + 1.5;
+}
+
+// A non-const lvalue reference never binds the converted temporary (clang refuses too).
+expect_error("cannot bind its right operand because the CFlat expression is an rvalue") {
+    opfl.Mut opfMut = default;
+    int opfMutResult = opfMut + 2.5;
+}
+
+// A native free function named by UFCS keeps its own parameter diagnostic for a C++ receiver.
+expect_error("cannot pass parameter 's' of 'opfl_ufcs' of type 'char*' from a value of type 'int'") {
+    OpunHold opfHold = default;
+    int opfUfcsResult = opfHold.opfl_ufcs(5);
+}
+expect_error("operator+(int), operator+(unsigned int)") {
+    opfu.IU iuOp = default;
+    int iuOpResult = iuOp + 1.5;
 }
 }

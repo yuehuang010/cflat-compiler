@@ -14,7 +14,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // inherit an enclosing initializer/return destination.
         DeclExpectedTypeScope newExpectedScope(&declExpectedType, {});
         DiagnoseAssignmentArguments(ctx->argumentExpressionList());
-        std::string typeName = NewExpressionElementTypeName(ctx);
+        uint32_t elementConstMask = 0;
+        std::string typeName = NewExpressionElementTypeName(ctx, &elementConstMask);
+        const bool forceRootType = IsGlobalScopeQualifiedType(ctx->typeSpecifier());
         bool isArray = ctx->assignmentExpression() != nullptr;
 
         // If type substitution produced a pointer type (e.g. T=Employee*), strip the '*'
@@ -30,14 +32,10 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         const auto spellNewType = [&]() {
             return typeName + std::string(typeStars, '*');
         };
-        const int spelledPointerStars = ctx->pointer() == nullptr
-            ? 0 : static_cast<int>(ctx->pointer()->Star().size());
-        // A written '*' over a substituted pointer type (T* with T=int*) counts the substituted stars too.
-        if (spelledPointerStars >= PointerDepthCap
-            || (spelledPointerStars > 0 && typeStars + 1 > PointerDepthCap))
+        if (typeStars + 1 > MaxDeclaratorPointerDepth)
         {
-            LogErrorContext(ctx, PointerDepthCapMessage(
-                std::format("'new {}'", spellNewType()), typeStars + 1));
+            LogErrorContext(ctx, std::format("'new {}' produces pointer depth {}, exceeding the limit of {}",
+                spellNewType(), typeStars + 1, MaxDeclaratorPointerDepth));
             return {};
         }
 
@@ -46,7 +44,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // per-element construction done by init's own `new T[n]`.
         if (desugarToArray && isArray)
         {
-            std::string elemSpelling = typeName + (typeIsPtr ? "*" : "");
+            std::string elemSpelling = JoinConstTypeArgument(spellNewType(),
+                ContiguousLowConstLevels(elementConstMask));
             std::string wantName = MangledGenericName("array", { elemSpelling });
             if (wantName != arrayNewDesugarTarget.TypeName)
             {
@@ -790,7 +789,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     compiler->pendingCxxSretTypeName_ = typeName;
                     compiler->pendingCxxSretForFixedArray_ = true;
                 }
-                llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
+                llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(
+                    typeName, {}, forceRootType);
                 const bool builtInPlace = nativeCtorSret
                     && compiler->pendingCxxSretDest_ == nullptr;
                 if (nativeCtorSret)
@@ -859,7 +859,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 compiler->pendingCxxSretTypeName_ = typeName;
                 compiler->pendingCxxSretReturn_ = true;
             }
-            llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, ctorArgs);
+            llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(
+                typeName, ctorArgs, forceRootType);
             const bool builtInPlace = armLoweredSret && compiler->pendingCxxSretDest_ == nullptr;
             if (armLoweredSret)
             {
@@ -957,6 +958,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     ? argNV.Primary : LoadNamedVariable(argNV);
                 LLVMBackend::TypeAndValue slotType{ .TypeName = typeName, .Pointer = typeIsPtr };
                 slotType.PointerDepth = typeStars;
+                slotType.ConstMask = elementConstMask;
                 if (argVal != nullptr)
                 {
                     compiler->RejectImplicitIntegerPointeePointerConversion(
@@ -1032,14 +1034,12 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // A substituted POINTER element ('new T[n]' with T=S*) is an 'S*[]' view; without the
         // star the result read as an 'S[]' and bound anything an 'S[]' binds.
         result.TypeAndValue.ElemPointer = typeIsPtr;
-        result.TypeAndValue.PointerDepth = typeStars + 1 <= PointerDepthCap
-            ? typeStars + 1 : 0;
+        result.TypeAndValue.PointerDepth = isArray ? typeStars : typeStars + 1;
         result.Primary = typedPtr;
         // `new T[n]` / `new T` with T bound to a pointee-const argument (`(const char)*`).
-        if (int constDepth = SubstitutedConstDepth(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
-            constDepth > 0 && typeStars == 1)   // deeper results exceed the 2-level model
+        if (elementConstMask != 0 && typeStars > 0)
         {
-            result.TypeAndValue.ConstMask = static_cast<uint8_t>((1u << std::min(constDepth, 7)) - 1u);
+            result.TypeAndValue.ConstMask = elementConstMask;
             result.Primary = compiler->MarkCastQualification(typedPtr, result.TypeAndValue,
                 SpellTypeForSymbolDump(*compiler, result.TypeAndValue));
         }
@@ -1064,10 +1064,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // transparent wrapper (a '?:' arm) is still recognized as owning. See ownedNewTemps_.
         if (!isWinrtNew && !isArray)
             compiler->RegisterOwnedNewTemp(typedPtr, typeName, siteExcess);
-        // Ledger the concrete class too: a '?:' phi carries no TypeName, and the interface
-        // upcast needs one per arm. See valueElementTypeNames_.
-        if (!isArray)
-            compiler->RegisterValueElementTypeName(typedPtr, typeName);
+        // Ledger the element name too (arrays included): a '?:' phi or a direct `new` argument
+        // carries no TypeName, and the interface upcast / view gate need one. See valueElementTypeNames_.
+        compiler->RegisterValueElementTypeName(typedPtr, typeName);
         return result;
     }
 
@@ -2973,6 +2972,15 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         if (moveSourceIsWholeBinding && argNV.TypeAndValue.IsArrayView)
         {
             movedViewGuaranteedOwns = argNV.IsOwning && !argNV.OwnFlagMayBeFalse;
+            if (!llvm::isa<llvm::AllocaInst>(argNV.Storage))
+            {
+                const std::string sourcePathKey = argNV.MoveSourcePathKey.empty()
+                    ? compiler->NonLocalElementPathKey(argNV) : argNV.MoveSourcePathKey;
+                const bool nonLocalMayBeBorrowed = compiler->NonLocalViewMayBeBorrowed(
+                    argNV.Storage, sourcePathKey).value_or(false);
+                movedViewGuaranteedOwns = movedViewGuaranteedOwns
+                    || !nonLocalMayBeBorrowed;
+            }
             if (argNV.IsOwning && argNV.OwnFlagActive && argNV.OwnFlag != nullptr)
                 movedViewOwns = compiler->builder->CreateLoad(
                     compiler->builder->getInt1Ty(), argNV.OwnFlag, "moved_view_owns");
@@ -3104,7 +3112,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // like the already-blocked `delete b`) is rejected, and so a PLAIN `T*` destination declines
         // to adopt, instead of double-freeing.
         result.IsBorrowed     = srcBorrowLive;
-        result.IsOwning       = argNV.IsOwning;
+        result.IsOwning       = argNV.IsOwning || movedViewGuaranteedOwns;
         result.BorrowedOrigin = srcBorrowLive ? argNV.BorrowedOrigin : std::string();
         return result;
     }

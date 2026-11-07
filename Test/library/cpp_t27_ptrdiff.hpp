@@ -24,6 +24,12 @@ struct IntCtor
     int get() const { return value; }
 };
 
+struct FloatAdd
+{
+    float value = 1.0f;
+    float operator+(double d) const { return value + (float)d; }
+};
+
 // 2 = int*, 3 = char*, 4 = double*, 1 = anything else.
 template<class T> int kind(T) noexcept
 {

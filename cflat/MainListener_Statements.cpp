@@ -1076,6 +1076,13 @@ bool MainListener::IsActiveRangeCollectionElement(
 
 void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
         auto* enumBackend = Compiler(ctx);
+        // The function guard owns its outer body frame through deferred sink inference.
+        auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(ctx->parent);
+        const bool isFunctionBody = compound != nullptr
+            && dynamic_cast<CFlatParser::FunctionDefinitionContext*>(compound->parent) != nullptr;
+        std::optional<LLVMBackend::AliasScopeGuard> aliasScope;
+        if (!isFunctionBody && !IsStatementIfConstArm(compound))
+            aliasScope.emplace(enumBackend);
         std::string enumScope = enumBackend->activeLocalEnumFunction_;
         if (!enumScope.empty())
         {
@@ -4664,6 +4671,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             return;
         }
         auto* compiler = Compiler(statement);
+        // A for-init typedef stays visible through the loop, then ends with the statement.
+        LLVMBackend::AliasScopeGuard aliasScope(compiler);
         DeferredLoopScope loop{ compiler, compiler->BeginDeferredLoop() };
         ParseStatementBody(statement);
         loop.Close();
@@ -5710,9 +5719,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                         compiler->InitializeBlock(nullptr, true, blockIncrement, blockResume, blockResume);
 
                         auto iteratorPointeeType = [](LLVMBackend::TypeAndValue type) {
-                            int depth = type.PointerDepth;
-                            if (depth == 0 && type.Pointer)
-                                depth = type.ElemPointer ? 2 : 1;
+                            int depth = type.ValuePointerDepth();
                             if (depth > 0) --depth;
                             type.PointerDepth = depth;
                             type.Pointer = depth > 0;
@@ -6641,6 +6648,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // Rewind point for the per-function pending logs (see PendingAnalysisMark).
                 auto* markedFn = entryBB != nullptr ? entryBB->getParent() : nullptr;
                 auto pendingMark = compilerLLVM->MarkPendingAnalyses(markedFn);
+                auto pendingInstantiationMark = MarkPendingInstantiations();
                 auto recoveryMark = MarkExpectErrorRecoveryState();
                 compiler->InitializeBlock(nullptr, true);
                 bool errorReceived = false;
@@ -6663,6 +6671,9 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     // The swallowed diagnostic already answered everything this block queued;
                     // leaving it queued makes the end-of-module sweep report it a second time.
                     compilerLLVM->RewindPendingAnalyses(markedFn, pendingMark);
+                    // Generic requests this block queued answer the swallowed error too; those
+                    // queued before the block stay (they drain from their own flush).
+                    DropPendingInstantiationsSince(pendingInstantiationMark);
                     compilerLLVM->DiscardOwnedTempsSince(ownedTempMark);
                     // Terminate abandoned blocks and reconnect the live path to recovery.
                     if (auto* bb = compilerLLVM->builder->GetInsertBlock())

@@ -123,8 +123,7 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
         return false;
 
     // The pointee conversion applies only when both pointers have the same indirection depth.
-    if ((fromPointer.ElemPointer || fromPointer.PointerDepth >= 2)
-        != (toPointer.ElemPointer || toPointer.PointerDepth >= 2))
+    if (fromPointer.ValuePointerDepth() != toPointer.ValuePointerDepth())
         return false;
 
     auto isInteger = [&](const std::string& name) {
@@ -178,10 +177,8 @@ std::string LLVMBackend::ImplicitIntegerPointeeConversionText(
     };
     const std::string fromBase = resolvedPointee(fromPointer);
     const std::string toBase = resolvedPointee(toPointer);
-    const bool fromDouble = fromPointer.ElemPointer || fromPointer.PointerDepth >= 2;
-    const bool toDouble = toPointer.ElemPointer || toPointer.PointerDepth >= 2;
-    const std::string fromType = fromBase + (fromDouble ? "**" : "*");
-    const std::string toType = toBase + (toDouble ? "**" : "*");
+    const std::string fromType = fromBase + std::string(fromPointer.ValuePointerDepth(), '*');
+    const std::string toType = toBase + std::string(toPointer.ValuePointerDepth(), '*');
     return std::format("cannot convert '{}' to '{}' implicitly: the pointee types differ; "
                        "use an explicit cast '({})p'", fromType, toType, toType);
 }
@@ -206,13 +203,12 @@ void LLVMBackend::RejectImplicitIntegerPointeePointerConversion(
 
 // ---- Definitions moved out of LLVMBackend.h (Overloads) ----
 
-// The '*' count a diagnostic prints for a value type. Depth caps at 2, and array/view/simd/fat
-// shapes spell it about their ELEMENT rather than themselves.
+// The '*' count a diagnostic prints for a value type. Array/view/simd/fat shapes spell it about
+// their ELEMENT rather than themselves.
 static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
 {
     if (!tv.Pointer) return "";
-    bool deep = tv.ElemPointer || tv.PointerDepth >= 2;
-    return (deep && tv.DepthIsAboutThisValue()) ? "**" : "*";
+    return std::string(std::max(tv.ValuePointerDepth(), 1), '*');
 }
 
 static bool ContainsViewOrPointer(
@@ -261,20 +257,20 @@ static LLVMBackend::TypeAndValue ReceiverPathPointee(const LLVMBackend::TypeAndV
     if (type.IsArrayView)
     {
         element.IsArrayView = false;
-        element.Pointer = type.ElemPointer;
-        element.PointerDepth = type.ElemPointer ? 1 : 0;
+        element.Pointer = type.ElementPointerDepth() > 0;
+        element.PointerDepth = type.ElementPointerDepth();
     }
-    else if (type.ElemPointer || type.PointerDepth >= 2)
+    else if (type.ValuePointerDepth() >= 2)
     {
         element.Pointer = true;
-        element.PointerDepth = type.PointerDepth >= 2 ? type.PointerDepth - 1 : 1;
+        element.PointerDepth = type.ValuePointerDepth() - 1;
     }
     else
     {
         element.Pointer = false;
         element.PointerDepth = 0;
     }
-    element.ElemPointer = false;
+    element.ElemPointer = element.Pointer && element.PointerDepth >= 2;
     return element;
 }
 
@@ -391,8 +387,8 @@ bool LLVMBackend::ReceiverMayHandOutViewOrPointer(const FunctionSymbol& method)
                     if (type.ConstArraySize > 0 && !type.Pointer)
                     {
                         type.ConstArraySize = 0;
-                        type.Pointer = type.ElemPointer;
-                        type.PointerDepth = type.ElemPointer ? 1 : 0;
+                        type.Pointer = type.ValuePointerDepth() > 0;
+                        type.PointerDepth = type.ValuePointerDepth();
                         type.ElemPointer = false;
                     }
                     else if (type.Pointer || type.IsArrayView)
@@ -548,9 +544,9 @@ LLVM_ATTRIBUTE_NOINLINE static bool CxxPointerReferenceValueMix(
             || xp.PointeeConstMask() != yp.PointeeConstMask()))
             continue;
         const bool xConstPointerReference = xRef
-            && (xp.CxxConstRef() || ((xp.ConstMask >> xp.ValuePointerDepth()) & 1u) != 0);
+            && (xp.CxxConstRef() || xp.IsConstObject());
         const bool yConstPointerReference = yRef
-            && (yp.CxxConstRef() || ((yp.ConstMask >> yp.ValuePointerDepth()) & 1u) != 0);
+            && (yp.CxxConstRef() || yp.IsConstObject());
         const bool constPointerReference = xConstPointerReference || yConstPointerReference;
         if (argIndex < arguments.size() && constPointerReference)
             return true;
@@ -913,6 +909,52 @@ unsigned LLVMBackend::ArithResultNarrowWidth(const TypedValue& lhs, const TypedV
         const bool runtime = (lhs.value != nullptr && !llvm::isa<llvm::Constant>(lhs.value))
             || (rhs.value != nullptr && !llvm::isa<llvm::Constant>(rhs.value));
         return lhsWidth != 0 && rhsWidth != 0 && runtime ? std::max(lhsWidth, rhsWidth) : 0;
+}
+
+// The C++ operator RHS floating operand is a float (not a double/long double): an unsuffixed
+// literal, a declared float, or a built-in arithmetic result identity decides.
+static bool CxxFloatOperandIsFloat(const LLVMBackend::NamedVariable& arg)
+{
+        if (!arg.LiteralIdentity.empty()) return arg.LiteralIdentity == "float";
+        if (!arg.CxxArithIdentity.empty()) return arg.CxxArithIdentity == "float";
+        if (!arg.TypeAndValue.TypeName.empty()) return arg.TypeAndValue.TypeName == "float";
+        return arg.BaseType != nullptr && arg.BaseType->isFloatTy();
+}
+
+// C++ floating-to-scalar conversion of a binary operator's RHS (CxxOperatorFloatToInteger): a
+// Conversion-rank standard conversion to an integer, bool or float parameter ([conv.fpint],
+// [conv.bool], [conv.double]). Other targets and float-to-float exact binds are not this rule.
+static bool CxxOperatorFloatRuleAccepts(const LLVMBackend::NamedVariable& arg,
+                                        const LLVMBackend::TypeAndValue& target)
+{
+        if (!arg.CxxOperatorFloatToInteger || arg.BaseType == nullptr || !arg.BaseType->isFloatingPointTy()
+            || arg.TypeAndValue.Pointer || target.Pointer || target.ElemPointer)
+            return false;
+        if (target.TypeName == "bool") return true;
+        if (target.IsInteger() != -1) return true;
+        return target.TypeName == "float" && !CxxFloatOperandIsFloat(arg);
+}
+
+// The value a C++ binary operator's floating RHS becomes for a parameter the rule admits: bool
+// is a truth test, float a truncation, an integer a truncation toward zero. A `const T&` scalar
+// converts to its referent so the temporary it binds stores exactly.
+llvm::Value* LLVMBackend::ConvertCxxOperatorFloatOperand(llvm::Value* value, const NamedVariable& arg,
+                                                         const TypeAndValue& param)
+{
+        if (value == nullptr || !value->getType()->isFloatingPointTy() || param.Pointer || param.ElemPointer
+            || param.IsRvalueRef || (param.IsAlias && !param.CxxConstRef()))
+            return value;
+        const TypeAndValue target = param.IsAlias ? ScalarArgumentReferent(param) : param;
+        if (!CxxOperatorFloatRuleAccepts(arg, target)) return value;
+        llvm::Type* targetType = GetType(target);
+        if (target.TypeName == "bool")
+            return builder->CreateZExt(
+                builder->CreateFCmpUNE(value, llvm::ConstantFP::get(value->getType(), 0.0)), targetType);
+        if (target.TypeName == "float")
+            return builder->CreateFPTrunc(value, targetType);
+        return target.IsUnsignedInteger() != -1
+            ? builder->CreateFPToUI(value, targetType)
+            : builder->CreateFPToSI(value, targetType);
 }
 
 /*
@@ -1909,9 +1951,9 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 const bool pointerReference = param.IsCxxRefToPointer;
                 const bool pointerLvalue = arg.Storage != nullptr && !arg.IsRvalue
                     && !IsCxxRvalueReferenceArgument(arg);
-                const int sourceMask = arg.TypeAndValue.PointeeConstMask()
+                const uint32_t sourceMask = arg.TypeAndValue.PointeeConstMask()
                     | (CxxArgumentPointeeConst(arg) ? 1 : 0);
-                const int targetMask = param.PointeeConstMask();
+                const uint32_t targetMask = param.PointeeConstMask();
                 const bool dropsConst = (sourceMask & targetMask) != sourceMask;
                 const bool cannotBindRef = pointerReference && !param.CxxConstRef()
                     && !param.IsRvalueRef && !pointerLvalue;
@@ -3536,7 +3578,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             if (CxxConstScalarRefReferent(tmpParam, constRefReferent)
                                 && (CompareUpconvert(GetType(tmpArg), GetType(constRefReferent)) >= 0
                                     || ClassifyScalarArgConversion(arg, constRefReferent)
-                                        == ScalarArgConversion::Widen))
+                                        == ScalarArgConversion::Widen
+                                    || (candidate.IsCxx && CxxOperatorFloatRuleAccepts(arg, constRefReferent))))
                             {
                                 result = 1;
                                 constRefReferentArm = true;
@@ -3642,7 +3685,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     {
                         // A `const T&` scalar binds a temporary: score the REFERENT by the scalar table.
                         // Widen is a converted temporary; argument lowering materializes it.
-                        if (const ScalarArgConversion conv = ClassifyScalarArgConversion(arg, constRefReferent);
+                        if (candidate.IsCxx && CxxOperatorFloatRuleAccepts(arg, constRefReferent))
+                            result = 1;
+                        else if (const ScalarArgConversion conv = ClassifyScalarArgConversion(arg, constRefReferent);
                             conv == ScalarArgConversion::Exact || conv == ScalarArgConversion::Widen)
                             result = conv == ScalarArgConversion::Exact ? 0 : 1;
                         else
@@ -3979,9 +4024,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // viable, ranked below an exact int overload by RankIntegerConversion.
                 if (result < 0 && scalarConv == ScalarArgConversion::PromotedNarrow)
                     result = 1;
+                // A free `const T&` parameter is the pointer-shaped alias: judge its referent.
+                const bool cxxFloatToInteger = candidate.IsCxx
+                    && (!candidateParamItr->Pointer || candidateParamItr->CxxConstRef())
+                    && (!candidateParamItr->IsAlias || candidateParamItr->CxxConstRef())
+                    && !candidateParamItr->IsRvalueRef
+                    && CxxOperatorFloatRuleAccepts(arg, ScalarArgumentReferent(*candidateParamItr));
                 if (result >= 0 && (scalarConv == ScalarArgConversion::Narrow
                                     || scalarConv == ScalarArgConversion::EnumMismatch))
                     result = -1;
+                if (cxxFloatToInteger && (scalarConv == ScalarArgConversion::Narrow
+                                          || scalarConv == ScalarArgConversion::Exact))
+                    result = 1;
                 // double and long double lower alike, so the lowered types scored them perfect;
                 // a floating Widen between them is a conversion, so the exact one wins.
                 if (result == 0 && scalarConv == ScalarArgConversion::Widen
@@ -4549,9 +4603,19 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
          * survivors each better at some argument are ambiguous. The tiers alone cannot see this:
          * they count conversions per candidate, and a floating position is never ranked in them.
          */
+        // A floating binary-operator operand is ranked by the C++ sequences alone: a native operator
+        // that is not viable for the call (CFlat's string `operator+`) must not keep it on the tiers.
+        const bool floatRuleCall = !candidates.empty()
+            && std::any_of(candidates.front().first.begin(), candidates.front().first.end(),
+                           [](const NamedVariable& a) { return a.CxxOperatorFloatToInteger; });
         const bool cxxRanking = tiedOut != nullptr && !candidates.empty()
-            && std::all_of(candidates.begin(), candidates.end(), [](const auto& c) {
-                   return c.second.IsCxx; });
+            && (std::all_of(candidates.begin(), candidates.end(), [](const auto& c) {
+                   return c.second.IsCxx; })
+                || (floatRuleCall && std::all_of(perfect.begin(), perfect.end(), [](const Ranked& r) {
+                       return r.pair->second.IsCxx; })
+                    && std::all_of(possible.begin(), possible.end(), [](const Ranked& r) {
+                       return r.pair->second.IsCxx; })
+                    && !(perfect.empty() && possible.empty())));
         std::map<const Result*, std::vector<CxxConversionRank>> cxxRanks;
         std::set<const Result*> receiverCvRejected;
         // A variadic whose ellipsis receives an argument joins the ranking: its declared
@@ -5592,6 +5656,10 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
                 argTV.TypeName = declared->TypeName;
                 argTV.Pointer = argTV.Pointer || declared->Pointer;
             }
+        // A direct `new T[n]` argument has no caller name; its element name rides the value ledger
+        // that ParseNewExpression registers, so the message never spells the 'T' stand-in.
+        if (argTV.TypeName.empty() && argTV.IsArrayView && arg.Primary != nullptr)
+            argTV.TypeName = FindValueElementTypeName(arg.Primary);
         // The reverse ('T[] -> T*' decay) is always safe; a view argument carries IsArrayView.
         // A fixed pointer-element array is an array source too; let the element gate reshape it.
         if (param.IsArrayView && argTV.Pointer && !argTV.IsArrayView
@@ -6981,6 +7049,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     && (p.VariableName.ends_with("__") || (c.IsCxx && p.VariableName == "this")))
                     continue;   // the implicit 'this'
                 std::string spelled = SpellType(*this, p);
+                // A C++ scalar by-value parameter shows its C++ spelling (unsigned int), not u32.
+                static const std::set<std::string> cflatScalarNames = {
+                    "bool", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "uint", "u32",
+                    "long", "i64", "ulong", "u64", "float", "double" };
+                if (c.IsCxx && !p.Pointer && !p.IsAlias && !p.IsRvalueRef && cflatScalarNames.count(p.TypeName) != 0)
+                    if (std::string cxxScalar; CxxSpellingForCflatType(p.TypeName, cxxScalar))
+                        spelled = cxxScalar;
                 const bool defaulted = wrapperShape && i < c.DefaultArguments.size()
                     && !c.DefaultArguments[i].kind.empty();
                 // A free C++ function's reference parameter keeps its declared spelling.
@@ -7433,6 +7508,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 for (const auto& c : candidates)
                 {
                     if (c.IsCxx || c.Parameters.size() != arguments.size()) continue;
+                    if (!arguments.empty() && IsCxxRecord(arguments.front().TypeAndValue.TypeName)
+                        && !c.Parameters.empty()
+                        && c.Parameters.front().TypeName != arguments.front().TypeAndValue.TypeName)
+                        continue;
                     if (!std::all_of(arguments.begin(), arguments.end(), [](const auto& arg) {
                             return arg.TypeAndValue.VariableName.empty();
                         }))
@@ -7779,7 +7858,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         paramList += (i > 0 ? ", " : "") + spelled;
                     }
                     msg += std::format("    {}({}) was rejected because the operand is const or an rvalue and the parameter is a non-const lvalue reference\n",
-                        StripCxxConstTwin(c.SourceName.empty() ? shownFunctionName : c.SourceName), paramList);
+                        c.SourceName.starts_with(globalOperatorAlias) ? shownFunctionName
+                            : StripCxxConstTwin(c.SourceName.empty() ? shownFunctionName : c.SourceName), paramList);
                 }
                 shownCandidates.clear();
             }
@@ -7966,12 +8046,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 auto pi = c.Parameters.begin();
                 for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
                 {
-                    bool tooDeep = (arguments[i].TypeAndValue.IsProvenDoublePointer()
-                                 || arguments[i].TypeAndValue.IsProvenDecayedDoublePointer())
-                                && pi->IsProvenSinglePointer();
-                    bool tooShallow = arguments[i].TypeAndValue.IsProvenSinglePointerDepth()
-                                   && pi->IsProvenDoublePointer();
-                    if (!tooDeep && !tooShallow) continue;
+                    const int argumentDepth = arguments[i].TypeAndValue.EffectiveProvenPointerDepth();
+                    const int parameterDepth = pi->ProvenPointerDepth();
+                    if (!arguments[i].TypeAndValue.PointerDepthRefuses(*pi)) continue;
+                    const bool tooDeep = argumentDepth > parameterDepth;
+                    const bool legacyTooDeep = tooDeep && argumentDepth == 2 && parameterDepth == 1;
+                    const bool legacyTooShallow = !tooDeep && argumentDepth == 1 && parameterDepth == 2;
                     // A mangled instantiation name is not writable source, so the advice clause is
                     // dropped rather than naming a type the user cannot spell.
                     TypeAndValue parameterBase = *pi;
@@ -7980,7 +8060,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     parameterBase.PointerDepth = 0;
                     parameterBase.IsArrayView = false;
                     std::string shown = SpellType(*this, parameterBase);
-                    std::string argShown = SpellType(*this, arguments[i].TypeAndValue);
+                    TypeAndValue shownArgument = arguments[i].TypeAndValue;
+                    if (shownArgument.TypeName.empty() && !legacyTooDeep && !legacyTooShallow)
+                        shownArgument.TypeName = pi->TypeName;
+                    std::string argShown = SpellType(*this, shownArgument);
                     const bool writable = !shown.empty();
                     // A PRIMITIVE pointer argument carries no CFlat TypeName at all, so the depth
                     // is all that is known about it - say only that, never "type '**'".
@@ -7988,7 +8071,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         return argShown.empty() ? std::string(unnamed)
                                                 : std::format("type '{}{}'", argShown, stars);
                     };
-                    if (tooDeep)
+                    if (!legacyTooDeep && !legacyTooShallow)
+                    {
+                        std::string parameterShown = SpellType(*this, *pi);
+                        if (parameterShown.empty()) parameterShown = std::format("pointer depth {}", parameterDepth);
+                        std::string argumentShown = argShown.empty()
+                            ? std::format("pointer depth {}", argumentDepth) : argShown;
+                        msg += std::format("  [{}] parameter {} '{}' has type '{}' and the argument has type '{}' - "
+                                           "the pointer depths differ.\n",
+                            SpellFunctionSymbol(*this, c.UniqueName), i, pi->VariableName,
+                            parameterShown, argumentShown);
+                    }
+                    else if (legacyTooDeep)
                     {
                         std::string advice = writable
                             ? std::format(", or declare the parameter as '{}**'", shown) : std::string();
@@ -8008,7 +8102,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             SpellFunctionSymbol(*this, c.UniqueName), i, pi->VariableName, shown,
                             argType("", "one more level of indirection"), how, advice);
                     }
-                    else
+                    else if (legacyTooShallow)
                     {
                         std::string advice = writable
                             ? std::format(", or declare the parameter as '{}*'", shown) : std::string();
@@ -9273,6 +9367,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         // shared with virtual dispatch via CallInterfaceMethod.
                         value = LowerByValueArg(value, *candParamItr, arg);
                     }
+                    // A `const T&` scalar converts to its referent first (ConvertCxxOperatorFloatOperand).
+                    if (candidate.IsCxx && value != nullptr)
+                        value = ConvertCxxOperatorFloatOperand(value, arg, *candParamItr);
 
                     // An owning-struct RVALUE temp passed to a by-value BORROW param has no named
                     // owner and the callee will not free it; register it for end-of-full-expression
@@ -10961,7 +11058,7 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
                 argumentType.PointerDepth = param.PointerDepth;
                 argumentType.ElemPointer = param.Pointer && param.PointerDepth >= 2;
                 argumentType.ConstMask = param.ConstMask < 0
-                    ? 0 : static_cast<uint8_t>(param.ConstMask);
+                    ? 0 : static_cast<uint32_t>(param.ConstMask);
                 NamedVariable argument;
                 argument.TypeAndValue = argumentType;
                 argument.BaseType = GetType(argumentType);

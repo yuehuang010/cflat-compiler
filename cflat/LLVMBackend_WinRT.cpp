@@ -1638,7 +1638,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
         tv.IsArrayView = p.IsArrayView;
         tv.PointerDepth = p.PointerDepth;
         tv.ElemPointer = tv.Pointer && p.PointerDepth >= 2;
-        if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint8_t>(p.ConstMask);
+        if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint32_t>(p.ConstMask);
         tv.IsInterface = IsInterfaceType(p.TypeName);
         tv.IsAlias = p.IsAlias;
         tv.IsRvalueRef = p.IsRvalueRef;
@@ -3256,6 +3256,80 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
         const bool candidateFieldMayBeBorrowedValue = sourceRootCandidatesMayBeBorrowed.value_or(false);
         const bool localMayBeBorrowed = live != nullptr
             && (live->OwnFlagMayBeFalse || allJoinArmsKeepOwner);
+        bool sourceIsFrameBackedView = false;
+        if (arg.IsExplicitMove && arg.TypeAndValue.IsArrayView && storageIsLocalSlot)
+        {
+            const auto* sourceSlot = llvm::cast<llvm::AllocaInst>(moveSourceStorage);
+            auto* sourceLoad = llvm::dyn_cast<llvm::LoadInst>(arg.Primary);
+            struct FrameViewProof
+            {
+                bool Known = false;
+                bool SawFrame = false;
+            };
+            const bool loadReadsSourceSlot = sourceLoad != nullptr
+                && sourceLoad->getPointerOperand()->stripPointerCasts() == sourceSlot;
+            if (loadReadsSourceSlot)
+            {
+                std::unordered_map<llvm::BasicBlock*, FrameViewProof> memo;
+                std::function<FrameViewProof(llvm::BasicBlock*, const llvm::Instruction*,
+                    std::unordered_set<const llvm::BasicBlock*>&)> inspectReachingStore;
+                inspectReachingStore = [&](llvm::BasicBlock* block,
+                    const llvm::Instruction* before,
+                    std::unordered_set<const llvm::BasicBlock*>& active) -> FrameViewProof
+                {
+                    if (block == nullptr) return {};
+                    if (before == nullptr)
+                        if (auto found = memo.find(block); found != memo.end()) return found->second;
+                    if (!active.insert(block).second) return {};
+                    const auto finishBlock = [&](FrameViewProof proof) {
+                        if (before == nullptr) memo.insert_or_assign(block, proof);
+                        active.erase(block);
+                        return proof;
+                    };
+                    auto it = before != nullptr ? before->getIterator() : block->end();
+                    while (it != block->begin())
+                    {
+                        --it;
+                        const auto* instruction = &*it;
+                        const auto* store = llvm::dyn_cast<llvm::StoreInst>(instruction);
+                        if (store == nullptr
+                            || store->getPointerOperand()->stripPointerCasts() != sourceSlot)
+                            continue;
+                        const llvm::Value* value = store->getValueOperand();
+                        if (const auto* constant = llvm::dyn_cast<llvm::Constant>(value);
+                            constant != nullptr && constant->isNullValue())
+                            return finishBlock({ true, false });
+                        if (value->getType()->isPointerTy())
+                        {
+                            const llvm::Value* root = value->stripPointerCasts();
+                            while (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(root))
+                                root = gep->getPointerOperand()->stripPointerCasts();
+                            if (llvm::isa<llvm::AllocaInst>(root))
+                                return finishBlock({ true, true });
+                        }
+                        return finishBlock({});
+                    }
+                    FrameViewProof merged{ true, false };
+                    if (llvm::pred_empty(block)) merged.Known = false;
+                    for (llvm::BasicBlock* predecessor : llvm::predecessors(block))
+                    {
+                        const FrameViewProof path = inspectReachingStore(predecessor, nullptr, active);
+                        merged.Known = merged.Known && path.Known;
+                        merged.SawFrame = merged.SawFrame || path.SawFrame;
+                    }
+                    return finishBlock(merged);
+                };
+                std::unordered_set<const llvm::BasicBlock*> active;
+                const FrameViewProof proof = inspectReachingStore(
+                    sourceLoad->getParent(), sourceLoad, active);
+                sourceIsFrameBackedView = proof.Known && proof.SawFrame;
+            }
+        }
+        if (sourceIsFrameBackedView)
+        {
+            LogBorrowedMoveSlotError();
+            return;
+        }
         auto makeDiagnostic = [&]() {
             const std::string sourceName = !arg.FieldPathText.empty()
                 ? arg.FieldPathText
@@ -4640,8 +4714,8 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
             if (!allowPointerRefTemporary && nonConstPointerLvalueRef
                 && CxxPointerReferenceNeedsConversion(arg, param))
             {
-                const int sourceMask = sourcePointerType.PointeeConstMask();
-                const int targetMask = param.PointeeConstMask();
+                const uint32_t sourceMask = sourcePointerType.PointeeConstMask();
+                const uint32_t targetMask = param.PointeeConstMask();
                 const bool addsConst = sourceMask != targetMask
                     && (sourceMask | targetMask) == targetMask;
                 if (addsConst)
@@ -4710,6 +4784,7 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
             && !arg.TypeAndValue.IsInterface)
             return arg.Storage;
         llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+        value = ConvertCxxOperatorFloatOperand(value, arg, param);
         value = LowerByValueArg(value, param, arg);
         if (value == nullptr)
             return llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(paramTy));
@@ -5088,10 +5163,11 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
             && arg.TypeAndValue.TypeName == p.TypeName)
         {
             const int valueDepth = p.PointerDepth;
-            const int valueMask = (1 << valueDepth) - 1;
-            const int sourceMask = arg.TypeAndValue.PointeeConstMask() & valueMask;
-            const int targetMask = p.ConstMask & valueMask;
-            const bool constReference = (p.ConstMask & (1 << p.PointerDepth)) != 0;
+            const uint32_t valueMask = TypeAndValue::ConstBitsBelow(valueDepth);
+            const uint32_t sourceMask = arg.TypeAndValue.PointeeConstMask() & valueMask;
+            const uint32_t targetMask = static_cast<uint32_t>(p.ConstMask) & valueMask;
+            const bool constReference = (static_cast<uint32_t>(p.ConstMask)
+                & TypeAndValue::ConstBitAt(p.PointerDepth)) != 0;
             if (sourceMask != targetMask)
             {
                 const bool addsOnly = (sourceMask | targetMask) == targetMask;
@@ -5108,10 +5184,11 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
             && arg.TypeAndValue.TypeName == p.TypeName)
         {
             const int valueDepth = p.PointerDepth - 1;
-            const int valueMask = (1 << valueDepth) - 1;
-            const int sourceMask = arg.TypeAndValue.PointeeConstMask() & valueMask;
-            const int targetMask = p.ConstMask & valueMask;
-            const bool constReference = (p.ConstMask & (1 << p.PointerDepth)) != 0;
+            const uint32_t valueMask = TypeAndValue::ConstBitsBelow(valueDepth);
+            const uint32_t sourceMask = arg.TypeAndValue.PointeeConstMask() & valueMask;
+            const uint32_t targetMask = static_cast<uint32_t>(p.ConstMask) & valueMask;
+            const bool constReference = (static_cast<uint32_t>(p.ConstMask)
+                & TypeAndValue::ConstBitAt(p.PointerDepth)) != 0;
             if (!constReference && sourceMask != targetMask)
             {
                 if ((sourceMask | targetMask) == targetMask)
@@ -5126,9 +5203,23 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
         TypeAndValue parameterBase;
         parameterBase.TypeName = p.TypeName;
         std::string shown = SpellType(*this, parameterBase);
-        std::string argShown = SpellType(*this, arg.TypeAndValue);
         // A primitive pointer argument carries no CFlat TypeName; report only the depth then.
-        if (p.PointerDepth >= 2)
+        const int argumentDepth = arg.TypeAndValue.EffectiveProvenPointerDepth();
+        const bool legacyTooDeep = argumentDepth == 2 && p.PointerDepth == 1;
+        const bool legacyTooShallow = argumentDepth == 1 && p.PointerDepth == 2;
+        TypeAndValue shownArgument = arg.TypeAndValue;
+        if (shownArgument.TypeName.empty() && !legacyTooDeep && !legacyTooShallow)
+            shownArgument.TypeName = param.TypeName;
+        std::string argShown = SpellType(*this, shownArgument);
+        if (!legacyTooDeep && !legacyTooShallow)
+        {
+            TypeAndValue parameter = param;
+            std::string parameterShown = SpellType(*this, parameter);
+            return std::format("has type '{}' and the argument has type '{}' - the pointer depths differ",
+                parameterShown.empty() ? std::format("pointer depth {}", p.PointerDepth) : parameterShown,
+                argShown.empty() ? std::format("pointer depth {}", argumentDepth) : argShown);
+        }
+        if (legacyTooShallow)
             return std::format("has type '{}**' and the argument has {} - there is no "
                 "implicit address-of. Take its address with '&' at the call site", shown,
                 argShown.empty() ? std::string("one fewer level of indirection")
@@ -5157,11 +5248,27 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
             }
             if (args[i].TypeAndValue.PointerDepthRefuses(params[i]))
             {
-                bool tooDeep = args[i].TypeAndValue.IsProvenDoublePointer()
-                    || args[i].TypeAndValue.IsProvenDecayedDoublePointer();
+                const int argumentDepth = args[i].TypeAndValue.EffectiveProvenPointerDepth();
+                const int parameterDepth = params[i].ProvenPointerDepth();
+                const bool tooDeep = argumentDepth > parameterDepth;
+                const bool legacyDepthMismatch =
+                    (tooDeep && argumentDepth == 2 && parameterDepth == 1)
+                    || (!tooDeep && argumentDepth == 1 && parameterDepth == 2);
                 std::string shown = SpellType(*this, params[i]);
-                std::string argShown = SpellType(*this, args[i].TypeAndValue);
-                if (tooDeep)
+                TypeAndValue shownArgument = args[i].TypeAndValue;
+                if (shownArgument.TypeName.empty() && !legacyDepthMismatch)
+                    shownArgument.TypeName = params[i].TypeName;
+                std::string argShown = SpellType(*this, shownArgument);
+                if (!legacyDepthMismatch)
+                {
+                    LogErrorMessage(
+                        "call to '{}.{}': parameter {} '{}' has type '{}' and the argument has type '{}' - "
+                        "the pointer depths differ.",
+                        { displayIface, methodName, std::to_string(i), params[i].VariableName,
+                          shown.empty() ? std::format("pointer depth {}", parameterDepth) : shown,
+                          argShown.empty() ? std::format("pointer depth {}", argumentDepth) : argShown });
+                }
+                else if (tooDeep)
                 {
                     LogErrorMessage(
                         "call to '{}.{}': parameter {} '{}' has type '{}' and the argument has {} - "

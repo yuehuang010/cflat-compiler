@@ -583,7 +583,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.ConstMask = p.FunctionParamConstMask();
             fp.IsCxxRefToPointer = p.IsCxxRefToPointer;
             if (fp.IsCxxRefToPointer && p.CxxConstRef())
-                fp.ConstMask |= 1 << fp.PointerDepth;
+                fp.ConstMask |= static_cast<int64_t>(TypeAndValue::ConstBitAt(fp.PointerDepth));
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
             fp.IsAlias = ParameterIsAliasByPointer(p);
             tv.FuncPtrParams.push_back(fp);
@@ -600,7 +600,7 @@ void LLVMBackend::ApplyFuncPtrReturnConst(const TypeAndValue& funcPtrType, TypeA
                                       funcPtrType.FuncPtrReturnPointer ? 1 : 0);
         retTV.ElemPointer = retTV.PointerDepth >= 2;
         if (funcPtrType.FuncPtrReturnConstMask >= 0)
-            retTV.ConstMask = static_cast<uint8_t>(funcPtrType.FuncPtrReturnConstMask);
+            retTV.ConstMask = static_cast<uint32_t>(funcPtrType.FuncPtrReturnConstMask);
         if (funcPtrType.FuncPtrReturnAlias && funcPtrType.FuncPtrReturnConstMask > 0)
             retTV.MarkCxxRef();
     }
@@ -758,9 +758,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             target.PointerDepth = param.PointerDepth > 0 ? param.PointerDepth : 1;
             target.ElemPointer = target.PointerDepth >= 2;
             if (param.ConstMask >= 0)
-                target.ConstMask = static_cast<uint8_t>(param.ConstMask);
+                target.ConstMask = static_cast<uint32_t>(param.ConstMask);
             else if (param.IsPointeeConst)
-                target.ConstMask = static_cast<uint8_t>((1u << target.ValuePointerDepth()) - 1u);
+                target.ConstMask = TypeAndValue::ConstBitsBelow(target.ValuePointerDepth());
             const TypeAndValue source = argNVs != nullptr && i < argNVs->size()
                 ? (*argNVs)[i].TypeAndValue : TypeAndValue{};
             std::string from, to;

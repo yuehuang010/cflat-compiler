@@ -384,6 +384,7 @@ typeSpecifier
     | structClassUnion
     | 'auto'
     | Move                           // soft keyword - ownership modifier on parameters
+    | rootQualifiedTypeName          // global:: scope escape in a type position
     | qualifiedGenericIdentifier     // namespace-qualified type (e.g. MathAdv.MyNumber, Windows.Foundation.IReference<int>)
     | memberTypeSpecifier            // member type of a generic instantiation (e.g. std.vector<int>.value_type)
     | genericIdentifier
@@ -987,6 +988,12 @@ genericIdentifier
 // `string` - it is a lexer keyword); at statement scope `a.string b;` reads as a declaration, like `a.b`.
 qualifiedGenericIdentifier
     : Identifier ('.' memberNameToken)+ genericTypeParameters?
+    ;
+
+// Root-only type spelling. `global` remains a contextual Identifier and is validated by the
+// listener, matching the expression form; this rule adds no lexer token or parser predicate.
+rootQualifiedTypeName
+    : Identifier DoubleColon Identifier ('.' memberNameToken)*
     ;
 
 // `Spec<args>.name` - a member type (C++ member typedef / nested type, CFlat struct `using`) of a

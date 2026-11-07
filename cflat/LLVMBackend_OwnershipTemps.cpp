@@ -2385,6 +2385,22 @@ void LLVMBackend::SetVariableOwnFlagValue(const std::string& varName, bool mayOw
         }
     }
 
+void LLVMBackend::SetArrayViewOwnFlagFromRawArrayResult(const std::string& varName,
+                                                        llvm::Value* value)
+{
+        const auto* raw = FindRawArrayResult(value);
+        if (raw == nullptr) return;
+        llvm::Value* runtimeOwns = raw->RuntimeOwns;
+        bool runtimeCanBeFalse = !raw->Owns;
+        if (runtimeOwns == nullptr)
+            runtimeOwns = builder->getInt1(raw->Owns);
+        else if (const auto* constant = llvm::dyn_cast<llvm::ConstantInt>(runtimeOwns))
+            runtimeCanBeFalse = constant->isZero();
+        const bool updateRuntimeFlag = raw->RuntimeOwns != nullptr || !raw->Owns;
+        SetVariableOwnFlagValue(varName, RawArrayResultMayOwn(value), runtimeOwns,
+                                runtimeCanBeFalse, updateRuntimeFlag);
+    }
+
 void LLVMBackend::ActivateOwnFlag(const std::string& varName)
 {
         if (varName.empty() || stackNamedVariable.empty()) return;

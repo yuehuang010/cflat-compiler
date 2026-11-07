@@ -2838,9 +2838,10 @@ void MainListener::DecayFlexibleArrayMember(LLVMBackend::NamedVariable& namedVar
         tv.ConstArraySize = 0;
         tv.ConstInnerDimensions.clear();
         tv.IsArrayView = false;
-        if (tv.Pointer) tv.ElemPointer = true;
+        const int depth = tv.ValuePointerDepth() + 1;
         tv.Pointer = true;
-        if (tv.PointerDepth >= 1) tv.PointerDepth = tv.PointerDepth >= 2 ? 2 : tv.PointerDepth + 1;
+        tv.PointerDepth = depth;
+        tv.ElemPointer = depth >= 2;
     }
 
 /*
@@ -3405,6 +3406,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             std::string primaryIdentifier;
             std::string callDisplayName;
             std::string namespaceContext;
+            bool namespaceContextForceRoot = false;
+            auto clearNamespaceContext = [&]() {
+                namespaceContext.clear();
+                namespaceContextForceRoot = false;
+            };
             std::vector<std::string> cxxExplicitTemplateArgs;
 
             auto HasCFlatMemberMethod = [&](const std::string& ownerType,
@@ -4568,9 +4574,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 qualifiedName = namespaceContext + "." + memberName;
                                 const std::string spelledQualifiedName = qualifiedName;
-                                // C++ using-directives are lookup-time namespace re-exports. Keep
-                                // the exact member first, then resolve a nominated namespace.
-                                qualifiedName = Compiler(ctx)->ResolveQualifiedName(qualifiedName);
+                                // Resolve enclosing namespace matches, using-directives, then root.
+                                qualifiedName = Compiler(ctx)->ResolveQualifiedName(
+                                    qualifiedName, namespaceContextForceRoot);
                                 const bool followedByGenericTypeParameters = childIndex < ctx->children.size()
                                     && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(
                                         ctx->children[childIndex]) != nullptr;
@@ -4719,12 +4725,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namespaceContext = Compiler(ctx)->IsDataStructure(qualifiedName)
                                         ? qualifiedName : resolvedQualifiedName;
                                     primaryIdentifier = namespaceContext;
+                                    globalScopeCall = namespaceContextForceRoot
+                                        && IsFollowedByCall(ctx, terminal);
                                     namedVar = {};
                                     structVar = {};
                                     interfaceVar = {};
                                     break;
                                 }
                                 namespaceContext = qualifiedName;
+                                // The root-only state is preserved through nested namespace links.
                                 primaryIdentifier = namespaceContext;
                                 namedVar = {};
                             }
@@ -4784,6 +4793,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namespaceContext = Compiler(ctx)->IsDataStructure(qualifiedName)
                                         ? qualifiedName : resolvedQualifiedName;
                                     primaryIdentifier = namespaceContext;
+                                    globalScopeCall = namespaceContextForceRoot
+                                        && IsFollowedByCall(ctx, terminal);
                                     namedVar = {};
                                     structVar = {};
                                     interfaceVar = {};
@@ -4836,16 +4847,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (auto dot = qualifiedName.rfind('.'); dot != std::string::npos)
                                 {
                                     std::string owner = qualifiedName.substr(0, dot);
-                                    std::string enumKey = Compiler(ctx)->ResolveEnumTypeName(owner);
+                                    std::string enumKey = namespaceContextForceRoot
+                                        && !Compiler(ctx)->GetEnumBackingType(owner).empty()
+                                        ? owner : Compiler(ctx)->ResolveEnumTypeName(owner);
                                     if (!enumKey.empty() && enumKey != owner)
                                         qualifiedName = enumKey + qualifiedName.substr(dot);
                                 }
                                 primaryIdentifier = qualifiedName;
+                                const bool wasRootedNamespaceContext = namespaceContextForceRoot;
                                 bool wasRealNamespace = !isFileAlias
                                     && (Compiler(ctx)->IsNamespace(namespaceContext)
                                         || Compiler(ctx)->IsCxxNamespace(namespaceContext));
                                 std::string namespaceName = namespaceContext;
-                                namespaceContext.clear();
+                                globalScopeCall = wasRootedNamespaceContext
+                                    && IsFollowedByCall(ctx, terminal);
+                                clearNamespaceContext();
 
                                 auto globalNV = Compiler(ctx)->GetGlobalVariableNV(primaryIdentifier);
                                 if (globalNV.Storage != nullptr)
@@ -5947,6 +5963,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // which ResolveQualifiedName never prepends the current namespace to.
                                 namespaceContext = compiler->IsCxxNamespace(rootName)
                                     ? rootName : compiler->ResolveNamespace(rootName, true);
+                                namespaceContextForceRoot = true;
                                 primaryIdentifier = namespaceContext;
                                 namedVar = {};
                                 structVar = {};
@@ -6276,18 +6293,79 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 || Compiler(ctx)->GetLocalVariable(idName).Storage != nullptr
                                 || Compiler(ctx)->GetFunctionArgument(idName).GetValue() != nullptr
                                 || Compiler(ctx)->HasMemberVariable(idName);
+                            bool firstScopedVariable = false;
+                            bool firstScopedNamespace = false;
+                            std::string firstScopedVariableName;
+                            std::string firstScopedNamespaceName;
+                            std::string firstMemberName;
+                            if (childIndex < childLimit && ctx->children[childIndex]->getText() == "."
+                                && childIndex + 1 < childLimit)
+                                firstMemberName = ctx->children[childIndex + 1]->getText();
+                            if (followedByDot && !localOrMemberVariable)
+                            {
+                                const auto scopedCandidates = Compiler(ctx)->ScopedNameCandidates(
+                                    idName, ScopedLookupOptions{ .PrefixDottedNames = true });
+                                for (size_t candidateIndex = 0;
+                                     candidateIndex < scopedCandidates.size(); ++candidateIndex)
+                                {
+                                    const std::string& candidate = scopedCandidates[candidateIndex];
+                                    if (Compiler(ctx)->GetGlobalVariableNV(candidate).Storage != nullptr)
+                                    {
+                                        if (!firstScopedVariable && !firstScopedNamespace)
+                                        {
+                                            firstScopedVariable = true;
+                                            firstScopedVariableName = candidate;
+                                        }
+                                        continue;
+                                    }
+                                    if (Compiler(ctx)->IsNamespace(candidate, true))
+                                    {
+                                        const std::string resolved =
+                                            Compiler(ctx)->ResolveNamespace(candidate, true);
+                                        firstScopedNamespace = true;
+                                        firstScopedNamespaceName = resolved;
+                                        break;
+                                    }
+                                    if (Compiler(ctx)->IsCxxNamespace(candidate))
+                                    {
+                                        firstScopedNamespace = true;
+                                        firstScopedNamespaceName = candidate;
+                                        break;
+                                    }
+                                }
+                            }
+                            // A primitive variable cannot supply a member. Keep the established
+                            // qualified-name fallback when a later namespace has that member.
+                            if (firstScopedVariable && firstScopedNamespace
+                                && !firstMemberName.empty())
+                            {
+                                const auto variable = Compiler(ctx)->GetGlobalVariableNV(
+                                    firstScopedVariableName);
+                                if (variable.TypeAndValue.IsPrimitive())
+                                {
+                                    const std::string memberKey =
+                                        firstScopedNamespaceName + "." + firstMemberName;
+                                    const std::string genericKey =
+                                        Compiler(ctx)->ResolveGenericFunctionBase(memberKey);
+                                    if (Compiler(ctx)->GetFunction(memberKey) != nullptr
+                                        || Compiler(ctx)->GetReturnBlock(memberKey) != nullptr
+                                        || genericFunctionTemplates.count(genericKey) != 0)
+                                        firstScopedVariable = false;
+                                }
+                            }
                             auto typeSubstitution = activeTypeSubstitutions.end();
                             if (followedByDot && !localOrMemberVariable
                                 && !activeTypeSubstitutions.empty())
                                 typeSubstitution = activeTypeSubstitutions.find(idName);
                             const bool genericTypeParameter =
                                 typeSubstitution != activeTypeSubstitutions.end();
-                            const bool globalVariable =
-                                Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
+                            const bool globalVariable = firstScopedVariable
+                                || (!followedByDot
+                                    && Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr);
                             const std::string qualifiedName =
                                 Compiler(ctx)->ResolveQualifiedName(idName);
-                            const bool namespaceVariable = qualifiedName != idName
-                                && Compiler(ctx)->GetGlobalVariableNV(qualifiedName).Storage != nullptr;
+                            const bool namespaceVariable = firstScopedVariable
+                                && firstScopedVariableName != idName;
                             const bool nameIsVariable = localOrMemberVariable || globalVariable;
                             // The alias checks below also yield to a namespaced global of the name; the
                             // namespace-vs-variable decision keeps master's rule above.
@@ -6381,11 +6459,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 interfaceVar = {};
                             }
                             else if (!namesEnclosingMethod
-                                && (Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
+                                && (firstScopedNamespace
+                                    || Compiler(ctx)->IsNamespace(idName)
+                                    || Compiler(ctx)->IsCxxNamespace(idName))
                                 && (!nameIsVariable || localTypeMember) && !defaultedCxxBaseAlias)
                             {
-                                namespaceContext = Compiler(ctx)->IsCxxNamespace(idName)
-                                    ? idName : Compiler(ctx)->ResolveNamespace(idName);
+                                namespaceContext = firstScopedNamespace
+                                    ? firstScopedNamespaceName
+                                    : Compiler(ctx)->IsCxxNamespace(idName)
+                                        ? idName : Compiler(ctx)->ResolveNamespace(idName);
                                 namedVar = {};
                                 structVar = {};
                             }
@@ -7231,25 +7313,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             // An indexed element is a single slot, never a whole-allocation view -
                             // drop the array-view flag so `&a[i]` cannot be bound back into a `T[]`.
+                            const bool indexedView = elementTypeAndValue.IsArrayView;
+                            const int elementPointerDepth = indexedView
+                                ? elementTypeAndValue.ElementPointerDepth()
+                                : std::max(elementTypeAndValue.ValuePointerDepth() - 1, 0);
                             elementTypeAndValue.IsArrayView = false;
-                            // Indexing strips one level, so a recorded depth must step down with it -
-                            // left alone, a `T**` buffer's element falsely proves depth 2.
-                            if (elementTypeAndValue.PointerDepth >= 1)
-                                elementTypeAndValue.PointerDepth--;
-                            if (elementTypeAndValue.ElemPointer)
-                            {
-                                // Double-pointer (e.g. T* where T=Employee*): element type is T* (Employee*).
-                                // Keep Pointer=true, clear ElemPointer - element is a pointer value.
-                                elementTypeAndValue.ElemPointer = false;
-                            }
-                            else
-                            {
-                                elementTypeAndValue.Pointer = false;
-                                // For interface arrays (T* where T=IFace), the element is a bare fat-ptr
-                                // {i8*,i8*}, not a pointer-to-fat-ptr. Clear IsInterfacePointer so
-                                // GetType returns {i8*,i8*} instead of {i8*,i8*}*.
+                            elementTypeAndValue.PointerDepth = elementPointerDepth;
+                            elementTypeAndValue.Pointer = elementPointerDepth > 0;
+                            elementTypeAndValue.ElemPointer = elementPointerDepth >= 2;
+                            if (!elementTypeAndValue.Pointer)
                                 elementTypeAndValue.IsInterfacePointer = false;
-                            }
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
                             // An UNSIZED element has no stride: a 'void*' traps in LLVM's
                             // alignment query, an incomplete record emitted invalid IR.
@@ -7428,7 +7501,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (Compiler(ctx)->IsCxxForeignTypeRegistered(mangled))
                             {
                                 primaryIdentifier = mangled;
-                                namespaceContext.clear();
+                                clearNamespaceContext();
                                 namedVar = {};
                                 break;
                             }
@@ -7471,7 +7544,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 auto globalNV = Compiler(ctx)->GetGlobalVariableNV(mangled);
                                 primaryIdentifier = mangled;
-                                namespaceContext.clear();
+                                clearNamespaceContext();
                                 namedVar = globalNV;
                                 structVar = {};
                                 interfaceVar = {};
@@ -7499,7 +7572,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 namedVar = Compiler(ctx)->GetGlobalVariableNV(mangled);
                                 primaryIdentifier = mangled;
-                                namespaceContext.clear();
+                                clearNamespaceContext();
                                 structVar = {};
                                 interfaceVar = {};
                                 break;
@@ -7630,7 +7703,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // mode so `ns.f<T>(x).member` reads the call result as an object.
                             if (!namespaceContext.empty()
                                 && cxxTemplateName.starts_with(namespaceContext + "."))
-                                namespaceContext.clear();
+                                clearNamespaceContext();
                             cxxExplicitTemplateArgs.clear();
                             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             {
@@ -9289,9 +9362,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             {
                                                 // The pointee / element level: bit 0 is the innermost.
                                                 const int level = operand.IsArrayView
-                                                    ? (operand.ElemPointer ? 1 : 0)
+                                                    ? operand.ElementPointerDepth()
                                                     : std::max(operand.ValuePointerDepth() - 1, 0);
-                                                isConst = ((operand.ConstMask >> level) & 1u) != 0;
+                                                isConst = level < 32
+                                                    && ((operand.ConstMask >> level) & 1u) != 0;
                                             }
                                         }
                                     }
@@ -14166,7 +14240,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar = std::move(deferred);
                                     structVar = {};
                                     interfaceVar = {};
-                                    namespaceContext.clear();
+                                    clearNamespaceContext();
                                     break;
                                 }
                             }
@@ -14190,7 +14264,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar = std::move(deferred);
                                     structVar = {};
                                     interfaceVar = {};
-                                    namespaceContext.clear();
+                                    clearNamespaceContext();
                                     break;
                                 }
                             }
@@ -14251,7 +14325,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // The class spelling qualified the constructor call, but the
                                 // following postfix link must resolve against this temporary as
                                 // an object (`T(args).member`), not as `T.member` in a namespace.
-                                namespaceContext.clear();
+                                clearNamespaceContext();
                             }
                             else if (foreignCxxConstructor)
                             {
@@ -14584,7 +14658,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 interfaceVar = {};
                                 // Leave qualified-name mode after materializing `T(args)`, so the
                                 // next `.`/`->` link uses the temporary receiver storage.
-                                namespaceContext.clear();
+                                clearNamespaceContext();
                             }
                             else if (winrtSlot)
                             {
@@ -14760,6 +14834,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // nxt()'s result below, not the stale pre-call receiver type.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                if (!namespaceContext.empty()
+                                    && Compiler(ctx)->IsDataStructure(namespaceContext)
+                                    && Compiler(ctx)->ResolveTypeAlias(namespaceContext)
+                                        == Compiler(ctx)->ResolveTypeAlias(namedVar.TypeAndValue.TypeName))
+                                    clearNamespaceContext();
                                 PrepareAliasCallResult(ctx, namedVar);
                                 if (namedVar.Primary != nullptr && structVar.ContainsBondedClosure
                                     && (namedVar.TypeAndValue.IsFunctionPointer
@@ -15274,6 +15353,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // so that subsequent member access (->field) can resolve the struct.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
+                                if (!namespaceContext.empty()
+                                    && Compiler(primaryCtx)->IsDataStructure(namespaceContext)
+                                    && Compiler(primaryCtx)->ResolveTypeAlias(namespaceContext)
+                                        == Compiler(primaryCtx)->ResolveTypeAlias(namedVar.TypeAndValue.TypeName))
+                                    clearNamespaceContext();
                                 // A direct call produces a fresh temporary; preserve that value
                                 // category for a foreign C++ rvalue-reference parameter.
                                 PrepareAliasCallResult(primaryCtx, namedVar, true);
@@ -16247,7 +16331,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 {
                     bool pointer = param->pointer() != nullptr;
                     int stars = PointerDepthOf(param->pointer());
-                    int constMask = 0;
+                    uint32_t constMask = 0;
                     std::string encodedName = ResolveSigComponentConstCodegen(
                         param->typeSpecifier(), pointer, stars, constMask,
                         param->multiWordTypeSuffix());
@@ -16257,7 +16341,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                         p.Pointer = pointer;
                         p.PointerDepth = ReconcilePointerDepth(pointer, stars);
                         p.ElemPointer = p.PointerDepth >= 2;
-                        p.ConstMask = static_cast<uint8_t>(constMask);
+                        p.ConstMask = static_cast<uint32_t>(constMask);
                     }
                     else
                         p.TypeName = encodedName;
@@ -16265,6 +16349,15 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 else if (functionTypeAlias != nullptr)
                 {
                     static_cast<LLVMBackend::TypeAndValue&>(p) = *functionTypeAlias;
+                    p.Pointer = param->pointer() != nullptr;
+                    p.PointerDepth = PointerDepthOf(param->pointer());
+                    p.ElemPointer = p.PointerDepth >= 2;
+                }
+                else if (auto* tupleSpec = param->typeSpecifier()->tupleTypeSpecifier())
+                {
+                    // `(int x, (int,int) t) => ...`: an inline tuple spelling encodes like a
+                    // function parameter's, not as a name the canonical text path can look up.
+                    p.TypeName = ParseTupleTypeSpecifier(tupleSpec);
                     p.Pointer = param->pointer() != nullptr;
                     p.PointerDepth = PointerDepthOf(param->pointer());
                     p.ElemPointer = p.PointerDepth >= 2;
@@ -16280,6 +16373,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                         p.TypeName = ResolveMemberTypeSpecifier(memberType);
                     p.TypeName = compiler->ResolveTypeAlias(p.TypeName);
                     p.Pointer = param->pointer() != nullptr;
+                    p.PointerDepth = PointerDepthOf(param->pointer());
+                    p.ElemPointer = p.PointerDepth >= 2;
                 }
                 // `((const char)* s) => ...`: the whole-word wrapper keeps its pointee const.
                 if (auto* nested = param->typeSpecifier()->typeName(); nested != nullptr)
@@ -16340,7 +16435,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 returnType.PointerDepth = std::max(lambdaExpectedType.FuncPtrReturnPointerDepth, 1);
                 returnType.ElemPointer = returnType.PointerDepth >= 2;
             }
-            returnType.ConstMask = static_cast<uint8_t>(lambdaExpectedType.FuncPtrReturnConstMask);
+            returnType.ConstMask = static_cast<uint32_t>(lambdaExpectedType.FuncPtrReturnConstMask);
             if (returnType.IsAlias) returnType.MarkCxxRef();
         }
         // An EMPTY expected return type means no context supplied one (e.g. an immediately-invoked
@@ -16841,7 +16936,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             fp.ConstMask = p.FunctionParamConstMask();
             fp.IsCxxRefToPointer = p.IsCxxRefToPointer;
             if (fp.IsCxxRefToPointer && p.CxxConstRef())
-                fp.ConstMask |= 1 << fp.PointerDepth;
+                fp.ConstMask |= static_cast<int64_t>(LLVMBackend::TypeAndValue::ConstBitAt(fp.PointerDepth));
             // Carry the inferred sink onto the TYPE so the indirect call site can null the
             // caller's source; a declared Lambda<...> spelling never sets these.
             fp.IsOwningSink = p.IsOwningSink;
@@ -19985,6 +20080,9 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
             case CFlatParser::RuleCompoundStatement:
             {
                 auto* compound = static_cast<CFlatParser::CompoundStatementContext*>(ruleCtx);
+                std::optional<LLVMBackend::AliasScopeGuard> blockAliasScope;
+                if (!IsStatementIfConstArm(compound))
+                    blockAliasScope.emplace(Compiler(compound));
                 LLVMBackend::ScanTimeVariableTypeScopeGuard localTypeScope(Compiler(compound));
                 ScanAndQueueGenericTypeUses(compound->blockItemList(), /*topLevel*/ false,
                     localEnumNames, insideScopedExpectation, afterBareExpectation);
@@ -19994,9 +20092,20 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
             {
                 auto* expectError = static_cast<CFlatParser::ExpectErrorStatementContext*>(ruleCtx);
                 if (expectError->compoundStatement() != nullptr)
+                {
+                    LLVMBackend::AliasScopeGuard errorBlockAliasScope(Compiler(expectError));
                     ScanAndQueueGenericTypeUses(expectError->compoundStatement()->blockItemList(),
                         /*topLevel*/ false, localEnumNames, /*insideScopedExpectation*/ true,
                         afterBareExpectation);
+                }
+                continue;
+            }
+            case CFlatParser::RuleIterationStatement:
+            {
+                auto* iteration = static_cast<CFlatParser::IterationStatementContext*>(ruleCtx);
+                LLVMBackend::AliasScopeGuard loopAliasScope(Compiler(iteration));
+                ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames,
+                    insideScopedExpectation, afterBareExpectation);
                 continue;
             }
             case CFlatParser::RuleStructDefinition:
@@ -20011,6 +20120,12 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
             case CFlatParser::RuleUsingDeclaration:
                 {
                     auto* usingDecl = static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx);
+                    // A block-scope function-type alias must name its signature before a tuple
+                    // element in this body can be judged a type (the scratch frame is popped after).
+                    if (auto* fpSpec = usingDecl->typeSpecifier()->functionPointerSpecifier();
+                        fpSpec != nullptr && usingDecl->Identifier() != nullptr)
+                        Compiler(usingDecl)->RegisterFunctionTypeAlias(
+                            usingDecl->Identifier()->getText(), BuildFuncPtrAliasType(fpSpec));
                     std::string usingBase;
                     auto* usingParams = GenericSpecOf(usingDecl->typeSpecifier(), usingBase);
                     if (!GenericArgumentsNeedFunctionLocalEnumDeferral(
@@ -20123,9 +20238,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                                     elementContext, entry, &argError);
                                 if (HasPrimitiveTypeError(argError))
                                     LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(entry), argError));
-                                if (entry->typeSpecifier()->simdTypeSpecifier() == nullptr
-                                    && !Compiler(entry)->IsKnownTypeName(argName)
-                                    && !Compiler(entry)->IsTypeArgTypeKey(argName))
+                                if (!TupleElementEntryNamesType(Compiler(entry), entry, argName))
                                     allArgsResolveAsTypes = false;
                                 typeArgs.push_back(std::move(argName));
                             }
@@ -20169,10 +20282,17 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                             }
                         if (deferForCountof) continue;
                         std::vector<std::string> typeArgs;
+                        bool unresolvedTypeArgument = false;
                         // ResolveTypeArgEntry applies active substitutions AND recursively
                         // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-                            typeArgs.push_back(ResolveTypeArgEntry(entry));
+                        {
+                            bool unresolvedArgument = false;
+                            typeArgs.push_back(ResolveTypeArgEntry(
+                                entry, false, &unresolvedArgument));
+                            unresolvedTypeArgument |= unresolvedArgument;
+                        }
+                        if (unresolvedTypeArgument) continue;
                         ResolveEnumTypeArguments(typeArgs);
                         compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         bool resolvesAsType = compiler->IsKnownTypeName(baseName)
@@ -20240,8 +20360,15 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                             }
                         if (deferForCountof) continue;
                         std::vector<std::string> typeArgs;
+                        bool unresolvedTypeArgument = false;
                         for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
-                            typeArgs.push_back(ResolveTypeArgEntry(entry));
+                        {
+                            bool unresolvedArgument = false;
+                            typeArgs.push_back(ResolveTypeArgEntry(
+                                entry, false, &unresolvedArgument));
+                            unresolvedTypeArgument |= unresolvedArgument;
+                        }
+                        if (unresolvedTypeArgument) continue;
                         ResolveEnumTypeArguments(typeArgs);
                         // Queue PRE-SCAN: the declaration path reports a refused pattern.
                         Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);

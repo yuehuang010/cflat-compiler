@@ -789,7 +789,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             e.ret.ConstMask |= CxxSpellingPointeeConstMask(r.retType, e.ret.ValuePointerDepth());
         // A C result keeps its spelled pointee levels like a C parameter (`const char *` -> 1).
         if (!r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer && !e.ret.IsArrayView)
-            if (const uint8_t mask = CSpellingPointeeConstMask(r.retType, e.ret.ValuePointerDepth());
+            if (const uint32_t mask = CSpellingPointeeConstMask(r.retType, e.ret.ValuePointerDepth());
                 mask != 0 && (mask & (mask + 1u)) == 0)
                 e.ret.ConstMask = mask;
         if (r.isCxx && CxxSpellingHasVolatileTarget(r.retType))
@@ -894,7 +894,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     if (CxxSpellingHasConstPointee(r.paramTypes[i]))
                     {
                         if (ptv.ConstMask == 0)
-                            ptv.ConstMask = static_cast<uint8_t>((1u << ptv.ValuePointerDepth()) - 1u);
+                            ptv.ConstMask = LLVMBackend::TypeAndValue::ConstBitsBelow(ptv.ValuePointerDepth());
                         ptv.SetPointeeConstBit(true);
                     }
                 }
@@ -1797,8 +1797,8 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         if (!cxxBoundary && !e.type.IsFunctionPointer && !e.type.IsArrayView)
         {
             const int depth = e.type.ValuePointerDepth();
-            const uint8_t mask = static_cast<uint8_t>(CSpellingPointeeConstMask(mappedType, depth)
-                | (r.isConst ? (1u << depth) : 0u));
+            const uint32_t mask = static_cast<uint32_t>(CSpellingPointeeConstMask(mappedType, depth)
+                | (r.isConst ? LLVMBackend::TypeAndValue::ConstBitAt(depth) : 0u));
             if (mask != 0 && (mask & (mask + 1u)) == 0) e.type.ConstMask = mask;
         }
         // A C const array, or a C `const int *` global (the pointer is writable, its pointee is
@@ -1819,7 +1819,8 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         // The global's own const is its object level in ConstMask (C and C++, `T *const` too): the
         // one source the boundary checks read. A header global's levels are exact, never filled.
         if (r.isConst && !e.type.IsArrayView)
-            e.type.ConstMask |= static_cast<uint8_t>(1u << (isArray ? 0 : e.type.ValuePointerDepth()));
+            e.type.ConstMask |= LLVMBackend::TypeAndValue::ConstBitAt(
+                isArray ? 0 : e.type.ValuePointerDepth());
         e.type.VariableName = r.name;
         if (auto it = cxxBindingRefusals_.find(e.name);
             it != cxxBindingRefusals_.end() && it->second.starts_with("global array '"))

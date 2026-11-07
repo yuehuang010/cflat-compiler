@@ -302,7 +302,7 @@ bool CxxParamIsConstRefToPointer(const std::string& spelling)
  * innermost pointee): `const int **` -> 1, `const int *const *` -> 3. The parameter's own
  * top-level const is not part of it. 0 when the spelling is not `depth` plain stars.
  */
-uint8_t CSpellingPointeeConstMask(const std::string& spelling, int depth)
+uint32_t CSpellingPointeeConstMask(const std::string& spelling, int depth)
 {
         if (spelling.find_first_of("()[<&") != std::string::npos || depth <= 0) return 0;
         std::vector<std::string> segments(1);
@@ -322,9 +322,9 @@ uint8_t CSpellingPointeeConstMask(const std::string& spelling, int depth)
             }
             return false;
         };
-        uint8_t mask = 0;
+        uint32_t mask = 0;
         for (int k = 0; k < depth; ++k)
-            if (hasConst(segments[k])) mask |= static_cast<uint8_t>(1u << k);
+            if (k < 32 && hasConst(segments[k])) mask |= uint32_t{ 1 } << k;
         return mask;
 }
 bool CxxSpellingHasConstPointee(const std::string& spelling)
@@ -358,11 +358,11 @@ bool CxxSpellingHasConstPointee(const std::string& spelling)
  * levels once a trailing reference is dropped, and the innermost pointee from the template-aware
  * head scan the C helper does not attempt (`const std::vector<int> *`).
  */
-uint8_t CxxSpellingPointeeConstMask(const std::string& spelling, int depth)
+uint32_t CxxSpellingPointeeConstMask(const std::string& spelling, int depth)
 {
         std::string s = spelling;
         while (!s.empty() && (s.back() == ' ' || s.back() == '&')) s.pop_back();
-        uint8_t mask = CSpellingPointeeConstMask(s, depth);
+        uint32_t mask = CSpellingPointeeConstMask(s, depth);
         if (depth > 0 && CxxSpellingHasConstPointee(spelling)) mask |= 1u;
         return mask;
 }
@@ -977,8 +977,8 @@ const char* CxxArmCategoryTag(LLVMBackend::CxxArmCategory category)
 void MarkCxxDeclaredConstField(LLVMBackend::TypeAndValue& tv, bool isConst)
 {
         if (!isConst) return;
-        const int depth = tv.IsArrayView ? (tv.ElemPointer ? 1 : 0) : tv.ValuePointerDepth();
-        tv.ConstMask |= static_cast<uint8_t>(1u << depth);
+        const int depth = tv.IsArrayView ? tv.ElementPointerDepth() : tv.ValuePointerDepth();
+        if (depth < 32) tv.ConstMask |= uint32_t{ 1 } << depth;
 }
 bool CxxIncrementalSpellingSafe(const std::string& spelling)
 {

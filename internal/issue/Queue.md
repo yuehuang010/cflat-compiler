@@ -99,7 +99,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| B-MOVEVIEW | p3/move-of-array-view-aborts | view move semantics | `int[] b = move a;` + foreach aborts 134; RULED 2026-11-04: transfer own bit, refuse frame view into sink |
 | - | p3/cpp-using-declaration-member-access-gaps | C++ record flattening + member lookup | `using` re-exposure through a base, two same-named base fields, shadow + using, method using, virtual base: refused, clang accepts; T99 reviews 2-4, pre-existing |
 | - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | global/function name collisions, anonymous/inline-namespace enums, comma, `auto&&`, deref macros, C errno/INT_MAX; T98 reviews 1-2, pre-existing |
 | - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | non-const trivially-copyable lvalue copy-init skips U&& template (unnamed-enum half landed 2026-10-30) |
@@ -123,6 +122,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), implicit-this message, 3 pre-existing P3 | OPEN (array-member move refused T489; borrowed-param move closed 2026-11-04 as a copy) |
 | B16 | p3/cpp-operator-move-operand-leftovers | template U&&, elision, cond move into forwarding operator=, member-receiver lhs move | NEW 2026-09-28 (D8 report) |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | extra copies (paren call arms, arr elem init) + bare scalar/nested ternary refusals + 3 unrelated | OPEN (P2 landed 1955bd95) |
+| L-QUALORDER | p3/qualified-name-root-declared-later-invisible | type order in signatures | namespace members declared later landed QUALORDER (b67999d8); open: later struct / interface types in qualified signatures, member access through a later global of a later struct type, bare root globals used before declaration |
 | W13b | p3/cpp-overload-variadic-and-conversion-gaps | variadic-set ambiguity, defaulted param before ellipsis, member variadics, user conversions at C++ call args, inline variadic link, non-record const pointers | NEW 2026-09-30 (W13 reviews) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 | B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
@@ -170,7 +170,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | Run | Issue(s) | Mode |
 |-----|----------|------|
 | F1 | p4/localize-relayed-clang-diagnostics + p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | one run: every relayed clang cause surfaces, prefixed `clang: ` (2026-09-27 ruling, no translation). Batch for the prefix sites; the harvest-suppression half is full-mode review |
-| F2 | p3/expect-error-leaves-queued-generic-instantiation | full; second "never completed" error after an expect_error block |
 
 ### G - request cache and incremental infrastructure
 
@@ -209,10 +208,8 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
-| L-TUPLE | p3/tuple-leftovers-after-tuplit + p3/tuple-alias-and-element-type-gaps | ruled 2026-11-01; aliases, function-type / pointer / generic elements |
+| L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; TUPALIAS ffb93282 + TUPLEFT d24422a0 landed; residue: new S((nullptr,4)), owned unique-element refusals, R133/R134 |
 | L-GENERIC | p3/generic-template-one-slot-silent-replace + p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | RULED 2026-10-31 (overload sets); instantiation as value; ctor deduction (ruled 2026-10-13) |
-| L-TYPEDEFSCOPE | p3/block-scope-typedef-leaks-past-block | silent wrong type; RULED 2026-11-04: block-scoped alias; resume parked worktree cflat-fix-tdscope |
-| L-NS | p3/namespace-nontemplate-vs-global-template-lookup | global generic beats a same-named namespace non-template |
 | L-PERF | p3/nested-ternary-compile-time | ~2x per `?:` level |
 
 ### P - plans and staged work
@@ -252,14 +249,13 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | N13 | p3/cpp-ctor-expression-position-const-ref-copies-lvalue | C++ ctor in expression position - remaining `const T&` copies and enum `T&&` refusal | NEW 2026-09-29 |
 | N15 | p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | C++ header default-wrapper batch chunk stores a stripped prefix (latent replay failure) | scheduled as CHUNK |
 | N22 | p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | C++ template constructor deduction - enum lvalue and arithmetic rvalue deduce the wrong T | scheduled as SRCTYPE |
-| N23 | p3/cpp-unary-operator-leftovers-after-d7 | Unary operator leftovers after D7+C3 | scheduled as OPUNARY |
 | N24 | p3/cpp-unrequested-specialization-pointer-eager-request | C++ interop compile time; left by D6 | perf |
 | N28 | p3/cpp-deferred-special-members-mid-size-harvest-cost | R1 deferral costs +1-2% cold on 64..~500-record harvests (interop fixtures); cutoff adjustable later (maintainer) | perf |
 | N31 | p3/cpp-interpreter-drops-cc1-only-flags | -Xclang cc1-only flags silently dropped by the Interpreter driver (pre-existing, H1 review) | perf |
 | N34 | p3/cpp-deployment-target-env-core-cache-miss | Non-default MACOSX_DEPLOYMENT_TARGET misses the core bitcode cache every compile (R4 review) | perf |
 | N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | perf |
-| N41 | p3/cpp-variadic-alias-template-refused | in-repo `template<auto... I> using A = S<I...>` refused (alias machinery has no pack support); trailing-pack aliases landed 2026-11-01 | NEW 2026-10-01 |
+| N41 | p3/cpp-variadic-alias-template-refused | pack patterns landed 58661ee4 (VARALIAS); residue: non-type EXPRESSION alias arguments (pack and non-pack) refused | NEW 2026-10-01 |
 | N42 | p3/cpp-header-unreferenced-global-initializers-skipped | residue: root-const / qualified-const `if const` order, non-inline extern destructible shared global, same guard macro in two files | p3 |
 | N47 | p3/cpp-constant-fold-and-const-static-twin-leftovers | constexpr-call initializer refused by the fold guard; const receiver + static twin overload refused (ST4 re-review leftovers) | NEW 2026-10-01 |
 | N52 | p3/cpp-range-for-member-name-lookup-and-count-probe | range-for member lookup misses enum/nested-type begin/end (accepts invalid); count/get clients pay a failed ADL probe; ST6 follow-up | NEW 2026-10-01 |
@@ -273,7 +269,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |---|---|---|
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
 | p3/cpp-pointer-depth-and-array-pointer-param-gaps | (C++ interop) | non-null int** accepted into C++ int***; member/static array-pointer params refuse valid args |
-| p3/float-literal-plus-variable-computed-in-float | (C++ interop) | `i + 1.0` / `f + 1.0` typed float (clang double); RULED 2026-11-04: double at C++ template deduction only |
 | p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (ef83ffa02); ruled picks landed GENOVLR (5344802ed); leftovers: CFlat expression typing (1 << 2L, 1.5 + x, char arithmetic), strlit vs char*, named-arg inference, generic-only const pointee return, UFCS free generic |
 | p3/member-type-path-remaining-gaps | (none) | `Outer<int>.Inner<long>.type`, closure-alias members, CFlat static data members, C++ statics as value template args (T37 follow-up) |
 
@@ -283,8 +278,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |---|---|
 | p3/alias-return-byvalue-param-leftovers-after-b21 | item 5 ratified (extern C callee owns by-value params) - no code |
 | p4/three-way-comparison-operator | `<=>` in the CFlat language RULED 2026-10-02, plus defaulted member-wise `==` |
-| p3/qualified-name-rooted-vs-innermost-precedence | RULED 2026-11-04: innermost-first like C++/C#; flip rooted-wins legs (test_basic, test_generics 909) |
-| p3/new-pointer-depth-carrier | RULED 2026-11-04: lift the depth-2 cap, carry any depth; plan-sized, scope the carrier first |
+| p3/new-pointer-depth-carrier | RULED 2026-11-04: lift the depth-2 cap; step 1 (spelled depth <= 31) and step 2a (`new`, generic substitution, const deduction; 68445d55) landed, step 2b (C/C++ interop depth > 2) open |
 
 ### Grouped runs 2026-10-10 (ranked; source scratch/issue_groups_2026-10-10.md; landed rows removed)
 
@@ -298,10 +292,9 @@ this table.
 | 1 | DIAG-TEXT | M/L | p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | shared KIND only (relayed clang / refusal text) (u) | F1 | yes |
 | 3 | NULLCTOR | M/H | p3/cpp-null-macro-and-nullptr-spellings-refused, p3/cpp-null-constant-ctor-leftovers-after-t132 | C++ ctor null-constant selection: scalar-reference mirror, SelectCxxConstructorListed, RequestCxxBraceConstructor | CTOR-VIABILITY, PTRRANK | no |
 | 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | CheckCxxNamespaceConflicts + struct identity canonicalization | - | yes, careful on identity |
-| 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7 | items 1-2 (volatile operand, const prvalue into free C&&) + OPBIN residue | CONVOP | yes |
 | 8 | PTRRANK | M/H | p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg, TryBinaryOperatorOverload | NULLCTOR, CTOR-VIABILITY | no |
 | 10 | CLIBNAME | M/M | p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | - | RULED 2026-10-21: nobuiltin on CFlat bodies |
-| 14 | CONVOP | M/H | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator call path (u) | OPUNARY | no |
+| 14 | CONVOP | M/H | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator call path (u) | - | no |
 | 15 | ASSIGN | M/H | p3/cpp-assign-operator-route-leftovers, p3/cpp-assignment-result-leftovers-after-b9, p3/cpp-nested-member-class-free-return-and-call-result-assign | C++ assignment route + class-result receivers (u) | - | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | CTOR-VIABILITY | no |
 | 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-viability-not-clang-selected, p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM, PTRRANK | no |
@@ -325,6 +318,6 @@ Overload/ctor selection family (never two at once): NULLCTOR, PTRRANK, CTOR-VIAB
 ### Conflict map (never concurrent)
 
 The overload/ctor family (NULLCTOR, PTRRANK, CTOR-VIABILITY, CONSTTWIN, CONSTPOINTEE, REFPARAM) all touch
-LLVMBackend_Overloads ctor/argument selection - run them one after another. OPUNARY and CONVOP share operator dispatch.
+LLVMBackend_Overloads ctor/argument selection - run them one after another. CONVOP and the operator ranking in MainListener_BinaryOperators share operator dispatch.
 A3 and CHUNK share the incremental action. CACHE-KEY -> G3 share the request-cache key. N runs share the ownership
 dataflow in MainListener / nulldf - one native ownership run at a time.

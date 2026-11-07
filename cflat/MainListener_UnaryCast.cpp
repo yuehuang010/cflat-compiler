@@ -194,12 +194,13 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
         {
             auto* compiler = Compiler(ctx);
             std::string ignored;
-            const uint8_t before = compiler->StoredConstLevels(result.Primary, ignored);
+            const uint32_t before = compiler->StoredConstLevels(result.Primary, ignored);
             result.Primary = compiler->MarkCastQualification(result.Primary, result.TypeAndValue,
                                                              CollapsedSourceText(ctx));
             // A re-read of the operand's own slot (`((int*)p)[0]`) would lose the stamp, so a cast
             // that changes the qualification reads through a slot of its own.
-            const uint8_t depthMask = static_cast<uint8_t>((1u << result.TypeAndValue.ValuePointerDepth()) - 1u);
+            const uint32_t depthMask = LLVMBackend::TypeAndValue::ConstBitsBelow(
+                result.TypeAndValue.ValuePointerDepth());
             // A view keeps its slot: its element count lives beside it.
             if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(result.Primary);
                 load != nullptr && !result.TypeAndValue.IsArrayView && result.Storage != nullptr
@@ -955,7 +956,7 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                     {
                         typeValue.Pointer = true;
                         typeValue.ElemPointer = aliasPointerDepth >= 2;
-                        typeValue.PointerDepth = aliasPointerDepth > 2 ? 0 : aliasPointerDepth;
+                        typeValue.PointerDepth = aliasPointerDepth;
                     }
                     std::string cxxError;
                     const bool cxxType = compilerLLVM->TryRequestCxxType(
@@ -988,7 +989,7 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                     {
                         typeValue.Pointer = true;
                         typeValue.ElemPointer = aliasPointerDepth >= 2;
-                        typeValue.PointerDepth = aliasPointerDepth > 2 ? 0 : aliasPointerDepth;
+                        typeValue.PointerDepth = aliasPointerDepth;
                     }
                     const size_t scope = typeValue.TypeName.rfind('.');
                     if (!compilerLLVM->IsKnownTypeName(typeValue.TypeName)
@@ -1021,7 +1022,8 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                             LocalizePrimitiveTypeError(compilerLLVM, canonicalError));
                     typeValue.TypeName = canonical.TypeName;
                     typeValue.ConstMask |= canonical.ConstMask;
-                    if (IsUnparameterizedNamedTypeSpecifier(typeSpec)
+                    if (!IsGlobalScopeQualifiedType(typeSpec)
+                        && IsUnparameterizedNamedTypeSpecifier(typeSpec)
                         && activeTypeSubstitutions.count(
                             typeSpec->getText()) == 0)
                     {
@@ -1035,8 +1037,7 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                     {
                         typeValue.Pointer = true;
                         typeValue.ElemPointer = canonical.PointerDepth >= 2;
-                        typeValue.PointerDepth = canonical.PointerDepth > 2
-                            ? 0 : canonical.PointerDepth;
+                        typeValue.PointerDepth = canonical.PointerDepth;
                     }
                     if (typeValue.TypeName == "longdouble" && !HasPrimitiveTypeError(canonicalError)
                         && !compilerLLVM->IsCInteropLongDoubleSupported())
@@ -1085,8 +1086,9 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
             const int declaredDepth = PointerDepthOf(abstractDecl->pointer());
             const int totalDepth = typeValue.PointerDepth + declaredDepth;
             typeValue.ElemPointer = typeValue.ElemPointer || totalDepth >= 2;
-            typeValue.PointerDepth = totalDepth > PointerDepthCap ? 0 : totalDepth;
+            typeValue.PointerDepth = totalDepth;
         }
+        ValidateDeclaratorPointerDepth(typeContext, typeValue.ValuePointerDepth());
 
         // Cast targets keep enum identity for lookup, but integer operations also need the
         // backing type so signedness survives casts of unsigned enum constants.
@@ -1718,8 +1720,8 @@ void MainListener::PropagateParentConstToField(LLVMBackend::NamedVariable& field
         if (!parentConst || fieldType.IsAlias || fieldType.IsCxxRef()
             || fieldType.IsCxxMutableField) return;
         const int depth = field.TypeAndValue.ValuePointerDepth();
-        if (depth >= 0 && depth < 8)
-            field.TypeAndValue.ConstMask |= static_cast<uint8_t>(1u << depth);
+        if (depth >= 0 && depth < 32)
+            field.TypeAndValue.ConstMask |= uint32_t{ 1 } << depth;
 }
 
 void MainListener::PropagateCxxPrvalueSubobject(LLVMBackend::NamedVariable& field,
@@ -1885,6 +1887,11 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
         auto castExpCtx = ctx->castExpression();
         auto unaryOperator = ctx->unaryOperator();
         auto typeNameCtx = ctx->typeName();
+        auto floatingUnaryIdentity = [&](const LLVMBackend::NamedVariable& operand) {
+            if (!operand.CxxArithIdentity.empty()) return operand.CxxArithIdentity;
+            if (!operand.LiteralIdentity.empty()) return operand.LiteralIdentity;
+            return CxxLiteralOperandIdentity(castExpCtx);
+        };
         auto clearConsumedUnarySource = [](LLVMBackend::NamedVariable& value) {
             value.CallerName.clear();
             value.FieldName.clear();
@@ -2359,26 +2366,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.TypeAndValue.ConstArraySize = 0;
                     namedVar.TypeAndValue.ConstInnerDimensions.clear();
                 }
-                /*
-                 * Depth: `&` adds one level to an ALREADY-RECORDED depth. An operand whose depth
-                 * was never recorded stays unrecorded - `&` cannot invent a claim. An operand
-                 * already PROVEN at the cap would produce a depth-3 VALUE, which the two-level
-                 * model cannot represent; refuse it where it is produced, exactly as a written
-                 * `T***` is refused at its declarator, rather than clamping it back to `T**`.
-                 */
-                if (namedVar.TypeAndValue.PointerDepth >= PointerDepthCap
-                    && namedVar.TypeAndValue.DepthIsAboutThisValue())
-                {
-                    std::string subject = namedVar.CallerName.empty()
-                        ? std::string("address-of expression")
-                        : std::format("address-of '{}{}'", namedVar.CallerName,
-                            namedVar.FieldName.empty() ? "" : "." + namedVar.FieldName);
-                    LogErrorContext(ctx, PointerDepthCapMessage(subject,
-                        namedVar.TypeAndValue.PointerDepth + 1));
-                }
-                if (namedVar.TypeAndValue.PointerDepth >= 1)
-                    namedVar.TypeAndValue.PointerDepth =
-                        namedVar.TypeAndValue.PointerDepth >= 2 ? 2 : namedVar.TypeAndValue.PointerDepth + 1;
+                const int addressedDepth = namedVar.TypeAndValue.Pointer
+                    ? namedVar.TypeAndValue.ValuePointerDepth() + 1 : 0;
+                namedVar.TypeAndValue.PointerDepth = addressedDepth;
                 if (addressOfUniqueSlot) namedVar.TypeAndValue.PointerDepth = 1;
                 // The operand's storage moved to Primary above: judge the object at that address.
                 LLVMBackend::NamedVariable addressedObject = namedVar;
@@ -2389,6 +2379,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     && !namedVar.TypeAndValue.IsCxxRefToPointer;
                 if (!namedVar.TypeAndValue.Pointer)
                     namedVar.TypeAndValue.Pointer = true;
+                if (namedVar.TypeAndValue.PointerDepth > 2)
+                    namedVar.TypeAndValue.ElemPointer = true;
                 if (addressOfConstObject)
                     namedVar.TypeAndValue.SetPointeeConstBit(true);
                 namedVar.IsCxxAddressOfPointerValue = addressOfPointerObject
@@ -2718,10 +2710,6 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 }
 
                 // Strip one pointer level from the CFlat type to get the pointee type.
-                // For char** (ElemPointer=true): deref gives char* (keep Pointer, clear ElemPointer).
-                // For char* (ElemPointer=false): deref gives char (clear Pointer).
-                // Depth: `*` removes one level from an already-recorded depth; an unrecorded
-                // operand stays unrecorded.
                 const auto derefOperandType = namedVar.TypeAndValue;
                 // A decayed T[N][M] is a pointer to T[M]. On `*p`, move the first preserved
                 // inner dimension back to the pointee's outer array shape before lowering it.
@@ -2734,15 +2722,14 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.TypeAndValue.ConstInnerDimensions.erase(
                         namedVar.TypeAndValue.ConstInnerDimensions.begin());
                 }
-                if (namedVar.TypeAndValue.PointerDepth >= 1)
-                    namedVar.TypeAndValue.PointerDepth--;
-                if (namedVar.TypeAndValue.ElemPointer)
-                    namedVar.TypeAndValue.ElemPointer = false;
-                else
-                {
-                    namedVar.TypeAndValue.Pointer = false;
+                const int pointeeDepth = derefOperandType.IsArrayView
+                    ? derefOperandType.ElementPointerDepth()
+                    : std::max(derefOperandType.ValuePointerDepth() - 1, 0);
+                namedVar.TypeAndValue.PointerDepth = pointeeDepth;
+                namedVar.TypeAndValue.Pointer = pointeeDepth > 0;
+                namedVar.TypeAndValue.ElemPointer = pointeeDepth >= 2;
+                if (!namedVar.TypeAndValue.Pointer)
                     namedVar.TypeAndValue.IsInterfacePointer = false;
-                }
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
                 // A TYPELESS pointee (a 'void*') cannot be loaded: LLVM's own alignment query
                 // traps on it instead of reporting anything. An unsized NAMED type (an
@@ -2912,6 +2899,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.Storage = nullptr;
                 }
                 namedVar.ArithNarrowWidth = static_cast<uint8_t>(unaryMark);
+                if (overload == nullptr && newValue != nullptr
+                    && newValue->getType()->isFloatingPointTy())
+                    namedVar.CxxArithIdentity = floatingUnaryIdentity(namedVar);
             }
             else if (opText == "+")
             {
@@ -2948,6 +2938,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.IsCxxNullIntegerMacro = false;
                 }
                 namedVar.Storage = nullptr;
+                if (overload == nullptr && newValue != nullptr
+                    && newValue->getType()->isFloatingPointTy())
+                    namedVar.CxxArithIdentity = floatingUnaryIdentity(namedVar);
             }
             else if (opText == "~")
             {
@@ -3033,10 +3026,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                             ? typeSpecs.front() : nullptr;
                         auto* qualifiedType = soleTypeSpec != nullptr
                             ? soleTypeSpec->qualifiedGenericIdentifier() : nullptr;
+                        auto* rootQualifiedType = soleTypeSpec != nullptr
+                            ? soleTypeSpec->rootQualifiedTypeName() : nullptr;
                         auto* memberType = soleTypeSpec != nullptr
                             ? soleTypeSpec->memberTypeSpecifier() : nullptr;
                         auto* genericType = soleTypeSpec != nullptr
                             ? soleTypeSpec->genericIdentifier() : nullptr;
+                        resolvesAsType = IsGlobalScopeQualifiedType(soleTypeSpec);
                         antlr4::tree::TerminalNode* typeHead = nullptr;
                         if (genericType != nullptr && genericType->genericTypeParameters() == nullptr)
                             typeHead = genericType->Identifier();
@@ -3050,7 +3046,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         auto* arrayDims = arraySuffix != nullptr ? arraySuffix->arrayDimSpec() : nullptr;
                         const bool indexedExpressionShape = arrayDims != nullptr
                             && !arrayDims->assignmentExpression().empty();
-                        const bool qualifiedTypeShape = qualifiedType != nullptr || memberType != nullptr;
+                        const bool qualifiedTypeShape = qualifiedType != nullptr
+                            || rootQualifiedType != nullptr || memberType != nullptr;
                         bool visibleVariableHead = typeHead != nullptr
                             && (compiler->FindLiveNamedVariable(typeHead->getText()) != nullptr
                                 || NamesVisibleVariable(compiler, typeHead->getText())
@@ -3068,12 +3065,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         const bool genericValueParameter = bareName != nullptr
                             && activeValueSubstitutions.find(bareName->getText())
                                 != activeValueSubstitutions.end();
-                        resolvesAsType = !hasGenericTypeArguments && !sizeofHeadIsVariable
-                            && !genericValueParameter
-                            && (compiler->IsKnownTypeName(spelling)
-                                || compiler->IsTypeArgTypeKey(spelling)
-                                || activeTypeSubstitutions.count(spelling) != 0
-                                || activePackSubstitutions.count(spelling) != 0);
+                        resolvesAsType = resolvesAsType
+                            || (!hasGenericTypeArguments && !sizeofHeadIsVariable
+                                && !genericValueParameter
+                                && (compiler->IsKnownTypeName(spelling)
+                                    || compiler->IsTypeArgTypeKey(spelling)
+                                    || activeTypeSubstitutions.count(spelling) != 0
+                                    || activePackSubstitutions.count(spelling) != 0));
                         if (!resolvesAsType && bareName != nullptr
                             && !genericValueParameter
                             && specList->getText() == bareName->getText()
@@ -3161,9 +3159,12 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                                         contextualTypeSpec = specifier;
                                         break;
                                     }
-                            const std::string contextual = ResolveContextualTypeName(compiler, spelling,
-                                candidate, contextualTypeSpec, aggregateScopes,
-                                NamespaceNameFromContext(compiler, typeNameCtx));
+                            const std::string contextual = contextualTypeSpec != nullptr
+                                && !IsGlobalScopeQualifiedType(contextualTypeSpec)
+                                ? ResolveContextualTypeName(compiler, spelling, candidate,
+                                    contextualTypeSpec, aggregateScopes,
+                                    NamespaceNameFromContext(compiler, typeNameCtx))
+                                : std::string();
                             if (!contextual.empty())
                             {
                                 candidate = contextual;

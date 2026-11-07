@@ -1114,7 +1114,7 @@ std::string LLVMBackend::FuncPtrComponentDeclaringKey(const std::string& name) c
     }
 
 LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string& typeName, bool pointer,
-        int pointerDepth, const std::string& resolvedKey, bool isArrayView, int constMask, bool isAlias) const
+        int pointerDepth, const std::string& resolvedKey, bool isArrayView, int64_t constMask, bool isAlias) const
 {
         FuncPtrComponent c;
         c.IsAlias = isAlias;
@@ -1178,7 +1178,7 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
     }
 
 LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrFunctionTypeComponentOf(const TypeAndValue& signature,
-        bool pointer, int pointerDepth, bool isArrayView, int constMask, bool isAlias) const
+        bool pointer, int pointerDepth, bool isArrayView, int64_t constMask, bool isAlias) const
 {
         FuncPtrComponent c;
         c.IsAlias = isAlias;
@@ -1335,7 +1335,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.ConstMask = p.FunctionParamConstMask();
             fp.IsCxxRefToPointer = p.IsCxxRefToPointer;
             if (fp.IsCxxRefToPointer && p.CxxConstRef())
-                fp.ConstMask |= 1 << fp.PointerDepth;
+                fp.ConstMask |= static_cast<int64_t>(TypeAndValue::ConstBitAt(fp.PointerDepth));
             // Same predicate the callee lowers by: an alias closure/fn-ptr param is passed by address.
             fp.IsAlias = ParameterIsAliasByPointer(p);
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
@@ -1464,14 +1464,14 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
         // One '*' per recorded level, so a depth mismatch is visible as `int**` vs `int*` rather
         // than as two identical-looking spellings; recorded pointee const prints whole-word.
         auto component = [&](const std::string& name, bool pointer, int depth,
-                             int constMask, bool isArrayView) {
+                             int64_t constMask, bool isArrayView) {
             TypeAndValue type;
             type.TypeName = name;
             type.Pointer = pointer || isArrayView;
             type.IsArrayView = isArrayView;
             type.PointerDepth = depth;
             type.ElemPointer = type.Pointer && depth >= 2;
-            if (constMask >= 0) type.ConstMask = static_cast<uint8_t>(constMask);
+            if (constMask >= 0) type.ConstMask = static_cast<uint32_t>(constMask);
             if ((pointer || isArrayView) && constMask > 0)
             {
                 type.PointerDepth = std::max(depth, 1);

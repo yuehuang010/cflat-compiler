@@ -2416,8 +2416,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             auto appendParamSpelling = [&](const LLVMBackend::DeclTypeAndValue& param,
                                            std::string& out) -> bool {
                 if (!compiler->CxxSpellingForCflatType(param.TypeName, out)) return false;
-                const int depth = param.PointerDepth > 0
-                    ? param.PointerDepth : (param.Pointer ? (param.ElemPointer ? 2 : 1) : 0);
+                const int depth = param.ValuePointerDepth();
                 for (int i = 0; i < depth; ++i) out += " *";
                 return true;
             };
@@ -2639,8 +2638,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                      && compiler->IsCxxRecord(returnType.TypeName))
                     || !compiler->CxxSpellingForCflatType(returnType.TypeName, returnSpelling))
                     continue;
-                const int returnDepth = returnType.PointerDepth > 0 ? returnType.PointerDepth
-                    : (returnType.Pointer ? (returnType.ElemPointer ? 2 : 1) : 0);
+                const int returnDepth = returnType.ValuePointerDepth();
                 for (int i = 0; i < returnDepth; ++i) returnSpelling += " *";
                 if (returnType.IsRvalueRef) returnSpelling += " &&";
                 bool spellable = true;
@@ -2658,8 +2656,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         spellable = false;
                         break;
                     }
-                    const int depth = param.PointerDepth > 0 ? param.PointerDepth
-                        : (param.Pointer ? (param.ElemPointer ? 2 : 1) : 0);
+                    const int depth = param.ValuePointerDepth();
                     if (depth == 0 && param.IsRvalueRef) spelling += " &&";
                     else if (depth == 0 && param.CxxConstRef()) spelling += " const&";
                 }
@@ -7177,12 +7174,18 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         size_t line = func->getStart()->getLine();
         bool varargs = func->parameterTypeList() && func->parameterTypeList()->Ellipsis() != nullptr;
 
+        // Parameter types first: a tuple parameter's body must exist before the signature is built.
+        // ParseFunctionDefinition scans the parameter list the same way.
+        const auto& ctorLocalEnumNames = FunctionLocalEnumNames(func);
+        if (auto* paramTypeList = func->parameterTypeList())
+            ScanAndQueueGenericTypeUses(paramTypeList, true, &ctorLocalEnumNames);
         // Pre-scan body for generic instantiations (same as ParseFunctionDefinition)
         if (auto* blockItemList = func->compoundStatement()->blockItemList())
         {
             ScanAndQueueGenericTypeUses(blockItemList);
             ProcessPendingInstantiations();
         }
+        ProcessPendingInstantiations();
 
         LLVMBackend::DeclTypeAndValue returnType;
         returnType.TypeName = structName;

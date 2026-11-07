@@ -281,9 +281,11 @@ string operator string(IString s)
 // Wrap a raw C string pointer into a non-owning string value. The result borrows `s`
 // (no allocation; owned bit clear); it must not outlive the buffer. Call `.copy()` to take
 // ownership. The borrowed bytes stay read-only: data() is (const char)*, data_mut() copies.
+// A null pointer wraps as the empty string (default), matching data() on an empty string.
 string operator string(const char* s)
 {
     string result = default;
+    if (s == nullptr) return result;
     result._ptr = s;
     result._len = strlen(s);
     return result;

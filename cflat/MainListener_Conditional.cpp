@@ -1052,7 +1052,7 @@ static bool UnrelatedPointerJoinTypes(LLVMBackend* compiler,
                                       const LLVMBackend::TypeAndValue& b)
 {
     auto depth = [](const LLVMBackend::TypeAndValue& t) {
-        return t.PointerDepth == 0 && !t.ElemPointer ? 1 : t.PointerDepth;
+        return t.ValuePointerDepth();
     };
     if (!a.Pointer || !b.Pointer || a.IsFunctionPointer || b.IsFunctionPointer
         || a.IsInterface || b.IsInterface || a.IsInterfacePointer || b.IsInterfacePointer
@@ -1715,8 +1715,7 @@ void MainListener::JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
             if (!type.Pointer || type.IsArrayView || type.IsSimd || type.IsInterface
                 || type.IsInterfacePointer || type.IsFunctionPointer || type.ConstArraySize != 0)
                 return {};
-            // A single-level pointer may leave its depth unrecorded (0); a deeper one may not.
-            depth = type.PointerDepth == 0 && !type.ElemPointer ? 1 : type.PointerDepth;
+            depth = type.ValuePointerDepth();
             if (depth < 1 || type.ElemPointer != (depth > 1)) return {};
             const std::string name = compiler->ResolveTypeAlias(type.TypeName);
             if (name.empty() || LLVMBackend::IsPrimitiveTypeName(name)
@@ -5116,7 +5115,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 fp.ConstMask = parameter.FunctionParamConstMask();
                 fp.IsCxxRefToPointer = parameter.IsCxxRefToPointer;
                 if (fp.IsCxxRefToPointer && parameter.CxxConstRef())
-                    fp.ConstMask |= 1 << fp.PointerDepth;
+                    fp.ConstMask |= static_cast<int64_t>(LLVMBackend::TypeAndValue::ConstBitAt(fp.PointerDepth));
                 fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
                 fp.IsAlias = compiler->ParameterIsAliasByPointer(parameter);
                 type.FuncPtrParams.push_back(std::move(fp));
@@ -5566,7 +5565,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     fp.ConstMask = parameter.FunctionParamConstMask();
                     fp.IsCxxRefToPointer = parameter.IsCxxRefToPointer;
                     if (fp.IsCxxRefToPointer && parameter.CxxConstRef())
-                        fp.ConstMask |= 1 << fp.PointerDepth;
+                        fp.ConstMask |= static_cast<int64_t>(LLVMBackend::TypeAndValue::ConstBitAt(fp.PointerDepth));
                     fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
                     fp.IsAlias = compiler->ParameterIsAliasByPointer(parameter);
                     type.FuncPtrParams.push_back(std::move(fp));
