@@ -517,6 +517,9 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 namedVar.Primary = result;
                 namedVar.Storage = nullptr;
                 namedVar.TypeAndValue = destTypeName;
+                if (argNV.StackCharBufferBorrow || argNV.TypeAndValue.TypeName == "char"
+                    || argNV.TypeAndValue.TypeName == "string_view")
+                    CarryStackCharBufferBorrow(namedVar, argNV, argNV.Primary);
                 return namedVar;
             }
 
@@ -1130,6 +1133,19 @@ LLVMBackend::NamedVariable MainListener::SizeOrAlignOfType(const LLVMBackend::Ty
 LLVMBackend::NamedVariable MainListener::TrySizeofPostfixAsType(CFlatParser::UnaryExpressionContext* ctx,
                                                                 CFlatParser::PostfixExpressionContext* postFixCtx) {
         auto* compiler = Compiler(ctx);
+        auto* operandPostfix = SolePostfixExpressionShape(postFixCtx);
+        // A subscript on a postfix operand is an expression shape. Do not reinterpret its
+        // bracket index as a fixed-array type dimension from the concatenated source text.
+        if (operandPostfix != nullptr && !operandPostfix->expression().empty())
+            return {};
+        if (operandPostfix != nullptr && operandPostfix->children.size() == 1)
+            if (auto* primary = operandPostfix->primaryExpression(); primary != nullptr)
+                if (auto* generic = primary->genericIdentifier(); generic != nullptr
+                    && generic->genericTypeParameters() == nullptr
+                    && generic->Identifier() != nullptr
+                    && activeValueSubstitutions.find(generic->Identifier()->getText())
+                        != activeValueSubstitutions.end())
+                    return {};
         const bool prefixSizeof = true;
         // The parser matched sizeof as a prefix on a postfixExpression.
         // Extract the type name from the text (e.g., "sizeof(Point)" -> "Point")
@@ -1590,6 +1606,35 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
         return out;
     }
 
+llvm::Type* MainListener::ResolveUnevaluatedOperandType(
+    const UnevaluatedOperandType& operand, LLVMBackend::TypeAndValue& typeValue)
+{
+        auto* compiler = Compiler();
+        typeValue = operand.Type;
+        if ((typeValue.TypeName == "auto" || typeValue.TypeName.empty()) && operand.ValueType != nullptr)
+        {
+            typeValue = {};
+            typeValue.Pointer = operand.ValueType->isPointerTy();
+            typeValue.TypeName = typeValue.Pointer ? "void" : LLVMTypeToTypeName(operand.ValueType);
+            if (operand.ValueType->isVoidTy()) typeValue.TypeName.clear();
+        }
+
+        // Array expressions retain their exact LLVM shape in BaseType, even when the
+        // TypeAndValue metadata no longer records the remaining dimension.
+        llvm::Type* innermost = operand.BaseType;
+        while (auto* arrayType = llvm::dyn_cast_or_null<llvm::ArrayType>(innermost))
+            innermost = arrayType->getElementType();
+        // On an array of pointers the Pointer flag describes the element, not the operand.
+        bool pointerOperand = typeValue.Pointer && !(innermost != nullptr && innermost->isPointerTy());
+        llvm::Type* llvmType = !pointerOperand && !typeValue.IsArrayView
+            && llvm::isa_and_nonnull<llvm::ArrayType>(operand.BaseType) ? operand.BaseType : nullptr;
+        if (llvmType == nullptr && !typeValue.TypeName.empty())
+            llvmType = compiler->GetType(typeValue, nullptr, true);
+        if (llvmType == nullptr || llvmType->isVoidTy())
+            llvmType = operand.ValueType;
+        return llvmType;
+}
+
 LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use) {
         return ParseUnaryExpressionImpl(ctx, use, ctx->Sizeof().size());
@@ -1731,6 +1776,28 @@ LLVMBackend::NamedVariable MainListener::ParseOffsetofText(antlr4::ParserRuleCon
         }
         if (found == compiler->dataStructures.end() || field == found->second.StructFields.end())
         {
+            std::vector<unsigned> promotedPath;
+            if (FindTransparentAnonFieldPath(currentType, fieldName, promotedPath)
+                && !promotedPath.empty())
+            {
+                auto pathRecord = compiler->GetDataStructure(currentType);
+                for (size_t i = 0; i < promotedPath.size(); ++i)
+                {
+                    const unsigned index = promotedPath[i];
+                    if (index >= pathRecord.StructFields.size()) break;
+                    if (!pathRecord.IsUnion)
+                    {
+                        if (pathRecord.CxxOffsetLayout && index < pathRecord.CxxFieldOffsets.size())
+                            totalOffset += pathRecord.CxxFieldOffsets[index];
+                        else if (pathRecord.StructType != nullptr && !pathRecord.StructType->isOpaque())
+                            totalOffset += compiler->module->getDataLayout().getStructLayout(
+                                pathRecord.StructType)->getElementOffset(index);
+                    }
+                    if (i + 1 < promotedPath.size())
+                        pathRecord = compiler->GetDataStructure(pathRecord.StructFields[index].TypeName);
+                }
+                continue;
+            }
             LogErrorContext(errCtx, std::format("offsetof: unknown field '{}' in '{}'", fieldName, currentType));
             return {};
         }
@@ -1811,18 +1878,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 LogErrorContext(ctx, "sizeof/alignof: could not determine type");
                 return {};
             }
-            auto typeValue = operand.Type;
-            if ((typeValue.TypeName == "auto" || typeValue.TypeName.empty()) && operand.ValueType != nullptr)
-            {
-                typeValue = {};
-                typeValue.Pointer = operand.ValueType->isPointerTy();
-                typeValue.TypeName = typeValue.Pointer ? "void" : LLVMTypeToTypeName(operand.ValueType);
-                if (operand.ValueType->isVoidTy()) typeValue.TypeName.clear();
-            }
-            llvm::Type* llvmType = typeValue.TypeName.empty()
-                ? nullptr : compiler->GetType(typeValue, nullptr, true);
-            if (llvmType == nullptr || llvmType->isVoidTy())
-                llvmType = operand.ValueType;
+            LLVMBackend::TypeAndValue typeValue;
+            llvm::Type* llvmType = ResolveUnevaluatedOperandType(operand, typeValue);
             if (llvmType == nullptr || llvmType->isVoidTy())
             {
                 LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
@@ -1865,19 +1922,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 LogErrorContext(ctx, "sizeof/alignof: could not determine type");
                 return {};
             }
-            auto typeValue = operand.Type;
-            if ((typeValue.TypeName == "auto" || typeValue.TypeName.empty()) && operand.ValueType != nullptr)
-            {
-                // No declared type: the operand value's own LLVM type is exact (a pointer stays one).
-                typeValue = {};
-                typeValue.Pointer = operand.ValueType->isPointerTy();
-                typeValue.TypeName = typeValue.Pointer ? "void" : LLVMTypeToTypeName(operand.ValueType);
-                if (operand.ValueType->isVoidTy()) typeValue.TypeName.clear();
-            }
-            llvm::Type* llvmType = typeValue.TypeName.empty()
-                ? nullptr : compiler->GetType(typeValue, nullptr, true);
-            if (llvmType == nullptr || llvmType->isVoidTy())
-                llvmType = operand.ValueType;
+            LLVMBackend::TypeAndValue typeValue;
+            llvm::Type* llvmType = ResolveUnevaluatedOperandType(operand, typeValue);
             if (llvmType == nullptr || llvmType->isVoidTy())
             {
                 LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
@@ -2674,7 +2720,18 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     ctx->getStart()->getCharPositionInLine());
                 if (compiler->IsMovedDerefHere(namedVar))
                     LogErrorContext(ctx, compiler->MovedDerefDiagnostic(namedVar));
-                llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                const bool unionScalarPointerArm = namedVar.UnionFieldType != nullptr
+                    && namedVar.UnionFieldType->isPointerTy()
+                    && derefOperandType.Pointer
+                    && derefOperandType.ConstArraySize == 0
+                    && derefOperandType.ConstInnerDimensions.empty();
+                const bool unionArrayArm = namedVar.UnionFieldType != nullptr
+                    && namedVar.UnionFieldType->isArrayTy();
+                llvm::Value* loadedPtr = unionScalarPointerArm
+                    ? LoadNamedVariable(namedVar)
+                    : unionArrayArm
+                        ? compiler->CreateLoad(compiler->builder->getPtrTy(), namedVar.Storage)
+                        : compiler->CreateLoad(namedVar.Storage);
                 std::string pointerPathRoot = namedVar.FieldPathRoot;
                 if (pointerPathRoot.empty())
                     pointerPathRoot = !namedVar.CallerName.empty()
@@ -2689,6 +2746,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 // The deref'd location: loadedPtr is the address; pointeeType is what it holds.
                 // Storing it in Storage (not Primary) makes it usable as both lvalue and rvalue.
                 namedVar.Storage  = loadedPtr;
+                namedVar.UnionFieldType = nullptr;
                 namedVar.Primary  = nullptr;
                 namedVar.BaseType = pointeeType;
                 namedVar.FieldPathRoot = std::move(pointerPathRoot);
@@ -2930,19 +2988,54 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     if (specList != nullptr)
                     {
                         const std::string spelling = specList->getText();
-                        // A visible local, parameter or this-field named by the first component wins,
-                        // as in C++: `sizeof(X.Y)` is then a field read, not a scoped type.
-                        const std::string sizeofHead = spelling.substr(0, spelling.find('.'));
-                        const bool sizeofHeadIsVariable = spelling.find('.') != std::string::npos
-                            && (compiler->FindLiveNamedVariable(sizeofHead) != nullptr
-                                || NamesVisibleVariable(compiler, sizeofHead)
-                                || compiler->FindImplicitThisField(sizeofHead, nullptr, nullptr) != nullptr);
-                        resolvesAsType = spelling.find('<') == std::string::npos && !sizeofHeadIsVariable
+                        auto typeSpecs = specList->typeSpecifier();
+                        auto* soleTypeSpec = specList->typeQualifier() == nullptr && typeSpecs.size() == 1
+                            ? typeSpecs.front() : nullptr;
+                        auto* qualifiedType = soleTypeSpec != nullptr
+                            ? soleTypeSpec->qualifiedGenericIdentifier() : nullptr;
+                        auto* memberType = soleTypeSpec != nullptr
+                            ? soleTypeSpec->memberTypeSpecifier() : nullptr;
+                        auto* genericType = soleTypeSpec != nullptr
+                            ? soleTypeSpec->genericIdentifier() : nullptr;
+                        antlr4::tree::TerminalNode* typeHead = nullptr;
+                        if (genericType != nullptr && genericType->genericTypeParameters() == nullptr)
+                            typeHead = genericType->Identifier();
+                        else if (qualifiedType != nullptr)
+                            typeHead = qualifiedType->Identifier();
+                        else if (memberType != nullptr && memberType->memberTypeOwner() != nullptr)
+                            typeHead = memberType->memberTypeOwner()->Identifier();
+
+                        auto* abstractDecl = typeNameCtx->abstractDeclarator();
+                        auto* arraySuffix = abstractDecl != nullptr ? abstractDecl->arrayTypeSuffix() : nullptr;
+                        auto* arrayDims = arraySuffix != nullptr ? arraySuffix->arrayDimSpec() : nullptr;
+                        const bool indexedExpressionShape = arrayDims != nullptr
+                            && !arrayDims->assignmentExpression().empty();
+                        const bool qualifiedTypeShape = qualifiedType != nullptr || memberType != nullptr;
+                        bool visibleVariableHead = typeHead != nullptr
+                            && (compiler->FindLiveNamedVariable(typeHead->getText()) != nullptr
+                                || NamesVisibleVariable(compiler, typeHead->getText())
+                                || compiler->FindImplicitThisField(typeHead->getText(), nullptr, nullptr) != nullptr);
+                        if (qualifiedType != nullptr && qualifiedType->genericTypeParameters() == nullptr)
+                            visibleVariableHead = visibleVariableHead
+                                || NamesVisibleVariable(compiler, qualifiedType->getText());
+                        // The parse-tree shape and value lookup resolve an ambiguous subscript before type lookup.
+                        const bool sizeofHeadIsVariable = visibleVariableHead
+                            && (indexedExpressionShape || qualifiedTypeShape);
+                        const bool hasGenericTypeArguments =
+                            (genericType != nullptr && genericType->genericTypeParameters() != nullptr)
+                            || (qualifiedType != nullptr && qualifiedType->genericTypeParameters() != nullptr)
+                            || memberType != nullptr;
+                        const bool genericValueParameter = bareName != nullptr
+                            && activeValueSubstitutions.find(bareName->getText())
+                                != activeValueSubstitutions.end();
+                        resolvesAsType = !hasGenericTypeArguments && !sizeofHeadIsVariable
+                            && !genericValueParameter
                             && (compiler->IsKnownTypeName(spelling)
                                 || compiler->IsTypeArgTypeKey(spelling)
                                 || activeTypeSubstitutions.count(spelling) != 0
                                 || activePackSubstitutions.count(spelling) != 0);
                         if (!resolvesAsType && bareName != nullptr
+                            && !genericValueParameter
                             && specList->getText() == bareName->getText()
                             && typeNameCtx->abstractDeclarator() == nullptr
                             && NamesVisibleVariable(compiler, bareName->getText()))
@@ -2950,6 +3043,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         // A bare identifier in a declaration type position can be forward-declared
                         // or hidden behind a conditional scan; preserve type parsing unless shadowed.
                         if (!resolvesAsType && bareName != nullptr
+                            && !genericValueParameter
                             && specList->getText() == bareName->getText()
                             && typeNameCtx->getText() == bareName->getText()
                             && typeNameCtx->abstractDeclarator() == nullptr
@@ -3011,7 +3105,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                             }
                             if (resolvesAsType) break;
                         }
-                        if (!resolvesAsType && spelling.find('.') != std::string::npos && !sizeofHeadIsVariable)
+                        if (!resolvesAsType && qualifiedTypeShape && !sizeofHeadIsVariable)
                         {
                             std::string candidate = compiler->ResolveQualifiedName(spelling, true);
                             std::vector<std::string> aggregateScopes;
@@ -3070,6 +3164,11 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     // Keep the diagnosed `sizeof(a<b,c>d)` case on the type diagnostic path;
                     // its earlier expression fallback produced invalid IR.
                     resolvesAsType = resolvesAsType || ambiguousTemplateComparison;
+                    // A value template parameter hides an outer type even if an earlier
+                    // registry heuristic recognized that same spelling as a type.
+                    if (bareName != nullptr
+                        && activeValueSubstitutions.count(bareName->getText()) != 0)
+                        resolvesAsType = false;
 
                     // The grammar can read an expression such as `s.field` or `arr[i]` as a
                     // typeName. Reparse only unresolved spellings as an expression; type probes
@@ -3126,20 +3225,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                                 LogErrorContext(ctx, "sizeof/alignof: could not determine type");
                                 return {};
                             }
-                            auto typeValue = operand.Type;
-                            if ((typeValue.TypeName == "auto" || typeValue.TypeName.empty())
-                                && operand.ValueType != nullptr)
-                            {
-                                typeValue = {};
-                                typeValue.Pointer = operand.ValueType->isPointerTy();
-                                typeValue.TypeName = typeValue.Pointer
-                                    ? "void" : LLVMTypeToTypeName(operand.ValueType);
-                                if (operand.ValueType->isVoidTy()) typeValue.TypeName.clear();
-                            }
-                            llvm::Type* llvmType = typeValue.TypeName.empty()
-                                ? nullptr : compiler->GetType(typeValue, nullptr, true);
-                            if (llvmType == nullptr || llvmType->isVoidTy())
-                                llvmType = operand.ValueType;
+                            LLVMBackend::TypeAndValue typeValue;
+                            llvm::Type* llvmType = ResolveUnevaluatedOperandType(operand, typeValue);
                             if (llvmType == nullptr || llvmType->isVoidTy())
                             {
                                 LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");

@@ -67,6 +67,47 @@ CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
         return SolePostfixExpressionShape(primary->expression());
     return nullptr;
 }
+std::optional<StringLiteralExpressionInfo> MainListener::StringLiteralExpressionValue(
+    antlr4::tree::ParseTree* node)
+{
+    if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        node = UnwrapInitializerParens(assign);
+    auto* postfix = SolePostfixExpressionShape(node);
+    if (postfix == nullptr || postfix->children.size() != 1
+        || postfix->primaryExpression() == nullptr) return std::nullopt;
+    auto literals = postfix->primaryExpression()->StringLiteral();
+    if (literals.empty()) return std::nullopt;
+    StringLiteralExpressionInfo value;
+    for (auto* literal : literals)
+    {
+        const std::string spelling = literal->getText();
+        if (!IsRawStringTokenSpelling(spelling))
+        {
+            const size_t quote = spelling.find('"');
+            const std::string prefix = quote == std::string::npos
+                ? std::string() : spelling.substr(0, quote);
+            if (prefix != "") value.IsNarrow = false;
+            if (prefix != "" && prefix != "u8") value.IsNarrowOrUtf8 = false;
+            value.HasExpressionSegment = value.HasExpressionSegment
+                || HasInterpolationSegment(spelling);
+        }
+        value.Value += DecodeStringLiteralToken(spelling, /*foldBraces=*/true);
+    }
+    return value;
+}
+CFlatParser::ArgumentExpressionListContext* SoleDirectNamedCallArguments(
+    antlr4::tree::ParseTree* node, const std::string& functionName)
+{
+    auto* postfix = SolePostfixExpressionShape(node);
+    if (postfix == nullptr || postfix->children.size() != 4
+        || postfix->primaryExpression() == nullptr
+        || postfix->argumentExpressionList().size() != 1) return nullptr;
+    auto* identifier = postfix->primaryExpression()->genericIdentifier();
+    if (identifier == nullptr || identifier->genericTypeParameters() != nullptr
+        || identifier->Identifier() == nullptr
+        || identifier->Identifier()->getText() != functionName) return nullptr;
+    return postfix->argumentExpressionList().front();
+}
 std::string EnumMemberSourceSpelling(antlr4::tree::ParseTree* node)
 {
     while (node != nullptr)
@@ -276,8 +317,12 @@ std::string ValidateImportSoftKeywords(CFlatParser::ImportDeclarationContext* im
 std::string ValidateImportLeadingMarker(CFlatParser::ImportDeclarationContext* imp)
 {
     if (imp == nullptr || imp->children.size() < 2) return "malformed import declaration";
+    if (dynamic_cast<CFlatParser::ImportGroupContext*>(imp->children[1]) != nullptr)
+        return {};
     std::string first = imp->children[1]->getText();
-    if (!first.empty() && (first.front() == '"' || first.front() == '{')) return {};
+    if (auto* literal = dynamic_cast<antlr4::tree::TerminalNode*>(imp->children[1]);
+        literal != nullptr && literal->getSymbol()->getType() == CFlatLexer::StringLiteral)
+        return {};
     // `cpp` binds the named file as C++ - the marker, not the extension, selects the mode.
     if (first == "program" || first == "package" || first == "framework"
         || first == "cpp" || first == "package-vcpkg" || first == "package-nuget")
@@ -743,6 +788,40 @@ std::string ResolveTupleTypeElementArgName(
         argName += std::string(elementPointerDepth, '*') + "[]";
     else if (pointerDepth > 0)
         argName += std::string(pointerDepth, '*');
+
+    if (entry != nullptr && entry->Identifier() != nullptr)
+    {
+        const std::string qualifier = entry->Identifier()->getText();
+        if (qualifier != "unique")
+        {
+            if (context.ReportError != nullptr)
+                context.ReportError(entry, std::format(
+                    "unknown tuple element qualifier '{}'; only 'unique' is allowed", qualifier));
+        }
+        if (isArrayView || pointerDepth > 1
+            || (pointerDepth == 0 && (compiler == nullptr || !compiler->IsInterfaceType(argName))))
+        {
+            if (context.ReportError != nullptr)
+                context.ReportError(entry,
+                    "'unique' tuple elements require one pointer or an interface type");
+        }
+        const std::string pointee = pointerDepth == 1
+            ? argName.substr(0, argName.size() - 1) : argName;
+        if (context.ResolveUniqueType != nullptr)
+            return context.ResolveUniqueType(pointee, pointerDepth == 1, entry);
+        if (compiler != nullptr)
+        {
+            std::string cxxError;
+            const std::string cxxUnique = pointerDepth == 1
+                ? compiler->CxxUniquePtrForUniqueKeyword(pointee, cxxError) : std::string();
+            if (!cxxError.empty() && context.ReportError != nullptr)
+                context.ReportError(entry, std::move(cxxError));
+            if (!cxxUnique.empty()) return cxxUnique;
+        }
+        return compiler != nullptr
+            ? MangleGenericInstance(*compiler, "unique", { pointee })
+            : std::string("unique__") + pointee;
+    }
     return argName;
 }
 std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
@@ -820,10 +899,9 @@ std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m)
 }
 std::string AnnotationArgOne(CFlatParser::AnnotationArgContext* arg)
 {
-    std::string raw = arg->getText();
-    if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
-        return raw.substr(1, raw.size() - 2);
-    return raw;
+    if (arg != nullptr && arg->StringLiteral() != nullptr)
+        return DecodeStringLiteralToken(arg->StringLiteral()->getText(), /*foldBraces=*/true);
+    return arg == nullptr ? std::string{} : arg->getText();
 }
 std::vector<std::string> AnnotationArgTexts(CFlatParser::AnnotationContext* ann)
 {
@@ -939,6 +1017,289 @@ std::optional<int64_t> FoldCompileTimeInt(LLVMBackend* compiler, antlr4::tree::P
         }
         return FoldCompileTimeIntLeaf(compiler, node);
     }
+
+static std::optional<LLVMBackend::TypeAndValue> ScanTimeGlobalVariableType(
+    LLVMBackend* compiler, const std::string& name)
+{
+    if (compiler == nullptr || name.empty()) return std::nullopt;
+    const std::string resolved = compiler->ResolveQualifiedName(name);
+    if (auto scanType = compiler->GetScanTimeGlobalVariableType(resolved)) return scanType;
+    auto global = compiler->GetGlobalVariableNV(resolved);
+    if (global.Storage != nullptr || !global.TypeAndValue.TypeName.empty())
+        return global.TypeAndValue;
+    if (resolved != name)
+    {
+        if (auto scanType = compiler->GetScanTimeGlobalVariableType(name)) return scanType;
+        global = compiler->GetGlobalVariableNV(name);
+        if (global.Storage != nullptr || !global.TypeAndValue.TypeName.empty())
+            return global.TypeAndValue;
+    }
+    return std::nullopt;
+}
+
+static std::optional<LLVMBackend::TypeAndValue> ScanTimeVariableType(
+    LLVMBackend* compiler, const std::string& name)
+{
+    if (compiler == nullptr || name.empty()) return std::nullopt;
+    auto local = compiler->GetScopedLocalOrArgument(name);
+    if (local.Storage != nullptr || !local.TypeAndValue.TypeName.empty())
+        return local.TypeAndValue;
+    auto argument = compiler->GetFunctionArgument(name);
+    if (argument.GetValue() != nullptr || !argument.TypeAndValue.TypeName.empty())
+        return argument.TypeAndValue;
+    if (name == "this")
+    {
+        auto thisValue = compiler->GetThisPointer();
+        if (!thisValue.TypeAndValue.TypeName.empty()) return thisValue.TypeAndValue;
+    }
+    if (const auto* field = compiler->FindImplicitThisField(name, nullptr, nullptr))
+        return field->TypeAndValue;
+    if (auto scanType = compiler->GetScanTimeVariableType(name)) return scanType;
+    return ScanTimeGlobalVariableType(compiler, name);
+}
+
+static std::optional<LLVMBackend::TypeAndValue> ScanTimeCountofOperandType(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return std::nullopt;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+    {
+        auto* primary = postfix->primaryExpression();
+        if (primary == nullptr) return std::nullopt;
+        if (primary->expression() != nullptr)
+        {
+            if (postfix->children.size() != 1) return std::nullopt;
+            return ScanTimeCountofOperandType(compiler, primary->expression());
+        }
+        LLVMBackend::TypeAndValue type;
+        if (auto* generic = primary->genericIdentifier(); generic != nullptr
+            && generic->Identifier() != nullptr)
+        {
+            const std::string baseName = generic->Identifier()->getText();
+            auto resolved = ScanTimeVariableType(compiler, baseName);
+            if (!resolved)
+            {
+                std::string qualifiedName = baseName;
+                bool hasMember = false;
+                bool isQualifiedPath = true;
+                const auto& children = postfix->children;
+                for (size_t i = 1; i < children.size();)
+                {
+                    auto* dot = dynamic_cast<antlr4::tree::TerminalNode*>(children[i]);
+                    auto* member = i + 1 < children.size()
+                        ? dynamic_cast<CFlatParser::MemberNameTokenContext*>(children[i + 1]) : nullptr;
+                    if (dot == nullptr || dot->getSymbol()->getType() != CFlatParser::Dot
+                        || member == nullptr)
+                    {
+                        isQualifiedPath = false;
+                        break;
+                    }
+                    qualifiedName += "." + member->getText();
+                    hasMember = true;
+                    i += 2;
+                }
+                if (isQualifiedPath && hasMember)
+                    return ScanTimeGlobalVariableType(compiler, qualifiedName);
+                return std::nullopt;
+            }
+            type = std::move(*resolved);
+        }
+        else return std::nullopt;
+
+        const auto& children = postfix->children;
+        for (size_t i = 1; i < children.size(); ++i)
+        {
+            auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(children[i]);
+            if (terminal == nullptr) return std::nullopt;
+            const std::string suffix = terminal->getText();
+            if (suffix == "[" && i + 2 < children.size()
+                && dynamic_cast<CFlatParser::ExpressionContext*>(children[i + 1]) != nullptr
+                && children[i + 2]->getText() == "]")
+            {
+                if (type.IsArrayView || (type.ConstArraySize == 0 && type.AliasArraySize == 0))
+                    return std::nullopt;
+                if (type.ConstArraySize != 0)
+                {
+                    type.ConstArraySize = type.ConstInnerDimensions.empty()
+                        ? 0 : type.ConstInnerDimensions.front();
+                    if (!type.ConstInnerDimensions.empty())
+                        type.ConstInnerDimensions.erase(type.ConstInnerDimensions.begin());
+                }
+                else
+                {
+                    type.ConstArraySize = type.AliasInnerDims.empty()
+                        ? 0 : type.AliasInnerDims.front();
+                    type.AliasArraySize = 0;
+                    if (!type.AliasInnerDims.empty())
+                        type.AliasInnerDims.erase(type.AliasInnerDims.begin());
+                }
+                i += 2;
+                continue;
+            }
+            if ((suffix == "." || suffix == "->") && i + 1 < children.size())
+            {
+                auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(children[i + 1]);
+                if (member == nullptr) return std::nullopt;
+                const std::string owner = compiler->ResolveTypeAlias(type.TypeName);
+                auto structure = compiler->GetDataStructure(owner);
+                if (structure.StructType == nullptr)
+                    structure = compiler->GetDataStructure(type.TypeName);
+                if (structure.StructType == nullptr) return std::nullopt;
+                bool matched = false;
+                for (const auto& field : structure.StructFields)
+                    if (field.VariableName == member->getText())
+                    {
+                        type = static_cast<const LLVMBackend::TypeAndValue&>(field);
+                        matched = true;
+                        break;
+                    }
+                if (!matched) return std::nullopt;
+                ++i;
+                continue;
+            }
+            return std::nullopt;
+        }
+        return type;
+    }
+    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    if (rule != nullptr && rule->children.size() == 1)
+        return ScanTimeCountofOperandType(compiler, rule->children.front());
+    return std::nullopt;
+}
+
+static std::optional<int64_t> FoldScanTimeCountof(
+    LLVMBackend* compiler, CFlatParser::PostfixExpressionContext* call)
+{
+    if (compiler == nullptr || call == nullptr || call->children.size() != 4
+        || call->primaryExpression() == nullptr
+        || call->primaryExpression()->genericIdentifier() == nullptr
+        || call->primaryExpression()->genericIdentifier()->Identifier() == nullptr
+        || call->primaryExpression()->genericIdentifier()->Identifier()->getText() != "countof"
+        || call->argumentExpressionList().size() != 1)
+        return std::nullopt;
+
+    auto local = compiler->GetScopedLocalOrArgument("countof");
+    auto argument = compiler->GetFunctionArgument("countof");
+    if (local.Storage != nullptr || !local.TypeAndValue.TypeName.empty()
+        || argument.GetValue() != nullptr || !argument.TypeAndValue.TypeName.empty()
+        || compiler->FindImplicitThisField("countof", nullptr, nullptr) != nullptr)
+        return std::nullopt;
+    const std::string resolvedName = compiler->ResolveQualifiedName("countof");
+    auto global = compiler->GetGlobalVariableNV(resolvedName);
+    if (global.Storage != nullptr || !global.TypeAndValue.TypeName.empty()) return std::nullopt;
+    if (compiler->GetScanTimeGlobalVariableType(resolvedName)
+        || compiler->GetScanTimeVariableType("countof")
+        || compiler->GetScanTimeGlobalVariableType("countof"))
+        return std::nullopt;
+    const std::string genericBase = compiler->ResolveGenericFunctionBase(resolvedName);
+    if (compiler->GetFunction(resolvedName) != nullptr
+        || compiler->GetReturnBlock(resolvedName) != nullptr
+        || compiler->IsGenericFunctionKeyInNamespace(genericBase, compiler->GetCurrentNamespace()))
+        return std::nullopt;
+
+    const auto* currentFunction = compiler->GetCurrentFunctionSymbol();
+    if (currentFunction != nullptr && currentFunction->IsMethod
+        && !currentFunction->Parameters.empty())
+    {
+        const std::string owner = compiler->ResolveTypeAlias(currentFunction->Parameters.front().TypeName);
+        if (compiler->GetFunction(owner + ".countof") != nullptr
+            || compiler->IsGenericFunctionKeyInNamespace(owner + ".countof", compiler->GetCurrentNamespace()))
+            return std::nullopt;
+    }
+
+    auto args = call->argumentExpressionList(0)->argumentNamedExpression();
+    if (args.size() != 1 || args[0]->assignmentExpression() == nullptr)
+        return std::nullopt;
+    auto type = ScanTimeCountofOperandType(compiler, args[0]->assignmentExpression());
+    if (!type) return std::nullopt;
+    const uint64_t extent = type->ConstArraySize != 0
+        ? type->ConstArraySize : type->AliasArraySize;
+    if (extent == 0 || type->IsArrayView || type->IsUnique
+        || compiler->IsCoreUniqueType(type->TypeName)
+        || compiler->IsCoreUniqueType(compiler->ResolveTypeAlias(type->TypeName)))
+        return std::nullopt;
+    return extent <= INT64_MAX ? std::optional<int64_t>(static_cast<int64_t>(extent)) : std::nullopt;
+}
+
+bool HasUnfoldableCountofCall(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+    {
+        auto* primary = call->primaryExpression();
+        auto* identifier = primary != nullptr && primary->genericIdentifier() != nullptr
+            ? primary->genericIdentifier()->Identifier() : nullptr;
+        if (identifier != nullptr && identifier->getText() == "countof"
+            && call->children.size() == 4 && call->argumentExpressionList().size() == 1
+            && !FoldScanTimeCountof(compiler, call))
+            return true;
+    }
+    for (auto* child : node->children)
+        if (HasUnfoldableCountofCall(compiler, child)) return true;
+    return false;
+}
+
+void SeedScanTimeLocalVariableTypes(
+    LLVMBackend* compiler, CFlatParser::DeclarationContext* declaration)
+{
+    if (compiler == nullptr || declaration == nullptr) return;
+    auto* specs = declaration->declarationSpecifiers();
+    auto* initList = declaration->initDeclaratorList();
+    auto* lastSpec = specs != nullptr
+        ? LastDeclarationTypeSpecifier(specs->declarationSpecifier()) : nullptr;
+    if (specs == nullptr || initList == nullptr || lastSpec == nullptr
+        || lastSpec->typeSpecifier() == nullptr)
+        return;
+
+    std::string baseName = CanonicalTypeSpecifierText(lastSpec->typeSpecifier());
+    baseName = compiler->ResolveQualifiedName(baseName);
+    std::string aliasBase = compiler->ResolveTypeAlias(baseName);
+    std::vector<uint64_t> aliasDims;
+    PeelAliasArrayDims(aliasBase, aliasDims);
+
+    LLVMBackend::TypeAndValue value{ .TypeName = aliasBase };
+    value.IsUnique = HasSoftDeclarationSpecifier(specs, "unique");
+    for (auto* spec : specs->declarationSpecifier())
+    {
+        if (spec->pointer() != nullptr) value.Pointer = true;
+    }
+    if (auto* dimSpec = ArrayDimsOf(lastSpec); dimSpec != nullptr)
+    {
+        auto dimensions = dimSpec->assignmentExpression();
+        if (dimensions.empty())
+        {
+            value.IsArrayView = true;
+            value.Pointer = true;
+        }
+        else
+        {
+            std::vector<uint64_t> extents;
+            for (auto* dimension : dimensions)
+            {
+                auto folded = FoldCompileTimeInt(compiler, dimension);
+                if (!folded || *folded <= 0) return;
+                extents.push_back(static_cast<uint64_t>(*folded));
+            }
+            value.ConstArraySize = extents.front();
+            value.ConstInnerDimensions.assign(extents.begin() + 1, extents.end());
+        }
+    }
+    if (!aliasDims.empty())
+    {
+        value.AliasArraySize = aliasDims.front();
+        value.AliasInnerDims.assign(aliasDims.begin() + 1, aliasDims.end());
+    }
+
+    for (auto* init : initList->initDeclarator())
+    {
+        auto* declarator = init->declarator();
+        auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+        const std::string name = getDirectDeclName(direct);
+        if (name.empty()) continue;
+        compiler->SetScanTimeVariableType(name, value);
+    }
+}
+
 std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antlr4::tree::ParseTree* node) {
         if (node == nullptr) return std::nullopt;
 
@@ -1102,6 +1463,7 @@ std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antlr4::tre
         }
         if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
         {
+            if (auto count = FoldScanTimeCountof(compiler, n)) return count;
             if (compiler != nullptr && n->primaryExpression() != nullptr
                 && n->primaryExpression()->genericIdentifier() != nullptr
                 && n->primaryExpression()->genericIdentifier()->Identifier() != nullptr
@@ -1962,45 +2324,60 @@ std::vector<std::string> NamedTypePathFromContext(CFlatParser::TypeSpecifierCont
         path.push_back(generic->Identifier()->getText());
     return path;
 }
+namespace
+{
+std::vector<antlr4::ParserRuleContext*> EnclosingAggregateDefinitionsFromContext(
+    antlr4::tree::ParseTree* node)
+{
+    std::vector<antlr4::ParserRuleContext*> definitions;
+    for (auto* parent = node != nullptr ? node->parent : nullptr;
+         parent != nullptr; parent = parent->parent)
+    {
+        if (dynamic_cast<CFlatParser::NestedAggregateFieldContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::ProgramDefinitionContext*>(parent) != nullptr)
+            definitions.push_back(dynamic_cast<antlr4::ParserRuleContext*>(parent));
+    }
+    return definitions;
+}
+
+std::vector<CFlatParser::AggregateMemberContext*> AggregateMembersFromDefinition(
+    antlr4::ParserRuleContext* definition)
+{
+    if (auto* nested = dynamic_cast<CFlatParser::NestedAggregateFieldContext*>(definition))
+        return nested->aggregateMember();
+    if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(definition))
+        return structure->aggregateMember();
+    if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(definition))
+        return classDefinition->aggregateMember();
+    return {};
+}
+}
+
 bool HasNestedAggregatePathInContext(antlr4::tree::ParseTree* useSite,
     size_t aggregateIndex, const std::vector<std::string>& path)
 {
     if (path.empty()) return false;
-    antlr4::tree::ParseTree* owner = nullptr;
-    for (auto* parent = useSite != nullptr ? useSite->parent : nullptr;
-         parent != nullptr; parent = parent->parent)
-    {
-        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) == nullptr
-            && dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) == nullptr)
-            continue;
-        if (aggregateIndex-- == 0)
-        {
-            owner = parent;
-            break;
-        }
-    }
-    if (owner == nullptr) return false;
+    const auto definitions = EnclosingAggregateDefinitionsFromContext(useSite);
+    if (aggregateIndex >= definitions.size()) return false;
+    auto* owner = definitions[aggregateIndex];
     auto hasPath = [&](auto&& self, antlr4::tree::ParseTree* aggregate, size_t part) -> bool
     {
-        std::vector<CFlatParser::AggregateMemberContext*> members;
-        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(aggregate))
-            members = structure->aggregateMember();
-        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(aggregate))
-            members = classDefinition->aggregateMember();
-        for (auto* member : members)
+        auto* definition = dynamic_cast<antlr4::ParserRuleContext*>(aggregate);
+        for (auto* member : AggregateMembersFromDefinition(definition))
         {
             if (part + 1 == path.size())
                 if (auto* alias = member->usingDeclaration(); alias != nullptr
                     && alias->Identifier() != nullptr
                     && alias->Identifier()->getText() == path[part])
                     return true;
-            antlr4::tree::ParseTree* nested = member->structDefinition();
+            antlr4::tree::ParseTree* nested = member->nestedAggregateField();
+            if (nested == nullptr) nested = member->structDefinition();
             if (nested == nullptr) nested = member->classDefinition();
             if (nested == nullptr) continue;
-            auto* direct = dynamic_cast<CFlatParser::StructDefinitionContext*>(nested);
-            auto* classDirect = dynamic_cast<CFlatParser::ClassDefinitionContext*>(nested);
-            const std::string nestedName = direct != nullptr
-                ? direct->directDeclarator()->getText() : classDirect->directDeclarator()->getText();
+            auto* nestedDefinition = dynamic_cast<antlr4::ParserRuleContext*>(nested);
+            const std::string nestedName = AggregateDefinitionName(nestedDefinition);
             if (nestedName != path[part]) continue;
             if (part + 1 == path.size() || self(self, nested, part + 1)) return true;
         }
@@ -2021,23 +2398,15 @@ std::vector<EnclosingAggregateLookupScope> EnclosingAggregateTypeScopesFromConte
     LLVMBackend* compiler, antlr4::tree::ParseTree* node)
 {
     if (compiler == nullptr) return {};
-    std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> aggregates;
-    for (auto* parent = node != nullptr ? node->parent : nullptr;
-         parent != nullptr; parent = parent->parent)
-    {
-        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
-            aggregates.emplace_back(structure->directDeclarator()->getText(), structure);
-        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent))
-            aggregates.emplace_back(classDefinition->directDeclarator()->getText(), classDefinition);
-        else if (auto* programDefinition = dynamic_cast<CFlatParser::ProgramDefinitionContext*>(parent))
-            aggregates.emplace_back(programDefinition->directDeclarator()->getText(), programDefinition);
-    }
+    const auto definitions = EnclosingAggregateDefinitionsFromContext(node);
     std::string scope = NamespaceNameFromContext(compiler, node);
     std::vector<EnclosingAggregateLookupScope> scopes;
-    for (auto it = aggregates.rbegin(); it != aggregates.rend(); ++it)
+    for (auto it = definitions.rbegin(); it != definitions.rend(); ++it)
     {
-        scope += (scope.empty() ? "" : ".") + it->first;
-        scopes.push_back({ scope, it->second });
+        const std::string name = AggregateDefinitionName(*it);
+        if (name.empty()) continue;
+        scope += (scope.empty() ? "" : ".") + name;
+        scopes.push_back({ scope, *it });
     }
     std::reverse(scopes.begin(), scopes.end());
     return scopes;
@@ -2054,6 +2423,11 @@ std::vector<std::string> EnclosingAggregateNamesFromContext(
 }
 std::string AggregateDefinitionName(antlr4::ParserRuleContext* definition)
 {
+    if (auto* nested = dynamic_cast<CFlatParser::NestedAggregateFieldContext*>(definition))
+    {
+        const auto names = nested->directDeclarator();
+        if (!names.empty()) return names[0]->getText();
+    }
     if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(definition))
         return structure->directDeclarator()->getText();
     if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(definition))

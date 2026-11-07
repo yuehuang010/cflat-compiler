@@ -255,6 +255,7 @@ string fixed = s.replace("ell", "ELL");
 
 // Split and join
 list<string> parts = "a,b,c".split(",");
+list<string> words = "a,,b,".split(",", true); // ["a", "b"] - drops empty fields
 string joined = join("-", parts);         // "a-b-c"
 ```
 
@@ -330,6 +331,15 @@ string r = a + b;        // "foobar" - owned, freed at scope exit
 #### String interpolation
 
 Any string literal containing `{expr}` is automatically treated as an interpolated string - no prefix required. Each `{expr}` segment is converted to `string` (primitives via their built-in stringification, custom types via `IString`) and the segments are concatenated at runtime:
+
+Use a Rust-style raw prefix to keep a literal's contents verbatim, without interpolation or escape processing. `r"..."` ends at the next quote; add matching hashes on both sides when the content needs quotes, as in `r#"say "hi""#`. Raw literals can span lines, and the `r` must touch the opening quote. A raw literal can be adjacent to an ordinary interpolated literal; each token keeps its own rules:
+
+```c
+const char* json = r#"{"name":"Ada"}"#;
+string line = r"a{" "b{n}";             // `a{b<value>` (only the second token interpolates)
+```
+
+For example, `r"\n"` contains a backslash followed by `n`. Ordinary adjacent literals without a raw token remain an error; use `+` to join those.
 
 ```c
 string name = "World";
@@ -2818,6 +2828,11 @@ sizeof(x)                     // 4 - same as sizeof(int)
 
 On a name collision the type meaning wins, matching C. The result is typed
 `i64`.
+
+`countof(array)` returns the outermost element count of a fixed-size array as a
+compile-time `i64`; its operand is not evaluated. Pointers, array views, unique
+arrays, and non-arrays are rejected. Ordinary name lookup runs first, so a
+visible variable or function named `countof` takes precedence over the intrinsic.
 
 `offsetof(Type, field)` returns the byte offset of a record member as `u64`.
 Nested value fields use dotted paths; a path cannot pass through a pointer.

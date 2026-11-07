@@ -1,6 +1,19 @@
 struct JsonConstNonliteralCfg { int value = default; };
+struct JsonConstStringNonliteralCfg { string value = default; };
 
 expect_error("json_const initializer must be a compile-time literal") {
     int source = 3;
     string value = json_const(JsonConstNonliteralCfg, { value = source });
+}
+
+extern int main()
+{
+    string source = "X";
+    expect_error("json_const initializer must be a compile-time literal") {
+        string value = json_const(JsonConstStringNonliteralCfg, { value = r"a" "{source}" });
+    }
+    expect_error("json_const initializer must be a compile-time literal") {
+        string value = json_const(JsonConstStringNonliteralCfg, { value = "{source}" r"a" });
+    }
+    return 0;
 }

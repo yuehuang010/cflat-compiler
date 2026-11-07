@@ -2414,6 +2414,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
                 fe.access = f.access;
                 fe.isBitfield = f.isBitfield; fe.bitWidth = f.bitWidth;
                 fe.isPromoted = f.isPromoted;
+                fe.isAnonymousMember = f.isAnonymousMember;
                 fe.isZeroSize = f.isZeroSize;
                 fe.isConst = f.isConst;
                 fe.isMutable = f.isMutable;

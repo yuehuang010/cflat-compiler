@@ -1400,6 +1400,12 @@ LLVMBackend::NamedVariable LLVMBackend::GetGlobalVariableNV(const std::string& n
         if (tvIt != globalVariableTypes.end())
             nv.TypeAndValue = tvIt->second;
 
+        if (auto* length = gIt->second->getMetadata("cflat.array-view.length");
+            length != nullptr && length->getNumOperands() == 1)
+            if (auto* value = llvm::dyn_cast<llvm::ValueAsMetadata>(length->getOperand(0));
+                value != nullptr)
+                nv.RawArrayLengthStorage = value->getValue();
+
         return nv;
     }
 
@@ -1438,6 +1444,50 @@ bool LLVMBackend::TryGetConstGlobalInt(const std::string& name, int64_t& out) co
         if (it == constGlobalInts_.end()) return false;
         out = it->second;
         return true;
+    }
+
+void LLVMBackend::SetScanTimeGlobalVariableType(const std::string& name, const TypeAndValue& type)
+{
+        if (!name.empty()) scanTimeGlobalVariableTypes_[name] = type;
+    }
+
+std::optional<LLVMBackend::TypeAndValue> LLVMBackend::GetScanTimeGlobalVariableType(
+    const std::string& name) const
+{
+        auto it = scanTimeGlobalVariableTypes_.find(name);
+        if (it == scanTimeGlobalVariableTypes_.end()) return std::nullopt;
+        return it->second;
+    }
+
+void LLVMBackend::PushScanTimeVariableTypeScope()
+{
+        scanTimeVariableTypeScopes_.emplace_back();
+    }
+
+void LLVMBackend::PopScanTimeVariableTypeScope()
+{
+        if (!scanTimeVariableTypeScopes_.empty()) scanTimeVariableTypeScopes_.pop_back();
+    }
+
+void LLVMBackend::SetScanTimeVariableType(const std::string& name, const TypeAndValue& type)
+{
+        if (name.empty()) return;
+        if (scanTimeVariableTypeScopes_.empty())
+            scanTimeGlobalVariableTypes_[name] = type;
+        else
+            scanTimeVariableTypeScopes_.back()[name] = type;
+    }
+
+std::optional<LLVMBackend::TypeAndValue> LLVMBackend::GetScanTimeVariableType(
+    const std::string& name) const
+{
+        for (auto scope = scanTimeVariableTypeScopes_.rbegin();
+             scope != scanTimeVariableTypeScopes_.rend(); ++scope)
+        {
+            auto it = scope->find(name);
+            if (it != scope->end()) return it->second;
+        }
+        return std::nullopt;
     }
 
 void LLVMBackend::SetConstGlobalFP(const std::string& name)

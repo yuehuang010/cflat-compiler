@@ -5329,6 +5329,8 @@ void LLVMBackend::DiscardOptimizedViewState()
 
 void LLVMBackend::ResetForReanalysis()
 {
+    scanTimeGlobalVariableTypes_.clear();
+    scanTimeVariableTypeScopes_.clear();
     deferredOwnedElementDeletes_.clear();
     openDeferredLoops_.clear();
     JoinCHeaderDiskCacheWriters();
@@ -7774,6 +7776,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     {
         o["fp"]  = true;
         o["fpr"] = s.FuncPtrReturnTypeName;
+        if (!s.FuncPtrReturnAliasSpelling.empty()) o["fpras"] = s.FuncPtrReturnAliasSpelling;
         if (s.FuncPtrReturnFunctionType)
             o["fprft"] = SerializeTav(s.FuncPtrReturnFunctionType->ToTypeAndValue());
         if (s.FuncPtrReturnPointer) o["fprp"] = true;
@@ -7828,6 +7831,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsArrayView) o["av"] = true;
     if (s.IsFlexibleArrayMember) o["fam"] = true;
     if (s.IsZeroLengthArrayMember) o["zfam"] = true;
+    if (s.IsAnonymousMember) o["am"] = true;
+    if (s.IsInlineAggregateField) o["iaf"] = true;
     if (s.AllocAlignValue > 0) o["aa"] = static_cast<int64_t>(s.AllocAlignValue);
     if (s.NewAllocAlignment > 0) o["naa"] = static_cast<int64_t>(s.NewAllocAlignment);
     return o;
@@ -7881,6 +7886,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (s.IsFunctionPointer)
     {
         if (auto v = o.getString("fpr"))   s.FuncPtrReturnTypeName = v->str();
+        if (auto v = o.getString("fpras")) s.FuncPtrReturnAliasSpelling = v->str();
         if (auto* nested = o.getObject("fprft"))
             s.FuncPtrReturnFunctionType = std::make_shared<LLVMBackend::SerializedTav>(
                 LLVMBackend::SerializedTav::From(DeserializeTav(*nested)));
@@ -7929,6 +7935,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("av")) s.IsArrayView = *v;
     if (auto v = o.getBoolean("fam")) s.IsFlexibleArrayMember = *v;
     if (auto v = o.getBoolean("zfam")) s.IsZeroLengthArrayMember = *v;
+    if (auto v = o.getBoolean("am")) s.IsAnonymousMember = *v;
+    if (auto v = o.getBoolean("iaf")) s.IsInlineAggregateField = *v;
     if (auto v = o.getInteger("aa")) s.AllocAlignValue = static_cast<uint64_t>(*v);
     if (auto v = o.getInteger("naa")) s.NewAllocAlignment = static_cast<uint64_t>(*v);
     return s.ToTypeAndValue();

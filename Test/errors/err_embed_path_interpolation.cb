@@ -1,0 +1,7 @@
+extern int main()
+{
+    expect_error("embed paths cannot contain string interpolation") {
+        string value = embed("payload{x}.txt");
+    }
+    return 0;
+}

@@ -76,28 +76,6 @@ std::string MainListener::BorrowedParameterCallName(
 
 // The CFlat spelling of a machine type, for an operand that reaches operator lookup as a bare
 // llvm::Value (a literal or a temporary). Empty when the type is not a plain scalar.
-// Expression text that is one string literal, through transparent parentheses: `"A"`, `("A")`.
-static bool IsStringLiteralText(std::string_view text)
-{
-        while (text.size() >= 2 && text.front() == '(' && text.back() == ')')
-        {
-            int depth = 0;
-            bool inString = false;
-            bool wraps = true;
-            for (size_t i = 0; i + 1 < text.size(); ++i)
-            {
-                const char c = text[i];
-                if (inString) { if (c == '\\') ++i; else if (c == '"') inString = false; continue; }
-                if (c == '"') inString = true;
-                else if (c == '(') ++depth;
-                else if (c == ')' && --depth == 0) { wraps = false; break; }
-            }
-            if (!wraps) break;
-            text = text.substr(1, text.size() - 2);
-        }
-        return text.size() >= 2 && text.front() == '"' && text.back() == '"';
-}
-
 // A CFlat arithmetic type name (signed and unsigned spelled apart; the name, not the width, says which).
 
 
@@ -554,8 +532,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                                                         // the use unchanged. Any operator/value context
                                                         // takes the fallback below with ResultUse::Value.
                                                         auto passthrough = ParseCastExpression(muls[0], false, use);
-                                                        const std::string text = ctx->getText();
-                                                        passthrough.IsStringLiteral = IsStringLiteralText(text);
+                                                        auto stringLiteral = StringLiteralExpressionValue(ctx);
+                                                        passthrough.IsStringLiteral = stringLiteral.has_value()
+                                                            && stringLiteral->IsNarrow;
                                                         passthrough.CxxParamLastUse = IsLastUseOfForeignCxxParam(
                                                             compilerLLVM, ctx, passthrough);
                                                         return FinishAssignmentExpressionNamed(passthrough, savedOwned);
@@ -653,6 +632,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 result.BorrowsOwnedElement = tv.borrowsOwnedElement;
                 result.BorrowedElementExternallyOwned = tv.borrowedElementExternallyOwned;
                 result.OwnedElementContainer = tv.ownedElementContainer;
+                result.StackCharBufferBorrow = tv.stackCharBufferBorrow;
+                result.StackCharBufferSource = tv.stackCharBufferSource;
+                result.StackCharBufferScopeDepth = tv.stackCharBufferScopeDepth;
                 result.IsRvalue = tv.isRvalue;
                 result.IsCxxPrvalueConditional = tv.isCxxPrvalueConditional;
                 result.IsPointerArithmeticResult = tv.isPointerArithmeticResult;
@@ -854,7 +836,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                     result.TypeAndValue.TypeName = LLVMTypeToTypeName(result.Primary->getType());
             }
             const std::string text = ctx->getText();
-            result.IsStringLiteral = IsStringLiteralText(text);
+            auto stringLiteral = StringLiteralExpressionValue(ctx);
+            result.IsStringLiteral = stringLiteral.has_value() && stringLiteral->IsNarrow;
             if (text == "nullptr" && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(result.Primary))
                 result.TypeAndValue.IsCxxNullptrT = true;
             result.TernaryTempAlreadyRegistered = inCallArgument_
@@ -3861,10 +3844,9 @@ bool MainListener::RefuseImmovableAssignSource(LLVMBackend* compiler, antlr4::Pa
 static bool OwnedOrNullArms(antlr4::tree::ParseTree* node, bool& sawNew)
 {
     if (node == nullptr) return false;
-    // The lexer emits `nullptr` as a Constant token (same as PostfixExpression's constant check).
+    // Match the dedicated null token so an owning `new`/nullptr join remains an owning RHS.
     if (auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(node))
-        return term->getSymbol()->getType() == CFlatParser::Constant
-            && term->getText() == "nullptr";
+        return term->getSymbol()->getType() == CFlatParser::NullPtrConstant;
     if (dynamic_cast<CFlatParser::NewExpressionContext*>(node) != nullptr)
     {
         sawNew = true;
@@ -6164,7 +6146,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // just the base variable, and the suggested remedy would name the wrong thing.
                 std::string lhsName = unaryCtx != nullptr && !unaryCtx->getText().empty()
                     ? unaryCtx->getText() : namedVar.CallerName;
-                if (!rhsText.empty() && rhsText.front() == '"')
+                if (auto stringLiteral = StringLiteralExpressionValue(assignCtx);
+                    stringLiteral.has_value() && stringLiteral->IsNarrow)
                     LogErrorContext(unaryCtx, std::format(
                         "cannot assign a string literal to fixed array '{}' - CFlat has no "
                         "C-style character-array assignment. Use 'char* p = ...' to point at the "
@@ -6524,6 +6507,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             if (operatorText == "=")
                 ArmArrayNewDesugar(assignCtx, namedVar.TypeAndValue);
 
+            if (operatorText == "=" && !namedVar.TypeAndValue.Pointer
+                && compiler->ResolveTypeAlias(namedVar.TypeAndValue.TypeName) == "string"
+                && IsNullptrLiteralExpressionTree(assignCtx))
+            {
+                const std::string targetName = !namedVar.FieldName.empty()
+                    ? namedVar.FieldName
+                    : !namedVar.CallerName.empty() ? namedVar.CallerName
+                    : namedVar.TypeAndValue.VariableName;
+                LogErrorContext(assignCtx, std::format(
+                    "cannot initialize string '{}' from nullptr", targetName));
+            }
+
             auto rightNV = [&] {
                 CxxCallArgumentScope cxxAssignRhsScope(inCxxCallArgument_,
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
@@ -6691,8 +6686,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             if (operatorText == "=")
             {
                 // Ruling 2026-10-31: explicit `move` of a PROVEN borrowed pointer into any slot.
-                if (rightNV.IsExplicitMove && namedVar.TypeAndValue.Pointer
-                    && !namedVar.TypeAndValue.IsArrayView && compiler->MoveSourceIsAddressBorrow(rightNV))
+                const bool uniqueValueDestination = !namedVar.TypeAndValue.Pointer
+                    && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName);
+                if (rightNV.IsExplicitMove
+                    && (namedVar.TypeAndValue.Pointer || uniqueValueDestination)
+                    && !namedVar.TypeAndValue.IsArrayView
+                    && compiler->MoveSourceIsAddressBorrow(rightNV))
                 {
                     compiler->LogBorrowedMoveSlotError();
                     return finishStore(nullptr);
@@ -6709,15 +6708,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         !namedVar.FieldName.empty() ? namedVar.FieldName
                             : !namedVar.TypeAndValue.VariableName.empty()
                                 ? namedVar.TypeAndValue.VariableName : namedVar.CallerName);
-                const bool sameScopeStringLocal = NamedVarIsString(namedVar)
+                const bool stackBorrowValueSlot = NamedVarIsString(namedVar)
+                    || NamedVarIsStringView(namedVar);
+                const bool sameScopeStackBorrowLocal = stackBorrowValueSlot
                     && namedVar.FieldName.empty() && !isDerefStorage()
                     && !namedVar.CallerName.empty()
                     && llvm::isa<llvm::AllocaInst>(destination)
                     && !StackCharBufferOutlives(rightNV, namedVar);
-                if (NamedVarIsString(namedVar) && !sameScopeStringLocal
+                if (stackBorrowValueSlot && !sameScopeStackBorrowLocal
                     && RejectStackCharBufferEscape(rightNV, ctx))
                     return finishStore(nullptr);
-                if (sameScopeStringLocal)
+                if (sameScopeStackBorrowLocal)
                     compiler->SetStackCharBufferBorrow(
                         namedVar.CallerName,
                         rightNV.StackCharBufferBorrow,
@@ -10579,6 +10580,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && rightNV.TypeAndValue.ConstArraySize > 0
                     && !rightNV.TypeAndValue.IsArrayView)
                     compiler->SetVariableOwning(namedVar.CallerName, false);
+            }
+
+            if (operatorText == "=" && namedVar.TypeAndValue.IsArrayView
+                && llvm::isa_and_nonnull<llvm::GlobalVariable>(namedVar.Storage))
+            {
+                llvm::Value* globalViewCount = nullptr;
+                if (rightNV.TypeAndValue.ConstArraySize > 0 && !rightNV.TypeAndValue.IsArrayView)
+                    globalViewCount = compiler->builder->getInt64(
+                        rightNV.TypeAndValue.ConstArraySize);
+                else
+                    globalViewCount = compiler->LoadRawArrayLength(rightNV);
+                compiler->StoreRawArrayLength(namedVar, globalViewCount);
             }
 
             /*

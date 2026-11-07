@@ -1,0 +1,28 @@
+import "string.cb";
+
+expect_error("string(...) accepts one cast-compatible argument") {
+    void f() { string value = string(); }
+}
+
+expect_error("string(...) accepts one cast-compatible argument") {
+    void f() { char[2] bytes = {'a', 0}; string value = string(&bytes[0], 1, 2); }
+}
+
+expect_error("string(expr) requires an argument accepted by '(string)expr'") {
+    void f() { int* pointer = nullptr; string value = string(pointer); }
+}
+
+expect_error("string(ptr, len) requires an integer length") {
+    void f() { char* pointer = nullptr; string value = string(pointer, "1"); }
+}
+
+// A diagnostic raised while the string(ptr, len) fragment is lowered is reported at the argument.
+int takeMovedString(move string s) { return s.length(); }
+expect_error("use of moved variable 'p'") {
+    int movedStringFragment() {
+        char[3] bytes = {'a', 'b', 0};
+        char* p = &bytes[0];
+        int taken = takeMovedString((string)p);
+        return taken + string(p, 2).length();
+    }
+}

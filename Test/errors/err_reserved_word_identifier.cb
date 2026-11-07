@@ -21,3 +21,7 @@ void reservedParam(int if) { return; }
 expect_error("'where' is a reserved keyword and cannot be used as a name here") {
     int reservedWhere() { char[64] where = default; return 0; }
 }
+// A missing ';' before a `string` declaration is a plain parse error, not an expression misuse.
+expect_error("expected ';' at 'string'");
+void missingSemiBeforeString() { int x = 1
+    string s = "a"; }

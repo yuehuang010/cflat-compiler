@@ -9236,6 +9236,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (!isCoreUniqueConstructor && !isCoreUniqueReset)
             {
                 const auto& sinkParam = candidate.Parameters[i];
+                if (!candidate.IsCxx && !sinkParam.Pointer
+                    && ResolveTypeAlias(sinkParam.TypeName) == "string"
+                    && IsNullptrLiteralExpressionTree(matched[i].SourceExpressionContext))
+                {
+                    if (matched[i].SourceExpressionContext != nullptr
+                        && matched[i].SourceExpressionContext->getStart() != nullptr)
+                        SetSourceLocation(
+                            matched[i].SourceExpressionContext->getStart()->getLine(),
+                            matched[i].SourceExpressionContext->getStart()->getCharPositionInLine());
+                    const std::string targetName = sinkParam.VariableName.empty()
+                        ? "parameter" : sinkParam.VariableName;
+                    LogError(std::format("cannot initialize string '{}' from nullptr", targetName));
+                }
                 bool foreignCxxPointerSink = candidate.IsCxx && matched[i].IsExplicitMove
                     && sinkParam.Pointer
                     && !sinkParam.IsAlias && !sinkParam.IsRvalueRef

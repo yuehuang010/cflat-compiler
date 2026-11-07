@@ -228,6 +228,9 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_raw_string_base.hpp";
+import cpp "library/cpp_bracefold_base.hpp";
+import "application.cb";
 import cpp "library/cpp_defarg_trace.hpp";
 import cpp "library/cpp_cdefarg.hpp";
 import cpp "library/cpp_mixs2.hpp";
@@ -369,6 +372,8 @@ int t64Forward<T>(T value) { return t64TakeInt(value); }
 i64 t64ForwardI64<T>(T value) { return t64TakeI64(value); }
 int t64PrintU8<T>(T value) { return printf("%u", value); }
 int t64PrintU16<T>(T value) { return printf("%u", value); }
+u32 floatFoldInteropBits(float value) { return *(u32*)&value; }
+u64 doubleFoldInteropBits(double value) { return *(u64*)&value; }
 t300.DoubleCtor t300MakeDouble(double value) { return value; }
 t300.DoubleCtor t300MakeDoubleCtor(double value) { return value; }
 extern int abs(int value);
@@ -1324,6 +1329,91 @@ int t320Del = 0;
     static void operator delete(void* p) { t320Del = t320Del + 1; free(p); }
     T320E(int x) { z = t261.bval(x); }
 };
+// A raw CFlat literal is converted to an ordinary C++ string spelling in a generated base init.
+[cpp] struct RawstrDerived : rawstr.Base
+{
+    RawstrDerived() : rawstr.Base(r#"raw "quoted" \tail"#) {}
+};
+int rawstrBaseCtorProbe()
+{
+    RawstrDerived value = default;
+    return value.selected() == 1 && value.matches() ? 1 : 0;
+}
+[cpp] struct RawstrParenRaw : rawstr.Base
+{
+    RawstrParenRaw() : rawstr.Base((r#"raw "quoted" \tail"#)) {}
+};
+[cpp] struct RawstrParenOrdinary : rawstr.Base
+{
+    RawstrParenOrdinary() : rawstr.Base(("raw \"quoted\" \\tail")) {}
+};
+[cpp] struct RawstrAdjacentOrdinary : rawstr.Base
+{
+    RawstrAdjacentOrdinary() : rawstr.Base(("raw " "\"quoted\"" " \\tail")) {}
+};
+int rawstrParenthesizedBaseCtorProbe()
+{
+    RawstrParenRaw raw = default;
+    RawstrParenOrdinary ordinary = default;
+    RawstrAdjacentOrdinary adjacent = default;
+    return raw.selected() == 1 && raw.matches()
+        && ordinary.selected() == 1 && ordinary.matches()
+        && adjacent.selected() == 1 && adjacent.matches() ? 1 : 0;
+}
+[cpp] struct BracefoldBaseSingle : bracefold.Base
+{
+    BracefoldBaseSingle() : bracefold.Base("a{{b}}") {}
+};
+[cpp] struct BracefoldBaseMixed : bracefold.Base
+{
+    BracefoldBaseMixed() : bracefold.Base(("a{{" r"x}}")) {}
+};
+[cpp] struct BracefoldBaseParen : bracefold.Base
+{
+    BracefoldBaseParen() : bracefold.Base(("p{{x}}")) {}
+};
+// A Verbatim JSON-like region must keep its exact runtime text through base-init folding.
+[cpp] struct BracefoldBaseVerbatim : bracefold.Base
+{
+    BracefoldBaseVerbatim() : bracefold.Base("{\"k\":1}") {}
+};
+[cpp] struct BracefoldBaseVerbatimMix : bracefold.Base
+{
+    BracefoldBaseVerbatimMix() : bracefold.Base("{\"a{{b}}\"}") {}
+};
+[cpp] struct BracefoldBaseVerbatimPlainBrace : bracefold.Base
+{
+    BracefoldBaseVerbatimPlainBrace() : bracefold.Base("{\"a\"} {}}") {}
+};
+application AppInfo bracefoldVerbatimApp = {
+    name = "{\"x\":1}", identifier = "com.cflat.interop.bracefold"
+};
+int bracefoldCppBaseCtorProbe()
+{
+    BracefoldBaseSingle single = default;
+    BracefoldBaseMixed mixed = default;
+    BracefoldBaseParen paren = default;
+    BracefoldBaseVerbatim verbatim = default;
+    BracefoldBaseVerbatimMix verbatimMix = default;
+    string verbatimExpected = "{\"k\":1}";
+    string verbatimMixExpected = "{\"a{{b}}\"}";
+    return single.selected() == 1 && single.matches("a{{b}}")
+        && mixed.selected() == 1 && mixed.matches("a{{" r"x}}")
+        && paren.selected() == 1 && paren.matches(("p{{x}}"))
+        && verbatim.selected() == 1 && verbatim.matches(verbatimExpected.data())
+        && verbatimMix.selected() == 1 && verbatimMix.matches(verbatimMixExpected.data()) ? 1 : 0;
+}
+int bracefoldBaseVerbatimPlainBraceProbe()
+{
+    BracefoldBaseVerbatimPlainBrace value = default;
+    string expected = "{\"a\"} {}}";
+    return value.selected() == 1 && value.matches(expected.data()) ? 1 : 0;
+}
+int bracefoldApplicationNameProbe()
+{
+    string runtimeName = "{\"x\":1}";
+    return Application.name() == runtimeName ? 1 : 0;
+}
 int T320Throw(int x) { T320D* p = new T320D(x); delete p; return 0; }
 int T320EThrow(int x) { T320E* p = new T320E(x); delete p; return 0; }
 // T320 r2: unique<D> drops free through the pair the class declares: its own delete, or the base's.
@@ -4045,8 +4135,18 @@ int tmcFieldArm(bool f)
     return t.item != nullptr ? t.item->id : -1;
 }
 
+int T235TupleDtorCount = 0;
 extern int main()
 {
+    if (floatFoldInteropBits(ff_cppdefaults.round_float()) != 0x5d800001) return 97001;
+    if (floatFoldInteropBits(ff_cppdefaults.negative_float()) != 0xdd800001) return 97002;
+    if (floatFoldInteropBits(ff_cppdefaults.unsigned_float()) != 0x5f000001) return 97003;
+    if (doubleFoldInteropBits(ff_cppdefaults.round_double()) != 0x43b0000010000000) return 97004;
+    if (rawstrBaseCtorProbe() != 1) return 54020;
+    if (rawstrParenthesizedBaseCtorProbe() != 1) return 54021;
+    if (bracefoldCppBaseCtorProbe() != 1) return 54022;
+    if (bracefoldApplicationNameProbe() != 1) return 54023;
+    if (bracefoldBaseVerbatimPlainBraceProbe() != 1) return 54024;
     selfRetCppImportDtorCount = 0;
     {
         unique SelfRetCppImportProbe* b = nullptr;
@@ -17308,6 +17408,29 @@ extern int main()
         int g = cppbv.readc(move m1 + cppbv.make(8));
         if (g != 13 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 1
             || cppbv.Cnt.dtors != 3) return 3695;
+        // TUPSAFE r5: a transferred tuple slot is destroyed when a later C++ element throws.
+        T235TupleDtorCount = 0;
+        int tupleCallThrow = cppbv.guardInt(T235TupleThrowCall, 5);
+        if (tupleCallThrow != -5 || T235TupleDtorCount != 1) return 53981;
+        T235TupleDtorCount = 0;
+        int tupleAssignThrow = cppbv.guardInt(T235TupleThrowAssign, 5);
+        if (tupleAssignThrow != -5 || T235TupleDtorCount != 1) return 53982;
+        T235TupleDtorCount = 0;
+        int tupleMoveThrow = cppbv.guardInt(T235TupleThrowMove, 5);
+        if (tupleMoveThrow != -5 || T235TupleDtorCount != 1) return 53983;
+        T235TupleDtorCount = 0;
+        int nestedOuterThrow = cppbv.guardInt(T235NestedTupleThrowOuter, 5);
+        if (nestedOuterThrow != -5 || T235TupleDtorCount != 1) return 53984;
+        T235TupleDtorCount = 0;
+        int nestedInnerThrow = cppbv.guardInt(T235NestedTupleThrowInner, 5);
+        if (nestedInnerThrow != -5 || T235TupleDtorCount != 1) return 53985;
+        // TUPSAFE r7: rvalue slot and ternary arm throw shapes (dtor counts: 1 and 2).
+        T235TupleDtorCount = 0;
+        int nestedRvalueThrow = cppbv.guardInt(T235NestedRvalueThrow, 5);
+        if (nestedRvalueThrow != -5 || T235TupleDtorCount != 1) return 53986;
+        T235TupleDtorCount = 0;
+        int nestedTernaryThrow = cppbv.guardInt(T235NestedTernaryThrow, 5);
+        if (nestedTernaryThrow != -5 || T235TupleDtorCount != 2) return 53987;
         // T235 review: a mixed set (by value + const&) binds a prvalue operand without a move.
         cppbv.Cnt.reset();
         int h = cppbv.readc(cppbv.make(6) / 1.5) + cppbv.readc(1.5 / cppbv.make(6));
@@ -23584,6 +23707,50 @@ int t231_cfl_takes(cppbv.Cnt x) { return x.v; }
 // T235: a prvalue first and a throwing callee / throwing later argument (legs 3691-3692).
 int T235Throw(int x) { return cppbv.pairThrow(cppbv.make(x), cppbv.Cnt(x * 100)); }
 int T235Later(int x) { return cppbv.pair(cppbv.make(x), cppbv.Cnt(cppbv.boomArg(x))); }
+struct T235TupleRes { int v = 0; ~T235TupleRes() { T235TupleDtorCount = T235TupleDtorCount + 1; } };
+int T235TupleSink((unique<T235TupleRes>, int) value) { return value.item_1; }
+int T235TupleThrowCall(int x)
+{
+    { unique<T235TupleRes> owner = new T235TupleRes(); T235TupleSink((owner, cppbv.boomArg(x))); }
+    return 0;
+}
+int T235TupleThrowAssign(int x)
+{
+    { unique<T235TupleRes> owner = new T235TupleRes(); (unique<T235TupleRes>, int) t = default; t = (owner, cppbv.boomArg(x)); }
+    return 0;
+}
+int T235TupleThrowMove(int x)
+{
+    { unique<T235TupleRes> owner = new T235TupleRes(); T235TupleSink((move owner, cppbv.boomArg(x))); }
+    return 0;
+}
+int T235NestedTupleSink(((unique<T235TupleRes>, int), int) value)
+{
+    return value.item_0.item_1 + value.item_1;
+}
+int T235NestedTupleThrowOuter(int x)
+{
+    { unique<T235TupleRes> owner = new T235TupleRes(); T235NestedTupleSink(((owner, 3), cppbv.boomArg(x))); }
+    return 0;
+}
+int T235NestedTupleThrowInner(int x)
+{
+    { unique<T235TupleRes> owner = new T235TupleRes(); T235NestedTupleSink(((owner, cppbv.boomArg(x)), 3)); }
+    return 0;
+}
+unique<T235TupleRes> T235MkOwner() { return new T235TupleRes(); }
+int T235NestedRvalueThrow(int x)
+{
+    // TUPSAFE r7: a call result in a nested slot is destroyed when a later element throws.
+    T235NestedTupleSink(((T235MkOwner(), 3), cppbv.boomArg(x)));
+    return 0;
+}
+int T235NestedTernaryThrow(int x)
+{
+    // TUPSAFE r7: the moved ternary arm and the borrowed scope owner are each destroyed once.
+    { unique<T235TupleRes> a = new T235TupleRes(); unique<T235TupleRes> b = new T235TupleRes(); bool pick = x > 0; T235NestedTupleSink(((pick ? a : b, 3), cppbv.boomArg(x))); }
+    return 0;
+}
 int ObPtrParam(cppas.ObSelf* p) { if (*p) return 1; return 2; }
 int* EscTernFieldAddr(int x) { return x > 0 ? &(new cppon.Esc(x))->v : nullptr; }
 int* EscLaunderedFieldAddr(int x) { return (int*)(long)&(new cppon.Esc(x))->v; }

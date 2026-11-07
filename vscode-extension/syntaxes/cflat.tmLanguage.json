@@ -83,6 +83,23 @@
     "strings": {
       "patterns": [
         {
+          "name": "string.quoted.double.raw.cflat",
+          "begin": "\\br\"",
+          "end": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.cflat" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.cflat" } }
+        },
+        {
+          "name": "string.quoted.double.raw.cflat",
+          "begin": "\\br(#+)\"",
+          "end": "\"\\1",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.cflat" },
+            "1": { "name": "punctuation.definition.string.raw-hashes.cflat" }
+          },
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.cflat" } }
+        },
+        {
           "name": "string.quoted.double.cflat",
           "begin": "\"",
           "end": "\"",

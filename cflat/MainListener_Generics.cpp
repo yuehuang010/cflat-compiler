@@ -111,18 +111,16 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
         auto savedValueSubst = activeValueSubstitutions;
         auto savedPackSubst = activePackSubstitutions;
         GenericValueMacroScope valueMacros(compilerLLVM);
-        // Same shadow rule as the struct/function paths: a name this interface binds must not
-        // keep an enclosing instantiation's binding of the OTHER kind.
+        valueMacros.Park(savedValueSubst);
+        activeTypeSubstitutions = TypeSubstitutionMap{};
+        activeValueSubstitutions.clear();
+        activePackSubstitutions.clear();
         for (const auto& [k, v] : substitutions)
         {
-            activePackSubstitutions.erase(k);
-            activeValueSubstitutions.erase(k);
             activeTypeSubstitutions.Bind(k, v);
         }
         for (const auto& [k, v] : packSubstitutions)
         {
-            activeTypeSubstitutions.erase(k);
-            activeValueSubstitutions.erase(k);
             activePackSubstitutions[k] = v;
         }
         for (const auto& [k, v] : valueSubstitutions)
@@ -264,6 +262,71 @@ std::string MainListener::GenericMemberTemplateOwner(
         return Compiler()->IsDataStructure(owner) ? owner : std::string{};
     }
 
+void MainListener::BindGenericOwnerSubstitutions(
+        const std::string& owner, GenericValueMacroScope& valueMacros) {
+        std::unordered_set<std::string> visited;
+        std::vector<std::pair<std::string, std::vector<std::string>>> ownerBindings;
+        for (std::string current = owner; !current.empty() && visited.insert(current).second; )
+        {
+            std::string ownerBase;
+            std::vector<std::string> ownerArgs;
+            auto instance = compilerLLVM->gts.genericAggregateInstances.find(current);
+            if (instance != compilerLLVM->gts.genericAggregateInstances.end())
+            {
+                ownerBase = instance->second.templateName;
+                ownerArgs = instance->second.typeArgs;
+            }
+            else
+            {
+                ownerBase = MangledBase(current);
+                auto ownerParams = genericStructTypeParams.find(ownerBase);
+                if (ownerParams != genericStructTypeParams.end())
+                {
+                    ownerArgs.reserve(ownerParams->second.size());
+                    for (size_t i = 0; i < ownerParams->second.size(); ++i)
+                        ownerArgs.push_back(MangledGenericArgument(*compilerLLVM, current, i));
+                }
+            }
+
+            if (!ownerBase.empty()
+                && std::none_of(ownerArgs.begin(), ownerArgs.end(),
+                    [](const std::string& arg) { return arg.empty(); })
+                && MangleGenericInstance(*compilerLLVM, ownerBase, ownerArgs) == current)
+                ownerBindings.emplace_back(ownerBase, std::move(ownerArgs));
+
+            auto parent = aggregateParentScopes_.find(current);
+            if (parent == aggregateParentScopes_.end() || parent->second == current) break;
+            current = parent->second;
+        }
+        for (auto binding = ownerBindings.rbegin(); binding != ownerBindings.rend(); ++binding)
+        {
+            auto ownerParams = genericStructTypeParams.find(binding->first);
+            if (ownerParams == genericStructTypeParams.end()) continue;
+            const auto& ownerValueParams = genericStructValueParams[binding->first];
+            auto ownerPackIt = genericStructPackIndex.find(binding->first);
+            size_t ownerPackIdx = ownerPackIt != genericStructPackIndex.end()
+                ? ownerPackIt->second : std::string::npos;
+            for (size_t i = 0; i < ownerParams->second.size() && i < binding->second.size(); ++i)
+            {
+                const std::string& param = ownerParams->second[i];
+                if (i == ownerPackIdx)
+                {
+                    activePackSubstitutions[param] = std::vector<std::string>(
+                        binding->second.begin() + i, binding->second.end());
+                    if (!activePackSubstitutions[param].empty())
+                        activeTypeSubstitutions.Bind(param, activePackSubstitutions[param].front());
+                    break;
+                }
+                if (i < ownerValueParams.size() && !ownerValueParams[i].empty())
+                {
+                    activeValueSubstitutions[param] = binding->second[i];
+                    valueMacros.Bind(param, ParseValueArg(binding->second[i]));
+                }
+                else activeTypeSubstitutions.Bind(param, binding->second[i]);
+            }
+        }
+    }
+
 std::string MainListener::GenericMethodOwner(
         const std::string& baseName, CFlatParser::FunctionDefinitionContext* tmplCtx) {
         if (tmplCtx == nullptr || isFunctionStatic(tmplCtx)) return {};
@@ -374,49 +437,12 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         auto savedValueSubst = activeValueSubstitutions;
         auto savedPackSubst = activePackSubstitutions;
         GenericValueMacroScope valueMacros(compilerLLVM);
+        valueMacros.Park(savedValueSubst);
+        activeTypeSubstitutions = TypeSubstitutionMap{};
+        activeValueSubstitutions.clear();
+        activePackSubstitutions.clear();
         const std::string genericMemberOwner = GenericMemberTemplateOwner(baseName, tmplCtx);
-        for (std::string owner = genericMemberOwner; !owner.empty(); )
-        {
-            auto instance = compilerLLVM->gts.genericAggregateInstances.find(owner);
-            if (instance != compilerLLVM->gts.genericAggregateInstances.end())
-            {
-                auto ownerParams = genericStructTypeParams.find(instance->second.templateName);
-                if (ownerParams != genericStructTypeParams.end())
-                {
-                    const auto& ownerValueParams =
-                        genericStructValueParams[instance->second.templateName];
-                    for (size_t i = 0; i < ownerParams->second.size(); ++i)
-                        if (i < instance->second.typeArgs.size()
-                            && (i >= ownerValueParams.size() || ownerValueParams[i].empty()))
-                            activeTypeSubstitutions.Bind(
-                                ownerParams->second[i], instance->second.typeArgs[i]);
-                }
-            }
-            else
-            {
-                const std::string ownerBase(MangledBase(owner));
-                auto ownerParams = genericStructTypeParams.find(ownerBase);
-                if (ownerParams != genericStructTypeParams.end())
-                {
-                    std::vector<std::string> ownerArgs;
-                    ownerArgs.reserve(ownerParams->second.size());
-                    for (size_t i = 0; i < ownerParams->second.size(); ++i)
-                        ownerArgs.push_back(MangledGenericArgument(*compilerLLVM, owner, i));
-                    if (std::none_of(ownerArgs.begin(), ownerArgs.end(),
-                            [](const std::string& arg) { return arg.empty(); })
-                        && MangleGenericInstance(*compilerLLVM, ownerBase, ownerArgs) == owner)
-                    {
-                        const auto& ownerValueParams = genericStructValueParams[ownerBase];
-                        for (size_t i = 0; i < ownerParams->second.size(); ++i)
-                            if (i >= ownerValueParams.size() || ownerValueParams[i].empty())
-                                activeTypeSubstitutions.Bind(ownerParams->second[i], ownerArgs[i]);
-                    }
-                }
-            }
-            auto parent = aggregateParentScopes_.find(owner);
-            if (parent == aggregateParentScopes_.end() || parent->second == owner) break;
-            owner = parent->second;
-        }
+        BindGenericOwnerSubstitutions(genericMemberOwner, valueMacros);
         const auto& valueParams = genericFunctionValueParams[baseName];
         if (!ValidateGenericArgumentKinds(baseName, typeParams, valueParams, typeArgs))
         {
@@ -427,6 +453,7 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             return {};
         }
         // Same shadow rule as the struct drain: this instantiation OWNS its parameter names.
+        for (const auto& tp : typeParams) valueMacros.Park(tp);
         for (const auto& tp : typeParams)
         {
             activeTypeSubstitutions.erase(tp);
@@ -782,6 +809,8 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
         {
             if (primary->Constant() != nullptr)
                 return LLVMBackend::LiteralIdentityForOverload(primary->Constant()->getText());
+            if (primary->NullPtrConstant() != nullptr)
+                return LLVMBackend::LiteralIdentityForOverload("nullptr");
             if (node->children.size() == 3)
             {
                 auto* left = dynamic_cast<antlr4::tree::TerminalNode*>(node->children[0]);
@@ -1332,7 +1361,7 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             int retConst = 0;
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
-                fpSpec->multiWordTypeSuffix(), aliasReturn);
+                fpSpec->multiWordTypeSuffix(), aliasReturn, &tv.FuncPtrReturnAliasSpelling);
             tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
             tv.FuncPtrReturnOwned = returnQualifierText == "move";
@@ -1808,13 +1837,19 @@ void MainListener::ProcessPendingInstantiations() {
             auto savedValueSubst = activeValueSubstitutions;
             auto savedPackSubst = activePackSubstitutions;
             GenericValueMacroScope valueMacros(compilerLLVM);
+            valueMacros.Park(savedValueSubst);
+            activeTypeSubstitutions = TypeSubstitutionMap{};
+            activeValueSubstitutions.clear();
+            activePackSubstitutions.clear();
+            const size_t ownerDot = pending.mangledName.rfind('.');
+            if (ownerDot != std::string::npos)
+                BindGenericOwnerSubstitutions(pending.mangledName.substr(0, ownerDot), valueMacros);
 
             auto packMapIt = genericStructPackIndex.find(pending.templateName);
             size_t packIdx = (packMapIt != genericStructPackIndex.end()) ? packMapIt->second : std::string::npos;
 
-            // A record drained while ANOTHER instantiation is mid-flight (tuple<T...> imports
-            // tuple.cb and re-enters here) must not inherit that one's binding for a parameter
-            // name it declares itself: a stale pack "T" expands this template's "T v" field.
+            // Keep the owner chain, then install this record's parameters over it.
+            for (const auto& tp : typeParams) valueMacros.Park(tp);
             for (const auto& tp : typeParams)
             {
                 activeTypeSubstitutions.erase(tp);

@@ -3175,6 +3175,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
             rawField.access = field.access;
             rawField.isBitfield = field.isBitfield;
             rawField.isPromoted = field.isPromoted;
+            rawField.isAnonymousMember = field.isAnonymousMember;
             rawField.isZeroSize = field.isZeroSize;
             rawField.isConst = field.isConst;
             rawField.isMutable = field.isMutable;

@@ -72,16 +72,50 @@ bool MainListener::RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpre
 static void CarryNestedTernaryBorrow(LLVMBackend* compiler, LLVMBackend::TypedValue& tv)
 {
     const auto& nested = compiler->lastTernaryJoinShape;
-    if (tv.value == nullptr || tv.value != nested.value || !nested.borrowsOwnedElement) return;
-    tv.borrowsOwnedElement = true;
-    tv.borrowedElementExternallyOwned = nested.borrowedElementExternallyOwned;
-    tv.ownedElementContainer = nested.ownedElementContainer;
+    if (tv.value == nullptr || tv.value != nested.value) return;
+    if (nested.stackCharBufferBorrow)
+    {
+        tv.stackCharBufferBorrow = true;
+        tv.stackCharBufferSource = nested.stackCharBufferSource;
+        tv.stackCharBufferScopeDepth = nested.stackCharBufferScopeDepth;
+    }
+    if (nested.borrowsOwnedElement)
+    {
+        tv.borrowsOwnedElement = true;
+        tv.borrowedElementExternallyOwned = nested.borrowedElementExternallyOwned;
+        tv.ownedElementContainer = nested.ownedElementContainer;
+    }
+}
+
+static void JoinConditionalStackCharBufferBorrow(LLVMBackend::TypedValue& result,
+        const LLVMBackend::TypedValue& trueArm,
+        const LLVMBackend::TypedValue& falseArm)
+{
+    if (result.value == nullptr) return;
+    auto* stringViewType = llvm::StructType::getTypeByName(
+        result.value->getType()->getContext(), "string_view");
+    auto* stringType = llvm::StructType::getTypeByName(
+        result.value->getType()->getContext(), "string");
+    if (result.value->getType() != stringViewType && result.value->getType() != stringType)
+        return;
+    if (!trueArm.stackCharBufferBorrow && !falseArm.stackCharBufferBorrow) return;
+
+    const LLVMBackend::TypedValue* source = trueArm.stackCharBufferBorrow ? &trueArm : &falseArm;
+    if (falseArm.stackCharBufferBorrow
+        && (!trueArm.stackCharBufferBorrow
+            || falseArm.stackCharBufferScopeDepth > trueArm.stackCharBufferScopeDepth))
+        source = &falseArm;
+    result.stackCharBufferBorrow = true;
+    result.stackCharBufferSource = source->stackCharBufferSource;
+    result.stackCharBufferScopeDepth = std::max(
+        trueArm.stackCharBufferBorrow ? trueArm.stackCharBufferScopeDepth : 0,
+        falseArm.stackCharBufferBorrow ? falseArm.stackCharBufferScopeDepth : 0);
 }
 
 // A ternary arm parsed for its VALUE. Same lowering as ParseExpression (which forwards a
 // non-assignment expression straight to ParseConditionalExpression), but it keeps the arm's
 // signedness so the join can zero-extend an unsigned arm instead of sign-extending it.
-LLVMBackend::TypedValue MainListener::ParseTernaryArmExpression(
+LLVM_ATTRIBUTE_NOINLINE LLVMBackend::TypedValue MainListener::ParseTernaryArmExpression(
         CFlatParser::ExpressionContext* ctx) {
         auto* assignCtx = ctx->assignmentExpression();
         auto* bareIdentifier = BareIdentifierInExpression(ctx);
@@ -100,8 +134,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryArmExpression(
             auto named = ParseAssignmentExpressionNamed(assignCtx);
             return TypedValueOfNamedOperand(named, ctx);
         }
-        LLVMBackend::TypedValue tv;
-        tv.value = ParseExpression(ctx);
+        auto named = ParseAssignmentExpressionNamed(assignCtx);
+        auto tv = TypedValueOfNamedOperand(named, ctx);
+        ProcessPlusPlus();
+        auto* value = tv.value;
+        EnsureOperatorBoolForValue(value);
+        tv.value = value;
         tv.isAlias = tv.value != nullptr && Compiler(ctx)->IsAliasValue(tv.value);
         CarryNestedTernaryBorrow(Compiler(ctx), tv);
         return tv;
@@ -545,7 +583,8 @@ bool MainListener::IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool c
         if (postfix == nullptr || postfix->children.size() != 1) return false;
         auto* primary = postfix->primaryExpression();
         if (primary == nullptr) return false;
-        if (primary->Constant() != nullptr || !primary->StringLiteral().empty()) return true;
+        if (primary->Constant() != nullptr || primary->NullPtrConstant() != nullptr
+            || !primary->StringLiteral().empty()) return true;
         auto* identifier = BareIdentifierInExpression(ctx);
         if (identifier == nullptr) return false;
         const auto* local = Compiler()->FindLiveNamedVariable(identifier->getText());
@@ -4174,6 +4213,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                                     trueBr != nullptr ? trueShape : falseShape);
             JoinTernaryClassPointee(result, trueBr != nullptr ? trueShape : falseShape,
                                     trueBr != nullptr ? trueShape : falseShape);
+            const auto& onlyShape = trueBr != nullptr ? trueShape : falseShape;
+            JoinConditionalStackCharBufferBorrow(result, onlyShape, onlyShape);
             return result;
         }
 
@@ -5028,6 +5069,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         // A join reading a container-owned element borrows it, whichever arm is the fresh one: the
         // `new` arm does not make the join owning, so the element arm's fact is carried through.
         JoinElementBorrow(compiler, result, trueShape, falseShape);
+        JoinConditionalStackCharBufferBorrow(result, trueShape, falseShape);
         result.isAlias = (trueAlias || falseAlias) && !cxxRefBorrowJoin;
         // A join is an explicit move only when every arm is one: `cond ? move a : b` stays a borrow.
         result.isExplicitMove = trueShape.isExplicitMove && falseShape.isExplicitMove;
@@ -6358,6 +6400,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 result.isAlias = compiler->IsAliasValue(selectValue);
                 JoinTernaryPointerShape(result, trueShape, falseShape);
                 JoinTernaryClassPointee(result, trueShape, falseShape);
+                JoinConditionalStackCharBufferBorrow(result, trueShape, falseShape);
                 carryCommonThinFunctionPointerType(result, trueShape, falseShape,
                                                     trueValue, falseValue);
                 CarryCommonClosureSignature(compiler, result, trueShape, falseShape);

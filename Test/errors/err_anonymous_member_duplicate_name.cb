@@ -1,0 +1,51 @@
+expect_error("duplicate member name 'i'") {
+    struct AnonymousDuplicate { int i = default; union { int i = default; float f = default; }; };
+}
+
+expect_error("initializing multiple members of union") {
+    union TwoInlineMemberDefaults {
+        struct { int a = 1; };
+        struct { float f = 2.0; };
+    };
+}
+
+expect_error("initializing multiple members of union") {
+    union DirectThenInlineDefault {
+        int a = 1;
+        struct { float f = 2.0; };
+    };
+}
+
+expect_error("initializing multiple members of union") {
+    union InlineThenDirectDefault {
+        struct { int a = 1; };
+        float f = 2.0;
+    };
+}
+
+expect_error("initializing multiple members of union") {
+    union NestedInlineDefaults {
+        struct { struct { int a = 1; }; };
+        struct { float f = 2.0; };
+    };
+}
+
+expect_error("anonymous struct in 'S'") {
+    struct S { union { int i; float f; }; struct { int a; } n; };
+    int main() { S s = default; int x = s.n; return x; }
+}
+
+expect_error("unrelated struct type 'UnionRound5D1.In'") {
+    struct UnionRound5D1 { struct In { int a; } inn; };
+    int union_round5_d1() { UnionRound5D1 s = default; int x = s.inn; return x; }
+}
+
+expect_error("unrelated struct type 'anonymous struct in 'UnionRound5D2.In''") {
+    struct UnionRound5D2 { struct In { struct { int a; } n; } inn; };
+    int union_round5_d2() { UnionRound5D2 s = default; int x = s.inn.n; return x; }
+}
+
+expect_error("unrelated struct type 'UnionRound5D3.In'") {
+    struct UnionRound5D3 { struct { struct In { int a; } inn; }; };
+    int union_round5_d3() { UnionRound5D3 s = default; int x = s.inn; return x; }
+}

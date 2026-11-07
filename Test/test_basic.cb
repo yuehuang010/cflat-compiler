@@ -1,4 +1,4 @@
-import "test_helper.cb"; import "list.cb";
+import "test_helper.cb"; import "list.cb"; import "application.cb";
 
 // =============================================================
 // Union types
@@ -51,6 +51,30 @@ bool testBuiltinIdentifiers()
     result &= Test("__LINE__", __LINE__, 51); // Remember to adjust if shifted.
     return result;
 }
+
+struct RawStringConstFold { string value = default; };
+struct RawStringWideBraceFold {
+    string utf16 = default;
+    string utf32 = default;
+    string wide = default;
+};
+struct RawStringEncodingFold {
+    string a = default;
+    string b = default;
+    string c = default;
+    string d = default;
+};
+struct RawstrXmlNode { string xmlns = default; };
+struct RawstrXmlRoot { RawstrXmlNode node = default; };
+const string rawstrCompileTimeVersion = r"0.1\raw";
+const string rawstrParenCompileTimeVersion = ("paren text");
+const string rawstrParenBraceCompileTimeVersion = (r"{x}");
+const string braceFoldCompileTimeVersion = "const{{x}}";
+const string braceFoldMixedCompileTimeVersion = "const{{" r"x}}";
+const string braceFoldParenCompileTimeVersion = ("const{{x}}");
+application AppInfo rawstrLiteralApp = {
+    name = u8"Utf8 " r"App", identifier = "com.cflat.rawstr"
+};
 
 int[4] t6PointerGlobal = { 10, 20, 30, 40 };
 enum T114Bound : int { T114Two = 2 };
@@ -1367,6 +1391,82 @@ struct T151Bool { bool x : 1; };
 struct T151Byte { u8 a : 8; };
 struct T84Bits { u32 a : 12; u32 b : 20; };
 union T84Union { u32 f; double d; };
+u32 floatFoldFBits(float x) { return *(u32*)&x; }
+u64 floatFoldDBits(double x) { return *(u64*)&x; }
+float ffGlobalF_p24 = 16777217;
+double ffGlobalD_p24 = 16777217;
+const float ffConstF_p24 = 16777217;
+const double ffConstD_p24 = 16777217;
+float ffRetF_p24() { return 16777217; }
+double ffRetD_p24() { return 16777217; }
+union FFUnionF_p24 { float f = 16777217; u32 raw; };
+union FFUnionD_p24 { double d = 16777217; u64 raw; };
+float ffGlobalF_p53 = 9007199254740993;
+double ffGlobalD_p53 = 9007199254740993;
+const float ffConstF_p53 = 9007199254740993;
+const double ffConstD_p53 = 9007199254740993;
+float ffRetF_p53() { return 9007199254740993; }
+double ffRetD_p53() { return 9007199254740993; }
+union FFUnionF_p53 { float f = 9007199254740993; u32 raw; };
+union FFUnionD_p53 { double d = 9007199254740993; u64 raw; };
+float ffGlobalF_round = 0x1000001000000001;
+double ffGlobalD_round = 0x1000001000000001;
+const float ffConstF_round = 0x1000001000000001;
+const double ffConstD_round = 0x1000001000000001;
+float ffRetF_round() { return 0x1000001000000001; }
+double ffRetD_round() { return 0x1000001000000001; }
+union FFUnionF_round { float f = 0x1000001000000001; u32 raw; };
+union FFUnionD_round { double d = 0x1000001000000001; u64 raw; };
+float ffGlobalF_neg = -0x1000001000000001;
+double ffGlobalD_neg = -0x1000001000000001;
+const float ffConstF_neg = -0x1000001000000001;
+const double ffConstD_neg = -0x1000001000000001;
+float ffRetF_neg() { return -0x1000001000000001; }
+double ffRetD_neg() { return -0x1000001000000001; }
+union FFUnionF_neg { float f = -0x1000001000000001; u32 raw; };
+union FFUnionD_neg { double d = -0x1000001000000001; u64 raw; };
+float ffGlobalF_umax = 0xFFFFFFFFFFFFFFFF;
+double ffGlobalD_umax = 0xFFFFFFFFFFFFFFFF;
+const float ffConstF_umax = 0xFFFFFFFFFFFFFFFF;
+const double ffConstD_umax = 0xFFFFFFFFFFFFFFFF;
+float ffRetF_umax() { return 0xFFFFFFFFFFFFFFFF; }
+double ffRetD_umax() { return 0xFFFFFFFFFFFFFFFF; }
+union FFUnionF_umax { float f = 0xFFFFFFFFFFFFFFFF; u32 raw; };
+union FFUnionD_umax { double d = 0xFFFFFFFFFFFFFFFF; u64 raw; };
+float ffGlobalF_imin = -0x7FFFFFFFFFFFFFFF - 1;
+double ffGlobalD_imin = -0x7FFFFFFFFFFFFFFF - 1;
+const float ffConstF_imin = -0x7FFFFFFFFFFFFFFF - 1;
+const double ffConstD_imin = -0x7FFFFFFFFFFFFFFF - 1;
+float ffRetF_imin() { return -0x7FFFFFFFFFFFFFFF - 1; }
+double ffRetD_imin() { return -0x7FFFFFFFFFFFFFFF - 1; }
+union FFUnionF_imin { float f = -0x7FFFFFFFFFFFFFFF - 1; u32 raw; };
+union FFUnionD_imin { double d = -0x7FFFFFFFFFFFFFFF - 1; u64 raw; };
+float ffGlobalF_uhi = 0x8000008000000001;
+double ffGlobalD_uhi = 0x8000008000000001;
+const float ffConstF_uhi = 0x8000008000000001;
+const double ffConstD_uhi = 0x8000008000000001;
+float ffRetF_uhi() { return 0x8000008000000001; }
+double ffRetD_uhi() { return 0x8000008000000001; }
+union FFUnionF_uhi { float f = 0x8000008000000001; u32 raw; };
+union FFUnionD_uhi { double d = 0x8000008000000001; u64 raw; };
+struct FFFoldFieldDefaults {
+    float f_p24 = 16777217;
+    double d_p24 = 16777217;
+    float f_p53 = 9007199254740993;
+    double d_p53 = 9007199254740993;
+    float f_round = 0x1000001000000001;
+    double d_round = 0x1000001000000001;
+    float f_neg = -0x1000001000000001;
+    double d_neg = -0x1000001000000001;
+    float f_umax = 0xFFFFFFFFFFFFFFFF;
+    double d_umax = 0xFFFFFFFFFFFFFFFF;
+    float f_imin = -0x7FFFFFFFFFFFFFFF - 1;
+    double d_imin = -0x7FFFFFFFFFFFFFFF - 1;
+    float f_uhi = 0x8000008000000001;
+    double d_uhi = 0x8000008000000001;
+};
+float[6] ffArrayF = { 16777217, 9007199254740993, 0x1000001000000001, -0x1000001000000001, 0xFFFFFFFFFFFFFFFF, -0x7FFFFFFFFFFFFFFF - 1 };
+double[6] ffArrayD = { 16777217, 9007199254740993, 0x1000001000000001, -0x1000001000000001, 0xFFFFFFFFFFFFFFFF, -0x7FFFFFFFFFFFFFFF - 1 };
 
 // Brace-init into a 'bool' field is the third door onto the truth test (after '=' and the
 // explicit cast); 'g' pins that the neighbouring field is not clobbered by a wide store.
@@ -2927,6 +3027,91 @@ bool testReturnDefaultConditional()
 
 // operator string(char*) and operator string(i32) are now provided by core/string.cb.
 
+string strctorReturnBorrowedString(string value) { return value; }
+int strctorObserveBorrowedString(string value) { return value.length(); }
+struct StrctorStackByteMember { char[4] bytes = default; };
+struct StrctorStringHolder { string s = default; };
+char[4] strctorGlobalBorrowBytes = {'c', 'a', 't', 0};
+string strctorGlobalBorrowSlot = default;
+
+string strctorParamCastReturn(char* p) { return (string)p; }
+string strctorParamParenCastReturn(char* p) { return (string)(p); }
+string strctorParamFunctionalReturn(char* p) { return string(p); }
+string strctorParamLengthReturn(char* p) { return string(p, 3); }
+string_view strctorParamViewReturn(char* p) { return string_view(p, 3); }
+string strctorParamAddressReturn(char* p) { return (string)&p[0]; }
+string strctorParamTernaryReturn(char* p) { bool c = true; return c ? (string)p : "x"; }
+string_view strctorUserFnView(char* scratch, i32 n)
+{
+    return string_view(&strctorGlobalBorrowBytes[0], n);
+}
+string_view strctorUserFnViewPointerProbe()
+{
+    char[4] scratch = {'s', 'c', 'r', 0};
+    return strctorUserFnView(&scratch[0], 3);
+}
+string_view strctorUserFnViewArrayProbe()
+{
+    char[4] scratch = {'s', 'c', 'r', 0};
+    return strctorUserFnView(scratch, 3);
+}
+struct StrctorViewPicker
+{
+    i32 tag = 0;
+    string_view pick(char* scratch, i32 n)
+    {
+        return string_view(&strctorGlobalBorrowBytes[0], n);
+    }
+};
+string_view strctorUserMethodViewProbe()
+{
+    char[4] scratch = {'s', 'c', 'r', 0};
+    StrctorViewPicker picker = default;
+    return picker.pick(scratch, 3);
+}
+string_view strctorGlobalViewJoin(bool chooseFirst)
+{
+    return chooseFirst
+        ? string_view(&strctorGlobalBorrowBytes[0], 3)
+        : string_view(&strctorGlobalBorrowBytes[0], 2);
+}
+int strctorLocalViewJoinUse()
+{
+    bool chooseStack = true;
+    char[4] scratch = {'c', 'a', 't', 0};
+    string_view view = chooseStack
+        ? string_view(scratch, 3)
+        : string_view(&strctorGlobalBorrowBytes[0], 3);
+    return view.length() * 100 + (int)view.data()[0];
+}
+
+string strctorLocalArrayTernaryReturn()
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    return true ? (string)bytes : "x";
+}
+string strctorLocalMemberTernaryReturn()
+{
+    StrctorStackByteMember bytes = default;
+    bytes.bytes[0] = 'c'; bytes.bytes[1] = 'a'; bytes.bytes[2] = 't'; bytes.bytes[3] = 0;
+    return true ? (string)bytes.bytes : "x";
+}
+void strctorLocalArrayTernaryStoreGlobal()
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    strctorGlobalBorrowSlot = true ? (string)bytes : "x";
+}
+void strctorLocalArrayTernaryStoreField(StrctorStringHolder* holder)
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    holder->s = true ? (string)bytes : "x";
+}
+void strctorLocalArrayTernaryOut(string* out)
+{
+    char[4] bytes = {'c', 'a', 't', 0};
+    *out = true ? (string)bytes : "x";
+}
+
 bool testStringType()
 {
     bool result = true;
@@ -2939,6 +3124,209 @@ bool testStringType()
     string s2 = "world!!";
     result &= Test("string2_length", s2.length(), 7);
     result &= Test("string2_data", s2.data(), "world!!");
+
+    // STRCTOR accept-set: functional construction must preserve these cast/view forms.
+    char[5] strctorBytes = {'c', 'a', 't', 0, 0};
+    char* strctorPtr = &strctorBytes[0];
+    string strctorCastPointer = (string)strctorPtr;
+    result &= Test("strctor cast pointer value and length",
+                   strctorCastPointer == "cat" && strctorCastPointer.length() == 3, true);
+    result &= Test("strctor cast pointer keeps borrow identity",
+                   strctorCastPointer.data() == strctorPtr, true);
+    result &= Test("strctor cast pointer stays borrowed",
+                   (strctorCastPointer._len & (i32)0x80000000) == 0, true);
+
+    string strctorCastArray = (string)strctorBytes;
+    result &= Test("strctor cast fixed array value and length",
+                   strctorCastArray == "cat" && strctorCastArray.length() == 3, true);
+    result &= Test("strctor cast fixed array keeps borrow identity",
+                   strctorCastArray.data() == strctorPtr, true);
+
+    char[] strctorCharView = (char[])strctorPtr;
+    string strctorCastView = (string)strctorCharView;
+    result &= Test("strctor cast array view value and length",
+                   strctorCastView == "cat" && strctorCastView.length() == 3, true);
+    result &= Test("strctor cast array view keeps borrow identity",
+                   strctorCastView.data() == strctorPtr, true);
+
+    string_view strctorView = string_view(strctorPtr, 2);
+    result &= Test("strctor string_view i32 value and length",
+                   strctorView.length() == 2 && strctorView.data() == strctorPtr, true);
+
+    string strctorOne = string(strctorPtr);
+    result &= Test("strctor one-arg equals cast form",
+                   strctorOne == strctorCastPointer && strctorOne.length() == 3, true);
+    result &= Test("strctor one-arg keeps pointer identity",
+                   strctorOne.data() == strctorPtr, true);
+    result &= Test("strctor one-arg remains borrowed",
+                   (strctorOne._len & (i32)0x80000000) == 0, true);
+    result &= Test("strctor one-arg sizeof matches cast",
+                   sizeof(strctorOne) == sizeof(strctorCastPointer), true);
+
+    string strctorOneArray = string(strctorBytes);
+    result &= Test("strctor one-arg fixed array decays",
+                   strctorOneArray == "cat" && strctorOneArray.data() == strctorPtr, true);
+    string strctorOneView = string(strctorCharView);
+    result &= Test("strctor one-arg array view keeps identity",
+                   strctorOneView == "cat" && strctorOneView.data() == strctorPtr, true);
+    const char* strctorConstPtr = strctorPtr;
+    string strctorOneConst = string(strctorConstPtr);
+    result &= Test("strctor one-arg const char pointer",
+                   strctorOneConst == "cat" && strctorOneConst.data() == strctorConstPtr, true);
+    string strctorOneLiteral = string("cat");
+    result &= Test("strctor one-arg string literal stays borrowed",
+                   strctorOneLiteral == "cat" && strctorOneLiteral.length() == 3
+                       && strctorOneLiteral.data() == "cat"
+                       && (strctorOneLiteral._len & (i32)0x80000000) == 0, true);
+    // Suffixed one-arg and literal forms take a receiver; values match the cast twins.
+    char[3] strctorSuffixBytes = {'a', 'b', 0};
+    char* strctorSuffixPtr = &strctorSuffixBytes[0];
+    result &= Test("strctor one-arg length suffix", string(strctorSuffixPtr).length(), 2);
+    result &= Test("strctor one-arg length suffix matches cast twin",
+                   ((string)strctorSuffixPtr).length(), 2);
+    result &= Test("strctor one-arg data suffix keeps identity",
+                   string(strctorSuffixPtr).data() == strctorSuffixPtr, true);
+    result &= Test("strctor one-arg data suffix matches cast twin",
+                   ((string)strctorSuffixPtr).data() == strctorSuffixPtr, true);
+    result &= Test("strctor literal length suffix chain", string("cat").length(), 3);
+    // Discarded suffixed value: the leg is that it compiles and runs.
+    string(strctorSuffixPtr).length();
+
+    string strctorReturned = strctorReturnBorrowedString(string(strctorPtr));
+    result &= Test("strctor return preserves borrowed bytes",
+                   strctorReturned == "cat" && strctorReturned.data() == strctorPtr, true);
+    result &= Test("strctor return stays borrowed",
+                   (strctorReturned._len & (i32)0x80000000) == 0, true);
+    result &= Test("strctor pass observes length",
+                   strctorObserveBorrowedString(string(strctorPtr)), 3);
+
+    char[4] strctorBytesNoTerminator = {'a', 'b', 'c', 'd'};
+    char* strctorNoTerminatorPtr = &strctorBytesNoTerminator[0];
+    string strctorTwo = string(strctorNoTerminatorPtr, 3);
+    result &= Test("strctor two-arg explicit length value",
+                   strctorTwo == "abc" && strctorTwo.length() == 3, true);
+    result &= Test("strctor two-arg keeps pointer identity",
+                   strctorTwo.data() == strctorNoTerminatorPtr, true);
+    result &= Test("strctor two-arg remains borrowed",
+                   (strctorTwo._len & (i32)0x80000000) == 0, true);
+    string strctorTwoArray = string(strctorBytesNoTerminator, 2);
+    result &= Test("strctor two-arg fixed array decay",
+                   strctorTwoArray == "ab" && strctorTwoArray.data() == strctorNoTerminatorPtr, true);
+    char[] strctorNoTerminatorView = (char[])strctorNoTerminatorPtr;
+    string strctorTwoView = string(strctorNoTerminatorView, 3);
+    result &= Test("strctor two-arg array view",
+                   strctorTwoView == "abc" && strctorTwoView.data() == strctorNoTerminatorPtr, true);
+    i64 strctorWideLength = 2;
+    string strctorTwoWide = string(strctorNoTerminatorPtr, strctorWideLength);
+    result &= Test("strctor two-arg i64 length",
+                   strctorTwoWide == "ab" && strctorTwoWide.length() == 2
+                       && strctorTwoWide.data() == strctorNoTerminatorPtr, true);
+
+    // Frozen STRRETGATE accept-set controls: caller, global, heap, literal, and same-frame
+    // values must keep their borrowed pointer and bytes through cast and constructor lowering.
+    char[4] strctorCallerBytes = {'c', 'a', 't', 0};
+    char* strctorCallerPtr = &strctorCallerBytes[0];
+    string fromParamCast = strctorParamCastReturn(strctorCallerPtr);
+    result &= Test("strctor param bare cast return value and identity",
+                   fromParamCast == "cat" && fromParamCast.data() == strctorCallerPtr, true);
+    string fromParamParenCast = strctorParamParenCastReturn(strctorCallerPtr);
+    result &= Test("strctor param parenthesized cast return value and identity",
+                   fromParamParenCast == "cat" && fromParamParenCast.data() == strctorCallerPtr, true);
+    string fromParamFunctional = strctorParamFunctionalReturn(strctorCallerPtr);
+    result &= Test("strctor param functional return value and identity",
+                   fromParamFunctional == "cat" && fromParamFunctional.data() == strctorCallerPtr, true);
+    string fromParamLength = strctorParamLengthReturn(strctorCallerPtr);
+    result &= Test("strctor param two-arg return value and identity",
+                   fromParamLength == "cat" && fromParamLength.data() == strctorCallerPtr, true);
+    string_view fromParamView = strctorParamViewReturn(strctorCallerPtr);
+    result &= Test("strctor param string_view return value and identity",
+                   fromParamView.length() == 3 && fromParamView.data() == strctorCallerPtr, true);
+    string_view fromUserFnPointer = strctorUserFnViewPointerProbe();
+    result &= Test("strctor user function string_view pointer arg keeps global result",
+                   fromUserFnPointer.length() == 3
+                       && fromUserFnPointer.data() == &strctorGlobalBorrowBytes[0]
+                       && fromUserFnPointer.data()[0] == 'c', true);
+    string_view fromUserFnArray = strctorUserFnViewArrayProbe();
+    result &= Test("strctor user function string_view array arg keeps global result",
+                   fromUserFnArray.length() == 3
+                       && fromUserFnArray.data() == &strctorGlobalBorrowBytes[0]
+                       && fromUserFnArray.data()[0] == 'c', true);
+    string_view fromUserMethod = strctorUserMethodViewProbe();
+    result &= Test("strctor user method string_view array arg keeps global result",
+                   fromUserMethod.length() == 3
+                       && fromUserMethod.data() == &strctorGlobalBorrowBytes[0]
+                       && fromUserMethod.data()[0] == 'c', true);
+    string_view fromGlobalJoinTrue = strctorGlobalViewJoin(true);
+    string_view fromGlobalJoinFalse = strctorGlobalViewJoin(false);
+    result &= Test("strretgate string_view global join values and branch selection",
+                   fromGlobalJoinTrue.length() * 10 + fromGlobalJoinFalse.length() == 32
+                       && fromGlobalJoinTrue.data() == &strctorGlobalBorrowBytes[0]
+                       && fromGlobalJoinFalse.data() == &strctorGlobalBorrowBytes[0], true);
+    result &= Test("strretgate string_view local join stays within frame",
+                   strctorLocalViewJoinUse(), 399);
+    string fromParamAddress = strctorParamAddressReturn(strctorCallerPtr);
+    result &= Test("strctor param address cast return value and identity",
+                   fromParamAddress == "cat" && fromParamAddress.data() == strctorCallerPtr, true);
+    string fromParamTernary = strctorParamTernaryReturn(strctorCallerPtr);
+    result &= Test("strctor param ternary return value",
+                   fromParamTernary == "cat" && fromParamTernary.length() == 3, true);
+
+    strctorGlobalBorrowSlot = string(strctorGlobalBorrowBytes, 3);
+    result &= Test("strctor global two-arg store value and identity",
+                   strctorGlobalBorrowSlot == "cat"
+                       && strctorGlobalBorrowSlot.data() == &strctorGlobalBorrowBytes[0], true);
+    strctorGlobalBorrowSlot = default;
+
+    StrctorStackByteMember strctorMember = default;
+    strctorMember.bytes[0] = 'c'; strctorMember.bytes[1] = 'a';
+    strctorMember.bytes[2] = 't'; strctorMember.bytes[3] = 0;
+    string strctorMemberString = (string)strctorMember.bytes;
+    result &= Test("strctor local struct field stays usable in frame",
+                   strctorMemberString == "cat" && strctorMemberString.length() == 3, true);
+    string_view strctorMemberView = string_view(strctorMember.bytes, 3);
+    result &= Test("strctor local struct view stays usable in frame",
+                   strctorMemberView.length() == 3
+                       && strctorMemberView.data() == &strctorMember.bytes[0], true);
+
+    char* strctorHeapBorrowBytes = new char[4];
+    strctorHeapBorrowBytes[0] = 'c'; strctorHeapBorrowBytes[1] = 'a';
+    strctorHeapBorrowBytes[2] = 't'; strctorHeapBorrowBytes[3] = 0;
+    string strctorHeapBorrow = (string)strctorHeapBorrowBytes;
+    string_view strctorHeapView = string_view(strctorHeapBorrowBytes, 3);
+    result &= Test("strctor heap source cast and view values",
+                   strctorHeapBorrow == "cat" && strctorHeapView.length() == 3
+                       && strctorHeapBorrow.data() == strctorHeapBorrowBytes
+                       && strctorHeapView.data() == strctorHeapBorrowBytes, true);
+    strctorHeapBorrow = default;
+    delete[] strctorHeapBorrowBytes;
+
+    string strctorLiteralTernary = true ? (string)"cat" : "x";
+    result &= Test("strctor literal ternary value",
+                   strctorLiteralTernary == "cat" && strctorLiteralTernary.length() == 3, true);
+
+    string strctorLocalTernaryReturn = strctorLocalArrayTernaryReturn();
+    result &= Test("strctor local stack ternary return owns its value",
+                   strctorLocalTernaryReturn == "cat"
+                       && (strctorLocalTernaryReturn._len & (i32)0x80000000) != 0, true);
+    string strctorMemberTernaryReturn = strctorLocalMemberTernaryReturn();
+    result &= Test("strctor local member ternary return owns its value",
+                   strctorMemberTernaryReturn == "cat"
+                       && (strctorMemberTernaryReturn._len & (i32)0x80000000) != 0, true);
+    strctorLocalArrayTernaryStoreGlobal();
+    result &= Test("strctor local stack ternary global store owns its value",
+                   strctorGlobalBorrowSlot == "cat"
+                       && (strctorGlobalBorrowSlot._len & (i32)0x80000000) != 0, true);
+    strctorGlobalBorrowSlot = default;
+    StrctorStringHolder strctorTernaryHolder = default;
+    strctorLocalArrayTernaryStoreField(&strctorTernaryHolder);
+    result &= Test("strctor local stack ternary field store owns its value",
+                   strctorTernaryHolder.s == "cat"
+                       && (strctorTernaryHolder.s._len & (i32)0x80000000) != 0, true);
+    string strctorTernaryOut = default;
+    strctorLocalArrayTernaryOut(&strctorTernaryOut);
+    result &= Test("strctor local stack ternary out parameter owns its value",
+                   strctorTernaryOut == "cat"
+                       && (strctorTernaryOut._len & (i32)0x80000000) != 0, true);
 
     return result;
 }
@@ -2999,6 +3387,29 @@ bool testStringLiteral()
     string s4 = "line1\nline2";
     result &= Test("str_lit_escape_length", s4.length(), 11);
 
+    // Raw strings preserve escapes and braces, including quotes under a matching hash delimiter.
+    const char* rawText = r"line\n{n}";
+    result &= Test("raw_string_verbatim", strcmp(rawText, "line\\n\{n\}"), 0);
+    const char* rawQuoted = r##"say "hi" and "# still"##;
+    result &= Test("raw_string_hash_quote", strcmp(rawQuoted, "say \"hi\" and \"# still"), 0);
+    const char* rawTriple = r###"a "## b "## c"###;
+    result &= Test("raw_string_three_hashes", strcmp(rawTriple, "a \"## b \"## c"), 0);
+    const char* rawMultiline = r#"first
+second"#;
+    result &= Test("raw_string_multiline", strcmp(rawMultiline, "first\nsecond"), 0);
+    result &= Test("raw_string_call_argument", strcmp(r"\n", "\\n"), 0);
+    string rawString = r"{raw}";
+    result &= Test("raw_string_string_initializer", rawString.data(), "\{raw\}");
+
+    // A raw token next to an ordinary token keeps interpolation local to the ordinary token.
+    int rawValue = 7;
+    string rawAdjacent = r"a{" "b{rawValue}";
+    result &= Test("raw_string_adjacent_interpolation", rawAdjacent.data(), "a\{b7");
+    result &= Test("raw_string_adjacent_method", r"a{" "b{rawValue}".length(), 4);
+    string r = "pre";
+    string rExpression = r + "x";
+    result &= Test("raw_prefix_keeps_identifier_r", rExpression.data(), "prex");
+
     // Multiple string variables can coexist with independent values
     string sa = "alpha";
     string sb = "beta!";
@@ -3020,11 +3431,23 @@ bool testStringLiteral()
 
     // Encoding prefixes retain their element type and terminate the encoded array.
     (const wchar)* wide = L"abcd";
+    (const wchar)* wideBraceFold = L"{{L}}";
+    (const c16)* utf16BraceFold = u"{{u}}";
+    (const c32)* utf32BraceFold = U"{{U}}";
     int wideLength = 0;
     while (wide[wideLength] != 0) wideLength++;
     result &= Test("wide_literal_size", sizeof(wchar), sizeof(wide[0]));
     result &= Test("wide_literal_element", wide[1], (wchar)'b');
     result &= Test("wide_literal_length", wideLength, 4);
+    result &= Test("wide_literal_bracefold",
+        wideBraceFold[0] == '{' && wideBraceFold[1] == 'L'
+            && wideBraceFold[2] == '}' && wideBraceFold[3] == 0, true);
+    result &= Test("utf16_literal_bracefold",
+        utf16BraceFold[0] == '{' && utf16BraceFold[1] == 'u'
+            && utf16BraceFold[2] == '}' && utf16BraceFold[3] == 0, true);
+    result &= Test("utf32_literal_bracefold",
+        utf32BraceFold[0] == '{' && utf32BraceFold[1] == 'U'
+            && utf32BraceFold[2] == '}' && utf32BraceFold[3] == 0, true);
     if const (__WINDOWS__)
         result &= Test("wide_literal_width", sizeof(wchar), 2);
     else
@@ -3178,6 +3601,13 @@ bool testFormatString()
 	p.y = 20;
 	string pointStr = "Point is {p}.";
 	result &= Test("fmt_object", pointStr.data(), "Point is 10, 20.");
+
+    string pointCast = (string)p;
+    string pointFunctional = string(p);
+    result &= Test("strctor IString matches cast result", pointFunctional, pointCast);
+    result &= Test("strctor IString preserves owned result",
+                   (pointFunctional._len & (i32)0x80000000)
+                       == (pointCast._len & (i32)0x80000000), true);
 
     // Numeric interpolation: int goes through operator string(i32); float must
     // promote to operator string(double) (regression for float -> double overload
@@ -4287,6 +4717,56 @@ bool testCast()
     i64 yi = 999;
     result &= Test("i64(999).to_i64()", yi.to_i64(),  999);
 
+    return result;
+}
+
+// Exact bit checks cover every folded integer-to-float route. The round, neg, and unsigned uhi
+// float cells differ by one ULP on the old int -> double -> float path.
+bool testFloatFold() {
+    bool result = true;
+    FFFoldFieldDefaults fields = default;
+    float ffLocalF_round = 0x1000001000000001;
+    float ffAssignF_round; ffAssignF_round = 0x1000001000000001;
+    float ffCompoundF_round = (0x1000001000000001 + 0);
+    FFUnionF_round ffUnionF_round = default;
+    simd<float,4> ffSimdF_round = 0x1000001000000001;
+    float ffLocalF_neg = -0x1000001000000001;
+    float ffAssignF_neg; ffAssignF_neg = -0x1000001000000001;
+    float ffCompoundF_neg = (-0x1000001000000001 + 0);
+    FFUnionF_neg ffUnionF_neg = default;
+    simd<float,4> ffSimdF_neg = -0x1000001000000001;
+    float ffLocalF_uhi = 0x8000008000000001;
+    float ffAssignF_uhi; ffAssignF_uhi = 0x8000008000000001;
+    float ffCompoundF_uhi = (0x8000008000000001 + 0);
+    FFUnionF_uhi ffUnionF_uhi = default;
+    simd<float,4> ffSimdF_uhi = 0x8000008000000001;
+    result &= Test("ff_global_round_f32", (i64)floatFoldFBits(ffGlobalF_round), (i64)0x5d800001);
+    result &= Test("ff_const_round_f32", (i64)floatFoldFBits(ffConstF_round), (i64)0x5d800001);
+    result &= Test("ff_local_round_f32", (i64)floatFoldFBits(ffLocalF_round), (i64)0x5d800001);
+    result &= Test("ff_assign_round_f32", (i64)floatFoldFBits(ffAssignF_round), (i64)0x5d800001);
+    result &= Test("ff_compound_round_f32", (i64)floatFoldFBits(ffCompoundF_round), (i64)0x5d800001);
+    result &= Test("ff_field_round_f32", (i64)floatFoldFBits(fields.f_round), (i64)0x5d800001);
+    result &= Test("ff_union_round_f32", (i64)floatFoldFBits(ffUnionF_round.f), (i64)0x5d800001);
+    result &= Test("ff_return_round_f32", (i64)floatFoldFBits(ffRetF_round()), (i64)0x5d800001);
+    result &= Test("ff_simd_round_f32", (i64)floatFoldFBits(ffSimdF_round[0]), (i64)0x5d800001);
+    result &= Test("ff_global_neg_f32", (i64)floatFoldFBits(ffGlobalF_neg), (i64)0xdd800001);
+    result &= Test("ff_const_neg_f32", (i64)floatFoldFBits(ffConstF_neg), (i64)0xdd800001);
+    result &= Test("ff_local_neg_f32", (i64)floatFoldFBits(ffLocalF_neg), (i64)0xdd800001);
+    result &= Test("ff_assign_neg_f32", (i64)floatFoldFBits(ffAssignF_neg), (i64)0xdd800001);
+    result &= Test("ff_compound_neg_f32", (i64)floatFoldFBits(ffCompoundF_neg), (i64)0xdd800001);
+    result &= Test("ff_field_neg_f32", (i64)floatFoldFBits(fields.f_neg), (i64)0xdd800001);
+    result &= Test("ff_union_neg_f32", (i64)floatFoldFBits(ffUnionF_neg.f), (i64)0xdd800001);
+    result &= Test("ff_return_neg_f32", (i64)floatFoldFBits(ffRetF_neg()), (i64)0xdd800001);
+    result &= Test("ff_simd_neg_f32", (i64)floatFoldFBits(ffSimdF_neg[0]), (i64)0xdd800001);
+    result &= Test("ff_global_uhi_f32", (i64)floatFoldFBits(ffGlobalF_uhi), (i64)0x5f000001);
+    result &= Test("ff_const_uhi_f32", (i64)floatFoldFBits(ffConstF_uhi), (i64)0x5f000001);
+    result &= Test("ff_local_uhi_f32", (i64)floatFoldFBits(ffLocalF_uhi), (i64)0x5f000001);
+    result &= Test("ff_assign_uhi_f32", (i64)floatFoldFBits(ffAssignF_uhi), (i64)0x5f000001);
+    result &= Test("ff_compound_uhi_f32", (i64)floatFoldFBits(ffCompoundF_uhi), (i64)0x5f000001);
+    result &= Test("ff_field_uhi_f32", (i64)floatFoldFBits(fields.f_uhi), (i64)0x5f000001);
+    result &= Test("ff_union_uhi_f32", (i64)floatFoldFBits(ffUnionF_uhi.f), (i64)0x5f000001);
+    result &= Test("ff_return_uhi_f32", (i64)floatFoldFBits(ffRetF_uhi()), (i64)0x5f000001);
+    result &= Test("ff_simd_uhi_f32", (i64)floatFoldFBits(ffSimdF_uhi[0]), (i64)0x5f000001);
     return result;
 }
 
@@ -6646,6 +7126,7 @@ extern int main()
     total++; passed += testOverloadResolution()          ? 1 : 0;
     total++; passed += testStatic()                      ? 1 : 0;
     total++; passed += testCast()                        ? 1 : 0;
+    total++; passed += testFloatFold()                    ? 1 : 0;
     total++; passed += testNullableTypes()               ? 1 : 0;
     total++; passed += testPointerArithmetic()           ? 1 : 0;
     total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
@@ -6714,6 +7195,9 @@ extern int main()
     total++; passed += testT515ClosureAliasElementAccess() ? 1 : 0;
     total++; passed += testT515ClosureRangeBindingBorrows() ? 1 : 0;
     total++; passed += testT515PlainAliasGetterBorrow() ? 1 : 0;
+    total++; passed += testCountofNameResolution() ? 1 : 0;
+    total++; passed += testCountofSemantics() ? 1 : 0;
+    total++; passed += testCountofNamespaceResolution() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -7021,9 +7505,367 @@ bool testInPlaceDtor()
 // Union tests
 // =============================================================
 
+struct UnionAnonV { int tag = default; union { int i = default; float f = default; }; };
+struct UnionAnonNestedStruct { union { struct { short lo = default; int hi = default; }; double d = default; }; };
+struct UnionAnonNestedUnion { struct { union { int i = default; float f = default; }; int tail = default; }; };
+union UnionAnonW { struct { int lo = default; int hi = default; }; i64 all = default; };
+struct UnionAnonNamedField { union { int i = default; float f = default; } u = default; };
+struct UnionAnonNamedTypeField { union U { int i = default; float f = default; } u = default; };
+union UnionAnonO { union { int i = default; float f = default; }; i64 all = default; };
+class UnionAnonClass { int tag = default; union { int i = default; float f = default; }; };
+struct UnionAnonForward { int read() { return value; } union { int value = default; }; };
+struct UnionAnonLookup { union { int unionAnonPick = default; float other = default; }; };
+struct UnionAnonReservedInner { int z = 3; };
+struct UnionAnonReservedName { UnionAnonReservedInner __anonx = default; };
+struct UnionAnonDefault { struct { int b = 5; int c = 6; }; };
+UnionAnonDefault unionAnonGlobal = default;
+struct UnionAnonFieldOfField { UnionAnonDefault inner = default; };
+UnionAnonFieldOfField unionAnonNestedGlobal = default;
+struct UnionAnonNamedStructDefault { struct { int b = 17; int c = 18; } value = default; };
+UnionAnonNamedStructDefault unionAnonNamedStructGlobal = default;
+struct UnionAnonTaggedStructDefault
+{
+    struct Inner { int b = 19; int c = 20; } value = default;
+};
+UnionAnonTaggedStructDefault unionAnonTaggedStructGlobal = default;
+struct UnionAnonNamedDefault { union { int i = 7; float f; } u = default; };
+UnionAnonNamedDefault unionAnonNamedGlobal = default;
+struct UnionAnonTaggedDefault { union U { int i = 9; float f; } u = default; };
+UnionAnonTaggedDefault unionAnonTaggedGlobal = default;
+union UnionAnonFirstDefault { struct { int first = 13; }; int other; };
+UnionAnonFirstDefault unionAnonFirstGlobal = default;
+union UnionResDoubleDefault { double d = 1.5; i64 q; };
+UnionResDoubleDefault unionResDoubleGlobal = default;
+union UnionResFloatDefault { float f = 1.5; i64 q; };
+UnionResFloatDefault unionResFloatGlobal = default;
+union UnionResIntDoubleDefault { double d = 1; i64 q; };
+UnionResIntDoubleDefault unionResIntDoubleGlobal = default;
+union UnionResIntFloatDefault { float f = 2; i64 q; };
+UnionResIntFloatDefault unionResIntFloatGlobal = default;
+union UnionResFloatDoubleDefault { double d = 1.5f; i64 q; };
+UnionResFloatDoubleDefault unionResFloatDoubleGlobal = default;
+union UnionResDoubleFloatDefault { float f = 2.5; i64 q; };
+UnionResDoubleFloatDefault unionResDoubleFloatGlobal = default;
+struct UnionResNamedDoubleHolder { union { double d = 1.5; i64 q; } inner = default; };
+UnionResNamedDoubleHolder unionResNamedDoubleGlobal = default;
+struct UnionResAnonDoubleHolder { int tag = default; union { double d = 1.5; i64 q; }; };
+UnionResAnonDoubleHolder unionResAnonDoubleGlobal = default;
+union UnionResNestedDouble { double d = 1.5; i64 q; };
+union UnionResNestedOuter { UnionResNestedDouble inner = default; i64 raw; };
+UnionResNestedOuter unionResNestedDoubleGlobal = default;
+struct UnionResPairDefault { i32 lo = 17; i32 hi = 29; };
+union UnionResPairUnionDefault { UnionResPairDefault pair = default; i64 raw; };
+UnionResPairUnionDefault unionResPairGlobal = default;
+struct UnionResNode { int v = default; };
+struct UnionResIntPointer { int tag = default; union { int* p; i64 q; }; };
+struct UnionResCharPointer { int tag = default; union { char* p; i64 q; }; };
+struct UnionResNodePointer { int tag = default; union { UnionResNode* p; i64 q; }; };
+struct UnionResIntPointerHolder { UnionResIntPointer inner = default; };
+struct UnionResIntArrayArm { int tag = default; union { int[2] arr; i64 q; }; };
+union UnionResNamedIntArrayArm { int[2] arr; i64 q; };
+struct UnionResCharArrayArm { int tag = default; union { char[8] bytes; i64 q; }; };
+struct UnionResIntPointerArrayArm { int tag = default; union { int*[2] ps; i64[2] q; }; };
+struct UnionResIntArrayHolder { UnionResIntArrayArm inner = default; };
+UnionResIntPointer unionResGlobalIntPointer;
+UnionResCharPointer unionResGlobalCharPointer;
+UnionResNodePointer unionResGlobalNodePointer;
+UnionResIntPointerHolder unionResGlobalIntHolder;
+UnionResIntArrayArm unionResGlobalIntArray = default;
+UnionResNamedIntArrayArm unionResGlobalNamedIntArray = default;
+UnionResIntArrayHolder unionResGlobalIntArrayHolder = default;
+struct UnionR4ScopeK
+{
+    struct UnionR4MidK { int m = 1; };
+    struct UnionR4InnerK { UnionR4MidK x = default; } inn = default;
+};
+struct UnionR4MidM { int m = 9; };
+struct UnionR4ScopeM
+{
+    struct UnionR4MidM { int m = 1; };
+    struct UnionR4InnerM { UnionR4MidM x = default; } inn = default;
+};
+struct UnionR4DeepScope { int z = 9; };
+struct UnionR4ShadowScope
+{
+    struct UnionR4InnerDeep
+    {
+        struct UnionR4DeepScope { int z = 4; };
+        UnionR4DeepScope d = default;
+    } inn = default;
+    UnionR4DeepScope e = default;
+};
+union UnionR4NamedNestedDefault
+{
+    struct { struct UnionR4N { int z = 3; } n; };
+    float f = 2.0;
+};
+struct UnionUserAnon0Before { int __anon0 = 7; union { int i = default; float f = default; }; };
+struct UnionUserAnon0After { union { int i = default; float f = default; }; int __anon0 = 9; };
+struct UnionUserInline0Type
+{
+    struct __inline0 { int q = 1; } n = default;
+    union { int i = default; float f = default; };
+};
+struct UnionInlineNestedScope
+{
+    struct In { struct Deep { int x; }; Deep d; } inn;
+};
+union UnionAcceptDirectDefault { int a = 9; float f; };
+union UnionAcceptInlineManyDefaults { struct { int a = 5; int b = 6; }; float f; };
+union UnionAcceptInlineAndDefaulted { struct { int a = 5; }; struct { int b = default; }; };
+union UnionAcceptDefaultKeywords { struct { int a = default; }; struct { int b = default; }; };
+union UnionAcceptDirectAndPlainInline { int a = 9; struct { float f; }; };
+union UnionAcceptInlineAndPlainDirect { struct { int a = 5; }; float f; };
+union UnionAcceptNamedInlineNestedDmi { struct Item { int a = 1; } named; int b = 2; };
+union UnionSelectNestedDefault { struct { int a; }; struct { int b = 5; }; };
+UnionSelectNestedDefault unionSelectNestedDefaultGlobal = default;
+struct UnionTaggedMethodField
+{
+    union U
+    {
+        int i = 9;
+        int get() { return i + 10; }
+        int get(int add) { return i + add; }
+    } u = default;
+};
+
+int unionAnonPick(int value) { return 10; }
+int unionAnonPick(float value) { return 20; }
+
 bool testUnion()
 {
     bool result = true;
+
+    UnionUserAnon0Before userAnonBefore;
+    userAnonBefore.i = 3;
+    result &= Test("union user __anon0 before anonymous member",
+        userAnonBefore.__anon0 * 10 + userAnonBefore.i, 73);
+    UnionUserAnon0After userAnonAfter;
+    userAnonAfter.i = 5;
+    result &= Test("union user __anon0 after anonymous member",
+        userAnonAfter.__anon0 * 10 + userAnonAfter.i, 95);
+    UnionUserInline0Type userInlineType;
+    userInlineType.i = 3;
+    result &= Test("union user __inline0 nested type remains distinct",
+        userInlineType.n.q * 100 + userInlineType.i, 103);
+    UnionInlineNestedScope inlineScope;
+    inlineScope.inn.d.x = 4;
+    result &= Test("union named inline aggregate nested type scope",
+        inlineScope.inn.d.x, 4);
+
+    UnionAcceptDirectDefault acceptDirect;
+    result &= Test("union accept one direct DMI", acceptDirect.a, 9);
+    UnionAcceptInlineManyDefaults acceptInlineMany;
+    result &= Test("union accept multiple defaults in one inline member",
+        acceptInlineMany.a * 100 + acceptInlineMany.b, 506);
+    UnionAcceptInlineAndDefaulted acceptInlineDefaulted;
+    result &= Test("union accept inline DMI beside default keyword",
+        acceptInlineDefaulted.a, 5);
+    UnionAcceptDefaultKeywords acceptDefaultKeywords;
+    result &= Test("union accept default keywords in inline members",
+        acceptDefaultKeywords.a, 0);
+    UnionAcceptDirectAndPlainInline acceptDirectPlainInline;
+    result &= Test("union accept direct DMI beside plain inline member",
+        acceptDirectPlainInline.a, 9);
+    UnionAcceptInlineAndPlainDirect acceptInlinePlainDirect;
+    result &= Test("union accept inline DMI beside plain direct member",
+        acceptInlinePlainDirect.a, 5);
+    UnionAcceptNamedInlineNestedDmi acceptNamedInlineNested;
+    result &= Test("union accept named inline type with nested DMI",
+        acceptNamedInlineNested.b, 2);
+    UnionSelectNestedDefault selectNestedDefault;
+    result &= Test("union selects inline arm with nested DMI", selectNestedDefault.b, 5);
+    result &= Test("global union selects inline arm with nested DMI",
+        unionSelectNestedDefaultGlobal.b, 5);
+    result &= Test("global union double DMI active value", unionResDoubleGlobal.d == 1.5, true);
+    result &= Test("global union double DMI preserves union bits", unionResDoubleGlobal.q,
+        (i64)0x3ff8000000000000);
+    result &= Test("global union float DMI active value", unionResFloatGlobal.f, 1.5f);
+    result &= Test("global union float DMI preserves union bits", unionResFloatGlobal.q,
+        (i64)0x3fc00000);
+    result &= Test("global union integer DMI double value",
+        unionResIntDoubleGlobal.d == 1.0, true);
+    result &= Test("global union integer DMI double bits", unionResIntDoubleGlobal.q,
+        (i64)0x3ff0000000000000);
+    result &= Test("global union integer DMI float value", unionResIntFloatGlobal.f, 2.0f);
+    result &= Test("global union float DMI widens to double",
+        unionResFloatDoubleGlobal.d == 1.5, true);
+    result &= Test("global union float DMI widened bits", unionResFloatDoubleGlobal.q,
+        (i64)0x3ff8000000000000);
+    result &= Test("global union double DMI narrows to float", unionResDoubleFloatGlobal.f, 2.5f);
+    result &= Test("global named union field double DMI",
+        unionResNamedDoubleGlobal.inner.d == 1.5, true);
+    result &= Test("global named union field preserves bits", unionResNamedDoubleGlobal.inner.q,
+        (i64)0x3ff8000000000000);
+    result &= Test("global anonymous union field double DMI", unionResAnonDoubleGlobal.d == 1.5, true);
+    result &= Test("global anonymous union field preserves bits", unionResAnonDoubleGlobal.q,
+        (i64)0x3ff8000000000000);
+    result &= Test("global nested union double DMI",
+        unionResNestedDoubleGlobal.inner.d == 1.5, true);
+    result &= Test("global nested union preserves bits", unionResNestedDoubleGlobal.inner.q,
+        (i64)0x3ff8000000000000);
+    result &= Test("global union nested struct DMI lo", unionResPairGlobal.pair.lo, 17);
+    result &= Test("global union nested struct DMI hi", unionResPairGlobal.pair.hi, 29);
+    result &= Test("global union nested struct DMI bytes", unionResPairGlobal.raw,
+        (i64)0x0000001d00000011);
+
+    UnionResIntArrayArm unionResR2AnonArray = default;
+    unionResR2AnonArray.arr[0] = 41; unionResR2AnonArray.arr[1] = 42;
+    result &= Test("union array arm dereference anonymous", *unionResR2AnonArray.arr, 41);
+    result &= Test("union array arm neighbor anonymous", unionResR2AnonArray.arr[1], 42);
+    UnionResNamedIntArrayArm unionResR2NamedArray = default;
+    unionResR2NamedArray.arr[0] = 51; unionResR2NamedArray.arr[1] = 52;
+    result &= Test("union array arm dereference named", *unionResR2NamedArray.arr, 51);
+    result &= Test("union array arm neighbor named", unionResR2NamedArray.arr[1], 52);
+    UnionResCharArrayArm unionResR2CharArray = default;
+    unionResR2CharArray.bytes[0] = 'h'; unionResR2CharArray.bytes[1] = 'i';
+    result &= Test("union char array arm dereference", *unionResR2CharArray.bytes, 'h');
+    result &= Test("union char array arm neighbor", unionResR2CharArray.bytes[1], 'i');
+    int[3] unionResR2PointerArrayValues = {13, 24, 35};
+    UnionResIntPointerArrayArm unionResR2PointerArray = default;
+    unionResR2PointerArray.ps[0] = &unionResR2PointerArrayValues[0];
+    unionResR2PointerArray.ps[1] = &unionResR2PointerArrayValues[1];
+    result &= Test("union pointer array arm double dereference", **unionResR2PointerArray.ps, 13);
+    result &= Test("union pointer array arm second element", *unionResR2PointerArray.ps[1], 24);
+    unionResGlobalIntArray.arr[0] = 61; unionResGlobalIntArray.arr[1] = 62;
+    unionResGlobalNamedIntArray.arr[0] = 71; unionResGlobalNamedIntArray.arr[1] = 72;
+    unionResGlobalIntArrayHolder.inner.arr[0] = 81;
+    result &= Test("global union array arm dereference", *unionResGlobalIntArray.arr, 61);
+    result &= Test("global union array arm neighbor", unionResGlobalIntArray.arr[1], 62);
+    result &= Test("global named union array arm dereference", *unionResGlobalNamedIntArray.arr, 71);
+    result &= Test("global field union array arm dereference",
+        *unionResGlobalIntArrayHolder.inner.arr, 81);
+
+    int[2] unionResLocalInts = {31, 42};
+    UnionResIntPointer unionResLocalIntPointer = default;
+    unionResLocalIntPointer.p = &unionResLocalInts[0];
+    result &= Test("union selects inline arm pointer dereference local", *unionResLocalIntPointer.p, 31);
+    (*unionResLocalIntPointer.p)++;
+    result &= Test("union inline pointer pointee increment local", unionResLocalInts[0], 32);
+    *unionResLocalIntPointer.p += 2;
+    result &= Test("union inline pointer pointee compound local", unionResLocalInts[0], 34);
+    result &= Test("union inline pointer index local", unionResLocalIntPointer.p[1], 42);
+
+    int[3] unionResR2StoreValues = {10, 20, 30};
+    UnionResIntPointer unionResR2StorePointer = default;
+    unionResR2StorePointer.p = &unionResR2StoreValues[0];
+    *unionResR2StorePointer.p = 5;
+    result &= Test("union dereference store pointee", unionResR2StoreValues[0], 5);
+    result &= Test("union dereference store neighbor", unionResR2StoreValues[1], 20);
+    *unionResR2StorePointer.p *= 3;
+    result &= Test("union dereference multiply compound", unionResR2StoreValues[0], 15);
+    result &= Test("union dereference multiply neighbor", unionResR2StoreValues[1], 20);
+    *unionResR2StorePointer.p /= 3;
+    result &= Test("union dereference divide compound", unionResR2StoreValues[0], 5);
+    result &= Test("union dereference divide neighbor", unionResR2StoreValues[1], 20);
+    *unionResR2StorePointer.p %= 4;
+    result &= Test("union dereference modulo compound", unionResR2StoreValues[0], 1);
+    result &= Test("union dereference modulo neighbor", unionResR2StoreValues[1], 20);
+
+    int[3] unionResR2IndexValues = {10, 20, 30};
+    UnionResIntPointer unionResR2IndexPointer = default;
+    unionResR2IndexPointer.p = &unionResR2IndexValues[0];
+    unionResR2IndexPointer.p[1] = 5;
+    result &= Test("union pointer index store neighbor zero", unionResR2IndexValues[0], 10);
+    result &= Test("union pointer index store target", unionResR2IndexValues[1], 5);
+    result &= Test("union pointer index store neighbor two", unionResR2IndexValues[2], 30);
+    unionResR2IndexPointer.p[1] *= 2;
+    result &= Test("union pointer index compound target", unionResR2IndexValues[1], 10);
+    result &= Test("union pointer index compound neighbor", unionResR2IndexValues[2], 30);
+
+    int[2] unionResGlobalInts = {51, 62};
+    unionResGlobalIntPointer.p = &unionResGlobalInts[0];
+    result &= Test("union inline pointer dereference global", *unionResGlobalIntPointer.p, 51);
+    (*unionResGlobalIntPointer.p)++;
+    *unionResGlobalIntPointer.p += 2;
+    result &= Test("union inline pointer update global", unionResGlobalInts[0], 54);
+
+    int[2] unionResFieldInts = {71, 82};
+    unionResGlobalIntHolder.inner.p = &unionResFieldInts[0];
+    result &= Test("union inline pointer dereference field of global", *unionResGlobalIntHolder.inner.p, 71);
+    (*unionResGlobalIntHolder.inner.p)++;
+    *unionResGlobalIntHolder.inner.p += 2;
+    result &= Test("union inline pointer update field of global", unionResFieldInts[0], 74);
+
+    char[3] unionResChars = "ab";
+    unionResGlobalCharPointer.p = &unionResChars[0];
+    result &= Test("union char pointer dereference global", *unionResGlobalCharPointer.p == 'a', true);
+    (*unionResGlobalCharPointer.p)++;
+    *unionResGlobalCharPointer.p += 1;
+    result &= Test("union char pointer update global", unionResChars[0] == 'c', true);
+
+    UnionResNode[2] unionResNodes = default;
+    unionResNodes[0].v = 91;
+    unionResNodes[1].v = 92;
+    unionResGlobalNodePointer.p = &unionResNodes[0];
+    result &= Test("union struct pointer dereference field of global", (*unionResGlobalNodePointer.p).v, 91);
+    result &= Test("union struct pointer arrow field of global", unionResGlobalNodePointer.p->v, 91);
+    (*unionResGlobalNodePointer.p).v++;
+    (*unionResGlobalNodePointer.p).v += 2;
+    result &= Test("union struct pointer pointee update field of global", unionResNodes[0].v, 94);
+    result &= Test("union struct pointer index field of global", unionResGlobalNodePointer.p[1].v, 92);
+
+    UnionAnonDefault unionAnonLocal;
+    UnionAnonDefault unionAnonBraced = {};
+    UnionAnonDefault unionAnonExplicitDefault = default;
+    UnionAnonDefault* unionAnonHeap = new UnionAnonDefault();
+    result &= Test("anonymous inline default global b", unionAnonGlobal.b, 5);
+    result &= Test("anonymous inline default global c", unionAnonGlobal.c, 6);
+    result &= Test("anonymous inline default local", unionAnonLocal.b, 5);
+    result &= Test("anonymous inline default brace", unionAnonBraced.c, 6);
+    result &= Test("anonymous inline default keyword", unionAnonExplicitDefault.b, 5);
+    result &= Test("anonymous inline default new", unionAnonHeap.c, 6);
+    delete unionAnonHeap;
+
+    UnionR4ScopeK scopeK = default;
+    result &= Test("owner nested type default in named aggregate field", scopeK.inn.x.m, 1);
+    UnionR4ScopeM scopeM = default;
+    result &= Test("owner nested type shadows global in named field", scopeM.inn.x.m, 1);
+    UnionR4ShadowScope shadowScope = default;
+    result &= Test("nested type wins inside named field", shadowScope.inn.d.z, 4);
+    result &= Test("global type remains visible outside named field", shadowScope.e.z, 9);
+    UnionR4NamedNestedDefault namedNestedDefault = default;
+    result &= Test("named nested type default is not union arm default",
+        (int)(namedNestedDefault.f * 10.0), 20);
+
+    result &= Test("anonymous inline field of field global", unionAnonNestedGlobal.inner.b, 5);
+    UnionAnonFieldOfField unionAnonNestedLocal = default;
+    result &= Test("anonymous inline field of field local", unionAnonNestedLocal.inner.c, 6);
+    UnionAnonNamedStructDefault unionAnonNamedStructLocal = default;
+    UnionAnonNamedStructDefault* unionAnonNamedStructHeap = new UnionAnonNamedStructDefault();
+    result &= Test("anonymous inline named struct global", unionAnonNamedStructGlobal.value.b, 17);
+    result &= Test("anonymous inline named struct local", unionAnonNamedStructLocal.value.c, 18);
+    result &= Test("anonymous inline named struct new", unionAnonNamedStructHeap.value.b, 17);
+    delete unionAnonNamedStructHeap;
+    UnionAnonTaggedStructDefault unionAnonTaggedStructLocal = default;
+    result &= Test("anonymous inline tagged struct global", unionAnonTaggedStructGlobal.value.b, 19);
+    result &= Test("anonymous inline tagged struct local", unionAnonTaggedStructLocal.value.c, 20);
+    UnionAnonNamedDefault unionAnonNamed;
+    result &= Test("anonymous inline named field default", unionAnonNamed.u.i, 7);
+    UnionAnonNamedDefault* unionAnonNamedHeap = new UnionAnonNamedDefault();
+    result &= Test("anonymous inline named field global", unionAnonNamedGlobal.u.i, 7);
+    result &= Test("anonymous inline named field new", unionAnonNamedHeap.u.i, 7);
+    delete unionAnonNamedHeap;
+    UnionAnonTaggedDefault unionAnonTagged;
+    result &= Test("anonymous inline tagged field default", unionAnonTagged.u.i, 9);
+    UnionAnonTaggedDefault* unionAnonTaggedHeap = new UnionAnonTaggedDefault();
+    result &= Test("anonymous inline tagged field global", unionAnonTaggedGlobal.u.i, 9);
+    result &= Test("anonymous inline tagged field new", unionAnonTaggedHeap.u.i, 9);
+    delete unionAnonTaggedHeap;
+    UnionAnonFirstDefault unionAnonFirst = default;
+    result &= Test("anonymous inline union first member global", unionAnonFirstGlobal.first, 13);
+    result &= Test("anonymous inline union first member default", unionAnonFirst.first, 13);
+    UnionTaggedMethodField unionTaggedMethod = default;
+    result &= Test("tagged inline aggregate method zero arg overload",
+        unionTaggedMethod.u.get(), 19);
+    result &= Test("tagged inline aggregate method one arg overload",
+        unionTaggedMethod.u.get(2), 11);
+    UnionAnonReservedName unionAnonReserved = default;
+    result &= Test("user __anonx field stays directly named",
+        unionAnonReserved.__anonx.z, 3);
+    expect_error("Unknown identifier 'z'") {
+        int unionAnonReservedPromoted = unionAnonReserved.z;
+    }
 
     UnionIntFloat u;
     u.i = 42;
@@ -7089,6 +7931,98 @@ bool testUnion()
     unionNodeDtors = 0;
     { UnionManualUnique u = default; u.b.p = new UnionDtorNode(); }
     result &= Test("union explicit destructor releases unique", unionNodeDtors, 1);
+
+    UnionAnonV av = { .tag = 1, .i = 42 };
+    UnionAnonV* avp = &av;
+    result &= Test("anon union designated tag", av.tag, 1);
+    result &= Test("anon union designated i", av.i, 42);
+    result &= Test("anon union pointer arrow", avp->i, 42);
+    result &= Test("anon union int overload", unionAnonPick(av.i), 10);
+    UnionAnonLookup lookup;
+    lookup.unionAnonPick = 17;
+    result &= Test("anonymous field before same-named function", unionAnonPick(lookup.unionAnonPick), 10);
+    av.f = 1.5f;
+    result &= Test("anon union float overload", unionAnonPick(av.f), 20);
+    result &= Test("anon union V size", sizeof(UnionAnonV), (u64)8);
+    result &= Test("anon union V align", alignof(UnionAnonV), (u64)4);
+    result &= Test("anon union V offset tag", offsetof(UnionAnonV, tag), (u64)0);
+    result &= Test("anon union V offset i", offsetof(UnionAnonV, i), (u64)4);
+    result &= Test("anon union V offset f", offsetof(UnionAnonV, f), (u64)4);
+
+    UnionAnonNestedStruct ans;
+    ans.lo = 3;
+    ans.hi = 7;
+    result &= Test("nested anon struct lo", ans.lo, 3);
+    result &= Test("nested anon struct hi", ans.hi, 7);
+    result &= Test("nested anon struct overload", unionAnonPick(ans.hi), 10);
+    result &= Test("nested anon struct size", sizeof(UnionAnonNestedStruct), (u64)8);
+    result &= Test("nested anon struct align", alignof(UnionAnonNestedStruct), (u64)8);
+    result &= Test("nested anon struct offset lo", offsetof(UnionAnonNestedStruct, lo), (u64)0);
+    result &= Test("nested anon struct offset hi", offsetof(UnionAnonNestedStruct, hi), (u64)4);
+    result &= Test("nested anon struct offset d", offsetof(UnionAnonNestedStruct, d), (u64)0);
+
+    UnionAnonNestedUnion anu;
+    anu.i = 8;
+    anu.tail = 9;
+    result &= Test("nested anon union i", anu.i, 8);
+    result &= Test("nested anon union tail", anu.tail, 9);
+    result &= Test("nested anon union size", sizeof(UnionAnonNestedUnion), (u64)8);
+    result &= Test("nested anon union align", alignof(UnionAnonNestedUnion), (u64)4);
+    result &= Test("nested anon union offset i", offsetof(UnionAnonNestedUnion, i), (u64)0);
+    result &= Test("nested anon union offset f", offsetof(UnionAnonNestedUnion, f), (u64)0);
+    result &= Test("nested anon union offset tail", offsetof(UnionAnonNestedUnion, tail), (u64)4);
+
+    UnionAnonW aw;
+    aw.lo = 3;
+    aw.hi = 4;
+    result &= Test("anon struct in union lo", aw.lo, 3);
+    result &= Test("anon struct in union hi", aw.hi, 4);
+    result &= Test("anon struct in union overload", unionAnonPick(aw.hi), 10);
+    result &= Test("anon struct union size", sizeof(UnionAnonW), (u64)8);
+    result &= Test("anon struct union align", alignof(UnionAnonW), (u64)8);
+    result &= Test("anon struct union offset lo", offsetof(UnionAnonW, lo), (u64)0);
+    result &= Test("anon struct union offset hi", offsetof(UnionAnonW, hi), (u64)4);
+    result &= Test("anon struct union offset all", offsetof(UnionAnonW, all), (u64)0);
+
+    UnionAnonNamedField anf;
+    anf.u.i = 11;
+    result &= Test("anonymous type named field", anf.u.i, 11);
+    result &= Test("anonymous named field size", sizeof(UnionAnonNamedField), (u64)4);
+    result &= Test("anonymous named field align", alignof(UnionAnonNamedField), (u64)4);
+    result &= Test("anonymous named field offset u", offsetof(UnionAnonNamedField, u), (u64)0);
+    result &= Test("anonymous named field offset u.i", offsetof(UnionAnonNamedField, u.i), (u64)0);
+    result &= Test("anonymous named field offset u.f", offsetof(UnionAnonNamedField, u.f), (u64)0);
+
+    UnionAnonNamedTypeField ant;
+    ant.u.f = 1.5f;
+    result &= Test("nested union type named field", ant.u.f, 1.5f);
+    result &= Test("nested union type size", sizeof(UnionAnonNamedTypeField), (u64)4);
+    result &= Test("nested union type align", alignof(UnionAnonNamedTypeField), (u64)4);
+    result &= Test("nested union type offset u", offsetof(UnionAnonNamedTypeField, u), (u64)0);
+    result &= Test("nested union type offset u.i", offsetof(UnionAnonNamedTypeField, u.i), (u64)0);
+    result &= Test("nested union type offset u.f", offsetof(UnionAnonNamedTypeField, u.f), (u64)0);
+
+    UnionAnonO ao;
+    ao.i = 12;
+    result &= Test("anonymous union inside union", ao.i, 12);
+    result &= Test("anonymous union outer size", sizeof(UnionAnonO), (u64)8);
+    result &= Test("anonymous union outer align", alignof(UnionAnonO), (u64)8);
+    result &= Test("anonymous union outer offset i", offsetof(UnionAnonO, i), (u64)0);
+    result &= Test("anonymous union outer offset f", offsetof(UnionAnonO, f), (u64)0);
+    result &= Test("anonymous union outer offset all", offsetof(UnionAnonO, all), (u64)0);
+
+    UnionAnonClass akc;
+    akc.i = 13;
+    result &= Test("class anonymous union member", akc.i, 13);
+    result &= Test("class anonymous union size", sizeof(UnionAnonClass), (u64)8);
+    result &= Test("class anonymous union align", alignof(UnionAnonClass), (u64)4);
+    result &= Test("class anonymous union offset tag", offsetof(UnionAnonClass, tag), (u64)0);
+    result &= Test("class anonymous union offset i", offsetof(UnionAnonClass, i), (u64)4);
+    result &= Test("class anonymous union offset f", offsetof(UnionAnonClass, f), (u64)4);
+
+    UnionAnonForward af;
+    af.value = 6;
+    result &= Test("forward method sees anonymous field", af.read(), 6);
 
     return result;
 }
@@ -9773,6 +10707,114 @@ bool testConstStringLiterals()
     char[16] out = default;
     result &= Test("const_literal_into_variadic", snprintf(out, 16, "%s-%s", "ab", "cd"), 5);
     result &= Test("const_literal_printf_result", (int)out[2], 45);
+    string rawConstJson = json_const(RawStringConstFold, { value = rawstrCompileTimeVersion });
+    string rawLiteralJson = json_const(RawStringConstFold, { value = r"raw { text }" });
+    string rawParenJson = json_const(RawStringConstFold, { value = ("paren text") });
+    string rawAdjacentJson = json_const(RawStringConstFold, { value = "adj" "acent" });
+    string rawMixedJson = json_const(RawStringConstFold, {
+        value = r#"raw"# " " "ordinary" " " r##"end"## });
+    string rawParenConstJson = json_const(RawStringConstFold, {
+        value = rawstrParenCompileTimeVersion });
+    string rawBraceParenJson = json_const(RawStringConstFold, { value = (r"{x}") });
+    string rawBraceAdjacentJson = json_const(RawStringConstFold, { value = "a" r"{x}" });
+    string rawParenBraceConstJson = json_const(RawStringConstFold, {
+        value = rawstrParenBraceCompileTimeVersion });
+    string rawRuntimeParenBrace = (r"{x}");
+    string rawRuntimeAdjacentBrace = "a" r"{x}";
+    string rawXmlParenNamespace = xml_const(RawstrXmlRoot, { node = { xmlns = (r"{x}") } });
+    string rawXmlAdjacentNamespace = xml_const(RawstrXmlRoot, {
+        node = { xmlns = "a" r"{x}" } });
+    string rawRuntimeXmlParenNamespace = (r"{x}");
+    string rawRuntimeXmlAdjacentNamespace = "a" r"{x}";
+    string rawEncodingJson = json_const(RawStringEncodingFold, {
+        a = u8"a", b = u"b", c = U"c", d = L"d" });
+    string rawXmlNamespace = xml_const(RawstrXmlRoot, {
+        node = { xmlns = ("urn:round3") } });
+    string braceFoldJsonSingle = json_const(RawStringConstFold, { value = "a{{b}}" });
+    string braceFoldJsonVerbatim = json_const(RawStringConstFold, { value = "{\"a\":1}" });
+    string braceFoldJsonAdjacent = json_const(RawStringConstFold,
+        { value = "a{{" r"b}}" });
+    string braceFoldJsonParen = json_const(RawStringConstFold, { value = ("p{{x}}") });
+    string braceFoldJsonEscaped = json_const(RawStringConstFold, { value = "{{x}}" });
+    string braceFoldJsonRaw = json_const(RawStringConstFold, { value = r"raw {{x}}" });
+    string braceFoldJsonConst = json_const(RawStringConstFold,
+        { value = braceFoldCompileTimeVersion });
+    string braceFoldJsonMixedConst = json_const(RawStringConstFold,
+        { value = braceFoldMixedCompileTimeVersion });
+    string braceFoldJsonParenConst = json_const(RawStringConstFold,
+        { value = braceFoldParenCompileTimeVersion });
+    string braceFoldXmlSingle = xml_const(RawstrXmlRoot,
+        { node = { xmlns = "x{{y}}" } });
+    string braceFoldXmlAdjacent = xml_const(RawstrXmlRoot,
+        { node = { xmlns = "x{{" r"y}}" } });
+    string braceFoldXmlParen = xml_const(RawstrXmlRoot,
+        { node = { xmlns = ("x{{y}}") } });
+    string braceFoldXmlRaw = xml_const(RawstrXmlRoot,
+        { node = { xmlns = r"x{{y}}" } });
+    string braceFoldWideEncodingJson = json_const(RawStringWideBraceFold, {
+        utf16 = u"{{u}}", utf32 = U"{{U}}", wide = L"{{L}}" });
+    int braceFoldInterpolation = 7;
+    expect_error("json_const initializer must be a compile-time literal") {
+        string rejected = json_const(RawStringConstFold,
+            { value = "value {braceFoldInterpolation}" });
+    }
+    expect_error("xml_const initializer must be a compile-time literal") {
+        string rejected = xml_const(RawstrXmlRoot,
+            { node = { xmlns = "value {braceFoldInterpolation}" } });
+    }
+    result &= Test("raw_literal_compile_time_string_constant",
+        rawConstJson == "{\"value\":\"0.1\\\\raw\"}", true);
+    result &= Test("raw_literal_json_const", rawLiteralJson == "{\"value\":\"raw { text }\"}", true);
+    result &= Test("raw_paren_json_const", rawParenJson, "{\"value\":\"paren text\"}");
+    result &= Test("raw_adjacent_json_const", rawAdjacentJson, "{\"value\":\"adjacent\"}");
+    result &= Test("raw_mixed_adjacent_json_const", rawMixedJson,
+        "{\"value\":\"raw ordinary end\"}");
+    result &= Test("raw_parenthesized_compile_time_string_constant", rawParenConstJson,
+        "{\"value\":\"paren text\"}");
+    result &= Test("raw_brace_parenthesized_json_const", rawBraceParenJson,
+        "{\"value\":\"{x}\"}");
+    result &= Test("raw_brace_adjacent_json_const", rawBraceAdjacentJson,
+        "{\"value\":\"a{x}\"}");
+    result &= Test("raw_brace_parenthesized_compile_time_constant", rawParenBraceConstJson,
+        "{\"value\":\"{x}\"}");
+    result &= Test("raw_brace_parenthesized_matches_runtime",
+        rawBraceParenJson == "{\"value\":\"" + rawRuntimeParenBrace + "\"}", true);
+    result &= Test("raw_brace_adjacent_matches_runtime",
+        rawBraceAdjacentJson == "{\"value\":\"" + rawRuntimeAdjacentBrace + "\"}", true);
+    result &= Test("raw_xml_parenthesized_namespace", rawXmlParenNamespace,
+        r#"<node xmlns="{x}"/>"#);
+    result &= Test("raw_xml_adjacent_namespace", rawXmlAdjacentNamespace,
+        r#"<node xmlns="a{x}"/>"#);
+    result &= Test("raw_xml_parenthesized_matches_runtime",
+        rawXmlParenNamespace == "<node xmlns=\"" + rawRuntimeXmlParenNamespace + "\"/>", true);
+    result &= Test("raw_xml_adjacent_matches_runtime",
+        rawXmlAdjacentNamespace == "<node xmlns=\"" + rawRuntimeXmlAdjacentNamespace + "\"/>", true);
+    result &= Test("rawstr_application_utf8_raw_name", Application.name(), "Utf8 App");
+    result &= Test("json_const_encoding_prefixes", rawEncodingJson,
+        "{\"a\":\"a\",\"b\":\"b\",\"c\":\"c\",\"d\":\"d\"}");
+    result &= Test("xml_const_parenthesized_namespace", rawXmlNamespace,
+        "<node xmlns=\"urn:round3\"/>");
+    result &= Test("bracefold_json_single", braceFoldJsonSingle, r#"{"value":"a{b}"}"#);
+    result &= Test("bracefold_json_verbatim", braceFoldJsonVerbatim,
+        r#"{"value":"{\"a\":1}"}"#);
+    result &= Test("bracefold_json_adjacent", braceFoldJsonAdjacent, r#"{"value":"a{b}}"}"#);
+    result &= Test("bracefold_json_parenthesized", braceFoldJsonParen, r#"{"value":"p{x}"}"#);
+    result &= Test("bracefold_json_escaped_braces", braceFoldJsonEscaped, r#"{"value":"{x}"}"#);
+    result &= Test("bracefold_json_raw_braces", braceFoldJsonRaw, r#"{"value":"raw {{x}}"}"#);
+    result &= Test("bracefold_json_const_string", braceFoldJsonConst, r#"{"value":"const{x}"}"#);
+    result &= Test("bracefold_json_mixed_const_string", braceFoldJsonMixedConst,
+        r#"{"value":"const{x}}"}"#);
+    result &= Test("bracefold_json_parenthesized_const_string", braceFoldJsonParenConst,
+        r#"{"value":"const{x}"}"#);
+    result &= Test("bracefold_const_runtime_single", braceFoldCompileTimeVersion, r"const{x}");
+    result &= Test("bracefold_const_runtime_mixed", braceFoldMixedCompileTimeVersion, r"const{x}}");
+    result &= Test("bracefold_const_runtime_parenthesized", braceFoldParenCompileTimeVersion, r"const{x}");
+    result &= Test("bracefold_xml_single", braceFoldXmlSingle, r#"<node xmlns="x{y}"/>"#);
+    result &= Test("bracefold_xml_adjacent", braceFoldXmlAdjacent, r#"<node xmlns="x{y}}"/>"#);
+    result &= Test("bracefold_xml_parenthesized", braceFoldXmlParen, r#"<node xmlns="x{y}"/>"#);
+    result &= Test("bracefold_xml_raw", braceFoldXmlRaw, r#"<node xmlns="x{{y}}"/>"#);
+    result &= Test("bracefold_wide_json_prefixes", braceFoldWideEncodingJson,
+        r#"{"utf16":"{u}","utf32":"{U}","wide":"{L}"}"#);
     return result;
 }
 
@@ -11168,5 +12210,269 @@ bool testConstFunctionType()
     // Overloads on a function-type parameter's pointee const pick the exact match (clang++ -std=c++20).
     result &= Test("const_fntype_overload_value", c14TPick(g) * 100 + c14TPick(f), 1020);
     result &= Test("const_fntype_overload_name", c14TPick(c14TPoke) * 100 + c14TPick(c14TLen), 1020);
+    return result;
+}
+
+namespace CountofFunctions
+{
+    int countof(int value) { return value + 10; }
+    int call() { return countof(32); }
+}
+int testCountofGlobalFunction() { return CountofFunctions.call(); }
+namespace CountofGlobalVariable
+{
+    function<int(int)> countof = default;
+    int call()
+    {
+        countof = (int value) => value + 10;
+        return countof(32);
+    }
+}
+int testCountofParameter(function<int(int)> countof, int value) { return countof(value); }
+
+struct CountofFieldCaller
+{
+    function<int(int)> countof = default;
+    int call() { return countof(5); }
+};
+
+bool testCountofNameResolution()
+{
+    bool result = true;
+    result &= Test("countof user function wins", testCountofGlobalFunction(), 42);
+    result &= Test("countof global variable wins", CountofGlobalVariable.call(), 42);
+    function<int(int)> countof = (int value) => value + 20;
+    result &= Test("countof local shadow wins", countof(22), 42);
+    result &= Test("countof parameter wins", testCountofParameter((int value) => value + 39, 3), 42);
+    CountofFieldCaller holder = default;
+    holder.countof = (int value) => value + 37;
+    result &= Test("countof implicit this field wins", holder.call(), 42);
+    return result;
+}
+
+using CountofArrayAlias = int[5];
+
+struct CountofBuffer<T, int N>
+{
+    T[N] items = default;
+    int count() { return (int)countof(items); }
+};
+
+struct CountofValueBox<int Size>
+{
+    int value() { return Size; }
+};
+
+struct CountofLeaf
+{
+    int[3][4] data = default;
+    int countThis() { return (int)countof(this.data); }
+};
+
+struct CountofBranch { CountofLeaf leaf = default; };
+struct CountofRoot { CountofBranch branch = default; };
+
+int[3][4] countofGlobalMatrix = default;
+const int countofGlobalExtent = (int)countof(countofGlobalMatrix);
+CountofBuffer<int, (int)countof(countofGlobalMatrix)> countofGlobalBuffer = default;
+CountofBuffer<int, 3> countofLiteralBuffer = default;
+
+struct SizeofRowCell { int first = default; int second = default; };
+struct SizeofRowCollision { int one = default; int two = default; };
+struct SizeofRowFixture
+{
+    int[2][3] ints = default;
+    int[2][3][4] cube = default;
+    double[2][3] doubles = default;
+    SizeofRowCell[2][3] cells = default;
+    char[2][3] chars = default;
+};
+int[2][3] sizeofRowGlobal2 = default;
+int[2][3][4] sizeofRowGlobal3 = default;
+double[2][3] sizeofRowGlobalDouble2 = default;
+char[2][3] sizeofRowGlobalChar2 = default;
+int sizeofRowSideCalls = 0;
+int sizeofRowIndex()
+{
+    sizeofRowSideCalls++;
+    return 1;
+}
+int sizeofRowParam2(SizeofRowFixture value) { return (int)sizeof(value.ints[1]); }
+int sizeofRowParam2Element(SizeofRowFixture value) { return (int)sizeof(value.ints[1][2]); }
+int sizeofRowParam3(SizeofRowFixture value) { return (int)sizeof(value.cube[1]); }
+int sizeofRowParam3Middle(SizeofRowFixture value) { return (int)sizeof(value.cube[1][2]); }
+int sizeofRowParam3Element(SizeofRowFixture value) { return (int)sizeof(value.cube[1][2][3]); }
+
+int[11] countofNestedItems = default;
+namespace CountofNestedOuter
+{
+    int[8] countofNestedItems = default;
+    namespace Inner
+    {
+        int[3] countofNestedItems = default;
+        int verify()
+        {
+            int[countof(countofNestedItems)] local = default;
+            int branch = 0;
+            if const (countof(countofNestedItems) == 3) { branch = 1; } else { branch = 2; }
+            return (int)countof(local) * 100 + (int)countof(countofNestedItems) * 10 + branch;
+        }
+    }
+}
+
+int[11] countofFallbackItems = default;
+namespace CountofFallbackOuter
+{
+    int[8] countofFallbackItems = default;
+    namespace Inner
+    {
+        int verify()
+        {
+            int[countof(countofFallbackItems)] local = default;
+            return (int)countof(local) * 100 + (int)countof(countofFallbackItems);
+        }
+    }
+}
+
+int[7] countofNItems = default;
+namespace CountofQualifiedNs
+{
+    int[5] countofNItems = default;
+    int verifyBare()
+    {
+        CountofValueBox<(int)countof(countofNItems)> box = default;
+        return box.value() * 10 + (int)countof(countofNItems);
+    }
+    int verifyQualified()
+    {
+        CountofValueBox<(int)countof(CountofQualifiedNs.countofNItems)> box = default;
+        return box.value() * 10 + (int)countof(CountofQualifiedNs.countofNItems);
+    }
+}
+
+int[11] countofMethodItems = default;
+namespace CountofMethodNamespace
+{
+    int[6] countofMethodItems = default;
+    struct Counter
+    {
+        int verify()
+        {
+            int[countof(countofMethodItems)] local = default;
+            return (int)countof(local) * 10 + (int)countof(countofMethodItems);
+        }
+    };
+}
+
+bool testCountofNamespaceResolution()
+{
+    bool result = true;
+    result &= Test("countof nested namespace shadow", CountofNestedOuter.Inner.verify(), 331);
+    result &= Test("countof parent namespace fallback", CountofFallbackOuter.Inner.verify(), 808);
+    result &= Test("countof namespace generic value", CountofQualifiedNs.verifyBare(), 55);
+    result &= Test("countof explicitly qualified generic value", CountofQualifiedNs.verifyQualified(), 55);
+    CountofMethodNamespace.Counter counter = default;
+    result &= Test("countof namespace struct method", counter.verify(), 66);
+    return result;
+}
+
+bool testCountofSemantics()
+{
+    bool result = true;
+    int[3][4] matrix = default;
+    result &= Test("countof local outer dimension", (int)countof(matrix), 3);
+    result &= Test("countof result type i64", countof(matrix), (i64)3);
+    result &= Test("countof indexed inner dimension", (int)countof(matrix[0]), 4);
+    result &= Test("countof parenthesized operand", (int)countof((matrix)), 3);
+    int*[2] pointers = default;
+    result &= Test("countof fixed array of pointers", (int)countof(pointers), 2);
+
+    CountofArrayAlias alias = default;
+    result &= Test("countof array alias", (int)countof(alias), 5);
+    CountofLeaf leaf = default;
+    result &= Test("countof direct field", (int)countof(leaf.data), 3);
+    result &= Test("countof explicit this field", leaf.countThis(), 3);
+    CountofRoot root = default;
+    result &= Test("countof nested field path", (int)countof(root.branch.leaf.data), 3);
+    result &= Test("countof global array", (int)countof(countofGlobalMatrix), 3);
+    result &= Test("countof global initializer", countofGlobalExtent, 3);
+
+    int index = 0;
+    int innerCount = (int)countof(matrix[index++]);
+    result &= Test("countof operand side effect omitted", innerCount * 10 + index, 40);
+
+    int branch = 0;
+    if const (countof(matrix) == 3) { branch = 17; } else { branch = 29; }
+    result &= Test("countof if const", branch, 17);
+    int[countof(matrix)] bounded = default;
+    result &= Test("countof array dimension", (int)(sizeof(bounded) / sizeof(int)), 3);
+    CountofBuffer<int, (int)countof(matrix)> localBuffer = default;
+    result &= Test("countof local generic value argument", localBuffer.count(), 3);
+    result &= Test("countof generic value argument", countofGlobalBuffer.count(), 3);
+    result &= Test("countof generic body T[N]", countofLiteralBuffer.count(), 3);
+    result &= Test("sizeof remains byte size", (int)sizeof(matrix), 48);
+
+    // Packed dimensions make each row-size leg fail on master while checking scalar sizes too.
+    result &= Test("sizeof global int2 syntax forms and element",
+        (int)sizeof(sizeofRowGlobal2) * 1000
+            + (int)sizeof sizeofRowGlobal2[1] * 100
+            + (int)sizeof((sizeofRowGlobal2[1])) * 10
+            + (int)sizeof(sizeofRowGlobal2[1][2]), 25324);
+    result &= Test("sizeof global int3 row middle and element",
+        (int)sizeof(sizeofRowGlobal3) * 10000 + (int)sizeof(sizeofRowGlobal3[1]) * 100
+            + (int)sizeof(sizeofRowGlobal3[1][2]) * 10 + (int)sizeof(sizeofRowGlobal3[1][2][3]), 964964);
+    result &= Test("sizeof global runtime index and no side effect",
+        (int)sizeof(sizeofRowGlobal3[sizeofRowIndex()]) * 10 + sizeofRowSideCalls, 480);
+    result &= Test("sizeof global double2 row", (int)sizeof(sizeofRowGlobalDouble2[1]), 24);
+    result &= Test("sizeof global char2 row", (int)sizeof(sizeofRowGlobalChar2[1]), 3);
+
+    int[2][3] sizeofRowLocal2 = default;
+    int[2][3][4] sizeofRowLocal3 = default;
+    double[2][3] sizeofRowLocalDouble2 = default;
+    SizeofRowCell[2][3] sizeofRowLocalStruct2 = default;
+    char[2][3] sizeofRowLocalChar2 = default;
+    int sizeofRowLocalIndex = 0;
+    result &= Test("sizeof local int2 row runtime index and element",
+        (int)sizeof(sizeofRowLocal2[1]) * 100
+            + (int)sizeof(sizeofRowLocal2[sizeofRowLocalIndex]) * 10
+            + (int)sizeof(sizeofRowLocal2[1][2]), 1324);
+    int[2][3] SizeofRowCollision = default;
+    result &= Test("sizeof local type-name collision and unique row",
+        (int)sizeof(SizeofRowCollision[1]) * 10 + (int)sizeof(sizeofRowLocal2[1]), 132);
+    result &= Test("sizeof local int3 row middle and element",
+        (int)sizeof(sizeofRowLocal3[1]) * 100 + (int)sizeof(sizeofRowLocal3[1][2]) * 10
+            + (int)sizeof(sizeofRowLocal3[1][2][3]), 4964);
+    result &= Test("sizeof local double2 row", (int)sizeof(sizeofRowLocalDouble2[1]), 24);
+    result &= Test("sizeof local struct2 row and element",
+        (int)sizeof(sizeofRowLocalStruct2[1]) * 10
+            + (int)sizeof(sizeofRowLocalStruct2[1][2]), 248);
+    result &= Test("sizeof local char2 row", (int)sizeof(sizeofRowLocalChar2[1]), 3);
+
+    SizeofRowFixture sizeofRowFixture = default;
+    SizeofRowFixture* sizeofRowPointer = &sizeofRowFixture;
+    result &= Test("sizeof field and arrow int2 row and element",
+        (int)sizeof(sizeofRowFixture.ints[1]) * 100
+            + (int)sizeof(sizeofRowPointer->ints[1]) * 10
+            + (int)sizeof(sizeofRowFixture.ints[1][2]), 1324);
+    result &= Test("sizeof field int3 row middle and element",
+        (int)sizeof(sizeofRowFixture.cube[1]) * 100
+            + (int)sizeof(sizeofRowFixture.cube[1][2]) * 10
+            + (int)sizeof(sizeofRowFixture.cube[1][2][3]), 4964);
+    result &= Test("sizeof field double2 row", (int)sizeof(sizeofRowFixture.doubles[1]), 24);
+    result &= Test("sizeof field struct2 row and element",
+        (int)sizeof(sizeofRowFixture.cells[1]) * 10
+            + (int)sizeof(sizeofRowFixture.cells[1][2]), 248);
+    result &= Test("sizeof field char2 row", (int)sizeof(sizeofRowFixture.chars[1]), 3);
+    result &= Test("sizeof struct parameter int2 row and element",
+        sizeofRowParam2(sizeofRowFixture) * 10 + sizeofRowParam2Element(sizeofRowFixture), 124);
+    result &= Test("sizeof struct parameter int3 row middle and element",
+        sizeofRowParam3(sizeofRowFixture) * 100 + sizeofRowParam3Middle(sizeofRowFixture) * 10
+            + sizeofRowParam3Element(sizeofRowFixture), 4964);
+    result &= Test("sizeof arrow runtime index and no side effect",
+        (int)sizeof(sizeofRowPointer->ints[sizeofRowIndex()]) * 10 + sizeofRowSideCalls, 120);
+    int*[2][3] sizeofRowPointers2 = default;
+    result &= Test("sizeof pointer-array row element and alignof row",
+        (int)sizeof(sizeofRowPointers2[1]) * 100 + (int)sizeof(sizeofRowPointers2[1][2]) * 10
+            + (int)alignof(sizeofRowPointers2[1]), 2488);
     return result;
 }

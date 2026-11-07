@@ -998,6 +998,7 @@
     "unknowntypearg0": [
       "GiDeadOnly__i32"
     ],
+    "unterminatedrawstringliteral": [],
     "virtualisnotacflatke...sdeducedfromthecbase2687475741f225d0": []
   },
   "argumentNames": {
@@ -2315,6 +2316,7 @@
     "unknownoperationarg0": "unknown operation '{0}'",
     "unknownparentinterfacearg0": "unknown parent interface: '{0}'",
     "unknowntypearg0": "unknown type '{0}'",
+    "unterminatedrawstringliteral": "unterminated raw string literal",
     "unusedimportarg0": "unused import '{0}'",
     "virtualisnotacflatke...sdeducedfromthecbase2687475741f225d0": "'virtual' is not a CFlat keyword; virtual-ness is deduced from the C++ base",
     "windowssdkvisualstud...ationbutwerenotfound94074d79622a7b60": "Windows SDK / Visual Studio build tools are required for this build configuration but were not found.",

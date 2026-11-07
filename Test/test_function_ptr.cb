@@ -7767,6 +7767,263 @@ alias Lambda<int(int)> t512GetAliasGlobal() { return t512Global; }
 function<int(int)> t512GetThin() { return doubleIt; }
 function<Lambda<int(int)>()> t512GetClosureGetter() { return t512GetGlobal; }
 
+// FNTYPE acceptance set: aliases stay transparent in function signatures and overload binding.
+typedef int FntypeTypedef;
+using FntypeUsing = int;
+using FntypeInner = int;
+using FntypeNested = FntypeInner;
+using FntypePointer = int*;
+typedef int* FntypePointerTypedef;
+using FntypeTuple = tuple<int, int>;
+typedef tuple<int, int> FntypeTupleTypedef;
+
+int fntypeTargetTypedef(FntypeTypedef x) { return x + 10; }
+int fntypeTargetTypedef(double x) { return 200; }
+int fntypeTargetUsing(FntypeUsing x) { return x + 10; }
+int fntypeTargetUsing(double x) { return 200; }
+int fntypeTargetNested(FntypeNested x) { return x + 10; }
+int fntypeTargetNested(double x) { return 200; }
+int fntypeTargetPointer(FntypePointer x) { return *x + 10; }
+int fntypeTargetPointer(double* x) { return 200; }
+int fntypeTargetPointerTypedef(FntypePointerTypedef x) { return *x + 10; }
+int fntypeTargetPointerTypedef(double* x) { return 200; }
+int fntypeTargetTuple(FntypeTuple x) { return 15; }
+int fntypeTargetTuple(double x) { return 200; }
+int fntypeTargetTupleTypedef(FntypeTupleTypedef x) { return 15; }
+int fntypeTargetTupleTypedef(double x) { return 200; }
+
+function<int(FntypeUsing)> fntypeGetUsing() { return fntypeTargetUsing; }
+function<int(FntypeNested)> fntypeGetNested() { return fntypeTargetNested; }
+function<int(FntypePointer)> fntypeGetPointer() { return fntypeTargetPointer; }
+function<int(FntypePointerTypedef)> fntypeGetPointerTypedef() { return fntypeTargetPointerTypedef; }
+function<int(FntypeTypedef)> fntypeGetTypedef() { return fntypeTargetTypedef; }
+function<int(FntypeTuple)> fntypeGetTuple() { return fntypeTargetTuple; }
+function<int(FntypeTupleTypedef)> fntypeGetTupleTypedef() { return fntypeTargetTupleTypedef; }
+
+int fntypeInvokeTypedef(function<int(FntypeTypedef)> fn, FntypeTypedef x) { return fn(x); }
+int fntypeInvokeLambdaTypedef(Lambda<int(FntypeTypedef)> fn, FntypeTypedef x) { return fn(x); }
+int fntypeInvokeUsing(function<int(FntypeUsing)> fn, FntypeUsing x) { return fn(x); }
+int fntypeInvokeNested(function<int(FntypeNested)> fn, FntypeNested x) { return fn(x); }
+int fntypeInvokePointer(function<int(FntypePointer)> fn, FntypePointer x) { return fn(x); }
+int fntypeInvokePointerTypedef(function<int(FntypePointerTypedef)> fn, FntypePointerTypedef x) { return fn(x); }
+int fntypeInvokeTuple(function<int(FntypeTuple)> fn, FntypeTuple x) { return fn(x); }
+int fntypeInvokeLambdaTuple(Lambda<int(FntypeTuple)> fn, FntypeTuple x) { return fn(x); }
+int fntypeInvokeTupleTypedef(function<int(FntypeTupleTypedef)> fn, FntypeTupleTypedef x) { return fn(x); }
+int fntypeInvokeLambdaTupleTypedef(Lambda<int(FntypeTupleTypedef)> fn, FntypeTupleTypedef x) { return fn(x); }
+
+FntypeTypedef fntypeReturnTypedef(int x) { return x + 10; }
+FntypeTypedef fntypeReturnTypedef(double x) { return 200; }
+FntypeUsing fntypeReturnUsing(int x) { return x + 10; }
+FntypeNested fntypeReturnNested(int x) { return x + 10; }
+int fntypeReturnUsing(double x) { return 200; }
+int fntypeReturnNested(double x) { return 200; }
+function<FntypeUsing(int)> fntypeGetReturnUsing() { return fntypeReturnUsing; }
+function<FntypeNested(int)> fntypeGetReturnNested() { return fntypeReturnNested; }
+function<FntypeTypedef(int)> fntypeGetReturnTypedef() { return fntypeReturnTypedef; }
+function<FntypeTuple(int)> fntypeGetReturnTuple();
+int fntypeInvokeReturnUsing(function<FntypeUsing(int)> fn, int x) { return fn(x); }
+int fntypeInvokeReturnNested(function<FntypeNested(int)> fn, int x) { return fn(x); }
+int fntypeInvokeReturnTypedef(function<FntypeTypedef(int)> fn, int x) { return fn(x); }
+int fntypeInvokeReturnTypedefLambda(Lambda<FntypeTypedef(int)> fn, int x) { return fn(x); }
+
+int fntypePointerValue = 15;
+FntypePointer fntypeReturnPointer(int x) { return &fntypePointerValue; }
+function<FntypePointer(int)> fntypeGetReturnPointer() { return fntypeReturnPointer; }
+int fntypeInvokeReturnPointer(function<FntypePointer(int)> fn, int x) { return *fn(x); }
+
+FntypeTuple fntypeReturnTuple(int x) { FntypeTuple v = default; v.item_0 = 15; return v; }
+FntypeTuple fntypeReturnTuple(double x) { FntypeTuple v = default; v.item_0 = 200; return v; }
+function<FntypeTuple(int)> fntypeGetReturnTuple() { return fntypeReturnTuple; }
+int fntypeScoreTuple(FntypeTuple x) { return x.item_0; }
+int fntypeInvokeReturnTuple(function<FntypeTuple(int)> fn, int x) { return fntypeScoreTuple(fn(x)); }
+int fntypeInvokeReturnTupleLambda(Lambda<FntypeTuple(int)> fn, int x) { return fntypeScoreTuple(fn(x)); }
+FntypeTupleTypedef fntypeReturnTupleTypedef(int x) { FntypeTupleTypedef v = default; v.item_0 = 15; return v; }
+FntypeTupleTypedef fntypeReturnTupleTypedef(double x) { FntypeTupleTypedef v = default; v.item_0 = 200; return v; }
+int fntypeScoreTupleTypedef(FntypeTupleTypedef x) { return x.item_0; }
+function<FntypeTupleTypedef(int)> fntypeGetReturnTupleTypedef() { return fntypeReturnTupleTypedef; }
+int fntypeInvokeReturnTupleTypedef(function<FntypeTupleTypedef(int)> fn, int x) { return fntypeScoreTupleTypedef(fn(x)); }
+int fntypeInvokeReturnTupleTypedefLambda(Lambda<FntypeTupleTypedef(int)> fn, int x) { return fntypeScoreTupleTypedef(fn(x)); }
+int fntypeTupleView((int, int)[] p) { return 17; }
+int fntypeTuplePp((int, int)** p) { return 27; }
+
+int fntypeGenericTarget<T>(T x) { return (int)x + 10; }
+function<int(T)> fntypeGenericGet<T>() { return fntypeGenericTarget<T>; }
+int fntypeGenericInvoke<T>(function<int(T)> fn, T x) { return fn(x); }
+int fntypeGenericProbe<T>(T x)
+{
+    using Alias = T;
+    function<int(Alias)> thin = fntypeGenericTarget<T>;
+    Lambda<int(Alias)> fat = fntypeGenericTarget<T>;
+    function<function<int(Alias)>()> get = fntypeGenericGet<T>;
+    return thin(x) + fat(x) + fntypeGenericInvoke<T>(thin, x) + get()(x);
+}
+
+T fntypeGenericReturn<T>(int x) { return (T)15; }
+function<T(int)> fntypeGenericReturnGet<T>() { return fntypeGenericReturn<T>; }
+int fntypeGenericReturnInvoke<T>(function<T(int)> fn, int x) { return (int)fn(x); }
+int fntypeGenericReturnProbe<T>(int x)
+{
+    using Alias = T;
+    function<Alias(int)> thin = fntypeGenericReturn<T>;
+    Lambda<Alias(int)> fat = fntypeGenericReturn<T>;
+    function<function<Alias(int)>()> get = fntypeGenericReturnGet<T>;
+    return (int)thin(x) + (int)fat(x) + fntypeGenericReturnInvoke<T>(thin, x)
+        + (int)get()(x);
+}
+
+bool testFntypeAliasAcceptSet()
+{
+    bool result = true;
+    int value = 5;
+
+    function<int(FntypeTypedef)> typedefThin = fntypeTargetTypedef;
+    Lambda<int(FntypeTypedef)> typedefFat = fntypeTargetTypedef;
+    result &= Test("fntype typedef thin value and overload", typedefThin(5), 15);
+    result &= Test("fntype typedef Lambda value and overload", typedefFat(5), 15);
+
+    function<int(FntypeUsing)> usingThin = fntypeTargetUsing;
+    Lambda<int(FntypeUsing)> usingFat = fntypeTargetUsing;
+    function<function<int(FntypeUsing)>()> usingGet = fntypeGetUsing;
+    result &= Test("fntype using thin value and overload", usingThin(5), 15);
+    result &= Test("fntype using Lambda value and overload", usingFat(5), 15);
+    result &= Test("fntype using call through parameter", fntypeInvokeUsing(fntypeTargetUsing, 5), 15);
+    result &= Test("fntype using nested getter overload", usingGet()(5), 15);
+
+    function<int(FntypeNested)> nestedThin = fntypeTargetNested;
+    Lambda<int(FntypeNested)> nestedFat = fntypeTargetNested;
+    function<function<int(FntypeNested)>()> nestedGet = fntypeGetNested;
+    result &= Test("fntype nested thin value and overload", nestedThin(5), 15);
+    result &= Test("fntype nested Lambda value and overload", nestedFat(5), 15);
+    result &= Test("fntype nested call through parameter", fntypeInvokeNested(fntypeTargetNested, 5), 15);
+    result &= Test("fntype nested getter overload", nestedGet()(5), 15);
+
+    function<int(FntypePointer)> pointerThin = fntypeTargetPointer;
+    Lambda<int(FntypePointer)> pointerFat = fntypeTargetPointer;
+    function<function<int(FntypePointer)>()> pointerGet = fntypeGetPointer;
+    result &= Test("fntype pointer alias thin value and overload", pointerThin(&value), 15);
+    result &= Test("fntype pointer alias Lambda value and overload", pointerFat(&value), 15);
+    result &= Test("fntype pointer alias call through parameter", fntypeInvokePointer(fntypeTargetPointer, &value), 15);
+    result &= Test("fntype pointer alias nested getter overload", pointerGet()(&value), 15);
+
+    function<int(FntypePointerTypedef)> pointerTypedefThin = fntypeTargetPointerTypedef;
+    Lambda<int(FntypePointerTypedef)> pointerTypedefFat = fntypeTargetPointerTypedef;
+    result &= Test("fntype typedef pointer thin value and overload", pointerTypedefThin(&value), 15);
+    result &= Test("fntype typedef pointer Lambda value and overload", pointerTypedefFat(&value), 15);
+    result &= Test("fntype typedef pointer call through parameter",
+        fntypeInvokePointerTypedef(fntypeTargetPointerTypedef, &value), 15);
+    result &= Test("fntype typedef pointer nested getter overload",
+        fntypeGetPointerTypedef()(&value), 15);
+
+    function<int(FntypeTuple)> tupleThin = fntypeTargetTuple;
+    Lambda<int(FntypeTuple)> tupleFat = fntypeTargetTuple;
+    result &= Test("fntype tuple alias thin value and overload", tupleThin(default), 15);
+    result &= Test("fntype tuple alias Lambda value and overload", tupleFat(default), 15);
+
+    function<int(FntypeTupleTypedef)> tupleTypedefThin = fntypeTargetTupleTypedef;
+    Lambda<int(FntypeTupleTypedef)> tupleTypedefFat = fntypeTargetTupleTypedef;
+    result &= Test("fntype typedef tuple thin value and overload", tupleTypedefThin(default), 15);
+    result &= Test("fntype typedef tuple Lambda value and overload", tupleTypedefFat(default), 15);
+
+    function<FntypeTypedef(int)> returnTypedefThin = fntypeReturnTypedef;
+    Lambda<FntypeTypedef(int)> returnTypedefFat = fntypeReturnTypedef;
+    result &= Test("fntype typedef return thin", returnTypedefThin(5), 15);
+    result &= Test("fntype typedef return Lambda", returnTypedefFat(5), 15);
+
+    function<FntypeUsing(int)> returnUsingThin = fntypeReturnUsing;
+    Lambda<FntypeUsing(int)> returnUsingFat = fntypeReturnUsing;
+    function<function<FntypeUsing(int)>()> returnUsingGet = fntypeGetReturnUsing;
+    result &= Test("fntype using return thin overload", returnUsingThin(5), 15);
+    result &= Test("fntype using return Lambda overload", returnUsingFat(5), 15);
+    result &= Test("fntype using return call through", fntypeInvokeReturnUsing(fntypeReturnUsing, 5), 15);
+    result &= Test("fntype using return nested getter", returnUsingGet()(5), 15);
+
+    function<FntypeNested(int)> returnNestedThin = fntypeReturnNested;
+    Lambda<FntypeNested(int)> returnNestedFat = fntypeReturnNested;
+    function<function<FntypeNested(int)>()> returnNestedGet = fntypeGetReturnNested;
+    result &= Test("fntype nested return thin overload", returnNestedThin(5), 15);
+    result &= Test("fntype nested return Lambda overload", returnNestedFat(5), 15);
+    result &= Test("fntype nested return call through", fntypeInvokeReturnNested(fntypeReturnNested, 5), 15);
+    result &= Test("fntype nested return getter overload", returnNestedGet()(5), 15);
+
+    function<FntypePointer(int)> returnPointerThin = fntypeReturnPointer;
+    Lambda<FntypePointer(int)> returnPointerFat = fntypeReturnPointer;
+    function<function<FntypePointer(int)>()> returnPointerGet = fntypeGetReturnPointer;
+    result &= Test("fntype pointer return thin", *returnPointerThin(0), 15);
+    result &= Test("fntype pointer return Lambda", *returnPointerFat(0), 15);
+    result &= Test("fntype pointer return call through", fntypeInvokeReturnPointer(fntypeReturnPointer, 0), 15);
+    result &= Test("fntype pointer return nested getter", *returnPointerGet()(0), 15);
+
+    function<FntypeTuple(int)> returnTupleThin = fntypeReturnTuple;
+    Lambda<FntypeTuple(int)> returnTupleFat = fntypeReturnTuple;
+    result &= Test("fntype tuple return thin", returnTupleThin(0).item_0, 15);
+    result &= Test("fntype tuple return Lambda", returnTupleFat(0).item_0, 15);
+
+    function<FntypeTupleTypedef(int)> returnTupleTypedefThin = fntypeReturnTupleTypedef;
+    Lambda<FntypeTupleTypedef(int)> returnTupleTypedefFat = fntypeReturnTupleTypedef;
+    result &= Test("fntype typedef tuple return thin", fntypeScoreTupleTypedef(returnTupleTypedefThin(0)), 15);
+    result &= Test("fntype typedef tuple return Lambda", fntypeScoreTupleTypedef(returnTupleTypedefFat(0)), 15);
+
+    result &= Test("fntype generic parameter aliases", fntypeGenericProbe<int>(5), 60);
+    result &= Test("fntype generic return aliases", fntypeGenericReturnProbe<int>(5), 60);
+    return result;
+}
+
+bool testFntypeSignatureRegressions()
+{
+    bool result = true;
+    FntypeTuple tupleValue = default;
+
+    function<function<int(FntypeTypedef)>()> typedefGet = fntypeGetTypedef;
+    result &= Test("fntype typedef nested getter chooses overload", typedefGet()(5), 15);
+    result &= Test("fntype typedef call through thin parameter",
+        fntypeInvokeTypedef(fntypeTargetTypedef, 5), 15);
+    result &= Test("fntype typedef call through Lambda parameter",
+        fntypeInvokeLambdaTypedef(fntypeTargetTypedef, 5), 15);
+
+    function<function<int(FntypeTuple)>()> tupleGet = fntypeGetTuple;
+    result &= Test("fntype tuple alias nested getter", tupleGet()(tupleValue), 15);
+    result &= Test("fntype tuple alias call through thin parameter",
+        fntypeInvokeTuple(fntypeTargetTuple, tupleValue), 15);
+    result &= Test("fntype tuple alias call through Lambda parameter",
+        fntypeInvokeLambdaTuple(fntypeTargetTuple, tupleValue), 15);
+
+    function<function<int(FntypeTupleTypedef)>()> tupleTypedefGet = fntypeGetTupleTypedef;
+    result &= Test("fntype typedef tuple nested getter", tupleTypedefGet()(tupleValue), 15);
+    result &= Test("fntype typedef tuple call through thin parameter",
+        fntypeInvokeTupleTypedef(fntypeTargetTupleTypedef, tupleValue), 15);
+    result &= Test("fntype typedef tuple call through Lambda parameter",
+        fntypeInvokeLambdaTupleTypedef(fntypeTargetTupleTypedef, tupleValue), 15);
+
+    function<function<FntypeTypedef(int)>()> returnTypedefGet = fntypeGetReturnTypedef;
+    result &= Test("fntype typedef return nested getter chooses overload", returnTypedefGet()(5), 15);
+    result &= Test("fntype typedef return call through thin parameter",
+        fntypeInvokeReturnTypedef(fntypeReturnTypedef, 5), 15);
+    result &= Test("fntype typedef return call through Lambda parameter",
+        fntypeInvokeReturnTypedefLambda(fntypeReturnTypedef, 5), 15);
+
+    function<function<FntypeTuple(int)>()> returnTupleGet = fntypeGetReturnTuple;
+    result &= Test("fntype tuple return nested getter",
+        fntypeScoreTuple(returnTupleGet()(0)), 15);
+    result &= Test("fntype tuple return call through thin parameter",
+        fntypeInvokeReturnTuple(fntypeReturnTuple, 0), 15);
+    result &= Test("fntype tuple return call through Lambda parameter",
+        fntypeInvokeReturnTupleLambda(fntypeReturnTuple, 0), 15);
+
+    function<function<FntypeTupleTypedef(int)>()> returnTupleTypedefGet = fntypeGetReturnTupleTypedef;
+    result &= Test("fntype typedef tuple return nested getter",
+        fntypeScoreTupleTypedef(returnTupleTypedefGet()(0)), 15);
+    result &= Test("fntype typedef tuple return call through thin parameter",
+        fntypeInvokeReturnTupleTypedef(fntypeReturnTupleTypedef, 0), 15);
+    result &= Test("fntype typedef tuple return call through Lambda parameter",
+        fntypeInvokeReturnTupleTypedefLambda(fntypeReturnTupleTypedef, 0), 15);
+
+    function<int((int, int)[])> tupleView = fntypeTupleView;
+    function<int((int, int)**)> tuplePp = fntypeTuplePp;
+    result &= Test("fntype tuple view signature retained", tupleView(nullptr), 17);
+    result &= Test("fntype tuple double-pointer depth retained", tuplePp(nullptr), 27);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -8025,6 +8282,8 @@ extern int main(int argc, char** argv)
     total++; passed += testT501FunctionPointerSlotAddresses() ? 1 : 0;
     total++; passed += testT500NestedFunctionAcceptSet() ? 1 : 0;
     total++; passed += testT512NamedClosureReturnSlots() ? 1 : 0;
+    total++; passed += testFntypeAliasAcceptSet() ? 1 : 0;
+    total++; passed += testFntypeSignatureRegressions() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

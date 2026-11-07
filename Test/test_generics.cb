@@ -7,6 +7,8 @@ import "unique.cb";
 import "string.cb";
 import "diagnostic/heap_audit.cb";
 
+namespace N { }
+
 // =============================================================
 // Generic struct tests (compile-time only monomorphization)
 // =============================================================
@@ -6603,6 +6605,246 @@ struct Buf<T, int N> { int value = default; int cap() { return N; } };
 // dropping a trailing argument equal to its default.
 struct DefBuf<T, int N = 4> { T[N] items = default; int cap() { return N; } };
 
+namespace GennsUnrelated { }
+namespace GennsCaller { }
+int GennsGlobalFn() { return 17; }
+enum GennsEnumScope : int { GennsEnumConst = 17 };
+struct GennsStructType { int first; int second; };
+
+struct GennsBoxN<int N>
+{
+    int get() { return N; }
+    int plus() { return N + 1; }
+    int size() { return (int)sizeof(N); }
+    int sizePrefix() { return (int)sizeof N; }
+    int withDefault(int value = N) { return value; }
+};
+
+struct GennsBoxUnrelated<int GennsUnrelated>
+{
+    int get() { return GennsUnrelated; }
+    int plus() { return GennsUnrelated + 1; }
+    int size() { return (int)sizeof(GennsUnrelated); }
+    int sizePrefix() { return (int)sizeof GennsUnrelated; }
+    int withDefault(int value = GennsUnrelated) { return value; }
+};
+
+struct GennsBoxFunction<int GennsGlobalFn>
+{
+    int size() { return (int)sizeof(GennsGlobalFn); }
+};
+
+struct GennsBoxEnum<int GennsEnumConst>
+{
+    int size() { return (int)sizeof(GennsEnumConst); }
+};
+
+struct GennsBoxType<int GennsStructType>
+{
+    int get() { return GennsStructType; }
+    int plus() { return GennsStructType + 1; }
+    int size() { return (int)sizeof(GennsStructType); }
+    int sizePrefix() { return (int)sizeof GennsStructType; }
+    int withDefault(int value = GennsStructType) { return value; }
+};
+
+namespace N
+{
+bool genns_enclosing_namespace_inside()
+{
+    GennsBoxN<5> box = default;
+    bool result = true;
+    result &= Test("genns_enclosing_namespace_return_inside", box.get(), 5);
+    result &= Test("genns_enclosing_namespace_plus_inside", box.plus(), 6);
+    result &= Test("genns_enclosing_namespace_sizeof_inside", box.size(), 4);
+    result &= Test("genns_enclosing_namespace_sizeof_prefix_inside", box.sizePrefix(), 4);
+    result &= Test("genns_enclosing_namespace_default_argument_inside", box.withDefault(), 5);
+    return result;
+}
+}
+
+bool genns_enclosing_namespace_global()
+{
+    GennsBoxN<6> box = default;
+    bool result = true;
+    result &= Test("genns_enclosing_namespace_return_global", box.get(), 6);
+    result &= Test("genns_enclosing_namespace_plus_global", box.plus(), 7);
+    result &= Test("genns_enclosing_namespace_sizeof_global", box.size(), 4);
+    result &= Test("genns_enclosing_namespace_sizeof_prefix_global", box.sizePrefix(), 4);
+    result &= Test("genns_enclosing_namespace_default_argument_global", box.withDefault(), 6);
+    return result;
+}
+
+bool genns_enclosing_namespace_genericInner<T>()
+{
+    GennsBoxN<7> box = default;
+    bool result = true;
+    result &= Test("genns_enclosing_namespace_return_generic", box.get(), 7);
+    result &= Test("genns_enclosing_namespace_plus_generic", box.plus(), 8);
+    result &= Test("genns_enclosing_namespace_sizeof_generic", box.size(), 4);
+    result &= Test("genns_enclosing_namespace_sizeof_prefix_generic", box.sizePrefix(), 4);
+    result &= Test("genns_enclosing_namespace_default_argument_generic", box.withDefault(), 7);
+    return result;
+}
+bool genns_enclosing_namespace_generic() { return genns_enclosing_namespace_genericInner<int>(); }
+
+namespace GennsCaller
+{
+bool genns_unrelated_namespace_inside()
+{
+    GennsBoxUnrelated<5> box = default;
+    bool result = true;
+    result &= Test("genns_unrelated_namespace_return_inside", box.get(), 5);
+    result &= Test("genns_unrelated_namespace_plus_inside", box.plus(), 6);
+    result &= Test("genns_unrelated_namespace_sizeof_inside", box.size(), 4);
+    result &= Test("genns_unrelated_namespace_sizeof_prefix_inside", box.sizePrefix(), 4);
+    result &= Test("genns_unrelated_namespace_default_argument_inside", box.withDefault(), 5);
+    return result;
+}
+}
+
+bool genns_unrelated_namespace_global()
+{
+    GennsBoxUnrelated<6> box = default;
+    bool result = true;
+    result &= Test("genns_unrelated_namespace_return_global", box.get(), 6);
+    result &= Test("genns_unrelated_namespace_plus_global", box.plus(), 7);
+    result &= Test("genns_unrelated_namespace_sizeof_global", box.size(), 4);
+    result &= Test("genns_unrelated_namespace_sizeof_prefix_global", box.sizePrefix(), 4);
+    result &= Test("genns_unrelated_namespace_default_argument_global", box.withDefault(), 6);
+    return result;
+}
+
+bool genns_unrelated_namespace_genericInner<T>()
+{
+    GennsBoxUnrelated<7> box = default;
+    bool result = true;
+    result &= Test("genns_unrelated_namespace_return_generic", box.get(), 7);
+    result &= Test("genns_unrelated_namespace_plus_generic", box.plus(), 8);
+    result &= Test("genns_unrelated_namespace_sizeof_generic", box.size(), 4);
+    result &= Test("genns_unrelated_namespace_sizeof_prefix_generic", box.sizePrefix(), 4);
+    result &= Test("genns_unrelated_namespace_default_argument_generic", box.withDefault(), 7);
+    return result;
+}
+bool genns_unrelated_namespace_generic() { return genns_unrelated_namespace_genericInner<int>(); }
+
+namespace GennsCaller
+{
+bool genns_global_function_inside()
+{
+    GennsBoxFunction<5> box = default;
+    bool result = true;
+    result &= Test("genns_global_function_sizeof_inside", box.size(), 4);
+    return result;
+}
+}
+
+bool genns_global_function_global()
+{
+    GennsBoxFunction<6> box = default;
+    bool result = true;
+    result &= Test("genns_global_function_sizeof_global", box.size(), 4);
+    return result;
+}
+
+bool genns_global_function_genericInner<T>()
+{
+    GennsBoxFunction<7> box = default;
+    bool result = true;
+    result &= Test("genns_global_function_sizeof_generic", box.size(), 4);
+    return result;
+}
+bool genns_global_function_generic() { return genns_global_function_genericInner<int>(); }
+
+namespace GennsCaller
+{
+bool genns_enum_constant_inside()
+{
+    GennsBoxEnum<5> box = default;
+    bool result = true;
+    result &= Test("genns_enum_constant_sizeof_inside", box.size(), 4);
+    return result;
+}
+}
+
+bool genns_enum_constant_global()
+{
+    GennsBoxEnum<6> box = default;
+    bool result = true;
+    result &= Test("genns_enum_constant_sizeof_global", box.size(), 4);
+    return result;
+}
+
+bool genns_enum_constant_genericInner<T>()
+{
+    GennsBoxEnum<7> box = default;
+    bool result = true;
+    result &= Test("genns_enum_constant_sizeof_generic", box.size(), 4);
+    return result;
+}
+bool genns_enum_constant_generic() { return genns_enum_constant_genericInner<int>(); }
+
+namespace GennsCaller
+{
+bool genns_struct_type_inside()
+{
+    GennsBoxType<5> box = default;
+    bool result = true;
+    result &= Test("genns_struct_type_return_inside", box.get(), 5);
+    result &= Test("genns_struct_type_plus_inside", box.plus(), 6);
+    result &= Test("genns_struct_type_sizeof_inside", box.size(), 4);
+    result &= Test("genns_struct_type_sizeof_prefix_inside", box.sizePrefix(), 4);
+    result &= Test("genns_struct_type_default_argument_inside", box.withDefault(), 5);
+    return result;
+}
+}
+
+bool genns_struct_type_global()
+{
+    GennsBoxType<6> box = default;
+    bool result = true;
+    result &= Test("genns_struct_type_return_global", box.get(), 6);
+    result &= Test("genns_struct_type_plus_global", box.plus(), 7);
+    result &= Test("genns_struct_type_sizeof_global", box.size(), 4);
+    result &= Test("genns_struct_type_sizeof_prefix_global", box.sizePrefix(), 4);
+    result &= Test("genns_struct_type_default_argument_global", box.withDefault(), 6);
+    return result;
+}
+
+bool genns_struct_type_genericInner<T>()
+{
+    GennsBoxType<7> box = default;
+    bool result = true;
+    result &= Test("genns_struct_type_return_generic", box.get(), 7);
+    result &= Test("genns_struct_type_plus_generic", box.plus(), 8);
+    result &= Test("genns_struct_type_sizeof_generic", box.size(), 4);
+    result &= Test("genns_struct_type_sizeof_prefix_generic", box.sizePrefix(), 4);
+    result &= Test("genns_struct_type_default_argument_generic", box.withDefault(), 7);
+    return result;
+}
+bool genns_struct_type_generic() { return genns_struct_type_genericInner<int>(); }
+
+bool testGenericValueParameterShadowsOuterNames()
+{
+    bool result = true;
+    result &= N.genns_enclosing_namespace_inside();
+    result &= genns_enclosing_namespace_global();
+    result &= genns_enclosing_namespace_generic();
+    result &= GennsCaller.genns_unrelated_namespace_inside();
+    result &= genns_unrelated_namespace_global();
+    result &= genns_unrelated_namespace_generic();
+    result &= GennsCaller.genns_global_function_inside();
+    result &= genns_global_function_global();
+    result &= genns_global_function_generic();
+    result &= GennsCaller.genns_enum_constant_inside();
+    result &= genns_enum_constant_global();
+    result &= genns_enum_constant_generic();
+    result &= GennsCaller.genns_struct_type_inside();
+    result &= genns_struct_type_global();
+    result &= genns_struct_type_generic();
+    return result;
+}
+
 int testGenericValueDefaults()
 {
     int result = 1;
@@ -7567,6 +7809,50 @@ bool testGenericFieldLaterList()
     return TListLateDropCount == 2;
 }
 
+namespace Genns2Ns { int g() { return 7; } }
+struct Genns2NsBox<int Genns2Ns>
+{
+    int n() { return Genns2Ns.g(); }
+};
+bool testGenns2NamespaceValueParam()
+{
+    Genns2NsBox<3> box = default;
+    bool result = true;
+    result &= Test("genns2 namespace qualifier wins", box.n(), 7);
+    return result;
+}
+
+namespace Genns2LeakNs { int g() { return 7; } }
+struct Genns2LeakBox<int K> { int n() { return Genns2LeakNs.g() + K; } };
+int Genns2LeakFunction<int Genns2LeakNs>()
+{
+    Genns2LeakBox<3> box = default;
+    return box.n() + Genns2LeakNs;
+}
+bool testGenns2NestedValueBindingDoesNotLeak()
+{
+    bool result = true;
+    result &= Test("genns2 nested value binding isolation", Genns2LeakFunction<3>(), 13);
+    return result;
+}
+
+struct Genns2SizeofName { i64 a; i64 b; };
+struct Genns2Inner<int K>
+{
+    int s() { return (int)sizeof(Genns2SizeofName) + K; }
+};
+int Genns2SizeofLeak<int Genns2SizeofName>()
+{
+    Genns2Inner<1> inner = default;
+    return inner.s() * 100 + Genns2SizeofName;
+}
+bool testGenns2NestedSizeofUsesType()
+{
+    bool result = true;
+    result &= Test("genns2 nested sizeof uses type", Genns2SizeofLeak<3>(), 1703);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -7574,6 +7860,7 @@ extern int main()
     total++; passed += testGenericAlias()                ? 1 : 0;
     total++; passed += testGenericStructs();
     total++; passed += testGenericValueDefaults();
+    total++; passed += testGenericValueParameterShadowsOuterNames();
     total++; passed += testInterface()                   ? 1 : 0;
     total++; passed += testGenericInterface()            ? 1 : 0;
     total++; passed += testReturnListFreeFunc()          ? 1 : 0;
@@ -7755,6 +8042,9 @@ extern int main()
     total++; passed += testMix5BareArrayDeduction()                  ? 1 : 0;
     total++; passed += testMix8TupleTemplates()                      ? 1 : 0;
     total++; passed += testTupleLiteralElementConversions()           ? 1 : 0;
+    total++; passed += testGenns2NamespaceValueParam()                ? 1 : 0;
+    total++; passed += testGenns2NestedValueBindingDoesNotLeak()       ? 1 : 0;
+    total++; passed += testGenns2NestedSizeofUsesType()                ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

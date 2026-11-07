@@ -1,0 +1,9 @@
+import "application.cb";
+
+expect_error("application field 'name' cannot contain string interpolation") {
+    application AppInfo badName = {
+        name = "App {name}", identifier = "com.cflat.error.appname"
+    };
+}
+
+extern int main() { return 0; }

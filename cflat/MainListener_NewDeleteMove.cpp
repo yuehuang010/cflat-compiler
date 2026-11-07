@@ -3355,7 +3355,9 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             elems.reserve(n);
             for (unsigned i = 0; i < n; i++)
                 elems.push_back(elemTy->isFloatingPointTy()
-                    ? (llvm::Constant*)llvm::ConstantFP::get(elemTy, (double)i)
+                    ? (llvm::Constant*)LLVMBackend::ConvertIntegerConstantToFloatingPoint(
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), i),
+                        elemTy, true)
                     : (llvm::Constant*)llvm::ConstantInt::get(elemTy, i));
             result.Primary = llvm::ConstantVector::get(elems);
             result.BaseType = vecTy;
@@ -3516,6 +3518,36 @@ const MainListener::SimdMathIntrinsic* MainListener::LookupSimdMathIntrinsic(con
         return it == table.end() ? nullptr : &it->second;
     }
 
+bool MainListener::FindTransparentAnonFieldPath(const std::string& structName,
+        const std::string& fieldName, std::vector<unsigned>& path)
+{
+        auto* compiler = Compiler();
+        std::function<bool(const LLVMBackend::StructData&)> find =
+            [&](const LLVMBackend::StructData& data) -> bool
+        {
+            for (unsigned i = 0; i < data.StructFields.size(); ++i)
+            {
+                const auto& field = data.StructFields[i];
+                if (!field.IsAnonymousMember) continue;
+                const auto nested = compiler->GetDataStructure(field.TypeName);
+                if (nested.StructType == nullptr) continue;
+                for (unsigned k = 0; k < nested.StructFields.size(); ++k)
+                    if (nested.StructFields[k].VariableName == fieldName)
+                    {
+                        path.push_back(i);
+                        path.push_back(k);
+                        return true;
+                    }
+                path.push_back(i);
+                if (find(nested)) return true;
+                path.pop_back();
+            }
+            return false;
+        };
+        path.clear();
+        return find(compiler->GetDataStructure(structName));
+}
+
 bool MainListener::ResolveTransparentAnonField(
         antlr4::ParserRuleContext* ctx,
         const LLVMBackend::NamedVariable& structVar,
@@ -3527,7 +3559,7 @@ bool MainListener::ResolveTransparentAnonField(
         auto* topStructTy = llvm::dyn_cast_or_null<llvm::StructType>(structVar.BaseType);
         if (!topStructTy) return false;
 
-        // DFS through anonymous (__anonN) members for fieldName. `chain` holds field indices root-to-leaf.
+        // DFS through marked anonymous members for fieldName. `chain` holds field indices root-to-leaf.
         // bitfieldHit captured by value: GetDataStructure returns a copy, so a pointer into `inner` would dangle.
         std::vector<int> chain;
         bool isBitfieldHit = false;
@@ -3538,7 +3570,7 @@ bool MainListener::ResolveTransparentAnonField(
             for (int i = 0; i < (int)sd.StructFields.size(); ++i)
             {
                 const auto& f = sd.StructFields[i];
-                if (f.VariableName.rfind("__anon", 0) != 0) continue;  // only transparent members
+                if (!f.IsAnonymousMember) continue;
                 const auto& inner = compiler->GetDataStructure(f.TypeName);
                 if (!inner.StructType) continue;
                 for (int k = 0; k < (int)inner.StructFields.size(); ++k)

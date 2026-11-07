@@ -318,14 +318,63 @@ static bool IsIdentifierChar(char c)
     return IsIdentifierStart(c) || (c >= '0' && c <= '9');
 }
 
-static std::vector<SymbolLineToken> ScanSymbolLine(const std::string& line)
+struct SymbolRawStringState
+{
+    bool active = false;
+    size_t hashCount = 0;
+    bool inBlockComment = false;
+};
+
+static std::vector<SymbolLineToken> ScanSymbolLine(
+    const std::string& line, SymbolRawStringState& rawState)
 {
     std::vector<SymbolLineToken> tokens;
     size_t pos = 0;
     while (pos < line.size())
     {
+        if (rawState.active)
+        {
+            size_t afterClose = 0;
+            if (RawStringClosingDelimiterAt(line, pos, rawState.hashCount, afterClose))
+            {
+                rawState.active = false;
+                pos = afterClose;
+            }
+            else
+                ++pos;
+            continue;
+        }
+        if (rawState.inBlockComment)
+        {
+            if (line[pos] == '*' && pos + 1 < line.size() && line[pos + 1] == '/')
+            {
+                rawState.inBlockComment = false;
+                pos += 2;
+            }
+            else
+                ++pos;
+            continue;
+        }
         if (line[pos] == '/' && pos + 1 < line.size() && line[pos + 1] == '/')
             break;
+        if (line[pos] == '/' && pos + 1 < line.size() && line[pos + 1] == '*')
+        {
+            rawState.inBlockComment = true;
+            pos += 2;
+            continue;
+        }
+        if (line[pos] == 'r')
+        {
+            size_t contentStart = 0;
+            size_t hashCount = 0;
+            if (TryRawStringOpening(line, pos, contentStart, hashCount))
+            {
+                rawState.active = true;
+                rawState.hashCount = hashCount;
+                pos = contentStart;
+                continue;
+            }
+        }
         if (line[pos] == '\'' || line[pos] == '"')
         {
             const char quote = line[pos++];
@@ -389,6 +438,17 @@ static std::vector<SymbolLineToken> ScanSymbolLine(const std::string& line)
         tokens.push_back(std::move(token));
     }
     return tokens;
+}
+
+static std::vector<std::vector<SymbolLineToken>> ScanSymbolLines(
+    const std::vector<std::string>& lines)
+{
+    std::vector<std::vector<SymbolLineToken>> scanned;
+    scanned.reserve(lines.size());
+    SymbolRawStringState rawState;
+    for (const auto& line : lines)
+        scanned.push_back(ScanSymbolLine(line, rawState));
+    return scanned;
 }
 
 static std::string TrimLineText(const std::string& line)
@@ -459,6 +519,7 @@ static SymbolArgumentFamily SymbolTypeFamily(const std::string& typeName)
 
 static bool IsQuotedSymbolLiteral(const std::string& text, char quote)
 {
+    if (quote == '"' && IsRawStringTokenSpelling(text)) return true;
     if (text.size() < 2 || text.front() != quote || text.back() != quote) return false;
     bool escaped = false;
     for (size_t i = 1; i + 1 < text.size(); ++i)
@@ -592,6 +653,15 @@ static bool SplitSymbolTopLevel(const std::string& text, std::vector<std::string
             else if (c == quote) quote = 0;
             continue;
         }
+        if (c == 'r')
+        {
+            size_t afterRaw = i;
+            if (SkipRawStringSpelling(text, afterRaw))
+            {
+                i = afterRaw - 1;
+                continue;
+            }
+        }
         if (c == '\'' || c == '"') { quote = c; continue; }
         if (c == '(') ++parens;
         else if (c == ')' && --parens < 0) return false;
@@ -628,6 +698,15 @@ static bool ExtractSymbolCallArguments(const std::string& line, size_t openParen
             else if (c == '\\') escaped = true;
             else if (c == quote) quote = 0;
             continue;
+        }
+        if (c == 'r')
+        {
+            size_t afterRaw = i;
+            if (SkipRawStringSpelling(line, afterRaw))
+            {
+                i = afterRaw - 1;
+                continue;
+            }
         }
         if (c == '\'' || c == '"') { quote = c; continue; }
         if (c == '(') ++depth;
@@ -938,6 +1017,7 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
                            size_t lineNumber, bool& firstLine,
                            const std::string& preferredFile,
                            int scopeStartLine, int scopeEndLine,
+                           const std::vector<SymbolLineToken>& lineTokens,
                            const SymbolDef* preferredFunction = nullptr)
 {
     if (!firstLine) std::cout << "\n";
@@ -952,7 +1032,7 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
     const std::string& sourceLine = sourceLines[lineNumber - 1];
     std::cout << std::format("line {}: {}\n", lineNumber, TrimLineText(sourceLine));
     std::unordered_set<std::string> printed;
-    for (const auto& token : ScanSymbolLine(sourceLine))
+    for (const auto& token : lineTokens)
     {
         const SymbolDef* def = index.LookupResolvedCall(
             preferredFile, (int)lineNumber, (int)token.start);
@@ -1125,6 +1205,8 @@ static size_t FindFunctionEndLine(const std::vector<std::string>& sourceLines, s
     if (startLine == 0 || startLine > sourceLines.size()) return 0;
 
     bool inBlockComment = false;
+    bool inRawString = false;
+    size_t rawHashCount = 0;
     char quote = 0;
     int depth = 0;
     bool foundBody = false;
@@ -1143,6 +1225,16 @@ static size_t FindFunctionEndLine(const std::vector<std::string>& sourceLines, s
                 }
                 continue;
             }
+            if (inRawString)
+            {
+                size_t afterClose = 0;
+                if (RawStringClosingDelimiterAt(line, i, rawHashCount, afterClose))
+                {
+                    inRawString = false;
+                    i = afterClose - 1;
+                }
+                continue;
+            }
             if (quote)
             {
                 if (c == '\\' && i + 1 < line.size())
@@ -1157,6 +1249,16 @@ static size_t FindFunctionEndLine(const std::vector<std::string>& sourceLines, s
                 inBlockComment = true;
                 ++i;
                 continue;
+            }
+            if (c == 'r')
+            {
+                size_t contentStart = 0;
+                if (TryRawStringOpening(line, i, contentStart, rawHashCount))
+                {
+                    inRawString = true;
+                    i = contentStart - 1;
+                    continue;
+                }
             }
             if (c == '\'' || c == '"')
             {
@@ -1225,6 +1327,7 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
     bool firstLine = true;
     std::vector<std::string> inputLines;
     bool inputLinesRead = false;
+    std::vector<std::vector<SymbolLineToken>> inputLineTokens;
     for (const auto& selector : selectors)
     {
         if (selector.kind == SymbolDumpSelectorKind::Line)
@@ -1237,11 +1340,15 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
                     return 1;
                 }
                 inputLinesRead = true;
+                inputLineTokens = ScanSymbolLines(inputLines);
             }
             for (size_t lineNumber = selector.firstLine;; ++lineNumber)
             {
+                const std::vector<SymbolLineToken> emptyTokens;
+                const auto& lineTokens = lineNumber <= inputLineTokens.size()
+                    ? inputLineTokens[lineNumber - 1] : emptyTokens;
                 DumpSymbolLine(index, inputLines, lineNumber, firstLine,
-                               std::filesystem::absolute(*source).string(), 0, 0);
+                               std::filesystem::absolute(*source).string(), 0, 0, lineTokens);
                 if (lineNumber == selector.lastLine) break;
             }
             continue;
@@ -1269,10 +1376,14 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
                                      selector.functionName);
             return 1;
         }
+        const auto functionLineTokens = ScanSymbolLines(functionLines);
         for (size_t lineNumber = startLine;; ++lineNumber)
         {
+            const std::vector<SymbolLineToken> emptyTokens;
+            const auto& lineTokens = lineNumber <= functionLineTokens.size()
+                ? functionLineTokens[lineNumber - 1] : emptyTokens;
             DumpSymbolLine(index, functionLines, lineNumber, firstLine, def->file,
-                           (int)startLine, (int)endLine, def);
+                           (int)startLine, (int)endLine, lineTokens, def);
             if (lineNumber == endLine) break;
         }
     }

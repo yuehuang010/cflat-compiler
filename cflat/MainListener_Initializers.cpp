@@ -4,6 +4,18 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include "MainListener_ExpressionsShared.h"
+
+std::string MainListener::UniqueHiddenGlobalName(LLVMBackend* compiler, const std::string& kind)
+{
+        const std::string prefix = std::string(1, char(1)) + "cflat.array_view." + kind + ".";
+        for (uint64_t index = 0;; ++index)
+        {
+            std::string candidate = prefix + std::to_string(index);
+            if (compiler->module->getNamedValue(candidate) == nullptr)
+                return candidate;
+        }
+}
+
 std::string MainListener::ParseTupleTypeSpecifier(
     CFlatParser::TupleTypeSpecifierContext* tupleSpec) {
         auto* compiler = Compiler(tupleSpec);
@@ -66,6 +78,21 @@ TupleTypeElementResolveContext MainListener::TupleTypeElementContext(
             .ResolveType = [this, namespaceName](auto* typeSpec, auto* suffix) {
                 return ResolveTupleTypeElementSpecifier(
                     typeSpec, suffix, &activeTypeSubstitutions, namespaceName);
+            },
+            .ReportError = [this](antlr4::ParserRuleContext* errorSite, std::string message) {
+                LogErrorContext(errorSite, std::move(message));
+            },
+            .ResolveUniqueType = [this](const std::string& pointee, bool isPointer,
+                                        antlr4::ParserRuleContext* useSite) {
+                auto* compiler = Compiler(useSite);
+                std::string cxxError;
+                const std::string cxxUnique = isPointer
+                    ? compiler->CxxUniquePtrForUniqueKeyword(pointee, cxxError) : std::string();
+                if (!cxxError.empty()) LogErrorContext(useSite, std::move(cxxError));
+                if (!cxxUnique.empty()) return cxxUnique;
+                const std::string uniqueType = MangledGenericName("unique", { pointee }, useSite);
+                QueueGenericInstantiation("unique", { pointee }, uniqueType, useSite);
+                return uniqueType;
             }
         };
 }
@@ -997,7 +1024,8 @@ bool MainListener::EmitOneFieldInit(
             return false;
         }
         compiler->RejectImplicitIntegerPointeePointerConversion(rightNV.TypeAndValue, fieldType);
-        if (fieldType.TypeName == "string" && !fieldType.Pointer
+        if ((fieldType.TypeName == "string" || fieldType.TypeName == "string_view")
+            && !fieldType.Pointer
             && RejectStackCharBufferEscape(rightNV, errCtx))
             return false;
         const bool isForeignCxxField = !fieldType.Pointer && !fieldType.ElemPointer
@@ -2708,6 +2736,29 @@ void MainListener::EmitFieldInitializer(
         }
         const auto& sd = it->second;
 
+        std::unordered_set<std::string> promotedFieldInitializers;
+        for (auto* fi : ctx->fieldInit())
+        {
+            if (fi->Identifier() == nullptr) continue;
+            const std::string fieldName = fi->Identifier()->getText();
+            if (onlyField != nullptr && fieldName != *onlyField) continue;
+            const bool directField = std::any_of(sd.StructFields.begin(), sd.StructFields.end(),
+                [&](const auto& field) { return field.VariableName == fieldName; });
+            if (directField) continue;
+
+            std::vector<unsigned> path;
+            if (!FindTransparentAnonFieldPath(typeName, fieldName, path) || path.empty()) continue;
+            const unsigned anonymousIndex = path.front();
+            if (anonymousIndex >= sd.StructFields.size()) continue;
+            const auto& anonymousField = sd.StructFields[anonymousIndex];
+            llvm::Value* nestedDestination = sd.IsUnion ? structPtr
+                : compiler->CreateCxxFieldGEP(sd, structPtr, anonymousIndex,
+                    anonymousField.VariableName + "_designated_init");
+            promotedFieldInitializers.insert(fieldName);
+            EmitFieldInitializer(nestedDestination, anonymousField.TypeName, ctx,
+                destinationIsFresh, &fieldName, deferForeignReplacementDrop);
+        }
+
         std::unordered_set<std::string> seen;
         for (auto* fi : ctx->fieldInit())
         {
@@ -2725,6 +2776,7 @@ void MainListener::EmitFieldInitializer(
                 continue;
             }
             std::string fieldName = fi->Identifier()->getText();
+            if (promotedFieldInitializers.count(fieldName) != 0) continue;
             if (!seen.insert(fieldName).second)
             {
                 LogErrorContext(fi, std::format("Duplicate field initializer for '{}'", fieldName));
@@ -3087,6 +3139,11 @@ void MainListener::EmitFieldInitializer(
                     compiler->pendingInitAllocAlign = field.AllocAlignValue;
                 break;
             }
+            if (initField != nullptr && !initField->Pointer
+                && compiler->ResolveTypeAlias(initField->TypeName) == "string"
+                && IsNullptrLiteralExpressionTree(fi->assignmentExpression(0)))
+                LogErrorContext(fi->assignmentExpression(0), std::format(
+                    "cannot initialize string '{}' from nullptr", fieldName));
             llvm::Value* fieldDestination = nullptr;
             bool armFieldSret = false;
             if (destinationIsFresh && initField != nullptr && !initField->Pointer
@@ -4501,15 +4558,30 @@ void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBa
     }
 
 llvm::Constant* MainListener::CoerceConstantToArrayElement(
-        LLVMBackend* compiler, llvm::Constant* c, llvm::Type* elemTy) {
+        LLVMBackend* compiler, llvm::Constant* c, llvm::Type* elemTy,
+        const LLVMBackend::TypeAndValue& sourceTV) {
         if (c->getType() == elemTy) return c;
         if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(c))
         {
             if (elemTy->isIntegerTy())
-                return llvm::ConstantInt::get(elemTy, ci->getZExtValue());
+            {
+                const bool sourceUnsigned = sourceTV.IsUnsignedInteger() != -1
+                    || compiler->ResolveTypeAlias(sourceTV.TypeName) == "bool"
+                    || ci->getBitWidth() == 1;
+                const unsigned destBits = elemTy->getIntegerBitWidth();
+                const llvm::APInt value = sourceUnsigned
+                    ? ci->getValue().zextOrTrunc(destBits)
+                    : ci->getValue().sextOrTrunc(destBits);
+                return llvm::ConstantInt::get(elemTy, value);
+            }
             if (elemTy->isFloatingPointTy())
-                return llvm::ConstantFP::get(elemTy, ci->getBitWidth() == 1
-                    ? (double)ci->getZExtValue() : (double)ci->getSExtValue());
+            {
+                const bool sourceUnsigned = sourceTV.IsUnsignedInteger() != -1
+                    || compiler->ResolveTypeAlias(sourceTV.TypeName) == "bool"
+                    || ci->getBitWidth() == 1;
+                return LLVMBackend::ConvertIntegerConstantToFloatingPoint(
+                    ci, elemTy, sourceUnsigned);
+            }
         }
         else if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c))
         {
@@ -4534,11 +4606,20 @@ void MainListener::EmitGlobalFixedArrayInit(
         CFlatParser::InitializerListContext* initList,
         bool positionalArray,
         CFlatParser::DirectDeclaratorContext* direct,
-        antlr4::ParserRuleContext* errCtx, bool threadLocal) {
+        antlr4::ParserRuleContext* errCtx, bool threadLocal,
+        bool hiddenBacking, llvm::ArrayType* typeOverride,
+        llvm::GlobalVariable** backingResult) {
         auto* compiler = Compiler(errCtx);
+        if (backingResult != nullptr) *backingResult = nullptr;
         if (RejectNestedNamedBraceInitializer(initList,
                 "nested named brace initializer is not supported in global fixed-array elements")) return;
-        auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
+        auto* arrTy = typeOverride != nullptr ? typeOverride
+            : llvm::dyn_cast<llvm::ArrayType>(compiler->GetType(tv));
+        if (arrTy == nullptr)
+        {
+            LogErrorContext(errCtx, "invalid global fixed-array initializer type");
+            return;
+        }
         auto* elemTy = arrTy->getElementType();
         uint64_t n = tv.ConstArraySize;
 
@@ -4552,9 +4633,24 @@ void MainListener::EmitGlobalFixedArrayInit(
         // route (the default ctor, else the list ctor), so the stored constant is only zero storage.
         // The outer `{}` of a C++-class array is the same thing: every element value-initialized at startup.
         const bool cxxEmptyBraceElems = emptyInit
-            ? (compiler->IsCxxRecord(tv.TypeName) && !tv.Pointer && !tv.ElemPointer && !tv.IsAlias
+            ? (n != 0 && compiler->IsCxxRecord(tv.TypeName) && !tv.Pointer && !tv.ElemPointer && !tv.IsAlias
                && !tv.IsArrayView && tv.ConstInnerDimensions.empty())
             : (positionalArray && IsCxxEmptyBraceArrayInit(tv, initList));
+
+        if (hiddenBacking && n != 0 && cxxReferenceAggregateArray)
+            LogErrorContext(errCtx, std::format(
+                "a global array view of '{}' cannot initialize elements that need a runtime constructor",
+                SpellType(*compiler, tv)));
+        if (hiddenBacking && n != 0 && cxxEmptyBraceElems
+            && compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
+            LogErrorContext(errCtx, std::format(
+                "a global array view of '{}' cannot initialize elements that need a runtime constructor",
+                SpellType(*compiler, tv)));
+        if (hiddenBacking && n != 0 && emptyInit
+            && compiler->GetFunction(tv.TypeName) != nullptr)
+            LogErrorContext(errCtx, std::format(
+                "a global array view of '{}' cannot initialize elements that need a runtime constructor",
+                SpellType(*compiler, tv)));
 
         if (cxxReferenceAggregateArray)
             arrConst = llvm::Constant::getNullValue(arrTy);
@@ -4840,7 +4936,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                             compiler->RefuseNarrowingBraceConstant(c,
                                 nv.TypeAndValue.IsUnsignedInteger() != -1, leafTy,
                                 globalElemTV.IsUnsignedInteger() != -1);
-                            c = CoerceConstantToArrayElement(compiler, c, leafTy);
+                            c = CoerceConstantToArrayElement(compiler, c, leafTy, nv.TypeAndValue);
                         }
                         if (c == nullptr)
                         {
@@ -4920,6 +5016,19 @@ void MainListener::EmitGlobalFixedArrayInit(
             globalElemTV.ElemPointer = globalElemTVStars >= 2;
             globalElemTV.ConstArraySize = 0;
             globalElemTV.IsArrayView = false;
+            auto foldGlobalInteger = [&](llvm::Value* value) -> llvm::Constant* {
+                if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value))
+                    return constant;
+                if (hiddenBacking && value != nullptr && value->getType()->isIntegerTy())
+                {
+                    uint64_t folded = 0;
+                    if (TryFoldConstInt(value, folded, &constFoldableGlobals_,
+                                        &compiler->ImportedEnumeratorGlobals()))
+                        return llvm::ConstantInt::get(value->getType(), folded,
+                            /*IsSigned=*/false, /*ImplicitTrunc=*/true);
+                }
+                return nullptr;
+            };
             // Code-value store reject, RECORDED not raised: LogErrorContext throws, and the
             // builder is redirected into a throwaway function here, so unwinding from inside the
             // loop would leave the insert point in `tmpFn` and skip the restore below.
@@ -4929,12 +5038,163 @@ void MainListener::EmitGlobalFixedArrayInit(
             // cannot have - the scalar spelling 'P g = {a = 1};' is rejected at global scope for
             // the same reason. RECORDED, not raised: the builder is redirected into tmpFn here.
             CFlatParser::FieldInitContext* braceElem = nullptr;
+            CFlatParser::FieldInitContext* nonconstantStructElem = nullptr;
+            bool namedFieldStructElem = false;
+            bool needsRuntimeConstructorStructElem = false;
+            auto needsGlobalRuntimeConstructor = [&](auto&& self,
+                                                      const LLVMBackend::TypeAndValue& type,
+                                                      int depth) -> bool {
+                if (depth > 32 || type.Pointer || type.ElemPointer || type.IsAlias
+                    || type.IsArrayView || type.IsFunctionPointer)
+                    return false;
+                const std::string typeName = compiler->ResolveTypeAlias(type.TypeName);
+                if (compiler->IsCxxRecord(typeName))
+                    return compiler->CxxElementNeedsDefaultConstruction(typeName);
+                if (explicitNoArgConstructors_.count(typeName) != 0
+                    || !compiler->CFlatStructHasOnlyNoArgCtor(typeName))
+                    return true;
+                const auto data = compiler->GetDataStructure(typeName);
+                if (data.StructType == nullptr || data.IsUnion) return false;
+                for (const auto& field : data.StructFields)
+                {
+                    if (field.Pointer || field.ElemPointer || field.IsAlias || field.IsArrayView
+                        || field.IsFunctionPointer || field.IsSimd || field.IsBitfield
+                        || field.IsPadding || field.TypeName == typeName)
+                        continue;
+                    if (self(self, field, depth + 1)) return true;
+                }
+                return false;
+            };
+            auto foldStructBrace = [&](auto&& self,
+                                       const LLVMBackend::TypeAndValue& sourceTV,
+                                       CFlatParser::InitializerListContext* fieldsList)
+                                       -> llvm::Constant* {
+                if (needsGlobalRuntimeConstructor(needsGlobalRuntimeConstructor, sourceTV, 0))
+                {
+                    needsRuntimeConstructorStructElem = true;
+                    return nullptr;
+                }
+                if (fieldsList != nullptr)
+                {
+                    for (auto* fieldInit : fieldsList->fieldInit())
+                    {
+                        if (fieldInit->Identifier() != nullptr)
+                        {
+                            namedFieldStructElem = true;
+                            return nullptr;
+                        }
+                    }
+                }
+                LLVMBackend::DeclTypeAndValue structTV;
+                static_cast<LLVMBackend::TypeAndValue&>(structTV) = sourceTV;
+                structTV.IsArrayView = false;
+                structTV.ConstArraySize = 0;
+                structTV.ConstInnerDimensions.clear();
+                auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(compiler->GetType(structTV));
+                auto data = compiler->GetDataStructure(structTV.TypeName);
+                if (structTy == nullptr || data.StructType != structTy || data.IsUnion
+                    || data.CxxOffsetLayout || !data.Interfaces.empty()
+                    || compiler->IsCxxRecord(structTV.TypeName)
+                    || data.StructFields.size() != structTy->getNumElements())
+                    return nullptr;
+
+                auto* base = TryFoldGlobalDefaultConstruction(structTV);
+                if (base == nullptr || base->getType() != structTy) return nullptr;
+                std::vector<llvm::Constant*> values;
+                values.reserve(structTy->getNumElements());
+                for (unsigned i = 0; i < structTy->getNumElements(); ++i)
+                {
+                    auto* value = base->getAggregateElement(i);
+                    if (value == nullptr) return nullptr;
+                    values.push_back(value);
+                }
+                if (fieldsList == nullptr || fieldsList->fieldInit().empty()) return base;
+
+                size_t storageIndex = 0;
+                for (auto* fieldInit : fieldsList->fieldInit())
+                {
+                    while (storageIndex < data.StructFields.size()
+                        && data.StructFields[storageIndex].IsPadding)
+                        ++storageIndex;
+                    if (storageIndex >= data.StructFields.size()
+                        || data.StructFields[storageIndex].IsBitfield
+                        || fieldInit->Identifier() != nullptr)
+                        return nullptr;
+
+                    const auto& fieldTV = data.StructFields[storageIndex];
+                    auto* fieldTy = structTy->getElementType((unsigned)storageIndex);
+                    llvm::Constant* fieldValue = nullptr;
+                    if (fieldInit->initializerList() != nullptr)
+                    {
+                        fieldValue = self(self, fieldTV, fieldInit->initializerList());
+                    }
+                    else if (fieldInit->assignmentExpression().size() == 1)
+                    {
+                        LLVMBackend::NamedVariable nv;
+                        {
+                            DeclExpectedTypeScope expectedScope(&declExpectedType, fieldTV, true);
+                            nv = ParseAssignmentExpressionNamed(fieldInit->assignmentExpression(0));
+                        }
+                        BindNamedFunctionToFuncPtrSlot(compiler, nv, fieldTV, fieldInit);
+                        llvm::Value* value = LoadNamedVariable(nv);
+                        if (value != nullptr && fieldTV.TypeName == "string"
+                            && value->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
+                            if (auto* literal = llvm::dyn_cast<llvm::Constant>(value);
+                                literal != nullptr && compiler->IsStringLiteralConstant(literal))
+                                value = compiler->WrapStringLiteralAsString(value);
+                        if (value != nullptr && compiler->CodeValueIntoDataDestination(nv, fieldTV))
+                            return nullptr;
+                        if (value != nullptr)
+                        {
+                            compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, fieldTV);
+                            RejectConstDiscardingConversion(fieldInit, nv, value, fieldTV);
+                            fieldValue = foldGlobalInteger(value);
+                        }
+                        if (fieldValue != nullptr)
+                        {
+                            LLVMBackend::NativeBraceScope braceScope(*compiler);
+                            compiler->RefuseImplicitFloatToInt(fieldValue, fieldTy,
+                                fieldTV.IsUnsignedInteger() != -1);
+                            compiler->RefuseNarrowingBraceConstant(fieldValue,
+                                nv.TypeAndValue.IsUnsignedInteger() != -1, fieldTy,
+                                fieldTV.IsUnsignedInteger() != -1);
+                            fieldValue = CoerceConstantToArrayElement(
+                                compiler, fieldValue, fieldTy, nv.TypeAndValue);
+                        }
+                    }
+                    else
+                    {
+                        LLVMBackend::DeclTypeAndValue defaultField;
+                        static_cast<LLVMBackend::TypeAndValue&>(defaultField) = fieldTV;
+                        fieldValue = TryFoldGlobalDefaultConstruction(defaultField);
+                    }
+                    if (fieldValue == nullptr || fieldValue->getType() != fieldTy) return nullptr;
+                    values[storageIndex++] = fieldValue;
+                }
+                return llvm::ConstantStruct::get(structTy, values);
+            };
             for (size_t i = 0; i < elements.size(); i++)
             {
                 auto* fi = elements[i];
                 if (FieldInitIsBraceElement(fi) && cxxEmptyBraceElems)
                 {
                     elems.push_back(llvm::Constant::getNullValue(elemTy));
+                    continue;
+                }
+                if (hiddenBacking && FieldInitIsBraceElement(fi) && elemTy->isStructTy())
+                {
+                    namedFieldStructElem = false;
+                    auto* value = foldStructBrace(foldStructBrace, globalElemTV, fi->initializerList());
+                    if (value == nullptr)
+                    {
+                        if (namedFieldStructElem)
+                            braceElem = fi;
+                        else
+                            nonconstantStructElem = fi;
+                        ok = false;
+                        break;
+                    }
+                    elems.push_back(value);
                     continue;
                 }
                 if (FieldInitIsBraceElement(fi))
@@ -4970,18 +5230,20 @@ void MainListener::EmitGlobalFixedArrayInit(
                     if (lit != nullptr && compiler->IsStringLiteralConstant(lit))
                         val = compiler->WrapStringLiteralAsString(val);
                 }
-                auto* c = llvm::dyn_cast_or_null<llvm::Constant>(val);
+                auto* c = foldGlobalInteger(val);
                 if (c)
                 {
                     LLVMBackend::NativeBraceScope braceScope(*compiler);
                     compiler->RefuseImplicitFloatToInt(c, elemTy, globalElemTV.IsUnsignedInteger() != -1);
                     compiler->RefuseNarrowingBraceConstant(c, nv.TypeAndValue.IsUnsignedInteger() != -1,
                         elemTy, globalElemTV.IsUnsignedInteger() != -1);
-                    c = CoerceConstantToArrayElement(compiler, c, elemTy);
+                    c = CoerceConstantToArrayElement(compiler, c, elemTy, nv.TypeAndValue);
                 }
                 if (!c)
                 {
-                    if (elemTy->isStructTy())
+                    if (elemTy->isStructTy()
+                        && needsGlobalRuntimeConstructor(needsGlobalRuntimeConstructor,
+                                                         globalElemTV, 0))
                         LogErrorContext(fi, std::format(
                             "a global array of '{}' can only be initialized from compile-time constants; "
                             "this element needs a runtime constructor - assign it at startup, or use "
@@ -5005,6 +5267,24 @@ void MainListener::EmitGlobalFixedArrayInit(
                     "global array '{}' of type '{}' at global scope; assign the elements at startup, "
                     "or declare the array as a local",
                     name, SpellType(*compiler, tv)));
+            if (nonconstantStructElem != nullptr)
+            {
+                LLVMBackend::DeclTypeAndValue elemType;
+                static_cast<LLVMBackend::TypeAndValue&>(elemType) = globalElemTV;
+                elemType.ConstArraySize = 0;
+                elemType.ConstInnerDimensions.clear();
+                const bool needsRuntimeConstruction =
+                    needsRuntimeConstructorStructElem
+                    || compiler->CxxElementNeedsDefaultConstruction(tv.TypeName)
+                    || TryFoldGlobalDefaultConstruction(elemType) == nullptr;
+                if (needsRuntimeConstruction)
+                    LogErrorContext(nonconstantStructElem, std::format(
+                        "a global array of '{}' can only be initialized from compile-time constants; "
+                        "this element needs a runtime constructor - assign it at startup, or use "
+                        "'const char*[]' for a static table of literals", SpellType(*compiler, tv)));
+                LogErrorContext(nonconstantStructElem,
+                    "global array initializer elements must be compile-time constants");
+            }
             if (codeValueElem != nullptr)
                 LogErrorContext(codeValueElem, compiler->DescribeCodeValueIntoData(
                     CodeValueDestSpelling(globalElemTV), "brace-initialize",
@@ -5022,7 +5302,14 @@ void MainListener::EmitGlobalFixedArrayInit(
             return;
         }
 
-        auto* globalArr = compiler->CreateGlobalVariable(tv, arrConst, threadLocal);
+        auto* globalArr = hiddenBacking
+            ? new llvm::GlobalVariable(*compiler->module, arrTy, false,
+                llvm::GlobalValue::InternalLinkage, arrConst,
+                UniqueHiddenGlobalName(compiler, "backing"))
+            : compiler->CreateGlobalVariable(tv, arrConst, threadLocal);
+        if (hiddenBacking && threadLocal)
+            globalArr->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);
+        if (backingResult != nullptr) *backingResult = globalArr;
         const size_t pendingConstructionsBefore = pendingGlobalDefaultConstructions_.size()
             + pendingGlobalCxxConstructions_.size();
         if (cxxReferenceAggregateArray && globalArr != nullptr
@@ -5041,6 +5328,9 @@ void MainListener::EmitGlobalFixedArrayInit(
         if (globalArr != nullptr && !globalArr->isDeclaration() && globalArr->hasInitializer()
             && ConstantNamesThreadLocal(globalArr->getInitializer()))
         {
+            if (hiddenBacking)
+                LogErrorContext(errCtx,
+                    "global array-view initializer elements cannot refer to thread_local storage");
             llvm::Constant* value = globalArr->getInitializer();
             globalArr->setInitializer(llvm::Constant::getNullValue(globalArr->getValueType()));
             LLVMBackend::DeclTypeAndValue declTv;
@@ -5050,7 +5340,7 @@ void MainListener::EmitGlobalFixedArrayInit(
             pendingGlobalCxxConstructions_.back().StoreValue = value;
         }
         // Every element is value-initialized at startup (a zero constant is only the storage).
-        if (cxxEmptyBraceElems && globalArr != nullptr)
+        if (cxxEmptyBraceElems && globalArr != nullptr && !hiddenBacking)
         {
             LLVMBackend::DeclTypeAndValue declTv;
             static_cast<LLVMBackend::TypeAndValue&>(declTv) = tv;
@@ -5059,7 +5349,7 @@ void MainListener::EmitGlobalFixedArrayInit(
         }
         // A native struct with a default (field defaults or a CFlat constructor): `T[N] g = {};`
         // default-constructs each element like `T[N] g;`, so the zero constant above is replaced.
-        if (emptyInit && globalArr != nullptr && !compiler->IsCxxRecord(tv.TypeName)
+        if (!hiddenBacking && emptyInit && globalArr != nullptr && !compiler->IsCxxRecord(tv.TypeName)
             && !tv.Pointer && !tv.ElemPointer && !tv.IsAlias && !tv.IsArrayView
             && compiler->GetFunction(tv.TypeName) != nullptr)
         {
@@ -5069,9 +5359,11 @@ void MainListener::EmitGlobalFixedArrayInit(
             QueuePendingGlobalConstruction(pendingGlobalDefaultConstructions_, {globalArr, declTv, direct});
         }
 
-        if (pendingConstructionsBefore == pendingGlobalDefaultConstructions_.size()
+        if (!hiddenBacking && pendingConstructionsBefore == pendingGlobalDefaultConstructions_.size()
                 + pendingGlobalCxxConstructions_.size())
             MarkConstGlobalReadOnly(globalArr, tv);
+
+        if (hiddenBacking) return;
 
         // Register the global for LSP/--symbol, matching the scalar global path.
         if (auto* s = compiler->GetSymbolSink())
@@ -5082,6 +5374,88 @@ void MainListener::EmitGlobalFixedArrayInit(
                                 SpellTypeForSymbolDump(*compiler, tv));
             s->Register(SymbolKind::Variable, name, compiler->GetSourceFilePath(), dl, dc,
                         std::format("{}[{}] {}", SpellTypeForSymbolDump(*compiler, tv), n, name), {}, name);
+        }
+    }
+
+void MainListener::EmitGlobalArrayViewInferredInit(
+        const std::string& name,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList,
+        CFlatParser::DirectDeclaratorContext* direct,
+        antlr4::ParserRuleContext* errCtx, bool threadLocal) {
+        auto* compiler = Compiler(errCtx);
+        std::vector<CFlatParser::FieldInitContext*> elements;
+        if (initList != nullptr) elements = initList->fieldInit();
+
+        if (elements.size() > (size_t)INT32_MAX)
+            LogErrorContext(initList != nullptr ? static_cast<antlr4::ParserRuleContext*>(initList) : errCtx,
+                "array size exceeds the maximum supported element count");
+        for (auto* fi : elements)
+            if (fi->Identifier() != nullptr
+                || (fi->assignmentExpression().size() != 1 && !FieldInitIsBraceElement(fi)))
+                LogErrorContext(fi, std::format(
+                    "'{}' uses a positional initializer list; named or 'key: value' elements are not allowed",
+                    SpellType(*compiler, tv)));
+
+        LLVMBackend::TypeAndValue backingTV = tv;
+        backingTV.IsArrayView = false;
+        backingTV.Pointer = tv.ElemPointer;
+        backingTV.ElemPointer = false;
+        backingTV.ConstArraySize = elements.size();
+        backingTV.ConstInnerDimensions.clear();
+        llvm::Type* elementTy = compiler->GetType(backingTV);
+        auto* backingArrayTy = elements.empty()
+            ? llvm::ArrayType::get(elementTy, 0)
+            : llvm::dyn_cast<llvm::ArrayType>(compiler->GetType(backingTV));
+        if (backingArrayTy == nullptr)
+        {
+            LogErrorContext(errCtx, "invalid global array-view backing type");
+            return;
+        }
+
+        llvm::GlobalVariable* backing = nullptr;
+        EmitGlobalFixedArrayInit(name, backingTV, initList, !elements.empty(), direct, errCtx,
+            threadLocal, true, backingArrayTy, &backing);
+        if (backing == nullptr) return;
+
+        auto* indexTy = compiler->builder->getInt32Ty();
+        llvm::Constant* zero = llvm::ConstantInt::get(indexTy, 0);
+        llvm::Constant* indices[] = { zero, zero };
+        auto* dataPtr = llvm::ConstantExpr::getInBoundsGetElementPtr(
+            backingArrayTy, backing, indices);
+
+        auto* viewGlobal = threadLocal
+            ? compiler->CreateGlobalVariable(tv, nullptr, true)
+            : compiler->CreateGlobalVariable(tv, dataPtr, false);
+        if (viewGlobal == nullptr) return;
+        if (threadLocal)
+        {
+            LLVMBackend::DeclTypeAndValue declTV;
+            static_cast<LLVMBackend::TypeAndValue&>(declTV) = tv;
+            declTV.threadLocal = true;
+            QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_,
+                {viewGlobal, declTV, direct});
+            pendingGlobalCxxConstructions_.back().StoreValue = dataPtr;
+        }
+
+        auto* lengthTy = compiler->builder->getInt64Ty();
+        auto* lengthGlobal = new llvm::GlobalVariable(*compiler->module, lengthTy, false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(lengthTy, elements.size()),
+            UniqueHiddenGlobalName(compiler, "length"));
+        if (threadLocal)
+            lengthGlobal->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);
+        viewGlobal->setMetadata("cflat.array-view.length",
+            llvm::MDNode::get(*compiler->context, llvm::ValueAsMetadata::get(lengthGlobal)));
+
+        if (auto* sink = compiler->GetSymbolSink())
+        {
+            const int line = (int)direct->getStart()->getLine();
+            const int column = (int)direct->getStart()->getCharPositionInLine();
+            sink->RegisterVariable(name, tv.TypeName, compiler->GetSourceFilePath(), line, column,
+                                   SpellTypeForSymbolDump(*compiler, tv));
+            sink->Register(SymbolKind::Variable, name, compiler->GetSourceFilePath(), line, column,
+                           std::format("{} {}", SpellTypeForSymbolDump(*compiler, tv), name), {}, name);
         }
     }
 

@@ -170,6 +170,34 @@ struct TypeManglingAccess
             || compiler.gts.genericInterfaceTypeParams.count(name) != 0;
     }
 
+    static bool InlineAggregateTypeInfo(const LLVMBackend& compiler, std::string_view key,
+                                        std::string& owner, bool& isUnion)
+    {
+        const size_t dot = key.rfind('.');
+        if (dot == std::string_view::npos) return false;
+        const std::string_view segment = key.substr(dot + 1);
+        const auto hasSyntheticSuffix = [&](std::string_view prefix)
+        {
+            return segment.starts_with(prefix) && segment.size() > prefix.size()
+                && std::all_of(segment.begin() + prefix.size(), segment.end(),
+                    [](char c) { return c >= '0' && c <= '9'; });
+        };
+        if (!hasSyntheticSuffix("@inline") && !hasSyntheticSuffix("@anon")) return false;
+        owner = std::string(key.substr(0, dot));
+        const auto parent = compiler.dataStructures.find(owner);
+        const auto aggregate = compiler.dataStructures.find(std::string(key));
+        if (parent == compiler.dataStructures.end() || aggregate == compiler.dataStructures.end())
+            return false;
+        const bool isInlineField = std::any_of(parent->second.StructFields.begin(),
+            parent->second.StructFields.end(), [&](const LLVMBackend::DeclTypeAndValue& field)
+            {
+                return field.IsInlineAggregateField && field.TypeName == key;
+            });
+        if (!isInlineField) return false;
+        isUnion = aggregate->second.IsUnion;
+        return true;
+    }
+
     static bool IsRegisteredLocalEnum(const LLVMBackend& compiler,
                                       std::string_view name)
     {
@@ -673,8 +701,45 @@ static std::string GenericLocalEnumDisplayName(const LLVMBackend& compiler,
 
 std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& spelling);
 
+static bool InlineAggregateOwnerKey(const LLVMBackend& compiler, const std::string& key,
+                                    std::string& owner)
+{
+    bool isUnion = false;
+    return TypeManglingAccess::InlineAggregateTypeInfo(compiler, key, owner, isUnion);
+}
+
+static bool SpellInlineAggregateType(const LLVMBackend& compiler, const std::string& key,
+                                    std::string& display)
+{
+    std::string owner;
+    bool isUnion = false;
+    if (!TypeManglingAccess::InlineAggregateTypeInfo(compiler, key, owner, isUnion)) return false;
+
+    std::string enclosing = owner;
+    std::string parent;
+    while (InlineAggregateOwnerKey(compiler, enclosing, parent)) enclosing = parent;
+
+    TypeSpelling ownerSpelling;
+    const std::string ownerName = DemangleType(compiler, enclosing, ownerSpelling)
+        ? PrintTypeSpelling(compiler, ownerSpelling) : enclosing;
+    display = std::string("anonymous ") + (isUnion ? "union" : "struct")
+        + " in '" + ownerName + "'";
+    return true;
+}
+
 static std::string SpellNestedTypeBase(const LLVMBackend& compiler, const std::string& base)
 {
+    std::string inlineDisplay;
+    if (SpellInlineAggregateType(compiler, base, inlineDisplay)) return inlineDisplay;
+    // A named type declared inside an anonymous member is spelled through the named owner: 'S.In'.
+    if (const size_t leafDot = base.rfind('.'); leafDot != std::string::npos)
+    {
+        std::string owner = base.substr(0, leafDot);
+        std::string namedOwner;
+        bool climbed = false;
+        while (InlineAggregateOwnerKey(compiler, owner, namedOwner)) { owner = namedOwner; climbed = true; }
+        if (climbed) return SpellNestedTypeBase(compiler, owner + base.substr(leafDot));
+    }
     if (!TypeManglingAccess::IsNestedAggregateTypeKey(compiler, base)) return base;
     const size_t dot = base.rfind('.');
     if (dot == std::string::npos) return base;

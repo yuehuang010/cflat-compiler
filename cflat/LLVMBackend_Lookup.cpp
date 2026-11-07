@@ -1388,9 +1388,14 @@ bool LLVMBackend::NamedFunctionArgMismatches(const NamedVariable& arg, const Typ
 
 std::string LLVMBackend::FuncPtrAliasParamSpelling(const TypeAndValue::FuncPtrParam& p) const
 {
+        return FuncPtrAliasComponentSpelling(p.AliasSpelling);
+}
+
+std::string LLVMBackend::FuncPtrAliasComponentSpelling(const std::string& spelling) const
+{
         // The alias name already carries its own levels and const, so only the written stars
         // print here; reapplying the mask would put the alias's pointee const on the wrong level.
-        std::string name = p.AliasSpelling;
+        std::string name = spelling;
         int written = 0;
         while (!name.empty() && name.back() == '*') { name.pop_back(); ++written; }
         TypeAndValue type;
@@ -1439,10 +1444,11 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
             return std::string(nested.IsThinFnPtr() ? "function<" : "Lambda<")
                 + FuncPtrSpellingOf(nested) + ">";
         };
-        std::string returnSpelling = signature.FuncPtrReturnFunctionType
-                && !signature.FuncPtrReturnPointer
-            ? nestedFunctionType(*signature.FuncPtrReturnFunctionType)
-            : component(signature.FuncPtrReturnTypeName,
+        std::string returnSpelling = !signature.FuncPtrReturnAliasSpelling.empty()
+            ? FuncPtrAliasComponentSpelling(signature.FuncPtrReturnAliasSpelling)
+            : signature.FuncPtrReturnFunctionType && !signature.FuncPtrReturnPointer
+                ? nestedFunctionType(*signature.FuncPtrReturnFunctionType)
+                : component(signature.FuncPtrReturnTypeName,
                 signature.FuncPtrReturnPointer, signature.FuncPtrReturnPointerDepth,
                 signature.FuncPtrReturnConstMask, false);
         if (signature.FuncPtrReturnOwned) returnSpelling = "move " + returnSpelling;

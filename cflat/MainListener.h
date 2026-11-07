@@ -72,6 +72,18 @@ CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
 
 CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
     antlr4::tree::ParseTree* node);
+struct StringLiteralExpressionInfo
+{
+    std::string Value;
+    bool IsNarrow = true;
+    bool IsNarrowOrUtf8 = true;
+    // True only for a real expression segment; Verbatim brace regions remain literal text.
+    bool HasExpressionSegment = false;
+};
+std::string DecodeStringLiteralToken(const std::string& rawText, bool foldBraces);
+bool HasInterpolationSegment(const std::string& rawText);
+CFlatParser::ArgumentExpressionListContext* SoleDirectNamedCallArguments(
+    antlr4::tree::ParseTree* node, const std::string& functionName);
 
 std::string EnumMemberSourceSpelling(antlr4::tree::ParseTree* node);
 
@@ -334,6 +346,8 @@ struct TupleTypeElementResolveContext
     std::unordered_set<std::string> LocalTypes;
     std::function<std::string(CFlatParser::TypeSpecifierContext*,
                               CFlatParser::MultiWordTypeSuffixContext*)> ResolveType;
+    std::function<void(antlr4::ParserRuleContext*, std::string)> ReportError;
+    std::function<std::string(const std::string&, bool, antlr4::ParserRuleContext*)> ResolveUniqueType;
 };
 
 std::string ResolveTupleTypeElementArgName(
@@ -369,8 +383,7 @@ static constexpr CapabilitySpec kCapabilities[] = {
     { "ISharedLockable", "acquire_read", "release_read", "read" },
 };
 
-// Quote-stripped text of one annotation argument. A string literal loses its surrounding
-// quotes; any other token (Constant, Identifier) is returned verbatim.
+// Decoded text of one annotation argument; non-string tokens are returned verbatim.
 std::string AnnotationArgOne(CFlatParser::AnnotationArgContext* arg);
 
 // Every quote-stripped argument of an annotation, in source order (empty when it has none).
@@ -413,6 +426,9 @@ bool HasTernary(antlr4::tree::ParseTree* node);
 bool IsStructurallyGrouped(antlr4::tree::ParseTree* node);
 bool IsGroupedFoldCandidate(antlr4::tree::ParseTree* node);
 std::optional<int64_t> FoldCompileTimeInt(LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+bool HasUnfoldableCountofCall(LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+void SeedScanTimeLocalVariableTypes(LLVMBackend* compiler,
+                                    CFlatParser::DeclarationContext* declaration);
 
 // The leaf half: constant-folds the integer operator chain without emitting IR. Covers a
 // compile-time macro (a -D define, a platform builtin, or a seeded const int global), an integer
@@ -2549,6 +2565,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
 
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
         ScanAggregateAliases(ctx->aggregateMember());
+        ScanInlineAggregateMembers(ctx->aggregateMember(), typeName);
         // `Owner.name` from outside the body resolves through this frame until the main pass
         // walks the aggregate and saves its authoritative one.
         compiler->SaveAggregateAliasScope(typeName, /*provisional*/ true);
@@ -2670,6 +2687,9 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
     // are registered before generic uses; other aliases remain authoritative in the main pass.
     void RegisterRenameAlias(CFlatParser::UsingDeclarationContext* ctx);
     void ScanAggregateAliases(const std::vector<CFlatParser::AggregateMemberContext*>& members);
+    void ScanInlineAggregateMembers(
+        const std::vector<CFlatParser::AggregateMemberContext*>& members,
+        const std::string& ownerName);
 
 public:
     ForwardRefScanner(LLVMBackend* compiler);
@@ -4098,26 +4118,41 @@ public:
                                      const std::unordered_map<std::string, std::string>& valueSubstitutions = {});
 
     /*
-     * Binds generic VALUE parameters as scoped compile-time macros for the duration of one
-     * instantiation. Only the names actually bound are saved and restored, so a template with
-     * no value parameters costs nothing on this hot path. Restore() is idempotent and the
-     * destructor is only a backstop; each caller restores where it restores the type
-     * substitutions.
+     * Parks enclosing generic value macros and binds this instantiation's values in their place.
+     * Restore() is idempotent; each caller restores where it restores the substitution maps.
      */
     struct GenericValueMacroScope
     {
         LLVMBackend* compiler = nullptr;
         std::vector<std::pair<std::string, LLVMBackend::CompileTimeMacro>> shadowed;
         std::vector<std::string> introduced;
+        std::unordered_set<std::string> touched;
 
         explicit GenericValueMacroScope(LLVMBackend* c) : compiler(c) {}
         ~GenericValueMacroScope() { Restore(); }
 
-        void Bind(const std::string& name, int64_t value)
+        void Record(const std::string& name)
         {
+            if (!touched.insert(name).second) return;
             auto it = compiler->compileTimeMacros.find(name);
             if (it != compiler->compileTimeMacros.end()) shadowed.push_back({ name, it->second });
-            else                                         introduced.push_back(name);
+            else introduced.push_back(name);
+        }
+
+        void Park(const std::string& name)
+        {
+            Record(name);
+            compiler->compileTimeMacros.erase(name);
+        }
+
+        void Park(const std::unordered_map<std::string, std::string>& values)
+        {
+            for (const auto& entry : values) Park(entry.first);
+        }
+
+        void Bind(const std::string& name, int64_t value)
+        {
+            Record(name);
             auto* intType = llvm::Type::getInt32Ty(*compiler->context);
             compiler->SetCompileTimeMacro(name,
                 llvm::ConstantInt::get(intType, (uint64_t)value, true), "int");
@@ -4129,6 +4164,7 @@ public:
             for (const auto& [name, prior] : shadowed) compiler->compileTimeMacros[name] = prior;
             introduced.clear();
             shadowed.clear();
+            touched.clear();
         }
     };
 
@@ -4142,6 +4178,7 @@ public:
     // Declaring aggregate of a generic member template, including static templates.
     std::string GenericMemberTemplateOwner(const std::string& baseName,
         CFlatParser::FunctionDefinitionContext* tmplCtx);
+    void BindGenericOwnerSubstitutions(const std::string& owner, GenericValueMacroScope& valueMacros);
 
     // Template key for a generic method called on a receiver ("Holder" + "get" -> "Holder.get"),
     // or "" when the receiver's type declares no such template.
@@ -5341,6 +5378,12 @@ public:
 
     // True when the NamedVariable's value is the `string` value type.
     bool NamedVarIsString(const LLVMBackend::NamedVariable& nv);
+    bool NamedVarIsStringView(const LLVMBackend::NamedVariable& nv);
+    void CarryStringViewConstructionBorrow(CFlatParser::PostfixExpressionContext* ctx,
+                                           LLVMBackend::NamedVariable& namedVar);
+    void CarryStackCharBufferBorrow(LLVMBackend::NamedVariable& destination,
+                                    const LLVMBackend::NamedVariable& source,
+                                    llvm::Value* sourcePointer = nullptr);
     static bool IsStackCharBufferBorrow(const LLVMBackend::NamedVariable& nv);
     static bool StackCharBufferOutlives(const LLVMBackend::NamedVariable& source,
                                         const LLVMBackend::NamedVariable& destination);
@@ -6527,6 +6570,8 @@ public:
         bool IsStringLiteral = false;  // the value is a string literal's global
     };
     UnevaluatedOperandType EvaluateOperandTypeOnly(const std::function<LLVMBackend::NamedVariable()>& emit);
+    llvm::Type* ResolveUnevaluatedOperandType(const UnevaluatedOperandType& operand,
+                                               LLVMBackend::TypeAndValue& typeValue);
     // sizeof (isSizeof) or alignof of a resolved type, honoring struct-level alignas; i64 result.
     LLVMBackend::NamedVariable SizeOrAlignOfAutoVariable(const std::string& name, bool isSizeof);
     LLVMBackend::NamedVariable SizeOrAlignOfType(const LLVMBackend::TypeAndValue& typeValue,
@@ -6839,6 +6884,10 @@ public:
         const std::string& structName,
         llvm::StructType* structType,
         std::vector<LLVMBackend::DeclTypeAndValue>& declList);
+    antlr4::ParserRuleContext* FindExplicitUnionMemberDefault(
+        const LLVMBackend::DeclTypeAndValue& field);
+    void ValidateUnionMemberDefaultInitializers(
+        const std::vector<LLVMBackend::DeclTypeAndValue>& fields);
 
     /*
      * Code-value store gate for the AGGREGATE spellings the declarator, assignment and return
@@ -7011,10 +7060,12 @@ public:
                                    antlr4::ParserRuleContext* where = nullptr,
                                    bool forceRoot = false);
 
-    // Coerce a folded element constant to the array's element type so ConstantArray::get
-    // does not assert. Mirrors CreateGlobalVariable's int/fp-widen/null coercion.
+    // Coerce folded brace elements to their storage type using the source CFlat signedness.
+    // LLVM literal width can be smaller than the source type's width.
     static llvm::Constant* CoerceConstantToArrayElement(
-        LLVMBackend* compiler, llvm::Constant* c, llvm::Type* elemTy);
+        LLVMBackend* compiler, llvm::Constant* c, llvm::Type* elemTy,
+        const LLVMBackend::TypeAndValue& sourceTV);
+    static std::string UniqueHiddenGlobalName(LLVMBackend* compiler, const std::string& kind);
 
     // Global fixed-size array brace/positional initializer: T[N] g = {v0,...} / {}.
     // Lowers to an LLVM constant array on the GlobalVariable (no runtime stores, which
@@ -7024,6 +7075,17 @@ public:
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* initList,
         bool positionalArray,
+        CFlatParser::DirectDeclaratorContext* direct,
+        antlr4::ParserRuleContext* errCtx, bool threadLocal = false,
+        bool hiddenBacking = false, llvm::ArrayType* typeOverride = nullptr,
+        llvm::GlobalVariable** backingResult = nullptr);
+
+    // Global T[] brace initializer: fold elements into hidden mutable storage, then bind the
+    // user-visible view global to its first element and retain its runtime range length.
+    void EmitGlobalArrayViewInferredInit(
+        const std::string& name,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList,
         CFlatParser::DirectDeclaratorContext* direct,
         antlr4::ParserRuleContext* errCtx, bool threadLocal = false);
 
@@ -7258,18 +7320,20 @@ public:
     const SimdMathIntrinsic* LookupSimdMathIntrinsic(const std::string& name);
 
     // C11 transparent anonymous-member access: resolve `base.fieldName` where `fieldName` is not
-    // a direct field of `base` but lives inside an anonymous (synthetic "__anonN") struct/union
-    // member - possibly nested. The C-interop extractor flattens a C11 anonymous member to a
-    // synthetic "__anonN" sub-record (e.g. _LARGE_INTEGER's unnamed DUMMYSTRUCTNAME struct), so
-    // reaching `li.LowPart` means walking through `li.__anon0.LowPart`. Builds the chained
-    // GEP/load and returns an lvalue NamedVariable identical to the explicit form. Only "__anonN"
-    // members are searched (real named members like `u` are NOT transparent). Returns false
+    // a direct field of `base` but lives inside an anonymous synthetic struct/union member.
+    // The C-interop extractor flattens a C11 anonymous member to a synthetic `__anonN` sub-record
+    // (e.g. _LARGE_INTEGER's unnamed DUMMYSTRUCTNAME struct), so `li.LowPart` walks that chain.
+    // Builds the chained GEP/load and returns an lvalue NamedVariable identical to the explicit
+    // form. Only synthetic anonymous-member fields are searched (real named members like `u`
+    // are NOT transparent). Returns false
     // (leaving `out` untouched) when no anonymous member exposes `fieldName`.
     bool ResolveTransparentAnonField(
         antlr4::ParserRuleContext* ctx,
         const LLVMBackend::NamedVariable& structVar,
         const std::string& fieldName,
         LLVMBackend::NamedVariable& out);
+    bool FindTransparentAnonFieldPath(const std::string& structName,
+        const std::string& fieldName, std::vector<unsigned>& path);
 
     // Classify a postfix call result into the struct/interface receiver slots so the next
     // chained '.member'/'.method()' resolves against it. Mirrors the inline classifier used
@@ -7319,6 +7383,8 @@ public:
     // every exit through the void-result gate below.
     LLVMBackend::NamedVariable ParsePostfixExpressionInner(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
                                                        size_t dropTrailingChildren, ResultUse use);
+    LLVMBackend::NamedVariable ParseStringFunctionalConstruction(
+        CFlatParser::PrimaryExpressionContext* ctx, ResultUse use);
 
     // A call whose return type is 'void' produces no consumable value: the direct path hands
     // back a void-typed CallInst that reaches the verifier as `void <badref>`. Reject at the
@@ -7368,9 +7434,7 @@ public:
     // 'delete[_] p'. Returns nullptr if the chain branches before reaching such a cast.
     CFlatParser::CastExpressionContext* tryGetCastExpression(antlr4::RuleContext* ctx);
 
-    // Returns true if rawText (the full StringLiteral token text including quotes)
-    // contains at least one unescaped '{' that starts an interpolation expression.
-    // '{{' is an escaped literal '{' and does NOT count as interpolation.
+    // True when the runtime format path is needed for a real segment or Verbatim region.
     bool HasInterpolation(const std::string& rawText);
 
     // Parses a format string literal with {expr} interpolation.
@@ -7378,6 +7442,8 @@ public:
     // coerces each expression segment to string via operator string,
     // stacks all (ptr, len) pairs on the stack and calls __strconcat.
     llvm::Value* ParseFormatString(CFlatParser::PrimaryExpressionContext* ctx, const std::string& rawText);
+    llvm::Value* ParseFormatString(CFlatParser::PrimaryExpressionContext* ctx,
+                                   const std::vector<std::string>& rawTexts);
 
     struct CaptureInfo
     {
@@ -7436,16 +7502,13 @@ public:
 
     LLVMBackend::NamedVariable ParseIdentifier(antlr4::tree::TerminalNode* node);
 
-    // Consumes one escape sequence starting just after the leading '\'.
-    // Advances itr past the consumed character(s) and returns the decoded char.
-    char ProcessEscapeChar(std::string::const_iterator& itr, const std::string::const_iterator& end);
-
     uint32_t ParseCharLiteral(const std::string& text);
 
-    // foldBraces: when true, {{ -> { and }} -> } (source-level escape for non-interpolated strings).
-    // Pass false when decoding accumulated literal content inside ParseFormatString, because
-    // that content may contain legitimate }} sequences (e.g. from JSON) that must not be folded.
+    // foldBraces folds doubled braces outside Verbatim regions; raw strings keep their braces.
+    // Pass false for accumulated literal text inside ParseFormatString.
     std::string ProcessRawText(const std::string& rawText, bool foldBraces = false);
+    std::optional<StringLiteralExpressionInfo> StringLiteralExpressionValue(
+        antlr4::tree::ParseTree* node);
 
     llvm::Value* ParseExpression(CFlatParser::ExpressionContext* ctx);
 
@@ -7582,6 +7645,15 @@ public:
     bool EnsureArenaChannelInstantiated(LLVMBackend* compiler);
 
     void ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {});
+    LLVMBackend::DeclTypeAndValue ParseInlineAggregateField(
+        const std::string& ownerName, CFlatParser::AggregateMemberContext* member,
+        unsigned& anonymousIndex);
+    void ValidateAnonymousMemberNames(
+        const std::vector<CFlatParser::AggregateMemberContext*>& members);
+    void ParseInlineAggregateBody(const std::string& typeName, bool isUnion,
+        const std::vector<CFlatParser::AggregateMemberContext*>& members,
+        CFlatParser::AlignmentSpecifierContext* alignment, unsigned& anonymousIndex,
+        bool anonymousMemberBody);
 
     void PrepareLaterCppStructDefinitions(CFlatParser::StructDefinitionContext* ctx,
                                           const std::string& namespaceName);

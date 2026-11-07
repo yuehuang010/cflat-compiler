@@ -1736,6 +1736,18 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // in the returned expression, exactly as a declarator's type is for its initializer.
         std::optional<DeclExpectedTypeScope> returnExpectedScope;
         returnExpectedScope.emplace(&declExpectedType, compiler->currentFunctionReturnTV, true);
+        if (assignExpr != nullptr
+            && !compiler->currentFunctionReturnTV.Pointer
+            && compiler->ResolveTypeAlias(compiler->currentFunctionReturnTV.TypeName) == "string"
+            && IsNullptrLiteralExpressionTree(assignExpr))
+        {
+            const auto* returnSymbol = compiler->currentFunction != nullptr
+                ? compiler->FindSymbolForFunction(compiler->currentFunction) : nullptr;
+            const std::string targetName = returnSymbol != nullptr
+                ? std::string(MangledBase(returnSymbol->SourceName)) : "return";
+            LogErrorContext(assignExpr, std::format(
+                "cannot initialize string '{}' from nullptr", targetName));
+        }
         if (assignExpr != nullptr)
             ArmArrayNewDesugar(assignExpr, compiler->currentFunctionReturnTV);
         const bool cxxSretReturn = compiler->currentFunctionAbiRecipe.hasLowering
@@ -1893,6 +1905,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // A generic instantiation returned as a function value (`return dbl<int>;`) is bound to its
             // instance here, the way a named function value is, before the return slot is checked.
             ResolveGenericFunctionValueOperand(returnNV, assignExpr);
+            const auto& returnType = compiler->currentFunctionReturnTV;
+            const bool uniqueReturnDestination = compiler->IsCoreUniqueType(returnType.TypeName)
+                || (returnType.Pointer && returnType.IsUnique && !returnType.ElemPointer);
+            if (uniqueReturnDestination && returnNV.IsExplicitMove
+                && compiler->MoveSourceIsAddressBorrow(returnNV))
+                compiler->LogBorrowedMoveSlotError();
             GuardRawPointerIntoOwningTempField(returnNV, compiler->currentFunctionReturnTV,
                 true, compiler->currentFunctionReturnTV.IsAlias, "return value", errCtx);
             // A returned function-pointer VALUE must match the declared return slot (variadic-ness and bind rule).
@@ -2066,7 +2084,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     "to transfer it, or copy the value before returning",
                     SpellType(*compiler, returnNV.TypeAndValue), retText));
         }
-        if (!defaultValue && compiler->currentFunctionReturnTV.TypeName == "string"
+        if (!defaultValue
+            && (compiler->currentFunctionReturnTV.TypeName == "string"
+                || compiler->currentFunctionReturnTV.TypeName == "string_view")
             && !compiler->currentFunctionReturnTV.Pointer
             && RejectStackCharBufferEscape(returnNV, errCtx))
             return;

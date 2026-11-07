@@ -283,8 +283,7 @@ struct ClosureEnvStoreScan
                 return LambdaBodyIsEnvFree(lambda, scope, findLive, hasThisField, isGlobal, isFunction);
             auto* primary = SolePrimaryExpression(source);
             if (primary == nullptr) return false;
-            if (primary->Constant() != nullptr
-                && primary->Constant()->getSymbol()->getType() == CFlatParser::NullPtrConstant)
+            if (primary->NullPtrConstant() != nullptr)
                 return true;
             auto* identifier = primary->genericIdentifier() != nullptr
                 ? primary->genericIdentifier()->Identifier() : nullptr;
@@ -1182,6 +1181,8 @@ std::string MainListener::ResolveSigComponentConstCodegen(
         // A member alias (`A<int>.CP`) keeps its stars and its const mask: both come from the owner.
         uint8_t memberMask = 0;
         const bool memberSpelled = ts != nullptr && ts->memberTypeSpecifier() != nullptr;
+        const std::string writtenName = memberSpelled
+            ? ts->getText() : CanonicalTypeSpecifierText(ts, suffix);
         std::string name = memberSpelled
             ? Compiler()->ResolveTypeAlias(ResolveMemberTypeSpecifier(ts->memberTypeSpecifier(), &memberMask))
             : ResolveSigComponentCodegen(ts, outPointer, suffix);
@@ -1193,16 +1194,18 @@ std::string MainListener::ResolveSigComponentConstCodegen(
         if (int substituted = SubstitutedConstDepth(ts, suffix); substituted > 0)
             mask |= (1 << std::min(substituted, 7)) - 1;
         constMask = PointeeConstOfComponent(mask, depth + aliasStars, preserveAliasReferentConst);
+        const bool spellingDiffers = memberSpelled ? aliased != writtenName : aliased != name;
+        const std::string& spellingName = memberSpelled ? writtenName : name;
+        // Keep the source spelling for diagnostics; `aliased` remains the matching type.
+        if (aliasSpelling != nullptr && (spellingDiffers || aliasStars > 0))
+            *aliasSpelling = spellingName + std::string(depth, '*');
         if (aliasStars > 0)
         {
-            // Matching uses the resolved base and depth; diagnostics keep the alias spelling.
-            if (aliasSpelling != nullptr)
-                *aliasSpelling = (memberSpelled ? ts->getText() : name) + std::string(depth, '*');
             stars = depth + aliasStars;
             outPointer = true;
             return aliased;
         }
-        return name;
+        return aliased;
     }
 
 std::string MainListener::SigComponentResolvedKey(const std::string& name) {
@@ -1284,8 +1287,9 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         }
         const bool aliasReturn = returnQualifierText == "alias";
         int retConst = 0;
+        std::string retAliasSpelling;
         std::string retName = ResolveSigComponentConstCodegen(fpSpec->typeSpecifier(), retPtr,
-            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn);
+            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn, &retAliasSpelling);
         bool nestedFunctionType = false;
         for (auto* ancestor = fpSpec->parent; ancestor != nullptr; ancestor = ancestor->parent)
             if (dynamic_cast<CFlatParser::FunctionPointerSpecifierContext*>(ancestor) != nullptr)
@@ -1312,6 +1316,7 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
             LogErrorContext(fpSpec, PointerDepthCapMessage(
                 std::format("function type return '{}'", retName), retStars));
         sig.FuncPtrReturnTypeName = retName;
+        sig.FuncPtrReturnAliasSpelling = retAliasSpelling;
         sig.FuncPtrReturnPointer  = retPtr;
         sig.FuncPtrReturnOwned = returnQualifierText == "move";
         sig.FuncPtrReturnAlias = aliasReturn;
@@ -1369,8 +1374,10 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
         ValidateConstAfterPointerStar(fnSpec->pointer(),
             SpelledTypeNameBase(fnSpec->typeSpecifier(), fnSpec->multiWordTypeSuffix()));
         int retConst = 0;
+        std::string retAliasSpelling;
         sig.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(fnSpec->typeSpecifier(), retPtr,
-            retStars, retConst, fnSpec->multiWordTypeSuffix());
+            retStars, retConst, fnSpec->multiWordTypeSuffix(), false, &retAliasSpelling);
+        sig.FuncPtrReturnAliasSpelling = retAliasSpelling;
         sig.FuncPtrReturnConstMask = retConst;
         sig.FuncPtrReturnPointer = retPtr;
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
@@ -1638,9 +1645,24 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             c->CreateFunctionDeclaration(mangledName, rt, {});
                         }
                     }
-                    declType.Pointer = declSpecWithSuffix->pointer() != nullptr;
-                    declType.ArraySize = ArrayDimsOf(declSpecWithSuffix) ?
-                        ArrayDimsOf(declSpecWithSuffix)->assignmentExpression(0) : nullptr;
+                    const int pointerDepth = PointerDepthOf(declSpecWithSuffix->pointer());
+                    declType.Pointer = pointerDepth > 0;
+                    declType.ElemPointer = pointerDepth >= 2;
+                    declType.PointerDepth = pointerDepth > PointerDepthCap ? 0 : pointerDepth;
+                    if (auto* dims = ArrayDimsOf(declSpecWithSuffix))
+                    {
+                        auto values = dims->assignmentExpression();
+                        declType.ArraySize = values.empty() ? nullptr : values[0];
+                        for (size_t di = 1; di < values.size(); di++)
+                            declType.ExtraArrayDims.push_back(values[di]);
+                        if (values.empty())
+                        {
+                            const bool elementPointer = declType.Pointer;
+                            declType.IsArrayView = true;
+                            declType.Pointer = true;
+                            declType.ElemPointer = elementPointer || declType.ElemPointer;
+                        }
+                    }
                     break;
                 }
                 // function pointer type: `function<...>` (thin C ptr) or `Lambda<...>` (fat closure)
@@ -1675,9 +1697,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         const bool returnTypeIsGenericDerivedAlias =
                             Compiler(declSpecs)->IsGenericDerivedTypeAlias(returnTypeSpelling);
                         int retConst = 0;
+                        std::string retAliasSpelling;
                         declType.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                             fpSpec->typeSpecifier(), retPtr, retStars, retConst,
-                            fpSpec->multiWordTypeSuffix(), aliasReturn);
+                            fpSpec->multiWordTypeSuffix(), aliasReturn, &retAliasSpelling);
+                        declType.FuncPtrReturnAliasSpelling = retAliasSpelling;
                         if (!retPtr)
                             if (const auto* nested = Compiler(declSpecs)->GetEncodedClosureType(
                                     declType.FuncPtrReturnTypeName))
@@ -1830,10 +1854,6 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     auto* parameterList = genParams->typeParameterList();
                     for (auto* entry : parameterList->typeParameterEntry())
                         {
-                            // `tuple` is a plain aggregate with no destructor, so a `unique` element would
-                            // never be freed - reject it rather than silently drop the ownership.
-                            if (baseName == "tuple" && TypeArgHasUnique(entry))
-                                LogErrorContext(entry, "unique is not supported as a tuple element type");
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
                         }
             const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
@@ -1946,6 +1966,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
+                    declType.FuncPtrReturnAliasSpelling = fit->FuncPtrReturnAliasSpelling;
                     declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrNoPrototype = fit->FuncPtrNoPrototype;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
@@ -2498,16 +2519,18 @@ CFlatParser::NewExpressionContext* MainListener::AsDirectNew(antlr4::tree::Parse
 std::optional<uint64_t> MainListener::DirectEmbedByteCount(
         CFlatParser::AssignmentExpressionContext* expr) {
         if (expr == nullptr) return std::nullopt;
-        std::string text = expr->getText();
-        if (text.size() < 9 || text.rfind("embed(\"", 0) != 0 || text.back() != ')')
-            return std::nullopt;
-        std::string quoted = text.substr(6, text.size() - 7);
-        if (quoted.size() < 2 || quoted.front() != '"' || quoted.back() != '"')
-            return std::nullopt;
+        auto* callArguments = SoleDirectNamedCallArguments(expr, "embed");
+        if (callArguments == nullptr) return std::nullopt;
+        auto arguments = callArguments->argumentNamedExpression();
+        if (arguments.size() != 1) return std::nullopt;
+        auto* pathExpression = arguments.front()->assignmentExpression();
+        auto literalPath = StringLiteralExpressionValue(pathExpression);
+        if (!literalPath.has_value() || !literalPath->IsNarrowOrUtf8
+            || literalPath->HasExpressionSegment) return std::nullopt;
         auto* compiler = Compiler();
         std::string resolvedPath;
         std::string embedError;
-        auto bytes = compiler->LoadEmbedFile(ProcessRawText(quoted, false),
+        auto bytes = compiler->LoadEmbedFile(literalPath->Value,
                                              compiler->GetSourceFilePath(), resolvedPath, embedError);
         if (!bytes.has_value()) return std::nullopt;
         return (uint64_t)bytes->size();
@@ -2985,10 +3008,12 @@ llvm::Constant* MainListener::EvaluateFieldDefaultConstant(const std::string& ow
             llvm::Function::PrivateLinkage, "__global_field_default_tmp", compiler->module.get());
         compiler->builder->SetInsertPoint(llvm::BasicBlock::Create(*compiler->context, "entry", tempFn));
         llvm::Constant* folded = nullptr;
+        bool sourceIsUnsigned = false;
         try
         {
             GlobalScopeGuard defaultCtorScope(global_scope);
-            llvm::Value* value = ParseFieldDefaultInitializer(ownerName, typeValue, expr);
+            llvm::Value* value = ParseFieldDefaultInitializer(ownerName, typeValue, expr,
+                &sourceIsUnsigned);
             llvm::DenseMap<const llvm::Value*, llvm::Constant*> noArgs;
             llvm::DenseMap<const llvm::Value*, llvm::Constant*> rootMemo;
             folded = FoldConstructedValueToConstant(value, noArgs, rootMemo, foldState);
@@ -3011,6 +3036,20 @@ llvm::Constant* MainListener::EvaluateFieldDefaultConstant(const std::string& ow
         if (source != nullptr && target->isIntegerTy())
             return llvm::ConstantInt::get(target,
                 source->getValue().sextOrTrunc(target->getIntegerBitWidth()));
+        if (source != nullptr && target->isFloatingPointTy())
+        {
+            const bool isUnsigned = sourceIsUnsigned || source->getType()->isIntegerTy(1);
+            return LLVMBackend::ConvertIntegerConstantToFloatingPoint(source, target, isUnsigned);
+        }
+        auto* sourceFloat = llvm::dyn_cast<llvm::ConstantFP>(folded);
+        if (sourceFloat != nullptr && target->isFloatingPointTy())
+        {
+            llvm::APFloat converted = sourceFloat->getValueAPF();
+            bool losesInfo = false;
+            converted.convert(target->getFltSemantics(),
+                llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+            return llvm::ConstantFP::get(target, converted);
+        }
         return nullptr;
 }
 
@@ -3066,11 +3105,192 @@ llvm::Constant* MainListener::StructuralDefaultConstant(const LLVMBackend::DeclT
             }
             if (expr != nullptr) return nullptr;
             const auto data = compiler->GetDataStructure(typeValue.TypeName);
-            if (data.StructType == nullptr || data.IsUnion || data.CxxOffsetLayout
+            if (data.StructType == nullptr || data.CxxOffsetLayout
                 || !data.Interfaces.empty() || compiler->IsCxxRecord(typeValue.TypeName)
                 || !compiler->StructDefaultsKnown(typeValue.TypeName))
                 return nullptr;
             auto* structType = llvm::cast<llvm::StructType>(type);
+            if (data.IsUnion)
+            {
+                size_t selected = data.StructFields.size();
+                bool hasExplicitInitializer = false;
+                for (size_t i = 0; i < data.StructFields.size(); ++i)
+                {
+                    const auto& field = data.StructFields[i];
+                    if (field.TypeName == "auto" || field.IsBitfieldStorage) continue;
+                    const bool explicitInitializer =
+                        FindExplicitUnionMemberDefault(field) != nullptr;
+                    if (!explicitInitializer) continue;
+                    selected = i;
+                    hasExplicitInitializer = true;
+                    break;
+                }
+                if (!hasExplicitInitializer)
+                    for (size_t i = 0; i < data.StructFields.size(); ++i)
+                    {
+                        const auto& field = data.StructFields[i];
+                        if (field.TypeName == "auto" || field.IsBitfieldStorage) continue;
+                        if ((field.Initializer != nullptr
+                                && field.Initializer->Default() != nullptr)
+                            || field.IsInlineAggregateField)
+                        {
+                            selected = i;
+                            break;
+                        }
+                    }
+                if (selected == data.StructFields.size())
+                    return llvm::Constant::getNullValue(type);
+
+                const auto& field = data.StructFields[selected];
+                CFlatParser::AssignmentExpressionContext* fieldExpr = nullptr;
+                if (!FieldDefaultSpelling(field, fieldExpr)) return nullptr;
+                auto* fieldValue = StructuralDefaultConstant(field, typeValue.TypeName,
+                    fieldExpr, foldState, depth + 1);
+                if (fieldValue == nullptr) return nullptr;
+
+                // Repack the active member's bytes into the union's LLVM storage type.
+                if (structType->getNumElements() != 1) return nullptr;
+                auto* storageType = structType->getElementType(0);
+                const auto& layout = compiler->module->getDataLayout();
+                const auto storageSize = layout.getTypeAllocSize(storageType);
+                if (storageSize.isScalable()) return nullptr;
+                const uint64_t storageBytes = storageSize.getFixedValue();
+                std::vector<uint8_t> bytes(storageBytes, 0);
+                auto writeConstant = [&](auto&& self, llvm::Constant* value,
+                    uint64_t offset) -> bool {
+                    if (value == nullptr) return false;
+                    if (value->isNullValue()) return true;
+                    auto writeBits = [&](const llvm::APInt& bits, uint64_t byteOffset) {
+                        const uint64_t scalarBytes = (bits.getBitWidth() + 7) / 8;
+                        if (byteOffset > bytes.size()
+                            || scalarBytes > bytes.size() - byteOffset) return false;
+                        for (unsigned bit = 0; bit < bits.getBitWidth(); ++bit)
+                        {
+                            if (!bits[bit]) continue;
+                            const uint64_t memoryByte = layout.isLittleEndian()
+                                ? byteOffset + bit / 8
+                                : byteOffset + scalarBytes - 1 - bit / 8;
+                            bytes[memoryByte] |= static_cast<uint8_t>(1u << (bit % 8));
+                        }
+                        return true;
+                    };
+                    if (auto* integer = llvm::dyn_cast<llvm::ConstantInt>(value))
+                        return writeBits(integer->getValue(), offset);
+                    if (auto* floating = llvm::dyn_cast<llvm::ConstantFP>(value))
+                        return writeBits(floating->getValueAPF().bitcastToAPInt(), offset);
+                    if (auto* pointer = llvm::dyn_cast<llvm::ConstantPointerNull>(value))
+                        return pointer != nullptr;
+                    if (auto* array = llvm::dyn_cast<llvm::ArrayType>(value->getType()))
+                    {
+                        const auto elementSize = layout.getTypeAllocSize(array->getElementType());
+                        if (elementSize.isScalable()) return false;
+                        for (uint64_t i = 0; i < array->getNumElements(); ++i)
+                        {
+                            auto* element = value->getAggregateElement(static_cast<unsigned>(i));
+                            if (!self(self, element,
+                                offset + i * elementSize.getFixedValue())) return false;
+                        }
+                        return true;
+                    }
+                    if (auto* aggregate = llvm::dyn_cast<llvm::StructType>(value->getType()))
+                    {
+                        if (aggregate->isOpaque()) return false;
+                        const auto* structLayout = layout.getStructLayout(aggregate);
+                        for (unsigned i = 0; i < aggregate->getNumElements(); ++i)
+                        {
+                            auto* element = value->getAggregateElement(i);
+                            if (!self(self, element,
+                                offset + structLayout->getElementOffset(i))) return false;
+                        }
+                        return true;
+                    }
+                    return false;
+                };
+                if (!writeConstant(writeConstant, fieldValue, 0)) return nullptr;
+                std::function<llvm::Constant*(llvm::Type*, uint64_t)> readConstant;
+                readConstant = [&](llvm::Type* valueType, uint64_t offset) -> llvm::Constant* {
+                    const auto valueSize = layout.getTypeAllocSize(valueType);
+                    if (valueSize.isScalable() || offset > bytes.size()
+                        || valueSize.getFixedValue() > bytes.size() - offset)
+                        return nullptr;
+                    auto readBits = [&](unsigned bitWidth) -> std::optional<llvm::APInt> {
+                        const uint64_t scalarBytes = (bitWidth + 7) / 8;
+                        if (bitWidth == 0 || offset > bytes.size()
+                            || scalarBytes > bytes.size() - offset)
+                            return std::nullopt;
+                        llvm::APInt bits(bitWidth, 0);
+                        for (unsigned bit = 0; bit < bitWidth; ++bit)
+                        {
+                            const uint64_t memoryByte = layout.isLittleEndian()
+                                ? offset + bit / 8
+                                : offset + scalarBytes - 1 - bit / 8;
+                            bits.setBitVal(bit,
+                                (bytes[memoryByte] & (1u << (bit % 8))) != 0);
+                        }
+                        return bits;
+                    };
+                    if (auto* integerType = llvm::dyn_cast<llvm::IntegerType>(valueType))
+                    {
+                        auto bits = readBits(integerType->getBitWidth());
+                        return bits ? llvm::ConstantInt::get(integerType, *bits) : nullptr;
+                    }
+                    if (valueType->isFloatingPointTy())
+                    {
+                        auto bitSize = valueType->getPrimitiveSizeInBits();
+                        if (bitSize.isScalable()
+                            || bitSize.getFixedValue() > std::numeric_limits<unsigned>::max())
+                            return nullptr;
+                        auto bits = readBits(static_cast<unsigned>(bitSize.getFixedValue()));
+                        if (!bits) return nullptr;
+                        auto* integerType = llvm::IntegerType::get(
+                            *compiler->context, static_cast<unsigned>(bitSize.getFixedValue()));
+                        auto* integer = llvm::ConstantInt::get(integerType, *bits);
+                        return llvm::ConstantExpr::getBitCast(integer, valueType);
+                    }
+                    if (auto* pointerType = llvm::dyn_cast<llvm::PointerType>(valueType))
+                    {
+                        const uint64_t end = offset + valueSize.getFixedValue();
+                        if (std::any_of(bytes.begin() + offset, bytes.begin() + end,
+                                [](uint8_t byte) { return byte != 0; }))
+                            return nullptr;
+                        return llvm::ConstantPointerNull::get(pointerType);
+                    }
+                    if (auto* arrayType = llvm::dyn_cast<llvm::ArrayType>(valueType))
+                    {
+                        const auto elementSize = layout.getTypeAllocSize(arrayType->getElementType());
+                        if (elementSize.isScalable()) return nullptr;
+                        std::vector<llvm::Constant*> elements;
+                        elements.reserve(arrayType->getNumElements());
+                        for (uint64_t i = 0; i < arrayType->getNumElements(); ++i)
+                        {
+                            auto* element = readConstant(arrayType->getElementType(),
+                                offset + i * elementSize.getFixedValue());
+                            if (element == nullptr) return nullptr;
+                            elements.push_back(element);
+                        }
+                        return llvm::ConstantArray::get(arrayType, elements);
+                    }
+                    if (auto* aggregateType = llvm::dyn_cast<llvm::StructType>(valueType))
+                    {
+                        if (aggregateType->isOpaque()) return nullptr;
+                        const auto* aggregateLayout = layout.getStructLayout(aggregateType);
+                        std::vector<llvm::Constant*> elements;
+                        elements.reserve(aggregateType->getNumElements());
+                        for (unsigned i = 0; i < aggregateType->getNumElements(); ++i)
+                        {
+                            auto* element = readConstant(aggregateType->getElementType(i),
+                                offset + aggregateLayout->getElementOffset(i));
+                            if (element == nullptr) return nullptr;
+                            elements.push_back(element);
+                        }
+                        return llvm::ConstantStruct::get(aggregateType, elements);
+                    }
+                    return nullptr;
+                };
+                auto* storage = readConstant(storageType, 0);
+                if (storage == nullptr) return nullptr;
+                return llvm::ConstantStruct::get(structType, { storage });
+            }
             if (data.StructFields.size() != structType->getNumElements()) return nullptr;
             std::vector<llvm::Constant*> elements;
             elements.reserve(data.StructFields.size());
@@ -5789,6 +6009,21 @@ std::vector<LLVMBackend::AnnotationValue> MainListener::ParseAnnotationList(CFla
                 LogErrorContext(ann, "Unknown annotation '" + annName + "': no annotation declaration found");
                 continue;
             }
+
+            // The UUID registry key names GUID syntax; its braces are not interpolation syntax.
+            const bool isUuidAttribute = regIt->first == "uuid";
+            bool hasInterpolationSegment = false;
+            if (ann->annotationArgList() != nullptr)
+                for (auto* arg : ann->annotationArgList()->annotationArg())
+                    if (arg->StringLiteral() != nullptr
+                        && !isUuidAttribute
+                        && HasInterpolationSegment(arg->StringLiteral()->getText()))
+                    {
+                        LogErrorContext(arg,
+                            "annotation arguments cannot contain string interpolation");
+                        hasInterpolationSegment = true;
+                    }
+            if (hasInterpolationSegment) continue;
 
             auto argValues = AnnotationArgTexts(ann);
             bool hasArg = ann->annotationArgList() != nullptr;
@@ -8982,14 +9217,20 @@ bool MainListener::FoldApplicationLiteral(antlr4::ParserRuleContext* ctx, const 
     auto stringField = [&](CFlatParser::FieldInitContext* field, const std::string& name,
                            std::string& value) {
         auto* expression = soleExpression(field);
-        std::string raw = expression == nullptr ? std::string() : expression->getText();
-        if (raw.size() < 2 || raw.front() != '"' || raw.back() != '"')
+        auto literalValue = StringLiteralExpressionValue(expression);
+        if (!literalValue.has_value() || !literalValue->IsNarrowOrUtf8)
         {
             LogErrorContext(field, std::format(
                 "application field '{}' must be a string literal", name));
             return false;
         }
-        value = ProcessRawText(raw);
+        if (literalValue->HasExpressionSegment)
+        {
+            LogErrorContext(field, std::format(
+                "application field '{}' cannot contain string interpolation", name));
+            return false;
+        }
+        value = literalValue->Value;
         // The VS_VERSIONINFO block length is a u16, so an over-long field would silently truncate.
         static const size_t kMaxAppStringBytes = 32000;
         if (value.size() > kMaxAppStringBytes)
@@ -9125,22 +9366,30 @@ bool MainListener::FoldApplicationLiteral(antlr4::ParserRuleContext* ctx, const 
                         return false;
                     }
                     auto* expression = soleExpression(iconField);
-                    std::string raw = expression == nullptr ? std::string() : expression->getText();
-                    if (!raw.starts_with("embed(") || !raw.ends_with(")"))
+                    auto* callArguments = SoleDirectNamedCallArguments(expression, "embed");
+                    if (callArguments == nullptr)
                     {
                         LogErrorContext(iconField, std::format(
                             "application icon entry {} must be 'image = embed(\"icon.png\")'", index));
                         return false;
                     }
-                    std::string pathLiteral = raw.substr(6, raw.size() - 7);
-                    if (pathLiteral.size() < 2 || pathLiteral.front() != '"'
-                        || pathLiteral.back() != '"')
+                    auto iconArguments = callArguments->argumentNamedExpression();
+                    auto* pathExpression = iconArguments.size() == 1
+                        ? iconArguments.front()->assignmentExpression() : nullptr;
+                    auto literalPathValue = StringLiteralExpressionValue(pathExpression);
+                    if (!literalPathValue.has_value() || !literalPathValue->IsNarrowOrUtf8)
                     {
                         LogErrorContext(iconField, std::format(
                             "application icon entry {} must embed a string literal path", index));
                         return false;
                     }
-                    std::string literalPath = ProcessRawText(pathLiteral, false);
+                    if (literalPathValue->HasExpressionSegment)
+                    {
+                        LogErrorContext(iconField,
+                            "application icon paths cannot contain string interpolation");
+                        return false;
+                    }
+                    std::string literalPath = literalPathValue->Value;
                     std::string resolvedPath;
                     std::string embedError;
                     auto bytes = compiler->LoadEmbedFile(literalPath,
@@ -10172,7 +10421,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto* arrInitList = barebraceInit ? barebraceList
                                       : initializer->initializerList();
                     if (global_scope)
-                        LogErrorContext(initDecl, "array-view initializer '= {}' is not allowed at global scope");
+                        EmitGlobalArrayViewInferredInit(name, typeAndValue, arrInitList, direct,
+                            initDecl, typeAndValue.threadLocal);
                     else if (isStaticLocal)
                         // The brace list's backing array is a stack alloca, so the static view would
                         // dangle after the first call. A sized 'T[N]' static owns its own storage.
@@ -10215,6 +10465,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         srcRhsExprText = assignmentExpression->getText();
                     // Redundant parentheses take the bare initializer's route (elision, ternary arms).
                     assignmentExpression = UnwrapInitializerParens(assignmentExpression);
+                    if (assignmentExpression != nullptr
+                        && !typeAndValue.Pointer
+                        && compiler->ResolveTypeAlias(typeAndValue.TypeName) == "string"
+                        && IsNullptrLiteralExpressionTree(assignmentExpression))
+                        LogErrorContext(assignmentExpression, std::format(
+                            "cannot initialize string '{}' from nullptr", name));
                     bool foldedGlobalIntegerInit = false;
                     if (globalInitTempFn != nullptr && assignmentExpression != nullptr)
                     {
@@ -12852,10 +13108,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && typeAndValue.TypeName == "string" && initializer != nullptr
                         && initializer->assignmentExpression() != nullptr)
                     {
-                        std::string raw = initializer->assignmentExpression()->getText();
-                        if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"'
-                            && !HasInterpolation(raw))
-                            compiler->RecordCompileTimeStringConstant(name, ProcessRawText(raw));
+                        auto* expression = initializer->assignmentExpression();
+                        if (auto literalValue = StringLiteralExpressionValue(expression);
+                            literalValue.has_value() && !literalValue->HasExpressionSegment)
+                            compiler->RecordCompileTimeStringConstant(name, literalValue->Value);
                     }
                     // A native const scalar / pointer / scalar-array global with a constant initializer
                     // and no module-init construction is read-only data.
@@ -14095,11 +14351,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 && !typeAndValue.IsUnique && !destUniqueLoc);
                         // Ruling 2026-10-31: an explicit `move` of a PROVEN borrowed pointer into any slot
                         // is refused; the move-from-owning-slot fix stays legal (srcMovedFromSlot).
-                        const bool borrowedMoveSlotRefused = typeAndValue.Pointer
-                            && !typeAndValue.IsArrayView && !srcMovedFromSlot && haveInitializerSourceNV
-                            && initAssignExprOwn != nullptr
-                            && TopLevelMoveExpression(initAssignExprOwn) != nullptr
+                        const bool explicitMove = initAssignExprOwn != nullptr
+                            && TopLevelMoveExpression(initAssignExprOwn) != nullptr;
+                        const bool moveSourceIsProvenBorrow = haveInitializerSourceNV
                             && compiler->MoveSourceIsAddressBorrow(initializerSourceNV);
+                        const bool borrowedMoveSlotRefused = (typeAndValue.Pointer || destUniqueLoc)
+                            && !typeAndValue.IsArrayView && !srcMovedFromSlot
+                            && haveInitializerSourceNV && explicitMove
+                            && moveSourceIsProvenBorrow;
                         if (borrowedMoveSlotRefused)
                             compiler->LogBorrowedMoveSlotError();
                         if (typeAndValue.Pointer && !typeAndValue.IsUnique
@@ -14111,7 +14370,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         {
                             // ParseMoveExpression sets lastOwningResult unconditionally and records the
                             // true provenance in IsBorrowed, so consult that; the `=` path has the same gate.
-                            if (srcIsBorrowed && !srcMovedFromSlot && destUniqueLoc && !borrowedMoveSlotRefused)
+                            if (srcIsBorrowed && !srcMovedFromSlot && destUniqueLoc
+                                && !borrowedMoveSlotRefused)
                             {
                                 bool srcIsField = !srcBorrowedField.empty();
                                 std::string srcDesc = srcIsField
@@ -14159,11 +14419,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->GetOrCreateStackVariable(name).PointsToBorrowedAddress = true;
                         if (haveInitializerSourceNV
                             && (typeAndValue.Pointer || (!typeAndValue.Pointer
-                                && typeAndValue.TypeName == "string"))
+                                && (typeAndValue.TypeName == "string"
+                                    || typeAndValue.TypeName == "string_view")))
                             && initializerSourceNV.StackCharBufferBorrow)
                         {
                             auto& local = compiler->GetOrCreateStackVariable(name);
-                            if (!typeAndValue.Pointer && typeAndValue.TypeName == "string"
+                            if (!typeAndValue.Pointer
+                                && (typeAndValue.TypeName == "string"
+                                    || typeAndValue.TypeName == "string_view")
                                 && StackCharBufferOutlives(initializerSourceNV, local))
                                 RejectStackCharBufferEscape(initializerSourceNV, initDecl);
                             local.StackCharBufferBorrow = true;
@@ -16490,6 +16753,33 @@ bool MainListener::NamedVarIsString(const LLVMBackend::NamedVariable& nv) {
         return false;
 }
 
+bool MainListener::NamedVarIsStringView(const LLVMBackend::NamedVariable& nv) {
+        if (nv.TypeAndValue.TypeName == "string_view") return true;
+        if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType))
+            return st->getName() == "string_view";
+        return false;
+}
+
+void MainListener::CarryStackCharBufferBorrow(LLVMBackend::NamedVariable& destination,
+                                               const LLVMBackend::NamedVariable& source,
+                                               llvm::Value* sourcePointer) {
+        const bool charArray = source.TypeAndValue.TypeName == "char"
+            && (source.TypeAndValue.ConstArraySize > 0
+                || llvm::isa_and_nonnull<llvm::ArrayType>(source.BaseType));
+        llvm::Value* pointer = sourcePointer != nullptr ? sourcePointer : source.Primary;
+        if (!source.StackCharBufferBorrow
+            && !PointsIntoStackFrame(pointer)
+            && !(charArray && PointsIntoStackFrame(source.Storage)))
+            return;
+        destination.StackCharBufferBorrow = true;
+        destination.StackCharBufferSource = !source.StackCharBufferSource.empty()
+            ? source.StackCharBufferSource
+            : !source.CallerName.empty() ? source.CallerName
+            : source.TypeAndValue.VariableName;
+        destination.StackCharBufferScopeDepth = source.StackCharBufferScopeDepth != 0
+            ? source.StackCharBufferScopeDepth : source.DeclarationScopeDepth;
+}
+
 bool MainListener::IsStackCharBufferBorrow(const LLVMBackend::NamedVariable& nv) {
         return nv.StackCharBufferBorrow;
 }
@@ -16871,13 +17161,25 @@ bool MainListener::EnsureAggregateAliases(const std::string& owner) {
             auto savedSubst = activeTypeSubstitutions;
             auto savedValueSubst = activeValueSubstitutions;
             auto savedPackSubst = activePackSubstitutions;
+            GenericValueMacroScope valueMacros(compiler);
+            valueMacros.Park(savedValueSubst);
+            activeTypeSubstitutions = TypeSubstitutionMap{};
+            activeValueSubstitutions.clear();
+            activePackSubstitutions.clear();
+            const size_t ownerDot = owner.rfind('.');
+            if (ownerDot != std::string::npos)
+                BindGenericOwnerSubstitutions(owner.substr(0, ownerDot), valueMacros);
+            for (const auto& param : typeParams) valueMacros.Park(param);
             for (size_t i = 0; i < typeParams.size() && i < typeArgs.size(); i++)
             {
                 activeTypeSubstitutions.erase(typeParams[i]);
                 activeValueSubstitutions.erase(typeParams[i]);
                 activePackSubstitutions.erase(typeParams[i]);
                 if (i < valueParams.size() && !valueParams[i].empty())
+                {
                     activeValueSubstitutions[typeParams[i]] = typeArgs[i];
+                    valueMacros.Bind(typeParams[i], ParseValueArg(typeArgs[i]));
+                }
                 else
                     activeTypeSubstitutions.Bind(typeParams[i], typeArgs[i]);
             }
@@ -16904,6 +17206,7 @@ bool MainListener::EnsureAggregateAliases(const std::string& owner) {
             activeTypeSubstitutions = savedSubst;
             activeValueSubstitutions = savedValueSubst;
             activePackSubstitutions = savedPackSubst;
+            valueMacros.Restore();
         }
         aggregateAliasesInProgress_.erase(owner);
         return collected;
@@ -17085,17 +17388,42 @@ void MainListener::RecordAggregateValueMembers(const std::string& owner,
 {
         // Field and method names of `owner`, so `owner.name` in type position is refused as
         // "a member but not a type" instead of "no member type".
-        auto& names = Compiler()->aggregateValueMembers_[owner];
-        for (auto* member : members)
+        std::function<void(const std::vector<CFlatParser::AggregateMemberContext*>&,
+                           const std::string&, bool)> collect;
+        collect = [&](const std::vector<CFlatParser::AggregateMemberContext*>& current,
+                      const std::string& valueOwner, bool transparent)
         {
-            if (auto* decl = member->declaration())
+            auto& valueNames = Compiler()->aggregateValueMembers_[valueOwner];
+            for (auto* member : current)
             {
-                if (auto* list = decl->initDeclaratorList())
-                    for (auto* init : list->initDeclarator())
-                        if (auto* declarator = init->declarator())
-                            names.insert(getDirectDeclName(declarator->directDeclarator()));
+                if (auto* decl = member->declaration())
+                {
+                    if (!transparent) continue;
+                    if (auto* list = decl->initDeclaratorList())
+                        for (auto* init : list->initDeclarator())
+                            if (auto* declarator = init->declarator())
+                                valueNames.insert(getDirectDeclName(declarator->directDeclarator()));
+                }
+                else if (auto* func = member->functionDefinition())
+                {
+                    if (transparent) valueNames.insert(getFunctionName(func));
+                }
+                else if (auto* anonymous = member->anonymousAggregateMember())
+                {
+                    auto* field = anonymous->directDeclarator();
+                    if (field != nullptr)
+                    {
+                        if (transparent) valueNames.insert(getDirectDeclName(field));
+                    }
+                    else
+                        collect(ResolveAggregateMembers(anonymous), valueOwner, transparent);
+                }
+                else if (auto* nested = member->nestedAggregateField())
+                {
+                    const auto declarators = nested->directDeclarator();
+                    if (transparent) valueNames.insert(getDirectDeclName(declarators[1]));
+                }
             }
-            else if (auto* func = member->functionDefinition())
-                names.insert(getFunctionName(func));
-        }
+        };
+        collect(members, owner, true);
 }

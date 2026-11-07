@@ -1293,6 +1293,71 @@ int testHashsetChurn()
 // A static table of string literals at file scope: each element folds to a borrowed
 // {ptr,len} constant, the same shape a scalar `string g = "x";` global takes.
 string[2] g_symbolTable = { "AAPL", "MSFT" };
+int[3] g_gviewCountedInts = { 4, 5, 6 };
+string[] g_gviewStrings = { "AAPL", "MSFT" };
+int[] g_gviewInts = { 10, 20, 30 };
+struct GViewPoint { int x; int y; };
+GViewPoint[] g_gviewPoints = { { 3, 4 }, { 5, 6 } };
+struct GViewInnerPod { int value; };
+struct GViewOuterPod { GViewInnerPod inner; int tail; };
+GViewOuterPod[] g_gviewNestedPod = { { { 7 }, 8 } };
+int[] g_gviewEmpty = {};
+float[] g_gviewFloats = { 1.5, 2.5 };
+bool[] g_gviewBools = { true, false };
+char[] g_gviewChars = { 'A', 'Z' };
+int*[] g_gviewPointers = { nullptr, nullptr };
+enum GViewColor : int { GViewBlack = 0, GViewRed = 3 };
+GViewColor[] g_gviewColors = { GViewColor.GViewRed, GViewColor.GViewBlack };
+int[] g_gviewBare { 41, 42 };
+namespace CoreGlobalViewNS { int[] values = { 51, 52 }; }
+static int[] g_gviewStatic = { 61, 62 };
+thread_local int[] g_gviewThreadLocal = { 71, 72 };
+(const int)[] g_gviewConstElems = { 81, 82 };
+int[] g_gviewMultiA = { 91, 92 }, g_gviewMultiB = { 93, 94 };
+int[2] g_gviewSource2 = { 1, 2 };
+int[4] g_gviewSource4 = { 3, 4, 5, 6 };
+int[] g_gviewRebind = { 7, 8 };
+
+const int g_gviewSignK = 4;
+const u32 g_gviewKU32 = 4294967295;
+enum GViewU8Enum : u8 { GViewEnumTwoHundred = 200 };
+enum GViewSignEnum : int { GViewSignMinusNine = -9 };
+struct GViewWide { i64 value; };
+struct GViewWideU64 { u64 value; };
+struct GViewWide128 { i128 value; };
+struct GViewFloat { double value; };
+int[2] g_gviewNegativePair = { -1, -2 };
+long[1] g_gviewNegativeLong = { -6 };
+long[1] g_gviewConstLong = { g_gviewSignK - 10 };
+i64[1] g_gviewFixedS8 = { (i8)-1 }; i64[] g_gviewViewS8 = { (i8)-1 }; GViewWide[] g_gviewStructS8 = { { (i8)-1 } };
+i64[1] g_gviewFixedS16 = { (i16)-2 }; i64[] g_gviewViewS16 = { (i16)-2 }; GViewWide[] g_gviewStructS16 = { { (i16)-2 } };
+i64[1] g_gviewFixedS32 = { (int)-3 }; i64[] g_gviewViewS32 = { (int)-3 }; GViewWide[] g_gviewStructS32 = { { (int)-3 } };
+i128[1] g_gviewFixedS64 = { (i64)-4 }; i128[] g_gviewViewS64 = { (i64)-4 }; GViewWide128[] g_gviewStructS64 = { { (i64)-4 } };
+i64[1] g_gviewFixedU8 = { (u8)255 }; i64[] g_gviewViewU8 = { (u8)255 }; GViewWide[] g_gviewStructU8 = { { (u8)255 } };
+i64[1] g_gviewFixedU16 = { (u16)65535 }; i64[] g_gviewViewU16 = { (u16)65535 }; GViewWide[] g_gviewStructU16 = { { (u16)65535 } };
+i64[1] g_gviewFixedU32 = { (u32)4294967295 }; i64[] g_gviewViewU32 = { (u32)4294967295 }; GViewWide[] g_gviewStructU32 = { { (u32)4294967295 } };
+i128[1] g_gviewFixedU64 = { (u64)-1 }; i128[] g_gviewViewU64 = { (u64)-1 }; GViewWide128[] g_gviewStructU64 = { { (u64)-1 } };
+i64[1] g_gviewFixedChar = { (char)-5 }; i64[] g_gviewViewChar = { (char)-5 }; GViewWide[] g_gviewStructChar = { { (char)-5 } };
+i64[1] g_gviewFixedBool = { true }; i64[] g_gviewViewBool = { true }; GViewWide[] g_gviewStructBool = { { true } };
+i64[1] g_gviewFixedBoolFalse = { false }; i64[] g_gviewViewBoolFalse = { false }; GViewWide[] g_gviewStructBoolFalse = { { false } };
+i64[1] g_gviewFixedEnum = { (GViewSignEnum)-9 }; i64[] g_gviewViewEnum = { (GViewSignEnum)-9 }; GViewWide[] g_gviewStructEnum = { { (GViewSignEnum)-9 } };
+i64[1] g_gviewFixedConst = { g_gviewSignK - 10 }; i64[] g_gviewViewConst = { g_gviewSignK - 10 }; GViewWide[] g_gviewStructConst = { { g_gviewSignK - 10 } };
+i64[1] g_gviewFixedNegConst = { -g_gviewSignK }; i64[] g_gviewViewNegConst = { -g_gviewSignK }; GViewWide[] g_gviewStructNegConst = { { -g_gviewSignK } };
+double[1] g_gviewFixedDoubleU8 = { (u8)255 }; double[] g_gviewViewDoubleU8 = { (u8)255 }; GViewFloat[] g_gviewStructDoubleU8 = { { (u8)255 } };
+u64[] g_gviewConstU32U64 = { g_gviewKU32 };
+i64[] g_gviewConstU32I64 = { g_gviewKU32 };
+i64[] g_gviewEnumU8I64 = { GViewU8Enum.GViewEnumTwoHundred };
+GViewWideU64[] g_gviewStructConstU32 = { { g_gviewKU32 } };
+
+int gviewReadValues(int[] values)
+{
+    return values[0] * 100 + values[1] * 10 + values[2];
+}
+
+int gviewReadStringLengths(string[] values)
+{
+    return values[0].length() * 10 + values[1].length();
+}
 
 struct StringRow { string name = default; };
 
@@ -1313,6 +1378,94 @@ CPToken makeCPToken(string t)
 int lenOfString(string s)
 {
     return (int)s.length();
+}
+
+int testGViewIntegerCoercions()
+{
+    int passed = 0;
+    i128 expectedU64 = (i128)(u64)-1;
+    passed += Test("global int and long signed values",
+        g_gviewNegativePair[0] == -1 && g_gviewNegativePair[1] == -2
+            && g_gviewNegativeLong[0] == -6 && g_gviewConstLong[0] == -6, true);
+    passed += Test("global signed i8 widening",
+        g_gviewFixedS8[0] == -1 && g_gviewViewS8[0] == -1 && g_gviewStructS8[0].value == -1, true);
+    passed += Test("global signed i16 widening",
+        g_gviewFixedS16[0] == -2 && g_gviewViewS16[0] == -2 && g_gviewStructS16[0].value == -2, true);
+    passed += Test("global signed i32 widening",
+        g_gviewFixedS32[0] == -3 && g_gviewViewS32[0] == -3 && g_gviewStructS32[0].value == -3, true);
+    passed += Test("global signed i64 widening",
+        g_gviewFixedS64[0] == -4 && g_gviewViewS64[0] == -4 && g_gviewStructS64[0].value == -4, true);
+    passed += Test("global unsigned u8 widening",
+        g_gviewFixedU8[0] == 255 && g_gviewViewU8[0] == 255 && g_gviewStructU8[0].value == 255, true);
+    passed += Test("global unsigned u16 widening",
+        g_gviewFixedU16[0] == 65535 && g_gviewViewU16[0] == 65535 && g_gviewStructU16[0].value == 65535, true);
+    passed += Test("global unsigned u32 widening",
+        g_gviewFixedU32[0] == 4294967295 && g_gviewViewU32[0] == 4294967295 && g_gviewStructU32[0].value == 4294967295, true);
+    passed += Test("global unsigned u64 widening",
+        g_gviewFixedU64[0] == expectedU64 && g_gviewViewU64[0] == expectedU64
+            && g_gviewStructU64[0].value == expectedU64, true);
+    passed += Test("global char widening",
+        g_gviewFixedChar[0] == -5 && g_gviewViewChar[0] == -5 && g_gviewStructChar[0].value == -5, true);
+    passed += Test("global bool widening",
+        g_gviewFixedBool[0] == 1 && g_gviewViewBool[0] == 1 && g_gviewStructBool[0].value == 1
+            && g_gviewFixedBoolFalse[0] == 0 && g_gviewViewBoolFalse[0] == 0
+            && g_gviewStructBoolFalse[0].value == 0, true);
+    passed += Test("global negative enum widening",
+        g_gviewFixedEnum[0] == -9 && g_gviewViewEnum[0] == -9 && g_gviewStructEnum[0].value == -9, true);
+    passed += Test("global const expression widening",
+        g_gviewFixedConst[0] == -6 && g_gviewViewConst[0] == -6 && g_gviewStructConst[0].value == -6, true);
+    passed += Test("global negative const widening",
+        g_gviewFixedNegConst[0] == -4 && g_gviewViewNegConst[0] == -4
+            && g_gviewStructNegConst[0].value == -4, true);
+    passed += Test("global unsigned byte to double",
+        g_gviewFixedDoubleU8[0] == 255.0 && g_gviewViewDoubleU8[0] == 255.0
+            && g_gviewStructDoubleU8[0].value == 255.0, true);
+    passed += Test("global u32 const view widening",
+        g_gviewConstU32U64[0] == 4294967295 && g_gviewConstU32I64[0] == 4294967295, true);
+    passed += Test("global u8 enum view widening",
+        g_gviewEnumU8I64[0] == 200, true);
+    passed += Test("global u32 const struct field view widening",
+        g_gviewStructConstU32[0].value == 4294967295, true);
+
+    i64[1] localFixedS8 = { (i8)-1 }; i64[] localViewS8 = { (i8)-1 };
+    i64[1] localFixedS16 = { (i16)-2 }; i64[] localViewS16 = { (i16)-2 };
+    i64[1] localFixedS32 = { (int)-3 }; i64[] localViewS32 = { (int)-3 };
+    i128[1] localFixedS64 = { (i64)-4 }; i128[] localViewS64 = { (i64)-4 };
+    i64[1] localFixedU8 = { (u8)255 }; i64[] localViewU8 = { (u8)255 };
+    i64[1] localFixedU16 = { (u16)65535 }; i64[] localViewU16 = { (u16)65535 };
+    i64[1] localFixedU32 = { (u32)4294967295 }; i64[] localViewU32 = { (u32)4294967295 };
+    i128[1] localFixedU64 = { (u64)-1 }; i128[] localViewU64 = { (u64)-1 };
+    i64[1] localFixedChar = { (char)-5 }; i64[] localViewChar = { (char)-5 };
+    i64[1] localFixedBool = { true }; i64[] localViewBool = { true };
+    i64[1] localFixedBoolFalse = { false }; i64[] localViewBoolFalse = { false };
+    i64[1] localFixedEnum = { (GViewSignEnum)-9 }; i64[] localViewEnum = { (GViewSignEnum)-9 };
+    i64[1] localFixedConst = { g_gviewSignK - 10 }; i64[] localViewConst = { g_gviewSignK - 10 };
+    i64[1] localFixedNegConst = { -g_gviewSignK }; i64[] localViewNegConst = { -g_gviewSignK };
+    double[1] localFixedDoubleU8 = { (u8)255 }; double[] localViewDoubleU8 = { (u8)255 };
+    u64[] localConstU32U64 = { g_gviewKU32 }; i64[] localConstU32I64 = { g_gviewKU32 };
+    i64[] localEnumU8I64 = { GViewU8Enum.GViewEnumTwoHundred };
+    passed += Test("local signed i8 widening", localFixedS8[0] == -1 && localViewS8[0] == -1, true);
+    passed += Test("local signed i16 widening", localFixedS16[0] == -2 && localViewS16[0] == -2, true);
+    passed += Test("local signed i32 widening", localFixedS32[0] == -3 && localViewS32[0] == -3, true);
+    passed += Test("local signed i64 widening", localFixedS64[0] == -4 && localViewS64[0] == -4, true);
+    passed += Test("local unsigned u8 widening", localFixedU8[0] == 255 && localViewU8[0] == 255, true);
+    passed += Test("local unsigned u16 widening", localFixedU16[0] == 65535 && localViewU16[0] == 65535, true);
+    passed += Test("local unsigned u32 widening", localFixedU32[0] == 4294967295 && localViewU32[0] == 4294967295, true);
+    passed += Test("local unsigned u64 widening",
+        localFixedU64[0] == expectedU64 && localViewU64[0] == expectedU64, true);
+    passed += Test("local char widening", localFixedChar[0] == -5 && localViewChar[0] == -5, true);
+    passed += Test("local bool widening",
+        localFixedBool[0] == 1 && localViewBool[0] == 1
+            && localFixedBoolFalse[0] == 0 && localViewBoolFalse[0] == 0, true);
+    passed += Test("local negative enum widening", localFixedEnum[0] == -9 && localViewEnum[0] == -9, true);
+    passed += Test("local const expression widening", localFixedConst[0] == -6 && localViewConst[0] == -6, true);
+    passed += Test("local negative const widening", localFixedNegConst[0] == -4 && localViewNegConst[0] == -4, true);
+    passed += Test("local unsigned byte to double",
+        localFixedDoubleU8[0] == 255.0 && localViewDoubleU8[0] == 255.0, true);
+    passed += Test("local u32 const view widening",
+        localConstU32U64[0] == 4294967295 && localConstU32I64[0] == 4294967295, true);
+    passed += Test("local u8 enum view widening", localEnumU8I64[0] == 200, true);
+    return passed;
 }
 
 int testString()
@@ -1729,6 +1882,64 @@ int testStringView()
 
     passed += Test("global string array element 0", g_symbolTable[0], "AAPL");
     passed += Test("global string array element 1", g_symbolTable[1], "MSFT");
+    passed += testGViewIntegerCoercions();
+
+    string[] localStringView = { "LOCAL", "VIEW" };
+    passed += Test("gview accept local string 0", localStringView[0], "LOCAL");
+    passed += Test("gview accept local string length", localStringView[1].length(), 4);
+    int[] localIntView = { 4, 5, 6 };
+    passed += Test("gview accept local inferred pass", gviewReadValues(localIntView), 456);
+    passed += Test("gview accept counted global pass", gviewReadValues(g_gviewCountedInts), 456);
+
+    passed += Test("global string view element 0", g_gviewStrings[0], "AAPL");
+    passed += Test("global string view element 1", g_gviewStrings[1], "MSFT");
+    passed += Test("global string view passed", gviewReadStringLengths(g_gviewStrings), 44);
+    passed += Test("global int view element 0", g_gviewInts[0], 10);
+    passed += Test("global int view element 2", g_gviewInts[2], 30);
+    passed += Test("global int view passed", gviewReadValues(g_gviewInts), 1230);
+    int gviewCount = 0;
+    int gviewSum = 0;
+    for (int value in g_gviewInts) { gviewCount++; gviewSum += value; }
+    passed += Test("global int view foreach count and sum", gviewCount * 100 + gviewSum, 360);
+    g_gviewInts[1] = 99;
+    passed += Test("global int view writes hidden backing", g_gviewInts[1], 99);
+    passed += Test("global struct view nested braces",
+        g_gviewPoints[0].x * 1000 + g_gviewPoints[0].y * 100
+            + g_gviewPoints[1].x * 10 + g_gviewPoints[1].y, 3456);
+    passed += Test("global nested POD struct view",
+        g_gviewNestedPod[0].inner.value * 10 + g_gviewNestedPod[0].tail, 78);
+    int gviewEmptyCount = 0;
+    for (int value in g_gviewEmpty) gviewEmptyCount++;
+    passed += Test("global empty view has zero length", gviewEmptyCount, 0);
+    passed += Test("global float view constants", g_gviewFloats[0] + g_gviewFloats[1], 4.0f);
+    passed += Test("global bool view constants", g_gviewBools[0] && !g_gviewBools[1], true);
+    passed += Test("global char view constants",
+        (int)g_gviewChars[0] * 100 + (int)g_gviewChars[1], 6590);
+    passed += Test("global null pointer view constants",
+        g_gviewPointers[0] == nullptr && g_gviewPointers[1] == nullptr, true);
+    passed += Test("global enum view constants",
+        (int)g_gviewColors[0] * 10 + (int)g_gviewColors[1], 30);
+    passed += Test("global bare-brace view", g_gviewBare[0] * 10 + g_gviewBare[1], 452);
+    passed += Test("namespaced global view",
+        CoreGlobalViewNS.values[0] * 10 + CoreGlobalViewNS.values[1], 562);
+    passed += Test("static global view", g_gviewStatic[0] * 10 + g_gviewStatic[1], 672);
+    passed += Test("thread-local global view", g_gviewThreadLocal[0] * 10 + g_gviewThreadLocal[1], 782);
+    passed += Test("global const-element view",
+        g_gviewConstElems[0] * 10 + g_gviewConstElems[1], 892);
+    passed += Test("multi-declarator global views", g_gviewMultiA[0] * 100 + g_gviewMultiB[1], 9194);
+    int gviewRebindCount = 0;
+    for (int value in g_gviewRebind) gviewRebindCount++;
+    int gviewRebindResult = gviewRebindCount * 1000;
+    g_gviewRebind = g_gviewSource4;
+    gviewRebindCount = 0;
+    int gviewRebindSum = 0;
+    for (int value in g_gviewRebind) { gviewRebindCount++; gviewRebindSum += value; }
+    gviewRebindResult += gviewRebindCount * 100 + gviewRebindSum;
+    g_gviewRebind = g_gviewSource2;
+    gviewRebindCount = 0;
+    for (int value in g_gviewRebind) gviewRebindCount++;
+    gviewRebindResult += gviewRebindCount;
+    passed += Test("global view rebind updates foreach length", gviewRebindResult, 2420);
 
     return passed;
 }
@@ -2368,6 +2579,28 @@ int testStringAPI()
     passed += Test("split trailing count", trail.count(), 3);
     passed += Test("split trailing last",  trail.get(2),  "");
 
+    list<string> trailKeep = splitSrc2.split(",", false);
+    passed += Test("split false parity count", trailKeep.count(), 3);
+    passed += Test("split false parity[0]", trailKeep.get(0), "a");
+    passed += Test("split false parity[1]", trailKeep.get(1), "b");
+    passed += Test("split false parity[2]", trailKeep.get(2), "");
+
+    string repeatedSrc = "a,,b";
+    list<string> repeatedDrop = repeatedSrc.split(",", true);
+    passed += Test("split remove repeated count", repeatedDrop.count(), 2);
+    passed += Test("split remove repeated[0]", repeatedDrop.get(0), "a");
+    passed += Test("split remove repeated[1]", repeatedDrop.get(1), "b");
+
+    string edgeSrc = ",a,b,";
+    list<string> edgeDrop = edgeSrc.split(",", true);
+    passed += Test("split remove edge count", edgeDrop.count(), 2);
+    passed += Test("split remove edge[0]", edgeDrop.get(0), "a");
+    passed += Test("split remove edge[1]", edgeDrop.get(1), "b");
+
+    string allSepSrc = ",,,";
+    list<string> allSepDrop = allSepSrc.split(",", true);
+    passed += Test("split remove all separators", allSepDrop.count(), 0);
+
     string splitSrc3 = "hello";
     list<string> noSep = splitSrc3.split(",");
     passed += Test("split no match count", noSep.count(), 1);
@@ -2376,6 +2609,23 @@ int testStringAPI()
     list<string> emptyParts = empty.split(",");
     passed += Test("split empty input count", emptyParts.count(), 1);
     passed += Test("split empty input[0]",    emptyParts.get(0),  "");
+
+    list<string> emptyDrop = empty.split(",", true);
+    passed += Test("split remove empty input", emptyDrop.count(), 0);
+
+    list<string> noSepDrop = splitSrc3.split(",", true);
+    passed += Test("split remove no match count", noSepDrop.count(), 1);
+    passed += Test("split remove no match[0]", noSepDrop.get(0), "hello");
+
+    list<string> emptySepKeep = splitSrc3.split("", false);
+    passed += Test("split empty separator false count", emptySepKeep.count(), 1);
+    passed += Test("split empty separator false[0]", emptySepKeep.get(0), "hello");
+    list<string> emptySepDrop = splitSrc3.split("", true);
+    passed += Test("split empty separator true count", emptySepDrop.count(), 1);
+    passed += Test("split empty separator true[0]", emptySepDrop.get(0), "hello");
+    list<string> emptyInputEmptySep = empty.split("", true);
+    passed += Test("split empty input empty separator count", emptyInputEmptySep.count(), 1);
+    passed += Test("split empty input empty separator[0]", emptyInputEmptySep.get(0), "");
 
     // split by char
     string splitSrc4 = "x:y:z";
@@ -5263,14 +5513,39 @@ int testRawArrayRuntimeCount()
 // directory, so both assets live in Test/library/. The text asset goes to a `string`
 // (byte-exact length, no NUL games); the binary asset goes to a u8[N] whose N is the
 // file size, so sizeof() measures the asset and 0x00 / 0xFF bytes survive intact.
+const u8[] rawstrParenthesizedEmbedFile = embed(("library/embed_bytes.bin"));
+const string braceFoldEmbedSingle = embed("library/embed_bracefold{{x}}.hpp");
+const string braceFoldEmbedAdjacent = embed("library/embed_bracefold{{" r"x}}.hpp");
+const string braceFoldEmbedParen = embed(("library/embed_bracefold{{x}}.hpp"));
 int testEmbed()
 {
     int passed = 0;
+
+    expect_error("embed requires a string literal path") {
+        const u8[] bad = embed(u"library/embed_payload.txt");
+    }
+    expect_error("embed requires a string literal path") {
+        const u8[] bad = embed(U"library/embed_payload.txt");
+    }
+    expect_error("embed requires a string literal path") {
+        const u8[] bad = embed(L"library/embed_payload.txt");
+    }
 
     const string text = embed("library/embed_payload.txt");
     passed += Test("embed string length", (int)text.length(), 40);
     passed += Test("embed string content",
         text == "cflat embed fixture\nline two\nline three\n", true);
+
+    const string rawText = embed(r"library/embed_payload.txt");
+    passed += Test("raw embed string content",
+        rawText == "cflat embed fixture\nline two\nline three\n", true);
+
+    const string parenthesizedText = embed(("library/embed_payload.txt"));
+    passed += Test("parenthesized embed string content",
+        parenthesizedText == "cflat embed fixture\nline two\nline three\n", true);
+
+    const string utf8Text = embed(u8"library/embed_payload.txt");
+    passed += Test("u8 embed string length", (int)utf8Text.length(), 40);
 
     const u8[] bytes = embed("library/embed_bytes.bin");
     passed += Test("embed u8[] sizeof",   (int)sizeof(bytes), 16);
@@ -5278,6 +5553,28 @@ int testEmbed()
     passed += Test("embed u8[] ascii",    (int)bytes[4],      64);
     passed += Test("embed u8[] high bit", (int)bytes[14],     255);
     passed += Test("embed u8[] last",     (int)bytes[15],     10);
+
+    const u8[] rawBytes = embed(r"library/embed_bytes.bin");
+    passed += Test("raw embed u8[] sizeof", (int)sizeof(rawBytes), 16);
+    passed += Test("raw embed u8[] last",   (int)rawBytes[15],     10);
+
+    const u8[] parenthesizedBytes = embed(("library/embed_bytes.bin"));
+    passed += Test("parenthesized embed u8[] sizeof", (int)sizeof(parenthesizedBytes), 16);
+    passed += Test("parenthesized embed u8[] last",   (int)parenthesizedBytes[15], 10);
+    passed += Test("parenthesized file-scope embed sizeof",
+        (int)sizeof(rawstrParenthesizedEmbedFile), 16);
+    passed += Test("bracefold embed single path", braceFoldEmbedSingle,
+        r#"#pragma once
+inline constexpr char embedBracefoldSingle[] = "bracefold-single";"# + "\n");
+    passed += Test("bracefold embed adjacent path", braceFoldEmbedAdjacent,
+        r#"#pragma once
+inline constexpr char embedBracefoldMixed[] = "bracefold-mixed";"# + "\n");
+    passed += Test("bracefold embed parenthesized path", braceFoldEmbedParen,
+        r#"#pragma once
+inline constexpr char embedBracefoldSingle[] = "bracefold-single";"# + "\n");
+
+    const u8[] utf8Bytes = embed(u8"library/embed_bytes.bin");
+    passed += Test("u8 embed u8[] sizeof", (int)sizeof(utf8Bytes), 16);
 
     // Explicit extent is the same value; the count is not inferred away.
     u8[16] sized = embed("library/embed_bytes.bin");
@@ -5291,6 +5588,27 @@ int testEmbed()
 // time. The icon PNGs resolve against THIS file's directory, like every embed above. On this
 // portable path only the compile-time constants are observable; the .res / Info.plist / .icns
 // serializations are exercised by the per-target link.
+expect_error("application field 'name' must be a string literal") {
+    application AppInfo badNameU = { name = u"Wide App", identifier = "com.x.bad" };
+}
+expect_error("application field 'name' must be a string literal") {
+    application AppInfo badNameU32 = { name = U"Wide App", identifier = "com.x.bad" };
+}
+expect_error("application field 'name' must be a string literal") {
+    application AppInfo badNameL = { name = L"Wide App", identifier = "com.x.bad" };
+}
+expect_error("application icon entry 0 must embed a string literal path") {
+    application AppInfo badIconU = { name = "Bad Icon", identifier = "com.x.bad",
+        icon = { { image = embed(u"library/app_icon_16.png") } } };
+}
+expect_error("application icon entry 0 must embed a string literal path") {
+    application AppInfo badIconU32 = { name = "Bad Icon", identifier = "com.x.bad",
+        icon = { { image = embed(U"library/app_icon_16.png") } } };
+}
+expect_error("application icon entry 0 must embed a string literal path") {
+    application AppInfo badIconL = { name = "Bad Icon", identifier = "com.x.bad",
+        icon = { { image = embed(L"library/app_icon_16.png") } } };
+}
 application AppInfo cflatTestApp = {
     name        = "CFlat Core Test",
     identifier  = "com.cflat.coretest",
@@ -5583,14 +5901,14 @@ extern int main()
     r = testStackQueueOwning(); passed += r; total += 7;
     r = testListPtrOwnership(); passed += r; total += 4;
     r = testFor();              passed += r; total += 10;
-    r = testString();           passed += r; total += 26;
+    r = testString();           passed += r; total += 61;
     r = testStringConcat();     passed += r; total += 14;
     r = testStringIString();    passed += r; total += 4;
     r = testStringInterpolation(); passed += r; total += 10;
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 24;
-    r = testStringView();       passed += r; total += 20;
-    r = testStringAPI();        passed += r; total += 116;
+    r = testStringView();       passed += r; total += 46;
+    r = testStringAPI();        passed += r; total += 136;
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
@@ -5598,7 +5916,7 @@ extern int main()
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 89;
-    r = testEmbed();            passed += r; total += 9;
+    r = testEmbed();            passed += r; total += 21;
     r = testApplication();      passed += r; total += 6;
     r = testT75StringCasts();   passed += r; total += 4;
     r = testT141TernaryClassPointee(); passed += r; total += 6;

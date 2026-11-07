@@ -39,12 +39,49 @@ options { contextSuperClass = CFlatRuleContext; }
 #include "CFlatRuleContext.h"
 }
 
+@lexer::members {
+    size_t RawStringOpeningHashCount() {
+        const ssize_t firstHashOffset = static_cast<ssize_t>(tokenStartCharIndex + 1)
+            - static_cast<ssize_t>(getCharIndex());
+        size_t count = 0;
+        ssize_t offset = firstHashOffset;
+        while (_input->LA(offset) == '#') {
+            ++count;
+            ++offset;
+        }
+        return count;
+    }
+
+    bool RawStringClosingDelimiterAhead() {
+        if (_input->LA(1) != '"')
+            return false;
+        const size_t hashCount = RawStringOpeningHashCount();
+        for (size_t i = 0; i < hashCount; ++i)
+            if (_input->LA(static_cast<ssize_t>(i + 2)) != '#')
+                return false;
+        return true;
+    }
+
+    size_t RawStringClosingHashCount() {
+        size_t count = 0;
+        while (_input->LA(-static_cast<ssize_t>(count + 1)) == '#') ++count;
+        return count;
+    }
+
+    void ReportUnterminatedRawStringLiteral() {
+        getErrorListenerDispatch().syntaxError(this, nullptr, tokenStartLine,
+            tokenStartCharPositionInLine, "unterminated raw string literal", std::exception_ptr{});
+    }
+}
+
 primaryExpression
     : Constant
+    | NullPtrConstant
     | Default                                    // 'default' as a VALUE: type comes from the destination
     | Identifier DoubleColon genericIdentifier   // global:: scope-escape qualifier ('global' is a contextual soft keyword, checked in the listener)
     | simdTypeSpecifier                          // static methods on the simd type: simd<T,N>.load(...) / .store(...)
     | operatorCallName
+    | String '(' argumentExpressionList ')'      // borrowed builtin string construction
     | genericIdentifier
     | StringLiteral+
     | lambdaExpression
@@ -374,7 +411,7 @@ tupleTypePackEntry
     ;
 
 tupleTypeEntry
-    : typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix?   // `T[]` element = a noalias array-view member; `[N]`/`[]*` rejected in the listener
+    : Identifier? typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix?   // leading `unique` qualifies an owning tuple element; `T[]` is a noalias array-view member
     ;
 
 // `function<...>` is the thin C function pointer; `Lambda<...>` is the fat owning
@@ -627,8 +664,8 @@ initializerList
     ;
 
 fieldInit
-    : Identifier '=' assignmentExpression               // named struct field:    {x = 1}
-    | Identifier '=' '{' initializerList? ','? '}'       // named nested/list brace field
+    : '.'? Identifier '=' assignmentExpression          // named struct field:    {.x = 1}
+    | '.'? Identifier '=' '{' initializerList? ','? '}'  // named nested/list brace field
     | assignmentExpression ':' assignmentExpression      // dictionary key:value:   {k: v}
     | assignmentExpression                               // positional list/array:  {v0, v1}
     | '{' initializerList? ','? '}'                       // nested fixed-array row
@@ -903,8 +940,22 @@ aggregateMember
     | destructorDefinition
     | structDefinition
     | classDefinition
+    | anonymousAggregateMember
+    | nestedAggregateField
     | lockFieldGroup
     | ifConstMember
+    ;
+
+// C11 anonymous aggregates have no tag. The optional declarator makes a named field of an
+// anonymous aggregate type; without it the member is transparent in the enclosing record.
+anonymousAggregateMember
+    : ('struct' | 'union') alignmentSpecifier? '{' aggregateMember* '}' directDeclarator? ('=' initializer)? ';'
+    ;
+
+// A tagged inline aggregate can also declare its field (`union U { ... } value;`). Keep this
+// separate from structDefinition, whose one directDeclarator is the nested type name.
+nestedAggregateField
+    : ('struct' | 'union') alignmentSpecifier? directDeclarator '{' aggregateMember* '}' directDeclarator ('=' initializer)? ';'
     ;
 
 // Member-scope `if const`. Mirrors the file-scope ifConstDeclaration/ifConstBlock pair so the
@@ -1572,7 +1623,10 @@ Constant
     | FloatingConstant
     //|   EnumerationConstant
     | CharacterConstant
-    | NullPtrConstant
+    ;
+
+NullPtrConstant
+    : 'nullptr'
     ;
 
 Identifier
@@ -1659,10 +1713,6 @@ fragment LongSuffix
 fragment LongLongSuffix
     : 'll'
     | 'LL'
-    ;
-
-NullPtrConstant
-    : 'nullptr'
     ;
 
 BooleanConstant
@@ -1763,6 +1813,22 @@ fragment HexadecimalEscapeSequence
 
 StringLiteral
     : EncodingPrefix? '"' SCharSequence? '"'
+    ;
+
+RawStringLiteral
+    : 'r' '#' * '"'
+      ( {!RawStringClosingDelimiterAhead()}? . )*?
+      '"'
+      ({RawStringClosingHashCount() < RawStringOpeningHashCount()}? '#')*
+      {RawStringClosingHashCount() == RawStringOpeningHashCount()}?
+      -> type(StringLiteral)
+    ;
+
+UnterminatedRawStringLiteral
+    : 'r' '#' * '"'
+      ( {!RawStringClosingDelimiterAhead()}? . )* EOF
+      {ReportUnterminatedRawStringLiteral();}
+      -> skip
     ;
 
 fragment EncodingPrefix

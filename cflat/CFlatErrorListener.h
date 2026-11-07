@@ -75,12 +75,27 @@ public:
                                                        reservedSourceMessage, msg);
         if (sourceReservedCol >= 0)
             d.col = sourceReservedCol;
-        if (msg.rfind(lexerPrefix, 0) == 0)
+        const bool stringExpressionHint = isUnsupportedStringExpression(recognizer, offendingSymbol);
+        if (stringExpressionHint)
+        {
+            const std::string message = "'string' is a type keyword, not an expression; use "
+                "'(string)expr' for a NUL-terminated borrow or string_view(ptr, len) "
+                "for an explicit-length borrow";
+            d.message = localizeMessage_(message, {});
+            d.sourceMessage = DiagnosticLocalization::FormatSourceTemplate(message, {});
+        }
+        else if (msg.rfind(lexerPrefix, 0) == 0)
         {
             std::vector<std::string> arguments{msg.substr(lexerPrefix.size())};
             d.message = localizeMessage_("unexpected character: {}", arguments);
             d.sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
                 "found an unexpected character: {}", arguments);
+        }
+        else if (msg == "unterminated raw string literal")
+        {
+            d.message = localizeMessage_("unterminated raw string literal", {});
+            d.sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
+                "unterminated raw string literal", {});
         }
         else if (!reserved.empty())
         {
@@ -107,7 +122,8 @@ public:
             if (d.sourceMessage.empty())
                 d.sourceMessage = d.message;
         }
-        d.hint    = reserved.empty() ? buildHint(recognizer, diagnosticToken, e, msg) : std::string();
+        d.hint    = reserved.empty() && !stringExpressionHint
+            ? buildHint(recognizer, diagnosticToken, e, msg) : std::string();
         diagnostics_.push_back(std::move(d));
     }
 
@@ -121,6 +137,36 @@ private:
     std::set<int> seenLines_;
     std::string reservedKeywordPending_;
     std::function<std::string(std::string, std::vector<std::string>)> localizeMessage_;
+
+    static bool isUnsupportedStringExpression(antlr4::Recognizer* recognizer,
+                                             antlr4::Token* offendingSymbol)
+    {
+        auto* parser = dynamic_cast<antlr4::Parser*>(recognizer);
+        if (parser == nullptr || parser->getTokenStream() == nullptr || offendingSymbol == nullptr)
+            return false;
+        auto* tokens = parser->getTokenStream();
+        const size_t offendingIndex = offendingSymbol->getTokenIndex();
+        antlr4::Token* keyword = nullptr;
+        if (offendingSymbol->getType() == CFlatParser::String)
+            keyword = offendingSymbol;
+        else if (offendingSymbol->getType() == CFlatParser::Dot && offendingIndex > 0)
+        {
+            auto* previous = tokens->get(offendingIndex - 1);
+            if (previous != nullptr && previous->getType() == CFlatParser::String)
+                keyword = previous;
+        }
+        if (keyword == nullptr) return false;
+        auto* next = tokens->get(keyword->getTokenIndex() + 1);
+        if (next != nullptr && next->getType() == CFlatParser::LeftParen) return false;
+        // `return string` is an expression position; ';' is also expected there (optional value).
+        auto* before = keyword->getTokenIndex() > 0 ? tokens->get(keyword->getTokenIndex() - 1) : nullptr;
+        const bool afterReturn = before != nullptr && before->getType() == CFlatParser::Return;
+        // ';' expected at the keyword: the statement before it lacks its terminator, so `string`
+        // starts a declaration, not an expression.
+        if (!afterReturn && parser->getExpectedTokens().contains(static_cast<size_t>(CFlatParser::Semi)))
+            return false;
+        return true;
+    }
 
     static bool isKnownReservedWord(const std::string& word)
     {

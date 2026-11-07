@@ -562,6 +562,12 @@ llvm::Value* MainListener::ComputeAggregateFieldDefault(
         GlobalScopeGuard defaultCtorScope(global_scope);
         rvalue = GenerateDefaultValue(typeValue);
     }
+    if (rvalue == nullptr && typeValue.IsInlineAggregateField
+        && typeValue.Initializer == nullptr && !typeValue.Pointer)
+    {
+        GlobalScopeGuard defaultCtorScope(global_scope);
+        rvalue = GenerateDefaultValue(typeValue);
+    }
     if (rvalue == nullptr && typeValue.Initializer == nullptr
         && FieldDefaultBraceList(typeValue) == nullptr && !typeValue.Pointer
         && compiler->IsCxxRecord(typeValue.TypeName)
@@ -1294,6 +1300,345 @@ void MainListener::RecheckPendingNontrivialCxxUnionMembers(const std::string& co
     }
 }
 
+void MainListener::ValidateAnonymousMemberNames(
+        const std::vector<CFlatParser::AggregateMemberContext*>& members)
+{
+        if (std::none_of(members.begin(), members.end(), [](auto* member) {
+                return member->anonymousAggregateMember() != nullptr
+                    || member->nestedAggregateField() != nullptr;
+            }))
+            return;
+
+        struct MemberName
+        {
+            std::string Name;
+            bool Promoted = false;
+            antlr4::ParserRuleContext* Context = nullptr;
+        };
+
+        std::function<void(const std::vector<CFlatParser::AggregateMemberContext*>&)> validateScope;
+        validateScope = [&](const std::vector<CFlatParser::AggregateMemberContext*>& scope)
+        {
+            std::vector<MemberName> names;
+            std::function<void(const std::vector<CFlatParser::AggregateMemberContext*>&, bool)> collect;
+            collect = [&](const std::vector<CFlatParser::AggregateMemberContext*>& current, bool promoted)
+            {
+                for (auto* member : current)
+                {
+                    if (auto* declaration = member->declaration())
+                    {
+                        if (auto* list = declaration->initDeclaratorList())
+                            for (auto* init : list->initDeclarator())
+                                if (auto* declarator = init->declarator())
+                                    if (const std::string name = getDirectDeclName(
+                                            declarator->directDeclarator()); !name.empty())
+                                        names.push_back({ name, promoted, member });
+                    }
+                    else if (auto* anonymous = member->anonymousAggregateMember())
+                    {
+                        if (auto* field = anonymous->directDeclarator())
+                        {
+                            const std::string name = getDirectDeclName(field);
+                            if (!name.empty()) names.push_back({ name, promoted, member });
+                        }
+                        else
+                        {
+                            collect(anonymous->aggregateMember(), true);
+                        }
+                    }
+                    else if (auto* nested = member->nestedAggregateField())
+                    {
+                        const auto fields = nested->directDeclarator();
+                        if (fields.size() > 1)
+                        {
+                            const std::string name = getDirectDeclName(fields[1]);
+                            if (!name.empty()) names.push_back({ name, promoted, member });
+                        }
+                    }
+                }
+            };
+            collect(scope, false);
+
+            std::unordered_map<std::string, MemberName> seen;
+            for (const auto& name : names)
+            {
+                auto [it, inserted] = seen.emplace(name.Name, name);
+                if (!inserted && (it->second.Promoted || name.Promoted))
+                    LogErrorContext(name.Context,
+                        std::format("duplicate member name '{}'", name.Name));
+            }
+
+            for (auto* member : scope)
+            {
+                if (auto* anonymous = member->anonymousAggregateMember())
+                    validateScope(anonymous->aggregateMember());
+                else if (auto* nested = member->nestedAggregateField())
+                    validateScope(nested->aggregateMember());
+                else if (auto* nested = member->structDefinition())
+                    validateScope(nested->aggregateMember());
+                else if (auto* nested = member->classDefinition())
+                    validateScope(nested->aggregateMember());
+            }
+        };
+        validateScope(members);
+}
+
+LLVMBackend::DeclTypeAndValue MainListener::ParseInlineAggregateField(
+        const std::string& ownerName,
+        CFlatParser::AggregateMemberContext* member,
+        unsigned& anonymousIndex)
+{
+        auto* compiler = Compiler(member);
+        CFlatParser::DirectDeclaratorContext* fieldDeclarator = nullptr;
+        CFlatParser::AlignmentSpecifierContext* alignment = nullptr;
+        std::vector<CFlatParser::AggregateMemberContext*> nestedMembers;
+        bool isUnion = false;
+        bool anonymousMemberBody = false;
+        std::string typeName;
+        CFlatParser::InitializerContext* fieldInitializer = nullptr;
+
+        if (auto* anonymous = member->anonymousAggregateMember())
+        {
+            isUnion = anonymous->Union() != nullptr;
+            alignment = anonymous->alignmentSpecifier();
+            nestedMembers = anonymous->aggregateMember();
+            fieldDeclarator = anonymous->directDeclarator();
+            fieldInitializer = anonymous->initializer();
+            anonymousMemberBody = fieldDeclarator == nullptr;
+            const std::string syntheticName = "@inline" + std::to_string(anonymousIndex++);
+            typeName = ownerName + "." + syntheticName;
+        }
+        else if (auto* nested = member->nestedAggregateField())
+        {
+            isUnion = nested->Union() != nullptr;
+            alignment = nested->alignmentSpecifier();
+            nestedMembers = nested->aggregateMember();
+            fieldInitializer = nested->initializer();
+            const auto declarators = nested->directDeclarator();
+            typeName = ownerName + "." + declarators[0]->getText();
+            fieldDeclarator = declarators[1];
+        }
+        else
+        {
+            return {};
+        }
+
+        std::string fieldName;
+        if (auto* anonymous = member->anonymousAggregateMember(); anonymous != nullptr
+            && anonymous->directDeclarator() == nullptr)
+            fieldName = "@anon" + std::to_string(anonymousIndex - 1);
+        else
+            fieldName = fieldDeclarator != nullptr
+                ? getDirectDeclName(fieldDeclarator) : std::string();
+
+        ParseInlineAggregateBody(typeName, isUnion, nestedMembers, alignment, anonymousIndex,
+                                 anonymousMemberBody);
+        LLVMBackend::DeclTypeAndValue field;
+        field.TypeName = typeName;
+        field.VariableName = fieldName;
+        field.Initializer = fieldInitializer;
+        field.IsAnonymousMember = anonymousMemberBody;
+        field.IsInlineAggregateField = true;
+        return field;
+}
+
+void MainListener::ParseInlineAggregateBody(
+        const std::string& typeName,
+        bool isUnion,
+        const std::vector<CFlatParser::AggregateMemberContext*>& members,
+        CFlatParser::AlignmentSpecifierContext* alignment,
+        unsigned& anonymousIndex,
+        bool anonymousMemberBody)
+{
+        auto* compiler = Compiler();
+        if (anonymousMemberBody)
+        {
+            for (auto* member : members)
+            {
+                if (member->ifConstMember() != nullptr)
+                    LogErrorContext(member,
+                        "if const is not supported inside an anonymous aggregate");
+
+                if (member->functionDefinition() != nullptr
+                    || member->destructorDefinition() != nullptr
+                    || member->structDefinition() != nullptr
+                    || member->classDefinition() != nullptr
+                    || member->usingDeclaration() != nullptr
+                    || member->lockFieldGroup() != nullptr)
+                    LogErrorContext(member,
+                        "anonymous aggregate may contain only non-static data members");
+
+                auto* declaration = member->declaration();
+                if (declaration == nullptr) continue;
+                bool hasStorageClass = false;
+                if (auto* declarationSpecifiers = declaration->declarationSpecifiers())
+                    for (auto* specifier : declarationSpecifiers->declarationSpecifier())
+                        hasStorageClass = hasStorageClass
+                            || specifier->storageClassSpecifier() != nullptr;
+                bool hasFunctionDeclarator = false;
+                if (auto* list = declaration->initDeclaratorList())
+                    for (auto* init : list->initDeclarator())
+                        if (auto* declarator = init->declarator())
+                            hasFunctionDeclarator = hasFunctionDeclarator
+                                || declarator->parameterTypeList() != nullptr
+                                || declarator->identifierList() != nullptr
+                                || declarator->children.size() > 1;
+                if (hasStorageClass || hasFunctionDeclarator
+                    || declaration->initDeclaratorList() == nullptr
+                    || declaration->initDeclaratorList()->initDeclarator().empty())
+                    LogErrorContext(member,
+                        "anonymous aggregate may contain only non-static data members");
+            }
+        }
+
+        std::vector<CFlatParser::AggregateMemberContext*> resolvedMembers;
+        AppendResolvedMembers(members, resolvedMembers);
+        compiler->CreateStructType(typeName, {});
+        if (!structScopeStack.empty())
+            aggregateParentScopes_[typeName] = structScopeStack.back();
+        AggregateTypeScopeGuard typeScope(structScopeStack, typeName);
+        RecordAggregateValueMembers(typeName, resolvedMembers);
+
+        for (auto* member : resolvedMembers)
+            if (auto* nested = member->structDefinition())
+                ParseStructDefinition(nested, {}, typeName);
+            else if (auto* nested = member->classDefinition())
+                ParseClassDefinition(nested, {}, typeName);
+
+        std::vector<LLVMBackend::DeclTypeAndValue> fields;
+        for (auto* member : resolvedMembers)
+        {
+            if (auto* usingDecl = member->usingDeclaration())
+            {
+                ParseUsingDeclaration(usingDecl);
+                continue;
+            }
+            if (auto* declaration = member->declaration())
+            {
+                for (const auto& field : ParseDeclarationList({ declaration }))
+                    fields.push_back(field);
+            }
+            else if (member->anonymousAggregateMember() != nullptr
+                || member->nestedAggregateField() != nullptr)
+                fields.push_back(ParseInlineAggregateField(typeName, member, anonymousIndex));
+        }
+
+        const uint64_t userAlign = alignment != nullptr
+            ? ParseAlignmentSpecifier(alignment) : 0;
+        if (isUnion)
+            ValidateUnionMemberDefaultInitializers(fields);
+        llvm::StructType* structType = isUnion
+            ? compiler->CreateUnionType(typeName, std::move(fields), userAlign)
+            : compiler->CreateStructType(typeName, std::move(fields), userAlign);
+
+        LLVMBackend::TypeAndValue returnType{ .TypeName = typeName };
+        const std::string baseName = typeName.substr(typeName.rfind('.') == std::string::npos
+            ? 0 : typeName.rfind('.') + 1);
+        std::vector<CFlatParser::FunctionDefinitionContext*> functionDefinitions;
+        for (auto* member : resolvedMembers)
+            if (auto* function = member->functionDefinition())
+                functionDefinitions.push_back(function);
+        const bool hasExplicitNoArgCtor = std::any_of(functionDefinitions.begin(),
+            functionDefinitions.end(), [&](auto* func) {
+                return !FunctionDeclaresReturnType(func) && getFunctionName(func) == baseName
+                    && (!func->parameterTypeList()
+                        || AllParametersDefaulted(func->parameterTypeList()));
+            });
+        if (hasExplicitNoArgCtor)
+            explicitNoArgConstructors_.insert(typeName);
+        else
+        {
+            compiler->CreateFunctionDefinition(typeName, returnType, {});
+            auto& storedFields = compiler->dataStructures.at(typeName).StructFields;
+            if (isUnion)
+                EmitUnionDefaultConstructorBody(nullptr, typeName, structType, storedFields);
+            else
+            {
+                auto namesMember = [&](const std::string& memberName) {
+                    return std::any_of(storedFields.begin(), storedFields.end(),
+                        [&](const auto& field) { return field.VariableName == memberName; });
+                };
+                bool usesImplicitMember = false;
+                for (const auto& field : storedFields)
+                {
+                    if (field.Initializer != nullptr
+                        && field.Initializer->assignmentExpression() != nullptr)
+                        usesImplicitMember = usesImplicitMember || FieldDefaultNamesMember(
+                            field.Initializer->assignmentExpression(), namesMember);
+                    usesImplicitMember = usesImplicitMember || FieldDefaultNamesMember(
+                        FieldDefaultBraceList(field), namesMember);
+                }
+                LLVMBackend::UnwindPartialScope partialFields(*compiler);
+                if (usesImplicitMember)
+                {
+                    llvm::Value* fieldDefaultsThis = compiler->AllocaAtEntry(
+                        structType, nullptr, typeName + "__field_defaults");
+                    compiler->builder->CreateStore(llvm::Constant::getNullValue(structType),
+                                                   fieldDefaultsThis);
+                    LLVMBackend::TypeAndValue thisTv;
+                    thisTv.TypeName = typeName;
+                    thisTv.VariableName = typeName + "__";
+                    thisTv.Pointer = true;
+                    compiler->RegisterThisPointer(thisTv, fieldDefaultsThis, structType);
+                    for (size_t fieldIndex = 0; fieldIndex < storedFields.size(); ++fieldIndex)
+                    {
+                        bool fieldSrcUnsigned = false;
+                        auto* value = ComputeAggregateFieldDefault(
+                            typeName, structType, storedFields, fieldIndex, fieldSrcUnsigned);
+                        value = ResolveAggregateFieldValue(
+                            structType, storedFields, fieldIndex, value, fieldSrcUnsigned);
+                        if (value != nullptr)
+                            compiler->builder->CreateStore(value,
+                                compiler->builder->CreateStructGEP(structType, fieldDefaultsThis,
+                                    static_cast<unsigned>(fieldIndex)));
+                    }
+                    partialFields.Release();
+                    compiler->CreateReturnCall(compiler->builder->CreateLoad(
+                        structType, fieldDefaultsThis));
+                }
+                else
+                {
+                    std::vector<llvm::Value*> initializers;
+                    std::vector<char> initializerUnsigned;
+                    for (size_t fieldIndex = 0; fieldIndex < storedFields.size(); ++fieldIndex)
+                    {
+                        bool fieldSrcUnsigned = false;
+                        initializers.push_back(ComputeAggregateFieldDefault(
+                            typeName, structType, storedFields, fieldIndex, fieldSrcUnsigned));
+                        initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
+                    }
+                    llvm::Value* structValue = llvm::Constant::getNullValue(structType);
+                    for (size_t fieldIndex = 0; fieldIndex < initializers.size(); ++fieldIndex)
+                    {
+                        auto* value = ResolveAggregateFieldValue(structType, storedFields,
+                            fieldIndex, initializers[fieldIndex], initializerUnsigned[fieldIndex] != 0);
+                        if (value != nullptr)
+                            structValue = compiler->CreateInsertValue(
+                                structValue, value, static_cast<unsigned>(fieldIndex));
+                    }
+                    partialFields.Release();
+                    compiler->CreateReturnCall(structValue);
+                }
+            }
+            compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        for (auto* func : functionDefinitions)
+        {
+            if (!FunctionDeclaresReturnType(func) && getFunctionName(func) == baseName)
+                ParseConstructorDefinition(func, typeName,
+                    !func->parameterTypeList()
+                        || AllParametersDefaulted(func->parameterTypeList()), SIZE_MAX,
+                    hasExplicitNoArgCtor);
+            else
+                ParseFunctionDefinition(func, typeName);
+        }
+        for (auto* member : resolvedMembers)
+            if (auto* destructor = member->destructorDefinition())
+                ParseDestructorDefinition(destructor, typeName);
+        compiler->NoteStructDefinitionWalked(typeName, hasExplicitNoArgCtor);
+}
+
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
@@ -1417,6 +1762,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             return;
         }
 
+        ValidateAnonymousMemberNames(ResolveAggregateMembers(ctx));
         if (isCppStruct) compiler->RegisterCppStructName(structName);
         std::string cppBaseName;
         std::string cppBaseSpelling;
@@ -1700,8 +2046,21 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     declarator->directDeclarator()->getText(), element));
             }
         };
-        for (auto* decl : declarationList)
+        unsigned anonymousMemberIndex = 0;
+        for (auto* member : ResolveAggregateMembers(ctx))
         {
+            auto* decl = member->declaration();
+            if (decl == nullptr)
+            {
+                if (member->anonymousAggregateMember() != nullptr
+                    || member->nestedAggregateField() != nullptr)
+                {
+                    auto field = ParseInlineAggregateField(structName, member, anonymousMemberIndex);
+                    rejectNontrivialCxxUnionMember(field, member);
+                    declList.push_back(std::move(field));
+                }
+                continue;
+            }
             rejectFixedArrayMemberPrototype(decl);
             std::string packParamName;
             if (decl->declarationSpecifiers())
@@ -1874,6 +2233,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         }
         if (isUnion)
         {
+            ValidateUnionMemberDefaultInitializers(declList);
             // A union body is one array: an over-aligned member cannot get a pad slot, it
             // just raises the union's alignment (all members start at offset 0).
             structType = compiler->CreateUnionType(structName, declList, userAlign);
@@ -2324,11 +2684,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 std::string BaseInitializer;
             };
             std::vector<ConstructorSourceInfo> constructors;
-            auto isCppLiteral = [](const std::string& text) {
+            auto isCppLiteral = [](const std::string& text, bool isStringLiteral) {
                 if (text == "true" || text == "false") return true;
+                if (isStringLiteral) return true;
                 if (text.size() >= 2
-                    && ((text.front() == '"' && text.back() == '"')
-                        || (text.front() == '\'' && text.back() == '\''))) return true;
+                    && text.front() == '\'' && text.back() == '\'') return true;
                 if (text.empty()) return false;
                 size_t pos = (text[0] == '+' || text[0] == '-') ? 1 : 0;
                 if (pos == text.size()) return false;
@@ -2422,13 +2782,58 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         auto* assignment = arg->assignmentExpression();
                         const std::string text = assignment == nullptr ? arg->getText()
                                                                        : assignment->getText();
-                        if (parameterNames.count(text) == 0 && !isCppLiteral(text))
+                        auto literalValue = StringLiteralExpressionValue(assignment);
+                        if (literalValue.has_value() && literalValue->HasExpressionSegment)
+                        {
+                            LogErrorContext(assignment,
+                                "C++ base initializer string literals cannot contain interpolation");
+                            return false;
+                        }
+                        const bool isNarrowString = literalValue.has_value()
+                            && literalValue->IsNarrow;
+                        if (parameterNames.count(text) == 0
+                            && !isCppLiteral(text, isNarrowString))
                         {
                             Compiler(func)->LogErrorMessage(
                                 "base initializer arguments must be constructor parameters or literals");
                             return false;
                         }
-                        args.push_back(text);
+                        std::string emittedText = text;
+                        auto* unwrapped = assignment != nullptr
+                            ? UnwrapInitializerParens(assignment) : nullptr;
+                        auto* postfix = SolePostfixExpressionShape(unwrapped);
+                        if (isNarrowString && postfix != nullptr)
+                        {
+                            auto* primary = postfix->primaryExpression();
+                            emittedText.clear();
+                            auto appendQuoted = [&](const std::string& value,
+                                                    const std::string& prefix) {
+                                emittedText += prefix + "\"";
+                                for (unsigned char c : value)
+                                {
+                                    if (c == '\\') emittedText += "\\\\";
+                                    else if (c == '"') emittedText += "\\\"";
+                                    else if (c == '\n') emittedText += "\\n";
+                                    else if (c == '\r') emittedText += "\\r";
+                                    else if (c == '\t') emittedText += "\\t";
+                                    else if (c < 0x20 || c >= 0x7f)
+                                        emittedText += std::format("\\{:03o}", (unsigned int)c);
+                                    else emittedText += static_cast<char>(c);
+                                }
+                                emittedText += "\"";
+                            };
+                            for (auto* literal : primary->StringLiteral())
+                            {
+                                const std::string spelling = literal->getText();
+                                const bool rawLiteral = IsRawStringTokenSpelling(spelling);
+                                const size_t quote = rawLiteral
+                                    ? std::string::npos : spelling.find('"');
+                                const std::string prefix = rawLiteral || quote == std::string::npos
+                                    ? std::string() : spelling.substr(0, quote);
+                                appendQuoted(ProcessRawText(spelling, /*foldBraces=*/true), prefix);
+                            }
+                        }
+                        args.push_back(std::move(emittedText));
                     }
                 result = " : " + baseCxxName + "(";
                 for (size_t i = 0; i < args.size(); ++i)
@@ -2863,7 +3268,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             auto sd = compiler->GetDataStructure(structName);
             for (const auto& field : sd.StructFields)
             {
-                if (field.VariableName.empty() || field.IsPadding) continue;
+                if (field.VariableName.empty() || field.IsPadding
+                    || field.IsAnonymousMember) continue;
                 std::string annSig;
                 for (const auto& ann : field.Annotations)
                 {
@@ -2881,6 +3287,31 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             (int)ctx->getStart()->getCharPositionInLine(),
                             annSig + typeSig + " " + displayFieldName, {}, {}, displayFieldName);
             }
+            std::unordered_set<std::string> promoted;
+            std::function<void(const std::string&)> registerPromoted = [&](const std::string& nestedName)
+            {
+                const auto nested = compiler->GetDataStructure(nestedName);
+                for (const auto& field : nested.StructFields)
+                {
+                    if (field.IsAnonymousMember)
+                    {
+                        registerPromoted(field.TypeName);
+                        continue;
+                    }
+                    if (field.VariableName.empty() || !promoted.insert(field.VariableName).second) continue;
+                    LLVMBackend::TypeAndValue ownerType{ .TypeName = structName };
+                    const std::string displayName = SpellType(*compiler, ownerType)
+                        + "." + field.VariableName;
+                    s->Register(SymbolKind::Field, structName + "." + field.VariableName,
+                        compiler->GetSourceFilePath(), (int)ctx->getStart()->getLine(),
+                        (int)ctx->getStart()->getCharPositionInLine(),
+                        SpellTypeForSymbolDump(*compiler, field) + " " + displayName,
+                        {}, {}, displayName);
+                }
+            };
+            for (const auto& field : sd.StructFields)
+                if (field.IsAnonymousMember)
+                    registerPromoted(field.TypeName);
         }
 
         // Member function signatures were pre-declared above (before the flush).
@@ -3093,6 +3524,56 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             ProcessDeferredGenericMemberBodies(deferredBodiesAtEntry, true);
     }
 
+antlr4::ParserRuleContext* MainListener::FindExplicitUnionMemberDefault(
+        const LLVMBackend::DeclTypeAndValue& field)
+{
+        auto* compiler = Compiler();
+        std::unordered_set<std::string> activeTypes;
+        std::function<antlr4::ParserRuleContext*(
+            const LLVMBackend::DeclTypeAndValue&, bool)> find;
+        find = [&](const LLVMBackend::DeclTypeAndValue& candidate, bool inspectNestedDefaults)
+            -> antlr4::ParserRuleContext*
+        {
+            if (auto* braceList = FieldDefaultBraceList(candidate)) return braceList;
+            if (FieldHasEmptyCxxBraceInitializer(candidate)) return candidate.Initializer;
+            if (candidate.Initializer != nullptr
+                && candidate.Initializer->assignmentExpression() != nullptr)
+                return candidate.Initializer;
+            if (!inspectNestedDefaults || !candidate.IsInlineAggregateField
+                || candidate.TypeName.empty()
+                || !activeTypes.insert(candidate.TypeName).second)
+                return nullptr;
+
+            const auto data = compiler->GetDataStructure(candidate.TypeName);
+            for (const auto& nested : data.StructFields)
+                if (auto* nestedSite = find(nested, nested.IsAnonymousMember); nestedSite != nullptr)
+                {
+                    activeTypes.erase(candidate.TypeName);
+                    return nestedSite;
+                }
+            activeTypes.erase(candidate.TypeName);
+            return nullptr;
+        };
+        return find(field, field.IsAnonymousMember);
+}
+
+void MainListener::ValidateUnionMemberDefaultInitializers(
+        const std::vector<LLVMBackend::DeclTypeAndValue>& fields)
+{
+        bool sawExplicit = false;
+        for (const auto& field : fields)
+        {
+            if (field.TypeName == "auto" || field.IsBitfieldStorage) continue;
+            auto* site = FindExplicitUnionMemberDefault(field);
+            if (site == nullptr) continue;
+            if (sawExplicit)
+                LogErrorContext(site,
+                    "initializing multiple members of union; members of a union share storage, "
+                    "so at most one may be initialized.");
+            sawExplicit = true;
+        }
+}
+
 void MainListener::EmitUnionDefaultConstructorBody(
         antlr4::ParserRuleContext* ctx,
         const std::string& structName,
@@ -3109,23 +3590,15 @@ void MainListener::EmitUnionDefaultConstructorBody(
         {
             auto& tv = declList[i];
             if (tv.TypeName == "auto" || tv.IsBitfieldStorage) continue;
-            bool explicitInit = FieldDefaultBraceList(tv) != nullptr
-                || FieldHasEmptyCxxBraceInitializer(tv)
-                || (tv.Initializer != nullptr && tv.Initializer->assignmentExpression() != nullptr);
-            if (!explicitInit) continue;
+            auto* explicitSite = FindExplicitUnionMemberDefault(tv);
+            if (explicitSite == nullptr) continue;
             if (sawExplicit)
             {
                 // Point the caret at the OFFENDING field's own initializer, not at the `union`
                 // keyword. LogErrorContext throws, so nothing after this runs.
-                antlr4::ParserRuleContext* at = tv.Initializer != nullptr
-                    ? static_cast<antlr4::ParserRuleContext*>(tv.Initializer)
-                    : static_cast<antlr4::ParserRuleContext*>(FieldDefaultBraceList(tv));
-                LogErrorContext(at != nullptr ? at : ctx, std::format(
-                    "union '{}' gives field '{}' a default initializer, but field '{}' already has "
-                    "one - members of a union share storage, so at most one may be initialized. "
-                    "Write '= default' on all but one.",
-                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName }),
-                    tv.VariableName, declList[chosen].VariableName));
+                LogErrorContext(explicitSite,
+                    "initializing multiple members of union; members of a union share storage, "
+                    "so at most one may be initialized.");
             }
             sawExplicit = true;
             chosen = i;
@@ -3136,7 +3609,12 @@ void MainListener::EmitUnionDefaultConstructorBody(
             {
                 auto& tv = declList[i];
                 if (tv.TypeName == "auto" || tv.IsBitfieldStorage) continue;
-                if (tv.Initializer != nullptr && tv.Initializer->Default() != nullptr) { chosen = i; break; }
+                if ((tv.Initializer != nullptr && tv.Initializer->Default() != nullptr)
+                    || tv.IsInlineAggregateField)
+                {
+                    chosen = i;
+                    break;
+                }
             }
         }
 
@@ -5173,7 +5651,8 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             auto sd = compiler->GetDataStructure(name);
             for (const auto& field : sd.StructFields)
             {
-                if (field.VariableName.empty() || field.IsPadding) continue;
+                if (field.VariableName.empty() || field.IsPadding
+                    || field.IsAnonymousMember) continue;
                 std::string annSig;
                 for (const auto& ann : field.Annotations)
                 {
@@ -5191,6 +5670,31 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                             (int)ctx->getStart()->getCharPositionInLine(),
                             annSig + typeSig + " " + displayFieldName, {}, {}, displayFieldName);
             }
+            std::unordered_set<std::string> promoted;
+            std::function<void(const std::string&)> registerPromoted = [&](const std::string& nestedName)
+            {
+                const auto nested = compiler->GetDataStructure(nestedName);
+                for (const auto& field : nested.StructFields)
+                {
+                    if (field.IsAnonymousMember)
+                    {
+                        registerPromoted(field.TypeName);
+                        continue;
+                    }
+                    if (field.VariableName.empty() || !promoted.insert(field.VariableName).second) continue;
+                    LLVMBackend::TypeAndValue ownerType{ .TypeName = name };
+                    const std::string displayName = SpellType(*compiler, ownerType)
+                        + "." + field.VariableName;
+                    s->Register(SymbolKind::Field, name + "." + field.VariableName,
+                        compiler->GetSourceFilePath(), (int)ctx->getStart()->getLine(),
+                        (int)ctx->getStart()->getCharPositionInLine(),
+                        SpellTypeForSymbolDump(*compiler, field) + " " + displayName,
+                        {}, {}, displayName);
+                }
+            };
+            for (const auto& field : sd.StructFields)
+                if (field.IsAnonymousMember)
+                    registerPromoted(field.TypeName);
         }
 
         // Parse member functions (includes user's main)
@@ -5357,6 +5861,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             return;
         }
 
+        ValidateAnonymousMemberNames(ResolveAggregateMembers(ctx));
         // Validate type-level annotations against the registry (errors on unknown) and keep them
         // for storage on the StructData below. winrt/uuid are ordinary annotations from com.cb.
         auto classAnnotations = ParseAnnotationList(ctx->annotationList());
@@ -5567,8 +6072,17 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     declarator->directDeclarator()->getText(), element));
             }
         };
-        for (auto* decl : declarationList)
+        unsigned anonymousMemberIndex = 0;
+        for (auto* member : ResolveAggregateMembers(ctx))
         {
+            auto* decl = member->declaration();
+            if (decl == nullptr)
+            {
+                if (member->anonymousAggregateMember() != nullptr
+                    || member->nestedAggregateField() != nullptr)
+                    declList.push_back(ParseInlineAggregateField(structName, member, anonymousMemberIndex));
+                continue;
+            }
             rejectFixedArrayMemberPrototype(decl);
             std::string packParamName;
             if (decl->declarationSpecifiers())
@@ -5833,7 +6347,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             auto sd = compiler->GetDataStructure(structName);
             for (const auto& field : sd.StructFields)
             {
-                if (field.VariableName.empty() || field.IsPadding) continue;
+                if (field.VariableName.empty() || field.IsPadding
+                    || field.IsAnonymousMember) continue;
                 std::string annSig;
                 for (const auto& ann : field.Annotations)
                 {
@@ -5851,6 +6366,31 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                             (int)ctx->getStart()->getCharPositionInLine(),
                             annSig + typeSig + " " + displayFieldName, {}, {}, displayFieldName);
             }
+            std::unordered_set<std::string> promoted;
+            std::function<void(const std::string&)> registerPromoted = [&](const std::string& nestedName)
+            {
+                const auto nested = compiler->GetDataStructure(nestedName);
+                for (const auto& field : nested.StructFields)
+                {
+                    if (field.IsAnonymousMember)
+                    {
+                        registerPromoted(field.TypeName);
+                        continue;
+                    }
+                    if (field.VariableName.empty() || !promoted.insert(field.VariableName).second) continue;
+                    LLVMBackend::TypeAndValue ownerType{ .TypeName = structName };
+                    const std::string displayName = SpellType(*compiler, ownerType)
+                        + "." + field.VariableName;
+                    s->Register(SymbolKind::Field, structName + "." + field.VariableName,
+                        compiler->GetSourceFilePath(), (int)ctx->getStart()->getLine(),
+                        (int)ctx->getStart()->getCharPositionInLine(),
+                        SpellTypeForSymbolDump(*compiler, field) + " " + displayName,
+                        {}, {}, displayName);
+                }
+            };
+            for (const auto& field : sd.StructFields)
+                if (field.IsAnonymousMember)
+                    registerPromoted(field.TypeName);
         }
 
         // Member function signatures were pre-declared above (before the flush).

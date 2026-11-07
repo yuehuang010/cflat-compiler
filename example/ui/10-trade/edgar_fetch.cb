@@ -7,7 +7,6 @@ import "os.cb";
 import "json.cb";
 
 
-const int UNIVERSE_COUNT = 30;
 string[30] g_universe = { "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "V", "JNJ",
                         "WMT", "PG", "XOM", "UNH", "HD", "MA", "CVX", "KO", "PEP", "COST",
                         "ABBV", "MRK", "BAC", "ORCL", "CSCO", "NFLX", "ADBE", "CRM", "AMD", "INTC" };
@@ -373,7 +372,7 @@ extern int main(int argc, char** argv)
 
     if (symbols->count() == 0)
     {
-        for (int u = 0; u < UNIVERSE_COUNT; u++) symbols->add(g_universe[u]);
+        for (int u = 0; u < countof(g_universe); u++) symbols->add(g_universe[u]);
     }
 
     Directory.createAll("data/earnings/raw");

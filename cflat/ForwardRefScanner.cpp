@@ -364,9 +364,24 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         if (tts->tupleTypePackEntry() != nullptr)
                             break;
                         declType.TypeName = ResolveTupleTypeSpecifier(tts);
-                        declType.Pointer = declSpecWithSuffix->pointer() != nullptr;
-                        declType.ArraySize = ArrayDimsOf(declSpecWithSuffix) ?
-                            ArrayDimsOf(declSpecWithSuffix)->assignmentExpression(0) : nullptr;
+                        const int pointerDepth = PointerDepthOf(declSpecWithSuffix->pointer());
+                        declType.Pointer = pointerDepth > 0;
+                        declType.ElemPointer = pointerDepth >= 2;
+                        declType.PointerDepth = pointerDepth > PointerDepthCap ? 0 : pointerDepth;
+                        if (auto* dims = ArrayDimsOf(declSpecWithSuffix))
+                        {
+                            auto values = dims->assignmentExpression();
+                            declType.ArraySize = values.empty() ? nullptr : values[0];
+                            for (size_t di = 1; di < values.size(); di++)
+                                declType.ExtraArrayDims.push_back(values[di]);
+                            if (values.empty())
+                            {
+                                const bool elementPointer = declType.Pointer;
+                                declType.IsArrayView = true;
+                                declType.Pointer = true;
+                                declType.ElemPointer = elementPointer || declType.ElemPointer;
+                            }
+                        }
                         break;
                     }
                     // function pointer type: `function<...>` (thin C ptr) or `Lambda<...>` (fat closure)
@@ -392,9 +407,11 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             const bool returnTypeIsGenericDerivedAlias =
                                 compiler->IsGenericDerivedTypeAlias(returnTypeSpelling);
                             int retConst = 0;
+                            std::string retAliasSpelling;
                             declType.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
                                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
-                                fpSpec->multiWordTypeSuffix(), aliasReturn);
+                                fpSpec->multiWordTypeSuffix(), aliasReturn, &retAliasSpelling);
+                            declType.FuncPtrReturnAliasSpelling = retAliasSpelling;
                             if (!retPtr)
                                 if (const auto* nested = compiler->GetEncodedClosureType(
                                         declType.FuncPtrReturnTypeName))
@@ -577,6 +594,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
+                    declType.FuncPtrReturnAliasSpelling = fit->FuncPtrReturnAliasSpelling;
                     declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrNoPrototype = fit->FuncPtrNoPrototype;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
@@ -1417,31 +1435,91 @@ void ForwardRefScanner::SeedConstIntGlobals(CFlatParser::TranslationUnitContext*
     };
 
     auto seedDeclaration = [&](CFlatParser::DeclarationContext* decl, bool& changed) {
+        if (decl == nullptr) return;
         std::vector<CFlatParser::InitDeclaratorContext*> declarators;
-        if (decl == nullptr || !isConstIntDeclaration(decl, declarators)) return;
-        for (auto* init : declarators)
+        if (isConstIntDeclaration(decl, declarators))
         {
-            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
-            auto* initializer = init->initializer();
-            if (direct == nullptr || direct->assignmentExpression() != nullptr || initializer == nullptr
-                || initializer->assignmentExpression() == nullptr)
-                continue;
-            const std::string bare = getDirectDeclName(direct);
-            // Keyed by the qualified name ("N.K" inside namespace N), the same key the main pass
-            // resolves the global under; a bare name inside N reaches it through FoldCompileTimeIdentifier.
+            for (auto* init : declarators)
+            {
+                auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+                auto* initializer = init->initializer();
+                if (direct == nullptr || direct->assignmentExpression() != nullptr || initializer == nullptr
+                    || initializer->assignmentExpression() == nullptr)
+                    continue;
+                const std::string bare = getDirectDeclName(direct);
+                // Keyed by the qualified name ("N.K" inside namespace N), the same key the main pass
+                // resolves the global under; a bare name inside N reaches it through FoldCompileTimeIdentifier.
+                const std::string ns = compilerLLVM->GetCurrentNamespace();
+                const std::string name = ns.empty() || bare.empty() ? bare : ns + "." + bare;
+                int64_t already = 0;
+                // A -D define and the platform builtins own the name; never shadow one, and never
+                // re-seed a name already recorded (that is what makes the fixpoint monotone).
+                if (bare.empty() || compilerLLVM->IsReservedMacroName(bare)
+                    || compilerLLVM->GetCompileTimeMacro(bare).value != nullptr
+                    || compilerLLVM->TryGetConstGlobalInt(name, already))
+                    continue;
+                auto folded = FoldCompileTimeInt(compilerLLVM, initializer->assignmentExpression());
+                if (!folded) continue;
+                compilerLLVM->SetConstGlobalInt(name, *folded);
+                changed = true;
+            }
+        }
+
+        auto* specs = decl->declarationSpecifiers();
+        auto* initList = decl->initDeclaratorList();
+        auto* lastSpec = specs != nullptr
+            ? LastDeclarationTypeSpecifier(specs->declarationSpecifier()) : nullptr;
+        if (specs == nullptr || initList == nullptr || lastSpec == nullptr
+            || lastSpec->typeSpecifier() == nullptr)
+            return;
+
+        auto* dimSpec = ArrayDimsOf(lastSpec);
+        auto directDims = dimSpec != nullptr ? dimSpec->assignmentExpression()
+            : std::vector<CFlatParser::AssignmentExpressionContext*>();
+        std::string baseName = CanonicalTypeSpecifierText(lastSpec->typeSpecifier());
+        baseName = compilerLLVM->ResolveQualifiedName(baseName);
+        std::string aliasBase = compilerLLVM->ResolveTypeAlias(baseName);
+        std::vector<uint64_t> aliasDims;
+        PeelAliasArrayDims(aliasBase, aliasDims);
+
+        LLVMBackend::TypeAndValue value{ .TypeName = aliasBase };
+        value.IsUnique = HasSoftDeclarationSpecifier(specs, "unique");
+        bool fixedArray = !directDims.empty() || !aliasDims.empty();
+        std::vector<uint64_t> extents;
+        if (!directDims.empty())
+        {
+            for (auto* dimension : directDims)
+            {
+                auto folded = FoldCompileTimeInt(compilerLLVM, dimension);
+                if (!folded || *folded <= 0)
+                {
+                    fixedArray = false;
+                    break;
+                }
+                extents.push_back(static_cast<uint64_t>(*folded));
+            }
+            if (fixedArray && !extents.empty())
+            {
+                value.ConstArraySize = extents.front();
+                value.ConstInnerDimensions.assign(extents.begin() + 1, extents.end());
+            }
+        }
+        if (!aliasDims.empty())
+        {
+            value.AliasArraySize = aliasDims.front();
+            value.AliasInnerDims.assign(aliasDims.begin() + 1, aliasDims.end());
+        }
+        if (!fixedArray && value.ConstArraySize == 0 && value.AliasArraySize == 0)
+            value.TypeName = baseName;
+        for (auto* init : initList->initDeclarator())
+        {
+            auto* declarator = init->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            const std::string name = getDirectDeclName(direct);
+            if (name.empty() || (!fixedArray && name != "countof")) continue;
             const std::string ns = compilerLLVM->GetCurrentNamespace();
-            const std::string name = ns.empty() || bare.empty() ? bare : ns + "." + bare;
-            int64_t already = 0;
-            // A -D define and the platform builtins own the name; never shadow one, and never
-            // re-seed a name already recorded (that is what makes the fixpoint monotone).
-            if (bare.empty() || compilerLLVM->IsReservedMacroName(bare)
-                || compilerLLVM->GetCompileTimeMacro(bare).value != nullptr
-                || compilerLLVM->TryGetConstGlobalInt(name, already))
-                continue;
-            auto folded = FoldCompileTimeInt(compilerLLVM, initializer->assignmentExpression());
-            if (!folded) continue;
-            compilerLLVM->SetConstGlobalInt(name, *folded);
-            changed = true;
+            const std::string key = ns.empty() ? name : ns + "." + name;
+            compilerLLVM->SetScanTimeGlobalVariableType(key, value);
         }
     };
 
@@ -1936,6 +2014,8 @@ std::string ForwardRefScanner::ResolveSigComponentConstScanner(
         // A member alias (`A<int>.CP`) keeps its stars and its const mask: both come from the owner.
         uint8_t memberMask = 0;
         const bool memberSpelled = ts != nullptr && ts->memberTypeSpecifier() != nullptr;
+        const std::string writtenName = memberSpelled
+            ? ts->getText() : CanonicalTypeSpecifierText(ts, suffix);
         std::string name;
         int substitutedConstDepth = 0;
         if (memberSpelled)
@@ -1961,16 +2041,18 @@ std::string ForwardRefScanner::ResolveSigComponentConstScanner(
         if (substitutedConstDepth > 0)
             aliasMask |= (1 << std::min(substitutedConstDepth, 7)) - 1;
         constMask = PointeeConstOfComponent(aliasMask, depth + aliasStars, preserveAliasReferentConst);
+        const bool spellingDiffers = memberSpelled ? aliased != writtenName : aliased != name;
+        const std::string& spellingName = memberSpelled ? writtenName : name;
+        // Keep the source spelling for diagnostics; `aliased` remains the matching type.
+        if (aliasSpelling != nullptr && (spellingDiffers || aliasStars > 0))
+            *aliasSpelling = spellingName + std::string(depth, '*');
         if (aliasStars > 0)
         {
-            // Matching uses the resolved base and depth; diagnostics keep the alias spelling.
-            if (aliasSpelling != nullptr)
-                *aliasSpelling = (memberSpelled ? ts->getText() : name) + std::string(depth, '*');
             stars = depth + aliasStars;
             outPointer = true;
             return aliased;
         }
-        return name;
+        return aliased;
     }
 
 std::string ForwardRefScanner::SigComponentResolvedKeyScanner(const std::string& name) {
@@ -1989,9 +2071,11 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
         const bool aliasReturn = fpSpec->functionReturnQualifier() != nullptr
             && fpSpec->functionReturnQualifier()->getText() == "alias";
         int retConst = 0;
+        std::string retAliasSpelling;
         std::string retName = ResolveSigComponentConstScanner(fpSpec->typeSpecifier(), retPtr,
-            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn);
+            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn, &retAliasSpelling);
         sig.FuncPtrReturnTypeName = retName;
+        sig.FuncPtrReturnAliasSpelling = retAliasSpelling;
         sig.FuncPtrReturnPointer = retPtr;
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
         sig.FuncPtrReturnConstMask = retConst;
@@ -2013,8 +2097,9 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
                 bool pPtr = param->pointer() != nullptr || pIsArrayView;
                 int pStars = PointerDepthOf(param->pointer()) + (pIsArrayView ? 1 : 0);
                 int pConst = 0;
+                std::string pSpelling;
                 std::string pName = ResolveSigComponentConstScanner(param->typeSpecifier(), pPtr,
-                                                                    pStars, pConst, param->multiWordTypeSuffix());
+                    pStars, pConst, param->multiWordTypeSuffix(), false, &pSpelling);
                 const int pDepth = ReconcilePointerDepth(pPtr, pStars);
                 LLVMBackend::TypeAndValue::FuncPtrParam p;
                 p.TypeName = pName;
@@ -2022,6 +2107,7 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
                 p.PointerDepth = pDepth;
                 p.IsArrayView = pIsArrayView;
                 p.ConstMask = pConst;
+                p.AliasSpelling = pSpelling;
                 p.IsMove = param->Move() != nullptr;
                 p.ResolvedTypeKey = SigComponentResolvedKeyScanner(pName);
                 if (!pPtr)
@@ -2041,8 +2127,10 @@ std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(
         bool retPtr = fnSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fnSpec->pointer());
         int retConst = 0;
+        std::string retAliasSpelling;
         sig.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(fnSpec->typeSpecifier(), retPtr,
-            retStars, retConst, fnSpec->multiWordTypeSuffix());
+            retStars, retConst, fnSpec->multiWordTypeSuffix(), false, &retAliasSpelling);
+        sig.FuncPtrReturnAliasSpelling = retAliasSpelling;
         sig.FuncPtrReturnConstMask = retConst;
         sig.FuncPtrReturnPointer = retPtr;
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
@@ -2251,6 +2339,15 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                                             unkeyable || cd->genericTypeParameters() != nullptr);
                 continue;
             }
+            case CFlatParser::RuleNestedAggregateField:
+            {
+                const std::string tn = AggregateDefinitionName(
+                    static_cast<CFlatParser::NestedAggregateFieldContext*>(ruleCtx));
+                recordTypeName(tn);
+                CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns,
+                    QualifyName(typePath, tn), unkeyable);
+                continue;
+            }
             case CFlatParser::RuleInterfaceDefinition:
             {
                 auto* nameGid = static_cast<CFlatParser::InterfaceDefinitionContext*>(ruleCtx)->genericIdentifier();
@@ -2428,6 +2525,11 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
                         &compiler->gts.scannedNonLocalEnumNames,
                         &compiler->gts.scannedTypeNames))
                     return;  // The main walk queues this after the local enum declaration registers.
+                for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
+                    if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr
+                        && HasUnfoldableCountofCall(compiler,
+                            entry->shiftExpression()))
+                        return;  // An opaque zero-valued shell would disagree with the main pass.
                 // Name the shell after the registered KEY, not the spelling: a bare use inside a
                 // namespace would otherwise leave an opaque 'Box$int' that 'NS.Box$int' never completes.
                 std::vector<std::string> args;
@@ -2672,7 +2774,7 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
             int retConst = 0;
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
-                fpSpec->multiWordTypeSuffix(), aliasReturn);
+                fpSpec->multiWordTypeSuffix(), aliasReturn, &tv.FuncPtrReturnAliasSpelling);
             tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
             tv.FuncPtrReturnOwned = returnQualifierText == "move";
@@ -2920,6 +3022,102 @@ void ForwardRefScanner::ScanAggregateAliases(
             scanIfConst(scanIfConst, ifConst);
         }
     }
+
+void ForwardRefScanner::ScanInlineAggregateMembers(
+        const std::vector<CFlatParser::AggregateMemberContext*>& members,
+        const std::string& ownerName)
+{
+        unsigned anonymousIndex = 0;
+        std::function<void(const std::vector<CFlatParser::AggregateMemberContext*>&,
+                           const std::string&, const std::string&, bool, bool)> scan;
+        scan = [&](const std::vector<CFlatParser::AggregateMemberContext*>& current,
+                   const std::string& typeOwner, const std::string& promotedOwner,
+                   bool registerFields, bool scanTypeMembers)
+        {
+            for (auto* member : current)
+            {
+                if (auto* function = member->functionDefinition())
+                {
+                    if (!scanTypeMembers) continue;
+                    const std::string baseName = typeOwner.substr(
+                        typeOwner.rfind('.') == std::string::npos ? 0 : typeOwner.rfind('.') + 1);
+                    if (!FunctionDeclaresReturnType(function)
+                        && getFunctionName(function) == baseName)
+                    {
+                        LLVMBackend::TypeAndValue returnType{ .TypeName = typeOwner };
+                        std::vector<LLVMBackend::TypeAndValue> params;
+                        if (function->parameterTypeList() != nullptr)
+                        {
+                            auto parsed = ParseParameterTypeList(function->parameterTypeList());
+                            params.assign(parsed.begin(), parsed.end());
+                        }
+                        Compiler(member)->CreateFunctionDeclaration(typeOwner, returnType, params);
+                    }
+                    else
+                        ScanFunctionDefinition(function, typeOwner);
+                    continue;
+                }
+
+                if (auto* destructor = member->destructorDefinition())
+                {
+                    if (!scanTypeMembers) continue;
+                    LLVMBackend::DeclTypeAndValue thisParam;
+                    thisParam.TypeName = typeOwner;
+                    thisParam.VariableName = typeOwner + "__";
+                    thisParam.Pointer = true;
+                    LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+                    Compiler(destructor)->CreateFunctionDeclaration(
+                        "~" + typeOwner, voidReturn, { thisParam });
+                    continue;
+                }
+
+                if (scanTypeMembers)
+                {
+                    if (auto* nested = member->structDefinition())
+                    {
+                        ScanStructDefinition(nested, typeOwner);
+                        continue;
+                    }
+                    if (auto* nested = member->classDefinition())
+                    {
+                        ScanClassDefinition(nested, typeOwner);
+                        continue;
+                    }
+                }
+
+                if (auto* declaration = member->declaration())
+                {
+                    if (!registerFields || declaration->initDeclaratorList() == nullptr) continue;
+                    for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                        if (auto* declarator = init->declarator())
+                            Compiler(member)->aggregateValueMembers_[promotedOwner].insert(
+                                getDirectDeclName(declarator->directDeclarator()));
+                    continue;
+                }
+
+                if (auto* anonymous = member->anonymousAggregateMember())
+                {
+                    const std::string syntheticType = typeOwner + ".@inline"
+                        + std::to_string(anonymousIndex++);
+                    Compiler(member)->CreateStructType(syntheticType, {});
+                    const bool transparent = anonymous->directDeclarator() == nullptr;
+                    scan(ResolveAggregateMembers(anonymous), syntheticType,
+                        transparent ? promotedOwner : syntheticType, true, !transparent);
+                    continue;
+                }
+
+                if (auto* nested = member->nestedAggregateField())
+                {
+                    const auto declarators = nested->directDeclarator();
+                    const std::string nestedType = typeOwner + "." + declarators[0]->getText();
+                    Compiler(member)->gts.scannedTypeNames.insert(nestedType);
+                    Compiler(member)->CreateStructType(nestedType, {});
+                    scan(ResolveAggregateMembers(nested), nestedType, nestedType, true, true);
+                }
+            }
+        };
+        scan(members, ownerName, ownerName, false, false);
+}
 
 void ForwardRefScanner::ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = Compiler(ctx);

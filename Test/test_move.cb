@@ -19133,7 +19133,7 @@ extern int main()
     passed += testT364NativeOperatorReturnFacts();
     passed += testMix9ReleaseReturn();
     passed += uqrawAcceptLegs();
-    total += 11; // UQRAW accept-set legs (uqrawAcceptLegs)
+    total += 94; // UQRAW and TUPSAFE accept-set legs (uqrawAcceptLegs)
     total += 4; // release() results returned as bare pointers (heap-array gate)
     total += 97; // mvfield legs and four CALLEEREF accept-set legs
     passed += testT523ByrefClosureRebind();
@@ -19438,6 +19438,7 @@ extern int main()
     total += 6;
     total += 26;
     total += 6;
+    total += 22;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -25879,11 +25880,93 @@ int testMix9ReleaseReturn()
 // owning slots that stay legal next to the new borrowed-pointer refusals.
 int uqrawDtors = 0;
 struct UqrawBox { int v = 0; ~UqrawBox() { uqrawDtors = uqrawDtors + 1; } int val() { return v; } };
+struct UqrawValueHolder { unique<UqrawBox> u = default; };
+struct UqrawPairHolder { unique<UqrawBox> a = default; unique<UqrawBox> b = default; };
+struct UqrawRawPairHolder { unique UqrawBox* a = default; unique UqrawBox* b = default; };
 unique UqrawBox* uqrawMk(int n) { unique UqrawBox* p = new UqrawBox(); p->v = n; return move p; }
 unique UqrawBox* uqrawWrap(int n) { return uqrawMk(n); }
 UqrawBox* uqrawIdp(UqrawBox* p) { return p; }
 int uqrawUse(UqrawBox* p) { return p->v; }
 void uqrawSink(unique UqrawBox* p) { }
+UqrawBox* uqrawOpaque() { return nullptr; }
+int uqrawTakeByValue(unique<UqrawBox> value) { return value->v; }
+int uqrawTakeByValue((unique<UqrawBox>, int) value) { return value.item_0->v + value.item_1; }
+int uqrawTakePair((unique<UqrawBox>, unique<UqrawBox>) value)
+{
+    return value.item_0->v + (value.item_1.get() == nullptr ? 0 : 1000);
+}
+int uqrawTakeNested(((unique<UqrawBox>, int), unique<UqrawBox>) value)
+{
+    return value.item_0.item_0->v * 100 + value.item_0.item_1 * 10 + value.item_1->v;
+}
+int uqrawTakeHolderNested(((UqrawValueHolder, int), int) value)
+{
+    return value.item_0.item_1 + value.item_1;
+}
+int uqrawTakeValueNested(((UqrawBox, int), int) value)
+{
+    return value.item_0.item_1 + value.item_1 + value.item_0.item_0.v;
+}
+int uqrawBorrowedDerefFlat(unique<UqrawBox>* p)
+{
+    return uqrawTakeByValue((*p, 3));
+}
+int uqrawBorrowedIndexFlat(unique<UqrawBox>* p)
+{
+    return uqrawTakeByValue((p[0], 3));
+}
+int uqrawBorrowedDerefNested(unique<UqrawBox>* p, unique<UqrawBox>* q)
+{
+    return uqrawTakeNested(((*p, 4), *q));
+}
+unique<UqrawBox> uqrawOwnedFn(int n)
+{
+    unique<UqrawBox> owner = new UqrawBox();
+    owner->v = n;
+    return owner;
+}
+int uqrawTernaryProducedSlot(int pick)
+{
+    return uqrawTakeByValue(((pick == 1 ? uqrawOwnedFn(4) : uqrawOwnedFn(5)), 3));
+}
+int uqrawMoveParamSlot(move unique<UqrawBox> u) { return uqrawTakeByValue((u, 3)); }
+int uqrawMoveParamNested(move unique<UqrawBox> u)
+{
+    return uqrawTakeNested(((u, 4), uqrawOwnedFn(5)));
+}
+// TUPSAFE r9: a declared move param of an owning VALUE struct is borrowed by a slot; its teardown owns it.
+// Only a live (v != 0) destroy counts, so the zeroed caller local a `move` leaves behind is not counted.
+int uqrawLiveDtors = 0;
+struct UqrawLiveBox { int v = 0; ~UqrawLiveBox() { if (v != 0) uqrawLiveDtors = uqrawLiveDtors + 1; } };
+int uqrawValueTakeTuple((UqrawLiveBox, int) t) { return t.item_1; }
+int uqrawValueTakeNested(((UqrawLiveBox, int), int) t) { return t.item_0.item_1 + t.item_1; }
+int uqrawMoveParamValueSlot(move UqrawLiveBox b) { return uqrawValueTakeTuple((b, 3)); }
+int uqrawMoveParamValueNested(move UqrawLiveBox b) { return uqrawValueTakeNested(((b, 5), 2)); }
+// TUPSAFE r9: a declared move unique param takes the same tuple-declaration transfer a scalar decl does.
+int uqrawMoveParamDeclTuple(move unique<UqrawBox> u)
+{
+    (unique<UqrawBox>, int) t = (u, 4);
+    return t.item_1;
+}
+int uqrawMoveParamDeclNested(move unique<UqrawBox> u)
+{
+    ((unique<UqrawBox>, int), int) t = ((u, 5), 2);
+    return t.item_0.item_1 + t.item_1;
+}
+unique<UqrawBox> uqrawGlobalOwner = default;
+struct UqrawCtorHolder { int a = 0; UqrawCtorHolder((unique<UqrawBox>, int) t) { a = t.item_1; } };
+int uqrawTakePointerFieldTuple(UqrawValueHolder* holder)
+{
+    return uqrawTakeByValue((holder->u, 3));
+}
+int uqrawTakeRawValue(unique UqrawBox* value) { return value->v; }
+int uqrawTakeRawTuple((unique UqrawBox*, int) value) { return value.item_0->v + value.item_1; }
+(unique<UqrawBox>, int) uqrawTupleReturn(int n)
+{
+    unique<UqrawBox> owner = new UqrawBox();
+    owner->v = n;
+    return (owner, n + 1);
+}
 
 int uqrawAcceptLegs()
 {
@@ -25916,5 +25999,437 @@ int uqrawAcceptLegs()
     int* moved = move owned;
     passed += Test("uqraw move owning slot", *moved, 9);
     delete moved;
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = new UqrawBox();
+        owner->v = 18;
+        (unique<UqrawBox>, int) tuple = default;
+        tuple = (owner, 19);
+        passed += Test("tupsafe tuple unique value", tuple.item_0->v, 18);
+        passed += Test("tupsafe tuple unique companion", tuple.item_1, 19);
+    }
+    passed += Test("tupsafe tuple unique value dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        UqrawValueHolder holder = default;
+        holder.u = new UqrawBox();
+        holder.u->v = 25;
+        (unique<UqrawBox>, int) tuple = default;
+        tuple = (holder.u, 26);
+        passed += Test("tupsafe tuple unique field value", tuple.item_0->v, 25);
+        passed += Test("tupsafe tuple unique field companion", tuple.item_1, 26);
+    }
+    passed += Test("tupsafe tuple unique field dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = new UqrawBox();
+        unique<UqrawBox> right = new UqrawBox();
+        left->v = 31;
+        right->v = 32;
+        (unique<UqrawBox>, int) tuple = default;
+        tuple = true ? (left, 33) : (right, 34);
+        passed += Test("tupsafe tuple unique ternary left value", tuple.item_0->v, 31);
+        passed += Test("tupsafe tuple unique ternary left companion", tuple.item_1, 33);
+    }
+    passed += Test("tupsafe tuple unique ternary left dtors", uqrawDtors, 2);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = new UqrawBox();
+        unique<UqrawBox> right = new UqrawBox();
+        left->v = 41;
+        right->v = 42;
+        (unique<UqrawBox>, int) tuple = default;
+        tuple = false ? (left, 43) : (right, 44);
+        passed += Test("tupsafe tuple unique ternary right value", tuple.item_0->v, 42);
+        passed += Test("tupsafe tuple unique ternary right companion", tuple.item_1, 44);
+    }
+    passed += Test("tupsafe tuple unique ternary right dtors", uqrawDtors, 2);
+
+    uqrawDtors = 0;
+    {
+        (unique<UqrawBox>, int) tuple = uqrawTupleReturn(51);
+        passed += Test("tupsafe tuple unique return value", tuple.item_0->v, 51);
+        passed += Test("tupsafe tuple unique return companion", tuple.item_1, 52);
+    }
+    passed += Test("tupsafe tuple unique return dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique UqrawBox* owner = uqrawMk(20);
+        (unique UqrawBox*, int) tuple = default;
+        tuple = (move owner, 21);
+        passed += Test("tupsafe tuple unique pointer", tuple.item_0->v, 20);
+        passed += Test("tupsafe tuple unique pointer companion", tuple.item_1, 21);
+    }
+    passed += Test("tupsafe tuple unique pointer dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = uqrawMk(37);
+        passed += Test("tupsafe scalar unique argument value", uqrawTakeByValue(owner), 37);
+    }
+    passed += Test("tupsafe scalar unique argument dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = uqrawMk(40);
+        passed += Test("tupsafe tuple unique argument value", uqrawTakeByValue((owner, 2)), 42);
+    }
+    passed += Test("tupsafe tuple unique argument dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = uqrawMk(44);
+        passed += Test("tupsafe tuple explicit move argument value",
+            uqrawTakeByValue((move owner, 7)), 51);
+    }
+    passed += Test("tupsafe tuple explicit move argument dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        UqrawValueHolder holder = default;
+        holder.u = uqrawMk(59);
+        holder.u->v = 59;
+        passed += Test("tupsafe tuple local field argument value",
+            uqrawTakeByValue((holder.u, 3)), 62);
+        passed += Test("tupsafe tuple local field argument source cleared",
+            holder.u.get() == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("tupsafe tuple local field argument dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        UqrawValueHolder holder = default;
+        holder.u = uqrawMk(63);
+        holder.u->v = 63;
+        passed += Test("tupsafe tuple pointer field argument value",
+            uqrawTakePointerFieldTuple(&holder), 66);
+        passed += Test("tupsafe tuple pointer field argument source cleared",
+            holder.u.get() == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("tupsafe tuple pointer field argument dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = uqrawMk(67);
+        owner->v = 67;
+        unique<UqrawBox>* alias = &owner;
+        passed += Test("tupsafe tuple alias call value",
+            uqrawTakePair((owner, *alias)), 67);
+    }
+    passed += Test("tupsafe tuple alias call dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox>[2] owners = default;
+        owners[0] = uqrawMk(71);
+        owners[0]->v = 71;
+        int i = 0;
+        int j = 0;
+        passed += Test("tupsafe tuple alias index call value",
+            uqrawTakePair((owners[i], owners[j])), 71);
+    }
+    passed += Test("tupsafe tuple alias index call dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = uqrawMk(73);
+        owner->v = 73;
+        unique<UqrawBox>* alias = &owner;
+        (unique<UqrawBox>, unique<UqrawBox>) tuple = default;
+        tuple = (owner, *alias);
+        passed += Test("tupsafe tuple alias assignment value", tuple.item_0->v, 73);
+        passed += Test("tupsafe tuple alias assignment second null",
+            tuple.item_1.get() == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("tupsafe tuple alias assignment dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = uqrawMk(79);
+        owner->v = 79;
+        unique<UqrawBox>* left = &owner;
+        unique<UqrawBox>* right = &owner;
+        (unique<UqrawBox>, unique<UqrawBox>) tuple = default;
+        tuple = (*left, *right);
+        passed += Test("tupsafe tuple alias deref assignment value", tuple.item_0->v, 79);
+        passed += Test("tupsafe tuple alias deref assignment second null",
+            tuple.item_1.get() == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("tupsafe tuple alias deref assignment dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        UqrawValueHolder holder = default;
+        holder.u = uqrawMk(83);
+        holder.u->v = 83;
+        UqrawValueHolder* holderAlias = &holder;
+        (unique<UqrawBox>, unique<UqrawBox>) tuple = default;
+        tuple = (holder.u, holderAlias->u);
+        passed += Test("tupsafe tuple alias field assignment value", tuple.item_0->v, 83);
+        passed += Test("tupsafe tuple alias field assignment second null",
+            tuple.item_1.get() == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("tupsafe tuple alias field assignment dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox>[2] owners = default;
+        owners[0] = uqrawMk(89);
+        owners[0]->v = 89;
+        int i = 0;
+        int j = 0;
+        (unique<UqrawBox>, unique<UqrawBox>) tuple = default;
+        tuple = (owners[i], owners[j]);
+        passed += Test("tupsafe tuple alias index assignment value", tuple.item_0->v, 89);
+        passed += Test("tupsafe tuple alias index assignment second null",
+            tuple.item_1.get() == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("tupsafe tuple alias index assignment dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique UqrawBox* owner = uqrawMk(47);
+        passed += Test("tupsafe scalar raw unique argument value", uqrawTakeRawValue(owner), 47);
+    }
+    passed += Test("tupsafe scalar raw unique argument dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        unique UqrawBox* owner = uqrawMk(50);
+        passed += Test("tupsafe tuple raw unique argument value", uqrawTakeRawTuple((owner, 2)), 52);
+    }
+    passed += Test("tupsafe tuple raw unique argument dtor", uqrawDtors, 1);
+
+    uqrawDtors = 0;
+    {
+        UqrawPairHolder holder = default;
+        holder.a = uqrawMk(51);
+        holder.b = uqrawMk(52);
+        (unique<UqrawBox>, unique<UqrawBox>) tuple = default;
+        tuple = (holder.a, holder.b);
+        passed += Test("tupsafe distinct tuple fields value a", tuple.item_0->v, 51);
+        passed += Test("tupsafe distinct tuple fields value b", tuple.item_1->v, 52);
+    }
+    passed += Test("tupsafe distinct tuple fields dtor once each", uqrawDtors, 2);
+
+    uqrawDtors = 0;
+    {
+        UqrawRawPairHolder holder = default;
+        holder.a = uqrawMk(61);
+        holder.b = uqrawMk(62);
+        (unique UqrawBox*, unique UqrawBox*) tuple = default;
+        tuple = (holder.a, holder.b);
+        passed += Test("tupsafe distinct raw tuple fields value a", tuple.item_0->v, 61);
+        passed += Test("tupsafe distinct raw tuple fields value b", tuple.item_1->v, 62);
+    }
+    passed += Test("tupsafe distinct raw tuple fields dtor once each", uqrawDtors, 2);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = uqrawMk(101);
+        unique<UqrawBox> right = uqrawMk(102);
+        unique<UqrawBox> owner = uqrawMk(103);
+        left->v = 101;
+        owner->v = 103;
+        passed += Test("tupsafe borrowed ternary first value",
+            uqrawTakePair((true ? left : right, owner)), 1101);
+    }
+    passed += Test("tupsafe borrowed ternary first dtor", uqrawDtors, 3);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = uqrawMk(111);
+        unique<UqrawBox> right = uqrawMk(112);
+        unique<UqrawBox> owner = uqrawMk(113);
+        owner->v = 113;
+        passed += Test("tupsafe borrowed ternary second value",
+            uqrawTakePair((owner, true ? left : right)), 1113);
+    }
+    passed += Test("tupsafe borrowed ternary second dtor", uqrawDtors, 3);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = uqrawMk(121);
+        unique<UqrawBox> right = uqrawMk(122);
+        unique<UqrawBox>* alias = &left;
+        left->v = 121;
+        passed += Test("tupsafe borrowed ternary alias value",
+            uqrawTakePair((true ? left : right, *alias)), 1121);
+    }
+    passed += Test("tupsafe borrowed ternary alias dtor", uqrawDtors, 2);
+
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = uqrawMk(131);
+        unique<UqrawBox> right = uqrawMk(132);
+        left->v = 131;
+        passed += Test("tupsafe borrowed-only ternary value",
+            uqrawTakeByValue((true ? left : right, 1)), 132);
+    }
+    passed += Test("tupsafe borrowed-only ternary dtor", uqrawDtors, 2);
+
+    uqrawDtors = 0;
+    {
+        UqrawBox* unknown = uqrawOpaque();
+        unique<UqrawBox> owner = move unknown;
+        passed += Test("tupsafe unknown move into unique", owner.get() == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("tupsafe unknown move dtor", uqrawDtors, 0);
+
+    HeapAudit.enable();
+    i64 nestedHeapBaseline = (i64)HeapAudit.reportLeaks();
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = uqrawMk(141);
+        unique<UqrawBox> right = uqrawMk(142);
+        left->v = 141;
+        right->v = 142;
+        passed += Test("tupsafe nested call value",
+            uqrawTakeNested(((left, 7), right)), 14312);
+    }
+    passed += Test("tupsafe nested call dtor once each", uqrawDtors, 2);
+    passed += Test("tupsafe nested call heap delta",
+        (i64)HeapAudit.reportLeaks() - nestedHeapBaseline, (i64)0);
+
+    // TUPSAFE r7: a borrowed ternary arm inside an inner tuple is never destroyed by the tuple.
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> left = uqrawMk(141);
+        unique<UqrawBox> right = uqrawMk(142);
+        unique<UqrawBox> spare = uqrawMk(143);
+        bool pick = uqrawDtors == 0;
+        passed += Test("tupsafe nested ternary arm value",
+            uqrawTakeNested(((pick ? left : right, 7), spare)), 14313);
+    }
+    passed += Test("tupsafe nested ternary arm dtor once each", uqrawDtors, 3);
+    // TUPSAFE r7: a value or unique<T> field inside a nested borrowed element is not destroyed by the tuple.
+    uqrawDtors = 0;
+    {
+        UqrawValueHolder holder = default;
+        holder.u = new UqrawBox();
+        passed += Test("tupsafe nested holder slot value", uqrawTakeHolderNested(((holder, 1), 2)), 3);
+    }
+    passed += Test("tupsafe nested holder slot dtor once", uqrawDtors, 1);
+    uqrawDtors = 0;
+    {
+        UqrawBox boxed = default;
+        boxed.v = 4;
+        passed += Test("tupsafe nested value struct slot", uqrawTakeValueNested(((boxed, 1), 2)), 7);
+    }
+    passed += Test("tupsafe nested value struct dtor once", uqrawDtors, 1);
+    // TUPSAFE r7: a deref of a borrowed pointer is a borrow in a call-argument tuple, flat or nested.
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = new UqrawBox();
+        owner->v = 9;
+        passed += Test("tupsafe borrowed deref flat value", uqrawBorrowedDerefFlat(&owner), 12);
+        // TUPSAFE r8: a borrowed deref in a call-argument tuple is consumed like the scalar argument.
+        passed += Test("tupsafe borrowed deref flat consumed in call", uqrawDtors, 1);
+    }
+    passed += Test("tupsafe borrowed deref flat dtor once", uqrawDtors, 1);
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> first = new UqrawBox();
+        unique<UqrawBox> second = new UqrawBox();
+        first->v = 5;
+        second->v = 6;
+        passed += Test("tupsafe borrowed deref nested value",
+            uqrawBorrowedDerefNested(&first, &second), 546);
+        passed += Test("tupsafe borrowed deref nested consumed in call", uqrawDtors, 2);
+    }
+    passed += Test("tupsafe borrowed deref nested dtor once each", uqrawDtors, 2);
+    // TUPSAFE r8: an indexed borrowed element in a call-argument tuple is consumed like the scalar argument.
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = new UqrawBox();
+        owner->v = 9;
+        passed += Test("tupsafe borrowed index flat value", uqrawBorrowedIndexFlat(&owner), 12);
+        passed += Test("tupsafe borrowed index flat consumed in call", uqrawDtors, 1);
+    }
+    passed += Test("tupsafe borrowed index flat dtor once", uqrawDtors, 1);
+    // TUPSAFE r7: a call result in a tuple slot is owned by that slot, flat or nested.
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> right = uqrawMk(142);
+        passed += Test("tupsafe nested call result slot",
+            uqrawTakeNested((uqrawTupleReturn(5), right)), 702);
+    }
+    passed += Test("tupsafe nested call result dtor once each", uqrawDtors, 2);
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> right = uqrawMk(9);
+        passed += Test("tupsafe flat call result slot",
+            uqrawTakePair((uqrawOwnedFn(7), right)), 1007);
+    }
+    passed += Test("tupsafe flat call result dtor once each", uqrawDtors, 2);
+    // TUPSAFE r7: a tuple literal passed to a constructor owns its moved slot.
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = uqrawMk(3);
+        UqrawCtorHolder* holder = new UqrawCtorHolder((owner, 1));
+        passed += Test("tupsafe ctor tuple slot value", holder->a, 1);
+        delete holder;
+    }
+    passed += Test("tupsafe ctor tuple slot dtor once", uqrawDtors, 1);
+    // TUPSAFE r8: a ternary of produced owners in a tuple slot is owned once (the PHI is not a slot owner).
+    uqrawDtors = 0;
+    passed += Test("tupsafe ternary produced slot value", uqrawTernaryProducedSlot(1), 7);
+    passed += Test("tupsafe ternary produced slot other arm value", uqrawTernaryProducedSlot(0), 8);
+    passed += Test("tupsafe ternary produced slot dtor once each", uqrawDtors, 2);
+    // TUPSAFE r8: a move parameter moved into a call-argument tuple is consumed once; its own slot is nulled.
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = new UqrawBox();
+        owner->v = 6;
+        passed += Test("tupsafe move param tuple value", uqrawMoveParamSlot(move owner), 9);
+    }
+    passed += Test("tupsafe move param tuple dtor once", uqrawDtors, 1);
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = new UqrawBox();
+        owner->v = 6;
+        passed += Test("tupsafe move param nested value", uqrawMoveParamNested(move owner), 645);
+    }
+    passed += Test("tupsafe move param nested dtor once each", uqrawDtors, 2);
+    // TUPSAFE r9: value-struct move param in a call tuple slot, flat and nested: one live destroy.
+    uqrawLiveDtors = 0;
+    {
+        UqrawLiveBox boxFlat = default;
+        boxFlat.v = 6;
+        passed += Test("tupsafe value move param tuple value", uqrawMoveParamValueSlot(move boxFlat), 3);
+    }
+    passed += Test("tupsafe value move param tuple dtor once", uqrawLiveDtors, 1);
+    uqrawLiveDtors = 0;
+    {
+        UqrawLiveBox boxNested = default;
+        boxNested.v = 6;
+        passed += Test("tupsafe value move param nested value", uqrawMoveParamValueNested(move boxNested), 7);
+    }
+    passed += Test("tupsafe value move param nested dtor once", uqrawLiveDtors, 1);
+    // TUPSAFE r9: a unique move param in a tuple declaration (flat and nested) transfers once.
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = new UqrawBox();
+        owner->v = 6;
+        passed += Test("tupsafe move param decl tuple value", uqrawMoveParamDeclTuple(move owner), 4);
+    }
+    passed += Test("tupsafe move param decl tuple dtor once", uqrawDtors, 1);
+    uqrawDtors = 0;
+    {
+        unique<UqrawBox> owner = new UqrawBox();
+        owner->v = 6;
+        passed += Test("tupsafe move param decl nested value", uqrawMoveParamDeclNested(move owner), 7);
+    }
+    passed += Test("tupsafe move param decl nested dtor once", uqrawDtors, 1);
+    // TUPSAFE r7: a global owner is refused in a nested call argument, as in the flat form.
+    expect_error("out of storage that outlives this function") {
+        unique<UqrawBox> spare = uqrawMk(4);
+        uqrawTakeNested(((uqrawGlobalOwner, 7), spare));
+    }
     return passed;
 }

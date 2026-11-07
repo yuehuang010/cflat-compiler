@@ -1,0 +1,97 @@
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullDecl() { string s = nullptr; }
+}
+
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullAssign() { string s = default; s = nullptr; }
+}
+
+expect_error("cannot initialize string 'tupsafeStringNullReturn' from nullptr") {
+    string tupsafeStringNullReturn() { return nullptr; }
+}
+
+void tupsafeTakeString(string s) { }
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullArgument() { tupsafeTakeString(nullptr); }
+}
+
+struct TupsafeStringField { string s = default; };
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullField() { TupsafeStringField value = { s = nullptr }; }
+}
+
+expect_error("cannot initialize string 'item_0' from nullptr") {
+    void tupsafeStringNullTuple() { (string, int) value = (nullptr, 4); }
+}
+
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullTernaryDecl()
+    {
+        int c = 1;
+        string t = "text";
+        string s = c ? nullptr : t;
+    }
+}
+
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullTernaryAssign()
+    {
+        int c = 0;
+        string t = "text";
+        string s = "seed";
+        s = c ? t : nullptr;
+    }
+}
+
+expect_error("cannot initialize string 'tupsafeStringNullTernaryReturn' from nullptr") {
+    string tupsafeStringNullTernaryReturn(int c)
+    {
+        string t = "text";
+        return c ? nullptr : t;
+    }
+}
+
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullTernaryArgument()
+    {
+        int c = 0;
+        string t = "text";
+        tupsafeTakeString(c ? t : nullptr);
+    }
+}
+
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullParenArm()
+    {
+        int c = 1;
+        string t = "text";
+        string s = c ? (nullptr) : t;
+    }
+}
+
+expect_error("cannot initialize string 's' from nullptr") {
+    void tupsafeStringNullTernaryField()
+    {
+        int c = 1;
+        string t = "text";
+        TupsafeStringField value = { s = c ? nullptr : t };
+    }
+}
+
+expect_error("cannot initialize string 'item_0' from nullptr") {
+    void tupsafeStringNullTernaryTuple()
+    {
+        int c = 0;
+        string t = "text";
+        (string, int) value = (c ? t : nullptr, 4);
+    }
+}
+
+expect_error("cannot initialize string 's' from nullptr") {
+    int tupsafeStringNullDefault(string s = nullptr) { return 0; }
+}
+
+expect_error("cannot initialize string 'mkT' from nullptr") {
+    T mkT<T>() { return nullptr; }
+    int tupsafeStringNullGenericReturn() { string s = mkT<string>(); return s.length(); }
+}

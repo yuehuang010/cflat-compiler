@@ -1,0 +1,69 @@
+import "unique.cb";
+
+struct TupsafeBorrowed { int value = 0; ~TupsafeBorrowed() { } };
+struct TupsafeBorrowedHolder { TupsafeBorrowed value = default; };
+TupsafeBorrowed tupsafeBorrowedGlobal = default;
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void tupsafeBorrowedLocalDecl()
+    {
+        TupsafeBorrowed value = default;
+        TupsafeBorrowed* raw = &value;
+        unique<TupsafeBorrowed> owner = move raw;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void tupsafeBorrowedFieldDecl()
+    {
+        TupsafeBorrowedHolder holder = default;
+        TupsafeBorrowed* raw = &holder.value;
+        unique<TupsafeBorrowed> owner = move raw;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void tupsafeBorrowedGlobalDecl()
+    {
+        TupsafeBorrowed* raw = &tupsafeBorrowedGlobal;
+        unique<TupsafeBorrowed> owner = move raw;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void tupsafeBorrowedCopyDecl()
+    {
+        TupsafeBorrowed value = default;
+        TupsafeBorrowed* raw = &value;
+        TupsafeBorrowed* copy = raw;
+        unique<TupsafeBorrowed> owner = move copy;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void tupsafeBorrowedAssign()
+    {
+        unique<TupsafeBorrowed> owner = new TupsafeBorrowed();
+        TupsafeBorrowed value = default;
+        TupsafeBorrowed* raw = &value;
+        owner = move raw;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    unique<TupsafeBorrowed> tupsafeBorrowedReturn()
+    {
+        TupsafeBorrowed value = default;
+        TupsafeBorrowed* raw = &value;
+        return move raw;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void tupsafeBorrowedTuple()
+    {
+        TupsafeBorrowed value = default;
+        TupsafeBorrowed* raw = &value;
+        (unique<TupsafeBorrowed>, int) tuple = (move raw, 4);
+    }
+}

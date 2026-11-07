@@ -1,0 +1,10 @@
+import "application.cb";
+
+expect_error("application icon paths cannot contain string interpolation") {
+    application AppInfo badIcon = {
+        name = "Icon", identifier = "com.cflat.error.appicon",
+        icon = { { image = embed("icon{name}.png") } }
+    };
+}
+
+extern int main() { return 0; }

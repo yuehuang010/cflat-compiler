@@ -1451,6 +1451,14 @@ void LLVMBackend::EmitError(std::string message, std::string sourceMessage) cons
         // is re-evaluated for real later, where the diagnostic (if any) fires normally.
         if (suppressErrors_)
             throw SpeculativeEvalAbort{};
+        // A fragment-lowered diagnostic reports at its original argument. EmitError always throws
+        // or exits, so the location it leaves in currentLine/currentColumn is never read again.
+        if (fragmentDiagnosticAnchor_.active && fragmentDiagnosticAnchor_.file == sourceFileName)
+        {
+            auto* self = const_cast<LLVMBackend*>(this);
+            self->currentLine = fragmentDiagnosticAnchor_.line;
+            self->currentColumn = fragmentDiagnosticAnchor_.column;
+        }
         // An expect_error match is not a real diagnostic - test it before the sink dispatch so it
         // never reaches the editor as a live error, nor aborts LSP analysis of the rest of the file.
         const std::string& matchMessage = sourceMessage.empty() ? message : sourceMessage;
@@ -7485,23 +7493,33 @@ bool LLVMBackend::TernaryArmIsProvenBorrow(llvm::Value* armValue, llvm::Value* a
 
 bool LLVMBackend::MoveSourceIsAddressBorrow(const NamedVariable& source) const
 {
-        // Only a plain local or parameter slot is provable; fields, elements and derefs keep
-        // their own owning-slot rules.
-        if (!source.FieldName.empty() || !source.FieldPathText.empty() || source.IsElementAccess)
+        if (source.TypeAndValue.IsArrayView || source.TypeAndValue.ElemPointer != 0
+            || source.TypeAndValue.ConstArraySize > 0
+            || source.TypeAndValue.IsFlexibleArrayMember)
             return false;
+        if (source.IsOwning || source.IsNewAllocated || source.IsOwningStruct
+            || source.IsOwningString)
+            return false;
+        if (source.PointsToBorrowedAddress || IsBorrowedAddressValue(source.Primary)
+            || IsProvableNonHeapAddress(source.Primary))
+            return true;
         const llvm::Value* storage = source.MoveSourceStorage != nullptr
             ? source.MoveSourceStorage : source.Storage;
-        if (!llvm::isa_and_nonnull<llvm::AllocaInst>(storage)) return false;
-        const NamedVariable* live = FindVariableByStorage(storage);
-        if (live == nullptr || live->IsOwning || live->IsNewAllocated
-            || live->IsOwningStruct || live->IsOwningString)
-            return false;
-        return live->PointsToBorrowedAddress || source.PointsToBorrowedAddress;
+        if (llvm::isa_and_nonnull<llvm::AllocaInst>(storage))
+        {
+            const NamedVariable* live = FindVariableByStorage(storage);
+            return live != nullptr && !live->IsOwning && !live->IsNewAllocated
+                && !live->IsOwningStruct && !live->IsOwningString
+                && live->PointsToBorrowedAddress;
+        }
+        if (llvm::isa_and_nonnull<llvm::GlobalVariable>(storage))
+            return globalAssignBorrowedAddress_.count(storage) != 0;
+        return false;
     }
 
 void LLVMBackend::LogBorrowedMoveSlotError() const
 {
-        LogErrorMessage("cannot move a borrowed pointer; move from the owning slot");
+        LogError("cannot move a borrowed pointer; move from the owning slot");
     }
 
 bool LLVMBackend::IsUniqueOwningCallResult(const TypeAndValue& result) const

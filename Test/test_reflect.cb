@@ -3,12 +3,17 @@ import "list.cb";
 import "array.cb";
 import "json.cb";
 import "xml.cb";
+import "application.cb";
 import "diagnostic/heap_audit.cb";
 
 annotation Private   { };
 annotation JsonName  { string value; };
 annotation JsonText  { };
 annotation MaxLength { int value; };
+
+application AppInfo bracefoldTestApp = {
+    name = "Reflect {{Name}}", identifier = "com.cflat.reflect.bracefold"
+};
 
 // -- Structs ------------------------------------------------------------------
 
@@ -130,6 +135,24 @@ struct AnnotatedPerson {
     int age = 0;
 
     string lastName = default;
+};
+
+struct BracefoldAnnotationProbe {
+    [JsonName("v{{x}}")]
+    int ordinary = 0;
+    [JsonName(r"raw {{x}}")]
+    int raw = 0;
+    [JsonName("k{{x}}\t")]
+    int tab = 0;
+};
+
+struct BracefoldVerbatimPlainBraceAnnotationProbe {
+    [JsonName("{\"a\"} {}}")]
+    int value = 0;
+};
+
+struct BracefoldVerbatimPlainBraceJsonProbe {
+    string value = default;
 };
 
 enum JsonConstDpi : int { JsonConstUnaware, JsonConstSystem, JsonConstPerMonitor, JsonConstPerMonitorV2 };
@@ -356,6 +379,8 @@ extern int main()
     // Annotation tests
     // =========================================================================
 
+    total++; passed += Test("application name brace folding", Application.name(), r"Reflect {Name}");
+
     string fn = annotationof(AnnotatedPerson, "firstName", "JsonName");
     total++; passed += Test("JsonName on firstName", fn.data(), "first_name");
 
@@ -370,6 +395,29 @@ extern int main()
 
     string none = annotationof(AnnotatedPerson, "lastName", "JsonName");
     total++; passed += Test("no annotation on lastName", none.length(), 0);
+
+    string foldedAnnotation = annotationof(BracefoldAnnotationProbe, "ordinary", "JsonName");
+    string runtimeAnnotation = "v{{x}}";
+    total++; passed += Test("annotationof folds ordinary braces",
+        foldedAnnotation.data(), runtimeAnnotation.data());
+
+    string rawAnnotation = annotationof(BracefoldAnnotationProbe, "raw", "JsonName");
+    total++; passed += Test("annotationof keeps raw braces", rawAnnotation.data(), r"raw {{x}}");
+
+    string annotationJson = json_const(BracefoldAnnotationProbe,
+        { ordinary = 1, raw = 2, tab = 3 });
+    total++; passed += Test("json_const folds annotation key and decodes escapes",
+        annotationJson.data(), r#"{"v{x}":1,"raw {{x}}":2,"k{x}\t":3}"#);
+
+    string verbatimPlainBraceAnnotation = annotationof(
+        BracefoldVerbatimPlainBraceAnnotationProbe, "value", "JsonName");
+    total++; passed += Test("annotationof keeps plain braces after a verbatim region",
+        verbatimPlainBraceAnnotation.data(), "{\"a\"} {}}");
+
+    string verbatimPlainBraceJson = json_const(BracefoldVerbatimPlainBraceJsonProbe,
+        { value = "{\"a\"} {}}" });
+    total++; passed += Test("json_const keeps plain braces after a verbatim region",
+        verbatimPlainBraceJson.data(), "{\"value\":\"{\\\"a\\\"} {}}\"}");
 
     // =========================================================================
     // json_const() compile-time fold tests

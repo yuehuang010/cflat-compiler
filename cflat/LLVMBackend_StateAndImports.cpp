@@ -2448,6 +2448,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
             if (s.FuncPtrReturnPointer) j["fprp"] = true;
             if (s.FuncPtrReturnOwned) j["fpro"] = true;
             if (s.FuncPtrReturnAlias) j["fpra"] = true;
+            if (!s.FuncPtrReturnAliasSpelling.empty()) j["fpras"] = s.FuncPtrReturnAliasSpelling;
             if (s.FuncPtrVariadic) j["fpv"] = true;
             if (s.FuncPtrReturnPointerDepth > 1) j["fprd"] = s.FuncPtrReturnPointerDepth;
             if (!s.FuncPtrReturnResolvedKey.empty()) j["fprk"] = s.FuncPtrReturnResolvedKey;
@@ -2531,6 +2532,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
             s.FuncPtrReturnPointer = j.value("fprp", false);
             s.FuncPtrReturnOwned = j.value("fpro", false);
             s.FuncPtrReturnAlias = j.value("fpra", false);
+            s.FuncPtrReturnAliasSpelling = j.value("fpras", std::string{});
             s.FuncPtrVariadic = j.value("fpv", false);
             s.FuncPtrReturnPointerDepth = j.value("fprd", s.FuncPtrReturnPointerDepth);
             s.FuncPtrReturnResolvedKey = j.value("fprk", std::string{});
@@ -2901,6 +2903,7 @@ nlohmann::json LLVMBackend::FieldToJson(const CRecordFieldEntry& f)
         nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
         if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
         if (f.isPromoted) j["pr"] = true;
+        if (f.isAnonymousMember) j["am"] = true;
         if (f.isZeroSize) j["zs"] = true;
         if (f.isConst) j["c"] = true;
         if (f.isMutable) j["mu"] = true;
@@ -2920,6 +2923,7 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
         f.ctype     = j.value("ct", std::string{});
         f.isBitfield = j.value("bf", false);
         f.isPromoted = j.value("pr", false);
+        f.isAnonymousMember = j.value("am", false);
         f.isZeroSize = j.value("zs", false);
         f.isConst = j.value("c", false);
         f.isMutable = j.value("mu", false);

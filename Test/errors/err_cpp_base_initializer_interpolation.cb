@@ -1,0 +1,10 @@
+import cpp "cpp_bracefold_base.hpp";
+
+expect_error("C++ base initializer string literals cannot contain interpolation") {
+    [cpp] struct BadBracefoldBase : bracefold.Base
+    {
+        BadBracefoldBase() : bracefold.Base("a{name}") {}
+    };
+}
+
+extern int main() { return 0; }

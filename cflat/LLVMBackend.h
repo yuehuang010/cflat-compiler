@@ -128,6 +128,38 @@ inline const char* CxxCompactIntegerSpellingToCflat(std::string_view compact)
 #include <llvm/TargetParser/Host.h>
 #pragma warning(pop)
 #include "platform/GeneratedParser.h" // antlr runtime + generated parser/lexer/listener + kTokenEOF
+
+// True for a nullptr literal, its parentheses, or either value arm of a ternary. Other operators,
+// casts, names, and calls keep their ordinary resolved-value behavior.
+inline bool IsNullptrLiteralExpressionTree(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+        conditional != nullptr && conditional->expression() != nullptr)
+        return IsNullptrLiteralExpressionTree(conditional->expression())
+            || IsNullptrLiteralExpressionTree(conditional->conditionalExpression());
+    if (auto* argument = dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node))
+        return argument->assignmentExpression() != nullptr
+            && IsNullptrLiteralExpressionTree(argument->assignmentExpression());
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+    {
+        if (primary->NullPtrConstant() != nullptr) return true;
+        if (primary->Constant() != nullptr)
+            return false;
+        return primary->expression() != nullptr
+            && IsNullptrLiteralExpressionTree(primary->expression());
+    }
+    auto* rule = dynamic_cast<antlr4::RuleContext*>(node);
+    if (rule == nullptr) return false;
+    antlr4::RuleContext* onlyRuleChild = nullptr;
+    for (auto* child : node->children)
+        if (auto* childRule = dynamic_cast<antlr4::RuleContext*>(child))
+        {
+            if (onlyRuleChild != nullptr) return false;
+            onlyRuleChild = childRule;
+        }
+    return onlyRuleChild != nullptr && IsNullptrLiteralExpressionTree(onlyRuleChild);
+}
 #include <fstream>
 #include "ArgParser.h"
 #include "CClangExtract.h"
@@ -572,8 +604,103 @@ inline bool IsBareTypeName(const std::string& s)
 
 // Strip surrounding quotes from an ANTLR StringLiteral token text (e.g. `"foo"` -> `foo`).
 // Returns the raw text unchanged if it is shorter than 2 characters.
+inline bool TryRawStringOpening(std::string_view text, size_t start,
+                               size_t& contentStart, size_t& hashCount)
+{
+    if (start >= text.size() || text[start] != 'r') return false;
+    if (start > 0)
+    {
+        const char previous = text[start - 1];
+        const bool identifierChar = (previous >= 'A' && previous <= 'Z')
+            || (previous >= 'a' && previous <= 'z')
+            || (previous >= '0' && previous <= '9') || previous == '_';
+        if (identifierChar) return false;
+    }
+    size_t quote = start + 1;
+    while (quote < text.size() && text[quote] == '#') ++quote;
+    if (quote >= text.size() || text[quote] != '"') return false;
+    hashCount = quote - start - 1;
+    contentStart = quote + 1;
+    return true;
+}
+
+inline bool RawStringClosingDelimiterAt(std::string_view text, size_t quote,
+                                        size_t hashCount, size_t& afterClose)
+{
+    if (quote >= text.size() || text[quote] != '"') return false;
+    if (hashCount > text.size() - quote - 1) return false;
+    for (size_t i = 0; i < hashCount; ++i)
+        if (text[quote + 1 + i] != '#') return false;
+    afterClose = quote + 1 + hashCount;
+    return true;
+}
+
+inline bool SkipRawStringSpelling(std::string_view text, size_t& pos)
+{
+    size_t contentStart = 0;
+    size_t hashCount = 0;
+    if (!TryRawStringOpening(text, pos, contentStart, hashCount)) return false;
+    pos = contentStart;
+    while (pos < text.size())
+    {
+        size_t afterClose = 0;
+        if (RawStringClosingDelimiterAt(text, pos, hashCount, afterClose))
+        {
+            pos = afterClose;
+            return true;
+        }
+        ++pos;
+    }
+    return true;
+}
+
+inline bool IsRawStringTokenSpelling(std::string_view text)
+{
+    size_t contentStart = 0;
+    size_t hashCount = 0;
+    if (!TryRawStringOpening(text, 0, contentStart, hashCount)) return false;
+    size_t pos = contentStart;
+    while (pos < text.size())
+    {
+        size_t afterClose = 0;
+        if (RawStringClosingDelimiterAt(text, pos, hashCount, afterClose))
+            return afterClose == text.size();
+        ++pos;
+    }
+    return false;
+}
+
 inline std::string DequoteStringLiteral(const std::string& raw)
 {
+    if (raw.size() >= 3 && raw[0] == 'r')
+    {
+        size_t quote = 1;
+        while (quote < raw.size() && raw[quote] == '#') ++quote;
+        if (quote < raw.size() && raw[quote] == '"')
+        {
+            const size_t hashes = quote - 1;
+            if (raw.size() > quote + hashes + 1)
+            {
+                const size_t close = raw.size() - hashes - 1;
+                bool matching = close > quote && raw[close] == '"';
+                for (size_t i = close + 1; matching && i < raw.size(); ++i)
+                    matching = raw[i] == '#';
+                if (matching)
+                {
+                    std::string contents = raw.substr(quote + 1, close - quote - 1);
+                    std::string normalized;
+                    normalized.reserve(contents.size());
+                    for (size_t i = 0; i < contents.size(); ++i)
+                    {
+                        if (contents[i] == '\r' && i + 1 < contents.size() && contents[i + 1] == '\n')
+                            continue;
+                        normalized += contents[i];
+                    }
+                    return normalized;
+                }
+            }
+        }
+    }
     return raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : raw;
 }
 
@@ -1018,6 +1145,8 @@ public:
         // A reader of these three must therefore NOT assume IsFunctionPointer (FuncPtrSignatureOf
         // is the first such reader); a reader of IsFunctionPointer may still assume these.
         std::string FuncPtrReturnTypeName;
+        // Written return alias for diagnostics; signature identity uses the resolved name above.
+        std::string FuncPtrReturnAliasSpelling;
         std::shared_ptr<TypeAndValue> FuncPtrReturnFunctionType;
         bool FuncPtrReturnPointer = false;
         // Return ownership is semantic metadata carried by a stored function value. It is
@@ -1101,6 +1230,10 @@ public:
         bool IsFlexibleArrayMember = false;
         // C's `T field[0]` permits sizeof(field)==0; `T field[]` remains incomplete.
         bool IsZeroLengthArrayMember = false;
+        bool IsAnonymousMember = false;
+        // Fields declared by inline aggregate syntax need their own default construction even
+        // when the containing member has no written initializer.
+        bool IsInlineAggregateField = false;
 
         // Allocation-alignment clause: arg2 of `alignas(slot, alloc)`. Records that the heap BLOCK
         // this pointer/array-view owns is N-aligned so a field/param/return and the matching
@@ -1506,6 +1639,7 @@ public:
         std::string GuardedBy;
         bool IsFunctionPointer = false;
         std::string FuncPtrReturnTypeName;
+        std::string FuncPtrReturnAliasSpelling;
         std::shared_ptr<SerializedTav> FuncPtrReturnFunctionType;
         bool FuncPtrReturnPointer = false;
         bool FuncPtrReturnOwned = false;
@@ -1543,6 +1677,8 @@ public:
         bool IsArrayView = false;
         bool IsFlexibleArrayMember = false;
         bool IsZeroLengthArrayMember = false;
+        bool IsAnonymousMember = false;
+        bool IsInlineAggregateField = false;
         uint64_t AllocAlignValue = 0;
         uint64_t NewAllocAlignment = 0;
         std::string EnumBacking;
@@ -1590,6 +1726,7 @@ public:
             s.GuardedBy = t.GuardedBy;
             s.IsFunctionPointer = t.IsFunctionPointer;
             s.FuncPtrReturnTypeName = t.FuncPtrReturnTypeName;
+            s.FuncPtrReturnAliasSpelling = t.FuncPtrReturnAliasSpelling;
             if (t.FuncPtrReturnFunctionType)
                 s.FuncPtrReturnFunctionType = std::make_shared<SerializedTav>(From(*t.FuncPtrReturnFunctionType));
             s.FuncPtrReturnPointer = t.FuncPtrReturnPointer;
@@ -1630,6 +1767,8 @@ public:
             s.IsArrayView = t.IsArrayView;
             s.IsFlexibleArrayMember = t.IsFlexibleArrayMember;
             s.IsZeroLengthArrayMember = t.IsZeroLengthArrayMember;
+            s.IsAnonymousMember = t.IsAnonymousMember;
+            s.IsInlineAggregateField = t.IsInlineAggregateField;
             s.AllocAlignValue = t.AllocAlignValue;
             s.NewAllocAlignment = t.NewAllocAlignment;
             return s;
@@ -1677,6 +1816,7 @@ public:
             t.GuardedBy = GuardedBy;
             t.IsFunctionPointer = IsFunctionPointer;
             t.FuncPtrReturnTypeName = FuncPtrReturnTypeName;
+            t.FuncPtrReturnAliasSpelling = FuncPtrReturnAliasSpelling;
             if (FuncPtrReturnFunctionType)
                 t.FuncPtrReturnFunctionType = std::make_shared<TypeAndValue>(FuncPtrReturnFunctionType->ToTypeAndValue());
             t.FuncPtrReturnPointer = FuncPtrReturnPointer;
@@ -1717,6 +1857,8 @@ public:
             t.IsArrayView = IsArrayView;
             t.IsFlexibleArrayMember = IsFlexibleArrayMember;
             t.IsZeroLengthArrayMember = IsZeroLengthArrayMember;
+            t.IsAnonymousMember = IsAnonymousMember;
+            t.IsInlineAggregateField = IsInlineAggregateField;
             t.AllocAlignValue = AllocAlignValue;
             t.NewAllocAlignment = NewAllocAlignment;
             return t;
@@ -2335,6 +2477,9 @@ public:
         bool         borrowsOwnedElement = false;
         bool         borrowedElementExternallyOwned = false;
         std::string  ownedElementContainer;
+        bool         stackCharBufferBorrow = false;
+        std::string  stackCharBufferSource;
+        size_t       stackCharBufferScopeDepth = 0;
         bool         isPointerArithmeticResult = false; // `p + n` / `p - n` pointer result
         // Narrow width (1, 8 or 16) an int arithmetic result was built from (r3 call-argument mark), else 0.
         // Set from operand TYPES where the operation is typed; read only by call-argument classification.
@@ -2635,7 +2780,17 @@ public:
     size_t currentColumn = 0;
 
     public:
-    TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
+    // While a re-parsed fragment (string(...) lowering) is lowered, its tokens sit at fragment
+    // coordinates. Every diagnostic in that window reports at this anchor in the source file instead.
+    struct FragmentDiagnosticAnchor
+    {
+        bool active = false;
+        std::string file;
+        size_t line = 0;
+        size_t column = 0;
+    };
+    FragmentDiagnosticAnchor fragmentDiagnosticAnchor_;
+    TypeAndValue lastCallReturnType;       // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
     // Result value of the LAST call when it returned an owning `unique` result, else null (see
     // IsUniqueOwningCallResult). Gates compare an RHS value against it, so methods are covered too.
     llvm::Value* lastUniqueOwningCallResult = nullptr;
@@ -5092,6 +5247,7 @@ private:
         // reported offset - RegisterCRecords computes it from MSVC ABI rules.
         bool isBitfield = false;
         bool isPromoted = false;
+        bool isAnonymousMember = false;
         bool isZeroSize = false;
         bool isConst = false;
         bool isMutable = false;
@@ -5470,6 +5626,9 @@ private:
 
     // Fold-only view of file-scope `const` integer globals (see SetConstGlobalInt).
     std::unordered_map<std::string, int64_t> constGlobalInts_;
+    // Fixed-array global types seeded before generic type shells are scanned.
+    std::unordered_map<std::string, TypeAndValue> scanTimeGlobalVariableTypes_;
+    std::vector<std::unordered_map<std::string, TypeAndValue>> scanTimeVariableTypeScopes_;
     // Import discovery records decisions so later passes select the same file-scope arm.
     std::unordered_map<const CFlatParser::IfConstDeclarationContext*, int>
         sourceOrderedIfConstDecisions_;
@@ -9789,6 +9948,7 @@ public:
     TypeAndValue FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p, size_t index) const;
     // Display text of a named-pointer-alias param (its AliasSpelling plus the written stars).
     std::string FuncPtrAliasParamSpelling(const TypeAndValue::FuncPtrParam& p) const;
+    std::string FuncPtrAliasComponentSpelling(const std::string& spelling) const;
 
     // Is this argument PROVABLY a data pointer being passed to a closure parameter? Deliberately
     // one-sided: it answers yes only when the frontend positively recorded a pointer that is not
@@ -10094,6 +10254,9 @@ public:
     llvm::Value* CreateExtractValue(llvm::Value* structInstance, unsigned int index);
 
     llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false, llvm::Type* explicitDestType = nullptr, bool destUnsigned = false, bool destIsArrayView = false);
+
+    static llvm::ConstantFP* ConvertIntegerConstantToFloatingPoint(
+        const llvm::ConstantInt* value, llvm::Type* destType, bool srcIsUnsigned);
 
     llvm::LoadInst* CreateLoad(llvm::Value* value);
 
@@ -13204,6 +13367,23 @@ public:
      */
     void SetConstGlobalInt(const std::string& name, int64_t value);
     bool TryGetConstGlobalInt(const std::string& name, int64_t& out) const;
+    void SetScanTimeGlobalVariableType(const std::string& name, const TypeAndValue& type);
+    std::optional<TypeAndValue> GetScanTimeGlobalVariableType(const std::string& name) const;
+    void PushScanTimeVariableTypeScope();
+    void PopScanTimeVariableTypeScope();
+    void SetScanTimeVariableType(const std::string& name, const TypeAndValue& type);
+    std::optional<TypeAndValue> GetScanTimeVariableType(const std::string& name) const;
+    struct ScanTimeVariableTypeScopeGuard
+    {
+        LLVMBackend* Backend;
+        explicit ScanTimeVariableTypeScopeGuard(LLVMBackend* backend) : Backend(backend)
+        {
+            Backend->PushScanTimeVariableTypeScope();
+        }
+        ~ScanTimeVariableTypeScopeGuard() { Backend->PopScanTimeVariableTypeScope(); }
+        ScanTimeVariableTypeScopeGuard(const ScanTimeVariableTypeScopeGuard&) = delete;
+        ScanTimeVariableTypeScopeGuard& operator=(const ScanTimeVariableTypeScopeGuard&) = delete;
+    };
     void SetSourceOrderedIfConstDecision(
         const CFlatParser::IfConstDeclarationContext* ctx, int decision);
     std::optional<int> GetSourceOrderedIfConstDecision(
@@ -14549,7 +14729,9 @@ public:
     // 312: class-default text only when the bound expression re-reads to the same meaning.
     // 313: default initializers are verified against the bound default (identity), else refused.
     // 314: variable template explicit/partial specializations join the template's group; deleted-rvalue ctor requests.
-    static constexpr int kCHeaderCacheVersion = 316;
+    // 317: C anonymous-member fields use an unspellable marker; inline aggregate fields retain default-construction metadata.
+    // 318: default numeric values retain their declared parameter conversion in extracted metadata.
+    static constexpr int kCHeaderCacheVersion = 318;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

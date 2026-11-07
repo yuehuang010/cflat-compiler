@@ -2025,24 +2025,6 @@ static bool JsonConstIdentifier(const std::string& text)
     return true;
 }
 
-static bool JsonConstStringToken(const std::string& text)
-{
-    size_t quote = 0;
-    if (text.starts_with("u8")) quote = 2;
-    else if (!text.empty() && (text[0] == 'u' || text[0] == 'U' || text[0] == 'L')) quote = 1;
-    if (quote >= text.size() || text[quote] != '"') return false;
-
-    bool escaped = false;
-    for (size_t i = quote + 1; i < text.size(); ++i)
-    {
-        char c = text[i];
-        if (!escaped && c == '"') return i + 1 == text.size();
-        if (!escaped && c == '\\') escaped = true;
-        else escaped = false;
-    }
-    return false;
-}
-
 static bool JsonConstIntegerToken(const std::string& text)
 {
     if (text.empty()) return false;
@@ -2219,8 +2201,9 @@ std::optional<std::string> MainListener::FoldConstLiteral(
         if (fieldType == "string")
         {
             std::string value;
-            if (JsonConstStringToken(raw) && !HasInterpolation(raw))
-                value = ProcessRawText(raw);
+            if (auto literalValue = StringLiteralExpressionValue(expression);
+                literalValue.has_value() && !literalValue->HasExpressionSegment)
+                value = literalValue->Value;
             else if (auto constant = compiler->GetCompileTimeStringConstant(raw))
                 value = *constant;
             else
@@ -2380,21 +2363,25 @@ std::optional<std::string> MainListener::FoldConstLiteral(
                     || !(displayName == "xmlns" || displayName.starts_with("xmlns:")))
                     continue;
                 std::string raw;
+                CFlatParser::AssignmentExpressionContext* sourceExpression = nullptr;
                 if (auto it = named.find(field.VariableName); it != named.end())
                 {
                     auto* source = it->second;
                     if (source->initializerList() != nullptr || source->Colon() != nullptr
                         || source->assignmentExpression().size() != 1)
                         continue;
-                    raw = source->assignmentExpression(0)->getText();
+                    sourceExpression = source->assignmentExpression(0);
                 }
                 else if (field.Initializer != nullptr
                     && field.Initializer->assignmentExpression() != nullptr)
-                    raw = field.Initializer->assignmentExpression()->getText();
+                    sourceExpression = field.Initializer->assignmentExpression();
                 else
                     continue;
-                if (JsonConstStringToken(raw) && !HasInterpolation(raw))
-                    xmlNamespaceBindings[displayName] = ProcessRawText(raw);
+                if (sourceExpression == nullptr) continue;
+                raw = sourceExpression->getText();
+                if (auto literalValue = StringLiteralExpressionValue(sourceExpression);
+                    literalValue.has_value() && !literalValue->HasExpressionSegment)
+                    xmlNamespaceBindings[displayName] = literalValue->Value;
             }
 
         auto recordXmlTextLeaf = [&](const std::string& displayName, const std::string& value) {
@@ -2579,6 +2566,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             DiagnoseAssignmentArguments(argumentList);
         const size_t arrowTempMark = arrowOwnedTemps_.size();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        if (ctx->argumentExpressionList().size() == 1)
+            CarryStringViewConstructionBorrow(ctx, namedVar);
         if (namedVar.Primary != nullptr
             && namedVar.Primary->getType() == Compiler(ctx)->GetClosureFatPtrType()
             && Compiler(ctx)->lastCallIsBonded)
@@ -5647,6 +5636,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             Compiler(ctx)->UniqueFieldNullKey(namedVar));
                                 }
                             }
+                            else if (LLVMBackend::NamedVariable anonNV;
+                                     ResolveTransparentAnonField(ctx, structVar, primaryIdentifier, anonNV))
+                            {
+                                // Resolve promoted fields before free-function and method fallbacks.
+                                // Otherwise a same-named global function can hide the field.
+                                namedVar = anonNV;
+                            }
                             // C++ `obj.f()` for a static-only member function is the qualified call
                             // `Owner.f()`; the receiver is a plain operand, already evaluated. A name
                             // with non-static overloads too is selected at the call (over both sets).
@@ -5693,15 +5689,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
                                         danglingMemberOwner = st->getName().str();
                                 danglingIsMethod = true;
-                            }
-                            else if (LLVMBackend::NamedVariable anonNV;
-                                     ResolveTransparentAnonField(ctx, structVar, primaryIdentifier, anonNV))
-                            {
-                                // C11 transparent anonymous-member access: the field lives inside an
-                                // anonymous (synthetic "__anonN") struct/union member of the base
-                                // (e.g. LARGE_INTEGER's LowPart/HighPart). Resolved as if written
-                                // base.__anonN.field.
-                                namedVar = anonNV;
                             }
                             // A static member of a private/protected base named through an
                             // instance: the helper names the base (clang's text).
@@ -6180,8 +6167,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // primary yielded an EMPTY NamedVariable with no diagnostic. A FIELD of
                             // the enclosing struct, read bare through the implicit 'this', counts.
                             const bool localTypeMember = followedByDot && localTypeShadowsValue;
+                            const bool genericValueParameter =
+                                !(followedByDot
+                                    && (Compiler(ctx)->IsNamespace(idName)
+                                        || Compiler(ctx)->IsCxxNamespace(idName)))
+                                && activeValueSubstitutions.find(idName) != activeValueSubstitutions.end();
                             const bool localOrMemberVariable =
-                                Compiler(ctx)->GetLocalVariable(idName).Storage != nullptr
+                                genericValueParameter
+                                || Compiler(ctx)->GetLocalVariable(idName).Storage != nullptr
                                 || Compiler(ctx)->GetFunctionArgument(idName).GetValue() != nullptr
                                 || Compiler(ctx)->HasMemberVariable(idName);
                             const bool globalVariable =
@@ -6267,6 +6260,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 structVar = {};
                             }
                             else if (prevPrimary->genericIdentifier()->genericTypeParameters() == nullptr
+                                     && !genericValueParameter
                                      && (Compiler(ctx)->IsDataStructure(qualifiedName)
                                          || !lexicalAggregateType.empty())
                                      && !namesEnclosingMethod
@@ -6381,9 +6375,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             // A parenthesized primary that IS the whole postfix expression keeps the
                             // caller's position; a suffix (`(g())(x)`, `(p).f`) consumes it as a value.
-                            namedVar.Primary = ParsePrimaryExpression(
-                                prevPrimary, childLimit == 1 ? use : ResultUse::Value);
-                            namedVar.Storage = nullptr;
+                            const bool stringFunctional = prevPrimary->String() != nullptr
+                                && prevPrimary->argumentExpressionList() != nullptr;
+                            if (stringFunctional)
+                                namedVar = ParseStringFunctionalConstruction(prevPrimary,
+                                    childLimit == 1 ? use : ResultUse::Value);
+                            else
+                            {
+                                namedVar.Primary = ParsePrimaryExpression(
+                                    prevPrimary, childLimit == 1 ? use : ResultUse::Value);
+                                namedVar.Storage = nullptr;
+                            }
                             if (auto* literal = prevPrimary->Constant())
                             {
                                 auto literalType = ParseLiteralTypeAndValue(literal->getText());
@@ -6393,6 +6395,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
                                         literal->getText(), &namedVar.LiteralIdentitySuffixed);
                                 }
+                                namedVar.IsRvalue = true;
+                            }
+                            else if (prevPrimary->NullPtrConstant() != nullptr)
+                            {
                                 namedVar.IsRvalue = true;
                             }
                             if (!prevPrimary->StringLiteral().empty())
@@ -6431,6 +6437,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // suffix and the caller both see the right type, not an empty one.
                             if (prevPrimary->Default() != nullptr && !declExpectedType.TypeName.empty())
                                 namedVar.TypeAndValue = declExpectedType;
+                            // A suffixed string(...) value is a by-value receiver. It already carries its
+                            // BaseType, so the struct-receiver block below skips it and nothing gives
+                            // `.method()` an address: materialize it into a temp, as `((string)p)` does.
+                            if (stringFunctional && childLimit > 1 && namedVar.Storage == nullptr
+                                && namedVar.Primary != nullptr)
+                            {
+                                auto* dot = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[1]);
+                                auto sd = Compiler(ctx)->GetDataStructure("string");
+                                if (dot != nullptr && dot->getSymbol()->getType() == CFlatParser::Dot
+                                    && sd.StructType != nullptr
+                                    && namedVar.Primary->getType() == sd.StructType)
+                                {
+                                    auto* tmp = Compiler(ctx)->CreateAlloca(sd.StructType);
+                                    Compiler(ctx)->builder->CreateStore(namedVar.Primary, tmp);
+                                    namedVar.Storage = tmp;
+                                    namedVar.BaseType = sd.StructType;
+                                }
+                            }
                             // A STRING LITERAL followed by `.method()` is an ordinary `string`
                             // receiver: wrap the global into a {ptr,len} `string` and give it a
                             // temp slot, the same materialization the two-statement workaround
@@ -6441,7 +6465,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && namedVar.TypeAndValue.TypeName.empty())
                             {
                                 auto* compilerP = Compiler(ctx);
-                                bool isStringLiteral = prevPrimary->StringLiteral().size() == 1;
+                                bool isStringLiteral = !prevPrimary->StringLiteral().empty();
                                 if (!isStringLiteral && prevPrimary->expression() != nullptr)
                                 {
                                     if (auto* literalValue = llvm::dyn_cast<llvm::Constant>(namedVar.Primary))
@@ -6655,10 +6679,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // matching the two-statement `string t = (string)buf; t.copy()` workaround.
                             // An lvalue (`(*p)`) already has storage; keep it so writes land in the
                             // pointee rather than a copy.
+                            // A whole-expression string(...) value is left as the cast spells it:
+                            // a suffix-free result gets no temp, so `string s = string("x")` borrows.
                             if (namedVar.Primary != nullptr
                                 && namedVar.BaseType == nullptr
                                 && !namedVar.TypeAndValue.Pointer
-                                && !namedVar.TypeAndValue.TypeName.empty())
+                                && !namedVar.TypeAndValue.TypeName.empty()
+                                && !(stringFunctional && childLimit == 1))
                             {
                                 auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
                                 if (sd.StructType != nullptr
@@ -7110,6 +7137,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
                             namedVar.BaseType = elementType;
                             namedVar.TypeAndValue = elementTypeAndValue;
+                            namedVar.UnionFieldType = nullptr;
                             ClearCxxPrvalueProvenance(namedVar);
                         }
                         else
@@ -8095,6 +8123,75 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
 
+                        // countof is an unevaluated expression intrinsic. Ordinary symbols resolve first.
+                        if (!postfixMemberCallPending && functionName == "countof"
+                            && namedVar.Primary == nullptr && namedVar.Storage == nullptr
+                            && namedVar.TypeAndValue.TypeName.empty() && namedVar.CallerName.empty())
+                        {
+                            auto* compiler = Compiler(ctx);
+                            const std::string resolvedName = compiler->ResolveQualifiedName(functionName);
+                            const bool hasResolvedFunction = compiler->GetFunction(resolvedName) != nullptr;
+                            const bool hasGenericFunction = genericFunctionTemplates.count(
+                                compiler->ResolveGenericFunctionBase(resolvedName)) != 0;
+                            const bool hasReturnBlock = compiler->GetReturnBlock(resolvedName) != nullptr;
+                            const auto aggregateScopes = EnclosingAggregateScopesForCall(compiler, primaryCtx);
+                            auto thisVariable = compiler->GetThisPointer();
+                            std::string methodOwner = thisVariable.TypeAndValue.TypeName;
+                            if (methodOwner.empty())
+                                methodOwner = EnclosingAggregateScopeFromContext(compiler, primaryCtx);
+                            methodOwner = LexicalAggregateMemberOwner(
+                                compiler, aggregateScopes, functionName, methodOwner, primaryCtx);
+                            const bool hasImplicitMemberFunction = !methodOwner.empty()
+                                && (HasCFlatMemberMethod(methodOwner, functionName)
+                                    || !GenericMethodTemplateKey(methodOwner, functionName).empty());
+                            if (!hasResolvedFunction && !hasGenericFunction && !hasReturnBlock
+                                && !hasImplicitMemberFunction)
+                            {
+                                auto args = argumentList.empty()
+                                    ? std::vector<CFlatParser::ArgumentNamedExpressionContext*>()
+                                    : argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (args.size() != 1 || args[0]->assignmentExpression() == nullptr)
+                                {
+                                    LogErrorContext(ctx, "countof requires exactly one expression operand");
+                                    namedVar = {};
+                                    break;
+                                }
+
+                                auto* operandCtx = args[0]->assignmentExpression();
+                                std::string operandSpelling = operandCtx->getText();
+                                if (operandCtx->start != nullptr && operandCtx->stop != nullptr
+                                    && operandCtx->start->getInputStream() != nullptr)
+                                    operandSpelling = operandCtx->start->getInputStream()->getText(
+                                        antlr4::misc::Interval(operandCtx->start->getStartIndex(),
+                                            operandCtx->stop->getStopIndex()));
+                                const auto operand = EvaluateOperandTypeOnly([&]() {
+                                    return ParseAssignmentExpressionNamed(operandCtx);
+                                });
+                                const auto& type = operand.Type;
+                                uint64_t extent = type.ConstArraySize != 0
+                                    ? type.ConstArraySize : type.AliasArraySize;
+                                if (extent == 0)
+                                    if (auto* arrayType = llvm::dyn_cast_or_null<llvm::ArrayType>(operand.BaseType))
+                                        extent = arrayType->getNumElements();
+                                const std::string resolvedType = compiler->ResolveTypeAlias(type.TypeName);
+                                if (extent == 0 || type.IsArrayView || type.IsUnique
+                                    || compiler->IsCoreUniqueType(type.TypeName)
+                                    || compiler->IsCoreUniqueType(resolvedType))
+                                {
+                                    LogErrorContext(ctx, std::format(
+                                        "countof needs a fixed-size array; operand '{}'", operandSpelling));
+                                    namedVar = {};
+                                    break;
+                                }
+
+                                namedVar = {};
+                                namedVar.Primary = llvm::ConstantInt::get(
+                                    llvm::Type::getInt64Ty(*compiler->context), extent);
+                                namedVar.TypeAndValue.TypeName = "i64";
+                                break;
+                            }
+                        }
+
                         // Compile-time intrinsic: annotationof(TypeName, "fieldName", "AnnotationName")
                         // queries a field; annotationof(TypeName, "AnnotationName") queries the type
                         // itself (e.g. a class's [winrt]). Returns the annotation's argument value as
@@ -8110,10 +8207,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                 auto getArgText = [&](int idx) -> std::string {
                                     if (idx >= (int)allArgs.size()) return {};
-                                    std::string t = allArgs[idx]->assignmentExpression()->getText();
-                                    // Strip surrounding quotes from string literal args
-                                    if (t.size() >= 2 && t.front() == '"' && t.back() == '"')
-                                        return t.substr(1, t.size() - 2);
+                                    auto* expression = allArgs[idx]->assignmentExpression();
+                                    std::string t = expression->getText();
+                                    if (auto value = StringLiteralExpressionValue(expression);
+                                            value.has_value() && value->IsNarrowOrUtf8)
+                                    {
+                                        if (value->HasExpressionSegment)
+                                        {
+                                            LogErrorContext(expression,
+                                                "annotationof arguments cannot contain string interpolation");
+                                            return {};
+                                        }
+                                        return value->Value;
+                                    }
                                     return t;
                                 };
 
@@ -9348,15 +9454,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
                                 if (!namedArgCtx.empty())
                                 {
-                                    // Argument must be a string LITERAL - DequoteStringLiteral just
-                                    // strips the first/last char, so a bare identifier would yield
-                                    // garbage. Reject anything not quoted.
-                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
-                                    if (argText.size() < 2 || argText.front() != '"' || argText.back() != '"')
+                                    // Require a bare string-literal primary; do not classify by text.
+                                    auto* assignment = namedArgCtx[0]->assignmentExpression();
+                                    auto* postfix = SolePostfixExpressionShape(assignment);
+                                    const bool isStringLiteral = postfix != nullptr
+                                        && postfix->children.size() == 1
+                                        && postfix->primaryExpression() != nullptr
+                                        && !postfix->primaryExpression()->StringLiteral().empty();
+                                    if (!isStringLiteral)
                                     {
                                         LogErrorContext(ctx, "compile_error requires a string literal");
                                         break;
                                     }
+                                    std::string argText = assignment->getText();
                                     msg = DequoteStringLiteral(argText);
                                 }
                             }
@@ -9454,14 +9564,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     "literal path, as in 'embed(\"data/payload.bin\")'");
                                 break;
                             }
-                            std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
-                            if (argText.size() < 2 || argText.front() != '"' || argText.back() != '"')
+                            auto* pathExpression = namedArgCtx[0]->assignmentExpression();
+                            auto literalPathValue = StringLiteralExpressionValue(pathExpression);
+                            if (!literalPathValue.has_value() || !literalPathValue->IsNarrowOrUtf8)
                             {
                                 LogErrorContext(ctx, "embed requires a string literal path, as in "
                                     "'embed(\"data/payload.bin\")'");
                                 break;
                             }
-                            std::string literalPath = ProcessRawText(argText, false);
+                            if (literalPathValue->HasExpressionSegment)
+                            {
+                                LogErrorContext(ctx,
+                                    "embed paths cannot contain string interpolation");
+                                break;
+                            }
+                            std::string literalPath = literalPathValue->Value;
                             std::string resolvedPath;
                             std::string embedError;
                             auto bytes = compiler->LoadEmbedFile(
@@ -9782,6 +9899,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         else if (const auto* encoded = Compiler(ctx)->GetEncodedClosureType(
                                                      argExpectedDest.TypeName))
                                             lambdaExpectedType = *encoded;
+                                        if (!argExpectedDest.Pointer
+                                            && Compiler(ctx)->ResolveTypeAlias(argExpectedDest.TypeName) == "string"
+                                            && IsNullptrLiteralExpressionTree(
+                                                namedArgument->assignmentExpression()))
+                                            LogErrorContext(namedArgument->assignmentExpression(), std::format(
+                                                "cannot initialize string '{}' from nullptr",
+                                                argExpectedDest.VariableName.empty()
+                                                    ? "parameter" : argExpectedDest.VariableName));
                                         CallArgumentScope callArgumentScope(
                                             inCallArgument_, ternaryCallArgumentDepth_);
                                         DirectViewCallArgumentScope directViewArgumentScope(
@@ -10619,6 +10744,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
                                     std::optional<DeclExpectedTypeScope> ifaceArgExpectedScope;
                                     ifaceArgExpectedScope.emplace(&declExpectedType, ifaceArgExpectedDest, true);
+                                    if (!ifaceArgExpectedDest.Pointer
+                                        && Compiler(ctx)->ResolveTypeAlias(
+                                            ifaceArgExpectedDest.TypeName) == "string"
+                                        && IsNullptrLiteralExpressionTree(
+                                            namedArgument->assignmentExpression()))
+                                        LogErrorContext(namedArgument->assignmentExpression(), std::format(
+                                            "cannot initialize string '{}' from nullptr",
+                                            ifaceArgExpectedDest.VariableName.empty()
+                                                ? "parameter" : ifaceArgExpectedDest.VariableName));
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
                                     DirectViewCallArgumentScope directViewArgumentScope(
@@ -10705,6 +10839,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.Storage = argNV.Storage;
+                                    argVar.IsStaticLocal = argNV.IsStaticLocal;
                                     argVar.MoveSourcePathKey = argNV.MoveSourcePathKey;
                                     argVar.AddressedUniqueSlot = argNV.AddressedUniqueSlot;
                                     argVar.AddressedUniqueTypeName = argNV.AddressedUniqueTypeName;
@@ -10738,10 +10873,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
                                         CxxArgumentLvalueKind(namedArgument->assignmentExpression());
-                                    const std::string argText = namedArgument->assignmentExpression()->getText();
+                                    auto stringLiteral = StringLiteralExpressionValue(
+                                        namedArgument->assignmentExpression());
                                     argVar.IsStringLiteral = argNV.IsStringLiteral
-                                        || (argText.size() >= 2 && argText.front() == '"'
-                                            && argText.back() == '"');
+                                        || (stringLiteral.has_value() && stringLiteral->IsNarrow);
                                     // Tuple-literal provenance gates element-wise call conversion.
                                     argVar.IsTupleLiteral = argNV.IsTupleLiteral;
                                     argVar.TupleLiteralElements = argNV.TupleLiteralElements;
@@ -12304,6 +12439,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                                      antlr4::tree::ParseTree* node) -> bool {
                                         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
                                             return primary->Constant() != nullptr
+                                                || primary->NullPtrConstant() != nullptr
                                                 || !primary->StringLiteral().empty();
                                         auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
                                         return rule != nullptr && rule->children.size() == 1
@@ -12976,6 +13112,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.MovedFields = argNV.MovedFields;
                                     // Propagate storage and ownership so move-param zeroing works at the call site.
                                     argVar.Storage = argNV.Storage;
+                                    argVar.IsStaticLocal = argNV.IsStaticLocal;
                                     argVar.MoveSourcePathKey = argNV.MoveSourcePathKey;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.OwnsInterfaceBox = argNV.OwnsInterfaceBox;
@@ -12998,10 +13135,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
                                         CxxArgumentLvalueKind(namedArgument->assignmentExpression());
-                                    const std::string argText = namedArgument->assignmentExpression()->getText();
+                                    auto stringLiteral = StringLiteralExpressionValue(
+                                        namedArgument->assignmentExpression());
                                     argVar.IsStringLiteral = argNV.IsStringLiteral
-                                        || (argText.size() >= 2 && argText.front() == '"'
-                                            && argText.back() == '"');
+                                        || (stringLiteral.has_value() && stringLiteral->IsNarrow);
                                     // Tuple-literal provenance gates element-wise call conversion.
                                     argVar.IsTupleLiteral = argNV.IsTupleLiteral;
                                     argVar.TupleLiteralElements = argNV.TupleLiteralElements;
@@ -15278,11 +15415,77 @@ CFlatParser::CastExpressionContext* MainListener::tryGetCastExpression(antlr4::R
 
 namespace {
 
+bool RawStringParts(const std::string& text, size_t& quote, size_t& hashCount)
+{
+    if (text.empty() || text[0] != 'r') return false;
+    quote = 1;
+    while (quote < text.size() && text[quote] == '#') ++quote;
+    if (quote >= text.size() || text[quote] != '"') return false;
+    hashCount = quote - 1;
+    if (text.size() <= quote + hashCount + 1) return false;
+    const size_t closingQuote = text.size() - hashCount - 1;
+    if (closingQuote <= quote || text[closingQuote] != '"') return false;
+    for (size_t i = closingQuote + 1; i < text.size(); ++i)
+        if (text[i] != '#') return false;
+    return true;
+}
+
+bool IsRawStringLiteralText(const std::string& text)
+{
+    size_t quote = 0;
+    size_t hashCount = 0;
+    return RawStringParts(text, quote, hashCount);
+}
+
+std::string RawStringContents(const std::string& text)
+{
+    size_t quote = 0;
+    size_t hashCount = 0;
+    if (!RawStringParts(text, quote, hashCount)) return {};
+    const size_t closingQuote = text.size() - hashCount - 1;
+    const std::string source = text.substr(quote + 1, closingQuote - quote - 1);
+    std::string contents;
+    contents.reserve(source.size());
+    for (size_t i = 0; i < source.size(); ++i)
+    {
+        if (source[i] == '\r' && i + 1 < source.size() && source[i + 1] == '\n')
+            continue;
+        contents += source[i];
+    }
+    return contents;
+}
+
+std::string EscapeRawStringContents(const std::string& contents)
+{
+    std::string escaped;
+    escaped.reserve(contents.size());
+    for (char c : contents)
+    {
+        if (c == '\\') escaped += "\\\\";
+        else if (c == '"') escaped += "\\\"";
+        else if (c == '{' || c == '}')
+        {
+            escaped += '\\';
+            escaped += c;
+        }
+        else escaped += c;
+    }
+    return escaped;
+}
+
 enum class BraceKind { Escaped, PlainChar, Verbatim, Segment };
+enum class FormatPartKind { Text, EscapedOpen, EscapedClose, PlainChar, Verbatim, Segment };
+
+struct FormatPart
+{
+    FormatPartKind kind;
+    size_t begin;
+    size_t end;
+};
 
 /*
  * The single definition of what a '{' at rawText[i] means (i < end, end = index of the closing
- * quote); ParseFormatString and HasInterpolation both use it so they cannot disagree.
+ * quote); ParseFormatString and both interpolation checks use it so they cannot disagree.
  *   Escaped   - '{{', a literal '{'.
  *   PlainChar - an empty pair '{}' or a '{' with no matching '}': no expression, so the braces
  *               are ordinary text and the literal is NOT interpolated (closeIdx = last index).
@@ -15319,12 +15522,79 @@ BraceKind ClassifyBrace(const std::string& rawText, size_t i, size_t end, size_t
     return BraceKind::Segment;
 }
 
+std::vector<FormatPart> WalkFormatStringLiteral(const std::string& rawText, size_t begin, size_t end)
+{
+    std::vector<FormatPart> parts;
+    size_t i = begin;
+    size_t textBegin = begin;
+    auto flushText = [&](size_t stop)
+    {
+        if (textBegin < stop)
+            parts.push_back({ FormatPartKind::Text, textBegin, stop });
+    };
+
+    while (i < end)
+    {
+        if (rawText[i] == '\\')
+        {
+            i += (i + 1 < end) ? 2 : 1;
+            continue;
+        }
+
+        if (rawText[i] == '{')
+        {
+            size_t closeIdx = i;
+            const BraceKind kind = ClassifyBrace(rawText, i, end, closeIdx);
+            if (kind == BraceKind::Escaped)
+            {
+                flushText(i);
+                parts.push_back({ FormatPartKind::EscapedOpen, i, i + 2 });
+                i += 2;
+                textBegin = i;
+                continue;
+            }
+            if (kind == BraceKind::PlainChar || kind == BraceKind::Verbatim)
+            {
+                flushText(i);
+                parts.push_back({ kind == BraceKind::PlainChar
+                    ? FormatPartKind::PlainChar : FormatPartKind::Verbatim, i, closeIdx + 1 });
+                i = closeIdx + 1;
+                textBegin = i;
+                continue;
+            }
+
+            flushText(i);
+            parts.push_back({ FormatPartKind::Segment, i, closeIdx + 1 });
+            i = closeIdx + 1;
+            textBegin = i;
+            continue;
+        }
+
+        if (rawText[i] == '}' && i + 1 < end && rawText[i + 1] == '}')
+        {
+            flushText(i);
+            parts.push_back({ FormatPartKind::EscapedClose, i, i + 2 });
+            i += 2;
+            textBegin = i;
+            continue;
+        }
+
+        ++i;
+    }
+
+    flushText(end);
+    return parts;
+}
+
 } // namespace
 
 bool MainListener::HasInterpolation(const std::string& rawText) {
+        if (IsRawStringLiteralText(rawText)) return false;
+        const size_t quote = rawText.find('"');
+        if (quote == std::string::npos || rawText.empty()) return false;
         bool inEscape = false;
         size_t end = rawText.size() - 1; // index of the closing "
-        for (size_t i = 1; i < end; i++) // skip opening/closing "
+        for (size_t i = quote + 1; i < end; i++) // skip opening/closing "
         {
             char c = rawText[i];
             if (inEscape) { inEscape = false; continue; }
@@ -15341,7 +15611,34 @@ bool MainListener::HasInterpolation(const std::string& rawText) {
         return false;
     }
 
+bool HasInterpolationSegment(const std::string& rawText) {
+        if (IsRawStringLiteralText(rawText)) return false;
+        const size_t quote = rawText.find('"');
+        if (quote == std::string::npos || rawText.empty()) return false;
+        bool inEscape = false;
+        const size_t end = rawText.size() - 1;
+        for (size_t i = quote + 1; i < end; i++)
+        {
+            char c = rawText[i];
+            if (inEscape) { inEscape = false; continue; }
+            if (c == '\\') { inEscape = true; continue; }
+            if (c != '{') continue;
+
+            size_t closeIdx = i;
+            BraceKind kind = ClassifyBrace(rawText, i, end, closeIdx);
+            if (kind == BraceKind::Segment)
+                return true;
+            i = (kind == BraceKind::Escaped) ? i + 1 : closeIdx;
+        }
+        return false;
+    }
+
 llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionContext* ctx, const std::string& rawText) {
+        return ParseFormatString(ctx, std::vector<std::string>{ rawText });
+    }
+
+llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionContext* ctx,
+                                              const std::vector<std::string>& rawTexts) {
         auto* compiler = Compiler(ctx);
         compiler->EnsureStrConcatRegistered();
 
@@ -15352,64 +15649,64 @@ llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionConte
         auto* i8Ty  = compiler->builder->getInt8Ty();
         auto* i32Ty = compiler->builder->getInt32Ty();
 
-        // Walk rawText between the outer quotes, splitting on unescaped { ... }
-        // rawText format:  "...{expr}..."  (quotes included)
-        size_t i = 1; // skip opening "
-        size_t end = rawText.size() - 1; // stop before closing "
-        std::string litAccum;
-
-        auto flushLiteral = [&]()
+        for (const auto& rawText : rawTexts)
         {
-            if (litAccum.empty()) return;
-            // Re-encode as a quoted string so ProcessRawText can decode escapes
-            std::string quoted = "\"" + litAccum + "\"";
-            std::string text = ProcessRawText(quoted);
-            auto* gv  = compiler->CreateGlobalString("fmtlit", text);
-            auto* len = compiler->builder->getInt32((int32_t)text.size());
-            segments.push_back({ gv, len });
-            litAccum.clear();
-        };
-
-        bool inEscape = false;
-        while (i < end)
-        {
-            char c = rawText[i];
-            if (inEscape)
+            if (IsRawStringLiteralText(rawText))
             {
-                litAccum += '\\';
-                litAccum += c;
-                inEscape = false;
-                i++;
+                const std::string text = RawStringContents(rawText);
+                if (!text.empty())
+                {
+                    auto* gv = compiler->CreateGlobalString("fmtlit", text);
+                    auto* len = compiler->builder->getInt32(static_cast<int32_t>(text.size()));
+                    segments.push_back({ gv, len });
+                }
                 continue;
             }
-            if (c == '\\')
-            {
-                inEscape = true;
-                i++;
+
+            const size_t quote = rawText.find('"');
+            if (quote == std::string::npos || rawText.size() <= quote + 1)
                 continue;
-            }
-            if (c == '{')
+            // Walk this literal between its outer quotes; each adjacent token keeps its own
+            // interpolation and escape rules.
+            size_t i = quote + 1;
+            size_t end = rawText.size() - 1;
+            std::string litAccum;
+            auto flushLiteral = [&]()
             {
-                size_t closeIdx = i;
-                BraceKind kind = ClassifyBrace(rawText, i, end, closeIdx);
-                if (kind == BraceKind::Escaped)
+                if (litAccum.empty()) return;
+                std::string quoted = "\"" + litAccum + "\"";
+                std::string text = ProcessRawText(quoted);
+                auto* gv = compiler->CreateGlobalString("fmtlit", text);
+                auto* len = compiler->builder->getInt32(static_cast<int32_t>(text.size()));
+                segments.push_back({ gv, len });
+                litAccum.clear();
+            };
+
+            const auto parts = WalkFormatStringLiteral(rawText, i, end);
+            for (const auto& part : parts)
+            {
+                if (part.kind != FormatPartKind::Segment)
                 {
-                    // {{ is a literal '{', not an interpolation start.
-                    litAccum += '{';
-                    i += 2;
-                    continue;
-                }
-                if (kind == BraceKind::PlainChar || kind == BraceKind::Verbatim)
-                {
-                    // Unmatched '{', empty '{}', or non-expression content (e.g. JSON) - literal text.
-                    litAccum.append(rawText, i, closeIdx - i + 1);
-                    i = closeIdx + 1;
+                    switch (part.kind)
+                    {
+                    case FormatPartKind::Text:
+                    case FormatPartKind::PlainChar:
+                    case FormatPartKind::Verbatim:
+                        litAccum.append(rawText, part.begin, part.end - part.begin);
+                        break;
+                    case FormatPartKind::EscapedOpen:
+                        litAccum += '{';
+                        break;
+                    case FormatPartKind::EscapedClose:
+                        litAccum += '}';
+                        break;
+                    case FormatPartKind::Segment:
+                        break;
+                    }
                     continue;
                 }
 
-                std::string exprText = rawText.substr(i + 1, closeIdx - i - 1);
-                i = closeIdx + 1; // skip past '}'
-
+                const std::string exprText = rawText.substr(part.begin + 1, part.end - part.begin - 2);
                 flushLiteral();
 
                 // Re-parse the expression text
@@ -15479,19 +15776,9 @@ llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionConte
                 }
 
                 segments.push_back({ ptr, len });
-                continue;
             }
-            // }} is a literal '}', not special on its own, but symmetric with {{.
-            if (c == '}' && i + 1 < end && rawText[i + 1] == '}')
-            {
-                litAccum += '}';
-                i += 2;
-                continue;
-            }
-            litAccum += c;
-            i++;
+            flushLiteral();
         }
-        flushLiteral();
 
         if (segments.empty())
         {
@@ -16535,6 +16822,58 @@ std::string MainListener::LLVMTypeToTypeName(llvm::Type* ty, const std::string& 
         return "";
     }
 
+enum class TupleLiteralTargetUse { Other, CallArgument, Declaration, Assignment, Return };
+
+static TupleLiteralTargetUse ClassifyTupleLiteralTargetUse(
+    CFlatParser::TupleExpressionContext* ctx)
+{
+        antlr4::tree::ParseTree* node = ctx;
+        while (node != nullptr && node->parent != nullptr)
+        {
+            auto* parent = node->parent;
+            if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent) != nullptr)
+                return TupleLiteralTargetUse::CallArgument;
+            if (dynamic_cast<CFlatParser::InitializerContext*>(parent) != nullptr)
+                return TupleLiteralTargetUse::Declaration;
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                return TupleLiteralTargetUse::Assignment;
+            if (auto* jump = dynamic_cast<CFlatParser::JumpStatementContext*>(parent);
+                jump != nullptr && jump->Return() != nullptr)
+                return TupleLiteralTargetUse::Return;
+            if (auto* entry = dynamic_cast<CFlatParser::TupleConstructEntryContext*>(parent);
+                entry != nullptr)
+            {
+                auto* enclosingTuple = dynamic_cast<CFlatParser::TupleExpressionContext*>(entry->parent);
+                return enclosingTuple != nullptr
+                    && ClassifyTupleLiteralTargetUse(enclosingTuple)
+                        == TupleLiteralTargetUse::CallArgument
+                    ? TupleLiteralTargetUse::CallArgument : TupleLiteralTargetUse::Other;
+            }
+            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent);
+                conditional != nullptr && conditional->expression() != nullptr
+                && (node == conditional->expression()
+                    || node == conditional->conditionalExpression()))
+            {
+                node = parent;
+                continue;
+            }
+            if (parent->children.size() == 1)
+            {
+                node = parent;
+                continue;
+            }
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parent);
+                primary != nullptr && primary->expression() != nullptr)
+            {
+                node = parent;
+                continue;
+            }
+            return TupleLiteralTargetUse::Other;
+        }
+        return TupleLiteralTargetUse::Other;
+}
+
 LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::TupleExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         auto entries = ctx->tupleConstructEntry();
@@ -16557,7 +16896,50 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         // Evaluate each element and collect its type name
         std::vector<llvm::Value*> elemValues;
         std::vector<LLVMBackend::NamedVariable> tupleLiteralElements;
-        std::vector<bool> uniqueRawTransfers;
+        std::vector<bool> uniqueSourceTransfers;
+        std::vector<llvm::Value*> tupleElementOwnerSlots;
+        std::vector<std::string> tupleElementOwnerTypes;
+        const auto tupleTargetUse = ClassifyTupleLiteralTargetUse(ctx);
+        // Tuple elements are evaluated left to right; key implicit transfers by resolved binding
+        // and move path so one slot cannot be copied twice.
+        const auto sameUniqueSource = [](const LLVMBackend::NamedVariable& left,
+                                         const LLVMBackend::NamedVariable& right) {
+            if (left.MovePathHasDynamicIndex || right.MovePathHasDynamicIndex)
+                return left.Storage != nullptr && left.Storage == right.Storage;
+            if (left.CallerName.empty() || right.CallerName.empty())
+                return left.CallerName.empty() && right.CallerName.empty()
+                    && left.Storage != nullptr && left.Storage == right.Storage;
+            return left.CallerName == right.CallerName
+                && LLVMBackend::FieldMoveKey(left) == LLVMBackend::FieldMoveKey(right)
+                && left.TypeAndValue.Pointer == right.TypeAndValue.Pointer
+                && left.TypeAndValue.TypeName == right.TypeAndValue.TypeName;
+        };
+        auto clearTransferredSource = [&](LLVMBackend::NamedVariable& source, llvm::Value* value) {
+            if (IsUniqueFieldRead(source))
+            {
+                EmitImplicitUniqueFieldMove(source, value, nullptr, {}, ctx);
+                return;
+            }
+            llvm::Type* sourceType = compiler->GetType(source.TypeAndValue);
+            if (!source.TypeAndValue.Pointer
+                && compiler->IsCoreUniqueType(source.TypeAndValue.TypeName)
+                && sourceType != nullptr && sourceType->isStructTy())
+                compiler->builder->CreateStore(
+                    llvm::ConstantAggregateZero::get(sourceType), source.Storage);
+            else if (source.TypeAndValue.Pointer && sourceType != nullptr
+                && sourceType->isPointerTy())
+                compiler->builder->CreateStore(
+                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(sourceType)),
+                    source.Storage);
+            if (!source.CallerName.empty() && source.FieldName.empty()
+                && source.OwningStructName.empty() && !source.IsElementAccess)
+            {
+                compiler->MarkVariableMoved(source.CallerName);
+                compiler->MarkVariableExplicitlyMovedNull(source.CallerName);
+                if (compiler->IsCoreUniqueType(source.TypeAndValue.TypeName))
+                    compiler->RecordNullSet(source.CallerName);
+            }
+        };
         std::vector<std::string> typeArgs;
         for (size_t i = 0; i < entries.size(); ++i)
         {
@@ -16581,9 +16963,17 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             if (!expectedFields.empty() && loaded != nullptr)
             {
                 const auto& expected = expectedFields[i];
+                if (!expected.Pointer && compiler->ResolveTypeAlias(expected.TypeName) == "string"
+                    && IsNullptrLiteralExpressionTree(entry->assignmentExpression()))
+                    LogErrorContext(entry->assignmentExpression(), std::format(
+                        "cannot initialize string '{}' from nullptr", expected.VariableName));
                 auto* expectedType = compiler->GetType(expected);
                 matchesExpectedTupleElement = expectedType != nullptr
                     && loaded->getType() == expectedType;
+                const bool expectedCoreUnique = compiler->IsCoreUniqueType(expected.TypeName);
+                if (expectedCoreUnique && nv.IsExplicitMove
+                    && compiler->MoveSourceIsAddressBorrow(nv))
+                    compiler->LogBorrowedMoveSlotError();
                 const bool numericConversion = expectedType != nullptr
                     && (loaded->getType()->isIntegerTy() || loaded->getType()->isFloatingPointTy())
                     && (expectedType->isIntegerTy() || expectedType->isFloatingPointTy());
@@ -16596,7 +16986,7 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                     matchesExpectedTupleElement = true;
                 }
                 if (!matchesExpectedTupleElement && expectedType != nullptr
-                    && entry->assignmentExpression()->getText() == "nullptr")
+                    && IsNullptrLiteralExpressionTree(entry->assignmentExpression()))
                 {
                     if (expectedType->isPointerTy())
                         loaded = llvm::ConstantPointerNull::get(
@@ -16659,8 +17049,98 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                         || compiler->IsCoreUniqueType(expected.TypeName);
                 }
             }
+
+            const bool sourceCoreUniqueValue = !nv.TypeAndValue.Pointer
+                && compiler->IsCoreUniqueType(nv.TypeAndValue.TypeName);
+            const bool targetCoreUniqueValue = expectedFields.empty()
+                ? sourceCoreUniqueValue
+                : !expectedFields[i].Pointer
+                    && compiler->IsCoreUniqueType(expectedFields[i].TypeName);
+            const bool sameCoreUniqueType = expectedFields.empty()
+                || compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName)
+                    == compiler->ResolveTypeAlias(expectedFields[i].TypeName);
+            bool transferUniqueValue = false;
+            if (loaded != nullptr && sourceCoreUniqueValue && targetCoreUniqueValue
+                && sameCoreUniqueType && loaded->getType()->isStructTy()
+                && nv.Storage != nullptr && !nv.IsExplicitMove
+                // Produced ternary arms are already registered as temps; the slot must not take them too.
+                && !nv.TernaryTempAlreadyRegistered)
+            {
+                const std::string& targetType = expectedFields.empty()
+                    ? nv.TypeAndValue.TypeName : expectedFields[i].TypeName;
+                AssignSourceKind sourceKind;
+                loaded = ClassifyOwningAssignSource(loaded, targetType, false,
+                    entry->assignmentExpression(), sourceKind);
+                if (sourceKind == AssignSourceKind::Move)
+                {
+                    // A declared `move` parameter is an owner here, as the scalar decl accepts it
+                    // (a nested tuple element is Other, so it takes the same exemption).
+                    if ((!nv.TypeAndValue.IsMove
+                            && (tupleTargetUse == TupleLiteralTargetUse::Declaration
+                                || (tupleTargetUse == TupleLiteralTargetUse::Other && !tupleIsCallArgument)))
+                        || BorrowAdoptionIsUnsound(compiler, nv))
+                    {
+                        const std::string sourceName = compiler->BorrowedSourceDisplayName(nv);
+                        LLVMBackend::TypeAndValue target = expectedFields.empty()
+                            ? nv.TypeAndValue : expectedFields[i];
+                        target.VariableName = "item_" + std::to_string(i);
+                        const std::string shownType = SpellType(*compiler, target);
+                        if (sourceName.empty())
+                            LogErrorContext(entry->assignmentExpression(), std::format(
+                                "cannot initialize {} '{}' from a borrowed value - the source still owns it; "
+                                "use 'new', a 'move' expression, or a move-returning call",
+                                shownType, target.VariableName));
+                        else
+                            LogErrorContext(entry->assignmentExpression(), std::format(
+                                "cannot initialize {} '{}' from borrowed value '{}' - the source still owns it; "
+                                "use 'new', a 'move' expression, or a move-returning call",
+                                shownType, target.VariableName, sourceName));
+                    }
+                    if (tupleTargetUse != TupleLiteralTargetUse::CallArgument && IsUniqueFieldRead(nv)
+                        && (RejectImplicitConsumeOfOutlivingOwner(
+                                compiler, nv, false, entry->assignmentExpression())
+                            || RejectConsumeOfBorrowedByValueParamField(
+                                compiler, nv, entry->assignmentExpression())))
+                        return {};
+                    transferUniqueValue = true;
+                    matchesExpectedTupleElement = true;
+                    if (!expectedFields.empty()) expectedUnique = true;
+                }
+            }
+            if ((transferUniqueRaw || transferUniqueValue) && !nv.IsExplicitMove)
+            {
+                for (size_t previous = 0; previous < uniqueSourceTransfers.size(); ++previous)
+                {
+                    if (uniqueSourceTransfers[previous]
+                        && sameUniqueSource(tupleLiteralElements[previous], nv))
+                    {
+                        const std::string movePath = LLVMBackend::FieldMoveKey(nv);
+                        std::string sourceName = !nv.CallerName.empty() && !movePath.empty()
+                            ? nv.CallerName + "." + movePath
+                            : compiler->BorrowedSourceDisplayName(nv);
+                        if (sourceName.empty())
+                            sourceName = nv.CallerName.empty()
+                                ? SpellType(*compiler, nv.TypeAndValue) : nv.CallerName;
+                        LogMovedUse(entry->assignmentExpression(), sourceName);
+                    }
+                }
+            }
             elemValues.push_back(loaded);
-            uniqueRawTransfers.push_back(transferUniqueRaw);
+            if (uniqueSourceTransfers.size() < i + 1)
+                uniqueSourceTransfers.push_back(transferUniqueRaw || transferUniqueValue);
+
+            const bool implicitUniqueTransfer = uniqueSourceTransfers.back() && !nv.IsExplicitMove;
+            if (implicitUniqueTransfer && tupleTargetUse == TupleLiteralTargetUse::CallArgument
+                && !nv.MovePathHasDynamicIndex)
+                if (std::string error = compiler->ImplicitOutlivingOwnerConsumeError(nv, false);
+                    !error.empty())
+                    compiler->LogError(error);
+            if (implicitUniqueTransfer
+                && tupleTargetUse == TupleLiteralTargetUse::Assignment
+                && !IsUniqueFieldRead(nv)
+                && RejectImplicitConsumeOfOutlivingOwner(
+                    compiler, nv, false, entry->assignmentExpression()))
+                return {};
 
             // Prefer TypeAndValue.TypeName (set for variables); fall back to LLVM type
             std::string typeName = nv.TypeAndValue.TypeName;
@@ -16696,6 +17176,53 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                      && !typeName.empty() && typeName.back() != '*')
                 typeName += "*";
             typeArgs.push_back(typeName);
+            const bool conditionalBorrow = std::any_of(
+                nv.ConditionalMoveSources.begin(), nv.ConditionalMoveSources.end(),
+                [](const auto& source) { return source.BorrowedPointer; });
+            // A declared `move` parameter read in a slot is bits the slot borrows, as a scalar
+            // by-value argument is: the parameter's scope-exit teardown keeps ownership. A unique
+            // one the slot takes is a transfer (uniqueSourceTransfers), not an owning move here.
+            const bool declaredMoveParamRead = !nv.IsExplicitMove && nv.TypeAndValue.IsMove
+                && nv.Storage != nullptr && nv.FieldName.empty() && !nv.IsElementAccess
+                && compiler->IsFunctionParameter(nv.CallerName);
+            const bool explicitOwningMove = (nv.IsExplicitMove
+                    || (nv.TypeAndValue.IsMove && !declaredMoveParamRead))
+                && !nv.IsBorrowed && !nv.IsAliasBorrow && !nv.TypeAndValue.IsAlias
+                && !conditionalBorrow;
+            // A produced owning temp (call result) in a slot is owned by that slot, as a scalar
+            // argument temp is. A nested tuple is never owned whole; a ternary PHI's arms own their temps.
+            const std::string producedTypeName = compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName);
+            const bool producedOwningTemp = !nv.IsTupleLiteral && nv.Storage == nullptr
+                && loaded != nullptr && loaded->getType()->isStructTy()
+                && !llvm::isa<llvm::PHINode>(loaded)
+                && compiler->IsProducedTempValue(loaded)
+                && !nv.TypeAndValue.Pointer && !nv.TypeAndValue.IsAlias && !nv.FromOwningTempField
+                && producedTypeName != "string" && producedTypeName != "__closure_fat_ptr"
+                && compiler->IsOwningValueType(producedTypeName);
+            const bool elementTransfersOwnership = uniqueSourceTransfers.back()
+                || explicitOwningMove || producedOwningTemp;
+            llvm::Value* ownerSlot = nullptr;
+            std::string ownerType;
+            if (elementTransfersOwnership && loaded != nullptr
+                && !nv.TypeAndValue.Pointer && loaded->getType()->isStructTy())
+            {
+                ownerType = !expectedFields.empty() && matchesExpectedTupleElement
+                    ? expectedFields[i].TypeName : nv.TypeAndValue.TypeName;
+                ownerType = compiler->ResolveTypeAlias(ownerType);
+                if (compiler->IsOwningValueType(ownerType))
+                {
+                    ownerSlot = compiler->CreateAlloca(loaded->getType());
+                    compiler->builder->CreateStore(loaded, ownerSlot);
+                    compiler->UnregisterOwnedStringTemp(loaded);
+                    compiler->UnregisterOwnedClosureTemp(loaded);
+                    compiler->UnregisterOwnedStructTempsHolding(loaded);
+                    compiler->RegisterOwnedStructTemp(ownerSlot, ownerType);
+                }
+            }
+            tupleElementOwnerSlots.push_back(ownerSlot);
+            tupleElementOwnerTypes.push_back(ownerType);
+            if (uniqueSourceTransfers.back())
+                clearTransferredSource(tupleLiteralElements.back(), loaded);
         }
 
         std::string mangledName = MangledGenericName("tuple", typeArgs);
@@ -16738,17 +17265,11 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             }
             auto* gep = compiler->CreateStructGEP(structType, alloca, fieldIdx);
             compiler->builder->CreateStore(elemValues[i], gep);
-            if (uniqueRawTransfers[i])
+            if (tupleElementOwnerSlots[i] != nullptr)
             {
-                auto& source = tupleLiteralElements[i];
-                compiler->builder->CreateStore(
-                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(
-                        elemValues[i]->getType())), source.Storage);
-                if (!source.CallerName.empty())
-                {
-                    compiler->MarkVariableMoved(source.CallerName);
-                    compiler->MarkVariableExplicitlyMovedNull(source.CallerName);
-                }
+                compiler->UnregisterOwnedStructTemp(tupleElementOwnerSlots[i]);
+                if (tupleTargetUse == TupleLiteralTargetUse::CallArgument)
+                    compiler->RegisterOwnedStructTemp(gep, tupleElementOwnerTypes[i]);
             }
         }
 
@@ -17044,6 +17565,335 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
         return structPtr;
     }
 
+// Lowers a re-parsed string(...) fragment. Its tokens sit at fragment coordinates, so every
+// diagnostic in the scope reports at the first argument, which is in the file. A nested fragment
+// keeps the outer anchor, already in file coordinates.
+struct StringFragmentAnchorScope
+{
+    LLVMBackend* backend;
+    LLVMBackend::FragmentDiagnosticAnchor saved;
+    StringFragmentAnchorScope(LLVMBackend* compiler, const std::string& file, antlr4::Token* argumentStart)
+        : backend(compiler), saved(compiler->fragmentDiagnosticAnchor_)
+    {
+        if (saved.active || argumentStart == nullptr) return;
+        backend->fragmentDiagnosticAnchor_ = { true, file,
+            argumentStart->getLine(), argumentStart->getCharPositionInLine() };
+    }
+    ~StringFragmentAnchorScope() { backend->fragmentDiagnosticAnchor_ = saved; }
+};
+
+// Kept out of the recursive ParsePostfixExpression frame: a NamedVariable local there costs
+// stack headroom on deeply nested expressions.
+LLVM_ATTRIBUTE_NOINLINE void MainListener::CarryStringViewConstructionBorrow(
+    CFlatParser::PostfixExpressionContext* ctx, LLVMBackend::NamedVariable& namedVar)
+{
+        auto* argumentList = ctx->argumentExpressionList().front();
+        const auto arguments = argumentList->argumentNamedExpression();
+        auto* primary = ctx->primaryExpression();
+        auto* directTypeName = primary != nullptr ? primary->genericIdentifier() : nullptr;
+        if (ctx->children.size() != 4 || directTypeName == nullptr
+            || directTypeName->genericTypeParameters() != nullptr)
+            return;
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(namedVar.Primary);
+        llvm::Function* callee = call != nullptr ? call->getCalledFunction() : nullptr;
+        if (call != nullptr && callee == nullptr)
+            callee = llvm::dyn_cast<llvm::Function>(call->getCalledOperand()->stripPointerCasts());
+        const auto* symbol = callee != nullptr ? Compiler(ctx)->GetFunctionSymbol(callee) : nullptr;
+        if (symbol == nullptr || !symbol->IsCoreLibraryFunction || symbol->IsMethod
+            || symbol->SourceName != symbol->ReturnType.TypeName
+            || symbol->ReturnType.TypeName != namedVar.TypeAndValue.TypeName
+            || !Compiler(ctx)->IsDataStructure(symbol->ReturnType.TypeName))
+            return;
+        if (arguments.size() != 2 || arguments[0]->assignmentExpression() == nullptr
+            || !NamedVarIsStringView(namedVar) || namedVar.TypeAndValue.Pointer
+            || !Compiler(ctx)->IsDataStructure(namedVar.TypeAndValue.TypeName))
+            return;
+        LLVMBackend::NamedVariable sourceBorrow;
+        EvaluateOperandTypeOnly([&]() {
+            auto source = ParseAssignmentExpressionNamed(arguments[0]->assignmentExpression());
+            const bool charPointer = source.TypeAndValue.TypeName == "char"
+                && (source.TypeAndValue.Pointer || source.TypeAndValue.IsArrayView
+                    || source.TypeAndValue.ConstArraySize > 0
+                    || llvm::isa_and_nonnull<llvm::ArrayType>(source.BaseType));
+            if (charPointer)
+                CarryStackCharBufferBorrow(sourceBorrow, source, source.Primary);
+            return source;
+        });
+        CarryStackCharBufferBorrow(namedVar, sourceBorrow);
+}
+
+LLVMBackend::NamedVariable MainListener::ParseStringFunctionalConstruction(
+    CFlatParser::PrimaryExpressionContext* ctx, ResultUse use)
+{
+        auto* compiler = Compiler(ctx);
+        auto* list = ctx->argumentExpressionList();
+        std::vector<CFlatParser::ArgumentNamedExpressionContext*> args =
+            list != nullptr ? list->argumentNamedExpression()
+                            : std::vector<CFlatParser::ArgumentNamedExpressionContext*>{};
+        const std::string workingForms =
+            "use '(string)ptr' for a NUL-terminated char buffer, string_view(ptr, len) "
+            "for an explicit-length borrow, or value.toString() for primitive values";
+        auto reportBadArguments = [&]() {
+            LogErrorContext(ctx, "string(...) accepts one cast-compatible argument or "
+                "(char*-like, integer) arguments; " + workingForms);
+            return LLVMBackend::NamedVariable{};
+        };
+        if (args.size() != 1 && args.size() != 2) return reportBadArguments();
+        for (auto* arg : args)
+            if (arg->Identifier() != nullptr || arg->LeftBrace() != nullptr)
+                return reportBadArguments();
+
+        DiagnoseAssignmentArguments(list);
+        auto sourceText = [](CFlatParser::AssignmentExpressionContext* expression) {
+            if (expression == nullptr || expression->getStart() == nullptr
+                || expression->getStop() == nullptr)
+                return std::string{};
+            auto* start = expression->getStart();
+            auto* stop = expression->getStop();
+            auto* chars = start->getInputStream();
+            if (chars == nullptr) return expression->getText();
+            return chars->getText(antlr4::misc::Interval(start->getStartIndex(), stop->getStopIndex()));
+        };
+        auto fragmentIsWhole = [](CFlatParser& parser) {
+            return parser.getNumberOfSyntaxErrors() == 0
+                && parser.getCurrentToken()->getType() == cflat::kTokenEOF;
+        };
+        auto isStringLiteralArgument = [](CFlatParser::AssignmentExpressionContext* expression) {
+            antlr4::tree::ParseTree* node = expression;
+            while (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node))
+            {
+                if (rule->getRuleIndex() == CFlatParser::RulePrimaryExpression)
+                {
+                    auto* primary = static_cast<CFlatParser::PrimaryExpressionContext*>(rule);
+                    if (!primary->StringLiteral().empty())
+                        return primary->children.size() == primary->StringLiteral().size();
+                    if (primary->expression() != nullptr && primary->children.size() == 3)
+                    {
+                        node = primary->expression();
+                        continue;
+                    }
+                    return false;
+                }
+                if (rule->children.size() != 1) return false;
+                node = rule->children.front();
+            }
+            return false;
+        };
+        auto typeOfArgument = [&](CFlatParser::ArgumentNamedExpressionContext* arg) {
+            return EvaluateOperandTypeOnly([&]() {
+                CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
+                DirectViewCallArgumentScope directViewScope(
+                    directViewCallArgument_, arg->assignmentExpression());
+                return ParseAssignmentExpressionNamed(arg->assignmentExpression());
+            });
+        };
+        auto isCharPointerLike = [](const UnevaluatedOperandType& value) {
+            if (value.IsStringLiteral)
+                return value.Type.TypeName.empty() || value.Type.TypeName == "char";
+            if (value.Type.TypeName != "char") return false;
+            const bool charPointer = value.Type.Pointer && !value.Type.ElemPointer
+                && value.Type.ValuePointerDepth() == 1;
+            return charPointer || value.Type.IsArrayView || value.Type.ConstArraySize > 0
+                || (value.BaseType != nullptr && llvm::isa<llvm::ArrayType>(value.BaseType));
+        };
+
+        if (args.size() == 1)
+        {
+            const bool stringLiteralArgument = isStringLiteralArgument(
+                args[0]->assignmentExpression());
+            const auto probe = stringLiteralArgument
+                ? UnevaluatedOperandType{} : typeOfArgument(args[0]);
+            const auto& type = probe.Type;
+            const bool scalarShape = !type.Pointer && !type.IsArrayView && !type.ElemPointer
+                && type.ConstArraySize == 0 && !type.IsFunctionPointer;
+            bool primitiveValue = scalarShape
+                && (type.IsInteger() > 0 || type.IsFloatingPoint() >= 0 || type.TypeName == "bool");
+            if (!primitiveValue && scalarShape)
+            {
+                auto* expression = args[0]->assignmentExpression();
+                auto* start = expression != nullptr ? expression->getStart() : nullptr;
+                auto* stop = expression != nullptr ? expression->getStop() : nullptr;
+                if (start != nullptr && start == stop
+                    && (start->getType() == CFlatParser::Constant
+                        || start->getType() == CFlatParser::DigitSequence))
+                {
+                    const std::string literalType = LLVMBackend::LiteralIdentityForOverload(start->getText());
+                    primitiveValue = literalType == "bool" || literalType == "char"
+                        || literalType == "wchar" || literalType == "c16" || literalType == "c32"
+                        || literalType == "int" || literalType == "u32" || literalType == "long"
+                        || literalType == "ulong" || literalType == "i64" || literalType == "u64"
+                        || literalType == "i128" || literalType == "u128"
+                        || literalType == "float" || literalType == "double"
+                        || literalType == "longdouble";
+                }
+            }
+            if (primitiveValue)
+            {
+                LogErrorContext(ctx, "string(expr) does not stringify primitive values; "
+                    "use expr.toString(). For a borrowed buffer, " + workingForms);
+                return {};
+            }
+
+            bool hasStringOperator = false;
+            const std::string sourceType = compiler->ResolveTypeAlias(type.TypeName);
+            if (auto it = compiler->functionTable.find("operator string");
+                it != compiler->functionTable.end())
+            {
+                for (const auto& candidate : it->second)
+                {
+                    if (candidate.IsMethod || candidate.Parameters.size() != 1) continue;
+                    const auto& parameter = candidate.Parameters[0];
+                    const std::string parameterType = compiler->ResolveTypeAlias(parameter.TypeName);
+                    if (sourceType == parameterType && type.Pointer == parameter.Pointer
+                        && type.IsArrayView == parameter.IsArrayView
+                        && type.ElemPointer == parameter.ElemPointer)
+                    {
+                        hasStringOperator = true;
+                        break;
+                    }
+                    if (parameter.IsInterface && !type.Pointer && !type.IsArrayView
+                        && compiler->TypeImplementsInterface(sourceType, parameterType))
+                    {
+                        hasStringOperator = true;
+                        break;
+                    }
+                }
+            }
+            if (!stringLiteralArgument && !isCharPointerLike(probe) && !hasStringOperator)
+            {
+                LogErrorContext(ctx, "string(expr) requires an argument accepted by '(string)expr'; "
+                    + workingForms);
+                return {};
+            }
+
+            const std::string argumentText = sourceText(args[0]->assignmentExpression());
+            if (argumentText.empty()) return reportBadArguments();
+            auto* parse = NewCallFragment(compiler, "(string)(" + argumentText + ")");
+            auto* cast = parse->parser.castExpression();
+            if (!fragmentIsWhole(parse->parser)) return reportBadArguments();
+            const auto savedParenType = lastParenExprType;
+            auto* const savedParenStorage = lastParenExprStorage;
+            const bool savedParenFromTempField = lastParenExprFromOwningTempField;
+            const bool savedParenTempParent = lastParenExprOwningTempParent;
+            const auto savedParenStructName = lastParenExprOwningStructName;
+            const auto savedParenFieldName = lastParenExprFieldName;
+            const auto savedParenCallerName = lastParenExprCallerName;
+            auto savedParenNamed = lastParenExprNamed;
+            auto result = [&]() {
+                StringFragmentAnchorScope anchor(compiler, compiler->sourceFileName,
+    args[0]->assignmentExpression()->getStart());
+                return ParseCastExpression(cast, false, use);
+            }();
+            lastParenExprType = savedParenType;
+            lastParenExprStorage = savedParenStorage;
+            lastParenExprFromOwningTempField = savedParenFromTempField;
+            lastParenExprOwningTempParent = savedParenTempParent;
+            lastParenExprOwningStructName = savedParenStructName;
+            lastParenExprFieldName = savedParenFieldName;
+            lastParenExprCallerName = savedParenCallerName;
+            lastParenExprNamed = std::move(savedParenNamed);
+            return result;
+        }
+
+        const auto pointerProbe = typeOfArgument(args[0]);
+        if (!isCharPointerLike(pointerProbe))
+        {
+            LogErrorContext(ctx, "string(ptr, len) requires a char*-like first argument; "
+                + workingForms);
+            return {};
+        }
+        const auto lengthProbe = typeOfArgument(args[1]);
+        bool integerLength = lengthProbe.Type.IsInteger() > 0
+            && !lengthProbe.Type.Pointer && !lengthProbe.Type.IsArrayView
+            && !lengthProbe.Type.ElemPointer && lengthProbe.Type.ConstArraySize == 0;
+        if (!integerLength)
+        {
+            auto* expression = args[1]->assignmentExpression();
+            auto* start = expression != nullptr ? expression->getStart() : nullptr;
+            auto* stop = expression != nullptr ? expression->getStop() : nullptr;
+            if (start != nullptr && start == stop
+                && (start->getType() == CFlatParser::Constant
+                    || start->getType() == CFlatParser::DigitSequence))
+            {
+                const std::string literalType = LLVMBackend::LiteralIdentityForOverload(start->getText());
+                integerLength = literalType == "char" || literalType == "wchar"
+                    || literalType == "c16" || literalType == "c32"
+                    || literalType == "int" || literalType == "u32" || literalType == "long"
+                    || literalType == "ulong" || literalType == "i64" || literalType == "u64"
+                    || literalType == "i128" || literalType == "u128";
+            }
+        }
+        if (!integerLength)
+        {
+            LogErrorContext(ctx, "string(ptr, len) requires an integer length; " + workingForms);
+            return {};
+        }
+
+        const std::string pointerText = sourceText(args[0]->assignmentExpression());
+        const std::string lengthText = sourceText(args[1]->assignmentExpression());
+        if (pointerText.empty() || lengthText.empty())
+        {
+            LogErrorContext(ctx, "could not read string(ptr, len) arguments; " + workingForms);
+            return {};
+        }
+        // The string representation reserves the top length bit for ownership. The internal
+        // conversion to `int` is explicit so i64 arguments are accepted without call narrowing.
+        auto* parse = NewCallFragment(compiler, "string_view(" + pointerText
+            + ", (int)(" + lengthText + "))");
+        auto* expression = parse->parser.assignmentExpression();
+        if (!fragmentIsWhole(parse->parser))
+        {
+            LogErrorContext(ctx, "could not parse string_view(ptr, len); " + workingForms);
+            return {};
+        }
+        auto view = [&]() {
+            StringFragmentAnchorScope anchor(compiler, compiler->sourceFileName,
+    args[0]->assignmentExpression()->getStart());
+            return ParseAssignmentExpressionNamed(expression, ResultUse::Value);
+        }();
+
+        auto viewData = compiler->GetDataStructure("string_view");
+        auto stringData = compiler->GetDataStructure("string");
+        auto fieldIndex = [](const LLVMBackend::StructData& data, const std::string& name)
+            -> std::optional<unsigned> {
+            for (unsigned i = 0; i < data.StructFields.size(); ++i)
+                if (data.StructFields[i].VariableName == name) return i;
+            return std::nullopt;
+        };
+        const auto viewPtrIndex = fieldIndex(viewData, "_ptr");
+        const auto viewLenIndex = fieldIndex(viewData, "_len");
+        const auto stringPtrIndex = fieldIndex(stringData, "_ptr");
+        const auto stringLenIndex = fieldIndex(stringData, "_len");
+        if (viewData.StructType == nullptr || stringData.StructType == nullptr
+            || !viewPtrIndex || !viewLenIndex || !stringPtrIndex || !stringLenIndex)
+        {
+            LogErrorContext(ctx, "string(ptr, len) requires the core string and string_view types");
+            return {};
+        }
+        llvm::Value* viewValue = view.Primary;
+        if (viewValue == nullptr && view.Storage != nullptr)
+            viewValue = compiler->CreateLoad(view.Storage);
+        if (viewValue == nullptr || viewValue->getType() != viewData.StructType)
+        {
+            LogErrorContext(ctx, "could not lower string_view(ptr, len) for string construction");
+            return {};
+        }
+        llvm::Value* pointer = compiler->builder->CreateExtractValue(viewValue, { *viewPtrIndex });
+        llvm::Value* length = compiler->builder->CreateExtractValue(viewValue, { *viewLenIndex });
+        length = compiler->builder->CreateAnd(length, compiler->builder->getInt32(0x7FFFFFFF));
+        llvm::Value* resultValue = llvm::UndefValue::get(stringData.StructType);
+        resultValue = compiler->builder->CreateInsertValue(resultValue, pointer, { *stringPtrIndex });
+        resultValue = compiler->builder->CreateInsertValue(resultValue, length, { *stringLenIndex });
+
+        LLVMBackend::NamedVariable result;
+        result.Primary = resultValue;
+        result.BaseType = stringData.StructType;
+        result.TypeAndValue.TypeName = "string";
+        result.IsRvalue = true;
+        CarryStackCharBufferBorrow(result, view);
+        return result;
+}
+
 llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx, ResultUse use) {
         auto* compiler = Compiler(ctx);
 
@@ -17067,6 +17917,7 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
 
         auto expressionCtx = ctx->expression();
         auto constant = ctx->Constant();
+        auto nullPtrConstant = ctx->NullPtrConstant();
         auto stringLiteral = ctx->StringLiteral();
 
         // `default` as an expression: the value is the destination type's default. Without a
@@ -17276,18 +18127,96 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
         }
         else if (stringLiteral.size() > 0)
         {
-            // Adjacent string literals are NOT concatenated (unlike C). Silently keeping
-            // only the first would lose data, so require the explicit '+' operator.
-            if (stringLiteral.size() > 1)
+            std::vector<std::string> literalTexts;
+            literalTexts.reserve(stringLiteral.size());
+            for (auto* literal : stringLiteral)
+                literalTexts.push_back(literal->getText());
+
+            if (literalTexts.size() > 1)
             {
-                LogErrorContext(ctx,
-                    "adjacent string literals are not concatenated. Join them with the '+' "
-                    "operator, e.g. \"a\" + \"b\".");
-                return nullptr;
+                const bool hasRawLiteral = std::any_of(
+                    literalTexts.begin(), literalTexts.end(), IsRawStringLiteralText);
+                if (!hasRawLiteral)
+                {
+                    LogErrorContext(ctx,
+                        "adjacent string literals are not concatenated. Join them with the '+' "
+                        "operator, e.g. \"a\" + \"b\".");
+                    return nullptr;
+                }
+
+                std::string wideEncoding;
+                bool hasInterpolation = false;
+                for (const auto& text : literalTexts)
+                {
+                    hasInterpolation = hasInterpolation || HasInterpolation(text);
+                    if (IsRawStringLiteralText(text)) continue;
+                    const size_t quote = text.find('"');
+                    const std::string prefix = quote == std::string::npos
+                        ? std::string() : text.substr(0, quote);
+                    if (!prefix.empty() && prefix != "u8" && wideEncoding.empty())
+                        wideEncoding = prefix;
+                }
+
+                if (hasInterpolation)
+                {
+                    if (!wideEncoding.empty())
+                    {
+                        LogErrorContext(ctx, "string interpolation is not supported in a prefixed string literal");
+                        return nullptr;
+                    }
+                    return ParseFormatString(ctx, literalTexts);
+                }
+
+                if (wideEncoding.empty())
+                {
+                    std::string processed;
+                    for (const auto& text : literalTexts)
+                        processed += ProcessRawText(text, /*foldBraces=*/true);
+                    return compiler->CreateGlobalString("", processed);
+                }
+
+                const unsigned width = wideEncoding == "U" ? 32 : wideEncoding == "u" ? 16
+                    : static_cast<unsigned>(compiler->wcharBits_);
+                std::vector<uint32_t> values;
+                for (const auto& text : literalTexts)
+                {
+                    std::string content;
+                    size_t quote = 0;
+                    const bool rawLiteral = IsRawStringLiteralText(text);
+                    if (rawLiteral)
+                    {
+                        content = EscapeRawStringContents(RawStringContents(text));
+                        quote = std::string::npos;
+                    }
+                    else
+                    {
+                        quote = text.find('"');
+                        if (quote == std::string::npos) continue;
+                    }
+                    auto it = quote == std::string::npos
+                        ? content.cbegin() : text.cbegin() + quote + 1;
+                    auto end = quote == std::string::npos
+                        ? content.cend() : text.cend() - 1;
+                    while (it != end)
+                    {
+                        if (!rawLiteral && (*it == '{' || *it == '}')
+                            && it + 1 != end && *(it + 1) == *it)
+                        {
+                            const char brace = *it;
+                            it += 2;
+                            AppendEncodedScalar(values, brace, width);
+                        }
+                        else AppendEncodedScalar(values, DecodeLiteralScalar(it, end), width);
+                    }
+                }
+                values.push_back(0);
+                return compiler->CreateGlobalEncodedString(".wide.str", values, width);
             }
-            std::string rawText = ctx->getText();
+            std::string rawText = literalTexts.front();
+            const bool rawLiteral = IsRawStringLiteralText(rawText);
             const size_t quote = rawText.find('"');
-            const std::string encoding = quote == std::string::npos ? "" : rawText.substr(0, quote);
+            const std::string encoding = rawLiteral || quote == std::string::npos
+                ? "" : rawText.substr(0, quote);
             // u8 stays a narrow UTF-8 string; u / U / L lower to NUL-terminated c16 / c32 / wchar.
             if (encoding.empty() || encoding == "u8")
             {
@@ -17307,9 +18236,21 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             auto it = rawText.cbegin() + quote + 1;
             auto end = rawText.cend() - 1;
             while (it != end)
-                AppendEncodedScalar(values, DecodeLiteralScalar(it, end), width);
+            {
+                if ((*it == '{' || *it == '}') && it + 1 != end && *(it + 1) == *it)
+                {
+                    const char brace = *it;
+                    it += 2;
+                    AppendEncodedScalar(values, brace, width);
+                }
+                else AppendEncodedScalar(values, DecodeLiteralScalar(it, end), width);
+            }
             values.push_back(0);
             return compiler->CreateGlobalEncodedString(".wide.str", values, width);
+        }
+        else if (nullPtrConstant != nullptr)
+        {
+            return compiler->CreateConstant("nullptr", "nullptr");
         }
         else if (constant)
         {
@@ -17321,10 +18262,6 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             else if (constantText == "false")
             {
                 return compiler->CreateConstant("bool", constantText);
-            }
-            else if (constantText == "nullptr")
-            {
-                return compiler->CreateConstant("nullptr", constantText);
             }
             else if (constantText.front() == '\'' ||
                 (constantText.size() > 1 &&
@@ -17448,7 +18385,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                                     static_cast<const LLVMBackend::TypeAndValue&>(*field);
                                 continue;
                             }
-                            // C anonymous struct/union members live under transparent __anonN fields.
+                            // C anonymous struct/union members live under marked transparent fields.
                             std::function<const LLVMBackend::DeclTypeAndValue*(
                                 const LLVMBackend::StructData&)> findAnon =
                                 [&](const LLVMBackend::StructData& sd)
@@ -17456,7 +18393,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                             {
                                 for (const auto& f : sd.StructFields)
                                 {
-                                    if (f.VariableName.rfind("__anon", 0) != 0) continue;
+                                    if (!f.IsAnonymousMember) continue;
                                     const auto inner = compiler->dataStructures.find(
                                         compiler->ResolveTypeAlias(f.TypeName));
                                     if (inner == compiler->dataStructures.end()) continue;
@@ -17686,6 +18623,22 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         }
 
         auto memberVar = compiler->GetMemberVariable(name);
+        if (memberVar.Storage == nullptr && memberVar.BitfieldStorage == nullptr)
+        {
+            auto thisVar = compiler->GetThisPointer();
+            auto thisData = compiler->dataStructures.find(thisVar.TypeAndValue.TypeName);
+            if (thisData != compiler->dataStructures.end() && thisData->second.StructType != nullptr)
+            {
+                if (auto* thisSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(thisVar.Storage);
+                    thisSlot != nullptr && thisSlot->getAllocatedType()->isPointerTy())
+                    thisVar.Storage = compiler->builder->CreateLoad(
+                        thisSlot->getAllocatedType(), thisVar.Storage, "anon_this");
+                thisVar.BaseType = thisData->second.StructType;
+                thisVar.TypeAndValue.Pointer = false;
+                if (auto* nodeContext = dynamic_cast<antlr4::ParserRuleContext*>(node->parent))
+                    ResolveTransparentAnonField(nodeContext, thisVar, name, memberVar);
+            }
+        }
         // A bitfield member carries no addressable Storage - its lvalue is the packed
         // storage word plus mask/shift metadata, so admit it by BitfieldStorage too.
         if (memberVar.Storage != nullptr || memberVar.BitfieldStorage != nullptr)
@@ -18259,7 +19212,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_unique", "is_const", "is_interface", "is_copyable", "is_movable", "is_assignable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_const", "is_interface", "is_copyable", "is_movable", "is_assignable", "is_cpp_class", "is_primitive", "is_string", "annotationof", "countof",
             "compile_error", "construct_at", "embed",
             "reflect", "reflect_set", "json_const", "xml_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
@@ -18338,7 +19291,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         return {};
     }
 
-char MainListener::ProcessEscapeChar(std::string::const_iterator& itr, const std::string::const_iterator& end) {
+static char ProcessEscapeChar(std::string::const_iterator& itr, const std::string::const_iterator& end) {
         if (itr == end)
             return '\\';
 
@@ -18385,34 +19338,74 @@ uint32_t MainListener::ParseCharLiteral(const std::string& text) {
         return DecodeLiteralScalar(begin, end);
     }
 
-std::string MainListener::ProcessRawText(const std::string& rawText, bool foldBraces) {
+std::string DecodeStringLiteralToken(const std::string& rawText, bool foldBraces) {
+        if (IsRawStringLiteralText(rawText))
+            return RawStringContents(rawText);
+
+        const size_t quote = rawText.find('"');
+        if (quote == std::string::npos || rawText.empty()) return {};
+        const size_t end = rawText.size() - 1;
+        const auto endIter = rawText.cbegin() + end;
         std::string output;
-        auto itr = rawText.cbegin();
+        auto itr = rawText.cbegin() + quote + 1;
+        bool formatWalkChecked = false;
 
-        // Skip encoding prefix (u8, u, U, L)
-        if (*itr == 'u' && *(itr + 1) == '8')
-            itr += 2;
-        else if (*itr == 'u' || *itr == 'U' || *itr == 'L')
-            ++itr;
-
-        ++itr; // skip opening "
-
-        while (itr != rawText.cend() && *itr != '"')
+        while (itr != endIter)
         {
+            if (foldBraces && !formatWalkChecked && *itr == '{' && itr + 1 != endIter
+                && (*(itr + 1) == '\\' || *(itr + 1) == '"'))
+            {
+                formatWalkChecked = true;
+                const auto parts = WalkFormatStringLiteral(rawText, quote + 1, end);
+                const bool hasVerbatim = std::any_of(parts.begin(), parts.end(), [](const FormatPart& part)
+                {
+                    return part.kind == FormatPartKind::Verbatim;
+                });
+                if (hasVerbatim)
+                {
+                    output.clear();
+                    auto appendDecodedSpan = [&](size_t begin, size_t stop)
+                    {
+                        std::string quoted = "\"" + rawText.substr(begin, stop - begin) + "\"";
+                        output += DecodeStringLiteralToken(quoted, /*foldBraces=*/false);
+                    };
+                    for (const auto& part : parts)
+                    {
+                        switch (part.kind)
+                        {
+                        case FormatPartKind::Text:
+                        case FormatPartKind::PlainChar:
+                        case FormatPartKind::Verbatim:
+                        case FormatPartKind::Segment:
+                            appendDecodedSpan(part.begin, part.end);
+                            break;
+                        case FormatPartKind::EscapedOpen:
+                            output += '{';
+                            break;
+                        case FormatPartKind::EscapedClose:
+                            output += '}';
+                            break;
+                        }
+                    }
+                    return output;
+                }
+            }
+
             if (*itr == '\\')
             {
                 ++itr;
-                if (itr != rawText.cend() && (*itr == 'u' || *itr == 'U'))
+                if (itr != endIter && (*itr == 'u' || *itr == 'U'))
                 {
                     auto escape = itr - 1;
-                    AppendUtf8Scalar(output, DecodeLiteralScalar(escape, rawText.cend()));
+                    AppendUtf8Scalar(output, DecodeLiteralScalar(escape, endIter));
                     itr = escape;
                 }
-                else output += ProcessEscapeChar(itr, rawText.cend());
+                else output += ProcessEscapeChar(itr, endIter);
             }
-            else if (foldBraces && (*itr == '{' || *itr == '}') && (itr + 1) != rawText.cend() && *(itr + 1) == *itr)
+            else if (foldBraces && (*itr == '{' || *itr == '}')
+                && (itr + 1) != endIter && *(itr + 1) == *itr)
             {
-                // {{ -> { and }} -> } (only for source-level non-interpolated strings)
+                // Plain literals fold doubled braces; Verbatim literals use the shared format walk above.
                 output += *itr;
                 itr += 2;
             }
@@ -18423,6 +19416,10 @@ std::string MainListener::ProcessRawText(const std::string& rawText, bool foldBr
         }
 
         return output;
+    }
+
+std::string MainListener::ProcessRawText(const std::string& rawText, bool foldBraces) {
+        return DecodeStringLiteralToken(rawText, foldBraces);
     }
 
 void MainListener::EnsureOperatorBoolForValue(llvm::Value* value) {
@@ -18701,6 +19698,25 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
         // is gone before the real walk registers it - the queued type argument still folds to it.
         std::optional<LLVMBackend::AliasScopeGuard> scanAliasScope;
         if (topLevel) scanAliasScope.emplace(Compiler());
+        std::optional<LLVMBackend::ScanTimeVariableTypeScopeGuard> scanVariableScope;
+        if (topLevel) scanVariableScope.emplace(Compiler());
+        if (topLevel)
+            for (auto* parent = ctx->parent; parent != nullptr; parent = parent->parent)
+                if (auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+                {
+                    auto* paramList = function->parameterTypeList() != nullptr
+                        ? function->parameterTypeList()->parameterList() : nullptr;
+                    if (paramList != nullptr)
+                        for (auto* param : paramList->parameterDeclaration())
+                        {
+                            auto* declarator = param->declarator();
+                            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                            if (getDirectDeclName(direct) == "countof")
+                                Compiler(param)->SetScanTimeVariableType(
+                                    "countof", LLVMBackend::TypeAndValue{ .TypeName = "__scan_time_shadow" });
+                        }
+                    break;
+                }
         ++memberTypeSilentDepth_;
         struct SilentExit { int& d; ~SilentExit() { --d; } } silentExit{memberTypeSilentDepth_};
         auto isCflatTemplate = [&](LLVMBackend* compiler, const std::string& baseName) {
@@ -18718,6 +19734,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
             bool bareExpectationArmed = afterBareExpectation;
             for (auto* item : static_cast<CFlatParser::BlockItemListContext*>(ctx)->blockItem())
             {
+                if (item->declaration() != nullptr)
+                    SeedScanTimeLocalVariableTypes(Compiler(item), item->declaration());
                 auto* expectError = item->statement() != nullptr
                     ? item->statement()->expectErrorStatement() : nullptr;
                 if (expectError != nullptr && expectError->compoundStatement() == nullptr)
@@ -18738,6 +19756,14 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
             // Use getRuleIndex() (integer compare) instead of dynamic_cast for each node type.
             switch (ruleCtx->getRuleIndex())
             {
+            case CFlatParser::RuleCompoundStatement:
+            {
+                auto* compound = static_cast<CFlatParser::CompoundStatementContext*>(ruleCtx);
+                LLVMBackend::ScanTimeVariableTypeScopeGuard localTypeScope(Compiler(compound));
+                ScanAndQueueGenericTypeUses(compound->blockItemList(), /*topLevel*/ false,
+                    localEnumNames, insideScopedExpectation, afterBareExpectation);
+                continue;
+            }
             case CFlatParser::RuleExpectErrorStatement:
             {
                 auto* expectError = static_cast<CFlatParser::ExpectErrorStatementContext*>(ruleCtx);
@@ -18906,6 +19932,16 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                                 &Compiler(typeSpec)->gts.scannedNonLocalEnumNames,
                                 &Compiler(typeSpec)->gts.scannedTypeNames))
                             continue;  // Queue after the declaration registers the local enum.
+                        bool deferForCountof = false;
+                        for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                            if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr
+                                && HasUnfoldableCountofCall(compiler,
+                                    entry->shiftExpression()))
+                            {
+                                deferForCountof = true;
+                                break;
+                            }
+                        if (deferForCountof) continue;
                         std::vector<std::string> typeArgs;
                         // ResolveTypeArgEntry applies active substitutions AND recursively
                         // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
@@ -18967,6 +20003,16 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                                 &Compiler(primaryExpr)->gts.scannedNonLocalEnumNames,
                                 &Compiler(primaryExpr)->gts.scannedTypeNames))
                             continue;  // Queue after the declaration registers the local enum.
+                        bool deferForCountof = false;
+                        for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
+                            if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr
+                                && HasUnfoldableCountofCall(compiler,
+                                    entry->shiftExpression()))
+                            {
+                                deferForCountof = true;
+                                break;
+                            }
+                        if (deferForCountof) continue;
                         std::vector<std::string> typeArgs;
                         for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));

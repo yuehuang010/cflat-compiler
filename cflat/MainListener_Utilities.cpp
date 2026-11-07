@@ -137,6 +137,13 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
             }
 
             paramType.DefaultValue = paramDecl->initializer();
+            if (!paramType.Pointer
+                && Compiler(paramDecl)->ResolveTypeAlias(paramType.TypeName) == "string"
+                && paramType.DefaultValue != nullptr
+                && paramType.DefaultValue->assignmentExpression() != nullptr
+                && IsNullptrLiteralExpressionTree(paramType.DefaultValue->assignmentExpression()))
+                LogErrorContext(paramType.DefaultValue, std::format(
+                    "cannot initialize string '{}' from nullptr", paramType.VariableName));
             params.push_back(paramType);
 
             if (paramType.VariableName == "")

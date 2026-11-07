@@ -15,6 +15,14 @@
 
 import "test_helper.cb";
 import "com.cb";
+import "application.cb";
+
+application AppInfo bracefoldComApp = {
+    name = "{\"a\"} {}}", identifier = "com.cflat.com.bracefold"
+};
+
+[uuid("{4d57f3c2-8e1a-4b9d-9d3a-1f2e3c4b5a60}")]
+struct BracedUuidProbe { int value = 0; };
 
 struct T451HResultConstValue
 {
@@ -387,6 +395,15 @@ bool testTypeLevelAnnotation()
     return result;
 }
 
+bool testBracefoldAndBracedUuidAnnotations()
+{
+    bool result = true;
+    result &= Test("com_app_name_plain_after_verbatim", Application.name(), "{\"a\"} {}}");
+    result &= Test("com_uuid_braced_guid", annotationof(BracedUuidProbe, "uuid"),
+        r"{4d57f3c2-8e1a-4b9d-9d3a-1f2e3c4b5a60}");
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -401,6 +418,7 @@ extern int main()
     total++; passed += testTypeLevelAnnotation()          ? 1 : 0;
     total++; passed += testAnnotationBeforeDef()          ? 1 : 0;
     total++; passed += testHResultConstField()             ? 1 : 0;
+    total++; passed += testBracefoldAndBracedUuidAnnotations() ? 1 : 0;
 
     printf("COM produce-side tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

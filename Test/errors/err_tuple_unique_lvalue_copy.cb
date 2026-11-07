@@ -1,0 +1,142 @@
+import "unique.cb";
+
+struct TupsafeTupleOwner { int value = 0; ~TupsafeTupleOwner() { } };
+struct TupsafeTupleHolder { unique<TupsafeTupleOwner> a = default; };
+struct TupsafeRawTupleHolder { unique TupsafeTupleOwner* a = default; };
+unique<TupsafeTupleOwner> tupsafeGlobalTupleOwner = default;
+int tupsafeTakeUniqueTuple((unique<TupsafeTupleOwner>, int) value) { return value.item_1; }
+int tupsafeTakeUniquePair((unique<TupsafeTupleOwner>, unique<TupsafeTupleOwner>) value) { return 0; }
+int tupsafeTakeUniqueScalar(unique<TupsafeTupleOwner> value) { return value->value; }
+int tupsafeTakeRawUniqueTuple((unique TupsafeTupleOwner*, int) value) { return value.item_1; }
+
+expect_error("cannot initialize unique<TupsafeTupleOwner> 'x' from borrowed value 'u' - the source still owns it; use 'new', a 'move' expression, or a move-returning call") {
+    void tupsafeScalarUniqueCopy()
+    {
+        unique<TupsafeTupleOwner> u = new TupsafeTupleOwner();
+        unique<TupsafeTupleOwner> x = u;
+    }
+}
+
+expect_error("cannot initialize unique<TupsafeTupleOwner> 'item_0' from borrowed value 'u' - the source still owns it; use 'new', a 'move' expression, or a move-returning call") {
+    void tupsafeTupleUniqueCopy()
+    {
+        unique<TupsafeTupleOwner> u = new TupsafeTupleOwner();
+        (unique<TupsafeTupleOwner>, int) tuple = (u, 4);
+    }
+}
+
+expect_error("cannot initialize unique<TupsafeTupleOwner> 'item_0' from borrowed value 'p' - the source still owns it; use 'new', a 'move' expression, or a move-returning call") {
+    int tupsafeTupleUniqueParam(unique<TupsafeTupleOwner> p)
+    {
+        (unique<TupsafeTupleOwner>, int) tuple = (p, 4);
+        return tuple.item_1;
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void tupsafeDuplicateTupleUniqueLocal()
+    {
+        unique<TupsafeTupleOwner> u = new TupsafeTupleOwner();
+        (unique<TupsafeTupleOwner>, unique<TupsafeTupleOwner>) tuple = default;
+        tuple = (u, u);
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void tupsafeTupleUniqueArgumentConsumesSource()
+    {
+        unique<TupsafeTupleOwner> u = new TupsafeTupleOwner();
+        tupsafeTakeUniqueTuple((u, 4));
+        unique<TupsafeTupleOwner> after = u;
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void tupsafeTupleRawUniqueArgumentConsumesSource()
+    {
+        unique TupsafeTupleOwner* u = new TupsafeTupleOwner();
+        tupsafeTakeRawUniqueTuple((u, 4));
+        unique TupsafeTupleOwner* after = u;
+    }
+}
+
+expect_error("use of moved variable 'holder.a'") {
+    void tupsafeDuplicateTupleUniqueField()
+    {
+        TupsafeTupleHolder holder = default;
+        holder.a = new TupsafeTupleOwner();
+        (unique<TupsafeTupleOwner>, unique<TupsafeTupleOwner>) tuple = default;
+        tuple = (holder.a, holder.a);
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void tupsafeDuplicateTupleUniqueCallWithMove()
+    {
+        unique<TupsafeTupleOwner> u = new TupsafeTupleOwner();
+        tupsafeTakeUniquePair((u, move u));
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void tupsafeDuplicateTupleUniqueAssignWithMove()
+    {
+        unique<TupsafeTupleOwner> u = new TupsafeTupleOwner();
+        (unique<TupsafeTupleOwner>, unique<TupsafeTupleOwner>) tuple = default;
+        tuple = (u, move u);
+    }
+}
+
+expect_error("cannot consume owning value 'tupsafeGlobalTupleOwner' out of storage that outlives this function") {
+    void tupsafeGlobalTupleCall()
+    {
+        tupsafeGlobalTupleOwner = new TupsafeTupleOwner();
+        tupsafeTakeUniqueTuple((tupsafeGlobalTupleOwner, 4));
+    }
+}
+
+expect_error("cannot consume owning value 'owner' out of storage that outlives this function") {
+    void tupsafeStaticTupleCall()
+    {
+        static unique<TupsafeTupleOwner> owner = default;
+        owner = new TupsafeTupleOwner();
+        tupsafeTakeUniqueTuple((owner, 4));
+    }
+}
+
+expect_error("cannot consume owning value 'tupsafeGlobalTupleOwner' out of storage that outlives this function") {
+    void tupsafeGlobalTupleAssignment()
+    {
+        tupsafeGlobalTupleOwner = new TupsafeTupleOwner();
+        (unique<TupsafeTupleOwner>, int) tuple = default;
+        tuple = (tupsafeGlobalTupleOwner, 4);
+    }
+}
+
+expect_error("cannot consume owning value 'owner' out of storage that outlives this function") {
+    void tupsafeStaticScalarCall()
+    {
+        static unique<TupsafeTupleOwner> owner = default;
+        owner = new TupsafeTupleOwner();
+        tupsafeTakeUniqueScalar(owner);
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void tupsafeDuplicateTupleRawUniqueLocal()
+    {
+        unique TupsafeTupleOwner* u = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, unique TupsafeTupleOwner*) tuple = default;
+        tuple = (u, u);
+    }
+}
+
+expect_error("use of moved variable 'holder.a'") {
+    void tupsafeDuplicateTupleRawUniqueField()
+    {
+        TupsafeRawTupleHolder holder = default;
+        holder.a = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, unique TupsafeTupleOwner*) tuple = default;
+        tuple = (holder.a, holder.a);
+    }
+}

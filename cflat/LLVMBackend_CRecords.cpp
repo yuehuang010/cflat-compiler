@@ -2362,6 +2362,7 @@ bool LLVMBackend::MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndVal
         out.ConstArraySize = f.sizeBytes / unit;
         if (f.alignBytes > 8) out.UserAlignValue = f.alignBytes;
         out.VariableName = f.name;
+        out.IsAnonymousMember = f.isAnonymousMember;
         MarkCxxDeclaredConstField(out, f.isConst);
         out.IsCxxMutableField = f.isMutable;
         return true;
@@ -3387,6 +3388,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                                 && MakeOpaqueFieldBlob(f, d))
                             {
                                 d.VariableName = f.name;
+                                d.IsAnonymousMember = f.isAnonymousMember;
                                 out.push_back(std::move(d));
                                 return true;
                             }
@@ -3413,6 +3415,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         MarkCxxDeclaredConstField(tv, r.isCxx && f.isConst && !f.isMutable);
                         static_cast<TypeAndValue&>(d) = tv;
                         d.VariableName = f.name;
+                        d.IsAnonymousMember = f.isAnonymousMember;
                         if (f.isBitfield)
                         {
                             d.IsBitfield = true;
@@ -3613,6 +3616,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 DeclTypeAndValue d;
                 static_cast<TypeAndValue&>(d) = tv;
                 d.VariableName = f.name;
+                d.IsAnonymousMember = f.isAnonymousMember;
                 if (f.isBitfield)
                 {
                     d.IsBitfield = true;

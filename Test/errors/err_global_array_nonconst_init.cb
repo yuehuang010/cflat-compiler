@@ -6,3 +6,43 @@ int g_seed = 5;
 expect_error("global array initializer elements must be compile-time constants") {
     int[3] g_arr = {1, g_seed, 3};
 }
+
+// A global inferred view accepts compile-time elements and rejects a mutable global read.
+expect_error("global array initializer elements must be compile-time constants") {
+    int[] g_view_arr = { g_seed };
+}
+
+int g_view_ctor_effects = 0;
+struct GViewCtor { int value; GViewCtor() { g_view_ctor_effects++; value = 7; } };
+expect_error("this element needs a runtime constructor") {
+    GViewCtor[] g_view_ctor = { {} };
+}
+
+struct GViewArgCtor { int value; GViewArgCtor(int a) { value = a * 2; } };
+expect_error("this element needs a runtime constructor") {
+    GViewArgCtor[] g_view_arg_ctor = { { 3 } };
+}
+struct GViewNestedArgCtor { GViewArgCtor item; int tail; };
+expect_error("this element needs a runtime constructor") {
+    GViewNestedArgCtor[] g_view_nested_arg_ctor = { { { 3 }, 1 } };
+}
+int g_view_arg_ctor_seed = 3;
+expect_error("this element needs a runtime constructor") {
+    GViewArgCtor[] g_view_arg_ctor_nonconstant = { { g_view_arg_ctor_seed } };
+}
+
+struct GViewPod { int x; int y; };
+GViewPod g_view_pod_source;
+expect_error("global array initializer elements must be compile-time constants") {
+    GViewPod[] g_view_pod_scalar_nonconstant = { g_view_pod_source };
+}
+int g_view_pod_seed = 3;
+expect_error("global array initializer elements must be compile-time constants") {
+    GViewPod[] g_view_pod_nonconstant = { { g_view_pod_seed, 1 } };
+}
+expect_error("global array initializer elements must be compile-time constants") {
+    GViewPod[] g_view_pod_named = { { x: 1 } };
+}
+expect_error("field initializers ('{field = value}') are not supported") {
+    GViewPod[] g_view_pod_field = { { x = 1 } };
+}

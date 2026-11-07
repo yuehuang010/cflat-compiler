@@ -492,6 +492,9 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
         result.arithNarrowWidth = namedVar.ArithNarrowWidth;
         result.isAlias = namedVar.TypeAndValue.IsAlias || namedVar.IsAliasBorrow;
+        result.stackCharBufferBorrow = namedVar.StackCharBufferBorrow;
+        result.stackCharBufferSource = namedVar.StackCharBufferSource;
+        result.stackCharBufferScopeDepth = namedVar.StackCharBufferScopeDepth;
         result.sourceCallerName = namedVar.CallerName.empty()
             ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
         result.sourceFieldName = namedVar.FieldName;

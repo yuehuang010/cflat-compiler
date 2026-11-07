@@ -64,4 +64,287 @@ expect_error("cannot store a string borrowed from stack buffer 'buf'") {
 
 // list<string>.add is intentionally absent from the rejects: its value insertion path copies
 // a borrowed string, as pinned by testStringStackBufferSources in test_list_ownership.cb.
+
+struct StackCharSource { char[8] bytes = default; };
+struct StackStringViewHolder { string_view s = default; };
+string_view gStackStringView = default;
+char[8] strretgateGlobalViewBytes = {'g', 'l', 'o', 'b', 'a', 'l', 0, 0};
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    string_view strretgate_local_view_ternary_return() {
+        bool chooseStack = true;
+        char[8] buf = {'b', 'u', 'f', 0, 0, 0, 0, 0};
+        return chooseStack
+            ? string_view(buf, 3)
+            : string_view(strretgateGlobalViewBytes, 3);
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void strretgate_local_view_ternary_global_store() {
+        bool chooseStack = true;
+        char[8] buf = {'b', 'u', 'f', 0, 0, 0, 0, 0};
+        gStackStringView = chooseStack
+            ? string_view(buf, 3)
+            : string_view(strretgateGlobalViewBytes, 3);
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void strretgate_local_view_ternary_param_field(StackStringViewHolder* holder) {
+        bool chooseStack = true;
+        char[8] buf = {'b', 'u', 'f', 0, 0, 0, 0, 0};
+        holder->s = chooseStack
+            ? string_view(buf, 3)
+            : string_view(strretgateGlobalViewBytes, 3);
+    }
+}
+
+expect_error("cannot store a string borrowed from stack buffer 'buf'") {
+    void strretgate_local_view_ternary_out_param(string_view* output) {
+        bool chooseStack = true;
+        char[8] buf = {'b', 'u', 'f', 0, 0, 0, 0, 0};
+        *output = chooseStack
+            ? string_view(buf, 3)
+            : string_view(strretgateGlobalViewBytes, 3);
+    }
+}
+
+// STRRETGATE matrix legs: every borrowed cast / constructor form must be rejected at each
+// existing escape sink for a local array and for an array field rooted in a local struct.
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_array_cast_bare_return() { char[8] buf = {'h', 'i', 0}; return (string)buf; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_bare_global_store() { char[8] buf = {'h', 'i', 0}; gStackString = (string)buf; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_bare_param_field(StackStringHolder* h) { char[8] buf = {'h', 'i', 0}; h->s = (string)buf; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_bare_out_param(string* out) { char[8] buf = {'h', 'i', 0}; *out = (string)buf; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_array_cast_parenthesized_return() { char[8] buf = {'h', 'i', 0}; return (string)(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_parenthesized_global_store() { char[8] buf = {'h', 'i', 0}; gStackString = (string)(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_parenthesized_param_field(StackStringHolder* h) { char[8] buf = {'h', 'i', 0}; h->s = (string)(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_parenthesized_out_param(string* out) { char[8] buf = {'h', 'i', 0}; *out = (string)(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_array_functional_one_return() { char[8] buf = {'h', 'i', 0}; return string(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_functional_one_global_store() { char[8] buf = {'h', 'i', 0}; gStackString = string(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_functional_one_param_field(StackStringHolder* h) { char[8] buf = {'h', 'i', 0}; h->s = string(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_functional_one_out_param(string* out) { char[8] buf = {'h', 'i', 0}; *out = string(buf); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_array_functional_two_return() { char[8] buf = {'h', 'i', 0}; return string(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_functional_two_global_store() { char[8] buf = {'h', 'i', 0}; gStackString = string(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_functional_two_param_field(StackStringHolder* h) { char[8] buf = {'h', 'i', 0}; h->s = string(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_functional_two_out_param(string* out) { char[8] buf = {'h', 'i', 0}; *out = string(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_local_array_string_view_two_return() { char[8] buf = {'h', 'i', 0}; return string_view(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_string_view_two_global_store() { char[8] buf = {'h', 'i', 0}; gStackStringView = string_view(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_string_view_two_param_field(StackStringViewHolder* h) { char[8] buf = {'h', 'i', 0}; h->s = string_view(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_string_view_two_out_param(string_view* out) { char[8] buf = {'h', 'i', 0}; *out = string_view(buf, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_array_cast_address_return() { char[8] buf = {'h', 'i', 0}; return (string)&buf[0]; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_address_global_store() { char[8] buf = {'h', 'i', 0}; gStackString = (string)&buf[0]; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_address_param_field(StackStringHolder* h) { char[8] buf = {'h', 'i', 0}; h->s = (string)&buf[0]; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_array_cast_address_out_param(string* out) { char[8] buf = {'h', 'i', 0}; *out = (string)&buf[0]; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_struct_field_cast_bare_return() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; return (string)p.bytes; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_bare_global_store() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; gStackString = (string)p.bytes; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_bare_param_field(StackStringHolder* h) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; h->s = (string)p.bytes; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_bare_out_param(string* out) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; *out = (string)p.bytes; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_struct_field_cast_parenthesized_return() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; return (string)(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_parenthesized_global_store() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; gStackString = (string)(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_parenthesized_param_field(StackStringHolder* h) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; h->s = (string)(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_parenthesized_out_param(string* out) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; *out = (string)(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_struct_field_functional_one_return() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; return string(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_functional_one_global_store() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; gStackString = string(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_functional_one_param_field(StackStringHolder* h) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; h->s = string(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_functional_one_out_param(string* out) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; *out = string(p.bytes); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_struct_field_functional_two_return() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; return string(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_functional_two_global_store() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; gStackString = string(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_functional_two_param_field(StackStringHolder* h) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; h->s = string(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_functional_two_out_param(string* out) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; *out = string(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_local_struct_field_string_view_two_return() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; return string_view(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_string_view_two_global_store() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; gStackStringView = string_view(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_string_view_two_param_field(StackStringViewHolder* h) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; h->s = string_view(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_string_view_two_out_param(string_view* out) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; *out = string_view(p.bytes, 2); }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_local_struct_field_cast_address_return() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; return (string)&p.bytes[0]; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_address_global_store() { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; gStackString = (string)&p.bytes[0]; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_address_param_field(StackStringHolder* h) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; h->s = (string)&p.bytes[0]; }
+}
+
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_local_struct_field_cast_address_out_param(string* out) { StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0; *out = (string)&p.bytes[0]; }
+}
+
+
+// Named intermediate values keep the same stack root until an escape sink consumes them.
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_cast_bare_named_return() {
+        char[8] buf = {'h', 'i', 0}; string value = (string)buf; return value;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string strretgate_functional_two_named_return() {
+        char[8] buf = {'h', 'i', 0}; string value = string(buf, 2); return value;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_string_view_named_return() {
+        char[8] buf = {'h', 'i', 0}; string_view value = string_view(buf, 2); return value;
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    string_view strretgate_struct_field_view_named_return() {
+        StackCharSource p = default; p.bytes[0] = 'h'; p.bytes[1] = 'i'; p.bytes[2] = 0;
+        string_view value = string_view(p.bytes, 2); return value;
+    }
+}
+
+
+// Brace initialization shares the same field escape gate as assignment.
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_bare_cast_field_init() {
+        char[8] buf = {'h', 'i', 0}; StackStringHolder h = { s = (string)buf };
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_two_arg_string_field_init() {
+        char[8] buf = {'h', 'i', 0}; StackStringHolder h = { s = string(buf, 2) };
+    }
+}
+expect_error("cannot store a string borrowed from stack buffer") {
+    void strretgate_string_view_field_init() {
+        char[8] buf = {'h', 'i', 0}; StackStringViewHolder h = { s = string_view(buf, 2) };
+    }
+}
+
 extern int main() { return 0; }

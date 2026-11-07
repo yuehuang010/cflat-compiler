@@ -1,0 +1,22 @@
+annotation JsonName { string value; };
+
+expect_error("annotation arguments cannot contain string interpolation") {
+    struct InterpolatedAnnotationProbe {
+        [JsonName("value{field_name}")]
+        int field_name = 0;
+    };
+}
+
+struct AnnProbe {
+    [JsonName("field_name")]
+    int field_name = 0;
+};
+
+extern int main()
+{
+    string part = "_name";
+    expect_error("annotationof arguments cannot contain string interpolation") {
+        string found = annotationof(AnnProbe, "field{part}", "JsonName");
+    }
+    return 0;
+}

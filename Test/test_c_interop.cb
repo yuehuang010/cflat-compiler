@@ -1058,6 +1058,42 @@ extern int main()
     // Symmetric write from cflat: write as_float through the anon, read as_int.
     o.__anon0.as_float = 3.14159274f;
     if (o.__anon0.as_int != ref2)                return 134;
+    CUnionResPV anonPointer = default;
+    int[2] anonPointerValues = { 101, 202 };
+    anonPointer.p = &anonPointerValues[0];
+    if (*anonPointer.p != 101) return 9501;
+    (*anonPointer.p)++;
+    if (anonPointerValues[0] != 102) return 9502;
+    *anonPointer.p += 3;
+    if (anonPointerValues[0] != 105) return 9503;
+    if (anonPointer.p[1] != 202) return 9504;
+    *anonPointer.p = 5;
+    if (anonPointerValues[0] != 5 || anonPointerValues[1] != 202) return 9505;
+    CUnionResCV anonCharPointer = default;
+    char[4] anonCharPointerValues = "xyz";
+    anonCharPointer.p = &anonCharPointerValues[0];
+    *anonCharPointer.p = 65;
+    if (anonCharPointerValues[0] != 'A' || anonCharPointerValues[1] != 'y'
+        || anonCharPointerValues[2] != 'z') return 9506;
+    CUnionResArray anonArray = default;
+    anonArray.arr[0] = 91; anonArray.arr[1] = 92;
+    if (*anonArray.arr != 91 || anonArray.arr[1] != 92) return 9507;
+    CUnionResCharArray anonCharArray = default;
+    anonCharArray.bytes[0] = 'x'; anonCharArray.bytes[1] = 'y';
+    if (*anonCharArray.bytes != 'x' || anonCharArray.bytes[1] != 'y') return 9508;
+    CUnionResPointerArray anonPointerArray = default;
+    int[3] anonPointerArrayValues = { 13, 24, 35 };
+    anonPointerArray.ps[0] = &anonPointerArrayValues[0];
+    anonPointerArray.ps[1] = &anonPointerArrayValues[1];
+    if (**anonPointerArray.ps != 13 || *anonPointerArray.ps[1] != 24) return 9509;
+    CUnionResPV anonPointerIndex = default;
+    int[3] anonPointerIndexValues = { 10, 20, 30 };
+    anonPointerIndex.p = &anonPointerIndexValues[0];
+    anonPointerIndex.p[1] = 5;
+    if (anonPointerIndexValues[0] != 10 || anonPointerIndexValues[1] != 5
+        || anonPointerIndexValues[2] != 30) return 9510;
+    anonPointerIndex.p[1] *= 2;
+    if (anonPointerIndexValues[1] != 10 || anonPointerIndexValues[2] != 30) return 9511;
     // Compile + non-null only: a field-default self address still points at the construction temporary (p3).
     TFieldInitAnonAddr anonAddr = default;
     if (anonAddr.q == nullptr) return 9135;

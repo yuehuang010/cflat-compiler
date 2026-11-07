@@ -1218,6 +1218,12 @@ move string _str_owned_range((const char)* src, i32 len)
 // An empty sep returns a list containing a copy of the whole string.
 move list<string> split(string self, string sep)
 {
+    return move self.split(sep, false);
+}
+
+// Optionally omit empty fields. An empty separator keeps split("") semantics.
+move list<string> split(string self, string sep, bool removeEmpty)
+{
     list<string> out = default;
     i32 slen = self.length();
     i32 dlen = sep.length();
@@ -1243,11 +1249,13 @@ move list<string> split(string self, string sep)
         {
             // No more separators: append the remainder and stop.
             i32 partLen = slen - pos;
-            out.add(_str_owned_range(sp + pos, partLen));
+            if (!removeEmpty || partLen > 0)
+                out.add(_str_owned_range(sp + pos, partLen));
             break;
         }
         i32 partLen = found - pos;
-        out.add(_str_owned_range(sp + pos, partLen));
+        if (!removeEmpty || partLen > 0)
+            out.add(_str_owned_range(sp + pos, partLen));
         pos = found + dlen;
     }
     return move out;

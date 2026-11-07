@@ -21,3 +21,17 @@ is itself a multi-level pointer. A real carrier would lift the cap.
 
 Carry pointer depth for the `new` result (count of extra levels on the pointee) through
 ParseNewExpression -> declaration / assignment sinks, then drop the cap in MainListener_NewDeleteMove.cpp.
+
+## Box 10 attempt (2026-11-03) - parked, needs a maintainer ruling
+
+The general type model caps pointer depth at 2 (`PointerDepthCap`, MainListener.h; `int*** p` is refused), so the
+refusal of `new int**[2]` / `new T*` with T = int* is correct and the "carrier" premise above is moot unless the cap is
+lifted. The real defect is that a generic-SUBSTITUTED pointee does not count toward the cap: `new T(v)` / `new T[n]` with
+T at depth 2 silently produce a depth-2 result. Counting it (one depth predicate for spelled and substituted pointees)
+works for user code (60-cell matrix green), but breaks the core containers: list / array / dictionary / hashset / queue /
+stack / channel / spsc_queue / hpc parallel allocate `new T[n]` under `if const (is_pointer(T))`, and test_basic /
+test_generics instantiate them with T at depth 2 (string-pointer / alias-pointer elements). Swapping those buffers to
+calloc hit const-discard conversions (`void**` -> `(const char)**`) after three attempts. Decide: (a) lift the cap to 3
+for `new` element buffers, (b) a core-only raw slot allocation builtin for pointer elements, or (c) leave substituted
+`new T` uncounted. Implementer patch + 60-cell matrix kept in the main checkout's scratch/briefs/newdepth_*_parked.*
+(not tracked).

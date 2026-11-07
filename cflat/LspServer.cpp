@@ -186,6 +186,15 @@ std::unordered_map<std::string, int> scanIdentifierOccurrences(const std::string
             i = (i + 1 < n) ? i + 2 : n;
             continue;
         }
+        if (c == 'r')
+        {
+            size_t afterRaw = i;
+            if (SkipRawStringSpelling(text, afterRaw))
+            {
+                i = afterRaw;
+                continue;
+            }
+        }
         // String / char literals
         if (c == '"' || c == '\'')
         {
@@ -337,6 +346,16 @@ inline std::string findEnclosingTypeName(const std::string& text, int line, int 
             while (i + 1 < offset && !(text[i] == '*' && text[i + 1] == '/')) ++i;
             ++i;
             continue;
+        }
+        if (c == 'r')
+        {
+            size_t afterRaw = i;
+            if (SkipRawStringSpelling(text, afterRaw))
+            {
+                flushWord();
+                i = afterRaw;
+                continue;
+            }
         }
         if (c == '"' || c == '\'')
         {
@@ -837,6 +856,16 @@ private:
         for (size_t i = open; i < s.size(); ++i)
         {
             char c = s[i];
+            if (c == 'r')
+            {
+                size_t afterRaw = i;
+                if (SkipRawStringSpelling(s, afterRaw))
+                {
+                    sawItem = true;
+                    i = afterRaw - 1;
+                    continue;
+                }
+            }
             if (c == '"' || c == '\'')
             {
                 char q = c;

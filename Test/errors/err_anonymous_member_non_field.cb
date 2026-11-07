@@ -1,0 +1,41 @@
+int unionAnonymousGuard;
+
+expect_error("anonymous aggregate may contain only non-static data members") {
+    struct AnonymousMethod { union { int i; int get() { return i; } }; };
+}
+
+expect_error("anonymous aggregate may contain only non-static data members") {
+    struct AnonymousPrototype { union { int i; int get(); }; };
+}
+
+expect_error("anonymous aggregate may contain only non-static data members") {
+    struct AnonymousDestructor { union { int i; ~AnonymousDestructor() {} }; };
+}
+
+expect_error("anonymous aggregate may contain only non-static data members") {
+    struct AnonymousNestedType { union { struct Inner { int i; }; int other; }; };
+}
+
+expect_error("anonymous aggregate may contain only non-static data members") {
+    struct AnonymousUsing { union { using Alias = int; int i; }; };
+}
+
+expect_error("anonymous aggregate may contain only non-static data members") {
+    struct AnonymousLock { union { lock(unionAnonymousGuard) { int i; } }; };
+}
+
+expect_error("anonymous aggregate may contain only non-static data members") {
+    struct AnonymousStatic { union { static int i; }; };
+}
+
+expect_error("if const is not supported inside an anonymous aggregate") {
+    struct AnonymousIfConst
+    {
+        union { if const (true) { int i = 7; } float f = default; };
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

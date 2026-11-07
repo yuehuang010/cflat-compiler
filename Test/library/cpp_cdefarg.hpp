@@ -85,3 +85,11 @@ namespace cdefns { inline cppcdef::B pk(int v) { return cppcdef::B(v + 50); } }
 namespace cdefum { inline cppcdef::B cdefgq(int v) { return cppcdef::B(v + 60); } }
 namespace cppcdef { using namespace cdefum; }
 inline cppcdef::B cdefgp(int v) { return cppcdef::B(v + 70); }
+// Float/double defaults from integer constants round once, like clang.
+namespace ff_cppdefaults
+{
+    inline float round_float(float value = 0x1000001000000001) { return value; }
+    inline float negative_float(float value = -0x1000001000000001) { return value; }
+    inline float unsigned_float(float value = 0x8000008000000001ULL) { return value; }
+    inline double round_double(double value = 0x1000001000000001) { return value; }
+}

@@ -74,10 +74,8 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                 // the int path below asks a non-integer type for its bit width.
                 if (destinationType->isFloatingPointTy())
                 {
-                    double converted = srcIsUnsigned || intValue->getBitWidth() == 1
-                        ? static_cast<double>(intValue->getZExtValue())
-                        : static_cast<double>(intValue->getSExtValue());
-                    initValue = llvm::ConstantFP::get(destinationType, converted);
+                    initValue = ConvertIntegerConstantToFloatingPoint(
+                        intValue, destinationType, srcIsUnsigned);
                 }
                 else if (destinationType->isIntegerTy()
                     && intValue->getIntegerType()->getBitWidth() != destinationType->getIntegerBitWidth())
@@ -623,7 +621,9 @@ llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, 
         if (arithmeticType->isFloatingPointTy())
         {
             const auto magnitude = amount < 0 ? -static_cast<int64_t>(amount) : amount;
-            llvm::Constant* value = llvm::ConstantFP::get(arithmeticType, static_cast<double>(magnitude));
+            auto* intValue = llvm::ConstantInt::get(builder->getInt64Ty(), magnitude, true);
+            llvm::Constant* value = ConvertIntegerConstantToFloatingPoint(
+                intValue, arithmeticType, false);
             if (vectorType != nullptr)
                 value = llvm::cast<llvm::Constant>(builder->CreateVectorSplat(
                     vectorType->getElementCount(), value));
@@ -1113,14 +1113,8 @@ llvm::Value* LLVMBackend::Upconvert(llvm::Value* value, llvm::Type* destType, bo
         {
             // bool (i1) is unsigned: true -> 1.0, never -1.0.
             srcIsUnsigned = srcIsUnsigned || srcType->isIntegerTy(1);
-            // Integer literal initializer for a float/double field (e.g. float x = 0)
             if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
-            {
-                double converted = srcIsUnsigned
-                    ? static_cast<double>(constInt->getZExtValue())
-                    : static_cast<double>(constInt->getSExtValue());
-                return llvm::ConstantFP::get(destType, converted);
-            }
+                return ConvertIntegerConstantToFloatingPoint(constInt, destType, srcIsUnsigned);
             return srcIsUnsigned ? builder->CreateUIToFP(value, destType)
                                  : builder->CreateSIToFP(value, destType);
         }
@@ -1278,6 +1272,18 @@ std::string LLVMBackend::IntegerTypeSpelling(unsigned bits, bool isUnsigned)
         return std::format("{}{}", isUnsigned ? 'u' : 'i', bits);
 }
 
+llvm::ConstantFP* LLVMBackend::ConvertIntegerConstantToFloatingPoint(
+        const llvm::ConstantInt* value, llvm::Type* destType, bool srcIsUnsigned)
+{
+        if (value == nullptr || destType == nullptr || !destType->isFloatingPointTy())
+            return nullptr;
+        llvm::APFloat converted(destType->getFltSemantics());
+        converted.convertFromAPInt(value->getValue(),
+            !(srcIsUnsigned || value->getType()->isIntegerTy(1)),
+            llvm::APFloat::rmNearestTiesToEven);
+        return llvm::ConstantFP::get(destType->getContext(), converted);
+}
+
 // T151: every implicit floating -> integer store lands here (decl init, '=', compound, element,
 // field, global, bitfield, C++ conversion operator). Bool is a truth test and stays legal.
 void LLVMBackend::RefuseImplicitFloatToInt(llvm::Value* value, llvm::Type* destType, bool destUnsigned) const
@@ -1358,6 +1364,9 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
         // Integer -> Float; bool (i1) is unsigned: true -> 1.0, never -1.0.
         if (srcType->isIntegerTy() && destType->isFloatingPointTy())
         {
+            if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value))
+                return ConvertIntegerConstantToFloatingPoint(constant, destType,
+                    !isSigned || srcType->isIntegerTy(1));
             return isSigned && !srcType->isIntegerTy(1) ? builder->CreateSIToFP(value, destType)
                             : builder->CreateUIToFP(value, destType);
         }

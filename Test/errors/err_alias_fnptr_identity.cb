@@ -14,6 +14,45 @@ expect_error("parameter 1 is 'alias' in one signature and by value in the other"
     }
 }
 
+// Tuple signature shape is retained when a named function is bound to a function value.
+int fntypeErrTuplePtr((int, int)* p) { return 1; }
+int fntypeErrTuplePp((int, int)** p) { return 2; }
+int fntypeErrTupleView((int, int)[] p) { return 3; }
+int fntypeErrIntPtr(int* p) { return 4; }
+int fntypeErrIntView(int[] p) { return 5; }
+
+expect_error("parameter 1 differs") {
+    int fntypeErrDepthMismatch()
+    {
+        function<int((int, int)*)> bad = fntypeErrTuplePp;
+        return 0;
+    }
+}
+
+expect_error("parameter 1 differs") {
+    int fntypeErrDepthMismatchReverse()
+    {
+        function<int((int, int)**)> bad = fntypeErrTuplePtr;
+        return 0;
+    }
+}
+
+expect_error("parameter 1 differs") {
+    int fntypeErrViewToPointer()
+    {
+        function<int(int*)> bad = fntypeErrIntView;
+        return 0;
+    }
+}
+
+expect_error("parameter 1 differs") {
+    int fntypeErrPointerToView()
+    {
+        function<int(int[])> bad = fntypeErrIntPtr;
+        return 0;
+    }
+}
+
 expect_error("the arms of the conditional expression have different signatures") {
     int aliasIdentityJoin()
     {
@@ -52,5 +91,45 @@ expect_error("parameter 1 is 'alias' in one signature and by value in the other"
         function other = aliasIdentityByValue;
         other = call;
         return other(f);
+    }
+}
+
+typedef int FntypeDiagnosticInt;
+using FntypeDiagnosticPtr = int*;
+int fntypeDiagParamTarget(double value) { return 1; }
+double fntypeDiagReturnTarget(int value) { return 1.0; }
+double* fntypeDiagPointerReturnTarget(int value) { return nullptr; }
+
+expect_error("function-pointer type 'int(FntypeDiagnosticInt)'") {
+    int fntypeDiagParam()
+    {
+        function<int(FntypeDiagnosticInt)> bad = fntypeDiagParamTarget;
+        return 0;
+    }
+}
+
+expect_error("function-pointer type 'FntypeDiagnosticInt(int)'") {
+    int fntypeDiagReturn()
+    {
+        function<FntypeDiagnosticInt(int)> bad = fntypeDiagReturnTarget;
+        return 0;
+    }
+}
+
+expect_error("function-pointer type 'FntypeDiagnosticPtr(int)'") {
+    int fntypeDiagPointerReturn()
+    {
+        function<FntypeDiagnosticPtr(int)> bad = fntypeDiagPointerReturnTarget;
+        return 0;
+    }
+}
+
+using FntypeDiagReturnCb = function<FntypeDiagnosticInt(int)>;
+
+expect_error("function-pointer type 'FntypeDiagnosticInt(int)'") {
+    int fntypeDiagReturnUsing()
+    {
+        FntypeDiagReturnCb bad = fntypeDiagReturnTarget;
+        return 0;
     }
 }

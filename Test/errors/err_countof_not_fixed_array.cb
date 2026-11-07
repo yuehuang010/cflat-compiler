@@ -1,0 +1,39 @@
+int countofPointerParameter(int* p)
+{
+    expect_error("countof needs a fixed-size array; operand 'p'") {
+        countof(p);
+    }
+    return 0;
+}
+
+int countofViewParameter(int[] v)
+{
+    expect_error("countof needs a fixed-size array; operand 'v'") {
+        countof(v);
+    }
+    return 0;
+}
+
+extern int main()
+{
+    unique<int>[3] uniqueValues = default;
+    expect_error("countof needs a fixed-size array; operand 'uniqueValues'") {
+        countof(uniqueValues);
+    }
+
+    int value = 3;
+    expect_error("countof needs a fixed-size array; operand 'value'") {
+        countof(value);
+    }
+
+    int* p = nullptr;
+    expect_error("countof needs a fixed-size array; operand 'p + 1'") {
+        countof(p + 1);
+    }
+
+    int[2] backing = default;
+    int[] view = backing;
+    countofPointerParameter(nullptr);
+    countofViewParameter(view);
+    return 0;
+}

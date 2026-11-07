@@ -1747,6 +1747,7 @@ namespace cflat_cinterop
                 result.kind = "nonconst";
                 return result;
             }
+            const Expr* valueInit = init;
             init = init->IgnoreParenImpCasts();
             // `= nullptr`, `= NULL` (clang's `__null`), `= 0` on a pointer parameter all mean the
             // null pointer; a pointer default that is anything else is not a constant here.
@@ -1771,7 +1772,7 @@ namespace cflat_cinterop
                 return result;
             }
             Expr::EvalResult ev;
-            if (!init->EvaluateAsRValue(ev, ctx))
+            if (!valueInit->EvaluateAsRValue(ev, ctx))
             {
                 result.kind = "nonconst";
                 return result;
@@ -3898,9 +3899,9 @@ namespace cflat_cinterop
 
             // Fill rec.fields from a record. C11 transparent anonymous members (unnamed fields
             // whose type is an anonymous struct/union) get a synthetic `<tag>__anon<N>` record
-            // plus a synthetic `__anon<N>` field, matching the old libclang path so CFlat reaches
-            // the inner members via `o.__anon0.field`. Named nested records are emitted on their
-            // own by the visitor. Anonymous bitfields are width markers (storage-unit boundaries).
+            // plus a synthetic `__anon<N>` field marked as transparent in the record metadata.
+            // Named nested records are emitted on their own by the visitor. Anonymous bitfields
+            // are width markers (storage-unit boundaries).
             void CollectFields(const RecordDecl* rd, const std::string& tag, RawRecord& rec)
             {
                 int anonIdx = 0;
@@ -3970,6 +3971,7 @@ namespace cflat_cinterop
                             nested.alignBytes = nestedLayout.getAlignment().getQuantity();
                             RawField fe;
                             fe.name = "__anon" + std::to_string(idx);
+                            fe.isAnonymousMember = true;
                             fe.ctype = (isUnion ? "union " : "struct ") + synTag;
                             fe.access = MapAccess(f->getAccess());
                             fe.offsetBytes = layout.getFieldOffset(f->getFieldIndex()) / 8;
@@ -3978,7 +3980,7 @@ namespace cflat_cinterop
                             const uint64_t anonOffset = layout.getFieldOffset(f->getFieldIndex()) / 8;
                             for (const RawField& child : nested.fields)
                             {
-                                if (child.name.empty() || child.name.starts_with("__anon")
+                                if (child.name.empty() || child.isAnonymousMember
                                     || child.isBitfield) continue;
                                 const bool promoteAll = st.req.cxxMode
                                     && MapAccess(f->getAccess()) == AccessPublic;
@@ -5256,7 +5258,7 @@ namespace cflat_cinterop
                         hasPublicField = std::any_of(rec.fields.begin(), rec.fields.end(),
                             [](const RawField& field) {
                                 return !field.isBitfield && field.access == AccessPublic
-                                    && !field.name.starts_with("__anon");
+                                    && !field.isAnonymousMember;
                             });
                     }
                     if (!hasPublicField)

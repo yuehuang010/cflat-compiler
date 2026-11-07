@@ -2019,7 +2019,7 @@ static bool CollectSourcePointerRootNames(antlr4::tree::ParseTree* value,
     {
         // This is reached only for a well-typed pointer initializer/store; a bare constant there
         // is a null pointer constant, so it contributes no local root candidate.
-        if (primary->Constant() != nullptr) return true;
+        if (primary->Constant() != nullptr || primary->NullPtrConstant() != nullptr) return true;
         return false;
     }
     if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(value))
