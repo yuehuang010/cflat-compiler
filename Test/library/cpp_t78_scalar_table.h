@@ -41,3 +41,17 @@ enum FB : int { FBV = 6 };
 inline int takeFB(FB b) { return (int)b; }
 inline int takeFBInt(int x) { return x + 100; }
 }
+// CTORVIAB: a constructor template decides a narrowing only when clang selects it. Each class is one
+// accept-set or refusal shape; test_cpp_interop.cb (accept legs) and err_cpp_ctor_selected_narrowing.cb.
+namespace t78 {
+template <bool B> struct CvIfT { };
+template <> struct CvIfT<true> { using type = int; };
+template <class T> struct CvIdentity { using type = T; };
+struct CvAway { int v; CvAway(short x) : v(x) {} template <class T> requires (sizeof(T) == 1) CvAway(T) : v(99) {} };
+struct CvEnableAway { int v; CvEnableAway(short x) : v(x) {} template <class T, typename CvIfT<sizeof(T) == 1>::type = 0> CvEnableAway(T) : v(99) {} };
+struct CvExact { int v; CvExact(short x) : v(x) {} template <class T, typename CvIfT<sizeof(T) == 4>::type = 0> CvExact(T x) : v((int)x + 1000) {} };
+struct CvReq { int v; CvReq(short x) : v(x) {} template <class T> requires (sizeof(T) == 4) CvReq(T x) : v((int)x + 2000) {} };
+struct CvDeduce { int v; CvDeduce(short x) : v(x) {} template <class T> CvDeduce(T x) : v((int)x + 50) {} };
+struct CvIdent { int v; CvIdent(short, int) : v(11) {} template <class T> CvIdent(typename CvIdentity<T>::type* p, T x) : v((int)x + 50) {} };
+struct CvNull { int v; CvNull(short, int) : v(11) {} template <class T> CvNull(T*, double) : v(99) {} };
+}

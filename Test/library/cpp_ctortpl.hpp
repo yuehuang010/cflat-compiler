@@ -1,5 +1,6 @@
 #pragma once
 #include <type_traits>
+#include <cstddef>
 
 namespace ctortpl {
 inline int calls = 0;
@@ -23,6 +24,35 @@ struct Two {
     Two(int x, int y) : value(x + y) { picked = 1; }
     template<class U, std::enable_if_t<std::is_enum_v<U>, int> = 0>
     Two(U x, int y) : value(static_cast<int>(x) + y + 100) { picked = 2; }
+};
+
+struct NullPF {
+    int value = 0;
+    NullPF(int x, int*) : value(x) { picked = 1; }
+    template<class U, std::enable_if_t<std::is_enum_v<U>, int> = 0>
+    NullPF(U x, int*) : value(static_cast<int>(x) + 100) { picked = 2; ++calls; }
+};
+struct NullPFReceiver { int accept(NullPF p) { return p.value; } };
+
+struct DeletedEnum {
+    int value = 0;
+    DeletedEnum(int x) : value(x) { picked = 1; }
+    template<class U, std::enable_if_t<std::is_enum_v<U>, int> = 0>
+    DeletedEnum(U) = delete;
+};
+struct DeletedEnumReceiver { int accept(DeletedEnum p) { return p.value; } };
+
+enum AmbiguousEnum { AmbiguousValue = 3 };
+struct AmbiguousD5 {
+    int value = 0;
+    AmbiguousD5(decltype(AmbiguousValue) x, int = 0) : value(100 + static_cast<int>(x)) {}
+    AmbiguousD5(decltype(AmbiguousValue) x) : value(200 + static_cast<int>(x)) {}
+};
+struct AmbiguousD5Receiver { int accept(AmbiguousD5 p) { return p.value; } };
+
+struct D5Single {
+    int value = 0;
+    D5Single(decltype(AmbiguousValue) x, int = 0) : value(300 + static_cast<int>(x)) {}
 };
 
 struct Forward {

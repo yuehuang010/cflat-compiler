@@ -625,6 +625,7 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
 static const std::string kCxxLvalueMacroMarker = "\x1f" "CFLAT_LVALUE_MACRO";
 // A function-like system macro (`assert`): bound at its call through a generated wrapper.
 static const std::string kCxxFunctionMacroMarker = "\x1f" "CFLAT_FUNCTION_MACRO";
+static const std::string kCxxImportedFunctionMacroMarker = "\x1f" "CFLAT_IMPORTED_FUNCTION_MACRO";
 
 bool LLVMBackend::BindCxxLvalueMacro(const CxxRequestGroup& group, const std::string& name,
                                      const std::string& file)
@@ -693,6 +694,151 @@ std::string LLVMBackend::RequestCxxArgumentFreeMacroCall(const std::string& name
         return GetFunction(wrapperName) != nullptr ? wrapperName : std::string();
 }
 
+bool LLVMBackend::IsCxxMacroFunctionTemplate(const std::string& name) const
+{
+        auto templates = gts.genericFunctionTemplates.find(name);
+        if (templates == gts.genericFunctionTemplates.end() || templates->second.empty()) return false;
+        return std::all_of(templates->second.begin(), templates->second.end(), [&](auto* context) {
+            return cxxMacroTemplateContexts_.count(context) != 0;
+        });
+}
+
+bool LLVMBackend::TryGetCxxMacroExpansionNullZero(const std::string& name,
+                                                   const std::string& invocation,
+                                                   CMacroEntry& out)
+{
+        if (!IsImportedCxxFunctionMacro(name) || invocation.empty()) return false;
+        auto owner = cxxFunctionOwnerGroup_.find(name);
+        if (owner == cxxFunctionOwnerGroup_.end() || owner->second >= cxxImportGroups_.size())
+            return false;
+
+        const CxxRequestGroup group = MakeCxxRequestGroup(owner->second, {});
+        const std::string memoryKey = std::to_string(owner->second) + "\x1f" + name
+            + "\x1f" + invocation;
+        if (auto cached = cxxMacroExpansionZeroCache_.find(memoryKey);
+            cached != cxxMacroExpansionZeroCache_.end())
+        {
+            out.name = name;
+            out.intTypeName = cached->second.second;
+            out.isIntegerLiteralZero = cached->second.first;
+            out.isIntegerLiteralToken = cached->second.first;
+            return cached->second.first;
+        }
+
+        const std::string source = "static const __auto_type __cflat_macro_0_call = "
+            + invocation + ";\n";
+        const std::vector<std::string> args = BuildCxxRequestClangArgs(group);
+        const std::string cacheSource = BuildCxxRequestIncludes(group) + source;
+        const std::string cacheKey = CxxTypeRequestCacheKey(
+            group, "|function-macro-expansion|" + name + "|" + invocation,
+            cacheSource, args, /*emitDefinitions*/ false) + "|MACROEXP";
+
+        CFileSigCacheEntry cachedEntry;
+        std::string missReason;
+        if (TryLoadCxxTypeRequestCache(group, cacheKey, /*emitDefinitions*/ false,
+                                       cachedEntry, missReason, /*allowDisk*/ true)
+            && cachedEntry.macros.size() == 1 && cachedEntry.macros.front().name == name)
+        {
+            out = cachedEntry.macros.front();
+            const bool isZero = out.isIntegerLiteralZero && out.isIntegerLiteralToken;
+            cxxMacroExpansionZeroCache_.emplace(memoryKey,
+                std::pair{ isZero, out.intTypeName });
+            if (verbose)
+                std::cout << std::format("[verbose] C++ macro expansion cache hit '{}': {}\n",
+                    name, isZero ? "integer literal zero" : "not integer literal zero");
+            return isZero;
+        }
+
+        cflat_cinterop::CxxMacroProbe probe;
+        probe.name = name;
+        probe.file = group.headers.empty() ? std::string{} : group.headers.front();
+        cflat_cinterop::ExtractRequest req;
+        req.mainFileName = "cflat_cpp_macro_expansion.cpp";
+        req.cxxMode = true;
+        req.cxxImportGroupKey = CxxIncrementalGroupKey(group);
+        req.args = args;
+        req.verbose = verbose;
+        req.cxxMacroProbes = { probe };
+        req.cxxWrapperBatch = true;
+        req.emitDefinitions = false;
+        req.demandOnlyDefinitions = false;
+        req.assumeInlineDefinitions = true;
+        req.skipFunctionBodies = true;
+        req.requireInScope = false;
+
+        CMacroEntry result;
+        result.name = name;
+        result.file = probe.file;
+        std::string error;
+        CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(group, error);
+        cflat_cinterop::ExtractResult raw;
+        const bool parsed = incremental != nullptr
+            && incremental->ParseRequest(req, source, raw, error);
+        if (parsed && raw.macros.size() == 1)
+            ClassifyRawMacro(raw.macros.front(), result, /*cxxBoundary*/ true);
+
+        const bool isZero = result.isIntegerLiteralZero && result.isIntegerLiteralToken;
+        CFileSigCacheEntry stored;
+        stored.macros.push_back(result);
+        StoreCxxTypeRequestCache(group, cacheKey, /*emitDefinitions*/ false,
+                                 std::move(stored), /*allowDisk*/ true, nullptr);
+        cxxMacroExpansionZeroCache_.emplace(memoryKey,
+            std::pair{ isZero, result.intTypeName });
+        out = std::move(result);
+        if (verbose)
+            std::cout << std::format("[verbose] C++ macro expansion probe '{}': {}\n",
+                name, isZero ? "integer literal zero" : "not integer literal zero");
+        return isZero;
+}
+
+bool LLVMBackend::IsCFlatVariableBinding(const std::string& name)
+{
+        // Same lookup order as the postfix path: locals and parameters, then implicit-this fields,
+        // then globals. A global that is only a bound C++ macro is not a CFlat binding.
+        if (GetScopedLocalOrArgument(name).Storage != nullptr) return true;
+        if (GetFunctionArgument(name).GetValue() != nullptr) return true;
+        if (HasMemberVariable(name)) return true;
+        // A bare name inside `namespace a.b` also binds a.b.name and a.name.
+        for (std::string ns = currentNamespace_; !ns.empty();)
+        {
+            const std::string qualified = ns + "." + name;
+            if (GetGlobalVariableNV(qualified).Storage != nullptr && !IsCxxMacroGlobalName(qualified))
+                return true;
+            const size_t dot = ns.rfind('.');
+            ns = dot == std::string::npos ? std::string() : ns.substr(0, dot);
+        }
+        return GetGlobalVariableNV(name).Storage != nullptr && !IsCxxMacroGlobalName(name);
+}
+
+const std::vector<LLVMBackend::FunctionSymbol>* LLVMBackend::FindCFlatCallCandidates(
+    const std::string& name) const
+{
+        for (std::string ns = currentNamespace_; !ns.empty();)
+        {
+            auto it = functionTable.find(ns + "." + name);
+            if (it != functionTable.end() && !it->second.empty()) return &it->second;
+            const size_t dot = ns.rfind('.');
+            ns = dot == std::string::npos ? std::string() : ns.substr(0, dot);
+        }
+        auto it = functionTable.find(name);
+        return it == functionTable.end() || it->second.empty() ? nullptr : &it->second;
+}
+
+bool LLVMBackend::ParameterMayTakeNullConstant(const TypeAndValue& parameter)
+{
+        if (parameter.Pointer || parameter.ElemPointer || parameter.PointerDepth > 0
+            || parameter.IsFunctionPointer || parameter.IsCxxRefToPointer || parameter.IsCxxNullptrT
+            || parameter.IsInterface || parameter.IsInterfacePointer || parameter.IsArrayView
+            || !parameter.ConstInnerDimensions.empty())
+            return true;
+        static const std::unordered_set<std::string> kArithmetic = {
+            "bool", "char", "signed char", "unsigned char", "short", "unsigned short",
+            "int", "unsigned", "unsigned int", "long", "unsigned long", "long long",
+            "unsigned long long", "float", "double",
+        };
+        return kArithmetic.count(parameter.TypeName) == 0;
+}
+
 bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
 {
         if (!HasCxxImportGroup() || name.empty() || name.starts_with("__cflat")) return false;
@@ -713,6 +859,7 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
         std::vector<Candidate> pending;
         std::optional<Candidate> hit;
         CMacroEntry hitEntry;
+        std::vector<CFunctionMacroEntry> hitFunctionMacros;
         /*
          * Every group's stored answer is loaded, not just up to the first hit: a load notes its
          * entry in the group's demand-companion key, so a warm compile must note exactly what
@@ -736,6 +883,7 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
                 if (entry.macros.front().name == name && !hit.has_value())
                 {
                     hitEntry = entry.macros.front();
+                    hitFunctionMacros = entry.funcMacros;
                     hit = std::move(c);
                 }
                 continue;   // a hit, or a remembered absence
@@ -747,11 +895,32 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
         {
             if (hitEntry.aliasTarget == kCxxLvalueMacroMarker)
                 return BindCxxLvalueMacro(hit->group, name, hitEntry.file);
-            if (hitEntry.aliasTarget == kCxxFunctionMacroMarker)
+            if (hitEntry.aliasTarget == kCxxFunctionMacroMarker
+                || hitEntry.aliasTarget == kCxxImportedFunctionMacroMarker)
             {
-                cxxFunctionMacros_.insert(name);
                 cxxFunctionOwnerGroup_[name] = hit->primary;
-                if (hitEntry.value == 1) cxxArgumentFreeMacros_.insert(name);
+                if (hitEntry.aliasTarget == kCxxImportedFunctionMacroMarker)
+                {
+                    importedCxxFunctionMacros_.insert(name);
+                    auto macro = std::find_if(hitFunctionMacros.begin(), hitFunctionMacros.end(),
+                        [&](const CFunctionMacroEntry& entry) { return entry.name == name; });
+                    bool hasTranslatedTemplate = false;
+                    if (macro != hitFunctionMacros.end())
+                    {
+                        RegisterCFunctionMacros({ *macro }, macro->file);
+                        ProcessPendingMacroSources();
+                        hasTranslatedTemplate = gts.genericFunctionTemplates.count(name) != 0;
+                    }
+                    if (hasTranslatedTemplate) cxxFunctionMacros_.erase(name);
+                    else cxxFunctionMacros_.insert(name);
+                    if (hitEntry.value == 1 && !hasTranslatedTemplate)
+                        cxxArgumentFreeMacros_.insert(name);
+                }
+                else
+                {
+                    cxxFunctionMacros_.insert(name);
+                    if (hitEntry.value == 1) cxxArgumentFreeMacros_.insert(name);
+                }
                 return true;
             }
             RegisterCMacros({ hitEntry });
@@ -787,6 +956,50 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
             {
                 rememberAbsent();
                 continue;
+            }
+            if (found.functionLike && !found.systemHeader)
+            {
+                const bool usesParameter = [&] {
+                    std::vector<std::string> params = found.params;
+                    if (found.variadic) params.push_back("__VA_ARGS__");
+                    size_t start = 0;
+                    while (start < found.body.size())
+                    {
+                        size_t end = found.body.find(' ', start);
+                        if (end == std::string::npos) end = found.body.size();
+                        const std::string token = found.body.substr(start, end - start);
+                        if (std::find(params.begin(), params.end(), token) != params.end())
+                            return true;
+                        start = end + 1;
+                    }
+                    return false;
+                }();
+                CFunctionMacroEntry imported;
+                imported.name = name;
+                imported.params = found.params;
+                imported.body = found.body;
+                imported.file = found.file;
+                imported.line = found.line;
+                imported.col = found.col;
+                RegisterCFunctionMacros({ imported }, found.file);
+                ProcessPendingMacroSources();
+                const bool hasTranslatedTemplate = gts.genericFunctionTemplates.count(name) != 0;
+                CMacroEntry marker;
+                marker.name = name;
+                marker.aliasTarget = kCxxImportedFunctionMacroMarker;
+                marker.file = found.file;
+                marker.value = usesParameter ? 0 : 1;
+                CFileSigCacheEntry stored;
+                stored.macros.push_back(std::move(marker));
+                stored.funcMacros.push_back(imported);
+                StoreCxxTypeRequestCache(c.group, c.key, /*emitDefinitions*/ false,
+                                         std::move(stored), /*allowDisk*/ true, nullptr);
+                if (hasTranslatedTemplate) cxxFunctionMacros_.erase(name);
+                else cxxFunctionMacros_.insert(name);
+                importedCxxFunctionMacros_.insert(name);
+                cxxFunctionOwnerGroup_[name] = c.primary;
+                if (!usesParameter && !hasTranslatedTemplate) cxxArgumentFreeMacros_.insert(name);
+                return true;
             }
             if (found.functionLike)
             {
@@ -5690,6 +5903,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 // from `const T*` overloads. Keep both in the candidate set for C++ ranking.
                 if (CxxSpellingHasConstPointee(m.paramTypes[p])) t += "|const-pointee";
                 if (CxxSpellingHasVolatileTarget(m.paramTypes[p])) t += "|volatile-pointee";
+                // A non-const lvalue `T&` and a by-value `T` share one CFlat surface type, but C++
+                // ranks them apart (clang: ambiguous for an lvalue), so both stay in the set.
+                if (refKind == CxxReferenceKind::Lvalue && !constReferent) t += "|lref";
                 if (refKind == CxxReferenceKind::Rvalue) t += "|rvalue";
                 else if (refKind == CxxReferenceKind::RefToPointer)
                 {
@@ -8604,6 +8820,14 @@ void LLVMBackend::RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>
                 ++skipped;
                 if (verbose) std::cout << std::format("[verbose]   skip macro {}: name already defined\n", m.name);
                 continue;
+            }
+
+            if (activeCxxRequestGroup_ != nullptr
+                && activeCxxRequestGroup_->primary < cxxImportGroups_.size())
+            {
+                importedCxxFunctionMacros_.insert(m.name);
+                cxxFunctionMacros_.insert(m.name);
+                cxxFunctionOwnerGroup_.try_emplace(m.name, activeCxxRequestGroup_->primary);
             }
 
             // Only generic templates are bound, and `auto F<>()` is no CFlat syntax.

@@ -491,6 +491,7 @@ int dixTimesTen(int x) { return x * 10; }
 int*[2][2] dixGlobalPointers;
 int srctypeTag(i64 value) { return 5; }
 int srctypeTag(u64 value) { return 6; }
+int srctypeTag(u32 value) { return 7; }
 
 extern int main()
 {
@@ -503,13 +504,21 @@ extern int main()
     srctypePassed += Test("native auto sizeof type and value", typeof(srctypeSize), "i64");
     srctypePassed += Test("native auto sizeof comparison", srctypeSize - 8 < 0 ? 1 : 0, 1);
     srctypePassed += Test("native auto sizeof overload", srctypeTag(srctypeSize), 5);
-    srctypePassed += Test("native auto shift type", typeof(srctypeShift), "i64");
+    if const (__WINDOWS__) {
+        // LLP64: long is int and ulong is uint, so the usual conversions stay 32-bit.
+        srctypePassed += Test("native auto shift type", typeof(srctypeShift), "int");
+        srctypePassed += Test("native auto xor type", typeof(srctypeXor), "u32");
+        srctypePassed += Test("native auto and type", typeof(srctypeAnd), "u32");
+        srctypePassed += Test("native auto unsigned overload", srctypeTag(srctypeAnd), 7);
+    } else {
+        srctypePassed += Test("native auto shift type", typeof(srctypeShift), "i64");
+        srctypePassed += Test("native auto xor type", typeof(srctypeXor), "i64");
+        srctypePassed += Test("native auto and type", typeof(srctypeAnd), "u64");
+        srctypePassed += Test("native auto unsigned overload", srctypeTag(srctypeAnd), 6);
+    }
     srctypePassed += Test("native auto shift value", srctypeShift, 6);
-    srctypePassed += Test("native auto xor type", typeof(srctypeXor), "i64");
     srctypePassed += Test("native auto xor value", srctypeXor, 5);
-    srctypePassed += Test("native auto and type", typeof(srctypeAnd), "u64");
     srctypePassed += Test("native auto and value", srctypeAnd, 2);
-    srctypePassed += Test("native auto unsigned overload", srctypeTag(srctypeAnd), 6);
     auto srctypeParen = (srctypeLong + 1);
     auto srctypeParen2 = ((srctypeLong * 2));
     srctypePassed += Test("native auto paren additive type", typeof(srctypeParen), "long");

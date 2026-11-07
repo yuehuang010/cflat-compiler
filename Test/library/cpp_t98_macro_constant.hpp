@@ -97,6 +97,41 @@ struct NsAnonPick {
     NsAnonPick(NsAnonEnum) : n(31) {}
     NsAnonPick(int) : n(30) {}
 };
+// WINENUM: a fixed-underlying enum argument is a promotion to its underlying type, never
+// identity (clang in MSVC mode fixes every unscoped enum at int). Int-first order failed on master.
+enum T98FixedEnum : int { T98_FIXED_VALUE = 27 };
+enum : int { T98_FIXED_ANON = 28 };
+using T98FixedAnon = decltype(T98_FIXED_ANON);
+enum T98FixedBool : bool { T98_FIXED_BOOL = true };
+enum T98FixedShort : short { T98_FIXED_SHORT = 29 };
+inline int fixedTypePick(T98FixedAnon) { return 90; }
+inline int fixedTypePick(int) { return 91; }
+inline int fixedTypePick(T98FixedEnum) { return 92; }
+inline int fixedBoolPick(bool) { return 93; }
+inline int fixedBoolPick(T98FixedBool) { return 94; }
+inline int fixedShortPick(short) { return 95; }
+inline int fixedShortPick(int) { return 96; }
+inline int fixedRefPick(int) { return 97; }
+inline int fixedRefPick(const T98FixedEnum&) { return 98; }
+inline int fixedCrefPick(const int&) { return 51; }
+inline int fixedCrefPick(T98FixedEnum) { return 52; }
+inline int fixedCrefPair(const int&) { return 53; }
+inline int fixedCrefPair(const T98FixedEnum&) { return 54; }
+inline int fixedRvalPick(int&&) { return 55; }
+inline int fixedRvalPick(T98FixedEnum&&) { return 56; }
+// A const int& constructor set is lowered through a ranked brace wrapper (enum spelled by name).
+struct FixedCrefPick {
+    int n;
+    FixedCrefPick(const int&) : n(57) {}
+    FixedCrefPick(T98FixedEnum) : n(58) {}
+};
+struct FixedPick {
+    int n;
+    FixedPick(int) : n(61) {}
+    FixedPick(T98FixedEnum) : n(62) {}
+    int m(int) { return 63; }
+    int m(T98FixedEnum) { return 64; }
+};
 inline int macroTypePick2(T98NamedEnum, int) { return 12; }
 inline int macroTypePick2(int, int) { return 13; }
 inline int macroCommaId(int x) { return x; }
@@ -106,5 +141,6 @@ struct Ulongs {
 };
 }
 
+#define T98_FIXED_MACRO cpi_t98::T98_FIXED_VALUE
 #define T98_INLINE_MACRO cpi_t98::InlineValue
 #define T98_DEREF (*cpi_t98::derefPointer)

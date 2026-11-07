@@ -1,6 +1,7 @@
 #include <set>
 #include <tuple>
 #include "MainListener.h"
+#include <llvm/Analysis/ValueTracking.h>
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Support/SaveAndRestore.h"
 
@@ -92,17 +93,6 @@ static bool IsTernaryArmOfBinaryOperand(antlr4::ParserRuleContext* arm)
             if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
                 assignment != nullptr && assignment->assignmentOperator() != nullptr) return true;
         }
-        return false;
-    }
-
-// A subscript may be a C++ operator[] call, so a unary over one keeps the call route.
-static bool SubtreeContainsCallOrSubscript(antlr4::tree::ParseTree* node)
-{
-        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
-            postfix != nullptr && (!postfix->argumentExpressionList().empty() || !postfix->expression().empty()))
-            return true;
-        for (auto* child : node->children)
-            if (SubtreeContainsCallOrSubscript(child)) return true;
         return false;
     }
 
@@ -513,6 +503,23 @@ static bool ClosureLocalStoresAreProvablyEnvFree(CFlatParser::InitDeclaratorCont
         return scan.foundCandidate && scan.envFree;
     }
 
+// The initializer is one unary operator (parentheses transparent): its operand is fold-scoped.
+static bool IsSoleUnaryExpression(antlr4::tree::ParseTree* node)
+{
+        if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+            return assign->assignmentOperator() == nullptr && assign->conditionalExpression() != nullptr
+                && IsSoleUnaryExpression(assign->conditionalExpression());
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
+            return IsSoleUnaryExpression(primary->expression());
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+            return unary->unaryOperator() != nullptr && unary->Sizeof().empty();
+        if (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            ctx != nullptr && ctx->children.size() == 1)
+            return IsSoleUnaryExpression(ctx->children[0]);
+        return false;
+    }
+
 static bool IsSoleOperatorExpression(antlr4::tree::ParseTree* node)
 {
         if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
@@ -530,11 +537,10 @@ static bool IsSoleOperatorExpression(antlr4::tree::ParseTree* node)
         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
             primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
             return IsSoleOperatorExpression(primary->expression());
-        // A unary operand is parsed without a fold scope: a call inside it would take the slot.
-        // A plain postfix/primary unary falls through, so `(a + f(2))` reaches its parens.
+        // Unary operands use a fold scope, so nested calls and subscripts cannot take the result slot.
         if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
             unary != nullptr && unary->unaryOperator() != nullptr)
-            return unary->Sizeof().empty() && !SubtreeContainsCallOrSubscript(unary);
+            return unary->Sizeof().empty();
         if (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
             ctx != nullptr && ctx->children.size() == 1)
             return IsSoleOperatorExpression(ctx->children[0]);
@@ -7053,9 +7059,32 @@ bool MainListener::CxxCallResultFrameBound(llvm::CallBase* call, const CxxFactPo
         llvm::Value* arg = call->getArgOperand(i);
         if (arg->getType()->isPointerTy())
         {
-            const bool bound = call->paramHasAttr(i, llvm::Attribute::ByVal)
-                ? CxxStorageValueFrameBound(arg, at, depth)
-                : CxxArgumentRootedInFrame(arg, 0);
+            // A by-value aggregate through a hidden caller copy (`byval`, or a plain `ptr %abi.byval`
+            // on MS x64 / arm64 over 16 B) is judged by the one value stored into the copy.
+            auto* copy = llvm::dyn_cast<llvm::AllocaInst>(arg->stripPointerCasts());
+            const bool byValAttr = call->paramHasAttr(i, llvm::Attribute::ByVal);
+            llvm::Value* stored = nullptr;
+            unsigned stores = 0;
+            if (copy != nullptr && (byValAttr || copy->getName().starts_with("abi.byval")))
+                for (auto* user : copy->users())
+                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                        if (store->getPointerOperand()->stripPointerCasts() == copy)
+                        {
+                            stored = store->getValueOperand();
+                            ++stores;
+                        }
+            bool bound = false;
+            // A value loaded through a pointer (`*p`, `p->b`) has no provable root: fail closed.
+            auto* storedLoad = llvm::dyn_cast_or_null<llvm::LoadInst>(stored);
+            llvm::Value* loadRoot = storedLoad != nullptr
+                ? llvm::getUnderlyingObject(storedLoad->getPointerOperand()) : nullptr;
+            if (stores == 1 && storedLoad != nullptr
+                && !llvm::isa<llvm::AllocaInst, llvm::GlobalVariable>(loadRoot)
+                && !CxxStorageHasProvenance(storedLoad->getPointerOperand()))
+                bound = true;
+            else if (stores == 1) bound = CxxValueFrameBound(stored, at, depth + 1);
+            else if (byValAttr) bound = CxxStorageValueFrameBound(arg, at, depth);
+            else bound = CxxArgumentRootedInFrame(arg, 0);   // unproven copy: fail closed
             if (bound) return true;
         }
         else if ((arg->getType()->isStructTy() || arg->getType()->isArrayTy())
@@ -9169,7 +9198,11 @@ cxx_dtor_ready:
                 // body refusal of the constructor clang selected (MSVC's fill constructor).
                 if (wrapperError.starts_with("clang: ") && why.starts_with("cannot copy C++ class"))
                     wrapperError.clear();
-                if (wrapperError.starts_with("clang: "))
+                // Clang refusing its own wrapper (a deleted or ambiguous pick) stands over the
+                // listed constructor the CFlat side would otherwise call.
+                const bool clangRefusedWrapper = ctor != nullptr && !wrapperError.empty()
+                    && compiler->lastCxxVariadicCtorClangRefused_;
+                if (wrapperError.starts_with("clang: ") || clangRefusedWrapper)
                 {
                     LogErrorContext(direct, wrapperError);
                     return true;
@@ -9177,7 +9210,9 @@ cxx_dtor_ready:
                 if (ctor == nullptr || clangOnlyConstructorSet)
                 {
                     // The listed refusal names the parameter; clang's line stands otherwise.
-                    if (!wrapperError.empty() && !why.starts_with("constructor '")) why = wrapperError;
+                    if (!wrapperError.empty() && !why.starts_with("constructor '"))
+                        why = why.starts_with("matches more than one constructor overload")
+                            ? why + "; " + wrapperError : wrapperError;
                     LogErrorContext(direct, why.starts_with("no overload of '")
                         ? why : std::format("C++ class '{}' {}",
                             compiler->DisplayCxxClassName(typeName), why));
@@ -9439,8 +9474,11 @@ cxx_dtor_ready:
                 parsedArrayRetValue = compiler->lastCxxRetValue_;
                 hasParsedArrayInitializer = true;
             }
+            // A sole unary operator is armed at the operator slot below; pre-parsing it here
+            // would build its result before the slot exists.
             else if (!directCxxSubscript && !IsBareIdentifierText(srcText)
-                && srcText.find('[') != std::string::npos)
+                && srcText.find('[') != std::string::npos
+                && !IsSoleUnaryExpression(assign))
             {
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
@@ -9713,9 +9751,8 @@ cxx_dtor_ready:
             return true;
         }
 
-        // A top-level operator result may construct directly into the declared slot. BINARY
-        // operand parsing scopes this slot away from nested calls; a unary operand with a call
-        // is not armed (IsSoleOperatorExpression), since its operand parse has no such scope.
+        // A top-level operator result may construct directly into the declared slot. Binary and
+        // unary operand scopes hide the slot from nested calls and subscripts.
         // A ternary has two independent control-flow arms. Do not arm the ordinary first-call
         // slot for it: ParseTernaryBranches moves each arm's own return temporary into the slot.
         // A trivially copyable class (admitted for its converting ctor) joins its '?:' arms as
@@ -9724,7 +9761,7 @@ cxx_dtor_ready:
             && compiler->IsForeignNontrivialCxxClass(typeName);
         // A call-free initializer (`x[0]`, `a.b`, `-a`) has no inner call to take the slot.
         const bool armedOperator = SoleTernaryExpression(assign) == nullptr
-            && (assign->getText().find('(') == std::string::npos || IsSoleOperatorExpression(assign)
+            && (!SubtreeContainsCall(assign) || IsSoleOperatorExpression(assign)
                 || SoleAssignmentExpression(assign) != nullptr);
         compiler->lastCxxRetTemp_ = nullptr;
         compiler->lastCxxRetValue_ = nullptr;

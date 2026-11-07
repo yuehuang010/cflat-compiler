@@ -350,7 +350,7 @@ std::string LLVMBackend::ResolveMemberType(const std::string& owner, const std::
         bool bound = false;
         if (auto group = cxxTypeOwnerGroup_.find(owner); group != cxxTypeOwnerGroup_.end())
         {
-            CxxRequestGroup request = MakeCxxRequestGroup(group->second, {});
+            CxxRequestGroup request = MakeCxxClassRequestGroup(group->second, owner);
             if (!request.headers.empty())
             {
                 CxxRequestGroupScope scope(*this, &request);

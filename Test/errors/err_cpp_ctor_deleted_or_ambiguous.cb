@@ -1,0 +1,39 @@
+import cpp "cpp_ctortpl.hpp";
+
+extern int main()
+{
+    expect_error("deleted constructor") {
+        ctortpl.DeletedEnum value = ctortpl.DeletedEnum(ctortpl.AnonValue);
+    }
+    expect_error("deleted constructor") {
+        ctortpl.DeletedEnum value = {ctortpl.AnonValue};
+    }
+    expect_error("deleted function") {
+        ctortpl.DeletedEnum value = ctortpl.AnonValue;
+    }
+    expect_error("deleted constructor") {
+        ctortpl.DeletedEnum* value = new ctortpl.DeletedEnum(ctortpl.AnonValue);
+    }
+    expect_error("deleted function") {
+        ctortpl.DeletedEnumReceiver receiver = default;
+        receiver.accept(ctortpl.AnonValue);
+    }
+
+    expect_error("ambiguous") {
+        ctortpl.AmbiguousD5 value = ctortpl.AmbiguousD5(ctortpl.AmbiguousValue);
+    }
+    expect_error("ambiguous") {
+        ctortpl.AmbiguousD5 value = {ctortpl.AmbiguousValue};
+    }
+    expect_error("ambiguous") {
+        ctortpl.AmbiguousD5 value = ctortpl.AmbiguousValue;
+    }
+    expect_error("ambiguous") {
+        ctortpl.AmbiguousD5* value = new ctortpl.AmbiguousD5(ctortpl.AmbiguousValue);
+    }
+    expect_error("ambiguous") {
+        ctortpl.AmbiguousD5Receiver receiver = default;
+        receiver.accept(ctortpl.AmbiguousValue);
+    }
+    return 0;
+}

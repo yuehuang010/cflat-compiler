@@ -2837,8 +2837,27 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             {
                 std::string wrapperName;
                 std::string wrapperError;
-                if (compiler->RequestCxxVariadicConstructor(
-                        typeName, { source }, wrapperName, wrapperError, /*copyInit*/ true))
+                // A returned local or parameter is an xvalue (C++20 implicit move): clang's copy-init
+                // overload resolution runs on the rvalue first; the lvalue wrapper is its fallback.
+                const bool movableReturn = IsImplicitMoveReturnLocal(compiler, assignExpr, source,
+                                                                     typeName, explicitMove);
+                auto sourceArg = source;
+                bool requested = false;
+                if (movableReturn)
+                {
+                    // A named source is an lvalue to the wrapper unless it is an explicit move.
+                    sourceArg.IsRvalue = true;
+                    sourceArg.IsExplicitMove = true;
+                    requested = compiler->RequestCxxVariadicConstructor(
+                        typeName, { sourceArg }, wrapperName, wrapperError, /*copyInit*/ true);
+                }
+                if (!requested)
+                {
+                    sourceArg = source;
+                    requested = compiler->RequestCxxVariadicConstructor(
+                        typeName, { sourceArg }, wrapperName, wrapperError, /*copyInit*/ true);
+                }
+                if (requested)
                 {
                     LLVMBackend::NamedVariable self;
                     self.Primary = cxxSretDest;
@@ -2846,7 +2865,6 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     self.TypeAndValue.TypeName = typeName;
                     self.TypeAndValue.Pointer = true;
                     self.IsRvalue = true;
-                    auto sourceArg = source;
                     sourceArg.TypeAndValue.VariableName.clear();
                     compiler->CreateOverloadedFunctionCall(wrapperName, { self, sourceArg });
                     finishCxxSretReturn();

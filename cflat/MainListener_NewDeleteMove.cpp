@@ -529,7 +529,11 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             // refusal of the constructor clang selected (MSVC's fill constructor).
             if (wrapperError.starts_with("clang: ") && why.starts_with("cannot copy C++ class"))
                 wrapperError.clear();
-            if (!wrapped && wrapperError.starts_with("clang: "))
+            // Clang refusing its own wrapper (a deleted or ambiguous pick) stands over the listed
+            // constructor the CFlat side would otherwise call.
+            const bool clangRefusedWrapper = !wrapped && ctor != nullptr && !wrapperError.empty()
+                && compiler->lastCxxVariadicCtorClangRefused_;
+            if (!wrapped && (wrapperError.starts_with("clang: ") || clangRefusedWrapper))
             {
                 // Clang picked a constructor whose body failed to instantiate.
                 LogErrorContext(ctx, wrapperError);
@@ -539,7 +543,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             if (!wrapped && (ctor == nullptr
                              || clangOnlyConstructorSet))
             {
-                if (!wrapperError.empty() && !why.starts_with("constructor '")) why = wrapperError;
+                if (!wrapperError.empty() && !why.starts_with("constructor '"))
+                    why = why.starts_with("matches more than one constructor overload")
+                        ? why + "; " + wrapperError : wrapperError;
                 // A scalar-reference set whose every constructor narrows has no listed refusal.
                 if (why.empty()) why = compiler->CxxCtorNoMatchReason(ctorArgTypes);
                 LogErrorContext(ctx, why.starts_with("no overload of '")
@@ -2316,13 +2322,19 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                     || (compiler->IsCxxRecord(tn) && compiler->IsCxxTriviallyCopyableRecord(tn)));
         };
         const std::string moveOperandText = ctx->unaryExpression()->getText();
-        const auto* currentFunctionSymbol = compiler->builder->GetInsertBlock() != nullptr
-            ? compiler->FindSymbolForFunction(compiler->builder->GetInsertBlock()->getParent())
-            : nullptr;
+        // A method or a lambda that captures `this` (the lambda is not itself a method) reads the member.
         const bool namesImplicitThisField = IsBareIdentifierText(moveOperandText)
             && compiler->GetScopedLocalOrArgument(moveOperandText).Storage == nullptr
             && compiler->HasMemberVariable(moveOperandText)
-            && currentFunctionSymbol != nullptr && currentFunctionSymbol->IsMethod;
+            && compiler->GetFunctionArgument("this").GetValue() != nullptr;
+        // Implicit-this `data` names the same member as `this->data`: same refusal, decided before the copy path.
+        if (namesImplicitThisField && (argNV.TypeAndValue.ConstArraySize > 0
+                || argNV.TypeAndValue.IsFlexibleArrayMember || argNV.TypeAndValue.IsZeroLengthArrayMember))
+        {
+            LogErrorContext(ctx,
+                "cannot move an array member; take its address or copy the elements");
+            return {};
+        }
         if (namesImplicitThisField && !argNV.TypeAndValue.Pointer
             && !argNV.TypeAndValue.ElemPointer && copiesAsPlainValue(argNV))
         {

@@ -2684,6 +2684,7 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         if (!e.paramBindKinds.empty()) j["pbind"] = e.paramBindKinds;
         if (!e.conditionalArgumentKinds.empty()) j["pcond"] = e.conditionalArgumentKinds;
         if (!e.closureKeptParams.empty()) j["pckeep"] = e.closureKeptParams;
+        if (!e.ctorSelectedParams.empty()) j["cpsel"] = e.ctorSelectedParams;
         if (!e.selectedCalleeType.empty())
         {
             j["scty"] = e.selectedCalleeType;
@@ -2755,6 +2756,7 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         e.paramBindKinds = j.value("pbind", std::string());
         e.conditionalArgumentKinds = j.value("pcond", std::string());
         e.closureKeptParams = j.value("pckeep", std::string());
+        if (j.contains("cpsel")) e.ctorSelectedParams = j["cpsel"].to_string_vector();
         e.selectedCalleeType = j.value("scty", std::string());
         e.selectedCalleeTemplateArgs = j.value("scta", std::string());
         if (j.contains("scd"))

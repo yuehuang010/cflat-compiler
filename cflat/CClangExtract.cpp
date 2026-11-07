@@ -629,6 +629,32 @@ namespace cflat_cinterop
             return out;
         }
 
+        // Generated constructor wrappers: the parameter spellings of the constructor clang SELECTED for the
+        // wrapper's placement new (a constructor template's deduced specialization included). Empty otherwise.
+        std::vector<std::string> WrapperSelectedConstructorParams(const ASTContext& ctx, const FunctionDecl* fd)
+        {
+            if (fd == nullptr || fd->getBody() == nullptr
+                || !fd->getNameAsString().starts_with("__cflat_ctor_"))
+                return {};
+            struct Visitor : RecursiveASTVisitor<Visitor>
+            {
+                const CXXConstructorDecl* selected = nullptr;
+
+                bool VisitCXXNewExpr(CXXNewExpr* expr)
+                {
+                    if (selected == nullptr && expr != nullptr && expr->getConstructExpr() != nullptr)
+                        selected = expr->getConstructExpr()->getConstructor();
+                    return selected == nullptr;
+                }
+            } visitor;
+            visitor.TraverseStmt(fd->getBody());
+            std::vector<std::string> out;
+            if (visitor.selected == nullptr) return out;
+            for (const ParmVarDecl* parameter : visitor.selected->parameters())
+                out.push_back(CanonicalSpelling(ctx, parameter->getType()));
+            return out;
+        }
+
         // Report the constructor selected by Clang for a same-class copy/move wrapper: exactly
         // (dst, source) with dst pointing at the source's class. Other wrappers keep their identity.
         CtorPick WrapperCopyMoveConstructorPick(const FunctionDecl* fd)
@@ -3474,6 +3500,7 @@ namespace cflat_cinterop
                     WrapperLiteralPointerTemporaries(ctx, fd, sig.paramTemporaryTypes,
                                                      sig.calleeIdentity);
                     sig.ctorPick = WrapperCopyMoveConstructorPick(fd);
+                    sig.ctorSelectedParams = WrapperSelectedConstructorParams(ctx, fd);
                     sig.resultBorrowsBraceList = WrapperResultBorrowsBraceList(
                         ctx, fd, sig.braceListElementTypes);
                     sig.paramBindKinds = WrapperParameterBindKinds(fd);
@@ -5894,6 +5921,16 @@ namespace cflat_cinterop
                         while (leaf->isPointerType()) leaf = leaf->getPointeeType().getCanonicalType();
                         if (!canon->isDependentType()
                             && (leaf->isBuiltinType() || canon->isFunctionPointerType()))
+                        {
+                            RawTypedef t;
+                            t.name = marker;
+                            FillTypedefUnderlying(td->getUnderlyingType(), t);
+                            st.out.typedefs.push_back(std::move(t));
+                        }
+                        // A typedef of a pointer to a class (std::vector<T*>::value_type). The
+                        // owner's request publishes the pointee, so the scalar binding maps it.
+                        else if (!canon->isDependentType() && canon->isPointerType()
+                                 && leaf->isRecordType())
                         {
                             RawTypedef t;
                             t.name = marker;

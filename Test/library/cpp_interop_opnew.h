@@ -173,3 +173,9 @@ inline int clsDelArr() noexcept { return Cnt::clsDelArr; }
 inline int live() noexcept { return Cnt::live; }
 inline int dtors() noexcept { return Cnt::dtors; }
 }
+
+// Member-typedef fixture (WRAPGRP r3): a pointer typedef over a class template specialization.
+namespace cppon {
+template <class T> struct Later { int v = 7; };
+template <class T> struct LaterBox { typedef Later<T>* later_ptr; };
+}

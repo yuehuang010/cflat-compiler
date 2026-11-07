@@ -4802,6 +4802,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 bool rightTypedPointer = false;
                 bool leftReference = false;
                 bool rightReference = false;
+                bool leftByValueSame = false;
+                bool rightByValueSame = false;
                 bool leftMutableReference = false;
                 bool rightMutableReference = false;
                 // Refuse an rvalue only when NO viable candidate takes that operand otherwise.
@@ -4876,6 +4878,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         if (!rightInfo.second.empty())
                             rightReference = rightReference || isReferenceParam(candidate, 1)
                                          || candidate.Parameters[1].Pointer;
+                        // A by-value parameter of the operand's own class beside a reference one: the
+                        // operand stays a value, so both candidates rank it (clang: the pair ties).
+                        if (!leftInfo.second.empty() && !isReferenceParam(candidate, 0)
+                            && !candidate.Parameters[0].Pointer
+                            && candidate.Parameters[0].TypeName == leftInfo.second)
+                            leftByValueSame = true;
+                        if (!rightInfo.second.empty() && !isReferenceParam(candidate, 1)
+                            && !candidate.Parameters[1].Pointer
+                            && candidate.Parameters[1].TypeName == rightInfo.second)
+                            rightByValueSame = true;
                         if (isMutableReferenceParam(candidate, 0))
                         {
                             leftMutableReference = true;
@@ -4927,7 +4939,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
                 auto makeArgument = [&](llvm::Value* value, llvm::Value* storage,
                                         llvm::StructType* structType, const std::string& typeName,
-                                        bool reference, int pointerDepth, bool cxxNullptrT) {
+                                        bool reference, int pointerDepth, bool cxxNullptrT,
+                                        bool byValueSame) {
                     LLVMBackend::NamedVariable result;
                     result.Primary = value;
                     result.Storage = storage;
@@ -4937,7 +4950,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     const bool nullPointer = pointerDepth < 1
                         && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(value);
                     const bool nullType = cxxNullptrT || nullPointer;
-                    const bool preserveClassValue = hasClassConversionCandidate
+                    const bool preserveClassValue = (hasClassConversionCandidate || byValueSame)
                         && structType != nullptr && pointerDepth == 0 && !nullType
                         && !typeName.empty() && compiler->IsCxxRecord(typeName);
                     result.TypeAndValue.Pointer = !nullType && reference && !preserveClassValue;
@@ -4987,10 +5000,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
                 auto leftArg = makeArgument(lvalue, leftXvalue ? lhsStorage : freeLhsStorage,
                                              leftInfo.first, leftInfo.second, leftReference,
-                                             lhsPointerDepth, lhsCxxNullptrT);
+                                             lhsPointerDepth, lhsCxxNullptrT, leftByValueSame);
                 auto rightArg = makeArgument(rvalue, rightXvalue ? rhsStorage : freeRhsStorage,
                                               rightInfo.first, rightInfo.second, rightReference,
-                                              rhsPointerDepth, rhsCxxNullptrT);
+                                              rhsPointerDepth, rhsCxxNullptrT, rightByValueSame);
                 setLiteralIdentity(leftArg, 0);
                 setLiteralIdentity(rightArg, 1);
                 // The floating operand rule (C++ binary operator scalar parameters) applies to both sides.

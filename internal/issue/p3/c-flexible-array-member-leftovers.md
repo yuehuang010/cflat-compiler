@@ -5,10 +5,10 @@
 Summary: A6 (2026-09-28) decays `p->data` to `T*` in every value context. CFLEX (2026-09-29) made `sizeof` of a bare zero-length `[0]` member 0 and refused `sizeof` of a bare true-flexible `[]` member in every spelling (`->`, `(*p).`, `t.`), made `alignof` the element alignment, and promoted anonymous struct/union flexible tails. Probes: scratch/repro_keep/a6r3/ and scratch/repro_keep/cflex/ (main checkout).
 Still open:
 - Explicit `move` of a raw local or parameter pointer that points into another object (`int* data = &x; int* p = move data;`) traps at scope exit (rc 134, master too); needs a ruling under the explicit-move rule. (Array members are refused since T489.)
-- (P3, master too) Implicit-this `move data` of an array member inside a method is refused with an unrelated message (aggregate cast / return mismatch) instead of the T489 text; `move this->data` is correct.
-- (P3, master too) `sizeof` of one row of an `int data[0][3]` member gives 4; clang gives 12.
-- (P3, master too) `sizeof(*&z->data)` is refused; clang gives 0.
-- (P3, master too) A C++ class with both a method and an anonymous struct member cannot reach the anonymous member's fields.
+- (P3, master too) `sizeof(*z->data)` of a 2-D zero-length / flexible member (`int data[0][3]`, `int data[][3]`) gives 4; clang gives 12 (the row). `sizeof(z->data[0])` is 12 on master and clang (not reproduced). Root cause: DecayFlexibleArrayMember (value context, MainListener_PostfixExpression.cpp) clears ConstInnerDimensions, so `*` sees a bare `T*`; the sizeof keep list (DirectOperandPostfixes) also stops at a prefix `*`. Widening only the keep list regressed `sizeof(*p->data)` on `int data[]` (refused), so the fix needs a row-shaped decay.
+- (P3, master too) A C++ class with both a method and an anonymous struct member: NOT reproduced (class, const method, ctor, static factory, pointer, member-before-method shapes all match clang++). Needs a repro from the reporter.
+- (sibling, master too) `sizeof(z->data[0][1])` on a 1-D `int data[0]` / `int data[]` member is accepted (4); clang refuses (invalid subscript).
+- (sibling, master too, plain arrays, not CFLEX) `auto row = m[0];` for `int[2][3] m` decays to `int*` (sizeof 8; clang 12); `sizeof(&a)` for `int[2] a` is 16; clang 8.
 
 FIXED in UQRAW for the address-of shapes (narrowed; see the note at the end of this paragraph). RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31): explicit `move` of a raw pointer whose borrowed provenance is
 PROVEN (address-of a local or field, a borrowed pointer parameter, a local copied directly from one) into any slot is REFUSED at compile

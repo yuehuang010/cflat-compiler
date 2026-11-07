@@ -232,6 +232,9 @@ namespace cflat_cinterop
         // (WrapperParameterBindKinds): '.' unused, 'v'/'r' by value / reference, 'V'/'R' the same
         // for a pointer slot the wrapper dereferences (the callee reads the caller's storage).
         std::string paramBindKinds;
+        // Generated constructor wrappers only: the parameter spellings of the constructor clang selected
+        // (the deduced specialization for a constructor template). Empty otherwise.
+        std::vector<std::string> ctorSelectedParams;
         // Generated wrappers only (T518): per argument of the call the wrapper makes, '.' when it is
         // not a `?:`, '=' when the selected callee's parameter is the conditional's own class (by
         // value or reference), '!' when it is another class (WrapperConditionalArgumentKinds).

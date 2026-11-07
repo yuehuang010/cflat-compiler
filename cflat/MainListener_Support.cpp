@@ -150,6 +150,64 @@ std::vector<antlr4::ParserRuleContext*> DirectOperandPostfixes(antlr4::tree::Par
     }
     return layers;
 }
+// `( expression )` as a whole postfix: parentheses keep the value of a flagged `*&X` / `&X` operand.
+bool IsParenthesizedPostfix(CFlatParser::PostfixExpressionContext* postfix)
+{
+    auto* primary = postfix->primaryExpression();
+    return postfix->children.size() == 1 && primary != nullptr && primary->children.size() == 3
+        && primary->expression() != nullptr && primary->children[0]->getText() == "(";
+}
+
+// True when `node` is the whole operand of a prefix '*', reached through single-child rules and parentheses.
+bool IsWholeDerefOperand(antlr4::tree::ParseTree* node)
+{
+    for (auto* p = node->parent; p != nullptr; p = p->parent)
+    {
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(p))
+        {
+            if (unary->unaryOperator() != nullptr) return unary->unaryOperator()->getText() == "*";
+            continue;
+        }
+        const bool parenPrimary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(p) != nullptr
+            && p->children.size() == 3 && p->children[0]->getText() == "(";
+        if (p->children.size() != 1 && !parenPrimary) return false;
+    }
+    return false;
+}
+
+// Operator of the unary expression that is the whole operand (through parentheses); empty when none.
+std::string LeadingUnaryOperator(antlr4::tree::ParseTree* castNode)
+{
+    antlr4::tree::ParseTree* node = castNode;
+    while (node != nullptr)
+    {
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+        {
+            node = cast->unaryExpression();
+            continue;
+        }
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+        {
+            if (unary->unaryOperator() != nullptr) return unary->unaryOperator()->getText();
+            node = unary->postfixExpression();
+            continue;
+        }
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            auto* primary = postfix->primaryExpression();
+            if (postfix->children.size() == 1 && primary != nullptr && primary->children.size() == 3
+                && primary->expression() != nullptr && primary->children[0]->getText() == "(")
+            {
+                node = primary->expression();
+                continue;
+            }
+            return {};
+        }
+        if (node->children.size() != 1) return {};
+        node = node->children[0];
+    }
+    return {};
+}
 LLVM_ATTRIBUTE_NOINLINE CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
     CFlatParser::AssignmentExpressionContext* assign)
 {

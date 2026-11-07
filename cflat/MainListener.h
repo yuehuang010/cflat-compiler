@@ -58,6 +58,10 @@ std::string FlexibleArrayMemberLengthError(const LLVMBackend::TypeAndValue& type
 // parenthesised layer down to the member expression. Empty when the operand is anything more
 // than that, e.g. `*m` or `m + 1`.
 std::vector<antlr4::ParserRuleContext*> DirectOperandPostfixes(antlr4::tree::ParseTree* node);
+// Shape queries for `*&X` (flexible-member flags): whole operand of a prefix '*' / its operator.
+bool IsWholeDerefOperand(antlr4::tree::ParseTree* node);
+bool IsParenthesizedPostfix(CFlatParser::PostfixExpressionContext* postfix);
+std::string LeadingUnaryOperator(antlr4::tree::ParseTree* castNode);
 
 // Installs the keep list for ONE operand and restores the enclosing list afterwards (also on a
 // LogError throw), so a nested `*p` / `&x` / assignment cannot wipe `sizeof((*p).data)`'s list.

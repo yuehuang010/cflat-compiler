@@ -666,6 +666,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.paramBindKinds = r.paramBindKinds;
         e.conditionalArgumentKinds = r.conditionalArgumentKinds;
         e.closureKeptParams = r.closureKeptParams;
+        e.ctorSelectedParams = r.ctorSelectedParams;
         e.selectedCalleeType = r.selectedCalleeType;
         e.selectedCalleeTemplateArgs = r.selectedCalleeTemplateArgs;
         e.selectedCalleeDefaults = r.selectedCalleeDefaults;
@@ -933,6 +934,7 @@ void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
             raw.paramBindKinds = cached.paramBindKinds;
             raw.conditionalArgumentKinds = cached.conditionalArgumentKinds;
             raw.closureKeptParams = cached.closureKeptParams;
+            raw.ctorSelectedParams = cached.ctorSelectedParams;
             raw.selectedCalleeType = cached.selectedCalleeType;
             raw.selectedCalleeTemplateArgs = cached.selectedCalleeTemplateArgs;
             raw.selectedCalleeDefaults = cached.selectedCalleeDefaults;

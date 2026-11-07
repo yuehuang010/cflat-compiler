@@ -2821,7 +2821,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             }
             arrowOwnedTemps_.resize(write);
         }
-        if (namedVar.TypeAndValue.IsFlexibleArrayMember && !lValue && std::find(flexibleArrayKeep_.begin(), flexibleArrayKeep_.end(), ctx) == flexibleArrayKeep_.end())
+        // A parenthesised `(*&X)` / `(&X)` keeps the flags its inner expression set; the inner member decayed already.
+        if (namedVar.TypeAndValue.IsFlexibleArrayMember && !lValue && !IsParenthesizedPostfix(ctx)
+            && std::find(flexibleArrayKeep_.begin(), flexibleArrayKeep_.end(), ctx) == flexibleArrayKeep_.end())
             DecayFlexibleArrayMember(namedVar);
         if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
             Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
@@ -3397,6 +3399,75 @@ static CFlatParser::GenericIdentifierContext* BareIdentifierThroughParens(
             primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(part);
         }
         return primary != nullptr && primary->children.size() == 1 ? primary->genericIdentifier() : nullptr;
+}
+
+// True when an identifier in the argument names a CFlat binding or a CFlat function. The macro probe
+// re-spells the argument for clang, so such an argument must never reach it.
+static bool ArgumentNamesCFlatBinding(antlr4::tree::ParseTree* node, LLVMBackend* compiler)
+{
+        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+        {
+            if (terminal->getSymbol()->getType() != CFlatParser::Identifier) return false;
+            const std::string name = terminal->getText();
+            return compiler->IsCFlatVariableBinding(name) || compiler->FindCFlatCallCandidates(name) != nullptr;
+        }
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (rule == nullptr) return false;
+        for (antlr4::tree::ParseTree* child : rule->children)
+            if (ArgumentNamesCFlatBinding(child, compiler)) return true;
+        return false;
+}
+
+// The probe only matters when the macro's value can become a null pointer constant. That needs a
+// direct call argument whose callee has a pointer-capable (or unknown) parameter at its position.
+// Every other shape, and an int-only callee, is decided without clang. Decided by parse-tree shape.
+static bool MacroCallArgumentMayBeNullConstant(CFlatParser::PostfixExpressionContext* macroCall,
+                                               LLVMBackend* compiler)
+{
+        antlr4::tree::ParseTree* node = macroCall;
+        while (node->parent != nullptr
+            && dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node->parent) == nullptr)
+        {
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node->parent);
+            if (rule == nullptr || rule->children.size() != 1) return false;
+            node = node->parent;
+        }
+        auto* argument = node->parent != nullptr
+            ? dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node->parent) : nullptr;
+        if (argument == nullptr) return false;
+        if (argument->Identifier() != nullptr) return true;
+        auto* list = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(argument->parent);
+        auto* call = list != nullptr ? dynamic_cast<CFlatParser::PostfixExpressionContext*>(list->parent) : nullptr;
+        if (call == nullptr) return true;
+        const auto& arguments = list->argumentNamedExpression();
+        size_t index = 0;
+        while (index < arguments.size() && arguments[index] != argument) ++index;
+        if (index == arguments.size()) return true;
+
+        // Callee shapes: `name(` (list at child 2) and `ns.name(` (list at child 4).
+        const auto& parts = call->children;
+        const size_t listAt = std::find(parts.begin(), parts.end(), list) - parts.begin();
+        if (listAt != 2 && listAt != 4) return true;
+        auto* member = listAt == 4 ? dynamic_cast<CFlatParser::MemberNameTokenContext*>(parts[2]) : nullptr;
+        if (listAt == 4 && member == nullptr) return true;
+        auto* identifier = BareIdentifierThroughParens(dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parts[0]));
+        if (identifier == nullptr || identifier->genericTypeParameters() != nullptr) return true;
+        const std::string receiver = identifier->getText();
+        if (compiler->IsCFlatVariableBinding(receiver)) return true;
+        // An enclosing imported function macro re-spells this whole argument for its own probe.
+        if (listAt == 2 && compiler->IsImportedCxxFunctionMacroName(receiver)) return false;
+        const std::string callee = listAt == 2
+            ? compiler->ResolveQualifiedName(receiver)
+            : compiler->ResolveQualifiedName(receiver + "." + member->getText());
+        const std::vector<LLVMBackend::FunctionSymbol>* candidates = compiler->FindCFlatCallCandidates(callee);
+        if (candidates == nullptr) return true;
+        for (const LLVMBackend::FunctionSymbol& candidate : *candidates)
+        {
+            if (candidate.IsMethod || candidate.Variadic || index >= candidate.Parameters.size()
+                || LLVMBackend::ParameterMayTakeNullConstant(candidate.Parameters[index]))
+                return true;
+        }
+        return false;
 }
 
 LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
@@ -8151,6 +8222,76 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // `offsetof` is an ordinary identifier. Only an unshadowed bare call
                         // uses the intrinsic path; declarations and C++ macros keep normal lookup.
                         auto* compiler = Compiler(ctx);
+                        const bool hasMacroCallArguments = functionArgCounter >= 0
+                            && functionArgCounter < static_cast<int>(argumentList.size());
+                        const bool hasCxxMacroTemplate =
+                            genericFunctionTemplates.count(functionName) != 0;
+                        if (directBareCall && bareIdentifier != nullptr
+                            && bareIdentifier->Identifier() != nullptr
+                            && structVar.BaseType == nullptr && namedVar.Primary == nullptr
+                            && namedVar.Storage == nullptr
+                            && compiler->IsImportedCxxFunctionMacro(functionName)
+                            && (hasCxxMacroTemplate
+                                ? compiler->IsCxxMacroFunctionTemplate(functionName)
+                                : compiler->GetFunction(functionName) == nullptr)
+                            && hasMacroCallArguments)
+                        {
+                            auto macroArguments = argumentList[functionArgCounter]->argumentNamedExpression();
+                            std::string invocation = functionName + "(";
+                            bool hasOnlyExpressions = true;
+                            for (size_t i = 0; i < macroArguments.size(); ++i)
+                            {
+                                auto* expression = macroArguments[i]->assignmentExpression();
+                                if (expression == nullptr || macroArguments[i]->Identifier() != nullptr)
+                                {
+                                    hasOnlyExpressions = false;
+                                    break;
+                                }
+                                if (i != 0) invocation += ", ";
+                                std::string spelling = expression->getText();
+                                if (expression->start != nullptr && expression->stop != nullptr
+                                    && expression->start->getInputStream() != nullptr)
+                                    spelling = expression->start->getInputStream()->getText(
+                                        antlr4::misc::Interval(expression->start->getStartIndex(),
+                                                               expression->stop->getStopIndex()));
+                                invocation += spelling;
+                            }
+                            invocation += ")";
+                            bool argumentsNameCFlat = false;
+                            for (auto* argumentNamed : macroArguments)
+                                argumentsNameCFlat = argumentsNameCFlat
+                                    || ArgumentNamesCFlatBinding(argumentNamed, compiler);
+                            LLVMBackend::CMacroEntry macroExpansion;
+                            if (hasOnlyExpressions && !argumentsNameCFlat
+                                && MacroCallArgumentMayBeNullConstant(ctx, compiler)
+                                && compiler->TryGetCxxMacroExpansionNullZero(
+                                    functionName, invocation, macroExpansion))
+                            {
+                                LLVMBackend::TypeAndValue macroType;
+                                macroType.TypeName = macroExpansion.intTypeName.empty()
+                                    ? "int" : macroExpansion.intTypeName;
+                                llvm::Type* expansionType = compiler->GetType(macroType);
+                                auto* integerType = llvm::dyn_cast_or_null<llvm::IntegerType>(expansionType);
+                                if (integerType == nullptr)
+                                {
+                                    macroType.TypeName = "int";
+                                    integerType = llvm::cast<llvm::IntegerType>(compiler->GetType(macroType));
+                                }
+                                namedVar = {};
+                                namedVar.Primary = llvm::ConstantInt::get(integerType, 0);
+                                namedVar.BaseType = integerType;
+                                namedVar.TypeAndValue = macroType;
+                                namedVar.InferSourceTypeName = macroType.TypeName;
+                                namedVar.IsCxxMacroGlobal = true;
+                                namedVar.IsCxxNullIntegerMacro = true;
+                                namedVar.IsRvalue = true;
+                                structVar = {};
+                                interfaceVar = {};
+                                functionArgCounter++;
+                                break;
+                            }
+                        }
+
                         const bool hasResolvedFunction = functionName == "offsetof" && [&]
                         {
                             const std::string resolvedFunctionName =
@@ -14064,6 +14205,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ? functionName : functionName.substr(adlDot + 1);
                                 const bool adlCandidate = adlAssociated
                                     && compiler->IsCxxFriendName(adlSimpleName);
+                                bool needsEnumClassConversionWrapper = false;
                                 if (auto existing = compiler->functionTable.find(resolvedName);
                                     existing != compiler->functionTable.end()
                                     && cxxExplicitTemplateArgs.empty()
@@ -14088,6 +14230,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 || symbol.Parameters[0].TypeName == owner))
                                         {
                                             hasNonWrapper = true;
+                                            if (symbol.IsCxx && symbol.IsMethod
+                                                && symbol.Parameters.size() == arguments.size())
+                                                for (size_t i = 1; i < arguments.size(); ++i)
+                                                {
+                                                    const auto& argument = arguments[i];
+                                                    const auto& parameter = symbol.Parameters[i];
+                                                    const std::vector<LLVMBackend::NamedVariable> singleArgument{
+                                                        argument };
+                                                    const bool hiddenScalarCtor = compiler->HasHiddenScalarCxxConstructor(
+                                                        parameter.TypeName, { argument.TypeAndValue },
+                                                        &singleArgument);
+                                                    const bool defaultedCtorTie = compiler->HasDefaultedCxxConstructorTie(
+                                                        parameter.TypeName, { argument.TypeAndValue }, true);
+                                                    if (!argument.TypeAndValue.Pointer
+                                                        && !parameter.Pointer
+                                                        && compiler->IsCxxRecord(parameter.TypeName)
+                                                        && argument.TypeAndValue.TypeName != parameter.TypeName
+                                                        && (hiddenScalarCtor || defaultedCtorTie))
+                                                        needsEnumClassConversionWrapper = true;
+                                                }
                                             if (symbol.Parameters.size() == arguments.size())
                                             {
                                                 bool exact = true;
@@ -14154,7 +14316,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     const bool needsDirectConstructionWrapper = std::any_of(
                                         arguments.begin(), arguments.end(), [](const auto& argument) {
                                             return argument.IsCxxDirectConstruction;
-                                        });
+                                        }) || needsEnumClassConversionWrapper;
                                     if (hasNonWrapper
                                         && (!cxxFreeFunction || !functionName.starts_with("std.")
                                             || hasExactNonWrapper)
@@ -14208,7 +14370,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !compiler->HasArityViableCxxFunctionTemplate(
                                             functionName, {}, arguments.size());
                                     bool clangRejectedAddressFallback = false;
-                                    if (cxxFreeFunction && !noViableTemplateArityFallback)
+                                    if (cxxFreeFunction && !noViableTemplateArityFallback
+                                        && !needsEnumClassConversionWrapper)
                                     {
                                         std::string freeError;
                                         std::vector<LLVMBackend::NamedVariable> originalArguments;
@@ -14262,6 +14425,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     if (!clangRejectedAddressFallback
                                         && !noViableTemplateArityFallback
+                                        && !needsEnumClassConversionWrapper
                                         && (!hasDirectConstructionArgument
                                             || !(cxxDirectConstructionMemberCall
                                                  || cxxStaticDeferredCall)))
@@ -14372,6 +14536,25 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 const std::string memberReceiverType = cxxMemberReceiverType();
                                 if (!requested && !isTemplate && hasDirectConstructionArgument
                                     && cxxDirectConstructionMemberCall && !memberReceiverType.empty())
+                                {
+                                    std::string memberError;
+                                    requested = compiler->RequestCxxFreeFunction(
+                                        functionName, {}, arguments, registeredName, memberError,
+                                        {}, {}, {}, false, {}, memberReceiverType);
+                                    clangRejected = compiler->LastCxxRequestClangRejected();
+                                    clangNoViableAtRequest = compiler->LastCxxRequestNoViableAtRequest();
+                                    if (requested)
+                                    {
+                                        resolvedName = registeredName;
+                                        templateError.clear();
+                                    }
+                                    else if (!memberError.empty())
+                                    {
+                                        templateError = memberError;
+                                    }
+                                }
+                                if (!requested && !isTemplate && needsEnumClassConversionWrapper
+                                    && !memberReceiverType.empty())
                                 {
                                     std::string memberError;
                                     requested = compiler->RequestCxxFreeFunction(
@@ -14794,7 +14977,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     wrapperError.clear();
                                 // A scalar-reference overload set has no listed fallback, nor
                                 // does clang's pick of a body-refused constructor.
-                                const bool bodyRefused = wrapperError.starts_with("clang: ");
+                                // Clang refusing its own wrapper (a deleted or ambiguous pick) stands
+                                // over the listed constructor the CFlat side would otherwise call.
+                                const bool clangRefusedWrapper = !wrapped && ctor != nullptr
+                                    && !wrapperError.empty()
+                                    && compiler->lastCxxVariadicCtorClangRefused_;
+                                const bool bodyRefused = wrapperError.starts_with("clang: ")
+                                    || clangRefusedWrapper;
                                 if (wrapped || (ctor == nullptr && !hardReferenceRejection)
                                     || clangOnlyConstructorSet || bodyRefused)
                                 {
@@ -14853,7 +15042,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     else
                                     {
                                         if (!wrapperError.empty() && !why.starts_with("constructor '"))
-                                            why = wrapperError;
+                                            why = why.starts_with("matches more than one constructor overload")
+                                                ? why + "; " + wrapperError : wrapperError;
                                         // A scalar-reference set whose every constructor narrows
                                         // reaches here with no listed refusal to name.
                                         if (why.empty()) why = compiler->CxxCtorNoMatchReason(ctorTypes);

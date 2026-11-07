@@ -22,6 +22,11 @@ struct OnHolderCounted
 
 extern int main()
 {
+    // A pointer typedef over an unpublished class template specialization is refused, not void*.
+    expect_error("named 'later_ptr'") {
+        cppon.LaterBox<cppon.Cls>.later_ptr later = nullptr;
+        cppon.Cls* c = later;
+    }
     OnHolderCounted h = default;
     h.buf = new cppon.Arr[3];
     h.Drop();

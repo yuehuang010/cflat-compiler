@@ -1011,6 +1011,16 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             if (want.Pointer && got.Pointer == false && want.IsAlias && !want.ElemPointer
                 && IsCxxDerivedToBaseValue(got, want, nullptr))
                 return true;                 // a public derived value binds to Base&
+            // A public derived VALUE slices to a by-value base parameter: viable, then ranked. One
+            // public non-virtual path only (a diamond is ambiguous), and a base copy ctor not deleted.
+            if (!want.Pointer && !got.Pointer && IsCxxRecord(want.TypeName)
+                && IsCxxDerivedToBaseValue(got, want, nullptr))
+            {
+                const auto routes = CollectCxxBaseRoutes(got.TypeName, want.TypeName, false);
+                if (!routes.unknown && !routes.viaVirtual && routes.nonVirtual == 1
+                    && routes.offsetPublic)
+                    return true;
+            }
             if (want.Pointer && !got.Pointer && (want.IsAlias || want.IsRvalueRef)
                 && !want.ElemPointer && want.TypeName == "void"
                 && IsForeignCxxClassWithConstructors(got.TypeName))
@@ -1225,7 +1235,6 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 && a.IsFunctionPointer == b.IsFunctionPointer && a.IsAlias == b.IsAlias
                 && a.IsMove == b.IsMove && a.IsRvalueRef == b.IsRvalueRef;
         };
-        size_t foundOmitted = 0;
         size_t foundExact = 0;
         size_t foundPromotion = 0;
         size_t foundReferencePreference = 0;
@@ -1243,7 +1252,6 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
         struct Viable
         {
             const CxxClassInfo::Structor* ctor;
-            size_t omitted;
             size_t exact;
             size_t promotion;
             size_t referencePreference;
@@ -1251,6 +1259,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             bool numeric;   // blocked by an integer <-> floating argument, not by a default
             std::vector<CxxConversionRank> ranks;
             bool ranked;
+            bool deletedSlice = false;   // blocked by a by-value base whose copy constructor is deleted
         };
         std::vector<Viable> viable;
         std::string blockedWhy;
@@ -1280,6 +1289,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             }
             if (!blocked) ++candidates;
             bool softRefused = false;
+            bool deletedSlice = false;   // a by-value base slice whose base copy constructor is deleted
             bool ok = true;
             size_t exact = 0;
             size_t promotion = 0;
@@ -1538,6 +1548,12 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     && !got.Pointer && IsNullPointerConstantArgument((*argVars)[i], true);
                 const bool compatibleArg = namedFunctionMatches || nullScalarReference
                     || compatible(want, got);
+                // The slice ties like any by-value base, but refuses when C++ picks it.
+                if (compatibleArg && !want.Pointer && !got.Pointer && want.TypeName != got.TypeName
+                    && IsCxxRecord(want.TypeName) && IsCxxDerivedToBaseValue(got, want, nullptr))
+                    if (const CxxClassInfo* baseInfo = GetCxxClassInfo(want.TypeName);
+                        baseInfo != nullptr && baseInfo->hasDeletedCopyCtor)
+                        deletedSlice = true;
                 if (!copyRef && !scalarRvalueRef && !compatibleArg)
                 {
                     // An integer <-> floating argument is refused as a CALL here, but C++ still
@@ -1600,8 +1616,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 std::cout << std::format("[verbose]   ctor candidate {}({}) for ({}): exact={} omitted={} linkage={} blocked={}\n",
                                          typeName, shape, got, exact, omitted, c.linkageName, blocked || softRefused);
             }
-            viable.push_back({ &c, omitted, exact, promotion, currentReferencePreference, blocked || softRefused,
-                               softRefused, {}, false });
+            viable.push_back({ &c, exact, promotion, currentReferencePreference,
+                               blocked || softRefused || deletedSlice, softRefused, {}, false, deletedSlice });
         }
         // Legacy pick over `pool` (in declaration order). C++ ranks only the PASSED arguments:
         // more exactly-typed parameters beat same-family conversions (`format_int(42)` picks the int
@@ -1613,7 +1629,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             {
                 const auto& c = *v->ctor;
                 auto take = [&] {
-                    found = &c; foundOmitted = v->omitted; foundExact = v->exact;
+                    found = &c; foundExact = v->exact;
                     foundPromotion = v->promotion;
                     foundReferencePreference = v->referencePreference;
                     ambiguous = false; tied.clear();
@@ -1627,8 +1643,6 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 if (argTypes.size() == 1 && v->promotion > foundPromotion) { take(); continue; }
                 if (v->referencePreference < foundReferencePreference) continue;
                 if (v->referencePreference > foundReferencePreference) { take(); continue; }
-                if (v->omitted > foundOmitted) continue;
-                if (v->omitted < foundOmitted) { take(); continue; }
                 bool sameShape = c.params.size() == found->params.size();
                 for (size_t i = 0; sameShape && i < c.params.size(); ++i)
                     sameShape = sameBoundaryType(c.params[i], found->params[i]);
@@ -1727,8 +1741,9 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                                     shape += v->ctor->params[i].IsAlias ? "&" : "*";
                             }
                             blockedWhy = "the overload C++ selects, " + shape + "), "
-                                + (v->numeric ? "needs an implicit integer <-> floating conversion"
-                                              : "has a default argument that is not a constant");
+                                + (v->deletedSlice ? "takes a by-value base class whose copy constructor is deleted"
+                                   : v->numeric ? "needs an implicit integer <-> floating conversion"
+                                                : "has a default argument that is not a constant");
                         }
                 if (refusedByBlocked) pool.clear();
                 else if (!survivors.empty())
@@ -1763,8 +1778,9 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 // each such position binds an lvalue of exactly the referent type (clang: `Amb(const
                 // V&)` with `Amb(V)` is ambiguous for an lvalue V). A materialized temporary keeps
                 // the legacy pick, which takes the by-value parameter (ruling, Overloads ~4528).
-                auto exactLvalueMixes = [&](const CxxClassInfo::Structor& x,
-                                            const CxxClassInfo::Structor& y) {
+                auto exactLvalueMixes = [&](const Viable& dx, const Viable& dy) {
+                    const CxxClassInfo::Structor& x = *dx.ctor;
+                    const CxxClassInfo::Structor& y = *dy.ctor;
                     for (size_t k = 1; k < x.params.size() && k < y.params.size(); ++k)
                     {
                         const bool xRef = x.params[k].IsAlias || x.params[k].IsRvalueRef;
@@ -1773,9 +1789,15 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                         const size_t i = k - 1;
                         if (argVars == nullptr || i >= argVars->size()) return false;
                         const NamedVariable& arg = (*argVars)[i];
-                        if (argumentIsRvalue(i) || arg.TypeAndValue.Pointer || arg.Storage == nullptr)
+                        // A class prvalue or xvalue of the parameter's own class ties too (clang: the same
+                        // identity bind); a scalar temporary keeps the legacy pick.
+                        const bool classRvalue = argumentIsRvalue(i) && IsCxxRecord(arg.TypeAndValue.TypeName);
+                        if (arg.TypeAndValue.Pointer || (!classRvalue && (argumentIsRvalue(i) || arg.Storage == nullptr)))
                             return false;
-                        if (arg.TypeAndValue.TypeName != x.params[k].TypeName) return false;
+                        // A derived argument ties when both constructors bind the same base (rank 2).
+                        const bool sameBase = i < dx.ranks.size() && i < dy.ranks.size()
+                            && CxxSameBaseBindRank(dx.ranks[i], dy.ranks[i], x.params[k].TypeName);
+                        if (arg.TypeAndValue.TypeName != x.params[k].TypeName && !sameBase) return false;
                     }
                     return true;
                 };
@@ -1789,7 +1811,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                         indistinguishable = CompareCxxConversionRanks(
                                 distinct[i]->ranks, distinct[j]->ranks, crossing) == 0
                             && (!referenceMix(*distinct[i]->ctor, *distinct[j]->ctor)
-                                || exactLvalueMixes(*distinct[i]->ctor, *distinct[j]->ctor));
+                                || exactLvalueMixes(*distinct[i], *distinct[j]));
                     }
                 }
                 if (indistinguishable)
@@ -2892,10 +2914,13 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             && (param.IsRvalueRef || param.CxxConstRef()) && IsCxxRecord(argType.TypeName)
             && HasImplicitClassConversionOperator(argType.TypeName);
         const bool unnamedEnumTemplateSelection = CxxUnnamedEnumTemplateArgument(param.TypeName, arg);
+        const bool defaultedCtorTie = HasDefaultedCxxConstructorTie(
+            param.TypeName, { argType }, /*allowExplicit*/ false);
         // A slice with no listed constructor is the implicit base copy: clang's wrapper builds it.
         const bool sliceByWrapper = slicesToBase && ctor == nullptr;
         const bool wrapped = (sliceByWrapper || info != nullptr)
             && (sliceByWrapper || operatorBindsBetter || classTemplateConversion || operatorOnly || zeroTie
+                || defaultedCtorTie
                 || unnamedEnumTemplateSelection
                 || ((ctor == nullptr || clangResolves)
                     && (info->constructors.empty()
@@ -3885,6 +3910,27 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         // When the source has an implicit conversion operator, let clang resolve the whole
         // copy-initialization sequence before the listed constructor fast path can choose one.
         const TypeAndValue argType = InferImplicitCxxArgumentType(source, *this);
+        const std::vector<NamedVariable> scalarSource{ source };
+        if (!argType.Pointer && IsCxxRecord(targetType)
+            && CxxUnnamedEnumExpression(source.Storage) != nullptr
+            && HasHiddenScalarCxxConstructor(targetType, { argType }, &scalarSource))
+        {
+            NamedVariable probe = source;
+            probe.TypeAndValue = argType;
+            probe.TypeAndValue.VariableName.clear();
+            probe.IsRvalue = true;
+            std::string wrapperName;
+            std::string wrapperError;
+            if (RequestCxxVariadicConstructor(targetType, { probe }, wrapperName, wrapperError,
+                                              /*copyInit*/ true))
+            {
+                ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
+                return CxxConvertingCtorResult::Converted;
+            }
+            refusal = wrapperError;
+            return refusal.empty() ? CxxConvertingCtorResult::NotApplicable
+                                   : CxxConvertingCtorResult::Refused;
+        }
         if (!argType.Pointer && IsCxxRecord(argType.TypeName) && IsCxxRecord(targetType)
             && ResolveTypeAlias(argType.TypeName) != ResolveTypeAlias(targetType))
         {
@@ -4058,13 +4104,21 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
                     /*allowScalarNarrowing*/ false) == nullptr
                 && widenWhy.starts_with("matches more than one constructor overload"))
                 scalarTableTie = false;
+            const bool defaultedCtorTie = HasDefaultedCxxConstructorTie(
+                targetType, { argType }, /*allowExplicit*/ false);
             std::string wrapperName;
             std::string wrapperError;
-            if (scalarTableTie && RequestCxxVariadicConstructor(targetType, { probe }, wrapperName,
+            if ((scalarTableTie || defaultedCtorTie)
+                && RequestCxxVariadicConstructor(targetType, { probe }, wrapperName,
                                                                 wrapperError, /*copyInit*/ true))
             {
                 ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
                 return CxxConvertingCtorResult::Converted;
+            }
+            if (defaultedCtorTie)
+            {
+                refusal = wrapperError;
+                return CxxConvertingCtorResult::Refused;
             }
             // Clang confirms this tie but omits candidate signatures from the wrapper diagnostic.
             // Keep its other refusals; the typed constructor table below supplies the candidates.

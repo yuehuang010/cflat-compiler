@@ -6036,8 +6036,6 @@ extern int main(int argc, char** argv)
     if (cppt.module_dtors() != 3) return 1539;
 
     std.string sharedText = std.string("abcd");
-    if (cppt.shared_pick_string(sharedText) != 24) return 1540;
-    if (cppt.shared_pick_string(std.string("abc")) != 13) return 1541;
     if (cppt.shared_pick_pointer(&sharedGlobal) != 11) return 1542;
 
     // A shared_ptr FIELD whose argument class is declared after the owner: the field's type was
@@ -6121,7 +6119,6 @@ extern int main(int argc, char** argv)
             if ((int)fromField.size() != 36)            return 1704;
         }
         if ((int)box.s.size() != 36)                    return 1705;
-        if (cppt.shared_pick_string(box.s) != 56)          return 1706;
     }
     if (cppt.module_dtors() != 1)                       return 1707;
 

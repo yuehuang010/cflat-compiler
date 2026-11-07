@@ -1,0 +1,84 @@
+// CVAMB: a const& / & / && parameter and a by-value parameter tie for an argument of class type
+// (clang: ambiguous), on free functions and methods, so the call is refused rather than resolved
+// to the reference overload. `dv` is a derived-to-base tie to one base.
+import cpp "cpp_mix11_ctor.hpp";
+import cpp "cpp_interop_tpl.h";
+import cpp "string";
+
+struct CvaBox
+{
+    std.string s = default;
+};
+
+extern int main()
+{
+    CvaV lv = 1;
+    CvaD dv = 3;
+    CvaM mo = 4;
+    std.string sharedText = std.string("abcd");
+    expect_error("ambiguous call to 'cva_a': no candidate ranks better than the others") {
+        cva_a(lv);
+    }
+    expect_error("ambiguous call to 'cva_a': no candidate ranks better than the others") {
+        cva_a(CvaV(5));
+    }
+    expect_error("ambiguous call to 'cva_b': no candidate ranks better than the others") {
+        cva_b(lv);
+    }
+    expect_error("ambiguous call to 'cva_c': no candidate ranks better than the others") {
+        cva_c(move lv);
+    }
+    expect_error("ambiguous call to 'mb': no candidate ranks better than the others") {
+        mo.mb(lv);
+    }
+    expect_error("ambiguous call to 'mb': no candidate ranks better than the others") {
+        mo.mb(dv);
+    }
+    expect_error("ambiguous call to 'cppt.shared_pick_string': no candidate ranks better than the others") {
+        cppt.shared_pick_string(sharedText);
+    }
+    expect_error("ambiguous call to 'cppt.shared_pick_string': no candidate ranks better than the others") {
+        cppt.shared_pick_string(std.string("abc"));
+    }
+    expect_error("ambiguous") {
+        int a = lv + 1;
+    }
+    expect_error("ambiguous") {
+        int b = CvaV(5) + 1;
+    }
+    expect_error("ambiguous") {
+        Mx11Amb m = Mx11Amb(Mx11V2(1));
+    }
+    CvaBox box = default;
+    box.s = std.string("abcdefghijklmnopqrstuvwxyz0123456789");
+    expect_error("ambiguous call to 'cppt.shared_pick_string': no candidate ranks better than the others") {
+        cppt.shared_pick_string(box.s);
+    }
+    expect_error("ambiguous") {
+        CvaCtr c1 = CvaCtr(dv);
+    }
+    expect_error("ambiguous") {
+        CvaCtr c2 = CvaCtr(CvaD(5));
+    }
+    expect_error("ambiguous call to 'mb': no candidate ranks better than the others: mb(CvaV &), mb(CvaV)") {
+        mo.mb(lv);
+    }
+    expect_error("ambiguous") {
+        int q = cva_fi(5);
+    }
+    expect_error("ambiguous call to 'cppt.shared_pick_string': no candidate ranks better than the others") {
+        cppt.shared_pick_string("abc");
+    }
+    CvaDM dm = 1;
+    CvaND nd = 2;
+    expect_error("ambiguous conversion from derived class") {
+        CvaCL cl = CvaCL(dm);
+    }
+    expect_error("has no constructor whose parameter types match these arguments") {
+        CvaCN cn = CvaCN(nd);
+    }
+    expect_error("call to constructor of 'CvaCN2' is ambiguous") {
+        CvaCN2 cn2 = CvaCN2(nd);
+    }
+    return 0;
+}

@@ -202,4 +202,7 @@ namespace refescr3 {
 struct Ref { int& r; int v; };
 inline Ref mk(int& x) { return Ref{ x, 1 }; }
 inline Ref pass(Ref v) { return v; }
+struct Big { int& r; long a; long b; };
+inline Big mkb(int& x) { return Big{ x, 1, 2 }; }
+inline Big passb(Big v) { return v; }
 }

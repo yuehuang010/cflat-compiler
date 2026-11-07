@@ -3688,7 +3688,7 @@ extern int main()
     // template-only class was not a constructor class at all. Legs marked "control" passed
     // on master too; they pin the listed-pick and already-working shapes.
     {
-        long ctorLong = 5;
+        long long ctorLong = 5;   // 8 bytes on LP64 and LLP64: the sizeof(U) == 8 template
         short ctorShort = 3;
         double ctorDbl = 1.5;
         // Pre-fix: Req(short) picked by narrowing (how 22). C++ picks the exact template.

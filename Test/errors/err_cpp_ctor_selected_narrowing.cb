@@ -1,0 +1,20 @@
+import cpp "cpp_t78_scalar_table.h";
+
+// CTORVIAB: the constructor clang selects decides the narrowing, for a class with constructor templates.
+extern int main()
+{
+    int count = 257;
+    expect_error("constructor that C++ selects for these arguments narrows argument 1 from 'int' to 'short'") {
+        t78.CvAway paren = t78.CvAway(count);
+    }
+    expect_error("constructor that C++ selects for these arguments narrows argument 1 from 'int' to 'short'") {
+        t78.CvEnableAway enabled = t78.CvEnableAway(count);
+    }
+    expect_error("constructor that C++ selects for these arguments narrows argument 1 from 'int' to 'short'") {
+        t78.CvAway* heap = new t78.CvAway(count);
+    }
+    expect_error("constructor that C++ selects for these arguments narrows argument 2 from 'double' to 'int'") {
+        t78.CvNull* pair = new t78.CvNull(0, 1.5);
+    }
+    return 0;
+}

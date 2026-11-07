@@ -256,3 +256,28 @@ expect_error("cannot move an array member; take its address or copy the elements
 expect_error("cannot move an array member; take its address or copy the elements") {
     void t489_fixed_pointer_subscript_dot(T489Fixed* pa) { int* out = move pa[1].data; }
 }
+
+// T489 discriminator: implicit-this member spelling (no `this->`), same refusal as this->data; t489_implicit_decl_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    struct T489ImplicitA { int[2] data = default; void t489_implicit_decl_init() { int* out = move data; } };
+}
+
+// T489 discriminator: implicit-this member, assignment; t489_implicit_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    struct T489ImplicitB { int[2] data = default; void t489_implicit_assignment() { int* out = nullptr; out = move data; } };
+}
+
+// T489 discriminator: implicit-this member, return; t489_implicit_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    struct T489ImplicitC { int[2] data = default; int* t489_implicit_return() { return move data; } };
+}
+
+// T489 discriminator: implicit-this member, move-param call; t489_implicit_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    struct T489ImplicitD { int[2] data = default; void t489_implicit_move_param_call() { T489Sink(move data); } };
+}
+
+// T489 discriminator: implicit-this member read inside a lambda that captures this (F3); t489_implicit_lambda.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    struct T489ImplicitLambda { int[2] data = default; int t489_implicit_lambda() { Lambda<int()> l = () => { int* o = move data; return 6; }; return l(); } };
+}

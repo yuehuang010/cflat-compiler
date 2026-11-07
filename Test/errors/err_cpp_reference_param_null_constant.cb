@@ -1,4 +1,28 @@
 import cpp "cpp_t52_refnull.hpp";
+import cpp "cpp_t103_nullctor.hpp";
+expect_error("no overload") {
+    int rejectedFunctionMacroOne = cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(1));
+}
+expect_error("no overload") {
+    int rejectedFunctionMacroVariable = 1;
+    int rejectedFunctionMacroVariableCall = cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(rejectedFunctionMacroVariable));
+}
+expect_error("no overload") {
+    int rejectedFunctionMacroExpression = cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO + 0));
+}
+expect_error("no overload") {
+    int nullmacfnShadowPtrLocal() { int CFLAT_NULLMACFN_ZERO = 7; return cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO)); }
+}
+// A namespace global with the macro's name binds in CFlat, so the macro is never probed.
+expect_error("no overload") {
+    namespace nullmacfnShadowNs { int CFLAT_NULLMACFN_ZERO = 7; int h() { return cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO)); } }
+}
+expect_error("ambiguous call") {
+    int rejectedFunctionMacroOverload = cpp_nullmacfn_overload.lp(CFLAT_NULLMACFN_ID(0));
+}
+expect_error("ambiguous call") {
+    int unchangedObjectMacroOverload = cpp_nullmacfn_overload.lp(CFLAT_NULLMACFN_ZERO);
+}
 
 expect_error("no overload") {
     int t52ShadowParam(long ZERO) { return cpi_t52.lp(ZERO); }

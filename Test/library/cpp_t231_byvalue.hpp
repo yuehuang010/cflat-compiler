@@ -51,6 +51,48 @@ inline int readc(Cnt x) noexcept { return x.v; }
 inline Cnt readc2(Cnt x) noexcept { return Cnt(x.v + 100); }
 // By-value operands on a free operator.
 inline Cnt operator+(Cnt a, Cnt b) noexcept { ++Cnt::plusCalls; return Cnt(a.v + b.v); }
+class UnaryCnt
+{
+public:
+    static inline int ctors = 0;
+    static inline int copies = 0;
+    static inline int moves = 0;
+    static inline int dtors = 0;
+    static inline int which = 0;
+    static inline void reset() noexcept { ctors = 0; copies = 0; moves = 0; dtors = 0; which = 0; }
+    inline UnaryCnt() noexcept : v(0) { ++ctors; }
+    inline explicit UnaryCnt(int x) noexcept : v(x) { ++ctors; }
+    inline UnaryCnt(const UnaryCnt& o) noexcept : v(o.v) { ++copies; }
+    inline UnaryCnt(UnaryCnt&& o) noexcept : v(o.v) { o.v = -1; ++moves; }
+    inline UnaryCnt& operator=(const UnaryCnt& o) noexcept { v = o.v; return *this; }
+    inline UnaryCnt& operator=(UnaryCnt&& o) noexcept { v = o.v; o.v = -1; return *this; }
+    inline ~UnaryCnt() noexcept { v = -99; ++dtors; }
+    inline UnaryCnt operator-() const noexcept { which = 1; return UnaryCnt(-v); }
+    inline UnaryCnt operator+() const noexcept { which = 2; return UnaryCnt(v); }
+    inline UnaryCnt operator!() const noexcept { which = 3; return UnaryCnt(v == 0 ? 1 : 0); }
+    inline UnaryCnt operator~() const noexcept { which = 4; return UnaryCnt(~v); }
+    inline UnaryCnt operator*() const noexcept { which = 5; return UnaryCnt(v + 100); }
+    inline UnaryCnt method(int x) const noexcept { return UnaryCnt(v + x); }
+    inline UnaryCnt operator*(const UnaryCnt& o) const noexcept { return UnaryCnt(v * o.v); }
+    int v;
+};
+inline UnaryCnt unaryMake(int x) noexcept { return UnaryCnt(x); }
+inline UnaryCnt unaryPick(UnaryCnt x) noexcept { return x; }
+inline int readUnary(UnaryCnt x) noexcept { return x.v; }
+class UnaryVV
+{
+public:
+    inline UnaryVV() noexcept : e0(3), e1(4) {}
+    inline UnaryCnt operator[](int i) const noexcept { return i ? e1 : e0; }
+    UnaryCnt e0, e1;
+};
+class UnaryVR
+{
+public:
+    inline UnaryVR() noexcept : e0(3), e1(4) {}
+    inline UnaryCnt& operator[](int i) noexcept { return i ? e1 : e0; }
+    UnaryCnt e0, e1;
+};
 // Reference-returning free operator (T246: a parenthesized lvalue result copies from it).
 inline Cnt& operator<<(Cnt& a, int x) noexcept { a.v = a.v * 10 + x; return a; }
 // Derived class whose base is the by-value parameter type.

@@ -68,6 +68,7 @@ struct CBF_Pack2
 /* Flexible and zero-length tails are typed views at a zero-storage field offset. */
 struct CBF_FlexInt { int count; int data[]; };
 struct CBF_ZeroInt { int count; int data[0]; };
+struct CBF_ZeroRows { int count; int data[0][3]; };
 struct CBF_FlexByte { unsigned char count; unsigned char data[]; };
 struct CBF_FlexItemElement { int value; };
 struct CBF_FlexItem { int count; struct CBF_FlexItemElement data[]; };

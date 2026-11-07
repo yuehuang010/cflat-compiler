@@ -9,6 +9,11 @@
 #define T296_CAST_LONG_NULL ((long long*)0)
 #define T296_CONST_CAST_NULL ((const int*)0)
 
+#define CFLAT_NULLMACFN_ZERO 0
+#define CFLAT_NULLMACFN_ID(x) x
+#define CFLAT_NULLMACFN_MZ() 0
+#define CFLAT_NULLMACFN_PID(x) (x)
+
 namespace t103 {
 inline int only_int(int) { return 11; }
 inline int only_pointer(int* p) { return p == nullptr ? 22 : 23; }
@@ -58,4 +63,16 @@ struct Owners {
     int unique_empty(std::unique_ptr<int> p) { return p ? 51 : 52; }
     int shared_empty(std::shared_ptr<int> p) { return p ? 61 : 62; }
 };
+}
+
+namespace cpp_nullmacfn {
+inline int ptr(int* p) { return p == nullptr ? 5 : 6; }
+inline int value(int v) { return v; }
+inline int pi(int v) { return 100 + v; }
+struct K { int v; K(int* p) : v(p == nullptr ? 5 : 6) {} };
+}
+
+namespace cpp_nullmacfn_overload {
+inline int lp(int* p) { return p == nullptr ? 5 : 6; }
+inline int lp(long v) { return 20 + (int)v; }
 }

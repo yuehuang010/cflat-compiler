@@ -1,29 +1,44 @@
-# C++ wrapper requests omit the headers that declare template arguments
+# C++ wrapper requests omit the headers that declare template arguments (remaining)
 
-Found by T70 round 2 (2026-10-07); master same. Some generated C++ wrapper requests (explicit move
-transfer `EmitCxxExplicitMoveTransfer` LLVMBackend_CInterop.cpp ~10360, generated move ctor, default
-ctor, implicit dtor) build their TU from the template IMPORTER's header group only. For
-`std.unique_ptr<cppon.Cls>` that drops cpp_interop_opnew.h (declares `cppon`), so clang reports
-"use of undeclared identifier 'cppon'". Hidden in the default incremental executor; reproduces with
-`CFLAT_CPP_INCREMENTAL=0` on scratch/repro_keep/t70_unique_repro.cb (run from a worktree root with
-`-i Test`, fresh CFLAT_CACHE_DIR). A cached failure of this request then replays across builds.
-Experimental partial fix: scratch/repro_keep/t70_groupfix.patch (fixes the move-transfer site; the
-implicit dtor site fails next) - the fix is a shared "header group of a type incl. its template
-arguments" used by every wrapper-request site.
+Fixed: C++ member-type requests (`std.unique_ptr<cppon.Cls>.element_type`, `.pointer`,
+`std.vector<cppon.Cls*>.value_type`, `.pointer`, nested `cppt.ListTraits<cppon.Cls>.elem_type`)
+build from `MakeCxxClassRequestGroup`, and a typedef of a pointer to a class is harvested as a
+scalar marker (CClangExtract.cpp, pointer-to-record branch). Legs: Test/test_cpp_interop.cb
+"Member typedef requests keep the headers of template arguments".
 
-UPDATE 2026-10-11 (T110 round 3): a shared MakeCxxClassRequestGroup (owner group + the groups of
-every template-argument owner, via CollectCxxTypeOwnerGroups) now builds the TU at 17 class-owned
-wrapper request sites (default/move ctor, xvalue transfer, brace ctors, variadic ctor, operator->,
-type-definition upgrades, special-member completion, base conversion, refused-member retry, xvalue
-pointer conversion); header cache 240. The default incremental executor compiles and runs
-t70_unique_repro.cb cold and warm, and test_cpp_interop cold + second compile (it was the warm
-failure that blocked T110). STILL OPEN: with CFLAT_CPP_INCREMENTAL=0 the implicit
-std.unique_ptr<cppon.Cls> destructor still fails cold and warm ("no destructor cflat can call");
-three targeted group updates (special-member completion, refused member retry, registered-type
-definition upgrade) did not change it - see scratch/repro_keep/t110/report_r3.md.
-Also still on the owner-only group (T110 review 2): the C++ member-type request
-(LLVMBackend_Interfaces.cpp ~297, `std.unique_ptr<cppon.Cls>.element_type` / `std.vector<cppon.Cls*>
-.value_type` -> "has no member type named", same on master; fix: MakeCxxClassRequestGroup(group, owner)),
-and, not shown reachable: Overloads.cpp ~1790 (class pointer -> void* xvalue), EmitAndLink.cpp ~2857 and
-CInterop.cpp ~6629 (assumed-body owners), CInterop.cpp ~17457/~17491 (field binding), ~19686/~24176
-(base/member specializations). Probes: scratch/repro_keep/t110/rev2/.
+Earlier wrapper sites (T110): default/move ctor, xvalue transfer, brace ctors, variadic ctor,
+operator->, type-definition upgrades, special-member completion, base conversion, refused member
+retry, xvalue pointer conversion all use MakeCxxClassRequestGroup (kCHeaderCacheVersion 240).
+
+## Still open: CFLAT_CPP_INCREMENTAL=0 implicit std.unique_ptr<cppon.Cls> destructor
+
+Not reproduced in the WRAPGRP run (2026-11-06). The repro scratch/wrapgrp_repro/t70_unique_repro.cb
+stops earlier, in both master and fix, at a separate noinc defect:
+
+- core/list.cb:48 `calloc((i64)newCap, (i64)sizeof(T))`: "cannot choose which 'calloc' to call:
+  calloc(u64, u64), calloc(unsigned long, unsigned long)". The first is cruntime.cb's wrapper, the
+  second the C header's declaration. Any `list<T>` with CFLAT_CPP_INCREMENTAL=0 and a C++ import
+  of memory/vector/basic.h hits it (`list<int>` too), so the no-dtor diagnostic is never reached.
+- Noinc-only, master identical: `struct Holder { std.unique_ptr<cppon.Cls> p; };` then
+  `h.p = std.unique_ptr<cppon.Cls>(new cppon.Cls(7));` -> "overload resolution selected deleted
+  operator '='" (default mode passes).
+
+Next step: fix the calloc overload first (or log the set of calloc candidates per import group),
+then rerun t70 noinc. Only then root-cause the dtor with lldb or a GetOrCreateCxxClassDestructor
+log (MainListener_Declarations.cpp, "it has no destructor cflat can call"). A candidate to test
+first is LLVMBackend_EmitAndLink.cpp (upgrade of layout-only assumed bodies) builds its request
+with the owner-only group, MakeCxxRequestGroup(groupIt->second, {}). Unverified.
+
+## Owner-only sites (audit)
+
+Not converted: no repro reached them in this run. The issue's old line numbers moved; current sites
+are MakeCxxRequestGroup(..., {}) in LLVMBackend_Overloads.cpp:2878 (class pointer -> void*),
+LLVMBackend_EmitAndLink.cpp:2921 (assumed-body owners), LLVMBackend_CHeaderDemand.cpp:1376
+(assumed-body field binding), plus the CRecords/CSignatures/CxxRequest sites without a repro.
+
+## Open: pointer typedef over an unpublished class-template specialization
+
+`template<class T> struct Box { typedef Later<T>* later_ptr; }` with `Later<Cls2>` not yet published by
+the CFlat request (a header inline body instantiating it does not count, e.g. `Box2<long>.later_ptr l = q.mkl()`, clang 7): the scalar binding is now REFUSED (master wording), not void*. Clang accepts
+`useLater(l)` (value 0). Preferred fix: publish the leaf record for this request (complete it in the
+probe and request it by name), then bind. Until then the member typedef is refused.

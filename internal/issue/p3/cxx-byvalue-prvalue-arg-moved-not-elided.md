@@ -14,14 +14,9 @@ destination ownership at the CFlat wrapper boundary or mixed ternary arm, then c
 clang++ -std=c++20 before changing the transfer path.
 
 ## Left after T239 (Opus review 1; repros scratch/repro_keep/t239_rev/, oracle.cpp + r.hpp)
-- A unary C++ operator over a call, `rv.C z = -rv.make(4);` (also `-rv.pick(a)`, `-(a * rv.make(2))`), is refused
-  "cannot initialize C++ class ... from this expression" (master too); clang accepts, 2,0,0,1. T239 r1 armed the slot
-  for it and produced invalid IR (`sub ptr`), so a unary operand containing a call is not armed; arming it needs a
-  ParseCxxFoldOperand scope around the unary operand in ParseUnaryExpression.
-
 - (T246 review 1, pre-existing; repros scratch/repro_keep/t246_rev/cases/) subscript operands of a by-value operator
-  keep one extra temp: `(vv[0] + b)` 1,2,1,3 (clang 1,2,0,2), `(vv[0] * b)`, `(vr[0] * b)`; `(-vv[1])` one extra copy,
-  bare `-vv[1]` / `-vr[1]` refused; `auto z = k ? move a : C(2)` and `k ? (move a) : C(2)` still copy (paren hides move).
+  keep one extra temp: `(vv[0] + b)` 1,2,1,3 (clang 1,2,0,2), `(vv[0] * b)`, `(vr[0] * b)`; `auto z = k ? move a : C(2)`
+  and `k ? (move a) : C(2)` still copy (paren hides move). Unary operators over calls and subscripts are fixed (UNARYCALL).
 
 ## Left after TERNELIDE (daa3a99f, 2026-10-30 box 7; Opus reviews, repros scratch/repro_keep/ternelide/ w/x/y/z .cb + .cpp twins, w.hpp)
 - Same-class prvalue conditional (and plain prvalue) into `gen<T>(...)`, `function<>` and `Lambda<>` calls: one extra move (indirect /

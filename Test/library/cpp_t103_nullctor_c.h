@@ -4,3 +4,8 @@
 #define T103_C_EXPR_ZERO (1-1)
 #define T103_C_CAST_ZERO ((int)0)
 #define T103_C_CHAR_ZERO '\0'
+
+static inline int cpp_nullmacfn_c_ptr(int* p)
+{
+    return p == 0 ? 31 : 32;
+}

@@ -342,3 +342,15 @@ expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference memb
         return z0;
     }
 }
+
+// A by-value aggregate argument through a hidden caller copy (MS x64 16 B, arm64 over 16 B) keeps
+// the source local's frame binding.
+expect_error("cannot return C++ aggregate 'refescr3.Ref': reference member 'r' cannot bind to a local or temporary value") {
+    refescr3.Ref RefescPassLocal() { int x = 1; refescr3.Ref l = refescr3.mk(x); auto a = refescr3.pass(l); return a; }
+}
+expect_error("cannot return C++ aggregate 'refescr3.Big': reference member 'r' cannot bind to a local or temporary value") {
+    refescr3.Big RefescPassBigLocal() { int x = 1; refescr3.Big l = refescr3.mkb(x); auto a = refescr3.passb(l); return a; }
+}
+expect_error("cannot return C++ aggregate 'refescr3.Big': reference member 'r' cannot bind to a local or temporary value") {
+    refescr3.Big RefescPassBigThroughPointer() { int x = 1; refescr3.Big l = refescr3.mkb(x); refescr3.Big* p = &l; return refescr3.passb(*p); }
+}

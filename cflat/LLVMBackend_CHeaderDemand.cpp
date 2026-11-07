@@ -4397,6 +4397,9 @@ std::string LLVMBackend::CxxBraceSelectorElement(
         if (element.TypeAndValue.Pointer || valueType == nullptr
             || (!valueType->isIntegerTy() && !valueType->isFloatingPointTy()))
             return {};
+        if (const std::string* unnamedEnum = CxxUnnamedEnumExpression(element.Storage);
+            unnamedEnum != nullptr)
+            return *unnamedEnum;
         if (IsNullPointerConstantArgument(element, true))
         {
             if (element.IsCxxMacroGlobal && !element.CallerName.empty())

@@ -615,8 +615,6 @@ static std::optional<uint64_t> FixedCxxArrayReferenceExtent(std::string_view spe
     return extent;
 }
 
-// A C++ null pointer constant is an integer literal of value 0 of any integer type, unsigned or
-// suffixed, but never a +0 / -0 expression. Native CFlat keeps the identity-int rule.
 bool LLVMBackend::IsNullPointerConstantArgument(const NamedVariable& arg, bool cxx) const
 {
     if (cxx)
@@ -651,6 +649,20 @@ bool LLVMBackend::IsNullPointerConstantArgument(const NamedVariable& arg, bool c
             return isNullMacro && macroValue;
         }
         if (arg.LiteralSigned || kZeroIdentities.count(arg.LiteralIdentity) == 0) return false;
+    }
+    else if (arg.IsCxxMacroGlobal)
+    {
+        if (!arg.IsCxxNullIntegerMacro || arg.IsExplicitMove) return false;
+        auto isZeroMacroGlobal = [&](llvm::Value* value) {
+            auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(value);
+            return global != nullptr
+                && cxxZeroIntegerMacroNames_.count(global->getName().str()) != 0;
+        };
+        auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary);
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arg.Primary);
+        return (constant != nullptr && constant->isZero())
+            || (load != nullptr && isZeroMacroGlobal(load->getPointerOperand()))
+            || (arg.Primary == nullptr && isZeroMacroGlobal(arg.Storage));
     }
     else if (arg.LiteralIdentity != "int")
         return false;
@@ -1175,6 +1187,55 @@ bool LLVMBackend::CxxCtorSetRequiresNarrowing(const std::string& typeName,
                 sawCandidate = true;
             }
         return sawCandidate;
+}
+
+/*
+ * CTORVIAB: a class with constructor templates. The listed ranking cannot see a template's deduction
+ * or constraints (T78 r2: a constrained-away template beside `short`; r4: a null constant that cannot
+ * deduce `T *`), so the constructor clang SELECTS is read back from its variadic wrapper: the deduced
+ * specialization's parameters, each classified by the scalar table. Requested only with a scalar
+ * argument present; a refusal by clang leaves the caller's own error.
+ */
+std::string LLVMBackend::CxxCtorTemplatePickNarrowingError(const std::string& typeName,
+                                                           const std::vector<NamedVariable>& argVars)
+{
+        if (argVars.empty()) return {};
+        const auto scalarArgument = [this](const NamedVariable& arg) {
+            return !arg.TypeAndValue.Pointer && !arg.TypeAndValue.ElemPointer && !arg.IsStringLiteral
+                && !IsCxxRecord(arg.TypeAndValue.TypeName)
+                && (CallArgumentIntegerBits(arg) != -1 || arg.TypeAndValue.IsFloatingPoint() != -1
+                    || (arg.BaseType != nullptr && arg.BaseType->isFloatingPointTy()));
+        };
+        if (!std::any_of(argVars.begin(), argVars.end(), scalarArgument)) return {};
+        std::string wrapperName;
+        std::string error;
+        if (!RequestCxxVariadicConstructor(typeName, argVars, wrapperName, error)) return {};
+        const auto signatures = cxxFunctionSignatures_.find(wrapperName);
+        if (signatures == cxxFunctionSignatures_.end()) return {};
+        const std::vector<std::string>* selected = nullptr;
+        for (auto signature = signatures->second.rbegin(); signature != signatures->second.rend(); ++signature)
+            if (!signature->ctorSelectedParams.empty())
+            {
+                selected = &signature->ctorSelectedParams;
+                break;
+            }
+        if (selected == nullptr) return {};
+        for (size_t i = 0; i < argVars.size() && i < selected->size(); ++i)
+        {
+            // A pointer, a class or a non-scalar parameter is not the scalar table's to judge.
+            const std::string scalar = CxxScalarNameOfSpelling((*selected)[i]);
+            if (scalar.empty()) continue;
+            TypeAndValue param;
+            param.TypeName = scalar;
+            const ScalarArgConversion conv = ClassifyScalarArgConversion(argVars[i], param);
+            if (conv != ScalarArgConversion::Narrow && conv != ScalarArgConversion::EnumMismatch) continue;
+            const std::string from = !argVars[i].TypeAndValue.TypeName.empty()
+                ? argVars[i].TypeAndValue.TypeName : argVars[i].LiteralIdentity;
+            return std::format("constructor that C++ selects for these arguments narrows argument {} "
+                               "from '{}' to '{}' (no implicit narrowing at a call); cast it explicitly",
+                               i + 1, from, scalar);
+        }
+        return {};
 }
 
 bool LLVMBackend::ArgumentConvertsToBoolParameter(
@@ -4271,9 +4332,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 const bool targetIsEnum = !targetEnumKey.empty()
                     || IsScopedEnumTypeName(candidateParamItr->TypeName)
                     || enumBackingTypes.count(candidateParamItr->TypeName) != 0;
-                if (sourceIsEnum && !targetIsEnum && !candidateParamItr->Pointer
-                    && !candidateParamItr->ElemPointer && !candidateParamItr->IsFunctionPointer
-                    && candidateParamItr->IsInteger() != -1)
+                // C++: judged at a reference's referent (`const int&`, `int&&`), and an
+                // `enum : bool` value to a bool parameter is a promotion too, not identity.
+                const TypeAndValue enumTarget = candidate.IsCxx
+                    ? ScalarArgumentReferent(*candidateParamItr) : *candidateParamItr;
+                if (sourceIsEnum && !targetIsEnum && !enumTarget.Pointer
+                    && !enumTarget.ElemPointer && !enumTarget.IsFunctionPointer
+                    && (enumTarget.IsInteger() != -1
+                        || (candidate.IsCxx && enumTarget.TypeName == "bool")))
                     enumToIntegerConversion = true;
                 const bool exactEnumPointer = arg.TypeAndValue.Pointer && candidateParamItr->Pointer
                     && arg.TypeAndValue.ElemPointer == candidateParamItr->ElemPointer
@@ -4512,7 +4578,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 }
                 integerCosts.push_back(integerCost);
                 standardCosts.push_back(integerCost);
-                if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg, candidate.IsCxx)
+                if (standardCosts.back() < 0
+                    && IsNullPointerConstantArgument(arg, candidate.IsCxx)
                     && candidateParamItr->Pointer && !candidateParamItr->IsArrayView
                     && (!IsCxxReferenceParameter(candidate, paramIndex)
                         || CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
@@ -4545,10 +4612,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             {
                 Ranked ranked;
                 ranked.pair = &pair;
-                // In a joined native-template set, enum-to-integer is a promotion, so an exact
-                // instantiated enum parameter must rank above the concrete integer overload.
+                // Enum-to-integer is a promotion in a joined native-template set and for a C++
+                // candidate (even at the enum's fixed underlying type), never an exact match.
                 const bool exactForRanking = perfectMatch && !constDiscardNotViable
-                    && !(rankEnumToIntegerAsConversion && enumToIntegerConversion)
+                    && !((rankEnumToIntegerAsConversion || candidate.IsCxx) && enumToIntegerConversion)
                     && !(candidate.Variadic && arguments.size() > candidate.Parameters.size());
                 ranked.perfectMatch = exactForRanking;
                 ranked.enumToIntegerConversion = enumToIntegerConversion;
@@ -4891,6 +4958,42 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 }
                 return true;
             };
+            /*
+             * clang ([over.ics.rank] 3.2.3 / 3.2.6 order two reference bindings only): a by-value
+             * class parameter and a reference parameter binding the same argument at the same rank tie.
+             * Identity class binds (rank 0) and derived-to-base binds to one base (rank 2) on both sides
+             * are such ties, so clang finds no best viable function for an lvalue, const lvalue, prvalue
+             * or `move` argument. Scalar sequences keep the tiers below; so do user-defined sequences
+             * through different conversions.
+             */
+            auto sameClassIdentityMix = [this](const std::vector<CxxConversionRank>& rx,
+                                               const std::vector<CxxConversionRank>& ry,
+                                               const FunctionSymbol& x, const FunctionSymbol& y) {
+                for (size_t k = 0; k < rx.size() && k < ry.size() && k < x.Parameters.size()
+                                    && k < y.Parameters.size(); ++k)
+                {
+                    const bool mixed = (x.Parameters[k].IsAlias || x.Parameters[k].IsRvalueRef)
+                        != (y.Parameters[k].IsAlias || y.Parameters[k].IsRvalueRef);
+                    if (!mixed) continue;
+                    if (!IsCxxRecord(x.Parameters[k].TypeName)
+                        || x.Parameters[k].TypeName != y.Parameters[k].TypeName
+                        || rx[k].rank != ry[k].rank)
+                        return false;
+                    // [over.ics.rank] 3.3: the same conversion function (or converting ctor, empty
+                    // userFunction) and the same second standard conversion are indistinguishable.
+                    if (rx[k].rank == 3)
+                    {
+                        if (rx[k].userFunction != ry[k].userFunction || rx[k].second != ry[k].second
+                            || !rx[k].ambiguousOperators.empty() || !ry[k].ambiguousOperators.empty())
+                            return false;
+                        continue;
+                    }
+                    const bool identity = rx[k].rank == 0;
+                    const bool sameBase = CxxSameBaseBindRank(rx[k], ry[k], x.Parameters[k].TypeName);
+                    if (!identity && !sameBase) return false;
+                }
+                return true;
+            };
             bool indistinguishable = !anyCrossing && survivors.size() > 1;
             auto differentClassConstructorConversions = [this](
                     const std::vector<CxxConversionRank>& rx,
@@ -4930,7 +5033,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             || unrelatedDerivedMix(cxxRanks[survivors[i]->pair],
                                                    cxxRanks[survivors[j]->pair],
                                                    survivors[i]->pair->second,
-                                                   survivors[j]->pair->second));
+                                                   survivors[j]->pair->second)
+                            || sameClassIdentityMix(cxxRanks[survivors[i]->pair],
+                                                    cxxRanks[survivors[j]->pair],
+                                                    survivors[i]->pair->second,
+                                                    survivors[j]->pair->second));
                 }
             }
             if (indistinguishable)
@@ -6859,7 +6966,6 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             return false;
         };
-
         /*
          * `obj.f(args)` where the C++ class declares f both static and non-static: C++ selects
          * over both sets, the static's implicit object matching any receiver. Score each static
@@ -7237,6 +7343,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (c.IsCxx && !c.IsMethod && (p.IsAlias || p.IsRvalueRef))
                     if (std::string declared = CxxReferenceParameterSpelling(c, i); !declared.empty())
                         spelled = declared;
+                // A C++ method's class reference shows its '&' (the declared spelling is not reachable here).
+                if (c.IsCxx && c.IsMethod && (p.IsAlias || p.IsRvalueRef) && !p.IsCxxRefToPointer
+                    && !p.ElemPointer && IsCxxRecord(p.TypeName))
+                    spelled = std::string(p.CxxConstRef() ? "const " : "") + p.TypeName
+                        + (p.IsRvalueRef ? " &&" : " &");
                 if (spelled.empty())
                     spelled = p.TypeName + PointerStars(p);
                 // A C++ pointer-to-const parameter shows its const: it may be all that differs.

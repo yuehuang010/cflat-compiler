@@ -4441,6 +4441,7 @@ private:
     std::unordered_map<std::string, SameClassCopyRequest> sameClassCopyRequests_;
     // Unscoped C++ enum -> CFlat name of its integral promotion type ([conv.prom]/3-4).
     std::unordered_map<std::string, std::string> enumPromotedTypes_;
+    bool RankedCxxParameterBaseSpelling(const TypeAndValue& parameter, std::string& spelling) const;
     // Enum keys read from a clang declaration (imported C/C++). A registered enum key outside this
     // set is CFlat-declared: C++ sees its values as its backing integers.
     std::unordered_set<std::string> importedEnumTypes_;
@@ -4843,6 +4844,9 @@ private:
         cxxFunctionTemplates_;
     std::unordered_map<std::string, size_t> cxxFunctionTemplateOwnerGroup_;
     std::unordered_map<std::string, size_t> cxxFunctionOwnerGroup_;
+    std::unordered_set<std::string> importedCxxFunctionMacros_;
+    std::unordered_map<std::string, std::pair<bool, std::string>> cxxMacroExpansionZeroCache_;
+    std::unordered_set<CFlatParser::FunctionDefinitionContext*> cxxMacroTemplateContexts_;
     // "<name>\x1f<linkage>" of every C++ free declaration RegisterCSignatures fully bound.
     std::unordered_set<std::string> cxxBoundSignatureKeys_;
     // CFlat foreign type name -> the import group index whose request registered it.
@@ -5221,6 +5225,8 @@ private:
         std::string conditionalArgumentKinds;
         // RawSig::closureKeptParams of a generated wrapper (round-trips through the cache).
         std::string closureKeptParams;
+        // RawSig::ctorSelectedParams of a generated constructor wrapper (round-trips through the cache).
+        std::vector<std::string> ctorSelectedParams;
         // RawSig::selectedCalleeType / selectedCalleeDefaults of a generated wrapper (cached).
         std::string selectedCalleeType;
         std::string selectedCalleeTemplateArgs;
@@ -8243,6 +8249,11 @@ private:
     // Function-like system macros (`assert`) bound per call by RequestCxxFreeFunction.
     std::unordered_set<std::string> cxxFunctionMacros_;
     bool IsCxxFunctionMacro(const std::string& name) const { return cxxFunctionMacros_.count(name) != 0; }
+    bool IsImportedCxxFunctionMacro(const std::string& name) const { return importedCxxFunctionMacros_.count(name) != 0; }
+    bool IsCxxMacroFunctionTemplate(const std::string& name) const;
+    bool TryGetCxxMacroExpansionNullZero(const std::string& name,
+                                         const std::string& invocation,
+                                         CMacroEntry& out);
     // Those whose replacement list names no parameter: a call evaluates no argument.
     std::unordered_set<std::string> cxxArgumentFreeMacros_;
     bool IsCxxArgumentFreeMacro(const std::string& name) const { return cxxArgumentFreeMacros_.count(name) != 0; }
@@ -8762,6 +8773,14 @@ private:
     Operation ParseOperation(const std::string& operationText);
 
 public:
+    // CFlat itself binds the name (local, parameter, implicit-this field, non-macro global).
+    bool IsCFlatVariableBinding(const std::string& name);
+    // Overload candidates CFlat holds under this (resolved) name, or null when there are none.
+    const std::vector<FunctionSymbol>* FindCFlatCallCandidates(const std::string& name) const;
+    // A parameter a null pointer constant could bind to (pointer-like, class, template or unknown).
+    static bool ParameterMayTakeNullConstant(const TypeAndValue& parameter);
+    bool IsImportedCxxFunctionMacroName(const std::string& name) const { return IsImportedCxxFunctionMacro(name); }
+
     // Public view of ParameterRetainsArgument (conservative: unknown callees retain).
     bool CalleeMayRetainArgument(const llvm::Function* fn, unsigned argIndex)
     {
@@ -11947,7 +11966,11 @@ public:
     // A deleted or private non-copy/move constructor that fits the arity and takes a scalar argument:
     // harvest drops it, but C++ ranks it in the tie, so only clang can decide that call.
     bool HasHiddenScalarCxxConstructor(const std::string& typeName,
-                                       const std::vector<TypeAndValue>& argTypes) const;
+                                       const std::vector<TypeAndValue>& argTypes,
+                                       const std::vector<NamedVariable>* argVars = nullptr) const;
+    bool HasDefaultedCxxConstructorTie(const std::string& typeName,
+                                       const std::vector<TypeAndValue>& argTypes,
+                                       bool allowExplicit) const;
     bool CxxConstructorNeedsClangResolution(const std::string& typeName,
                                             const CxxClassInfo::Structor* selected,
                                             const std::vector<TypeAndValue>& argTypes,
@@ -11977,6 +12000,10 @@ public:
     std::string CxxCtorSelectedNarrowingError(const std::string& typeName,
                                               const std::vector<NamedVariable>& argVars,
                                               bool floatToIntegerOnly = false);
+    // CTORVIAB: the same refusal for a class with constructor templates, from the constructor clang
+    // selects (its variadic wrapper's recorded parameters). Empty when nothing narrows.
+    std::string CxxCtorTemplatePickNarrowingError(const std::string& typeName,
+                                                  const std::vector<NamedVariable>& argVars);
     /*
      * Name of the `explicit` constructor of `typeName` that WOULD have taken `argTypes` had it
      * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
@@ -12414,6 +12441,9 @@ public:
     // "invalid operands" at the wrapper's own expression (round-trips in the NEG request cache).
     bool lastCxxWrapperNoViableAtRequest_ = false;
     bool pendingCxxWrapperNoViableAtRequest_ = false;
+    // The newest RequestCxxVariadicConstructor failed because clang refused its wrapper (not a
+    // no-viable miss): clang's pick refuses, so a caller keeps that refusal, not the listed pick.
+    bool lastCxxVariadicCtorClangRefused_ = false;
     // Set only where a generated call wrapper failed under clang; CFlat-side refusals leave it off.
     bool lastCxxRequestClangRejected_ = false;
     bool lastCxxRequestNoViableAtRequest_ = false;
@@ -13722,6 +13752,14 @@ public:
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.
     bool IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to,
                                  const NamedVariable* source) const;
+    // [over.ics.rank] same-class tie: both candidates bind the argument by a derived-to-base
+    // conversion to the same base `paramClass` from the same argument type (no user-defined step).
+    static bool CxxSameBaseBindRank(const CxxConversionRank& rx, const CxxConversionRank& ry,
+                                    const std::string& paramClass)
+    {
+        return rx.rank == 2 && ry.rank == 2 && !rx.toClass.empty() && rx.toClass == ry.toClass
+            && rx.from == ry.from && rx.toClass == paramClass;
+    }
     // A derived-to-base binding to a reference parameter: an lvalue reference, or `Base&&` when the
     // argument is a PROVEN rvalue. By-value parameters are not reference bindings (false).
     bool IsCxxDerivedToBaseReferenceBinding(const TypeAndValue& from, const TypeAndValue& to,
@@ -15025,7 +15063,7 @@ public:
     // 323: the ambiguity names cover every access level (clang looks up names before access).
     // 324: function-pointer cache entries keep array-reference result spellings and stripped inner dimensions (FNREFCTOR).
     // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
-    static constexpr int kCHeaderCacheVersion = 325;
+    static constexpr int kCHeaderCacheVersion = 327;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

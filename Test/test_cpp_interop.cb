@@ -502,6 +502,7 @@ import cpp "library/cpp_mix7_operator_rank.hpp";
 import cpp "library/cpp_mix7_fnptr_bool.hpp";
 import cpp "library/cpp_mix14_scalar_ctor.hpp";
 import cpp "library/cpp_mix18_overloads.hpp";
+import cpp "library/cpp_mix11_ctor.hpp";
 
 int mix7FnTwice(int x) { return x * 2; }
 int mix14Twice(int x) { return x * 2; }
@@ -2472,6 +2473,26 @@ int T226CallMoveLvalue(bool c)
 }
 int T243NestedFieldDepth(bool c) { t226s.B g = c ? t226s.mkH2(1).h.d : t226s.D(2); return g.get(); }
 int T243NestedFieldDepthReversed(bool c) { t226s.B g = c ? t226s.D(2) : t226s.mkH2(1).h.d; return g.get(); }
+// STATLEFT: `return d;` of a derived local or parameter into its base return type is an xvalue (C++20
+// implicit move, clang counts). A parenthesized return moves; a reference return copies.
+t226s.B StatLeftDerivedRet(int x) { t226s.D d = t226s.D(x); return d; }
+int StatLeftDerivedUse(int x) { t226s.B g = StatLeftDerivedRet(x); return g.get(); }
+int StatLeftStaticUse(int x) { static t226s.B g = StatLeftDerivedRet(x); return g.get(); }
+t226s.B StatLeftParamRet(t226s.D d) { return d; }
+int StatLeftParamUse(int x) { return StatLeftParamRet(t226s.D(x)).get(); }
+t226s.B StatLeftCopyOnlyRet(int x) { t226s.Dc d = t226s.Dc(x); return d; }
+int StatLeftCopyOnlyUse(int x) { t226s.B g = StatLeftCopyOnlyRet(x); return g.get(); }
+t226s.B StatLeftParenRet(int x) { t226s.D d = t226s.D(x); return (d); }
+int StatLeftParenUse(int x) { t226s.B g = StatLeftParenRet(x); return g.get(); }
+t226s.B StatLeftRefRet(int x) { t226s.D d = t226s.D(x); alias t226s.D r = d; return r; }
+int StatLeftRefUse(int x) { t226s.B g = StatLeftRefRet(x); return g.get(); }
+// STATLEFT round 2: B(const D&) alone, B(const D&) beside B(D&&), and an explicit B(B&&).
+t226s.BK StatLeftConvCRet(int x) { t226s.DK d = t226s.DK(x); return d; }
+int StatLeftConvCUse(int x) { t226s.BK g = StatLeftConvCRet(x); return g.get(); }
+t226s.BV StatLeftConvBRet(int x) { t226s.DV d = t226s.DV(x); return d; }
+int StatLeftConvBUse(int x) { t226s.BV g = StatLeftConvBRet(x); return g.get(); }
+t226s.BX StatLeftExplRet(int x) { t226s.DX d = t226s.DX(x); return d; }
+int StatLeftExplUse(int x) { t226s.BX g = StatLeftExplRet(x); return g.get(); }
 enum T45Ternary : int { Picked = true ? 7 : 8, Other = false ? 7 : 8 };
 
 int T46GenericDot<T>(T p) { return p.get() == nullptr ? 1 : 0; }
@@ -4367,6 +4388,12 @@ refescr3.Ref refescr3PassGlobal()
     auto a = refescr3.pass(l);
     return a;
 }
+refescr3.Big refescr3PassBigGlobal()
+{
+    refescr3.Big l = refescr3.mkb(refescr3Gi);
+    auto a = refescr3.passb(l);
+    return a;
+}
 R3Wrap refescr3OuterStable()
 {
     cppref.BraceRefInner s = refescr3G;
@@ -4451,9 +4478,37 @@ alias cppternbase.B ternbaseChooseReverse(bool choose, cppternbase.D* derived,
 int macroLeftDiscardDtorCount = 0;
 struct MacroLeftDiscardD { ~MacroLeftDiscardD() { macroLeftDiscardDtorCount++; } };
 MacroLeftDiscardD makeMacroLeftDiscardD() { MacroLeftDiscardD d; return d; }
+// A CFlat local, parameter and field named like an object macro win over the macro (NULLMACFN).
+int nullmacfnShadowLocal() { int CFLAT_NULLMACFN_ZERO = 7; return cpp_nullmacfn.pi(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO)); }
+int nullmacfnShadowParam(int CFLAT_NULLMACFN_ZERO) { return cpp_nullmacfn.pi(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO)); }
+struct NullmacfnShadowField
+{
+    int CFLAT_NULLMACFN_ZERO;
+    int get() { return cpp_nullmacfn.pi(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO)); }
+};
 
 extern int main()
 {
+    int nullmacfnValue = 7;
+    int* nullmacfnPointer = &nullmacfnValue;
+    if (cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(0)) != 5) return 86201;
+    if (cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO)) != 5) return 86202;
+    if (cpp_nullmacfn.ptr(CFLAT_NULLMACFN_MZ()) != 5) return 86203;
+    if (cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ID(0))) != 5) return 86204;
+    cpp_nullmacfn.K nullmacfnCtor = cpp_nullmacfn.K(CFLAT_NULLMACFN_PID(CFLAT_NULLMACFN_ZERO));
+    if (nullmacfnCtor.v != 5) return 86205;
+    if (cpp_nullmacfn.value(CFLAT_NULLMACFN_ID(0)) != 0) return 86206;
+    if (cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ZERO) != 5) return 86207;
+    if (cpp_nullmacfn.ptr(nullmacfnPointer) != 6) return 86208;
+    if (cpp_nullmacfn.ptr(&nullmacfnValue) != 6) return 86209;
+    if (cpp_nullmacfn.ptr(nullptr) != 5) return 86210;
+    if (cpp_nullmacfn.ptr((int*)0) != 5) return 86211;
+    if (cpp_nullmacfn_c_ptr(CFLAT_NULLMACFN_ID(0)) != 31) return 86212;
+    if (nullmacfnShadowLocal() != 107) return 86213;
+    if (nullmacfnShadowParam(7) != 107) return 86214;
+    NullmacfnShadowField nullmacfnField;
+    nullmacfnField.CFLAT_NULLMACFN_ZERO = 7;
+    if (nullmacfnField.get() != 107) return 86215;
     // The root C++ namespace must win over the same-named nested CFlat namespace.
     if (RootCxxEscape.r4RootCxxNamespacePick() != 7) return 39008;
     if (RootCxxEscape.r4InnerCxxNamespacePick() != -1) return 39010;
@@ -5436,6 +5491,25 @@ extern int main()
     // Round 4: a null pointer constant takes a pointer constructor; the pick itself is not asserted.
     t78.NullAlt* t78Na = new t78.NullAlt(0, 1.5);
     delete t78Na;
+    // CTORVIAB: a constructor template decides a narrowing only when clang selects it (clang: 307 for
+    // the pointer+int template, 1257 / 2257 / 307 exact or deduced templates, 0 literal, 257 copy-init, 11 null).
+    int cvAddr = 5;
+    t78.CvIdent cvIdent = t78.CvIdent(&cvAddr, 257);
+    if (cvIdent.v != 307) return 98330;
+    int cvInt = 257;
+    t78.CvExact cvExact = t78.CvExact(cvInt);
+    if (cvExact.v != 1257) return 98331;
+    t78.CvReq cvReq = t78.CvReq(cvInt);
+    if (cvReq.v != 2257) return 98332;
+    t78.CvDeduce cvDeduce = t78.CvDeduce(cvInt);
+    if (cvDeduce.v != 307) return 98333;
+    t78.CvAway cvZero = t78.CvAway(0);
+    if (cvZero.v != 0) return 98334;
+    t78.CvAway cvCopy = cvInt;
+    if (cvCopy.v != 257) return 98335;
+    t78.CvNull* cvNull = new t78.CvNull(0, 1);
+    if (cvNull.v != 11) return 98336;
+    delete cvNull;
     // T87: a literal 0 (any integer suffix, or a zero macro) is a null pointer constant to clang: it
     // reaches the pointer constructor as a conversion ranked beside the integral one (clang: 99).
     t87.P* t87P0 = new t87.P(0, 1.5);
@@ -6806,6 +6880,25 @@ extern int main()
     if (T243NestedFieldDepth(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93053;
     t226s.reset();
     if (T243NestedFieldDepthReversed(false) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93054;
+    // STATLEFT: derived->base return counts equal clang++ -std=c++20 (value 6 each).
+    t226s.reset();
+    if (StatLeftDerivedUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93055;
+    t226s.reset();
+    if (StatLeftParamUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93056;
+    t226s.reset();
+    if (StatLeftCopyOnlyUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93057;
+    t226s.reset();
+    if (StatLeftStaticUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 1) return 93058;
+    t226s.reset();
+    if (StatLeftParenUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93059;
+    t226s.reset();
+    if (StatLeftRefUse(6) != 6 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93060;
+    t226s.reset();
+    if (StatLeftConvCUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.conv != 1 || t226s.dead != 2) return 93061;
+    t226s.reset();
+    if (StatLeftConvBUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.conv != 10 || t226s.dead != 2) return 93062;
+    t226s.reset();
+    if (StatLeftExplUse(6) != 6 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.conv != 0 || t226s.dead != 2) return 93063;
     if (T62StaticAutoGlobalCopy() != 1) return 62010;
     cpp_t62.set_global_string("changed");
     if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
@@ -7079,6 +7172,25 @@ extern int main()
     if (cpi_t98.macroTypePick(T98_INLINE_MACRO) != 82
         || cpi_t98.macroTypePick(T98_NAMED_MACRO) != 83
         || cpi_t98.macroTypePick(T98_BOOL_MACRO) != 84) return 98918;
+    // WINENUM: a fixed `: int` / `: bool` / `: short` enum argument promotes, the enum overload wins.
+    {
+        cpi_t98.T98FixedEnum fixedLocal = cpi_t98.T98_FIXED_VALUE;
+        cpi_t98.T98FixedBool fixedBool = cpi_t98.T98_FIXED_BOOL;
+        cpi_t98.T98FixedShort fixedShort = cpi_t98.T98_FIXED_SHORT;
+        if (cpi_t98.fixedTypePick(fixedLocal) != 92 || cpi_t98.fixedTypePick(cpi_t98.T98_FIXED_VALUE) != 92
+            || cpi_t98.fixedTypePick(T98_FIXED_MACRO) != 92) return 98919;
+        if (cpi_t98.fixedBoolPick(fixedBool) != 94 || cpi_t98.fixedBoolPick(cpi_t98.T98_FIXED_BOOL) != 94
+            || cpi_t98.fixedShortPick(fixedShort) != 95 || cpi_t98.fixedShortPick(cpi_t98.T98_FIXED_SHORT) != 95)
+            return 98920;
+        cpi_t98.FixedPick fixedCtor{fixedLocal};
+        if (cpi_t98.fixedRefPick(fixedLocal) != 98 || fixedCtor.n != 62 || fixedCtor.m(fixedLocal) != 64
+            || fixedCtor.m(cpi_t98.T98_FIXED_VALUE) != 64) return 98921;
+        // WINENUM r2: a `const int&` / `int&&` referent is judged like a by-value int.
+        cpi_t98.FixedCrefPick fixedCrefCtor{fixedLocal};
+        if (cpi_t98.fixedCrefPick(fixedLocal) != 52 || cpi_t98.fixedCrefPick(cpi_t98.T98_FIXED_VALUE) != 52
+            || cpi_t98.fixedCrefPair(fixedLocal) != 54 || cpi_t98.fixedCrefPair(cpi_t98.T98_FIXED_VALUE) != 54
+            || cpi_t98.fixedRvalPick(cpi_t98.T98_FIXED_VALUE) != 56 || fixedCrefCtor.n != 58) return 98922;
+    }
     // T98: enum macros retain their type for template deduction and paren construction.
     if (cpi_t98.macroTypeTemplate(T98_NAMED_MACRO) != 1) return 99300;
     cpi_t98.MacroNamedPick t98ParenPick = cpi_t98.MacroNamedPick(T98_NAMED_MACRO);
@@ -7835,6 +7947,38 @@ extern int main()
         ctortpl.picked = 0;
         ctortpl.Two plain = ctortpl.Two(2, 5);
         if (plain.value != 7 || ctortpl.picked != 1) return 54318;
+
+        int* ctortplNullPointer = nullptr;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPF pointerControl = ctortpl.NullPF(ctortpl.AnonValue, ctortplNullPointer);
+        if (pointerControl.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54319;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPF zeroControl = ctortpl.NullPF(ctortpl.AnonValue, 0);
+        if (zeroControl.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54320;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPF nullControl = ctortpl.NullPF(ctortpl.AnonValue, NULL);
+        if (nullControl.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54321;
+        ctortpl.D5Single singleCtor = ctortpl.AmbiguousValue;
+        if (singleCtor.value != 303) return 54322;
+
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPF paren = ctortpl.NullPF(ctortpl.AnonValue, nullptr);
+        if (paren.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54323;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPF braced = {ctortpl.AnonValue, nullptr};
+        if (braced.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54324;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPF copied = ctortpl.NullPF(ctortpl.AnonValue, nullptr);
+        if (copied.value != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54325;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPF* nullHeap = new ctortpl.NullPF(ctortpl.AnonValue, nullptr);
+        int nullHeapValue = nullHeap->value;
+        delete nullHeap;
+        if (nullHeapValue != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54326;
+        ctortpl.calls = 0; ctortpl.picked = 0;
+        ctortpl.NullPFReceiver nullReceiver = default;
+        int nullMethodValue = nullReceiver.accept(ctortpl.NullPF(ctortpl.AnonValue, nullptr));
+        if (nullMethodValue != 103 || ctortpl.picked != 2 || ctortpl.calls != 1) return 54327;
     }
 
     // T34: a static non-template member beside same-name static member templates binds by
@@ -8369,8 +8513,16 @@ extern int main()
         || t58SrcX * (t58SrcUlong + 1) != 1007
         || t58SrcIntX * (t58SrcInt + 1) != 2002
         || t58SrcDoubleX * (t58SrcLong + 1.0) != 3002) return 27088;
-    expect_error("ambiguous call to 't27ptr.operator*': no candidate ranks better than the others") {
-        long t58SrcAmbiguous = t58SrcX * (t58SrcInt + 1);
+    if const (__WINDOWS__)
+    {
+        // LLP64 alias ruling: long is int, so int + 1 matches operator*(ArithmeticX, long) exactly.
+        if (t58SrcX * (t58SrcInt + 1) != 902) return 27090;
+    }
+    else
+    {
+        expect_error("ambiguous call to 't27ptr.operator*': no candidate ranks better than the others") {
+            long t58SrcAmbiguous = t58SrcX * (t58SrcInt + 1);
+        }
     }
     // T439: constant-folded comparisons keep bool for C++ template deduction.
     if (t27ptr.bool_kind(1e3 > 1) != 1 || t27ptr.bool_kind(1e3 == 1) != 1
@@ -12336,6 +12488,8 @@ extern int main()
     if (r3g.r != 61) return 49807;
     refescr3.Ref r3h = refescr3PassGlobal();
     if (r3h.r != 61) return 49808;
+    refescr3.Big r3hb = refescr3PassBigGlobal();
+    if (r3hb.r != 61 || r3hb.b != 2) return 49818;
     R3Wrap r3i = refescr3OuterStable();
     if (r3i.i.r != 61) return 49809;
     R3Wrap r3j = refescr3BraceCallArg();
@@ -19090,6 +19244,403 @@ extern int main()
             if (cppbv.Cnt.dtors != 1) return 3717;
         }
     }
+    // Each expression checks the unary overload ID, value, and exact C++ lifetime counts.
+    // The unique return code identifies the cell; the selected overload writes UnaryCnt.which.
+    {
+        cppbv.UnaryCnt seed = cppbv.UnaryCnt(5);
+        cppbv.UnaryVV vv = cppbv.UnaryVV();
+        cppbv.UnaryVR vr = cppbv.UnaryVR();
+        // lv_neg: -seed
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = -seed;
+            if (!TUnaryCounts(z.v, -5, 1, 1, 0, 0, 0)) return 30100;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30100;
+        // lv_pos: +seed
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = +seed;
+            if (!TUnaryCounts(z.v, 5, 2, 1, 0, 0, 0)) return 30101;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30101;
+        // lv_not: !seed
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = !seed;
+            if (!TUnaryCounts(z.v, 0, 3, 1, 0, 0, 0)) return 30102;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30102;
+        // lv_bitnot: ~seed
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = ~seed;
+            if (!TUnaryCounts(z.v, -6, 4, 1, 0, 0, 0)) return 30103;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30103;
+        // lv_deref: *seed
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = *seed;
+            if (!TUnaryCounts(z.v, 105, 5, 1, 0, 0, 0)) return 30104;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30104;
+        // call_neg_decl: -cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = -cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, -4, 1, 2, 0, 0, 1)) return 30105;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30105;
+        // pick_call_neg_decl: -cppbv.unaryPick(seed)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = -cppbv.unaryPick(seed);
+            if (!TUnaryCounts(z.v, -5, 1, 1, 1, 1, 2)) return 30106;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30106;
+        // method_neg_decl: -seed.method(2)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = -seed.method(2);
+            if (!TUnaryCounts(z.v, -7, 1, 2, 0, 0, 1)) return 30107;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30107;
+        // sub_vv_neg_decl: -vv[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = -vv[1];
+            if (!TUnaryCounts(z.v, -4, 1, 1, 1, 0, 1)) return 30108;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30108;
+        // sub_vr_neg_decl: -vr[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = -vr[1];
+            if (!TUnaryCounts(z.v, -4, 1, 1, 0, 0, 0)) return 30109;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30109;
+        // binary_call_neg_decl: -(seed * cppbv.unaryMake(2))
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = -(seed * cppbv.unaryMake(2));
+            if (!TUnaryCounts(z.v, -10, 1, 3, 0, 0, 2)) return 30110;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30110;
+        // call_pos_decl: +cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = +cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, 4, 2, 2, 0, 0, 1)) return 30111;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30111;
+        // pick_call_pos_decl: +cppbv.unaryPick(seed)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = +cppbv.unaryPick(seed);
+            if (!TUnaryCounts(z.v, 5, 2, 1, 1, 1, 2)) return 30112;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30112;
+        // method_pos_decl: +seed.method(2)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = +seed.method(2);
+            if (!TUnaryCounts(z.v, 7, 2, 2, 0, 0, 1)) return 30113;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30113;
+        // sub_vv_pos_decl: +vv[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = +vv[1];
+            if (!TUnaryCounts(z.v, 4, 2, 1, 1, 0, 1)) return 30114;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30114;
+        // sub_vr_pos_decl: +vr[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = +vr[1];
+            if (!TUnaryCounts(z.v, 4, 2, 1, 0, 0, 0)) return 30115;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30115;
+        // binary_call_pos_decl: +(seed * cppbv.unaryMake(2))
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = +(seed * cppbv.unaryMake(2));
+            if (!TUnaryCounts(z.v, 10, 2, 3, 0, 0, 2)) return 30116;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30116;
+        // call_not_decl: !cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = !cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, 0, 3, 2, 0, 0, 1)) return 30117;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30117;
+        // pick_call_not_decl: !cppbv.unaryPick(seed)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = !cppbv.unaryPick(seed);
+            if (!TUnaryCounts(z.v, 0, 3, 1, 1, 1, 2)) return 30118;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30118;
+        // method_not_decl: !seed.method(2)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = !seed.method(2);
+            if (!TUnaryCounts(z.v, 0, 3, 2, 0, 0, 1)) return 30119;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30119;
+        // sub_vv_not_decl: !vv[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = !vv[1];
+            if (!TUnaryCounts(z.v, 0, 3, 1, 1, 0, 1)) return 30120;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30120;
+        // sub_vr_not_decl: !vr[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = !vr[1];
+            if (!TUnaryCounts(z.v, 0, 3, 1, 0, 0, 0)) return 30121;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30121;
+        // binary_call_not_decl: !(seed * cppbv.unaryMake(2))
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = !(seed * cppbv.unaryMake(2));
+            if (!TUnaryCounts(z.v, 0, 3, 3, 0, 0, 2)) return 30122;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30122;
+        // call_bitnot_decl: ~cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = ~cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, -5, 4, 2, 0, 0, 1)) return 30123;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30123;
+        // pick_call_bitnot_decl: ~cppbv.unaryPick(seed)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = ~cppbv.unaryPick(seed);
+            if (!TUnaryCounts(z.v, -6, 4, 1, 1, 1, 2)) return 30124;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30124;
+        // method_bitnot_decl: ~seed.method(2)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = ~seed.method(2);
+            if (!TUnaryCounts(z.v, -8, 4, 2, 0, 0, 1)) return 30125;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30125;
+        // sub_vv_bitnot_decl: ~vv[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = ~vv[1];
+            if (!TUnaryCounts(z.v, -5, 4, 1, 1, 0, 1)) return 30126;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30126;
+        // sub_vr_bitnot_decl: ~vr[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = ~vr[1];
+            if (!TUnaryCounts(z.v, -5, 4, 1, 0, 0, 0)) return 30127;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30127;
+        // binary_call_bitnot_decl: ~(seed * cppbv.unaryMake(2))
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = ~(seed * cppbv.unaryMake(2));
+            if (!TUnaryCounts(z.v, -11, 4, 3, 0, 0, 2)) return 30128;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30128;
+        // call_deref_decl: *cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = *cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, 104, 5, 2, 0, 0, 1)) return 30129;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30129;
+        // pick_call_deref_decl: *cppbv.unaryPick(seed)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = *cppbv.unaryPick(seed);
+            if (!TUnaryCounts(z.v, 105, 5, 1, 1, 1, 2)) return 30130;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30130;
+        // method_deref_decl: *seed.method(2)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = *seed.method(2);
+            if (!TUnaryCounts(z.v, 107, 5, 2, 0, 0, 1)) return 30131;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30131;
+        // sub_vv_deref_decl: *vv[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = *vv[1];
+            if (!TUnaryCounts(z.v, 104, 5, 1, 1, 0, 1)) return 30132;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30132;
+        // sub_vr_deref_decl: *vr[1]
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = *vr[1];
+            if (!TUnaryCounts(z.v, 104, 5, 1, 0, 0, 0)) return 30133;
+        }
+        if (cppbv.UnaryCnt.dtors != 1) return 30133;
+        // binary_call_deref_decl: *(seed * cppbv.unaryMake(2))
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = *(seed * cppbv.unaryMake(2));
+            if (!TUnaryCounts(z.v, 110, 5, 3, 0, 0, 2)) return 30134;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30134;
+        // paren_sub_vv_neg: (-vv[1])
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = (-vv[1]);
+            if (!TUnaryCounts(z.v, -4, 1, 1, 1, 0, 1)) return 30135;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30135;
+        // paren_sub_vv_pos: (+vv[1])
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = (+vv[1]);
+            if (!TUnaryCounts(z.v, 4, 2, 1, 1, 0, 1)) return 30136;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30136;
+        // paren_sub_vv_not: (!vv[1])
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = (!vv[1]);
+            if (!TUnaryCounts(z.v, 0, 3, 1, 1, 0, 1)) return 30137;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30137;
+        // paren_sub_vv_bitnot: (~vv[1])
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = (~vv[1]);
+            if (!TUnaryCounts(z.v, -5, 4, 1, 1, 0, 1)) return 30138;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30138;
+        // paren_sub_vv_deref: (*vv[1])
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = (*vv[1]);
+            if (!TUnaryCounts(z.v, 104, 5, 1, 1, 0, 1)) return 30139;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30139;
+        // call_neg_assign: -cppbv.unaryMake(4)
+        {
+            cppbv.UnaryCnt z = cppbv.UnaryCnt(99);
+            cppbv.UnaryCnt.reset();
+            z = -cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, -4, 1, 2, 0, 0, 2)) return 30140;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30140;
+        // call_neg_arg: -cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            int value = cppbv.readUnary(-cppbv.unaryMake(4));
+            if (!TUnaryCounts(value, -4, 1, 2, 0, 0, 2)) return 30141;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30141;
+        // call_neg_return: -cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = TUnaryReturn_neg();
+            if (!TUnaryCounts(z.v, -4, 1, 2, 0, 0, 1)) return 30142;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30142;
+        // call_pos_assign: +cppbv.unaryMake(4)
+        {
+            cppbv.UnaryCnt z = cppbv.UnaryCnt(99);
+            cppbv.UnaryCnt.reset();
+            z = +cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, 4, 2, 2, 0, 0, 2)) return 30143;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30143;
+        // call_pos_arg: +cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            int value = cppbv.readUnary(+cppbv.unaryMake(4));
+            if (!TUnaryCounts(value, 4, 2, 2, 0, 0, 2)) return 30144;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30144;
+        // call_pos_return: +cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = TUnaryReturn_pos();
+            if (!TUnaryCounts(z.v, 4, 2, 2, 0, 0, 1)) return 30145;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30145;
+        // call_not_assign: !cppbv.unaryMake(4)
+        {
+            cppbv.UnaryCnt z = cppbv.UnaryCnt(99);
+            cppbv.UnaryCnt.reset();
+            z = !cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, 0, 3, 2, 0, 0, 2)) return 30146;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30146;
+        // call_not_arg: !cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            int value = cppbv.readUnary(!cppbv.unaryMake(4));
+            if (!TUnaryCounts(value, 0, 3, 2, 0, 0, 2)) return 30147;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30147;
+        // call_not_return: !cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = TUnaryReturn_not();
+            if (!TUnaryCounts(z.v, 0, 3, 2, 0, 0, 1)) return 30148;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30148;
+        // call_bitnot_assign: ~cppbv.unaryMake(4)
+        {
+            cppbv.UnaryCnt z = cppbv.UnaryCnt(99);
+            cppbv.UnaryCnt.reset();
+            z = ~cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, -5, 4, 2, 0, 0, 2)) return 30149;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30149;
+        // call_bitnot_arg: ~cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            int value = cppbv.readUnary(~cppbv.unaryMake(4));
+            if (!TUnaryCounts(value, -5, 4, 2, 0, 0, 2)) return 30150;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30150;
+        // call_bitnot_return: ~cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = TUnaryReturn_bitnot();
+            if (!TUnaryCounts(z.v, -5, 4, 2, 0, 0, 1)) return 30151;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30151;
+        // call_deref_assign: *cppbv.unaryMake(4)
+        {
+            cppbv.UnaryCnt z = cppbv.UnaryCnt(99);
+            cppbv.UnaryCnt.reset();
+            z = *cppbv.unaryMake(4);
+            if (!TUnaryCounts(z.v, 104, 5, 2, 0, 0, 2)) return 30152;
+        }
+        if (cppbv.UnaryCnt.dtors != 3) return 30152;
+        // call_deref_arg: *cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            int value = cppbv.readUnary(*cppbv.unaryMake(4));
+            if (!TUnaryCounts(value, 104, 5, 2, 0, 0, 2)) return 30153;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30153;
+        // call_deref_return: *cppbv.unaryMake(4)
+        cppbv.UnaryCnt.reset();
+        {
+            cppbv.UnaryCnt z = TUnaryReturn_deref();
+            if (!TUnaryCounts(z.v, 104, 5, 2, 0, 0, 1)) return 30154;
+        }
+        if (cppbv.UnaryCnt.dtors != 2) return 30154;
+    }
     // T249: a CFlat struct with a C++ field (lowered) joined by '?:' with a move arm builds ONE
     // shared temporary, as clang's prvalue join does: the moved field is moved (not copied from a
     // zeroed source), the moved-from source reads -1, and the counts match clang++ -std=c++20.
@@ -19438,6 +19989,31 @@ extern int main()
         }
         if (cppon.clsNew() != 2 || cppon.clsDel() != 2 || cppon.dtors() != 2
             || cppon.live() != 0) return 3603;
+    }
+    // Member typedef requests keep the headers of template arguments and nested user templates.
+    {
+        cppon.reset();
+        {
+            std.unique_ptr<cppon.Cls> owner =
+                std.unique_ptr<cppon.Cls>(new cppon.Cls(51));
+            std.unique_ptr<cppon.Cls>.element_type* element = owner.get();
+            std.unique_ptr<cppon.Cls>.pointer uniquePointer = owner.get();
+            std.vector<cppon.Cls*>.value_type value = owner.get();
+            std.vector<cppon.Cls*>.pointer vectorPointer = &value;
+            std.vector<int>.value_type integer = 52;
+            cppt.ListTraits<cppon.Cls>.elem_type* nested = owner.get();
+            if (element->get() != 51 || uniquePointer->get() != 51 || value->get() != 51
+                || (*vectorPointer)->get() != 51 || integer != 52 || nested->get() != 51)
+                return 3660;
+        }
+        if (cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 1
+            || cppon.live() != 0) return 3661;
+        // A pointer typedef over a class template specialization binds the specialization.
+        {
+            cppon.Later<cppon.Cls> seen = default;
+            cppon.LaterBox<cppon.Cls>.later_ptr later = &seen;
+            if (later->v != 7) return 3662;
+        }
     }
     {
         cppon.reset();
@@ -25395,6 +25971,19 @@ cppas.TallyByValue ByValueParenTernReturn2(int f, cppas.TallyByValue* a, cppas.T
 {
     return ((f != 0 ? (*a = 3) : (*c += 5)));
 }
+bool TUnaryCounts(int value, int expectedValue, int expectedWhich, int ctors, int copies, int moves, int dtors)
+{
+    return value == expectedValue && cppbv.UnaryCnt.which == expectedWhich
+        && cppbv.UnaryCnt.ctors == ctors && cppbv.UnaryCnt.copies == copies
+        && cppbv.UnaryCnt.moves == moves && cppbv.UnaryCnt.dtors == dtors;
+}
+
+cppbv.UnaryCnt TUnaryReturn_neg() { return -cppbv.unaryMake(4); }
+cppbv.UnaryCnt TUnaryReturn_pos() { return +cppbv.unaryMake(4); }
+cppbv.UnaryCnt TUnaryReturn_not() { return !cppbv.unaryMake(4); }
+cppbv.UnaryCnt TUnaryReturn_bitnot() { return ~cppbv.unaryMake(4); }
+cppbv.UnaryCnt TUnaryReturn_deref() { return *cppbv.unaryMake(4); }
+
 cppas.Life T239ParenTernReturn(bool pick)
 {
     return (pick ? cppas.Life(1) : cppas.Life(2));
@@ -26230,21 +26819,39 @@ int srctypeRound4Legs()
     t27ptr.T58Plain e = t27ptr.T58A;
     long op4 = (ul | 1) - x;
     if (op4 != 807) return 27301;
-    long op5 = sizeof(int) - x;
-    if (op5 != 804) return 27302;
-    long op7 = x * sizeof(int);
-    if (op7 != 1004) return 27303;
+    if const (__WINDOWS__)
+    {
+        // LLP64: size_t is unsigned long long, so long and unsigned long tie (clang-cl: ambiguous).
+        expect_error("no overload of 't27ptr.operator-' matches the given arguments") {
+            long op5w = sizeof(int) - x;
+        }
+        expect_error("no overload of 't27ptr.operator*' matches the given arguments") {
+            long op7w = x * sizeof(int);
+        }
+    }
+    else
+    {
+        long op5 = sizeof(int) - x;
+        if (op5 != 804) return 27302;
+        long op7 = x * sizeof(int);
+        if (op7 != 1004) return 27303;
+    }
+    // size_t is unsigned long on LP64 (code 4), unsigned long long on LLP64 (code 14); u ^ l is
+    // long on LP64 (code 3) but unsigned long on LLP64, where long cannot hold every unsigned.
+    int sizeCode = 4;
+    int xorCode = 3;
+    if const (__WINDOWS__) { sizeCode = 14; xorCode = 4; }
     // Auto locals keep the C++ identity of their source when they reach a C++ template.
     auto q1 = sizeof(int);
-    if (t27ptr.arithmetic_value(q1) != 404) return 27304;
+    if (t27ptr.arithmetic_value(q1) != sizeCode * 100 + 4) return 27304;
     auto q2 = l << 1;
     if (t27ptr.arithmetic_value(q2) != 306) return 27305;
     auto q3 = u ^ l;
-    if (t27ptr.arithmetic_value(q3) != 305) return 27306;
+    if (t27ptr.arithmetic_value(q3) != xorCode * 100 + 5) return 27306;
     auto q4 = l & ul;
     if (t27ptr.arithmetic_value(q4) != 402) return 27307;
     auto q5 = sizeof(long) + 1;
-    if (t27ptr.arithmetic_value(q5) != 409) return 27308;
+    if (t27ptr.arithmetic_value(q5) != sizeCode * 100 + (int)sizeof(long) + 1) return 27308;
     auto q6 = ul | 1;
     if (t27ptr.arithmetic_value(q6) != 407) return 27309;
     auto q7 = l + 1;
@@ -26258,14 +26865,33 @@ int srctypeRound4Legs()
     auto q11 = e << 2;
     if (t27ptr.arithmetic_value(q11) != 104) return 27314;
     auto q12 = alignof(long);
-    if (t27ptr.arithmetic_value(q12) != 408) return 27315;
+    if (t27ptr.arithmetic_value(q12) != sizeCode * 100 + (int)alignof(long)) return 27315;
     // SRCTYPE round 5: the same locals bind a C++ `T&&` as the identity lvalue (clang oracle).
     auto r1 = sizeof(int);
-    if (t27ptr.arithmetic_value_ref(r1) != 2404) return 27316;
+    if (t27ptr.arithmetic_value_ref(r1) != (20 + sizeCode) * 100 + 4) return 27316;
     auto r2 = l << 1;
     if (t27ptr.arithmetic_value_ref(r2) != 2306) return 27317;
     auto r3 = u ^ l;
-    if (t27ptr.arithmetic_value_ref(r3) != 2305) return 27318;
-    if (t27ptr.arithmetic_bump_ref(r1) != 2405 || r1 != 5) return 27319;
+    if (t27ptr.arithmetic_value_ref(r3) != (20 + xorCode) * 100 + 5) return 27318;
+    if (t27ptr.arithmetic_bump_ref(r1) != (20 + sizeCode) * 100 + 5 || r1 != 5) return 27319;
+    // CVAMB: clang-accepted siblings of a reference and a by-value overload (fixtures in cpp_mix11_ctor.hpp).
+    // A const& / && overload wins only where clang gives it a binding the by-value one lacks.
+    CvaV cvaLv = 1;
+    const CvaV cvaCv = 2;
+    CvaD cvaDv = 3;
+    CvaM cvaMo = 4;
+    if (cva_b(cvaCv) != 2 || cva_b(CvaV(6)) != 2) return 69101;
+    if (cva_b(move cvaLv) != 2) return 69102;
+    CvaV cvaLv2 = 7;
+    if (cva_c(cvaLv2) != 2 || cva_c(cvaDv) != 2) return 69103;
+    if (cva_d(cvaLv2) != 1 || cva_d(cvaCv) != 1 || cva_d(CvaV(6)) != 2) return 69104;
+    CvaV cvaLv3 = 8;
+    if (cva_d(move cvaLv3) != 2) return 69105;
+    CvaV cvaLv4 = 9;
+    if (cva_e(cvaLv4, 1) != 1 || cva_f(cvaLv4, 1) != 2) return 69107;
+    if (cva_g(cvaLv4) != 1 || cva_g(CvaV(6)) != 1 || cva_g(cvaDv) != 3) return 69108;
+    if (cva_h(cvaLv4) != 2 || cva_h(cvaDv) != 3) return 69109;
+    if (cvaMo.mb(cvaCv) != 2 || cvaMo.mb(CvaV(6)) != 2) return 69110;
+    if (cvaMo.mb(move cvaLv4) != 2) return 69111;
     return 0;
 }

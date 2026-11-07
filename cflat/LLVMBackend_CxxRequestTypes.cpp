@@ -77,6 +77,20 @@ static std::string RankedReferentSpelling(const std::string& spelling)
         return amp == std::string::npos ? spelling : spelling.substr(0, amp);
 }
 
+// The C++ type a ranked constructor parameter is cast to. An imported unscoped enum keeps its own
+// name: CxxSpellingForCflatType spells it as the backing integer, which re-ranks another overload.
+bool LLVMBackend::RankedCxxParameterBaseSpelling(const TypeAndValue& parameter, std::string& spelling) const
+{
+        if (!parameter.IsScopedEnum && enumPromotedTypes_.count(parameter.TypeName) != 0)
+        {
+            spelling = parameter.TypeName;
+            for (size_t pos = 0; (pos = spelling.find('.', pos)) != std::string::npos; pos += 2)
+                spelling.replace(pos, 1, "::");
+            return true;
+        }
+        return CxxSpellingForCflatType(parameter.TypeName, spelling);
+}
+
 bool LLVMBackend::RequestCxxBraceConstructor(
         const std::string& typeName, std::vector<NamedVariable>& arguments,
         std::vector<CxxBraceArgument>& braceArguments, std::string& wrapperName,
@@ -130,7 +144,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
             if (rankedConstructor == nullptr || index + 1 >= rankedConstructor->params.size())
                 return false;
             const TypeAndValue& parameter = rankedConstructor->params[index + 1];
-            if (!CxxSpellingForCflatType(parameter.TypeName, spelling)) return false;
+            if (!RankedCxxParameterBaseSpelling(parameter, spelling)) return false;
             if (parameter.Pointer && !parameter.ElemPointer)
             {
                 if (parameter.CxxConstRef()) spelling += " const &";
@@ -1130,7 +1144,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             if (rankedConstructor == nullptr || index + 1 >= rankedConstructor->params.size())
                 return false;
             const TypeAndValue& parameter = rankedConstructor->params[index + 1];
-            if (!CxxSpellingForCflatType(parameter.TypeName, spelling)) return false;
+            if (!RankedCxxParameterBaseSpelling(parameter, spelling)) return false;
             if (parameter.Pointer && !parameter.ElemPointer)
             {
                 if (parameter.CxxConstRef()) spelling += " const &";
@@ -1276,6 +1290,17 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             const std::string targetType = !(scalarReferenceSet && scalarElement)
                 && elementTargetTypes != nullptr
                 && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
+            if (const std::string* unnamedEnum = CxxUnnamedEnumExpression(elements[i].Storage);
+                unnamedEnum != nullptr)
+            {
+                size_t at = 0;
+                while ((at = init.find(marker, at)) != std::string::npos)
+                {
+                    init.replace(at, marker.size(), *unnamedEnum);
+                    at += unnamedEnum->size();
+                }
+                continue;
+            }
             if (CxxBraceFieldIsReference(targetType))
             {
                 std::string replacement = param;
@@ -1485,9 +1510,13 @@ std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeNa
 {
         if (argVars.empty()) return {};
         const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
-        if (info == nullptr || info->hasCtorTemplate) return {};
+        if (info == nullptr) return {};
         const auto raw = cxxRecordEntries_.find(typeName);
-        if (raw == cxxRecordEntries_.end() || !raw->second.ctorTemplates.empty()) return {};
+        // A constructor template is no listed candidate (deduction and constraints decide it): clang's
+        // pick is read back instead (CTORVIAB). The float-to-integer variant stays listed-only.
+        if (info->hasCtorTemplate || (raw != cxxRecordEntries_.end() && !raw->second.ctorTemplates.empty()))
+            return floatToIntegerOnly ? std::string() : CxxCtorTemplatePickNarrowingError(typeName, argVars);
+        if (raw == cxxRecordEntries_.end()) return {};
         for (const auto& member : raw->second.members)
             if (member.kind == cflat_cinterop::RawCxxMember::Constructor
                 && (member.variadic || member.requiresConstructorWrapper))
@@ -1596,13 +1625,32 @@ std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeNa
 }
 
 bool LLVMBackend::HasHiddenScalarCxxConstructor(const std::string& typeName,
-        const std::vector<TypeAndValue>& argTypes) const
+        const std::vector<TypeAndValue>& argTypes,
+        const std::vector<NamedVariable>* argVars) const
 {
         bool anyScalar = false;
         for (const TypeAndValue& tv : argTypes)
             anyScalar = anyScalar || (!tv.Pointer && (tv.IsInteger() != -1
-                || tv.IsFloatingPoint() != -1 || tv.TypeName == "bool"));
+                || tv.IsFloatingPoint() != -1 || tv.TypeName == "bool"
+                || !GetEnumBackingType(tv.TypeName).empty()));
+        if (!anyScalar && argVars != nullptr)
+            anyScalar = std::any_of(argVars->begin(), argVars->end(), [&](const NamedVariable& arg) {
+                return CxxUnnamedEnumExpression(arg.Storage) != nullptr;
+            });
         if (!anyScalar) return false;
+        // A constructor template binds only a real scalar: `&p` (an address-of pointer value) reads
+        // as an int here but is pointer-shaped, so it keeps the listed refusal.
+        const bool sizedVars = argVars != nullptr && argVars->size() == argTypes.size();
+        bool anyRealScalar = false;
+        for (size_t i = 0; !anyRealScalar && i < argTypes.size(); ++i)
+        {
+            const TypeAndValue& tv = argTypes[i];
+            if (tv.Pointer || tv.PointerDepth != 0 || (sizedVars && (*argVars)[i].IsCxxAddressOfPointerValue))
+                continue;
+            anyRealScalar = tv.IsInteger() != -1 || tv.IsFloatingPoint() != -1
+                || tv.TypeName == "bool" || !GetEnumBackingType(tv.TypeName).empty()
+                || (sizedVars && CxxUnnamedEnumExpression((*argVars)[i].Storage) != nullptr);
+        }
         auto record = cxxRecordEntries_.find(typeName);
         if (record == cxxRecordEntries_.end()) return false;
         // A tie needs a visible constructor to tie with: a class whose only fitting constructor is
@@ -1621,7 +1669,64 @@ bool LLVMBackend::HasHiddenScalarCxxConstructor(const std::string& typeName,
             if (member.isDeleted || member.access != cflat_cinterop::AccessPublic) hidden = true;
             else visible = true;
         }
+        for (const auto& ctorTemplate : record->second.ctorTemplates)
+        {
+            if (!anyRealScalar) break;
+            if (ctorTemplate.paramTypes.size() < argTypes.size()) continue;
+            bool fits = true;
+            size_t fixedCount = ctorTemplate.paramTypes.size();
+            if (ctorTemplate.hasParameterPack && fixedCount != 0) --fixedCount;
+            if (argTypes.size() > fixedCount
+                && !ctorTemplate.hasParameterPack && !ctorTemplate.variadic)
+                fits = false;
+            for (size_t i = argTypes.size(); fits && i < fixedCount; ++i)
+                fits = i < ctorTemplate.defaulted.size() && ctorTemplate.defaulted[i] != 0;
+            if (!fits) continue;
+            if (ctorTemplate.isDeleted
+                || ctorTemplate.access != static_cast<int>(cflat_cinterop::AccessPublic))
+                hidden = true;
+            else
+                visible = true;
+        }
         return hidden && visible;
+}
+
+bool LLVMBackend::HasDefaultedCxxConstructorTie(const std::string& typeName,
+        const std::vector<TypeAndValue>& argTypes, bool allowExplicit) const
+{
+        const CxxClassInfo* listed = GetCxxClassInfoWithConstructors(typeName);
+        if (listed == nullptr) return false;
+        std::vector<const CxxClassInfo::Structor*> candidates;
+        for (const auto& ctor : listed->constructors)
+        {
+            if (ctor.isCopyCtor || ctor.isMoveCtor || (!allowExplicit && ctor.isExplicit)
+                || ctor.params.size() < argTypes.size() + 1)
+                continue;
+            bool viable = true;
+            for (size_t i = argTypes.size() + 1; viable && i < ctor.params.size(); ++i)
+                viable = i < ctor.defaultArgs.size() && !ctor.defaultArgs[i].kind.empty();
+            if (viable) candidates.push_back(&ctor);
+        }
+        auto sameParameter = [](const TypeAndValue& a, const TypeAndValue& b) {
+            return a.TypeName == b.TypeName && a.Pointer == b.Pointer
+                && a.ElemPointer == b.ElemPointer && a.PointerDepth == b.PointerDepth
+                && a.IsAlias == b.IsAlias && a.IsRvalueRef == b.IsRvalueRef
+                && a.IsCxxRefToPointer == b.IsCxxRefToPointer
+                && a.IsFunctionPointer == b.IsFunctionPointer
+                && a.ConstMask == b.ConstMask;
+        };
+        for (size_t i = 0; i < candidates.size(); ++i)
+            for (size_t j = i + 1; j < candidates.size(); ++j)
+            {
+                const auto& a = *candidates[i];
+                const auto& b = *candidates[j];
+                if (a.params.size() == b.params.size()) continue;
+                bool sameSuppliedTypes = true;
+                for (size_t p = 1; sameSuppliedTypes && p <= argTypes.size(); ++p)
+                    sameSuppliedTypes = sameParameter(a.params[p], b.params[p]);
+                if (sameSuppliedTypes) return true;
+            }
+        return false;
 }
 
 bool LLVMBackend::CxxConstructorNeedsClangResolution(
@@ -1643,6 +1748,7 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
                 return IsUnnamedEnumValue(arg);
             }))
             return true;
+        if (HasDefaultedCxxConstructorTie(typeName, argTypes, allowExplicit)) return true;
         const bool addressValue = argVars != nullptr
             && std::any_of(argVars->begin(), argVars->end(), [](const NamedVariable& arg) {
                 return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr;
@@ -1770,7 +1876,7 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
             }
         // A deleted/private/protected ctor is dropped at harvest yet still ranks in a C++ tie, so
         // such a call goes to clang, which decides the tie and the access/deleted refusal.
-        if (selected != nullptr && HasHiddenScalarCxxConstructor(typeName, argTypes))
+        if (selected != nullptr && HasHiddenScalarCxxConstructor(typeName, argTypes, argVars))
         {
             // Clang-only set, like a null-pointer tie: its refusal must reach the caller.
             if (nullPointerCandidate != nullptr) *nullPointerCandidate = true;
@@ -2099,6 +2205,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         if (noViableCandidate != nullptr) *noViableCandidate = false;
         error.clear();
         wrapperName.clear();
+        lastCxxVariadicCtorClangRefused_ = false;
 
         // An implicit conversion can recurse through overload ranking back into the same ctor
         // request. Direct-init and copy-init share this key: only one may resolve at a time.
@@ -2191,7 +2298,12 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         // No variadic/inherited constructor in the record still leaves the TEMPLATE constructors
         // clang never lists (std::optional's converting ctor). Try the wrapper anyway, but report
         // nothing when it fails so the caller keeps its own overload diagnostic.
-        bool declaredWrapperCtor = hasVariadicCtor(typeName, seen);
+        const bool unnamedEnumArgument = std::any_of(
+            arguments.begin(), arguments.end(), [&](const NamedVariable& arg) {
+                return CxxUnnamedEnumExpression(arg.Storage) != nullptr;
+            });
+        bool declaredWrapperCtor = hasVariadicCtor(typeName, seen)
+            || unnamedEnumArgument;
         // A hidden deleted or private sibling tie is decided by clang: its refusal must surface.
         if (!declaredWrapperCtor)
         {
@@ -2203,7 +2315,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                     tv.TypeName = arg.LiteralIdentity;
                 argTypes.push_back(tv);
             }
-            declaredWrapperCtor = HasHiddenScalarCxxConstructor(typeName, argTypes);
+            declaredWrapperCtor = HasHiddenScalarCxxConstructor(typeName, argTypes, &arguments)
+                || HasDefaultedCxxConstructorTie(typeName, argTypes, !copyInit);
         }
         if (!declaredWrapperCtor && copyInit && arguments.size() == 1
             && !arguments.front().TypeAndValue.Pointer
@@ -2230,6 +2343,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         static constexpr std::string_view kArrayReferenceParameterMarker =
             "(&cflat_array_argument_marker)";
         auto giveUp = [&](const char* why) {
+            lastCxxVariadicCtorClangRefused_ = false;
             if (declaredWrapperCtor) error = why;
             return false;
         };
@@ -2241,6 +2355,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
 
         auto cflatTypeOf = [&](const NamedVariable& arg) {
+            if (IsCxxNullTypedArgument(arg)) return std::string("std.nullptr_t");
             std::string type = !arg.LiteralIdentity.empty()
                 ? arg.LiteralIdentity : arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
@@ -2370,6 +2485,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 callArguments.push_back(CxxClosureCallArgument(arg, "p" + std::to_string(i + 1)));
                 continue;
             }
+            if (IsCxxNullTypedArgument(arg))
+                spelling = "std::nullptr_t";
             const bool fixedArray = IsCxxFixedArrayArgument(arg);
             std::vector<uint64_t> arrayDimensions;
             if (fixedArray && arg.TypeAndValue.ConstArraySize != 0)
@@ -2408,7 +2525,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             else if ((arg.TypeAndValue.TypeName == "char" && arg.TypeAndValue.Pointer
                     && arg.IsRvalue) || stringLiteral)
                 spelling = "const char *";
-            else if (!CxxThinFunctionPointerSpelling(arg.TypeAndValue, spelling)
+            else if (spelling.empty() && !CxxThinFunctionPointerSpelling(arg.TypeAndValue, spelling)
                      && !enumSpelling(arg.TypeAndValue, spelling)
                      && !CxxSpellingForCflatType(cflatType, spelling))
             {
@@ -2485,6 +2602,17 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 {
                     callArgument = "static_cast<" + spelling + " &&>(" + callArgument + ")";
                     spelling += " &&";
+                }
+                else if (IsCxxNullTypedArgument(arg))
+                {
+                    // nullptr_t keeps its category: a literal is an rvalue, a named object an lvalue.
+                    if (namedLvalue)
+                        spelling += " &";
+                    else
+                    {
+                        callArgument = "static_cast<std::nullptr_t &&>(" + callArgument + ")";
+                        spelling += " &&";
+                    }
                 }
             }
             else if ((arg.TypeAndValue.Pointer
@@ -2855,6 +2983,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
         if (!requested)
         {
+            lastCxxVariadicCtorClangRefused_ = !lastCxxWrapperNoViableAtRequest_;
             if (noViableCandidate != nullptr)
                 *noViableCandidate = lastCxxWrapperNoViableAtRequest_;
             // Clang selected a constructor whose body failed to instantiate: its refusal stands.
@@ -3044,6 +3173,7 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             raw.paramBindKinds = stored.paramBindKinds;
             raw.conditionalArgumentKinds = stored.conditionalArgumentKinds;
             raw.closureKeptParams = stored.closureKeptParams;
+            raw.ctorSelectedParams = stored.ctorSelectedParams;
             raw.selectedCalleeType = stored.selectedCalleeType;
             raw.selectedCalleeTemplateArgs = stored.selectedCalleeTemplateArgs;
             raw.selectedCalleeDefaults = stored.selectedCalleeDefaults;
@@ -3523,6 +3653,16 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 || mapped.TypeName.empty() || (mapped.IsFunctionPointer && mapped.Pointer))
                 return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                         cxxSpelling));
+            // An unpublished class-template specialization pointee maps to an opaque void*; it is
+            // never bound as void* (a Later<T>* member typedef stays refused, as on master).
+            {
+                std::string pointee = spelling.substr(0, spelling.find_first_of("*&"));
+                while (!pointee.empty() && pointee.back() == ' ') pointee.pop_back();
+                const bool specializedPointee = pointee.find('<') != std::string::npos;
+                if (mapped.TypeName == "void" && mapped.Pointer && specializedPointee)
+                    return fail(std::format("'{}' does not name a C++ class type in the imported headers",
+                                            cxxSpelling));
+            }
             // A function-pointer typedef (std::new_handler) binds like `using F = function<...>`.
             if (mapped.IsFunctionPointer)
             {

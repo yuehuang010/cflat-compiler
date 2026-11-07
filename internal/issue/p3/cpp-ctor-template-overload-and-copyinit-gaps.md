@@ -9,11 +9,6 @@ Also refused on master (clang accepts; T54 review 3, 2026-10-06; repros scratch/
 Also on master (T54 reviews 4-5, 2026-10-06; repros scratch/repro_keep/t54_rev/rev4/, rev5/):
 - a converting ctor whose trailing default is not a literal (`int w = next()`, `int w = g`, `Tr t = Tr(7)`) is refused
   with "cannot initialize C++ class" (clang evaluates the default per construction);
-- `D5(E, int = 0)` next to `D5(E)`: clang reports ambiguity, CFlat silently picks `D5(E)`;
 - `q.T1 d = move ia[nx()];` refused ("needs a plain variable as its source"); clang constructs T1(int) from std::move.
 
-CTORTPL (2026-10-30 box 7) fixed the unnamed-enum pick (all ctor paths) and non-const same-class copy-init via the forwarding template.
-Left (Opus review 2, repros scratch/repro_keep/ctortpl/ + rv3.hpp):
-- unnamed enum + literal `nullptr`, `rq.PF(rq.EA, nullptr)`, still picks the int ctor (clang 101 2, cflat 1 1); an `int*` variable works.
-  The nullptr-literal candidate path runs before / skips the unnamed-enum clang-resolution return (p5.cb).
-- a ctor template deleted for enums (`template<class U> PI(U) = delete`) next to an int ctor: clang errors, cflat picks the int ctor (p4.cb; master same).
+The unnamed-enum/nullptr selection, deleted enum constructor-template selection, and defaulted-parameter constructor ambiguity residue from CTORTPL/T54 are fixed in the CTORTPL2 worktree. The non-literal trailing-default, move-source, and derived-to-base copy-init items above remain active.

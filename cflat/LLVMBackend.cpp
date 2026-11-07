@@ -4511,6 +4511,7 @@ void LLVMBackend::ProcessPendingMacroSources()
                 }
             }
             const size_t candidateIndex = gts.RegisterGenericFunctionTemplate(name, func);
+            cxxMacroTemplateContexts_.insert(func);
             const std::string candidateKey =
                 GenericTemplateState::GenericFunctionCandidateKey(name, candidateIndex);
             gts.genericFunctionTypeParams[candidateKey] = typeParams;
@@ -5630,6 +5631,9 @@ void LLVMBackend::ResetForReanalysis()
     cxxSystemMacroLookups_.clear();
     cxxLvalueMacros_.clear();
     cxxFunctionMacros_.clear();
+    importedCxxFunctionMacros_.clear();
+    cxxMacroExpansionZeroCache_.clear();
+    cxxMacroTemplateContexts_.clear();
     cxxArgumentFreeMacros_.clear();
     cxxNamespaceObjectProbed_.clear();
     generatedCxxRecords_.clear();
@@ -6045,6 +6049,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallReturnsAllocAlign = 0;
     lastCallIsBonded = false;
     lastCxxRequestClangRejected_ = false;
+    lastCxxVariadicCtorClangRefused_ = false;
     lastCxxBraceLifetimeRefused_ = false;
     // Left non-zero by an aborted compile mid-ternary, this would wrongly suppress the deref
     // guard for the next file's straight-line code.

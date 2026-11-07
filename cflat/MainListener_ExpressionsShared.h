@@ -232,9 +232,16 @@ inline std::string ScalarArithmeticResultName(LLVMBackend* compiler,
         {
             const Arith& u = l.isUnsigned ? l : r;
             const Arith& sgn = l.isUnsigned ? r : l;
-            // LP64/LLP64 widths: int 32; long and long long both 64 where CFlat `long` is i64.
+            // The signed type wins only when wider: long is 64-bit on LP64, 32-bit on LLP64.
+            auto bits = [&](const Arith& a) -> unsigned {
+                if (a.rank != 5) return a.rank == 4 ? 32u : 64u;
+                LLVMBackend::TypeAndValue longType;
+                longType.TypeName = "long";
+                llvm::Type* longLlvm = compiler->GetType(longType);
+                return longLlvm != nullptr && longLlvm->isIntegerTy(32) ? 32u : 64u;
+            };
             if (u.rank >= sgn.rank) result = u;
-            else if (sgn.rank > 4 && u.rank == 4) result = sgn;
+            else if (bits(sgn) > bits(u)) result = sgn;
             else result = { sgn.rank, true, false };
         }
     }

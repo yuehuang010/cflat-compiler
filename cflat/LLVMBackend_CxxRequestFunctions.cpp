@@ -2295,6 +2295,21 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 {
                     std::string spelling;
                     const std::string type = cflatTypeOf(argument);
+                    if (const std::string* unnamedEnum = CxxUnnamedEnumExpression(argument.Storage);
+                        unnamedEnum != nullptr)
+                    {
+                        const std::string parameter = "p" + std::to_string(flatParameterIndex++);
+                        parameterSpellings.push_back("decltype(" + *unnamedEnum + ")");
+                        constructorArguments.push_back(parameter);
+                        continue;
+                    }
+                    if (IsCxxNullTypedArgument(argument))
+                    {
+                        parameterSpellings.push_back("std::nullptr_t");
+                        ++flatParameterIndex;
+                        constructorArguments.push_back("nullptr");
+                        continue;
+                    }
                     TypeAndValue functionType = argument.TypeAndValue;
                     if (IsCxxFunctionDesignatorArgument(argument))
                         if (auto* fn = llvm::dyn_cast<llvm::Function>(
@@ -4134,6 +4149,21 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                 }
                 else
                 {
+                    if (const std::string* unnamedEnum = CxxUnnamedEnumExpression(argument.Storage);
+                        unnamedEnum != nullptr)
+                    {
+                        const std::string parameter = "p"
+                            + std::to_string(parameterSpellings.size());
+                        parameterSpellings.push_back("decltype(" + *unnamedEnum + ")");
+                        constructorArguments.push_back(parameter);
+                        continue;
+                    }
+                    if (IsCxxNullTypedArgument(argument))
+                    {
+                        parameterSpellings.push_back("std::nullptr_t");
+                        constructorArguments.push_back("nullptr");
+                        continue;
+                    }
                     TypeAndValue childType = argumentType(argument);
                     if (IsCxxFunctionDesignatorArgument(argument))
                         if (auto* fn = llvm::dyn_cast<llvm::Function>(
@@ -4272,6 +4302,13 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             if (type.TypeName == "std.nullptr_t" && !type.Pointer)
             {
                 parameterSpellings.push_back("decltype(nullptr)");
+                callArguments.push_back("p" + std::to_string(parameterIndex));
+                continue;
+            }
+            if (const std::string* unnamedEnum = CxxUnnamedEnumExpression(arg.Storage);
+                unnamedEnum != nullptr)
+            {
+                parameterSpellings.push_back("decltype(" + *unnamedEnum + ")");
                 callArguments.push_back("p" + std::to_string(parameterIndex));
                 continue;
             }

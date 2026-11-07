@@ -2097,11 +2097,20 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 ~AddressOfDepthScope() { if (depth) --*depth; }
             } addressDepth{ opText == "&" ? &addressOfOperandDepth_ : nullptr };
             if (addressDepth.depth) ++*addressDepth.depth;
-            auto namedVar = ParseCastExpression(castExpCtx);
+            auto namedVar = ParseCxxFoldOperand(compiler, [&] {
+                return ParseCastExpression(castExpCtx);
+            });
             const bool unarySourceHasPointerDereference = namedVar.FieldPathHasPointerDereference;
             const bool unarySourcePointerFrameLocal = namedVar.FieldPathPointerFrameLocal;
             if (addressDepth.depth) { --*addressDepth.depth; addressDepth.depth = nullptr; }
             addressKeep.reset();
+            // `*` of a deref result (`**&X`) is one row or element: drop the flexible / zero-length
+            // flags that only `*&X` itself keeps for sizeof.
+            if (opText == "*" && LeadingUnaryOperator(castExpCtx) != "&")
+            {
+                namedVar.TypeAndValue.IsFlexibleArrayMember = false;
+                namedVar.TypeAndValue.IsZeroLengthArrayMember = false;
+            }
             const bool addressOfPointerObject = opText == "&"
                 && namedVar.TypeAndValue.IsProvenSinglePointerDepth();
             const bool cxxReferenceResult = namedVar.TypeAndValue.IsAlias
@@ -2376,8 +2385,10 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 // the noalias contract must keep one-way). Mark a scalar operand's address as a
                 // pointer so the array-view bind gate sees `&a[i]` as the raw `int*` it is.
                 namedVar.TypeAndValue.IsArrayView = false;
-                // `&flexible` is a pointer to its first element, never a sized array.
-                if (namedVar.TypeAndValue.IsFlexibleArrayMember)
+                // `&flexible` is a pointer to its first element, never a sized array - except as the
+                // operand of a prefix '*', where `*&X` is X itself (sizeof(*&z->data) is the array's size).
+                const bool addressIsDerefOperand = IsWholeDerefOperand(ctx);
+                if (namedVar.TypeAndValue.IsFlexibleArrayMember && !addressIsDerefOperand)
                 {
                     namedVar.TypeAndValue.IsFlexibleArrayMember = false;
                     namedVar.TypeAndValue.IsZeroLengthArrayMember = false;
