@@ -429,6 +429,16 @@ import cpp "library/cpp_interop_ctorref.h";
 import cpp "library/cpp_interop_tpl.h";
 using T469Gate = cppt.dflt.Gate;
 using T469GateExplicit = cppt.dflt.Gate<cppt.dflt.CountDone>;
+struct T469Holder<T> { T* p = default; };
+struct T469GatePointerField { T469Gate* p = default; };
+T469Gate* t469GateIdentity(T469Gate* p) { return p; }
+int t469ReadGate<T>(T* p) { return (int)p->arrive(); }
+int t469ReadSize<T>(T* p) { return (int)sizeof(T); }
+namespace T469AliasShadowNS
+{
+    using T469Gate = cppt.dflt.Plain;
+    int size() { return (int)sizeof(T469Gate); }
+}
 import cpp "library/cpp_interop_varctor.h";
 import cpp "library/cpp_interop_freeoptpl.h";
 import cpp "library/cpp_t460_operator_lookup.hpp";
@@ -459,6 +469,7 @@ import cpp "complex";
 import cpp "library/cpp_t10_refexpr.hpp";
 import cpp "vector";
 import cpp "library/cpp_t67_postinc.hpp";
+import cpp "library/cpp_charptrref.hpp";
 import cpp "library/cpp_interop_iterdiff.hpp";
 import cpp "functional";
 import cpp "unordered_map";
@@ -1519,6 +1530,8 @@ function<int(int)> T56GlobalFn = fnptr_add_one;
 int fnptr_add_two_double(double x) { return (int)x + 2; }
 int fnptr_times_ten(int x) { return x * 10; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
+int t322_scalar_lref_callback(int* value) { *value = 8; return 4; }
+int t322_scalar_const_lref_callback(int* value) { return *value; }
 void fnptr_noop() {}
 // A C++ reference return and a derived pointer at a RETURN statement (3370-3389). Each helper
 // returns through the conversion the declaration and '=' forms already applied.
@@ -1542,6 +1555,51 @@ struct RgFieldDefault { cpprefgate.B* r = cpprefgate.bref(); };
 // A C pointer joined with a C++ reference address is a plain pointer: `p ?? &cell()`, `p ? p : &cell()`.
 cpprefgate.C* RgJoinCoalesce(cpprefgate.C* p) { return p ?? &cpprefgate.cell(); }
 cpprefgate.C* RgJoinTernary(cpprefgate.C* p) { return p != nullptr ? p : &cpprefgate.cell(); }
+
+cpprefgate.C* RgNFreeRet(cpprefgate.C* p) { return p ?? cpprefgate.cell(); }
+cpprefgate.C* RgNFreeInit(cpprefgate.C* p) { cpprefgate.C* q = p ?? cpprefgate.cell(); return q; }
+cpprefgate.C* RgNFreeAssign(cpprefgate.C* p) { p = p ?? cpprefgate.cell(); return p; }
+cpprefgate.C* RgNFreeCoalAssign(cpprefgate.C* p) { p ??= cpprefgate.cell(); return p; }
+cpprefgate.C* RgNFreeArg(cpprefgate.C* p) { return RgNPointerIdentity(p ?? cpprefgate.cell()); }
+cpprefgate.C* RgNPointerIdentity(cpprefgate.C* p) { return p; }
+cpprefgate.C* RgNMemberRet(cpprefgate.C* p, cpprefgate.Hold* h) { return p ?? h.member(); }
+cpprefgate.C* RgNMemberInit(cpprefgate.C* p, cpprefgate.Hold* h) { cpprefgate.C* q = p ?? h.member(); return q; }
+cpprefgate.C* RgNMemberAssign(cpprefgate.C* p, cpprefgate.Hold* h) { p = p ?? h.member(); return p; }
+cpprefgate.C* RgNMemberCoalAssign(cpprefgate.C* p, cpprefgate.Hold* h) { p ??= h.member(); return p; }
+cpprefgate.C* RgNMemberArg(cpprefgate.C* p, cpprefgate.Hold* h) { return RgNPointerIdentity(p ?? h.member()); }
+(const cpprefgate.C)* RgNConstRet((const cpprefgate.C)* p) { return p ?? cpprefgate.const_ref(cpprefgate.cell()); }
+(const cpprefgate.C)* RgNConstInit((const cpprefgate.C)* p) { (const cpprefgate.C)* q = p ?? cpprefgate.const_ref(cpprefgate.cell()); return q; }
+(const cpprefgate.C)* RgNConstAssign((const cpprefgate.C)* p) { p = p ?? cpprefgate.const_ref(cpprefgate.cell()); return p; }
+(const cpprefgate.C)* RgNConstCoalAssign((const cpprefgate.C)* p) { p ??= cpprefgate.const_ref(cpprefgate.cell()); return p; }
+(const cpprefgate.C)* RgNConstArg((const cpprefgate.C)* p) { return RgNConstPointerIdentity(p ?? cpprefgate.const_ref(cpprefgate.cell())); }
+(const cpprefgate.C)* RgNConstPointerIdentity((const cpprefgate.C)* p) { return p; }
+cpprefgate.C* RgNAddressRet(cpprefgate.C* p) { return p ?? RgStaticAmp(); }
+cpprefgate.C* RgNAddressInit(cpprefgate.C* p) { cpprefgate.C* q = p ?? RgStaticAmp(); return q; }
+cpprefgate.C* RgNAddressAssign(cpprefgate.C* p) { p = p ?? RgStaticAmp(); return p; }
+cpprefgate.C* RgNAddressCoalAssign(cpprefgate.C* p) { p ??= RgStaticAmp(); return p; }
+cpprefgate.C* RgNAddressArg(cpprefgate.C* p) { return RgNPointerIdentity(p ?? RgStaticAmp()); }
+cpprefgate.C* RgNNullRet(cpprefgate.C* p) { return p ?? nullptr; }
+cpprefgate.C* RgNNullInit(cpprefgate.C* p) { cpprefgate.C* q = p ?? nullptr; return q; }
+cpprefgate.C* RgNNullAssign(cpprefgate.C* p) { p = p ?? nullptr; return p; }
+cpprefgate.C* RgNNullCoalAssign(cpprefgate.C* p) { p ??= nullptr; return p; }
+cpprefgate.C* RgNNullArg(cpprefgate.C* p) { return RgNPointerIdentity(p ?? nullptr); }
+cpprefgate.C* RgNAliasInit(cpprefgate.C* p) { cpprefgate.C* q = p ?? RgAlias(); return q; }
+cpprefgate.C* RgNAliasAssign(cpprefgate.C* p) { p = p ?? RgAlias(); return p; }
+cpprefgate.C* RgNAliasCoalAssign(cpprefgate.C* p) { p ??= RgAlias(); return p; }
+cpprefgate.C* RgNAliasArg(cpprefgate.C* p) { return RgNPointerIdentity(p ?? RgAlias()); }
+cpprefgate.C* RgNFreeTernary(cpprefgate.C* p) { return p != nullptr ? p : cpprefgate.cell(); }
+cpprefgate.C* RgNAddressTernary(cpprefgate.C* p) { return p != nullptr ? p : RgStaticAmp(); }
+cpprefgate.C* RgNNullTernary(cpprefgate.C* p) { return p != nullptr ? p : nullptr; }
+int nullrefR2SideCalls = 0;
+cpprefgate.Hold* nullrefR2SideBump(cpprefgate.Hold* h)
+{
+    nullrefR2SideCalls++;
+    return h;
+}
+cpprefgate.C* nullrefR2SideJoin(cpprefgate.C* p, cpprefgate.Hold* h)
+{
+    return p ?? nullrefR2SideBump(h).member();
+}
 
 cppi.RefCell* RrCell() { return cppi.ref_cell(); }
 (const cppi.RefCell)* RrCellConst() { return cppi.ref_cell_const(); }
@@ -2312,6 +2370,20 @@ int T243FieldBothTern(bool c) { t226s.B g = c ? t226s.mkH(1).d : t226s.mkH(2).d;
 int T243FieldMoveTern(bool c) { t226s.D d2 = t226s.D(2); t226s.B g = c ? t226s.mkH(1).d : move d2; return g.get(); }
 int T243FieldTemp(bool c) { t226s.B g = t226s.mkH(1).d; return g.get(); }
 int T243NamedFieldTern(bool c) { t226s.H h = t226s.mkH(1); t226s.B g = c ? h.d : t226s.D(2); return g.get(); }
+int T226CallLvalueMove(bool c)
+{
+    t226s.T a = t226s.T(1);
+    t226s.T b = t226s.T(2);
+    return t226s.take(c ? a : move b) * 100 + a.get() * 10 + b.get();
+}
+int T226CallMoveLvalue(bool c)
+{
+    t226s.T a = t226s.T(1);
+    t226s.T b = t226s.T(2);
+    return t226s.take(c ? move a : b) * 100 + a.get() * 10 + b.get();
+}
+int T243NestedFieldDepth(bool c) { t226s.B g = c ? t226s.mkH2(1).h.d : t226s.D(2); return g.get(); }
+int T243NestedFieldDepthReversed(bool c) { t226s.B g = c ? t226s.D(2) : t226s.mkH2(1).h.d; return g.get(); }
 enum T45Ternary : int { Picked = true ? 7 : 8, Other = false ? 7 : 8 };
 
 int T46GenericDot<T>(T p) { return p.get() == nullptr ? 1 : 0; }
@@ -6377,6 +6449,14 @@ extern int main()
     if (T243FieldTemp(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93049;
     t226s.reset();
     if (T243NamedFieldTern(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 3) return 93050;
+    t226s.reset();
+    if (T226CallLvalueMove(false) != 209 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93051;
+    t226s.reset();
+    if (T226CallMoveLvalue(true) != 92 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93052;
+    t226s.reset();
+    if (T243NestedFieldDepth(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93053;
+    t226s.reset();
+    if (T243NestedFieldDepthReversed(false) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93054;
     if (T62StaticAutoGlobalCopy() != 1) return 62010;
     cpp_t62.set_global_string("changed");
     if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
@@ -7888,6 +7968,11 @@ extern int main()
     if (!(cpp_group_shared_nan != cpp_group_shared_nan)) return 7890;
     w1demand.Q<int> ctorBodyAccept = w1demand.Q<int>(2.5);
     if (ctorBodyAccept.v != 11) return 7890;
+    w1demand.T424Demand demandChain = default;
+    expect_error("member 'c' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int refused = demandChain.c();
+    }
+    if (demandChain.healthy() != 3) return 42401;
 
     float w11Float = 1.5f;
     if (w11round3.takeB(w11Float) != 5) return 7891;
@@ -10028,6 +10113,87 @@ extern int main()
         function<int(int)> T469Gate = (int x) => { return x + 40; };
         if (T469Gate(2) != 42) return 46907;
     }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        void* raw = &value;
+        T469Gate* casted = (T469Gate*)raw;
+        if (casted->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46911;
+        if (sizeof(T469Gate) != sizeof(cppt.dflt.Gate<>)) return 46912;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        T469Holder<T469Gate> aliasHolder = default;
+        aliasHolder.p = &value;
+        T469Holder<cppt.dflt.Gate<>> spelledHolder = default;
+        spelledHolder.p = &value;
+        T469Holder<cppt.dflt.Gate<>> sameInstantiation = aliasHolder;
+        if (sameInstantiation.p->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46913;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        if (t469ReadGate<T469Gate>(&value) != 0
+            || cppt.dflt.done_calls() != before + 1) return 46914;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        T469Holder<T469Gate> inner = default;
+        inner.p = &value;
+        T469Holder<T469Holder<T469Gate>> outer = default;
+        outer.p = &inner;
+        if (outer.p->p->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46915;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate[3] values = { T469Gate(1), T469Gate(1), T469Gate(1) };
+        long a = values[0].arrive();
+        long b = values[1].arrive();
+        long c = values[2].arrive();
+        if (a != 0 || b != 0 || c != 0 || cppt.dflt.done_calls() != before + 3) return 46916;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        T469Gate* pointer = t469GateIdentity(&value);
+        if (pointer->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46917;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        using T469LocalGate = T469Gate;
+        T469LocalGate value = T469LocalGate(1);
+        cppt.dflt.Gate<> spelled = cppt.dflt.Gate<>(1);
+        if (typeof(value) != typeof(spelled)) return 46918;
+        auto inferred = value;
+        if (inferred.arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46919;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        T469GatePointerField field = default;
+        field.p = &value;
+        if (field.p->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46920;
+    }
+    if (T469Gate.s() != 7) return 46921;
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        T469Gate* pointer = cppt.dflt.ptr_identity(&value);
+        if (pointer->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46922;
+        T469Gate refValue = T469Gate(1);
+        if (cppt.dflt.ref_identity(refValue).arrive() != 0
+            || cppt.dflt.done_calls() != before + 2) return 46923;
+    }
+    {
+        using T469Gate = cppt.dflt.Plain;
+        cppt.dflt.Plain value = default;
+        cppt.dflt.Plain* q = &value;
+        if ((int)sizeof(T469Gate) != (int)sizeof(cppt.dflt.Plain)) return 46924;
+        if (t469ReadSize<T469Gate>(q) != 4 || T469Gate.s() != 11) return 46925;
+    }
+    if (T469AliasShadowNS.size() != (int)sizeof(cppt.dflt.Plain)) return 46926;
 
     // cppi.calls_missing_symbol is an inline body whose callee is declared and
     // never defined; nothing here calls it, so it must not reach the linker. Its neighbour,
@@ -17155,6 +17321,80 @@ extern int main()
     if (RgJoinCoalesce(&mixedLocal) != &mixedLocal || RgJoinCoalesce(nullptr) != &cpprefgate.cell()) return 99151;
     if (RgJoinTernary(&mixedLocal) != &mixedLocal || RgJoinTernary(nullptr) != &cpprefgate.cell()) return 99152;
 
+    if (RgNFreeRet(nullptr) != &cpprefgate.cell()
+        || RgNFreeInit(nullptr) != &cpprefgate.cell()
+        || RgNFreeAssign(nullptr) != &cpprefgate.cell()
+        || RgNFreeCoalAssign(nullptr) != &cpprefgate.cell()
+        || RgNFreeArg(nullptr) != &cpprefgate.cell()) return 99200;
+    if (RgNFreeRet(&mixedLocal) != &mixedLocal
+        || RgNFreeInit(&mixedLocal) != &mixedLocal
+        || RgNFreeAssign(&mixedLocal) != &mixedLocal
+        || RgNFreeCoalAssign(&mixedLocal) != &mixedLocal
+        || RgNFreeArg(&mixedLocal) != &mixedLocal
+        || RgNFreeTernary(&mixedLocal) != &mixedLocal
+        || RgNFreeTernary(nullptr) != &cpprefgate.cell()) return 99201;
+    cpprefgate.Hold* rgNullrefHold = new cpprefgate.Hold();
+    cpprefgate.C* rgNullrefMember = &rgNullrefHold.member();
+    if (RgNMemberRet(nullptr, rgNullrefHold) != rgNullrefMember
+        || RgNMemberInit(nullptr, rgNullrefHold) != rgNullrefMember
+        || RgNMemberAssign(nullptr, rgNullrefHold) != rgNullrefMember
+        || RgNMemberCoalAssign(nullptr, rgNullrefHold) != rgNullrefMember
+        || RgNMemberArg(nullptr, rgNullrefHold) != rgNullrefMember) return 99202;
+    if (RgNMemberRet(&mixedLocal, rgNullrefHold) != &mixedLocal
+        || RgNMemberInit(&mixedLocal, rgNullrefHold) != &mixedLocal
+        || RgNMemberAssign(&mixedLocal, rgNullrefHold) != &mixedLocal
+        || RgNMemberCoalAssign(&mixedLocal, rgNullrefHold) != &mixedLocal
+        || RgNMemberArg(&mixedLocal, rgNullrefHold) != &mixedLocal) return 99203;
+    if (nullrefR2SideJoin(&mixedLocal, rgNullrefHold) != &mixedLocal
+        || nullrefR2SideCalls != 0) return 99213;
+    if (nullrefR2SideJoin(nullptr, rgNullrefHold) != rgNullrefMember
+        || nullrefR2SideCalls != 1) return 99214;
+    delete rgNullrefHold;
+    if (RgNConstRet(nullptr) != &cpprefgate.cell()
+        || RgNConstInit(nullptr) != &cpprefgate.cell()
+        || RgNConstAssign(nullptr) != &cpprefgate.cell()
+        || RgNConstCoalAssign(nullptr) != &cpprefgate.cell()
+        || RgNConstArg(nullptr) != &cpprefgate.cell()) return 99204;
+    if (RgNConstRet(&cpprefgate.cell()) != &cpprefgate.cell()
+        || RgNConstInit(&cpprefgate.cell()) != &cpprefgate.cell()
+        || RgNConstAssign(&cpprefgate.cell()) != &cpprefgate.cell()
+        || RgNConstCoalAssign(&cpprefgate.cell()) != &cpprefgate.cell()
+        || RgNConstArg(&cpprefgate.cell()) != &cpprefgate.cell()) return 99205;
+    if (RgNAddressRet(nullptr) != RgStaticAmp()
+        || RgNAddressInit(nullptr) != RgStaticAmp()
+        || RgNAddressAssign(nullptr) != RgStaticAmp()
+        || RgNAddressCoalAssign(nullptr) != RgStaticAmp()
+        || RgNAddressArg(nullptr) != RgStaticAmp()
+        || RgNAddressTernary(nullptr) != RgStaticAmp()) return 99206;
+    if (RgNAddressRet(&mixedLocal) != &mixedLocal
+        || RgNAddressInit(&mixedLocal) != &mixedLocal
+        || RgNAddressAssign(&mixedLocal) != &mixedLocal
+        || RgNAddressCoalAssign(&mixedLocal) != &mixedLocal
+        || RgNAddressArg(&mixedLocal) != &mixedLocal
+        || RgNAddressTernary(&mixedLocal) != &mixedLocal) return 99207;
+    if (RgNNullRet(nullptr) != nullptr || RgNNullInit(nullptr) != nullptr
+        || RgNNullAssign(nullptr) != nullptr || RgNNullCoalAssign(nullptr) != nullptr
+        || RgNNullArg(nullptr) != nullptr || RgNNullTernary(nullptr) != nullptr) return 99208;
+    if (RgNNullRet(&mixedLocal) != &mixedLocal || RgNNullInit(&mixedLocal) != &mixedLocal
+        || RgNNullAssign(&mixedLocal) != &mixedLocal || RgNNullCoalAssign(&mixedLocal) != &mixedLocal
+        || RgNNullArg(&mixedLocal) != &mixedLocal || RgNNullTernary(&mixedLocal) != &mixedLocal) return 99209;
+    if (RgNAliasInit(nullptr) != &cpprefgate.cell()
+        || RgNAliasAssign(nullptr) != &cpprefgate.cell()
+        || RgNAliasCoalAssign(nullptr) != &cpprefgate.cell()
+        || RgNAliasArg(nullptr) != &cpprefgate.cell()) return 99210;
+    if (RgNAliasInit(&mixedLocal) != &mixedLocal || RgNAliasAssign(&mixedLocal) != &mixedLocal
+        || RgNAliasCoalAssign(&mixedLocal) != &mixedLocal
+        || RgNAliasArg(&mixedLocal) != &mixedLocal) return 99211;
+    cpppoly.both_ref().rv = 44;
+    cpppoly.Right* nullrefR2Base = nullptr;
+    cpppoly.Right* nullrefR2Upcast = nullrefR2Base ?? cpppoly.both_ref();
+    if (nullrefR2Upcast != RrRightFromRef()
+        || cpppoly.call_right(nullrefR2Upcast) != 2044) return 99212;
+    cpprefgate.C* nullrefR2ConstSource = nullptr;
+    if (cpprefgate.pointer_cv_pick(nullrefR2ConstSource
+            ?? cpprefgate.const_ref(cpprefgate.cell())) != 2)
+        return 99215;
+
     // ---- C++ value ternaries keep temporary ownership through every destination (3570-3579) ----
     for (int i = 0; i < 2; i++)
     {
@@ -19175,6 +19415,40 @@ extern int main()
         || cppi322.const_arg_lref_pick(cppi322.make()) != 17
         || cppi322.mutable_arg_pick(cppi322.make2()) != 18) return 32211;
     if (cppi322.const_base_arg_pick(cppi322.make_derived()) != 22) return 32214;
+
+    // CONSTLREF accept-set: const sources still bind to const references and values; exact
+    // mutable lvalues bind to R&, preserve writes, and keep the C++ overload choice.
+    if (cppi322.lref_const(cppi322.lref_const_ref()) != 24
+        || cppi322.lref_value(cppi322.lref_const_ref()) != 34) return 33801;
+    if (cppi322.lref_const(cppi322.lref_const_global) != 24
+        || cppi322.lref_value(cppi322.lref_const_global) != 34) return 33802;
+    if (cppi322.lref_const(cppi322.lref_const_holder.value) != 24
+        || cppi322.lref_value(cppi322.lref_const_holder.value) != 34) return 33803;
+    if (cppi322.lref_const(*cppi322.lref_const_ptr()) != 24
+        || cppi322.lref_value(*cppi322.lref_const_ptr()) != 34) return 33804;
+    if (cppi322.lref_mutable(cppi322.lref_mutable_ref()) != 14
+        || cppi322.lref_const(cppi322.lref_mutable_ref()) != 24
+        || cppi322.lref_value(cppi322.lref_mutable_ref()) != 34) return 33805;
+    if (cppi322.lref_const(cppi322.lref_make()) != 24
+        || cppi322.lref_value(cppi322.lref_make()) != 34
+        || cppi322.lref_rvalue(cppi322.lref_make()) != 44) return 33806;
+    if (cppi322.lref_pick(cppi322.lref_const_ref()) != 52
+        || cppi322.lref_pick(cppi322.lref_mutable_ref()) != 51) return 33807;
+    if (cppi322.lref_write(cppi322.lref_mutable_ref()) != 99
+        || cppi322.lref_read_mutable() != 99) return 33808;
+    if (cppi322.lref_member.take(cppi322.lref_mutable_ref()) != 61) return 33809;
+    cppi322.LrefCtor t338Ctor = cppi322.LrefCtor(cppi322.lref_mutable_ref());
+    if (t338Ctor.value != 71) return 33810;
+    if (cppi322.lref_operator + cppi322.lref_mutable_ref() != 81) return 33811;
+    if (cppi322.lref_fn(cppi322.lref_mutable_ref()) != 91
+        || cppi322.lref_read_mutable() != 97) return 33812;
+    if (cppi322.lref_const_fn(cppi322.lref_const_ref()) != 92
+        || cppi322.lref_value_fn(cppi322.lref_const_global) != 93) return 33813;
+    cppi322.lref_reset_mutable();
+    if (cppi322.lref_fn(cppi322.lref_mutable_global) != 91
+        || cppi322.lref_read_mutable() != 97) return 33814;
+    if (cppi322.call_scalar_lref(t322_scalar_lref_callback) != 8
+        || cppi322.call_scalar_const_lref(t322_scalar_const_lref_callback) != 33) return 33815;
 
     // T337 round 2: forwarding wrappers retain source constness through C++ template deduction.
     if (cppi322.forwarding_const(cppi322.make()) != 18) return 33701;
@@ -21945,6 +22219,46 @@ int LoweredUserDtorAssignLegs(int argc)
     t67PtrPush.push_back(t67Ptr++);
     if (t67PtrPush[0] != &t67PtrArray[0]
         || t67Ptr - &t67PtrArray[0] != 1) return 67027;
+    cpp_t67.postinc_base = &t67PtrArray[0];
+    t67Ptr = &t67PtrArray[1];
+    std.vector<int*> t67PtrPushDec;
+    t67PtrPushDec.push_back(t67Ptr--);
+    if (t67PtrPushDec[0] != &t67PtrArray[1]
+        || t67Ptr != &t67PtrArray[0]) return 67111;
+    t67Ptr = &t67PtrArray[1];
+    std.vector<int*> t67PtrPushMove;
+    t67PtrPushMove.push_back(move t67Ptr);
+    if (t67PtrPushMove[0] != &t67PtrArray[1]) return 67070;
+    t67Ptr = &t67PtrArray[0];
+    std.vector<int*> t67PtrPushAddress;
+    t67PtrPushAddress.push_back(&t67PtrArray[2]);
+    if (t67PtrPushAddress[0] != &t67PtrArray[2]
+        || t67Ptr != &t67PtrArray[0]) return 67112;
+    std.vector<int*> t67PtrPushPlus;
+    t67PtrPushPlus.push_back(t67Ptr + 1);
+    if (t67PtrPushPlus[0] != &t67PtrArray[1]
+        || t67Ptr != &t67PtrArray[0]) return 67113;
+    int* t67PtrOther = &t67PtrArray[2];
+    bool t67PtrChoose = true;
+    std.vector<int*> t67PtrPushConditional;
+    t67PtrPushConditional.push_back(t67PtrChoose ? t67Ptr : t67PtrOther);
+    if (t67PtrPushConditional[0] != &t67PtrArray[0]
+        || t67Ptr != &t67PtrArray[0] || t67PtrOther != &t67PtrArray[2]) return 67114;
+    std.vector<int*> t67PtrPushLvalue;
+    t67PtrPushLvalue.push_back(t67Ptr);
+    if (t67PtrPushLvalue[0] != &t67PtrArray[0]
+        || t67Ptr != &t67PtrArray[0]
+        || cpp_t67.ptr_ref_overload(t67Ptr) != 20) return 67115;
+    t67Ptr = &t67PtrArray[2];
+    int* t67PtrRvalueResult = cpp_t67.ptr_rvalue_value(t67Ptr++);
+    if (t67PtrRvalueResult != &t67PtrArray[2]
+        || t67Ptr != &t67PtrArray[3]) return 67067;
+    t67Ptr = &t67PtrArray[2];
+    if (cpp_t67.ptr_ref_overload(t67Ptr++) != 12
+        || t67Ptr != &t67PtrArray[3]) return 67068;
+    t67Ptr = &t67PtrArray[2];
+    if (cpp_t67.ptr_ref_overload(t67Ptr) != 22
+        || t67Ptr != &t67PtrArray[2]) return 67069;
     t67Ptr = &t67PtrArray[0];
     std.vector<int*> t67PtrEmplace;
     t67PtrEmplace.emplace_back(t67Ptr++);
@@ -22035,6 +22349,59 @@ int LoweredUserDtorAssignLegs(int argc)
     if (m21P[1] != 'h' || m21Q[1] != 'd') return 67051;
     cpp_t67.cbump(t325F ? m21P : m21Q);
     if (m21Q[1] != 'h') return 67052;
+    // The qualified pointer ref accepts exact const char* slots and keeps the C++ neighbors intact.
+    const char* cprConst = nullptr;
+    if (cpp_charptrref.ref_slot(cprConst) != 11 || cprConst[0] != 'r'
+        || cpp_charptrref.by_value(cprConst) != 32) return 67055;
+    char* cprMutable = nullptr;
+    if (cpp_charptrref.mutable_ref_slot(cprMutable) != 41 || cprMutable[0] != 'r'
+        || cpp_charptrref.const_ref_slot(cprMutable) != 22
+        || cpp_charptrref.by_value(cprMutable) != 32) return 67056;
+    char* cprNull = nullptr;
+    if (cpp_charptrref.const_ref_slot(cprNull) != 21
+        || cpp_charptrref.by_value(cprNull) != 31) return 67057;
+    if (cpp_charptrref.choose(cprMutable) != 51) return 67058;
+    if (cpp_charptrref.const_ref_rvalue(cpp_charptrref.pointer_rvalue()) != 62
+        || cpp_charptrref.by_value_rvalue(cpp_charptrref.pointer_rvalue()) != 64
+        || cpp_charptrref.mutable_rvalue_ref(cpp_charptrref.pointer_rvalue()) != 72) return 67060;
+    const char* cprLeft = nullptr;
+    const char* cprRight = nullptr;
+    if (cpp_charptrref.ref_slot(t325T ? cprLeft : cprRight) != 11
+        || cprLeft[0] != 'r' || cprRight != nullptr) return 67059;
+    // CHARPTRREF r2 accept-set: exact reference slots still bind and the C++ callee updates them.
+    const char* cprCtorArg = nullptr;
+    cpp_charptrref.CprReferenceCtor cprConstructed =
+        cpp_charptrref.CprReferenceCtor(cprCtorArg);
+    if (cprConstructed.value != 73 || cprCtorArg[0] != 'r') return 67061;
+    cpp_charptrref.CprBase* cprBasePtr = nullptr;
+    if (cpp_charptrref.base_pointer_ref(cprBasePtr) != 71
+        || cprBasePtr != &cpp_charptrref.baseObject) return 67062;
+    const cpp_charptrref.CprBase* cprConstBasePtr = nullptr;
+    if (cpp_charptrref.const_base_pointer_ref(cprConstBasePtr) != 72
+        || cprConstBasePtr != &cpp_charptrref.baseObject) return 67063;
+    cpp_charptrref.CprDerived cprDerived = default;
+    cpp_charptrref.CprDerived* cprDerivedPtr = &cprDerived;
+    if (cpp_charptrref.const_base_slot_ref(cprDerivedPtr) != 81
+        || cpp_charptrref.base_pointer_value(cprDerivedPtr) != 91) return 67064;
+    if (cpp_charptrref.nested_const_pointer_ref(cpp_charptrref.exactNestedPointer) != 101)
+        return 67065;
+    cpp_charptrref.CprRefSlotFn cprRefFn = cpp_charptrref.ref_slot_function();
+    const char* cprFnSlot = nullptr;
+    if (cprRefFn(&cprFnSlot) != 11 || cprFnSlot[0] != 'r') return 67066;
+    // Named C++ function values preserve pointer-reference slots and write-through.
+    auto t67PtrBumpFn = cpp_t67.ptr_bump;
+    t67Ptr = &t67PtrArray[0];
+    t67PtrBumpFn(t67Ptr);
+    if (t67Ptr != &t67PtrArray[1]) return 67116;
+    auto cprRefIntFn = cpp_charptrref.ref_slot_int;
+    int cprFnIntSource = 17;
+    const int* cprFnIntSlot = &cprFnIntSource;
+    if (cprRefIntFn(cprFnIntSlot) != 14
+        || cprFnIntSlot != &cpp_charptrref.int_replacement || *cprFnIntSlot != 19)
+        return 67117;
+    if (cpp_charptrref.mutable_ambiguous(nullptr) != 4
+        || cpp_charptrref.mutable_ambiguous(cpp_charptrref.pointer_rvalue()) != 4)
+        return 67118;
     // MIX21: a postfix arm is a value, not a slot: the increment still lands on the arm's object.
     int m21V = (t325T ? t475I++ : t475J);
     if (m21V != 12 || t475I != 13) return 67053;

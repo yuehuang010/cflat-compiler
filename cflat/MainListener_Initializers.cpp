@@ -144,7 +144,8 @@ std::string MainListener::ResolveTupleTypeElementSpecifier(
             if (ResolveConstTypeSyntax(compiler, typeSpec->typeName(), shape, substitutions,
                     [this](auto* entry) { return ResolveTypeArgEntry(entry); },
                     [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
-                    [this](auto* tuple) { return ParseTupleTypeSpecifier(tuple); }))
+                    [this](auto* tuple) { return ParseTupleTypeSpecifier(tuple); },
+                    &MainListener::ReportCxxTypeUseError, this))
                 return compiler->ResolveTypeAlias(shape.TypeName)
                     + std::string(shape.PointerDepth, '*');
         }

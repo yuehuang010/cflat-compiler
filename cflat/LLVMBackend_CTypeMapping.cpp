@@ -1635,20 +1635,40 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         for (auto& p : parts)
         {
             TypeAndValue ptv;
-            if (!MapCTypeToTypeAndValueImpl(trim(p), ptv, visited, cxxBoundary)) return false;
+            const std::string parameterSpelling = trim(p);
+            if (!MapCTypeToTypeAndValueImpl(parameterSpelling, ptv, visited, cxxBoundary)) return false;
             if (ptv.IsFunctionPointer) return false; // nested fn-ptr arg not supported
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = ptv.TypeName;
             fp.Pointer = ptv.Pointer;
             fp.PointerDepth = ptv.ValuePointerDepth();
             fp.IsRvalueRef = ptv.IsRvalueRef;
+            const bool cxxLvalueReference = cxxBoundary
+                && parameterSpelling.ends_with('&') && !parameterSpelling.ends_with("&&");
+            const bool cxxPointerReference = cxxBoundary && ptv.Pointer
+                && parameterSpelling.find('*') != std::string::npos
+                && parameterSpelling.ends_with('&');
+            const bool cxxClassLvalueReference = cxxLvalueReference
+                && IsCxxRecord(ResolveTypeAlias(ptv.TypeName));
+            fp.IsAlias = cxxPointerReference || cxxClassLvalueReference;
             // Leading const qualifies the innermost pointee (`const void *`).
-            fp.IsPointeeConst = ptv.Pointer && trim(p).starts_with("const ");
+            fp.IsPointeeConst = ptv.Pointer && parameterSpelling.starts_with("const ");
             if (!cxxBoundary)
             {
-                int mask = CSpellingPointeeConstMask(trim(p), ptv.ValuePointerDepth());
+                int mask = CSpellingPointeeConstMask(parameterSpelling, ptv.ValuePointerDepth());
                 fp.ConstMask = mask != 0 ? mask : ptv.PointeeConstMask();
             }
+            else if (fp.Pointer)
+            {
+                const int valueDepth = fp.PointerDepth - (cxxPointerReference ? 1 : 0);
+                fp.ConstMask = CxxSpellingPointeeConstMask(parameterSpelling, valueDepth);
+                if (cxxPointerReference && CxxParamIsConstRefToPointer(parameterSpelling))
+                    fp.ConstMask |= 1 << fp.PointerDepth;
+            }
+            if (cxxBoundary && ((cxxClassLvalueReference && !cxxPointerReference)
+                || (fp.IsRvalueRef && !cxxPointerReference)))
+                fp.ConstMask = CxxParamIsConstLvalueReference(parameterSpelling)
+                    || (fp.IsRvalueRef && CxxRvalueReferenceIsConst(parameterSpelling)) ? 1 : 0;
             out.FuncPtrParams.push_back(fp);
         }
         return true;

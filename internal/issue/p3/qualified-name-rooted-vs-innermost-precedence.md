@@ -1,5 +1,11 @@
 # Qualified name precedence: rooted first vs C++/C# innermost-first
 
+RULED 2026-11-04 (maintainer): INNERMOST-FIRST, as in C++ and C#: the first qualifier of a dotted name resolves from the
+innermost enclosing namespace outward (`A.B` hides root `B` inside `A`); `global::B` is the explicit root spelling.
+Supersedes the rooted-first rule the qualns fix kept. Test consequence: the rooted-wins controls in test_basic and the
+test_generics `ta_dotted_arg_same_as_local` (909) leg flip in the same change; sweep core/ for bindings that change. The
+declaration-order item below stays a separate defect.
+
 - Current rule (kept by the qualns fix): a dotted name `B.Late` used inside namespace `A` resolves ROOTED first (`::B.Late`);
   only on a miss does it try enclosing prefixes (`A.B.Late`). Pinned by `Test/test_generics.cb` `ta_dotted_arg_same_as_local` (909)
   and the rooted-wins controls in `Test/test_basic.cb`.

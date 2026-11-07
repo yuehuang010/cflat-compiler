@@ -649,6 +649,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             specText, defaultedAliasType, defaultedAliasError);
                     if (resolvedDefaultedAlias)
                         specText = defaultedAliasType;
+                    else if (!defaultedAliasError.empty())
+                        compiler->LogError(defaultedAliasError);
                     else
                         specText = compiler->ResolveQualifiedName(specText);
                     if (!resolvedDefaultedAlias && defaultedAliasError.empty())
@@ -2979,6 +2981,16 @@ void ForwardRefScanner::PreRegisterRenameAliases(antlr4::RuleContext* ctx) {
         }
     }
 
+LLVM_ATTRIBUTE_NOINLINE static void ResolveDefaultedCxxAliasTypeArgumentForScan(
+    LLVMBackend* compiler, std::string& typeName)
+{
+    if (compiler == nullptr) return;
+    std::string resolvedType;
+    std::string error;
+    if (compiler->TryResolveDefaultedCxxGenericBaseAlias(typeName, resolvedType, error))
+        typeName = std::move(resolvedType);
+}
+
 std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry) {
         if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr)
         {
@@ -3063,13 +3075,29 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
                 if (!contextual.empty()) resolved = contextual;
             }
             bool substituted = false;
-            if (auto subst = scanTypeSubstitutions_.find(resolved); subst != scanTypeSubstitutions_.end())
+            auto subst = scanTypeSubstitutions_.find(resolved);
+            if (subst == scanTypeSubstitutions_.end())
+            {
+                if (const uint8_t aliasMask = Compiler(entry)->ResolveTypeAliasConstMask(resolved);
+                    aliasMask != 0)
+                    argConstDepth = std::popcount(aliasMask);
+                resolved = Compiler(entry)->ResolveQualifiedName(resolved);
+                resolved = Compiler(entry)->ResolveTypeAlias(resolved);
+                subst = scanTypeSubstitutions_.find(resolved);
+            }
+            if (subst != scanTypeSubstitutions_.end())
             {
                 resolved = subst->second;
                 substituted = true;
             }
-            else if (const uint8_t aliasMask = Compiler(entry)->ResolveTypeAliasConstMask(resolved); aliasMask != 0)
-                argConstDepth = std::popcount(aliasMask);
+            else
+            {
+                if (const uint8_t aliasMask = Compiler(entry)->ResolveTypeAliasConstMask(resolved);
+                    aliasMask != 0)
+                    argConstDepth = std::popcount(aliasMask);
+                if (Compiler(entry)->IsGenericBaseAlias(resolved))
+                    ResolveDefaultedCxxAliasTypeArgumentForScan(Compiler(entry), resolved);
+            }
             // Namespace enums are collected before this scan but their backing types are not
             // registered until ScanExternalDeclaration. Local enum arguments are deferred.
             if (!substituted)

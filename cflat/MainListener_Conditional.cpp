@@ -2311,7 +2311,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     LLVMBackend::NamedVariable ownedProbe = slice;
                     // A field of an owned temp (`mkH(1).d`) is an xvalue, not a place (clang).
                     const bool fieldOfTemp = !explicitMove
-                        && compiler->IsFieldOfOwnedStructTemp(armStorage);
+                        && compiler->IsFieldOfOwnedStructTemp(armStorage, armValue);
                     slice.IsRvalue = explicitMove || fieldOfTemp || compiler->IsOwnedTempValue(ownedProbe);
                     if (compiler->IsCxxDerivedToBaseValue(slice.TypeAndValue,
                             LLVMBackend::TypeAndValue{ .TypeName = cxxTernaryDeclType }, &slice))
@@ -3470,8 +3470,28 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 return CxxValueJoinResult::NotApplicable;
             const std::string trueName = compiler->ResolveTypeAlias(trueType.TypeName);
             const std::string falseName = compiler->ResolveTypeAlias(falseType.TypeName);
-            if (trueName.empty() || falseName.empty() || trueName == falseName
-                || !compiler->IsCxxRecord(trueName) || !compiler->IsCxxRecord(falseName))
+            using CxxArmCategory = LLVMBackend::CxxArmCategory;
+            auto armCategory = [&](const LLVMBackend::TypedValue& shape) {
+                if (shape.storage != nullptr
+                    && (shape.storage == trueCxxRetTemp || shape.storage == falseCxxRetTemp))
+                    return CxxArmCategory::Prvalue;
+                if (shape.isExplicitMove) return CxxArmCategory::Xvalue;
+                if (!shape.isRvalue) return CxxArmCategory::Lvalue;
+                if (shape.hasSourceType && shape.sourceType.IsRvalueRef)
+                    return CxxArmCategory::Xvalue;
+                if (shape.hasSourceType && shape.sourceType.IsCxxRef())
+                    return CxxArmCategory::Lvalue;
+                return CxxArmCategory::Prvalue;
+            };
+            CxxArmCategory trueCategory = armCategory(trueShape);
+            CxxArmCategory falseCategory = armCategory(falseShape);
+            if (trueName.empty() || falseName.empty()
+                || !compiler->IsCxxRecord(trueName) || !compiler->IsCxxRecord(falseName)
+                || (trueName == falseName
+                    && !((trueCategory == CxxArmCategory::Lvalue
+                            && falseCategory == CxxArmCategory::Xvalue)
+                        || (trueCategory == CxxArmCategory::Xvalue
+                            && falseCategory == CxxArmCategory::Lvalue))))
                 return CxxValueJoinResult::NotApplicable;
 
             const bool callArgument = !cxxTernaryDecl && inCallArgument_
@@ -3492,21 +3512,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 && !falseCxxTernaryDeclDeferred)
                 return CxxValueJoinResult::NotApplicable;
 
-            using CxxArmCategory = LLVMBackend::CxxArmCategory;
-            auto armCategory = [&](const LLVMBackend::TypedValue& shape) {
-                if (shape.storage != nullptr
-                    && (shape.storage == trueCxxRetTemp || shape.storage == falseCxxRetTemp))
-                    return CxxArmCategory::Prvalue;
-                if (shape.isExplicitMove) return CxxArmCategory::Xvalue;
-                if (!shape.isRvalue) return CxxArmCategory::Lvalue;
-                if (shape.hasSourceType && shape.sourceType.IsRvalueRef)
-                    return CxxArmCategory::Xvalue;
-                if (shape.hasSourceType && shape.sourceType.IsCxxRef())
-                    return CxxArmCategory::Lvalue;
-                return CxxArmCategory::Prvalue;
-            };
-            CxxArmCategory trueCategory = armCategory(trueShape);
-            CxxArmCategory falseCategory = armCategory(falseShape);
             auto rvalueRefClassArm = [&](const LLVMBackend::TypeAndValue& type,
                                          const LLVMBackend::TypedValue& shape,
                                          llvm::Value* value) {
@@ -3532,9 +3537,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             trueType.TypeName = trueName;
             falseType.TypeName = falseName;
 
-            const auto verdict = compiler->ClassifyCxxTernary(
-                trueType, trueCategory, falseType, falseCategory);
             using Kind = LLVMBackend::CxxTernaryVerdict::Kind;
+            LLVMBackend::CxxTernaryVerdict verdict;
+            if (trueName == falseName)
+            {
+                // A same-class lvalue/xvalue conditional is a prvalue by the C++ category rules.
+                verdict.kind = Kind::Prvalue;
+                verdict.resultIsTrue = true;
+            }
+            else
+                verdict = compiler->ClassifyCxxTernary(
+                    trueType, trueCategory, falseType, falseCategory);
             if (verdict.kind == Kind::Ambiguous)
                 LogErrorContext(ctx, std::format(
                     "ternary branches have ambiguous C++ conversions between '{}' and '{}'",
@@ -5101,6 +5114,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 fp.IsMove = parameter.IsMove;
                 fp.IsRvalueRef = parameter.IsRvalueRef;
                 fp.ConstMask = parameter.FunctionParamConstMask();
+                fp.IsCxxRefToPointer = parameter.IsCxxRefToPointer;
+                if (fp.IsCxxRefToPointer && parameter.CxxConstRef())
+                    fp.ConstMask |= 1 << fp.PointerDepth;
                 fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
                 fp.IsAlias = compiler->ParameterIsAliasByPointer(parameter);
                 type.FuncPtrParams.push_back(std::move(fp));
@@ -5383,6 +5399,45 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         return result;
     }
 
+LLVM_ATTRIBUTE_NOINLINE static bool LowerCxxReferenceJoinArmToPointer(
+        LLVMBackend* compiler, llvm::Value*& value, llvm::Value*& storage,
+        LLVMBackend::TypedValue& shape, const LLVMBackend::TypeAndValue& destination,
+        const char* destinationDescription) {
+        if (compiler == nullptr || value == nullptr || storage == nullptr || !destination.Pointer
+            || destination.PointerDepth > 1 || destination.ElemPointer || destination.IsArrayView
+            || !compiler->IsCxxRecord(destination.TypeName))
+            return false;
+        auto* record = llvm::dyn_cast<llvm::StructType>(value->getType());
+        if (record == nullptr || !record->hasName()
+            || !compiler->IsCxxRecord(record->getName().str()))
+            return false;
+
+        LLVMBackend::NamedVariable source;
+        source.TypeAndValue = shape.sourceType;
+        source.Primary = value;
+        source.BaseType = value->getType();
+        source.Storage = storage;
+        auto* address = compiler->CxxReferenceResultAsPointer(destination, source,
+                                                               destinationDescription);
+        if (address == nullptr) return false;
+        const bool sourcePointeeConst = shape.sourceType.CxxConstRef();
+        value = address;
+        storage = nullptr;
+        shape.value = value;
+        shape.storage = nullptr;
+        shape.receiverStorage = nullptr;
+        shape.sourceType = destination;
+        shape.hasSourceType = true;
+        shape.sourceTypeName = destination.TypeName;
+        shape.pointerDepth = destination.PointerDepth;
+        shape.elemPointer = destination.ElemPointer;
+        shape.isAlias = false;
+        shape.isRvalue = true;
+        shape.cxxRefValueType = nullptr;
+        shape.cxxPointeeConst = sourcePointeeConst;
+        return true;
+}
+
 LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         CFlatParser::ConditionalExpressionContext* ctx, ResultUse use) {
         RequireStackHeadroom(ctx);
@@ -5509,6 +5564,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     fp.IsMove = parameter.IsMove;
                     fp.IsRvalueRef = parameter.IsRvalueRef;
                     fp.ConstMask = parameter.FunctionParamConstMask();
+                    fp.IsCxxRefToPointer = parameter.IsCxxRefToPointer;
+                    if (fp.IsCxxRefToPointer && parameter.CxxConstRef())
+                        fp.ConstMask |= 1 << fp.PointerDepth;
                     fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
                     fp.IsAlias = compiler->ParameterIsAliasByPointer(parameter);
                     type.FuncPtrParams.push_back(std::move(fp));
@@ -5744,6 +5802,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             LLVMBackend::TypedValue rhsShape;
             bool lhsAlias = compiler->IsAliasValue(lhs);
             bool rhsAlias = false;
+            bool rhsCxxReferencePointer = false;
             bool lhsTempField = compiler->IsTempFieldValue(lhs);
             bool rhsTempField = false;
             bool rhsUniqueFieldRead = false;
@@ -5775,6 +5834,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     rhsShape = rhsTv;
                     rhs = rhsTv.value;
                     rhsStorage = rhsTv.receiverStorage;
+                    rhsCxxReferencePointer = LowerCxxReferenceJoinArmToPointer(compiler, rhs, rhsStorage,
+                        rhsShape, coalesceLeftExpected, "null-coalescing expression");
                     auto lhsJoinType = InferTernaryArmType(lhsTv);
                     auto rhsJoinType = InferTernaryArmType(rhsShape);
                     const bool lhsNullArm = llvm::isa_and_nonnull<llvm::ConstantPointerNull>(lhs)
@@ -5852,7 +5913,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     }
                     adjustCxxPointerArm(rhs, pointerJoinDest);
                     rhsUniqueFieldRead = compiler->IsUniqueFieldReadValue(rhs);
-                    rhsAlias = compiler->IsAliasValue(rhs);
+                    rhsAlias = !rhsCxxReferencePointer && compiler->IsAliasValue(rhs);
                     rhsTempField = compiler->IsTempFieldValue(rhs);
                 }
                 // An owning unique LOCAL rhs joins like the lhs local: its slot is a join source.

@@ -55,3 +55,45 @@ expect_error("discards qualifiers") {
         return c.n;
     }
 }
+
+expect_error("discards qualifiers") {
+    int t338_const_ref_result_nonconst_lref() {
+        return cppi322.lref_mutable(cppi322.lref_const_ref());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t338_const_global_nonconst_lref() {
+        return cppi322.lref_mutable(cppi322.lref_const_global);
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t338_const_member_nonconst_lref() {
+        return cppi322.lref_mutable(cppi322.lref_const_holder.value);
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t338_const_pointer_deref_nonconst_lref() {
+        return cppi322.lref_mutable(*cppi322.lref_const_ptr());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t338_const_member_function_nonconst_lref() {
+        return cppi322.lref_member.take(cppi322.lref_const_ref());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t338_const_function_value_nonconst_lref() {
+        return cppi322.lref_fn(cppi322.lref_const_ref());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t338_const_global_function_value_nonconst_lref() {
+        return cppi322.lref_fn(cppi322.lref_const_global);
+    }
+}

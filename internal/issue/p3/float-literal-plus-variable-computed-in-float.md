@@ -18,6 +18,12 @@ cppt.pick(f + 1.0);   // CFlat 2, clang 3
 Check CFlat's own literal typing rule first (is `1.0` deliberately float in CFlat? doc/LANGUAGE.md); if CFlat
 follows C, the arithmetic result is double. If CFlat deliberately types `1.0` as float, this needs a ruling.
 
+RULED 2026-11-04 (maintainer, reopening the deferral): C++ TEMPLATE DEDUCTION from any argument expression containing an
+unsuffixed floating literal deduces double, extending LANGUAGE.md's "generic deduction is the exception" line (bare literals
+already do). C++ overload RANKING keeps CFlat's narrowest literal rule, the same as a CFlat overload set (bridge
+transparency): `cppt.pick(i + 1.0)` / `pick(f + 1.0)` stay `pick(float)`, a deliberate clang difference. Test consequence:
+the T439 `-(1e3) + 1` C++ template leg becomes a clang-parity leg (double); the pick(float) shapes are pinned as by-design.
+
 DEFERRED 2026-10-13 (maintainer): `1.0` is float by design (doc/LANGUAGE.md, narrowest literal typing); whether C++ call
 arguments should type unsuffixed floating literals as double is deferred - no work until reopened.
 

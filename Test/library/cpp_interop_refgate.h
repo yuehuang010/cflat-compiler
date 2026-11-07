@@ -23,5 +23,7 @@ inline C& pointer_ref(C* value) { return *value; }
 inline C& value_ref(C value) { static C result; result = value; return result; }
 inline C& pointer_ref_ref(C*& value) { return *value; }
 inline const C& const_ref(const C& value) { return value; }
+inline int pointer_cv_pick(C*) noexcept { return 1; }
+inline int pointer_cv_pick(const C*) noexcept { return 2; }
 inline C& double_pointer_ref(C** value) { return **value; }
 }

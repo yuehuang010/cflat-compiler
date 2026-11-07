@@ -1,0 +1,13 @@
+// A member refused while an earlier caller's late parse also failed keeps its own clang text.
+import cpp "cpp_interop_demand_fail.h";
+extern int main()
+{
+    w1demand.T424Demand d = default;
+    expect_error("member 'a' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int x = d.a();
+    }
+    expect_error("with an lvalue of type 'const char[2]'") {
+        int y = d.c();
+    }
+    return 0;
+}

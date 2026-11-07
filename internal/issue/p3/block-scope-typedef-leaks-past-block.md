@@ -1,5 +1,11 @@
 # A block-scope typedef stays visible after its block and shadows the global one
 
+RULED 2026-11-04 (maintainer): a `typedef` / `using` declared in a block is scoped to that block, as in C, C++ and C#;
+`if const` arms stay transparent (conditional compilation, both passes - the parked cflat-fix-tdscope r1 splice). Supersedes
+the 4bfa4aab (2026-09-03) "no per-block alias frame" design. Test consequence: test_generics fn_scope_alias_nested_block_leak
+(== 5) flips - the later `FnAliasBox<FnAliasBlock>` becomes an err_ leg ("cannot find the type"); the if-const arm legs stay.
+Worktree cflat-fix-tdscope (commit 3cefad2d "TDSCOPE r1 temp") resumes on this ruling.
+
 Found 2026-11-03 by the fntype review (box 10), PRE-EXISTING. Silent wrong type.
 
 ```cflat

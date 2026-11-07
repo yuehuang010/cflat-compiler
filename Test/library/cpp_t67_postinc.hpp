@@ -15,6 +15,9 @@ inline void ptr_bump(int*& value) { value++; }
 inline long ptr_const_addr(int* const& value) { return (long)&value; }
 inline long ptr_const_const_addr(const int* const& value) { return (long)&value; }
 inline int* postinc_base = nullptr;
+inline int* ptr_rvalue_value(int*&& value) { return value; }
+inline int ptr_ref_overload(int*&& value) { return 10 + (value - postinc_base); }
+inline int ptr_ref_overload(int* const& value) { return 20 + (value - postinc_base); }
 
 struct Pair { int first, second; };
 struct PtrMade {

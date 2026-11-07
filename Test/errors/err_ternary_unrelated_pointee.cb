@@ -106,3 +106,11 @@ int t147Both(T147I s, int n) { return 2; }
 expect_error("cannot join 'T147IA*' and 'T147IB*' in a '?:'") {
     int t147BothViable(int c, T147IA* a, T147IB* b) { return t147Both(c > 0 ? a : b, 7); }
 }
+
+// A function-value parameter with an unrelated class pointer keeps the raw class join refused.
+expect_error("cannot join 'T147IA*' and 'T147IB*' in a '?:'") {
+    int t147FnPtrRawJoin(int c, T147IA* a, T147IB* b) {
+        Lambda<int(T147IA*)> fn = (T147IA* p) => { return p->v; };
+        return fn(c > 0 ? a : b);
+    }
+}

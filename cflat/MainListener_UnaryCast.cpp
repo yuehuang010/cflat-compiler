@@ -943,7 +943,8 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                     };
                     const std::vector<CFlatParser::TypeSpecifierContext*> genericSpecs{ typeSpec };
                     if (!ResolveCanonicalTypeSpecifier(compilerLLVM, genericSpecs,
-                            &activeTypeSubstitutions, resolveArg, {}, true, canonical))
+                            &activeTypeSubstitutions, resolveArg, {}, true, canonical,
+                            nullptr, {}, &MainListener::ReportCxxTypeUseError, this))
                         return typeValue;
                     baseName = canonical.GenericBase;
                     const auto& typeArgs = canonical.GenericArgs;
@@ -977,7 +978,8 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                         return ResolveMemberTypeSpecifier(member);
                     };
                     if (!ResolveCanonicalTypeSpecifier(compilerLLVM, typeSpecs,
-                            &activeTypeSubstitutions, {}, resolveMember, true, canonical))
+                            &activeTypeSubstitutions, {}, resolveMember, true, canonical,
+                            nullptr, {}, &MainListener::ReportCxxTypeUseError, this))
                         return typeValue;
                     typeValue.TypeName = canonical.TypeName;
                     typeValue.ConstMask |= canonical.ConstMask;
@@ -1013,7 +1015,8 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                     };
                     if (!ResolveCanonicalTypeSpecifier(compilerLLVM, typeSpecs,
                             &activeTypeSubstitutions, resolveArg, resolveMember, true,
-                            canonical, &canonicalError))
+                            canonical, &canonicalError, {},
+                            &MainListener::ReportCxxTypeUseError, this))
                         LogErrorContext(typeContext,
                             LocalizePrimitiveTypeError(compilerLLVM, canonicalError));
                     typeValue.TypeName = canonical.TypeName;

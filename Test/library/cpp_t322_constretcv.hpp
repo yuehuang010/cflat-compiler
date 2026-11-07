@@ -105,3 +105,57 @@ namespace cppi322
     struct AssignTagOnly { int n = 0; };
     inline AssignTagOnly& operator+=(AssignTagOnly& t, R&&) { t.n = 88; return t; }
 }
+
+namespace cppi322
+{
+    struct LrefR { int value; };
+    struct LrefHolder { LrefR value; };
+    inline const LrefR lref_const_global{14};
+    inline LrefR lref_mutable_global{14};
+    inline const LrefHolder lref_const_holder{{14}};
+    inline const LrefR& lref_const_ref() { return lref_const_global; }
+    inline const LrefR* lref_const_ptr() { return &lref_const_global; }
+    inline LrefR& lref_mutable_ref() { return lref_mutable_global; }
+    inline LrefR lref_make() { return LrefR{14}; }
+    inline int lref_mutable(LrefR&) { return 14; }
+    inline int lref_const(const LrefR&) { return 24; }
+    inline int lref_value(LrefR) { return 34; }
+    inline int lref_rvalue(LrefR&&) { return 44; }
+    inline int lref_write(LrefR& value) { value.value = 99; return value.value; }
+    inline int lref_read_mutable() { return lref_mutable_global.value; }
+    inline int lref_pick(LrefR&) { return 51; }
+    inline int lref_pick(const LrefR&) { return 52; }
+    struct LrefMember { int take(LrefR&) const { return 61; } };
+    inline LrefMember lref_member;
+    struct LrefCtor { int value; LrefCtor(LrefR&) : value(71) {} };
+    struct LrefOperator {};
+    inline LrefOperator lref_operator;
+    inline int operator+(const LrefOperator&, LrefR&) { return 81; }
+    inline int lref_fn_target(LrefR& value) { value.value = 97; return 91; }
+    using LrefFn = int(*)(LrefR&);
+    inline LrefFn lref_fn = &lref_fn_target;
+    inline void lref_reset_mutable() { lref_mutable_global.value = 14; }
+    inline int lref_const_fn_target(const LrefR&) { return 92; }
+    using LrefConstFn = int(*)(const LrefR&);
+    inline LrefConstFn lref_const_fn = &lref_const_fn_target;
+    inline int lref_value_fn_target(LrefR) { return 93; }
+    using LrefValueFn = int(*)(LrefR);
+    inline LrefValueFn lref_value_fn = &lref_value_fn_target;
+}
+
+namespace cppi322
+{
+    using ScalarLrefCallback = int(*)(int&);
+    using ScalarConstLrefCallback = int(*)(const int&);
+    inline int call_scalar_lref(ScalarLrefCallback callback)
+    {
+        int value = 40;
+        callback(value);
+        return value;
+    }
+    inline int call_scalar_const_lref(ScalarConstLrefCallback callback)
+    {
+        int value = 33;
+        return callback(value);
+    }
+}

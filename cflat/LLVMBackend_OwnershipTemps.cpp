@@ -7888,12 +7888,34 @@ bool LLVMBackend::IsOwnedStructTempSince(const OwnedTempMark& mark, llvm::Value*
         return false;
     }
 
-bool LLVMBackend::IsFieldOfOwnedStructTemp(const llvm::Value* storage) const
+bool LLVMBackend::IsFieldOfOwnedStructTemp(const llvm::Value* storage,
+                                          const llvm::Value* fieldValue) const
 {
-        auto* field = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(storage);
-        if (field == nullptr) return false;
-        for (const auto& e : pendingOwnedStructTemps)
-            if (e.Alloca == field->getPointerOperand()) return true;
+        std::vector<std::pair<const llvm::Value*, bool>> work{ { storage, false } };
+        llvm::SmallPtrSet<const llvm::Value*, 16> seenDirect;
+        llvm::SmallPtrSet<const llvm::Value*, 16> seenGep;
+        while (!work.empty())
+        {
+            auto [base, throughGep] = work.back();
+            work.pop_back();
+            if (base == nullptr) continue;
+            auto& seen = throughGep ? seenGep : seenDirect;
+            if (!seen.insert(base).second) continue;
+            if (auto* field = llvm::dyn_cast<llvm::GetElementPtrInst>(base))
+                work.emplace_back(field->getPointerOperand(), true);
+            // A PHI may join a named object with a temp; moving from it would empty the named one.
+            else if (auto* cast = llvm::dyn_cast<llvm::BitCastInst>(base))
+                work.emplace_back(cast->getOperand(0), throughGep);
+            else if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(base))
+            {
+                const bool subobject = throughGep
+                    || (fieldValue != nullptr
+                        && alloca->getAllocatedType() != fieldValue->getType());
+                if (subobject)
+                    for (const auto& e : pendingOwnedStructTemps)
+                        if (e.Alloca == alloca) return true;
+            }
+        }
         return false;
     }
 

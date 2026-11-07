@@ -1641,6 +1641,12 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
         if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint8_t>(p.ConstMask);
         tv.IsInterface = IsInterfaceType(p.TypeName);
         tv.IsAlias = p.IsAlias;
+        tv.IsRvalueRef = p.IsRvalueRef;
+        tv.IsCxxRefToPointer = p.IsCxxRefToPointer;
+        if (p.IsCxxRefToPointer)
+            tv.CxxRefLevel = static_cast<int8_t>(p.PointerDepth);
+        else if ((p.IsAlias || p.IsRvalueRef) && IsCxxRecord(p.TypeName))
+            tv.MarkCxxRef();
         tv.AllocAlignValue = p.AllocAlignValue;
         tv.IsOwningSink = p.IsOwningSink;
         tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
@@ -4590,8 +4596,10 @@ llvm::Value* LLVMBackend::LowerClosureFatToThinFnPtr(llvm::Value* val, llvm::Typ
 
 llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
                                                  const TypeAndValue& param,
-                                                 bool strictCxxScalarType)
+                                                 bool strictCxxScalarType,
+                                                 bool allowPointerRefTemporary)
 {
+        RejectCxxConstLvalueReferenceBinding(param, arg);
         auto* paramTy = GetType(param);
         // A named nullptr_t lvalue already has the object slot a C++ reference must borrow.
         if (param.IsCxxNullptrT && arg.TypeAndValue.IsCxxNullptrT
@@ -4620,8 +4628,35 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
                 : arg.BaseType == paramTy);
         if (param.IsCxxRefToPointer)
         {
-            // C++ T*& borrows the caller's T* slot. A plain pointer local already
-            // has exactly that slot; expressions and call results need a temporary.
+            const bool nonConstPointerLvalueRef = !param.CxxConstRef() && !param.IsRvalueRef;
+            if (!allowPointerRefTemporary && nonConstPointerLvalueRef && arg.TypeAndValue.Pointer
+                && IsCxxRvalueReferenceArgument(arg))
+                LogError(std::format("the parameter '{}' is a non-const reference to a pointer and "
+                    "cannot bind a pointer rvalue; pass an lvalue", param.VariableName));
+            TypeAndValue sourcePointerType = arg.TypeAndValue;
+            if (sourcePointerType.Pointer && !sourcePointerType.PointeeConst()
+                && CxxArgumentPointeeConst(arg))
+                sourcePointerType.SetPointeeConstBit(true);
+            if (!allowPointerRefTemporary && nonConstPointerLvalueRef
+                && CxxPointerReferenceNeedsConversion(arg, param))
+            {
+                const int sourceMask = sourcePointerType.PointeeConstMask();
+                const int targetMask = param.PointeeConstMask();
+                const bool addsConst = sourceMask != targetMask
+                    && (sourceMask | targetMask) == targetMask;
+                if (addsConst)
+                    LogError(std::format("the parameter '{}' is a non-const reference to a pointer and "
+                        "cannot bind a pointer whose pointee const would need to be added",
+                        param.VariableName));
+                else if (sourceMask != targetMask)
+                    LogError(std::format("the parameter '{}' is a non-const reference to a pointer and "
+                        "cannot bind a pointer whose pointee const would need to be removed",
+                        param.VariableName));
+                else
+                    LogError(std::format("the parameter '{}' is a non-const reference to a pointer and "
+                        "cannot bind a pointer conversion", param.VariableName));
+            }
+            // C++ T*& borrows the caller's T* slot; converted expressions need a temporary.
             if (arg.Storage != nullptr && arg.TypeAndValue.Pointer && arg.BaseType == paramTy
                 && !arg.IsRvalue)
                 return arg.Storage;
@@ -4709,16 +4744,22 @@ llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const Type
             }
         }
         // An explicit move of a pointer names the pointer object's slot. Bind T*&& to that slot
-        // directly; only pointer prvalues need the temporary below.
-        if (cxxCallee && param.ElemPointer && arg.TypeAndValue.Pointer && arg.IsExplicitMove)
+        // directly, including generated forwarding wrappers that record it as a C++ pointer ref.
+        if (cxxCallee && (param.ElemPointer || param.IsCxxRefToPointer)
+            && arg.TypeAndValue.Pointer && arg.IsExplicitMove)
         {
             llvm::Value* slot = arg.Storage;
             if (slot == nullptr && !arg.CallerName.empty())
                 slot = FindVariableStorage(arg.CallerName).Storage;
             if (slot != nullptr && slot->getType()->isPointerTy()) return slot;
         }
-        // A pointer prvalue needs a T* temporary slot; passing its value would be a T** mismatch.
-        if (cxxCallee && param.ElemPointer && (arg.TypeAndValue.Pointer
+        // Pointer prvalues need a T* temporary slot for T*&&, or the callee reads the value as T**.
+        // Generated wrappers can miss ElemPointer, and deferred postfix results can still have storage.
+        const bool pointerRvalueSink = param.IsRvalueRef && param.IsCxxRefToPointer
+            && !param.IsArrayView && arg.IsRvalue
+            && arg.TypeAndValue.ValuePointerDepth() == 1;
+        if (cxxCallee && (param.ElemPointer || pointerRvalueSink)
+            && (arg.TypeAndValue.Pointer
                                   || IsNullPointerConstantArgument(arg, true)
                                   || (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy())
                                   || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary)))
@@ -5041,6 +5082,43 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
         param.Pointer = true;
         param.PointerDepth = p.PointerDepth;
         param.ElemPointer = p.PointerDepth >= 2;
+        param.IsCxxRefToPointer = p.IsCxxRefToPointer;
+        if (p.IsCxxRefToPointer && p.PointerDepth >= 1 && p.ConstMask >= 0
+            && !arg.TypeAndValue.PointerDepthRefuses(param)
+            && arg.TypeAndValue.TypeName == p.TypeName)
+        {
+            const int valueDepth = p.PointerDepth;
+            const int valueMask = (1 << valueDepth) - 1;
+            const int sourceMask = arg.TypeAndValue.PointeeConstMask() & valueMask;
+            const int targetMask = p.ConstMask & valueMask;
+            const bool constReference = (p.ConstMask & (1 << p.PointerDepth)) != 0;
+            if (sourceMask != targetMask)
+            {
+                const bool addsOnly = (sourceMask | targetMask) == targetMask;
+                if (!(constReference && addsOnly))
+                {
+                    if (addsOnly)
+                        return "cannot bind a pointer whose pointee const would need to be added";
+                    return "cannot bind a pointer whose pointee const would need to be removed";
+                }
+            }
+        }
+        else if (p.IsAlias && p.PointerDepth >= 2 && p.ConstMask >= 0
+            && !arg.TypeAndValue.PointerDepthRefuses(param)
+            && arg.TypeAndValue.TypeName == p.TypeName)
+        {
+            const int valueDepth = p.PointerDepth - 1;
+            const int valueMask = (1 << valueDepth) - 1;
+            const int sourceMask = arg.TypeAndValue.PointeeConstMask() & valueMask;
+            const int targetMask = p.ConstMask & valueMask;
+            const bool constReference = (p.ConstMask & (1 << p.PointerDepth)) != 0;
+            if (!constReference && sourceMask != targetMask)
+            {
+                if ((sourceMask | targetMask) == targetMask)
+                    return "cannot bind a pointer whose pointee const would need to be added";
+                return "cannot bind a pointer whose pointee const would need to be removed";
+            }
+        }
         if (IsAddressedUniqueSlotToRawSlot(arg, arg.TypeAndValue, param)
             || !arg.TypeAndValue.PointerDepthRefuses(param))
             return "";

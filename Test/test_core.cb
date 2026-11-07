@@ -6250,6 +6250,28 @@ class T147B : IT147 { int v = 22; int val() { return v; } };
 int t147Tag = 0;
 int t147F(T147A* a, int* p) { t147Tag = 1; return 1; }
 int t147F(IT147 s, int n) { t147Tag = 2; return s.val() + 100; }
+int t147F2(T147A* a, T147A* b, int* p) { t147Tag = 1; return 1; }
+int t147F2(IT147 a, IT147 b, int n) { t147Tag = 2; return a.val() + b.val() + n; }
+struct T147Host {
+    int two(T147A* a, T147A* b, int* p) { t147Tag = 1; return 1; }
+    int two(IT147 a, IT147 b, int n) { t147Tag = 2; return a.val() + b.val() + n; }
+    int mismatch(T147A* a, int* p) { t147Tag = 1; return 1; }
+    int mismatch(IT147 a, int n) { t147Tag = 2; return a.val() + 100 + n; }
+};
+int t147UfcsTwo(int rec, T147A* a, T147A* b, int* p) { t147Tag = 1; return 1; }
+int t147UfcsTwo(int rec, IT147 a, IT147 b, int n) { t147Tag = 2; return a.val() + b.val() + n + rec; }
+int t147UfcsMismatch(int rec, T147A* a, int* p) { t147Tag = 1; return 1; }
+int t147UfcsMismatch(int rec, IT147 a, int n) { t147Tag = 2; return a.val() + 100 + n + rec; }
+int t147GenericOne<T>(T token, IT147 a) { return 50000 + a.val() + 100 + (int)token; }
+int t147GenericTwo<T>(T token, IT147 a, IT147 b, int n) { return 50000 + a.val() + b.val() + n + (int)token; }
+int t147GenericMismatch<T>(T token, IT147 a, int n) { return 50000 + a.val() + 100 + n + (int)token; }
+struct T147FnArg { int value = 9; };
+int t147FnSumView(IT147 s, int[] xs) { return 30000 + s.val() + xs[0] + xs[1]; }
+int t147FnOrder = 0;
+int t147FnCondition() { t147FnOrder = t147FnOrder * 10 + 1; return 0; }
+T147A* t147FnArmA(T147A* a) { t147FnOrder = t147FnOrder * 10 + 2; return a; }
+T147B* t147FnArmB(T147B* b) { t147FnOrder = t147FnOrder * 10 + 3; return b; }
+int t147FnOrdinary() { t147FnOrder = t147FnOrder * 10 + 4; return 7; }
 
 int testT147TernaryJoin()
 {
@@ -6259,6 +6281,97 @@ int testT147TernaryJoin()
     T147B* b = new T147B();
     int r = t147F(c > 0 ? a : b, 7);
     passed += Test("T147 mixed-class ternary boxes into the viable interface overload", t147Tag * 10000 + r, 20122);
+    r = t147F2(c > 0 ? a : b, c > 0 ? a : b, 7);
+    passed += Test("T147 two joins share the viable free-function interface overload", t147Tag * 10000 + r, 20051);
+    T147Host host;
+    r = host.two(c > 0 ? a : b, c > 0 ? a : b, 7);
+    passed += Test("T147 two joins share the viable method interface overload", t147Tag * 10000 + r, 20051);
+    r = host.mismatch(c > 0 ? a : b, 7);
+    passed += Test("T147 method join checks the ordinary argument", t147Tag * 10000 + r, 20129);
+    int rec = 100;
+    r = rec.t147UfcsTwo(c > 0 ? a : b, c > 0 ? a : b, 7);
+    passed += Test("T147 UFCS two joins include the receiver slot", t147Tag * 10000 + r, 20151);
+    r = rec.t147UfcsMismatch(c > 0 ? a : b, 7);
+    passed += Test("T147 UFCS join checks the ordinary argument", t147Tag * 10000 + r, 20229);
+    Lambda<int(IT147)> t147FnOne = (IT147 x) => { return 30000 + 100 + x.val(); };
+    r = t147FnOne(c > 0 ? a : b);
+    passed += Test("T147 function pointer boxes one viable interface argument", r, 30122);
+    Lambda<int(IT147, IT147, int)> t147FnTwo = (IT147 x, IT147 y, int n) => {
+        return 30000 + x.val() + y.val() + n;
+    };
+    r = t147FnTwo(c > 0 ? a : b, c > 0 ? a : b, 7);
+    passed += Test("T147 function pointer boxes two joins together", r, 30051);
+    Lambda<int(IT147, int)> t147FnMismatch = (IT147 x, int n) => {
+        return 30000 + 100 + x.val() + n;
+    };
+    r = t147FnMismatch(c > 0 ? a : b, 7);
+    passed += Test("T147 function pointer join checks the ordinary argument", r, 30129);
+    Lambda<int(IT147, int*)> t147FnNull = (IT147 x, int* p) => {
+        return 30000 + x.val() + (p == nullptr ? 1 : 0);
+    };
+    passed += Test("T147 function pointer boxes join with nullptr argument",
+        t147FnNull(c > 0 ? a : b, nullptr), 30023);
+    Lambda<int(IT147, (const char)*)> t147FnConstChar = (IT147 x, (const char)* p) => {
+        return 30000 + x.val() + (int)p[0];
+    };
+    passed += Test("T147 function pointer boxes join with const char literal argument",
+        t147FnConstChar(c > 0 ? a : b, "a"), 30119);
+    Lambda<int(IT147, float)> t147FnFloat = (IT147 x, float n) => {
+        return 30000 + x.val() + (int)(n * 10.0);
+    };
+    passed += Test("T147 function pointer join keeps int to float argument",
+        t147FnFloat(c > 0 ? a : b, 7), 30092);
+    Lambda<int(IT147, double)> t147FnDouble = (IT147 x, double n) => {
+        return 30000 + x.val() + (int)(n * 10.0);
+    };
+    passed += Test("T147 function pointer join keeps int to double argument",
+        t147FnDouble(c > 0 ? a : b, 7), 30092);
+    Lambda<int(IT147, long)> t147FnLong = (IT147 x, long n) => {
+        return 30000 + x.val() + (int)n;
+    };
+    passed += Test("T147 function pointer join keeps int to long argument",
+        t147FnLong(c > 0 ? a : b, 7), 30029);
+    Lambda<int(IT147, char)> t147FnChar = (IT147 x, char n) => {
+        return 30000 + x.val() + (int)n;
+    };
+    passed += Test("T147 function pointer join keeps char literal argument",
+        t147FnChar(c > 0 ? a : b, 'a'), 30119);
+    int[2] t147FnData; t147FnData[0] = 4; t147FnData[1] = 5;
+    Lambda<int(IT147, int[])> t147FnView = t147FnSumView;
+    passed += Test("T147 function pointer join keeps array to view argument",
+        t147FnView(c > 0 ? a : b, t147FnData), 30031);
+    T147FnArg t147FnArg;
+    Lambda<int(IT147, T147FnArg)> t147FnStruct = (IT147 x, T147FnArg p) => {
+        return 30000 + x.val() + p.value;
+    };
+    passed += Test("T147 function pointer join keeps struct by value argument",
+        t147FnStruct(c > 0 ? a : b, t147FnArg), 30031);
+    Lambda<int(IT147, int)> t147FnNested = (IT147 x, int n) => {
+        return 30000 + x.val() + n;
+    };
+    passed += Test("T147 function pointer join keeps nested ternary argument",
+        t147FnNested(c > 0 ? a : b,
+            c > 0 ? (c > 0 ? 4 : 5) : (c > 0 ? 6 : 7)), 30029);
+    Lambda<int(int)> t147FnAdd = (int n) => { return n + 5; };
+    Lambda<int(IT147, Lambda<int(int)>)> t147FnClosure =
+        (IT147 x, Lambda<int(int)> cb) => { return 30000 + x.val() + cb(7); };
+    passed += Test("T147 function pointer join keeps closure value argument",
+        t147FnClosure(c > 0 ? a : b, t147FnAdd), 30034);
+    t147FnOrder = 0;
+    Lambda<int(IT147, int)> t147FnSideEffects = (IT147 x, int n) => {
+        return 30000 + x.val() + n;
+    };
+    int sideEffectResult = t147FnSideEffects(
+        t147FnCondition() > 0 ? t147FnArmA(a) : t147FnArmB(b), t147FnOrdinary());
+    passed += Test("T147 function pointer join evaluates side effects once in order",
+        t147FnOrder, 134);
+    passed += Test("T147 function pointer join side effect call result", sideEffectResult, 30029);
+    r = t147GenericOne(3, c > 0 ? a : b);
+    passed += Test("T147 generic function boxes one viable interface argument", r, 50125);
+    r = t147GenericTwo(3, c > 0 ? a : b, c > 0 ? a : b, 7);
+    passed += Test("T147 generic function boxes two joins together", r, 50054);
+    r = t147GenericMismatch(3, c > 0 ? a : b, 7);
+    passed += Test("T147 generic function checks the ordinary argument", r, 50132);
     r = t147F((c > 0 ? a : b) as IT147, 7);
     passed += Test("T147 explicit interface cast of the same ternary picks the same overload", t147Tag * 10000 + r, 20122);
     // A string literal arm still joins a char pointer arm (only a class pointer arm is refused).
@@ -6266,6 +6379,9 @@ int testT147TernaryJoin()
     (const char)* s = c > 0 ? buf : "abc";
     int ch = s[0];
     passed += Test("T147 char pointer ternary with string literal arm keeps working", ch, 97);
+    Lambda<int(T147A*)> t147PointerRead = (T147A* p) => { return p->val(); };
+    passed += Test("T147 function pointer preserves a same-class pointer ternary",
+        t147PointerRead(c > 0 ? a : a), 11);
     delete a;
     delete b;
     return passed;
@@ -6334,7 +6450,7 @@ extern int main()
     r = testApplication();      passed += r; total += 6;
     r = testT75StringCasts();   passed += r; total += 4;
     r = testT141TernaryClassPointee(); passed += r; total += 6;
-    r = testT147TernaryJoin();  passed += r; total += 3;
+    r = testT147TernaryJoin();  passed += r; total += 27;
     r = testT513BareTernaryAcceptSet(); passed += r; total += 7;
     r = testT513DiscardedVoidArms(); passed += r; total += 5;
     r = testT323ImplicitCoreGlobal(); passed += r; total += 1;

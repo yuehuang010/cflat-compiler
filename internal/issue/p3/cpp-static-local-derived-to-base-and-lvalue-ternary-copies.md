@@ -14,13 +14,10 @@ Still open:
 3. Mixed LLVM-level ternary of lvalues of different classes outside an initializer
    (`c ? d1 : b2` with D d1, B b2) is refused by the phi join ("ternary branches have incompatible
    types"). T233 covers the static/local initializer form only.
-4. Same-type ternary with a moved arm (pre-existing, not a T233 regression): `T g = c ? a : move b;`
-   with c false copies b (`2 2 1 0 3`), clang moves it (`2 2 0 1 3`). Same for `static T g = ...`
-   (repro: `T a = T(1); T b = T(2); static T g = c ? a : move b;`, count with the T226 fixture).
-
 T226 review 1 (pre-existing on master): `static T g = move a` fixed by T233; `B mk(){ D d = D(6); return d; }` copies where C++20 implicit-moves.
 
-## Left after T243 (Opus review 1; repros scratch/repro_keep/t243_rev/, counts only, values right)
-- A NESTED field or array element of a class temp is still an lvalue arm: `c ? rv.mkH2(1).h.d : rv.D(2)` 1 1 1 1 3
-  (clang 1 1 0 2 3); `c ? rv.mkHA(1).a[0] : rv.D(2)` 1 2 0 1 3 (clang 1 2 0 2 4). IsFieldOfOwnedStructTemp
-  (LLVMBackend_OwnershipTemps.cpp ~4726) looks one GEP deep; walk the GEP chain back to the temp's alloca.
+## Left after T243 / TERNMOVE (Opus review 1; repros scratch/repro_keep/t243_rev/)
+- Array element of a class temp remains an lvalue arm: `c ? rv.mkHA(1).a[0] : rv.D(2)` gives `1 2 0 1 3`
+  (clang `1 2 0 2 4`). Reversed arm order has the same mismatch when the element arm is selected. The
+  nested-field case `c ? rv.mkH2(1).h.d : rv.D(2)` is fixed by TERNMOVE; the array GEP path still needs
+  to be traced back to the owning temporary alloca.

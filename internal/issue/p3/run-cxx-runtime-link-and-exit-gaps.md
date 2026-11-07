@@ -25,4 +25,8 @@ exit(). Probes match the -o exe (exit code, destructor output, order). Remaining
 - PRE-EXISTING (before | fix | exe): CFlat `new int` released by C++ `delete` - before --run link fail (sized
   delete) | fix --run nondeterministic (prints ok, 1 of 3 runs 0xC0000005) | exe 0xC0000374 heap corruption.
   Cross-language new/delete mixing is undefined in both modes; needs a ruling (refuse, or route both to one heap).
+  RULED 2026-11-04 (maintainer): for now TWO families - CFlat `new`/`delete` (active-allocator slot) and C++ `new`/`delete`
+  (global operator new) must not be mixed for scalar / CFlat types, a documented error with no diagnostic (like malloc vs new
+  in C++); C++ class types already pair. Target is ONE family, so C++ code allocates from a `program` thread's allocator:
+  internal/plan/cpp-one-allocator-family.md. Test consequence: none now; one LANGUAGE.md C++-interop line owed.
 - PRE-EXISTING: cruntime.cb declares `extern int atexit(void*)`, so `atexit(fa)` with a CFlat function needs `(void*)fa`.

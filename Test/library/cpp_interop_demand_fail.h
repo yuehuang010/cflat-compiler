@@ -92,3 +92,12 @@ template<class T> struct F {
     F(double x) : v(12) {}
 };
 }
+namespace w1demand {
+struct T424Demand {
+    int b() { return undefined_x; }
+    int c() { int y = "s"; return y; }
+    int a() { return c() + b(); }
+    int a2() { return b() + c(); }
+    int healthy() { return 3; }
+};
+}

@@ -354,13 +354,34 @@ namespace cppt
         template <class F = CountDone> class Gate
         {
         public:
+            static int s() noexcept { return 7; }
             explicit Gate(long n, F f = F()) : n_(n), f_(f) {}
             long arrive() { if (--n_ == 0) f_(); return n_; }
         private:
             long n_;
             F f_;
         };
+        struct Plain
+        {
+            int value = 5;
+            static int s() noexcept { return 11; }
+            int get() const noexcept { return value; }
+        };
+        inline Gate<>& ref_identity(Gate<>& value) { return value; }
+        inline Gate<>* ptr_identity(Gate<>* value) { return value; }
         inline int done_calls() noexcept { return CountDone::calls; }
+    }
+    namespace alias_partial
+    {
+        template <class T, class U = int> class Pair
+        {
+        public:
+            Pair(T a, U b) : a_(a), b_(b) {}
+            int sum() { return (int)a_ + (int)b_; }
+        private:
+            T a_;
+            U b_;
+        };
     }
     // Shaped like std::unique_ptr<T[]> / make_unique<T[]>: a `T[]` template argument, a partial
     // specialization on it, and a [[no_unique_address]] deleter whose type spells `T[]`.

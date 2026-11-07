@@ -1,5 +1,6 @@
 import cpp "cpp_interop_sink_blame.h";
 import cpp "cpp_interop_sink_blame_second.h";
+import cpp "cpp_interop_demand_fail.h";
 
 // A deleted-copy diagnostic is reported only when clang's error names the argument's own copy
 // constructor; any other instantiation failure keeps its own text.
@@ -61,6 +62,20 @@ extern int main()
     expect_error("failed to instantiate 'sbl::vhelperT'") {
         sbl.VirtBad2<int> v = default;
         int r = v.bad();
+    }
+    // T424: the caller must inherit a prior inline-member body refusal.
+    w1demand.T424Demand demand = default;
+    expect_error("member 'c' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int c = demand.c();
+    }
+    expect_error("member 'a' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int a = demand.a();
+    }
+    expect_error("member 'b' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int b = demand.b();
+    }
+    expect_error("member 'a2' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int a2 = demand.a2();
     }
     return 0;
 }

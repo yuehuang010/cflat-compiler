@@ -1,0 +1,118 @@
+import cpp "cpp_charptrref.hpp";
+import cpp "cpp_t67_postinc.hpp";
+import cpp "cpp_charptrref_r6.hpp";
+
+using CprCharPtr = char*;
+struct CprHolder { char* value = default; };
+char* cprGlobal = default;
+
+void cprCharPtrParameter(char* value)
+{
+    expect_error("cannot bind a pointer whose pointee const would need to be added");
+    cpp_charptrref.ref_slot(value);
+}
+
+extern int main()
+{
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        char* value = nullptr;
+        cpp_charptrref.ref_slot(value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        cpp_charptrref.ref_slot(cprGlobal);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        CprHolder holder = default;
+        cpp_charptrref.ref_slot(holder.value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        CprCharPtr value = nullptr;
+        cpp_charptrref.ref_slot(value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        char*[2] values = default;
+        cpp_charptrref.ref_slot(values[0]);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        char* value = nullptr;
+        cpp_charptrref.ref_slot((value));
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        int target = 19;
+        int* value = &target;
+        cpp_charptrref.ref_slot_int(value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        char* left = nullptr;
+        char* right = nullptr;
+        bool chooseLeft = true;
+        cpp_charptrref.ref_slot(chooseLeft ? left : right);
+    }
+    expect_error("cannot bind a pointer rvalue") {
+        cpp_charptrref.ref_slot(cpp_charptrref.pointer_rvalue());
+    }
+    expect_error("cannot bind a pointer rvalue") {
+        char* left = nullptr;
+        char* right = nullptr;
+        bool chooseLeft = true;
+        cpp_charptrref.ref_slot(chooseLeft ? left++ : right);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        char* value = nullptr;
+        cpp_charptrref.CprReferenceCtor rejected = cpp_charptrref.CprReferenceCtor(value);
+    }
+    expect_error("cannot bind a pointer conversion") {
+        cpp_charptrref.CprDerived derived = default;
+        cpp_charptrref.CprDerived* value = &derived;
+        cpp_charptrref.base_pointer_ref(value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        char** value = nullptr;
+        cpp_charptrref.nested_const_pointer_ref(value);
+    }
+    expect_error("ambiguous call") {
+        char* value = nullptr;
+        cpp_charptrref.ambiguous(value);
+    }
+    expect_error("ambiguous call") {
+        const char* value = nullptr;
+        cpp_charptrref.ambiguous(value);
+    }
+    expect_error("ambiguous call") {
+        char* value = nullptr;
+        cpp_charptrref.mutable_ambiguous(value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        cpp_charptrref.CprRefSlotFn cprFn = cpp_charptrref.ref_slot_function();
+        char* value = nullptr;
+        cprFn(&value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be removed") {
+        auto cprMutableRefFn = cpp_t67.ptr_bump;
+        int target = 0;
+        const int* value = &target;
+        cprMutableRefFn(value);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        auto cprConstRefFn = cpp_charptrref.ref_slot_int;
+        int target = 19;
+        int* value = &target;
+        cprConstRefFn(value);
+    }
+    expect_error("ambiguous call") {
+        cpp_charptrref_r6.a6(nullptr);
+    }
+    expect_error("ambiguous call") {
+        cpp_charptrref_r6.a6("x");
+    }
+    expect_error("ambiguous call") {
+        cpp_charptrref.ambiguous(nullptr);
+    }
+    expect_error("ambiguous call") {
+        cpp_charptrref.ambiguous("x");
+    }
+    expect_error("ambiguous call") {
+        cpp_charptrref_r6.b6(nullptr);
+    }
+    return 0;
+}

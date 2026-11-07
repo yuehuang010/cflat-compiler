@@ -630,6 +630,18 @@ void MainListener::ApplyVectorizeFpTier(LLVMBackend* compiler, VectorizeFpTier t
  * which still resolves to void* wherever CFlat needs the type itself. Shared by every
  * type-argument site, both declaration-specifier passes included.
  */
+LLVM_ATTRIBUTE_NOINLINE void MainListener::ResolveDefaultedCxxAliasTypeArgument(
+    CFlatParser::TypeParameterEntryContext* entry, std::string& typeName)
+{
+    auto* compiler = Compiler(entry);
+    std::string resolvedType;
+    std::string error;
+    if (compiler->TryResolveDefaultedCxxGenericBaseAlias(typeName, resolvedType, error))
+        typeName = std::move(resolvedType);
+    else if (!error.empty())
+        LogCxxErrorContext(entry, error);
+}
+
 std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry,
                                                bool pointerOnly) {
         std::string resolved = ResolveTypeArgEntryRaw(entry, pointerOnly);
@@ -802,6 +814,19 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             }
             auto substIt = activeTypeSubstitutions.find(resolved);
             bool substituted = substIt != activeTypeSubstitutions.end();
+            if (!substituted && !resolved.empty())
+                if (const uint8_t aliasMask = Compiler(entry)->ResolveTypeAliasConstMask(resolved);
+                    aliasMask != 0)
+                    argConstDepth = std::popcount(aliasMask);
+            if (!substituted)
+            {
+                resolved = Compiler(entry)->ResolveQualifiedName(resolved);
+                resolved = Compiler(entry)->ResolveTypeAlias(resolved);
+                substIt = activeTypeSubstitutions.find(resolved);
+                substituted = substIt != activeTypeSubstitutions.end();
+            }
+            if (!substituted && Compiler(entry)->IsGenericBaseAlias(resolved))
+                ResolveDefaultedCxxAliasTypeArgument(entry, resolved);
             if (!substituted && !resolved.empty())
                 if (const uint8_t aliasMask = Compiler(entry)->ResolveTypeAliasConstMask(resolved); aliasMask != 0)
                     argConstDepth = std::popcount(aliasMask);   // `using VP = (const int)*;`

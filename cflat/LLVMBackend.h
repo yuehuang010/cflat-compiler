@@ -1199,6 +1199,8 @@ public:
             bool IsRvalueRef = false;
             // Alias closure/fn-ptr param: the callee takes its caller slot by address (ParameterIsAliasByPointer).
             bool IsAlias = false;
+            // A named C++ T*& parameter needs its pointer slot passed through a function value.
+            bool IsCxxRefToPointer = false;
             bool IsPointeeConst = false;  // spelled `const T*` (a C++ signature: ConstMask is -1)
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
@@ -1662,6 +1664,7 @@ public:
             bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
             bool IsAlias = false;
+            bool IsCxxRefToPointer = false;
             bool IsPointeeConst = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
@@ -1751,6 +1754,7 @@ public:
                 q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
                 q.IsAlias = p.IsAlias;
+                q.IsCxxRefToPointer = p.IsCxxRefToPointer;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
@@ -1841,6 +1845,7 @@ public:
                 q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
                 q.IsAlias = p.IsAlias;
+                q.IsCxxRefToPointer = p.IsCxxRefToPointer;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
@@ -4808,6 +4813,13 @@ private:
     // Some argument of a C++ candidate hits CxxRvalueReferenceDropsObjectCv: not viable.
     bool CxxCandidateReferenceDropsCv(const std::vector<NamedVariable>& arguments,
                                       const FunctionSymbol& candidate) const;
+    // A C++ non-const class `T&` parameter cannot bind a const class object.
+    LLVM_ATTRIBUTE_NOINLINE bool CxxLvalueReferenceDropsObjectCv(
+        const FunctionSymbol& candidate, size_t index, const NamedVariable& arg) const;
+    LLVM_ATTRIBUTE_NOINLINE void RejectCxxConstLvalueReferenceBinding(
+        const TypeAndValue& param, const NamedVariable& arg) const;
+    LLVM_ATTRIBUTE_NOINLINE llvm::Value* CxxFunctionValueClassReferenceArg(
+        const TypeAndValue& param, const NamedVariable& arg, llvm::Value* value) const;
     // cv bits (const = 1, volatile = 2) of a C++ candidate's by-value return (0 for a pointer or
     // reference); an inherited member is looked up in its declaring class (CxxInheritedOwner).
     int CxxReturnValueCv(const FunctionSymbol& candidate);
@@ -6943,7 +6955,7 @@ private:
                                                  llvm::Value* address) const;
     bool ExtendCxxStructTempsToScopeSince(const OwnedTempMark& mark, llvm::Value* address);
     // True when `storage` is a field address inside a struct temp still on the owned-temp list.
-    bool IsFieldOfOwnedStructTemp(const llvm::Value* storage) const;
+    bool IsFieldOfOwnedStructTemp(const llvm::Value* storage, const llvm::Value* fieldValue) const;
     void HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::Value* address,
                                       llvm::BasicBlock* hoistTo, bool includeBareNew = false);
 
@@ -8642,9 +8654,8 @@ public:
     bool CompleteCxxTemplateTypeArgs(const std::string& baseName,
                                      std::vector<std::string>& typeArgs);
     // Resolve a bare CFlat generic-base alias to its all-defaulted C++ class specialization.
-    bool TryResolveDefaultedCxxGenericBaseAlias(const std::string& alias,
-                                                std::string& resolvedType,
-                                                std::string& error);
+    LLVM_ATTRIBUTE_NOINLINE bool TryResolveDefaultedCxxGenericBaseAlias(
+        const std::string& alias, std::string& resolvedType, std::string& error);
     void PushLexicalLocalTypeScope() { activeLexicalLocalTypeNames_.emplace_back(); }
     void PopLexicalLocalTypeScope()
     {
@@ -10103,7 +10114,8 @@ public:
     // Address handed to a non-pointer `alias T` parameter: the caller's own slot when the
     // shapes match exactly, otherwise a materialized temp (a converted value has no slot).
     llvm::Value* LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param,
-                                        bool strictCxxScalarType = false);
+                                        bool strictCxxScalarType = false,
+                                        bool allowPointerRefTemporary = false);
     llvm::Value* LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param, bool cxxCallee = false);
 
     /*
@@ -12217,6 +12229,9 @@ public:
     // The declaration a generated `__cflat_dflt_*` wrapper forwards to; other names unchanged.
     static std::string CxxDeclarationLinkageName(std::string name);
     std::string CxxReferenceParameterSpelling(const FunctionSymbol& candidate, size_t index) const;
+    struct CxxPointerReferenceInfo { bool IsReference = false; bool IsConstReference = false; };
+    LLVM_ATTRIBUTE_NOINLINE CxxPointerReferenceInfo CxxPointerReferenceProperties(
+        const FunctionSymbol& candidate, size_t index, const TypeAndValue& param) const;
     bool IsCxxReferenceParameter(const FunctionSymbol& candidate, size_t index) const;
     // C++ calls also classify address-less literals and expression results as rvalues. Keep this
     // broader predicate gated to C++ callees so native CFlat overload selection is unchanged.
@@ -12467,6 +12482,8 @@ public:
     // A named callee alias param bound to a by-value slot is refused by the alias gate, so this
     // view clears only that flag; the reverse direction keeps its signature mismatch.
     TypeAndValue AliasAlignedCallbackSig(const TypeAndValue& fn, const TypeAndValue& dest) const;
+    LLVM_ATTRIBUTE_NOINLINE bool CxxClassRefCallbackPointerShapeMatches(
+        const TypeAndValue::FuncPtrParam& fn, const TypeAndValue::FuncPtrParam& dest) const;
     bool FuncPtrSignaturesProvablyDiffer(const LLVMBackend::TypeAndValue& a,
         const LLVMBackend::TypeAndValue& b) const;
 
@@ -13597,6 +13614,11 @@ public:
         if (from.PointeeConst() == toConst) return CxxPointeeConstRelation::Same;
         return toConst ? CxxPointeeConstRelation::Adds : CxxPointeeConstRelation::Drops;
     }
+    LLVM_ATTRIBUTE_NOINLINE bool CxxPointerReferenceNeedsConversion(
+        const NamedVariable& argument, const TypeAndValue& param) const;
+    LLVM_ATTRIBUTE_NOINLINE bool CxxPointerReferenceBindingInvalid(
+        const FunctionSymbol& candidate, size_t index, const NamedVariable& argument,
+        const TypeAndValue& param, CxxPointeeConstRelation relation) const;
     CxxPointeeConstRelation CxxRecordPointeeConstRelation(const TypeAndValue& from,
                                                           const TypeAndValue& to) const
     {
@@ -14864,7 +14886,7 @@ public:
     // 314: variable template explicit/partial specializations join the template's group; deleted-rvalue ctor requests.
     // 317: C anonymous-member fields use an unspellable marker; inline aggregate fields retain default-construction metadata.
     // 318: default numeric values retain their declared parameter conversion in extracted metadata.
-    static constexpr int kCHeaderCacheVersion = 318;
+    static constexpr int kCHeaderCacheVersion = 319;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

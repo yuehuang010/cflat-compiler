@@ -920,6 +920,7 @@ std::string ResolveGenericTemplateSpellingAtScope(
 using TypeNameArgumentResolver = std::function<std::string(CFlatParser::TypeParameterEntryContext*)>;
 using TypeNameMemberResolver = std::function<std::string(CFlatParser::MemberTypeSpecifierContext*)>;
 using TypeNameTupleResolver = std::function<std::string(CFlatParser::TupleTypeSpecifierContext*)>;
+using CxxTypeErrorReporter = void (*)(void*, antlr4::ParserRuleContext*, const std::string&);
 
 struct CanonicalTypeSpecifier
 {
@@ -938,7 +939,8 @@ bool ResolveCanonicalTypeSpecifier(
     const TypeNameMemberResolver& resolveMemberType,
     bool reportGenericAlias, CanonicalTypeSpecifier& out,
     PrimitiveTypeError* errorOut = nullptr,
-    const TypeNameTupleResolver& resolveTupleType = {});
+    const TypeNameTupleResolver& resolveTupleType = {},
+    CxxTypeErrorReporter reportCxxTypeError = nullptr, void* reportContext = nullptr);
 
 struct ConstTypeSyntax
 {
@@ -955,21 +957,24 @@ bool ResolveConstTypeSyntax(
     const std::unordered_map<std::string, std::string>* substitutions = nullptr,
     const TypeNameArgumentResolver& resolveTypeArg = {},
     const TypeNameMemberResolver& resolveMemberType = {},
-    const TypeNameTupleResolver& resolveTupleType = {});
+    const TypeNameTupleResolver& resolveTupleType = {},
+    CxxTypeErrorReporter reportCxxTypeError = nullptr, void* reportContext = nullptr);
 
 bool ResolveConstTypeSpecifierSyntax(
     LLVMBackend* compiler, CFlatParser::TypeSpecifierContext* typeSpec, ConstTypeSyntax& out,
     const std::unordered_map<std::string, std::string>* substitutions = nullptr,
     const TypeNameArgumentResolver& resolveTypeArg = {},
     const TypeNameMemberResolver& resolveMemberType = {},
-    const TypeNameTupleResolver& resolveTupleType = {});
+    const TypeNameTupleResolver& resolveTupleType = {},
+    CxxTypeErrorReporter reportCxxTypeError = nullptr, void* reportContext = nullptr);
 
 bool ResolveConstCastTypeSyntax(
     LLVMBackend* compiler, CFlatParser::CastTypeNameContext* ctx, ConstTypeSyntax& out,
     const std::unordered_map<std::string, std::string>* substitutions = nullptr,
     const TypeNameArgumentResolver& resolveTypeArg = {},
     const TypeNameMemberResolver& resolveMemberType = {},
-    const TypeNameTupleResolver& resolveTupleType = {});
+    const TypeNameTupleResolver& resolveTupleType = {},
+    CxxTypeErrorReporter reportCxxTypeError = nullptr, void* reportContext = nullptr);
 
 std::string ResolveCastTypeNameForScanner(
     LLVMBackend* compiler, CFlatParser::CastTypeNameContext* castTypeName);
@@ -3886,6 +3891,11 @@ private:
     // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
     std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry,
                                     bool pointerOnly = false);
+    LLVM_ATTRIBUTE_NOINLINE void ResolveDefaultedCxxAliasTypeArgument(
+        CFlatParser::TypeParameterEntryContext* entry, std::string& typeName);
+    LLVM_ATTRIBUTE_NOINLINE int ResolveDefaultedCxxAliasQualifier(
+        antlr4::ParserRuleContext* ctx, const std::string& alias,
+        std::string& namespaceName, std::string& primaryName);
     // `struct G<const T>`: a template parameter is a bare name, never const-qualified (#14).
     void RefuseConstTemplateParameters(CFlatParser::GenericTypeParametersContext* params)
     {
@@ -5707,6 +5717,7 @@ public:
      * is the accept-nothing direction: the caller then leaves the argument untouched.
      */
     bool CollectJoinArmClasses(llvm::Value* value, std::vector<std::string>& out, int depth = 0);
+    LLVM_ATTRIBUTE_NOINLINE bool IsSharedInterfaceClassJoin(llvm::Value* value);
 
     // Resolve one leaf arm once, retaining both its concrete class and the binding that supplied it.
     // A call result has no binding; nested joins are handled by the recursive callers below.
@@ -5951,13 +5962,31 @@ public:
     // A `?:` call argument over two different classes that BoxPointerJoinArgument did not box into
     // an interface goes in as a raw pointer: refused like clang's unrelated A*/B* join.
     void RefuseUnboxedClassJoinArgument(antlr4::ParserRuleContext* ctx, llvm::Value* argValue);
-    // Second chance for such a join once every argument is typed: candidates that cannot take the
-    // OTHER arguments are dropped, then the join boxes into the one interface the rest share.
-    llvm::Value* BoxDeferredJoinArgument(const std::vector<LLVMBackend::NamedVariable>& arguments,
-                                         const std::vector<int64_t>& declaredIdx,
-                                         const std::string& functionName, size_t wantParams,
-                                         size_t argIdx, llvm::Value* argValue,
-                                         std::string& ifaceNameOut);
+    struct DeferredClassJoinArgument
+    {
+        size_t argIdx;
+        antlr4::ParserRuleContext* ctx;
+        llvm::Value* value;
+    };
+    // Probe all deferred joins as one overload candidate set, then emit boxing only after viability
+    // is settled. The receiver offset comes from the assembled arguments and explicit binding map.
+    LLVM_ATTRIBUTE_NOINLINE bool BoxDeferredJoinArguments(
+        std::vector<LLVMBackend::NamedVariable>& arguments,
+        const std::vector<int64_t>& declaredIdx, const std::string& functionName,
+        const std::vector<DeferredClassJoinArgument>& pending,
+        CFlatParser::ArgumentExpressionListContext* argList,
+        const std::vector<LLVMBackend::FunctionSymbol>* candidateFamily,
+        const LLVMBackend::NamedVariable* implicitReceiver);
+    // Indirect calls have one fixed signature; defer their interface boxing until every call
+    // argument is typed so ordinary-argument failures cannot trigger speculative boxing.
+    LLVM_ATTRIBUTE_NOINLINE llvm::Value* BoxFunctionPointerJoinArgument(
+        const LLVMBackend::TypeAndValue::FuncPtrParam& parameter, size_t paramIndex,
+        llvm::Value* argValue, std::string& ifaceNameOut);
+    LLVM_ATTRIBUTE_NOINLINE void ResolveFunctionPointerClassJoins(
+        std::vector<LLVMBackend::NamedVariable>& arguments,
+        std::vector<llvm::Value*>& values,
+        const LLVMBackend::TypeAndValue& functionType,
+        antlr4::ParserRuleContext* callCtx);
     bool ClassesShareInterface(const std::string& a, const std::string& b) const;
 
     /*
@@ -7949,6 +7978,12 @@ public:
                 { spelling, typeName });
         else
             LogErrorContext(ctx, errorMessage);
+    }
+
+    static void ReportCxxTypeUseError(
+        void* listener, antlr4::ParserRuleContext* ctx, const std::string& errorMessage)
+    {
+        static_cast<MainListener*>(listener)->LogCxxErrorContext(ctx, errorMessage);
     }
 
     void LogWarningContext(antlr4::ParserRuleContext* ctx, std::string warningMessage);

@@ -1,7 +1,13 @@
 import cpp "cpp_t242_join.h";
+import cpp "../library/cpp_interop_refgate.h";
+import cpp "../library/cpp_interop_ternaryref.h";
+import cpp "../library/cpp_interop_poly.h";
 
 struct T410JoinT { int v = 1; };
 struct T410JoinF { int v = 2; };
+struct NullrefFlatValue { int v = 0; };
+NullrefFlatValue nullrefFlatValue() { NullrefFlatValue value = { v = 88 }; return value; }
+NullrefFlatValue* nullrefFlatTake(NullrefFlatValue* p) { return p; }
 struct T410JoinHolder { T410JoinT* p; };
 T410JoinT t410JoinGlobalT = default;
 T410JoinF t410JoinGlobalF = default;
@@ -9,6 +15,7 @@ void* t410JoinGlobalVoid = nullptr;
 T410JoinT* t410JoinMakeT() { return &t410JoinGlobalT; }
 T410JoinF* t410JoinMakeF() { return &t410JoinGlobalF; }
 int t410JoinTakeT(T410JoinT* p) { return p == nullptr ? 0 : p->v; }
+cpprefgate.C* nullrefCppTake(cpprefgate.C* p) { return p; }
 
 extern int main()
 {
@@ -83,6 +90,36 @@ extern int main()
     expect_error("the pointee types differ") {
         t242vj.Ov value = t242vj.Ov(false ? new t242vj.E(1) : new t242vj.F(), 0);
     }
+    expect_error("cannot assign a struct value to a pointer variable") {
+        cpprefgate.C* p = nullptr; cpprefgate.C* q = p ?? ternref.value_a();
+    }
+    expect_error("cannot assign a struct value to a pointer variable") {
+        cpprefgate.C* p = nullptr; p = p ?? ternref.value_a();
+    }
+    expect_error("cannot assign a struct value to a pointer variable") {
+        cpprefgate.C* p = nullptr; nullrefCppTake(p ?? ternref.value_a());
+    }
+    expect_error("cannot assign a value of type 'ternref.C' to pointer variable 'p'") {
+        cpprefgate.C* p = nullptr; p ??= ternref.value_a();
+    }
+    expect_error("ternary branches have incompatible types") {
+        cpprefgate.C* p = nullptr; cpprefgate.C* q = p != nullptr ? p : ternref.value_a();
+    }
+    expect_error("cannot assign a struct value to a pointer variable") {
+        NullrefFlatValue* p = nullptr; NullrefFlatValue* q = p ?? nullrefFlatValue();
+    }
+    expect_error("cannot assign a struct value to a pointer variable") {
+        NullrefFlatValue* p = nullptr; p = p ?? nullrefFlatValue();
+    }
+    expect_error("cannot assign a struct value to a pointer variable") {
+        NullrefFlatValue* p = nullptr; nullrefFlatTake(p ?? nullrefFlatValue());
+    }
+    expect_error("cannot assign a value of type 'NullrefFlatValue' to pointer variable 'p'") {
+        NullrefFlatValue* p = nullptr; p ??= nullrefFlatValue();
+    }
+    expect_error("ternary branches have incompatible types") {
+        NullrefFlatValue* p = nullptr; NullrefFlatValue* q = p != nullptr ? p : nullrefFlatValue();
+    }
     return 0;
 }
 
@@ -97,4 +134,28 @@ expect_error("the pointee types differ") {
 }
 expect_error("the pointee types differ") {
     struct T410JoinUnrelatedField { T410JoinT* p = &t410JoinGlobalT ?? &t410JoinGlobalF; };
+}
+expect_error("cannot assign a struct value to a pointer variable") {
+    cpprefgate.C* nullrefCppReturn(cpprefgate.C* p) { return p ?? ternref.value_a(); }
+}
+expect_error("cannot assign a struct value to a pointer variable") {
+    NullrefFlatValue* nullrefFlatReturn(NullrefFlatValue* p) { return p ?? nullrefFlatValue(); }
+}
+expect_error("cannot assign a struct value to a pointer variable") {
+    void nullrefR2Unrelated()
+    {
+        cpprefgate.B* q = nullptr; cpprefgate.B* r = q ?? cpprefgate.cell();
+    }
+}
+expect_error("cannot assign a struct value to a pointer variable") {
+    void nullrefR2Downcast()
+    {
+        cpppoly.Both* q = nullptr; cpppoly.Both* r = q ?? cpppoly.right_ref();
+    }
+}
+expect_error("cannot assign a struct value to a pointer variable") {
+    void nullrefR2AliasValue()
+    {
+        alias cpprefgate.C a = cpprefgate.cell(); cpprefgate.C* p = nullptr; cpprefgate.C* x = p ?? a;
+    }
 }

@@ -1,13 +1,8 @@
-# CFlat alias of an all-defaults C++ class template: non-constructor type uses still fail
+# CFlat aliases of C++ templates: remaining type-use gaps
 
-Found by the T469 review (2026-10-24), same on master. T469 resolves `using G = cppt.dflt.Gate;` for the constructor spellings
-(`G(1)`, `G<>(1)`), brace init, declarations and `new G(1)`. Type uses that go through other resolvers still fail with
-"cannot find the type 'G'": casts `(G*)p`, `sizeof(G)`, and generic arguments `Holder<G>`.
-Repro: scratch/repro_keep/box1022/t469/rev_t469_opus_typeuse.cb (header rev_t469_opus_h.h next to it).
+Round 2 covers non-constructor type uses of aliases to all-defaulted C++ class templates, scoped shadowing, and specific refusals for partially-defaulted aliases. The remaining gaps are:
 
-Root cause: ResolveCanonicalTypeSpecifier (MainListener_Expressions.cpp ~21447) and ResolveTypeArgEntry do not call
-TryResolveDefaultedCxxGenericBaseAlias.
-
-Also same on master (T469 review): an alias of a template with only SOME defaulted params (`using P = rv.Pair;`) is refused with
-the vague "the function 'P' is not known"; an alias of a C++ alias template, an alias declared inside a CFlat namespace, and a static
-member call through the alias (`G.s()`) are unsupported.
+- A C++ alias-template target is still not handled as a C++ alias template.
+- A namespace-qualified use of an alias declared inside a CFlat namespace is still unsupported. Repro: `namespace ns { using G = cppt.dflt.Gate; }` followed by `sizeof(ns.G)` reports that `G` is not a member of `ns`. Unqualified `G` inside `ns` resolves.
+- `function<long(cppt.dflt.Gate<>*)>` fails for both the alias and spelled template type with `cannot find the type`.
+- `unique<G>` and the spelled `unique<cppt.dflt.Gate<>>` both fail while mapping to `std::unique_ptr`; the spelled form also fails, so this is separate from alias completion.

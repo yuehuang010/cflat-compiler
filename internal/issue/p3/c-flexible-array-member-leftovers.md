@@ -17,7 +17,13 @@ accepts) and the 2026-10-25 line that explicit move nulls only OWNING slots; the
 (refuse first, refine later). Covers the sibling shape `unique<int>* p = &u; unique<int>* q = move p;` (box 7 MIX12 finding, probe
 scratch/repro_keep/mix12/mix12_tmp/own11.cb, rc 134 on master). Test consequence: one new err_ leg each for the int* and unique<T>*
 
-OPEN (UQRAW): ruling says refuse, test_move bpm legs ~6250 pin accept - maintainer to choose.
+RULED 2026-11-04 (maintainer): the 2026-10-31 refusal is narrowed to ADDRESS-OF provenance (what UQRAW landed). `move` of a
+borrowed pointer parameter, or a local copied from one, into a plain `T*` slot is a plain copy - no adoption, no nulling,
+same line as the 2026-10-25 `move p->f` through-a-borrow ruling (Rust copies a moved `&T`, C++ std::move of a raw pointer
+copies). `move` into a C++ `T*&&` parameter is an xvalue cast for the overload pick, not a transfer. Test consequence: none -
+test_move bpm* legs and test_cpp_interop T248 (== 307) stay; this OPEN item closes.
+
+CLOSED 2026-11-04 by the ruling above: borrowed-param move stays a copy (bpm legs, T248 stay); no code change.
 
 Fixed in UQRAW (address-of provenance only): explicit `move` of an ADDRESS-OF binding (`int* p = &x;`, `&s.v`, `unique<int>* p = &u;`) into a
 raw local, a unique local, or by assignment is refused with the ruled text. Legs: Test/errors/err_move_borrowed_addr_slot.cb,

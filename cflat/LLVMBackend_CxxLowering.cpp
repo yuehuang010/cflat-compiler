@@ -1372,6 +1372,24 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     ok = false;
                     break;
                 }
+                if (want.IsCxxRefToPointer && !want.CxxConstRef() && !want.IsRvalueRef
+                    && got.Pointer && argVars != nullptr && i < argVars->size()
+                    && CxxPointerReferenceNeedsConversion((*argVars)[i], want))
+                {
+                    if (!blocked && !softRefused && !c.needsLocalDefinition
+                        && referenceRejection.empty())
+                    {
+                        const int sourceMask = got.PointeeConstMask();
+                        const int targetMask = want.PointeeConstMask();
+                        const bool addsConst = sourceMask != targetMask
+                            && (sourceMask | targetMask) == targetMask;
+                        referenceRejection = addsConst
+                            ? "cannot bind a pointer whose pointee const would need to be added"
+                            : "cannot bind a pointer conversion to a non-const reference to a pointer";
+                    }
+                    ok = false;
+                    break;
+                }
                 if (sameReferenceReferent && want.Pointer
                     && (want.IsAlias || want.IsCxxRefToPointer)
                     && !want.IsRvalueRef && !want.CxxConstRef()

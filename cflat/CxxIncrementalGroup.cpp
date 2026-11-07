@@ -733,7 +733,7 @@ namespace
         std::unordered_map<const clang::CXXRecordDecl*, bool> classDeleteCache;
         std::unordered_map<const clang::CXXRecordDecl*, std::string> vtableDeleteResults;
         cflat_cinterop::CxxDemandPlan* plan = nullptr;   // the group's, for the demand pass
-        const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
+        std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
         const std::unordered_map<const clang::FunctionDecl*, std::string>* causes = nullptr;
         std::string poisonDiagnostic;
         // Clang's error for a virtual destructor whose operator delete is unusable.
@@ -1178,6 +1178,9 @@ namespace
                 if (param->getIdentifier() != nullptr && fd->containsDecl(param))
                     fd->removeDecl(param);
             clang::DiagnosticErrorTrap trap(sema->getDiagnostics());
+            auto* counting = dynamic_cast<CountingDiagnosticConsumer*>(
+                sema->getDiagnostics().getClient());
+            const size_t textBefore = counting != nullptr ? counting->allText.size() : 0;
             fd->setHasSkippedBody(false);
             fd->setLateTemplateParsed(true);
             // A namespace-scope body was skipped after ActOnStartOfFunctionDef added the params to
@@ -1211,7 +1214,16 @@ namespace
             }
             fd->setBody(nullptr);
             fd->setHasSkippedBody(true);
-            fd->setInvalidDecl();
+            // Keep the declaration valid so clang can still parse later callers of this member.
+            // The poison maps retain the refusal and block calls to this bodyless declaration.
+            // Only this late parse's errors: allText spans the whole request.
+            std::string own = counting != nullptr && counting->allText.size() > textBefore
+                ? counting->allText.substr(textBefore) : std::string();
+            if (!own.empty() && own.front() == '\n') own.erase(0, 1);
+            const std::string verdict = !own.empty() ? own
+                : "failed to instantiate '" + fd->getQualifiedNameAsString() + "'";
+            replayedPoison.try_emplace(BodyVerdictKey(fd), verdict);
+            if (poisoned != nullptr) poisoned->try_emplace(fd, verdict);
             if (failure.empty()) failure = fd->getQualifiedNameAsString();
             return false;
         }
@@ -1277,7 +1289,7 @@ namespace
             auto failedCalleeDiagnostic = [&](const clang::FunctionDecl* function) {
                 if (function == nullptr) return std::string{};
                 auto recorded = [&](const clang::FunctionDecl* callee) {
-                    if (callee == nullptr || !callee->isInvalidDecl()) return std::string{};
+                    if (callee == nullptr) return std::string{};
                     if (auto bad = replayedPoison.find(BodyVerdictKey(callee));
                         bad != replayedPoison.end())
                         return bad->second;

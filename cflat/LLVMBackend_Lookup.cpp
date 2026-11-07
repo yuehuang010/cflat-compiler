@@ -896,6 +896,17 @@ std::string LLVMBackend::CxxReferenceParameterSpelling(const FunctionSymbol& can
         return {};
 }
 
+LLVM_ATTRIBUTE_NOINLINE LLVMBackend::CxxPointerReferenceInfo
+LLVMBackend::CxxPointerReferenceProperties(const FunctionSymbol& candidate, size_t index,
+                                            const TypeAndValue& param) const
+{
+        CxxPointerReferenceInfo info;
+        if (!candidate.IsCxx || (candidate.IsMethod && index == 0)) return info;
+        info.IsReference = param.IsCxxRefToPointer;
+        info.IsConstReference = param.CxxConstRef();
+        return info;
+}
+
 bool LLVMBackend::IsCxxTopLevelConstTypeAlias(const std::string& name) const
 {
         return cxxTopLevelConstTypeAliases_.count(name) != 0;
@@ -1319,8 +1330,12 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
+            fp.IsRvalueRef = p.IsRvalueRef;
             fp.PointerDepth = p.ValuePointerDepth();
             fp.ConstMask = p.FunctionParamConstMask();
+            fp.IsCxxRefToPointer = p.IsCxxRefToPointer;
+            if (fp.IsCxxRefToPointer && p.CxxConstRef())
+                fp.ConstMask |= 1 << fp.PointerDepth;
             // Same predicate the callee lowers by: an alias closure/fn-ptr param is passed by address.
             fp.IsAlias = ParameterIsAliasByPointer(p);
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
@@ -1755,9 +1770,27 @@ LLVMBackend::TypeAndValue LLVMBackend::AliasAlignedCallbackSig(const TypeAndValu
         TypeAndValue aligned = fn;
         if (aligned.FuncPtrParams.size() == dest.FuncPtrParams.size())
             for (size_t i = 0; i < aligned.FuncPtrParams.size(); i++)
+            {
                 if (aligned.FuncPtrParams[i].IsAlias && !dest.FuncPtrParams[i].IsAlias)
                     aligned.FuncPtrParams[i].IsAlias = false;
+                else if (!aligned.FuncPtrParams[i].IsAlias && dest.FuncPtrParams[i].IsAlias
+                    && CxxClassRefCallbackPointerShapeMatches(
+                        aligned.FuncPtrParams[i], dest.FuncPtrParams[i]))
+                    aligned.FuncPtrParams[i].IsAlias = true;
+            }
         return aligned;
+}
+
+LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::CxxClassRefCallbackPointerShapeMatches(
+        const TypeAndValue::FuncPtrParam& fn, const TypeAndValue::FuncPtrParam& dest) const
+{
+        auto isSingleClassPointer = [&](const TypeAndValue::FuncPtrParam& param) {
+            return param.Pointer && !param.IsArrayView && !param.IsCxxRefToPointer
+                && param.PointerDepth == 1 && param.FunctionTypeSignature == nullptr
+                && IsCxxRecord(ResolveTypeAlias(param.TypeName));
+        };
+        return isSingleClassPointer(fn) && isSingleClassPointer(dest)
+            && ResolveTypeAlias(fn.TypeName) == ResolveTypeAlias(dest.TypeName);
 }
 
 std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& functionName,

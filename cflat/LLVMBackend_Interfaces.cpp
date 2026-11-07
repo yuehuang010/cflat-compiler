@@ -1236,6 +1236,12 @@ void LLVMBackend::UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue&
             tv.IsWriteInferredSink = p.IsWriteInferredSink;
             tv.IsRvalueRef = p.IsRvalueRef;
             tv.IsAlias = p.IsAlias;
+            tv.IsCxxRefToPointer = p.IsCxxRefToPointer;
+            if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint8_t>(p.ConstMask);
+            if (p.IsCxxRefToPointer)
+                tv.CxxRefLevel = static_cast<int8_t>(p.PointerDepth);
+            else if ((p.IsAlias || p.IsRvalueRef) && IsCxxRecord(p.TypeName))
+                tv.MarkCxxRef();
             params.push_back(std::move(tv));
         }
     }

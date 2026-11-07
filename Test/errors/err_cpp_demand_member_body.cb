@@ -33,5 +33,13 @@ extern int main()
         w11fill.KeyCheck local = w11fill.KeyCheck(4);
         w11fill.Fill<w11fill.KeyCheck> values = w11fill.Fill<w11fill.KeyCheck>(3, local);
     }
+    // T424: a2 reaches b after b's earlier body refusal.
+    w1demand.T424Demand demand = default;
+    expect_error("member 'b' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int b = demand.b();
+    }
+    expect_error("member 'a2' of C++ class 'w1demand.T424Demand' cannot be instantiated") {
+        int a2 = demand.a2();
+    }
     return 0;
 }

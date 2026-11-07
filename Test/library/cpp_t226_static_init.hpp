@@ -11,6 +11,7 @@ struct T {
     ~T() { dead++; }
     int get() const { return v; }
 };
+inline int take(T x) { return x.get(); }
 struct B {
     int v;
     B(int x) : v(x) { made++; }
@@ -29,5 +30,15 @@ struct H {
     H(int x) : d(x) {}
 };
 inline H mkH(int x) { return H(x); }
+struct H2 {
+    H h;
+    H2(int x) : h(x) {}
+};
+struct HA {
+    D a[2];
+    HA(int x) : a{ D(x), D(x + 1) } {}
+};
+inline H2 mkH2(int x) { return H2(x); }
+inline HA mkHA(int x) { return HA(x); }
 inline void reset() { made = copies = moves = dead = 0; }
 }

@@ -3155,6 +3155,19 @@ bool MainListener::CollectJoinArmClasses(llvm::Value* value, std::vector<std::st
         return true;
     }
 
+LLVM_ATTRIBUTE_NOINLINE bool MainListener::IsSharedInterfaceClassJoin(llvm::Value* value) {
+        std::vector<std::string> classes;
+        if (!CollectJoinArmClasses(value, classes)) return false;
+        std::vector<std::string> distinct;
+        for (const auto& cls : classes)
+            if (std::find(distinct.begin(), distinct.end(), cls) == distinct.end())
+                distinct.push_back(cls);
+        for (size_t i = 0; i < distinct.size(); ++i)
+            for (size_t j = i + 1; j < distinct.size(); ++j)
+                if (ClassesShareInterface(distinct[i], distinct[j])) return true;
+        return false;
+    }
+
 bool MainListener::ResolveJoinArmClass(llvm::Value* value, ResolvedJoinArmClass& result) const {
         result = {};
         if (value == nullptr || !value->getType()->isPointerTy()) return false;
@@ -3558,36 +3571,254 @@ static bool CandidateTakesArgument(LLVMBackend* compiler, const LLVMBackend::Fun
         return !compiler->ComputeOverloadFunction(one).second.Parameters.empty();
     }
 
-// A class-join argument the arg loop could not box, judged once every argument is typed: a
-// candidate that cannot take the OTHER arguments is dropped, then the join boxes into the one
-// interface the rest share. Nothing viable, or a pointer candidate still viable, returns nullptr.
-llvm::Value* MainListener::BoxDeferredJoinArgument(
-        const std::vector<LLVMBackend::NamedVariable>& arguments,
+// Probe ordinary arguments and every deferred join together. No IR is emitted until one candidate
+// survives the full call and every pending position has one common implemented interface.
+LLVM_ATTRIBUTE_NOINLINE bool MainListener::BoxDeferredJoinArguments(
+        std::vector<LLVMBackend::NamedVariable>& arguments,
         const std::vector<int64_t>& declaredIdx, const std::string& functionName,
-        size_t wantParams, size_t argIdx, llvm::Value* argValue, std::string& ifaceNameOut) {
+        const std::vector<DeferredClassJoinArgument>& pending,
+        CFlatParser::ArgumentExpressionListContext* argList,
+        const std::vector<LLVMBackend::FunctionSymbol>* candidateFamily,
+        const LLVMBackend::NamedVariable* implicitReceiver) {
         auto* compiler = compilerLLVM;
-        if (arguments.size() != declaredIdx.size() || argIdx >= arguments.size()) return nullptr;
-        const int64_t joinSlot = declaredIdx[argIdx];
-        auto ftIt = compiler->functionTable.find(functionName);
-        if (joinSlot < 0 || ftIt == compiler->functionTable.end()) return nullptr;
-        std::vector<const LLVMBackend::TypeAndValue*> viable;
-        for (const auto& cand : ftIt->second)
+        const size_t receiverArgOffset = arguments.size() >= declaredIdx.size()
+            ? arguments.size() - declaredIdx.size() : 0;
+        const size_t parameterOffset = receiverArgOffset > 0 || implicitReceiver != nullptr ? 1 : 0;
+        const size_t wantParams = parameterOffset + declaredIdx.size();
+        if (pending.empty() || receiverArgOffset + declaredIdx.size() != arguments.size()) return false;
+        for (const auto& join : pending)
+            if (join.argIdx >= declaredIdx.size() || join.value == nullptr) return false;
+
+        const std::string genericBase = compiler->ResolveGenericFunctionBase(functionName);
+        std::string genericInstance;
+        if (genericFunctionTemplates.count(genericBase) != 0 && argList != nullptr)
+            genericInstance = TryInferAndInstantiateFromArgs(genericBase, arguments, argList, nullptr, true);
+
+        std::vector<const LLVMBackend::FunctionSymbol*> candidates;
+        if (genericFunctionTemplates.count(genericBase) != 0)
         {
-            if (cand.Parameters.size() != wantParams || joinSlot >= (int64_t)cand.Parameters.size())
+            if (!genericInstance.empty())
+                if (auto* instanceFunction = compiler->GetFunction(genericInstance))
+                    if (const auto* instanceSymbol = compiler->GetFunctionSymbol(instanceFunction))
+                        candidates.push_back(instanceSymbol);
+        }
+        else if (candidateFamily != nullptr)
+            for (const auto& candidate : *candidateFamily)
+                candidates.push_back(&candidate);
+        if (candidates.empty()) return false;
+
+        std::vector<std::vector<std::string>> armClasses(pending.size());
+        for (size_t i = 0; i < pending.size(); ++i)
+            if (!CollectJoinArmClasses(pending[i].value, armClasses[i]) || armClasses[i].empty())
+                return false;
+
+        std::vector<std::vector<std::string>> targets(pending.size());
+        bool pointerCandidate = false;
+        for (const auto* candidate : candidates)
+        {
+            if (candidate == nullptr || candidate->Parameters.size() != wantParams) continue;
+            std::vector<int64_t> candidateDeclaredIdx = declaredIdx;
+            if (argList != nullptr)
+            {
+                auto namedArguments = argList->argumentNamedExpression();
+                if (namedArguments.size() != declaredIdx.size()) continue;
+                std::vector<std::string> argumentNames;
+                argumentNames.reserve(namedArguments.size());
+                for (auto* namedArgument : namedArguments)
+                    argumentNames.push_back(namedArgument->Identifier()
+                        ? namedArgument->Identifier()->getText() : std::string());
+                auto binding = LLVMBackend::ComputeArgumentPositions(
+                    argumentNames, candidate->Parameters, candidate->Variadic, parameterOffset);
+                if (!binding.Ok || binding.PosMap.size() != declaredIdx.size()) continue;
+                candidateDeclaredIdx = std::move(binding.PosMap);
+            }
+            if (parameterOffset > 0 && receiverArgOffset == 0)
+            {
+                if (!candidate->IsMethod || implicitReceiver == nullptr
+                    || candidate->Parameters.empty()) continue;
+                std::string receiverType = implicitReceiver->TypeAndValue.TypeName;
+                if (receiverType.empty() && implicitReceiver->BaseType != nullptr)
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(implicitReceiver->BaseType))
+                        receiverType = st->getName().str();
+                if (receiverType.empty()
+                    || compiler->ResolveTypeAlias(receiverType)
+                        != compiler->ResolveTypeAlias(candidate->Parameters.front().TypeName))
+                    continue;
+            }
+            else if (parameterOffset == 0 && receiverArgOffset == 0 && candidate->IsMethod)
                 continue;
             bool takesRest = true;
-            for (size_t j = 0; j < arguments.size() && takesRest; ++j)
+            for (size_t i = 0; i < receiverArgOffset && takesRest; ++i)
             {
-                // An unbound named argument keeps the candidate: the conservative side.
-                if (j == argIdx || declaredIdx[j] < 0
-                    || declaredIdx[j] >= (int64_t)cand.Parameters.size())
-                    continue;
-                takesRest = CandidateTakesArgument(compiler, cand, (size_t)declaredIdx[j], arguments[j]);
+                if (i >= candidate->Parameters.size()) { takesRest = false; break; }
+                if (candidate->IsMethod && i == 0)
+                {
+                    std::string receiverType = arguments[i].TypeAndValue.TypeName;
+                    if (receiverType.empty() && arguments[i].BaseType != nullptr)
+                        if (auto* st = llvm::dyn_cast<llvm::StructType>(arguments[i].BaseType))
+                            receiverType = st->getName().str();
+                    takesRest = !receiverType.empty()
+                        && compiler->ResolveTypeAlias(receiverType)
+                            == compiler->ResolveTypeAlias(candidate->Parameters[i].TypeName);
+                }
+                else
+                    takesRest = CandidateTakesArgument(compiler, *candidate, i, arguments[i]);
             }
-            if (takesRest) viable.push_back(&cand.Parameters[joinSlot]);
+            // An implicit `this` is selected by the call-site receiver lookup and is not in arguments.
+            for (size_t explicitIdx = 0; explicitIdx < declaredIdx.size() && takesRest; ++explicitIdx)
+            {
+                const bool deferred = std::any_of(pending.begin(), pending.end(),
+                    [&](const auto& join) { return join.argIdx == explicitIdx; });
+                if (deferred) continue;
+                const int64_t slot = candidateDeclaredIdx[explicitIdx];
+                if (slot < 0 || slot >= (int64_t)candidate->Parameters.size()) continue;
+                takesRest = CandidateTakesArgument(compiler, *candidate, (size_t)slot,
+                    arguments[receiverArgOffset + explicitIdx]);
+            }
+            if (!takesRest) continue;
+
+            bool supportsEveryJoin = true;
+            std::vector<std::string> candidateTargets(pending.size());
+            for (size_t i = 0; i < pending.size(); ++i)
+            {
+                const int64_t slot = candidateDeclaredIdx[pending[i].argIdx];
+                if (slot < 0 || slot >= (int64_t)candidate->Parameters.size())
+                {
+                    supportsEveryJoin = false;
+                    continue;
+                }
+                const auto& param = candidate->Parameters[(size_t)slot];
+                if (param.Pointer)
+                {
+                    pointerCandidate = true;
+                    supportsEveryJoin = false;
+                    continue;
+                }
+                if (!param.IsInterface || param.TypeName.empty())
+                {
+                    supportsEveryJoin = false;
+                    continue;
+                }
+                bool allImplement = true;
+                for (const auto& cls : armClasses[i])
+                    if (!compiler->StructImplementsInterface(cls, param.TypeName)) allImplement = false;
+                if (!allImplement)
+                {
+                    supportsEveryJoin = false;
+                    continue;
+                }
+                candidateTargets[i] = param.TypeName;
+            }
+            if (!supportsEveryJoin) continue;
+            for (size_t i = 0; i < pending.size(); ++i)
+                if (std::find(targets[i].begin(), targets[i].end(), candidateTargets[i])
+                    == targets[i].end())
+                    targets[i].push_back(candidateTargets[i]);
         }
-        if (viable.empty()) return nullptr;
-        return BoxPointerJoinArgument(viable, argValue, ifaceNameOut);
+        if (pointerCandidate) return false;
+        for (const auto& target : targets)
+            if (target.size() != 1) return false;
+
+        // Candidate and interface feasibility is settled; only now materialize every fat join.
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            LLVMBackend::TypeAndValue ifaceParam;
+            ifaceParam.TypeName = targets[i].front();
+            ifaceParam.IsInterface = true;
+            std::vector<const LLVMBackend::TypeAndValue*> one{ &ifaceParam };
+            std::string ifaceName;
+            auto* fat = BoxPointerJoinArgument(one, pending[i].value, ifaceName);
+            if (fat == nullptr) return false;
+            auto& joined = arguments[receiverArgOffset + pending[i].argIdx];
+            joined.Primary = fat;
+            joined.BaseType = fat->getType();
+            joined.TypeAndValue.TypeName = ifaceName;
+            joined.TypeAndValue.IsInterface = true;
+            joined.TypeAndValue.IsInterfacePointer = false;
+            joined.TypeAndValue.Pointer = false;
+        }
+        return true;
+    }
+
+LLVM_ATTRIBUTE_NOINLINE llvm::Value* MainListener::BoxFunctionPointerJoinArgument(
+        const LLVMBackend::TypeAndValue::FuncPtrParam& parameter, size_t paramIndex,
+        llvm::Value* argValue, std::string& ifaceNameOut) {
+        LLVMBackend::TypeAndValue param = compilerLLVM->FuncPtrParamAsTypeAndValue(parameter, paramIndex);
+        std::vector<const LLVMBackend::TypeAndValue*> one{ &param };
+        return BoxPointerJoinArgument(one, argValue, ifaceNameOut);
+    }
+
+LLVM_ATTRIBUTE_NOINLINE void MainListener::ResolveFunctionPointerClassJoins(
+        std::vector<LLVMBackend::NamedVariable>& arguments,
+        std::vector<llvm::Value*>& values,
+        const LLVMBackend::TypeAndValue& functionType,
+        antlr4::ParserRuleContext* callCtx) {
+        auto* compiler = compilerLLVM;
+        const size_t count = std::min({ arguments.size(), values.size(), functionType.FuncPtrParams.size() });
+        std::vector<size_t> pending;
+        std::vector<std::vector<std::string>> armClasses;
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (!arguments[i].TypeAndValue.TypeName.empty() || values[i] == nullptr
+                || !values[i]->getType()->isPointerTy())
+                continue;
+            std::vector<std::string> classes;
+            if (!CollectJoinArmClasses(values[i], classes)) continue;
+            std::vector<std::string> distinct;
+            for (const auto& cls : classes)
+                if (std::find(distinct.begin(), distinct.end(), cls) == distinct.end())
+                    distinct.push_back(cls);
+            if (distinct.size() < 2 || !ClassesShareInterface(distinct[0], distinct[1])) continue;
+            pending.push_back(i);
+            armClasses.push_back(std::move(classes));
+        }
+        if (pending.empty()) return;
+
+        bool pointerParam = false;
+        std::vector<std::string> targets(pending.size());
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            const auto param = compiler->FuncPtrParamAsTypeAndValue(
+                functionType.FuncPtrParams[pending[i]], pending[i]);
+            if (param.Pointer)
+            {
+                pointerParam = true;
+                continue;
+            }
+            if (!param.IsInterface || param.TypeName.empty()) continue;
+            bool allImplement = true;
+            for (const auto& cls : armClasses[i])
+                if (!compiler->StructImplementsInterface(cls, param.TypeName)) allImplement = false;
+            if (allImplement) targets[i] = param.TypeName;
+        }
+        const bool canBoxAll = !pointerParam
+            && std::all_of(targets.begin(), targets.end(), [](const auto& target) { return !target.empty(); });
+        if (!canBoxAll)
+        {
+            for (size_t i = 0; i < pending.size(); ++i)
+                RefuseUnboxedClassJoinArgument(callCtx, values[pending[i]]);
+            return;
+        }
+
+        // The function signature is fixed; materialize joins before ordinary argument checks.
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            std::string ifaceName;
+            auto* fat = BoxFunctionPointerJoinArgument(
+                functionType.FuncPtrParams[pending[i]], pending[i], values[pending[i]], ifaceName);
+            if (fat == nullptr)
+            {
+                RefuseUnboxedClassJoinArgument(callCtx, values[pending[i]]);
+                return;
+            }
+            arguments[pending[i]].Primary = fat;
+            arguments[pending[i]].BaseType = fat->getType();
+            arguments[pending[i]].TypeAndValue.TypeName = ifaceName;
+            arguments[pending[i]].TypeAndValue.IsInterface = true;
+            arguments[pending[i]].TypeAndValue.IsInterfacePointer = false;
+            arguments[pending[i]].TypeAndValue.Pointer = false;
+            values[pending[i]] = fat;
+        }
     }
 
 llvm::Value* MainListener::BoxPointerJoinArgument(

@@ -1,0 +1,31 @@
+import cpp "cpp_interop_tpl.h";
+using T469PartialPair = cppt.alias_partial.Pair;
+
+expect_error("without defaults: T") {
+    int construct_partial_alias() {
+        T469PartialPair value = T469PartialPair(4, 5);
+        return value.sum();
+    }
+}
+
+expect_error("without defaults: T") {
+    int sizeof_partial_alias() {
+        return (int)sizeof(T469PartialPair);
+    }
+}
+
+expect_error("without defaults: T") {
+    int parameter_partial_alias(T469PartialPair* value) {
+        return 0;
+    }
+}
+
+using T469Gate = cppt.dflt.Gate;
+int t469ShadowRead<T>(T* value) { return (int)sizeof(T); }
+expect_error("no overload") {
+    int mismatched_shadowed_alias() {
+        using T469Gate = cppt.dflt.Plain;
+        cppt.dflt.Gate<>* value = default;
+        return t469ShadowRead<T469Gate>(value);
+    }
+}

@@ -1,5 +1,12 @@
 # `new` pointer element depth >= 2 is refused, not carried
 
+RULED 2026-11-04 (maintainer): the depth-2 cap (`PointerDepthCap`) was an initial implementation limit, not language
+design - fix it: carry any pointer depth, spelled or generic-substituted, like C (`int***`, `new int**[2]`, `new T(v)` with
+T = int** -> int***). Supersedes the box 10 premise below that the refusal is correct; options (a)-(c) are all dropped.
+Test consequence: the "caps at 2 levels" err_ legs (12 in err_double_pointer_arg_single_pointer_param,
+err_single_pointer_arg_double_pointer_param, err_using_alias_pointer_overcap) become value legs; core containers keep
+`new T[n]`. Likely plan-sized (37 PointerDepthCap sites): scope the carrier before a run.
+
 Filed 2026-10-31 at the fix/newptrarr landing (residue of `new int*[2]` / `new int*(a)`).
 
 ## Summary

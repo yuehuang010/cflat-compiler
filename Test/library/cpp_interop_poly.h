@@ -116,6 +116,7 @@ namespace cpppoly
     // Reference returns of a derived object for the RETURN-statement legs (3370-3389): a CFlat
     // `Right*` / `Shape*` function returning one must add the base offset (16 for Right).
     Both& both_ref() noexcept;
+    inline Right& right_ref() noexcept { return both_ref(); }
     Circle& circle_ref() noexcept;
 
     // M6b - class names that CONTAIN a declarator keyword as a substring ("const" inside

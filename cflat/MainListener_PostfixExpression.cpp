@@ -2565,6 +2565,37 @@ bool MainListener::TryReparseParenthesizedGenericCallee(CFlatParser::PostfixExpr
         return ReparseFragmentAsCast(compiler, fragment, lValue, use, out);
 }
 
+LLVM_ATTRIBUTE_NOINLINE int MainListener::ResolveDefaultedCxxAliasQualifier(
+    antlr4::ParserRuleContext* ctx, const std::string& alias,
+    std::string& namespaceName, std::string& primaryName)
+{
+    auto* compiler = Compiler(ctx);
+    const std::string qualified = compiler->ResolveQualifiedName(alias);
+    const std::string genericFunction = compiler->ResolveGenericFunctionBase(qualified);
+    if (compiler->GetFunction(qualified) != nullptr || compiler->GetFunction(alias) != nullptr
+        || compiler->GetReturnBlock(qualified) != nullptr
+        || compiler->GetReturnBlock(alias) != nullptr
+        || genericFunctionTemplates.count(genericFunction) != 0
+        || compiler->HasCxxFunctionTemplate(qualified)
+        || compiler->HasCxxFunctionTemplate(alias)
+        || compiler->IsCxxFunctionMacro(alias))
+        return 0;
+    std::string resolvedType;
+    std::string error;
+    if (compiler->TryResolveDefaultedCxxGenericBaseAlias(alias, resolvedType, error))
+    {
+        namespaceName = resolvedType;
+        primaryName = std::move(resolvedType);
+        return 1;
+    }
+    if (!error.empty())
+    {
+        LogCxxErrorContext(ctx, error);
+        return 2;
+    }
+    return 0;
+}
+
 LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
                                                        size_t dropTrailingChildren, ResultUse use) {
         LLVMBackend::NamedVariable rerouted;
@@ -6262,6 +6293,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // namespace-vs-variable decision keeps master's rule above.
                             const bool aliasNameIsVariable = nameIsVariable
                                 || namespaceVariable;
+                            if (followedByDot && !aliasNameIsVariable && !localTypeMember
+                                && Compiler(ctx)->IsGenericBaseAlias(idName))
+                            {
+                                const int aliasQualifier = ResolveDefaultedCxxAliasQualifier(
+                                    prevPrimary, idName, namespaceContext, primaryIdentifier);
+                                if (aliasQualifier != 0)
+                                {
+                                    if (aliasQualifier == 1)
+                                    {
+                                        namedVar = {};
+                                        structVar = {};
+                                        interfaceVar = {};
+                                    }
+                                    break;
+                                }
+                            }
                             bool defaultedCxxBaseAlias = false;
                             if (followedByCall && !aliasNameIsVariable
                                 && Compiler(ctx)->IsGenericBaseAlias(idName))
@@ -10196,7 +10243,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (argNV.ContainsBondedClosure)
                                             Compiler(ctx)->LogError(
                                                 "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
+                                        backend->RejectCxxConstLvalueReferenceBinding(argExpectedDest, argNV);
                                         auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
+                                        argValue = backend->CxxFunctionValueClassReferenceArg(
+                                            argExpectedDest, argNV, argValue);
                                         std::string indirectTargetName =
                                             SpellFunctionSymbol(*backend, functionName);
                                         std::string indirectParamName =
@@ -10404,6 +10454,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                 }
+                                ResolveFunctionPointerClassJoins(
+                                    argNVs, callArgs, funcPtrTV, ctx);
                                 const size_t fixedArgCount = funcPtrTV.FuncPtrParams.size();
                                 const size_t actualArgCount = argNVs.size();
                                 if (!funcPtrTV.FuncPtrNoPrototype
@@ -11482,15 +11534,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             bool cxxDirectConstructionMemberCall = false;
                             // T459: a deferred `?:` argument of a C++ static member call routes through its wrapper.
                             bool cxxStaticDeferredCall = false;
-                            // Class-pointer '?:' arguments the arg loop could not box yet (see
-                            // BoxDeferredJoinArgument): resolved after every argument is typed.
-                            struct PendingClassJoin
-                            {
-                                size_t argIdx;
-                                antlr4::ParserRuleContext* ctx;
-                                llvm::Value* value;
-                            };
-                            std::vector<PendingClassJoin> pendingJoinArguments;
+                            // Class-pointer joins the arg loop could not box yet are probed together
+                            // after every ordinary argument is typed.
+                            std::vector<DeferredClassJoinArgument> pendingJoinArguments;
                             auto evaluateCallArguments = [&]()
                             {
                                 bool localCxxDirectConstructionOrderSafe = true;
@@ -13423,7 +13469,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             argVar.TypeAndValue.IsInterface = true;
                                             argVar.TypeAndValue.Pointer = false;
                                         }
-                                        else
+                                        else if (IsSharedInterfaceClassJoin(argValue))
                                             pendingJoinArguments.push_back({ argIdx, namedArgument, argValue });
                                     }
 
@@ -13460,25 +13506,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     Compiler(ctx)->EndCastOccurrence(savedCastOcc);
                                     arguments.emplace_back(argVar);
                                 }
-                                // Every argument is typed now: a deferred class join drops the candidates
-                                // that cannot take the others, then boxes or stays refused.
-                                for (const auto& pending : pendingJoinArguments)
-                                {
-                                    std::string joinIface;
-                                    if (auto* fat = BoxDeferredJoinArgument(arguments, declaredIdx, functionName,
-                                            paramOffset + namedArgCtx.size(), pending.argIdx,
-                                            pending.value, joinIface))
-                                    {
-                                        auto& joined = arguments[pending.argIdx];
-                                        joined.Primary = fat;
-                                        joined.BaseType = fat->getType();
-                                        joined.TypeAndValue.TypeName = joinIface;
-                                        joined.TypeAndValue.IsInterface = true;
-                                        joined.TypeAndValue.Pointer = false;
-                                    }
-                                    else
+                                // All pending joins share one candidate set. The helper probes every
+                                // ordinary argument and interface target before it emits any boxing IR.
+                                if (!pendingJoinArguments.empty()
+                                    && !BoxDeferredJoinArguments(arguments, declaredIdx, functionName,
+                                        pendingJoinArguments,
+                                        functionArgCounter < argumentList.size()
+                                            ? argumentList[functionArgCounter] : nullptr,
+                                        funcSymFamily,
+                                        implicitCallReceiver.GetValue() != nullptr
+                                            ? &implicitCallReceiver : nullptr))
+                                    for (const auto& pending : pendingJoinArguments)
                                         RefuseUnboxedClassJoinArgument(pending.ctx, pending.value);
-                                }
                                 pendingJoinArguments.clear();
                             }
                             };
@@ -16800,6 +16839,9 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             fp.IsArrayView = p.IsArrayView;
             fp.PointerDepth = p.ValuePointerDepth();
             fp.ConstMask = p.FunctionParamConstMask();
+            fp.IsCxxRefToPointer = p.IsCxxRefToPointer;
+            if (fp.IsCxxRefToPointer && p.CxxConstRef())
+                fp.ConstMask |= 1 << fp.PointerDepth;
             // Carry the inferred sink onto the TYPE so the indirect call site can null the
             // caller's source; a declared Lambda<...> spelling never sets these.
             fp.IsOwningSink = p.IsOwningSink;

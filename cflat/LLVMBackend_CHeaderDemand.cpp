@@ -1538,7 +1538,7 @@ LLVMBackend::CxxVerdictFile* LLVMBackend::GetCxxVerdictFile(const CxxRequestGrou
         else if (CxxGroupHeaderStamp(group, stamp))
         {
             const std::string requestKey = CxxTypeRequestCacheKey(group,
-                "|demand-verdicts-v3-helper-diagnostic",
+                "|demand-verdicts-v4-bodyless-poison-preserved",
                 cohortFile ? cohortSource : generatedSource, BuildCxxRequestClangArgs(group), false)
                 + (cohortFile ? "|BODY_COHORT_SET" : "|BODY_SET");
             auto [slot, fresh] = cxxVerdictFiles_.try_emplace(requestKey);

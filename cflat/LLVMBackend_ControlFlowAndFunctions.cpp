@@ -578,8 +578,12 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
+            fp.IsRvalueRef = p.IsRvalueRef;
             fp.PointerDepth = p.ValuePointerDepth();
             fp.ConstMask = p.FunctionParamConstMask();
+            fp.IsCxxRefToPointer = p.IsCxxRefToPointer;
+            if (fp.IsCxxRefToPointer && p.CxxConstRef())
+                fp.ConstMask |= 1 << fp.PointerDepth;
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
             fp.IsAlias = ParameterIsAliasByPointer(p);
             tv.FuncPtrParams.push_back(fp);
@@ -741,12 +745,13 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 }
             }
         }
+        // Pointer references were checked at their referent depth by FuncPtrArgDepthMismatch.
         // #6 through a function value: its recorded parameter pointee const, else the interop
         // flag (then every level is read-only).
         for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); ++i)
         {
             const auto& param = funcPtrType.FuncPtrParams[i];
-            if (!param.Pointer || param.IsRvalueRef || IsCxxRecord(param.TypeName)) continue;
+            if (!param.Pointer || param.IsAlias || param.IsRvalueRef || IsCxxRecord(param.TypeName)) continue;
             TypeAndValue target;
             target.TypeName = param.TypeName;
             target.Pointer = true;
@@ -890,10 +895,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             AbiRecipe cxxSretRecipe = cxxIndirectRecipe;
             std::vector<llvm::Type*> paramTypes;
             if (cxxSretReturn) paramTypes.push_back(cflat_llvm::PointerTo(cxxSret.first));
-            for (const auto& p : funcPtrType.FuncPtrParams)
+            for (size_t i = 0; i < funcPtrType.FuncPtrParams.size(); ++i)
             {
-                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-                pTV.IsAlias = p.IsAlias; pTV.IsArrayView = p.IsArrayView;
+                const auto& p = funcPtrType.FuncPtrParams[i];
+                TypeAndValue pTV = FuncPtrParamAsTypeAndValue(p, i);
                 // An alias closure param takes its caller slot by address, as the callee declares it.
                 paramTypes.push_back((ParameterIsAliasByPointer(pTV) || (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
                         || HasForeignNontrivialCxxField(p.TypeName))))
@@ -933,11 +938,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 if (i < cxxIndirectArgs.size() && cxxIndirectArgs[i] != nullptr)
                 {
                     abiArgs.push_back(cxxIndirectArgs[i]);
-                    TypeAndValue pTV;
-                    pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
-                    pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
-                    pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
-                    pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
+                    TypeAndValue pTV = FuncPtrParamAsTypeAndValue(funcPtrType.FuncPtrParams[i], i);
                     if (ParameterCarriesRawArrayCount(pTV))
                     {
                         llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
@@ -960,11 +961,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                         IndirectArgArithWidth(argNVs, i));
                 CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
                 abiArgs.push_back(args[i]);
-                TypeAndValue pTV;
-                pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
-                pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
-                pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
-                pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
+                TypeAndValue pTV = FuncPtrParamAsTypeAndValue(funcPtrType.FuncPtrParams[i], i);
                 extParams.emplace_back((unsigned)(abiArgs.size() - 1), pTV);
                 if (ParameterCarriesRawArrayCount(pTV))
                 {
@@ -1092,12 +1089,14 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
 
         // Build invoker function type: (user_params..., i8* env) -> RetType (env-last ABI).
         std::vector<llvm::Type*> paramTypes;
-        for (const auto& p : funcPtrType.FuncPtrParams)
+        for (size_t i = 0; i < funcPtrType.FuncPtrParams.size(); ++i)
         {
-            TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-            pTV.IsArrayView = p.IsArrayView;
-            paramTypes.push_back(!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
-                    || HasForeignNontrivialCxxField(p.TypeName))
+            const auto& p = funcPtrType.FuncPtrParams[i];
+            TypeAndValue pTV = FuncPtrParamAsTypeAndValue(p, i);
+            const bool byAddress = ParameterIsAliasByPointer(pTV)
+                || (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
+                    || HasForeignNontrivialCxxField(p.TypeName)));
+            paramTypes.push_back(byAddress
                 ? cflat_llvm::PointerTo(GetType(pTV)) : GetType(pTV));
             if (ParameterCarriesRawArrayCount(pTV))
                 paramTypes.push_back(builder->getInt64Ty());
@@ -1133,11 +1132,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             if (i < cxxIndirectArgs.size() && cxxIndirectArgs[i] != nullptr)
             {
                 userArgs.push_back(cxxIndirectArgs[i]);
-                TypeAndValue pTV;
-                pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
-                pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
-                pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
-                pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
+                TypeAndValue pTV = FuncPtrParamAsTypeAndValue(funcPtrType.FuncPtrParams[i], i);
                 if (ParameterCarriesRawArrayCount(pTV))
                 {
                     llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
@@ -1160,11 +1155,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                         IndirectArgArithWidth(argNVs, i));
             CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
             userArgs.push_back(args[i]);
-            TypeAndValue pTV;
-            pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
-            pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
-            pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
-            pTV.IsArrayView = funcPtrType.FuncPtrParams[i].IsArrayView;
+            TypeAndValue pTV = FuncPtrParamAsTypeAndValue(funcPtrType.FuncPtrParams[i], i);
             if (ParameterCarriesRawArrayCount(pTV))
             {
                 llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
@@ -3005,13 +2996,13 @@ static llvm::Type* SizedParamOrPlaceholder(llvm::Type* type, llvm::IRBuilder<>& 
 llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
 {
         std::vector<llvm::Type*> paramTypes;
-        for (const auto& p : tv.FuncPtrParams)
+        for (size_t i = 0; i < tv.FuncPtrParams.size(); ++i)
         {
-            TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
-            pTV.IsMove = p.IsMove;
-            pTV.IsArrayView = p.IsArrayView;
-            if (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
-                || HasForeignNontrivialCxxField(p.TypeName)))
+            const auto& p = tv.FuncPtrParams[i];
+            TypeAndValue pTV = FuncPtrParamAsTypeAndValue(p, i);
+            if (ParameterIsAliasByPointer(pTV)
+                || (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
+                    || HasForeignNontrivialCxxField(p.TypeName))))
                 paramTypes.push_back(cflat_llvm::PointerTo(GetType(pTV)));
             else
                 paramTypes.push_back(SizedParamOrPlaceholder(GetType(pTV), *builder));

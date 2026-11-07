@@ -2736,6 +2736,23 @@ std::string ResolveGenericTemplateSpellingAtScope(
         EnclosingScopesForLegacyScope(compiler, enclosingScope, useSite), useSite, lookupName, report,
         nonGenericRefusal);
 }
+LLVM_ATTRIBUTE_NOINLINE static bool ResolveDefaultedCxxAliasTypeName(
+    LLVMBackend* compiler, std::string& typeName, antlr4::ParserRuleContext* useSite,
+    CxxTypeErrorReporter reportCxxTypeError, void* reportContext)
+{
+    if (compiler == nullptr || !compiler->IsGenericBaseAlias(typeName)) return false;
+    std::string resolvedType;
+    std::string error;
+    if (compiler->TryResolveDefaultedCxxGenericBaseAlias(typeName, resolvedType, error))
+    {
+        typeName = std::move(resolvedType);
+        return true;
+    }
+    if (!error.empty() && useSite != nullptr && reportCxxTypeError != nullptr)
+        reportCxxTypeError(reportContext, useSite, error);
+    return false;
+}
+
 bool ResolveCanonicalTypeSpecifier(
     LLVMBackend* compiler, const std::vector<CFlatParser::TypeSpecifierContext*>& specs,
     const std::unordered_map<std::string, std::string>* substitutions,
@@ -2743,7 +2760,8 @@ bool ResolveCanonicalTypeSpecifier(
     const TypeNameMemberResolver& resolveMemberType,
     bool reportGenericAlias, CanonicalTypeSpecifier& out,
     PrimitiveTypeError* errorOut,
-    const TypeNameTupleResolver& resolveTupleType)
+    const TypeNameTupleResolver& resolveTupleType,
+    CxxTypeErrorReporter reportCxxTypeError, void* reportContext)
 {
     if (compiler == nullptr || specs.empty()) return false;
     PrimitiveTypeError typeError;
@@ -2805,6 +2823,8 @@ bool ResolveCanonicalTypeSpecifier(
     out.TypeName = compiler->ResolveQualifiedName(out.TypeName);
     out.ConstMask |= compiler->ResolveTypeAliasConstMask(out.TypeName);
     out.TypeName = compiler->ResolveTypeAlias(out.TypeName);
+    ResolveDefaultedCxxAliasTypeName(compiler, out.TypeName,
+        specs.size() == 1 ? specs.front() : nullptr, reportCxxTypeError, reportContext);
     out.PointerDepth = PeelAliasPointerStars(out.TypeName);
     return true;
 }
@@ -2818,7 +2838,8 @@ bool ResolveConstTypeSyntax(
     const std::unordered_map<std::string, std::string>* substitutions,
     const TypeNameArgumentResolver& resolveTypeArg,
     const TypeNameMemberResolver& resolveMemberType,
-    const TypeNameTupleResolver& resolveTupleType)
+    const TypeNameTupleResolver& resolveTupleType,
+    CxxTypeErrorReporter reportCxxTypeError, void* reportContext)
 {
     if (compiler == nullptr || ctx == nullptr) return false;
     auto* spec = ctx->specifierQualifierList();
@@ -2829,14 +2850,16 @@ bool ResolveConstTypeSyntax(
     {
         if (specs.size() != 1) return false;
         if (!ResolveConstTypeSyntax(compiler, nested, out, substitutions,
-                resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
+                resolveTypeArg, resolveMemberType, resolveTupleType,
+                reportCxxTypeError, reportContext)) return false;
         ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
     }
     else
     {
         CanonicalTypeSpecifier resolved;
         if (!ResolveCanonicalTypeSpecifier(compiler, specs, substitutions, resolveTypeArg,
-                resolveMemberType, false, resolved, nullptr, resolveTupleType))
+                resolveMemberType, false, resolved, nullptr, resolveTupleType,
+                reportCxxTypeError, reportContext))
             return false;
         out.TypeName = resolved.TypeName;
         out.ConstMask = resolved.ConstMask;
@@ -2860,11 +2883,13 @@ bool ResolveConstTypeSpecifierSyntax(
     const std::unordered_map<std::string, std::string>* substitutions,
     const TypeNameArgumentResolver& resolveTypeArg,
     const TypeNameMemberResolver& resolveMemberType,
-    const TypeNameTupleResolver& resolveTupleType)
+    const TypeNameTupleResolver& resolveTupleType,
+    CxxTypeErrorReporter reportCxxTypeError, void* reportContext)
 {
     if (typeSpec == nullptr || typeSpec->typeName() == nullptr) return false;
     if (!ResolveConstTypeSyntax(compiler, typeSpec->typeName(), out, substitutions,
-            resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
+            resolveTypeArg, resolveMemberType, resolveTupleType,
+            reportCxxTypeError, reportContext)) return false;
     ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
     return true;
 }
@@ -2873,20 +2898,23 @@ bool ResolveConstCastTypeSyntax(
     const std::unordered_map<std::string, std::string>* substitutions,
     const TypeNameArgumentResolver& resolveTypeArg,
     const TypeNameMemberResolver& resolveMemberType,
-    const TypeNameTupleResolver& resolveTupleType)
+    const TypeNameTupleResolver& resolveTupleType,
+    CxxTypeErrorReporter reportCxxTypeError, void* reportContext)
 {
     if (compiler == nullptr || ctx == nullptr || ctx->typeSpecifier().empty()) return false;
     auto specs = ctx->typeSpecifier();
     if (specs.size() == 1 && specs.front()->typeName() != nullptr)
     {
         if (!ResolveConstTypeSpecifierSyntax(compiler, specs.front(), out, substitutions,
-                resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
+                resolveTypeArg, resolveMemberType, resolveTupleType,
+                reportCxxTypeError, reportContext)) return false;
     }
     else
     {
         CanonicalTypeSpecifier resolved;
         if (!ResolveCanonicalTypeSpecifier(compiler, specs, substitutions, resolveTypeArg,
-                resolveMemberType, false, resolved, nullptr, resolveTupleType))
+                resolveMemberType, false, resolved, nullptr, resolveTupleType,
+                reportCxxTypeError, reportContext))
             return false;
         out.ConstMask = resolved.ConstMask;
         out.PointerDepth = resolved.PointerDepth;

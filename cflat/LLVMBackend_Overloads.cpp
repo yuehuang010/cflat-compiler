@@ -34,6 +34,7 @@
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
+#include "CxxSpelling.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
 #include <filesystem>
@@ -444,13 +445,129 @@ bool LLVMBackend::ReceiverMayHandOutViewOrPointer(const FunctionSymbol& method)
     return visit(method);
 }
 
+// CxxConversionRank::cv for a pointer binding: bit 0 is the pointee const added; a pointer
+// reference sets kCvPointerRef, and kCvReferentConst when its referent is const (`T* const&`).
+constexpr int kCvReferentConst = 4;
+constexpr int kCvPointerRef = 8;
+
+// The type name a pointer argument ranks by. An unnamed primitive pointer (`char* p`) has an
+// empty TypeName; a C++ pointer reference reads its source name, as the by-value path does.
+LLVM_ATTRIBUTE_NOINLINE static const std::string& PointerArgumentTypeName(
+    const LLVMBackend::NamedVariable& arg, const LLVMBackend::TypeAndValue& param)
+{
+    if (!param.IsCxxRefToPointer || !arg.TypeAndValue.TypeName.empty())
+        return arg.TypeAndValue.TypeName;
+    return arg.InferSourceTypeName;
+}
+
 // C++ ranks `T*&` above `T*const&` for a modifiable lvalue pointer, and lets only `T*const&`
 // bind a pointer rvalue. 0 = the overload C++ picks, 1 = viable but worse.
-static int CxxRefToPointerScore(const LLVMBackend::NamedVariable& arg,
-                                const LLVMBackend::TypeAndValue& param)
+static int CxxRefToPointerScore(const LLVMBackend::NamedVariable& arg, bool paramIsConstRef)
 {
     const bool argIsLvalue = arg.Storage != nullptr && !arg.IsRvalue;
-    return (argIsLvalue != param.CxxConstRef()) ? 0 : 1;
+    return (argIsLvalue != paramIsConstRef) ? 0 : 1;
+}
+
+// A pointer rvalue (nullptr, a null constant, or a narrow string literal) binds a C++ `T* const&`
+// through a temporary holding the converted pointer. It ranks as the by-value pointer conversion
+// does, so the pair ties and clang reports the call ambiguous. A non-const `T*&` never binds an
+// rvalue and is left unjudged. Returns false when the argument is not such a pointer rvalue.
+LLVM_ATTRIBUTE_NOINLINE static bool CxxConstPointerReferenceRvalueRank(
+    const LLVMBackend::TypeAndValue& param, const std::string& spelling, bool nullConstant,
+    bool stringLiteral, LLVMBackend::CxxConversionRank& out)
+{
+    if (!param.IsCxxRefToPointer || !param.CxxConstRef() || param.IsRvalueRef
+        || param.IsFunctionPointer || param.IsArrayView || param.IsInterface
+        || param.ValuePointerDepth() < 1)
+        return false;
+    if (nullConstant)
+    {
+        out.rank = 2;
+        out.cxxViable = true;
+        out.from = "nullptr";
+        return true;
+    }
+    if (!stringLiteral || param.TypeName != "char") return false;
+    // `const char[N]` converts to `const char*` only: a `char* const&` target is not viable.
+    const bool targetPointeeConst = param.PointeeConstBit() || spelling.rfind("const ", 0) == 0;
+    out.from = "char";
+    if (!targetPointeeConst)
+    {
+        out.rank = LLVMBackend::kCxxNonViableRank;
+        return true;
+    }
+    // Same keys as the by-value literal path (cvBase "char", cv 0) once the reference bits are
+    // masked, so the two overloads tie on conversion and fall to the reference-mix check.
+    out.rank = 0;
+    out.cvBase = "char";
+    out.cv = kCvPointerRef | kCvReferentConst;
+    out.cxxViable = true;
+    return true;
+}
+
+LLVM_ATTRIBUTE_NOINLINE static bool HasEquivalentCxxByValuePointerCandidate(
+    const std::vector<std::pair<std::vector<LLVMBackend::NamedVariable>,
+                                LLVMBackend::FunctionSymbol>>& candidates,
+    size_t paramIndex, const LLVMBackend::TypeAndValue& referenceParam)
+{
+    for (const auto& entry : candidates)
+    {
+        const auto& candidate = entry.second;
+        if (!candidate.IsCxx || paramIndex >= candidate.Parameters.size()) continue;
+        const auto& param = candidate.Parameters[paramIndex];
+        if (param.Pointer && !param.IsArrayView && !param.IsAlias && !param.IsRvalueRef
+            && !param.IsCxxRefToPointer && param.TypeName == referenceParam.TypeName
+            && param.ElemPointer == referenceParam.ElemPointer
+            && param.ValuePointerDepth() == referenceParam.ValuePointerDepth()
+            && param.PointeeConstMask() == referenceParam.PointeeConstMask())
+            return true;
+    }
+    return false;
+}
+
+LLVM_ATTRIBUTE_NOINLINE static bool CxxPointerReferenceValueMix(
+    const std::vector<LLVMBackend::NamedVariable>& arguments,
+    const LLVMBackend::FunctionSymbol& x, const LLVMBackend::FunctionSymbol& y)
+{
+    const size_t offset = x.IsMethod && x.Parameters.size() == arguments.size() + 1 ? 1 : 0;
+    for (size_t k = offset; k < x.Parameters.size() && k < y.Parameters.size(); ++k)
+    {
+        const auto& xp = x.Parameters[k];
+        const auto& yp = y.Parameters[k];
+        const bool xRef = xp.IsCxxRefToPointer || xp.IsAlias;
+        const bool yRef = yp.IsCxxRefToPointer || yp.IsAlias;
+        if (xRef == yRef || !xp.Pointer || !yp.Pointer
+            || xp.IsArrayView || yp.IsArrayView)
+            continue;
+        const size_t argIndex = k - offset;
+        // nullptr converts to any pointer type by the same conversion, so pointees need not match.
+        const bool nullRvalue = argIndex < arguments.size()
+            && LLVMBackend::IsCxxNullTypedArgument(arguments[argIndex]);
+        if (!nullRvalue && (xp.TypeName != yp.TypeName || xp.ElemPointer != yp.ElemPointer
+            || xp.ValuePointerDepth() != yp.ValuePointerDepth()
+            || xp.PointeeConstMask() != yp.PointeeConstMask()))
+            continue;
+        const bool xConstPointerReference = xRef
+            && (xp.CxxConstRef() || ((xp.ConstMask >> xp.ValuePointerDepth()) & 1u) != 0);
+        const bool yConstPointerReference = yRef
+            && (yp.CxxConstRef() || ((yp.ConstMask >> yp.ValuePointerDepth()) & 1u) != 0);
+        const bool constPointerReference = xConstPointerReference || yConstPointerReference;
+        if (argIndex < arguments.size() && constPointerReference)
+            return true;
+        if (argIndex < arguments.size() && arguments[argIndex].TypeAndValue.Pointer
+            && arguments[argIndex].Storage != nullptr && !arguments[argIndex].IsRvalue)
+            return true;
+    }
+    return false;
+}
+
+static bool CxxParamIsConstPointerReference(const std::string& spelling,
+                                             const LLVMBackend::TypeAndValue& param)
+{
+    if (spelling.empty()) return param.CxxConstRef();
+    if (CxxParamIsConstRefToPointer(spelling)) return true;
+    return spelling.find('*') == std::string::npos
+        && CxxParamIsConstLvalueReference(spelling);
 }
 
 // A C++ `T (&)[N]` parameter arrives as a plain pointer; only its spelling tells it apart, and no
@@ -1780,6 +1897,51 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 }
                 continue;
             }
+            if (candidate.IsCxx && !(candidate.IsMethod && i == 0)
+                && param.Pointer && !param.IsFunctionPointer
+                && (!param.IsAlias || param.IsCxxRefToPointer)
+                && !param.IsArrayView && !param.IsCxxNullptrT
+                && arg.TypeAndValue.Pointer
+                && arg.TypeAndValue.ValuePointerDepth() == param.ValuePointerDepth()
+                && ResolveTypeAlias(PointerArgumentTypeName(arg, param))
+                    == ResolveTypeAlias(param.TypeName))
+            {
+                const bool pointerReference = param.IsCxxRefToPointer;
+                const bool pointerLvalue = arg.Storage != nullptr && !arg.IsRvalue
+                    && !IsCxxRvalueReferenceArgument(arg);
+                const int sourceMask = arg.TypeAndValue.PointeeConstMask()
+                    | (CxxArgumentPointeeConst(arg) ? 1 : 0);
+                const int targetMask = param.PointeeConstMask();
+                const bool dropsConst = (sourceMask & targetMask) != sourceMask;
+                const bool cannotBindRef = pointerReference && !param.CxxConstRef()
+                    && !param.IsRvalueRef && !pointerLvalue;
+                // Class values also carry Pointer: only a real pointer parameter takes the new ranks.
+                const bool pointerValued = param.ValuePointerDepth() >= 1;
+                // An rvalue reference never binds an lvalue pointer.
+                const bool rvalueRefToLvalue = pointerValued && param.IsRvalueRef && pointerLvalue;
+                if (dropsConst || cannotBindRef || rvalueRefToLvalue)
+                    out.rank = kCxxNonViableRank;
+                else if (pointerValued)
+                {
+                    // Added pointee const is a qualification conversion: Exact Match rank with
+                    // the cv tie-break, as the by-value single-level path ranks it.
+                    out.rank = 0;
+                    out.cvBase = param.TypeName;
+                    out.cv = (targetMask & ~sourceMask)
+                        | (pointerReference ? kCvPointerRef
+                                            | (param.CxxConstRef() ? kCvReferentConst : 0) : 0);
+                    out.cxxViable = true;
+                }
+                else
+                {
+                    out.rank = sourceMask == targetMask ? 0 : 1;
+                    out.cvBase = param.TypeName;
+                    out.cv = targetMask;
+                    out.cxxViable = true;
+                }
+                out.from = PointerArgumentTypeName(arg, param);
+                continue;
+            }
             if (candidate.IsCxx && param.Pointer && !param.IsAlias && !param.IsRvalueRef
                 && !param.IsCxxRefToPointer && param.ValuePointerDepth() == 1
                 && param.TypeName == "void" && !param.IsCxxNullptrT
@@ -1899,6 +2061,13 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 out.from = "nullptr";
                 continue;
             }
+            // A C++ `T* const&` binds a pointer rvalue through a temporary; the by-value twin ties.
+            if (candidate.IsCxx && !(candidate.IsMethod && i == 0) && param.IsCxxRefToPointer
+                && CxxConstPointerReferenceRvalueRank(
+                    param, CxxReferenceParameterSpelling(candidate, i),
+                    IsCxxNullTypedArgument(arg) || IsNullPointerConstantArgument(arg, true),
+                    arg.IsStringLiteral, out))
+                continue;
             // Literal 0 is a null pointer constant: a standard conversion (rank 2), so it outranks
             // the user-defined class conversion a converting ctor offers.
             if (cxxPointerShaped && candidate.IsCxx && !CxxArrayReferenceSpelling(candidate, i)
@@ -2396,10 +2565,15 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             // 3.2.5 / 3.2.6: from one source to one target, the less cv-qualified is better.
             if (!x.cvBase.empty() && x.cvBase == y.cvBase && x.from == y.from)
             {
-                if (x.cv != y.cv)
+                // Pointer-reference keys (PointerRefCvKey): the referent const decides only
+                // between two references, so a reference and a by-value bind tie on pointee cv.
+                const bool bothRefs = (x.cv & kCvPointerRef) != 0 && (y.cv & kCvPointerRef) != 0;
+                const int xKey = x.cv & ~(bothRefs ? kCvPointerRef : kCvPointerRef | kCvReferentConst);
+                const int yKey = y.cv & ~(bothRefs ? kCvPointerRef : kCvPointerRef | kCvReferentConst);
+                if (xKey != yKey)
                 {
-                    if ((x.cv & y.cv) == x.cv) return -1;
-                    if ((x.cv & y.cv) == y.cv) return 1;
+                    if ((xKey & yKey) == xKey) return -1;
+                    if ((xKey & yKey) == yKey) return 1;
                     return 0;
                 }
                 if (!x.refTarget.empty() && x.refTarget == y.refTarget && x.from == y.from
@@ -2860,10 +3034,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         cxxPointeeConstMismatches += 2;
                     else if (relation == CxxPointeeConstRelation::Adds)
                         cxxPointeeConstMismatches += 1;
-                    // Not viable in C++: a dropped pointee const, or any inner-const change at **.
+                    const size_t paramIndex = std::distance(
+                        candidate.Parameters.begin(), candidateParamItr);
+                    const bool invalidPointerRefBinding = candidate.IsCxx
+                        && CxxPointerReferenceBindingInvalid(candidate, paramIndex, arg,
+                                                             *candidateParamItr, relation);
+                    // Also not viable: a dropped pointee const or an inner-const change at **.
                     if (relation == CxxPointeeConstRelation::Drops
                         || (relation == CxxPointeeConstRelation::Adds
-                            && arg.TypeAndValue.ElemPointer))
+                            && arg.TypeAndValue.ElemPointer)
+                        || invalidPointerRefBinding)
                         cxxPointeeConstNotViable = true;
                 }
                 // C++ overloads on a callback's pointee const (`int(*)(const void*)` vs
@@ -3111,6 +3291,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                     LLVMBackend::TypeAndValue tmpArg = arg.TypeAndValue;
                     LLVMBackend::TypeAndValue tmpParam = *candidateParamItr;
+                    const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
+
+                    CxxPointerReferenceInfo tmpParamPointerRef;
+                    if (candidate.IsCxx && arg.TypeAndValue.Pointer
+                        && !(candidate.IsMethod && paramIndex == 0))
+                        tmpParamPointerRef = CxxPointerReferenceProperties(
+                            candidate, paramIndex, *candidateParamItr);
 
                     tmpArg.TypeName = resolveName(tmpArg.TypeName);
                     tmpParam.TypeName = resolveName(tmpParam.TypeName);
@@ -3132,7 +3319,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // Preserve legacy CFlat calls that used `&owner` as `T**`; an exact
                     // `unique<T>*` overload still outranks this slot-address compatibility.
                     coreUniqueAddressToRawSlot = IsAddressedUniqueSlotToRawSlot(arg, tmpArg, tmpParam);
-                    const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
                     const bool cxxByValueParam = candidate.IsCxx
                         && ((paramIndex < candidate.Recipe.paramSlots.size()
                              && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal)
@@ -3183,10 +3369,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         || coreUniqueOutParam
                         || IsStackValueToCoreUniqueInterface(arg, tmpParam))
                         result = 0;
-                    else if (tmpParam.IsCxxRefToPointer && tmpArg.Pointer)
+                    else if (tmpParamPointerRef.IsReference
+                        && tmpArg.Pointer)
                     {
                         result = 0;
-                        refPtrConstMismatches += CxxRefToPointerScore(arg, *candidateParamItr);
+                        const bool hasByValueTwin = HasEquivalentCxxByValuePointerCandidate(
+                            candidates, paramIndex, *candidateParamItr);
+                        if (!hasByValueTwin)
+                            refPtrConstMismatches += CxxRefToPointerScore(
+                                arg, tmpParamPointerRef.IsConstReference);
                     }
                     // `T *&&` takes the pointer VALUE through a temporary slot, so it binds a
                     // pointer rvalue whose pointee type matches the referred pointer.
@@ -3464,10 +3655,21 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     }
                     else
                     {
-                        const bool refToPointerBind = candidateParamItr->IsCxxRefToPointer
+                        const size_t paramIndex = std::distance(
+                            candidate.Parameters.begin(), candidateParamItr);
+                        const CxxPointerReferenceInfo pointerRef = candidate.IsCxx
+                            && arg.TypeAndValue.Pointer && !(candidate.IsMethod && paramIndex == 0)
+                            ? CxxPointerReferenceProperties(candidate, paramIndex, *candidateParamItr)
+                            : CxxPointerReferenceInfo{};
+                        const bool refToPointerBind = pointerRef.IsReference
                             && arg.TypeAndValue.Pointer;
                         if (refToPointerBind)
-                            refPtrConstMismatches += CxxRefToPointerScore(arg, *candidateParamItr);
+                        {
+                            if (!HasEquivalentCxxByValuePointerCandidate(
+                                    candidates, paramIndex, *candidateParamItr))
+                                refPtrConstMismatches += CxxRefToPointerScore(
+                                    arg, pointerRef.IsConstReference);
+                        }
                         result = refToPointerBind
                             ? 0 : CompareUpconvert(arg.BaseType, candidateParam);
                     }
@@ -3724,9 +3926,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // A string literal is an array lvalue: its decayed pointer is a prvalue, which a
                 // C++ `T *&` cannot bind (clang refuses); only `T *const &` takes a temporary.
                 // A generated wrapper's own `T *&` is a CFlat-side caller slot, not C++'s.
+                const std::string pointerReferenceSpelling = candidate.IsCxx
+                    ? CxxReferenceParameterSpelling(candidate, paramIndex) : std::string();
+                CxxReferenceKind pointerReferenceKind = CxxReferenceKind::None;
+                CxxSpellingWithoutRef(pointerReferenceSpelling, &pointerReferenceKind);
                 if (result >= 0 && candidate.IsCxx && !candidate.UniqueName.starts_with("__cflat_")
-                    && candidateParamItr->IsCxxRefToPointer
-                    && !candidateParamItr->CxxConstRef()
+                    && (candidateParamItr->IsCxxRefToPointer
+                        || pointerReferenceKind == CxxReferenceKind::RefToPointer)
+                    && !candidateParamItr->IsRvalueRef
+                    && !CxxParamIsConstPointerReference(pointerReferenceSpelling, *candidateParamItr)
                     && (arg.IsStringLiteral || isStringLiteralValue(arg.Primary)))
                     result = -1;
 
@@ -4491,6 +4699,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     indistinguishable = CompareCxxConversionRanks(cxxRanks[survivors[i]->pair],
                                                                   cxxRanks[survivors[j]->pair], crossing) == 0
                         && (!referenceMix(survivors[i]->pair->second, survivors[j]->pair->second)
+                            || CxxPointerReferenceValueMix(
+                                survivors[i]->pair->first, survivors[i]->pair->second,
+                                survivors[j]->pair->second)
                             || unrelatedDerivedMix(cxxRanks[survivors[i]->pair],
                                                    cxxRanks[survivors[j]->pair],
                                                    survivors[i]->pair->second,
@@ -5610,8 +5821,67 @@ bool LLVMBackend::CxxCandidateReferenceDropsCv(const std::vector<NamedVariable>&
                                                const FunctionSymbol& candidate) const
 {
         for (size_t i = 0; i < arguments.size(); ++i)
-            if (CxxRvalueReferenceDropsObjectCv(candidate, i, arguments[i])) return true;
+            if (CxxRvalueReferenceDropsObjectCv(candidate, i, arguments[i])
+                || CxxLvalueReferenceDropsObjectCv(candidate, i, arguments[i]))
+                return true;
         return false;
+}
+
+LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::CxxLvalueReferenceDropsObjectCv(
+    const FunctionSymbol& candidate, size_t index, const NamedVariable& arg) const
+{
+        if (!candidate.IsCxx || index >= candidate.Parameters.size()) return false;
+        const TypeAndValue& param = candidate.Parameters[index];
+        if (!param.IsAlias || param.IsRvalueRef || param.IsCxxRefToPointer || param.ElemPointer
+            || !IsCxxRecord(param.TypeName))
+            return false;
+        const TypeAndValue& source = arg.TypeAndValue;
+        if (source.Pointer || source.ElemPointer || !IsCxxRecord(source.TypeName)) return false;
+        if (source.TypeName != param.TypeName)
+        {
+            uint64_t offset = 0;
+            bool inaccessible = false;
+            if (!FindCxxValueBaseOffset(source.TypeName, param.TypeName, offset, inaccessible, nullptr))
+                return false;
+        }
+        const std::string spelling = CxxReferenceParameterSpelling(candidate, index);
+        if (!CxxReferenceCvIsKnown(candidate, index, spelling)) return false;
+        const int targetCv = CxxSpellingCv(spelling) | (param.CxxConstRef() ? 1 : 0)
+            | (param.IsCxxPointeeVolatile ? 2 : 0);
+        return (CxxReceiverCv(arg) & 1) != 0 && (targetCv & 1) == 0;
+}
+
+LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::RejectCxxConstLvalueReferenceBinding(
+    const TypeAndValue& param, const NamedVariable& arg) const
+{
+        if (!param.IsCxxRef() || param.IsRvalueRef || param.CxxConstRef()
+            || param.IsCxxRefToPointer || param.ElemPointer || !IsCxxRecord(param.TypeName))
+            return;
+        const TypeAndValue& source = arg.TypeAndValue;
+        if (source.Pointer || source.ElemPointer || !IsCxxRecord(source.TypeName)) return;
+        if (source.TypeName != param.TypeName)
+        {
+            uint64_t offset = 0;
+            bool inaccessible = false;
+            if (!FindCxxValueBaseOffset(source.TypeName, param.TypeName, offset, inaccessible, nullptr))
+                return;
+        }
+        if ((CxxReceiverCv(arg) & 1) == 0) return;
+        LogError(std::format("binding reference of type '{}' to value of type 'const {}' discards qualifiers",
+            DisplayCxxClassName(param.TypeName), DisplayCxxClassName(source.TypeName)));
+}
+
+LLVM_ATTRIBUTE_NOINLINE llvm::Value* LLVMBackend::CxxFunctionValueClassReferenceArg(
+    const TypeAndValue& param, const NamedVariable& arg, llvm::Value* value) const
+{
+        if (!param.IsCxxRef() || !param.IsAlias || param.IsRvalueRef
+            || param.IsCxxRefToPointer || !IsCxxRecord(param.TypeName)
+            || arg.IsRvalue || arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
+            || !IsCxxRecord(arg.TypeAndValue.TypeName)
+            || ResolveTypeAlias(param.TypeName) != ResolveTypeAlias(arg.TypeAndValue.TypeName)
+            || arg.Storage == nullptr)
+            return value;
+        return arg.Storage;
 }
 
 int LLVMBackend::CxxReturnValueCv(const FunctionSymbol& candidate)
@@ -6951,6 +7221,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             "binding reference of type '{}' to value of type 'const {}' discards qualifiers",
                             type, source));
                     }
+                    else if (CxxLvalueReferenceDropsObjectCv(c, i, arguments[i]))
+                        RejectCxxConstLvalueReferenceBinding(c.Parameters[i], arguments[i]);
                 for (size_t i = 0; i < arguments.size() && i < c.Parameters.size(); ++i)
                 {
                     const auto& param = c.Parameters[i];
@@ -8463,6 +8735,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const bool cxxNullptrReference = !inVariadicRange && candidate.IsCxx
                 && (candParamItr->IsCxxNullptrT || CxxSpellingIsNullptrT(cxxReferenceSpelling))
                 && cxxReferenceSpelling.find('&') != std::string::npos;
+            CxxReferenceKind cxxReferenceKind = CxxReferenceKind::None;
+            CxxSpellingWithoutRef(cxxReferenceSpelling, &cxxReferenceKind);
             if (!inVariadicRange && cxxNullptrReference)
             {
                 auto nullptrParam = *candParamItr;
@@ -8561,9 +8835,27 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
                 argList.push_back(ReboxInterfaceIfNeeded(val, arg.TypeAndValue.TypeName, candParamItr->TypeName));
             }
-            else if (!inVariadicRange && candParamItr->IsCxxRefToPointer)
+            else if (!inVariadicRange && (candParamItr->IsCxxRefToPointer
+                || (candidate.IsCxx && cxxReferenceKind == CxxReferenceKind::RefToPointer)))
             {
-                argList.push_back(LowerAliasByPointerArg(arg, *candParamItr));
+                TypeAndValue pointerRefParam = *candParamItr;
+                if (candidate.IsCxx && !cxxReferenceSpelling.empty())
+                {
+                    const bool pointeeConst = (pointerRefParam.ConstMask & 1u) != 0;
+                    const bool hasPointerSpelling = cxxReferenceSpelling.find('*') != std::string::npos;
+                    const bool constPointerReference = CxxParamIsConstPointerReference(
+                        cxxReferenceSpelling, pointerRefParam);
+                    pointerRefParam.DropCxxRef();
+                    pointerRefParam.IsCxxRefToPointer = true;
+                    pointerRefParam.IsAlias = true;
+                    pointerRefParam.MarkCxxRef();
+                    pointerRefParam.SetPointeeConstBit(hasPointerSpelling
+                        ? CxxSpellingHasConstPointee(cxxReferenceSpelling) : pointeeConst);
+                    pointerRefParam.SetCxxConstRef(constPointerReference);
+                }
+                const bool allowPointerRefTemporary = candidate.UniqueName.starts_with("__cflat_tpl_");
+                argList.push_back(LowerAliasByPointerArg(arg, pointerRefParam, false,
+                                                          allowPointerRefTemporary));
             }
             else if (TypeAndValue pointerBoolReferent;
                      !inVariadicRange && candidate.IsCxx

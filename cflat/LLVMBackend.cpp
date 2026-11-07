@@ -7932,6 +7932,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.IsWriteInferredSink) po["wis"] = true;
             if (p.IsRvalueRef) po["rr"] = true;
             if (p.IsAlias) po["ia"] = true;
+            if (p.IsCxxRefToPointer) po["crp"] = true;
             if (p.IsPointeeConst) po["pc"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
@@ -8044,6 +8045,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getBoolean("wis")) p.IsWriteInferredSink = *v;
                     if (auto v = po->getBoolean("rr")) p.IsRvalueRef = *v;
                     if (auto v = po->getBoolean("ia")) p.IsAlias = *v;
+                    if (auto v = po->getBoolean("crp")) p.IsCxxRefToPointer = *v;
                     if (auto v = po->getBoolean("pc")) p.IsPointeeConst = *v;
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);

@@ -357,9 +357,8 @@ bool LLVMBackend::CompleteCxxTemplateTypeArgs(const std::string& baseName,
         return true;
 }
 
-bool LLVMBackend::TryResolveDefaultedCxxGenericBaseAlias(const std::string& alias,
-                                                          std::string& resolvedType,
-                                                          std::string& error)
+LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::TryResolveDefaultedCxxGenericBaseAlias(
+    const std::string& alias, std::string& resolvedType, std::string& error)
 {
         resolvedType.clear();
         error.clear();
@@ -367,7 +366,29 @@ bool LLVMBackend::TryResolveDefaultedCxxGenericBaseAlias(const std::string& alia
         const std::string baseName = ResolveGenericBaseAlias(alias);
         if (!HasCxxClassTemplate(baseName)) return false;
         std::vector<std::string> typeArgs;
-        if (!CompleteCxxTemplateTypeArgs(baseName, typeArgs)) return false;
+        if (!CompleteCxxTemplateTypeArgs(baseName, typeArgs))
+        {
+            auto parameters = cxxClassTemplateParameters_.find(baseName);
+            if (parameters == cxxClassTemplateParameters_.end())
+                parameters = cxxClassTemplateParameters_.find(ResolveQualifiedName(baseName));
+            if (parameters != cxxClassTemplateParameters_.end()
+                && !AnyGenericTypeTemplateNamed(baseName))
+            {
+                std::string missing;
+                for (size_t i = typeArgs.size(); i < parameters->second.parameters.size(); ++i)
+                {
+                    const auto& parameter = parameters->second.parameters[i];
+                    if (parameter.hasDefault) continue;
+                    if (!missing.empty()) missing += ", ";
+                    missing += parameter.name.empty()
+                        ? std::format("#{}", i + 1) : parameter.name;
+                }
+                if (!missing.empty())
+                    error = std::format("C++ template alias '{}' requires explicit template "
+                        "argument(s) for parameter(s) without defaults: {}", alias, missing);
+            }
+            return false;
+        }
         const std::string mangledName = MangleGenericInstance(*this, baseName, typeArgs);
         if (!TryRequestCxxType(baseName, typeArgs, mangledName, error)
             && !IsCxxForeignTypeRegistered(ResolveTypeAlias(mangledName)))
@@ -4388,6 +4409,21 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
             }
         }
         const auto relation = CxxRecordPointeeConstRelation(decayedFrom, to);
+        if (!decayedFrom.Pointer || !to.Pointer) return relation;
+        const std::string referenceSpelling = candidate.IsCxx
+            ? CxxReferenceParameterSpelling(candidate, index) : std::string();
+        CxxReferenceKind referenceKind = CxxReferenceKind::None;
+        CxxSpellingWithoutRef(referenceSpelling, &referenceKind);
+        if (candidate.IsCxx && referenceKind == CxxReferenceKind::RefToPointer
+            && decayedFrom.Pointer && to.Pointer
+            && decayedFrom.ElemPointer == to.ElemPointer
+            && decayedFrom.ValuePointerDepth() == to.ValuePointerDepth()
+            && !decayedFrom.TypeName.empty() && !to.TypeName.empty()
+            && ResolveTypeAlias(decayedFrom.TypeName) == ResolveTypeAlias(to.TypeName))
+        {
+            return CxxPointeeConstRelationOf(
+                decayedFrom, CxxSpellingHasConstPointee(referenceSpelling));
+        }
         if (relation != CxxPointeeConstRelation::Unrelated || !candidate.IsCxx
             || (candidate.IsMethod && index == 0))
             return relation;
@@ -4412,6 +4448,40 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
             toConst = referent.find(" const ") != std::string::npos;
         }
         return CxxPointeeConstRelationOf(decayedFrom, toConst);
+}
+
+LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::CxxPointerReferenceNeedsConversion(
+        const NamedVariable& argument, const TypeAndValue& param) const
+{
+        TypeAndValue from = argument.TypeAndValue;
+        if (!from.Pointer || !param.Pointer) return false;
+        if (!from.PointeeConst() && CxxArgumentPointeeConst(argument))
+            from.SetPointeeConstBit(true);
+        if (from.ElemPointer != param.ElemPointer
+            || from.ValuePointerDepth() != param.ValuePointerDepth())
+            return false;
+        if (from.PointeeConstMask() != param.PointeeConstMask())
+            return true;
+        const auto relation = CxxRecordPointeeConstRelation(from, param);
+        return relation == CxxPointeeConstRelation::Adds
+            || relation == CxxPointeeConstRelation::Drops
+            || IsCxxDerivedToBasePointer(from, param);
+}
+
+LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::CxxPointerReferenceBindingInvalid(
+        const FunctionSymbol& candidate, size_t index, const NamedVariable& argument,
+        const TypeAndValue& param, CxxPointeeConstRelation relation) const
+{
+        if (!argument.TypeAndValue.Pointer || candidate.UniqueName.starts_with("__cflat_tpl_")
+            || (candidate.IsMethod && index == 0))
+            return false;
+        const CxxPointerReferenceInfo properties = CxxPointerReferenceProperties(
+            candidate, index, param);
+        if (!properties.IsReference || properties.IsConstReference || param.IsRvalueRef)
+            return false;
+        return relation == CxxPointeeConstRelation::Adds
+            || CxxPointerReferenceNeedsConversion(argument, param)
+            || IsCxxRvalueReferenceArgument(argument);
 }
 
 /*
@@ -5543,6 +5613,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 tv.IsAlias = true;
                 tv.MarkCxxRef();
                 tv.SetCxxConstRef(CxxParamIsConstRefToPointer(spelling));
+                tv.ConstMask |= CxxSpellingPointeeConstMask(spelling, tv.ValuePointerDepth());
             }
             if (refKind == CxxReferenceKind::Lvalue && tv.Pointer
                 && !tv.ElemPointer && !tv.IsFunctionPointer)

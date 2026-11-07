@@ -93,13 +93,13 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | A4 | p3/cpp-tu-odr-split-intermittent-base-lost | [cpp] struct TU emission | intermittent test_cpp_interop rc, not reproduced; evidence in the file |
 | A5 | p3/debug-assert-sweep-leftovers | Debug (assertions-on) builds | residue of the 2026-11-01 Debug sweep |
 | A6 | p3/windows-grouped-err-check-clang-layout-stack-overflow + p3/msvc-postfix-expression-frame-965kb | Windows stack depth | MSVC 965 KB ParsePostfixExpressionInner frame; grouped --check overflow in clang layout |
-| A7 | p3/run-cxx-runtime-link-and-exit-gaps | --run C++ runtime | Windows link failures, macOS exit() teardown after WINRUN |
+| A7 | p3/run-cxx-runtime-link-and-exit-gaps | --run C++ runtime | Windows link failures, macOS exit() teardown after WINRUN; RULED 2026-11-04: two new/delete families now, one-family plan P7 |
 
 ### B - wrong value / wrong overload pick
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| B-MOVEVIEW | p3/move-of-array-view-aborts | view move semantics | `int[] b = move a;` + foreach aborts 134 (needs ruling) |
+| B-MOVEVIEW | p3/move-of-array-view-aborts | view move semantics | `int[] b = move a;` + foreach aborts 134; RULED 2026-11-04: transfer own bit, refuse frame view into sink |
 | - | p3/cpp-using-declaration-member-access-gaps | C++ record flattening + member lookup | `using` re-exposure through a base, two same-named base fields, shadow + using, method using, virtual base: refused, clang accepts; T99 reviews 2-4, pre-existing |
 | - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | global/function name collisions, anonymous/inline-namespace enums, comma, `auto&&`, deref macros, C errno/INT_MAX; T98 reviews 1-2, pre-existing |
 | - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | non-const trivially-copyable lvalue copy-init skips U&& template (unnamed-enum half landed 2026-10-30) |
@@ -111,16 +111,16 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | - | p3/arithmetic-result-type-names-vs-clang | arithmetic result types | RULED 2026-10-31; usual conversions landed (3deaad3e), naming residue |
 | - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | const copy assignment picks differently; extra copies at return init |
 | - | p3/cpp-free-operator-conversion-vs-builtin-ambiguity + p3/template-member-operators-not-ranked + p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in; member operator templates not ranked; MIX7 residue (RULED 2026-10-31) |
-| - | p3/ternary-class-join-boxing-ignores-overload-viability | mixed-class `?:` argument boxing | T147 residue |
+| - | p3/ternary-class-join-boxing-ignores-overload-viability | literal/literal `?:` into C++ std::string param or converting ctor | class-join items landed 2026-11-04 (687d2c8e); string-conversion residue |
 | - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | take with NULLCTOR |
-| - | p3/cpp-const-prvalue-rvalue-ref-binding | const prvalue into T&& / const T&& | edge cases |
+| - | p3/cpp-const-prvalue-rvalue-ref-binding | const prvalue into a C++ constructor `R&&` (lvalue half landed) | edge cases |
 | - | p3/cpp-cast-global-init-std-size-array-fnref-ctor | fn pointer returning an array reference | loses C++ alias on direct ctor forwarding |
 | B5 | p3/cpp-const-twin-overloads-collapse | C++ class member registration (const / non-const twins share one CFlat signature) | NEW 2026-09-28 (B1 matrix, OUT cells C1/C4, E1-E5, F1/F4, H1/H4/H9, L10) |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | C++ class member registration (constrained same-signature twins with a default argument share one CFlat signature) | NEW 2026-10-03 (T22 review rounds 2-4; pre-existing on master) |
 | B5g | p3/cpp-callback-pointee-const-ranking-gaps | function-pointer values lose pointee const; clang-refused callback sets accepted | NEW 2026-10-03 (T25 rounds 3-5, pre-existing on master) |
 | B5h | p3/cpp-nested-member-class-free-return-and-call-result-assign | free function returning a nested member class; assignment to a class result of operator()/operator* | NEW 2026-10-03 (T30 review 2, pre-existing on master) |
 | B5j | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | `const char *const &` overloads: constructor wrapper path and direct non-template ranking; literal at a `const char *&&` template refused | NEW 2026-10-05 (T28 round 5 matrix, pre-existing on master) |
-| B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), implicit-this message, 3 pre-existing P3 | OPEN (array-member move refused T489) |
+| B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), implicit-this message, 3 pre-existing P3 | OPEN (array-member move refused T489; borrowed-param move closed 2026-11-04 as a copy) |
 | B16 | p3/cpp-operator-move-operand-leftovers | template U&&, elision, cond move into forwarding operator=, member-receiver lhs move | NEW 2026-09-28 (D8 report) |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | extra copies (paren call arms, arr elem init) + bare scalar/nested ternary refusals + 3 unrelated | OPEN (P2 landed 1955bd95) |
 | W13b | p3/cpp-overload-variadic-and-conversion-gaps | variadic-set ambiguity, defaulted param before ellipsis, member variadics, user conversions at C++ call args, inline variadic link, non-record const pointers | NEW 2026-09-30 (W13 reviews) |
@@ -134,24 +134,22 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|----------|------|-------|
 | - | p3/cpp-operator-template-set-ambiguity-without-drop-accepted | C++ operator ranking | free-only ambiguous operator template set with no dropped candidate accepted (clang ambiguous); int*/void*/template no-drop case (T85 reviews 3-4, pre-existing) |
 | - | p3/constref-byvalue-constructor-overload-ambiguity-accepted + p3/cpp-brace-overload-ambiguity-leftovers-after-t314 | C++ call / brace-arg ranking | `fw(const WV&)` + `fw(WV)` and brace-argument ties: clang ambiguous, CFlat picks |
-| - | p3/cxx-charptr-lvalue-binds-const-charptr-ref + p3/postfix-arm-ternary-binds-slot-and-literal-at-char-ptr-ref | `const char*&` binding | char* lvalue and string-literal arms bind (clang refuses) |
-| - | p3/cpp-call-after-failed-demand-is-accepted | member demand | member definition accepted after earlier member demands failed |
+| - | p3/postfix-arm-ternary-binds-slot-and-literal-at-char-ptr-ref | ternary arm lvalue residue (TERNADDR) | paren-depth parser overflow, cast-arm address, char-global address join; char* lvalue into const char*& landed 2026-11-04 |
 | - | p3/cpp-ref-return-gate-indirect-global-holders | `&ref()` return gate | global passed to `T*&` / `T**` param (refglob residue) |
 
 ### D - wrongly refused (acceptance gaps)
 
 | Run | Issue(s) | Site | Mode |
 |-----|----------|------|------|
-| - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | static-local C++ init | derived-to-base static refused with array-decay text; lvalue-arm ternary static skips the copy ctor; temp dtor exception not propagated (T93 review 1, pre-existing) |
+| - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | C++ class ternary + static init leftovers | array element of a temp as an arm, temp dtor exception not propagated, global move init, mixed-class lvalue join; moved-arm + nested temp field landed 2026-11-04 |
 | - | p3/cpp-null-macro-and-nullptr-spellings-refused + p3/function-slot-null-zero-spellings | null-constant classifier + converting ctor | full; NULL/__null/nullptr macros, nullptr -> std::function; function-slot ternary join (RULED 2026-10-20) |
 | D1b | p3/cpp-unguarded-header-class-template-lookup-fails-cold (cold-cache only) | free-function selection; incremental request units | NEW 2026-09-28 (D1 leftovers) |
 | - | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused | converting-ctor path | absorbed by P1 (converting constructors); land there |
 | - | p3/cpp-class-pointer-converting-ctor-leftovers | converting-ctor path | T305 residue; with P1 |
 | - | p3/variable-template-explicit-specialization-ignored | C++ variable templates | non-constexpr variable template values refused |
-| - | p3/cpp-defaulted-template-alias-type-uses | CFlat alias of an all-defaults C++ class template | non-ctor type uses fail |
+| - | p3/cpp-defaulted-template-alias-type-uses | CFlat alias of an all-defaults C++ class template | alias templates, qualified namespace aliases, function/unique forms (type uses landed 2026-11-04) |
 | - | p3/cpp-inherited-operator-diamond-and-protected-access | virtual inheritance in imported classes | with P4 virtual-base layout |
 | - | p3/cpp-cast-of-lvalue-skips-temporary-copy | assignment to a cast result | not parsed |
-| - | p3/nullish-reference-value-return-conversion-fails | `??` with a C++ reference rhs | treated as struct value, not address |
 
 ### E - temporary lifetime, leak, dangle (one issue per run, opus-tier area)
 
@@ -213,7 +211,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|----------|-------|
 | L-TUPLE | p3/tuple-leftovers-after-tuplit + p3/tuple-alias-and-element-type-gaps | ruled 2026-11-01; aliases, function-type / pointer / generic elements |
 | L-GENERIC | p3/generic-template-one-slot-silent-replace + p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | RULED 2026-10-31 (overload sets); instantiation as value; ctor deduction (ruled 2026-10-13) |
-| L-TYPEDEFSCOPE | p3/block-scope-typedef-leaks-past-block | silent wrong type: block typedef shadows the global after the block |
+| L-TYPEDEFSCOPE | p3/block-scope-typedef-leaks-past-block | silent wrong type; RULED 2026-11-04: block-scoped alias; resume parked worktree cflat-fix-tdscope |
 | L-NS | p3/namespace-nontemplate-vs-global-template-lookup | global generic beats a same-named namespace non-template |
 | L-PERF | p3/nested-ternary-compile-time | ~2x per `?:` level |
 
@@ -227,6 +225,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | P4 | virtual-base layout (item 2 of p3/cpp-inherited-member-access-and-virtual-base-diagnostics) + p3/cpp-new-virtual-base-class-unsized | refused today ("layout cannot be reproduced"; `new VB()` RULED 2026-10-25 by design until the layout lands); needs a plan |
 | P5 | p4/owning-nullable-string | RULED 2026-10-21: finish `T?` as a planned feature, plan `internal/plan/nullable-types.md` |
 | P6 | p3/no-incremental-build-and-no-up-to-date-check | RULED 2026-08-22; whole-program builds |
+| P7 | plan cpp-one-allocator-family (`internal/plan/cpp-one-allocator-family.md`) | RULED 2026-11-04: one new/delete family so C++ allocates from a `program` thread's allocator; two families until it lands |
 
 ### Platform, runtime library, tooling
 
@@ -274,7 +273,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |---|---|---|
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
 | p3/cpp-pointer-depth-and-array-pointer-param-gaps | (C++ interop) | non-null int** accepted into C++ int***; member/static array-pointer params refuse valid args |
-| p3/float-literal-plus-variable-computed-in-float | (C++ interop) | `i + 1.0` / `f + 1.0` typed float (clang double); check CFlat literal rule first |
+| p3/float-literal-plus-variable-computed-in-float | (C++ interop) | `i + 1.0` / `f + 1.0` typed float (clang double); RULED 2026-11-04: double at C++ template deduction only |
 | p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (ef83ffa02); ruled picks landed GENOVLR (5344802ed); leftovers: CFlat expression typing (1 << 2L, 1.5 + x, char arithmetic), strlit vs char*, named-arg inference, generic-only const pointee return, UFCS free generic |
 | p3/member-type-path-remaining-gaps | (none) | `Outer<int>.Inner<long>.type`, closure-alias members, CFlat static data members, C++ statics as value template args (T37 follow-up) |
 
@@ -284,7 +283,8 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |---|---|
 | p3/alias-return-byvalue-param-leftovers-after-b21 | item 5 ratified (extern C callee owns by-value params) - no code |
 | p4/three-way-comparison-operator | `<=>` in the CFlat language RULED 2026-10-02, plus defaulted member-wise `==` |
-| p4/global-string-array-view-initializer | view half landed 2026-11-03; remaining: global arrays whose elements need a run-time constructor |
+| p3/qualified-name-rooted-vs-innermost-precedence | RULED 2026-11-04: innermost-first like C++/C#; flip rooted-wins legs (test_basic, test_generics 909) |
+| p3/new-pointer-depth-carrier | RULED 2026-11-04: lift the depth-2 cap, carry any depth; plan-sized, scope the carrier first |
 
 ### Grouped runs 2026-10-10 (ranked; source scratch/issue_groups_2026-10-10.md; landed rows removed)
 
@@ -320,8 +320,7 @@ Overload/ctor selection family (never two at once): NULLCTOR, PTRRANK, CTOR-VIAB
 
 | Issue | Question |
 |-------|----------|
-| p3/qualified-name-rooted-vs-innermost-precedence | rooted-first vs C++/C# innermost-first qualified lookup (relative fallback landed 2026-11-01) |
-| p3/new-pointer-depth-carrier | counting a generic-substituted `new T` pointee toward the depth-2 cap breaks core containers instantiated with depth-2 T: lift cap for `new` buffers, core raw-slot builtin, or leave uncounted (box 10 attempt) |
+| (none) | all ruled 2026-11-04 |
 
 ### Conflict map (never concurrent)
 

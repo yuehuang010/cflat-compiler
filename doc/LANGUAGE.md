@@ -2536,6 +2536,11 @@ compile does not reparse the headers.
 Raw-pointer parameters of imported C++ functions borrow by default. To transfer a CFlat owner to
 a C++ callee that takes ownership, write `move p`; this consumes `p`, and later use is rejected.
 
+CFlat `new` / `delete` (the active allocator) and C++ `new` / `delete` (global `operator new`) are two
+allocator families. For scalars and CFlat types they must not be mixed: a block from one family freed
+by the other is undefined behaviour, with no diagnostic (like `malloc` vs `new` in C++). Imported C++
+class types already pair their own `new` and `delete`.
+
 #### Import alias (`as`)
 
 Give an imported file a local alias so its symbols are accessible under a qualified name:
