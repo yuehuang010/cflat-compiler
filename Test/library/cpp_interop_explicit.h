@@ -6,10 +6,59 @@
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <vector>
 
 namespace cppexp {
+
+struct TernStrStringCtor { int value; TernStrStringCtor(std::string s) : value((int)s[0]) {} };
+struct TernStrPtrCtor { int value; TernStrPtrCtor(const char* s) : value((int)s[0]) {} };
+struct TernStrExplicitPtrCtor { explicit TernStrExplicitPtrCtor(const char*) {} };
+inline int ternstr_explicit_sink(TernStrExplicitPtrCtor) { return 0; }
+struct TernStrNoCtor { int x; };
+inline int ternstr_no_ctor_cref(const TernStrNoCtor& f) { return f.x; }
+inline int ternstr_no_ctor_mut(TernStrNoCtor& f) { return f.x; }
+struct TernStrRefCtor { int value; TernStrRefCtor(const char* s) : value((int)s[0]) {} };
+inline int ternstr_ref_cref(const TernStrRefCtor& f) { return 100 + f.value; }
+inline int ternstr_ref_mut(TernStrRefCtor& f) { return 200 + f.value; }
+inline int ternstr_value(std::string s) { return (int)s[0]; }
+inline int ternstr_cref(const std::string& s) { return 100 + (int)s[0]; }
+inline int ternstr_rref(std::string&& s) { return 200 + (int)s[0]; }
+inline int ternstr_pick(std::string s) { return 300 + (int)s[0]; }
+inline int ternstr_pick(const char* s) { return 400 + (int)s[0]; }
+struct TernStrHost { int method(std::string s) { return 500 + (int)s[0]; } };
+
+struct TernStrOverloadCv { TernStrOverloadCv(const char*) {} };
+inline int ternstr_overload_ref(const TernStrOverloadCv&) { return 1; }
+inline int ternstr_overload_ref(const char*) { return 2; }
+inline int ternstr_overload_value(TernStrOverloadCv) { return 1; }
+inline int ternstr_overload_value(const char*) { return 2; }
+inline int ternstr_overload_string_ref(const std::string&) { return 1; }
+inline int ternstr_overload_string_ref(const char*) { return 2; }
+inline int ternstr_overload_ambiguous(const TernStrOverloadCv&) { return 1; }
+inline int ternstr_overload_ambiguous(std::string) { return 2; }
+inline int ternstr_uc_array(const unsigned char*) { return 1; }
+inline int ternstr_uc_array(const char*) { return 2; }
+inline int ternstr_ucv_array(unsigned char*) { return 1; }
+inline int ternstr_ucv_array(char*) { return 2; }
+inline int ternstr_ucs_array(const unsigned char* p) { return p[0]; }
+inline int ternstr_scs_array(const signed char* p) { return p[0]; }
+
+struct TernStrRankBase { int value; };
+struct TernStrRankDerived : TernStrRankBase {};
+struct TernStrRankSource {
+    operator TernStrRankDerived() const { return {}; }
+};
+inline int ternstr_rank_source(TernStrRankDerived) { return 1; }
+inline int ternstr_rank_source(const TernStrRankBase&) { return 2; }
+inline int ternstr_rank_source_rvalue(TernStrRankDerived&&) { return 1; }
+inline int ternstr_rank_source_rvalue(const TernStrRankBase&) { return 2; }
+struct TernStrRankSourceDerived : TernStrRankSource {};
+struct TernStrRankExplicitSource {
+    explicit operator TernStrRankDerived() const { return {}; }
+};
+struct TernStrRankSibling : TernStrRankExplicitSource, TernStrRankSource {};
 
 struct ExplicitListOnly {
     int n;

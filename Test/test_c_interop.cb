@@ -867,6 +867,11 @@ extern int main()
     // is still well inside our 0.01 tolerance.
     if (ML_FLOAT_F < 2.49 || ML_FLOAT_F > 2.51)         return 119;
 
+    // System macros from a C header bind on demand, including a transitive limit and errno lvalue.
+    errno = 73;
+    if (errno != 73) return 120;
+    if (INT_MAX != 2147483647) return 121;
+
     // String-literal macros - routed through Pass B's __typeof__ probe (recovered
     // type is char[N]) and resolved by the string-literal probe. Registered as
     // CFlat `char*` globals interned in the string pool; the C call-site ABI

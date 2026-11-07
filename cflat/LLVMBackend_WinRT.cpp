@@ -4703,10 +4703,49 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
         if (param.IsCxxRefToPointer)
         {
             const bool nonConstPointerLvalueRef = !param.CxxConstRef() && !param.IsRvalueRef;
+            if (nonConstPointerLvalueRef && IsUnwrappedFatClosure(arg) && !arg.IsRvalue
+                && arg.Storage != nullptr)
+            {
+                if (!ClosureSlotHasOnlyTrivialCaptures(arg.Storage))
+                    LogError(std::format(
+                        "cannot bind a CFlat closure with captured state to non-const C++ "
+                        "function-pointer reference parameter '{}'", param.VariableName));
+                if (!arg.CallerName.empty())
+                    if (NamedVariable* source = FindLiveNamedVariable(arg.CallerName);
+                        source != nullptr && source->Storage == arg.Storage)
+                        source->Primary = nullptr;
+                return builder->CreateStructGEP(GetClosureFatPtrType(), arg.Storage, 0,
+                                                "cxx.closure.fnptr.ref");
+            }
             if (!allowPointerRefTemporary && nonConstPointerLvalueRef && arg.TypeAndValue.Pointer
                 && IsCxxRvalueReferenceArgument(arg))
                 LogError(std::format("the parameter '{}' is a non-const reference to a pointer and "
                     "cannot bind a pointer rvalue; pass an lvalue", param.VariableName));
+            if (nonConstPointerLvalueRef && param.IsFunctionPointer && !arg.IsRvalue)
+            {
+                llvm::Type* functionPointerType = paramTy;
+                if (arg.Storage != nullptr && functionPointerType != nullptr
+                    && arg.BaseType == functionPointerType)
+                    return arg.Storage;
+                const std::string sourceName = !arg.CallerName.empty()
+                    ? arg.CallerName : arg.TypeAndValue.VariableName;
+                if (!sourceName.empty())
+                    if (NamedVariable* source = FindLiveNamedVariable(sourceName);
+                        source != nullptr && source->Storage == nullptr
+                        && source->Primary != nullptr
+                        && (source->TypeAndValue.IsFunctionPointer
+                            || llvm::isa<llvm::Function>(source->Primary->stripPointerCasts()))
+                        && functionPointerType != nullptr
+                        && source->Primary->getType() == functionPointerType)
+                    {
+                        auto* slot = AllocaAtEntry(functionPointerType, nullptr, "cxx.fnptr.ref");
+                        builder->CreateStore(source->Primary, slot);
+                        source->Storage = slot;
+                        source->Primary = nullptr;
+                        source->BaseType = functionPointerType;
+                        return slot;
+                    }
+            }
             TypeAndValue sourcePointerType = arg.TypeAndValue;
             if (sourcePointerType.Pointer && !sourcePointerType.PointeeConst()
                 && CxxArgumentPointeeConst(arg))

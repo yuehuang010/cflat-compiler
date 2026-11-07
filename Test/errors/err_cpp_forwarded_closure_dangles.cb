@@ -103,9 +103,6 @@ extern int main()
     // A result that IS a reference to the closure has no CFlat value form.
     Lambda<int(int)> f = (int v) => v * k;
     expect_error("returns a reference to the CFlat closure it was given") {
-        t525.pass(f);
-    }
-    expect_error("returns a reference to the CFlat closure it was given") {
         Lambda<int(int)> m9 = (int v) => v * k;
         t525.pass(move m9);
     }

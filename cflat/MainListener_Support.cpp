@@ -835,10 +835,17 @@ int PeelAliasPointerStars(std::string& name)
     while (!name.empty() && name.back() == '*') { name.pop_back(); depth++; }
     return depth;
 }
-std::string SignatureComponentAliasBase(const LLVMBackend* compiler, std::string name)
+std::string SignatureComponentAliasBase(LLVMBackend* compiler, std::string name)
 {
     if (compiler != nullptr) name = compiler->ResolveTypeAlias(name);
     PeelAliasPointerStars(name);
+    if (compiler != nullptr)
+    {
+        std::string resolved;
+        std::string error;
+        if (compiler->TryResolveDefaultedCxxGenericBaseAlias(name, resolved, error))
+            return resolved;
+    }
     return name;
 }
 bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, int& stars)
@@ -2892,6 +2899,10 @@ std::string ResolveGenericTemplateBaseAtScope(
         if (nonGenericRefusal != nullptr) *nonGenericRefusal = NonGenericRefusal::EnclosingNamespace;
         return {};
     }
+    const std::string qualifiedSpelling = compiler->ResolveQualifiedName(spelledBase);
+    if (!compiler->HasCxxAliasTemplate(qualifiedSpelling)
+        && compiler->IsGenericBaseAlias(qualifiedSpelling))
+        return compiler->ResolveGenericBaseAlias(qualifiedSpelling);
     if (compiler->HasCxxAliasTemplate(lexicalName)) return spelledBase;
     if (compiler->IsGenericBaseAlias(lexicalName))
         return compiler->ResolveGenericBaseAlias(lexicalName);
@@ -2950,6 +2961,8 @@ std::string ResolveGenericTemplateSpellingAtScope(
         base = ResolveGenericTemplateBaseAtScope(
             compiler, base, enclosingScopes, useSite, lookupName, nonGenericRefusal);
     }
+    else if (compiler->HasCxxAliasTemplate(base))
+        compiler->ResolveGenericAliasSpelling(base, args, report);
     else if (base == "unique" && compiler->IsGenericBaseAlias(spelledBase))
         compiler->ResolveGenericAliasSpelling(base, args, report);
     return base;

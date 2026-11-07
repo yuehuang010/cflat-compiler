@@ -740,6 +740,30 @@ std::string LLVMBackend::DeclaredPrimitiveIdentityForCxxArgument(const NamedVari
         return name;
 }
 
+/*
+ * An unscoped C++ enum element of a brace list is spelled by its own name, not its backing type
+ * (CxxSpellingForCflatType answers the backing). A name no request has bound yet has no reverse
+ * entry, so its CFlat name with '::' for '.' is the C++ name.
+ */
+bool LLVMBackend::CxxImportedEnumElementSpelling(const std::string& cflatType, std::string& out) const
+{
+        const std::string enumKey = ResolveEnumTypeName(cflatType);
+        if (enumKey.empty() || importedEnumTypes_.count(enumKey) == 0 || IsScopedEnumTypeName(enumKey))
+            return false;
+        if (auto it = cxxCflatToCxxSpelling_.find(enumKey); it != cxxCflatToCxxSpelling_.end())
+        {
+            out = it->second;
+            return true;
+        }
+        if (!std::all_of(enumKey.begin(), enumKey.end(), [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.'; }))
+            return false;
+        out = enumKey;
+        for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; pos += 2)
+            out.replace(pos, 1, "::");
+        return true;
+}
+
 bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const
 {
         // `T[]` as a template argument is C++'s array of unknown bound (make_unique<int[]>).
@@ -3143,6 +3167,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.isAbstract = cached.isAbstract;
         raw.hasFriendOperators = cached.hasFriendOperators;
         raw.friendNames = cached.friendNames;
+        raw.ambiguousFieldNames = cached.ambiguousFieldNames;
         raw.bases = cached.bases;
         raw.virtualBases = cached.virtualBases;
         raw.layoutRefusal = cached.layoutRefusal;
@@ -4265,8 +4290,11 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
                 ? arg.LiteralIdentity : arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
             llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType;
+            const std::string enumKey = ResolveEnumTypeName(arg.TypeAndValue.TypeName);
+            const bool importedEnum = !enumKey.empty() && !IsCflatOnlyUnscopedEnum(enumKey);
             // An arithmetic result keeps its C++ type (`l + 1` is `long`, not the i64 TypeName).
-            if (std::string arith = CxxArithIdentityForArgument(arg, valueType); !arith.empty())
+            if (std::string arith = CxxArithIdentityForArgument(arg, valueType);
+                !arith.empty() && !importedEnum)
                 type = arith;
             if (std::string promoted = CxxUnscopedEnumPromotedIdentity(arg); !promoted.empty())
                 type = promoted;
@@ -4345,9 +4373,12 @@ std::string LLVMBackend::CxxBraceElementIdentity(const NamedVariable& element) c
                                                            : element.BaseType;
         std::string type = !element.LiteralIdentity.empty() ? element.LiteralIdentity
                                                             : element.TypeAndValue.TypeName;
+        const std::string enumKey = ResolveEnumTypeName(element.TypeAndValue.TypeName);
+        const bool importedEnum = !enumKey.empty() && !IsCflatOnlyUnscopedEnum(enumKey);
         // Same identity CxxBraceElementSpelling keys the wrapper by (`l + 4` is `long`), so two
         // wrappers never share one selector namespace while ranking different element types.
-        if (std::string arith = CxxArithIdentityForArgument(element, valueType); !arith.empty())
+        if (std::string arith = CxxArithIdentityForArgument(element, valueType);
+            !arith.empty() && !importedEnum)
             type = arith;
         if (std::string promoted = CxxUnscopedEnumPromotedIdentity(element); !promoted.empty())
             type = promoted;
@@ -4360,6 +4391,7 @@ std::string LLVMBackend::CxxBraceElementIdentity(const NamedVariable& element) c
 std::string LLVMBackend::CxxBraceSelectorElement(
         const NamedVariable& element, const std::vector<std::string>& candidateElements)
 {
+        if (!element.CxxImportedLiteral.empty()) return element.CxxImportedLiteral;
         llvm::Type* valueType = element.Primary != nullptr ? element.Primary->getType()
                                                            : element.BaseType;
         if (element.TypeAndValue.Pointer || valueType == nullptr

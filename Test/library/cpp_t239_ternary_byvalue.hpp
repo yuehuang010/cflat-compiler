@@ -72,3 +72,46 @@ struct Shift {
 };
 inline Shift operator>>(Shift c, int s) noexcept { return Shift(c.value >> s); }
 }
+
+
+namespace cppternbase {
+inline int copies = 0;
+inline int dtors = 0;
+inline int assignments = 0;
+inline int which = 0;
+
+struct B {
+    int v;
+    B(int value) : v(value) {}
+    B(const B& other) : v(other.v) { ++copies; }
+    B& operator=(const B& other) { v = other.v; ++assignments; which = 4; return *this; }
+    ~B() { ++dtors; }
+};
+
+struct D : public B {
+    D(int value) : B(value) {}
+};
+
+struct D2 : public D {
+    D2(int value) : D(value + 100) {}
+};
+
+struct X : public B { X(int value) : B(value) {} };
+struct Y : public B { Y(int value) : B(value + 1) {} };
+struct Amb : public X, public Y { Amb(int value) : X(value), Y(value + 2) {} };
+struct Priv : private B { Priv(int value) : B(value) {} };
+struct Other { int v; Other(int value) : v(value) {} };
+
+inline void resetCounts() { copies = dtors = assignments = which = 0; }
+inline int constRef(const B& value) { which = 1; return value.v; }
+inline int mutRef(B& value) { which = 2; value.v += 1000; return value.v; }
+inline int byValue(B value) { which = 3; return value.v; }
+inline int memberPointer(const B& value)
+{
+    int B::*member = &B::v;
+    which = 6;
+    return value.*member;
+}
+inline int takeD(const D& value) { which = 7; return value.v + 200; }
+inline int takeB(const B& value) { which = 8; return value.v + 300; }
+}

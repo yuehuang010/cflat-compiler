@@ -1,3 +1,5 @@
+#include <set>
+#include <tuple>
 #include "MainListener.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -1277,6 +1279,13 @@ std::string MainListener::ResolveSigComponentCodegen(
                 outPointer = true;
             }
         }
+        {
+            std::string resolved;
+            std::string error;
+            if (Compiler(ts)->TryResolveDefaultedCxxGenericBaseAlias(name, resolved, error))
+                return resolved;
+            if (!error.empty()) LogErrorContext(ts, error);
+        }
         if (ts->qualifiedGenericIdentifier() != nullptr
             && ts->qualifiedGenericIdentifier()->genericTypeParameters() == nullptr
             && !Compiler(ts)->IsKnownTypeName(name))
@@ -2114,6 +2123,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrReturnAliasSpelling = fit->FuncPtrReturnAliasSpelling;
+                    declType.FuncPtrReturnHasStrippedInnerDimensions =
+                        fit->FuncPtrReturnHasStrippedInnerDimensions;
                     declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrNoPrototype = fit->FuncPtrNoPrototype;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
@@ -4706,7 +4717,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // already names. One hop - enough for the qualified-WinMD-name -> short-alias -> shorter
         // -alias chains that consuming a .winmd produces.
         target = compiler->ResolveQualifiedName(target);
-        target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
+        if (!compiler->HasCxxAliasTemplate(target))
+            target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
 
         // Alias targets may already carry decoration from an earlier alias (e.g. Q = P where
         // P = int*). Validate the undecorated base, then put every inherited decoration back into
@@ -4729,7 +4741,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         auto IsGenericTemplateName = [&](const std::string& n) {
             return genericStructTemplates.count(n) != 0 || genericClassTemplates.count(n) != 0
                 || genericInterfaceTemplates.count(n) != 0 || compiler->IsWinrtGenericBase(n)
-                || compiler->HasCxxClassTemplate(n);
+                || compiler->HasCxxClassTemplate(n) || compiler->HasCxxAliasTemplate(n);
         };
 
         // Generic RHS (using IL = list<int>): mangle to list$int and pre-declare the shell +
@@ -4857,7 +4869,8 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
 
         if (iface != nullptr)
         {
-            ParseInterfaceDefinition(iface, namespaceName);
+            if (preparsedInterfaceDefinitions_.erase(iface) == 0)
+                ParseInterfaceDefinition(iface, namespaceName);
         }
         else if (ns != nullptr)
         {
@@ -4884,11 +4897,29 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
         else if (dataStruct != nullptr)
         {
             if (preparsedCppStructDefinitions_.erase(dataStruct) == 0)
+            {
+                if (preparsedAggregateDefinitions_.erase(dataStruct) != 0)
+                {
+                    const std::string name = namespaceName.empty()
+                        ? dataStruct->directDeclarator()->getText()
+                        : namespaceName + "." + dataStruct->directDeclarator()->getText();
+                    ProcessDeferredGenericMemberBodies(0, false, name);
+                }
+                else
                 ParseStructDefinition(dataStruct, {}, namespaceName);
+            }
         }
         else if (classDef != nullptr)
         {
-            ParseClassDefinition(classDef, {}, namespaceName);
+            if (preparsedAggregateClassDefinitions_.erase(classDef) == 0)
+                ParseClassDefinition(classDef, {}, namespaceName);
+            else
+            {
+                const std::string name = namespaceName.empty()
+                    ? classDef->directDeclarator()->getText()
+                    : namespaceName + "." + classDef->directDeclarator()->getText();
+                ProcessDeferredGenericMemberBodies(0, false, name);
+            }
         }
         else if (auto progDef = ctx->programDefinition())
         {
@@ -5364,6 +5395,8 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
         // First pass: forward ref scan the taken branch to register symbols
         ForwardRefScanner scanner(Compiler());
         scanner.SetTokens(GetTokens());
+        for (auto* extDecl : branchDecls)
+            scanner.PreRegisterAggregateTypeShells(extDecl, namespaceName);
         for (auto* extDecl : branchDecls)
             scanner.PreRegisterEnums(extDecl, namespaceName);
         for (auto* extDecl : branchDecls)
@@ -6466,6 +6499,758 @@ bool MainListener::IsProgramLifetimeStorage(
         return isGlobalStorage(nv.Storage);
     }
 
+namespace {
+constexpr int64_t kCxxReferenceAnyIndex = std::numeric_limits<int64_t>::min();
+
+bool CxxReferenceStoragePath(llvm::Value* storage, llvm::Value*& root,
+                             std::vector<int64_t>& indices)
+{
+    std::function<bool(llvm::Value*)> walk = [&](llvm::Value* current) {
+        if (current == nullptr || !current->getType()->isPointerTy()) return false;
+        current = current->stripPointerCasts();
+        if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(current))
+        {
+            if (!walk(gep->getPointerOperand())) return false;
+            for (auto it = gep->idx_begin(); it != gep->idx_end(); ++it)
+            {
+                auto* constant = llvm::dyn_cast<llvm::ConstantInt>(it->get());
+                indices.push_back(constant == nullptr
+                    ? kCxxReferenceAnyIndex : constant->getSExtValue());
+            }
+            return true;
+        }
+        root = current;
+        return true;
+    };
+    return storage != nullptr && walk(storage);
+}
+
+bool CxxReferencePathPrefix(const std::vector<int64_t>& prefix,
+                            const std::vector<int64_t>& path)
+{
+    if (prefix.size() > path.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i)
+        if (prefix[i] != path[i] && prefix[i] != kCxxReferenceAnyIndex
+            && path[i] != kCxxReferenceAnyIndex)
+            return false;
+    return true;
+}
+}
+
+bool MainListener::CxxReferenceSourceOutlivesFunction(
+        const LLVMBackend::NamedVariable& nv) const
+{
+    if (IsProgramLifetimeStorage(nv)) return true;
+    auto* compiler = compilerLLVM;
+    if (compiler == nullptr || nv.Storage == nullptr
+        || !nv.Storage->getType()->isPointerTy())
+        return false;
+    auto* currentFunction = compiler->builder->GetInsertBlock() != nullptr
+        ? compiler->builder->GetInsertBlock()->getParent() : nullptr;
+    const auto* currentSymbol = currentFunction != nullptr
+        ? compiler->FindSymbolForFunction(currentFunction) : nullptr;
+    const auto thisReceiver = compiler->GetThisPointer();
+    llvm::Value* thisReceiverStorage = thisReceiver.Primary != nullptr
+        ? thisReceiver.Primary : thisReceiver.Storage;
+    std::unordered_set<llvm::Value*> active;
+    std::function<bool(llvm::Value*, bool)> storageOutlivesFunction;
+    storageOutlivesFunction = [&](llvm::Value* storage, bool allowAliasParameter) -> bool {
+        if (storage == nullptr || !storage->getType()->isPointerTy()) return false;
+        storage = storage->stripPointerCasts();
+        if (!active.insert(storage).second) return false;
+        bool outlives = false;
+        if (thisReceiver.IsThisReceiver && thisReceiverStorage != nullptr
+            && llvm::isa<llvm::LoadInst>(storage)
+            && llvm::cast<llvm::LoadInst>(storage)->getPointerOperand()
+                ->stripPointerCasts() == thisReceiverStorage->stripPointerCasts())
+            outlives = true;
+        else if (llvm::isa<llvm::GlobalVariable>(storage))
+            outlives = true;
+        else if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storage))
+            outlives = storageOutlivesFunction(gep->getPointerOperand(), allowAliasParameter);
+        else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(storage))
+            outlives = storageOutlivesFunction(select->getTrueValue(), allowAliasParameter)
+                && storageOutlivesFunction(select->getFalseValue(), allowAliasParameter);
+        else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(storage))
+        {
+            outlives = phi->getNumIncomingValues() != 0;
+            for (unsigned i = 0; outlives && i < phi->getNumIncomingValues(); ++i)
+                outlives = storageOutlivesFunction(phi->getIncomingValue(i), allowAliasParameter);
+        }
+        else if (auto* argument = llvm::dyn_cast<llvm::Argument>(storage))
+        {
+            const bool receiver = currentSymbol != nullptr && currentSymbol->IsMethod
+                && argument->getArgNo() == 0;
+            const auto* parameterNV = compiler->FindVariableByStorage(argument);
+            const bool borrowedAlias = allowAliasParameter && !receiver
+                && parameterNV != nullptr && parameterNV->TypeAndValue.IsAlias
+                && !parameterNV->TypeAndValue.Pointer;
+            outlives = receiver || borrowedAlias;
+        }
+        active.erase(storage);
+        return outlives;
+    };
+    return storageOutlivesFunction(nv.Storage, true);
+}
+
+void MainListener::RecordCxxReferenceMemberProvenance(
+        llvm::Value* objectSlot, const std::string& aggregateType,
+        const std::string& fieldName, CxxReferenceMemberLifetime lifetime,
+        antlr4::ParserRuleContext* context)
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return;
+    CxxReferenceMemberProvenance fact;
+    if (!CxxReferenceStoragePath(objectSlot, fact.Root, fact.ObjectPath)) return;
+    fact.AggregateType = aggregateType;
+    fact.FieldName = fieldName;
+    fact.Lifetime = lifetime;
+    fact.Context = context;
+    fact.Regions = CurrentCxxFactPoint().Regions;
+    fact.Seq = cxxFactSeq_++;
+    cxxReferenceMemberProvenance_[compilerLLVM->currentFunction].push_back(std::move(fact));
+}
+
+MainListener::CxxFactPoint MainListener::CurrentCxxFactPoint() const
+{
+    CxxFactPoint point;
+    point.Seq = cxxFactSeq_;
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return point;
+    const auto found = cxxFactRegions_.find(compilerLLVM->currentFunction);
+    if (found != cxxFactRegions_.end())
+        for (const auto& region : found->second) point.Regions.push_back(region.Id);
+    return point;
+}
+
+void MainListener::PushCxxFactRegion(llvm::Function* function, bool loop, bool switchCase,
+                                     bool hasDefault)
+{
+    if (function == nullptr) return;
+    CxxFactRegion region;
+    region.Id = static_cast<uint32_t>(cxxFactRegionIsLoop_.size());
+    region.Loop = loop;
+    region.SwitchCase = switchCase;
+    region.HasDefault = hasDefault;
+    region.Start = region.GroupStart = cxxFactSeq_;
+    cxxFactRegionIsLoop_.push_back(loop);
+    cxxFactRegions_[function].push_back(std::move(region));
+}
+
+/*
+ * Each case group of a switch is its own branch: dispatch can enter it skipping earlier ones. A
+ * group with no write and no break only falls through, so it joins the next group.
+ */
+void MainListener::RenewCxxFactSwitchCase()
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return;
+    const auto found = cxxFactRegions_.find(compilerLLVM->currentFunction);
+    if (found == cxxFactRegions_.end() || found->second.empty()
+        || !found->second.back().SwitchCase)
+        return;
+    auto& region = found->second.back();
+    if (cxxFactSeq_ == region.GroupStart && region.BreakSeq == UINT64_MAX) return;
+    region.Groups.push_back(CxxFactGroup{ region.Id, region.GroupStart, cxxFactSeq_,
+                                          region.BreakSeq });
+    region.Id = static_cast<uint32_t>(cxxFactRegionIsLoop_.size());
+    cxxFactRegionIsLoop_.push_back(false);
+    region.GroupStart = cxxFactSeq_;
+    region.BreakSeq = UINT64_MAX;
+}
+
+// A `break` leaves the innermost loop or switch case group, a `continue` the loop body: writes
+// after it do not cover that exit.
+void MainListener::NoteCxxFactJump(bool isContinue)
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return;
+    const auto found = cxxFactRegions_.find(compilerLLVM->currentFunction);
+    if (found == cxxFactRegions_.end()) return;
+    for (auto region = found->second.rbegin(); region != found->second.rend(); ++region)
+        if (region->Loop || (!isContinue && region->SwitchCase))
+        {
+            // A do-while `continue` jumps to the exit test, so it counts as an exit too.
+            if (!isContinue || region->ContinueExits)
+                region->BreakSeq = std::min(region->BreakSeq, cxxFactSeq_);
+            cxxFactJumps_[compilerLLVM->currentFunction].emplace_back(cxxFactSeq_, region->Id);
+            return;
+        }
+}
+
+// A do-while or constant-true loop runs its body before any exit.
+void MainListener::MarkCxxFactLoopEntersBody(bool continueExits)
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return;
+    const auto found = cxxFactRegions_.find(compilerLLVM->currentFunction);
+    if (found == cxxFactRegions_.end()) return;
+    for (auto region = found->second.rbegin(); region != found->second.rend(); ++region)
+        if (region->Loop)
+        {
+            region->AlwaysEnters = true;
+            region->ContinueExits = continueExits;
+            return;
+        }
+}
+
+// The branch region just closed at the current nesting depth (cleared by the caller before it).
+bool MainListener::TakeCxxFactBranch(CxxFactGroup& group, size_t depth) const
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr
+        || lastPoppedCxxFactRegion_.Function != compilerLLVM->currentFunction
+        || lastPoppedCxxFactRegion_.Depth != depth)
+        return false;
+    group = lastPoppedCxxFactRegion_;
+    return true;
+}
+
+namespace {
+using CxxSeqRanges = std::vector<std::pair<uint64_t, uint64_t>>;
+
+CxxSeqRanges NormalizeCxxSeqRanges(CxxSeqRanges ranges)
+{
+    std::sort(ranges.begin(), ranges.end());
+    CxxSeqRanges merged;
+    for (const auto& range : ranges)
+    {
+        if (range.first >= range.second) continue;
+        if (!merged.empty() && range.first <= merged.back().second)
+            merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    return merged;
+}
+
+CxxSeqRanges IntersectCxxSeqRanges(const CxxSeqRanges& left, const CxxSeqRanges& right)
+{
+    CxxSeqRanges result;
+    for (const auto& a : left)
+        for (const auto& b : right)
+            if (std::max(a.first, b.first) < std::min(a.second, b.second))
+                result.emplace_back(std::max(a.first, b.first), std::min(a.second, b.second));
+    return NormalizeCxxSeqRanges(std::move(result));
+}
+
+bool CxxSeqInRanges(uint64_t seq, const CxxSeqRanges& ranges)
+{
+    return std::any_of(ranges.begin(), ranges.end(),
+        [&](const auto& range) { return seq >= range.first && seq < range.second; });
+}
+}
+
+/*
+ * Every group (if/else branch, switch case group with a default, the body of a loop that always
+ * runs it) wrote the same member straight-line before any break: on each path reaching the join,
+ * a fact from before the construct, or from inside a group before that group's write, is dead.
+ */
+void MainListener::JoinCxxFactKills(const std::vector<CxxFactGroup>& groups, uint64_t outerStart)
+{
+    if (groups.empty() || compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr)
+        return;
+    auto& facts = cxxReferenceMemberProvenance_[compilerLLVM->currentFunction];
+    using ShapeKey = std::tuple<llvm::Value*, bool, std::vector<int64_t>, std::string, std::string>;
+    std::vector<std::map<ShapeKey, CxxSeqRanges>> killed(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g)
+        for (const auto& fact : facts)
+        {
+            if (fact.Regions.empty() || fact.Regions.back() != groups[g].Id
+                || fact.Seq >= groups[g].BreakSeq)
+                continue;
+            ShapeKey key{ fact.Root, fact.Whole, fact.ObjectPath,
+                          fact.Whole ? std::string() : fact.AggregateType,
+                          fact.Whole ? std::string() : fact.FieldName };
+            auto& ranges = killed[g][key];
+            if (fact.Join) ranges.insert(ranges.end(), fact.KillRanges.begin(), fact.KillRanges.end());
+            else ranges.emplace_back(0, fact.Seq);
+            ranges = NormalizeCxxSeqRanges(std::move(ranges));
+        }
+    const auto at = CurrentCxxFactPoint();
+    std::vector<CxxReferenceMemberProvenance> joins;
+    for (const auto& [key, firstRanges] : killed[0])
+    {
+        CxxSeqRanges before{ { 0, outerStart } };
+        CxxSeqRanges result;
+        bool everyGroup = true;
+        for (size_t g = 0; g < groups.size() && everyGroup; ++g)
+        {
+            const auto found = killed[g].find(key);
+            if (found == killed[g].end()) { everyGroup = false; break; }
+            before = IntersectCxxSeqRanges(before, found->second);
+            const auto inside = IntersectCxxSeqRanges(found->second,
+                CxxSeqRanges{ { groups[g].Start, groups[g].End } });
+            result.insert(result.end(), inside.begin(), inside.end());
+        }
+        if (!everyGroup) continue;
+        result.insert(result.end(), before.begin(), before.end());
+        CxxReferenceMemberProvenance join;
+        join.Root = std::get<0>(key);
+        join.Whole = std::get<1>(key);
+        join.ObjectPath = std::get<2>(key);
+        join.AggregateType = std::get<3>(key);
+        join.FieldName = std::get<4>(key);
+        join.Join = true;
+        join.KillRanges = NormalizeCxxSeqRanges(std::move(result));
+        join.Regions = at.Regions;
+        joins.push_back(std::move(join));
+    }
+    for (auto& join : joins)
+    {
+        join.Seq = cxxFactSeq_++;
+        facts.push_back(std::move(join));
+    }
+}
+
+bool MainListener::InsideCxxFactLoop() const
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return false;
+    const auto found = cxxFactRegions_.find(compilerLLVM->currentFunction);
+    return found != cxxFactRegions_.end()
+        && std::any_of(found->second.begin(), found->second.end(),
+            [](const auto& region) { return region.Loop; });
+}
+
+void MainListener::DeferCxxFactQuery(bool check, std::function<bool(bool& done)> run)
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return;
+    auto found = cxxFactRegions_.find(compilerLLVM->currentFunction);
+    if (found == cxxFactRegions_.end()) return;
+    for (auto region = found->second.rbegin(); region != found->second.rend(); ++region)
+        if (region->Loop)
+        {
+            region->Deferred.push_back(CxxDeferredFactQuery{ check, false, std::move(run) });
+            return;
+        }
+}
+
+/*
+ * Closing a loop re-runs the queries made inside it, now that every write of the body is known:
+ * fact producers (copies, call results) to a fixpoint, then return checks. Queries still open move
+ * to the enclosing loop, whose back edge can bring in more writes.
+ */
+void MainListener::PopCxxFactRegion(llvm::Function* function, bool runDeferred,
+                                    bool runChecks)
+{
+    auto found = cxxFactRegions_.find(function);
+    if (found == cxxFactRegions_.end() || found->second.empty()) return;
+    const size_t depth = found->second.size() - 1;
+    CxxFactRegion region = std::move(found->second.back());
+    found->second.pop_back();
+    const CxxFactGroup body = lastPoppedCxxFactRegion_;
+    lastPoppedCxxFactRegion_ = CxxFactGroup{ region.Id, region.GroupStart, cxxFactSeq_,
+                                             region.BreakSeq, depth, function };
+    const bool live = runDeferred && compilerLLVM != nullptr
+        && compilerLLVM->currentFunction == function;
+    if (live && region.Loop && region.AlwaysEnters && body.Function == function
+        && body.Depth == depth + 1 && body.Start >= region.Start)
+    {
+        CxxFactGroup group = body;
+        group.BreakSeq = std::min(group.BreakSeq, region.BreakSeq);
+        JoinCxxFactKills({ group }, region.Start);
+    }
+    if (live && region.SwitchCase && region.HasDefault)
+    {
+        region.Groups.push_back(CxxFactGroup{ region.Id, region.GroupStart, cxxFactSeq_,
+                                              region.BreakSeq });
+        JoinCxxFactKills(region.Groups, region.Start);
+    }
+    if (!region.Loop || region.Deferred.empty()) return;
+    std::vector<CxxDeferredFactQuery> deferred = std::move(region.Deferred);
+    if (live)
+    {
+        // Terminates: each copy query adds a member identity at most once.
+        for (;;)
+        {
+            bool added = false;
+            for (auto& query : deferred)
+                if (!query.Check && !query.Done && query.Run(query.Done)) added = true;
+            if (!added) break;
+        }
+        if (runChecks)
+            for (auto& query : deferred)
+                if (query.Check && !query.Done) query.Run(query.Done);
+    }
+    found = cxxFactRegions_.find(function);
+    if (found == cxxFactRegions_.end()) return;
+    for (auto outer = found->second.rbegin(); outer != found->second.rend(); ++outer)
+        if (outer->Loop)
+        {
+            for (auto& query : deferred)
+                if (!query.Done) outer->Deferred.push_back(std::move(query));
+            return;
+        }
+}
+
+/*
+ * Liveness of the write at `index` at point `at`, decided from the structured nesting, never from
+ * the CFG under construction. A later write kills it only when that write is straight-line in a
+ * region enclosing `at` (its region path is a prefix of at's); a write in a branch, case or loop
+ * body the point is outside of merges instead. A write after `at` in source order reaches it only
+ * through the back edge of a loop enclosing both, and is killed there only by a straight-line
+ * write inside that loop before `at`.
+ */
+bool MainListener::CxxFactReachesPoint(
+        const std::vector<CxxReferenceMemberProvenance>& facts, size_t index,
+        const CxxFactPoint& at) const
+{
+    const auto& fact = facts[index];
+    const bool forward = fact.Seq < at.Seq;
+    size_t loopDepth = 0;
+    if (!forward)
+    {
+        size_t common = 0;
+        while (common < fact.Regions.size() && common < at.Regions.size()
+            && fact.Regions[common] == at.Regions[common])
+            ++common;
+        for (size_t k = 0; k < common; ++k)
+            if (fact.Regions[k] < cxxFactRegionIsLoop_.size() && cxxFactRegionIsLoop_[fact.Regions[k]])
+                loopDepth = k + 1;
+        if (loopDepth == 0) return false;
+    }
+    auto prefixOf = [](const std::vector<uint32_t>& prefix, const std::vector<uint32_t>& path) {
+        return prefix.size() <= path.size()
+            && std::equal(prefix.begin(), prefix.end(), path.begin());
+    };
+    auto killsAfterFact = [&](const CxxReferenceMemberProvenance& writer) {
+        return writer.Join ? CxxSeqInRanges(fact.Seq, writer.KillRanges) : writer.Seq > fact.Seq;
+    };
+    const auto jumpsFound = cxxFactJumps_.find(compilerLLVM != nullptr
+        ? compilerLLVM->currentFunction : nullptr);
+    for (const auto& writer : facts)
+    {
+        if (writer.Root != fact.Root) continue;
+        const bool kills = writer.Whole
+            ? CxxReferencePathPrefix(writer.ObjectPath, fact.ObjectPath)
+            : writer.ObjectPath == fact.ObjectPath && writer.AggregateType == fact.AggregateType
+                && writer.FieldName == fact.FieldName;
+        if (!kills) continue;
+        if (writer.Seq < at.Seq)
+        {
+            // Straight-line before the point, after the fact (forward) or inside the loop (back edge).
+            if (forward ? killsAfterFact(writer) : writer.Regions.size() >= loopDepth)
+                if (prefixOf(writer.Regions, at.Regions)) return false;
+            continue;
+        }
+        // Back edge: a straight-line write after the fact inside the loop, with no break or
+        // continue between them that leaves a region holding the write, covers the latch.
+        if (forward || !killsAfterFact(writer) || writer.Regions.size() < loopDepth
+            || !prefixOf(writer.Regions, fact.Regions))
+            continue;
+        const bool jumpedOver = jumpsFound != cxxFactJumps_.end()
+            && std::any_of(jumpsFound->second.begin(), jumpsFound->second.end(),
+                [&](const auto& jump) {
+                    return jump.first > fact.Seq && jump.first <= writer.Seq
+                        && std::find(writer.Regions.begin(), writer.Regions.end(), jump.second)
+                            != writer.Regions.end();
+                });
+        if (!jumpedOver) return false;
+    }
+    return true;
+}
+
+bool MainListener::CxxStorageHasProvenance(llvm::Value* storage) const
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return false;
+    llvm::Value* root = nullptr;
+    std::vector<int64_t> path;
+    if (!CxxReferenceStoragePath(storage, root, path)) return true;
+    const auto found = cxxReferenceMemberProvenance_.find(compilerLLVM->currentFunction);
+    if (found == cxxReferenceMemberProvenance_.end()) return false;
+    return std::any_of(found->second.begin(), found->second.end(),
+        [&](const auto& fact) { return fact.Root == root; });
+}
+
+// A Frame fact on the object at root/path (or a member under it), live at `at`.
+const MainListener::CxxReferenceMemberProvenance* MainListener::CxxLiveFrameFact(
+        llvm::Value* root, const std::vector<int64_t>& path, const CxxFactPoint& at) const
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return nullptr;
+    const auto found = cxxReferenceMemberProvenance_.find(compilerLLVM->currentFunction);
+    if (found == cxxReferenceMemberProvenance_.end()) return nullptr;
+    const auto& facts = found->second;
+    for (size_t i = 0; i < facts.size(); ++i)
+    {
+        const auto& fact = facts[i];
+        if (fact.Whole || fact.Root != root
+            || fact.Lifetime != CxxReferenceMemberLifetime::Frame
+            || !CxxReferencePathPrefix(path, fact.ObjectPath))
+            continue;
+        if (CxxFactReachesPoint(facts, i, at)) return &fact;
+    }
+    return nullptr;
+}
+
+// A Frame fact under the storage, live at `at`. Facts never prove a binding for an unrecorded storage.
+bool MainListener::CxxStorageFrameBound(llvm::Value* storage, const CxxFactPoint& at) const
+{
+    llvm::Value* root = nullptr;
+    std::vector<int64_t> path;
+    if (!CxxReferenceStoragePath(storage, root, path)) return false;
+    return CxxLiveFrameFact(root, path, at) != nullptr;
+}
+
+// A by-value aggregate argument or result: its recorded facts decide. Only a value that was never
+// recorded (a call result in an unrecorded temporary) falls back to its producing call.
+bool MainListener::CxxValueFrameBound(llvm::Value* value, const CxxFactPoint& at,
+                                      unsigned depth) const
+{
+    if (value == nullptr || depth > 16) return false;
+    if (auto* call = llvm::dyn_cast<llvm::CallBase>(value))
+        return CxxCallResultFrameBound(call, at, depth + 1);
+    if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(value))
+        return CxxValueFrameBound(extract->getAggregateOperand(), at, depth + 1);
+    auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+    if (load == nullptr) return false;
+    if (CxxStorageFrameBound(load->getPointerOperand(), at)) return true;
+    if (CxxStorageHasProvenance(load->getPointerOperand())) return false;
+    if (llvm::Value* stored = CxxUniqueStoredValue(load->getPointerOperand()))
+        return CxxValueFrameBound(stored, at, depth + 1);
+    auto* producer = CxxCallResultProducer(value);
+    return producer != nullptr && CxxCallResultFrameBound(producer, at, depth + 1);
+}
+
+// A temporary holding an aggregate: its recorded facts decide, else the value written into it.
+bool MainListener::CxxStorageValueFrameBound(
+        llvm::Value* storage, const CxxFactPoint& at, unsigned depth) const
+{
+    if (CxxStorageFrameBound(storage, at)) return true;
+    if (CxxStorageHasProvenance(storage)) return false;
+    llvm::Value* stored = CxxUniqueStoredValue(storage);
+    return stored != nullptr && CxxValueFrameBound(stored, at, depth + 1);
+}
+
+// The single value written into an unrecorded temporary (an ABI coercion or return slot), or nullptr.
+llvm::Value* MainListener::CxxUniqueStoredValue(llvm::Value* storage)
+{
+    auto* temp = storage != nullptr ? storage->stripPointerCasts() : nullptr;
+    if (!llvm::isa_and_nonnull<llvm::AllocaInst>(temp)) return nullptr;
+    llvm::Value* stored = nullptr;
+    for (auto* user : temp->users())
+    {
+        if (llvm::isa<llvm::LoadInst>(user)) continue;
+        auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+        if (store == nullptr || store->getPointerOperand()->stripPointerCasts() != temp
+            || (stored != nullptr && stored != store->getValueOperand()))
+            return nullptr;
+        stored = store->getValueOperand();
+    }
+    return stored;
+}
+
+/*
+ * Call-argument rule: a pointer argument rooted in this frame, or an aggregate argument with a live
+ * Frame fact, makes the result frame-bound. A CFlat callee gates its own return and is trusted.
+ */
+bool MainListener::CxxCallResultFrameBound(llvm::CallBase* call, const CxxFactPoint& at,
+                                           unsigned depth) const
+{
+    if (call == nullptr || depth > 16
+        || call->getIntrinsicID() != llvm::Intrinsic::not_intrinsic)
+        return false;
+    auto* callee = call->getCalledFunction();
+    const auto* sym = callee != nullptr && compilerLLVM != nullptr
+        ? compilerLLVM->FindSymbolForFunction(callee) : nullptr;
+    if (sym != nullptr && !sym->IsCxx && !callee->getName().starts_with("__cflat_free_"))
+        return false;
+    for (unsigned i = 0; i < call->arg_size(); ++i)
+    {
+        if (call->paramHasAttr(i, llvm::Attribute::StructRet)) continue;
+        llvm::Value* arg = call->getArgOperand(i);
+        if (arg->getType()->isPointerTy())
+        {
+            const bool bound = call->paramHasAttr(i, llvm::Attribute::ByVal)
+                ? CxxStorageValueFrameBound(arg, at, depth)
+                : CxxArgumentRootedInFrame(arg, 0);
+            if (bound) return true;
+        }
+        else if ((arg->getType()->isStructTy() || arg->getType()->isArrayTy())
+            && CxxValueFrameBound(arg, at, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+bool MainListener::CopyCxxReferenceMemberProvenance(
+        llvm::Value* destination, llvm::Value* source)
+{
+    if (compilerLLVM == nullptr || compilerLLVM->currentFunction == nullptr) return false;
+    llvm::Value* destinationRoot = nullptr;
+    llvm::Value* sourceRoot = nullptr;
+    std::vector<int64_t> destinationPath;
+    std::vector<int64_t> sourcePath;
+    if (!CxxReferenceStoragePath(destination, destinationRoot, destinationPath)) return false;
+    const CxxFactPoint at = CurrentCxxFactPoint();
+    llvm::Function* function = compilerLLVM->currentFunction;
+    // The destination is overwritten whether or not the source carried a frame binding.
+    CxxReferenceMemberProvenance overwrite;
+    overwrite.Root = destinationRoot;
+    overwrite.ObjectPath = destinationPath;
+    overwrite.Whole = true;
+    overwrite.Regions = at.Regions;
+    overwrite.Seq = cxxFactSeq_++;
+    const uint64_t copySeq = cxxFactSeq_++;
+    if (!CxxReferenceStoragePath(source, sourceRoot, sourcePath))
+    {
+        cxxReferenceMemberProvenance_[function].push_back(std::move(overwrite));
+        return false;
+    }
+    // Copies every live Frame fact of the source not copied yet; returns whether any was added.
+    // A copy is keyed by its member identity, so a copy cycle in a loop body reaches a fixpoint.
+    auto copiedKeys = std::make_shared<std::set<std::tuple<std::vector<int64_t>, std::string,
+                                                           std::string>>>();
+    auto copyLive = [this, function, sourceRoot, sourcePath, destinationRoot, destinationPath,
+                     at, copySeq, copiedKeys](std::unordered_set<size_t>& copiedIndices) {
+        auto& facts = cxxReferenceMemberProvenance_[function];
+        std::vector<CxxReferenceMemberProvenance> copied;
+        for (size_t i = 0; i < facts.size(); ++i)
+        {
+            const auto& fact = facts[i];
+            if (fact.Whole || fact.Root != sourceRoot
+                || fact.Lifetime != CxxReferenceMemberLifetime::Frame
+                || !CxxReferencePathPrefix(sourcePath, fact.ObjectPath)
+                || copiedIndices.contains(i) || !CxxFactReachesPoint(facts, i, at))
+                continue;
+            copiedIndices.insert(i);
+            auto copy = fact;
+            copy.Root = destinationRoot;
+            copy.ObjectPath = destinationPath;
+            copy.ObjectPath.insert(copy.ObjectPath.end(),
+                fact.ObjectPath.begin() + static_cast<std::ptrdiff_t>(sourcePath.size()),
+                fact.ObjectPath.end());
+            copy.Regions = at.Regions;
+            copy.Seq = copySeq;
+            if (!copiedKeys->emplace(copy.ObjectPath, copy.AggregateType, copy.FieldName).second)
+                continue;
+            copied.push_back(std::move(copy));
+        }
+        facts.insert(facts.end(), copied.begin(), copied.end());
+        return !copied.empty();
+    };
+    cxxReferenceMemberProvenance_[function].push_back(std::move(overwrite));
+    auto copiedIndices = std::make_shared<std::unordered_set<size_t>>();
+    const bool copiedAny = copyLive(*copiedIndices);
+    if (InsideCxxFactLoop())
+        DeferCxxFactQuery(false, [copyLive, copiedIndices](bool&) {
+            return copyLive(*copiedIndices);
+        });
+    return copiedAny;
+}
+
+/*
+ * The call that produced a by-value C++ aggregate, or nullptr when the value does not come from
+ * exactly one call. A store of the call result or an sret argument into the temporary is the
+ * producer; any other write to that temporary makes the origin unknown.
+ */
+llvm::CallBase* MainListener::CxxCallResultProducer(llvm::Value* value)
+{
+    if (value == nullptr) return nullptr;
+    value = value->stripPointerCasts();
+    if (auto* call = llvm::dyn_cast<llvm::CallBase>(value))
+        return call->getIntrinsicID() == llvm::Intrinsic::not_intrinsic ? call : nullptr;
+    if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(value))
+        return CxxCallResultProducer(extract->getAggregateOperand());
+    auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+    if (load == nullptr) return nullptr;
+    auto* temp = load->getPointerOperand()->stripPointerCasts();
+    if (!llvm::isa<llvm::AllocaInst>(temp)) return nullptr;
+    llvm::CallBase* producer = nullptr;
+    auto setProducer = [&](llvm::CallBase* candidate) {
+        if (candidate == nullptr || (producer != nullptr && producer != candidate)) return false;
+        producer = candidate;
+        return true;
+    };
+    for (auto* user : temp->users())
+    {
+        if (llvm::isa<llvm::LoadInst>(user)) continue;
+        if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+        {
+            if (store->getPointerOperand()->stripPointerCasts() != temp
+                || !setProducer(llvm::dyn_cast<llvm::CallBase>(
+                    store->getValueOperand()->stripPointerCasts())))
+                return nullptr;
+            continue;
+        }
+        auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+        if (call == nullptr || call->getIntrinsicID() != llvm::Intrinsic::not_intrinsic)
+            return nullptr;
+        bool sretIntoTemp = false;
+        for (unsigned i = 0; i < call->arg_size(); ++i)
+            if (call->getArgOperand(i)->stripPointerCasts() == temp)
+            {
+                if (!call->paramHasAttr(i, llvm::Attribute::StructRet)
+                    || !setProducer(call))
+                    return nullptr;
+                sretIntoTemp = true;
+            }
+        if (!sretIntoTemp) return nullptr;
+    }
+    return producer;
+}
+
+/*
+ * A C++ aggregate initialized from, or assigned from, a call result. The write always overwrites
+ * the destination. Its reference members become Frame only when the call result is frame-bound.
+ */
+void MainListener::RecordCxxCallResultReferenceProvenance(
+        llvm::Value* objectSlot, const std::string& aggregateType, llvm::Value* value,
+        antlr4::ParserRuleContext* context)
+{
+    auto* compiler = compilerLLVM;
+    if (compiler == nullptr || compiler->currentFunction == nullptr) return;
+    const CxxFactPoint at = CurrentCxxFactPoint();
+    llvm::Function* function = compiler->currentFunction;
+    CxxReferenceMemberProvenance overwrite;
+    if (!CxxReferenceStoragePath(objectSlot, overwrite.Root, overwrite.ObjectPath)) return;
+    const llvm::Value* root = overwrite.Root;
+    const std::vector<int64_t> path = overwrite.ObjectPath;
+    overwrite.Whole = true;
+    overwrite.Regions = at.Regions;
+    overwrite.Seq = cxxFactSeq_++;
+    cxxReferenceMemberProvenance_[function].push_back(std::move(overwrite));
+    const auto members = CollectCxxReferenceMembers(compiler->ResolveTypeAlias(aggregateType));
+    if (members.empty()) return;
+    for (const auto& [member, count] : members)
+        if (count != 1) return;
+    const uint64_t memberSeq = cxxFactSeq_++;
+    auto recordFrame = [this, function, root, path, members, context, at, memberSeq]() {
+        auto& facts = cxxReferenceMemberProvenance_[function];
+        for (const auto& [member, count] : members)
+        {
+            CxxReferenceMemberProvenance fact;
+            fact.Root = const_cast<llvm::Value*>(root);
+            fact.ObjectPath = path;
+            fact.AggregateType = member.first;
+            fact.FieldName = member.second;
+            fact.Lifetime = CxxReferenceMemberLifetime::Frame;
+            fact.Context = context;
+            fact.Regions = at.Regions;
+            fact.Seq = memberSeq;
+            facts.push_back(std::move(fact));
+        }
+    };
+    if (CxxValueFrameBound(value, at, 0))
+    {
+        recordFrame();
+        return;
+    }
+    if (!InsideCxxFactLoop()) return;
+    llvm::WeakVH handle(value);
+    DeferCxxFactQuery(false, [this, handle, at, recordFrame](bool& done) {
+        llvm::Value* current = handle;
+        if (current == nullptr) { done = true; return false; }
+        if (!CxxValueFrameBound(current, at, 0)) return false;
+        recordFrame();
+        done = true;
+        return true;
+    });
+}
+
+// A nested brace inside a call argument is an argument temporary, not part of the returned aggregate.
+static bool InsideCallArgumentBeforeReturnBrace(antlr4::ParserRuleContext* context)
+{
+    for (antlr4::tree::ParseTree* node = context; node != nullptr; node = node->parent)
+    {
+        if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(node) != nullptr) return true;
+        if (dynamic_cast<CFlatParser::ReturnBraceInitializerContext*>(node) != nullptr) return false;
+    }
+    return false;
+}
+
 void MainListener::RejectLambdaReferenceCaptureEscape(
         bool destinationHasProgramLifetime,
         const LLVMBackend::NamedVariable& source,
@@ -6976,6 +7761,9 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
         bool rejectFrameBoundReferences)
 {
         auto* compiler = Compiler(errorContext);
+        rejectEscapingReferences = rejectEscapingReferences
+            || (rejectCxxReferenceMemberReturnBrace_
+                && !InsideCallArgumentBeforeReturnBrace(errorContext));
         if (!fields.empty())
         {
             BranchPostfixScope braceElementPostfix(this);
@@ -7454,66 +8242,12 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     }
                     if (rejectEscapingReferences && targetIsReference)
                     {
-                        auto* currentFunction = compiler->builder->GetInsertBlock() != nullptr
-                            ? compiler->builder->GetInsertBlock()->getParent() : nullptr;
-                        const auto* currentSymbol = currentFunction != nullptr
-                            ? compiler->FindSymbolForFunction(currentFunction) : nullptr;
-                        const auto thisReceiver = compiler->GetThisPointer();
-                        llvm::Value* thisReceiverStorage = thisReceiver.Primary != nullptr
-                            ? thisReceiver.Primary : thisReceiver.Storage;
-                        std::unordered_set<llvm::Value*> storageLifetimeActive;
-                        std::function<bool(llvm::Value*, bool)> storageOutlivesFunction;
-                        storageOutlivesFunction = [&](llvm::Value* storage,
-                                                      bool allowAliasParameter) -> bool {
-                            if (storage == nullptr || !storage->getType()->isPointerTy())
-                                return false;
-                            storage = storage->stripPointerCasts();
-                            if (!storageLifetimeActive.insert(storage).second) return false;
-                            bool outlives = false;
-                            if (thisReceiver.IsThisReceiver && thisReceiverStorage != nullptr
-                                && llvm::isa<llvm::LoadInst>(storage)
-                                && llvm::cast<llvm::LoadInst>(storage)->getPointerOperand()
-                                    ->stripPointerCasts()
-                                    == thisReceiverStorage->stripPointerCasts())
-                                outlives = true;
-                            else if (llvm::isa<llvm::GlobalVariable>(storage))
-                                outlives = true;
-                            else if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storage))
-                                outlives = storageOutlivesFunction(
-                                    gep->getPointerOperand(), allowAliasParameter);
-                            else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(storage))
-                                outlives = storageOutlivesFunction(
-                                    select->getTrueValue(), allowAliasParameter)
-                                    && storageOutlivesFunction(
-                                        select->getFalseValue(), allowAliasParameter);
-                            else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(storage))
-                            {
-                                outlives = phi->getNumIncomingValues() != 0;
-                                for (unsigned i = 0; outlives && i < phi->getNumIncomingValues(); ++i)
-                                    outlives = storageOutlivesFunction(
-                                        phi->getIncomingValue(i), allowAliasParameter);
-                            }
-                            else if (auto* argument = llvm::dyn_cast<llvm::Argument>(storage))
-                            {
-                                const bool receiver = currentSymbol != nullptr
-                                    && currentSymbol->IsMethod && argument->getArgNo() == 0;
-                                // Resolve by storage: method receivers and sret shift argument numbers.
-                                const auto* parameterNV = compiler->FindVariableByStorage(argument);
-                                const bool borrowedAlias = allowAliasParameter && !receiver
-                                    && parameterNV != nullptr
-                                    && parameterNV->TypeAndValue.IsAlias
-                                    && !parameterNV->TypeAndValue.Pointer;
-                                outlives = receiver || borrowedAlias;
-                            }
-                            storageLifetimeActive.erase(storage);
-                            return outlives;
-                        };
                         const bool localOrTemporary = elementNV.IsRvalue
                             || elementNV.Storage == nullptr
                             || PointsIntoStackFrame(elementNV.Storage);
                         const bool stableStorage = IsProgramLifetimeStorage(elementNV)
                             || (!localOrTemporary
-                                && storageOutlivesFunction(elementNV.Storage, true));
+                                && CxxReferenceSourceOutlivesFunction(elementNV));
                         if (!stableStorage)
                         {
                             const std::string fieldName = targetField != nullptr
@@ -7532,6 +8266,21 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                                     "storage whose lifetime cannot be proven to outlive the function",
                                     aggregateType, fieldName));
                         }
+                    }
+                    if (targetIsReference && !deferredDefault && !rejectEscapingReferences)
+                    {
+                        const bool frameRooted = elementNV.IsRvalue
+                            || elementNV.Storage == nullptr
+                            || PointsIntoStackFrame(elementNV.Storage);
+                        const auto lifetime = CxxReferenceSourceOutlivesFunction(elementNV)
+                            ? CxxReferenceMemberLifetime::Stable
+                            : frameRooted ? CxxReferenceMemberLifetime::Frame
+                                          : CxxReferenceMemberLifetime::Unknown;
+                        const std::string fieldName = targetField != nullptr
+                            ? targetField->VariableName
+                            : targetBaseType.empty() ? std::string("<base>") : targetBaseType;
+                        RecordCxxReferenceMemberProvenance(
+                            slotValue, typeName, fieldName, lifetime, element);
                     }
                     llvm::Value* elementValue = elementNV.Primary
                         ? elementNV.Primary : LoadNamedVariable(elementNV);
@@ -8017,6 +8766,8 @@ cxx_dtor_ready:
                             }
                             LLVMBackend::NamedVariable elementVar = elementNV;
                             elementVar.Primary = elementValue;
+                            elementVar.CxxImportedLiteral =
+                                compiler->CxxImportedConstantLiteral(elementNV);
                             elementVar.TypeAndValue.VariableName.clear();  // positional, see below
                             elementVar.Storage = nullptr;
                             elementVar.BaseType = elementValue->getType();
@@ -8180,6 +8931,13 @@ cxx_dtor_ready:
                                                                   conversionRefusal)
                         != LLVMBackend::CxxConvertingCtorResult::Converted)
                     {
+                        // No clang text: a capturing closure met a function-pointer parameter (a
+                        // thin target), which takes no capture.
+                        if (conversionRefusal.empty() && !nv.ClosureEnvKnownFree)
+                            conversionRefusal = std::format(
+                                "a capturing closure cannot be passed to C++ '{}': a "
+                                "function-pointer parameter cannot hold a capture",
+                                compiler->DisplayCxxClassName(typeName));
                         LogErrorContext(argAssign, std::format(
                             "cannot construct C++ '{}' from this closure{}",
                             compiler->DisplayCxxClassName(typeName),
@@ -8774,6 +9532,7 @@ cxx_dtor_ready:
                             implicitLastUse, std::format("into local '{}'", name).c_str(),
                             declType.DiagnosticTypeName,
                             compiler->CxxConstReceiverKind(*srcNV) != 0);
+                    CopyCxxReferenceMemberProvenance(slot, srcNV->Storage);
                     if (implicitLastUse) compiler->MarkVariableMoved(srcText);
                     return true;
                 }
@@ -11951,9 +12710,20 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
                                 srcInferredPointerDepth = rightNV.TypeAndValue.ValuePointerDepth();
                                 srcInferredConstMask = rightNV.TypeAndValue.ConstMask;
-                                if (rightNV.TypeAndValue.IsThinFnPtr() && !rightNV.TypeAndValue.Pointer
+                                if (rightNV.TypeAndValue.IsFunctionPointer
+                                    && rightNV.TypeAndValue.TypeName != "__closure_fat_ptr"
                                     && !rightNV.TypeAndValue.FuncPtrReturnTypeName.empty())
+                                {
                                     srcThinFnPtr = rightNV.TypeAndValue;
+                                    srcThinFnPtr->TypeName = "__c_fn_ptr";
+                                    srcThinFnPtr->Pointer = false;
+                                    srcThinFnPtr->PointerDepth = 0;
+                                    srcThinFnPtr->ElemPointer = false;
+                                    srcThinFnPtr->IsAlias = false;
+                                    srcThinFnPtr->IsRvalueRef = false;
+                                    srcThinFnPtr->IsCxxRefToPointer = false;
+                                    srcThinFnPtr->DropCxxRef();
+                                }
                                 else if (typeAndValue.TypeName == "auto" && !global_scope
                                     && llvm::isa_and_nonnull<llvm::Function>(rightNV.Primary))
                                 {
@@ -12191,6 +12961,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.FuncPtrReturnPointer = inferred.FuncPtrReturnPointer;
                                     typeAndValue.FuncPtrReturnOwned = inferred.FuncPtrReturnOwned;
                                     typeAndValue.FuncPtrReturnAlias = inferred.FuncPtrReturnAlias;
+                                    typeAndValue.FuncPtrReturnAliasSpelling =
+                                        inferred.FuncPtrReturnAliasSpelling;
+                                    typeAndValue.FuncPtrReturnHasStrippedInnerDimensions =
+                                        inferred.FuncPtrReturnHasStrippedInnerDimensions;
                                     typeAndValue.FuncPtrVariadic = inferred.FuncPtrVariadic;
                                     typeAndValue.FuncPtrNoPrototype = inferred.FuncPtrNoPrototype;
                                     typeAndValue.FuncPtrReturnPointerDepth = inferred.FuncPtrReturnPointerDepth;
@@ -12969,12 +13743,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 {
                     // C++ deduces the plain function pointer type; adopt only the signature.
                     typeAndValue.IsFunctionPointer = true;
-                    typeAndValue.TypeName = srcThinFnPtr->TypeName;
+                    typeAndValue.TypeName = "__c_fn_ptr";
                     typeAndValue.Pointer = false;
                     typeAndValue.FuncPtrReturnTypeName = srcThinFnPtr->FuncPtrReturnTypeName;
                     typeAndValue.FuncPtrReturnPointer = srcThinFnPtr->FuncPtrReturnPointer;
                     typeAndValue.FuncPtrReturnOwned = srcThinFnPtr->FuncPtrReturnOwned;
                     typeAndValue.FuncPtrReturnAlias = srcThinFnPtr->FuncPtrReturnAlias;
+                    typeAndValue.FuncPtrReturnAliasSpelling =
+                        srcThinFnPtr->FuncPtrReturnAliasSpelling;
+                    typeAndValue.FuncPtrReturnHasStrippedInnerDimensions =
+                        srcThinFnPtr->FuncPtrReturnHasStrippedInnerDimensions;
                     typeAndValue.FuncPtrReturnPointerDepth = srcThinFnPtr->FuncPtrReturnPointerDepth;
                     typeAndValue.FuncPtrReturnConstMask = srcThinFnPtr->FuncPtrReturnConstMask;
                     typeAndValue.FuncPtrReturnResolvedKey = srcThinFnPtr->FuncPtrReturnResolvedKey;
@@ -12993,6 +13771,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnPointer = srcClosureFnPtr->FuncPtrReturnPointer;
                     typeAndValue.FuncPtrReturnOwned = srcClosureFnPtr->FuncPtrReturnOwned;
                     typeAndValue.FuncPtrReturnAlias = srcClosureFnPtr->FuncPtrReturnAlias;
+                    typeAndValue.FuncPtrReturnAliasSpelling =
+                        srcClosureFnPtr->FuncPtrReturnAliasSpelling;
+                    typeAndValue.FuncPtrReturnHasStrippedInnerDimensions =
+                        srcClosureFnPtr->FuncPtrReturnHasStrippedInnerDimensions;
                     typeAndValue.FuncPtrReturnPointerDepth = srcClosureFnPtr->FuncPtrReturnPointerDepth;
                     typeAndValue.FuncPtrReturnConstMask = srcClosureFnPtr->FuncPtrReturnConstMask;
                     typeAndValue.FuncPtrReturnResolvedKey = srcClosureFnPtr->FuncPtrReturnResolvedKey;
@@ -14328,6 +15110,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     nrvoLocal ? compiler->GetType(typeAndValue) : nullptr,
                                     typeAndValue.IsUnsignedInteger() != -1,
                                     typeAndValue.IsArrayView);
+                            if (!global_scope && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                && right != nullptr && right->getType()->isStructTy()
+                                && haveInitializerSourceNV
+                                && !initializerSourceNV.TypeAndValue.Pointer
+                                && compiler->ResolveTypeAlias(typeAndValue.TypeName)
+                                    == compiler->ResolveTypeAlias(
+                                        initializerSourceNV.TypeAndValue.TypeName))
+                            {
+                                // A call result has no storage: its reference members come from
+                                // the producing call's arguments.
+                                if (srcStorage == nullptr
+                                    || !CopyCxxReferenceMemberProvenance(alloc, srcStorage))
+                                    RecordCxxCallResultReferenceProvenance(
+                                        alloc, typeAndValue.TypeName, right, direct);
+                            }
                             if (movedOwningStruct)
                             {
                                 compiler->builder->CreateStore(
@@ -14856,6 +15653,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             nv.BondDeclFunction = nv.BondDeclBlock != nullptr
                                 ? nv.BondDeclBlock->getParent() : nullptr;
                         }
+
+                        if (haveInitializerSourceNV && !initializerSourceNV.CxxClosureLenders.empty())
+                            compiler->GetOrCreateStackVariable(name).CxxClosureLenders =
+                                initializerSourceNV.CxxClosureLenders;
 
                         // Propagate borrow: if the RHS is a borrowed pointer (non-move param or
                         // a local that already aliases one, possibly via cast), this local also
@@ -17407,16 +18208,21 @@ void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::
             return;
         }
     }
-    // A `??` / `?:` pointer join carries no spelling: name it by the pointee its arms share.
-    if (argType.TypeName.empty() && !argType.Pointer && argValue != nullptr
-        && argValue->getType()->isPointerTy())
+    // A `??` / `?:` pointer join carries no spelling: recover its common pointee from the arms.
+    if (argType.TypeName.empty() && argValue != nullptr && argValue->getType()->isPointerTy())
     {
-        if (const auto joined = JoinedPointerArmType(argValue); !joined.TypeName.empty())
+        auto joined = JoinedPointerArmType(argValue);
+        if (joined.TypeName.empty() && Compiler()->JoinIsCharPointer(argValue))
+        {
+            joined.TypeName = "char";
+            joined.Pointer = true;
+        }
+        if (!joined.TypeName.empty())
         {
             argType.TypeName = joined.TypeName;
             argType.Pointer = true;
             // Lowering reads the source twin: a base-class pointer needs the derived pointee too.
-            if (sourceTwin != nullptr && sourceTwin->TypeName.empty() && !sourceTwin->Pointer)
+            if (sourceTwin != nullptr && sourceTwin->TypeName.empty())
             {
                 sourceTwin->TypeName = joined.TypeName;
                 sourceTwin->Pointer = true;

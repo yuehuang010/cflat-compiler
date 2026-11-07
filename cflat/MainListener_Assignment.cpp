@@ -5,6 +5,34 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include "MainListener_ExpressionsShared.h"
 
+static void MaterializeCxxFunctionPointerReference(
+    LLVMBackend* compiler, LLVMBackend::NamedVariable& value, bool keepSlot)
+{
+    auto& type = value.TypeAndValue;
+    const bool functionPointerReference = type.IsFunctionPointer && type.IsThinFnPtr()
+        && type.IsCxxRef();
+    if ((!type.IsCxxRefToPointer && !functionPointerReference) || !type.IsFunctionPointer)
+        return;
+    llvm::Value* slot = value.Primary != nullptr ? value.Primary : value.Storage;
+    if (slot == nullptr || !slot->getType()->isPointerTy()) return;
+    llvm::Type* functionPointerType = compiler->BuildThinFnPtrType(type);
+    if (functionPointerType == nullptr) return;
+    const bool isConstRef = type.CxxConstRef();
+    value.Primary = compiler->CreateLoad(functionPointerType, slot);
+    value.BaseType = functionPointerType;
+    value.Storage = keepSlot ? slot : nullptr;
+    type.DropCxxRef();
+    type.IsCxxRefToPointer = false;
+    type.IsAlias = false;
+    type.IsRvalueRef = false;
+    type.IsMove = false;
+    type.Pointer = false;
+    type.ElemPointer = false;
+    type.PointerDepth = 0;
+    if (isConstRef) type.ConstMask |= 1u;
+    value.IsRvalue = !keepSlot;
+}
+
 
 
 
@@ -354,9 +382,12 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
         // initialization. Parse the same inner tree so ownership and value-category facts survive.
         auto* expression = UnwrapInitializerParens(ctx);
         auto result = ParseAssignmentExpressionNamedBody(expression, use);
+        if (use != ResultUse::Discard)
+            MaterializeCxxFunctionPointerReference(compilerLLVM, result, false);
         // Direct call arguments are resolved against the selected parameter below. Other uses
         // consume a value, so detach an owning conditional read before it reaches a plain store.
         bool directCallArgument = false;
+        bool declarationInitializer = false;
         antlr4::tree::ParseTree* node = ctx;
         while (node != nullptr && node->parent != nullptr)
         {
@@ -364,6 +395,11 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent) != nullptr)
             {
                 directCallArgument = true;
+                break;
+            }
+            if (dynamic_cast<CFlatParser::InitDeclaratorContext*>(parent) != nullptr)
+            {
+                declarationInitializer = true;
                 break;
             }
             if (parent->children.size() == 1)
@@ -380,6 +416,14 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             }
             break;
         }
+        const bool lenderSink = declarationInitializer || use == ResultUse::ReturnOperand
+            || (ctx->assignmentOperator() != nullptr
+                && ctx->assignmentOperator()->getText() == "=");
+        if (!result.CxxClosureLenders.empty() && !lenderSink)
+            for (const auto& lender : result.CxxClosureLenders)
+                if (auto* source = compilerLLVM->FindStackVariableByStorage(lender.first);
+                    source != nullptr && source->CxxClosureLentTo.empty())
+                    source->CxxClosureLentTo = lender.second;
         if (!directCallArgument && use != ResultUse::Discard)
             MaterializeNullConditionalOwningValue(result, expression);
         // T483: only a `move` written directly over a call is a call-result move. A `?:` of moves
@@ -628,6 +672,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 auto tv = ParseConditionalExpression(condCtx, use);
                 joinShape = tv;
                 result.Primary = tv.value;
+                result.CxxClosureLenders = tv.cxxClosureLenders;
                 result.JoinClassPointee = tv.joinClassPointee;
                 result.JoinClassPointeeDepth = tv.joinClassPointeeDepth;
                 result.TypeAndValue.IsAlias = tv.isAlias;
@@ -735,6 +780,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                     result.BaseType = result.Primary->getType();
                     result.TypeAndValue = assignmentResult.TypeAndValue;
                     result.Storage = assignmentResult.Storage;
+                    result.CxxClosureLenders = assignmentResult.CxxClosureLenders;
                     result.IsRvalue = assignmentResult.IsRvalue;
                     if (assignmentResult.TypeAndValue.IsAlias
                         && assignmentResult.Storage != nullptr)
@@ -4919,6 +4965,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 FlexibleArrayKeepScope keep(flexibleArrayKeep_, DirectOperandPostfixes(unaryCtx));
                 return ParseUnaryExpression(unaryCtx);
             }();
+            MaterializeCxxFunctionPointerReference(compiler, namedVar, true);
             const llvm::GlobalVariable* enumMemberGlobal = nullptr;
             if (compiler->IsEnumMemberStorage(namedVar.Storage, &enumMemberGlobal))
                 LogErrorContext(unaryCtx, std::format("cannot assign to enum member '{}'",
@@ -6783,6 +6830,24 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                     && llvm::isa<llvm::AllocaInst>(destination))
                     compiler->SetStackCharBufferBorrow(namedVar.CallerName, false, {}, 0);
+                if (operatorText == "=" && storeSource != nullptr
+                    && !storeSource->CxxClosureLenders.empty())
+                {
+                    if (assignmentResult != nullptr)
+                        assignmentResult->CxxClosureLenders = storeSource->CxxClosureLenders;
+                    if (namedVar.FieldName.empty() && llvm::isa<llvm::AllocaInst>(destination))
+                    {
+                        if (auto* destMeta = compiler->FindStackVariableByStorage(destination))
+                            destMeta->CxxClosureLenders = storeSource->CxxClosureLenders;
+                    }
+                    else
+                    {
+                        for (const auto& lender : storeSource->CxxClosureLenders)
+                            if (auto* source = compiler->FindStackVariableByStorage(lender.first);
+                                source != nullptr && source->CxxClosureLentTo.empty())
+                                source->CxxClosureLentTo = lender.second;
+                    }
+                }
                 return resultValue;
             };
 
@@ -11157,6 +11222,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
+            if (operatorText == "=" && right != nullptr && right->getType()->isStructTy()
+                && !namedVar.TypeAndValue.Pointer)
+            {
+                if (rightNV.Storage == nullptr
+                    || !CopyCxxReferenceMemberProvenance(destination, rightNV.Storage))
+                    RecordCxxCallResultReferenceProvenance(
+                        destination, namedVar.TypeAndValue.TypeName, right, ctx);
+            }
             if (operatorText == "=" && namedVar.TypeAndValue.Pointer
                 && !namedVar.TypeAndValue.IsUnique
                 && (destIsStructField || namedVar.IsElementAccess)

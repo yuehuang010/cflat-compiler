@@ -361,6 +361,9 @@ namespace cppt
             long n_;
             F f_;
         };
+        template <class T = int> using GA = Gate<T>;
+        inline int ga_pick(Gate<long long>*) noexcept { return 11; }
+        inline int ga_pick(Gate<int>*) noexcept { return 22; }
         struct Plain
         {
             int value = 5;

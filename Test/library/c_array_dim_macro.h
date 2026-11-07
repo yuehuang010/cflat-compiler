@@ -1,4 +1,5 @@
 #pragma once
+#include <limits.h>
 
 /* T137: object-like macros and an unscoped enumerator used as fixed array dimensions. */
 #define ADIM_Q 3

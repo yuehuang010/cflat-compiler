@@ -14,6 +14,31 @@ inline int choose_rref(Ex&& e) { return e.v + 400; }
 inline Ex make_ex(int x) { return Ex(x); }
 inline Ex operator+(const Ex& a, const Ex& b) { return Ex(a.v + b.v); }
 
+struct CvCtorSource { int value; CvCtorSource() : value(23) {} };
+inline const CvCtorSource make_const_ctor_source() { return CvCtorSource(); }
+inline CvCtorSource make_ctor_source() { return CvCtorSource(); }
+inline const CvCtorSource& const_ctor_source_lvalue()
+{
+    static const CvCtorSource value;
+    return value;
+}
+struct CvCtorConstRef { int which; CvCtorConstRef(const CvCtorSource&) : which(11) {} };
+struct CvCtorByValue { int which; CvCtorByValue(CvCtorSource) : which(12) {} };
+struct CvCtorRRef { int which; CvCtorRRef(CvCtorSource&&) : which(13) {} };
+struct CvCtorConstRRef { int which; CvCtorConstRRef(const CvCtorSource&&) : which(14) {} };
+struct CvCtorPair {
+    int which;
+    CvCtorPair(CvCtorSource&&) : which(15) {}
+    CvCtorPair(const CvCtorSource&) : which(16) {}
+};
+template<class T> struct CvCtorIsConst { static constexpr bool value = false; };
+template<class T> struct CvCtorIsConst<const T> { static constexpr bool value = true; };
+struct CvCtorTemplate {
+    int which;
+    CvCtorTemplate(int) : which(18) {}
+    template<class T> CvCtorTemplate(T&&) : which(CvCtorIsConst<T>::value ? 17 : 19) {}
+};
+
 inline Ex& ref_ex()
 {
     static Ex value(70);

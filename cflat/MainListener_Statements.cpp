@@ -1535,6 +1535,7 @@ void MainListener::PrepareLoopConditionalDropFlags(CFlatParser::StatementContext
 void MainListener::ParseControlledBody(CFlatParser::StatementContext* body) {
         auto* compiler = Compiler(body);
         OwnershipControlScope controlScope(compiler);
+        CxxFactRegionScope factRegion(*this, false);
         ParseStatement(body);
         if (body != nullptr && body->compoundStatement() == nullptr)
             compiler->FlushOwnedTemps();
@@ -1785,6 +1786,203 @@ LLVM_ATTRIBUTE_NOINLINE static bool IsNamedIdentityCastOperand(
  * (`=> expr`) is `=> { return expr; }`, so it calls this instead of a bare
  * CreateReturnCall - otherwise none of the above runs inside its body.
  */
+std::map<std::pair<std::string, std::string>, size_t>
+MainListener::CollectCxxReferenceMembers(const std::string& resolvedType) const
+{
+    std::map<std::pair<std::string, std::string>, size_t> required;
+    auto* compiler = compilerLLVM;
+    if (compiler == nullptr) return required;
+    std::unordered_set<std::string> activeTypes;
+    std::function<void(const std::string&, size_t)> collectReferences;
+    collectReferences = [&](const std::string& inputType, size_t multiplicity) {
+        if (multiplicity == 0) return;
+        const std::string typeName = compiler->ResolveTypeAlias(inputType);
+        if (!activeTypes.insert(typeName).second) return;
+        const auto data = compiler->GetDataStructure(typeName);
+        if (data.StructType != nullptr)
+        {
+            for (const auto& field : data.StructFields)
+            {
+                if (compiler->IsForeignCxxAggregateClass(typeName))
+                {
+                    std::string spelling;
+                    bool isReference = false;
+                    if (compiler->CxxRecordFieldTypeSpelling(
+                            typeName, field.VariableName, spelling, &isReference)
+                        && isReference)
+                    {
+                        required[{typeName, field.VariableName}] += multiplicity;
+                        continue;
+                    }
+                }
+                if (field.Pointer || field.ElemPointer || field.IsArrayView) continue;
+                size_t count = multiplicity;
+                if (field.ConstArraySize > 0
+                    && static_cast<uint64_t>(field.ConstArraySize)
+                        <= std::numeric_limits<size_t>::max() / count)
+                    count *= static_cast<size_t>(field.ConstArraySize);
+                for (int64_t dimension : field.ConstInnerDimensions)
+                    if (dimension > 0 && static_cast<uint64_t>(dimension)
+                        <= std::numeric_limits<size_t>::max() / count)
+                        count *= static_cast<size_t>(dimension);
+                collectReferences(field.TypeName, count);
+            }
+            if (compiler->IsForeignCxxAggregateClass(typeName))
+                for (size_t i = 0; i < compiler->CxxAggregateBaseCount(typeName); ++i)
+                    if (const std::string base = compiler->CxxAggregateBaseTypeAt(typeName, i);
+                        !base.empty())
+                        collectReferences(base, multiplicity);
+        }
+        activeTypes.erase(typeName);
+    };
+    collectReferences(resolvedType, 1);
+    return required;
+}
+
+bool MainListener::CxxArgumentRootedInFrame(llvm::Value* arg, unsigned depth) const
+{
+    auto* compiler = compilerLLVM;
+    if (compiler == nullptr || arg == nullptr || !arg->getType()->isPointerTy()) return false;
+    if (PointsIntoStackFrame(arg)) return true;
+    llvm::Value* base = arg->stripPointerCasts();
+    while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
+        base = gep->getPointerOperand()->stripPointerCasts();
+    auto* inner = llvm::dyn_cast<llvm::CallBase>(base);
+    if (inner == nullptr || depth > 16 || !compiler->IsAliasValue(inner))
+        return false;
+    auto* innerCallee = inner->getCalledFunction();
+    const auto* innerSym = innerCallee != nullptr
+        ? compiler->FindSymbolForFunction(innerCallee) : nullptr;
+    if (innerSym == nullptr || !innerSym->IsCxx || !innerSym->ReturnType.IsAlias
+        || innerSym->ReturnType.Pointer)
+        return false;
+    for (unsigned j = 0; j < inner->arg_size(); ++j)
+        if (CxxArgumentRootedInFrame(inner->getArgOperand(j), depth + 1)) return true;
+    return false;
+}
+
+void MainListener::CheckCxxReferenceAggregateReturn(
+        const LLVMBackend::NamedVariable& value,
+        const std::string& returnTypeName,
+        antlr4::ParserRuleContext* context)
+{
+    auto* compiler = compilerLLVM;
+    if (compiler == nullptr || context == nullptr) return;
+    const std::string resolvedType = compiler->ResolveTypeAlias(returnTypeName);
+    const auto topData = compiler->GetDataStructure(resolvedType);
+    if (!compiler->IsForeignCxxAggregateClass(resolvedType) && topData.StructType == nullptr)
+        return;
+
+    const auto required = CollectCxxReferenceMembers(resolvedType);
+    if (required.empty()) return;
+
+    struct ObjectSlot
+    {
+        llvm::Value* Root = nullptr;
+        std::vector<int64_t> Path;
+    };
+    constexpr int64_t anyIndex = std::numeric_limits<int64_t>::min();
+    auto slotPath = [&](llvm::Value* storage, ObjectSlot& slot) {
+        std::function<bool(llvm::Value*)> walk = [&](llvm::Value* current) {
+            if (current == nullptr || !current->getType()->isPointerTy()) return false;
+            current = current->stripPointerCasts();
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(current))
+            {
+                if (!walk(gep->getPointerOperand())) return false;
+                for (auto it = gep->idx_begin(); it != gep->idx_end(); ++it)
+                {
+                    auto* constant = llvm::dyn_cast<llvm::ConstantInt>(it->get());
+                    slot.Path.push_back(constant == nullptr ? anyIndex
+                        : constant->getSExtValue());
+                }
+                return true;
+            }
+            slot.Root = current;
+            return true;
+        };
+        return storage != nullptr && walk(storage);
+    };
+    std::vector<ObjectSlot> objectSlots;
+    auto addSlot = [&](llvm::Value* storage) {
+        ObjectSlot slot;
+        if (!slotPath(storage, slot)) return;
+        if (std::none_of(objectSlots.begin(), objectSlots.end(), [&](const auto& found) {
+                return found.Root == slot.Root && found.Path == slot.Path;
+            }))
+            objectSlots.push_back(std::move(slot));
+    };
+    std::unordered_set<llvm::Value*> seenValues;
+    std::function<void(llvm::Value*)> collectValue = [&](llvm::Value* current) {
+        if (current == nullptr) return;
+        current = current->stripPointerCasts();
+        if (!seenValues.insert(current).second) return;
+        if (current->getType()->isPointerTy())
+        {
+            if (auto* select = llvm::dyn_cast<llvm::SelectInst>(current))
+            {
+                collectValue(select->getTrueValue());
+                collectValue(select->getFalseValue());
+            }
+            else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(current))
+                for (llvm::Value* incoming : phi->incoming_values()) collectValue(incoming);
+            else addSlot(current);
+            return;
+        }
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(current))
+            addSlot(load->getPointerOperand());
+        else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(current))
+        {
+            collectValue(select->getTrueValue());
+            collectValue(select->getFalseValue());
+        }
+        else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(current))
+            for (llvm::Value* incoming : phi->incoming_values()) collectValue(incoming);
+        else if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(current))
+        {
+            collectValue(insert->getAggregateOperand());
+            collectValue(insert->getInsertedValueOperand());
+        }
+        else if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(current))
+            collectValue(extract->getAggregateOperand());
+    };
+    collectValue(value.Storage);
+    collectValue(value.Primary);
+
+    // Only a PROVEN frame binding refuses: a live Frame fact on a slot the value reads, or a call
+    // result (no slot holds it) whose call-argument rule proves one.
+    std::vector<std::pair<llvm::Value*, std::vector<int64_t>>> slots;
+    for (auto& slot : objectSlots) slots.emplace_back(slot.Root, std::move(slot.Path));
+    llvm::WeakVH primary(value.Primary != nullptr && value.Primary->getType()->isStructTy()
+        ? value.Primary : nullptr);
+    const auto firstMember = required.begin()->first;
+    auto refuse = [this, compiler, slots, primary, firstMember, context](const CxxFactPoint& at) {
+        for (const auto& [root, path] : slots)
+            if (const auto* fact = CxxLiveFrameFact(root, path, at))
+            {
+                LogErrorContext(fact->Context != nullptr ? fact->Context : context,
+                    std::format("cannot return C++ aggregate '{}': reference member '{}' "
+                                "cannot bind to a local or temporary value",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{
+                            .TypeName = fact->AggregateType }), fact->FieldName));
+                return true;
+            }
+        llvm::Value* result = primary;
+        if (result == nullptr || !CxxValueFrameBound(result, at, 0)) return false;
+        LogErrorContext(context, std::format("cannot return C++ aggregate '{}': reference member "
+                "'{}' cannot bind to a local or temporary value",
+            SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = firstMember.first }),
+            firstMember.second));
+        return true;
+    };
+    const CxxFactPoint at = CurrentCxxFactPoint();
+    if (refuse(at) || !InsideCxxFactLoop()) return;
+    // A write later in an enclosing loop body reaches this return on the back edge.
+    DeferCxxFactQuery(true, [refuse, at](bool& done) {
+        done = refuse(at);
+        return false;
+    });
+}
+
 void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                         CFlatParser::AssignmentExpressionContext* assignExpr,
                                         const std::string& retText,
@@ -1953,6 +2151,14 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
             else
             {
+            struct RejectNestedReferenceEscapeScope
+            {
+                bool& Flag;
+                bool Previous;
+                explicit RejectNestedReferenceEscapeScope(bool& flag)
+                    : Flag(flag), Previous(flag) { Flag = true; }
+                ~RejectNestedReferenceEscapeScope() { Flag = Previous; }
+            } rejectNestedReferenceEscapeScope(rejectCxxReferenceMemberReturnBrace_);
             // Movable structs follow the declaration path (source-order field evaluation).
             const bool forceFresh = cxxSretReturn || compiler->IsImmovableCFlatStruct(resolvedTypeName);
             if (!EmitFreshBraceInitializeAggregate(returnDest, resolvedTypeName, fieldList, forceFresh))
@@ -2031,9 +2237,20 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             compiler->returnOperandFunction_ = compiler->currentFunction;
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
             trivialCxxMoveSite_ = nullptr;
+            for (const auto& lender : returnNV.CxxClosureLenders)
+                if (auto* source = compiler->FindStackVariableByStorage(lender.first);
+                    source != nullptr && source->CxxClosureLentTo.empty())
+                    source->CxxClosureLentTo = lender.second;
             // A generic instantiation returned as a function value (`return dbl<int>;`) is bound to its
             // instance here, the way a named function value is, before the return slot is checked.
             ResolveGenericFunctionValueOperand(returnNV, assignExpr);
+            if (braceInitializer == nullptr && !defaultValue
+                && !compiler->currentFunctionReturnTV.Pointer
+                && !compiler->currentFunctionReturnTV.ElemPointer
+                && !compiler->currentFunctionReturnTV.IsAlias
+                && !compiler->currentFunctionReturnTV.IsArrayView)
+                CheckCxxReferenceAggregateReturn(
+                    returnNV, compiler->currentFunctionReturnTypeName, errCtx);
             const auto& returnType = compiler->currentFunctionReturnTV;
             const bool uniqueReturnDestination = compiler->IsCoreUniqueType(returnType.TypeName)
                 || (returnType.Pointer && returnType.IsUnique && !returnType.ElemPointer);
@@ -3094,26 +3311,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     || sourceIsNullCoalesceJoin;
                 // An argument is frame-rooted directly, or through a nested C++ reference-result
                 // call whose own receiver/arguments are (`local_ref(local_ref(lc))`).
-                std::function<bool(llvm::Value*, unsigned)> argumentRootedInFrame;
-                argumentRootedInFrame = [&](llvm::Value* arg, unsigned depth) -> bool {
-                    if (arg == nullptr || !arg->getType()->isPointerTy()) return false;
-                    if (PointsIntoStackFrame(arg)) return true;
-                    llvm::Value* base = arg->stripPointerCasts();
-                    while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
-                        base = gep->getPointerOperand()->stripPointerCasts();
-                    auto* inner = llvm::dyn_cast<llvm::CallBase>(base);
-                    if (inner == nullptr || depth > 16 || !compiler->IsAliasValue(inner))
-                        return false;
-                    auto* innerCallee = inner->getCalledFunction();
-                    const auto* innerSym = innerCallee != nullptr
-                        ? compiler->FindSymbolForFunction(innerCallee) : nullptr;
-                    if (innerSym == nullptr || !innerSym->IsCxx || !innerSym->ReturnType.IsAlias
-                        || innerSym->ReturnType.Pointer)
-                        return false;
-                    for (unsigned j = 0; j < inner->arg_size(); ++j)
-                        if (argumentRootedInFrame(inner->getArgOperand(j), depth + 1)) return true;
-                    return false;
-                };
+                const std::function<bool(llvm::Value*, unsigned)> argumentRootedInFrame =
+                    [this](llvm::Value* arg, unsigned depth) {
+                        return CxxArgumentRootedInFrame(arg, depth);
+                    };
                 auto argumentComesFromGlobal = [](llvm::Value* arg) {
                     std::unordered_set<llvm::Value*> seen;
                     std::function<bool(llvm::Value*)> fromGlobal = [&](llvm::Value* value) {
@@ -4682,7 +4883,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
         // A for-init typedef stays visible through the loop, then ends with the statement.
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
         DeferredLoopScope loop{ compiler, compiler->BeginDeferredLoop() };
-        ParseStatementBody(statement);
+        {
+            CxxFactRegionScope factLoop(*this, true);
+            ParseStatementBody(statement);
+            factLoop.Close();
+        }
         loop.Close();
 }
 
@@ -4776,6 +4981,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
             compiler->RestoreOwnFlagJoinState(labelOwnFlagState);
             // Dispatch may skip earlier case groups: joins made inside the switch move out of its frame.
             compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagSwitchFrame);
+            RenewCxxFactSwitchCase();
             auto& ctx = switchStack.back();
             llvm::BasicBlock* targetBlock = nullptr;
 
@@ -4902,6 +5108,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
             }
             else if (jump->Continue())
             {
+                NoteCxxFactJump(true);
                 // continue re-tests the condition; an always-true condition never exits the loop there.
                 compiler->RecordOwnFlagLoopContinueState();
                 if (loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
@@ -4918,6 +5125,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
             }
             else if (jump->Break())
             {
+                NoteCxxFactJump(false);
                 // A break whose innermost breakable is the switch joins the switch's exits.
                 if (!switchStack.empty() && switchStack.back().loopDepth == loopBreakMovedStates_.size())
                 {
@@ -5028,6 +5236,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
 
                 compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
                 PrepareLoopConditionalDropFlags(innerStatement);
+                MarkCxxFactLoopEntersBody(true);
                 ParseControlledBody(innerStatement);
                 if ((loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
                     && compiler->IsInsertBlockLive() && !compiler->IsCurrentBlockUnreachable())
@@ -5086,7 +5295,10 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // IsCurrentBlockUnreachable() then recognizes it as dead at the end
                 // of the enclosing function/lambda (see the missing-return checks).
                 if (compiler->IsConstantTruthy(condition))
+                {
                     compiler->CreateBlockBreak(blockInner, false);  // unconditional br to body
+                    MarkCxxFactLoopEntersBody(false);
+                }
                 else
                     compiler->CreateConditionJump(condition, blockInner, blockResume);
 
@@ -6232,7 +6444,12 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 straightLineReturned_ = false;
                 straightLineJumped_ = false;
                 straightLineContinued_ = false;
+                const size_t factDepth = cxxFactRegions_.contains(compiler->currentFunction)
+                    ? cxxFactRegions_[compiler->currentFunction].size() : 0;
+                lastPoppedCxxFactRegion_.Function = nullptr;
                 ParseControlledBody(innerStatement[0]);
+                CxxFactGroup thenFacts;
+                const bool haveThenFacts = TakeCxxFactBranch(thenFacts, factDepth);
                 bool thenReturned = straightLineReturned_ || straightLineJumped_;
                 bool thenJumped = straightLineJumped_;
                 bool thenContinued = straightLineContinued_;
@@ -6254,7 +6471,11 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     straightLineReturned_ = false;
                     straightLineJumped_ = false;
                     straightLineContinued_ = false;
+                    lastPoppedCxxFactRegion_.Function = nullptr;
                     ParseControlledBody(innerStatement[1]);
+                    CxxFactGroup elseFacts;
+                    if (haveThenFacts && TakeCxxFactBranch(elseFacts, factDepth))
+                        JoinCxxFactKills({ thenFacts, elseFacts }, thenFacts.Start);
                     elseReturned = straightLineReturned_ || straightLineJumped_;
                     elseContinued = straightLineContinued_;
                     auto elseMovedState = compiler->SaveMovedState();
@@ -6590,6 +6811,8 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 {
                     // One frame for the whole body: every statement of a case group is conditional on its label.
                     OwnershipControlScope switchBodyControlScope(compiler, LLVMBackend::OwnFlagSwitchFrame);
+                    CxxFactRegionScope factCases(*this, false, true,
+                                                 switchCtx.defaultBlock != nullptr);
                     if (body && body->blockItemList())
                         ParseBlockItemList(body->blockItemList());
                 }

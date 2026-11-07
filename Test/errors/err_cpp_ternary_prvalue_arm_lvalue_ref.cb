@@ -1,4 +1,5 @@
 import cpp "cpp_t67_postinc.hpp";
+import cpp "../library/cpp_t239_ternary_byvalue.hpp";
 
 extern int main()
 {
@@ -25,6 +26,24 @@ extern int main()
         int j = 4;
         bool t = true;
         (t ? i++ : j) = 9;
+    }
+    expect_error("ambiguous C++ conversions") {
+        bool t = true;
+        cppternbase.Amb amb = cppternbase.Amb(1);
+        cppternbase.B base = cppternbase.B(2);
+        cppternbase.constRef(t ? amb : base);
+    }
+    expect_error("ternary branches have no common C++ type") {
+        bool t = true;
+        cppternbase.Priv derived = cppternbase.Priv(1);
+        cppternbase.B base = cppternbase.B(2);
+        cppternbase.constRef(t ? derived : base);
+    }
+    expect_error("ternary branches have no common C++ type") {
+        bool t = true;
+        cppternbase.D derived = cppternbase.D(1);
+        cppternbase.Other other = cppternbase.Other(2);
+        cppternbase.constRef(t ? derived : other);
     }
     return 0;
 }

@@ -329,6 +329,7 @@ import cpp "library/cpp_t52_refnull.hpp";
 import cpp "library/cpp_t111_nullptr_t.hpp";
 import cpp "library/cpp_t98_macro_constant.hpp";
 import cpp "library/cpp_t28_fwdref.hpp";
+import cpp "library/cpp_t525_fnwrap_r3.hpp";
 import cpp "library/t84_conversion.hpp";
 import cpp "library/cpp_t27_ptrdiff.hpp";
 import cpp "library/cpp_interop_lastuse.h";
@@ -430,11 +431,65 @@ import cpp "library/cpp_interop_ctorref.h";
 import cpp "library/cpp_interop_tpl.h";
 using T469Gate = cppt.dflt.Gate;
 using T469GateExplicit = cppt.dflt.Gate<cppt.dflt.CountDone>;
+using T469GA = cppt.dflt.GA;
+using T469GAExplicitCtor = cppt.dflt.GA;
 struct T469Holder<T> { T* p = default; };
 struct T469GatePointerField { T469Gate* p = default; };
+struct T469GAField { T469GA<>* p = default; };
 T469Gate* t469GateIdentity(T469Gate* p) { return p; }
+T469GA<> t469GAIdentity(T469GA<> value) { return value; }
+T469GA<>* t469GAPointerIdentity(T469GA<>* value) { return value; }
+int t469GAPick(T469GA<>* value) { return cppt.dflt.ga_pick(value); }
+long t469GateCallback(T469Gate* p) { return p->arrive(); }
+long t469CallGateAliasCallback(function<long(T469Gate*)> callback, T469Gate* p)
+{
+    return callback(p);
+}
+long t469CallGateSpelledCallback(function<long(cppt.dflt.Gate<>*)> callback,
+                                 cppt.dflt.Gate<>* p)
+{
+    return callback(p);
+}
 int t469ReadGate<T>(T* p) { return (int)p->arrive(); }
 int t469ReadSize<T>(T* p) { return (int)sizeof(T); }
+namespace T469DefaultAliasNS { using G = cppt.dflt.Gate; }
+namespace T469AliasCtorNS
+{
+    using G = cppt.dflt.Gate;
+    using GA = cppt.dflt.GA;
+}
+namespace T469DefaultAliasNS
+{
+    struct Holder { G* p = default; };
+    G* identity(G* p) { return p; }
+    int size() { return (int)sizeof(G); }
+    long makeAndUse()
+    {
+        G local = G(1);
+        long result = local.arrive();
+        G* heap = new G(1);
+        result += heap->arrive();
+        delete heap;
+        return result;
+    }
+}
+struct T469DefaultAliasQualifiedField { T469DefaultAliasNS.G* p = default; };
+T469DefaultAliasNS.G* t469DefaultAliasQualifiedPointer = nullptr;
+namespace T469GenericAliasNS
+{
+    using G = cppt.dflt.GA;
+    struct Holder { G<>* p = default; };
+    int size() { return (int)sizeof(G<>); }
+    G<> identity(G<> value) { return value; }
+    G<>* pointer(G<>* value) { return value; }
+    long makeAndUse()
+    {
+        G<>* value = new G<>(1);
+        if (value == nullptr) return 1;
+        delete value;
+        return 0;
+    }
+}
 namespace T469AliasShadowNS
 {
     using T469Gate = cppt.dflt.Plain;
@@ -1529,6 +1584,12 @@ int RpUnwind(int x)
     return p.v + cppunw.thrower(x);
 }
 int fnptr_add_one(int x) { return x + 1; }
+// FNWRAP r3 helpers: a function<> argument, a Lambda<> parameter moved into C++, an alias closure.
+int fnwrapUseFp(function<int(int)> q) { return q(5); }
+int fnwrapPassLambda(Lambda<int(int)> f) { return cppi.apply_n(move f, 3); }
+int fnwrapAliasValue = 7;
+alias int fnwrapAliasGetter() { return fnwrapAliasValue; }
+struct FnwrapBox { int v = 0; };
 function<int(int)> T56GlobalFn = fnptr_add_one;
 int fnptr_add_two_double(double x) { return (int)x + 2; }
 int fnptr_times_ten(int x) { return x * 10; }
@@ -1705,6 +1766,19 @@ int CppTemporaryRefCases()
     cppref.Ex refPickLvalue = cppref.Ex(5);
     if (cppref.choose_rref(cppref.Ex(5)) != 405
         || cppref.choose_rref(refPickLvalue) != 306 || refPickLvalue.v != 6) return 3394;
+    // clang++ -std=c++20: const prvalues retain const; the template deduces const CvCtorSource.
+    cppref.CvCtorConstRef constPrvalueCref = cppref.CvCtorConstRef(cppref.make_const_ctor_source());
+    if (constPrvalueCref.which != 11) return 3397;
+    cppref.CvCtorByValue constPrvalueByValue = cppref.CvCtorByValue(cppref.make_const_ctor_source());
+    if (constPrvalueByValue.which != 12) return 3398;
+    cppref.CvCtorConstRRef constPrvalueConstRref = cppref.CvCtorConstRRef(cppref.make_const_ctor_source());
+    if (constPrvalueConstRref.which != 14) return 3399;
+    cppref.CvCtorPair constPrvaluePair = cppref.CvCtorPair(cppref.make_const_ctor_source());
+    if (constPrvaluePair.which != 16) return 3400;
+    cppref.CvCtorTemplate constPrvalueTemplate = cppref.CvCtorTemplate(cppref.make_const_ctor_source());
+    if (constPrvalueTemplate.which != 17) return 3401;
+    cppref.CvCtorRRef mutablePrvalueRref = cppref.CvCtorRRef(cppref.make_ctor_source());
+    if (mutablePrvalueRref.which != 13) return 3402;
     ExFieldHolder refField = default;
     if (cppref.take_ref(refField.ex) != 6 || refField.ex.v != 6)             return 3395;
     if (cppref.take_ref(cppref.ref_ex()) != 71 || cppref.ref_ex().v != 71)  return 3396;
@@ -3933,6 +4007,33 @@ cppref.BraceRefInner refctxGlobalRefNamed = {
     r = refctxGlobalRefSource, v = 1, d = 0.0 };
 cppref.BraceConstRef refctxGlobalConstPositional = { refctxGlobalConstSource };
 cppref.BraceRvalRef refctxGlobalRvalPrvalue = { 42 };
+cppref.BraceRefInner refctxReturnNamedGlobal()
+{
+    cppref.BraceRefInner value = { r = refctxGlobalRefSource, v = 6, d = 0.0 };
+    return value;
+}
+cppref.BraceRefInner refctxReturnNamedHeap()
+{
+    static unique int* heap = new int(43);
+    cppref.BraceRefInner value = { r = *heap, v = *heap, d = 0.0 };
+    return value;
+}
+cppref.BraceRefInner refctxReturnNamedParameter(alias int source)
+{
+    cppref.BraceRefInner value = { r = source, v = 8, d = 0.0 };
+    return value;
+}
+cppref.BraceRefOuter refctxReturnNestedGlobal()
+{
+    return { m = { r = refctxGlobalRefSource, v = 9, d = 0.0 }, k = 10 };
+}
+int refctxNamedLocalOnly()
+{
+    int source = 11;
+    cppref.BraceRefInner value = { r = source, v = 12, d = 0.0 };
+    value.r = 13;
+    return source + value.v;
+}
 int refctxFieldDefaultSource = 43;
 int refctxFieldBraceSource = 44;
 struct RefctxFieldDefaultNamed
@@ -4237,6 +4338,119 @@ int T235TupleDtorCount = 0;
 using VarAliasProj = alnv.Proj<int, char>;
 // CONVOP cell 1, return position: the ternary is CFlat code, so the const-receiver pick is CFlat's (clang 1, hit 2).
 int convopReturnTernary(t105.CvBoolY* p) { return t105.cvBoolY(*p) ? 1 : 3; }
+int ternstrCflatChar(char* p) { return (int)p[0]; }
+
+[cpp] struct UsingDeclCppDerived : cppi_usingdecl.Select { int extra = 4; };
+int fnrefCtorPlus5(int x) { return x + 5; }
+function<int(int)> fnrefCtorRetfp() { return fnrefCtorPlus5; }
+// REFESC r3 accept set (review1 matrix): safe shapes that master accepts and clang accepts.
+int refescr3Gi = 61;
+cppref.BraceRefInner refescr3G = { r = refescr3Gi, v = 1, d = 0.0 };
+struct R3Wrap { cppref.BraceRefInner i; int k = default; };
+cppref.BraceRefInner refescr3HG() { return refescr3G; }
+cppref.BraceRefInner refescr3CflatCall() { return refescr3HG(); }
+refescr3.Ref refescr3CxxCallGlobal() { return refescr3.mk(refescr3Gi); }
+cppref.BraceRefInner refescr3DerefParam(cppref.BraceRefInner* p) { return *p; }
+cppref.BraceRefInner refescr3ArrowField(cppref.BraceRefOuter* p) { return p->m; }
+cppref.BraceRefInner refescr3CopyGlobal() { cppref.BraceRefInner a = refescr3G; return a; }
+cppref.BraceRefInner refescr3CopyParam(cppref.BraceRefInner p) { cppref.BraceRefInner a = refescr3G; a = p; return a; }
+cppref.BraceRefInner refescr3ReassignGlobal()
+{
+    int x = 1;
+    cppref.BraceRefInner a = { r = x, v = 1, d = 0.0 };
+    a = refescr3G;
+    return a;
+}
+refescr3.Ref refescr3PassGlobal()
+{
+    refescr3.Ref l = refescr3.mk(refescr3Gi);
+    auto a = refescr3.pass(l);
+    return a;
+}
+R3Wrap refescr3OuterStable()
+{
+    cppref.BraceRefInner s = refescr3G;
+    R3Wrap o = { i = s, k = 1 };
+    return o;
+}
+// REFESC r3 item 2: a brace temporary that is a call argument does not inherit the return brace's rule.
+R3Wrap refescr3BraceCallArg()
+{
+    int x = 1;
+    return { i = refescr3G, k = cppref.refctx_mut_byconst({ r = x, v = 1, d = 0.0 }) };
+}
+// REFESC r4: structured flow - a frame binding made inside a branch is dead after a later
+// straight-line overwrite, or when every path (if/else, switch with default, a body that always
+// runs) overwrites it; a loop write before the return in the same body covers the back edge.
+cppref.BraceRefInner refescr4BranchThenStable(bool c)
+{
+    int x = 1;
+    cppref.BraceRefInner fr = { r = x, v = 1, d = 0.0 };
+    cppref.BraceRefInner a = refescr3G;
+    if (c) { a = fr; }
+    a = refescr3G;
+    return a;
+}
+cppref.BraceRefInner refescr4AllPaths(bool c, int n)
+{
+    int x = 1;
+    cppref.BraceRefInner a = { r = x, v = 1, d = 0.0 };
+    if (c) { if (n > 0) { a = refescr3G; } else { a = refescr3G; } } else { a = refescr3G; }
+    return a;
+}
+cppref.BraceRefInner refescr4SwitchDefault(int n)
+{
+    int x = 1;
+    cppref.BraceRefInner a = { r = x, v = 1, d = 0.0 };
+    switch (n) { case 1: case 2: a = refescr3G; break; default: a = refescr3G; break; }
+    return a;
+}
+cppref.BraceRefInner refescr4WhileTrue()
+{
+    int x = 1;
+    int k = 0;
+    cppref.BraceRefInner a = { r = x, v = 1, d = 0.0 };
+    while (true) { k++; if (k < 2) { continue; } a = refescr3G; break; }
+    return a;
+}
+cppref.BraceRefInner refescr4DoWhile(int n)
+{
+    int x = 1;
+    cppref.BraceRefInner a = { r = x, v = 1, d = 0.0 };
+    do { a = refescr3G; } while (n < 0);
+    return a;
+}
+cppref.BraceRefInner refescr4LoopKillBefore(int n)
+{
+    int x = 1;
+    cppref.BraceRefInner fr = { r = x, v = 1, d = 0.0 };
+    cppref.BraceRefInner a = refescr3G;
+    for (int i = 0; i < n; i++) { a = refescr3G; if (i > 0) { return a; } a = fr; }
+    return refescr3G;
+}
+cppref.BraceRefInner refescr4LoopCopyKilled(int n)
+{
+    int x = 1;
+    cppref.BraceRefInner fr = { r = x, v = 1, d = 0.0 };
+    cppref.BraceRefInner a = refescr3G;
+    cppref.BraceRefInner b = refescr3G;
+    for (int i = 0; i < n; i++) { b = a; a = fr; a = refescr3G; }
+    return b;
+}
+
+alias cppternbase.B ternbaseChoose(bool choose, cppternbase.D* derived, cppternbase.B* base)
+{
+    return choose ? *derived : *base;
+}
+alias cppternbase.B ternbaseChooseReverse(bool choose, cppternbase.D* derived,
+                                          cppternbase.B* base)
+{
+    return choose ? *base : *derived;
+}
+
+int macroLeftDiscardDtorCount = 0;
+struct MacroLeftDiscardD { ~MacroLeftDiscardD() { macroLeftDiscardDtorCount++; } };
+MacroLeftDiscardD makeMacroLeftDiscardD() { MacroLeftDiscardD d; return d; }
 
 extern int main()
 {
@@ -6852,6 +7066,54 @@ extern int main()
     // T98: a parenthesized or nested `?:` of macro constants is a prvalue (clang: 50 and 50).
     if (cpi_t98.fwd((t98C ? T98_N5 : T98_N5)) != 95) return 98910;
     if (cpi_t98.fwd(t98C ? (t98C ? T98_N5 : T98_N5) : T98_N5) != 95) return 98911;
+    if (cpi_t98.commaPick((cpi_t98.commaBump(), T98_N5)) != 205
+        || cpi_t98.commaCount() != 1) return 98914;
+    cpi_t98.MacroAnonPick t98AnonPick{T98_ANON_MACRO};
+    cpi_t98.MacroInlinePick t98InlinePick{T98_INLINE_MACRO};
+    cpi_t98.MacroNamedPick t98NamedPick{T98_NAMED_MACRO};
+    cpi_t98.MacroBoolPick t98BoolPick{T98_BOOL_MACRO};
+    cpi_t98.MacroAnonBox t98AnonBox{T98_ANON_MACRO};
+    cpi_t98.MacroInlineBox t98InlineBox{T98_INLINE_MACRO};
+    if (t98AnonPick.n != 71 || t98InlinePick.n != 73 || t98NamedPick.n != 75
+        || t98BoolPick.n != 77 || t98AnonBox.n != 17 || t98InlineBox.n != 18) return 98915;
+    if (cpi_t98.macroTypePick(T98_INLINE_MACRO) != 82
+        || cpi_t98.macroTypePick(T98_NAMED_MACRO) != 83
+        || cpi_t98.macroTypePick(T98_BOOL_MACRO) != 84) return 98918;
+    // T98: enum macros retain their type for template deduction and paren construction.
+    if (cpi_t98.macroTypeTemplate(T98_NAMED_MACRO) != 1) return 99300;
+    cpi_t98.MacroNamedPick t98ParenPick = cpi_t98.MacroNamedPick(T98_NAMED_MACRO);
+    if (t98ParenPick.n != 75) return 99301;
+    // T98: auto locals keep enum identity for overloads, templates, and brace constructors.
+    auto t98EnumAuto = T98_NAMED_MACRO;
+    if (cpi_t98.macroTypePick(t98EnumAuto) != 83) return 99302;
+    if (cpi_t98.macroTypeTemplate(t98EnumAuto) != 1) return 99303;
+    cpi_t98.MacroNamedPick t98AutoPick{t98EnumAuto};
+    if (t98AutoPick.n != 75) return 99304;
+    // T98: an auto local from a bool macro still selects bool over int.
+    auto t98BoolAuto = T98_BOOL_MACRO;
+    if (cpi_t98.macroTypePick(t98BoolAuto) != 84) return 99305;
+    // T98: mixed arguments use the enum overload while the second argument stays int.
+    if (cpi_t98.macroTypePick2(T98_NAMED_MACRO, 1) != 12) return 99306;
+    // T98: enum-to-int local, arithmetic promotion, and switch remain ordinary CFlat uses.
+    int t98PureMacroInt = T98_NAMED_MACRO;
+    if (t98PureMacroInt != 19 || T98_NAMED_MACRO + 0 != 19) return 99307;
+    switch (T98_NAMED_MACRO) { case 19: break; default: return 99307; }
+    // T98: the discarded comma operand's destructor runs at the call full-expression end.
+    macroLeftDiscardDtorCount = 0;
+    int t98DiscardValue = cpi_t98.macroCommaId((makeMacroLeftDiscardD(), T98_NAMED_MACRO));
+    if (t98DiscardValue != 19) return 99308;
+    if (macroLeftDiscardDtorCount != 1) return 99309;
+    // T98: an unnamed-enum enumerator constructs and deduces like clang: T = T98AnonEnum (3, 22),
+    // the enum constructor in a brace list (71), a namespaced one too (31). Lvalues stay as master.
+    if (cpi_t98.macroTypeTemplate(T98_ANON_VALUE) != 3) return 99313;
+    if (cpi_t98.macroAnonFwd(T98_ANON_VALUE) != 22) return 99317;
+    cpi_t98.MacroAnonPick t98AnonBraceEnum{T98_ANON_VALUE};
+    if (t98AnonBraceEnum.n != 71) return 99321;
+    cpi_t98.NsAnonPick t98NsAnonBrace{cpi_t98.NsAnonValue};
+    if (t98NsAnonBrace.n != 31) return 99322;
+    if (T98_DEREF != 40) return 98916;
+    T98_DEREF = 42;
+    if (T98_DEREF != 42 || &T98_DEREF != &cpi_t98.derefCell) return 98917;
     T98Shadow t98Sh = default;
     t98Sh.T98_N5 = 6;
     t98Sh.t98Other = 6;
@@ -7743,6 +8005,11 @@ extern int main()
         // The slot is the variable: one object (same address), lvalue category, and a later
         // assignment is what a kept reference sees.
         if (t525.address(t525F) != t525.address(t525F) || t525.category(t525F) != 1) return 52512;
+        // A C++ Fp& result is a pointer slot: direct call and function<> initialization each load it once.
+        function<int(int)> t525FpSource = fnptr_add_one;
+        if (t525.fwdfp(t525FpSource)(5) != 6) return 52522;
+        function<int(int)> t525FpCopy = t525.fwdfp(t525FpSource);
+        if (t525FpCopy(5) != 6) return 52523;
         auto t525Kept = t28.holdfwd(t525F);
         t525F = (int v) => v + 100;
         t28.scribble();
@@ -7783,6 +8050,72 @@ extern int main()
         Lambda<int(int)> t525SizeofMoved = move t525SizeofSource;
         t28.scribble();
         if (t525SizeofMoved(5) != 20 || t525SizeofCopy(5) != 20) return 52521;
+    }
+    {
+        // FNWRAP r3 (clang oracle: tests in scratch/fnwrap_r2_tmp/oracle*.cpp): forwarded function
+        // pointer results, by-value closure results, and closure parameters of each C++ shape.
+        function<int(int)> fnwrapP1 = fnptr_add_one;
+        t525.fwdfp(fnwrapP1) = t525.add2;
+        if (fnwrapP1(5) != 7) return 52524;
+        function<int(int)> fnwrapP2 = fnptr_add_one;
+        auto fnwrapQ = t525.fwdfp(fnwrapP2);
+        if (fnwrapQ(5) != 6) return 52525;
+        if (fnwrapUseFp(t525.fwdfp(fnwrapP2)) != 6) return 52526;
+        int fnwrapK = 4;
+        Lambda<int(int)> fnwrapF = (int v) => v * fnwrapK;
+        if (t525.call5(t525.pass(fnwrapF)) != 20) return 52527;
+        Lambda<int(int)> fnwrapG = (int v) => v * fnwrapK;
+        auto fnwrapCopy = fnwrap3.copy_return(fnwrapG);
+        if (fnwrapCopy(3) != 12) return 52528;
+        Lambda<int(int)> fnwrapN50 = (int x) => x + 4;
+        // guard: runs on master too
+        if (fnwrapPassLambda(fnwrapN50) != 15) return 52529;
+        // A struct capture is by reference: the non-retaining apply_n(F&&) runs it (clang 9).
+        FnwrapBox fnwrapBox = { v = 4 };
+        Lambda<int(int)> fnwrapByRef = (int x) => x + fnwrapBox.v;
+        if (cppi.apply_n(fnwrapByRef, 2) != 9) return 52530;
+        Lambda<int(fnwrap3.Record)> fnwrapRec = (fnwrap3.Record x) => x.value + 1;
+        fnwrap3.Record fnwrapR = fnwrap3.Record(6);
+        if (fnwrap3.apply_record(fnwrapRec, fnwrapR) != 7) return 52531;
+        Lambda<int(string)> fnwrapStr = (string x) => x.length();
+        if (fnwrap3.apply_string(fnwrapStr, "hello") != 5) return 52532;
+        Lambda<alias int()> fnwrapAl = fnwrapAliasGetter;
+        if (fnwrap3.apply_alias_result(fnwrapAl) != 7) return 52533;
+        Lambda<int(move string)> fnwrapMv = (move string x) => x.length();
+        if (fnwrap3.apply_move_string(fnwrapMv, "hello") != 5) return 52534;
+        Lambda<int(int)> fnwrapOwnSrc = (int v) => v * fnwrapK;
+        auto fnwrapOwned = fnwrap3.holdowned(fnwrapOwnSrc);
+        Lambda<int(int)> fnwrapOwnMoved = move fnwrapOwnSrc;
+        // guard: runs on master too
+        if (fnwrapOwned.run(5) != 20 || fnwrapOwnMoved(5) != 20) return 52535;
+        Lambda<int(int)> fnwrapExSrc = (int v) => v * fnwrapK;
+        {
+            auto fnwrapH = t28.holdfwd(fnwrapExSrc);
+            if (fnwrapH.run(5) != 20) return 52536;
+        }
+        Lambda<int(int)> fnwrapExMoved = move fnwrapExSrc;
+        if (fnwrapExMoved(5) != 20) return 52537;
+        Lambda<int(int)> fnwrapDjSrc = (int v) => v * fnwrapK;
+        bool fnwrapBranch = true;
+        if (fnwrapBranch)
+        {
+            auto fnwrapH2 = t28.holdfwd(fnwrapDjSrc);
+            if (fnwrapH2.run(5) != 20) return 52538;
+        }
+        else
+        {
+            Lambda<int(int)> fnwrapDjG = move fnwrapDjSrc;
+            if (fnwrapDjG(5) != 20) return 52539;
+        }
+        Lambda<int(int)> fnwrapDjMoved = move fnwrapDjSrc;
+        if (fnwrapDjMoved(5) != 20) return 52540;
+        // const F& cref(const F&) binds the borrowed closure (clang 20); a second by-value
+        // copy_return of the same closure type reuses the adapter (clang 12 + 4).
+        Lambda<int(int)> fnwrapCr = (int v) => v * fnwrapK;
+        auto fnwrapCrRef = fnwrap3.cref(fnwrapCr);
+        if (fnwrapCrRef(5) != 20) return 52541;
+        auto fnwrapCopy2 = fnwrap3.copy_return(fnwrapG);
+        if (fnwrapCopy(3) + fnwrapCopy2(1) != 16) return 52542;
     }
     if ((int)HeapAudit.reportLeaks() != t69HeapBase) return 69004;
     // A borrowed closure wrapper leaves the owning environment count unchanged.
@@ -9827,6 +10160,61 @@ extern int main()
     if (virtBp.l() != 1033)                        return 453;
     if (virtBp.both_only() != 77)                  return 454;
 
+    // USINGDECL accept-set, measured before the ambiguous-field lookup guard.
+    cppi_usingdecl.Single usingSingle = cppi_usingdecl.Single();
+    if (usingSingle.v != 7)                        return 490;
+    cppi_usingdecl.Distinct usingDistinct = cppi_usingdecl.Distinct();
+    if (usingDistinct.left != 33 || usingDistinct.right != 44) return 491;
+    cppi_usingdecl.Shadow usingShadow = cppi_usingdecl.Shadow();
+    if (usingShadow.v != 31)                       return 492;
+    cppi_usingdecl.PublicUsing usingPublic = cppi_usingdecl.PublicUsing();
+    if (usingPublic.v != 7)                        return 493;
+
+    // USINGDECL: lookup selects the UsingShadow target and its exact base-subobject slot.
+    cppi_usingdecl.FromUsing usingFrom = cppi_usingdecl.FromUsing();
+    if (usingFrom.v != 7)                          return 494;
+    cppi_usingdecl.Select usingSelect = cppi_usingdecl.Select();
+    if (usingSelect.v != 13)                        return 495;
+    if (sizeof(cppi_usingdecl.Select) != cppi_usingdecl.select_size()) return 496;
+    usingSelect.v = 17;
+    if (cppi_usingdecl.selected_values(&usingSelect) != 717) return 497;
+    int* usingSelectedAddress = &usingSelect.v;
+    *usingSelectedAddress = 19;
+    if (cppi_usingdecl.selected_values(&usingSelect) != 719) return 498;
+    int usingRefResult = cppi_usingdecl.selected_ref(&usingSelect.v);
+    if (usingRefResult != 23 || cppi_usingdecl.selected_values(&usingSelect) != 723) return 499;
+    cppi_usingdecl.ShadowUsing usingShadowTarget = cppi_usingdecl.ShadowUsing();
+    if (usingShadowTarget.v != 31)                  return 500;
+    cppi_usingdecl.Method usingMethod = cppi_usingdecl.Method();
+    if (usingMethod.v() != 23)                      return 501;
+
+    // Pointer receivers follow the same selected field or method as direct receivers.
+    cppi_usingdecl.FromUsing* usingFromPointer = &usingFrom;
+    if (usingFromPointer.v != 7)                    return 502;
+    cppi_usingdecl.Select* usingSelectPointer = &usingSelect;
+    if (usingSelectPointer.v != 23)                 return 503;
+    cppi_usingdecl.ShadowUsing* usingShadowPointer = &usingShadowTarget;
+    if (usingShadowPointer.v != 31)                  return 504;
+    cppi_usingdecl.Method* usingMethodPointer = &usingMethod;
+    if (usingMethodPointer.v() != 23)                return 505;
+    UsingDeclCppDerived usingCppDerived = UsingDeclCppDerived();
+    if (usingCppDerived.v != 13)                    return 506;
+
+    // Two bases without a using are ambiguous whatever their access (clang looks up before access).
+    expect_error("member 'v' is ambiguous in C++ class 'cppi_usingdecl.AmbiguousPrivate': found in more than one base class") {
+        cppi_usingdecl.AmbiguousPrivate noUsingPrivate = cppi_usingdecl.AmbiguousPrivate();
+        int rejectedPrivate = noUsingPrivate.v;
+    }
+    expect_error("member 'v' is ambiguous in C++ class 'cppi_usingdecl.AmbiguousPublic': found in more than one base class") {
+        cppi_usingdecl.AmbiguousPublic noUsingPublic = cppi_usingdecl.AmbiguousPublic();
+        int rejectedPublic = noUsingPublic.v;
+    }
+
+    // Non-wrapper default-argument ambiguities retain the declared-default markers.
+    expect_error("cppi_usingdecl.default_tie(int, int = ...), cppi_usingdecl.default_tie(int, long = ...)") {
+        int rejectedDefaultTie = cppi_usingdecl.default_tie(4);
+    }
+
     // ---- class names containing a declarator keyword --------------------------------------------
     // "constant" contains "const" and "classBase" contains "class". Both are NON-PRIMARY bases
     // of QualNames, so a lost class identity shows up as a missing base adjustment.
@@ -10541,6 +10929,109 @@ extern int main()
         if (field.p->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46920;
     }
     if (T469Gate.s() != 7) return 46921;
+    {
+        int before = cppt.dflt.done_calls();
+        T469GA<> value = T469GA<>(1);
+        if (sizeof(T469GA<>) != sizeof(cppt.dflt.Gate<>)) return 46927;
+        if (t469GAPick(&value) != 22) return 46928;
+        T469GAField field = default;
+        field.p = t469GAPointerIdentity(&value);
+        if (t469GAPick(field.p) != 22) return 46929;
+        T469GA<> copy = t469GAIdentity(value);
+        if (t469GAPick(&copy) != 22 || cppt.dflt.done_calls() != before) return 46930;
+    }
+    {
+        T469GA<>* allocated = new T469GA<>(1);
+        allocated = t469GAPointerIdentity(allocated);
+        if (allocated == nullptr || t469GAPick(allocated) != 22) return 46931;
+        delete allocated;
+    }
+    if (sizeof(T469DefaultAliasNS.G) != sizeof(cppt.dflt.Gate<>)) return 46932;
+    if (T469DefaultAliasNS.size() != (int)sizeof(cppt.dflt.Gate<>)) return 46943;
+    {
+        int before = cppt.dflt.done_calls();
+        T469DefaultAliasNS.G local = cppt.dflt.Gate<>(1);
+        T469DefaultAliasNS.Holder holder = default;
+        holder.p = T469DefaultAliasNS.identity(&local);
+        T469DefaultAliasQualifiedField field = default;
+        field.p = holder.p;
+        t469DefaultAliasQualifiedPointer = field.p;
+        if (t469DefaultAliasQualifiedPointer == nullptr) return 46944;
+        if (holder.p->arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46945;
+        t469DefaultAliasQualifiedPointer = nullptr;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469DefaultAliasNS.G* heap = new T469DefaultAliasNS.G(1);
+        if (heap == nullptr || heap->arrive() != 0) return 46946;
+        delete heap;
+        if (cppt.dflt.done_calls() != before + 1) return 46947;
+        if (T469DefaultAliasNS.makeAndUse() != 0) return 46948;
+    }
+    if (T469GenericAliasNS.size() != (int)sizeof(cppt.dflt.Gate<>)) return 46933;
+    {
+        int before = cppt.dflt.done_calls();
+        T469GenericAliasNS.G<> value = cppt.dflt.GA<>(1);
+        T469GenericAliasNS.Holder holder = default;
+        holder.p = &value;
+        if (t469GAPick(holder.p) != 22) return 46934;
+        if (T469GenericAliasNS.pointer(&value) != &value) return 46949;
+        T469GenericAliasNS.G<> copy = T469GenericAliasNS.identity(value);
+        if (t469GAPick(&copy) != 22 || cppt.dflt.done_calls() != before) return 46935;
+        if (T469GenericAliasNS.makeAndUse() != 0) return 46936;
+    }
+    {
+        T469GenericAliasNS.G<>* heap = new T469GenericAliasNS.G<>(1);
+        if (heap == nullptr || t469GAPick(heap) != 22) return 46950;
+        delete heap;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        if (t469CallGateAliasCallback(t469GateCallback, &value) != 0
+            || cppt.dflt.done_calls() != before + 1) return 46937;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        // guard leg
+        if (t469CallGateSpelledCallback(t469GateCallback, &value) != 0
+            || cppt.dflt.done_calls() != before + 1) return 46938;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469AliasCtorNS.G value = T469AliasCtorNS.G(1);
+        if ((int)value.arrive() + 7 != 7 || cppt.dflt.done_calls() != before + 1)
+            return 46951;
+    }
+    {
+        T469AliasCtorNS.GA<> value = T469AliasCtorNS.GA<>(1);
+        if (cppt.dflt.ga_pick(&value) != 22) return 46952;
+    }
+    {
+        T469GAExplicitCtor<long long> value = T469GAExplicitCtor<long long>(1);
+        if (cppt.dflt.ga_pick(&value) != 11) return 46953;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        {
+            unique<T469Gate> owned = new T469Gate(1);
+            // guard leg
+            if (owned.get() == nullptr || owned->arrive() != 0) return 46939;
+        }
+        // guard leg
+        if (cppt.dflt.done_calls() != before + 1) return 46940;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        {
+            unique<cppt.dflt.Gate<>> owned = new cppt.dflt.Gate<>(1);
+            // guard leg
+            if (owned.get() == nullptr || owned->arrive() != 0) return 46941;
+        }
+        // guard leg
+        if (cppt.dflt.done_calls() != before + 1) return 46942;
+    }
     {
         int before = cppt.dflt.done_calls();
         T469Gate value = T469Gate(1);
@@ -11802,8 +12293,61 @@ extern int main()
     refctxReturnRvalPositional.r = 40;
     if (refctxReturnRvalPositionalSource != 40) return 47921;
 
+    // REFESC frozen accept-set: named aggregate returns keep stable reference-member roots.
+    int refescGlobalBefore = refctxGlobalRefSource;
+    cppref.BraceRefInner refescNamedGlobal = refctxReturnNamedGlobal();
+    refescNamedGlobal.r = 42;
+    if (refctxGlobalRefSource != 42 || refescNamedGlobal.v != 6) return 47933;
+    refctxGlobalRefSource = refescGlobalBefore;
+    cppref.BraceRefInner refescNamedHeap = refctxReturnNamedHeap();
+    refescNamedHeap.r = 44;
+    cppref.BraceRefInner refescNamedHeapAgain = refctxReturnNamedHeap();
+    if (refescNamedHeapAgain.r != 44 || refescNamedHeapAgain.v != 44) return 47934;
+    int refescParameterSource = 45;
+    cppref.BraceRefInner refescNamedParameter =
+        refctxReturnNamedParameter(refescParameterSource);
+    refescNamedParameter.r = 46;
+    if (refescParameterSource != 46 || refescNamedParameter.v != 8) return 47935;
+    cppref.BraceRefOuter refescNestedGlobal = refctxReturnNestedGlobal();
+    refescNestedGlobal.m.r = 47;
+    if (refctxGlobalRefSource != 47 || refescNestedGlobal.m.v != 9
+        || refescNestedGlobal.k != 10) return 47936;
+    refctxGlobalRefSource = refescGlobalBefore;
+    if (refctxNamedLocalOnly() != 25) return 47937;
+
     refctxGlobalRefNamed.r = 45;
     if (refctxGlobalRefSource != 45 || refctxGlobalRefNamed.v != 1) return 47922;
+
+    // REFESC r3 accept set: each returned binding still reads the global (61) or the call value.
+    cppref.BraceRefInner r3a = refescr3CflatCall();
+    if (r3a.r != 61) return 49801;
+    refescr3.Ref r3b = refescr3CxxCallGlobal();
+    if (r3b.r != 61) return 49802;
+    cppref.BraceRefInner r3c = refescr3DerefParam(&refescr3G);
+    if (r3c.r != 61) return 49803;
+    cppref.BraceRefOuter r3outer = { m = refescr3G, k = 2 };
+    cppref.BraceRefInner r3d = refescr3ArrowField(&r3outer);
+    if (r3d.r != 61) return 49804;
+    cppref.BraceRefInner r3e = refescr3CopyGlobal();
+    if (r3e.r != 61) return 49805;
+    cppref.BraceRefInner r3f = refescr3CopyParam(refescr3G);
+    if (r3f.r != 61) return 49806;
+    cppref.BraceRefInner r3g = refescr3ReassignGlobal();
+    if (r3g.r != 61) return 49807;
+    refescr3.Ref r3h = refescr3PassGlobal();
+    if (r3h.r != 61) return 49808;
+    R3Wrap r3i = refescr3OuterStable();
+    if (r3i.i.r != 61) return 49809;
+    R3Wrap r3j = refescr3BraceCallArg();
+    if (r3j.k != 2 || r3j.i.r != 61) return 49810;
+    // REFESC r4 accept set: every returned binding reads the global (61).
+    if (refescr4BranchThenStable(true).r != 61) return 49811;
+    if (refescr4AllPaths(true, 1).r != 61 || refescr4AllPaths(false, 0).r != 61) return 49812;
+    if (refescr4SwitchDefault(1).r != 61 || refescr4SwitchDefault(7).r != 61) return 49813;
+    if (refescr4WhileTrue().r != 61) return 49814;
+    if (refescr4DoWhile(1).r != 61) return 49815;
+    if (refescr4LoopKillBefore(3).r != 61) return 49816;
+    if (refescr4LoopCopyKilled(3).r != 61) return 49817;
     refctxGlobalConstSource = 46;
     if (refctxGlobalConstPositional.r != 46) return 47923;
     if (t47RefmemChurn(100) != 107 || refctxGlobalRvalPrvalue.r != 42)
@@ -14094,6 +14638,79 @@ extern int main()
     if (excHost.member_take(cppexp.Ex(5)) != 8)                                return 2203;
     if (cppexp.ExHost.static_take(cppexp.Ex(5)) != 50)                         return 2204;
     if (cppexp.take_ex_two(cppexp.Ex(5), 2) != 7)                              return 2205;
+    // TERNSTR: a pointer join is converted as its selected const-char data. Keep each arm value
+    // visible, and pin overload selection against std::string vs const char*.
+    bool ternstrPick = true;
+    if (cppexp.ternstr_value(ternstrPick ? "xyz" : "abc") != 120
+        || cppexp.ternstr_cref(ternstrPick ? "xyz" : "abc") != 220
+        || cppexp.ternstr_rref(ternstrPick ? "xyz" : "abc") != 320) return 26000;
+    ternstrPick = false;
+    if (cppexp.ternstr_value(ternstrPick ? "xyz" : "abc") != 97
+        || cppexp.ternstr_cref(ternstrPick ? "xyz" : "abc") != 197
+        || cppexp.ternstr_rref(ternstrPick ? "xyz" : "abc") != 297) return 26001;
+    const char* ternstrConst = "abc";
+    if (cppexp.ternstr_value(ternstrPick ? "xyz" : ternstrConst) != 97
+        || cppexp.ternstr_value(ternstrPick ? ternstrConst : "xyz") != 120) return 26002;
+    ternstrPick = true;
+    if (cppexp.ternstr_value(ternstrPick ? (ternstrPick ? "xyz" : "abc") : "abc") != 120)
+        return 26003;
+    ternstrPick = false;
+    if (cppexp.ternstr_value(ternstrPick ? (ternstrPick ? "xyz" : "abc") : "abc") != 97)
+        return 26009;
+    char[4] ternstrX = {120, 121, 122, 0};
+    char[4] ternstrA = {97, 98, 99, 0};
+    char* ternstrXPtr = &ternstrX[0];
+    char* ternstrAPtr = &ternstrA[0];
+    if (cppexp.ternstr_value(ternstrPick ? ternstrXPtr : ternstrAPtr) != 97
+        || cppexp.ternstr_value(ternstrPick ? ternstrAPtr : ternstrXPtr) != 120)
+        return 26004;
+    cppexp.TernStrStringCtor ternstrStringCtor = cppexp.TernStrStringCtor(ternstrPick ? "xyz" : "abc");
+    cppexp.TernStrPtrCtor ternstrPtrCtor = cppexp.TernStrPtrCtor(ternstrPick ? "xyz" : "abc");
+    if (ternstrStringCtor.value != 97 || ternstrPtrCtor.value != 97) return 26005;
+    if (cppexp.ternstr_pick(ternstrPick ? "xyz" : "abc") != 497) return 26006;
+    cppexp.TernStrHost ternstrHost = default;
+    if (ternstrHost.method(ternstrPick ? "xyz" : "abc") != 597) return 26007;
+    if (ternstrCflatChar(ternstrPick ? ternstrXPtr : ternstrAPtr) != 97) return 26008;
+    if (cppexp.ternstr_ref_cref("abc") != 197) return 26010;
+    ternstrPick = true;
+    if (cppexp.ternstr_ref_cref(ternstrPick ? "xyz" : "abc") != 220) return 26011;
+    ternstrPick = false;
+    const char* ternstrRefConst = "abc";
+    if (cppexp.ternstr_ref_cref(ternstrPick ? ternstrRefConst : "xyz") != 220) return 26012;
+    if (cppexp.ternstr_overload_ref("abc") != 2) return 26013;
+    if (cppexp.ternstr_overload_value(ternstrPick ? "xyz" : "abc") != 2) return 26014;
+    if (cppexp.ternstr_overload_string_ref(ternstrPick ? "xyz" : "abc") != 2) return 26015;
+    ternstrPick = true;
+    if (cppexp.ternstr_overload_ref(ternstrPick ? "xyz" : "abc") != 2) return 26016;
+    if (cppexp.ternstr_overload_ref(ternstrPick ? "xyz" : ternstrRefConst) != 2) return 26017;
+    if (cppexp.ternstr_overload_ref(ternstrPick ? ternstrX : "abc") != 2) return 26018;
+    u8[4] ternstrUnsignedFirst = {65, 0, 0, 0};
+    u8[4] ternstrUnsignedSecond = {66, 0, 0, 0};
+    i8[4] ternstrSignedFirst = {67, 0, 0, 0};
+    i8[4] ternstrSignedSecond = {68, 0, 0, 0};
+    ternstrPick = true;
+    if (cppexp.ternstr_ucs_array(ternstrPick ? ternstrUnsignedFirst : ternstrUnsignedSecond) != 65)
+        return 26019;
+    if (cppexp.ternstr_scs_array(ternstrPick ? ternstrSignedFirst : ternstrSignedSecond) != 67)
+        return 26020;
+    if (cppexp.ternstr_uc_array(ternstrPick ? ternstrUnsignedFirst : ternstrUnsignedSecond) != 1)
+        return 26022;
+    if (cppexp.ternstr_ucv_array(ternstrPick ? ternstrUnsignedFirst : ternstrUnsignedSecond) != 1)
+        return 26023;
+    ternstrPick = false;
+    if (cppexp.ternstr_ucs_array(ternstrPick ? ternstrUnsignedFirst : ternstrUnsignedSecond) != 66)
+        return 26019;
+    if (cppexp.ternstr_scs_array(ternstrPick ? ternstrSignedFirst : ternstrSignedSecond) != 68)
+        return 26020;
+    cppexp.TernStrRankSource ternstrRankSource = default;
+    if (cppexp.ternstr_rank_source(ternstrRankSource) != 1) return 26021;
+    if (cppexp.ternstr_rank_source_rvalue(ternstrRankSource) != 1) return 26024;
+    // A conversion operator inherited from a public base ranks like the base's own.
+    cppexp.TernStrRankSourceDerived ternstrRankSourceDerived = default;
+    if (cppexp.ternstr_rank_source(ternstrRankSourceDerived) != 1) return 26025;
+    // A sibling base's explicit conversion to the same type does not hide the other base's.
+    cppexp.TernStrRankSibling ternstrRankSibling = default;
+    if (cppexp.ternstr_rank_source(ternstrRankSibling) != 1) return 26026;
     // An explicit ctor with a DEFAULTED second parameter, spelled with one and with two args.
     if (cppexp.take_exdef(cppexp.ExDef(5)) != 12)                              return 2206;
     if (cppexp.take_exdef(cppexp.ExDef(5, 1)) != 6)                            return 2207;
@@ -21946,6 +22563,39 @@ int OpMoveNontrivialLegs()
     int* castglobEnd = std.end(castglobValues);
     if (castglobBegin[0] != 7 || castglobEnd[-1] != 9
         || (int)(castglobEnd - castglobBegin) != 3) return 42202;
+    castglob.Fn fnrefDirectCtor = castglob.Fn(castglob.getfn());
+    if (fnrefDirectCtor.get() != 97) return 42209;
+    if ((int)castglob.getfn()()[0] != 97) return 42210;
+    castglob.RefFn fnrefNamed = castglob.getfn();
+    castglob.Fn fnrefNamedCtor = castglob.Fn(fnrefNamed);
+    if (fnrefNamedCtor.get() != 97) return 42203;
+    if ((int)fnrefNamed()[0] != 97) return 42211;
+    if (castglob.callfn(castglob.getfn()) != 97) return 42204;
+    if (castglob.tref(castglobValues) != 12) return 42212;
+    int fnrefPointerValue = 11;
+    int* fnrefPointer = &fnrefPointerValue;
+    int fnrefPointerRef = castglob.take_ptr_ref(fnrefPointer);
+    if (fnrefPointerRef != 11 || fnrefPointer != nullptr) return 42205;
+    int[3] fnrefPointerArray = {7, 8, 9};
+    if (castglob.take_const_ptr_ref(fnrefPointerArray) != 7) return 42206;
+    if (castglob.take_rvalue_ptr_ref(fnrefPointerArray) != 7) return 42207;
+    if (castglob.take_ptr_value(fnrefPointerArray) != 7) return 42208;
+    if ((int)castglob.get2()()[1][2] != 6) return 42213;
+    if (castglob.use2(castglob.get2()) != 6) return 42214;
+    castglob.F2 fnrefTwoDimCtor = castglob.F2(castglob.get2());
+    if (fnrefTwoDimCtor.get() != 5) return 42215;
+    if (castglob.FnCtorPick(castglob.getcb()).get() != 103) return 42216;
+    if (castglob.FnCtorPick(fnrefCtorRetfp()).get() != 8) return 42217;
+    const int[3] castglobConstValues = {1, 2, 3};
+    if (castglob.tref_const(castglobConstValues) != 112) return 42218;
+    auto castglobLocalRef2 = castglob.get2();
+    if ((int)castglobLocalRef2()[1][2] != 6) return 42219;
+    int[2][3] fnrefctorRows = {{1, 2, 3}, {4, 5, 6}};
+    if (fnrefctor.tref(fnrefctorRows[1]) != 12) return 42220;
+    int[2][2][3] fnrefctorRows3D = {{{1, 2, 3}, {4, 5, 6}}, {{7, 8, 9}, {10, 11, 12}}};
+    if (fnrefctor.tget(fnrefctorRows3D[1][0]) != 39) return 42221;
+    if (fnrefctor.tref(fnrefctorRows3D[1][0]) != 12) return 42222;
+    if (fnrefctor.tptr(fnrefctorRows3D[1][0]) != 4) return 42223;
     return 0;
 }
 
@@ -22933,6 +23583,122 @@ int LoweredUserDtorAssignLegs(int argc)
     if (cpp_charptrref.mutable_ambiguous(nullptr) != 4
         || cpp_charptrref.mutable_ambiguous(cpp_charptrref.pointer_rvalue()) != 4)
         return 67118;
+    // TERNBASE: C++ derived/base lvalue joins stay aliases and use clang's base-reference result.
+    {
+        bool tbTrue = true;
+        bool tbFalse = false;
+        cppternbase.D tbD = cppternbase.D(11);
+        cppternbase.B tbB = cppternbase.B(22);
+        if (cppternbase.constRef(tbTrue ? tbD : tbB) != 11 || cppternbase.which != 1)
+            return 67201;
+        if (cppternbase.constRef(tbFalse ? tbD : tbB) != 22 || cppternbase.which != 1)
+            return 67202;
+        if (cppternbase.constRef(tbTrue ? tbB : tbD) != 22 || cppternbase.which != 1)
+            return 67203;
+        if (cppternbase.constRef(tbFalse ? tbB : tbD) != 11 || cppternbase.which != 1)
+            return 67204;
+        cppternbase.resetCounts();
+        if (cppternbase.mutRef(tbTrue ? tbD : tbB) != 1011
+            || tbD.v != 1011 || tbB.v != 22 || cppternbase.which != 2
+            || cppternbase.copies != 0 || cppternbase.dtors != 0) return 67205;
+        tbD.v = 11; tbB.v = 22;
+        if (cppternbase.mutRef(tbFalse ? tbD : tbB) != 1022
+            || tbD.v != 11 || tbB.v != 1022 || cppternbase.which != 2) return 67206;
+        tbD.v = 11; tbB.v = 22;
+        if (cppternbase.mutRef(tbTrue ? tbB : tbD) != 1022
+            || tbD.v != 11 || tbB.v != 1022 || cppternbase.which != 2) return 67207;
+        tbD.v = 11; tbB.v = 22;
+        if (cppternbase.mutRef(tbFalse ? tbB : tbD) != 1011
+            || tbD.v != 1011 || tbB.v != 22 || cppternbase.which != 2) return 67208;
+
+        cppternbase.resetCounts();
+        int tbByValueDBTrue = cppternbase.byValue(tbTrue ? tbD : tbB);
+        if (tbByValueDBTrue != 1011 || cppternbase.which != 3
+            || cppternbase.copies != 1 || cppternbase.dtors != 1)
+            return 67209;
+        cppternbase.resetCounts();
+        int tbByValueDBFalse = cppternbase.byValue(tbFalse ? tbD : tbB);
+        if (tbByValueDBFalse != 22 || cppternbase.which != 3
+            || cppternbase.copies != 1 || cppternbase.dtors != 1)
+            return 67210;
+        cppternbase.resetCounts();
+        int tbByValueBDTrue = cppternbase.byValue(tbTrue ? tbB : tbD);
+        if (tbByValueBDTrue != 22 || cppternbase.which != 3
+            || cppternbase.copies != 1 || cppternbase.dtors != 1)
+            return 67211;
+        cppternbase.resetCounts();
+        int tbByValueBDFalse = cppternbase.byValue(tbFalse ? tbB : tbD);
+        if (tbByValueBDFalse != 1011 || cppternbase.which != 3
+            || cppternbase.copies != 1 || cppternbase.dtors != 1)
+            return 67212;
+
+        cppternbase.B tbOut = cppternbase.B(0);
+        cppternbase.resetCounts();
+        tbOut = tbTrue ? tbD : tbB;
+        if (tbOut.v != 1011 || cppternbase.assignments != 1 || cppternbase.which != 4)
+            return 67213;
+        cppternbase.resetCounts();
+        tbOut = tbFalse ? tbD : tbB;
+        if (tbOut.v != 22 || cppternbase.assignments != 1 || cppternbase.which != 4)
+            return 67214;
+        cppternbase.resetCounts();
+        tbOut = tbTrue ? tbB : tbD;
+        if (tbOut.v != 22 || cppternbase.assignments != 1 || cppternbase.which != 4)
+            return 67215;
+        cppternbase.resetCounts();
+        tbOut = tbFalse ? tbB : tbD;
+        if (tbOut.v != 1011 || cppternbase.assignments != 1 || cppternbase.which != 4)
+            return 67216;
+
+        tbD.v = 11; tbB.v = 22;
+        alias cppternbase.B tbAliasDB = tbTrue ? tbD : tbB;
+        tbAliasDB.v = 31;
+        if (tbD.v != 31 || tbB.v != 22) return 67217;
+        tbD.v = 11; tbB.v = 22;
+        alias cppternbase.B tbAliasBD = tbTrue ? tbB : tbD;
+        tbAliasBD.v = 32;
+        if (tbB.v != 32 || tbD.v != 11) return 67218;
+
+        tbD.v = 11; tbB.v = 22;
+        if ((tbTrue ? tbD : tbB).v != 11 || (tbTrue ? tbB : tbD).v != 22)
+            return 67219;
+        (tbTrue ? tbD : tbB).v = 41;
+        if (tbD.v != 41 || tbB.v != 22) return 67220;
+        tbD.v = 11; tbB.v = 22;
+        (tbTrue ? tbB : tbD).v = 42;
+        if (tbB.v != 42 || tbD.v != 11) return 67221;
+        tbD.v = 11; tbB.v = 22;
+        if (cppternbase.memberPointer(tbTrue ? tbD : tbB) != 11
+            || cppternbase.which != 6) return 67222;
+        if (cppternbase.memberPointer(tbTrue ? tbB : tbD) != 22
+            || cppternbase.which != 6) return 67223;
+
+        cppternbase.D* tbDp = &tbD;
+        cppternbase.B* tbBp = &tbB;
+        alias cppternbase.B tbReturnedDB = ternbaseChoose(tbTrue, tbDp, tbBp);
+        tbReturnedDB.v = 61;
+        if (tbD.v != 61 || tbB.v != 22) return 67224;
+        tbD.v = 11; tbB.v = 22;
+        alias cppternbase.B tbReturnedBD = ternbaseChooseReverse(tbTrue, tbDp, tbBp);
+        tbReturnedBD.v = 62;
+        if (tbB.v != 62 || tbD.v != 11) return 67225;
+
+        tbD.v = 11; tbB.v = 22;
+        cppternbase.D2 tbD2 = cppternbase.D2(5);
+        cppternbase.D tbDBase = cppternbase.D(9);
+        if (cppternbase.takeD(tbTrue ? tbD2 : tbDBase) != 305
+            || cppternbase.which != 7) return 67226;
+        if (cppternbase.takeD(tbTrue ? tbDBase : tbD2) != 209
+            || cppternbase.which != 7) return 67227;
+        if (cppternbase.constRef(tbTrue ? tbD2 : tbB) != 105
+            || cppternbase.which != 1) return 67228;
+        if (cppternbase.constRef(tbTrue ? tbB : tbD2) != 22
+            || cppternbase.which != 1) return 67229;
+        if (cppternbase.takeB(tbTrue ? tbD2 : tbB) != 405
+            || cppternbase.which != 8) return 67230;
+        if (cppternbase.takeB(tbTrue ? tbB : tbD2) != 322
+            || cppternbase.which != 8) return 67231;
+    }
     // MIX21: a postfix arm is a value, not a slot: the increment still lands on the arm's object.
     int m21V = (t325T ? t475I++ : t475J);
     if (m21V != 12 || t475I != 13) return 67053;

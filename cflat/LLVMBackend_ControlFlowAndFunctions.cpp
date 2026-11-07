@@ -886,6 +886,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         {
             TypeAndValue retTV;
             retTV.TypeName = cxxRecipeRet.TypeName;
+            retTV.FuncPtrReturnAliasSpelling = funcPtrType.FuncPtrReturnAliasSpelling;
+            retTV.FuncPtrReturnHasStrippedInnerDimensions =
+                funcPtrType.FuncPtrReturnHasStrippedInnerDimensions;
             retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
             retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
             retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
@@ -1104,6 +1107,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         paramTypes.push_back(i8PtrTy); // env (trailing)
         TypeAndValue retTV;
         retTV.TypeName = cxxRecipeRet.TypeName;
+        retTV.FuncPtrReturnAliasSpelling = funcPtrType.FuncPtrReturnAliasSpelling;
+        retTV.FuncPtrReturnHasStrippedInnerDimensions =
+            funcPtrType.FuncPtrReturnHasStrippedInnerDimensions;
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
         retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
         retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;

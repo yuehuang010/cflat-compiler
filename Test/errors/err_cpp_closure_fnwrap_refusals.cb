@@ -1,0 +1,110 @@
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_t28_fwdref.hpp";
+import cpp "cpp_t525_fnwrap_r3.hpp";
+// FNWRAP: a typed closure field or a holder-kept closure crossing to C++ without `move` is refused as
+// clang requires; the refusal names the user-facing callee. Accepted forms are runtime legs in
+// test_cpp_interop.cb.
+struct FnwLF { Lambda<int(int)> fn; };
+struct FnwLF8 { Lambda<int(int)> fn; };
+T fnwIdh<T>(T x) { return x; }
+struct FnwLG { long k; Lambda<int(int)> fn; };
+struct FnwIn { Lambda<int(int)> fn; };
+struct FnwOut { long k; FnwIn inr; };
+struct FnwBox { int v = 0; };
+// A field reached through a pointer has writers the caller cannot see.
+expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+    int fnwCallIt(FnwLF* p) { return cppi.apply_n(p->fn, 2); }
+}
+// A by-value closure result keeps the argument's by-reference capture: it cannot escape.
+expect_error("returning bonded value whose source 'b' is not a 'bond' parameter") {
+    Lambda<int(int)> fnwMk() { FnwBox b = { v = 4 }; Lambda<int(int)> f = (int x) => x * b.v; return fnwrap3.copy_return(f); }
+}
+extern int main()
+{
+    // guard: refused on master too
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+        int b = 5; string str = "abc";
+        Lambda<int(int)> t = (int x) => x + b;
+        Lambda<int(int)> sc = (int x) => x + str.length();
+        FnwLF s = { fn = t };
+        s.fn = sc;
+        cppi.apply_n(s.fn, 2);
+    }
+    // guard: refused on master too
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+        int b = 5; string str = "abc";
+        Lambda<int(int)> t = (int x) => x + b;
+        Lambda<int(int)> sc = (int x) => x + str.length();
+        FnwLF s = { fn = sc };
+        cppi.apply_n(s.fn, 2);
+    }
+    // guard: refused on master too
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_copy' implicitly") {
+        int b = 5; string str = "abc";
+        Lambda<int(int)> t = (int x) => x + b;
+        Lambda<int(int)> sc = (int x) => x + str.length();
+        FnwLF s = { fn = sc };
+        int r = cppi.apply_copy(s.fn, 2);
+    }
+    // guard: refused on master too
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+        string str = "abc";
+        FnwLF8 s = { fn = (int x) => x + str.length() };
+        cppi.apply_n(s.fn, 2);
+    }
+    // A holder kept through a ternary arm or a CFlat generic identity call still refers to the closure.
+    // guard: refused on master too
+    expect_error("passed by reference to C++ 't28.holdfwd'") {
+        int k = 4;
+        Lambda<int(int)> f = (int v) => v * k;
+        Lambda<int(int)> f0 = (int v) => v + 1;
+        bool c = k > 1;
+        auto h = c ? t28.holdfwd(f) : t28.holdfwd(f0);
+        Lambda<int(int)> g = move f;
+    }
+    expect_error("passed by reference to C++ 't28.holdfwd'") {
+        int k = 4;
+        Lambda<int(int)> f = (int v) => v * k;
+        auto h = fnwIdh(t28.holdfwd(f));
+        Lambda<int(int)> g = move f;
+    }
+    // An owning closure stored at a non-zero offset, in an array element or a nested field.
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+        int b = 5; string str = "abc";
+        Lambda<int(int)> t = (int x) => x + b;
+        Lambda<int(int)> sc = (int x) => x + str.length();
+        FnwLG s = { k = 1, fn = t };
+        s.fn = sc;
+        cppi.apply_n(s.fn, 2);
+    }
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+        string str = "abc";
+        Lambda<int(int)> sc = (int x) => x + str.length();
+        Lambda<int(int)>[2] arr;
+        arr[1] = sc;
+        cppi.apply_n(arr[1], 2);
+    }
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+        string str = "abc";
+        Lambda<int(int)> sc = (int x) => x + str.length();
+        Lambda<int(int)>[2] arr;
+        int i = 1;
+        arr[i] = sc;
+        cppi.apply_n(arr[i], 2);
+    }
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'cppi.apply_n' implicitly") {
+        string str = "abc";
+        Lambda<int(int)> sc = (int x) => x + str.length();
+        FnwOut o;
+        o.inr.fn = sc;
+        cppi.apply_n(o.inr.fn, 2);
+    }
+    // cref returns `const F&`: assigning through the result is refused, as clang does.
+    expect_error("it is reached through a C++ const reference result") {
+        int k = 4;
+        Lambda<int(int)> g = (int v) => v * k;
+        Lambda<int(int)> h = (int v) => v + 1;
+        fnwrap3.cref(g) = h;
+    }
+    return 0;
+}

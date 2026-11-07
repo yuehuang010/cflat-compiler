@@ -196,3 +196,10 @@ inline int size_ref_derived() { return (int)sizeof(RefDerived); }
 inline int size_tref_int()    { return (int)sizeof(TRef<int>); }
 
 }
+
+// REFESC: a C++ aggregate with a reference member, built and passed by C++ calls.
+namespace refescr3 {
+struct Ref { int& r; int v; };
+inline Ref mk(int& x) { return Ref{ x, 1 }; }
+inline Ref pass(Ref v) { return v; }
+}

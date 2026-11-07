@@ -14,6 +14,26 @@ expect_error("cannot return C++ class 'cppexp.ConvExplicit' from this expression
 
 extern int main()
 {
+    bool ternstrRefCondition = false;
+    const char* ternstrRefConst = "abc";
+    expect_error("cannot store a string literal into parameter 'f' of 'cppexp.ternstr_no_ctor_cref'") {
+        cppexp.ternstr_no_ctor_cref("abc");
+    }
+    expect_error("cannot store a string literal into parameter 'f' of 'cppexp.ternstr_no_ctor_mut'") {
+        cppexp.ternstr_no_ctor_mut("abc");
+    }
+    expect_error("cannot store a string literal into parameter 'f' of 'cppexp.ternstr_no_ctor_cref'") {
+        cppexp.ternstr_no_ctor_cref(ternstrRefCondition ? "abc" : "xyz");
+    }
+    expect_error("cannot store a string literal into parameter 'f' of 'cppexp.ternstr_no_ctor_cref'") {
+        cppexp.ternstr_no_ctor_cref(ternstrRefCondition ? ternstrRefConst : "xyz");
+    }
+    expect_error("a user-defined conversion cannot bind to the non-const reference parameter") {
+        cppexp.ternstr_ref_mut("abc");
+    }
+    expect_error("is declared explicit, so it is not offered as an implicit conversion here") {
+        cppexp.ternstr_explicit_sink(true ? "xyz" : "abc");
+    }
     expect_error("cannot initialize C++ class 'cppexp.ConvExplicit' from this expression; C++ constructor 'cppexp.ConvExplicit(int)' is declared explicit") {
         cppexp.ConvExplicit initExplicit = 5;
     }

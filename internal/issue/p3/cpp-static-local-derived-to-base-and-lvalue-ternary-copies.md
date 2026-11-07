@@ -11,9 +11,6 @@ Still open:
 2. Global C++ class initialized from `move` of another global: cflat refuses any non-constant global
    C++ class initializer ("global variable initializer must be a compile-time constant"), so the
    global move count cannot be compared with clang yet. Not a move bug; revisit with global init design.
-3. Mixed LLVM-level ternary of lvalues of different classes outside an initializer
-   (`c ? d1 : b2` with D d1, B b2) is refused by the phi join ("ternary branches have incompatible
-   types"). T233 covers the static/local initializer form only.
 T226 review 1 (pre-existing on master): `static T g = move a` fixed by T233; `B mk(){ D d = D(6); return d; }` copies where C++20 implicit-moves.
 
 ## Left after T243 / TERNMOVE (Opus review 1; repros scratch/repro_keep/t243_rev/)

@@ -21,8 +21,13 @@ clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch
    element names. Residue (conservative refusals, clang accepts; repros scratch/repro_keep/refctx/): return binding to
    `*p` or `hp.g` through a raw pointer parameter (pointee lifetime untracked), a global binding `{ p = *gptr }`, a
    global whose referent is a non-scalar temporary (clang 73), a field default binding another field of the frame
-   (clang 9). Pre-existing: a named local aggregate returned (r12) and a nested explicit brace field (f04) escape the
-   return gate; a lambda returning the aggregate lacks return-type inference (r13).
+   (clang 9). Return-gate escapes (named local, nested brace, copies, ternary joins, branch/loop writes, call results)
+   landed REFESC. Remaining unsound spots, accepted and dangling on master too (repros in the REFESC reviews):
+   - a pointer argument loaded from a frame local (`int* p = &x; auto a = rvh.mkp(p); return a;`) is not traced;
+   - a CFlat callee is trusted: `mkc(int* p) { rvh.R a = rvh.mkp(p); return a; }` called as `return mkc(&x);`;
+   - a write through a lambda capture is not tracked (a Frame write inside the lambda is missed; the mirror Stable
+     write is a conservative refusal).
+   A lambda returning the aggregate lacks return-type inference (r13).
 4. Full-expression temp destruction order landed DTORORD (483f3b83d). Pre-existing residue found by its reviews (master
    behaves the same; repros scratch/repro_keep/dtorord/):
    - Alias of a temporary landed ALIASTMP (483f3b83d): the temp is extended to scope end; an alias of a reference that may

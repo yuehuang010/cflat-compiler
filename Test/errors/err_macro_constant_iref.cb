@@ -13,5 +13,14 @@ extern int main()
     expect_error("cannot bind") {
         int r = cpi_t98.iref(c ? T98_N5 : T98_N5);
     }
+    // A comma argument ending in an unnamed-enum variable or macro keeps master's refusal: the
+    // lowering carries no C++ category or enum identity (clang: T&& = T98AnonEnum& 21, T98AnonEnum 22).
+    expect_error("a comma expression ending in a variable or an anonymous-enum value") {
+        auto x = T98_ANON_VALUE;
+        int r = cpi_t98.macroAnonFwd((0, x));
+    }
+    expect_error("a comma expression ending in a variable or an anonymous-enum value") {
+        int r = cpi_t98.macroAnonFwd((0, T98_ANON_MACRO));
+    }
     return 0;
 }

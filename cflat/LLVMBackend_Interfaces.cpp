@@ -1400,6 +1400,9 @@ void LLVMBackend::UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue&
         ret.ElemPointer = ret.PointerDepth >= 2;
         ret.IsMove = fpTV.FuncPtrReturnOwned;
         ret.IsAlias = fpTV.FuncPtrReturnAlias;
+        ret.FuncPtrReturnAliasSpelling = fpTV.FuncPtrReturnAliasSpelling;
+        ret.FuncPtrReturnHasStrippedInnerDimensions =
+            fpTV.FuncPtrReturnHasStrippedInnerDimensions;
 
         params.clear();
         params.reserve(fpTV.FuncPtrParams.size());

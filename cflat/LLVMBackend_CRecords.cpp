@@ -362,11 +362,20 @@ LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::TryResolveDefaultedCxxGenericBaseAlias
 {
         resolvedType.clear();
         error.clear();
-        if (!HasCxxImportGroup() || !IsGenericBaseAlias(alias)) return false;
-        const std::string baseName = ResolveGenericBaseAlias(alias);
-        if (!HasCxxClassTemplate(baseName)) return false;
+        if (!HasCxxImportGroup()) return false;
+        std::string resolvedAlias = alias;
+        if (!IsGenericBaseAlias(resolvedAlias))
+        {
+            resolvedAlias = ResolveQualifiedName(alias);
+            if (!IsGenericBaseAlias(resolvedAlias)) return false;
+        }
+        std::string baseName = ResolveGenericBaseAlias(resolvedAlias);
         std::vector<std::string> typeArgs;
-        if (!CompleteCxxTemplateTypeArgs(baseName, typeArgs))
+        if (HasCxxAliasTemplate(baseName))
+            ResolveGenericAliasSpelling(baseName, typeArgs, false);
+        if (!HasCxxClassTemplate(baseName)) return false;
+        const bool completeArgs = CompleteCxxTemplateTypeArgs(baseName, typeArgs);
+        if (!completeArgs)
         {
             auto parameters = cxxClassTemplateParameters_.find(baseName);
             if (parameters == cxxClassTemplateParameters_.end())
@@ -620,6 +629,7 @@ static const std::string kCxxFunctionMacroMarker = "\x1f" "CFLAT_FUNCTION_MACRO"
 bool LLVMBackend::BindCxxLvalueMacro(const CxxRequestGroup& group, const std::string& name,
                                      const std::string& file)
 {
+        cppInteropUsed_ = true;
         const std::string wrapperName = "__cflat_mref_" + name;
         const std::string source = "extern \"C\" __attribute__((weak)) auto* " + wrapperName
             + "() noexcept { return &(" + name + "); }\n";
@@ -745,6 +755,8 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
                 return true;
             }
             RegisterCMacros({ hitEntry });
+            cxxConstantMacroNames_.insert(name);
+            cxxConstantMacroOwnerGroup_[name] = hit->primary;
             return GetGlobalVariableNV(name).Storage != nullptr;
         }
         if (pending.empty() || !UseCxxIncrementalRequests()) return false;
@@ -771,7 +783,7 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
             CxxIncrementalGroup* incremental = GetCxxIncrementalGroup(c.group, error);
             if (incremental == nullptr) continue;
             CxxIncrementalGroup::MacroLookup found;
-            if (!incremental->LookupMacro(name, found) || !found.systemHeader)
+            if (!incremental->LookupMacro(name, found))
             {
                 rememberAbsent();
                 continue;
@@ -858,6 +870,64 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
             return GetGlobalVariableNV(name).Storage != nullptr;
         }
         return false;
+}
+
+bool LLVMBackend::TryBindCHeaderMacro(const std::string& name)
+{
+        const size_t oldGroupCount = cxxImportGroups_.size();
+        auto addDefineName = [](const std::string& define, std::unordered_set<std::string>& names) {
+            std::string_view text = define;
+            if (text.starts_with("-D")) text.remove_prefix(2);
+            size_t end = 0;
+            while (end < text.size()
+                   && (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '_'))
+                ++end;
+            if (end != 0 && (std::isalpha(static_cast<unsigned char>(text.front()))
+                             || text.front() == '_'))
+                names.emplace(text.substr(0, end));
+        };
+        for (CHeaderMacroGroup& group : cHeaderMacroGroups_)
+        {
+            if (!group.macroNamesScanned)
+            {
+                group.macroNamesScanned = true;
+                for (const std::string& define : cDefines_) addDefineName(define, group.macroNames);
+                for (const std::string& define : group.defines) addDefineName(define, group.macroNames);
+                for (const std::string& path : group.dependencyFiles)
+                {
+                    std::ifstream input(path);
+                    std::string line;
+                    while (std::getline(input, line))
+                    {
+                        size_t at = line.find_first_not_of(" \t\r");
+                        if (at == std::string::npos || line[at++] != '#') continue;
+                        at = line.find_first_not_of(" \t", at);
+                        if (at == std::string::npos || line.compare(at, 6, "define") != 0) continue;
+                        at += 6;
+                        if (at < line.size()
+                            && !std::isspace(static_cast<unsigned char>(line[at]))) continue;
+                        at = line.find_first_not_of(" \t", at);
+                        if (at == std::string::npos
+                            || (!std::isalpha(static_cast<unsigned char>(line[at]))
+                                && line[at] != '_')) continue;
+                        size_t end = at + 1;
+                        while (end < line.size()
+                               && (std::isalnum(static_cast<unsigned char>(line[end]))
+                                   || line[end] == '_'))
+                            ++end;
+                        group.macroNames.emplace(line.substr(at, end - at));
+                    }
+                }
+            }
+            if (group.macroNames.count(name) != 0)
+                FindOrAddCxxImportGroup(group.headers, group.defines);
+        }
+        if (cxxImportGroups_.size() == oldGroupCount) return false;
+
+        // The first lookup cached misses for the C++ import groups already present. Replay them
+        // from cache while asking the newly added C-header groups for this one unresolved name.
+        cxxSystemMacroLookups_.erase(name);
+        return TryBindCxxSystemMacro(name);
 }
 
 bool LLVMBackend::TryBindCxxNamespaceConstant(const std::string& cflatName,
@@ -5090,6 +5160,15 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
             return RejectUnsupportedCxxLayout(typeName);
         if (auto f = info->fieldAccess.find(memberName); f != info->fieldAccess.end())
         {
+            if (info->ambiguousFieldNames.count(memberName) != 0)
+            {
+                const std::string className = DisplayCxxClassName(typeName);
+                LogError(std::format(
+                    "member '{}' is ambiguous in C++ class '{}': found in more than one base class "
+                    "(add a 'using' declaration in '{}' or qualify through a base)",
+                    memberName, className, className));
+                return true;
+            }
             if (f->second == cflat_cinterop::AccessPublic) return false;
             if (f->second == cflat_cinterop::AccessProtected
                 && CxxProtectedAccessAllowed(typeName, accessedThroughCurrentObject)) return false;
@@ -5493,6 +5572,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.moveAssignBindsConstRef = r.moveAssignBindsConstRef;
             info.moveAssignConstSourceBindsConstRef = r.moveAssignConstSourceBindsConstRef;
             info.isAggregate           = r.isAggregate;
+            info.ambiguousFieldNames.insert(r.ambiguousFieldNames.begin(),
+                                            r.ambiguousFieldNames.end());
             for (const auto& f : r.fields)
             {
                 if (f.name.empty()) continue;
@@ -8048,15 +8129,29 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
                 c = llvm::ConstantExpr::getIntToPtr(bits, i8Ptr);
                 valSuffix = std::format(" = 0x{:x}", (uint64_t)m.value);
             }
-            else if (!m.intTypeName.empty())
+            else if (!m.intTypeName.empty() && m.intTypeName != "__cflat_type_erased")
             {
-                // Register with the macro's natural C type so call sites match without casts;
-                // build at the type's width so truncation keeps the bit pattern exact.
-                tv.TypeName = m.intTypeName;
-                tv.Pointer  = false;
-                unsigned bits = BitfieldStorageBits(m.intTypeName);
-                c = cflat_llvm::GetIntTruncated(llvm::IntegerType::get(*context, bits),
-                                                      (uint64_t)m.value);
+                const std::string enumName = ResolveEnumTypeName(m.intTypeName);
+                const std::string enumBacking = enumName.empty()
+                    ? std::string() : GetEnumBackingType(enumName);
+                tv.TypeName = enumBacking.empty() ? m.intTypeName : enumName;
+                tv.Pointer = false;
+                if (!enumBacking.empty())
+                {
+                    tv.EnumBacking = enumBacking;
+                    tv.IsScopedEnum = IsScopedEnumTypeName(enumName);
+                    auto* enumTy = llvm::dyn_cast_or_null<llvm::IntegerType>(GetType(tv));
+                    if (enumTy != nullptr)
+                        c = llvm::ConstantInt::get(enumTy, llvm::APInt(
+                            enumTy->getBitWidth(), (uint64_t)m.value, m.value < 0, true));
+                }
+                else
+                {
+                    unsigned bits = BitfieldStorageBits(m.intTypeName);
+                    if (bits != 0)
+                        c = cflat_llvm::GetIntTruncated(llvm::IntegerType::get(*context, bits),
+                                                        (uint64_t)m.value);
+                }
                 valSuffix = ConstIntValueSuffix(tv.TypeName, m.value);
             }
             else
@@ -8072,6 +8167,12 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
             }
             CreateGlobalVariable(tv, c);
             cxxMacroGlobalNames_.insert(m.name);
+            if (m.isUnnamedEnum) cxxUnnamedEnumMacros_.insert(m.name);
+            if (activeCxxRequestGroup_ != nullptr)
+            {
+                cxxConstantMacroNames_.insert(m.name);
+                cxxConstantMacroOwnerGroup_[m.name] = activeCxxRequestGroup_->primary;
+            }
             // The set also tracks imported C pointer-valued NULL macros whose C++ expansion
             // is not preserved by the C-side value import.
             if (m.isIntegerLiteralZero && c != nullptr && c->getType()->isIntegerTy()
@@ -8624,6 +8725,34 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         const std::string& fileForLsp = realPaths.front();
 
+        size_t cHeaderMacroGroupIndex = static_cast<size_t>(-1);
+        if (!cppMode)
+        {
+            auto existing = std::find_if(cHeaderMacroGroups_.begin(), cHeaderMacroGroups_.end(),
+                [&](const CHeaderMacroGroup& group) {
+                    return group.headers == realPaths && group.defines == extraDefines;
+                });
+            if (existing == cHeaderMacroGroups_.end())
+            {
+                cHeaderMacroGroups_.push_back({ realPaths, extraDefines, realPaths });
+                cHeaderMacroGroupIndex = cHeaderMacroGroups_.size() - 1;
+            }
+            else
+            {
+                cHeaderMacroGroupIndex = static_cast<size_t>(
+                    std::distance(cHeaderMacroGroups_.begin(), existing));
+                existing->dependencyFiles.insert(existing->dependencyFiles.end(),
+                                                 realPaths.begin(), realPaths.end());
+            }
+        }
+        auto rememberMacroDependencies = [&](const std::vector<std::string>& paths) {
+            if (cHeaderMacroGroupIndex >= cHeaderMacroGroups_.size()) return;
+            auto& known = cHeaderMacroGroups_[cHeaderMacroGroupIndex].dependencyFiles;
+            for (const std::string& path : paths)
+                if (std::find(known.begin(), known.end(), path) == known.end())
+                    known.push_back(path);
+        };
+
         // The C++ link decision must not depend on whether the parse ran: a warm in-memory or
         // disk cache hit skips ExtractCHeaderClang entirely, and the flag would stay false.
         if (cppMode) cppInteropUsed_ = true;
@@ -9015,6 +9144,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         if (hit)
         {
+            rememberMacroDependencies(hitDepPaths);
             if (cppMode) NoteCxxDynamicInitializers(hitDynamicInitializers);
             for (const auto& classTemplate : hitClassTemplates)
                 cxxClassTemplateParameters_[classTemplate.name] = classTemplate;
@@ -9154,6 +9284,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     RecordDependency(dep.path);
                     diskDepPaths.push_back(dep.path);
                 }
+                rememberMacroDependencies(diskDepPaths);
                 if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, diskDepPaths);
                 if (cppMode) RememberCxxGroupClosureContent(cxxGroupIndex, diskEntry.deps);
                 for (const auto& classTemplate : diskEntry.classTemplates)
@@ -9331,6 +9462,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 }
                 return false;
             }
+            rememberMacroDependencies(includes);
             if (cppMode) NoteCxxDynamicInitializers(dynamicInitializers);
             // C inline demand inputs, computed once per group (never per signature, never C++:
             // C++ inline bodies come from the companion module).

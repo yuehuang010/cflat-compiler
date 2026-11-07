@@ -1,4 +1,5 @@
 #pragma once
+#include <errno.h>
 
 void c_p2i_take_int(int* value);
 void c_p2i_take_long(long* value);

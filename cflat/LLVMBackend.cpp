@@ -3005,11 +3005,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
         // Pre-scan: register all function signatures and struct type shells so
         // that forward references resolve during the main code-gen walk.
+        ForwardRefScanner scanner(this);
+        scanner.SetTokens(&tokens);
         {
             llvm::TimeTraceScope scanScope("ForwardRefScan", sourceFileName);
             if (verbose) std::cout << std::format("[verbose] forward-ref scan ({})\n", sourceFileName);
-            ForwardRefScanner scanner(this);
-            scanner.SetTokens(&tokens);
             scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
             // First pass: pre-declare opaque types and constructors for every
             // generic instantiation found anywhere in the file (including inside
@@ -3027,6 +3027,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.PreRegisterEnums(decl);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterAggregateTypeShells(decl);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 // Second pass: register non-generic struct shells and function signatures.
@@ -3050,6 +3052,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
             llvm::TimeTraceScope codegenScope("CodeGeneration", sourceFileName);
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
+            myListener->PreparseAggregateDefinitions(computeUnit->translationUnit(),
+                scanner.DeferredFunctionDefinitionContexts());
+            myListener->PrepareDeferredFunctionDefinitions(scanner.DeferredFunctionDefinitionContexts());
+            scanner.FinalizeDeferredFunctionDefinitions();
             auto walker = antlr4::tree::ParseTreeWalker();
             walker.walk(myListener.get(), computeUnit);
             {
@@ -4321,11 +4327,11 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         ImportedFileCompileScope importDepthScope(this);
 
         // Forward-ref scan the imported file
+        ForwardRefScanner scanner(this);
+        scanner.SetTokens(tokensPtr);
         {
             llvm::TimeTraceScope scanScope("ForwardRefScan", importFilename);
             if (verbose) std::cout << std::format("[verbose]   forward-ref scan: {}\n", importFilename);
-            ForwardRefScanner scanner(this);
-            scanner.SetTokens(tokensPtr);
             scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
             // Pre-declare opaque types for all generic instantiations found in the file
             // (including inside function/program bodies) before scanning declarations.
@@ -4342,6 +4348,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.PreRegisterEnums(decl);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterAggregateTypeShells(decl);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 for (auto* decl : tu->externalDeclaration())
@@ -4360,6 +4368,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             llvm::TimeTraceScope codegenScope("CodeGeneration", importFilename);
             auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
+            myListener->PreparseAggregateDefinitions(computeUnit->translationUnit(),
+                scanner.DeferredFunctionDefinitionContexts());
+            myListener->PrepareDeferredFunctionDefinitions(scanner.DeferredFunctionDefinitionContexts());
+            scanner.FinalizeDeferredFunctionDefinitions();
             antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
             {
                 NoCurrentFunctionScope noCurrent(this);
@@ -5326,10 +5338,10 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         }
 
         // Forward-ref scan
+        ForwardRefScanner scanner(this);
+        scanner.SetTokens(&tokens);
         {
             llvm::TimeTraceScope scanScope("ForwardRefScan", sourceFileName);
-            ForwardRefScanner scanner(this);
-            scanner.SetTokens(&tokens);
             scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
             // Generic interface templates first: a use like Container<int> must not be
             // pre-declared as an opaque struct shell (it is a fat-pointer interface).
@@ -5344,6 +5356,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 scanner.PreRegisterRenameAliases(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.PreRegisterEnums(decl);
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.PreRegisterAggregateTypeShells(decl);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
                 for (auto* decl : tu->externalDeclaration())
@@ -5361,6 +5375,10 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         {
             llvm::TimeTraceScope codegenScope("CodeGeneration", sourceFileName);
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
+            myListener->PreparseAggregateDefinitions(computeUnit->translationUnit(),
+                scanner.DeferredFunctionDefinitionContexts());
+            myListener->PrepareDeferredFunctionDefinitions(scanner.DeferredFunctionDefinitionContexts());
+            scanner.FinalizeDeferredFunctionDefinitions();
             auto walker = antlr4::tree::ParseTreeWalker();
             walker.walk(myListener.get(), computeUnit);
             {
@@ -5542,6 +5560,7 @@ void LLVMBackend::ResetForReanalysis()
     cppInteropUsed_ = false;
     cxxProgramEhGuardAttempted_ = false;
     cxxImportGroups_.clear();
+    cHeaderMacroGroups_.clear();
     currentCxxImportOrderPath_.clear();
     cxxHeaderGuardCache_.clear();
     tuParseCounts_.clear();
@@ -5733,6 +5752,8 @@ void LLVMBackend::ResetForReanalysis()
     cxxZeroIntegerMacroNames_.clear();
     cxxLiteralZeroIntegerMacroNames_.clear();
     cxxMacroGlobalNames_.clear();
+    cxxConstantMacroNames_.clear();
+    cxxConstantMacroOwnerGroup_.clear();
     cAbiFunctionThunkCache_.clear();
     dataStructures.clear();
     // C++ record identity/triviality follows dataStructures: a survivor would let the next file
@@ -5857,6 +5878,8 @@ void LLVMBackend::ResetForReanalysis()
     scopedCppEnumeratorHints_.clear();
     importedEnumeratorGlobals_.clear();
     cxxUnnamedEnumExpressions_.clear();
+    cxxUnnamedEnumAliases_.clear();
+    cxxUnnamedEnumMacros_.clear();
     sameClassCopyRequests_.clear();
     enumPromotedTypes_.clear();
     importedEnumTypes_.clear();
@@ -6042,6 +6065,7 @@ void LLVMBackend::ResetForReanalysis()
     // would mark the next file's first bonded value as by-address.
     lastCallBondByAddress = false;
     lastCallBondedSources.clear();
+    lastCallCxxClosureLenders_.clear();
     lastCallLambdaCaptureNames.clear();
     lastLambdaReferenceCaptureNames.clear();
     lastCallRequiredLocks.clear();
@@ -7921,6 +7945,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.LockThis)               o["lt"]  = true;
     if (s.LockThisMode != LockMode::Exclusive) o["ltm"] = static_cast<int64_t>(s.LockThisMode);
     if (!s.GuardedBy.empty())     o["gb"]  = s.GuardedBy;
+    if (s.FuncPtrReturnHasStrippedInnerDimensions) o["fprsid"] = true;
     if (s.FuncPtrNoPrototype)     o["fpnp"] = true;
     if (s.IsFunctionPointer)
     {
@@ -8032,6 +8057,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("lt")) s.LockThis = *v;
     if (auto v = o.getInteger("ltm")) s.LockThisMode = static_cast<LockMode>(*v);
     if (auto v = o.getString("gb"))  s.GuardedBy = v->str();
+    if (auto v = o.getBoolean("fprsid")) s.FuncPtrReturnHasStrippedInnerDimensions = *v;
     if (auto v = o.getBoolean("fp")) s.IsFunctionPointer = *v;
     if (auto v = o.getBoolean("fpnp")) s.FuncPtrNoPrototype = *v;
     if (s.IsFunctionPointer)
@@ -9174,6 +9200,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     scopedCppEnumeratorHints_.clear();
     importedEnumeratorGlobals_.clear();
     cxxUnnamedEnumExpressions_.clear();
+    cxxUnnamedEnumAliases_.clear();
+    cxxUnnamedEnumMacros_.clear();
     sameClassCopyRequests_.clear();
     enumPromotedTypes_.clear();
     importedEnumTypes_.clear();

@@ -3470,8 +3470,22 @@ void MainListener::EmitFieldInitializer(
             rightNV.CastOccurrenceId = thisCastOcc;
             compiler->EndCastOccurrence(savedCastOcc);
             suspendCompletedObject(&fieldName);
+            // A C++ aggregate field with reference members inherits its source's binding facts.
+            llvm::Value* provenanceSource = rightNV.Storage;
+            llvm::Value* provenanceValue = rightNV.Primary;
             EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, ownedTempMark, fi,
                              destinationIsFresh, deferForeignReplacementDrop);
+            if (initField != nullptr && !initField->Pointer && !initField->IsAlias
+                && !initField->IsArrayView && initField->ConstArraySize == 0
+                && !CollectCxxReferenceMembers(initField->TypeName).empty())
+            {
+                llvm::Value* fieldSlot = compiler->CreateCxxFieldGEP(sd, structPtr,
+                    initFieldIndex, fieldName + "_provenance");
+                if (provenanceSource == nullptr
+                    || !CopyCxxReferenceMemberProvenance(fieldSlot, provenanceSource))
+                    RecordCxxCallResultReferenceProvenance(fieldSlot, initField->TypeName,
+                        provenanceValue, fi);
+            }
             resumeCompletedObject();
         }
     }

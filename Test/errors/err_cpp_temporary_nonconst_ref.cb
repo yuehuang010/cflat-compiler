@@ -152,5 +152,11 @@ extern int main()
         cppref.Ex e = cppref.Ex(1);
         cppref.RefOwner owner = cppref.RefOwner(e = cppref.Ex(6));
     }
+    expect_error("cannot bind a non-const class reference") {
+        cppref.CvCtorRRef value = cppref.CvCtorRRef(cppref.make_const_ctor_source());
+    }
+    expect_error("const class object cannot bind a non-const class reference") {
+        cppref.CvCtorRRef value = cppref.CvCtorRRef(cppref.const_ctor_source_lvalue());
+    }
     return 0;
 }

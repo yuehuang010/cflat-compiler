@@ -1,16 +1,61 @@
-# Imported macro constant leftovers after T98
+# Imported macro constant `auto&&` binding
 
-T98 (2026-10-10) made imported macro constants prvalues and folded enum/macro constants in brace
-elements. Its reviews (Sol r1, r2) found these shapes failing on master too (pre-existing, not chased):
+Repro (`rv.hpp` from `scratch/rev_macroleft_opus_repro/`):
 
-- A global variable or function whose name collides with an imported macro: identity resolution
-  picks the wrong symbol (clang: the macro wins at the preprocessor, the global is unreachable by name).
-- Enumerators of an anonymous enum, or of an enum inside an inline namespace, used as macro values
-  or brace elements; enum-valued and bool-valued macros.
-- A comma expression whose last operand is a macro constant (`(f(), M)`) is not a prvalue.
-- `auto&& r = M;` syntax is not accepted.
-- A macro expanding to a dereference (`#define RDEREF (*p)`) - clang: lvalue.
-- C headers: errno-like macros and a transitively included INT_MAX fail to bind.
+```cflat
+import cpp "rv.hpp";
+extern int main() { auto&& r = EM; return r; }
+```
 
-Repros and evidence: scratch/repro_keep/t98/ (reviews t98_review1.md, t98_review2.md list the probes).
-Fix direction: each item is small; compare value AND chosen overload against clang++ -std=c++20.
+Master and the r1 worktree both reject at `auto&&` with `cannot understand the code at 'auto&&'`;
+the matching `clang++ -std=c++20` program compiles and returns 0. The failure happens before the
+initializer is visited, so this is not specific to imported macro binding.
+
+Root cause: `cflat/CFlat.g4`'s `declarator` only wraps `directDeclarator`; it has no reference
+declarator form. `&&` is available to expression rules, but not to object declarations.
+
+Fix direction: if local reference declarations are supported, add lvalue/rvalue reference
+declarators and implement `auto` reference deduction, category, and lifetime handling together.
+
+# Anonymous-enum lvalues into C++ overloads, constructors and templates
+
+Fixtures: `cpp_t98_macro_constant.hpp` (`T98_ANON_VALUE`, `using T98AnonEnum = decltype(T98_ANON_VALUE)`),
+review repros in `scratch/rev_macroleft_sol_tmp/`, `scratch/rev_macroleft_r4_sol_tmp/` and
+`scratch/rev_macroleft_r5_sol_tmp/` (each `.cb` has a `clang++ -std=c++20` `.cpp` twin).
+
+State after macroleft r7:
+- The ENUMERATOR rvalue follows clang (`IsUnnamedEnumValue`, keyed on the enumerator global in
+  `cxxUnnamedEnumExpressions_`): brace construction picks the enum constructor (71, a namespaced one 31),
+  paren construction of a namespaced class too (31), `T` / `T&&` deduce the enum type (3, 22). Legs 99313,
+  99317, 99321, 99322 in `Test/test_cpp_interop.cb`.
+- LVALUES behave exactly as on master (value or refusal), every shape: typed / auto / const local, field,
+  array element, dereference, pointer copy, `?:` join, any consumer. The alias `T98AnonEnum` is only
+  remembered by name (`RememberCxxAnonymousEnumAlias`) and stays the plain integer master maps it to.
+  Proof: `scratch/macroleft_r7_tmp/master_parity.sh` (empty output = parity).
+
+Open (clang value vs master/branch behaviour, all lvalues):
+- `?:` join of two lvalues (`auto a = A; AT b = B; f(true ? a : b)`): clang `T&&` = `AT&` (21); master
+  refuses (namespaced alias) or deduces int. Constructor / `T` / `T&` / variadic twins: clang 61/31/41/51.
+- Int deduction through a dereference or pointer copy (`auto p = &x; auto q = p; f(*q)`, `h->a`, `*p`):
+  clang deduces the enum (21, ctor 61); master deduces int (29, ctor 69) or fails at link.
+- Reference category and const: `T&&` on a typed local is `AT&` (21), on a const one `const AT&` (23); `T&`
+  deduces `AT` (11), const `const AT` (12); `C(AT&)` vs `C(const AT&)` constructors pick 51 / 52. Master
+  refuses a namespaced alias (`cannot find the type 'ns::(unnamed enum ...)'`) and deduces int for a
+  file-scope one (`T98AnonEnum v; macroAnonFwd(v)` is 29, clang 21).
+- Comma arguments (`f((0, x))`, `f((0, h.a))`, `f((0, AN))`, `f((0, AN_MACRO))` with `#define AN_MACRO AN`):
+  clang `T&&` deduces `AT&` (21) for a variable or field and `AT` (22) for the enumerator or macro. Master
+  refuses them all; the branch's C++ comma lowering (ParseTupleExpression) refuses them too ("a comma
+  expression ending in a variable or an anonymous-enum value"), the macro by its entry's clang type
+  (`CMacroEntry::isUnnamedEnum`). Repros `scratch/rev_macroleft_r6_sol_tmp/comma_*.cb`; legs in
+  `Test/errors/err_macro_constant_iref.cb`.
+- Free overloads with an anonymous-enum and an `int` parameter (`macroTypePick`): clang picks the enum one
+  (81) for the enumerator, the macro and any lvalue; master and the branch refuse ("cannot choose which",
+  both spelled `int`).
+- An anonymous-enum MACRO (`#define AM rw::AN`) keeps no enum identity: `C2(AM)` fails at link with
+  `undefined rw::C2::C2(rw::$_0)` (clang 31) and `tw(AM)` deduces int (2, clang 1), as on master. An r7 try
+  keyed on the macro name gave 30 for `C2(AM)` and lost the set on a warm cache, so it was dropped.
+
+Fix direction: an unnamed-enum lvalue needs its enum identity, cv and reference category spelled from its
+storage in every wrapper (the int it is lowered to cannot carry them). r2-r6 tried to track auto slots and
+respell wrappers; each round left a shape silently wrong, so that work was backed out in r7. A function with
+an unnamed-enum parameter and C++ linkage also needs a generated C++ thunk (clang mangles the type `$_0`).

@@ -2377,13 +2377,15 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         if (argNV.ContainsBondedClosure)
             LogErrorContext(ctx,
                 "cannot move a holder containing a bonded closure - the closure would outlive its captured local");
-        if (const auto* lent = argNV.Storage != nullptr
-                ? compiler->FindStackVariableByStorage(argNV.Storage) : nullptr;
-            lent != nullptr && !lent->CxxClosureLentTo.empty())
+        const auto* lent = argNV.Storage != nullptr
+            ? compiler->FindStackVariableByStorage(argNV.Storage) : nullptr;
+        const std::string lender = lent != nullptr && !lent->CxxClosureLentTo.empty()
+            ? lent->CxxClosureLentTo : compiler->FindLiveCxxClosureLender(argNV.Storage);
+        if (!lender.empty())
             LogErrorContext(ctx, std::format(
                 "cannot move closure '{}': it was passed by reference to C++ '{}', whose result may keep "
                 "that reference, and 'move' leaves the closure null; copy it instead",
-                ctx->unaryExpression()->getText(), lent->CxxClosureLentTo));
+                ctx->unaryExpression()->getText(), lender));
 
         // [immovable]: a value of the type may never be transferred, so `move` of one is refused
         // at the operation. A pointer to it is a movable pointer and passes through unchanged.
@@ -2709,6 +2711,14 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             result.Primary = ptrVal;
             result.Storage = nullptr;
             result.MoveSourceStorage = argNV.Storage;
+            result.CxxClosureLenders = argNV.CxxClosureLenders;
+            if (auto* source = argNV.Storage != nullptr
+                    ? compiler->FindStackVariableByStorage(argNV.Storage) : nullptr)
+            {
+                if (result.CxxClosureLenders.empty())
+                    result.CxxClosureLenders = source->CxxClosureLenders;
+                source->CxxClosureLenders.clear();
+            }
             result.MoveSourceFieldPath = LLVMBackend::FieldMoveKey(argNV);
             result.BaseType = argNV.BaseType;
             result.TypeAndValue = argNV.TypeAndValue;
@@ -2900,6 +2910,14 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 result.Primary      = ptrVal;       // original value captured before zeroing
                 result.Storage      = nullptr;      // prevent re-load from zeroed storage
                 result.MoveSourceStorage = argNV.Storage;
+                result.CxxClosureLenders = argNV.CxxClosureLenders;
+                if (auto* source = argNV.Storage != nullptr
+                        ? compiler->FindStackVariableByStorage(argNV.Storage) : nullptr)
+                {
+                    if (result.CxxClosureLenders.empty())
+                        result.CxxClosureLenders = source->CxxClosureLenders;
+                    source->CxxClosureLenders.clear();
+                }
                 result.MoveSourceFieldPath = LLVMBackend::FieldMoveKey(argNV);
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
@@ -3083,6 +3101,14 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         result.Primary        = ptrVal;
         result.Storage        = nullptr;
         result.MoveSourceStorage = argNV.Storage;
+        result.CxxClosureLenders = argNV.CxxClosureLenders;
+        if (auto* source = argNV.Storage != nullptr
+                ? compiler->FindStackVariableByStorage(argNV.Storage) : nullptr)
+        {
+            if (result.CxxClosureLenders.empty())
+                result.CxxClosureLenders = source->CxxClosureLenders;
+            source->CxxClosureLenders.clear();
+        }
         result.MoveSourcePathKey = compiler->NonLocalElementPathKey(argNV);
         result.MoveSourceFieldPath = LLVMBackend::FieldMoveKey(argNV);
         result.BaseType       = ptrVal ? ptrVal->getType() : nullptr;

@@ -3965,3 +3965,39 @@ inline int operator-=(FC1&, const int& x) { return x; }
 namespace opfu {
 struct IU { int operator+(int x) { return x; } int operator+(unsigned int x) { return 2; } };
 }
+
+namespace cppi_usingdecl {
+struct A { int v = 7; };
+struct B { int v = 13; };
+struct Single : public A {};
+struct Left { int left = 33; };
+struct Right { int right = 44; };
+struct Distinct : public Left, public Right {};
+struct Shadow : public A { int v = 31; };
+struct PublicUsing : public A { using A::v; };
+struct BaseUsing : private A { public: using A::v; };
+struct FromUsing : public BaseUsing {};
+struct Select : private A, private B {
+    public:
+    using B::v;
+    int a() const { return A::v; }
+    int b() const { return B::v; }
+};
+struct ShadowUsing : private Shadow { public: using Shadow::v; };
+struct M { int v() const { return 23; } };
+struct Method : private A, public M { public: using M::v; };
+struct AmbiguousPrivate : private A, private B {};
+struct AmbiguousPublic : public A, public B {};
+struct L { int v = 5; };
+struct LA : public L {};
+struct LB : public L {};
+struct Diamond : public LA, public LB {};
+struct Sh : public A { int v = 31; };
+struct ShA : public Sh, public B {};
+struct DSelA : public Select, public A {};
+inline int selected_ref(int& value) { value = 23; return value; }
+inline int selected_values(Select* value) { return value->a() * 100 + value->b(); }
+inline int select_size() { return sizeof(Select); }
+inline int default_tie(int, int value = 1) { return value; }
+inline int default_tie(int, long value = 2) { return (int)value; }
+}

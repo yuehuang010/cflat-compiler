@@ -72,10 +72,12 @@
 
 bool LLVMBackend::IsCxxFixedArrayArgument(const NamedVariable& arg)
 {
+        const bool arrayBaseType = llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType);
         return (arg.TypeAndValue.ConstArraySize != 0
-                || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType))
+                || !arg.TypeAndValue.ConstInnerDimensions.empty()
+                || arrayBaseType)
             && !arg.TypeAndValue.IsArrayView
-            && (arg.Primary == nullptr || arg.Primary->getType()->isPointerTy());
+            && (arrayBaseType || arg.Primary == nullptr || arg.Primary->getType()->isPointerTy());
 }
 
 LLVMBackend::TypeAndValue LLVMBackend::CxxFixedArrayDecayType(const NamedVariable& arg)
@@ -1556,14 +1558,39 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
 
         std::string argList = s.substr(argOpen + 1, argClose - argOpen - 1);
 
+        // A function pointer returning an array reference puts the array declarator after the
+        // function parameter list, so it belongs to the return type as well.
+        if (cxxBoundary && retSpelling.find("(&") != std::string::npos)
+        {
+            std::string suffix = s.substr(argClose + 1);
+            size_t next = suffix.find_first_not_of(" \t");
+            if (next != std::string::npos && suffix[next] == ')')
+            {
+                ++next;
+                next = suffix.find_first_not_of(" \t", next);
+                if (next != std::string::npos && suffix[next] == '[')
+                    retSpelling += suffix;
+            }
+        }
+
         // Resolve the return type via the same recursive resolver.
         TypeAndValue retTV;
-        if (!MapCTypeToTypeAndValueImpl(retSpelling, retTV, visited, cxxBoundary)) return false;
+        std::vector<uint64_t> returnArrayDims;
+        const bool cxxArrayReferenceReturn = cxxBoundary
+            && (retSpelling.find("(&)[") != std::string::npos
+                || retSpelling.find("(&&)[") != std::string::npos);
+        const size_t returnArrayDimensionCount = cxxArrayReferenceReturn
+            ? static_cast<size_t>(std::count(retSpelling.begin(), retSpelling.end(), '[')) : 0;
+        const std::string retMapSpelling = cxxArrayReferenceReturn
+            ? StripFixedArrayDims(retSpelling, returnArrayDims) : retSpelling;
+        if (!MapCTypeToTypeAndValueImpl(retMapSpelling, retTV, visited, cxxBoundary)) return false;
         // Function pointers returning function pointers are not supported here.
         if (retTV.IsFunctionPointer) return false;
         const bool cxxReferenceReturn = cxxBoundary
-            && (retSpelling.ends_with('&') || retSpelling.ends_with("&&"));
-        if (cxxReferenceReturn) MarkCxxReferenceField(retSpelling, retTV, true);
+            && (cxxArrayReferenceReturn || retSpelling.ends_with('&')
+                || retSpelling.ends_with("&&"));
+        if (cxxReferenceReturn && !cxxArrayReferenceReturn)
+            MarkCxxReferenceField(retSpelling, retTV, true);
         if (cxxBoundary && retTV.Pointer)
             retTV.ConstMask |= CxxSpellingPointeeConstMask(retSpelling, retTV.ValuePointerDepth());
 
@@ -1575,6 +1602,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             out.Pointer = true;
             out.IsAlias = functionPointerLvalueRef;
             out.IsRvalueRef = functionPointerRvalueRef;
+            out.IsCxxRefToPointer = functionPointerLvalueRef;
             out.MarkCxxRef();
             out.SetCxxConstRef(functionPointerConst);
         }
@@ -1583,6 +1611,11 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         // Keep the ABI reference slot pointer-shaped at this indirect-call door.
         out.FuncPtrReturnAlias = cxxReferenceReturn ? false : retTV.IsAlias;
         out.FuncPtrReturnPointerDepth = retTV.ValuePointerDepth();
+        if (cxxArrayReferenceReturn)
+        {
+            out.FuncPtrReturnAliasSpelling = retSpelling;
+            out.FuncPtrReturnHasStrippedInnerDimensions = returnArrayDimensionCount > 1;
+        }
         // ConstMask is part of the C++ callable's return type, including a reference referent.
         if (!cxxBoundary)
         {
@@ -1906,6 +1939,11 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
         if (foreignName.empty()) return false;
         out = TypeAndValue{};
         out.TypeName = foreignName;
+        if (auto it = enumBackingTypes.find(foreignName); it != enumBackingTypes.end())
+        {
+            out.EnumBacking = it->second;
+            out.IsScopedEnum = scopedEnumTypes_.count(foreignName) != 0;
+        }
         out.IsRvalueRef = ptr > 0 && ctype.find("&&") != std::string::npos;
         if (ptr > 0) out.Pointer = true;
         if (ptr > 1) out.ElemPointer = true;
@@ -2454,7 +2492,8 @@ bool LLVMBackend::ResetMovedStdFunctionSource(const std::string& typeName,
         return true;
 }
 
-bool LLVMBackend::CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::string& out) const
+bool LLVMBackend::CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::string& out,
+                                                bool closureAbi) const
 {
         // A stored function<> argument may carry its signature with IsFunctionPointer unset
         // (see TypeAndValue::FuncPtrReturnTypeName); the thin TypeName still identifies it.
@@ -2463,6 +2502,13 @@ bool LLVMBackend::CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::
         // Depth 0 means "not recorded" (see FuncPtrReturnPointerDepth): fall back to Pointer.
         auto spell = [&](const std::string& name, bool pointer, int depth, std::string& result) {
             if (name.empty()) return false;
+            if (closureAbi && (name == "string" || name == "__cflat_move_string_arg"))
+            {
+                result = name == "string" ? "__cflat_string_arg" : name;
+                if (pointer)
+                    for (int i = 0; i < std::max(depth, 1); ++i) result += " *";
+                return true;
+            }
             std::string cflat = name;
             const int stars = depth > 0 ? depth : (pointer ? 1 : 0);
             for (int i = 0; i < stars; ++i) cflat += "*";
@@ -2473,17 +2519,21 @@ bool LLVMBackend::CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::
             ? std::string("void") : type.FuncPtrReturnTypeName;
         if (!spell(retName, type.FuncPtrReturnPointer, type.FuncPtrReturnPointerDepth, ret))
             return false;
+        if (type.FuncPtrReturnAlias) ret += " &";
         std::string params;
         for (const auto& param : type.FuncPtrParams)
         {
             std::string one;
-            if (param.IsMove || param.IsRvalueRef
-                || !spell(param.TypeName, param.Pointer, param.PointerDepth, one))
+            if (!spell(param.IsMove && closureAbi && param.TypeName == "string"
+                           ? std::string("__cflat_move_string_arg") : param.TypeName,
+                       param.Pointer, param.PointerDepth, one))
                 return false;
             // CFlat drops const; a spelled `const T*` parameter keeps it for clang.
             if (param.IsPointeeConst && one.find('(') == std::string::npos
                 && !one.starts_with("const "))
                 one = "const " + one;
+            if (param.IsAlias) one += " &";
+            else if (param.IsRvalueRef) one += " &&";
             if (!params.empty()) params += ", ";
             params += one;
         }
@@ -2814,10 +2864,18 @@ const char* LLVMBackend::CxxClosureWrapperPreamble()
         // Copy, move and destroy go through CFlat closure routines (EnsureCxxClosureEnvHelpers).
         // No include guard (an incremental group parses declaration by declaration): an
         // incremental group remembers it as a prefix source, as it does kCxxWrapperPidDecl.
-        return "extern \"C\" void* __cflat_closure_env_copy(void*);\n"
+        return "#include <type_traits>\n"
+               "extern \"C\" void* __cflat_closure_env_copy(void*);\n"
                "extern \"C\" void* __cflat_closure_env_move(void**);\n"
                "extern \"C\" void __cflat_closure_env_destroy(void*);\n"
+               "template <class A> struct __cflat_closure_arg { using type = A; "
+               "template <class U> static A make(U&& value) { return static_cast<A>(static_cast<U&&>(value)); } };\n"
+               "template <class R> struct __cflat_closure_return { using type = R; "
+               "static R convert(R value) { return value; } };\n"
+               "template <> struct __cflat_closure_return<void> { using type = void; };\n"
                "template <class P> class __cflat_closure;\n"
+               "template <class T> struct __cflat_is_closure_value : std::false_type {};\n"
+               "template <class P> struct __cflat_is_closure_value<__cflat_closure<P>> : std::true_type {};\n"
                "template <class R, class... A> class __cflat_closure<R (*)(A...)> {\n"
                "    // Same layout as the CFlat closure pair {code, env}: a CFlat closure variable IS this\n"
                "    // object, so `F &` binds the caller's own slot. Ownership is the env's tag bit.\n"
@@ -2830,13 +2888,39 @@ const char* LLVMBackend::CxxClosureWrapperPreamble()
                "    __cflat_closure(__cflat_closure&& o) : code_(o.code_), env_(o.env_) {\n"
                "        if (env_ != nullptr) env_ = __cflat_closure_env_move(&o.env_); }\n"
                "    __cflat_closure& operator=(const __cflat_closure&) = delete;\n"
+               "    void release_to(void* out) noexcept { void** p = static_cast<void**>(out); "
+               "p[0] = code_; p[1] = env_; env_ = nullptr; }\n"
                "    ~__cflat_closure() { if (env_ != nullptr) __cflat_closure_env_destroy(env_); }\n"
-               "    R operator()(A... a) const {\n"
+               "    template <class... U> typename __cflat_closure_return<R>::type operator()(U&&... a) const {\n"
                "        void* env = reinterpret_cast<void*>(\n"
                "            reinterpret_cast<__UINTPTR_TYPE__>(env_) & ~static_cast<__UINTPTR_TYPE__>(1));\n"
-               "        return reinterpret_cast<R (*)(A..., void*)>(code_)(static_cast<A&&>(a)..., env);\n"
+               "        auto call = reinterpret_cast<R (*)(typename __cflat_closure_arg<A>::type..., void*)>(code_);\n"
+               "        if constexpr (std::is_void_v<R>) { call(__cflat_closure_arg<A>::make(static_cast<U&&>(a))..., env); }\n"
+               "        else return __cflat_closure_return<R>::convert(call(__cflat_closure_arg<A>::make(static_cast<U&&>(a))..., env));\n"
                "    }\n"
                "};\n";
+}
+
+const char* LLVMBackend::CxxClosureStringWrapperPreamble()
+{
+        return "#include <string>\n#include <cstring>\n"
+               "extern \"C\" void* __cflat_closure_string_alloc(unsigned long long);\n"
+               "extern \"C\" void __cflat_closure_string_free(void*);\n"
+               "struct __cflat_string_arg { const char* _ptr; int _len; };\n"
+               "struct __cflat_move_string_arg {};\n"
+               "template <> struct __cflat_closure_arg<__cflat_string_arg> { using type = __cflat_string_arg; "
+               "template <class U> static type make(U&& value) { return { value.data(), static_cast<int>(value.size()) }; } };\n"
+               "template <> struct __cflat_closure_arg<__cflat_move_string_arg> { using type = __cflat_string_arg; "
+               "template <class U> static type make(U&& value) { unsigned long long n = value.size(); "
+               "char* p = static_cast<char*>(__cflat_closure_string_alloc(n + 1)); "
+               "std::memcpy(p, value.data(), n); p[n] = 0; "
+               "return { p, static_cast<int>(n) | static_cast<int>(0x80000000u) }; } };\n"
+               "template <> struct __cflat_closure_return<__cflat_string_arg> { using type = std::string; "
+               "static type convert(__cflat_string_arg value) { unsigned int n = static_cast<unsigned int>(value._len); "
+               "bool owned = (n & 0x80000000u) != 0; n &= 0x7fffffffu; "
+               "type result(value._ptr == nullptr ? \"\" : value._ptr, n); "
+               "if (owned && value._ptr != nullptr) __cflat_closure_string_free(const_cast<char*>(value._ptr)); "
+               "return result; } };\n";
 }
 
 std::string LLVMBackend::CxxClosureCallArgument(const NamedVariable& arg, const std::string& param)
@@ -2852,92 +2936,330 @@ std::string LLVMBackend::CxxClosureCallArgument(const NamedVariable& arg, const 
 // A wrapper result spelled as a reference or pointer to the generated closure object itself.
 
 
-void LLVMBackend::MarkCxxClosureLentByReference(const NamedVariable& arg, const std::string& callee)
+std::string LLVMBackend::FindLiveCxxClosureLender(llvm::Value* storage) const
 {
-        auto* reference = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(arg.Primary);
-        if (reference == nullptr || reference->getMetadata("cflat.cxx.closure.ref") == nullptr) return;
-        if (NamedVariable* variable = FindStackVariableByStorage(reference->getPointerOperand()))
-            if (variable->CxxClosureLentTo.empty()) variable->CxxClosureLentTo = callee;
-}
-
-void LLVMBackend::MarkKeptCxxClosureArguments(const std::vector<NamedVariable>& arguments,
-                                              const CSigEntry& bound, const std::string& callee)
-{
-        if (bound.ret.IsFunctionPointer || !(bound.ret.Pointer || bound.ret.IsAlias || IsCxxRecord(bound.ret.TypeName)))
-            return;   // a scalar result keeps nothing
-        bool layoutKeeps = false;
-        if (!bound.ret.Pointer && IsCxxRecord(bound.ret.TypeName))
+        for (auto frame = stackNamedVariable.rbegin(); frame != stackNamedVariable.rend(); ++frame)
         {
-            EnsureCxxRecordProjected(bound.ret.TypeName, false);
-            layoutKeeps = CxxRecordStoresForwardedClosureReference(bound.ret.TypeName,
-                bound.retSpelling.find("__cflat_closure<") != std::string::npos);
+            auto find = [&](const auto& variables) -> std::string {
+                for (const auto& [name, variable] : variables)
+                    for (const auto& lender : variable.CxxClosureLenders)
+                        if (lender.first == storage) return lender.second;
+                return {};
+            };
+            if (std::string lender = find(frame->namedVariable); !lender.empty()) return lender;
+            if (std::string lender = find(frame->functionArgument); !lender.empty()) return lender;
         }
-        for (const NamedVariable& argument : arguments)
-            if (argument.CxxClosureBorrowed
-                && (layoutKeeps || (!argument.CxxClosureParam.empty()
-                    && bound.closureKeptParams.find("," + argument.CxxClosureParam + ",") != std::string::npos)))
-                MarkCxxClosureLentByReference(argument, callee);
+        return {};
 }
 
 bool LLVMBackend::ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const
 {
-        auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(slot);
-        if (alloca == nullptr) return false;
+        if (slot == nullptr || !slot->getType()->isPointerTy()) return false;
         auto isClosureEnvNew = [&](const llvm::Function* function) {
             if (auto helpers = functionTable.find("__closure_env_new"); helpers != functionTable.end())
                 for (const auto& symbol : helpers->second)
                     if (symbol.Function == function) return true;
             return module->getFunction("__closure_env_new") == function;
         };
-        // A fat value {code, env}: env null, or a fresh env built with a null cleanup function.
-        auto trivialFat = [&](llvm::Value* fat) {
+        std::unordered_set<llvm::Value*> visitedValues;
+        std::function<bool(llvm::Value*)> trivialEnv;
+        std::function<bool(llvm::Value*)> trivialFat;
+        std::function<bool(llvm::Value*)> trivialSlot;
+        auto envFieldOffset = [&](llvm::GetElementPtrInst* gep) -> std::optional<int64_t> {
+            llvm::APInt offset(64, 0);
+            if (!gep->accumulateConstantOffset(module->getDataLayout(), offset)) return std::nullopt;
+            return offset.getSExtValue();
+        };
+        trivialEnv = [&](llvm::Value* env) {
+            if (env == nullptr) return false;
+            if (llvm::isa<llvm::ConstantPointerNull>(env)) return true;
+            if (auto* function = llvm::dyn_cast<llvm::Function>(env->stripPointerCasts());
+                function != nullptr && function->getName().starts_with("__cflat_reverse_abi_"))
+                return true;
+            if (!visitedValues.insert(env).second) return false;
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(env))
+                return trivialSlot(load->getPointerOperand());
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(env))
+            {
+                if (phi->getNumIncomingValues() == 0) return false;
+                for (llvm::Value* incoming : phi->incoming_values())
+                    if (!trivialEnv(incoming)) return false;
+                return true;
+            }
+            if (auto* select = llvm::dyn_cast<llvm::SelectInst>(env))
+                return trivialEnv(select->getTrueValue()) && trivialEnv(select->getFalseValue());
+            if (auto* call = llvm::dyn_cast<llvm::CallInst>(env);
+                call != nullptr && call->getCalledFunction() != nullptr)
+            {
+                if (isClosureEnvNew(call->getCalledFunction()) && call->arg_size() == 2)
+                    return llvm::isa<llvm::ConstantPointerNull>(call->getArgOperand(1));
+                if (IsClosureHelperName(call->getCalledFunction()->getName(), "__cflat_closure_env_copy")
+                    && call->arg_size() == 1)
+                    return trivialEnv(call->getArgOperand(0));
+            }
+            if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(env);
+                extract != nullptr && extract->getNumIndices() == 1 && extract->getIndices()[0] == 1)
+            {
+                llvm::Value* aggregate = extract->getAggregateOperand();
+                if (auto* call = llvm::dyn_cast<llvm::CallBase>(aggregate);
+                    call != nullptr && call->getCalledFunction() != nullptr
+                    && IsClosureHelperName(call->getCalledFunction()->getName(), "__closure_fat_ptr.copy")
+                    && call->arg_size() == 1)
+                    return trivialFat(call->getArgOperand(0));
+                return trivialFat(aggregate);
+            }
+            return false;
+        };
+        trivialFat = [&](llvm::Value* fat) {
+            if (fat == nullptr || !visitedValues.insert(fat).second) return false;
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(fat))
+                return trivialSlot(load->getPointerOperand());
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(fat);
+                call != nullptr && call->getCalledFunction() != nullptr
+                && IsClosureHelperName(call->getCalledFunction()->getName(), "__closure_fat_ptr.copy")
+                && call->arg_size() == 1)
+                return trivialFat(call->getArgOperand(0));
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(fat))
+            {
+                if (phi->getNumIncomingValues() == 0) return false;
+                for (llvm::Value* incoming : phi->incoming_values())
+                    if (!trivialFat(incoming)) return false;
+                return true;
+            }
+            if (auto* select = llvm::dyn_cast<llvm::SelectInst>(fat))
+                return trivialFat(select->getTrueValue()) && trivialFat(select->getFalseValue());
             while (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(fat))
             {
                 if (insert->getNumIndices() == 1 && insert->getIndices()[0] == 1)
-                {
-                    llvm::Value* env = insert->getInsertedValueOperand();
-                    if (llvm::isa<llvm::ConstantPointerNull>(env)) return true;
-                    // A fresh environment with no cleanup function has only trivial captures.
-                    auto* call = llvm::dyn_cast<llvm::CallInst>(env);
-                    return call != nullptr && call->getCalledFunction() != nullptr
-                        && isClosureEnvNew(call->getCalledFunction())
-                        && call->arg_size() == 2
-                        && llvm::isa<llvm::ConstantPointerNull>(call->getArgOperand(1));
-                }
+                    return trivialEnv(insert->getInsertedValueOperand());
                 fat = insert->getAggregateOperand();
             }
             if (auto* constant = llvm::dyn_cast<llvm::Constant>(fat))
                 return constant->isNullValue()
                     || (constant->getAggregateElement(1u) != nullptr
-                        && constant->getAggregateElement(1u)->isNullValue());
+                        && trivialEnv(constant->getAggregateElement(1u)));
             return false;
         };
-        bool sawStore = false;
-        for (llvm::User* user : alloca->users())
-        {
-            if (llvm::isa<llvm::LoadInst>(user)) continue;
-            // The slot handed to a C++ wrapper as the closure object: C++ cannot assign it.
-            if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
-                gep != nullptr && gep->getMetadata("cflat.cxx.closure.ref") != nullptr)
-                continue;
-            // The scope-exit / unwind destructor only reads the slot.
-            if (auto* call = llvm::dyn_cast<llvm::CallInst>(user);
-                call != nullptr && call->getCalledFunction() != nullptr
-                && IsClosureHelperName(call->getCalledFunction()->getName(), "__closure_fat_ptr.dtor"))
-                continue;
-            auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
-            if (store == nullptr || store->getPointerOperand() != alloca
-                || !trivialFat(store->getValueOperand()))
+        // A slot is judged at its root alloca: every write that may reach the closure at byte
+        // `off` of `base` must store a trivial fat or env. -1 unsafe, 0 no write, 1 trivial write.
+        const llvm::DataLayout& layout = module->getDataLayout();
+        const int64_t ptrSize = (int64_t)layout.getPointerSize();
+        const int64_t fatSize = 2 * ptrSize;
+        std::map<std::pair<llvm::Value*, int64_t>, int> slotMemo;
+        std::function<int(llvm::Value*, int64_t, int64_t)> trivialRange;
+        std::function<bool(llvm::Value*)> readOnly;
+        std::function<bool(llvm::Value*, int64_t)> trivialSlotAt;
+        trivialSlot = [&](llvm::Value* storage) { return trivialSlotAt(storage, 0); };
+        auto isDestructor = [&](llvm::Function* function) {
+            if (IsClosureHelperName(function->getName(), "__closure_fat_ptr.dtor")) return true;
+            for (const auto& [typeName, destructor] : fullDestructorCache_)
+                if (destructor == function) return true;
+            return false;
+        };
+        auto overlaps = [&](int64_t begin, int64_t size, int64_t off) {
+            return size < 0 || (begin < off + fatSize && off < begin + size);
+        };
+        readOnly = [&](llvm::Value* pointer) {
+            for (llvm::User* user : pointer->users())
             {
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(user);
+                    load != nullptr && load->getPointerOperand() == pointer)
+                    continue;
+                if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+                    gep != nullptr && gep->getPointerOperand() == pointer)
+                {
+                    if (gep->getMetadata("cflat.cxx.closure.ref") == nullptr && !readOnly(gep))
+                        return false;
+                    continue;
+                }
+                if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                    call != nullptr && call->getCalledFunction() != nullptr
+                    && isDestructor(call->getCalledFunction()))
+                    continue;
                 return false;
             }
-            sawStore = true;
-        }
-        return sawStore;
+            return true;
+        };
+        // A closure-reference adapter result (`pass(f)`) is the closure it was lent, or a copy of it:
+        // judge the one closure slot the call borrowed.
+        auto closureRefAdapterSource = [&](llvm::Value* value) -> llvm::Value* {
+            auto* call = llvm::dyn_cast<llvm::CallBase>(value);
+            if (call == nullptr || call->getCalledFunction() == nullptr
+                || !call->getCalledFunction()->getName().starts_with("__cflat_tpl_closure_ref_"))
+                return nullptr;
+            llvm::Value* source = nullptr;
+            for (llvm::Value* operand : call->args())
+                if (auto* reference = llvm::dyn_cast<llvm::GetElementPtrInst>(operand);
+                    reference != nullptr && reference->getMetadata("cflat.cxx.closure.ref") != nullptr)
+                {
+                    if (source != nullptr) return nullptr;
+                    source = reference->getPointerOperand();
+                }
+            return source;
+        };
+        trivialSlotAt = [&](llvm::Value* storage, int64_t off) {
+            if (storage == nullptr || !storage->getType()->isPointerTy()) return false;
+            llvm::Value* root = storage;
+            for (;;)
+            {
+                if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(root))
+                {
+                    const auto offset = envFieldOffset(gep);
+                    if (!offset) return false;
+                    off += *offset;
+                    root = gep->getPointerOperand();
+                }
+                else if (auto* cast = llvm::dyn_cast<llvm::BitCastInst>(root))
+                    root = cast->getOperand(0);
+                else if (llvm::Value* lent = closureRefAdapterSource(root))
+                    root = lent;
+                else
+                    break;
+            }
+            // A loaded pointer (`p->fn`) or a parameter has writers this walk cannot see.
+            auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(root);
+            if (alloca == nullptr) return false;
+            const auto size = alloca->getAllocationSize(layout);
+            return trivialRange(alloca, off,
+                                size && !size->isScalable() ? (int64_t)size->getFixedValue() : -1) == 1;
+        };
+        trivialRange = [&](llvm::Value* base, int64_t off, int64_t extent) {
+            const auto key = std::make_pair(base, off);
+            if (auto it = slotMemo.find(key); it != slotMemo.end()) return it->second;
+            slotMemo[key] = 0;
+            int result = 0;
+            auto merge = [&](int r) { result = r < 0 || result < 0 ? -1 : std::max(result, r); };
+            for (llvm::User* user : base->users())
+            {
+                if (result < 0) break;
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(user);
+                    load != nullptr && load->getPointerOperand() == base)
+                    continue;
+                if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+                    gep != nullptr && gep->getPointerOperand() == base)
+                {
+                    if (gep->getMetadata("cflat.cxx.closure.ref") != nullptr || gep->use_empty()) continue;
+                    llvm::Type* element = gep->getResultElementType();
+                    const int64_t size = element->isSized() && !element->isIntegerTy(8)
+                        ? (int64_t)layout.getTypeAllocSize(element).getFixedValue() : -1;
+                    const auto offset = envFieldOffset(gep);
+                    if (!offset)
+                    {
+                        // A variable index may alias the closure: it must only read.
+                        if (!readOnly(gep)) result = -1;
+                        continue;
+                    }
+                    if (overlaps(*offset, size, off)) merge(trivialRange(gep, off - *offset, size));
+                    continue;
+                }
+                if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                    store != nullptr && store->getPointerOperand() == base
+                    && store->getValueOperand() != base)
+                {
+                    llvm::Value* value = store->getValueOperand();
+                    const int64_t size = (int64_t)layout.getTypeStoreSize(value->getType()).getFixedValue();
+                    if (!overlaps(0, size, off)) continue;
+                    // CFlat stores the code pointer at byte zero, the owning env at +sizeof(void*).
+                    if (off == 0 && value->getType() == GetClosureFatPtrType())
+                        merge(trivialFat(value) ? 1 : -1);
+                    else if (off == -ptrSize && value->getType()->isPointerTy())
+                        merge(trivialEnv(value) ? 1 : -1);
+                    else if (off == 0 && value->getType()->isPointerTy())
+                        continue;
+                    else if (off >= 0 && off + fatSize <= size)
+                    {
+                        // A whole-record store: zero-fill, or a copy of another slot's record.
+                        auto* constant = llvm::dyn_cast<llvm::Constant>(value);
+                        auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+                        if (constant != nullptr && constant->isNullValue()) merge(1);
+                        else if (load != nullptr)
+                            merge(trivialSlotAt(load->getPointerOperand(), off) ? 1 : -1);
+                        else
+                            result = -1;
+                    }
+                    else
+                        result = -1;
+                    continue;
+                }
+                if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                    call != nullptr && call->getCalledFunction() != nullptr)
+                {
+                    llvm::Function* function = call->getCalledFunction();
+                    if (isDestructor(function)) continue;
+                    if (function->getIntrinsicID() == llvm::Intrinsic::memset && call->getArgOperand(0) == base)
+                    {
+                        auto* fill = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+                        auto* length = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+                        if (fill == nullptr || !fill->isZero()) result = -1;
+                        else if (length == nullptr || overlaps(0, (int64_t)length->getZExtValue(), off)) merge(1);
+                        continue;
+                    }
+                    if (function->isDeclaration()) { result = -1; continue; }
+                    for (unsigned i = 0; i < call->arg_size() && result >= 0; ++i)
+                        if (call->getArgOperand(i) == base)
+                        {
+                            // Only a callee that provably initializes the slot (a ctor) is trusted.
+                            const int callee = i < function->arg_size()
+                                ? trivialRange(function->getArg(i), off, extent) : -1;
+                            merge(callee == 1 ? 1 : -1);
+                        }
+                    continue;
+                }
+                if (auto* cast = llvm::dyn_cast<llvm::BitCastInst>(user);
+                    cast != nullptr && cast->getOperand(0) == base)
+                {
+                    merge(trivialRange(cast, off, extent));
+                    continue;
+                }
+                result = -1;
+            }
+            slotMemo[key] = result;
+            return result;
+        };
+        return trivialSlot(slot);
 }
 
 void LLVMBackend::EnsureCxxClosureEnvHelpers()
 {
+        auto ensureStringAllocators = [&]() {
+            auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+            if (module->getFunction("__cflat_closure_string_alloc") == nullptr)
+            {
+                llvm::Function* allocate = GetFunction("operator new");
+                if (allocate != nullptr && allocate->arg_size() == 1)
+                {
+                    auto* ty = llvm::FunctionType::get(i8PtrTy, { builder->getInt64Ty() }, false);
+                    auto* wrapper = llvm::Function::Create(
+                        ty, llvm::Function::WeakODRLinkage,
+                        "__cflat_closure_string_alloc", *module);
+                    llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", wrapper));
+                    llvm::Value* size = wrapper->getArg(0);
+                    llvm::Type* parameterType = allocate->getFunctionType()->getParamType(0);
+                    if (parameterType != size->getType())
+                        size = b.CreateIntCast(size, parameterType, false);
+                    b.CreateRet(b.CreateCall(allocate->getFunctionType(), allocate, { size }));
+                }
+            }
+            if (module->getFunction("__cflat_closure_string_free") == nullptr)
+            {
+                llvm::Function* release = GetFunction("operator delete");
+                if (release != nullptr && release->arg_size() == 1)
+                {
+                    auto* ty = llvm::FunctionType::get(builder->getVoidTy(), { i8PtrTy }, false);
+                    auto* wrapper = llvm::Function::Create(
+                        ty, llvm::Function::WeakODRLinkage,
+                        "__cflat_closure_string_free", *module);
+                    llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", wrapper));
+                    llvm::Value* pointer = wrapper->getArg(0);
+                    llvm::Type* parameterType = release->getFunctionType()->getParamType(0);
+                    if (parameterType != pointer->getType())
+                        pointer = b.CreatePointerCast(pointer, parameterType);
+                    b.CreateCall(release->getFunctionType(), release, { pointer });
+                    b.CreateRetVoid();
+                }
+            }
+        };
+        ensureStringAllocators();
         if (module->getFunction("__cflat_closure_env_copy") != nullptr) return;
         EnsureClosureLifetimeRegistered();
         // The registered routines: a module restored from the core cache may carry them renamed.
@@ -2990,7 +3312,8 @@ void LLVMBackend::EnsureCxxClosureEnvHelpers()
 }
 
 std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std::string& target,
-                                                   const TypeAndValue* signatureHint)
+                                                   const TypeAndValue* signatureHint,
+                                                   bool deferReferenceCaptureCheck)
 {
         if (!IsUnwrappedFatClosure(arg)) return {};
         // Explicitly moved closure arguments no longer have storage to recover their binding type from.
@@ -3063,26 +3386,28 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
         // By-reference captures borrow the defining frame; C++ may keep the callable past it.
         if (arg.IsBonded || arg.ContainsBondedClosure || !arg.LambdaReferenceCaptureNames.empty())
         {
+            // A move-only capture is refused whether or not the by-reference check is deferred.
             for (const std::string& name : arg.LambdaReferenceCaptureNames)
             {
                 const NamedVariable* captured = FindLiveNamedVariable(name);
-                if (captured != nullptr
-                    && MangledBase(captured->TypeAndValue.TypeName) == "unique")
+                if (captured != nullptr && MangledBase(captured->TypeAndValue.TypeName) == "unique")
                     return std::format(
                         "a closure capturing the move-only '{}' cannot be passed to C++ '{}': the "
                         "C++ callable must be copyable, as C++ refuses a move-only lambda there",
                         name, target);
             }
-            std::string names;
-            for (const std::string& name : arg.LambdaReferenceCaptureNames)
-                names += (names.empty() ? "" : ", ") + name;
-            return std::format(
-                "a closure that captures by reference{} cannot be passed to C++ '{}': the C++ "
-                "callable can outlive the captured local; capture a pointer instead",
-                names.empty() ? std::string() : " ('" + names + "')", target);
+            if (!deferReferenceCaptureCheck)
+            {
+                std::string names;
+                for (const std::string& name : arg.LambdaReferenceCaptureNames)
+                    names += (names.empty() ? "" : ", ") + name;
+                return std::format(
+                    "a closure that captures by reference{} cannot be passed to C++ '{}': the C++ "
+                    "callable can outlive the captured local; capture a pointer instead",
+                    names.empty() ? std::string() : " ('" + names + "')", target);
+            }
         }
-        // The wrapper calls the CFlat invoker directly: only a scalar/pointer signature has the
-        // same calling convention on both sides.
+        // The generated wrapper adapts CFlat records, aliases and string values at the call edge.
         TypeAndValue thin = arg.TypeAndValue;
         thin.TypeName = "__c_fn_ptr";
         TypeAndValue ret;
@@ -3092,24 +3417,25 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
         if (scalarSignature)
         {
             UnpackFuncPtrSignature(thin, ret, params);
-            auto scalar = [](const TypeAndValue& t, bool isReturn) {
-                if (t.IsMove || t.IsRvalueRef || t.IsAlias) return false;
+            auto supported = [&](const TypeAndValue& t, bool isReturn) {
+                if (t.IsAlias || t.IsRvalueRef) return true;
                 if (t.Pointer) return true;
                 if (isReturn && (t.TypeName.empty() || t.TypeName == "void")) return true;
-                return t.IsPrimitive() && t.TypeName != "void";
+                return (t.IsPrimitive() && t.TypeName != "void")
+                    || t.TypeName == "string" || IsCxxRecord(t.TypeName);
             };
-            scalarSignature = scalar(ret, true);
-            for (const TypeAndValue& p : params) scalarSignature = scalarSignature && scalar(p, false);
+            scalarSignature = supported(ret, true);
+            for (const TypeAndValue& p : params) scalarSignature = scalarSignature && supported(p, false);
         }
         if (!thin.IsFunctionPointer)
             return std::format(
                 "a closure whose signature is not known at this argument (an 'auto' local, a call "
                 "result or a field) cannot be passed to C++ '{}'; bind it to a 'Lambda<...>' local "
                 "first", target);
-        if (!scalarSignature || !CxxThinFunctionPointerSpelling(thin, signature))
+        if (!scalarSignature || !CxxThinFunctionPointerSpelling(thin, signature, true))
             return std::format(
-                "a capturing closure cannot be passed to C++ '{}': only a closure whose parameters "
-                "and return are scalars or pointers crosses into C++", target);
+                "a capturing closure cannot be passed to C++ '{}': its parameter or return type "
+                "cannot cross the closure wrapper", target);
 
         llvm::Value* fat = arg.Primary;
         const bool explicitMove = arg.IsExplicitMove || arg.TypeAndValue.IsMove;
@@ -3120,7 +3446,22 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
         if (named)
         {
             // C++ may copy the borrowed closure: allowed only when no owning capture is copied.
-            if (!ClosureSlotHasOnlyTrivialCaptures(arg.Storage))
+            const bool trivialValueCaptures = [&] {
+                if (arg.LambdaCaptureNames.empty()) return false;
+                for (const std::string& name : arg.LambdaCaptureNames)
+                {
+                    const NamedVariable* captured = FindLiveNamedVariable(name);
+                    if (captured == nullptr || captured->TypeAndValue.Pointer) return false;
+                    const TypeAndValue& type = captured->TypeAndValue;
+                    if (type.IsInteger() >= 0 || type.IsFloatingPoint() >= 0) continue;
+                    if (IsCxxTriviallyCopyableRecord(type.TypeName)) continue;
+                    return false;
+                }
+                return true;
+            }();
+            if (!ClosureSlotHasOnlyTrivialCaptures(arg.Storage)
+                && !(deferReferenceCaptureCheck
+                     && (!arg.LambdaReferenceCaptureNames.empty() || trivialValueCaptures)))
                 return std::format(
                     "a closure that may own non-trivial captures cannot be copied into C++ '{}' "
                     "implicitly; pass 'move {}' to hand it over", target,
@@ -3157,10 +3498,15 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
         wrapped.BaseType = slot->getType();
         wrapped.TypeAndValue.TypeName = "void";
         wrapped.TypeAndValue.Pointer = true;
+        wrapped.OriginalArgumentType = arg.TypeAndValue;
+        wrapped.HasOriginalArgumentType = arg.TypeAndValue.IsFunctionPointer;
         wrapped.IsRvalue = !named;   // a closure variable crosses as the lvalue it is
         wrapped.CxxClosureSignature = signature;
         wrapped.CxxClosureBorrowed = named;
         wrapped.CxxClosureDisplay = "Lambda<" + FuncPtrSpellingOf(thin) + ">";
+        wrapped.IsBonded = arg.IsBonded;
+        wrapped.ContainsBondedClosure = arg.ContainsBondedClosure;
+        wrapped.LambdaReferenceCaptureNames = arg.LambdaReferenceCaptureNames;
         arg = std::move(wrapped);
         return {};
 }

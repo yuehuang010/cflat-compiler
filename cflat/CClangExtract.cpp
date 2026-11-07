@@ -4902,11 +4902,18 @@ namespace cflat_cinterop
              * a refusal and leaves the record opaque.
              */
             bool FlattenCxxLayout(const CXXRecordDecl* cxx, uint64_t baseOff, bool nameable,
-                                  const std::set<std::string>& ownNames, bool isOutermost,
-                                  std::set<std::string>& taken, int& synth, RawRecord& rec)
+                                  const std::set<std::string>& hidingNames, bool isOutermost,
+                                  std::map<std::string, size_t>& taken, int& synth,
+                                  RawRecord& rec, std::vector<const FieldDecl*>& fieldDecls)
             {
                 if (cxx->getNumVBases() > 0) return false;
+                const size_t firstField = rec.fields.size();
                 const ASTRecordLayout& layout = ctx.getASTRecordLayout(cxx);
+                std::set<std::string> declaredHere;
+                for (const FieldDecl* f : cxx->fields())
+                    if (!f->getDeclName().isEmpty()) declaredHere.insert(f->getNameAsString());
+                std::set<std::string> hidingForBases = hidingNames;
+                hidingForBases.insert(declaredHere.begin(), declaredHere.end());
                 if (layout.hasOwnVFPtr())
                 {
                     // Every flattened slot keeps a NAME: downstream, a nameless field means
@@ -4918,6 +4925,7 @@ namespace cflat_cinterop
                     vp.offsetBytes = baseOff;
                     vp.access = AccessPrivate;
                     rec.fields.push_back(std::move(vp));
+                    fieldDecls.push_back(nullptr);
                 }
                 for (const CXXBaseSpecifier& b : cxx->bases())
                 {
@@ -4928,8 +4936,8 @@ namespace cflat_cinterop
                         + (uint64_t)(b.isVirtual() ? layout.getVBaseClassOffset(brd)
                                                    : layout.getBaseClassOffset(brd)).getQuantity();
                     const bool basePublic = b.getAccessSpecifier() == AS_public;
-                    if (!FlattenCxxLayout(brd, off, nameable && basePublic, ownNames,
-                                          /*isOutermost*/ false, taken, synth, rec))
+                    if (!FlattenCxxLayout(brd, off, nameable && basePublic, hidingForBases,
+                                          /*isOutermost*/ false, taken, synth, rec, fieldDecls))
                         return false;
                 }
                 unsigned idx = 0;
@@ -4959,19 +4967,98 @@ namespace cflat_cinterop
                     RecordRawFieldLayout(named->getType(), rf);
                     rf.access = MapAccess(f->getAccess());
                     rf.inherited = !isOutermost;
-                    // Shadowed by a more derived field of the same name: keep the storage, give it
-                    // a reserved name nobody can write. Inherited through a non-public base: keep
-                    // the real name but mark it private, so naming it says exactly that.
-                    const bool shadowedByDerived = !isOutermost && ownNames.count(rf.name) != 0;
-                    if (shadowedByDerived || !taken.insert(rf.name).second)
+                    const size_t slot = rec.fields.size();
+                    const auto visible = taken.find(rf.name);
+                    if (hidingNames.count(rf.name) != 0)
                     {
                         rf.name = "__hidden" + std::to_string(synth++);
                         rf.access = AccessPrivate;
                     }
-                    else if (!nameable)
+                    else if (visible != taken.end())
+                    {
+                        // Two base subobjects with the same name are ambiguous until a using-declaration
+                        // selects one of their FieldDecls; clang checks ambiguity before access.
+                        if (std::find(rec.ambiguousFieldNames.begin(), rec.ambiguousFieldNames.end(), rf.name)
+                                == rec.ambiguousFieldNames.end())
+                            rec.ambiguousFieldNames.push_back(rf.name);
+                        rec.fields[visible->second].access = AccessPrivate;
+                        rf.name = "__hidden" + std::to_string(synth++);
                         rf.access = AccessPrivate;
+                    }
+                    else
+                    {
+                        taken.emplace(rf.name, slot);
+                        if (!nameable) rf.access = AccessPrivate;
+                    }
                     rec.fields.push_back(std::move(rf));
+                    fieldDecls.push_back(f);
                     ++idx;
+                }
+
+                auto hideSlot = [&](size_t index) {
+                    if (index >= rec.fields.size() || index >= fieldDecls.size()) return;
+                    RawField& field = rec.fields[index];
+                    auto visible = taken.find(field.name);
+                    if (visible == taken.end() || visible->second != index) return;
+                    taken.erase(visible);
+                    field.name = "__hidden" + std::to_string(synth++);
+                    field.access = AccessPrivate;
+                };
+                for (const Decl* d : cxx->decls())
+                {
+                    const auto* ud = dyn_cast<UsingDecl>(d);
+                    if (ud == nullptr || ud->shadow_size() == 0) continue;
+                    const std::string name = ud->getNameAsString();
+                    std::vector<const FieldDecl*> targets;
+                    bool selectsMethod = false;
+                    for (const UsingShadowDecl* shadow : ud->shadows())
+                    {
+                        if (const auto* field = dyn_cast<FieldDecl>(shadow->getTargetDecl()))
+                            targets.push_back(field);
+                        else if (const auto* method = dyn_cast<CXXMethodDecl>(shadow->getTargetDecl());
+                                 method != nullptr && !isa<CXXConstructorDecl>(method))
+                            selectsMethod = true;
+                    }
+                    if (!hidingNames.count(name) && !declaredHere.count(name) && !targets.empty())
+                    {
+                        for (const FieldDecl* target : targets)
+                        {
+                            size_t selected = rec.fields.size();
+                            size_t matches = 0;
+                            for (size_t i = firstField; i < rec.fields.size() && i < fieldDecls.size(); ++i)
+                                if (fieldDecls[i] == target) { selected = i; ++matches; }
+                            if (matches != 1) continue;
+                            for (size_t i = firstField; i < rec.fields.size(); ++i)
+                                if (i != selected && rec.fields[i].name == name) hideSlot(i);
+                            auto other = taken.find(name);
+                            if (other != taken.end() && other->second != selected)
+                            {
+                                // A using in one base cannot resolve a same-named member from a
+                                // sibling base; only a using in this complete class can select it.
+                                if (other->second >= firstField)
+                                    hideSlot(other->second);
+                                else
+                                {
+                                    rec.fields[other->second].access = AccessPrivate;
+                                    rec.fields[selected].access = AccessPrivate;
+                                    continue;
+                                }
+                            }
+                            std::erase(rec.ambiguousFieldNames, name);
+                            rec.fields[selected].name = name;
+                            rec.fields[selected].access = nameable ? MapAccess(ud->getAccess())
+                                                                  : AccessPrivate;
+                            if (isOutermost) rec.fields[selected].inherited = false;
+                            taken[name] = selected;
+                        }
+                    }
+                    else if (!hidingNames.count(name) && !declaredHere.count(name) && selectsMethod)
+                    {
+                        // A method selected by using hides a same-named data field from another base.
+                        for (size_t i = firstField; i < rec.fields.size(); ++i)
+                            if (rec.fields[i].name == name) hideSlot(i);
+                        std::erase(rec.ambiguousFieldNames, name);
+                    }
                 }
                 return true;
             }
@@ -4983,41 +5070,12 @@ namespace cflat_cinterop
              */
             bool CollectCxxFlatFields(const CXXRecordDecl* cxx, RawRecord& rec)
             {
-                std::set<std::string> ownNames;
-                for (const FieldDecl* f : cxx->fields())
-                    if (!f->getDeclName().isEmpty()) ownNames.insert(f->getNameAsString());
-                std::set<std::string> taken;
+                std::set<std::string> hidingNames;
+                std::map<std::string, size_t> taken;
+                std::vector<const FieldDecl*> fieldDecls;
                 int synth = 0;
-                if (!FlattenCxxLayout(cxx, 0, true, ownNames, /*isOutermost*/ true, taken, synth, rec))
-                    return false;
-                // `using Base::v;` naming a FIELD declares v in cxx itself; it takes the using's access
-                // only when the hierarchy holds one field v, so the flat slot is surely the target.
-                std::function<int(const CXXRecordDecl*, const std::string&)> countFields =
-                    [&](const CXXRecordDecl* r, const std::string& name) {
-                        int n = 0;
-                        for (const FieldDecl* f : r->fields()) n += f->getNameAsString() == name;
-                        for (const CXXBaseSpecifier& b : r->bases())
-                            if (const auto* brd = b.getType()->getAsCXXRecordDecl())
-                                if (brd->getDefinition() != nullptr)
-                                    n += countFields(brd->getDefinition(), name);
-                        return n;
-                    };
-                for (const Decl* d : cxx->decls())
-                {
-                    const auto* ud = dyn_cast<UsingDecl>(d);
-                    if (ud == nullptr || ud->shadow_size() == 0) continue;
-                    if (!std::all_of(ud->shadow_begin(), ud->shadow_end(), [](const UsingShadowDecl* sh) {
-                            return isa<FieldDecl>(sh->getTargetDecl()); }))
-                        continue;
-                    const std::string name = ud->getNameAsString();
-                    const bool unique = countFields(cxx, name) == 1;
-                    for (RawField& f : rec.fields)
-                        if (f.inherited && f.name == name)
-                        {
-                            f.inherited = false;
-                            if (unique) f.access = MapAccess(ud->getAccess());
-                        }
-                }
+                if (!FlattenCxxLayout(cxx, 0, true, hidingNames, /*isOutermost*/ true,
+                                      taken, synth, rec, fieldDecls)) return false;
                 if (std::none_of(rec.fields.begin(), rec.fields.end(),
                         [](const RawField& f) { return f.isZeroSize; }))
                     std::stable_sort(rec.fields.begin(), rec.fields.end(),

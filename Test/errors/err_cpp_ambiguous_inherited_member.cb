@@ -1,0 +1,19 @@
+// Public inherited fields with ambiguous C++ name lookup must keep that reason through flattening.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("member 'v' is ambiguous in C++ class 'cppi_usingdecl.Diamond': found in more than one base class") {
+        cppi_usingdecl.Diamond d = cppi_usingdecl.Diamond();
+        int value = d.v;
+    }
+    expect_error("member 'v' is ambiguous in C++ class 'cppi_usingdecl.ShA': found in more than one base class") {
+        cppi_usingdecl.ShA d = cppi_usingdecl.ShA();
+        int value = d.v;
+    }
+    expect_error("member 'v' is ambiguous in C++ class 'cppi_usingdecl.DSelA': found in more than one base class") {
+        cppi_usingdecl.DSelA d = cppi_usingdecl.DSelA();
+        int value = d.v;
+    }
+    return 0;
+}

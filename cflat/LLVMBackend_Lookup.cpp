@@ -1418,11 +1418,16 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::NamedFunctionOverloadForFuncPtr(
         return nullptr;
     }
 
+bool LLVMBackend::IsNamedFunctionValue(const NamedVariable& arg) const
+{
+        return arg.GenericFunctionValue || (arg.Primary != nullptr
+            && llvm::isa<llvm::Function>(arg.Primary->stripPointerCasts()));
+}
+
 bool LLVMBackend::NamedFunctionArgMismatches(const NamedVariable& arg, const TypeAndValue& param) const
 {
-        if (!param.IsFunctionPointer || arg.CallerName.empty()) return false;
+        if (!param.IsFunctionPointer || arg.CallerName.empty() || !IsNamedFunctionValue(arg)) return false;
         if (!arg.TypeAndValue.FuncPtrReturnTypeName.empty()) return false;
-        if (FindVariableStorage(arg.CallerName).Storage != nullptr) return false;
         return NamedFunctionProvablyMismatchesFuncPtr(arg.CallerName, param);
     }
 

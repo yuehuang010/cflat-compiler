@@ -199,7 +199,146 @@ expect_error("cannot return an 'alias' value") {
     }
 }
 
+// Named aggregates retain the provenance of reference-member initializers.
+int refctxAssignmentStableGlobal = 47;
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnNamedLocal() {
+        int value = 41;
+        cppref.BraceRefInner result = { r = value, v = 1, d = 0.0 };
+        return result;
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    struct RefctxNestedOuter { cppref.BraceRefInner inner; int k = default; };
+    RefctxNestedOuter RefctxReturnNestedLocal() {
+        int value = 42;
+        return { inner = { r = value, v = 2, d = 0.0 }, k = 3 };
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnCopiedLocal() {
+        int value = 43;
+        cppref.BraceRefInner first = { r = value, v = 4, d = 0.0 };
+        cppref.BraceRefInner second = first;
+        return second;
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnTernaryLocal(bool chooseFirst) {
+        int firstValue = 44;
+        int secondValue = 45;
+        cppref.BraceRefInner first = { r = firstValue, v = 5, d = 0.0 };
+        cppref.BraceRefInner second = { r = secondValue, v = 6, d = 0.0 };
+        return chooseFirst ? first : second;
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    struct RefctxAssignedOuter { cppref.BraceRefInner inner; int k = default; };
+    RefctxAssignedOuter RefctxReturnAssignedNestedLocal() {
+        int value = 46;
+        RefctxAssignedOuter result = {
+            inner = { r = refctxAssignmentStableGlobal, v = 7, d = 0.0 }, k = 8 };
+        cppref.BraceRefInner replacement = { r = value, v = 9, d = 0.0 };
+        result.inner = replacement;
+        return result;
+    }
+}
+
 extern int main()
 {
     return 0;
+}
+
+// A C++ call result binds its reference member to a frame local (frame-rooted call argument).
+import cpp "cpp_t28_fwdref.hpp";
+expect_error("reference member 'a' cannot bind to a local or temporary value") {
+    std.cflat_t28.LitRef RefctxReturnCallLocalBuffer() {
+        char[5] buffer = "abcd";
+        auto t = std.cflat_t28.fwd(buffer);
+        return t;
+    }
+}
+
+// REFESC r3: a conditional or looped overwrite does not hide an earlier frame binding.
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnBranchOverwrite(bool c) {
+        int value = 48;
+        cppref.BraceRefInner stable = { r = refctxAssignmentStableGlobal, v = 1, d = 0.0 };
+        cppref.BraceRefInner result = { r = value, v = 2, d = 0.0 };
+        if (c) result = stable;
+        return result;
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefctxReturnLoopOverwrite(int n) {
+        int value = 49;
+        cppref.BraceRefInner stable = { r = refctxAssignmentStableGlobal, v = 1, d = 0.0 };
+        cppref.BraceRefInner result = { r = value, v = 2, d = 0.0 };
+        for (int i = 0; i < n; i++) { result = stable; }
+        return result;
+    }
+}
+
+// REFESC r4: a frame write inside a branch reaches the return after it; a return inside a branch
+// sees the binding live there; a write later in a loop body reaches an earlier return on the back
+// edge (copy, call result and direct forms).
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefescR4StableThenCondFrame(bool c) {
+        int value = 50;
+        cppref.BraceRefInner stable = { r = refctxAssignmentStableGlobal, v = 1, d = 0.0 };
+        cppref.BraceRefInner frame = { r = value, v = 2, d = 0.0 };
+        cppref.BraceRefInner result = stable;
+        if (c) { result = frame; }
+        return result;
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefescR4ReturnInBranch(bool c) {
+        int value = 51;
+        cppref.BraceRefInner stable = { r = refctxAssignmentStableGlobal, v = 1, d = 0.0 };
+        cppref.BraceRefInner result = { r = value, v = 2, d = 0.0 };
+        if (c) { return result; }
+        return stable;
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefescR4BackEdgeDirect(int n) {
+        int value = 52;
+        cppref.BraceRefInner stable = { r = refctxAssignmentStableGlobal, v = 1, d = 0.0 };
+        cppref.BraceRefInner frame = { r = value, v = 2, d = 0.0 };
+        cppref.BraceRefInner result = stable;
+        for (int i = 0; i < n; i++) { if (i > 0) { return result; } result = frame; }
+        return stable;
+    }
+}
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefescR4BackEdgeCopy(int n) {
+        int value = 53;
+        cppref.BraceRefInner stable = { r = refctxAssignmentStableGlobal, v = 1, d = 0.0 };
+        cppref.BraceRefInner frame = { r = value, v = 2, d = 0.0 };
+        cppref.BraceRefInner a = stable;
+        cppref.BraceRefInner b = stable;
+        for (int i = 0; i < n; i++) { if (i > 0) { return b; } b = a; a = frame; }
+        return stable;
+    }
+}
+expect_error("cannot return C++ aggregate 'refescr3.Ref': reference member 'r' cannot bind to a local or temporary value") {
+    refescr3.Ref RefescR4BackEdgeCxxCall(int n) {
+        int value = 54;
+        refescr3.Ref result = refescr3.mk(refctxAssignmentStableGlobal);
+        for (int i = 0; i < n; i++) { if (i > 0) { return result; } result = refescr3.mk(value); }
+        return refescr3.mk(refctxAssignmentStableGlobal);
+    }
+}
+
+// A frame binding copied along a chain longer than any fixed round count still reaches the return.
+expect_error("cannot return C++ aggregate 'cppref.BraceRefInner': reference member 'r' cannot bind to a local or temporary value") {
+    cppref.BraceRefInner RefescLongCopyChain(int n) {
+        int value = 60;
+        cppref.BraceRefInner stable = { r = refctxAssignmentStableGlobal, v = 1, d = 0.0 };
+        cppref.BraceRefInner frame = { r = value, v = 2, d = 0.0 };
+        cppref.BraceRefInner z0 = stable; cppref.BraceRefInner z1 = stable; cppref.BraceRefInner z2 = stable; cppref.BraceRefInner z3 = stable; cppref.BraceRefInner z4 = stable; cppref.BraceRefInner z5 = stable; cppref.BraceRefInner z6 = stable; cppref.BraceRefInner z7 = stable; cppref.BraceRefInner z8 = stable; cppref.BraceRefInner z9 = stable; cppref.BraceRefInner z10 = stable; cppref.BraceRefInner z11 = stable; cppref.BraceRefInner z12 = stable; cppref.BraceRefInner z13 = stable; cppref.BraceRefInner z14 = stable; cppref.BraceRefInner z15 = stable; cppref.BraceRefInner z16 = stable; cppref.BraceRefInner z17 = stable; cppref.BraceRefInner z18 = stable; cppref.BraceRefInner z19 = stable; cppref.BraceRefInner z20 = stable; cppref.BraceRefInner z21 = stable; cppref.BraceRefInner z22 = stable; cppref.BraceRefInner z23 = stable; cppref.BraceRefInner z24 = stable; cppref.BraceRefInner z25 = stable; cppref.BraceRefInner z26 = stable; cppref.BraceRefInner z27 = stable; cppref.BraceRefInner z28 = stable; cppref.BraceRefInner z29 = stable; cppref.BraceRefInner z30 = stable; cppref.BraceRefInner z31 = stable; cppref.BraceRefInner z32 = stable; cppref.BraceRefInner z33 = stable; cppref.BraceRefInner z34 = stable; cppref.BraceRefInner z35 = stable;
+        for (int i = 0; i < n; i++) { z0 = z1; z1 = z2; z2 = z3; z3 = z4; z4 = z5; z5 = z6; z6 = z7; z7 = z8; z8 = z9; z9 = z10; z10 = z11; z11 = z12; z12 = z13; z13 = z14; z14 = z15; z15 = z16; z16 = z17; z17 = z18; z18 = z19; z19 = z20; z20 = z21; z21 = z22; z22 = z23; z23 = z24; z24 = z25; z25 = z26; z26 = z27; z27 = z28; z28 = z29; z29 = z30; z30 = z31; z31 = z32; z32 = z33; z33 = z34; z34 = z35; z35 = frame; }
+        return z0;
+    }
 }

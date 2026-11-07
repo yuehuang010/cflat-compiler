@@ -343,7 +343,7 @@ static bool ResolveEnumTypeArgumentBase(std::string& argument, ResolveBase&& res
 }
 
 // Function signatures store pointer shape separately from the base type name.
-std::string SignatureComponentAliasBase(const LLVMBackend* compiler, std::string name);
+std::string SignatureComponentAliasBase(LLVMBackend* compiler, std::string name);
 
 // Fold a POINTER alias (`using IP = int*;`) into a type-ARGUMENT spelling: rebinds `name` to the
 // alias target's bare base and adds the target's stars to `stars` (the ELEMENT depth for a view).
@@ -2407,9 +2407,20 @@ private:
         std::string UniqueName;
         std::vector<LLVMBackend::TypeAndValue> Parameters;
     };
+    struct DeferredFunctionDefinition
+    {
+        CFlatParser::FunctionDefinitionContext* Function = nullptr;
+        std::string StructName;
+        std::string NamespaceName;
+        std::string CurrentNamespace;
+        std::vector<std::string> RequiredLocks;
+    };
     LLVMBackend* compilerLLVM;
     antlr4::BufferedTokenStream* tokens_ = nullptr;
     std::vector<ViewFieldMoveInferenceEntry> viewFieldMoveInferenceEntries_;
+    std::vector<DeferredFunctionDefinition> deferredIncompleteFunctionDefinitions_;
+    std::unordered_map<std::string, size_t> functionSourceOrder_;
+    std::unordered_map<std::string, size_t> forwardDeclaredStructTypeSourceOrder_;
     // The eager generic-use scan runs before scoped expect_error handlers are armed.
     unsigned genericTypeUseScanDepth_ = 0;
 
@@ -2752,6 +2763,8 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
 public:
     ForwardRefScanner(LLVMBackend* compiler);
     void SetTokens(antlr4::BufferedTokenStream* t);
+    void FinalizeDeferredFunctionDefinitions();
+    std::vector<CFlatParser::FunctionDefinitionContext*> DeferredFunctionDefinitionContexts() const;
     void FinalizeViewFieldMoveInference();
     void CollectGlobalArrayViewNonInitializerStores(CFlatParser::TranslationUnitContext* tu,
                                                       bool allowUnresolvedGlobals = false);
@@ -2945,6 +2958,7 @@ public:
     void ScanAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx);
 
     void ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
+    void PreRegisterAggregateTypeShells(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
     void PreRegisterEnums(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
     void PreRegisterGlobals(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
 
@@ -3027,6 +3041,68 @@ private:
         std::unordered_map<std::string, std::string> RootNames;
     };
     std::unordered_map<llvm::Function*, std::vector<ReturnedStructFrameCandidate>> returnedStructFrameCandidates_;
+    enum class CxxReferenceMemberLifetime : uint8_t { Frame, Stable, Unknown };
+    struct CxxReferenceMemberProvenance
+    {
+        llvm::Value* Root = nullptr;
+        std::vector<int64_t> ObjectPath;
+        std::string AggregateType;
+        std::string FieldName;
+        CxxReferenceMemberLifetime Lifetime = CxxReferenceMemberLifetime::Unknown;
+        antlr4::ParserRuleContext* Context = nullptr;
+        // Seq is the source-order position; Regions the structured nesting (branch, loop,
+        // switch case) of the write. Whole overwrites every member under ObjectPath.
+        uint64_t Seq = 0;
+        std::vector<uint32_t> Regions;
+        bool Whole = false;
+        // A join kill made where every branch path wrote the same member: it kills only facts
+        // whose Seq lies in KillRanges ([lo, hi) pairs), never live by itself.
+        bool Join = false;
+        std::vector<std::pair<uint64_t, uint64_t>> KillRanges;
+    };
+    struct CxxFactGroup
+    {
+        uint32_t Id = 0;
+        uint64_t Start = 0;
+        uint64_t End = 0;
+        uint64_t BreakSeq = UINT64_MAX;
+        size_t Depth = 0;
+        llvm::Function* Function = nullptr;
+    };
+    struct CxxFactPoint
+    {
+        uint64_t Seq = 0;
+        std::vector<uint32_t> Regions;
+    };
+    // A query inside a loop body is re-run when the loop closes, to see writes on the back edge.
+    struct CxxDeferredFactQuery
+    {
+        bool Check = false;
+        bool Done = false;
+        std::function<bool(bool& done)> Run;
+    };
+    struct CxxFactRegion
+    {
+        uint32_t Id = 0;
+        bool Loop = false;
+        bool SwitchCase = false;
+        bool AlwaysEnters = false;
+        bool ContinueExits = false;
+        bool HasDefault = false;
+        uint64_t Start = 0;
+        uint64_t GroupStart = 0;
+        uint64_t BreakSeq = UINT64_MAX;
+        std::vector<CxxFactGroup> Groups;
+        std::vector<CxxDeferredFactQuery> Deferred;
+    };
+    CxxFactGroup lastPoppedCxxFactRegion_;
+    std::unordered_map<llvm::Function*, std::vector<CxxReferenceMemberProvenance>>
+        cxxReferenceMemberProvenance_;
+    std::unordered_map<llvm::Function*, std::vector<CxxFactRegion>> cxxFactRegions_;
+    std::vector<bool> cxxFactRegionIsLoop_;
+    uint64_t cxxFactSeq_ = 0;
+    std::unordered_map<llvm::Function*, std::vector<std::pair<uint64_t, uint32_t>>> cxxFactJumps_;
+    bool rejectCxxReferenceMemberReturnBrace_ = false;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     inline LLVMBackend* Compiler() { return compilerLLVM; }
@@ -3038,6 +3114,13 @@ private:
 public:
     void enterTranslationUnit(CFlatParser::TranslationUnitContext* ctx) override
     {
+        cxxReferenceMemberProvenance_.clear();
+        cxxFactRegions_.clear();
+        cxxFactRegionIsLoop_.clear();
+        cxxFactSeq_ = 0;
+        cxxFactJumps_.clear();
+        lastPoppedCxxFactRegion_ = {};
+        rejectCxxReferenceMemberReturnBrace_ = false;
         ForwardRefScanner scanner(Compiler(ctx));
         scanner.ValidateIsolatedIntegralPointerCasts(ctx);
     }
@@ -3366,7 +3449,9 @@ private:
         DeferredGenericMemberKind kind, const std::string& nameOverride = {},
         bool suppliesNoArgCtor = false, size_t cppCtorIndex = SIZE_MAX,
         bool hasExplicitNoArgCtor = false, bool waitForEnclosingLayout = false);
-    void ProcessDeferredGenericMemberBodies(size_t first = 0, bool enclosingLayoutReady = false);
+    void ProcessDeferredGenericMemberBodies(size_t first = 0, bool enclosingLayoutReady = false,
+        const std::string& ownerPrefix = {});
+    bool preparsingAggregateLayouts_ = false;
 
     // True while monomorphizing a generic template body. The body's tokens come from the
     // template's own file (e.g. core/list.cb), but currentSourceFilePath_ is the use-site
@@ -3419,6 +3504,10 @@ private:
     // C++ struct definitions parsed early so their generated C++ is available to later member
     // bodies, while the current struct's fields still observe source-order completeness.
     std::unordered_set<const CFlatParser::StructDefinitionContext*> preparsedCppStructDefinitions_;
+    // Source aggregate definitions whose layout/template registration is completed before codegen.
+    std::unordered_set<const CFlatParser::StructDefinitionContext*> preparsedAggregateDefinitions_;
+    std::unordered_set<const CFlatParser::ClassDefinitionContext*> preparsedAggregateClassDefinitions_;
+    std::unordered_set<const CFlatParser::InterfaceDefinitionContext*> preparsedInterfaceDefinitions_;
 
     // Set only while ParseDeclarationList parses a field's declarationSpecifiers. Pointer-form
     // `unique` fields desugar to core unique<T>; unique void* remains builtin.
@@ -3691,6 +3780,32 @@ private:
         bool* flag; bool saved;
         explicit ReturnFlagGuard(bool* f) : flag(f), saved(*f) {}
         ~ReturnFlagGuard() { *flag = saved; }
+    };
+
+    // One structured region (branch, loop, switch case group) for C++ reference-member facts.
+    struct CxxFactRegionScope {
+        MainListener& listener;
+        llvm::Function* function;
+        CxxFactRegionScope(MainListener& l, bool loop, bool switchCase = false, bool hasDefault = false)
+            : listener(l), function(l.compilerLLVM != nullptr ? l.compilerLLVM->currentFunction : nullptr)
+        {
+            listener.PushCxxFactRegion(function, loop, switchCase, hasDefault);
+        }
+        // Close() runs a loop's deferred return checks, which may report (and so throw); the
+        // destructor only pops.
+        void Close()
+        {
+            llvm::Function* closing = function;
+            function = nullptr;
+            if (closing != nullptr) listener.PopCxxFactRegion(closing, true, true);
+        }
+        ~CxxFactRegionScope()
+        {
+            if (function != nullptr)
+                listener.PopCxxFactRegion(function, std::uncaught_exceptions() == 0, false);
+        }
+        CxxFactRegionScope(const CxxFactRegionScope&) = delete;
+        CxxFactRegionScope& operator=(const CxxFactRegionScope&) = delete;
     };
 
     struct OwnershipControlScope {
@@ -4146,6 +4261,12 @@ public:
         std::vector<PendingGlobalDefaultConstruction> nativeRuntime);
 
     void SetImportNamespace(const std::string& ns);
+
+    void PreparseAggregateDefinitions(
+        CFlatParser::TranslationUnitContext* ctx,
+        const std::vector<CFlatParser::FunctionDefinitionContext*>& deferredFunctions = {});
+    void PrepareDeferredFunctionDefinitions(
+        const std::vector<CFlatParser::FunctionDefinitionContext*>& functions);
 
     // Returns the BufferedTokenStream that backs this listener's parser, so that
     // helpers like ExtractLeadingDoc can reach the hidden-channel comment tokens.
@@ -4645,6 +4766,10 @@ public:
                               const std::string& retText,
                               bool defaultValue = false,
                               CFlatParser::ReturnBraceInitializerContext* braceInitializer = nullptr);
+    void CheckCxxReferenceAggregateReturn(
+        const LLVMBackend::NamedVariable& value,
+        const std::string& returnTypeName,
+        antlr4::ParserRuleContext* context);
 
     void ParseStatement(CFlatParser::StatementContext* statement);
     void ParseStatementBody(CFlatParser::StatementContext* statement);
@@ -5290,6 +5415,41 @@ public:
         const LLVMBackend::NamedVariable& nv);
 
     bool IsProgramLifetimeStorage(const LLVMBackend::NamedVariable& nv) const;
+    bool CxxReferenceSourceOutlivesFunction(const LLVMBackend::NamedVariable& nv) const;
+    void RecordCxxReferenceMemberProvenance(
+        llvm::Value* objectSlot, const std::string& aggregateType,
+        const std::string& fieldName, CxxReferenceMemberLifetime lifetime,
+        antlr4::ParserRuleContext* context);
+    bool CopyCxxReferenceMemberProvenance(llvm::Value* destination, llvm::Value* source);
+    static llvm::CallBase* CxxCallResultProducer(llvm::Value* value);
+    void RecordCxxCallResultReferenceProvenance(
+        llvm::Value* objectSlot, const std::string& aggregateType, llvm::Value* value,
+        antlr4::ParserRuleContext* context);
+    std::map<std::pair<std::string, std::string>, size_t> CollectCxxReferenceMembers(
+        const std::string& resolvedType) const;
+    bool CxxArgumentRootedInFrame(llvm::Value* arg, unsigned depth) const;
+    bool CxxFactReachesPoint(const std::vector<CxxReferenceMemberProvenance>& facts,
+                             size_t index, const CxxFactPoint& at) const;
+    CxxFactPoint CurrentCxxFactPoint() const;
+    void PushCxxFactRegion(llvm::Function* function, bool loop, bool switchCase, bool hasDefault);
+    void PopCxxFactRegion(llvm::Function* function, bool runDeferred, bool runChecks);
+    void RenewCxxFactSwitchCase();
+    void NoteCxxFactJump(bool isContinue);
+    void MarkCxxFactLoopEntersBody(bool continueExits);
+    bool TakeCxxFactBranch(CxxFactGroup& group, size_t depth) const;
+    void JoinCxxFactKills(const std::vector<CxxFactGroup>& groups, uint64_t outerStart);
+    bool InsideCxxFactLoop() const;
+    void DeferCxxFactQuery(bool check, std::function<bool(bool& done)> run);
+    const CxxReferenceMemberProvenance* CxxLiveFrameFact(
+        llvm::Value* root, const std::vector<int64_t>& path, const CxxFactPoint& at) const;
+    bool CxxStorageHasProvenance(llvm::Value* storage) const;
+    bool CxxStorageFrameBound(llvm::Value* storage, const CxxFactPoint& at) const;
+    bool CxxValueFrameBound(llvm::Value* value, const CxxFactPoint& at, unsigned depth) const;
+    bool CxxCallResultFrameBound(llvm::CallBase* call, const CxxFactPoint& at,
+                                 unsigned depth) const;
+    static llvm::Value* CxxUniqueStoredValue(llvm::Value* storage);
+    bool CxxStorageValueFrameBound(llvm::Value* storage, const CxxFactPoint& at,
+                                   unsigned depth) const;
     static bool PointsIntoStackFrame(llvm::Value* value);
     static bool IsFrameOwnedBorrowingMemberCall(const LLVMBackend* compiler, llvm::Value* value);
     void RejectLambdaReferenceCaptureEscape(
@@ -6011,8 +6171,9 @@ public:
      */
     bool UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
-                              const LLVMBackend::TypedValue& trueShape,
-                              const LLVMBackend::TypedValue& falseShape,
+                              LLVMBackend::TypedValue& trueShape,
+                              LLVMBackend::TypedValue& falseShape,
+                              llvm::Value*& trueStorage, llvm::Value*& falseStorage,
                               const std::function<void()>& atTrue,
                               const std::function<void()>& atFalse,
                               size_t trueOccurrence, size_t falseOccurrence,

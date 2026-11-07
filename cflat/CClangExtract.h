@@ -568,6 +568,8 @@ namespace cflat_cinterop
         // C++ uuid-harvest pass (the C parse never sees it - the SDK gates the attr on __cplusplus).
         std::string uuid;
         std::vector<RawField> fields;
+        // Flattened field names for which C++ member lookup found multiple base subobjects.
+        std::vector<std::string> ambiguousFieldNames;
         // Opaque blob only (fields cleared): "R:<T>"/"P:<T>" per non-owning reference/pointer
         // subobject, T its immediate pointee; see CollectBlobIndirections.
         std::vector<std::string> blobIndirections;

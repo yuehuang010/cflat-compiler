@@ -1886,6 +1886,8 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
                 || gts.scannedTypeNames.count(candidate) != 0
                 || gts.scannedNonLocalEnumNames.count(candidate) != 0
                 || AnyGenericTypeTemplateNamed(candidate)
+                || IsGenericBaseAlias(candidate)
+                || HasCxxAliasTemplate(candidate)
                 || ResolveTypeAlias(candidate) != candidate
                 || enumBackingTypes.count(candidate) != 0;
         };
@@ -2444,6 +2446,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.LockThis)        j["lt"] = true;
         if (s.LockThisMode != LockMode::Exclusive) j["ltm"] = static_cast<int>(s.LockThisMode);
         if (!s.GuardedBy.empty()) j["gb"] = s.GuardedBy;
+        if (s.FuncPtrReturnHasStrippedInnerDimensions) j["fprsid"] = true;
         if (s.FuncPtrNoPrototype) j["fpnp"] = true;
         if (s.IsFunctionPointer)
         {
@@ -2528,6 +2531,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.LockThis = j.value("lt", false);
         s.LockThisMode = static_cast<LockMode>(j.value("ltm", 0));
         s.GuardedBy = j.value("gb", std::string{});
+        s.FuncPtrReturnHasStrippedInnerDimensions = j.value("fprsid", false);
         s.IsFunctionPointer = j.value("fp", false);
         s.FuncPtrNoPrototype = j.value("fpnp", false);
         if (s.IsFunctionPointer)
@@ -3174,6 +3178,11 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
             for (const std::string& s : r.friendNames) packed += s + "\n";
             return packed;
         }();
+        if (!r.ambiguousFieldNames.empty()) j["afn"] = [&] {
+            std::string packed;
+            for (const std::string& s : r.ambiguousFieldNames) packed += s + "\n";
+            return packed;
+        }();
         if (!r.layoutRefusal.empty()) j["lref"] = r.layoutRefusal;
         // The canonical C++ spelling: a template argument naming this class needs it, so a warm
         // cache that dropped it would refuse `cppt.Box<cppi.Tracked>` the second time around.
@@ -3300,6 +3309,16 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
                 start = end + 1;
             }
         }
+        {
+            const std::string packed = j.value("afn", std::string{});
+            for (size_t start = 0; start < packed.size();)
+            {
+                size_t end = packed.find('\n', start);
+                if (end == std::string::npos) end = packed.size();
+                r.ambiguousFieldNames.push_back(packed.substr(start, end - start));
+                start = end + 1;
+            }
+        }
         r.layoutRefusal         = j.value("lref", std::string{});
         r.canonicalCtype        = j.value("can", std::string{});
         r.stdOwnedType          = j.value("sown", std::string{});
@@ -3376,6 +3395,7 @@ nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m, CCachePathTable* f
         if (m.isFuncPtr){ j["isfp"] = true; j["fptv"] = TvToJson(m.funcPtrTV); }
         if (!m.intTypeName.empty()) j["ity"] = m.intTypeName;
         if (!m.aliasTarget.empty()) j["al"] = m.aliasTarget;
+        if (m.isUnnamedEnum) j["ue"] = true;
         return j;
     }
 
@@ -3403,6 +3423,7 @@ LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j, const CCache
         if (m.isFuncPtr && j.contains("fptv")) m.funcPtrTV = TvFromJson(j["fptv"]);
         m.intTypeName = j.value("ity", std::string{});
         m.aliasTarget = j.value("al", std::string{});
+        m.isUnnamedEnum = j.value("ue", false);
         return m;
     }
 

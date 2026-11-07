@@ -614,7 +614,9 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                 {
                     if (element != 0) braceCall += ", ";
                     parameterSpellings.push_back(braceType);
-                    braceCall += "p" + std::to_string(flatParameterIndex++);
+                    const std::string param = "p" + std::to_string(flatParameterIndex++);
+                    braceCall += brace->elements[element].CxxImportedLiteral.empty()
+                        ? param : brace->elements[element].CxxImportedLiteral;
                 }
                 braceCall += "}";
                 callArguments.push_back(std::move(braceCall));
@@ -716,7 +718,23 @@ bool LLVMBackend::RequestCxxBraceConstructor(
             error = "the C++ class's import group is unavailable";
             return false;
         }
-        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
+        std::vector<size_t> macroGroups;
+        for (const auto& brace : braceArguments)
+            for (const auto& element : brace.elements)
+            {
+                if (element.IsCxxMacroGlobal && !element.CxxImportedLiteral.empty())
+                    if (auto macroGroup = cxxConstantMacroOwnerGroup_.find(
+                            element.CxxImportedLiteral);
+                        macroGroup != cxxConstantMacroOwnerGroup_.end()
+                        && macroGroup->second != groupIt->second)
+                        macroGroups.push_back(macroGroup->second);
+                const std::string enumName = ResolveEnumTypeName(element.TypeAndValue.TypeName);
+                if (auto enumGroup = cxxTypeOwnerGroup_.find(enumName);
+                    !enumName.empty() && enumGroup != cxxTypeOwnerGroup_.end()
+                    && enumGroup->second != groupIt->second)
+                    macroGroups.push_back(enumGroup->second);
+            }
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName, macroGroups);
         if (group.headers.empty())
         {
             error = "the C++ class's import group is unavailable";
@@ -812,11 +830,15 @@ void LLVMBackend::RecordCxxConstantBraceElement(NamedVariable& element, llvm::Va
 
 std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element) const
 {
-        // C++ treats an imported enumerator or integer macro as a constant; CFlat keeps its global.
-        // The literal keeps the constant's own C++ type, so overloads and narrowing see what clang sees.
-        if (element.TypeAndValue.Pointer || element.TypeAndValue.IsScopedEnum || element.Storage == nullptr
-            || IsScopedEnumTypeName(ResolveEnumTypeName(element.TypeAndValue.TypeName)))
+        // Imported constants become typed expressions, preserving C++ list-narrowing checks.
+        const bool scopedEnum = element.TypeAndValue.IsScopedEnum
+            || IsScopedEnumTypeName(ResolveEnumTypeName(element.TypeAndValue.TypeName));
+        if (element.TypeAndValue.Pointer || element.Storage == nullptr
+            || (scopedEnum && !element.IsCxxMacroGlobal))
             return {};
+        // A constant macro is spelled by name: clang expands it to its own C++ type (enum, bool, int).
+        if (element.IsCxxMacroGlobal && cxxConstantMacroNames_.count(element.Storage->getName().str()) != 0)
+            return element.Storage->getName().str();
         // A CFlat enumerator is a constant of its backing integer: spelled as that type, value kept.
         const std::string enumKey = ResolveEnumTypeName(element.TypeAndValue.TypeName);
         if (const llvm::ConstantInt* value = CflatEnumeratorConstant(element.Storage, enumKey))
@@ -832,6 +854,9 @@ std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element
         if (!element.IsCxxMacroGlobal && !IsImportedEnumeratorStorage(element.Storage)) return {};
         if (IsImportedEnumeratorStorage(element.Storage))
         {
+            // An unnamed-enum enumerator has no enum TypeName: its name is its C++ expression.
+            if (const std::string* unnamed = CxxUnnamedEnumExpression(element.Storage))
+                return *unnamed;
             // An unscoped enumerator is spelled as its qualified name: its C++ type is the
             // enumeration, not the backing integer. The global is named `ns.A` (`A` at file scope).
             const std::string name = element.Storage->getName().str();
@@ -852,18 +877,41 @@ std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element
             }
             return qualified;
         }
+        const TypeAndValue& tv = element.TypeAndValue;
         auto* global = llvm::dyn_cast<llvm::GlobalVariable>(element.Storage);
         if (global == nullptr || !global->hasInitializer()) return {};
         auto* value = llvm::dyn_cast<llvm::ConstantInt>(global->getInitializer());
-        if (value == nullptr || value->getBitWidth() > 64 || value->getValue().isMinSignedValue())
-            return {};
+        if (value == nullptr || value->getBitWidth() > 64) return {};
+        const std::string enumName = ResolveEnumTypeName(tv.TypeName);
+        if (!enumName.empty() || !tv.EnumBacking.empty() || scopedEnum)
+        {
+            std::string enumSpelling;
+            if (!CxxSpellingForCflatType(tv.TypeName, enumSpelling)) return {};
+            const std::string backingName = tv.EnumBacking.empty()
+                ? GetEnumBackingType(enumName) : tv.EnumBacking;
+            if (backingName.empty()) return {};
+            TypeAndValue backingType;
+            backingType.TypeName = backingName;
+            const bool isUnsigned = backingType.IsUnsignedInteger() != -1;
+            const std::string literal = isUnsigned
+                ? std::to_string(value->getZExtValue()) + "ULL"
+                : value->getValue().isMinSignedValue()
+                    ? std::string("(-9223372036854775807LL - 1)")
+                    : std::to_string(value->getSExtValue()) + "LL";
+            return "static_cast<" + enumSpelling + ">(" + literal + ")";
+        }
         // Signedness and width come from the imported TYPE, not the APInt's high bit: an unsigned
         // 4294967295U is not -1, and an unsigned ULLONG_MAX stays 2^64-1.
-        const TypeAndValue& tv = element.TypeAndValue;
         const bool isUnsigned = tv.IsUnsignedInteger() != -1;
-        if (!isUnsigned && tv.IsInteger() == -1) return {};
+        if (!isUnsigned && tv.TypeName != "bool" && tv.IsInteger() == -1) return {};
         std::string spelled;
         if (!CxxSpellingForCflatType(tv.TypeName, spelled)) return {};
+        if (value->getValue().isMinSignedValue())
+        {
+            const std::string minimum = value->getBitWidth() <= 32
+                ? "(-2147483647 - 1)" : "(-9223372036854775807LL - 1)";
+            return "static_cast<" + spelled + ">(" + minimum + ")";
+        }
         const bool negative = !isUnsigned && value->getValue().isNegative();
         const std::string digits = isUnsigned ? std::to_string(value->getZExtValue())
                                               : std::to_string(negative ? -value->getSExtValue() : value->getSExtValue());
@@ -1026,7 +1074,21 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             error = "the C++ class's import group is unavailable";
             return false;
         }
-        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
+        std::vector<size_t> macroGroups;
+        for (const auto& element : elements)
+        {
+            if (element.IsCxxMacroGlobal && !element.CxxImportedLiteral.empty())
+                if (auto macroGroup = cxxConstantMacroOwnerGroup_.find(element.CxxImportedLiteral);
+                    macroGroup != cxxConstantMacroOwnerGroup_.end()
+                    && macroGroup->second != groupIt->second)
+                    macroGroups.push_back(macroGroup->second);
+            const std::string enumName = ResolveEnumTypeName(element.TypeAndValue.TypeName);
+            if (auto enumGroup = cxxTypeOwnerGroup_.find(enumName);
+                !enumName.empty() && enumGroup != cxxTypeOwnerGroup_.end()
+                && enumGroup->second != groupIt->second)
+                macroGroups.push_back(enumGroup->second);
+        }
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName, macroGroups);
         if (group.headers.empty())
         {
             error = "the C++ class's import group is unavailable";
@@ -1157,7 +1219,10 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 else
                     spelling = targetType;
             }
-            else if (type.TypeName.empty() || !CxxSpellingForCflatType(type.TypeName, spelling))
+            else if (type.TypeName.empty()
+                || (!(!type.Pointer && !type.ElemPointer
+                        && CxxImportedEnumElementSpelling(type.TypeName, spelling))
+                    && !CxxSpellingForCflatType(type.TypeName, spelling)))
             {
                 error = std::format("C++ brace-list element type '{}' has no C++ spelling",
                                     type.TypeName);
@@ -1570,6 +1635,12 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
         if (argVars != nullptr
             && std::any_of(argVars->begin(), argVars->end(), [&](const NamedVariable& arg) {
                 return CxxUnnamedEnumTemplateArgument(typeName, arg);
+            }))
+            return true;
+        // An unnamed-enum rvalue: the listed constructors rank it as int, clang ranks the enum one.
+        if (argVars != nullptr
+            && std::any_of(argVars->begin(), argVars->end(), [&](const NamedVariable& arg) {
+                return IsUnnamedEnumValue(arg);
             }))
             return true;
         const bool addressValue = argVars != nullptr
@@ -2354,6 +2425,11 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             // a user copy constructor) is forwarded by reference like a nontrivial one.
             const std::string& recordName = arg.TypeAndValue.TypeName.empty()
                 ? cflatType : arg.TypeAndValue.TypeName;
+            const bool classValue = !arg.TypeAndValue.Pointer && IsCxxRecord(recordName);
+            if (classValue && (CxxReceiverCv(arg) & 2) != 0)
+                PrependCv(spelling, "volatile ");
+            if (classValue && CxxConstReceiverKind(arg) != 0 && !spelling.starts_with("const "))
+                spelling = "const " + spelling;
             if (!arg.TypeAndValue.Pointer && IsCxxRecord(recordName)
                      && (namedLvalue || IsForeignNontrivialCxxClass(recordName)
                          || cxxTriviallyCopyableRecords_.count(recordName) == 0))
@@ -2374,9 +2450,6 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 {
                     // A volatile lvalue keeps its volatile in the wrapper: clang copies or binds it
                     // as the source site does (a copy ctor taking `const S&` refuses it).
-                    if ((CxxReceiverCv(arg) & 2) != 0) PrependCv(spelling, "volatile ");
-                    if (CxxConstReceiverKind(arg) != 0 && !spelling.starts_with("const "))
-                        spelling = "const " + spelling;
                     spelling += " &";
                 }
             }

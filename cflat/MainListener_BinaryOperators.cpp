@@ -584,6 +584,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.cxxArithIdentity = namedVar.CxxArithIdentity;
         result.sourceType = namedVar.TypeAndValue;
         result.hasSourceType = true;
+        result.cxxClosureLenders = namedVar.CxxClosureLenders;
         result.cxxPointeeConst = namedVar.TypeAndValue.PointeeConstBit()
             && namedVar.TypeAndValue.Pointer;
         result.cxxObjectCv = Compiler(ctx)->CxxOperandObjectCv(namedVar);

@@ -1161,6 +1161,7 @@ public:
         std::string FuncPtrReturnTypeName;
         // Written return alias for diagnostics; signature identity uses the resolved name above.
         std::string FuncPtrReturnAliasSpelling;
+        bool FuncPtrReturnHasStrippedInnerDimensions = false;
         std::shared_ptr<TypeAndValue> FuncPtrReturnFunctionType;
         bool FuncPtrReturnPointer = false;
         // Return ownership is semantic metadata carried by a stored function value. It is
@@ -1713,6 +1714,7 @@ public:
         bool IsFunctionPointer = false;
         std::string FuncPtrReturnTypeName;
         std::string FuncPtrReturnAliasSpelling;
+        bool FuncPtrReturnHasStrippedInnerDimensions = false;
         std::shared_ptr<SerializedTav> FuncPtrReturnFunctionType;
         bool FuncPtrReturnPointer = false;
         bool FuncPtrReturnOwned = false;
@@ -1801,6 +1803,7 @@ public:
             s.IsFunctionPointer = t.IsFunctionPointer;
             s.FuncPtrReturnTypeName = t.FuncPtrReturnTypeName;
             s.FuncPtrReturnAliasSpelling = t.FuncPtrReturnAliasSpelling;
+            s.FuncPtrReturnHasStrippedInnerDimensions = t.FuncPtrReturnHasStrippedInnerDimensions;
             if (t.FuncPtrReturnFunctionType)
                 s.FuncPtrReturnFunctionType = std::make_shared<SerializedTav>(From(*t.FuncPtrReturnFunctionType));
             s.FuncPtrReturnPointer = t.FuncPtrReturnPointer;
@@ -1892,6 +1895,7 @@ public:
             t.IsFunctionPointer = IsFunctionPointer;
             t.FuncPtrReturnTypeName = FuncPtrReturnTypeName;
             t.FuncPtrReturnAliasSpelling = FuncPtrReturnAliasSpelling;
+            t.FuncPtrReturnHasStrippedInnerDimensions = FuncPtrReturnHasStrippedInnerDimensions;
             if (FuncPtrReturnFunctionType)
                 t.FuncPtrReturnFunctionType = std::make_shared<TypeAndValue>(FuncPtrReturnFunctionType->ToTypeAndValue());
             t.FuncPtrReturnPointer = FuncPtrReturnPointer;
@@ -2318,6 +2322,7 @@ public:
         bool CxxClosureBorrowed = false;
         std::string CxxClosureDisplay;   // the CFlat closure type, for diagnostics
         std::string CxxClosureParam;     // its generated wrapper parameter ("pK")
+        std::vector<std::pair<llvm::Value*, std::string>> CxxClosureLenders;
         // The C++ callee this closure VARIABLE was bound by reference to, with a result that may
         // keep that reference: `move` would leave the reference calling a null closure.
         std::string CxxClosureLentTo;
@@ -2607,6 +2612,8 @@ public:
         bool         sourceRootIsBorrowedThisField = false;
         std::string  sourceThisFieldPath;
         std::vector<ConditionalMoveSource> conditionalMoveSources;
+        // A forwarded C++ closure result whose holder is kept by a later consumer.
+        std::vector<std::pair<llvm::Value*, std::string>> cxxClosureLenders;
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -2768,6 +2775,7 @@ public:
     class FunctionSymbol
     {
     public:
+        enum class CxxClosureResultKind : uint8_t { None, Reference, Value };
         std::string UniqueName;
         std::string SourceName;
         std::string CxxInheritedOwner;
@@ -2795,6 +2803,8 @@ public:
         bool IsDeleted = false;    // retained as a C++ overload candidate, rejected if selected
         bool IsCxxTemplateSpecialization = false;
         bool IsCxxConstructorForwardingWrapper = false;
+        CxxClosureResultKind CxxClosureResult = CxxClosureResultKind::None;
+        std::string CxxClosureKeptParams;
         cflat_cinterop::CtorPick CxxCtorPick = cflat_cinterop::CtorPick::Unknown;
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool CxxVolatile = false;  // volatile-qualified C++ member declaration
@@ -4124,6 +4134,7 @@ private:
     int lastCallReturnValueCv_ = 0;
     bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
+    std::vector<std::pair<llvm::Value*, std::string>> lastCallCxxClosureLenders_;
     // Capture names of the last lambda literal, for the C function-pointer diagnostic. Uses the
     // compiler-level channel because lastLambdaType is cleared too early by postfix processing.
     std::vector<std::string> lastCallLambdaCaptureNames;
@@ -4417,6 +4428,15 @@ private:
     // C++ enumerators from unnamed enums have no TypeAndValue spelling; retain their resolved
     // global identity so constructor wrappers can pass the original enum expression to Clang.
     std::unordered_map<const llvm::GlobalVariable*, std::string> cxxUnnamedEnumExpressions_;
+    // Typedef/alias names of unnamed enums (`using A = decltype(ANON_ENUMERATOR);`): plain integers
+    // to CFlat, as on master; only the template spelling paths consult it (to spell them as such).
+    std::unordered_set<std::string> cxxUnnamedEnumAliases_;
+    // Constant macro globals whose clang-evaluated type is an unnamed enum (CMacroEntry::isUnnamedEnum).
+    std::unordered_set<std::string> cxxUnnamedEnumMacros_;
+    bool IsUnnamedEnumMacro(const NamedVariable& arg) const;
+    bool IsUnnamedEnumValue(const NamedVariable& arg) const;
+    // The C++ type of an unnamed-enum enumerator (`decltype(ns::E)`), empty for anything else.
+    std::string CxxUnnamedEnumValueSpelling(const NamedVariable& arg) const;
     // Same-class copy request per class and constness: one wrapper and clang's pick, not per site.
     std::unordered_map<std::string, SameClassCopyRequest> sameClassCopyRequests_;
     // Unscoped C++ enum -> CFlat name of its integral promotion type ([conv.prom]/3-4).
@@ -4723,6 +4743,16 @@ private:
         mutable size_t closureHashFiles = static_cast<size_t>(-1);
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
+    // Plain C header groups also provide macros, but join the C++ request path only on demand.
+    struct CHeaderMacroGroup
+    {
+        std::vector<std::string> headers;
+        std::vector<std::string> defines;
+        std::vector<std::string> dependencyFiles;
+        std::unordered_set<std::string> macroNames;
+        bool macroNamesScanned = false;
+    };
+    std::vector<CHeaderMacroGroup> cHeaderMacroGroups_;
     cflat_cinterop::CxxImportOrder currentCxxImportOrderPath_;
     // Header guard verdicts are reused across constructor requests within one analysis.
     std::unordered_map<std::string, bool> cxxHeaderGuardCache_;
@@ -5360,6 +5390,8 @@ private:
         bool isIntegerLiteralZero = false;
         // The zero is spelled as an integer literal token, not __null or a pointer NULL.
         bool isIntegerLiteralToken = false;
+        // Clang typed the folded value as an unnamed enum (`#define M ANON_ENUMERATOR`).
+        bool isUnnamedEnum = false;
     };
     // Field types kept as raw C spellings so they can be re-resolved after all records in the
     // TU are registered (handles forward references between structs).
@@ -5407,6 +5439,7 @@ private:
         std::string vtableDeleteVerdict;
         bool hasFriendOperators = false;   // a friend operator: ADL may find what was not registered
         std::vector<std::string> friendNames;   // see RawRecord::friendNames
+        std::vector<std::string> ambiguousFieldNames; // see RawRecord::ambiguousFieldNames
         std::vector<cflat_cinterop::RawCxxBase> bases;
         std::vector<cflat_cinterop::RawCxxBase> virtualBases;   // see RawRecord::virtualBases
         std::string layoutRefusal;
@@ -5546,6 +5579,9 @@ private:
     // here until the compile ends and are intentionally never diagnosed.
     std::vector<CMacroEntry> pendingCInteropAliases_;
     std::unordered_set<std::string> cxxMacroGlobalNames_;
+    // C++ wrappers spell these constant macros by name, so clang expands them to their own type.
+    std::unordered_set<std::string> cxxConstantMacroNames_;
+    std::unordered_map<std::string, size_t> cxxConstantMacroOwnerGroup_;
     bool foldingArrayDim_ = false;   // see IsFoldingArrayDim (set only around a dimension fold)
     std::unordered_set<std::string> cxxZeroIntegerMacroNames_;
     std::unordered_set<std::string> cxxLiteralZeroIntegerMacroNames_;
@@ -8169,6 +8205,7 @@ private:
     std::string CxxUnscopedEnumPromotedIdentity(const NamedVariable& arg) const;
     // CFlat-declared unscoped enum: true for its key, false for an imported or scoped enum.
     bool IsCflatOnlyUnscopedEnum(const std::string& enumKey) const;
+    bool CxxImportedEnumElementSpelling(const std::string& cflatType, std::string& out) const;
     // Its backing integer's C++ spelling (`int`, `unsigned char`), false for any other key.
     bool CxxCflatEnumBackingSpelling(const std::string& enumKey, std::string& spelling) const;
     // The CFlat backing name ("int") of an unscoped CFlat-declared enum value, else empty.
@@ -8202,6 +8239,7 @@ private:
     // Bare names already asked of the import groups' preprocessors this compile.
     std::unordered_set<std::string> cxxSystemMacroLookups_;
     bool TryBindCxxSystemMacro(const std::string& name);
+    bool TryBindCHeaderMacro(const std::string& name);
     // Function-like system macros (`assert`) bound per call by RequestCxxFreeFunction.
     std::unordered_set<std::string> cxxFunctionMacros_;
     bool IsCxxFunctionMacro(const std::string& name) const { return cxxFunctionMacros_.count(name) != 0; }
@@ -8240,7 +8278,8 @@ private:
     const TypeAndValue* StdFunctionClosureSignature(const std::string& name) const;
     // `__typeof__(R (*)(A...))` for a thin CFlat function<> value, so a C++ wrapper can take it
     // as a parameter and a deduced template parameter sees a function pointer. False otherwise.
-    bool CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::string& out) const;
+    bool CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::string& out,
+                                        bool closureAbi = false) const;
     // True when the projected result record can retain a reference to the generated closure.
     bool CxxRecordStoresForwardedClosureReference(const std::string& typeName,
                                                    bool closureProjectionInResult) const;
@@ -8269,20 +8308,17 @@ private:
     // `signatureHint` (a std.function target's) types an `auto` closure that carries none; the
     // invoker stored in its slot must have exactly that lowered signature.
     std::string CxxClosureArgumentRefusal(NamedVariable& arg, const std::string& target,
-                                          const TypeAndValue* signatureHint = nullptr);
+                                          const TypeAndValue* signatureHint = nullptr,
+                                          bool deferReferenceCaptureCheck = false);
     // True when `arg` is a fat closure value or type not yet handed to C++.
     bool IsUnwrappedFatClosure(const NamedVariable& arg) const;
     // `__cflat_closure<SIG>(pN)` for a wrapped closure argument, empty otherwise.
     static std::string CxxClosureCallArgument(const NamedVariable& arg, const std::string& param);
-    // Records on the closure variable that a C++ result may keep a reference to its slot.
-    void MarkCxxClosureLentByReference(const NamedVariable& arg, const std::string& callee);
-    // Marks each closure-variable argument the bound wrapper's result keeps a reference to: the
-    // result's layout can hold F& / F* (T419 facts) or clang saw the callee keep the object.
-    void MarkKeptCxxClosureArguments(const std::vector<NamedVariable>& arguments, const CSigEntry& bound,
-                                     const std::string& callee);
+    std::string FindLiveCxxClosureLender(llvm::Value* storage) const;
     // The C++ definition of __cflat_closure<> (include-guarded), prepended to any wrapper source
     // that names it.
     static const char* CxxClosureWrapperPreamble();
+    static const char* CxxClosureStringWrapperPreamble();
     // True when every value stored into the closure slot is a fat closure whose env is null or
     // carries no capture-cleanup function (scalar-only captures): a copy is a byte copy.
     bool ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const;
@@ -8490,6 +8526,9 @@ private:
     bool ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntry& e, bool cxxBoundary);
 
     void AdoptRawTypedefs(const cflat_cinterop::ExtractResult& raw);
+    void RememberCxxAnonymousEnumAlias(const std::string& name,
+                                       const std::string& qualifiedName,
+                                       const std::string& target);
 
     // Surface a C typedef that names a record as a CFlat type alias. Two shapes:
     //   by value  `typedef struct tagMSG MSG;`            -> MSG            = tagMSG
@@ -9973,6 +10012,8 @@ public:
      * them. An unknown arm does not erase the proof supplied by a literal arm.
      */
     bool JoinIsAllStringLiterals(const llvm::Value* value, int depth = 0) const;
+    // True when every non-null leaf of a pointer ternary is a literal or resolved `char*`.
+    bool JoinIsCharPointer(const llvm::Value* value) const;
     std::string DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
                                                        const std::string& destDesc) const;
 
@@ -11026,6 +11067,8 @@ public:
         bool isAggregate = false;
         // Field name -> access, for the "is private" diagnostic on member access.
         std::map<std::string, int> fieldAccess;
+        // Flattening preserves the C++ name-lookup reason when colliding fields are hidden.
+        std::set<std::string> ambiguousFieldNames;
         // Member name -> access of the best (most accessible) overload, for method calls whose
         // name resolves to nothing because every candidate was filtered out.
         std::map<std::string, int> memberAccess;
@@ -12601,6 +12644,9 @@ public:
                                                           const TypeAndValue& param) const;
     bool NamedFunctionProvablyMismatchesFuncPtr(const std::string& functionName,
         const TypeAndValue& param) const;
+
+    // True for a named function or generic-function value, not a call result with the same name.
+    bool IsNamedFunctionValue(const NamedVariable& arg) const;
 
     /*
      * Does this ARGUMENT name a function whose every overload is wrong for this parameter? Applies
@@ -14974,7 +15020,12 @@ public:
     // 314: variable template explicit/partial specializations join the template's group; deleted-rvalue ctor requests.
     // 317: C anonymous-member fields use an unspellable marker; inline aggregate fields retain default-construction metadata.
     // 318: default numeric values retain their declared parameter conversion in extracted metadata.
-    static constexpr int kCHeaderCacheVersion = 320;
+    // 321: C++ using-shadow fields resolve to their selected flattened slot.
+    // 322: C++ flattened field ambiguity names survive the header cache.
+    // 323: the ambiguity names cover every access level (clang looks up names before access).
+    // 324: function-pointer cache entries keep array-reference result spellings and stripped inner dimensions (FNREFCTOR).
+    // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
+    static constexpr int kCHeaderCacheVersion = 325;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

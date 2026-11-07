@@ -347,6 +347,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                         if (sym.UniqueName == linkageName)
                         {
                             sym.DefaultArguments = e.defaultArgs;
+                            sym.CxxClosureKeptParams = e.closureKeptParams;
                             assignedDefaults = true;
                         }
                     }
@@ -741,8 +742,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             const std::string tag = cRecordPointee(r.retType);
             if (!tag.empty()) e.ret.TypeName = tag;
         }
-        if (r.isCxx && e.ret.IsFunctionPointer && e.ret.Pointer
-            && (e.ret.IsAlias || e.ret.IsRvalueRef))
+        if (r.isCxx && e.ret.IsFunctionPointer && e.ret.Pointer && e.ret.IsRvalueRef)
         {
             e.bindRefusal = std::format(
                 "'{}' was not bound: return type '{}' is an unsupported reference to a function pointer",
@@ -1883,6 +1883,7 @@ bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntr
         if (r.kind == K::Float)  { e.isFloat = true;  e.floatValue  = r.floatValue;  return true; }
 
         e.value = r.intValue;
+        e.isUnnamedEnum = cxxBoundary && r.naturalType.find("(unnamed enum at ") != std::string::npos;
         if (!r.naturalType.empty())
         {
             TypeAndValue tv;
@@ -1903,10 +1904,15 @@ bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntr
                     e.isPointer = true;
                     e.pointeeTypeName = tv.TypeName;
                 }
-                else if (!tv.Pointer && BitfieldStorageBits(tv.TypeName) != 0 && tv.TypeName != "bool")
+                else if (!tv.Pointer && (tv.TypeName == "bool" || !tv.EnumBacking.empty()))
+                    e.intTypeName = tv.TypeName;   // retain bool and enum identity on the global
+                else if (!tv.Pointer && BitfieldStorageBits(tv.TypeName) != 0)
                     e.intTypeName = tv.TypeName;   // known plain integer scalar
             }
         }
+        if (cxxBoundary && r.kind == K::Int && e.intTypeName.empty()
+            && !e.isIntegerLiteralToken)
+            e.intTypeName = "__cflat_type_erased";
         return true;
     }
 
@@ -1918,7 +1924,22 @@ void LLVMBackend::AdoptRawTypedefs(const cflat_cinterop::ExtractResult& raw)
                 cTypedefMap_.emplace(t.name, t.underlying);
                 if (!t.qualifiedName.empty() && t.qualifiedName != t.name)
                     cTypedefMap_.emplace(t.qualifiedName, t.underlying);
+                RememberCxxAnonymousEnumAlias(t.name, t.qualifiedName, t.underlying);
             }
+    }
+
+/*
+ * A C++ alias of an unnamed enum (`using AT = decltype(AN);`) is only remembered by name. It
+ * stays the plain integer master maps it to: an lvalue of it has no enum identity to pass on,
+ * so the template spelling paths must not spell the alias either.
+ */
+void LLVMBackend::RememberCxxAnonymousEnumAlias(const std::string& name,
+                                               const std::string& qualifiedName,
+                                               const std::string& target)
+{
+        if (name.empty() || target.find("(unnamed enum at ") == std::string::npos) return;
+        cxxUnnamedEnumAliases_.insert(name);
+        cxxUnnamedEnumAliases_.insert(qualifiedName.empty() ? name : qualifiedName);
     }
 
 void LLVMBackend::CollectRecordTypedefAliases(const cflat_cinterop::ExtractResult& raw,
@@ -2031,6 +2052,9 @@ void LLVMBackend::RegisterTypeAliasSymbol(const std::string& alias, const std::s
 void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& aliases,
                                            bool cxxBoundary)
 {
+        if (cxxBoundary)
+            for (const auto& alias : aliases)
+                RememberCxxAnonymousEnumAlias(alias.name, alias.qualifiedName, alias.target);
         auto cxxIdentity = [&](const CTypeAliasEntry& a, std::string& baseOut,
                                std::vector<std::string>& argsOut, std::string& out) -> bool {
             const std::string s = CanonicalizeCxxUniquePtrSpelling(a.cxxSpecialization);
@@ -2422,6 +2446,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.isFinal = r.isFinal;
             rec.hasFriendOperators = r.hasFriendOperators;
             rec.friendNames = r.friendNames;
+            rec.ambiguousFieldNames = r.ambiguousFieldNames;
             rec.bases = r.bases; rec.layoutRefusal = r.layoutRefusal;
             rec.virtualBases = r.virtualBases;
             rec.canonicalCtype = r.canonicalCtype;

@@ -1111,13 +1111,21 @@ void MainListener::DeferGenericMemberBody(antlr4::ParserRuleContext* member,
         deferredGenericMemberBodies_.push_back(std::move(deferred));
 }
 
-void MainListener::ProcessDeferredGenericMemberBodies(size_t first, bool enclosingLayoutReady)
+void MainListener::ProcessDeferredGenericMemberBodies(
+    size_t first, bool enclosingLayoutReady, const std::string& ownerPrefix)
 {
         std::vector<DeferredGenericMemberBody> pending;
         auto extractPending = [&]()
         {
             for (size_t i = first; i < deferredGenericMemberBodies_.size();)
             {
+                if (!ownerPrefix.empty()
+                    && deferredGenericMemberBodies_[i].ownerName != ownerPrefix
+                    && !deferredGenericMemberBodies_[i].ownerName.starts_with(ownerPrefix + "."))
+                {
+                    ++i;
+                    continue;
+                }
                 if (enclosingLayoutReady && !deferredGenericMemberBodies_[i].waitForEnclosingLayout)
                 {
                     ++i;
@@ -1608,6 +1616,613 @@ void MainListener::ParseInlineAggregateBody(
             if (auto* destructor = member->destructorDefinition())
                 ParseDestructorDefinition(destructor, typeName);
         compiler->NoteStructDefinitionWalked(typeName, hasExplicitNoArgCtor);
+}
+
+void MainListener::PreparseAggregateDefinitions(
+    CFlatParser::TranslationUnitContext* ctx,
+    const std::vector<CFlatParser::FunctionDefinitionContext*>& deferredFunctions)
+{
+        if (ctx == nullptr) return;
+        std::unordered_map<std::string, std::vector<size_t>> earlierAggregateUses;
+        std::unordered_set<std::string> genericTemplateUses;
+        struct PointerAccessMember
+        {
+            std::string Name;
+            size_t OperatorToken = 0;
+            bool Called = false;
+        };
+        struct PointerFieldAccessPath
+        {
+            std::string RootType;
+            std::vector<PointerAccessMember> Members;
+        };
+        std::vector<PointerFieldAccessPath> pointerFieldAccessPaths;
+        auto nominalTypeName = [&](CFlatParser::TypeSpecifierContext* type,
+                                   const std::string& namespaceName) -> std::string {
+            if (type == nullptr) return {};
+            std::string name;
+            bool genericTemplate = false;
+            if (auto* qualified = type->qualifiedGenericIdentifier())
+            {
+                genericTemplate = qualified->genericTypeParameters() != nullptr;
+                if (qualified->Identifier() != nullptr) name = qualified->Identifier()->getText();
+                for (auto* member : qualified->memberNameToken())
+                    name += "." + member->getText();
+                if (!name.empty())
+                    name = compilerLLVM->ResolveTypeAlias(name);
+            }
+            else if (auto* root = type->rootQualifiedTypeName())
+            {
+                for (auto* id : root->Identifier())
+                    name += (name.empty() ? "" : ".") + id->getText();
+            }
+            else if (auto* generic = type->genericIdentifier())
+            {
+                genericTemplate = generic->genericTypeParameters() != nullptr;
+                if (generic->Identifier() == nullptr) return {};
+                const std::string bare = generic->Identifier()->getText();
+                for (std::string scope = namespaceName; ;)
+                {
+                    const std::string candidate = scope.empty() ? bare : scope + "." + bare;
+                    if (compilerLLVM->dataStructures.count(candidate) != 0
+                        || (genericTemplate && compilerLLVM->AnyGenericTypeTemplateNamed(candidate)))
+                    {
+                        name = candidate;
+                        break;
+                    }
+                    const auto dot = scope.rfind('.');
+                    if (dot == std::string::npos)
+                    {
+                        name = bare;
+                        break;
+                    }
+                    else scope.resize(dot);
+                }
+            }
+            if (name.empty()) return {};
+            if (genericTemplate)
+                return compilerLLVM->AnyGenericTypeTemplateNamed(name) ? name : std::string();
+            name = compilerLLVM->ResolveTypeAlias(name);
+            auto found = compilerLLVM->dataStructures.find(name);
+            return found != compilerLLVM->dataStructures.end() && found->second.StructType != nullptr
+                && found->second.StructType->isOpaque() ? name : std::string();
+        };
+        auto isByValueTypeSpecifier = [](CFlatParser::DeclarationSpecifierContext* spec) {
+            if (spec == nullptr || spec->pointer() != nullptr || spec->Question() != nullptr
+                || ArrayPtrOf(spec) != nullptr)
+                return false;
+            return !IsArrayViewArg(spec);
+        };
+        auto genericTemplateName = [&](CFlatParser::TypeSpecifierContext* type,
+                                       const std::string& namespaceName) -> std::string {
+            const bool generic = (type != nullptr
+                    && type->genericIdentifier() != nullptr
+                    && type->genericIdentifier()->genericTypeParameters() != nullptr)
+                || (type != nullptr && type->qualifiedGenericIdentifier() != nullptr
+                    && type->qualifiedGenericIdentifier()->genericTypeParameters() != nullptr);
+            return generic ? nominalTypeName(type, namespaceName) : std::string();
+        };
+        std::unordered_set<std::string> deferredAggregateTypes;
+        auto recordGenericArgumentUses = [&](auto&& self, CFlatParser::TypeSpecifierContext* type,
+                                             const std::string& namespaceName, size_t sourceIndex,
+                                             bool deferred) -> void {
+            if (type == nullptr) return;
+            auto recordArguments = [&](CFlatParser::GenericTypeParametersContext* parameters) {
+                if (parameters == nullptr || parameters->typeParameterList() == nullptr) return;
+                for (auto* entry : parameters->typeParameterList()->typeParameterEntry())
+                {
+                    if (entry->typeSpecifier() == nullptr || entry->pointer() != nullptr
+                        || entry->arrayTypeSuffix() != nullptr || entry->Identifier() != nullptr)
+                        continue;
+                    auto* argumentType = entry->typeSpecifier();
+                    if (std::string generic = genericTemplateName(argumentType, namespaceName);
+                        !generic.empty())
+                        genericTemplateUses.insert(generic);
+                    if (std::string name = nominalTypeName(argumentType, namespaceName); !name.empty())
+                    {
+                        if (deferred) deferredAggregateTypes.insert(name);
+                        else earlierAggregateUses[name].push_back(sourceIndex);
+                    }
+                    self(self, argumentType, namespaceName, sourceIndex, deferred);
+                }
+            };
+            if (auto* generic = type->genericIdentifier(); generic != nullptr)
+                recordArguments(generic->genericTypeParameters());
+            if (auto* qualified = type->qualifiedGenericIdentifier(); qualified != nullptr)
+                recordArguments(qualified->genericTypeParameters());
+        };
+        auto recordDeclarationTypes = [&](CFlatParser::DeclarationSpecifiersContext* specs,
+                                          const std::string& namespaceName, size_t sourceIndex) {
+            if (specs == nullptr) return;
+            for (auto* spec : specs->declarationSpecifier())
+                if (auto* type = spec->typeSpecifier())
+                {
+                    const std::string generic = genericTemplateName(type, namespaceName);
+                    if (!generic.empty())
+                        genericTemplateUses.insert(generic);
+                    if (isByValueTypeSpecifier(spec))
+                    {
+                        if (std::string name = nominalTypeName(type, namespaceName); !name.empty())
+                            earlierAggregateUses[name].push_back(sourceIndex);
+                        if (!generic.empty())
+                            recordGenericArgumentUses(recordGenericArgumentUses, type,
+                                namespaceName, sourceIndex, false);
+                    }
+                }
+        };
+        auto recordDeferredTypes = [&](CFlatParser::DeclarationSpecifiersContext* specs,
+                                       const std::string& namespaceName) {
+            if (specs == nullptr) return;
+            for (auto* spec : specs->declarationSpecifier())
+                if (auto* type = spec->typeSpecifier())
+                {
+                    const std::string generic = genericTemplateName(type, namespaceName);
+                    if (!generic.empty())
+                        genericTemplateUses.insert(generic);
+                    if (isByValueTypeSpecifier(spec))
+                    {
+                        if (std::string name = nominalTypeName(type, namespaceName); !name.empty())
+                            deferredAggregateTypes.insert(name);
+                        if (!generic.empty())
+                            recordGenericArgumentUses(recordGenericArgumentUses, type,
+                                namespaceName, 0, true);
+                    }
+                }
+        };
+        for (auto* func : deferredFunctions)
+        {
+            const std::string namespaceName = NamespaceNameFromContext(Compiler(func), func);
+            recordDeferredTypes(func->declarationSpecifiers(), namespaceName);
+            if (auto* parameters = func->parameterTypeList(); parameters != nullptr
+                && parameters->parameterList() != nullptr)
+                for (auto* parameter : parameters->parameterList()->parameterDeclaration())
+                    recordDeferredTypes(parameter->declarationSpecifiers(), namespaceName);
+        }
+        std::function<void(CFlatParser::ExternalDeclarationContext*, const std::string&)> collectUses;
+        std::function<void(CFlatParser::IfConstDeclarationContext*, const std::string&)> collectIfConstUses;
+        collectIfConstUses = [&](CFlatParser::IfConstDeclarationContext* ifConst,
+                                 const std::string& namespaceName) {
+            auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ifConst);
+            if (!recorded) return;
+            const int decision = *recorded;
+            auto blocks = ifConst->ifConstBlock();
+            if (blocks.empty() || decision < 0) return;
+            if (decision == 0 && ifConst->ifConstDeclaration() != nullptr)
+            {
+                collectIfConstUses(ifConst->ifConstDeclaration(), namespaceName);
+                return;
+            }
+            const size_t index = decision != 0 ? 0 : 1;
+            if (index < blocks.size())
+                for (auto* child : blocks[index]->externalDeclaration()) collectUses(child, namespaceName);
+        };
+        collectUses = [&](CFlatParser::ExternalDeclarationContext* ext, const std::string& namespaceName) {
+            if (auto* ns = ext->namespaceDefinition())
+            {
+                std::string nested;
+                for (auto* id : ns->Identifier())
+                    nested += (nested.empty() ? "" : ".") + id->getText();
+                if (!namespaceName.empty()) nested = namespaceName + "." + nested;
+                LLVMBackend::NamespaceScope scope(Compiler(ns), nested);
+                for (auto* child : ns->externalDeclaration()) collectUses(child, nested);
+                return;
+            }
+            if (auto* func = ext->functionDefinition())
+            {
+                const size_t sourceIndex = func->getStart()->getStartIndex();
+                std::unordered_set<std::string> localNames;
+                std::unordered_map<std::string, std::string> localPointerAggregateTypes;
+                if (auto* parameters = func->parameterTypeList(); parameters != nullptr
+                    && parameters->parameterList() != nullptr)
+                    for (auto* parameter : parameters->parameterList()->parameterDeclaration())
+                    {
+                        recordDeclarationTypes(parameter->declarationSpecifiers(), namespaceName, sourceIndex);
+                        if (parameter->declarator() != nullptr)
+                            if (std::string name = getDirectDeclName(parameter->declarator()->directDeclarator());
+                                !name.empty())
+                            {
+                                localNames.insert(name);
+                                if (parameter->declarationSpecifiers() != nullptr)
+                                    for (auto* spec : parameter->declarationSpecifiers()->declarationSpecifier())
+                                        if ((spec->pointer() != nullptr || IsArrayViewArg(spec))
+                                            && spec->typeSpecifier() != nullptr)
+                                            if (std::string typeName = nominalTypeName(
+                                                    spec->typeSpecifier(), namespaceName);
+                                                !typeName.empty())
+                                                localPointerAggregateTypes[name] = typeName;
+                            }
+                    }
+                auto getMemberAccesses = [](CFlatParser::PostfixExpressionContext* postfix) {
+                    std::vector<PointerAccessMember> result;
+                    auto members = postfix->memberNameToken();
+                    auto calls = postfix->LeftParen();
+                    for (size_t i = 0; i < members.size(); ++i)
+                    {
+                        const size_t memberIndex = members[i]->getStart()->getTokenIndex();
+                        const size_t nextMemberIndex = i + 1 < members.size()
+                            ? members[i + 1]->getStart()->getTokenIndex()
+                            : std::numeric_limits<size_t>::max();
+                        const bool called = std::any_of(calls.begin(), calls.end(), [&](auto* call) {
+                            const size_t callIndex = call->getSymbol()->getTokenIndex();
+                            return memberIndex < callIndex && callIndex < nextMemberIndex;
+                        });
+                        size_t operatorToken = 0;
+                        for (size_t childIndex = 1; childIndex < postfix->children.size(); ++childIndex)
+                            if (postfix->children[childIndex] == members[i])
+                                if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(
+                                        postfix->children[childIndex - 1]))
+                                    operatorToken = terminal->getSymbol()->getType();
+                        result.push_back({ members[i]->getText(), operatorToken, called });
+                    }
+                    return result;
+                };
+                auto scanFunction = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                    if (node == nullptr) return;
+                    if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+                    {
+                        if (declaration->declarationSpecifiers() != nullptr)
+                            recordDeclarationTypes(declaration->declarationSpecifiers(), namespaceName, sourceIndex);
+                        if (declaration->initDeclaratorList() != nullptr)
+                            for (auto* item : declaration->initDeclaratorList()->initDeclarator())
+                                if (item->declarator() != nullptr)
+                                    if (std::string name = getDirectDeclName(
+                                            item->declarator()->directDeclarator()); !name.empty())
+                                    {
+                                        localNames.insert(name);
+                                        if (declaration->declarationSpecifiers() != nullptr)
+                                            for (auto* spec : declaration->declarationSpecifiers()->declarationSpecifier())
+                                                if ((spec->pointer() != nullptr || IsArrayViewArg(spec))
+                                                    && spec->typeSpecifier() != nullptr)
+                                                    if (std::string typeName = nominalTypeName(
+                                                            spec->typeSpecifier(), namespaceName);
+                                                        !typeName.empty())
+                                                        localPointerAggregateTypes[name] = typeName;
+                                    }
+                    }
+                    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+                    {
+                        auto* primary = postfix->primaryExpression();
+                        auto* base = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                        if (base != nullptr && base->Identifier() != nullptr)
+                            if (auto pointerType = localPointerAggregateTypes.find(
+                                    base->Identifier()->getText());
+                                pointerType != localPointerAggregateTypes.end())
+                            {
+                                auto members = getMemberAccesses(postfix);
+                                if (std::any_of(members.begin(), members.end(), [](const auto& member) {
+                                        return !member.Called;
+                                    }))
+                                {
+                                    earlierAggregateUses[pointerType->second].push_back(sourceIndex);
+                                    pointerFieldAccessPaths.push_back({ pointerType->second,
+                                        std::move(members) });
+                                }
+                            }
+                        if (base != nullptr && base->Identifier() != nullptr
+                            && base->genericTypeParameters() == nullptr
+                            && localNames.count(base->Identifier()->getText()) == 0)
+                        {
+                            std::string candidate = base->Identifier()->getText();
+                            for (auto* member : postfix->memberNameToken())
+                            {
+                                candidate += "." + member->getText();
+                                auto global = compilerLLVM->GetGlobalVariableNV(candidate);
+                                if (global.Storage == nullptr) continue;
+                                const std::string typeName = compilerLLVM->ResolveTypeAlias(
+                                    global.TypeAndValue.TypeName);
+                                auto type = compilerLLVM->dataStructures.find(typeName);
+                                if (type != compilerLLVM->dataStructures.end()
+                                    && type->second.StructType != nullptr && type->second.StructType->isOpaque())
+                                    earlierAggregateUses[typeName].push_back(sourceIndex);
+                                break;
+                            }
+                        }
+                    }
+                    for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+                };
+                LLVMBackend::NamespaceScope scope(Compiler(func), namespaceName);
+                recordDeclarationTypes(func->declarationSpecifiers(), namespaceName, sourceIndex);
+                scanFunction(scanFunction, func->parameterTypeList());
+                scanFunction(scanFunction, func->compoundStatement());
+                return;
+            }
+            if (auto* decl = ext->declaration())
+            {
+                const size_t sourceIndex = decl->getStart()->getStartIndex();
+                LLVMBackend::NamespaceScope scope(Compiler(decl), namespaceName);
+                recordDeclarationTypes(decl->declarationSpecifiers(), namespaceName, sourceIndex);
+                return;
+            }
+            if (auto* ifConst = ext->ifConstDeclaration())
+                collectIfConstUses(ifConst, namespaceName);
+        };
+        std::function<void(CFlatParser::ExternalDeclarationContext*, const std::string&)> collectSelectedUses;
+        collectSelectedUses = [&](CFlatParser::ExternalDeclarationContext* ext,
+                                  const std::string& namespaceName) { collectUses(ext, namespaceName); };
+        for (auto* ext : ctx->externalDeclaration()) collectSelectedUses(ext, {});
+        struct PreparingAggregateLayoutsScope
+        {
+            bool& flag;
+            bool previous;
+            explicit PreparingAggregateLayoutsScope(bool& value) : flag(value), previous(value)
+            {
+                flag = true;
+            }
+            ~PreparingAggregateLayoutsScope() { flag = previous; }
+        } preparingScope(preparsingAggregateLayouts_);
+        struct AggregateDefinition
+        {
+            CFlatParser::StructDefinitionContext* Struct = nullptr;
+            CFlatParser::ClassDefinitionContext* Class = nullptr;
+            std::string Namespace;
+            size_t SourceIndex = 0;
+        };
+        std::unordered_map<std::string, AggregateDefinition> aggregateDefinitions;
+        std::unordered_map<std::string,
+            std::pair<CFlatParser::InterfaceDefinitionContext*, std::string>> interfaceDefinitions;
+        std::function<void(CFlatParser::StructDefinitionContext*, const std::string&)> collectStructDefinition;
+        std::function<void(CFlatParser::ClassDefinitionContext*, const std::string&)> collectClassDefinition;
+        std::function<void(CFlatParser::ExternalDeclarationContext*, const std::string&)> collectDefinitions;
+        std::function<void(CFlatParser::IfConstDeclarationContext*, const std::string&)> collectIfConstDefinitions;
+        collectIfConstDefinitions = [&](CFlatParser::IfConstDeclarationContext* ifConst,
+                                        const std::string& namespaceName) {
+            auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ifConst);
+            if (!recorded) return;
+            const int decision = *recorded;
+            auto blocks = ifConst->ifConstBlock();
+            if (blocks.empty() || decision < 0) return;
+            if (decision == 0 && ifConst->ifConstDeclaration() != nullptr)
+            {
+                collectIfConstDefinitions(ifConst->ifConstDeclaration(), namespaceName);
+                return;
+            }
+            const size_t index = decision != 0 ? 0 : 1;
+            if (index < blocks.size())
+                for (auto* child : blocks[index]->externalDeclaration())
+                    collectDefinitions(child, namespaceName);
+        };
+        collectDefinitions = [&](CFlatParser::ExternalDeclarationContext* ext,
+                                 const std::string& namespaceName) {
+            if (auto* ns = ext->namespaceDefinition())
+            {
+                std::string nested;
+                for (auto* id : ns->Identifier())
+                    nested += (nested.empty() ? "" : ".") + id->getText();
+                if (!namespaceName.empty()) nested = namespaceName + "." + nested;
+                LLVMBackend::NamespaceScope scope(Compiler(ns), nested);
+                for (auto* child : ns->externalDeclaration())
+                    collectDefinitions(child, nested);
+                return;
+            }
+            if (auto* str = ext->structDefinition())
+                collectStructDefinition(str, namespaceName);
+            else if (auto* cls = ext->classDefinition())
+                collectClassDefinition(cls, namespaceName);
+            else if (auto* iface = ext->interfaceDefinition())
+            {
+                auto* generic = iface->genericIdentifier();
+                if (generic != nullptr && generic->Identifier() != nullptr)
+                {
+                    const std::string typeName = namespaceName.empty()
+                        ? generic->Identifier()->getText()
+                        : namespaceName + "." + generic->Identifier()->getText();
+                    interfaceDefinitions[typeName] = { iface, namespaceName };
+                }
+            }
+            if (auto* ifConst = ext->ifConstDeclaration())
+                collectIfConstDefinitions(ifConst, namespaceName);
+        };
+        collectStructDefinition = [&](CFlatParser::StructDefinitionContext* str,
+                                      const std::string& namespaceName) {
+            const std::string typeName = namespaceName.empty()
+                ? str->directDeclarator()->getText()
+                : namespaceName + "." + str->directDeclarator()->getText();
+            aggregateDefinitions[typeName] = { str, nullptr, namespaceName,
+                str->getStart()->getStartIndex() };
+            if (str->genericTypeParameters() == nullptr)
+            {
+                for (auto* member : str->aggregateMember())
+                {
+                    if (member->ifConstMember() != nullptr) continue;
+                    if (auto* nested = member->structDefinition()) collectStructDefinition(nested, typeName);
+                    if (auto* nested = member->classDefinition()) collectClassDefinition(nested, typeName);
+                }
+            }
+        };
+        collectClassDefinition = [&](CFlatParser::ClassDefinitionContext* cls,
+                                     const std::string& namespaceName) {
+            const std::string typeName = namespaceName.empty()
+                ? cls->directDeclarator()->getText()
+                : namespaceName + "." + cls->directDeclarator()->getText();
+            aggregateDefinitions[typeName] = { nullptr, cls, namespaceName,
+                cls->getStart()->getStartIndex() };
+            if (cls->genericTypeParameters() == nullptr)
+            {
+                for (auto* member : cls->aggregateMember())
+                {
+                    if (member->ifConstMember() != nullptr) continue;
+                    if (auto* nested = member->structDefinition()) collectStructDefinition(nested, typeName);
+                    if (auto* nested = member->classDefinition()) collectClassDefinition(nested, typeName);
+                }
+            }
+        };
+        for (auto* ext : ctx->externalDeclaration())
+            collectDefinitions(ext, {});
+
+        std::unordered_set<std::string> registeredGenericTemplates;
+        std::function<void(const std::string&)> registerGenericTemplate;
+        registerGenericTemplate = [&](const std::string& typeName) {
+            auto definition = aggregateDefinitions.find(typeName);
+            if (definition == aggregateDefinitions.end()
+                || !registeredGenericTemplates.insert(typeName).second)
+                return;
+            if (auto* str = definition->second.Struct;
+                str != nullptr && str->genericTypeParameters() != nullptr)
+            {
+                LLVMBackend::NamespaceScope scope(Compiler(str), definition->second.Namespace);
+                if (preparsedAggregateDefinitions_.insert(str).second)
+                    ParseStructDefinition(str, {}, definition->second.Namespace);
+            }
+            else if (auto* cls = definition->second.Class;
+                     cls != nullptr && cls->genericTypeParameters() != nullptr)
+            {
+                LLVMBackend::NamespaceScope scope(Compiler(cls), definition->second.Namespace);
+                if (preparsedAggregateClassDefinitions_.insert(cls).second)
+                    ParseClassDefinition(cls, {}, definition->second.Namespace);
+            }
+        };
+        for (const auto& typeName : genericTemplateUses)
+            registerGenericTemplate(typeName);
+
+        std::unordered_set<std::string> activeLayoutPreparations;
+        std::unordered_set<std::string> activeInterfacePreparations;
+        std::function<void(const std::string&)> preparseInterface;
+        preparseInterface = [&](const std::string& interfaceName) {
+            auto definition = interfaceDefinitions.find(interfaceName);
+            if (definition == interfaceDefinitions.end()
+                || preparsedInterfaceDefinitions_.count(definition->second.first) != 0
+                || !activeInterfacePreparations.insert(interfaceName).second)
+                return;
+            auto* iface = definition->second.first;
+            LLVMBackend::NamespaceScope scope(Compiler(iface), definition->second.second);
+            for (auto* base : iface->baseSpecifier())
+                preparseInterface(compilerLLVM->ResolveInterfaceName(BaseSpecifierName(base)));
+            ParseInterfaceDefinition(iface, definition->second.second);
+            preparsedInterfaceDefinitions_.insert(iface);
+            activeInterfacePreparations.erase(interfaceName);
+        };
+        std::function<void(const std::string&)> preparseLayout;
+        preparseLayout = [&](const std::string& typeName) {
+            auto definition = aggregateDefinitions.find(typeName);
+            if (definition == aggregateDefinitions.end()
+                || !activeLayoutPreparations.insert(typeName).second)
+                return;
+            if ((definition->second.Struct != nullptr
+                    && definition->second.Struct->genericTypeParameters() != nullptr)
+                || (definition->second.Class != nullptr
+                    && definition->second.Class->genericTypeParameters() != nullptr))
+            {
+                activeLayoutPreparations.erase(typeName);
+                return;
+            }
+            auto existing = compilerLLVM->dataStructures.find(typeName);
+            if (existing != compilerLLVM->dataStructures.end()
+                && existing->second.StructType != nullptr && !existing->second.StructType->isOpaque())
+            {
+                activeLayoutPreparations.erase(typeName);
+                return;
+            }
+            auto* structDef = definition->second.Struct;
+            LLVMBackend::NamespaceScope namespaceScope(
+                Compiler(structDef != nullptr ? static_cast<antlr4::ParserRuleContext*>(structDef)
+                                              : static_cast<antlr4::ParserRuleContext*>(definition->second.Class)),
+                definition->second.Namespace);
+            auto parseTypeDependencies = [&](auto&& self, CFlatParser::TypeSpecifierContext* type) -> void {
+                if (type == nullptr) return;
+                if (std::string dependency = nominalTypeName(type, definition->second.Namespace);
+                    !dependency.empty() && dependency != typeName
+                    && aggregateDefinitions.count(dependency) != 0)
+                {
+                    registerGenericTemplate(dependency);
+                    preparseLayout(dependency);
+                }
+                auto parseGenericArguments = [&](CFlatParser::GenericTypeParametersContext* parameters) {
+                    if (parameters == nullptr || parameters->typeParameterList() == nullptr) return;
+                    for (auto* entry : parameters->typeParameterList()->typeParameterEntry())
+                        if (entry->typeSpecifier() != nullptr && entry->pointer() == nullptr
+                            && entry->arrayTypeSuffix() == nullptr && entry->Identifier() == nullptr)
+                            self(self, entry->typeSpecifier());
+                };
+                if (auto* generic = type->genericIdentifier(); generic != nullptr)
+                    parseGenericArguments(generic->genericTypeParameters());
+                if (auto* qualified = type->qualifiedGenericIdentifier(); qualified != nullptr)
+                    parseGenericArguments(qualified->genericTypeParameters());
+            };
+            auto parseFieldDependencies = [&](const std::vector<CFlatParser::AggregateMemberContext*>& members) {
+                for (auto* member : members)
+                    if (auto* field = member->declaration(); field != nullptr
+                        && field->declarationSpecifiers() != nullptr)
+                        for (auto* spec : field->declarationSpecifiers()->declarationSpecifier())
+                            if (isByValueTypeSpecifier(spec))
+                                if (auto* type = spec->typeSpecifier())
+                                    parseTypeDependencies(parseTypeDependencies, type);
+            };
+            if (structDef != nullptr)
+                parseFieldDependencies(structDef->aggregateMember());
+            else if (auto* classDef = definition->second.Class; classDef != nullptr)
+                parseFieldDependencies(classDef->aggregateMember());
+            if (structDef != nullptr)
+            {
+                if (preparsedAggregateDefinitions_.insert(structDef).second)
+                    ParseStructDefinition(structDef, {}, definition->second.Namespace);
+            }
+            else if (auto* classDef = definition->second.Class; classDef != nullptr)
+            {
+                for (auto* base : classDef->baseSpecifier())
+                    preparseInterface(compilerLLVM->ResolveInterfaceName(BaseSpecifierName(base)));
+                if (preparsedAggregateClassDefinitions_.insert(classDef).second)
+                    ParseClassDefinition(classDef, {}, definition->second.Namespace);
+            }
+            activeLayoutPreparations.erase(typeName);
+        };
+        for (const auto& [typeName, uses] : earlierAggregateUses)
+        {
+            auto definition = aggregateDefinitions.find(typeName);
+            if (definition != aggregateDefinitions.end()
+                && std::any_of(uses.begin(), uses.end(), [&](size_t useIndex) {
+                    return useIndex < definition->second.SourceIndex;
+                }))
+                preparseLayout(typeName);
+        }
+        for (const auto& path : pointerFieldAccessPaths)
+        {
+            std::string currentType = compilerLLVM->ResolveTypeAlias(path.RootType);
+            for (size_t i = 0; i < path.Members.size(); ++i)
+            {
+                const auto& access = path.Members[i];
+                if (access.Called) break;
+                auto owner = compilerLLVM->dataStructures.find(currentType);
+                if (owner == compilerLLVM->dataStructures.end()
+                    || owner->second.StructType == nullptr || owner->second.StructType->isOpaque())
+                    break;
+                auto field = std::find_if(owner->second.StructFields.begin(),
+                    owner->second.StructFields.end(), [&](const auto& candidate) {
+                        return candidate.VariableName == access.Name;
+                    });
+                if (field == owner->second.StructFields.end() || i + 1 == path.Members.size())
+                    break;
+                const auto& next = path.Members[i + 1];
+                if (next.Called) break;
+                const int pointerDepth = field->ValuePointerDepth();
+                if (next.OperatorToken == CFlatParser::Arrow)
+                {
+                    if (pointerDepth != 1) break;
+                    currentType = compilerLLVM->ResolveTypeAlias(field->TypeName);
+                    preparseLayout(currentType);
+                }
+                else
+                {
+                    if (pointerDepth != 0) break;
+                    currentType = compilerLLVM->ResolveTypeAlias(field->TypeName);
+                    preparseLayout(currentType);
+                }
+            }
+        }
+        for (const auto& typeName : deferredAggregateTypes)
+            preparseLayout(typeName);
+}
+
+void MainListener::PrepareDeferredFunctionDefinitions(
+    const std::vector<CFlatParser::FunctionDefinitionContext*>& functions)
+{
+        for (auto* func : functions)
+        {
+            const auto& localEnums = FunctionLocalEnumNames(func);
+            ScanAndQueueGenericTypeUses(func->declarationSpecifiers(), true, &localEnums);
+            if (func->parameterTypeList() != nullptr)
+                ScanAndQueueGenericTypeUses(func->parameterTypeList(), true, &localEnums);
+        }
+        ProcessPendingInstantiations();
 }
 
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
@@ -3402,7 +4017,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     bool suppliesNoArgCtor = !isUnion && !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
                     const size_t ctorIndex = isCppStruct ? cppCtorIndex++ : SIZE_MAX;
-                    if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                    if (preparsingAggregateLayouts_
+                        || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
                         || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Constructor, {}, suppliesNoArgCtor,
@@ -3420,7 +4036,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 {
                     continue;
                 }
-                else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                else if (preparsingAggregateLayouts_
+                    || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
                     || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                     DeferGenericMemberBody(func, ctx, structName,
                         DeferredGenericMemberKind::Function,
@@ -3451,7 +4068,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
                         Compiler(func)->LogError(std::format(
                             "constructor '{}' is not allowed inside a lock field group", baseName));
-                    else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                    else if (preparsingAggregateLayouts_
+                        || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
                         || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Function, {}, false, SIZE_MAX, false,
@@ -3523,7 +4141,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
-                if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(dtor))
+                if (preparsingAggregateLayouts_
+                    || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(dtor))
                     || (!nameOverride.empty() && needsDeferredMemberBody(dtor)))
                     DeferGenericMemberBody(dtor, ctx, structName,
                         DeferredGenericMemberKind::Destructor, {}, false, SIZE_MAX, false,
@@ -3566,7 +4185,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // ProcessPendingInstantiations();
 
         structScopeStack.pop_back();
-        if (!deferNestedBodiesForIncompleteParent)
+        if (!preparsingAggregateLayouts_ && !deferNestedBodiesForIncompleteParent)
             ProcessDeferredGenericMemberBodies(deferredBodiesAtEntry, true);
     }
 
@@ -6592,7 +7211,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.
                     bool suppliesNoArgCtor = !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
-                    if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                    if (preparsingAggregateLayouts_
+                        || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
                         || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Constructor, {}, suppliesNoArgCtor,
@@ -6610,7 +7230,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 {
                     continue;
                 }
-                else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                else if (preparsingAggregateLayouts_
+                    || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
                     || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                     DeferGenericMemberBody(func, ctx, structName,
                         DeferredGenericMemberKind::Function,
@@ -6639,7 +7260,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
                         Compiler(func)->LogError(std::format(
                             "constructor '{}' is not allowed inside a lock field group", baseName));
-                    else if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
+                    else if (preparsingAggregateLayouts_
+                        || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(func))
                         || (!nameOverride.empty() && needsDeferredMemberBody(func)))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Function, {}, false, SIZE_MAX, false,
@@ -6656,7 +7278,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
-                if ((deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(dtor))
+                if (preparsingAggregateLayouts_
+                    || (deferNestedBodiesForIncompleteParent && GenericMemberNeedsDeferredBody(dtor))
                     || (!nameOverride.empty() && needsDeferredMemberBody(dtor)))
                     DeferGenericMemberBody(dtor, ctx, structName,
                         DeferredGenericMemberKind::Destructor, {}, false, SIZE_MAX, false,
@@ -6683,7 +7306,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // ProcessPendingInstantiations();
 
         structScopeStack.pop_back();
-        if (!deferNestedBodiesForIncompleteParent)
+        if (!preparsingAggregateLayouts_ && !deferNestedBodiesForIncompleteParent)
             ProcessDeferredGenericMemberBodies(deferredBodiesAtEntry, true);
     }
 

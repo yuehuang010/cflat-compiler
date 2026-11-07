@@ -5,6 +5,36 @@
 #include <functional>
 #include <limits>
 
+static std::vector<uint64_t> CxxArrayReferenceReturnDimensions(const std::string& spelling)
+{
+    size_t marker = spelling.find("(&)[");
+    size_t markerLength = 4;
+    if (marker == std::string::npos)
+    {
+        marker = spelling.find("(&&)[");
+        markerLength = 5;
+    }
+    if (marker == std::string::npos) return {};
+
+    std::vector<uint64_t> dimensions;
+    size_t pos = marker + markerLength - 1;
+    while (pos < spelling.size() && spelling[pos] == '[')
+    {
+        const size_t close = spelling.find(']', pos + 1);
+        if (close == std::string::npos || close == pos + 1) return {};
+        uint64_t extent = 0;
+        for (size_t i = pos + 1; i < close; ++i)
+        {
+            if (spelling[i] < '0' || spelling[i] > '9') return {};
+            extent = extent * 10 + static_cast<uint64_t>(spelling[i] - '0');
+        }
+        if (extent == 0) return {};
+        dimensions.push_back(extent);
+        pos = close + 1;
+    }
+    return dimensions;
+}
+
 static std::string ParentAggregateOwnerName(const std::string& owner)
 {
     size_t parentDot = std::string::npos;
@@ -2582,7 +2612,7 @@ LLVM_ATTRIBUTE_NOINLINE int MainListener::ResolveDefaultedCxxAliasQualifier(
         return 0;
     std::string resolvedType;
     std::string error;
-    if (compiler->TryResolveDefaultedCxxGenericBaseAlias(alias, resolvedType, error))
+    if (compiler->TryResolveDefaultedCxxGenericBaseAlias(qualified, resolvedType, error))
     {
         namespaceName = resolvedType;
         primaryName = std::move(resolvedType);
@@ -4802,13 +4832,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 if (followedByGenericTypeParameters && !isFileAlias
                                     && (genericStructTemplates.count(qualifiedName) != 0
-                                        || genericClassTemplates.count(qualifiedName) != 0))
+                                        || genericClassTemplates.count(qualifiedName) != 0
+                                        || Compiler(ctx)->IsGenericBaseAlias(qualifiedName)))
                                 {
                                     primaryIdentifier = memberName;
                                     namedVar = {};
                                     structVar = {};
                                     interfaceVar = {};
                                     break;
+                                }
+                                if (!isFileAlias && IsFollowedByCall(ctx, terminal)
+                                    && Compiler(ctx)->IsGenericBaseAlias(qualifiedName))
+                                {
+                                    const int aliasQualifier = ResolveDefaultedCxxAliasQualifier(
+                                        ctx, qualifiedName, namespaceContext, primaryIdentifier);
+                                    if (aliasQualifier != 0)
+                                    {
+                                        if (aliasQualifier == 1)
+                                        {
+                                            namedVar = {};
+                                            structVar = {};
+                                            interfaceVar = {};
+                                        }
+                                        break;
+                                    }
                                 }
                                 // A bound C++ OBJECT can never take template arguments: the grammar
                                 // read a '<' comparison as a generic parameter list.
@@ -6227,14 +6274,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     break;
                                 }
                             }
-                            // A C++ ALIAS TEMPLATE constructor-called at the undotted spelling
-                            // (`GVec<int>()`): the alias names the aliased template, so request
-                            // the TARGET's specialization the way the declaration path does.
+                            // A CFlat alias to a C++ template needs one alias hop first. Keep a
+                            // direct C++ alias-template spelling intact so its own pattern applies.
+                            const bool baseIsCxxAliasTemplate =
+                                Compiler(ctx)->HasCxxAliasTemplate(baseName);
+                            const std::string genericAliasTarget =
+                                !baseIsCxxAliasTemplate && Compiler(ctx)->IsGenericBaseAlias(baseName)
+                                    ? Compiler(ctx)->ResolveGenericBaseAlias(baseName) : baseName;
+                            const bool cflatAliasToCxxTemplate = !baseIsCxxAliasTemplate
+                                && Compiler(ctx)->IsGenericBaseAlias(baseName)
+                                && (Compiler(ctx)->HasCxxAliasTemplate(genericAliasTarget)
+                                    || Compiler(ctx)->HasCxxClassTemplate(genericAliasTarget));
                             if (isFollowedByCall && Compiler(ctx)->HasCxxImportGroup()
-                                && !isGenericType
-                                && Compiler(ctx)->IsGenericBaseAlias(baseName))
+                                && ((!isGenericType && Compiler(ctx)->IsGenericBaseAlias(baseName))
+                                    || cflatAliasToCxxTemplate))
                             {
-                                std::string aliasBase = baseName;
+                                std::string aliasBase = genericAliasTarget;
                                 std::vector<std::string> aliasArgs = typeArgs;
                                 ResolveEnumTypeArguments(aliasArgs);
                                 Compiler(ctx)->ResolveGenericAliasSpelling(aliasBase, aliasArgs);
@@ -7349,7 +7404,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 ComposeMovableTempField(ctx, namedVar, namedVar, arrTy, rvalue);
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
+                            const bool consumesInnerDimension =
+                                namedVar.TypeAndValue.ConstArraySize == 0;
                             namedVar.TypeAndValue.ConstArraySize = 0;
+                            if (consumesInnerDimension
+                                && !namedVar.TypeAndValue.ConstInnerDimensions.empty())
+                                namedVar.TypeAndValue.ConstInnerDimensions.erase(
+                                    namedVar.TypeAndValue.ConstInnerDimensions.begin());
                             // Keep inner dimensions only while the indexed element is another array.
                             if (!llvm::isa<llvm::ArrayType>(namedVar.BaseType))
                                 namedVar.TypeAndValue.ConstInnerDimensions.clear();
@@ -7363,60 +7424,100 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         else if (namedVar.TypeAndValue.Pointer)
                         {
                             namedVar.FieldPathThroughPointer = true;
-                            // Indexing through a pointer (e.g. char* p; p[i]).
-                            auto elementTypeAndValue = namedVar.TypeAndValue;
-                            // Array-view element access: tag the element's load/store with this view's
-                            // alias scope so the optimizer can prove distinct views are disjoint
-                            // (dropping the runtime overlap check) even when the view rides inside a
-                            // by-value struct field, where the `noalias` parameter attribute cannot
-                            // reach. Key the scope by the view's stable origin (the struct instance
-                            // for a field view `s.v[i]`, else the variable/param name) so every access
-                            // to the same buffer shares a scope and copies are not falsely disjoint.
-                            if (namedVar.TypeAndValue.IsArrayView)
+                            const auto returnArrayDims = CxxArrayReferenceReturnDimensions(
+                                namedVar.TypeAndValue.FuncPtrReturnAliasSpelling);
+                            if (namedVar.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions
+                                && returnArrayDims.size() <= 1)
+                                LogErrorContext(ctx,
+                                    "cannot index a function-pointer result with an unsupported array-reference return type");
+                            if (returnArrayDims.size() > 1)
                             {
-                                std::string originKey = namedVar.TypeAndValue.ParentVariableName;
-                                if (originKey.empty()) originKey = namedVar.TypeAndValue.VariableName;
-                                if (originKey.empty()) originKey = namedVar.CallerName;
-                                elementTypeAndValue.NoaliasScopeId = Compiler(ctx)->GetOrMintViewScope(originKey);
+                                // An indirect call returns a pointer to the full array; each
+                                // subscript steps by the remaining inner array's size.
+                                auto rowTypeAndValue = namedVar.TypeAndValue;
+                                rowTypeAndValue.Pointer = false;
+                                rowTypeAndValue.ElemPointer = false;
+                                rowTypeAndValue.PointerDepth = 0;
+                                rowTypeAndValue.ConstArraySize = returnArrayDims[1];
+                                rowTypeAndValue.ConstInnerDimensions.assign(
+                                    returnArrayDims.begin() + 2, returnArrayDims.end());
+                                rowTypeAndValue.FuncPtrReturnAliasSpelling.clear();
+                                rowTypeAndValue.FuncPtrReturnHasStrippedInnerDimensions = false;
+                                llvm::Type* rowType = Compiler(ctx)->GetType(rowTypeAndValue);
+                                if (rowType == nullptr || !rowType->isArrayTy() || !rowType->isSized())
+                                    LogErrorContext(ctx,
+                                        "cannot index a function-pointer result with an unsupported array-reference return type");
+                                llvm::Value* subBaseStorage = namedVar.Storage;
+                                Compiler(ctx)->RecordNullDerefFor(namedVar,
+                                    ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+                                if (Compiler(ctx)->IsMovedDerefHere(namedVar))
+                                    LogErrorContext(ctx, Compiler(ctx)->MovedDerefDiagnostic(namedVar));
+                                llvm::Value* ptrValue = LoadNamedVariable(namedVar);
+                                Compiler(ctx)->EmitOwnDerefGuard(subBaseStorage, ptrValue,
+                                    ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+                                namedVar.Storage = Compiler(ctx)->CreateGEP(rowType, ptrValue, rvalue);
+                                namedVar.BaseType = rowType;
+                                namedVar.TypeAndValue = std::move(rowTypeAndValue);
+                                namedVar.UnionFieldType = nullptr;
+                                ClearCxxPrvalueProvenance(namedVar);
                             }
-                            // An indexed element is a single slot, never a whole-allocation view -
-                            // drop the array-view flag so `&a[i]` cannot be bound back into a `T[]`.
-                            const bool indexedView = elementTypeAndValue.IsArrayView;
-                            const int elementPointerDepth = indexedView
-                                ? elementTypeAndValue.ElementPointerDepth()
-                                : std::max(elementTypeAndValue.ValuePointerDepth() - 1, 0);
-                            elementTypeAndValue.IsArrayView = false;
-                            elementTypeAndValue.PointerDepth = elementPointerDepth;
-                            elementTypeAndValue.Pointer = elementPointerDepth > 0;
-                            elementTypeAndValue.ElemPointer = elementPointerDepth >= 2;
-                            if (!elementTypeAndValue.Pointer)
-                                elementTypeAndValue.IsInterfacePointer = false;
-                            auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
-                            // An UNSIZED element has no stride: a 'void*' traps in LLVM's
-                            // alignment query, an incomplete record emitted invalid IR.
-                            Compiler(ctx)->TouchWaitingLayout(elementType);
-                            if (elementType == nullptr || !elementType->isSized())
-                                LogErrorContext(ctx, std::format(
-                                    "cannot index '{}': its element has no size, so there is no "
-                                    "stride to step by. Cast it to a typed pointer first (for "
-                                    "example '((int*)p)[i]').",
-                                    SpellType(*Compiler(ctx), namedVar.TypeAndValue)));
-                            llvm::Value* subBaseStorage = namedVar.Storage;
-                            // An indexed deref (`p[i]`) of an explicitly-moved-null thin pointer local
-                            // is statically null - reject it, same as the '->'/'.'/'*' guards.
-                            Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
-                                ctx->getStart()->getCharPositionInLine());
-                            if (Compiler(ctx)->IsMovedDerefHere(namedVar))
-                                LogErrorContext(ctx, Compiler(ctx)->MovedDerefDiagnostic(namedVar));
-                            auto ptrValue = LoadNamedVariable(namedVar);
-                            // --sanitize=ownership (M1): guard `p[i]` deref of a moved-from local.
-                            Compiler(ctx)->EmitOwnDerefGuard(subBaseStorage, ptrValue,
-                                ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
-                            namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
-                            namedVar.BaseType = elementType;
-                            namedVar.TypeAndValue = elementTypeAndValue;
-                            namedVar.UnionFieldType = nullptr;
-                            ClearCxxPrvalueProvenance(namedVar);
+                            else
+                            {
+                                // Indexing through a pointer (e.g. char* p; p[i]).
+                                auto elementTypeAndValue = namedVar.TypeAndValue;
+                                // Array-view element access: tag the element's load/store with this view's
+                                // alias scope so the optimizer can prove distinct views are disjoint
+                                // (dropping the runtime overlap check) even when the view rides inside a
+                                // by-value struct field, where the `noalias` parameter attribute cannot
+                                // reach. Key the scope by the view's stable origin (the struct instance
+                                // for a field view `s.v[i]`, else the variable/param name) so every access
+                                // to the same buffer shares a scope and copies are not falsely disjoint.
+                                if (namedVar.TypeAndValue.IsArrayView)
+                                {
+                                    std::string originKey = namedVar.TypeAndValue.ParentVariableName;
+                                    if (originKey.empty()) originKey = namedVar.TypeAndValue.VariableName;
+                                    if (originKey.empty()) originKey = namedVar.CallerName;
+                                    elementTypeAndValue.NoaliasScopeId = Compiler(ctx)->GetOrMintViewScope(originKey);
+                                }
+                                // An indexed element is a single slot, never a whole-allocation view -
+                                // drop the array-view flag so `&a[i]` cannot be bound back into a `T[]`.
+                                const bool indexedView = elementTypeAndValue.IsArrayView;
+                                const int elementPointerDepth = indexedView
+                                    ? elementTypeAndValue.ElementPointerDepth()
+                                    : std::max(elementTypeAndValue.ValuePointerDepth() - 1, 0);
+                                elementTypeAndValue.IsArrayView = false;
+                                elementTypeAndValue.PointerDepth = elementPointerDepth;
+                                elementTypeAndValue.Pointer = elementPointerDepth > 0;
+                                elementTypeAndValue.ElemPointer = elementPointerDepth >= 2;
+                                if (!elementTypeAndValue.Pointer)
+                                    elementTypeAndValue.IsInterfacePointer = false;
+                                auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
+                                // An UNSIZED element has no stride: a 'void*' traps in LLVM's
+                                // alignment query, an incomplete record emitted invalid IR.
+                                Compiler(ctx)->TouchWaitingLayout(elementType);
+                                if (elementType == nullptr || !elementType->isSized())
+                                    LogErrorContext(ctx, std::format(
+                                        "cannot index '{}': its element has no size, so there is no "
+                                        "stride to step by. Cast it to a typed pointer first (for "
+                                        "example '((int*)p)[i]').",
+                                        SpellType(*Compiler(ctx), namedVar.TypeAndValue)));
+                                llvm::Value* subBaseStorage = namedVar.Storage;
+                                // An indexed deref (`p[i]`) of an explicitly-moved-null thin pointer local
+                                // is statically null - reject it, same as the '->'/'.'/'*' guards.
+                                Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
+                                    ctx->getStart()->getCharPositionInLine());
+                                if (Compiler(ctx)->IsMovedDerefHere(namedVar))
+                                    LogErrorContext(ctx, Compiler(ctx)->MovedDerefDiagnostic(namedVar));
+                                auto ptrValue = LoadNamedVariable(namedVar);
+                                // --sanitize=ownership (M1): guard `p[i]` deref of a moved-from local.
+                                Compiler(ctx)->EmitOwnDerefGuard(subBaseStorage, ptrValue,
+                                    ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+                                namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
+                                namedVar.BaseType = elementType;
+                                namedVar.TypeAndValue = elementTypeAndValue;
+                                namedVar.UnionFieldType = nullptr;
+                                ClearCxxPrvalueProvenance(namedVar);
+                            }
                         }
                         else
                         {
@@ -7596,6 +7697,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // A C++ alias template (`template<class T> using Vec = vector<T>;`)
                             // names the aliased template; only the target has an identity to
                             // request, which is the hop the DECLARATION path already performs.
+                            if (!Compiler(ctx)->HasCxxAliasTemplate(baseName)
+                                && Compiler(ctx)->IsGenericBaseAlias(baseName))
+                                baseName = Compiler(ctx)->ResolveGenericBaseAlias(baseName);
                             Compiler(ctx)->ResolveGenericAliasSpelling(baseName, typeArgs);
                             Compiler(ctx)->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                             std::string mangled = MangleGenericInstance(*Compiler(), baseName,
@@ -10186,6 +10290,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             if (funcPtr != nullptr && funcPtrTV.IsThinFnPtr()
                                 && namedVar.TypeAndValue.Pointer
+                                && !namedVar.TypeAndValue.IsCxxRefToPointer
                                 && !namedVar.TypeAndValue.ElemPointer)
                                 funcPtr = Compiler(ctx)->CreateLoad(
                                     Compiler(ctx)->BuildThinFnPtrType(funcPtrTV), funcPtr);
@@ -11303,6 +11408,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The SIGNATURE too: the overload scorer rejects a function
                                     // pointer whose signature disagrees with the parameter's.
                                     argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
+                                    argVar.TypeAndValue.FuncPtrReturnAliasSpelling =
+                                        argNV.TypeAndValue.FuncPtrReturnAliasSpelling;
+                                    argVar.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions =
+                                        argNV.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
@@ -13536,6 +13645,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // scorer can reject a function pointer of a disagreeing signature.
                                     // TypeName and IsFunctionPointer are deliberately left alone here.
                                     argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
+                                    argVar.TypeAndValue.FuncPtrReturnAliasSpelling =
+                                        argNV.TypeAndValue.FuncPtrReturnAliasSpelling;
+                                    argVar.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions =
+                                        argNV.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
@@ -13990,8 +14103,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         && !structVar.TypeAndValue.TypeName.empty()
                                                         && argumentType == structVar.TypeAndValue.TypeName
                                                         && parameter.Pointer == argument.TypeAndValue.Pointer + 1;
+                                                    // An unnamed-enum rvalue held as int is not exact
+                                                    // for `int`: the template deduces the enum type.
                                                     exact = exact && !argumentType.empty()
                                                         && parameter.TypeName == argumentType
+                                                        && (!compiler->IsUnnamedEnumValue(argument)
+                                                            || compiler->cxxUnnamedEnumAliases_.count(
+                                                                   parameter.TypeName) != 0)
                                                         && (valueReceiver
                                                             || parameter.Pointer == argument.TypeAndValue.Pointer)
                                                         && parameter.ElemPointer == argument.TypeAndValue.ElemPointer
@@ -14180,6 +14298,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         arguments.begin(), arguments.end(), [&](const auto& arg) {
                                             const std::string& source = !arg.InferSourceTypeName.empty()
                                                 ? arg.InferSourceTypeName : arg.TypeAndValue.TypeName;
+                                            // An unnamed-enum value deduces its own specialization.
+                                            if (!compiler->CxxUnnamedEnumValueSpelling(arg).empty())
+                                                return true;
                                             return !source.empty()
                                                 && (compiler->IsCxxForeignNamespace(source)
                                                     || compiler->IsCxxForeignTypeRegistered(source))
@@ -14323,7 +14444,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && (!cxxExplicitTemplateArgs.empty()
                                         || registeredName.starts_with("__cflat_tpl_")
                                         || registeredName.starts_with("__cflat_free_")))
+                                {
                                     resolvedName = registeredName;
+                                    if (callDisplayName.empty()) callDisplayName = functionName;
+                                }
                                 else if (isStaticTemplateThroughObject)
                                     resolvedName = owner + "." + memberName;
                                 else if (isTemplate && !owner.empty()
@@ -14965,6 +15089,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // nxt()'s result below, not the stale pre-call receiver type.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                namedVar.CxxClosureLenders = std::move(
+                                    Compiler(ctx)->lastCallCxxClosureLenders_);
                                 if (!namespaceContext.empty()
                                     && Compiler(ctx)->IsDataStructure(namespaceContext)
                                     && Compiler(ctx)->ResolveTypeAlias(namespaceContext)
@@ -15500,6 +15626,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // so that subsequent member access (->field) can resolve the struct.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
+                                namedVar.CxxClosureLenders = std::move(
+                                    Compiler(primaryCtx)->lastCallCxxClosureLenders_);
                                 if (!namespaceContext.empty()
                                     && Compiler(primaryCtx)->IsDataStructure(namespaceContext)
                                     && Compiler(primaryCtx)->ResolveTypeAlias(namespaceContext)
@@ -17277,6 +17405,50 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         std::vector<LLVMBackend::DeclTypeAndValue> expectedFields;
         const bool tupleIsCallArgument = inCallArgument_
             && (IsDirectCallArgument(ctx) || IsCallArgumentThroughParens(ctx));
+        if (tupleIsCallArgument && inCxxCallArgument_)
+        {
+            // C++ parses `(a, b)` as a comma expression in a call argument. The grammar uses
+            // tupleExpression for that shape, so lower it to the last operand in this context.
+            LLVMBackend::NamedVariable result;
+            for (size_t i = 0; i < entries.size(); ++i)
+            {
+                auto* assignment = entries[i]->assignmentExpression();
+                const bool discarded = i + 1 != entries.size();
+                const bool bareExpr = assignment->assignmentOperator() == nullptr;
+                auto operand = ParseAssignmentExpressionNamed(assignment,
+                    discarded ? ResultUse::Discard : ResultUse::Value);
+                llvm::Value* value = operand.Primary != nullptr
+                    ? operand.Primary : LoadNamedVariable(operand);
+                if (value == nullptr) return {};
+                ProcessPlusPlus();
+                if (discarded)
+                {
+                    RegisterDiscardedOwningStructTemp(operand, bareExpr);
+                    continue;
+                }
+                // A comma ending in an lvalue or an anonymous-enum value (enumerator or macro of
+                // one) keeps master's refusal: this lowering carries no C++ category or enum identity.
+                if ((operand.Storage != nullptr && !operand.IsRvalue && !operand.IsCxxMacroGlobal)
+                    || compiler->IsUnnamedEnumValue(operand) || compiler->IsUnnamedEnumMacro(operand))
+                {
+                    LogErrorContext(ctx, "a comma expression ending in a variable or an anonymous-enum "
+                        "value cannot be passed to a C++ call");
+                    return {};
+                }
+                operand.Primary = value;
+                operand.BaseType = value->getType();
+                operand.Storage = nullptr;
+                operand.CallerName.clear();
+                operand.TypeAndValue.VariableName.clear();
+                operand.IsRvalue = true;
+                operand.IsCxxMacroGlobal = false;
+                operand.IsCxxNullIntegerMacro = false;
+                operand.IsCxxMacroJoin = false;
+                operand.LiteralIdentity.clear();
+                result = std::move(operand);
+            }
+            return result;
+        }
         if (!tupleIsCallArgument && !declExpectedType.TypeName.empty() && !declExpectedType.Pointer
             && !declExpectedType.IsArrayView
             && MangledBase(compiler->ResolveTypeAlias(declExpectedType.TypeName)) == "tuple")
@@ -19711,7 +19883,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             namedVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
             return namedVar;
         }
-        if (compiler->TryBindCxxSystemMacro(name))
+        if (compiler->TryBindCxxSystemMacro(name) || compiler->TryBindCHeaderMacro(name))
             return ParseIdentifier(node);
 
         // The postfix call path decides whether an unresolved `offsetof(...)` callee is the

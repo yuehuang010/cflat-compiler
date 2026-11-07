@@ -2050,6 +2050,249 @@ namespace T206Vla
     int local() { int[T206FileK] a = default; return (int)sizeof(a); }
 }
 
+namespace Qo2Use
+{
+    int pointerParam(Qo2Later.T* p) { return p->v; }
+    Qo2Later.T* pointerReturn() { return Qo2Later.pointer; }
+    Qo2Later.T* pointerBoth(Qo2Later.T* p) { return p; }
+    int localByValue() { Qo2Later.T x = default; x.v = 32; return x.v; }
+    int byValueParam(Qo2Later.T x) { return x.v; }
+    Qo2Later.T byValueReturn(int v) { Qo2Later.T x = default; x.v = v; return x; }
+    int globalPointer() { return Qo2Later.pointer->v; }
+    int globalValue() { return Qo2Later.stored.v; }
+    int genericPointer(Qo2Later.G<int>* p) { return p->value; }
+    int nestedPointer(Qo2Later.Child.T* p) { return p->v; }
+    Qo2Later.I interfacePass(Qo2Later.I value) { return value; }
+}
+namespace Qo2RootUse
+{
+    int pointerParam(Qo2RootLater* p) { return p->v; }
+    Qo2RootLater* pointerReturn() { return nullptr; }
+    Qo2RootLater* pointerBoth(Qo2RootLater* p) { return p; }
+    int localByValue() { Qo2RootLater x = default; x.v = 42; return x.v; }
+    int byValueParam(Qo2RootLater x) { return x.v; }
+    Qo2RootLater byValueReturn(int v) { Qo2RootLater x = default; x.v = v; return x; }
+    int genericPointer(Qo2RootG<int>* p) { return p->value; }
+    Qo2RootI interfacePass(Qo2RootI value) { return value; }
+}
+Qo2RootLater Qo2RootValue = default;
+namespace Qo2Later
+{
+    T* pointer = nullptr;
+    T stored = default;
+    struct T { int v = default; };
+    struct G<T> { T value = default; };
+    namespace Child { struct T { int v = default; }; }
+    interface I { int get(); };
+    class Impl : I { int v = default; int get() { return v; } };
+}
+struct Qo2RootLater { int v = default; };
+struct Qo2RootG<T> { T value = default; };
+interface Qo2RootI { int get(); };
+class Qo2RootImpl : Qo2RootI { int v = default; int get() { return v; } };
+
+int qo2r2UniqueDtors = 0;
+int qo2r2ClassCtors = 0;
+int qo2r2ClassDtors = 0;
+int qo2r2IfaceCtors = 0;
+int qo2r2IfaceDtors = 0;
+void qo2r2CountUniqueDtor();
+void qo2r2CountClassCtor();
+void qo2r2CountClassDtor();
+void qo2r2CountIfaceCtor();
+void qo2r2CountIfaceDtor();
+namespace Qo2R2PointerUse
+{
+    int run()
+    {
+        Qo2R2Types.PointerOwner* p = nullptr;
+        return p == nullptr ? 3 : 4;
+    }
+}
+namespace Qo2R2ValueUse
+{
+    int run()
+    {
+        Qo2R2Types.ValueOwner value = default;
+        value.w.v = 7;
+        return value.w.v;
+    }
+}
+namespace Qo2R2Types
+{
+    struct W { int v = default; };
+    struct PointerOwner { W w = default; };
+    struct ValueOwner { W w = default; };
+}
+namespace Qo2R2MutualUse
+{
+    int run()
+    {
+        Qo2R2MutualTypes.M m = default;
+        Qo2R2MutualTypes.N n = default;
+        m.n = &n;
+        n.m = &m;
+        m.v = 2;
+        n.v = 3;
+        return m.n->m->v * 10 + n.m->n->v;
+    }
+}
+namespace Qo2R2MutualTypes
+{
+    struct M { N* n = nullptr; int v = default; };
+    struct N { M* m = nullptr; int v = default; };
+}
+namespace Qo2R2SiblingUse
+{
+    int run()
+    {
+        Qo2R2SiblingTypes.U value = default;
+        value.e = Qo2R2SiblingTypes.E.Two;
+        value.w.v = 3;
+        return (int)value.e + value.w.v;
+    }
+}
+namespace Qo2R2SiblingTypes
+{
+    enum E : int { One = 1, Two = 2 };
+    struct W { int v = default; };
+    struct U { E e = default; W w = default; };
+}
+namespace Qo2R2AliasUse
+{
+    int run()
+    {
+        Qo2R2AliasTypes.U value = default;
+        value.n = 23;
+        return (int)value.n;
+    }
+}
+namespace Qo2R2AliasTypes
+{
+    using Num = long;
+    struct U { Num n = default; };
+}
+namespace Qo2R2UniqueUse
+{
+    int run()
+    {
+        Qo2R2UniqueTypes.S value = default;
+        value.name = "hello";
+        value.u = new Qo2R2UniqueTypes.P();
+        value.u->v = 5;
+        return (int)value.name.length() + value.u->v;
+    }
+}
+namespace Qo2R2UniqueTypes
+{
+    struct P { int v = default; ~P() { global::qo2r2CountUniqueDtor(); } };
+    struct S { string name = default; unique<P> u = default; };
+}
+namespace Qo2R2ClassUse
+{
+    int run()
+    {
+        Qo2R2ClassTypes.K value = default;
+        value.w.v = 8;
+        return value.get();
+    }
+    int byValue(Qo2R2ClassTypes.K value) { return value.w.v; }
+}
+namespace Qo2R2ClassTypes
+{
+    struct W { int v = default; };
+    class K
+    {
+        W w = default;
+        K() { global::qo2r2CountClassCtor(); }
+        ~K() { global::qo2r2CountClassDtor(); }
+        int get() { return w.v * 2; }
+    };
+}
+namespace Qo2R2IfaceUse
+{
+    int run()
+    {
+        Qo2R2IfaceTypes.Impl value = default;
+        value.w.v = 8;
+        Qo2R2IfaceTypes.I boxed = value;
+        return boxed.get() + value.get2();
+    }
+}
+namespace Qo2R2IfaceTypes
+{
+    struct W { int v = default; };
+    interface I { int get(); };
+    class Impl : I
+    {
+        W w = default;
+        Impl() { global::qo2r2CountIfaceCtor(); }
+        ~Impl() { global::qo2r2CountIfaceDtor(); }
+        int get() { return w.v * 2; }
+        int get2() { return w.v + 1; }
+    };
+}
+namespace Qo2R2NestedUse
+{
+    int run()
+    {
+        Qo2R2NestedTypes.O.In value = default;
+        value.w.v = 4;
+        return value.w.v * 2;
+    }
+}
+namespace Qo2R2NestedTypes
+{
+    struct O
+    {
+        struct W { int v = default; };
+        struct In { W w = default; };
+    };
+}
+int qo2r3ClassRoot = 0;
+namespace Qo2R3ClassUse
+{
+    int run()
+    {
+        Qo2R3ClassTypes.K value = default;
+        return value.get();
+    }
+}
+namespace Qo2R3ClassTypes
+{
+    class K { int a = default; int get() { return qo2r3ClassRoot + 4; } };
+}
+namespace Qo2R3PointerUse
+{
+    int two(Qo2R3PointerTypes.M* p) { return p->n->w; }
+    int three(Qo2R3PointerTypes.M* p) { return p->n->m->v; }
+}
+namespace Qo2R3PointerTypes
+{
+    struct M { N* n = default; int v = default; };
+    struct N { M* m = default; int w = default; };
+}
+namespace Qo2R3GenericUse
+{
+    int run()
+    {
+        Qo2R3GenericTypes.G<Qo2R3GenericTypes.T> value = default;
+        value.x.q.z = 6;
+        return sizeof(value) + value.x.q.z - 6;
+    }
+}
+namespace Qo2R3GenericTypes
+{
+    struct G<T> { T x = default; int n = default; };
+    struct T { i64 a = default; Q q = default; };
+    struct Q { int z = default; };
+}
+void qo2r2CountUniqueDtor() { qo2r2UniqueDtors++; }
+void qo2r2CountClassCtor() { qo2r2ClassCtors++; }
+void qo2r2CountClassDtor() { qo2r2ClassDtors++; }
+void qo2r2CountIfaceCtor() { qo2r2IfaceCtors++; }
+void qo2r2CountIfaceDtor() { qo2r2IfaceDtors++; }
+
 namespace QoAcceptRoot { int fn() { return 90; } int value = 80; enum E : int { item = 70 }; }
 namespace QoAcceptOuter
 {
@@ -2120,6 +2363,80 @@ namespace QoLateCollision { int fn() { return 90; } }
 bool testNamespace()
 {
     bool result = true;
+    Qo2Later.T qo2n = default;
+    qo2n.v = 31;
+    Qo2Later.pointer = &qo2n;
+    result &= Test("qualorder2_namespace_pointer_param", Qo2Use.pointerParam(&qo2n), 31);
+    result &= Test("qualorder2_namespace_pointer_return", Qo2Use.pointerReturn() == &qo2n, 1);
+    result &= Test("qualorder2_namespace_pointer_both", Qo2Use.pointerBoth(&qo2n)->v, 31);
+    result &= Test("qualorder2_namespace_byvalue_local", Qo2Use.localByValue(), 32);
+    result &= Test("qualorder2_namespace_byvalue_param", Qo2Use.byValueParam(qo2n), 31);
+    Qo2Later.T qo2nReturned = Qo2Use.byValueReturn(33);
+    result &= Test("qualorder2_namespace_byvalue_return", qo2nReturned.v, 33);
+    result &= Test("qualorder2_namespace_global_pointer", Qo2Use.globalPointer(), 31);
+    Qo2Later.stored.v = 34;
+    result &= Test("qualorder2_namespace_global_value", Qo2Use.globalValue(), 34);
+    Qo2Later.G<int> qo2g = default;
+    qo2g.value = 35;
+    result &= Test("qualorder2_namespace_generic_pointer", Qo2Use.genericPointer(&qo2g), 35);
+    Qo2Later.Child.T qo2child = default;
+    qo2child.v = 36;
+    result &= Test("qualorder2_nested_pointer", Qo2Use.nestedPointer(&qo2child), 36);
+    Qo2Later.Impl qo2impl = default;
+    qo2impl.v = 37;
+    Qo2Later.I qo2iface = qo2impl;
+    result &= Test("qualorder2_namespace_interface_signature", Qo2Use.interfacePass(qo2iface).get(), 37);
+    Qo2RootLater qo2root = default;
+    qo2root.v = 41;
+    result &= Test("qualorder2_root_pointer_param", Qo2RootUse.pointerParam(&qo2root), 41);
+    result &= Test("qualorder2_root_pointer_return", Qo2RootUse.pointerReturn() == nullptr, 1);
+    result &= Test("qualorder2_root_pointer_both", Qo2RootUse.pointerBoth(&qo2root)->v, 41);
+    result &= Test("qualorder2_root_byvalue_local", Qo2RootUse.localByValue(), 42);
+    result &= Test("qualorder2_root_byvalue_param", Qo2RootUse.byValueParam(qo2root), 41);
+    Qo2RootLater qo2rootReturned = Qo2RootUse.byValueReturn(43);
+    result &= Test("qualorder2_root_byvalue_return", qo2rootReturned.v, 43);
+    Qo2RootG<int> qo2rootg = default;
+    qo2rootg.value = 44;
+    result &= Test("qualorder2_root_generic_pointer", Qo2RootUse.genericPointer(&qo2rootg), 44);
+    Qo2RootImpl qo2rootimpl = default;
+    qo2rootimpl.v = 45;
+    Qo2RootI qo2rootiface = qo2rootimpl;
+    result &= Test("qualorder2_root_interface_signature", Qo2RootUse.interfacePass(qo2rootiface).get(), 45);
+    Qo2RootValue.v = 46;
+    result &= Test("qualorder2_root_global_byvalue", Qo2RootValue.v, 46);
+    result &= Test("qualorder2_r2_pointer_only_use", Qo2R2PointerUse.run(), 3);
+    result &= Test("qualorder2_r2_byvalue_sibling_field", Qo2R2ValueUse.run(), 7);
+    result &= Test("qualorder2_r2_mutual_sibling_fields", Qo2R2MutualUse.run(), 23);
+    result &= Test("qualorder2_r2_enum_sibling_field", Qo2R2SiblingUse.run(), 5);
+    result &= Test("qualorder2_r2_alias_sibling_field", Qo2R2AliasUse.run(), 23);
+    qo2r2UniqueDtors = 0;
+    result &= Test("qualorder2_r2_unique_sibling_field", Qo2R2UniqueUse.run(), 10);
+    result &= Test("qualorder2_r2_unique_sibling_dtor", qo2r2UniqueDtors, 1);
+    qo2r2ClassCtors = 0;
+    qo2r2ClassDtors = 0;
+    result &= Test("qualorder2_r2_class_sibling_field", Qo2R2ClassUse.run(), 16);
+    result &= Test("qualorder2_r2_class_ctor", qo2r2ClassCtors, 1);
+    result &= Test("qualorder2_r2_class_dtor", qo2r2ClassDtors, 1);
+    Qo2R2ClassTypes.K qo2r2ClassParam = default;
+    qo2r2ClassParam.w.v = 9;
+    result &= Test("qualorder2_r2_class_byvalue_param", Qo2R2ClassUse.byValue(qo2r2ClassParam), 9);
+    qo2r2IfaceCtors = 0;
+    qo2r2IfaceDtors = 0;
+    result &= Test("qualorder2_r2_interface_virtual_sibling_field", Qo2R2IfaceUse.run(), 25);
+    result &= Test("qualorder2_r2_interface_class_ctor", qo2r2IfaceCtors, 1);
+    result &= Test("qualorder2_r2_interface_class_dtor", qo2r2IfaceDtors, 1);
+    result &= Test("qualorder2_r2_nested_sibling_field", Qo2R2NestedUse.run(), 8);
+    result &= Test("qualorder2_r3_class_body_root_global", Qo2R3ClassUse.run(), 4);
+    Qo2R3PointerTypes.M qo2r3PointerM = default;
+    Qo2R3PointerTypes.N qo2r3PointerN = default;
+    qo2r3PointerM.v = 5;
+    qo2r3PointerN.w = 6;
+    qo2r3PointerM.n = &qo2r3PointerN;
+    qo2r3PointerN.m = &qo2r3PointerM;
+    result &= Test("qualorder2_r3_pointer_field_chain",
+        (Qo2R3PointerUse.two(&qo2r3PointerM) == 6
+            && Qo2R3PointerUse.three(&qo2r3PointerM) == 5), 1);
+    result &= Test("qualorder2_r3_generic_byvalue_argument", Qo2R3GenericUse.run(), 24);
     result &= Test("qualorder_accept_inner_function", QoAcceptOuter.call(), 10);
     result &= Test("qualorder_accept_inner_global", QoAcceptOuter.globalValue(), 20);
     result &= Test("qualorder_accept_inner_enum", QoAcceptOuter.enumValue(), 30);

@@ -1760,6 +1760,54 @@ bool LLVMBackend::JoinIsAllStringLiterals(const llvm::Value* value, int depth) c
     return false;
 }
 
+bool LLVMBackend::JoinIsCharPointer(const llvm::Value* value) const
+{
+        if (value == nullptr || (!llvm::isa<llvm::SelectInst>(value)
+            && !llvm::isa<llvm::PHINode>(value)))
+            return false;
+        const auto arms = JoinArmValues(value);
+        if (arms.empty()) return false;
+        const std::string joinedElementType = ResolvePointerElementTypeName(
+            const_cast<llvm::Value*>(value));
+        auto armElementTypeName = [&](llvm::Value* arm) {
+            std::string name = ResolvePointerElementTypeName(arm);
+            if (!name.empty()) return name;
+            const llvm::Value* storage = arm;
+            if (const auto* gep = llvm::dyn_cast_or_null<llvm::GEPOperator>(storage))
+                storage = gep->getPointerOperand();
+            const TypeAndValue* declared = FindDeclaredTypeAndValueForStorage(storage);
+            return declared != nullptr && declared->ConstArraySize != 0
+                ? declared->TypeName : std::string();
+        };
+        bool sawCharacterValue = false;
+        for (const llvm::Value* arm : arms)
+        {
+            const auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arm);
+            if (constant != nullptr && constant->isNullValue()) continue;
+            if (constant != nullptr
+                && IsStringLiteralConstant(const_cast<llvm::Constant*>(constant)))
+            {
+                sawCharacterValue = true;
+                continue;
+            }
+            const std::string armElementType = arm == nullptr || !arm->getType()->isPointerTy()
+                ? std::string() : armElementTypeName(const_cast<llvm::Value*>(arm));
+            const std::string& knownElementType = armElementType.empty()
+                ? joinedElementType : armElementType;
+            if (arm != nullptr && arm->getType()->isPointerTy()
+                && knownElementType == "char")
+            {
+                sawCharacterValue = true;
+                continue;
+            }
+            if (arm == nullptr || !arm->getType()->isPointerTy()
+                || knownElementType != "char")
+                return false;
+            sawCharacterValue = true;
+        }
+        return sawCharacterValue;
+}
+
 bool LLVMBackend::IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, llvm::Value* right)
 {
     if (right == nullptr || !destTV.Pointer) return false;

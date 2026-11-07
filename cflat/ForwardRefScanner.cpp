@@ -232,6 +232,10 @@ std::string ForwardRefScanner::ResolveGenericTemplateBaseAtUse(
             if (refusal != nullptr) *refusal = NonGenericRefusal::EnclosingNamespace;
             return {};
         }
+        const std::string qualifiedSpelling = compiler->ResolveQualifiedName(spelledBase);
+        if (!compiler->HasCxxAliasTemplate(qualifiedSpelling)
+            && compiler->IsGenericBaseAlias(qualifiedSpelling))
+            return compiler->ResolveGenericBaseAlias(qualifiedSpelling);
         if (compiler->HasCxxAliasTemplate(lexicalName)) return spelledBase;
         if (compiler->IsGenericBaseAlias(lexicalName))
             return compiler->ResolveGenericBaseAlias(lexicalName);
@@ -276,6 +280,8 @@ std::string ForwardRefScanner::ResolveGenericTemplateSpellingAtUse(
             compiler->ResolveGenericAliasSpelling(base, args, report);
             base = ResolveGenericTemplateBaseAtUse(compiler, base, useSite, lookupName, refusal);
         }
+        else if (compiler->HasCxxAliasTemplate(base))
+            compiler->ResolveGenericAliasSpelling(base, args, report);
         else if (base == "unique" && compiler->IsGenericBaseAlias(spelledBase))
             compiler->ResolveGenericAliasSpelling(base, args, report);
         return base;
@@ -654,6 +660,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrReturnAliasSpelling = fit->FuncPtrReturnAliasSpelling;
+                    declType.FuncPtrReturnHasStrippedInnerDimensions =
+                        fit->FuncPtrReturnHasStrippedInnerDimensions;
                     declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrNoPrototype = fit->FuncPtrNoPrototype;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
@@ -1050,6 +1058,30 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         }
         auto* paramTypeList = func->parameterTypeList();
         auto params = ParseParameterTypeList(paramTypeList);
+        auto incompleteAggregate = [&](const LLVMBackend::TypeAndValue& type, bool pointerLike) {
+            if (pointerLike) return false;
+            std::string name = compiler->ResolveTypeAlias(type.TypeName);
+            if (PeelAliasPointerStars(name) > 0) return false;
+            auto definitionOrder = forwardDeclaredStructTypeSourceOrder_.find(name);
+            if (definitionOrder == forwardDeclaredStructTypeSourceOrder_.end()
+                || definitionOrder->second <= func->getStart()->getStartIndex())
+                return false;
+            auto found = compiler->dataStructures.find(name);
+            return found != compiler->dataStructures.end() && found->second.StructType != nullptr
+                && found->second.StructType->isOpaque();
+        };
+        const bool incompleteReturn = incompleteAggregate(returnType, returnType.Pointer
+            || returnType.PointerDepth > 0 || returnType.IsArrayView);
+        const bool incompleteParameter = std::any_of(params.begin(), params.end(), [&](const auto& param) {
+            return incompleteAggregate(param, param.Pointer || param.PointerDepth > 0
+                || param.IsArrayView || param.IsAlias || param.IsRvalueRef || param.CxxConstRef());
+        });
+        if (incompleteReturn || incompleteParameter)
+        {
+            deferredIncompleteFunctionDefinitions_.push_back({
+                func, structName, namespaceName, compiler->GetCurrentNamespace(), extraRequiredLocks });
+            return;
+        }
         std::string cppBaseType;
         const bool borrowedCppOverride = !structName.empty()
             && compiler->IsCppStructName(structName)
@@ -1103,12 +1135,12 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
 
         const std::string linkageName = returnType.external && !namespaceName.empty()
             ? rawFuncName : std::string();
+        const std::string uniqueName = compiler->ComputeMangledName(name, returnType, allParams, varargs);
+        functionSourceOrder_[uniqueName] = func->getStart()->getStartIndex();
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs,
                                             returnsOwned, isMethod, returnType.CallConv, linkageName);
         if (!returnType.external && func->compoundStatement() != nullptr)
         {
-            const std::string uniqueName = compiler->ComputeMangledName(
-                name, returnType, allParams, varargs);
             std::unordered_map<std::string, size_t> viewParams;
             for (size_t i = 0; i < allParams.size(); ++i)
                 if (allParams[i].IsArrayView && !allParams[i].VariableName.empty())
@@ -1358,6 +1390,39 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
             compiler->CreateFunctionDeclaration(name, returnType, wrapperParams, false, false);
         }
     }
+
+void ForwardRefScanner::FinalizeDeferredFunctionDefinitions()
+{
+        auto pending = std::move(deferredIncompleteFunctionDefinitions_);
+        deferredIncompleteFunctionDefinitions_.clear();
+        for (auto& deferred : pending)
+        {
+            LLVMBackend::NamespaceScope scope(compilerLLVM, deferred.CurrentNamespace);
+            ScanFunctionDefinition(deferred.Function, deferred.StructName, deferred.NamespaceName,
+                deferred.RequiredLocks);
+        }
+        for (auto& [name, overloads] : compilerLLVM->functionTable)
+        {
+            (void)name;
+            if (overloads.size() < 2 || std::any_of(overloads.begin(), overloads.end(), [&](const auto& symbol) {
+                    return functionSourceOrder_.count(symbol.UniqueName) == 0;
+                }))
+                continue;
+            std::stable_sort(overloads.begin(), overloads.end(), [&](const auto& left, const auto& right) {
+                return functionSourceOrder_.at(left.UniqueName) < functionSourceOrder_.at(right.UniqueName);
+            });
+        }
+}
+
+std::vector<CFlatParser::FunctionDefinitionContext*>
+ForwardRefScanner::DeferredFunctionDefinitionContexts() const
+{
+        std::vector<CFlatParser::FunctionDefinitionContext*> functions;
+        functions.reserve(deferredIncompleteFunctionDefinitions_.size());
+        for (const auto& deferred : deferredIncompleteFunctionDefinitions_)
+            functions.push_back(deferred.Function);
+        return functions;
+}
 
 void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                                  const std::string& namespaceName) {
@@ -3396,6 +3461,12 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
         std::string result = CanonicalTypeSpecifierText(ts, suffix, false, &error);
         if (HasPrimitiveTypeError(error))
             compilerLLVM->LogError(LocalizePrimitiveTypeError(compilerLLVM, error));
+        std::string defaultedAliasType;
+        std::string defaultedAliasError;
+        if (compilerLLVM->TryResolveDefaultedCxxGenericBaseAlias(
+                result, defaultedAliasType, defaultedAliasError))
+            return defaultedAliasType;
+        if (!defaultedAliasError.empty()) compilerLLVM->LogError(defaultedAliasError);
         if (ts->qualifiedGenericIdentifier() != nullptr
             && ts->qualifiedGenericIdentifier()->genericTypeParameters() == nullptr
             && !compilerLLVM->IsKnownTypeName(result))
@@ -4451,7 +4522,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             if (!contextual.empty()) target = contextual;
         }
         target = compiler->ResolveQualifiedName(target);
-        target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
+        if (!compiler->HasCxxAliasTemplate(target))
+            target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
         std::string targetBase = target;
         std::vector<uint64_t> targetArrayDims;
         PeelAliasArrayDims(targetBase, targetArrayDims);
@@ -4466,7 +4538,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         if (suffix.empty() && (compiler->IsWinrtGenericBase(targetBase)
                                || compiler->IsGenericTemplateKey(targetBase)
                                || compiler->gts.scannedGenericStructNamesUncertain.count(targetBase) != 0
-                               || compiler->HasCxxClassTemplate(targetBase)))
+                               || compiler->HasCxxClassTemplate(targetBase)
+                               || compiler->HasCxxAliasTemplate(targetBase)))
         {
             compiler->RegisterGenericBaseAlias(alias, targetBase);
             return;
@@ -4876,6 +4949,86 @@ void ForwardRefScanner::ScanAnnotationDefinition(CFlatParser::AnnotationDefiniti
         compiler->annotationRegistry[name] = fields;
     }
 
+void ForwardRefScanner::PreRegisterAggregateTypeShells(
+    CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName)
+{
+        std::function<void(CFlatParser::StructDefinitionContext*, const std::string&)> visitStruct;
+        std::function<void(CFlatParser::ClassDefinitionContext*, const std::string&)> visitClass;
+        std::function<void(CFlatParser::ExternalDeclarationContext*, const std::string&)> visitExternal;
+        std::function<void(CFlatParser::IfConstDeclarationContext*, const std::string&)> visitIfConst;
+        visitStruct = [&](CFlatParser::StructDefinitionContext* str, const std::string& ns) {
+            std::string name = QualifyName(ns, str->directDeclarator()->getText());
+            if (str->genericTypeParameters() == nullptr)
+            {
+                forwardDeclaredStructTypeSourceOrder_[name] = str->getStart()->getStartIndex();
+                compilerLLVM->CreateStructType(name, {});
+            }
+            for (auto* nested : MemberStructDefinitions(str)) visitStruct(nested, name);
+            for (auto* nested : MemberClassDefinitions(str)) visitClass(nested, name);
+        };
+        visitClass = [&](CFlatParser::ClassDefinitionContext* cls, const std::string& ns) {
+            std::string name = QualifyName(ns, cls->directDeclarator()->getText());
+            if (cls->genericTypeParameters() == nullptr)
+            {
+                forwardDeclaredStructTypeSourceOrder_[name] = cls->getStart()->getStartIndex();
+                compilerLLVM->CreateStructType(name, {});
+            }
+            for (auto* nested : MemberStructDefinitions(cls)) visitStruct(nested, name);
+            for (auto* nested : MemberClassDefinitions(cls)) visitClass(nested, name);
+        };
+        visitIfConst = [&](CFlatParser::IfConstDeclarationContext* ifConst, const std::string& ns) {
+            int decision = ScannerDecideIfConst(ifConst->expression());
+            if (auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ifConst))
+                decision = *recorded;
+            auto blocks = ifConst->ifConstBlock();
+            if (blocks.empty() || decision < 0) return;
+            if (decision == 0 && ifConst->ifConstDeclaration() != nullptr)
+            {
+                visitIfConst(ifConst->ifConstDeclaration(), ns);
+                return;
+            }
+            const size_t index = decision != 0 ? 0 : 1;
+            if (index < blocks.size())
+                for (auto* decl : blocks[index]->externalDeclaration()) visitExternal(decl, ns);
+        };
+        visitExternal = [&](CFlatParser::ExternalDeclarationContext* ext, const std::string& ns) {
+            if (auto* nestedNs = ext->namespaceDefinition())
+            {
+                const std::string nested = NestedNamespaceName(ns, nestedNs);
+                for (size_t pos = 0; (pos = nested.find('.', pos)) != std::string::npos; ++pos)
+                    compilerLLVM->RegisterNamespace(nested.substr(0, pos));
+                compilerLLVM->RegisterNamespace(nested);
+                LLVMBackend::NamespaceScope scope(compilerLLVM, nested);
+                for (auto* decl : nestedNs->externalDeclaration()) visitExternal(decl, nested);
+                return;
+            }
+            if (auto* str = ext->structDefinition())
+            {
+                visitStruct(str, ns);
+                return;
+            }
+            if (auto* cls = ext->classDefinition())
+            {
+                visitClass(cls, ns);
+                return;
+            }
+            if (auto* iface = ext->interfaceDefinition())
+            {
+                auto* gid = iface->genericIdentifier();
+                if (gid == nullptr || gid->Identifier() == nullptr || gid->genericTypeParameters() != nullptr)
+                    return;
+                const std::string name = QualifyName(ns, gid->Identifier()->getText());
+                // The real definition pass fills methods, fields, and inheritance after all
+                // qualified interface names are visible.
+                compilerLLVM->CreateInterfaceDefinition(name, {}, {}, {});
+                return;
+            }
+            if (auto* ifConst = ext->ifConstDeclaration())
+                visitIfConst(ifConst, ns);
+        };
+        visitExternal(ctx, namespaceName);
+}
+
 void ForwardRefScanner::PreRegisterEnums(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName)
 {
         if (auto* ns = ctx->namespaceDefinition())
@@ -4901,7 +5054,7 @@ void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationConte
             return;
         }
         auto* decl = ctx->declaration();
-        if (namespaceName.empty() || decl == nullptr || decl->declarationSpecifiers() == nullptr
+        if (decl == nullptr || decl->declarationSpecifiers() == nullptr
             || decl->initDeclaratorList() == nullptr)
             return;
         auto* specs = decl->declarationSpecifiers();
@@ -4949,12 +5102,15 @@ void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationConte
                     continue;
                 std::vector<LLVMBackend::TypeAndValue> arguments(parsed.begin(), parsed.end());
                 const std::string bareName = getDirectDeclName(direct);
-                const std::string name = namespaceName + "." + bareName;
+                const std::string name = QualifyName(namespaceName, bareName);
                 const std::string linkage = type.external ? bareName : std::string();
                 compilerLLVM->CreateFunctionDeclaration(name, type, arguments, type.external,
                     params != nullptr && params->Ellipsis() != nullptr, false, false, type.CallConv, linkage);
                 continue;
             }
+            // Root globals remain source-ordered; root function declarations can safely be
+            // published now so a later aggregate's generated bodies see their prototypes.
+            if (namespaceName.empty()) continue;
             auto itemType = type;
             if (direct->assignmentExpression() != nullptr)
             {
@@ -4962,7 +5118,7 @@ void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationConte
                 if (!itemType.Pointer || !size || *size <= 0) continue;
                 itemType.ConstArraySize = static_cast<uint64_t>(*size);
             }
-            const std::string name = namespaceName + "." + getDirectDeclName(direct);
+            const std::string name = QualifyName(namespaceName, getDirectDeclName(direct));
             if (compilerLLVM->GetGlobalVariableNV(name).Storage != nullptr)
                 continue;
             itemType.VariableName = name;

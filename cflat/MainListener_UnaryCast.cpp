@@ -1431,14 +1431,27 @@ LLVMBackend::NamedVariable MainListener::TrySizeofPostfixAsType(CFlatParser::Una
             // wins over a same-named type, as in C, where an ordinary identifier in
             // scope hides a type name. Adopting its TypeAndValue here lets the normal
             // type path below compute the (padded) size or alignment.
+            bool visibleVariableType = false;
             if (!typeValue.Pointer
                 && postfixText.find('.') == std::string::npos
                 && postfixText.find('<') == std::string::npos
                 && NamesVisibleVariable(compiler, postfixText))
             {
                 typeValue = VisibleVariableType(compiler, postfixText);
+                visibleVariableType = true;
                 if (typeValue.TypeName == "auto" && rawArrayDims.empty())
                     return SizeOrAlignOfAutoVariable(postfixText, prefixSizeof);
+            }
+
+            if (!visibleVariableType && !knownGenericType && !typeValue.Pointer)
+            {
+                std::string resolvedType;
+                std::string error;
+                if (compiler->TryResolveDefaultedCxxGenericBaseAlias(
+                        typeValue.TypeName, resolvedType, error))
+                    typeValue.TypeName = std::move(resolvedType);
+                else if (!error.empty())
+                    LogErrorContext(ctx, error);
             }
 
             // The grammar can interpret expression-shaped postfix text as a type name.
@@ -3191,8 +3204,17 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                                 resolvesAsType = true;
                             }
                             else
+                            {
+                                std::string defaultedAliasType;
+                                std::string defaultedAliasError;
+                                resolvesAsType = compiler->TryResolveDefaultedCxxGenericBaseAlias(
+                                    candidate, defaultedAliasType, defaultedAliasError);
+                                if (!defaultedAliasError.empty())
+                                    LogErrorContext(ctx, defaultedAliasError);
+                                if (!resolvesAsType)
                                 resolvesAsType = compiler->IsKnownTypeName(candidate)
                                     || compiler->IsTypeArgTypeKey(candidate);
+                            }
                             const size_t scope = candidate.rfind('.');
                             if (!resolvesAsType && scope != std::string::npos
                                 && compiler->IsCxxNamespacePath(candidate.substr(0, scope)))

@@ -2827,6 +2827,7 @@ T208Fn t208LambdaResultResourceMaker()
     return maker();
 }
 struct BridgeFnHolder { std.function<int(int)> fn; };
+struct BridgeLambdaField { Lambda<int(int)> fn; };
 // Capturing closures returned as std.function: a literal (its write to `n` persists per call)
 // and a named Lambda<> (the C++ object copies it; the local is destroyed at return).
 std.function<int(int)> bridge_make_adder(int n)
@@ -5355,6 +5356,13 @@ extern int main(int argc, char** argv)
     // Deduced F: `F&&` borrows the caller's closure (its writes stay), by-value `F` copies it.
     if (cppi.apply_n(capH, 3) != 42)                return 647;
     if (cppi.apply_copy(capH, 5) != 40)             return 648;
+    int capAutoBase = 5;
+    Lambda<int(int)> capTyped = (int x) => x + capAutoBase;
+    auto capAutoCopy = capTyped;
+    if (cppi.apply_n(capAutoCopy, 2) != 11)         return 659;
+    int capFieldBase = 3;
+    BridgeLambdaField capField = { fn = (int x) => x + capFieldBase };
+    if (cppi.apply_n(capField.fn, 4) != 18)          return 660;
     // An `auto` closure takes the std.function's signature (its invoker must match it).
     int capHits = 0;
     int* capHp = &capHits;

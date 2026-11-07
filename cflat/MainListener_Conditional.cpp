@@ -1149,8 +1149,9 @@ static bool IsNestedConditionalJoinArm(antlr4::ParserRuleContext* ctx)
 
 bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
-                              const LLVMBackend::TypedValue& trueShape,
-                              const LLVMBackend::TypedValue& falseShape,
+                              LLVMBackend::TypedValue& trueShape,
+                              LLVMBackend::TypedValue& falseShape,
+                              llvm::Value*& trueStorage, llvm::Value*& falseStorage,
                               const std::function<void()>& atTrue,
                               const std::function<void()>& atFalse,
                               size_t trueOccurrence, size_t falseOccurrence,
@@ -1283,6 +1284,115 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
         else if (inCxxCallArgument_ && falseNullptr && trueValue->getType()->isPointerTy())
             falseValue = llvm::ConstantPointerNull::get(
                 llvm::cast<llvm::PointerType>(trueValue->getType()));
+
+        // C++ lvalue conditionals between a derived object and its base stay aliases. Validate the
+        // unique base conversion with clang, then join the values and addresses as the base type.
+        if (ctx->Question() != nullptr && trueValue->getType()->isStructTy()
+            && falseValue->getType()->isStructTy() && trueStorage != nullptr
+            && falseStorage != nullptr && !trueShape.isRvalue && !falseShape.isRvalue
+            && !trueShape.isExplicitMove && !falseShape.isExplicitMove)
+        {
+            auto objectType = [&](const LLVMBackend::TypedValue& shape, llvm::Value* value) {
+                LLVMBackend::TypeAndValue type = shape.hasSourceType
+                    ? shape.sourceType : InferTernaryArmType(shape);
+                if (type.TypeName.empty()) type.TypeName = shape.sourceTypeName;
+                auto* record = llvm::dyn_cast<llvm::StructType>(value->getType());
+                if (type.TypeName.empty() && record != nullptr && record->hasName())
+                    type.TypeName = record->getName().str();
+                const bool cxxReference = type.IsCxxRef()
+                    || (type.Pointer && (type.IsAlias || type.IsRvalueRef)
+                        && !type.IsCxxRefToPointer);
+                if (type.Pointer && !cxxReference) return LLVMBackend::TypeAndValue{};
+                const bool isConst = CxxTernaryArmConst(type);
+                type.Pointer = false;
+                type.PointerDepth = 0;
+                type.ElemPointer = false;
+                type.IsAlias = false;
+                type.IsRvalueRef = false;
+                type.IsCxxRefToPointer = false;
+                type.CxxRefLevel = -1;
+                type.IsCxxConstValueReturn = false;
+                type.ConstMask = isConst ? 1u : 0u;
+                return type;
+            };
+            auto trueClassType = objectType(trueShape, trueValue);
+            auto falseClassType = objectType(falseShape, falseValue);
+            const std::string trueClass = compiler->ResolveTypeAlias(trueClassType.TypeName);
+            const std::string falseClass = compiler->ResolveTypeAlias(falseClassType.TypeName);
+            if (!trueClass.empty() && !falseClass.empty() && trueClass != falseClass
+                && compiler->IsCxxRecord(trueClass) && compiler->IsCxxRecord(falseClass))
+            {
+                const size_t trueToFalse = compiler->CxxBaseSubobjectCount(trueClass, falseClass);
+                const size_t falseToTrue = compiler->CxxBaseSubobjectCount(falseClass, trueClass);
+                const bool trueIsDerived = trueToFalse == 1 && falseToTrue == 0;
+                const bool falseIsDerived = falseToTrue == 1 && trueToFalse == 0;
+                if (trueIsDerived || falseIsDerived)
+                {
+                    trueClassType.TypeName = trueClass;
+                    falseClassType.TypeName = falseClass;
+                    const auto verdict = compiler->ClassifyCxxTernary(trueClassType,
+                        LLVMBackend::CxxArmCategory::Lvalue, falseClassType,
+                        LLVMBackend::CxxArmCategory::Lvalue);
+                    using CxxKind = LLVMBackend::CxxTernaryVerdict::Kind;
+                    const std::string& baseClass = trueIsDerived ? falseClass : trueClass;
+                    if (verdict.kind == CxxKind::LvalueRef
+                        && (verdict.resultIsTrue ? trueClass : falseClass) == baseClass)
+                    {
+                        auto lowerDerivedArm = [&](bool isTrue) {
+                            auto& shape = isTrue ? trueShape : falseShape;
+                            llvm::Value*& value = isTrue ? trueValue : falseValue;
+                            llvm::Value*& storage = isTrue ? trueStorage : falseStorage;
+                            const auto& sourceType = isTrue ? trueClassType : falseClassType;
+                            const std::string& derivedClass = isTrue ? trueClass : falseClass;
+                            (isTrue ? atTrue : atFalse)();
+                            LLVMBackend::NamedVariable source;
+                            if (const auto* named = compiler->FindVariableByStorage(storage))
+                                source = *named;
+                            source.Primary = value;
+                            source.Storage = storage;
+                            source.BaseType = value->getType();
+                            source.TypeAndValue = sourceType;
+                            source.TypeAndValue.TypeName = derivedClass;
+                            source.TypeAndValue.IsAlias = source.TypeAndValue.IsAlias || shape.isAlias;
+                            source.IsAliasBorrow = shape.isAlias;
+                            source.IsRvalue = false;
+                            llvm::Value* adjusted = storage;
+                            if (!compiler->LowerCxxReferenceToBase(
+                                    derivedClass, baseClass, source, adjusted))
+                                return false;
+                            storage = adjusted;
+                            shape.storage = adjusted;
+                            shape.receiverStorage = adjusted;
+                            value = compiler->CreateLoad(compiler->GetType(
+                                LLVMBackend::TypeAndValue{ .TypeName = baseClass }), adjusted);
+                            shape.value = value;
+                            return true;
+                        };
+                        if (!(trueIsDerived ? lowerDerivedArm(true) : lowerDerivedArm(false)))
+                            return false;
+
+                        LLVMBackend::TypeAndValue resultType = trueIsDerived
+                            ? falseClassType : trueClassType;
+                        resultType.TypeName = baseClass;
+                        resultType.ConstMask = (CxxTernaryArmConst(trueClassType)
+                            || CxxTernaryArmConst(falseClassType)) ? 1u : 0u;
+                        auto adoptBaseType = [&](LLVMBackend::TypedValue& shape,
+                                                 llvm::Value* value, llvm::Value* storage) {
+                            shape.value = value;
+                            shape.storage = storage;
+                            shape.receiverStorage = storage;
+                            shape.sourceType = resultType;
+                            shape.sourceTypeName = baseClass;
+                            shape.hasSourceType = true;
+                            shape.isRvalue = false;
+                            shape.cxxObjectCv |= CxxTernaryArmConst(resultType) ? 1 : 0;
+                        };
+                        adoptBaseType(trueShape, trueValue, trueStorage);
+                        adoptBaseType(falseShape, falseValue, falseStorage);
+                    }
+                }
+            }
+        }
 
         if (trueValue->getType() == falseValue->getType())
             return true;
@@ -1609,6 +1719,14 @@ static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::Type
                                         const LLVMBackend::TypedValue& trueShape,
                                         const LLVMBackend::TypedValue& falseShape)
 {
+    auto carryLenders = [&](const auto& lenders) {
+        for (const auto& lender : lenders)
+            if (std::find(result.cxxClosureLenders.begin(), result.cxxClosureLenders.end(), lender)
+                == result.cxxClosureLenders.end())
+                result.cxxClosureLenders.push_back(lender);
+    };
+    carryLenders(trueShape.cxxClosureLenders);
+    carryLenders(falseShape.cxxClosureLenders);
     if (result.value == nullptr || result.value->getType() != compiler->GetClosureFatPtrType()) return;
     auto isClosure = [](const LLVMBackend::TypedValue& shape) {
         return shape.hasSourceType && shape.sourceType.TypeName == "__closure_fat_ptr"
@@ -1621,6 +1739,8 @@ static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::Type
     type.TypeName = "__closure_fat_ptr";
     type.IsFunctionPointer = true;
     type.FuncPtrReturnTypeName = t.FuncPtrReturnTypeName;
+    type.FuncPtrReturnAliasSpelling = t.FuncPtrReturnAliasSpelling;
+    type.FuncPtrReturnHasStrippedInnerDimensions = t.FuncPtrReturnHasStrippedInnerDimensions;
     type.FuncPtrReturnPointer = t.FuncPtrReturnPointer;
     type.FuncPtrReturnOwned = t.FuncPtrReturnOwned;
     type.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
@@ -3597,6 +3717,65 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 LLVMBackend::TypeAndValue{ .TypeName = resultName });
             if (resultObject == nullptr || !resultObject->isSized())
                 return CxxValueJoinResult::NotApplicable;
+            if (callArgument && outerExpected.IsCxxRef()
+                && verdict.kind == Kind::LvalueRef
+                && trueCategory == CxxArmCategory::Lvalue
+                && falseCategory == CxxArmCategory::Lvalue)
+            {
+                auto lowerLvalueAddress = [&](bool trueArm) -> llvm::Value* {
+                    const auto& armType = trueArm ? trueType : falseType;
+                    llvm::Value*& address = trueArm ? trueStorage : falseStorage;
+                    const auto& armValue = trueArm ? trueValue : falseValue;
+                    if (address == nullptr || armValue == nullptr) return nullptr;
+                    if (compiler->ResolveTypeAlias(armType.TypeName) != resultName)
+                    {
+                        LLVMBackend::NamedVariable source;
+                        source.Primary = armValue;
+                        source.Storage = address;
+                        source.BaseType = armValue->getType();
+                        source.TypeAndValue = armType;
+                        source.IsRvalue = false;
+                        if (!compiler->LowerCxxReferenceToBase(armType.TypeName, resultName,
+                                                               source, address))
+                            return nullptr;
+                    }
+                    return address;
+                };
+                if (trueEnd == nullptr || falseEnd == nullptr)
+                    return CxxValueJoinResult::NotApplicable;
+                std::array<llvm::Value*, 2> addresses{};
+                std::array<llvm::BasicBlock*, 2> incomingBlocks{};
+                for (bool trueArm : { true, false })
+                {
+                    llvm::BasicBlock* endBlock = trueArm ? trueEnd : falseEnd;
+                    compiler->builder->SetInsertPoint(endBlock);
+                    llvm::Value* address = lowerLvalueAddress(trueArm);
+                    if (address == nullptr) return CxxValueJoinResult::NotApplicable;
+                    const size_t index = trueArm ? 0 : 1;
+                    addresses[index] = address;
+                    incomingBlocks[index] = compiler->builder->GetInsertBlock();
+                }
+                compiler->SwitchToBlock(resumeBlock);
+                auto* resultAddress = compiler->builder->CreatePHI(
+                    cflat_llvm::PointerTo(resultObject), 2, "cxx.ternary.lvalue");
+                resultAddress->addIncoming(addresses[0], incomingBlocks[0]);
+                resultAddress->addIncoming(addresses[1], incomingBlocks[1]);
+                for (llvm::BasicBlock* incoming : incomingBlocks)
+                {
+                    compiler->builder->SetInsertPoint(incoming);
+                    if (cflat_llvm::GetTerminatorOrNull(incoming) == nullptr)
+                        compiler->CreateJump(resumeBlock);
+                }
+                compiler->SwitchToBlock(resumeBlock);
+                auto* joined = compiler->CreateLoad(resultObject, resultAddress);
+                joined->setName("cxx.ternary.lvalue.value");
+                cxxCallArgumentValue = LLVMBackend::TypedValue{ joined, false };
+                cxxCallArgumentValue.storage = resultAddress;
+                cxxCallArgumentValue.isRvalue = false;
+                cxxCallArgumentValue.sourceType.TypeName = resultName;
+                cxxCallArgumentValue.hasSourceType = true;
+                return CxxValueJoinResult::CallArgumentBuilt;
+            }
             std::string callReturnSpelling;
             llvm::Type* callReturnType = nullptr;
             if (callThroughSink)
@@ -4202,7 +4381,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         activeArmEnd = &falseEnd;
                     };
                     const bool validTypes = UnifyTernaryArmTypes(ctx,
-                        trueValue, falseValue, trueShape, falseShape, atTrue, atFalse,
+                        trueValue, falseValue, trueShape, falseShape,
+                        trueStorage, falseStorage, atTrue, atFalse,
                         trueOcc, falseOcc, trueUnsigned, falseUnsigned,
                         TernaryInterfaceDestination(*compiler, outerExpected),
                         !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0));
@@ -4570,7 +4750,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         const bool liftedArm = LiftTernaryFunctionArmToClosure(ctx, trueValue, falseValue, trueShape,
                                         falseShape, trueStorage, falseStorage, atTrue, atFalse);
         if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, trueShape, falseShape,
-                atTrue, atFalse, trueOcc, falseOcc,
+                trueStorage, falseStorage, atTrue, atFalse, trueOcc, falseOcc,
                 trueUnsigned, falseUnsigned, TernaryInterfaceDestination(*compiler, outerExpected),
                 !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0)))
         {
@@ -6425,8 +6605,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                                          trueShape, falseShape);
 
                 auto here = []() {};   // eager form: both arms already live in the current block
-                llvm::Value* eagerTrueStorage = nullptr;
-                llvm::Value* eagerFalseStorage = nullptr;
+                llvm::Value* eagerTrueStorage = trueShape.storage;
+                llvm::Value* eagerFalseStorage = falseShape.storage;
                 const bool eagerLifted = LiftTernaryFunctionArmToClosure(ctx, trueValue, falseValue,
                     trueShape, falseShape, eagerTrueStorage, eagerFalseStorage, here, here);
                 bool joinUnsigned = TernaryJoinIsUnsigned(
@@ -6434,7 +6614,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         ? trueValue->getType()->getIntegerBitWidth() : 0,
                     falseUnsigned, falseValue != nullptr && falseValue->getType()->isIntegerTy()
                         ? falseValue->getType()->getIntegerBitWidth() : 0);
-                if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, trueShape, falseShape, here, here,
+                if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, trueShape, falseShape,
+                        eagerTrueStorage, eagerFalseStorage, here, here,
                         compiler->CurrentCastOccurrence(), compiler->CurrentCastOccurrence(),
                         trueUnsigned, falseUnsigned,
                         TernaryInterfaceDestination(*compiler, outerExpected),

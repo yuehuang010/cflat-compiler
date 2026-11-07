@@ -160,7 +160,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 // its bare-name lowering picked first.
                 NamedVariable& named = loweredArgVars[i];
                 if (!named.CallerName.empty() && named.Storage == nullptr
-                    && FindVariableStorage(named.CallerName).Storage == nullptr)
+                    && IsNamedFunctionValue(named))
                     if (const FunctionSymbol* sym =
                             NamedFunctionOverloadForFuncPtr(named.CallerName, st.params[i + 1]);
                         sym != nullptr && sym->Function != nullptr)
@@ -983,6 +983,11 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             // Opaque LLVM pointers compare equal regardless of indirection. Apply the same
             // proven depth rule used by call overload scoring before any pointer fast path.
             if (got.PointerDepthRefuses(want)) return false;
+            // A function pointer converts to bool, but never to an integer constructor parameter.
+            if ((got.IsFunctionPointer || got.TypeName == "__c_fn_ptr"
+                    || !got.FuncPtrReturnTypeName.empty())
+                && !want.Pointer && want.TypeName != "bool" && want.IsInteger() != -1)
+                return false;
             if (got.IsScopedEnum)
                 return IsScopedEnumMatch(got, want);
             // C++ function-pointer references use an indirect parameter slot, while a CFlat
@@ -1094,6 +1099,9 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
         };
 
         bool rejectedIntegerFunctionPointer = false;
+        bool rejectedFunctionPointerToInteger = false;
+        size_t rejectedFunctionPointerIntegerParameter = 0;
+        std::string rejectedFunctionPointerIntegerType;
 
         /*
          * An opaque `void&` parameter (its class was not requested when the constructor was
@@ -1330,6 +1338,19 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     }
                 }
                 const bool rvalue = argumentIsRvalue(i);
+                const bool functionPointerValue = got.IsFunctionPointer
+                    || got.TypeName == "__c_fn_ptr" || !got.FuncPtrReturnTypeName.empty();
+                const bool functionPointerToInteger = functionPointerValue && !want.Pointer
+                    && want.TypeName != "bool" && want.IsInteger() != -1;
+                if (functionPointerToInteger)
+                {
+                    rejectedFunctionPointerToInteger = true;
+                    if (rejectedFunctionPointerIntegerParameter == 0)
+                    {
+                        rejectedFunctionPointerIntegerParameter = i + 1;
+                        rejectedFunctionPointerIntegerType = want.TypeName;
+                    }
+                }
                 const bool constClassArgument = argVars != nullptr && i < argVars->size()
                     && !got.Pointer && CxxConstReceiverKind((*argVars)[i]) != 0;
                 const bool mutableClassReference = want.Pointer
@@ -1492,6 +1513,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 // rule would not look at: it binds a C++ function pointer only when it matches.
                 if (want.IsFunctionPointer && argVars != nullptr && i < argVars->size()
                     && !(*argVars)[i].CallerName.empty() && (*argVars)[i].Storage == nullptr
+                    && IsNamedFunctionValue((*argVars)[i])
                     && !(*argVars)[i].TypeAndValue.Pointer
                     && !(*argVars)[i].TypeAndValue.FuncPtrReturnTypeName.empty()
                     && FuncPtrSignaturesProvablyDiffer(want, (*argVars)[i].TypeAndValue))
@@ -1502,7 +1524,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 if (argVars != nullptr && i < argVars->size()
                     && !(*argVars)[i].CallerName.empty()
                     && (*argVars)[i].Storage == nullptr && want.IsFunctionPointer
-                    && functionTable.count(ResolveQualifiedName((*argVars)[i].CallerName)) != 0)
+                    && IsNamedFunctionValue((*argVars)[i]))
                 {
                     if (NamedFunctionOverloadForFuncPtr((*argVars)[i].CallerName, want) == nullptr)
                     { ok = false; break; }
@@ -1805,6 +1827,17 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                               DisplayCxxClassName(typeName));
             return nullptr;
         }
+        if (rejectedFunctionPointerToInteger)
+        {
+            why = std::format("no overload of '{}' matches the given arguments; "
+                              "no matching conversion to parameter {} ('{}') of C++ constructor: "
+                              "a function or pointer value cannot convert to an integer "
+                              "(pointer -> integer needs an explicit cast)",
+                              DisplayCxxClassName(typeName),
+                              rejectedFunctionPointerIntegerParameter,
+                              rejectedFunctionPointerIntegerType);
+            return nullptr;
+        }
         // A copy-deleted lvalue whose const T& constructor clang refused to instantiate.
         size_t sinkIndex = 0;
         std::string sinkParam, sinkCause;
@@ -1960,6 +1993,21 @@ static LLVMBackend::TypeAndValue InferImplicitCxxArgumentType(
             type.IsCxxNullptrT = true;
             return type;
         }
+        // A pointer join can inherit its destination's class spelling; its arms are the source.
+        if (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()
+            && backend.JoinIsCharPointer(arg.Primary))
+        {
+            type.TypeName = "char";
+            type.Pointer = true;
+            type.ElemPointer = false;
+            type.IsArrayView = false;
+            type.IsFunctionPointer = false;
+            type.CxxRefLevel = -1;
+            type.IsAlias = false;
+            type.IsRvalueRef = false;
+            type.IsCxxRefToPointer = false;
+            return type;
+        }
         // A blanked primitive pointer: a C++ ctor needs `int*` back, as the spelled `T(&k)` does.
         if (IsProvenPrimitiveSinglePointerArg(arg))
             type.TypeName = arg.InferSourceTypeName;
@@ -2076,14 +2124,15 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                     && !param.ElemPointer && !cxxByValueParam
                 ? CxxArgConversion::NonConstLvalueRef : CxxArgConversion::Convertible;
         }
-        // A class pointer needs an explicit opt-in; raw void* remains an ordinary data pointer.
-        const bool classPointerArg = arg.TypeAndValue.Pointer
+        TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        // A class pointer needs an explicit opt-in; raw void* and resolved char* remain data pointers.
+        const bool classPointerArg = argType.Pointer
             && !IsCxxNullTypedArgument(arg)
-            && ((arg.TypeAndValue.TypeName.empty() && arg.InferSourceTypeName != "void"
+            && ((argType.TypeName.empty() && arg.InferSourceTypeName != "void"
                  && !IsProvenPrimitiveSinglePointerArg(arg))
-                || IsCxxRecord(arg.TypeAndValue.TypeName)
-                || dataStructures.count(arg.TypeAndValue.TypeName) != 0
-                || arg.TypeAndValue.IsFunctionPointer || arg.TypeAndValue.IsArrayView);
+                || IsCxxRecord(argType.TypeName)
+                || dataStructures.count(argType.TypeName) != 0
+                || argType.IsFunctionPointer || argType.IsArrayView);
         if (param.TypeName.empty() || param.IsInterface
             || (classPointerArg && (!arg.AllowCxxClassPointerCtorConversion
                 || (param.Pointer && (!param.IsAlias || param.IsCxxRefToPointer))))
@@ -2091,10 +2140,9 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                 && (!param.IsAlias || param.IsCxxRefToPointer)
                 && !IsForeignCxxClassWithConstructors(param.TypeName))
             || !IsForeignCxxClassWithConstructors(param.TypeName)
-            || arg.TypeAndValue.TypeName == param.TypeName)
+            || argType.TypeName == param.TypeName)
             return CxxArgConversion::NotApplicable;
 
-        TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
         argType.IsScopedEnum = argType.IsScopedEnum || IsScopedEnumTypeName(argType.TypeName);
         if (argType.TypeName.empty()) return CxxArgConversion::NotApplicable;
         const size_t sourceTemplate = argType.TypeName.find('$');
