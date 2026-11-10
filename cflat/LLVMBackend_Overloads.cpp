@@ -1822,7 +1822,7 @@ bool LLVMBackend::CxxDeductionWrapperDeducesOther(const NamedVariable& arg, cons
             if (!sourceType.empty() && spellIdentity(sourceType, argumentSpelling))
             {
                 // Compare the bare type: no cv, reference or elaborated `enum` keyword.
-                auto canonical = [](std::string spelling) {
+                auto canonical = [](const std::string& spelling) {
                     std::string out;
                     std::string word;
                     auto flush = [&] {
@@ -3709,7 +3709,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         // Unsigned source into a signed param at equal or greater width is a safe
                         // implicit conversion (e.g. u8 -> int, u64 -> i64); Upconvert zero-extends.
                         if (result < 0 && myBits != -1 && otherBits != -1 && myUnsigned && !otherUnsigned && myBits <= otherBits)
-                            result = (myBits == otherBits) ? 1 : 1;
+                            result = 1;
 
                         if (result < 0)
                         {
@@ -4842,6 +4842,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         if (cxxRanking)
         {
             std::vector<const Ranked*> viable;
+            viable.reserve(viable.size() + perfect.size());
             for (const Ranked& r : perfect) viable.push_back(&r);
             for (const Ranked& r : possible) viable.push_back(&r);
             for (const Ranked& r : ellipsisRanked) viable.push_back(&r);
@@ -5263,6 +5264,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         if (!perfect.empty())
         {
             std::vector<const Ranked*> best;
+            best.reserve(best.size() + perfect.size());
             for (const Ranked& r : perfect)
                 best.push_back(&r);
             keepLowest(best, [](const Ranked& r) { return r.cxxPointeeConstMismatches; });
@@ -5278,6 +5280,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         if (!possible.empty())
         {
             std::vector<const Ranked*> best;
+            best.reserve(best.size() + possible.size());
             for (const Ranked& r : possible)
                 best.push_back(&r);
             keepLowest(best, [](const Ranked& r) { return r.cxxPointeeConstMismatches; });
@@ -5659,9 +5662,7 @@ llvm::Value* LLVMBackend::TryEmitAtomicBuiltin(const std::string& name, const st
             Value* delta = (name == "__atomic_counter_decrement")
                 ? ConstantInt::get(Type::getInt64Ty(ctx), -1)
                 : (args.size() > 1 ? args[1] : ConstantInt::get(Type::getInt64Ty(ctx), 1));
-            auto op = (name == "__atomic_counter_decrement")
-                ? AtomicRMWInst::Add  // add(-1) == sub
-                : AtomicRMWInst::Add;
+            auto op = AtomicRMWInst::Add;  // decrement passes delta -1: add(-1) == sub
             auto* old = builder->CreateAtomicRMW(op, ptr, delta,
                 MaybeAlign(), AtomicOrdering::Monotonic);
             // return old + delta (new value)
@@ -8107,6 +8108,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
              * the point of an empty list, so a genuine free/other-type candidate still shows.
              */
             std::vector<const FunctionSymbol*> shownCandidates;
+            shownCandidates.reserve(shownCandidates.size() + candidates.size());
             for (const auto& c : candidates) shownCandidates.push_back(&c);
             if (!arguments.empty() && !candidates.empty()
                 && !candidates.front().Parameters.empty()
@@ -11865,7 +11867,7 @@ bool LLVMBackend::IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeA
         // IShape value, exactly as the explicit `unique<IShape>(new Sq())` spelling resolves.
         if (IsInterfaceType(paramPointee))
         {
-            const std::string ifaceName = paramPointee;
+            const std::string& ifaceName = paramPointee;
             if (arg.TypeAndValue.TypeName == ifaceName) return true;
             if (arg.TypeAndValue.Pointer
                 && StructImplementsInterface(arg.TypeAndValue.TypeName, ifaceName))
@@ -12005,7 +12007,7 @@ llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
         return result;
 }
 
-LLVMBackend::NamedVariable LLVMBackend::GetFunctionArgument(std::string name)
+LLVMBackend::NamedVariable LLVMBackend::GetFunctionArgument(const std::string& name)
 {
         for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {

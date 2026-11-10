@@ -39,7 +39,8 @@ Every C++ behaviour leg is checked against a `clang++ -std=c++20` oracle program
 pick), per the skill. Cache-touching rows (type G) add a cold + warm torch run to the gate.
 
 Timing note (2026-11-02): a build-stamp change over a full main-checkout local cache inflates buildci ~2x
-(PruneCxxTypeRequestDiskCache scan); clear the local cache before a timed run.
+(PruneCxxTypeRequestDiskCache scan, p2/cxx-request-cache-prune-scan-doubles-buildci); clear the local cache
+before a timed run.
 
 ## How to read the groups
 
@@ -66,6 +67,12 @@ concurrent runs on the same function). Line numbers in old rows predate the 2026
 
 Empty: p1 = 0, p2 = 0 (box 9 closed green 2026-11-02, master 16102f79, pushed). Run the Windows gate on the master tip
 once per box.
+
+Open: p2/expect-error-substring-source-check-loose (filed 2026-11-07, test-infra: the leg lint's check 2
+accepts nearly any text); p2/cxx-request-cache-prune-scan-doubles-buildci (filed
+2026-11-07, compile time: narrowed to one directory scan per storing process, ~25% over cold);
+p2/cold-cpp-interop-compile-peaks-23-27-gb (filed 2026-11-07, compile memory: 23-27 GB per cold
+test_cpp_interop compile; pages the Windows box).
 
 ## In flight
 
@@ -169,7 +176,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | G2 | p3/cpp-wrapper-request-group-omits-type-dependencies + p3/cpp-candidate-tier-differs-cold-vs-warm | batch | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; scheduled as CACHE-KEY below |
 | G3 | p3/cpp-check-mode-cannot-repopulate-type-request-cache | full | design: --check writing the cache |
 | G4 | p3/cpp-noinc-mode-divergences | full | CFLAT_CPP_INCREMENTAL=0 kept (RULED 2026-10-31); fallback must bind what incremental binds; two crashes fixed |
-| G7 | p3/cpp-ctor-candidate-refusal-cached-without-location-proof | full | refusal cached without location proof |
 
 ### H - coverage only (no known defect)
 
@@ -201,7 +207,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|----------|-------|
 | L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; TUPALIAS 43eceb08 + TUPLEFT 43eceb08 landed; residue: new S((nullptr,4)), owned unique-element refusals, R133/R134 |
 | L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | overload sets landed 72073fc6; C++ template instance as value; ctor deduction (ruled 2026-10-13) |
-| L-PERF | p3/nested-ternary-compile-time | ~2x per `?:` level |
+| L-PERF | p3/nested-ternary-compile-time | 2x per `?:` level fixed by b9f39cdb; residue: early-pass walkers overflow on deep paren / else-if / `((x)+1)` nesting |
 
 ### P - plans and staged work
 
@@ -228,13 +234,13 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | p3/lsp-slow-after-aborted-interop-compile | LSP ~491 s after an aborted interop compile |
 | p3/test-move-with-cpp-import-self-return-proof-refused | test_move with a C++ import reaches a later unique reset refusal |
 | p3/edge-fill-winui + p3/listview-dark-column-rules | Windows UI; Windows box only |
+| p3/clang-tidy-performance-backlog | ~232 string building left; profile-gated or turn the check off (other perf checks landed 2026-11-07) |
 
 ### New or rewritten 2026-09-29 (leftovers from landed rows)
 
 | Run | Issue | Summary | Status |
 |---|---|---|---|
 | N3 | p3/cpp-const-object-nonconst-member-call-writes-readonly | loop back-edge const-pointer dataflow, virtual-base twin | W13 landed const auto copy, const globals, const-pointer overload selection 2026-09-30; rest open |
-| N9 | p3/cpp-assign-operator-route-leftovers | C++ assignment operator route leftovers | scheduled as ASSIGN |
 | N10 | p3/cpp-brace-argument-backing-remaining-shapes | Brace-list backing: optional constructor parameter case remains | NEW 2026-09-29 |
 | N12 | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator leftovers: template operator U() only | CONVOP 72073fc6 landed the rest |
 | N13 | p3/cpp-ctor-expression-position-const-ref-copies-lvalue | C++ ctor in expression position - remaining `const T&` copies and enum `T&&` refusal | NEW 2026-09-29 |
@@ -298,6 +304,7 @@ this table.
 Pairs: CONSTPOINTEE = p3/cpp-callback-pointee-const-ranking-gaps (typed-null half closed by C05B).
 Cheap singletons (S, risk L): p3/os-abstraction-process-cb-not-converted, p3/view-element-gate-diagnostic-gaps.
 Overload/ctor selection family (never two at once): NULLCTOR, PTRRANK, CTOR-VIABILITY, CONSTTWIN, CONSTPOINTEE.
+Stale references found by the regroup: the std_full table named a static-auto prvalue / copy-initializer storage issue that was never filed (no file in git history, checked 2026-11-06);
 
 ### Parked - needs a maintainer ruling before any work
 

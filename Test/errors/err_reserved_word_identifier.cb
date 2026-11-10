@@ -1,5 +1,7 @@
 // A keyword after a type is not always an identifier misuse: these two lines must keep
 // reporting their real syntax error, not a bogus reserved-word diagnostic.
+// The `int if` parameter leg is in err_reserved_word_param_recovery.cb: the parser does not
+// resynchronize after it, so every later leg here would go dead.
 expect_error("missing ')' at '{'");
 int castNotReserved() { int q = (int)true; if (q { return 0; } return 1; }
 struct Buf { int a; };
@@ -16,12 +18,10 @@ expect_error("'true' is a reserved keyword and cannot be used as a name here");
 struct ReservedField { int true; };
 expect_error("'default' is a reserved keyword and cannot be used as a name here");
 int reservedFor() { for (int default = 0; default < 1; default++) { } return 0; }
-expect_error("'if' is a reserved keyword and cannot be used as a name here");
-void reservedParam(int if) { return; }
 expect_error("'where' is a reserved keyword and cannot be used as a name here") {
     int reservedWhere() { char[64] where = default; return 0; }
 }
 // A missing ';' before a `string` declaration is a plain parse error, not an expression misuse.
-expect_error("expected ';' at 'string'");
+expect_error("missing ';' at 'string'");
 void missingSemiBeforeString() { int x = 1
     string s = "a"; }

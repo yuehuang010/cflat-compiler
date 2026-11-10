@@ -500,7 +500,7 @@ bool LLVMBackend::IsCoreFileIoLinkageName(const std::string& linkageName)
         return false;
     }
 
-llvm::BasicBlock* LLVMBackend::CreateBasicBlock(std::string name, llvm::Function* fn)
+llvm::BasicBlock* LLVMBackend::CreateBasicBlock(const std::string& name, llvm::Function* fn)
 {
         if (fn == nullptr)
             fn = currentFunction;
@@ -895,7 +895,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             ApplyFuncPtrReturnConst(funcPtrType, retTV);
             auto cxxSret = prepareCxxSret(retTV);
             const bool cxxSretReturn = cxxSret.first != nullptr;
-            AbiRecipe cxxSretRecipe = cxxIndirectRecipe;
+            const AbiRecipe& cxxSretRecipe = cxxIndirectRecipe;
             std::vector<llvm::Type*> paramTypes;
             if (cxxSretReturn) paramTypes.push_back(cflat_llvm::PointerTo(cxxSret.first));
             for (size_t i = 0; i < funcPtrType.FuncPtrParams.size(); ++i)
@@ -1116,7 +1116,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         ApplyFuncPtrReturnConst(funcPtrType, retTV);
         auto cxxSret = prepareCxxSret(retTV);
         const bool cxxSretReturn = cxxSret.first != nullptr;
-        AbiRecipe cxxSretRecipe = cxxIndirectRecipe;
+        const AbiRecipe& cxxSretRecipe = cxxIndirectRecipe;
         if (cxxSretReturn) paramTypes.insert(paramTypes.begin(),
             cflat_llvm::PointerTo(cxxSret.first));
         if (ReturnCarriesRawArrayCount(retTV))
@@ -1463,7 +1463,7 @@ llvm::CondBrInst* LLVMBackend::CreateConditionJump(llvm::Value* cond, llvm::Basi
         return branchInst;
     }
 
-llvm::PHINode* LLVMBackend::CreatePHINode(std::string name, int reserve)
+llvm::PHINode* LLVMBackend::CreatePHINode(const std::string& name, int reserve)
 {
         return builder->CreatePHI(builder->getInt1Ty(), reserve, name);
     }

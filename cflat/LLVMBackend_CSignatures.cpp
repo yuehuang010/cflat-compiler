@@ -720,7 +720,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             std::function<std::string(const std::string&)> cRecordPointee =
                 [&](const std::string& spelling) -> std::string {
                 int ptrLevels = 0;
-                const std::string tag = AggregatePointeeTag(spelling, ptrLevels);
+                std::string tag = AggregatePointeeTag(spelling, ptrLevels);
                 if (ptrLevels == 1)
                     if (auto record = dataStructures.find(tag); record != dataStructures.end()
                         && record->second.StructType != nullptr && !record->second.StructType->isOpaque())
@@ -2360,7 +2360,7 @@ void LLVMBackend::PruneRecordsToNeededClosure(cflat_cinterop::ExtractResult& raw
         std::function<std::string(const std::string&, std::unordered_set<std::string>&)> resultRecordTag =
             [&](const std::string& spelling, std::unordered_set<std::string>& seen) -> std::string {
             int pointerDepth = 0;
-            const std::string tag = AggregatePointeeTag(spelling, pointerDepth);
+            std::string tag = AggregatePointeeTag(spelling, pointerDepth);
             if (pointerDepth != 1) return {};
             if (!tag.empty()) return tag;
             std::string base = spelling;

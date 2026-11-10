@@ -110,6 +110,7 @@ llvm::GlobalVariable* LLVMBackend::EmitGuidGlobal(const uint8_t bytes[16])
         if (auto* existing = module->getNamedGlobal(name)) return existing;
 
         std::vector<llvm::Constant*> elems;
+        elems.reserve(elems.size() + 16);
         for (int i = 0; i < 16; i++) elems.push_back(builder->getInt8(bytes[i]));
         auto* arrTy = llvm::ArrayType::get(builder->getInt8Ty(), 16);
         auto* init = llvm::ConstantArray::get(arrTy, elems);
@@ -983,6 +984,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
             auto* cloFnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*context), cloSig, false);
             auto* cloFn = b.CreateBitCast(code, cflat_llvm::PointerTo(cloFnTy), "clo_fn");
             std::vector<llvm::Value*> cloArgs;
+            cloArgs.reserve(cloArgs.size() + paramTys.size());
             for (size_t i = 0; i < paramTys.size(); i++) cloArgs.push_back(invokeFn->getArg(1 + (unsigned)i));
             cloArgs.push_back(env);
             b.CreateCall(cloFnTy, cloFn, cloArgs);
@@ -5265,7 +5267,7 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
         std::string argShown = SpellType(*this, shownArgument);
         if (!legacyTooDeep && !legacyTooShallow)
         {
-            TypeAndValue parameter = param;
+            const TypeAndValue& parameter = param;
             std::string parameterShown = SpellType(*this, parameter);
             return std::format("has type '{}' and the argument has type '{}' - the pointer depths differ",
                 parameterShown.empty() ? std::format("pointer depth {}", p.PointerDepth) : parameterShown,

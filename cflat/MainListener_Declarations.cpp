@@ -1235,7 +1235,7 @@ std::string MainListener::ResolveSigComponentCodegen(
         std::string genericBase;
         if (auto* genericParams = GenericSpecOf(ts, genericBase); genericParams != nullptr)
         {
-            const std::string baseName = genericBase;
+            const std::string& baseName = genericBase;
             std::vector<std::string> innerArgs;
             for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(entry));
@@ -1510,6 +1510,7 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 sig.FuncPtrParams.push_back(fp);
             }
         std::vector<int64_t> paramConsts;
+        paramConsts.reserve(paramConsts.size() + sig.FuncPtrParams.size());
         for (const auto& fp : sig.FuncPtrParams) paramConsts.push_back(fp.ConstMask);
         std::string encoded = BuildEncodedClosureName(Compiler(), isThin, retName,
             sig.FuncPtrReturnPointerDepth, encParams, sig.FuncPtrReturnConstMask,
@@ -3751,7 +3752,7 @@ void MainListener::EmitGlobalCxxFieldDefaultConstruction(
 }
 
 void MainListener::EmitPendingGlobalCxxConstructions(
-        std::vector<PendingGlobalDefaultConstruction> nativeRuntime)
+        const std::vector<PendingGlobalDefaultConstruction>& nativeRuntime)
 {
         /*
          * Non-folding native globals are rejected. The remaining C++ globals use one ordered
@@ -3771,6 +3772,7 @@ void MainListener::EmitPendingGlobalCxxConstructions(
             return !HasGlobalCxxFieldDefaultConstruction(item.TypeValue);
         }), pending.end());
         std::vector<RuntimeConstruction> ordered;
+        ordered.reserve(ordered.size() + nativeRuntime.size());
         for (auto& item : nativeRuntime) ordered.push_back({item, true});
         for (auto& item : pending) ordered.push_back({item, false});
         std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
@@ -5328,7 +5330,7 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                 // TU; .cb/.c route individually (see CompileImportGroup).
                 if (importFilenames.size() > 1)
                 {
-                    std::vector<std::string> entries = importFilenames;
+                    const std::vector<std::string>& entries = importFilenames;
                     std::vector<std::string> grpLibs;
                     if (auto* lc = imp->libClause())
                     {
@@ -5424,7 +5426,6 @@ void MainListener::ParseNamespaceDefinition(CFlatParser::NamespaceDefinitionCont
             namespaceName = parentNamespace + "." + namespaceName;
         auto* compiler = Compiler(ctx);
         // Register every prefix so qualified lookup can walk "os" -> "os.windows".
-        std::string prefix;
         for (size_t pos = 0; (pos = namespaceName.find('.', pos)) != std::string::npos; pos++)
             compiler->RegisterNamespace(namespaceName.substr(0, pos));
         compiler->RegisterNamespace(namespaceName);

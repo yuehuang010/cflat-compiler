@@ -13,8 +13,8 @@
 #   ./test.sh -j 8       # cap parallelism (default: nproc)
 #   ./test.sh --run      # opt-in in-process JIT smoke set
 #
-# Like test.bat, after the cold pass this runs `cflat --init-local` and re-runs the
-# negative tests against the warm bitcode cache. --init reconstructs compiler
+# Like test.bat, this warms the local bitcode cache up front; after the first pass it re-runs
+# `cflat --init-local-prune` and the negative tests against the warm bitcode cache. --init reconstructs compiler
 # state from a hand-written serializer (a second code path), so a field the
 # analysis reads but that is missing from the serializer is silently dropped on a
 # warm cache - the expect_error then stops firing. The warm pass catches that here
@@ -360,6 +360,11 @@ if [ -d "$SRC/errors" ]; then
   fi
 fi
 
+# Warm the local bitcode cache up front, as test.bat does: after a rebuild the core bitcode is
+# stale and every compile below would re-parse core from source (~0.4 s per err test).
+# The --init-local-prune before the warm pass below stays the gating, reported call.
+"$CFLAT" --init-local-prune >"$RES/_init_pre.log" 2>&1
+
 if [ "$RUN_MODE" -eq 0 ] && [ -f "$SRC/errors/err_cpp_header_parse_budget.cb" ]; then
   if ! CFLAT_CPP_MAX_HEADER_PARSES=0 "$CFLAT" --locale pseudo --update-locale en-pseudo \
       --locale-dir "$LOCALE_DIR" --check -i "$LIB" \
@@ -395,6 +400,26 @@ if [ "$RUN_MODE" -eq 0 ]; then
       --check -i "$LIB" ${ERR_FLAGS[@]+"${ERR_FLAGS[@]}"} "$f" >"$RES/$(basename "$f").locale.log" 2>&1 || true
   done
 fi
+
+# Test-leg lint (utilities/lint_test_legs.py): each failing check writes one lint_*.result into
+# $RES, so it counts as one failed test with file:line. A lint that dies without a verdict fails too.
+run_leg_lint() {
+  local phase="$1" rc=0
+  # ERR_SKIP fixtures write no log on purpose; any other fixture without one fails check 1.
+  python3 "$ROOT/utilities/lint_test_legs.py" --phase "$phase" --results "$RES" --skip "$ERR_SKIP" \
+    >"$RES/_lint_$phase.log" 2>&1 || rc=$?
+  grep -E '^LINT (FAIL|NOTE)' "$RES/_lint_$phase.log"
+  tail -n 1 "$RES/_lint_$phase.log"
+  # Exit 1 with the summary line is a lint verdict; anything else (traceback, exit 2) is a crash.
+  if [ "$rc" -ne 0 ] && ! grep -q '^LINT: [0-9]* failure' "$RES/_lint_$phase.log"; then
+    echo "FAIL: leg lint ($phase) exited $rc" >"$RES/lint_${phase}_crashed.result"
+    cp "$RES/_lint_$phase.log" "$RES/lint_${phase}_crashed.log"
+  fi
+}
+# Static checks 2-5 read sources only: launched before the workers, in the background (~10 s of
+# python), and waited for before check 1 runs.
+run_leg_lint static &
+leg_lint_pid=$!
 
 # C++ interop fixtures go first so the longest tests start first. One run each under the shared
 # header cache: --error-on-cpp-reparse still fails any second parse of a header.
@@ -436,6 +461,11 @@ if [ "$RUN_MODE" -eq 0 ]; then
     echo "FAIL" >"$RES/_init.result"
     tail -n 8 "$RES/_init.log" 2>/dev/null
   fi
+fi
+# Check 1 (bare-leg count) reads the per-fixture err logs the cold and warm passes just wrote.
+wait "$leg_lint_pid"
+if [ "$RUN_MODE" -eq 0 ]; then
+  run_leg_lint outputs
 fi
 
 # Warm/cold parity of global default-construction folding. A core constructor arrives LAZY from

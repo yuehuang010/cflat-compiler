@@ -71,6 +71,7 @@
 #include "LLVMBackend_CInteropShared.h"
 
 bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPaths,
+                             int64_t includeHashTime,
                              std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
                              std::vector<CRecordEntry>& outRecords,
                              std::vector<CMacroEntry>& outMacros,
@@ -358,7 +359,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                 for (const auto& param : sig.paramTypes) seedNamespace(param);
             }
             CollectHeaderNamespaceNamesParallel(
-                raw.includedFiles, cxxForeignNamespaces_,
+                raw.includedFiles, includeHashTime, cxxForeignNamespaces_,
                 activeCxxRequestGroup_->primary < cxxImportGroups_.size()
                     ? &cxxImportGroups_[activeCxxRequestGroup_->primary].namespaces : nullptr,
                 includedBuffers.empty() ? nullptr : &includedBuffers, includeHashes);
@@ -3908,7 +3909,7 @@ std::string LLVMBackend::ResolveCxxFunctionTemplateName(const std::string& owner
                                                         const std::string& memberName) const
 {
         auto direct = [&](const std::string& candidate) -> std::string {
-            const std::string exact = candidate + "." + memberName;
+            std::string exact = candidate + "." + memberName;
             auto exactIt = cxxFunctionTemplates_.find(exact);
             if (exactIt != cxxFunctionTemplates_.end() && !exactIt->second.empty()) return exact;
 
@@ -3926,7 +3927,7 @@ std::string LLVMBackend::ResolveCxxFunctionTemplateName(const std::string& owner
                 ownerSpelling.replace(pos, 2, ".");
                 ++pos;
             }
-            const std::string resolved = ownerSpelling + "." + memberName;
+            std::string resolved = ownerSpelling + "." + memberName;
             auto resolvedIt = cxxFunctionTemplates_.find(resolved);
             if (resolvedIt != cxxFunctionTemplates_.end() && !resolvedIt->second.empty())
                 return resolved;
@@ -4463,7 +4464,7 @@ std::string LLVMBackend::CxxBraceSelectorElement(
             bool lossy = false;
             llvm::APFloat value = constantFp->getValueAPF();
             value.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven, &lossy);
-            const std::string literal = std::format("{:a}", value.convertToDouble())
+            std::string literal = std::format("{:a}", value.convertToDouble())
                 .insert(value.isNegative() ? 1 : 0, "0x");
             if (element.LiteralIdentity.empty() && valueType->isFloatTy()) return literal;
             return "static_cast<" + spelling + ">(" + literal + ")";

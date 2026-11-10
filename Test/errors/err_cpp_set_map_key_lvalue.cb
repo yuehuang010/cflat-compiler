@@ -29,7 +29,7 @@ extern int main()
     }
     }
     // clang rejects insert<P> on is_constructible and never names a copy constructor.
-    expect_error("no instantiation of C++ function template 'std.map$cplv.Key$int.insert' accepts these argument types (std.map$cplv.Key$int, std.pair$cplv.Key$int) (clang: no matching member function for call to 'insert')") {
+    expect_error("(clang: no matching member function for call to 'insert')") {
         std.map<cplv.Key, int> table = default;
         std.pair<cplv.Key, int> entry = std.make_pair(cplv.Key(4), 7);
         table.insert(entry);

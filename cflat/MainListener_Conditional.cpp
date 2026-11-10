@@ -1837,7 +1837,7 @@ void MainListener::JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
                 return {};
             depth = type.ValuePointerDepth();
             if (depth < 1 || type.ElemPointer != (depth > 1)) return {};
-            const std::string name = compiler->ResolveTypeAlias(type.TypeName);
+            std::string name = compiler->ResolveTypeAlias(type.TypeName);
             if (name.empty() || LLVMBackend::IsPrimitiveTypeName(name)
                 || compiler->IsInterfaceType(name)
                 || (!compiler->IsCxxRecord(name)

@@ -3678,6 +3678,7 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
                 if (selected) select->addCase(head.getInt32(static_cast<uint32_t>(p)), block);
                 llvm::IRBuilder<> body(block);
                 std::vector<llvm::Value*> loaded;
+                loaded.reserve(loaded.size() + captures[p].values.size());
                 for (unsigned n = 0; n < captures[p].values.size(); ++n)
                     loaded.push_back(body.CreateLoad(fieldTypes[captures[p].first + n],
                         body.CreateStructGEP(envType, thunk->getArg(1), captures[p].first + n)));
@@ -5593,7 +5594,7 @@ std::string LLVMBackend::ScoreCxxConversionOperatorArgument(const NamedVariable&
         needsStandardConversion = false;
         bool ambiguous = false;
         std::vector<std::string> ambiguousCandidates;
-        const std::string opName = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
+        std::string opName = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
                                                            false, &needsStandardConversion,
                                                            &ambiguous, &ambiguousCandidates,
                                                            &arg.TypeAndValue);

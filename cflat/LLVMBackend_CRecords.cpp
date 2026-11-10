@@ -667,7 +667,7 @@ bool LLVMBackend::BindCxxLvalueMacro(const CxxRequestGroup& group, const std::st
 std::string LLVMBackend::RequestCxxArgumentFreeMacroCall(const std::string& name, size_t argc,
                                                          std::string& error)
 {
-        const std::string wrapperName = std::format("__cflat_mcall_{}_{}", name, argc);
+        std::string wrapperName = std::format("__cflat_mcall_{}_{}", name, argc);
         if (GetFunction(wrapperName) != nullptr) return wrapperName;
         auto owner = cxxFunctionOwnerGroup_.find(name);
         if (owner == cxxFunctionOwnerGroup_.end() || owner->second >= cxxImportGroups_.size())
@@ -5031,7 +5031,7 @@ std::string LLVMBackend::CxxUniquePtrForUniqueKeyword(const std::string& pointee
         error.clear();
         if (!IsCxxUniquePtrPointee(pointee)) return {};
         const std::string resolved = ResolveTypeAlias(pointee);
-        const std::string name = MangleGenericInstance(*this, "std.unique_ptr", { resolved });
+        std::string name = MangleGenericInstance(*this, "std.unique_ptr", { resolved });
         if (dataStructures.count(name) != 0 && CxxUniquePtrPointee(name) == resolved) return name;
         if (TryRequestCxxType("std.unique_ptr", { resolved }, name, error))
             return ResolveTypeAlias(name);
@@ -9219,6 +9219,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         // key, a stale entry silently outlives the code that wrote it.
         cacheKey += "|C" + CompilerBuildStamp();
 
+        const int64_t includeHashTime = (int64_t)std::filesystem::file_time_type::clock::now()
+                                            .time_since_epoch().count();
         uint64_t currentHash = 0;
         bool haveHash = false;
         // Content hashes this call already has (the headers below, then the included files the
@@ -9234,9 +9236,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     const bool hashed = cppMode
                         ? HashCxxHeaderFileContents(rp, h, /*force*/ true)
                         : HashFileContents(rp, h);
-                    if (hashed) knownHashes.emplace(rp, std::pair<uint64_t, int64_t>{h,
-                        (int64_t)std::filesystem::file_time_type::clock::now()
-                            .time_since_epoch().count()});
+                    if (hashed) knownHashes.emplace(rp,
+                        std::pair<uint64_t, int64_t>{h, includeHashTime});
                     currentHash ^= h; currentHash *= 1099511628211ULL;
                 }
                 haveHash = true;
@@ -9560,6 +9561,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                                     [](const CSigEntry& sig) { return sig.isInline; }))
                 {
                     std::vector<std::string> hashFiles;
+                    hashFiles.reserve(hashFiles.size() + diskEntry.deps.size());
                     for (const auto& dep : diskEntry.deps) hashFiles.push_back(dep.path);
                     hashFiles.insert(hashFiles.end(), realPaths.begin(), realPaths.end());
                     std::sort(hashFiles.begin(), hashFiles.end());
@@ -9664,7 +9666,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             includeHashSink_ = wantDeps ? &knownHashes : nullptr;
             struct SinkReset { std::unordered_map<std::string, std::pair<uint64_t, int64_t>>*& sink;
                                ~SinkReset() { sink = nullptr; } } sinkReset{includeHashSink_};
-            if (!ExtractCHeaderClang(realPaths, sigs, enums, records, macros, funcMacros, globals,
+            if (!ExtractCHeaderClang(realPaths, includeHashTime, sigs, enums, records, macros,
+                                     funcMacros, globals,
                                      aliases, typeAliases, extraDefines, &includes,
                                      &prereqFailure, &prereqMsg, &headerFailure, cppMode, &cxxBitcode,
                                      &functionPointerAbis, &longDoubleWidth,

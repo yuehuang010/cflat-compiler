@@ -528,7 +528,7 @@ inline std::string UnrelatedPointerJoinDiagnostic(
     };
     return std::format("cannot join '{}' and '{}' in a '{}': the pointee types differ; "
                        "use an explicit cast on one arm",
-                       spell(a), spell(b), op);
+                       spell(std::move(a)), spell(std::move(b)), op);
 }
 inline CFlatParser::ConditionalExpressionContext* ArmTernaryThroughParens(
         antlr4::tree::ParseTree* node) {

@@ -929,7 +929,7 @@ bool LLVMBackend::TryReuseCObject(uint64_t commandKey, const std::string& objPat
 void LLVMBackend::StoreCObject(uint64_t commandKey, const std::string& objPath, const std::string& depFilePath)
 {
         auto depText = llvm::MemoryBuffer::getFile(depFilePath);
-        llvm::sys::fs::remove(depFilePath);
+        (void)llvm::sys::fs::remove(depFilePath);
         if (!depText) return;
         llvm::json::Array stamps;
         std::unordered_set<std::string> seen;
@@ -965,7 +965,7 @@ void LLVMBackend::StoreCObject(uint64_t commandKey, const std::string& objPath, 
         if (llvm::sys::fs::copy_file(objPath, base + ".obj" + tempSuffix)
             || llvm::sys::fs::rename(base + ".obj" + tempSuffix, base + ".obj"))
         {
-            llvm::sys::fs::remove(base + ".obj" + tempSuffix);
+            (void)llvm::sys::fs::remove(base + ".obj" + tempSuffix);
             return;
         }
         std::string json;
@@ -981,7 +981,7 @@ void LLVMBackend::StoreCObject(uint64_t commandKey, const std::string& objPath, 
             written = static_cast<bool>(out);
         }
         if (!written || llvm::sys::fs::rename(depsTemp, base + ".deps.json"))
-            llvm::sys::fs::remove(depsTemp);
+            (void)llvm::sys::fs::remove(depsTemp);
 }
 
 bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::string& programAlias,
@@ -1015,7 +1015,7 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
             {
                 argStrs.push_back("-stdlib=libc++");
                 argStrs.push_back("-std=" + cppStandard_);
-                std::string sdk = MacSdkPathCached();
+                const std::string& sdk = MacSdkPathCached();
                 if (!sdk.empty()) { argStrs.push_back("-isysroot"); argStrs.push_back(sdk); }
             }
         }
@@ -1039,7 +1039,7 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         if (!CountTuParse(cxxMode ? "C++ source" : "C source", std::format("obj:{:016x}", commandKey),
                           cSourcePath, "object compile"))
         {
-            llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(objPath);
             return false;
         }
         const std::string depPath = objPath + ".d";
@@ -1048,6 +1048,7 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
             argStrs.push_back(arg);
 
         std::vector<llvm::StringRef> args;
+        args.reserve(args.size() + argStrs.size());
         for (auto& s : argStrs) args.push_back(s);
 
         if (verbose)
@@ -1067,8 +1068,8 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         }
         if (rc != 0)
         {
-            llvm::sys::fs::remove(objPath);
-            llvm::sys::fs::remove(depPath);
+            (void)llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(depPath);
             LogRawError(std::format("C compiler failed to compile C source '{}' (exit {}){}{}",
                 cSourcePath, rc, compileErr.empty() ? "" : ": ", compileErr));
             return false;
@@ -1158,7 +1159,7 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         if (!CountTuParse(cxxMode ? "C++ source" : "C source", std::format("obj:{:016x}", commandKey),
                           cSourcePath, "object compile"))
         {
-            llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(objPath);
             return false;
         }
         const std::string depPath = objPath + ".d";
@@ -1168,6 +1169,7 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         argStrs.push_back(std::string("/clang:-MT") + kCObjectDepTarget);
 
         std::vector<llvm::StringRef> args;
+        args.reserve(args.size() + argStrs.size());
         for (auto& s : argStrs) args.push_back(s);
 
         if (verbose)
@@ -1186,8 +1188,8 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         }
         if (rc != 0)
         {
-            llvm::sys::fs::remove(objPath);
-            llvm::sys::fs::remove(depPath);
+            (void)llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(depPath);
             LogRawError(std::format("clang-cl failed to compile C source '{}' (exit {}){}{}",
                 cSourcePath, rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
@@ -1244,6 +1246,7 @@ bool LLVMBackend::CompileCrashHandlerObject(const std::string& arch)
         };
 
         std::vector<llvm::StringRef> args;
+        args.reserve(args.size() + argStrs.size());
         for (auto& s : argStrs) args.push_back(s);
 
         if (verbose)
@@ -1258,7 +1261,7 @@ bool LLVMBackend::CompileCrashHandlerObject(const std::string& arch)
         int rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, {}, 0, 0, &clangCompileErr);
         if (rc != 0)
         {
-            llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(objPath);
             LogRawError(std::format("clang-cl failed to compile crash handler (exit {}){}{}",
                 rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
@@ -1315,6 +1318,7 @@ bool LLVMBackend::CompileBuiltinsObject(const std::string& arch)
         };
 
         std::vector<llvm::StringRef> args;
+        args.reserve(args.size() + argStrs.size());
         for (auto& s : argStrs) args.push_back(s);
 
         if (verbose)
@@ -1329,7 +1333,7 @@ bool LLVMBackend::CompileBuiltinsObject(const std::string& arch)
         int rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, {}, 0, 0, &clangCompileErr);
         if (rc != 0)
         {
-            llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(objPath);
             LogRawError(std::format("clang-cl failed to compile cflat_builtins.c (exit {}){}{}",
                 rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
@@ -2435,8 +2439,10 @@ std::string LLVMBackend::StdFunctionSpecializationForSpelling(const std::string&
         }
         std::vector<std::pair<std::string, int>> parts;
         std::vector<bool> partAliases;
+        partAliases.reserve(partAliases.size() + closure.FuncPtrParams.size());
         for (const auto& fp : closure.FuncPtrParams)
             partAliases.push_back(fp.IsAlias);
+        parts.reserve(parts.size() + closure.FuncPtrParams.size());
         for (const auto& fp : closure.FuncPtrParams)
             parts.push_back({ fp.TypeName, fp.PointerDepth });
         const std::string encoded = MangleClosureType(*this, true, closure.FuncPtrReturnTypeName,
@@ -2447,7 +2453,7 @@ std::string LLVMBackend::StdFunctionSpecializationForSpelling(const std::string&
         std::string functionTypeArg = encoded;
         functionTypeArg.replace(0, 3, "barefn");
         RegisterEncodedClosureType(functionTypeArg, closure);
-        const std::string className = MangleGenericInstance(
+        std::string className = MangleGenericInstance(
             *this, "std.function", { functionTypeArg });
         // The request is memoized per identity (RequestCxxForeignType), so asking again for an
         // already-registered specialization costs a map lookup - and skipping it would NOT be

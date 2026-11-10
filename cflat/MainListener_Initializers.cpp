@@ -113,7 +113,7 @@ TupleTypeElementResolveContext MainListener::TupleTypeElementContext(
                                         antlr4::ParserRuleContext* useSite) {
                 auto* compiler = Compiler(useSite);
                 std::string cxxError;
-                const std::string cxxUnique = isPointer
+                std::string cxxUnique = isPointer
                     ? compiler->CxxUniquePtrForUniqueKeyword(pointee, cxxError) : std::string();
                 if (!cxxError.empty()) LogErrorContext(useSite, std::move(cxxError));
                 if (!cxxUnique.empty()) return cxxUnique;

@@ -406,6 +406,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                 else
                 {
                     std::vector<std::string> candidateTypes;
+                    candidateTypes.reserve(candidateTypes.size() + selectorCandidates.size());
                     for (const auto& candidate : selectorCandidates)
                         candidateTypes.push_back(TrimCxxBraceType(StripCxxRefAndCv(candidate.params[i])));
                     const NamedVariable& arg = arguments[i];
@@ -4193,10 +4194,6 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                     + BuildStdFunctionCtorUse(cxxSpelling, "__cflat_req_0")
                     + BuildCxxVirtualThunks(probe.records)
                     + freeTemplateUses;
-                const std::string stage2Source =
-                    BuildCxxRequestIncludes(group) + effectivePrefixSource
-                    + BuildCxxRequestMarkers(single, /*instantiateAll*/ false)
-                    + stage2Extra;
                 const std::string stage2CacheSource =
                     BuildCxxRequestIncludes(group) + effectivePrefixSource
                     + BuildCxxRequestMarkers(single, /*instantiateAll*/ false)

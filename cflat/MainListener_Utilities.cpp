@@ -388,7 +388,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
         return params;
     }
 
-LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNumber) {
+LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(const std::string& rawNumber) {
         // Support suffixes: u/U, l/L, ll/LL, f/F, d/D and floating point forms with '.' or exponent.
         lastNumberLiteralIsBitPattern = false;
         if (rawNumber.empty())

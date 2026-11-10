@@ -855,7 +855,7 @@ std::string RemangleTypeSpelling(const LLVMBackend& compiler, const TypeSpelling
     return result;
 }
 
-std::string MangleTypeFromSpelling(const LLVMBackend& compiler, TypeSpelling spelling)
+std::string MangleTypeFromSpelling(const LLVMBackend& compiler, const TypeSpelling& spelling)
 {
     return RemangleTypeSpelling(compiler, spelling);
 }
@@ -1025,7 +1025,7 @@ void RememberMangledArity(const LLVMBackend& compiler, std::string_view mangled,
 std::string SpellType(const LLVMBackend& compiler,
                       const LLVMBackend::TypeAndValue& type)
 {
-    const std::string localEnum = GenericLocalEnumDisplayName(compiler, type.TypeName);
+    std::string localEnum = GenericLocalEnumDisplayName(compiler, type.TypeName);
     if (!localEnum.empty())
     {
         if (type.IsArrayView) return localEnum + "[]";
@@ -1062,7 +1062,7 @@ std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
             result += std::string(std::max(value.ValuePointerDepth(), 1), '*');
         return result;
     };
-    const std::string spelling = spell(type);
+    std::string spelling = spell(type);
     const int depth = type.IsArrayView ? type.ElementPointerDepth() : type.ValuePointerDepth();
     const uint32_t mask = type.ConstMask;
     int constLevel = -1;

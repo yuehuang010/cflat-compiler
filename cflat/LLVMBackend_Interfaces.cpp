@@ -105,6 +105,7 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
                     displayCurrent.resize(displayCurrent.rfind('('));
                     ReportingFileScope reportScope(this, displayCurrent, currentLine, currentColumn);
                     LogRawError(std::move(message));
+                    return;
                 }
                 LogRawError(std::move(message));
                 return;
@@ -303,7 +304,7 @@ std::string LLVMBackend::ResolveMemberType(const std::string& owner, const std::
                                            MemberTypeResult& result)
 {
         result = MemberTypeResult::Found;
-        const std::string key = owner + "." + member;
+        std::string key = owner + "." + member;
         const bool cxxOwner = IsCxxForeignTypeRegistered(owner);
         if (!cxxOwner)
         {

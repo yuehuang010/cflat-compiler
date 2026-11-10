@@ -320,7 +320,7 @@ std::string EnumMemberDiagnosticName(const LLVMBackend::NamedVariable& member,
                                             antlr4::tree::ParseTree* expression,
                                             const llvm::GlobalVariable* foundMember)
 {
-    const std::string sourceName = EnumMemberSourceSpelling(expression);
+    std::string sourceName = EnumMemberSourceSpelling(expression);
     if (!sourceName.empty()) return sourceName;
     return foundMember != nullptr ? foundMember->getName().str() : member.TypeAndValue.VariableName;
 }
@@ -877,6 +877,7 @@ std::string SpelledTypeNameBase(
     if (typeSpecs.size() == 1 && typeSpecs.front()->typeName() != nullptr)
         return SpelledTypeNameBase(typeSpecs.front()->typeName());
     std::vector<std::string> words;
+    words.reserve(words.size() + typeSpecs.size());
     for (auto* spec : typeSpecs) words.push_back(spec->getText());
     return words.empty() ? "T" : JoinTypeSpecifierWords(words);
 }
@@ -2923,13 +2924,13 @@ std::string ResolveGenericTemplateBaseAtScope(
     {
         for (const auto& scope : enclosingScopes)
         {
-            const std::string nested = scope.Name + "." + lexicalName;
+            std::string nested = scope.Name + "." + lexicalName;
             if (compiler->IsGenericTemplateKey(nested))
             {
                 if (IsAggregateMemberDeclarationTypeUse(useSite)
                     && !GenericTemplateDeclaredBeforeUse(compiler, nested, useSite))
                 {
-                    const std::string fallback = hasExactKey ? spelledBase
+                    std::string fallback = hasExactKey ? spelledBase
                         : compiler->ResolveGenericBaseAlias(spelledBase);
                     if (!compiler->IsGenericTemplateKey(fallback)
                         || GenericTemplateKeyNestedInAnyScope(fallback, enclosingScopes)) return {};
@@ -2971,7 +2972,7 @@ std::string ResolveGenericTemplateBaseAtScope(
             && !GenericTemplateDeclaredBeforeUse(compiler, spelledBase, useSite)) return {};
         return spelledBase;
     }
-    const std::string base = compiler->ResolveGenericBaseAlias(spelledBase);
+    std::string base = compiler->ResolveGenericBaseAlias(spelledBase);
     if (compiler->IsGenericTemplateKey(base))
     {
         if (IsAggregateMemberDeclarationTypeUse(useSite)
@@ -2981,13 +2982,13 @@ std::string ResolveGenericTemplateBaseAtScope(
     }
     for (const auto& scope : enclosingScopes)
     {
-        const std::string nested = scope.Name + "." + base;
+        std::string nested = scope.Name + "." + base;
         if (compiler->IsGenericTemplateKey(nested))
         {
             if (IsAggregateMemberDeclarationTypeUse(useSite)
                 && !GenericTemplateDeclaredBeforeUse(compiler, nested, useSite))
             {
-                const std::string fallback = compiler->ResolveGenericTemplateBase(base);
+                std::string fallback = compiler->ResolveGenericTemplateBase(base);
                 if (!compiler->IsGenericTemplateKey(fallback)
                     || (GenericTemplateKeyNestedInAnyScope(fallback, enclosingScopes)
                         && !GenericTemplateDeclaredBeforeUse(compiler, fallback, useSite))) return {};
@@ -3088,6 +3089,7 @@ bool ResolveCanonicalTypeSpecifier(
     if (specs.size() > 1)
     {
         std::vector<std::string> words;
+        words.reserve(words.size() + specs.size());
         for (auto* spec : specs) words.push_back(spec->getText());
         if (!CanonicalizePrimitiveTypeWords(words, out.TypeName, typeError))
         {

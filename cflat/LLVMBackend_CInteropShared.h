@@ -121,13 +121,17 @@ struct CxxExtractionStageTimer
             if (!enabled) return;
             const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
-            if (count.has_value())
-                std::cout << std::format(
-                    "[verbose]   extraction stage {}: {:.3f} ms (count: {})\n",
-                    name, ms, *count);
-            else
-                std::cout << std::format("[verbose]   extraction stage {}: {:.3f} ms\n",
-                                         name, ms);
+            try  // verbose timing only; never terminate from a destructor
+            {
+                if (count.has_value())
+                    std::cout << std::format(
+                        "[verbose]   extraction stage {}: {:.3f} ms (count: {})\n",
+                        name, ms, *count);
+                else
+                    std::cout << std::format("[verbose]   extraction stage {}: {:.3f} ms\n",
+                                             name, ms);
+            }
+            catch (...) {}
         }
 };
 
@@ -214,6 +218,7 @@ inline void CollectHeaderNamespaceNames(const std::string& path,
  * from those same bytes: the header cache's dependency stamps then need no second read.
  */
 inline void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& paths,
+                                                int64_t hashTime,
                                                 std::unordered_set<std::string>& out,
                                                 std::unordered_set<std::string>* out2 = nullptr,
                                                 const std::vector<std::string_view>* buffers = nullptr,
@@ -241,7 +246,6 @@ inline void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& 
         const unsigned workers = work.size() < 64 ? 1u : 4u;
         std::vector<std::unordered_set<std::string>> found(workers);
         std::vector<uint64_t> fileHashes(work.size(), 0);
-        std::vector<int64_t> fileHashTimes(work.size(), 0);
         LLVMBackend::RunParallel(work.size(), workers, [&](size_t w, unsigned worker) {
             const size_t i = work[w];
             const std::string_view text = buffers != nullptr ? (*buffers)[i] : std::string_view();
@@ -253,8 +257,6 @@ inline void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& 
             ScanHeaderNamespaceNames(text, found[worker]);
             if (wantHash[w])
             {
-                fileHashTimes[w] = (int64_t)std::filesystem::file_time_type::clock::now()
-                                       .time_since_epoch().count();
                 fileHashes[w] = Fnv1aBytes(text);
             }
         });
@@ -267,7 +269,7 @@ inline void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& 
         if (hashes != nullptr)
             for (size_t w = 0; w < work.size(); ++w)
                 if (wantHash[w]) hashes->emplace(paths[work[w]],
-                    std::pair<uint64_t, int64_t>{fileHashes[w], fileHashTimes[w]});
+                    std::pair<uint64_t, int64_t>{fileHashes[w], hashTime});
 }
 
 

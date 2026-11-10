@@ -1754,6 +1754,7 @@ private:
             int64_t offset = 0;
             if (!indexedOffset(extract->getAggregateOperand()->getType(), extract->getIndices(), offset)) return false;
             std::vector<int64_t> shifted;
+            shifted.reserve(shifted.size() + slots.size());
             for (int64_t slot : slots) shifted.push_back(slot + offset);
             return valueContents(extract->getAggregateOperand(), shifted, point, depth + 1);
         }
@@ -3527,6 +3528,7 @@ llvm::Value* MainListener::UpcastTernaryPhiToInterface(llvm::Value* right, const
         auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(right);
         if (phi == nullptr || interfaceName.empty() || !phi->getType()->isPointerTy()) return nullptr;
         std::vector<InterfaceJoinArm> arms;
+        arms.reserve(arms.size() + phi->getNumIncomingValues());
         for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
             arms.push_back({ phi->getIncomingValue(i), phi->getIncomingBlock(i) });
         return BoxInterfaceJoinArms(arms, phi, phi, interfaceName, armFailure, transferArmOwnership,
@@ -3542,6 +3544,7 @@ llvm::Value* MainListener::UpcastNullCoalesceToInterface(llvm::Value* right, con
         const auto* join = compilerLLVM->FindNullCoalesceJoin(load);
         if (join == nullptr) return nullptr;
         std::vector<InterfaceJoinArm> arms;
+        arms.reserve(arms.size() + join->Arms.size());
         for (const auto& arm : join->Arms) arms.push_back({ arm.Value, arm.Block });
         return BoxInterfaceJoinArms(arms, load, load, interfaceName, armFailure, transferArmOwnership,
                                     armNotOwned);
@@ -6502,7 +6505,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (std::string error = FlexibleArrayMemberLengthError(namedVar.TypeAndValue);
                     !error.empty())
                     LogErrorContext(unaryCtx, error);
-                std::string rhsText = assignCtx != nullptr ? assignCtx->getText() : std::string();
                 // The LHS as written, not CallerName - on a field receiver ('u.a') CallerName is
                 // just the base variable, and the suggested remedy would name the wrong thing.
                 std::string lhsName = unaryCtx != nullptr && !unaryCtx->getText().empty()

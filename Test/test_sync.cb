@@ -576,7 +576,6 @@ bool testSemaphoreBasic() {
     s.release();
     s.release();
 
-    result &= Test("semaphore basic acquire/release", 1, 1);
     s.destroy();
     return result;
 }
@@ -600,7 +599,6 @@ bool testSemaphoreWithThreads() {
     t1.join();
     t2.join();
 
-    result &= Test("semaphore threaded signal", 1, 1);
     s.destroy();
     return result;
 }
@@ -642,7 +640,6 @@ bool testLatchBasic() {
     l.init(1);
     l.count_down();
     l.wait();
-    result &= Test("latch count_down once then wait", 1, 1);
     l.destroy();
     return result;
 }
@@ -682,7 +679,6 @@ bool testLatchAlreadyZero() {
     l.count_down();
     l.wait();
     l.wait();
-    result &= Test("latch wait idempotent", 1, 1);
     l.destroy();
     return result;
 }
@@ -810,7 +806,6 @@ bool testLockDestroyIsIdempotent() {
         rw.destroy();
     }                     // ~rwlock() must be a no-op
 
-    result &= Test("lock destroy() is idempotent", true, true);
     return result;
 }
 
@@ -862,7 +857,6 @@ bool testEventSemaphoreBarrierDestroyIdempotent() {
         rwlock    rwUnused;
     }
 
-    result &= Test("event/semaphore/barrier destroy() idempotent", true, true);
     return result;
 }
 

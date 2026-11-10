@@ -1,22 +1,6 @@
-# Nested `?:` compile time grows about 2x per level
+# Nested `?:` residue (TERNADDR, pre-existing)
 
-Found by TERNADDR (2026-10-31) while measuring the nesting-depth crash; present on master, not caused by TERNADDR.
-
-## Repro
-
-`int* r = (i == 1 ? p : (i == 2 ? p : ... (i == k ? p : q)...));` in an initializer, master exe:
-k = 24: 2 s; k = 28: 26 s; k = 30: 96 s; k = 32: over 120 s. The right-nested form (`i == k ? p : i == k+1 ? ...`)
-is also over 60 s at k = 40.
-
-## Root cause
-
-Not diagnosed. Each `?:` level appears to typecheck or lower its arms more than once, so the cost multiplies.
-
-## Fix direction
-
-Find the repeated arm evaluation in ParseTernaryBranches (count ParseConditionalExpression calls per level with
--v or a counter) and make each arm parse once. The TERNADDR stack-headroom check (RequireStackHeadroom) only bounds crashes, not time: pointer-arm chains
-stay slow up to the point the stack check refuses them.
+The 2x-per-level compile time is fixed (b9f39cdb, per-query const-walk memo); its section was deleted 2026-11-07.
 
 ## Residue (TERNADDR, pre-existing on master, not guarded by the stack check)
 

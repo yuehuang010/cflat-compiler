@@ -160,8 +160,9 @@ explicit unsafe opt-outs used by BLAS/FFT bindings.
 
 Still open (this issue stays):
 - `T* p = new T[n]` into a raw pointer is unchanged: primitives stay uninitialized. About 800
-  such sites (core 174, Test 526, example 119) remain; the migration to `array<T>` is the
-  vec follow-up in [[raw-array-count-desugar-direction]].
+  such sites (core 174, Test 526, example 119) remain. The 2026-09-03 direction to migrate them
+  to `array<T>` was withdrawn (`internal/plan/delete-form-static-analysis.md`, Ruling): raw
+  `new T[n]` stays legal, so these reads are not closed by a migration.
 - The zero-fill is an unconditional memset, not the `alloc_zeroed` allocator entry sketched
   above; that optimization is worth doing only once the recycled-block allocators are measured.
 - (done 2026-09-03, see the Landed section above) Debug poison fill for `init_capacity`.

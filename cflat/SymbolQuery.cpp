@@ -782,6 +782,7 @@ static bool TryNarrowSymbolOverloads(const LspSymbolIndex& index, const SymbolDe
     if (!SplitSymbolTopLevel(argumentText, rawArguments)) return false;
     if (rawArguments.size() == 1 && TrimLineText(rawArguments[0]).empty()) rawArguments.clear();
     std::vector<SymbolArgumentType> arguments;
+    arguments.reserve(arguments.size() + rawArguments.size());
     for (const auto& raw : rawArguments)
         arguments.push_back(InferSymbolArgumentType(index, raw));
 

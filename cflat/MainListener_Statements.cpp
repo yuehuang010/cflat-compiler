@@ -739,7 +739,7 @@ std::string LoopSimpleAssignmentTarget(CFlatParser::UnaryExpressionContext* unar
         auto* postfix = unary->postfixExpression();
         bool isCall = false;
         if (postfix->children.size() != 1) return {};
-        const std::string name = LoopSimplePostfixName(postfix, isCall);
+        std::string name = LoopSimplePostfixName(postfix, isCall);
         if (isCall || name.empty()) return {};
         return name;
 }
@@ -1951,6 +1951,7 @@ void MainListener::CheckCxxReferenceAggregateReturn(
     // Only a PROVEN frame binding refuses: a live Frame fact on a slot the value reads, or a call
     // result (no slot holds it) whose call-argument rule proves one.
     std::vector<std::pair<llvm::Value*, std::vector<int64_t>>> slots;
+    slots.reserve(slots.size() + objectSlots.size());
     for (auto& slot : objectSlots) slots.emplace_back(slot.Root, std::move(slot.Path));
     llvm::WeakVH primary(value.Primary != nullptr && value.Primary->getType()->isStructTy()
         ? value.Primary : nullptr);

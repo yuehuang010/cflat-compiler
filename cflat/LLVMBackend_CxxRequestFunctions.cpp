@@ -2250,8 +2250,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                             construction.CxxDirectConstructionArguments,
                             index, rvalueReference, selectedReference, /*forceClangPick*/ true))
                         return selectedReference;
-                        return hasExactReferenceParameter(index, spelling, functionPointer,
-                                                                          rvalueReference);
+                    return hasExactReferenceParameter(index, spelling, functionPointer,
+                                                      rvalueReference);
                 }
                 if (selectedCtor == nullptr || index + 1 >= selectedCtor->params.size())
                     return fallback();
@@ -4106,8 +4106,8 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                             construction.CxxDirectConstructionArguments,
                             index, rvalueReference, selectedReference, /*forceClangPick*/ true))
                         return selectedReference;
-                        return hasExactReferenceParameter(index, spelling, functionPointer,
-                                                                          rvalueReference);
+                    return hasExactReferenceParameter(index, spelling, functionPointer,
+                                                      rvalueReference);
                 }
                 if (selectedCtor == nullptr || index + 1 >= selectedCtor->params.size())
                     return fallback();
@@ -5341,6 +5341,7 @@ bool LLVMBackend::RequestCxxFreeBraceCall(const std::string& functionName,
         lastCxxBraceLifetimeRefused_ = false;
         if (braceArguments.empty()) return false;
         std::vector<const CxxBraceArgument*> ordered;
+        ordered.reserve(ordered.size() + braceArguments.size());
         for (const auto& brace : braceArguments) ordered.push_back(&brace);
         std::sort(ordered.begin(), ordered.end(), [](const auto* a, const auto* b) {
             return a->argumentIndex < b->argumentIndex;

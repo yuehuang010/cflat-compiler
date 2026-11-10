@@ -435,7 +435,7 @@ std::string CxxMemberValueSpelling(const std::string& spelling)
 }
 std::string CxxFieldIdentitySpelling(const std::string& spelling)
 {
-        const std::string value = CxxMemberValueSpelling(spelling);
+        std::string value = CxxMemberValueSpelling(spelling);
         const size_t open = value.find('<');
         const size_t close = value.rfind('>');
         if (open == std::string::npos || close == std::string::npos || close < open) return value;
@@ -721,12 +721,12 @@ std::string CxxZeroLiteralSpelling(const std::string& identity)
 }
 std::string CxxFunctionPointerReferentParameter(const std::string& parameter)
 {
-        for (std::string marker : { std::string("(*&&)"), std::string("(*const &&)"),
-                                    std::string("(*volatile &&)"),
-                                    std::string("(*const volatile &&)"),
-                                    std::string("(*&)"), std::string("(*const &)"),
-                                    std::string("(*volatile &)"),
-                                    std::string("(*const volatile &)") })
+        for (std::string_view marker : { "(*&&)", "(*const &&)",
+                                          "(*volatile &&)",
+                                          "(*const volatile &&)",
+                                          "(*&)", "(*const &)",
+                                          "(*volatile &)",
+                                          "(*const volatile &)" })
             if (size_t at = parameter.find(marker); at != std::string::npos)
                 return parameter.substr(0, at) + "(*)" + parameter.substr(at + marker.size());
         return {};

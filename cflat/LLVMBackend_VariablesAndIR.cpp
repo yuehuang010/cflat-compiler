@@ -682,7 +682,7 @@ llvm::Value* LLVMBackend::CreateInsertValue(llvm::Value* structInstance, llvm::V
         return builder->CreateInsertValue(structInstance, newValue, index);
     }
 
-llvm::Value* LLVMBackend::CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName)
+llvm::Value* LLVMBackend::CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, const std::string& variableName)
 {
         // LLVM 18 opaque pointer mode: ConstantFolder folds GlobalVariable GEPs into ConstantExpr,
         // which calls ConstantExpr::getCast with an invalid type combination and asserts. Insert directly.
@@ -703,7 +703,7 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(const StructData& data, llvm::Value*
 }
 
 llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const StructData& data,
-                                             llvm::Value* object, unsigned index, std::string name)
+                                             llvm::Value* object, unsigned index, const std::string& name)
 {
         // Keep mutability on the field address after constness propagates from its receiver.
         auto markMutableField = [&](llvm::GetElementPtrInst* gep) {
@@ -993,7 +993,7 @@ unsigned LLVMBackend::CxxFieldElementIndex(const StructData& data, unsigned inde
         return data.CxxFieldElements[index];
 }
 
-llvm::Value* LLVMBackend::CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, std::string name)
+llvm::Value* LLVMBackend::CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, const std::string& name)
 {
         TouchWaitingLayout(type);
         return builder->CreateGEP(type, ptr, offset, name);
@@ -2064,8 +2064,8 @@ void LLVMBackend::RejectByValueContainmentCycles(const std::string& name,
         visit(name);
     }
 
-llvm::StructType* LLVMBackend::CreateStructType(std::string name,
-        std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign,
+llvm::StructType* LLVMBackend::CreateStructType(const std::string& name,
+        const std::vector<LLVMBackend::DeclTypeAndValue>& typeAndValues, uint64_t userAlign,
         std::vector<BitfieldInfo>* bitfields, bool isPacked, uint64_t physicalAlignment)
 {
 
@@ -2182,8 +2182,8 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name,
         }
     }
 
-llvm::StructType* LLVMBackend::CreateUnionType(std::string name,
-        std::vector<DeclTypeAndValue> typeAndValues, uint64_t userAlign,
+llvm::StructType* LLVMBackend::CreateUnionType(const std::string& name,
+        const std::vector<DeclTypeAndValue>& typeAndValues, uint64_t userAlign,
         std::vector<BitfieldInfo>* bitfields, bool capAlignToUserAlign)
 {
         uint64_t maxSize = 1;
@@ -2315,7 +2315,7 @@ llvm::Value* LLVMBackend::CreateConstant(ConstantVariant constantVariant)
         return value;
     }
 
-llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string initialValue)
+llvm::Constant* LLVMBackend::CreateConstant(const std::string& typeName, const std::string& initialValue)
 {
         llvm::Constant* value = nullptr;
 
@@ -2419,7 +2419,7 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
         return value;
     }
 
-llvm::Value* LLVMBackend::CreateGlobalString(std::string name, std::string text)
+llvm::Value* LLVMBackend::CreateGlobalString(const std::string& name, const std::string& text)
 {
         auto it = stringPool.find(text);
         if (it != stringPool.end())
@@ -2434,7 +2434,7 @@ llvm::Value* LLVMBackend::CreateGlobalString(std::string name, std::string text)
         return gv;
     }
 
-llvm::Value* LLVMBackend::CreateGlobalEncodedString(std::string name,
+llvm::Value* LLVMBackend::CreateGlobalEncodedString(const std::string& name,
                                                     const std::vector<uint32_t>& values,
                                                     unsigned width)
 {
@@ -2621,7 +2621,7 @@ bool LLVMBackend::RejectMoveParamFromNonHeapAddress(const std::string& functionN
         return true;
 }
 
-llvm::Value* LLVMBackend::CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
+llvm::Value* LLVMBackend::CreateOperation(const std::string& oper, llvm::Value* left, llvm::Value* right)
 {
         if (left == nullptr)
             return right;
@@ -3082,7 +3082,7 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
         return result;
     }
 
-llvm::Value* LLVMBackend::CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right,
+llvm::Value* LLVMBackend::CreateOperation(const std::string& oper, llvm::Value* left, llvm::Value* right,
                                   bool leftIsUnsigned, bool rightIsUnsigned)
 {
         if (left == nullptr)

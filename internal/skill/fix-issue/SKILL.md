@@ -50,7 +50,7 @@ Batch-mode deltas to the steps below:
 
 - Step 2, Phase A shrinks to: verify each filed repro on the current binary, record the
   pre/post pair per member, and for a lowering change read the `--symbol-dump-ir` of the leg.
-  No axis enumeration, no `scratch/<prefix>_matrix.md`, no accept-set. If verifying a repro
+  No axis enumeration, no `scratch/<prefix>/matrix.md`, no accept-set. If verifying a repro
   reveals the fix is NOT one-site (a second root cause, a rule question), the agent drops that
   member from the batch and says so - it does not grow the batch into a full-mode fix.
 - Step 2, Phase B unchanged except every member gets at least one value leg AND, for a
@@ -137,12 +137,12 @@ compiler):**
     template kinds). Probe them - it is cheap and sets the real scope.
   - **Sub-case axis**: a deferred or filed item is often two sub-cases with
     different answers (e.g. mixed vs fully-generic). Split and test each.
-- Write the matrix as a probe corpus in `scratch/` (unique file prefix) and run
+- Write the matrix as a probe corpus in the agent's own `scratch/<prefix>/` directory and run
   every cell against the CURRENT binary, recording verbatim pre-fix behaviour
   per cell. A leg that behaves identically before and after the fix tests
   nothing - this pre-fix recording is the one process step that has worked
   every time.
-- Write the matrix itself to `scratch/<prefix>_matrix.md` - one row per cell:
+- Write the matrix itself to `scratch/<prefix>/matrix.md` - one row per cell:
   probe file, shape, pre-fix behaviour, intended post-fix behaviour, in/out of
   scope. This file is the handoff artifact every review round reads from disk;
   keep it updated if later rounds change a cell.
@@ -243,7 +243,8 @@ The prompt must also contain:
 - Instruction to COMMIT the fix on the branch as **exactly one commit** - fix,
   regression test, and issue-file deletion all in it. If the agent makes
   intermediate commits while working, it must squash them down to one before
-  reporting (`git reset --soft master && git commit`). This is the one place
+  reporting (`python3 internal/skill/fix-issue/branch.py squash . -F <msgfile>` - it rebases, refuses
+  if master is not an ancestor, and checks the message's issue paths are in git). This is the one place
   committing is expected and the user has authorized it by invoking this skill.
   Still never commit to `master` directly.
 - Instruction to report: the coverage matrix with pre/post behaviour per cell,
@@ -252,7 +253,8 @@ The prompt must also contain:
   it could not resolve.
 
 Before accepting the report, verify it against reality yourself
-(`git rev-list --count master..HEAD`, `git status --porcelain`, the diff) -
+(`python3 internal/skill/fix-issue/branch.py status <worktree>`: commits ahead, porcelain, diff stat,
+live processes in the worktree - then read the diff) -
 agents have reported work that did not exist. A report with no coverage matrix,
 or a matrix whose cells were never run pre-fix, is incomplete: send it back
 before review, not into review.
@@ -302,7 +304,7 @@ every later opus round continues it via SendMessage so it keeps context -
 never spawn a second or parallel opus reviewer for the same issue. `codex exec`
 has no such continuity: each invocation is a fresh process. So every codex
 round's prompt must carry what SendMessage would otherwise carry - point it at
-the fix agent's `scratch/<prefix>_matrix.md` for the coverage matrix, and paste
+the fix agent's `scratch/<prefix>/matrix.md` for the coverage matrix, and paste
 a short summary of prior rounds' findings and what changed in response - so it
 is not re-discovering ground a prior round already covered. Do NOT paste the
 diff or the matrix inline: codex runs inside the worktree and reads
@@ -354,7 +356,7 @@ not re-derive it:
   probes then broke. Targeted crossings are the strong half. A clean sweep is
   necessary, never sufficient.
 
-Tell it to use a unique `scratch/` file prefix (e.g. `rev_`) so it cannot
+Tell it to work only in its own `scratch/<prefix>/` directory (e.g. `scratch/rev/`) so it cannot
 collide with the fix agent's files, to report findings as a ranked list with
 file:line, and to state plainly if the diff is clean - "safe with listed fixes"
 is not clean.
@@ -449,8 +451,9 @@ git -C ../cflat-fix-<slug> rev-list --count master..HEAD   # must print 1
 ```
 
 ```bash
-# in the worktree
-git -C ../cflat-fix-<slug> rebase master
+# rebase + ancestor check + single-commit squash; exits 1 on a conflict or a bad message
+git -C ../cflat-fix-<slug> log -1 --format=%B > scratch/<slug>.msg   # keep the branch's message
+python3 internal/skill/fix-issue/branch.py squash ../cflat-fix-<slug> -F scratch/<slug>.msg
 # re-verify after rebase (skippable ONLY if the rebase was a no-op - "up to date" -
 # and the full bar already ran green on this exact commit)
 cd ../cflat-fix-<slug> && ./cmake_build.sh release && ./test.sh Release && bash test_example.sh Release

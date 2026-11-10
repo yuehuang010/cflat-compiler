@@ -1,0 +1,5 @@
+// A reserved word as a parameter name (`int if`) is reported, but the parser cannot resynchronize
+// after it: no later diagnostic in the file is produced. So this leg lives alone, split out of
+// err_reserved_word_identifier.cb where it silenced the two legs after it.
+expect_error("'if' is a reserved keyword and cannot be used as a name here");
+void reservedParam(int if) { return; }

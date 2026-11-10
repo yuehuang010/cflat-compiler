@@ -133,7 +133,7 @@ static std::string resolveImportPath(const std::string& sourceFilePath,
                                      const std::vector<std::string>& importSearchDirs,
                                      const std::string& runtimeDir)
 {
-    auto tryCanonical = [](std::filesystem::path p) -> std::string {
+    auto tryCanonical = [](const std::filesystem::path& p) -> std::string {
         std::error_code ec;
         auto c = std::filesystem::canonical(p.lexically_normal(), ec);
         return ec ? std::string{} : c.string();
@@ -2665,7 +2665,7 @@ private:
     }
 
     nlohmann::json BuildViewResponse(const AnalysisJob& job, std::string text,
-                                     std::vector<LLVMBackend::LineMapping> mappings,
+                                     const std::vector<LLVMBackend::LineMapping>& mappings,
                                      const ViewTimings& timings)
     {
         nlohmann::json mappingJson = nlohmann::json::array();

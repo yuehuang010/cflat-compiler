@@ -1,6 +1,7 @@
 // A non-template type declared in a namespace hides a same-named global generic template when the
 // spelling with arguments is used inside that namespace (innermost-first, as C++). Each refused
 // spelling is one expect_error block. Accept cells live in Test/test_generics.cb (testLnsNamespaceShadow).
+// The pre-pass sites (namespace global, generic argument) are in err_namespace_nontemplate_hides_template_prepass.cb.
 
 struct Item<T> { T v = default; };
 struct Holder<T> { T v = default; };
@@ -142,24 +143,6 @@ namespace LnsErrField
     struct Item { int w = default; };
     expect_error("'Item' is not a generic type") {
         struct Carrier { Item<int> f = default; };
-    }
-}
-namespace LnsErrGlobal
-{
-    struct Item { int w = default; };
-    expect_error("'Item' is not a generic type");
-    Item<int> gv = default;
-}
-// The generic-argument site runs in the ForwardRefScanner pre-pass, before a block-scoped
-// expect_error is armed, so it uses a bare file-scope expectation (armed for the imports too).
-expect_error("'Item' is not a generic type");
-namespace LnsErrNestedArg
-{
-    struct Item { int w = default; };
-    int f()
-    {
-        Holder<Item<int>> b = default;
-        return 0;
     }
 }
 namespace LnsErrNestedAggregate

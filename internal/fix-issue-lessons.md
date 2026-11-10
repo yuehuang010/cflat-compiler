@@ -42,14 +42,10 @@ file. `internal/testing-notes.md` holds the mechanics of the suites.
   into a verified before/after. It caught a report that framed a REGRESSION as a tightening, and
   separately caught a tightening whose claimed witness did not compile on PRE at all - the claim
   was true, the evidence was not.
-- **Keep the PRE binary OUTSIDE the repo - `scratch/` is the fix agent's workspace, not the
-  reviewer's.** Second occurrence 2026-08-03 (the first was a merge agent deleting the scratch
-  directory a review was still drawing witnesses from): a PRE binary parked in `scratch/pre/` was
-  deleted by the Stage 1 implementation agent tidying up, and had to be rebuilt mid-review. Build it
-  in a detached worktree under `/tmp` and reference it by absolute path. Corollary: **verify the PRE
-  binary's identity before quoting it** - the first sign anything was wrong was every probe
-  returning exit 127, which is a missing binary, not a compiler verdict. A silent substitution
-  would have been far worse than a loud one.
+- **Keep the PRE binary OUTSIDE the repo**, in a detached worktree at the merge base, referenced
+  by absolute path (2026-08-03: one parked in `scratch/pre/` was deleted by an agent tidying up). A
+  copied exe is not a PRE binary. **Verify its identity before quoting it** - exit 127 on every
+  probe is a missing binary, not a compiler verdict.
 - **A stalled or failed review agent is not a clean review.** One round's reviewer died mid-run
   with no report; treating the silence as "nothing found" would have shipped an unverified cache
   round-trip.
@@ -98,13 +94,6 @@ file. `internal/testing-notes.md` holds the mechanics of the suites.
   the whole finding - inference between them is exactly the step that cannot be taken.
 - Cost: one round-trip each, after the fact, on work already believed finished. Requiring a
   measured pre/post pair with every equivalence claim is cheaper than any of them.
-
-- **A cached C++ request FAILURE outlives the build that wrote it.** The cheaders cache key carries
-  no build stamp, so a failed-request entry written by a work-in-progress build is replayed by every
-  later build, master included. T70 (2026-10-07): one such entry made a whole Luna isolation round
-  vacuous (every hunk "ruled out", nothing measured) and hid a real dropped `IsMove`. Bisects,
-  isolation builds and master-vs-branch comparisons on C++ interop run with a fresh empty
-  `CFLAT_CACHE_DIR`, or the comparison is meaningless.
 
 ## On changing approach vs. patching
 
@@ -219,10 +208,8 @@ The recurring failure mode of this whole family, stated once:
   so; the evidence was `Test/test_move.cb` itself moving from 13 allocations / 256 bytes to
   14 / 272 under `leaks --atExit`. The discipline was present and applied to one axis; the
   defect landed in the neighbouring one.
-- **A leg that cannot fail is worse than no leg, because it reads as coverage.** The same file
-  carried `Test("uae_string_elem_copy_survived_teardown", 1, 1)` - literally `1 == 1`. Sweep new
-  legs for this before reporting: any leg whose expression cannot produce a value other than the
-  expected one, and any leg that would still pass with the fix reverted.
+- **A leg that cannot fail is worse than no leg, because it reads as coverage.** Literal `Test(name, lit, lit)`
+  legs are linted (`utilities/lint_test_legs.py` check 4); still sweep for legs that pass with the fix reverted.
 - **One spelling tests one code path - so enumerate the axes BEFORE writing the legs.** This,
   not assertion strength, is where the misses came from. Two axes were each missed twice: the
   **spelling axis** (bare vs qualified vs aliased vs inferred use of the same name) and the
@@ -245,17 +232,10 @@ The recurring failure mode of this whole family, stated once:
 - **Verify a negative test is non-vacuous against the RIGHT baseline.** A test can be vacuous vs
   master yet still be a real tripwire for a defect introduced mid-work. Record which binary it
   discriminates against rather than labelling it vacuous.
-- **`expect_error` is fail-fast by design: a bare leg's error ends the check, and nothing after it
-  in compile order runs.** So a file PASSES with legs that never ran when a bare leg's error comes
-  first - a second bare leg in the same function, or any leg the walk reaches after a bare
-  file-scope leg's parse or pre-pass error. Found 2026-09-10: six dead legs in three err files.
-  Authoring rule, not a harness bug (maintainer: the harness keeps no queue of expectations): put
-  a bare leg alone in its file or last in compile order, use scoped blocks for everything else,
-  and run a changed err file alone, counting `PASS: expected error received` lines against legs.
-- **A test that pins a PATH in `expect_error` breaks on the other platform.**
-  `ShortenDefSiteForDisplay` returns native separators, deliberately. Pin the basename +
-  (line,col) TAIL only. `expect_error` is a plain `.find()` substring check
-  (`LLVMBackend.h:1201`).
+- **`expect_error` is fail-fast by design: a bare leg's error ends the check.** Dead legs are linted
+  (`utilities/lint_test_legs.py` check 1, PASS lines tied to legs); put a bare leg alone or last in compile order.
+- **No path, drive letter or `$`-mangled name in an `expect_error` substring** - linted (`lint_test_legs.py` check 3);
+  pin the basename + (line,col) tail.
 - **A deferred (end-of-compile) diagnostic cannot be caught by a SCOPED `expect_error` block.**
   The block closes first and prints `FAIL: expected error ... did not occur`, then `exit(1)`s
   BEFORE the real diagnostic - so the stated reason is the opposite of the truth. Use the bare
@@ -268,10 +248,9 @@ The recurring failure mode of this whole family, stated once:
   bar compile the fixture cold (~430 s at load ~10, limit 480 s in test.sh). T101 and T103 both
   hit it on 2026-10-11. Confirm with one standalone compile under gtimeout 900 (cold, then warm
   = 0 s) and its run exit before landing; never weaken the leg or the limit to get green.
-- **`expect_error` matches the `LogError*` format-string text, not the printed message.** The
-  printed line comes from `cflat/locales/en.json` and can differ in wording (T110: printed "cannot
-  choose which 'ov' to call", source "ambiguous call to 'ov'"). Copy the substring from the code,
-  not from the console; a printed-text substring reports FAIL even though it is visible.
+- **`expect_error` matches the `LogError*` format-string text, not the printed `en.json` text** (T110). Copy the
+  substring from the code. `lint_test_legs.py` check 2 catches en.json copies only; its source match is loose
+  (p2/expect-error-substring-source-check-loose).
 - **A Mac-green leg that leans on `long` width or a non-fixed enum's width is Windows-red.** LLP64: `long` is 32-bit
   (so `long*` converts like `int*`), and MSVC keeps a non-fixed enum `int`. Fix box 2026-10-15 shipped three such legs
   (T276 header twin, T296 and T298 `long` pointees), all red only at the close gate. Spell the 64-bit case `long long`,
@@ -279,23 +258,16 @@ The recurring failure mode of this whole family, stated once:
 
 ## On agent reports
 
-- **Agents have reported work that did not exist**: one returned a status update as if it had
-  implemented the feature (worktree had 0 commits, 0 modified files); one claimed a review round
-  "found the correctness core clean" while that review was still RUNNING. **After every agent
-  report, check `git rev-list --count master..HEAD`, `git log`, `git status --porcelain`, and
-  the diff yourself before believing any of it.**
-- An agent that delegates can orphan a child that keeps writing to the worktree with no one
-  watching. Detect that before spawning a replacement, or two writers corrupt the same files.
+- **Agents have reported work that did not exist** (a status update posing as an implementation,
+  0 commits; a "clean" review that was still RUNNING). After every agent report run
+  `internal/skill/fix-issue/branch.py status <worktree>` - commits ahead, porcelain, diff stat,
+  live processes - and read the diff before believing any of it. A live process means the worktree
+  is occupied (an orphaned child or a resumed agent): never escalate into it (2026-07-31
+  near-clobber).
 - **Counterexample worth trusting**: an agent reporting a bug ITS OWN tests caught is doing real
   work. Fabricated reports do not contain self-inflicted findings.
 - When an agent proposes diverging from the issue file's fix direction, treat it as a RISK.
-- Tell agents to use repo-root `scratch/` and never run `git stash`.
-- **Before declaring an agent has flailed, check for a LIVE PROCESS** (`ps` for the worktree
-  path), not just `git log` / `git status`. An agent resumed mid-turn can look idle at the exact
-  moment you sample it. On 2026-07-31 a resume was misread as a flail on correct evidence (HEAD
-  unmoved, tree clean, defect still live) and an opus escalation was spawned into the same
-  worktree; the two writers collided. The escalated agent detected it and stopped, which is the
-  only reason nothing was clobbered.
+- Tell agents to work in their own `scratch/<prefix>/` directory and never run `git stash`.
 - **When an agent overrules your instruction and explains why, check whether it is right** - it
   often is. Twice on 2026-07-31 an agent rejected a key I suggested (`ElementOwningUnique`,
   which is only ever set for a case that could never match) and corrected my arithmetic about
@@ -397,32 +369,18 @@ The recurring failure mode of this whole family, stated once:
 
 ## On concurrent agents sharing a worktree
 
-- **Concurrent agents WILL collide on scratch filenames.** A reviewer and a fix agent both wrote
-  `scratch/keep.cb` and destroyed each other's evidence; the round-1 must-keep-working results
-  had to be regenerated from scratch. Assign every agent a unique scratch prefix (`r2_`, `rev_`)
-  in its prompt.
-- **A delegating agent's "no live children" notification does NOT mean nothing is running.** One
-  fix agent spawned a sub-agent and returned immediately; the task notification fired, the branch
-  had zero commits, and the tree was clean - every git-visible signal said "flailed, escalate."
-  A build was in fact running in that worktree the whole time. `lsof -c ninja` / `ps` identified
-  which worktree owned it. **Check for a live process before escalating into an occupied
-  worktree** - escalating blind was already a near-clobber once before.
-- Escalation and cleanup both look at git state; git state alone cannot distinguish "not started"
-  from "in progress."
+- **Git state alone cannot tell "not started" from "in progress".** A delegating agent's "no live
+  children" notification fired with zero commits and a clean tree while its build was still
+  running. `branch.py status` lists live processes. On Windows it sees command lines and exe paths
+  but not a relative-path build's cwd, so a quiet worktree there still deserves a look.
 
 ## On squashing a branch onto master
 
-- **`git reset --soft master` on a branch NOT based on current master reverts whatever master
-  gained since the branch point.** Soft reset keeps the branch's TREE and moves HEAD, so the
-  squash commit's diff is "master -> branch tree" - every file master changed after the branch
-  forked is silently rolled back. 2026-09-29: D5 was based on the pre-E2 master; after E2 landed,
-  the squash produced a commit that deleted E2 and still ff-merged cleanly (it IS a descendant).
-  Caught only by reading `--stat`. **Rebase, then `git merge-base --is-ancestor master HEAD`,
-  then squash - in the SAME command**, so a failed or skipped rebase stops the squash.
-- **Never launch a review or bar after `git rebase ... | tail -1` with `&&`/`;`.** The pipe's exit status is
-  `tail`'s, so a conflicted rebase still "succeeds" and the agent/bar runs on a mid-rebase tree with
-  conflict markers. Happened twice on 2026-10-10 (T85 review r4, T95 bar). Rebase in its own command,
-  check `git diff --name-only --diff-filter=U` is empty, then launch.
+- **Squash only with `internal/skill/fix-issue/branch.py squash`.** A hand-rolled
+  `git reset --soft master` on a branch not based on current master silently reverts every landing
+  since the fork (D5 2026-09-29; V15 2026-10-01, -759 lines), and `git rebase ... | tail -1 && next`
+  launched a review on a conflicted tree twice (2026-10-10). The script rebases, refuses on a
+  conflict or a non-ancestor master, squashes, prints `--stat`, and exits 1 on any failure.
 - **A test binary's exit code is main's return mod 256, and heap-audit LEAK lines are not failures.**
   test_cpp_interop prints ~124 `heap-audit: LEAK` reports on master and still exits 0 (legs `new` without
   delete). A failing run that exits 140 means a leg returned N with N % 256 == 140 (396, 908, 7052...);
@@ -488,17 +446,9 @@ The recurring failure mode of this whole family, stated once:
 
 ## On issue files referenced by a commit before it lands
 
-- **An issue file referenced by a commit message must be tracked before the commit.** A commit
-  deleted two P1 issue files it had fixed, and its message pointed at a follow-up issue file as the
-  record of a deliberate deferral. That follow-up file existed on disk but had never been `git
-  add`ed - it was untracked in the main checkout. The commit would have removed two tracked issues
-  while the deferral it promised to record existed nowhere in history. A reviewer caught it with
-  `git ls-files <path>`.
-- Why it matters: `internal/issue/` files are routinely created untracked and stay that way for a
-  while, so "I wrote that file" and "that file is in git" are different claims. Any issue path
-  named in a commit message is a promise about HISTORY, not about the working tree. Before
-  committing, run `git ls-files` on every issue path the message mentions, and add the referenced
-  files to the same commit.
+- **An issue path named in a commit message is a promise about HISTORY.** A commit once cited an
+  untracked follow-up file as the record of a deferral. `branch.py squash` refuses such a message.
+  For a commit made by hand, run `branch.py check-msg <msgfile>` first.
 
 ## On the baseline binary a severity claim is measured against
 
@@ -769,26 +719,9 @@ in most cases already attempted and reverted once.
 
 ## On the differential corpus sweep (additions)
 
-- **Both binaries must be in the SAME `--init-local` cache state, and cold is the state to
-  compare in.** A warm POST against a cold PRE produced SEVEN phantom `core/*.cb` diffs, all
-  "redeclaration of global" - which is what a warm core cache produces, not a rejection. Hit
-  independently by four separate fix rounds (the multi-dimensional-bracket record, the
-  code-VALUE-into-ANY-data-parameter record, the code-value-evidence join-ledger record, and the
-  temp-unique-field-escape record).
-  Equalize (or freshly rebuild) the cache on both sides before reading a single diff.
-- **A header cache written by a DIFFERENT build at the same cache version is a false regression.**
-  Cache keys carry no build stamp, so a branch build reuses `cheaders/v<N>` entries written by an
-  earlier (buggy) round or another branch. Hit twice on 2026-10-01: the shared Windows gate tree
-  (master itself "failed" test_cpp_interop, ~25 min lost) and V15 r3 (18 "regressed" C++ error tests
-  were r2's cached bindings; cold they passed). Clear `cheaders` / `--init-clear-local` before
-  trusting any C++-interop failure from a worktree that ran an earlier round.
-- **`git reset --soft master` squashes onto the CURRENT master.** If master moved since the branch
-  forked, the commit silently reverts every landing in between (V15 squash, 2026-10-01: -759 lines).
-  Squash with `git reset --soft $(git merge-base HEAD master)`, then rebase; check
-  `git diff --stat master` before gating.
-- **A COPIED exe is not a PRE binary.** The non-aggregate-global-brace-list record's first core sweep used a copied PRE
-  binary whose `.cflat` cache still pointed at the other tree and produced 25 bogus
-  circular-import/redeclaration diffs. Build a detached worktree at the merge base.
+- **Compare PRE and POST in the same cache state (both warmed with `--init-local`).** Caches have
+  been build-stamped since 2026-10-21, so a foreign build's entries are no longer replayed. Under
+  `CFLAT_CACHE_BUILD_STAMP=0` the old phantom-diff and false-regression hazards come back.
 - **Capture rc into a variable BEFORE any command substitution.** `echo "$(basename $f) rc=$?"`
   reads `basename`'s exit code, reported a clean zero, and looked exactly like the answer the
   change wanted (recurred twice: the code-value-evidence join-ledger record and the
@@ -3094,10 +3027,9 @@ abandoned attempts. Before presenting a design block, check whether a tracked re
 contains the answer - re-opening a settled ruling costs a full round and risks ratifying a
 regression.
 
-**Re-check a named prerequisite against `git log` before deferring on it.** The q09 round skipped
-its p1 member as "blocked on `p3/interface-boxing-keyed-on-source-binding`" AFTER that blocker had
-already landed in `b911ccc` and its issue file had been deleted. A named blocker is a claim with a
-shelf life: verify the commit and the file's existence before repeating it.
+**A named blocker is a claim with a shelf life.** The q09 round deferred on a p3 blocker that had
+already landed and been deleted. `python3 utilities/check_issue_refs.py` lists every reference
+under `internal/issue/` to an issue file that no longer exists. Run it before deferring.
 
 See also the governing rule for the guard family (unknown ACCEPTS; a false rejection is a blocker,
 a missed dangle is today's behaviour), recorded above.
@@ -3375,15 +3307,11 @@ above.
 
 ### Any inbound type-mapping change must bump the C header disk-cache version
 
-Found reviewing the `long`/`ulong` fix (2026-09-10). The C header disk cache key
-(`CHeaderDiskCacheKey`, `LLVMBackend_StateAndImports.cpp`) has NO compiler build stamp, unlike the
-in-memory key, and it stores signatures ALREADY MAPPED (`SigToJson` / `TvToJson`), while records,
-enums and aliases store raw spellings and re-map on load. So a cache written by the old binary
-keeps serving the old mapping for signatures and the new one for everything else: one import, two
-answers. `test_cpp_interop_template.cb` / `test_cpp_interop_bridge.cb` import `cpp_interop_tpl.h`
-with `cache`, so a green suite run can
-load a stale entry and prove nothing. Any change to `MapCTypeToTypeAndValue*` output bumps the
-version at BOTH the check and the write (`version != N`, `j["version"] = N`) with a history line.
+The header disk cache stores signatures ALREADY MAPPED (`SigToJson` / `TvToJson`) while records,
+enums and aliases re-map on load, so a stale entry gives one import two answers. The build stamp
+(ruling 2026-10-21) now invalidates it per build. Under `CFLAT_CACHE_BUILD_STAMP=0` the version is
+still the only key, so any change to `MapCTypeToTypeAndValue*` output bumps it at BOTH the check
+and the write (`version != N`, `j["version"] = N`) with a history line.
 
 ### Addendum: `int` follows the target by coincidence, not by construction (2026-09-10)
 
@@ -3571,9 +3499,9 @@ Per-item detail lives in the named issue file; durable decisions here.
 The compiler build stamp (`cstamp`: cflat binary mtime + size) keys every persistent cache by default - C/C++ request and header
 JSON rows, demand companions, `--init` core metadata. `CFLAT_CACHE_BUILD_STAMP=0` opts out; unset or any other value is on. This
 supersedes the 2026-09-28 gate (flip only once cold cflat <= 1.1x clang cold). Trigger: a rebased fix worktree reused C++ entries
-written by its pre-rebase exe and the T393 landing bar crashed test_cpp_interop twice (fresh cache: clean). The earlier lessons at the
-top of this file (failed-request entry replayed by later builds; foreign-build `cheaders` false regression) are now closed by default;
-they still apply under `=0`. Cost: the first compile after any rebuild is cold; core bitcode stays cold until `--init` is re-run.
+written by its pre-rebase exe and the T393 landing bar crashed test_cpp_interop twice (fresh cache: clean). It closed the lessons on replayed
+failed-request entries and foreign-build `cheaders` false regressions (retired from this file 2026-11-06); both still apply
+under `=0`. Cost: the first compile after any rebuild is cold; core bitcode stays cold until `--init` is re-run.
 
 ## Ruling 2026-10-21: issue bucket meanings and the ship gate
 

@@ -300,7 +300,6 @@ bool testVoidFunctionPointer()
     Lambda<void()> f = doNothing;
     callVoid(f);
     callVoid(doNothing);
-    result &= Test("void funcptr", 1, 1);
 
     return result;
 }
@@ -518,7 +517,6 @@ bool testVoidLambda()
     Lambda<void()> noopLambda = () => { };
     callVoid(noopLambda);
     callVoid(() => { doNothing(); });
-    result &= Test("void lambda", 1, 1);
 
     return result;
 }
@@ -1676,7 +1674,6 @@ bool testFuncPtrInStructFieldVoid()
     VoidHandler vh;
     vh.fn = doNothing;
     vh.fn();
-    result &= Test("void struct field call", 1, 1);
 
     return result;
 }

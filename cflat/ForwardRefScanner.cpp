@@ -202,11 +202,11 @@ std::string ForwardRefScanner::ResolveGenericTemplateBaseAtUse(
         {
             for (const auto& scope : scopes)
             {
-                const std::string nested = scope.Name + "." + lexicalName;
+                std::string nested = scope.Name + "." + lexicalName;
                 if (compiler->IsGenericTemplateKey(nested))
                 {
                     if (!IsAggregateMemberDeclarationTypeUse(useSite) || !isLater(nested)) return nested;
-                    const std::string fallback = hasExactKey ? spelledBase
+                    std::string fallback = hasExactKey ? spelledBase
                         : compiler->ResolveGenericBaseAlias(spelledBase);
                     if (!compiler->IsGenericTemplateKey(fallback)
                         || GenericTemplateKeyNestedInAnyScope(fallback, scopes)) return {};
@@ -245,20 +245,20 @@ std::string ForwardRefScanner::ResolveGenericTemplateBaseAtUse(
                 && GenericTemplateKeyNestedInAnyScope(spelledBase, scopes) && isLater(spelledBase)) return {};
             return spelledBase;
         }
-        const std::string base = compiler->ResolveGenericBaseAlias(spelledBase);
+        std::string base = compiler->ResolveGenericBaseAlias(spelledBase);
         if (compiler->IsGenericTemplateKey(base))
         {
             if (IsAggregateMemberDeclarationTypeUse(useSite)
                 && GenericTemplateKeyNestedInAnyScope(base, scopes) && isLater(base)) return {};
             return base;
         }
-        const std::string resolved = ResolveGenericTemplateBaseAtScope(
+        std::string resolved = ResolveGenericTemplateBaseAtScope(
             compiler, spelledBase, scopes, useSite, lexicalName);
         if (IsAggregateMemberDeclarationTypeUse(useSite)
             && GenericTemplateKeyNestedInAnyScope(resolved, scopes) && isLater(resolved))
         {
             if (!lexicalBareName) return {};
-            const std::string fallback = compiler->IsGenericTemplateKey(base)
+            std::string fallback = compiler->IsGenericTemplateKey(base)
                 ? base : compiler->ResolveGenericTemplateBase(lexicalName);
             if (!compiler->IsGenericTemplateKey(fallback) || fallback == resolved
                 || GenericTemplateKeyNestedInAnyScope(fallback, scopes)) return {};
@@ -1493,6 +1493,7 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
                 }
             }
             std::vector<std::string> memberNames;
+            memberNames.reserve(memberNames.size() + methods.size());
             for (const auto& m : methods)
                 memberNames.push_back(m.Name);
             for (const auto& f : fields)
@@ -3440,7 +3441,7 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
         std::string genericBase;
         if (auto* genericParams = GenericSpecOf(ts, genericBase); genericParams != nullptr)
         {
-            const std::string baseName = genericBase;
+            const std::string& baseName = genericBase;
             std::vector<std::string> args;
             for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                 args.push_back(ResolveForwardTypeArg(entry));

@@ -3280,8 +3280,8 @@ int LLVMBackend::RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::
     {
         // Output cannot be held back, so do not link the replayed module at all: the cold
         // retry links without a replay.
-        if (!outPath.empty()) llvm::sys::fs::remove(outPath);
-        if (!errPath.empty()) llvm::sys::fs::remove(errPath);
+        if (!outPath.empty()) (void)llvm::sys::fs::remove(outPath);
+        if (!errPath.empty()) (void)llvm::sys::fs::remove(errPath);
         if (verbose)
             std::cout << "[verbose] cannot hold back linker output after a C++ demand replay: "
                          "retrying with C++ caches bypassed\n";
@@ -3307,8 +3307,8 @@ int LLVMBackend::RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::
                          "caches bypassed\n";
         cxxDemandRetry_ = true;
     }
-    llvm::sys::fs::remove(outPath);
-    llvm::sys::fs::remove(errPath);
+    (void)llvm::sys::fs::remove(outPath);
+    (void)llvm::sys::fs::remove(errPath);
     return rc;
 }
 
@@ -3658,7 +3658,7 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
                 if (auto p = llvm::sys::findProgramByName(cand)) { cc = *p; break; }
         if (cc.empty())
         {
-            llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(objPath);
             LogErrorMessage("no {} compiler driver found to link the executable.",
                             { cppInteropUsed_ ? "C++" : "C" });
             return false;
@@ -3684,13 +3684,14 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         if (debugInfo) argStrs.push_back("-g");
 
         std::vector<llvm::StringRef> args;
+        args.reserve(args.size() + argStrs.size());
         for (auto& s : argStrs) args.push_back(s);
 
         std::cout << std::format("Linking (elf): {}\n", exePath);
         std::string linkErr;
         int rc = RunLinkerProcess(cc, args, linkErr);
-        llvm::sys::fs::remove(objPath);
-        for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+        (void)llvm::sys::fs::remove(objPath);
+        for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
         if (rc != 0)
         {
             if (!cxxDemandRetry_)
@@ -3980,8 +3981,8 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
                 int rc = RunLinkerProcess(ld64, args, linkErr);
                 if (rc != 0)
                 {
-                    llvm::sys::fs::remove(objPath);
-                    for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                    (void)llvm::sys::fs::remove(objPath);
+                    for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                     if (!cxxDemandRetry_)
                         std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
                     return false;
@@ -3989,8 +3990,8 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
                 const bool keepObjects = debugInfo && !EmitMacDebugInfo(exePath);
                 if (!keepObjects)
                 {
-                    llvm::sys::fs::remove(objPath);
-                    for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                    (void)llvm::sys::fs::remove(objPath);
+                    for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                 }
                 return true;
             }
@@ -4019,7 +4020,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         {
             argStrs.push_back("-stdlib=libc++");
             argStrs.push_back("-std=" + cppStandard_);
-            const std::string sdkPath = MacSdkPathCached();
+            const std::string& sdkPath = MacSdkPathCached();
             if (!sdkPath.empty()) { argStrs.push_back("-isysroot"); argStrs.push_back(sdkPath); }
         }
         for (auto& cObj : cObjectFiles_) argStrs.push_back(cObj);
@@ -4032,6 +4033,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         if (asan_) argStrs.push_back("-fsanitize=address");
 
         std::vector<llvm::StringRef> args;
+        args.reserve(args.size() + argStrs.size());
         for (auto& s : argStrs) args.push_back(s);
 
         std::cout << std::format("Linking (mach-o): {}\n", exePath);
@@ -4039,8 +4041,8 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         int rc = RunLinkerProcess(cc, args, linkErr);
         if (rc != 0)
         {
-            llvm::sys::fs::remove(objPath);
-            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+            (void)llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
             if (!cxxDemandRetry_)
                 std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
             return false;
@@ -4051,8 +4053,8 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
 #endif
         if (!keepObjects)
         {
-            llvm::sys::fs::remove(objPath);
-            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+            (void)llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
         }
     return true;
     }
@@ -4077,7 +4079,7 @@ bool LLVMBackend::ValidateManifestActivationContext(const std::string& xml) cons
         if (!out)
         {
             out.close();
-            llvm::sys::fs::remove(path);
+            (void)llvm::sys::fs::remove(path);
             LogError(std::format("could not write manifest backstop input '{}'", path));
             return false;
         }
@@ -4097,7 +4099,7 @@ bool LLVMBackend::ValidateManifestActivationContext(const std::string& xml) cons
             if (!locations.empty()) locations += ", ";
             locations += std::format("{}:{}", fragment.SourceFile, fragment.Line);
         }
-        llvm::sys::fs::remove(path);
+        (void)llvm::sys::fs::remove(path);
         LogError(std::format(
             "manifest activation context failed with Win32 error {} for declaration(s) at {}",
             error, locations));
@@ -4122,7 +4124,7 @@ bool LLVMBackend::ValidateManifestActivationContext(const std::string& xml) cons
             {
                 unsigned long error = ok ? 0 : GetLastError();
                 ReleaseActCtx(handle);
-                llvm::sys::fs::remove(path);
+                (void)llvm::sys::fs::remove(path);
                 LogError(std::format(
                     "manifest [JsonText] backstop failed for '{}:{}' declared at {}:{}: "
                     "Win32 error {}; OS returned '{}', expected '{}'",
@@ -4133,7 +4135,7 @@ bool LLVMBackend::ValidateManifestActivationContext(const std::string& xml) cons
         }
 
     ReleaseActCtx(handle);
-    llvm::sys::fs::remove(path);
+    (void)llvm::sys::fs::remove(path);
     return true;
 #endif
 }
@@ -4296,7 +4298,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
 
         if (lldLinkPath.empty())
         {
-            llvm::sys::fs::remove(objPath);
+            (void)llvm::sys::fs::remove(objPath);
             std::cout << "Error: lld-link.exe not found\n";
             return false;
         }
@@ -4382,8 +4384,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         // instead of letting lld-link emit a raw "could not open ucrt.lib".
         if (!useSyntheticLibs && ucrtLibPath.empty())
         {
-            llvm::sys::fs::remove(objPath);
-            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+            (void)llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
             if (!keepVcRuntime && arch == "x64")
                 LogErrorMessage("Run cflat --init for the first time to finish setting up.");
             else
@@ -4399,8 +4401,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         {
             if (!ResolveAsanRuntime(arch, msvcLibPath, linkArgStrs, asanDllToCopy))
             {
-                llvm::sys::fs::remove(objPath);
-                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                (void)llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                 return false;
             }
         }
@@ -4468,7 +4470,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         std::vector<std::string> resourceTempFiles;
         auto cleanupResourceFiles = [&]() {
             for (const auto& path : resourceTempFiles)
-                llvm::sys::fs::remove(path);
+                (void)llvm::sys::fs::remove(path);
             resourceTempFiles.clear();
         };
         if (!manifestFragments_.empty() || applicationInfo_)
@@ -4479,8 +4481,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
                 auto merged = MergeManifestFragments();
                 if (!merged || !ValidateManifestActivationContext(*merged))
                 {
-                    llvm::sys::fs::remove(objPath);
-                    for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                    (void)llvm::sys::fs::remove(objPath);
+                    for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                     return false;
                 }
                 mergedManifestXml =
@@ -4488,8 +4490,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             }
             if (!ValidateApplicationForTarget(true))
             {
-                llvm::sys::fs::remove(objPath);
-                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                (void)llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                 return false;
             }
 
@@ -4497,8 +4499,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_resource", "res", resourcePath))
             {
                 LogError(std::format("could not create temporary resource file: {}", ec.message()));
-                llvm::sys::fs::remove(objPath);
-                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                (void)llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                 return false;
             }
             std::string path = resourcePath.str().str();
@@ -4509,11 +4511,11 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
                 std::filesystem::path(exePath).filename().string(), mergedManifestXml, resOverflow);
             if (resOverflow)
             {
-                llvm::sys::fs::remove(path);
+                (void)llvm::sys::fs::remove(path);
                 LogError("the application version resource is too large to encode; "
                     "shorten the application text fields");
-                llvm::sys::fs::remove(objPath);
-                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                (void)llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                 return false;
             }
             bool written = false;
@@ -4528,10 +4530,10 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             }
             if (!written)
             {
-                llvm::sys::fs::remove(path);
+                (void)llvm::sys::fs::remove(path);
                 LogError(std::format("could not write temporary resource file '{}'", path));
-                llvm::sys::fs::remove(objPath);
-                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                (void)llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
                 return false;
             }
             resourceTempFiles.push_back(path);
@@ -4539,6 +4541,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         }
 
         std::vector<llvm::StringRef> linkArgs;
+        linkArgs.reserve(linkArgs.size() + linkArgStrs.size());
         for (auto& s : linkArgStrs) linkArgs.push_back(s);
 
         std::cout << std::format("Linking ({}): {}\n", arch, exePath);
@@ -4547,8 +4550,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             llvm::TimeTraceScope linkScope("Link", exePath);
             std::string linkErr;
             int rc = RunLinkerProcess(lldLinkPath, linkArgs, linkErr);
-            llvm::sys::fs::remove(objPath);
-            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+            (void)llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
             cleanupResourceFiles();
 
             if (rc != 0)
@@ -5073,7 +5076,7 @@ bool LLVMBackend::JitRun(int& runExitCode)
                 LogErrorMessage("{}: could not read imported C object '{}': {}",
                                 { "--run", cObj, objOrErr.getError().message() });
                 for (const auto& path : cObjectFiles_)
-                    llvm::sys::fs::remove(path);
+                    (void)llvm::sys::fs::remove(path);
                 return false;
             }
             if (auto err = jit->addObjectFile(std::move(*objOrErr)))
@@ -5081,14 +5084,14 @@ bool LLVMBackend::JitRun(int& runExitCode)
                 LogErrorMessage("{}: could not load imported C object '{}': {}",
                                 { "--run", cObj, llvm::toString(std::move(err)) });
                 for (const auto& path : cObjectFiles_)
-                    llvm::sys::fs::remove(path);
+                    (void)llvm::sys::fs::remove(path);
                 return false;
             }
         }
         // addObjectFile owns the object bytes after this point, so the compiler's temporary
         // files are no longer needed. The JIT keeps its in-memory copies alive for execution.
         for (const auto& cObj : cObjectFiles_)
-            llvm::sys::fs::remove(cObj);
+            (void)llvm::sys::fs::remove(cObj);
 
         // Drop every module/context-bound debug-info handle BEFORE the JIT takes ownership.
         // With -g (which --sanitize=ownership implies) the DIBuilder holds tracking MDRefs into

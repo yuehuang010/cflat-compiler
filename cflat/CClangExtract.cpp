@@ -281,7 +281,8 @@ namespace cflat_cinterop
             if (!enabled) return;
             const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
-            std::cout << std::format("[verbose]   extraction stage {}: {:.3f} ms\n", name, ms);
+            try { std::cout << std::format("[verbose]   extraction stage {}: {:.3f} ms\n", name, ms); }
+            catch (...) {}  // verbose timing only; never terminate from a destructor
         }
     };
 
@@ -5427,7 +5428,7 @@ namespace cflat_cinterop
                         if (memberDecls[i] != nullptr)
                             st.memberAbiWork.push_back({ recIdx, i, memberDecls[i] });
                 }
-                if (rec.inScope && nameOverride.empty())
+                if (st.out.records.back().inScope && nameOverride.empty())
                     if (const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd))
                     {
                         std::function<void(const CXXRecordDecl*)> emitBases;
@@ -8203,9 +8204,13 @@ namespace cflat_cinterop
             // not now. Feed the resolved records' body-bearing methods directly as well.
             if (st.contextRoot != nullptr)
             {
-                std::unordered_set<const CXXRecordDecl*> records;
+                // memberAbiWork order, not pointer order: the hand-off order is CodeGen's emit order.
+                std::vector<const CXXRecordDecl*> records;
+                std::unordered_set<const CXXRecordDecl*> seenRecords;
                 for (const auto& w : st.memberAbiWork)
-                    if (w.md != nullptr) records.insert(w.md->getParent()->getDefinition());
+                    if (w.md != nullptr)
+                        if (const auto* def = w.md->getParent()->getDefinition(); seenRecords.insert(def).second)
+                            records.push_back(def);
                 // Skip what the announcement replay above already handed to CodeGen.
                 std::unordered_set<const FunctionDecl*> methods;
                 for (Decl* d : st.announcedDecls)

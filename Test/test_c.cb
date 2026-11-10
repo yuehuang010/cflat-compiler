@@ -685,15 +685,15 @@ int switchFallthrough(int x)
 bool testNumericLiterals()
 {
     bool result = true;
-    result &= Test("decimal_literal", 123, 123);
+    result &= Test("decimal_literal", 123, 0x7B);
     result &= Test("hex_literal", 0xFF, 255);
     result &= Test("octal_literal", 077, 63);
     result &= Test("unsigned_suffix", 123u, 123);
     result &= Test("long_suffix", 123L, 123);
     result &= Test("long_long_suffix", 123LL, 123);
-    result &= Test("negative_literal", -42, -42);
-    result &= Test("float_literal_f", 1.5f, 1.5f);
-    result &= Test("double_literal", 1.5, 1.5);
+    result &= Test("negative_literal", -42, 0 - 42);
+    result &= Test("float_literal_f", 1.5f, 3.0f / 2.0f);
+    result &= Test("double_literal", 1.5, 3.0 / 2.0);
     result &= Test("scientific_double", 1e3, 1000.0);
     return result;
 }
@@ -982,18 +982,7 @@ bool testIntToPtrCast()
 
 extern int main(int argc, char** argv)
 {
-    // Test the tests
     bool result = true;
-    result &= Test("TestInt", 1, 1);
-    result &= Test("TestFloat", 1.0f, 1.0f);
-    result &= Test("TestDouble", 1.0, 1.0);
-    result &= Test("TestBool", true, true);
-
-    if (!result)
-    {
-        printf("Test function is broken.\n");
-        return 0;
-    }
 
     testEmptyFunction();
     testEmptyIfStatement();

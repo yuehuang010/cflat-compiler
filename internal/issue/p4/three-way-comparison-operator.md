@@ -24,7 +24,8 @@ Earlier rulings this item would revise:
 ## Alternatives considered
 
 1. **Consume-only (status quo).** No spelling; users call `std.compare_three_way{}(a, b)` - which itself is
-   blocked today (p2/cpp-transparent-functor-template-call-operator-not-known.md, functor-temporary section).
+   was blocked when this was written (transparent functor template call operator on a temporary; the cited
+   p2 file was never created - re-probe).
 2. **Library function only** - a core `compare(a, b)` returning a CFlat `ordering` enum. No grammar change, but
    the result does not interoperate with C++ ordering types and C++ classes' `<=>` cannot bind onto it.
 3. **Full surface (above).**

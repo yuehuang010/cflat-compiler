@@ -396,7 +396,7 @@ std::string DiagnosticLocalization::ResolveClientLocale(std::string_view clientT
         return std::filesystem::exists(localeDirectory / (name + ".json"), ec);
     };
 
-    const std::string primary = tag.substr(0, tag.find('-'));
+    std::string primary = tag.substr(0, tag.find('-'));
     if (primary == "en")
         return "en";
 
@@ -407,7 +407,7 @@ std::string DiagnosticLocalization::ResolveClientLocale(std::string_view clientT
             || tag.find("-tw") != std::string::npos
             || tag.find("-hk") != std::string::npos
             || tag.find("-mo") != std::string::npos;
-        const std::string candidate = traditional ? "zh-Hant" : "zh-Hans";
+        std::string candidate = traditional ? "zh-Hant" : "zh-Hans";
         if (catalogExists(candidate))
             return candidate;
         return "en";

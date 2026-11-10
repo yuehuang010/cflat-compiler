@@ -1,0 +1,65 @@
+---
+# Bug-finding checks only (internal/plan/lint-clang-tidy.md, D2). Report only: nothing is gated yet.
+# Off for cost: clang-analyzer-* and bugprone-unchecked-optional-access (path / dataflow analysis)
+# ran 40+ min on MainListener_PostfixExpression.cpp; without them it takes ~15 s.
+# Off as noise (baseline 2026-11-07): derived-method-shadowing (every RecursiveASTVisitor Visit*),
+# performance-enum-size (int-backed enums).
+# exception-escape (ruling 2026-11-07): out-of-memory is fatal in the compiler, so allocation
+# failures are ignored; implicit member-wise moves of STL containers and main() are not checked
+# (main's terminate path is the crash handler). What remains must be fixed.
+# Naming (D5) is configured below but not enabled here; run it explicitly with
+#   --checks=-*,readability-identifier-naming,readability-identifier-length
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-unchecked-optional-access,
+  -bugprone-derived-method-shadowing-base-method,
+  performance-*,
+  -performance-enum-size,
+  misc-redundant-expression,
+  misc-unused-using-decls,
+  modernize-use-override,
+  modernize-use-nullptr,
+  readability-misleading-indentation,
+  readability-redundant-control-flow
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*[\\/]cflat[\\/].*\.(h|hpp)$'
+ExcludeHeaderFilterRegex: '.*antlr_generated.*'
+FormatStyle: none
+CheckOptions:
+  bugprone-unused-return-value.AllowCastToVoid: true
+  bugprone-exception-escape.CheckMoveMemberFunctions: 'false'
+  bugprone-exception-escape.CheckMain: 'false'
+  bugprone-exception-escape.IgnoredExceptions: 'bad_alloc,bad_array_new_length,length_error'
+  readability-identifier-naming.ClassCase: CamelCase
+  readability-identifier-naming.StructCase: CamelCase
+  readability-identifier-naming.EnumCase: CamelCase
+  readability-identifier-naming.UnionCase: CamelCase
+  readability-identifier-naming.TypedefCase: CamelCase
+  readability-identifier-naming.TypeAliasCase: CamelCase
+  readability-identifier-naming.FunctionCase: CamelCase
+  readability-identifier-naming.PublicMethodCase: CamelCase
+  readability-identifier-naming.PrivateMethodCase: camelBack
+  readability-identifier-naming.ProtectedMethodCase: camelBack
+  readability-identifier-naming.PublicMemberCase: CamelCase
+  readability-identifier-naming.PrivateMemberCase: camelBack
+  readability-identifier-naming.ProtectedMemberCase: camelBack
+  readability-identifier-naming.LocalVariableCase: camelBack
+  readability-identifier-naming.LocalConstantCase: camelBack
+  readability-identifier-naming.ParameterCase: camelBack
+  readability-identifier-naming.ConstantParameterCase: camelBack
+  readability-identifier-naming.ConstexprVariableCase: CamelCase
+  readability-identifier-naming.GlobalConstantCase: CamelCase
+  readability-identifier-naming.StaticConstantCase: CamelCase
+  readability-identifier-naming.ClassConstantCase: CamelCase
+  readability-identifier-length.MinimumVariableNameLength: 3
+  readability-identifier-length.MinimumParameterNameLength: 3
+  readability-identifier-length.MinimumLoopCounterNameLength: 3
+  readability-identifier-length.MinimumExceptionNameLength: 3
+  readability-identifier-length.IgnoredVariableNames: '^[ijk]$'
+  readability-identifier-length.IgnoredParameterNames: '^[ijk]$'
+  readability-identifier-length.IgnoredLoopCounterNames: '^[ijk]$'
+  readability-identifier-length.IgnoredExceptionVariableNames: ''
+...

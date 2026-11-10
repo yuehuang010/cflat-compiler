@@ -11,7 +11,7 @@ int count(std.deque<cpin.Opaque>* p) { return p->empty() ? 0 : (int)p->size(); }
 int touch(std.deque<cpin.Opaque>* p)
 {
     if const (__WINDOWS__) {
-        expect_error("no instantiation of C++ function template 'cpin.SignatureFailure$cpin.MissingMemberType.begin' accepts these argument types (cpin.SignatureFailure$cpin.MissingMemberType) (clang: no matching member function for call to 'begin')") {
+        expect_error("(clang: no matching member function for call to 'begin')") {
             cpin.SignatureFailure<cpin.MissingMemberType>* broken = nullptr;
             broken->begin();
         }

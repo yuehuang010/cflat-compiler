@@ -1490,6 +1490,7 @@ std::vector<unsigned> LLVMBackend::FunctionArgumentStoreDestinations(
     const auto result = CalleeStoresTracked(context, function, argumentIndex, { StorePath{} }, {}, 0);
     if (result.verdict != StoreVerdict::Stores || result.externalGlobal) return {};
     std::vector<unsigned> destinations;
+    destinations.reserve(destinations.size() + result.paramStores.size());
     for (const auto& [parameter, path] : result.paramStores)
         destinations.push_back(parameter);
     destinations.insert(destinations.end(), result.externalParameters.begin(), result.externalParameters.end());
@@ -1514,6 +1515,7 @@ std::vector<unsigned> LLVMBackend::FunctionArgumentStoreSinks(
         return {};
     }
     std::vector<unsigned> destinations;
+    destinations.reserve(destinations.size() + result.paramStores.size());
     for (const auto& [parameter, path] : result.paramStores)
         destinations.push_back(parameter);
     destinations.insert(destinations.end(), result.externalParameters.begin(), result.externalParameters.end());
@@ -6282,6 +6284,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (!functionDestination.FuncPtrReturnTypeName.empty())
                                     {
                                         std::vector<size_t> allowed;
+                                        allowed.reserve(allowed.size() + candidates.size());
                                         for (const auto& candidate : candidates)
                                             allowed.push_back(candidate.first);
                                         std::string refusal;
@@ -7942,6 +7945,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (!functionDestination.FuncPtrReturnTypeName.empty())
                                 {
                                     std::vector<size_t> allowed;
+                                    allowed.reserve(allowed.size() + candidates.size());
                                     for (const auto& candidate : candidates)
                                         allowed.push_back(candidate.first);
                                     std::string refusal;
@@ -9946,6 +9950,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     {
                                                         // Build a generic named only by this type operand.
                                                         std::vector<std::string> typeArgs;
+                                                        typeArgs.reserve(typeArgs.size() + spelling.args.size());
                                                         for (const auto& arg : spelling.args)
                                                             typeArgs.push_back(MangleType(*be, arg));
                                                         QueueGenericInstantiation(
@@ -12626,6 +12631,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     if (deducedIndices.empty())
                                                     {
                                                         std::vector<size_t> allIndices;
+                                                        allIndices.reserve(allIndices.size() + callbackCandidates.size());
                                                         for (size_t i = 0; i < callbackCandidates.size(); ++i)
                                                             allIndices.push_back(i);
                                                         LogErrorContext(namedArgument, std::format(
@@ -12891,6 +12897,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     *Compiler(ctx)->context, "entry", callback);
                                                 llvm::IRBuilder<> callbackBuilder(callbackEntry);
                                                 std::vector<llvm::Value*> callValues;
+                                                callValues.reserve(callValues.size() + captured.size());
                                                 for (size_t i = 0; i < captured.size(); ++i)
                                                     callValues.push_back(callbackBuilder.CreateLoad(
                                                         captureTypes[i], callbackBuilder.CreateStructGEP(
@@ -13446,6 +13453,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     auto* current = builder->GetInsertBlock();
                                                     auto* joinBlock = join->getParent();
                                                     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incoming;
+                                                    incoming.reserve(incoming.size() + join->getNumIncomingValues());
                                                     for (unsigned in = 0; in < join->getNumIncomingValues(); ++in)
                                                         incoming.emplace_back(join->getIncomingValue(in), join->getIncomingBlock(in));
                                                     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> exactIncoming;

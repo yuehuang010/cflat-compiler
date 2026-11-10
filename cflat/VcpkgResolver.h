@@ -284,11 +284,11 @@ private:
                     std::string outFileStr = outFile.str().str();
                     std::vector<llvm::StringRef> args = { vswhere, "-latest", "-property", "installationPath" };
                     std::optional<llvm::StringRef> redirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
-                    llvm::sys::ExecuteAndWait(vswhere, args, std::nullopt, redirects);
+                    (void)llvm::sys::ExecuteAndWait(vswhere, args, std::nullopt, redirects);
                     std::string vsPath;
                     if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
                         vsPath = buf.get()->getBuffer().trim().str();
-                    llvm::sys::fs::remove(outFile);
+                    (void)llvm::sys::fs::remove(outFile);
                     if (!vsPath.empty())
                     {
                         std::filesystem::path candidate = std::filesystem::path(vsPath) / "VC" / "vcpkg" / "vcpkg.exe";

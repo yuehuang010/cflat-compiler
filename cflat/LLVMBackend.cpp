@@ -3398,7 +3398,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             bool active = true;
             ~IsolatedTempCleanup()
             {
-                if (active && !path.empty()) std::filesystem::remove(path);
+                // Best-effort; the string -> path conversion can throw on Windows.
+                std::error_code ec;
+                try { if (active && !path.empty()) std::filesystem::remove(path, ec); }
+                catch (...) {}
             }
         } tempCleanup{isolatedOutput ? emitPath : std::string(), isolatedOutput};
         if (verbose) std::cout << std::format("[verbose] emitting executable to {}\n", emitPath);
@@ -4101,6 +4104,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
             return altEc ? "" : alt.string();
         };
         std::vector<std::string> altPaths;
+        altPaths.reserve(altPaths.size() + importSearchDirs.size());
         for (const auto& d : importSearchDirs)
             altPaths.push_back(tryAlt(d));
         if (!runtimeDir.empty())
@@ -5200,8 +5204,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     if (bitcodeLoaded && symbolSink_ != nullptr)
         symbolSink_->MergeFrom(coreSymbolIndex_);
 
-    if (!bitcodeLoaded && !runtimeDir.empty())
-    if (!skipRuntimeImport)
+    if (!bitcodeLoaded && !runtimeDir.empty() && !skipRuntimeImport)
     {
         auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
         if (std::filesystem::exists(runtimePath))
@@ -5556,7 +5559,7 @@ void LLVMBackend::ResetForReanalysis()
     if (!batchMode_) coreHashCache_.clear();
     dependencyPathMemo_.clear();
     dependencyDirMemo_.clear();
-    for (const auto& obj : cObjectFiles_) llvm::sys::fs::remove(obj);
+    for (const auto& obj : cObjectFiles_) (void)llvm::sys::fs::remove(obj);
     cObjectFiles_.clear();
     cppInteropUsed_ = false;
     cxxProgramEhGuardAttempted_ = false;
@@ -6697,10 +6700,10 @@ const VsInstall& VsInstallCached()
                 std::string outFileStr = outFile.str().str();
                 std::vector<llvm::StringRef> args = { vswhere, "-latest", "-property", "installationPath" };
                 std::optional<llvm::StringRef> redirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
-                llvm::sys::ExecuteAndWait(vswhere, args, std::nullopt, redirects);
+                (void)llvm::sys::ExecuteAndWait(vswhere, args, std::nullopt, redirects);
                 if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
                     found.path = buf.get()->getBuffer().trim().str();
-                llvm::sys::fs::remove(outFile);
+                (void)llvm::sys::fs::remove(outFile);
             }
         }
         if (!found.path.empty()) { found.source = "vswhere"; return found; }
@@ -7120,7 +7123,7 @@ static bool SynthesizeImportLib(const std::string& lldLink, const std::string& d
 
     std::string toolErr;
     int rc = llvm::sys::ExecuteAndWait(lldLink, args, std::nullopt, {}, 0, 0, &toolErr);
-    llvm::sys::fs::remove(defFile);
+    (void)llvm::sys::fs::remove(defFile);
     if (rc != 0)
     {
         errMsg = std::format("lld-link /lib failed (exit {}){}{}", rc,

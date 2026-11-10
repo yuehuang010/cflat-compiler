@@ -91,7 +91,9 @@ for %%F in (%SRC%\errors\err_*.cb) do (
 )
 if !GROUPFILES! gtr 0 (
     echo === error group %~1 of %~2 ===
-    %COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo %LOCALE_COLLECT% %TU_CHECK% "@!GROUP_RSP!"
+    REM No --nologo here: the per-file "PASS: <file>" / "FAIL: <file>" lines let
+    REM utilities\lint_test_legs.py count each fixture's expect_error legs (check 1).
+    %COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" %LOCALE_COLLECT% %TU_CHECK% "@!GROUP_RSP!"
     if !ERRORLEVEL! neq 0 (
         set /a ERRORS+=1
         set /a NORMAL_ERRORS+=1

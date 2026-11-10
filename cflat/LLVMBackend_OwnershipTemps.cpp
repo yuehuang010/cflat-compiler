@@ -1407,8 +1407,8 @@ void LLVMBackend::SetSourceLocation(size_t line, size_t column)
         currentColumn = column;
 }
 
-void LLVMBackend::LogErrorMessage(std::string englishTemplate,
-                                  std::vector<std::string> arguments) const
+void LLVMBackend::LogErrorMessage(const std::string& englishTemplate,
+                                  const std::vector<std::string>& arguments) const
 {
         EmitError(cflat_cinterop::DemangleGeneratedCflatStructNames(
                       diagnosticLocalization_.Localize(englishTemplate, arguments)),
@@ -1416,12 +1416,12 @@ void LLVMBackend::LogErrorMessage(std::string englishTemplate,
                       DiagnosticLocalization::FormatSourceTemplate(englishTemplate, arguments)));
 }
 
-void LLVMBackend::LogError(std::string message) const
+void LLVMBackend::LogError(const std::string& message) const
 {
         EmitError(cflat_cinterop::DemangleGeneratedCflatStructNames(message));
 }
 
-void LLVMBackend::LogRawError(std::string message) const
+void LLVMBackend::LogRawError(const std::string& message) const
 {
         EmitError(cflat_cinterop::DemangleGeneratedCflatStructNames(message));
 }
@@ -1444,7 +1444,7 @@ bool LLVMBackend::ReportArrayViewInstantiationFailure(const std::string& formedT
         return true;
     }
 
-void LLVMBackend::EmitError(std::string message, std::string sourceMessage) const
+void LLVMBackend::EmitError(std::string message, const std::string& sourceMessage) const
 {
         ++emitErrorCount_;
         // Speculative compile-time evaluation: swallow the diagnostic and unwind. The construct
@@ -1744,6 +1744,7 @@ void LLVMBackend::LeaveOwnershipControlRegion()
                 }
             }
             ownFlagLoopReownSnapshots_.pop_back();
+            // Order-free: each storage only updates the variables bound to that storage.
             for (const auto& [storage, origin] : borrowedExitSources)
             {
                 const bool reachesOuterSink = std::ranges::any_of(ownFlagLoopReownSnapshots_,
@@ -1992,6 +1993,7 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
         std::unordered_set<const llvm::Value*> borrowStorages;
         for (const auto& [storage, borrow] : first.borrowProvenance) borrowStorages.insert(storage);
         for (const auto& [storage, borrow] : second.borrowProvenance) borrowStorages.insert(storage);
+        // Order-free: the result is a map keyed by storage.
         for (const auto* storage : borrowStorages)
         {
             const auto firstIt = first.borrowProvenance.find(storage);
@@ -2076,6 +2078,7 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
                 && (!insideLoop || arm.iterationOwnedViewSlots.contains(slot)
                     || !loopMayRebindSlot(slot));
         };
+        // Order-free: the result is a map keyed by storage.
         for (const auto* storage : storages)
         {
             auto firstPath = first.mayBeFalsePaths.find(storage);
@@ -6231,7 +6234,7 @@ std::string LLVMBackend::BorrowedSourceDisplayName(const NamedVariable& nv) cons
                     self.IsAlias = false;
                     return SpellType(*this, self) + "." + sym->SourceName;
                 }
-        const std::string raw = BorrowedSourceName(nv);
+        std::string raw = BorrowedSourceName(nv);
         if (raw.find('$') == std::string::npos) return raw;
         return SpellType(*this, TypeAndValue{ .TypeName = raw });
     }
@@ -9393,6 +9396,8 @@ size_t LLVMBackend::InferCoreNoUnwind()
         };
 
         size_t marked = 0;
+        // Order-free: a callee still Visiting means a cycle, refused from any entry point, so the
+        // proven set and its deps do not depend on which function the walk starts from.
         for (auto& [fn, syms] : symbolsOf)
         {
             if (fn->isDeclaration() || !prove(fn)) continue;
@@ -9802,6 +9807,7 @@ namespace
             std::unordered_set<llvm::BasicBlock*> successors;
             for (llvm::BasicBlock* successor : llvm::successors(block))
                 if (!members.count(successor)) successors.insert(successor);
+            // Order-free: each call edits only that successor's phis.
             for (llvm::BasicBlock* successor : successors)
                 successor->removePredecessor(block, true);
         }
@@ -10319,11 +10325,11 @@ LLVMBackend::~LLVMBackend()
         // destructors): release its header-cache root or it stays in progress forever.
         EndActiveRoot();
 
-        builder.release();
-        module.release();
+        (void)builder.release();
+        (void)module.release();
 
         // context is last to be released.
-        context.release();
+        (void)context.release();
     }
 
 // ---- T407: constructor lambdas capturing `this` vs by-value copies of the object ----

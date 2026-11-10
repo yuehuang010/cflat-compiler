@@ -17,10 +17,10 @@ public:
     using MessageHandler = std::function<void(const nlohmann::json&)>;
 
     // Blocking loop - returns when "exit" message is received or stdin closes.
-    void Run(MessageHandler handler);
+    void Run(const MessageHandler& handler);
 
     // Thread-safe: send a JSON-RPC message (response or notification).
-    void Send(nlohmann::json msg);
+    void Send(const nlohmann::json& msg);
 
 private:
     bool ReadMessage(std::string& out);

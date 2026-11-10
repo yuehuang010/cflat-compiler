@@ -6516,13 +6516,9 @@ bool testOverloadResolution()
     bool flag = false;
     result &= Test("free fn beats method this", readBack(&flag), 7);
     result &= Test("free fn wrote through ptr", flag, true);
-    result &= Test("int overload",        42,    42);
-    result &= Test("bool overload",       true,  true);
-    result &= Test("char* overload",      "hello", "hello");
 
     float f = 1.5f;
     result &= Test("float overload exact",   f,      1.5f);
-    result &= Test("float overload literal", 3.14f,  3.14f);
     // Verify a known mismatch is caught (Test returns 0 on mismatch)
     result &= Test("float mismatch detected",   Test("_float_mm",  1.0f,   2.0f)  == 0, true);
 

@@ -83,7 +83,7 @@ bool JsonRpcLoop::ReadMessage(std::string& out)
     return true;
 }
 
-void JsonRpcLoop::Run(MessageHandler handler)
+void JsonRpcLoop::Run(const MessageHandler& handler)
 {
     if (verbose_) std::cerr << "[lsp] ReadMessage loop starting\n";
     std::string body;
@@ -116,7 +116,7 @@ void JsonRpcLoop::Run(MessageHandler handler)
     }
 }
 
-void JsonRpcLoop::Send(nlohmann::json msg)
+void JsonRpcLoop::Send(const nlohmann::json& msg)
 {
     std::string body = msg.dump();
 

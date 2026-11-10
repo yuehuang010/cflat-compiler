@@ -4196,12 +4196,12 @@ private:
 
     void SetSourceLocation(size_t line, size_t column);
 
-    void LogError(std::string message) const;
-    void LogRawError(std::string message) const;
-    void EmitError(std::string message, std::string sourceMessage = {}) const;
+    void LogError(const std::string& message) const;
+    void LogRawError(const std::string& message) const;
+    void EmitError(std::string message, const std::string& sourceMessage = {}) const;
     mutable size_t emitErrorCount_ = 0;  // every EmitError; a memoized cleanup region must add none
-    void LogErrorMessage(std::string englishTemplate,
-                         std::vector<std::string> arguments = {}) const;
+    void LogErrorMessage(const std::string& englishTemplate,
+                         const std::vector<std::string>& arguments = {}) const;
     void LogBorrowedPointerMoveSinkError(const std::string& sourceDescription,
                                          const std::string& parameterName,
                                          const std::string& functionName,
@@ -8583,7 +8583,7 @@ private:
                          const std::vector<std::string>& extraDefines,
                          std::vector<cflat_cinterop::RawRecord>& records);
 
-    bool ExtractCHeaderClang(const std::vector<std::string>& headerPaths,
+    bool ExtractCHeaderClang(const std::vector<std::string>& headerPaths, int64_t includeHashTime,
                              std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
                              std::vector<CRecordEntry>& outRecords,
                              std::vector<CMacroEntry>& outMacros,
@@ -10449,14 +10449,14 @@ public:
 
     llvm::Value* CreateInsertValue(llvm::Value* structInstance, llvm::Value* newValue, unsigned int index);
 
-    llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName = "");
+    llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, const std::string& variableName = "");
     llvm::Value* CreateCxxFieldGEP(const StructData& data, llvm::Value* object, unsigned index,
                                    std::string name = "");
     llvm::Value* CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const StructData& data,
-                                   llvm::Value* object, unsigned index, std::string name = "");
+                                   llvm::Value* object, unsigned index, const std::string& name = "");
     unsigned CxxFieldElementIndex(const StructData& data, unsigned index) const;
 
-    llvm::Value* CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, std::string name = "");
+    llvm::Value* CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, const std::string& name = "");
 
     llvm::Value* CreateExtractValue(llvm::Value* structInstance, unsigned int index);
 
@@ -10613,8 +10613,8 @@ public:
     // pack - the default-ctor path needs the packed list before this call to
     // emit one initializer per LLVM struct element.
     // physicalAlignment adds a zero-size tail member so LLVM honors clang's ABI alignment.
-    llvm::StructType* CreateStructType(std::string name,
-        std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0,
+    llvm::StructType* CreateStructType(const std::string& name,
+        const std::vector<LLVMBackend::DeclTypeAndValue>& typeAndValues, uint64_t userAlign = 0,
         std::vector<BitfieldInfo>* bitfields = nullptr, bool isPacked = false,
         uint64_t physicalAlignment = 0);
 
@@ -10628,17 +10628,17 @@ public:
     // The body is then grown to a multiple of it so getTypeAllocSize matches the padded sizeof.
     // `capAlignToUserAlign` lowers the union's alignment to `userAlign` when clang packs it
     // below its members' natural alignment (#pragma pack, bitfield-only MS unions).
-    llvm::StructType* CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues,
+    llvm::StructType* CreateUnionType(const std::string& name, const std::vector<DeclTypeAndValue>& typeAndValues,
                                       uint64_t userAlign = 0,
                                       std::vector<BitfieldInfo>* bitfields = nullptr,
                                       bool capAlignToUserAlign = false);
 
     llvm::Value* CreateConstant(ConstantVariant constantVariant);
 
-    llvm::Constant* CreateConstant(std::string typeName, std::string initialValue);
+    llvm::Constant* CreateConstant(const std::string& typeName, const std::string& initialValue);
 
-    llvm::Value* CreateGlobalString(std::string name, std::string text);
-    llvm::Value* CreateGlobalEncodedString(std::string name, const std::vector<uint32_t>& values, unsigned width);
+    llvm::Value* CreateGlobalString(const std::string& name, const std::string& text);
+    llvm::Value* CreateGlobalEncodedString(const std::string& name, const std::vector<uint32_t>& values, unsigned width);
 
     // Element-wise arithmetic and comparison on simd<T,N> values. Either operand may be a scalar,
     // which is splatted across all lanes (with element-type conversion). Both vector operands must
@@ -10696,7 +10696,7 @@ public:
     // (an array name decays to its element pointer without a Primary value of its own).
     static bool IsProvableNonHeapAddressSource(const NamedVariable& source);
 
-    llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right);
+    llvm::Value* CreateOperation(const std::string& oper, llvm::Value* left, llvm::Value* right);
 
     llvm::Value* CreateOperation(Operation op, llvm::Value* left, llvm::Value* right);
 
@@ -10704,7 +10704,7 @@ public:
     llvm::Value* CreateOperation(Operation op, llvm::Value* left, llvm::Value* right,
                                   bool leftIsUnsigned, bool rightIsUnsigned);
 
-    llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right,
+    llvm::Value* CreateOperation(const std::string& oper, llvm::Value* left, llvm::Value* right,
                                   bool leftIsUnsigned, bool rightIsUnsigned);
 
     llvm::Value* CreateNot(llvm::Value* value);
@@ -10716,7 +10716,7 @@ public:
 
     llvm::Value* CreateNeg(llvm::Value* value);
 
-    llvm::BasicBlock* CreateBasicBlock(std::string name, llvm::Function* fn = nullptr);
+    llvm::BasicBlock* CreateBasicBlock(const std::string& name, llvm::Function* fn = nullptr);
 
     void EnterOwnershipControlRegion(uint8_t frameKind = 0);
     void LeaveOwnershipControlRegion();
@@ -10852,7 +10852,7 @@ public:
 
     llvm::CondBrInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock);
 
-    llvm::PHINode* CreatePHINode(std::string name, int reserve);
+    llvm::PHINode* CreatePHINode(const std::string& name, int reserve);
 
     llvm::Value* CreateSelect(llvm::Value* cond, llvm::Value* falseValue, llvm::Value* trueValue);
 
@@ -13093,7 +13093,7 @@ public:
     // The result loads to the struct pointer (TypeName = struct, Pointer = true).
     NamedVariable GetThisPointer();
 
-    NamedVariable GetFunctionArgument(std::string name);
+    NamedVariable GetFunctionArgument(const std::string& name);
 
     // Returns the 0-based stack depth where name is declared, SIZE_MAX if not found.
     // Searches both functionArgument and namedVariable in each frame (innermost first).
@@ -14358,7 +14358,7 @@ public:
         const std::string& functionName,
         llvm::Function* oldFn,
         std::vector<AutoReturnSite>& sites,
-        std::vector<TypeAndValue> arguments,
+        const std::vector<TypeAndValue>& arguments,
         bool varargs,
         bool returnsOwned,
         bool isMethod);
@@ -14408,7 +14408,7 @@ public:
 
     void RecordManifestFragment(const std::string& sourceFile, size_t line,
                                 const std::string& xml,
-                                std::vector<ManifestFragment::Leaf> leaves = {});
+                                const std::vector<ManifestFragment::Leaf>& leaves = {});
     const std::vector<ManifestFragment>& GetManifestFragments() const;
     std::optional<std::string> MergeManifestFragments() const;
     bool ValidateManifestActivationContext(const std::string& xml) const;
@@ -14730,7 +14730,7 @@ public:
 
     std::string GetNameOfCurrentInsertionBlock();
 
-    void DumpCurrentInsertionPoint(std::string prefix = "");
+    void DumpCurrentInsertionPoint(const std::string& prefix = "");
 
     // If set, disables auto-import of core/runtime.cb
     void SetSkipRuntimeImport(bool v);
@@ -14745,8 +14745,8 @@ public:
     bool LoadLocale(bool verbose = false);
     void SetLocaleTemplateCollection(bool enabled);
     bool WriteCollectedLocale(const std::string& locale, bool verbose = false) const;
-    std::string LocalizeMessage(std::string englishTemplate,
-                                std::vector<std::string> arguments = {}) const;
+    std::string LocalizeMessage(const std::string& englishTemplate,
+                                const std::vector<std::string>& arguments = {}) const;
     std::function<std::string(std::string, std::vector<std::string>)> MakeDiagnosticLocalizer() const;
     void SetVerbose(bool v);
     bool IsVerbose() const;

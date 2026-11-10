@@ -663,6 +663,7 @@ std::string MainListener::InferAndInstantiateGenericFunction(const std::string& 
                     || receiverSpelling.args.size() != typeParams->second.size())
                     continue;
                 std::vector<std::string> typeArgs;
+                typeArgs.reserve(typeArgs.size() + receiverSpelling.args.size());
                 for (const auto& arg : receiverSpelling.args)
                     typeArgs.push_back(MangleType(*Compiler(), arg));
                 return InstantiateGenericFunction(funcName, typeArgs, index);
@@ -752,7 +753,7 @@ static std::string GenericLiteralBinaryIdentity(const std::string& leftName,
 {
         if (shift)
         {
-            const std::string left = GenericIntegerPromotion(leftName);
+            std::string left = GenericIntegerPromotion(leftName);
             GenericIntegerIdentity leftType{}, rightType{};
             if (!GetGenericIntegerIdentity(left, leftType)
                 || !GetGenericIntegerIdentity(GenericIntegerPromotion(rightName), rightType))
@@ -889,7 +890,7 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
                 && question->getSymbol()->getType() == CFlatParser::Question
                 && colon->getSymbol()->getType() == CFlatParser::Colon)
             {
-                const std::string left = GenericLiteralExpressionIdentity(conditional->children[2]);
+                std::string left = GenericLiteralExpressionIdentity(conditional->children[2]);
                 const std::string right = GenericLiteralExpressionIdentity(conditional->children[4]);
                 if (left.empty() || right.empty()) return {};
                 if (left == right) return left;
@@ -1672,6 +1673,7 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             if (refusal != nullptr)
             {
                 std::vector<std::string> bestNames;
+                bestNames.reserve(bestNames.size() + best.size());
                 for (size_t index : best)
                     bestNames.push_back(GenericFunctionCandidateDescription(funcName,
                         viable[index].context));
@@ -1802,6 +1804,7 @@ std::string MainListener::TryInferAndInstantiateFromFuncPtrCandidate(
         }
 
         std::vector<std::string> typeArgs;
+        typeArgs.reserve(typeArgs.size() + typeParams.size());
         for (const auto& param : typeParams)
             typeArgs.push_back(inferred.at(param));
         return InstantiateGenericFunction(funcName, typeArgs, candidateIndex);

@@ -212,7 +212,8 @@ guard on the dereference, not the reachability of the moving path.
 
 ## From the q10 bucket file (deleted 2026-08-12)
 
-The q10 bucket is gone; this file and [[move-of-borrow-into-move-sink-parameter]] are what remained
+The q10 bucket is gone; this file and the move-of-borrow-into-move-sink-parameter issue (landed
+fdb7ffa8, 2026-09-03) are what remained
 of it. What it recorded about this item: only the conditional-termination half is open. The
 cross-block diagnostic in `cflat/MoveDataflow.h` is intraprocedural, so a guard that prevents the
 dereference by calling a conditionally-terminating callee is invisible to it. Filed by design -

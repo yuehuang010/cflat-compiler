@@ -239,7 +239,7 @@ namespace movedf
         // Dense RPO-indexed CFG (entry = 0): reachable predecessors, successors, events.
         const int n = (int)rpo.size();
         std::vector<llvm::BasicBlock*> order(n);
-        for (const auto& [bb, idx] : rpo) order[idx] = bb;
+        for (const auto& [bb, idx] : rpo) order[idx] = bb;  // order-free: indexed by rpo number
         std::vector<std::vector<int>> preds(n), succs(n);
         std::vector<const std::vector<const Event*>*> blockEvents(n, nullptr);
         for (int i = 0; i < n; ++i)

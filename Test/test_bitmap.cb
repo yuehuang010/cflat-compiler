@@ -77,7 +77,7 @@ int testBounds()
     bmp->set(0, -1, px);
     bmp->set(2,  0, px);
     bmp->set(0,  2, px);
-    passed += Test("oob set does not crash", 1, 1);
+    passed += Test("oob set does not crash", bmp->get(0, 0).r, 0);
 
     delete bmp;
     return passed;

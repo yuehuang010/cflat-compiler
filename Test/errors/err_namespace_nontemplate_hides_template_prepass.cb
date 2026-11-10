@@ -1,0 +1,26 @@
+// Pre-pass sites of err_namespace_nontemplate_hides_template.cb: a namespace-scope global and a
+// generic argument are resolved in the ForwardRefScanner pre-pass, before a block-scoped leg inside
+// the namespace is armed. A file-scope scoped block around the namespace is armed in time, and unlike
+// a bare file-scope leg it does not end the check, so both sites run.
+
+struct Item<T> { T v = default; };
+struct Holder<T> { T v = default; };
+
+expect_error("'Item' is not a generic type") {
+namespace LnsErrGlobal
+{
+    struct Item { int w = default; };
+    Item<int> gv = default;
+}
+}
+expect_error("'Item' is not a generic type") {
+namespace LnsErrNestedArg
+{
+    struct Item { int w = default; };
+    int f()
+    {
+        Holder<Item<int>> b = default;
+        return 0;
+    }
+}
+}

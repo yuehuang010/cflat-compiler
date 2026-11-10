@@ -25,7 +25,7 @@ bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinatio
         return true;
 
     unsigned bits = destinationType->getIntegerBitWidth();
-    std::string typeName = destinationTypeName;
+    const std::string& typeName = destinationTypeName;
     bool isUnsigned = typeName == "u8" || typeName == "u16"
         || typeName == "u32" || typeName == "u64" || typeName == "u128"
         || typeName == "c8" || typeName == "c16" || typeName == "c32";
@@ -930,7 +930,7 @@ bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* mem
                 if (isOpaqueTypeSpecifier(specifier)) return true;
             return false;
         };
-        auto isOpaqueGenericType = [&](std::string spelledBase,
+        auto isOpaqueGenericType = [&](const std::string& spelledBase,
                                        CFlatParser::GenericTypeParametersContext* params,
                                        CFlatParser::TypeSpecifierContext* useSite)
         {
@@ -7567,6 +7567,7 @@ bool MainListener::CheckConstraints(
                 if (splitGeneric(sourceIface, base, args))
                 {
                     std::vector<std::string> mangledArgs;
+                    mangledArgs.reserve(mangledArgs.size() + args.size());
                     for (const auto& arg : args)
                         mangledArgs.push_back(mangleType(arg));
                     concreteIface = MangledGenericName(base, mangledArgs);
@@ -7690,8 +7691,10 @@ void MainListener::EmitCppStructConstructorThunk(
                 if (destinationType->isStructTy())
                     value = GenerateDefaultValue(field);
                 else
+                {
                     compiler->RefuseImplicitFloatToInt(value, destinationType, field.IsUnsignedInteger() != -1);
                     value = compiler->CreateCast(value, destinationType, false, field.IsUnsignedInteger() != -1);
+                }
             }
             if (value != nullptr && value->getType() == destinationType)
             {

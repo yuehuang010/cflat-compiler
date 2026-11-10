@@ -4,6 +4,13 @@ setlocal EnableDelayedExpansion
 set START_TIME=%TIME%
 set /a OVERALL_ERRORS=0
 
+REM Per-stage wall time, like buildci.sh: each stage start closes the previous one. The table prints
+REM at the end and one CSV line per run goes to scratch\buildci_timings.csv (Windows rows say win).
+set "STAGE_NAME="
+set "STAGE_TABLE="
+set "STAGE_CSV="
+set /a STAGE_T0=0
+
 REM --nightly: LIBS runs tiers 1-3 (adds libtorch) instead of tier 1 only.
 set LIBS_TIER=1
 if /I "%~1"=="--nightly" set LIBS_TIER=3
@@ -19,6 +26,7 @@ set CFG=%~1
 echo.
 echo =========================================================================
 echo BUILD: %CFG%
+call :StageClose BUILD
 echo =========================================================================
 call "%~dp0cmake_build.bat" %CFG%
 if errorlevel 1 (
@@ -30,6 +38,7 @@ if errorlevel 1 (
 echo.
 echo =========================================================================
 echo TESTS [%CFG%]: test.bat
+call :StageClose TESTS
 echo =========================================================================
 set CFLAT_CONFIG=%CFG%
 call "%~dp0test.bat"
@@ -41,6 +50,7 @@ if errorlevel 1 (
 echo.
 echo =========================================================================
 echo LIBS [%CFG%]: test_libs.bat (tiers 1-%LIBS_TIER%)
+call :StageClose LIBS
 echo =========================================================================
 set CFLAT_CONFIG=%CFG%
 call "%~dp0test_libs.bat" %CFG% -t %LIBS_TIER%
@@ -53,6 +63,7 @@ REM The LIBS stage above installs the test_libs vcpkg ports (test_libs/vcpkg.jso
 echo.
 echo =========================================================================
 echo EXAMPLES [%CFG%]: test_example.bat
+call :StageClose EXAMPLES
 echo =========================================================================
 call "%~dp0test_example.bat" %CFG%
 if errorlevel 1 (
@@ -63,6 +74,7 @@ if errorlevel 1 (
 echo.
 echo =========================================================================
 echo TESTS [%CFG%]: test_lsp.bat
+call :StageClose LSP
 echo =========================================================================
 set CFLAT_CONFIG=%CFG%
 call "%~dp0test_lsp.bat"
@@ -79,6 +91,7 @@ call :RunConfig Release
 echo.
 echo =========================================================================
 echo BUILD: vscode-extension
+call :StageClose VSCODE
 echo =========================================================================
 call "%~dp0vscode-extension\build.bat" ci
 if errorlevel 1 (
@@ -89,6 +102,7 @@ if errorlevel 1 (
 echo.
 echo =========================================================================
 echo PUBLISH: copying artifacts to drop\
+call :StageClose PUBLISH
 echo =========================================================================
 call :Publish
 if errorlevel 1 (
@@ -98,6 +112,7 @@ if errorlevel 1 (
 
 echo.
 echo =========================================================================
+call :TimingReport
 call :ElapsedTime "%START_TIME%" "%TIME%"
 if !OVERALL_ERRORS! EQU 0 (
     echo CI PASSED.
@@ -110,6 +125,32 @@ if !OVERALL_ERRORS! EQU 0 (
 :Publish
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0package_release.ps1"
 exit /b %ERRORLEVEL%
+
+:NowSecs
+for /f "tokens=1-3 delims=:." %%a in ("%TIME: =0%") do set /a NOWS=1%%a*3600+1%%b*60+1%%c-366100
+exit /b 0
+
+:StageClose
+call :NowSecs
+if defined STAGE_NAME (
+    set /a STAGE_D=NOWS-STAGE_T0
+    if !STAGE_D! lss 0 set /a STAGE_D+=86400
+    set "STAGE_TABLE=!STAGE_TABLE! !STAGE_NAME!:!STAGE_D!s"
+    set "STAGE_CSV=!STAGE_CSV!,!STAGE_NAME!=!STAGE_D!"
+)
+set "STAGE_NAME=%~1"
+set /a STAGE_T0=NOWS
+exit /b 0
+
+:TimingReport
+call :StageClose ""
+echo Stage timings:
+for %%s in (!STAGE_TABLE!) do echo   %%s
+set "TR_HEAD="
+for /f %%h in ('git -C "%~dp0." rev-parse --short HEAD 2^>nul') do set "TR_HEAD=%%h"
+if not exist "%~dp0scratch" mkdir "%~dp0scratch"
+>>"%~dp0scratch\buildci_timings.csv" echo %DATE% %TIME:~0,5%,!TR_HEAD!,win-tier%LIBS_TIER%!STAGE_CSV!
+exit /b 0
 
 :ElapsedTime
 setlocal

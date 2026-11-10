@@ -36,8 +36,8 @@ public:
         if (localizeMessage)
             localizeMessage_ = std::move(localizeMessage);
         else
-            localizeMessage_ = [](std::string englishTemplate,
-                                  std::vector<std::string> arguments) {
+            localizeMessage_ = [](const std::string& englishTemplate,
+                                  const std::vector<std::string>& arguments) {
                 return DiagnosticLocalization::FormatSourceTemplate(englishTemplate, arguments);
             };
     }

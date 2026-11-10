@@ -2173,7 +2173,7 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
         // CFlat variable or type. A function (template) name such as a manipulator is spelled
         // into the C++ expression too, where C++ deduces it against the stream.
         auto cxxNameOf = [&](antlr4::ParserRuleContext* operand) -> std::string {
-            const std::string text = operand != nullptr ? operand->getText() : std::string();
+            std::string text = operand != nullptr ? operand->getText() : std::string();
             const size_t lastDot = text.rfind('.');
             if (lastDot == std::string::npos || lastDot == 0 || lastDot + 1 == text.size())
                 return {};

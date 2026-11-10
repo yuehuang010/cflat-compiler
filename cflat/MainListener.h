@@ -4252,7 +4252,7 @@ public:
 
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);
     // Restores the drain hook the constructor replaced, so no touch reaches a dead listener.
-    ~MainListener();
+    ~MainListener() override;
 
     // Retry global default folds after all declarations and deferred instantiations are emitted.
     // Returns the native constructions that did not fold (run by the emit step below).
@@ -4262,7 +4262,7 @@ public:
     // ones handed in and the C++ ones queued here - merged in declaration order (Sequence). No
     // matching global_dtors: globals follow the Rust rule.
     void EmitPendingGlobalCxxConstructions(
-        std::vector<PendingGlobalDefaultConstruction> nativeRuntime);
+        const std::vector<PendingGlobalDefaultConstruction>& nativeRuntime);
 
     void SetImportNamespace(const std::string& ns);
 
@@ -8183,7 +8183,7 @@ public:
 
     std::vector<LLVMBackend::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList);
 
-    LLVMBackend::ConstantVariant ParseNumberConstant(std::string rawNumber);
+    LLVMBackend::ConstantVariant ParseNumberConstant(const std::string& rawNumber);
     // Set by ParseNumberConstant: the last unsuffixed literal folded to a signed value with its bit
     // pattern kept (hex in [2^31, 2^32), anything past INT64_MAX), and that pattern's bits.
     bool lastNumberLiteralIsBitPattern = false;

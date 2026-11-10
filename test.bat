@@ -177,6 +177,8 @@ if not exist "%OUT%\results" mkdir "%OUT%\results"
 if not exist "%OUT%\results\done" mkdir "%OUT%\results\done"
 del /q "%OUT%\results\*.result" 2>nul
 del /q "%OUT%\results\*.log" 2>nul
+REM Stale group batches from a run with another CFLAT_ERR_GROUPS would mispair in the leg lint.
+del /q "%OUT%\results\err_group_*.rsp" 2>nul
 del /q "%OUT%\results\done\*.done" 2>nul
 
 REM Warm the compiler cache (linker paths + core-library bitcode) once up front so the
@@ -210,6 +212,10 @@ if exist "%SRC%\cinterop\build_mathlib.bat" (
     call "%SRC%\cinterop\build_mathlib.bat" %CFLAT_CONFIG% >nul 2>&1
     if errorlevel 1 echo WARNING: failed to build cinterop fixture lib - test_c_package may fail
 )
+
+REM Test-leg lint, static checks 2-5 (sources only), before the workers launch. Each failing
+REM check writes one lint_*.result into results, so :Collect counts it as a failed test.
+call :RunLegLint static
 
 set /a LAUNCHED=0
 
@@ -421,6 +427,8 @@ if errorlevel 1 (
 :DefinesDone
 
 :Collect
+REM Test-leg lint check 1 (bare-leg count) reads the err logs the workers kept in results.
+call :RunLegLint outputs
 set /a ERRORS=0
 set /a SKIPS=0
 set FAILED_NAMES=
@@ -469,6 +477,23 @@ set /a SECS=S1-S0
 if !SECS! lss 0 set /a SECS+=86400
 echo Elapsed: !SECS!s
 endlocal
+exit /b 0
+
+REM :RunLegLint <phase> - run utilities\lint_test_legs.py. Exit 1 with its summary line is a
+REM verdict (the lint_*.result files carry it); any other failure (no python, a traceback) is
+REM recorded as one failed lint_<phase>_crashed test.
+:RunLegLint
+set "LINT_LOG=%OUT%\results\_lint_%~1.log"
+python utilities\lint_test_legs.py --phase %~1 --platform windows --results "%OUT%\results" >"!LINT_LOG!" 2>&1
+set LINT_RC=!ERRORLEVEL!
+findstr /b /c:"LINT " "!LINT_LOG!"
+if !LINT_RC! neq 0 (
+    findstr /r /b /c:"LINT: [0-9]* failure" "!LINT_LOG!" >nul
+    if errorlevel 1 (
+        echo FAILED: leg lint %~1 exited !LINT_RC!>"%OUT%\results\lint_%~1_crashed.result"
+        copy /y "!LINT_LOG!" "%OUT%\results\lint_%~1_crashed.log" >nul
+    )
+)
 exit /b 0
 
 REM Every worker mode ends here. The sentinel is what the wait loop counts, so it must be

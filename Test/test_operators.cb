@@ -1042,7 +1042,9 @@ extern int main()
     terPassed += Test("ternary ptr cond null",      terPn ? 1 : 0, 0);
     terPassed += Test("ternary bool cond",          terB  ? 1 : 0, 1);
     // Non-bool condition in a branch of if/while must keep working too.
-    if (terD) { terPassed += Test("if double cond nonzero", 1, 1); }
+    int terIfD = 0;
+    if (terD) { terIfD = 1; }
+    terPassed += Test("if double cond nonzero", terIfD, 1);
 
     // Only the SELECTED arm runs. The ternary used to compute both arms eagerly and combine
     // them with a select, so a side effect in the not-taken arm still happened.
@@ -1207,7 +1209,7 @@ extern int main()
     if (t412AliasReturnOperatorLeg() != 4) return 75;
     if (cppUnwindThroughHelperLegs() != 0) return 60;
     if (ternaddrLegs() != 15) return 81;
-    if (ternaddrDeepLegs() != 9) return 82;
+    if (ternaddrDeepLegs() != 10) return 82;
     if (nestedReceiverLegs() != 10) return 83;
 
     if (t484CallableVariableLegs() != 2) return 63;
@@ -2982,6 +2984,46 @@ int ternaddrUnaryArms(int i)
     return - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - i;
 }
 
+// Pointer ?: chain 30 deep in an initializer: each level compiles once (was about 2x per level).
+int ternaddrPointerChain30(int i)
+{
+    int v = 1;
+    int w = 2;
+    int* p = &v;
+    int* q = &w;
+    int* r = (i == 1 ? p :
+        (i == 2 ? p :
+        (i == 3 ? p :
+        (i == 4 ? p :
+        (i == 5 ? p :
+        (i == 6 ? p :
+        (i == 7 ? p :
+        (i == 8 ? p :
+        (i == 9 ? p :
+        (i == 10 ? p :
+        (i == 11 ? p :
+        (i == 12 ? p :
+        (i == 13 ? p :
+        (i == 14 ? p :
+        (i == 15 ? p :
+        (i == 16 ? p :
+        (i == 17 ? p :
+        (i == 18 ? p :
+        (i == 19 ? p :
+        (i == 20 ? p :
+        (i == 21 ? p :
+        (i == 22 ? p :
+        (i == 23 ? p :
+        (i == 24 ? p :
+        (i == 25 ? p :
+        (i == 26 ? p :
+        (i == 27 ? p :
+        (i == 28 ? p :
+        (i == 29 ? p :
+        (i == 30 ? p : q))))))))))))))))))))))))))))));
+    return *r;
+}
+
 int ternaddrDepthShapes()
 {
     int passed = 0;
@@ -2990,6 +3032,7 @@ int ternaddrDepthShapes()
     passed += Test("tern_plus_paren_20", ternaddrPlusArms(3), 23);
     passed += Test("tern_neg_paren_40", ternaddrNegArms(3), 3);
     passed += Test("tern_unary_minus_70", ternaddrUnaryArms(3), 3);
+    passed += Test("tern_ptr_chain_30", ternaddrPointerChain30(30), 1);
     return passed;
 }
 

@@ -40,6 +40,7 @@
 #include <map>
 #include <set>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <chrono>
 
@@ -99,7 +100,7 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
         const std::string& functionName,
         llvm::Function* oldFn,
         std::vector<AutoReturnSite>& sites,
-        std::vector<TypeAndValue> arguments,
+        const std::vector<TypeAndValue>& arguments,
         bool varargs,
         bool returnsOwned,
         bool isMethod)
@@ -645,7 +646,7 @@ bool LLVMBackend::ValidateManifestIdentity(const std::string& xml, const std::st
 
 void LLVMBackend::RecordManifestFragment(const std::string& sourceFile, size_t line,
                                          const std::string& xml,
-                                         std::vector<ManifestFragment::Leaf> leaves)
+                                         const std::vector<ManifestFragment::Leaf>& leaves)
 {
     for (const auto& fragment : manifestFragments_)
         if (fragment.Xml == xml)
@@ -864,7 +865,7 @@ std::string LLVMBackend::GetCurrentFunctionName() const
 
 void LLVMBackend::RegisterReturnBlock(const std::string& name, CFlatParser::CompoundStatementContext* body, std::vector<DeclTypeAndValue> params, TypeAndValue returnType)
 {
-        returnBlockTable[name] = { body, std::move(params), returnType };
+        returnBlockTable[name] = { body, std::move(params), std::move(returnType) };
     }
 
 const LLVMBackend::ReturnBlockEntry* LLVMBackend::GetReturnBlock(const std::string& name) const
@@ -1714,7 +1715,7 @@ std::string LLVMBackend::ResolveNamespace(const std::string& name, bool rootOnly
                 if (directive != cxxUsingDirectives_.end())
                     for (const std::string& nominated : directive->second)
                     {
-                        const std::string candidate = nominated + current.substr(prefixEnd);
+                        std::string candidate = nominated + current.substr(prefixEnd);
                         if (candidate != current
                             && (namespaceTable.count(candidate) != 0
                                 || namespaceAliasTable.count(candidate) != 0))
@@ -1866,7 +1867,7 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
             if (!rewrote) break;
         }
 
-        const std::string qualified = nsPrefix + "." + lastName;
+        std::string qualified = nsPrefix + "." + lastName;
         const auto isKnownQualified = [this, &isPublishedCxxName](const std::string& candidate) {
             return dataStructures.count(candidate) != 0
                 || interfaceTable.count(candidate) != 0
@@ -2012,7 +2013,7 @@ std::string LLVMBackend::GetNameOfCurrentInsertionBlock()
         return std::format("{}::{}", currentBlock->getParent()->getName().str(), currentBlock->getName().str());
     }
 
-void LLVMBackend::DumpCurrentInsertionPoint(std::string prefix)
+void LLVMBackend::DumpCurrentInsertionPoint(const std::string& prefix)
 {
         llvm::BasicBlock* currentBlock = builder->GetInsertBlock();
         llvm::outs() << prefix << "Current insertion block: " << currentBlock->getParent()->getName() << "::" << currentBlock->getName() << "\n";
@@ -2051,8 +2052,8 @@ void LLVMBackend::SetLocaleTemplateCollection(bool enabled)
 bool LLVMBackend::WriteCollectedLocale(const std::string& locale, bool verbose) const
 { return diagnosticLocalization_.WriteCollectedCatalog(locale, verbose); }
 
-std::string LLVMBackend::LocalizeMessage(std::string englishTemplate,
-                                         std::vector<std::string> arguments) const
+std::string LLVMBackend::LocalizeMessage(const std::string& englishTemplate,
+                                         const std::vector<std::string>& arguments) const
 { return diagnosticLocalization_.Localize(englishTemplate, arguments); }
 
 std::function<std::string(std::string, std::vector<std::string>)>
@@ -4180,6 +4181,96 @@ std::shared_ptr<LLVMBackend::CSigBaseline> LLVMBackend::AcquireSigBaseline(
         return LoadSigBaseline(cacheDir, id, /*forWrite*/ true);
     }
 
+// Request markers (.rq) read once per process and cache directory: owner -> marker file name ->
+// validity and scope. Built by the first store under the directory, before the publish mutex is
+// taken; after that it is only touched under gCHeaderDiskCachePublishMutex.
+struct CxxRequestMarkerInfo
+{
+        std::string validity;
+        std::string scope;
+};
+
+struct CxxRequestPruneIndex
+{
+        std::once_flag built;
+        std::map<std::string, std::map<std::string, CxxRequestMarkerInfo>> byOwner;
+        std::map<std::string, std::string> ownerOfFile;
+};
+
+static std::mutex gCxxRequestPruneIndexesMutex;
+static std::map<std::string, std::shared_ptr<CxxRequestPruneIndex>> gCxxRequestPruneIndexes;
+
+static bool ReadCxxRequestMarker(const std::filesystem::path& path, std::string& owner,
+                                 CxxRequestMarkerInfo& info)
+{
+        std::ifstream input(path, std::ios::binary);
+        if (!input.is_open() || !std::getline(input, owner)) return false;
+        std::getline(input, info.validity);
+        std::getline(input, info.scope);
+        return true;
+}
+
+static void NoteCxxRequestMarker(CxxRequestPruneIndex& index, const std::string& file,
+                                 const std::string& owner, CxxRequestMarkerInfo info)
+{
+        auto known = index.ownerOfFile.find(file);
+        if (known == index.ownerOfFile.end())
+            index.ownerOfFile.emplace(file, owner);
+        else if (known->second != owner)
+        {
+            index.byOwner[known->second].erase(file);
+            known->second = owner;
+        }
+        index.byOwner[owner][file] = std::move(info);
+}
+
+static void ForgetCxxRequestMarker(CxxRequestPruneIndex& index, const std::string& file)
+{
+        auto known = index.ownerOfFile.find(file);
+        if (known == index.ownerOfFile.end()) return;
+        index.byOwner[known->second].erase(file);
+        index.ownerOfFile.erase(known);
+}
+
+static void BuildCxxRequestPruneIndex(CxxRequestPruneIndex& index,
+                                      const std::filesystem::path& cacheDir)
+{
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (const auto& file : fs::directory_iterator(cacheDir, ec))
+        {
+            if (ec) return;
+            if (file.path().extension() != ".rq") continue;
+            std::string owner;
+            CxxRequestMarkerInfo info;
+            if (!ReadCxxRequestMarker(file.path(), owner, info)) continue;
+            NoteCxxRequestMarker(index, file.path().filename().string(), owner, std::move(info));
+        }
+}
+
+// The index for cacheDir; the first caller scans the directory, the rest wait for that scan.
+static CxxRequestPruneIndex& CxxRequestPruneIndexFor(const std::filesystem::path& cacheDir)
+{
+        std::shared_ptr<CxxRequestPruneIndex> index;
+        {
+            std::lock_guard<std::mutex> lock(gCxxRequestPruneIndexesMutex);
+            auto& slot = gCxxRequestPruneIndexes[cacheDir.string()];
+            if (!slot) slot = std::make_shared<CxxRequestPruneIndex>();
+            index = slot;
+        }
+        std::call_once(index->built, [&] { BuildCxxRequestPruneIndex(*index, cacheDir); });
+        return *index;
+}
+
+// A marker no compile can hit any more. Another scope is never judged; an empty scope is a
+// legacy entry and dead whatever its validity.
+static bool CxxRequestMarkerIsDead(const CxxRequestMarkerInfo& info, const std::string& current,
+                                   const std::string& scope)
+{
+        if (!info.scope.empty() && info.scope != scope) return false;
+        return info.scope.empty() || info.validity != current;
+}
+
 void LLVMBackend::WriteCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
@@ -4501,13 +4592,15 @@ void LLVMBackend::WriteCHeaderDiskCache(
         {
             // Line 2 is what the entry is valid for and line 3 what it may be compared with, so
             // a prune can tell a dead entry from a live one (PruneCxxTypeRequestDiskCache).
-            const std::string marker = CxxRequestGroupMarker(requestGroup->ownerHeaders,
-                                                              requestGroup->ownerDefines)
-                + "\n" + CxxRequestEntryValidity(mtime, contentHash)
-                + "\n" + CxxRequestPruneScope(requestGroup->pruneScope);
+            const std::string owner = CxxRequestGroupMarker(requestGroup->ownerHeaders,
+                                                             requestGroup->ownerDefines);
+            const CxxRequestMarkerInfo info{CxxRequestEntryValidity(mtime, contentHash),
+                                            CxxRequestPruneScope(requestGroup->pruneScope)};
+            const std::string marker = owner + "\n" + info.validity + "\n" + info.scope;
             const auto markerPath = cacheDir / std::format("{:016x}.rq", diskKey);
             const auto markerTmpPath = cacheDir
                 / std::format("{:016x}.{}.{}.rq.tmp", diskKey, _getpid(), tempId);
+            bool markerWritten = false;
             std::ofstream markerFile(markerTmpPath, std::ios::binary | std::ios::trunc);
             if (markerFile.is_open())
             {
@@ -4520,10 +4613,15 @@ void LLVMBackend::WriteCHeaderDiskCache(
                         ec = llvm::sys::fs::rename(markerTmpPath.string(), markerPath.string());
                     }
                     if (ec) { ec.clear(); fs::remove(markerTmpPath, ec); }
+                    else markerWritten = true;
                 }
                 else { fs::remove(markerTmpPath, ec); ec.clear(); }
             }
+            // The index scan runs outside the publish mutex (once per process and directory).
+            CxxRequestPruneIndex& index = CxxRequestPruneIndexFor(cacheDir);
             std::lock_guard<std::mutex> publishLock(gCHeaderDiskCachePublishMutex);
+            if (markerWritten)
+                NoteCxxRequestMarker(index, markerPath.filename().string(), owner, info);
             PruneCxxTypeRequestDiskCache(cacheDir, *requestGroup, mtime, contentHash);
         }
     }
@@ -4580,33 +4678,42 @@ void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cach
         const std::string owner = CxxRequestGroupMarker(group.ownerHeaders, group.ownerDefines);
         const std::string current = CxxRequestEntryValidity(mtime, contentHash);
         const std::string scope = CxxRequestPruneScope(group.pruneScope);
-        // Dead entries predate this process (its own writes are live), so one scan per directory,
-        // owner, scope and validity is enough. Callers hold gCHeaderDiskCachePublishMutex.
-        static std::unordered_set<std::string> pruned;
-        if (!pruned.insert(cacheDir.string() + "\n" + owner + "\n" + current + "\n" + scope).second)
-            return;
+        // The index holds every marker of the directory, so a prune reads no directory and only
+        // re-reads the dead entries it is about to delete. Callers hold gCHeaderDiskCachePublishMutex.
+        CxxRequestPruneIndex& index = CxxRequestPruneIndexFor(cacheDir);
+        const auto ownerEntries = index.byOwner.find(owner);
+        if (ownerEntries == index.byOwner.end()) return;
+        std::vector<std::string> dead;
+        for (const auto& [file, info] : ownerEntries->second)
+            if (CxxRequestMarkerIsDead(info, current, scope)) dead.push_back(file);
         const auto now = fs::file_time_type::clock::now();
         constexpr auto grace = std::chrono::minutes(10);
-        for (const auto& file : fs::directory_iterator(cacheDir, ec))
+        for (const auto& file : dead)
         {
-            if (ec) return;
-            if (file.path().extension() != ".rq") continue;
-            const auto age = now - fs::last_write_time(file.path(), ec);
-            if (ec) { ec.clear(); continue; }
+            const auto path = cacheDir / file;
+            const auto age = now - fs::last_write_time(path, ec);
+            if (ec) { ec.clear(); ForgetCxxRequestMarker(index, file); continue; }
+            // A racing writer's fresh file is spared by the grace.
             if (age < grace) continue;
-            std::ifstream input(file.path(), std::ios::binary);
-            std::string marker;
-            if (!input.is_open() || !std::getline(input, marker) || marker != owner) continue;
-            std::string validity, entryScope;
-            std::getline(input, validity);
-            std::getline(input, entryScope);
-            if (!entryScope.empty() && entryScope != scope) continue;
-            // Live: the stamp and content it was written for are the current ones.
-            if (!entryScope.empty() && validity == current) continue;
-            auto jsonPath = file.path();
+            // Re-read: another process may have rewritten the entry since the index saw it.
+            std::string freshOwner;
+            CxxRequestMarkerInfo fresh;
+            if (!ReadCxxRequestMarker(path, freshOwner, fresh))
+            {
+                ForgetCxxRequestMarker(index, file);
+                continue;
+            }
+            if (freshOwner != owner || !CxxRequestMarkerIsDead(fresh, current, scope))
+            {
+                NoteCxxRequestMarker(index, file, freshOwner, std::move(fresh));
+                continue;
+            }
+            auto jsonPath = path;
             jsonPath.replace_extension(".json");
             fs::remove(jsonPath, ec); ec.clear();
-            fs::remove(file.path(), ec); ec.clear();
+            fs::remove(path, ec); ec.clear();
+            if (!fs::exists(path, ec)) ForgetCxxRequestMarker(index, file);
+            ec.clear();
         }
     }
 

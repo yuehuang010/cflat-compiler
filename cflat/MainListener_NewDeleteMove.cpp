@@ -3279,6 +3279,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             if ((int)argNVs.size() != intrin->Arity)
                 LogErrorContext(ctx, std::format("simd<T,N>.{} expects {} vector argument(s).", method, intrin->Arity));
             std::vector<llvm::Value*> ops;
+            ops.reserve(ops.size() + static_cast<size_t>(intrin->Arity));
             for (int k = 0; k < intrin->Arity; k++)
                 ops.push_back(requireSimdArg(ctx, argValue(k), k, vecTy, method));
             auto* fn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), intrin->Id, {vecTy});
