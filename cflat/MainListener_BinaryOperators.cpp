@@ -2704,6 +2704,21 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             llvm::Type* elemType = lv.elemType;
             bool unsignedStorage = false;
             bool fixedArrayPointerArithmetic = false;
+            bool pointerToArrayArithmetic = false;
+            // A decayed 2-D flexible member is a pointer to its row: step and divide by the row.
+            auto IsPointerToRow = [](const auto& operand) {
+                return operand.hasSourceType && operand.sourceType.Pointer
+                    && !operand.sourceType.ConstInnerDimensions.empty();
+            };
+            auto PointerRowType = [&](const auto& operand) {
+                auto rowType = operand.sourceType;
+                rowType.Pointer = false;
+                rowType.ElemPointer = false;
+                rowType.PointerDepth = 0;
+                rowType.ConstArraySize = rowType.ConstInnerDimensions.front();
+                rowType.ConstInnerDimensions.erase(rowType.ConstInnerDimensions.begin());
+                return Compiler(ctx)->GetType(rowType);
+            };
             LLVMBackend::TypeAndValue pointerArithmeticSourceType = lv.sourceType;
             int pointerArithmeticDepth = lv.pointerDepth;
             bool hasPointerArithmeticResultType = false;
@@ -2780,6 +2795,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         LogVoidPointerArithmetic(ctx);
                         elemType = nullptr;
                     }
+                    if (elemType && IsPointerToRow(rv))
+                        elemType = PointerRowType(rv);
                     auto* i64Ty = Compiler(ctx)->builder->getInt64Ty();
                     auto* byteDiff = Compiler(ctx)->builder->CreateSub(
                         Compiler(ctx)->builder->CreatePtrToInt(lvalue, i64Ty),
@@ -2827,6 +2844,9 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                             rvalue, Compiler(ctx)->builder->getInt64Ty(), "bool_index");
                     if (op == "-")
                         rvalue = Compiler(ctx)->builder->CreateNeg(rvalue, "neg");
+                    pointerToArrayArithmetic = IsPointerToRow(lv);
+                    if (pointerToArrayArithmetic)
+                        elemType = PointerRowType(lv);
                     lvalue = Compiler(ctx)->CreateGEP(elemType, lvalue, rvalue, "ptrarith");
                     lhsStorage = nullptr;
                     lhsIsRvalue = true;
@@ -2844,6 +2864,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         pointerArithmeticDepth = lv.pointerDepth;
                     }
                     if (firstStepOnLeft && !fixedArrayPointerArithmetic && lv.hasSourceType
+                        && !pointerToArrayArithmetic
                         && (lv.sourceType.ConstArraySize != 0
                             || !lv.sourceType.ConstInnerDimensions.empty())
                         && !lv.sourceType.IsArrayView)
@@ -2866,7 +2887,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     if (lvalue->getType()->isIntegerTy(1))
                         lvalue = Compiler(ctx)->builder->CreateZExt(
                             lvalue, Compiler(ctx)->builder->getInt64Ty(), "bool_index");
-                    lvalue = Compiler(ctx)->CreateGEP(rv.elemType, rvalue, lvalue, "ptrarith");
+                    auto* stepType = IsPointerToRow(rv) ? PointerRowType(rv) : rv.elemType;
+                    lvalue = Compiler(ctx)->CreateGEP(stepType, rvalue, lvalue, "ptrarith");
                     lhsStorage = nullptr;
                     lhsIsRvalue = true;
                     lhsIsAlias = false;
@@ -2874,11 +2896,11 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     lhsRefType = nullptr;
                     lhsNativeArithmeticTypeName.clear();
                     lhsSourceTypeName.clear();
-                    elemType = rv.elemType;
+                    elemType = IsPointerToRow(rv) ? PointerRowType(rv) : rv.elemType;
                     hasPointerArithmeticResultType = true;
                     pointerArithmeticSourceType = rv.sourceType;
                     pointerArithmeticDepth = rv.pointerDepth;
-                    fixedArrayPointerArithmetic = rv.hasSourceType
+                    fixedArrayPointerArithmetic = rv.hasSourceType && !IsPointerToRow(rv)
                         && (rv.sourceType.ConstArraySize != 0
                             || !rv.sourceType.ConstInnerDimensions.empty())
                         && !rv.sourceType.IsArrayView;
@@ -5188,7 +5210,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                                             const std::string& sourceTypeName,
                                             int pointerDepth, bool elemPointer,
                                             bool cxxNullptrT,
-                                            bool pointeeConst = false) {
+                                            bool pointeeConst = false,
+                                            bool elideOperatorLhs = false) {
                     LLVMBackend::NamedVariable arg;
                     arg.Primary = value;
                     arg.Storage = storage;
@@ -5247,8 +5270,17 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     const bool ownValue = ownSlot != nullptr
                         && ((load != nullptr && load->getPointerOperand() == ownSlot)
                             || isParallelStorageJoin(value, ownSlot));
-                    if (structType != nullptr && arg.Storage == nullptr && arg.IsRvalue && ownValue)
-                        arg.Storage = ownSlot;
+                    llvm::Value* lhsPrvalueSlot = ownSlot != nullptr ? ownSlot
+                        : (elideOperatorLhs ? compiler->StorageOfLoadedCxxObject(value) : nullptr);
+                    const bool elideShiftLhs = (op == "<<" || op == ">>")
+                        && elideOperatorLhs && !lhsExplicitMove && arg.IsRvalue
+                        && lhsPrvalueSlot != nullptr
+                        && compiler->IsForeignNontrivialCxxClass(typeName);
+                    if (structType != nullptr && arg.Storage == nullptr && arg.IsRvalue
+                        && (ownValue || elideShiftLhs))
+                        arg.Storage = elideShiftLhs ? lhsPrvalueSlot : ownSlot;
+                    if (elideShiftLhs && arg.Storage != nullptr)
+                        arg.IsCxxPrvalueTemp = true;
                     else if (structType != nullptr && arg.Storage == nullptr)
                     {
                         auto* temp = compiler->CreateAlloca(structType);
@@ -5261,7 +5293,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 templateArgs.push_back(templateArgument(lvalue, freeLhsStorage, lhsStorage,
                                                        leftInfo.first, leftInfo.second, lhsTypeName,
                                                        lhsPointerDepth, lhsElemPointer,
-                                                       lhsCxxNullptrT));
+                                                       lhsCxxNullptrT, false, true));
                 templateArgs.push_back(templateArgument(rvalue, freeRhsStorage, rhsStorage,
                                                         rightInfo.first, rightInfo.second, rhsTypeName,
                                                         rhsPointerDepth, rhsElemPointer,
@@ -5337,6 +5369,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         && templateError.find("is a non-const lvalue reference and cannot bind")
                             != std::string::npos)
                         LogErrorContext(ctx, templateError);
+                    return nullptr;
+                }
+                if ((op == "<<" || op == ">>") && !compiler->SwitchCxxOperatorDirectByValueCall(
+                        sourceName, templateArgs, registeredName, templateError))
+                {
+                    LogErrorContext(ctx, templateError);
                     return nullptr;
                 }
                 FlushCallPostfix();
@@ -6173,6 +6211,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                             return true;
                 return false;
             };
+            auto hasMemberTemplateCandidate = [&](const std::string& className,
+                                                  const std::string& operatorName) {
+                return compiler->HasCxxFunctionTemplateMember(className, operatorName);
+            };
             auto hasFreeTemplateCandidate = [&](const std::string& className,
                                                 const std::string& operatorName) {
                 for (const std::string& source : CxxFreeOperatorSources(className, operatorName))
@@ -6227,6 +6269,21 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     llvm::cast<llvm::StructType>(lvalue->getType())->getName().str();
                 const std::string operatorName = "operator" + op;
                 const std::vector<std::string> sources = CxxFreeOperatorSources(leftName, operatorName);
+                // A registered operator template can change ranking even when no candidate was
+                // dropped. Let clang rank the complete set; template-free sets stay on CFlat's path.
+                if (op == "+" && rhsPointerDepth > 0
+                    && (hasMemberTemplateCandidate(leftName, operatorName)
+                        || hasFreeTemplateCandidate(leftName, operatorName)))
+                {
+                    adlClangRefusal.clear();
+                    if (llvm::Value* resolved = tryFreeOperator(true, true)) return resolved;
+                    if (adlClangAmbiguous) return nullptr;
+                    if (!adlClangRefusal.empty())
+                    {
+                        LogErrorContext(ctx, adlClangRefusal);
+                        return nullptr;
+                    }
+                }
                 // A member beside the free set keeps its own member-free tie diagnostic below.
                 if (sources.size() == 2 && !hasMemberCandidate(leftName, operatorName)
                     && sourceHasFreeCandidate(leftName, sources[0], operatorName)

@@ -6,5 +6,9 @@ extern int main()
         std.array<int, 3> bad = default;
         cppi.array_total(bad);
     }
+    expect_error("no overload of 'cppi.array_pointer_static_oracle' matches") {
+        int[3] bound = { 1, 2, 3 };
+        int rejected = cppi.array_pointer_static_oracle(&bound);
+    }
     return 0;
 }

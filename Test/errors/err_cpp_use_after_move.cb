@@ -82,5 +82,29 @@ extern int main()
         static cppi.Tracked first = move src;
         static cppi.Tracked second = move src;
     }
+    // A same-type cast creates the C++ argument temporary while preserving the deferred
+    // explicit-move identity of the named source for the call's moved-from check.
+    expect_error("use of moved variable 'src'") {
+        cppi.Tracked src = cppi.Tracked(2);
+        cppi.take_tracked((cppi.Tracked)(move src));
+        int leak = src.value();
+    }
+    expect_error("use of moved variable 'src'") {
+        cppi.Tracked src = cppi.Tracked(3);
+        cppi.take_tracked((cppi.Tracked)(move src));
+        cppi.take_tracked((cppi.Tracked)(move src));
+    }
+    expect_error("use of moved variable 'src'") {
+        cppi.Tracked src = cppi.Tracked(4);
+        cppi.take_tracked((cppi.Tracked)(move src));
+        cppi.take_tracked(move src);
+    }
+    expect_error("use of moved variable 'src'") {
+        cppi.Tracked src = cppi.Tracked(5);
+        bool chooseMove = true;
+        cppi.take_tracked(chooseMove
+            ? (cppi.Tracked)(move src) : cppi.make_tracked(6));
+        int leak = src.value();
+    }
     return 0;
 }

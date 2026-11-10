@@ -2692,6 +2692,7 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         {
             j["scty"] = e.selectedCalleeType;
             if (!e.selectedCalleeTemplateArgs.empty()) j["scta"] = e.selectedCalleeTemplateArgs;
+            if (!e.selectedCalleeSymbol.empty()) j["scs"] = e.selectedCalleeSymbol;
             nlohmann::json scd = nlohmann::json::array();
             for (const auto& d : e.selectedCalleeDefaults) scd.push_back({{"k", d.kind}, {"v", d.value}});
             j["scd"] = std::move(scd);
@@ -2762,6 +2763,7 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         if (j.contains("cpsel")) e.ctorSelectedParams = j["cpsel"].to_string_vector();
         e.selectedCalleeType = j.value("scty", std::string());
         e.selectedCalleeTemplateArgs = j.value("scta", std::string());
+        e.selectedCalleeSymbol = j.value("scs", std::string());
         if (j.contains("scd"))
             for (const auto& d : j["scd"])
                 e.selectedCalleeDefaults.push_back({ d.value("k", std::string{}), d.value("v", std::string{}) });
@@ -3462,7 +3464,8 @@ nlohmann::json LLVMBackend::TypeAliasToJson(const CTypeAliasEntry& a, CCachePath
                 {"iat", a.isCxxAliasTemplate}, {"cap", a.cxxAliasPattern},
                 {"can", a.cxxAliasParams}, {"capf", a.cxxAliasParamPackFlags},
                 {"catb", a.cxxAliasTargetBase},
-                {"caa", a.cxxAliasArgs}, {"cad", a.cxxAliasParamDefaults}};
+                {"caa", a.cxxAliasArgs}, {"caef", a.cxxAliasExpressionArgFlags},
+                {"cad", a.cxxAliasParamDefaults}};
         PathToJson(j, a.file, files);
         return j;
     }
@@ -3484,6 +3487,7 @@ LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j, cons
         if (j.contains("capf")) a.cxxAliasParamPackFlags = j["capf"].to_u64_vector();
         a.cxxAliasTargetBase = j.value("catb", std::string{});
         if (j.contains("caa")) a.cxxAliasArgs = j["caa"].to_string_vector();
+        if (j.contains("caef")) a.cxxAliasExpressionArgFlags = j["caef"].to_u64_vector();
         if (j.contains("cad")) a.cxxAliasParamDefaults = j["cad"].to_string_vector();
         return a;
     }

@@ -253,9 +253,20 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         cxxCallArgumentExpectedType_, argExpected);
                     CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
                     CxxCallArgumentScope cxxNewArgumentScope(inCxxCallArgument_, true);
+                    LLVMBackend::TypeAndValue ctorRefDest;
+                    std::string ctorRefPlaceType;
+                    const bool ctorRefTernary = IsCxxDeferrableDefaultTernary(
+                            argAssign, ctorRefPlaceType)
+                        && compiler->GetUniqueCxxConstructorValueParameter(
+                            typeName, argIndex, ctorArgNodes.size(), ctorRefDest,
+                            /*constRef*/ true)
+                        && ctorRefPlaceType == ctorRefDest.TypeName
+                        && compiler->IsForeignNontrivialCxxClass(ctorRefDest.TypeName);
                     auto nv = [&] {
                         CxxCallArgumentParseStateScope argumentState(compiler);
-                        auto parsed = ParseAssignmentExpressionNamed(argAssign);
+                        auto parsed = ctorRefTernary
+                            ? ParseCxxConstRefTernaryTemp(argAssign, ctorRefDest)
+                            : ParseAssignmentExpressionNamed(argAssign);
                         llvm::Value* retTemp = compiler->lastCxxRetTemp_;
                         llvm::Value* retValue = compiler->lastCxxRetValue_;
                         if (retTemp != nullptr
@@ -2313,6 +2324,8 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         const auto operandLayers = DirectOperandPostfixes(ctx->unaryExpression());
         FlexibleArrayKeepScope keep(flexibleArrayKeep_, operandLayers);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+        // An explicit move is an xvalue: a constructed temp's prvalue flag must not let it be elided.
+        argNV.IsCxxPrvalueTemp = false;
         // A copied field is non-owning, not [immovable], and holds no C++ class beyond a trivially
         // copyable record (a C++ move ctor must still run and leave the source moved-from).
         const auto copiesAsPlainValue = [&](const LLVMBackend::NamedVariable& nv) {

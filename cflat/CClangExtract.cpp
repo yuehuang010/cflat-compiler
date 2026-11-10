@@ -3536,7 +3536,7 @@ namespace cflat_cinterop
                         };
                         findCall(findCall, wrapperBody);
                         const FunctionDecl* callee = outer != nullptr && !llvm::isa<CXXMemberCallExpr>(outer)
-                                && !llvm::isa<CXXOperatorCallExpr>(outer) && !llvm::isa<UserDefinedLiteral>(outer)
+                                && !llvm::isa<UserDefinedLiteral>(outer)
                             ? outer->getDirectCallee() : nullptr;
                         if (callee != nullptr && callee->getBuiltinID() == 0
                             && !llvm::isa<CXXMethodDecl>(callee))
@@ -3603,6 +3603,8 @@ namespace cflat_cinterop
                             }
                             for (const ParmVarDecl* p : callee->parameters())
                                 sig.selectedCalleeDefaults.push_back(DefaultArgumentOf(p, ctx));
+                            if (callee->hasExternalFormalLinkage())
+                                sig.selectedCalleeSymbol = CxxLinkageName(ctx, callee);
                         }
                     }
                 }
@@ -6261,7 +6263,11 @@ namespace cflat_cinterop
                     t.cxxAliasTargetBase = CxxQualifiedName(target);
                 if (t.cxxAliasTargetBase.empty()) return;
                 for (const TemplateArgument& arg : tst->template_arguments())
+                {
                     t.cxxAliasArgs.push_back(printArgument(arg));
+                    t.cxxAliasExpressionArgFlags.push_back(
+                        arg.getKind() == TemplateArgument::Expression ? 1 : 0);
+                }
             }
 
             bool VisitTypeAliasTemplateDecl(TypeAliasTemplateDecl* atd)

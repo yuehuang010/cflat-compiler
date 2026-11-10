@@ -1435,7 +1435,13 @@ bool LLVMBackend::RequestCxxType(const std::string& baseName, const std::vector<
         size_t pos = 0;
         while ((pos = spelling.find('.', pos)) != std::string::npos)
         { spelling.replace(pos, 1, "::"); pos += 2; }
-        if (!typeArgs.empty())
+        std::string aliasUseKey = baseName + "\x1f";
+        for (const std::string& arg : typeArgs)
+            aliasUseKey += std::to_string(arg.size()) + ":" + arg;
+        auto aliasUse = cxxAliasUseSpellings_.find(aliasUseKey);
+        if (aliasUse != cxxAliasUseSpellings_.end())
+            spelling = aliasUse->second;
+        else if (!typeArgs.empty())
         {
             spelling += "<";
             for (size_t i = 0; i < typeArgs.size(); ++i)

@@ -2094,7 +2094,12 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
         if (!recipe.hasLowering && ParameterIsAliasByPointer(retType)) recipe.hasLowering = true;
         if (!recipe.hasLowering)
             for (const auto& p : params)
-                if (ParameterIsAliasByPointer(p)) { recipe.hasLowering = true; break; }
+                if (ParameterIsAliasByPointer(p)
+                    || (p.Pointer && p.ConstArraySize > 0))
+                {
+                    recipe.hasLowering = true;
+                    break;
+                }
         out = std::move(recipe);
         return true;
     }
@@ -2147,6 +2152,13 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
             }
             else if (s.kind == AbiSlot::ByVal)
                 ptypes.push_back(cflat_llvm::PointerTo(s.structTy));
+            else if (recipe.fromClang && params[i].Pointer && params[i].ConstArraySize > 0)
+            {
+                TypeAndValue arrayType = params[i];
+                arrayType.Pointer = false;
+                arrayType.PointerDepth = 0;
+                ptypes.push_back(cflat_llvm::PointerTo(GetType(arrayType)));
+            }
             else if (ParameterIsAliasByPointer(params[i]))
                 ptypes.push_back(cflat_llvm::PointerTo(GetType(params[i])));
             else

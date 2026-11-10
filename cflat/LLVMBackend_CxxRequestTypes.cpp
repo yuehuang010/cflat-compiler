@@ -3358,6 +3358,7 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             raw.selectedCalleeType = stored.selectedCalleeType;
             raw.selectedCalleeTemplateArgs = stored.selectedCalleeTemplateArgs;
             raw.selectedCalleeDefaults = stored.selectedCalleeDefaults;
+            raw.selectedCalleeSymbol = stored.selectedCalleeSymbol;
             for (const TypeAndValue& param : stored.params)
                 raw.paramNames.push_back(param.VariableName);
             raw.defaultArgs = stored.defaultArgs;

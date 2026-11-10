@@ -25,13 +25,5 @@ extern int main()
     expect_error("requires at least 1 template argument(s)") {
         req.FixedRequired<> unused = default;
     }
-    // A non-type EXPRESSION pattern is not folded: it is refused as a non-pack alias's
-    // expression is (clang folds it; CFlat has no C++ spelling for the value).
-    expect_error("has no C++ spelling") {
-        alnv.PlusSeq<1, 3> plusSeq = default;
-    }
-    expect_error("has no C++ spelling") {
-        alnv.DivSeq<1> divSeq = default;
-    }
     return 0;
 }

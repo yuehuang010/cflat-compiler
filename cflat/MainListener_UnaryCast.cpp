@@ -317,7 +317,9 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 }
             }
             LLVMBackend::NamedVariable namedVar;
+            bool castTernaryConsumed = false;
             {
+                llvm::Value* castInitDestination = compiler->pendingCxxSretDest_;
                 // Conversion casts hide the initializer slot. Transparent identity casts around
                 // a direct call may pass it through for guaranteed elision.
                 struct HideCastInitDestination
@@ -344,8 +346,59 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                     }
                 } hide(compiler, ctx == pendingCxxCastInitContext_
                     && !castInitIdentityCall && !castDefaultInPlace);
+                const bool castInitIdentityTernary = ctx == pendingCxxCastInitContext_
+                    && castInitDestination != nullptr
+                    && !destTypeName.Pointer && !destTypeName.ElemPointer
+                    && !destTypeName.IsArrayView
+                    && compiler->IsForeignNontrivialCxxClass(destTypeName.TypeName)
+                    && SoleTernaryExpression(castExp) != nullptr;
+                struct PendingCastTernaryDestination
+                {
+                    LLVMBackend* compiler;
+                    llvm::Value* destination;
+                    std::string typeName;
+                    bool consumed;
+                    bool failed;
+                    bool active;
+                    PendingCastTernaryDestination(LLVMBackend* compiler, llvm::Value* destination,
+                                                  bool active, const std::string& typeName)
+                        : compiler(compiler), destination(compiler->pendingCxxTernaryDeclDest_),
+                          typeName(compiler->pendingCxxTernaryDeclTypeName_),
+                          consumed(compiler->pendingCxxTernaryDeclConsumed_),
+                          failed(compiler->pendingCxxTernaryDeclFailed_), active(active)
+                    {
+                        if (!active) return;
+                        compiler->pendingCxxTernaryDeclDest_ = destination;
+                        compiler->pendingCxxTernaryDeclTypeName_ = typeName;
+                        compiler->pendingCxxTernaryDeclConsumed_ = false;
+                        compiler->pendingCxxTernaryDeclFailed_ = false;
+                    }
+                    bool Consumed() const
+                    {
+                        return active && compiler->pendingCxxTernaryDeclConsumed_
+                            && !compiler->pendingCxxTernaryDeclFailed_;
+                    }
+                    ~PendingCastTernaryDestination()
+                    {
+                        if (!active) return;
+                        compiler->pendingCxxTernaryDeclDest_ = destination;
+                        compiler->pendingCxxTernaryDeclTypeName_ = std::move(typeName);
+                        compiler->pendingCxxTernaryDeclConsumed_ = consumed;
+                        compiler->pendingCxxTernaryDeclFailed_ = failed;
+                    }
+                } ternaryDestination(compiler, castInitDestination, castInitIdentityTernary,
+                                     destTypeName.TypeName);
                 namedVar = ParseCastExpression(castExp, false,
                     destIsVoid ? ResultUse::Discard : ResultUse::Value);
+                castTernaryConsumed = ternaryDestination.Consumed();
+            }
+            if (castTernaryConsumed)
+            {
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+                namedVar.TypeAndValue = destTypeName;
+                namedVar.IsRvalue = true;
+                return namedVar;
             }
             if (castDefaultInPlace && compiler->pendingCxxSretDest_ == nullptr)
             {
@@ -409,6 +462,59 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 castValue.IsCxxPrvalueTemp = true;
                 castValue.IsCxxSameTypeCastCopy = true;
                 castValue.CxxLvalueKind = 0;
+                return castValue;
+            }
+            // `(T)(move prvalue)` creates a new object; otherwise `T&&` may bind to the
+            // original return temporary without running the move constructor.
+            bool insideCallArgument = false;
+            for (antlr4::tree::ParseTree* node = ctx; node != nullptr; node = node->parent)
+                if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(node) != nullptr)
+                {
+                    insideCallArgument = true;
+                    break;
+                }
+            if (IsRedundantCastOfSource(namedVar.TypeAndValue, destTypeName)
+                && !namedVar.TypeAndValue.Pointer && namedVar.IsExplicitMove
+                && inCxxCallArgument_ && insideCallArgument && namedVar.Storage != nullptr
+                && compiler->IsForeignNontrivialCxxClass(castSourceType))
+            {
+                auto* classType = compiler->GetType(destTypeName);
+                auto* temp = compiler->CreateAlloca(classType);
+                if (!compiler->EmitCxxCopyOrMoveConstruct(castSourceType, temp, namedVar.Storage,
+                        /*useMove*/ true, "for an explicit cast temporary", {}, false,
+                        /*directInit*/ true))
+                    return {};
+                compiler->RegisterOwnedStructTemp(temp, castSourceType);
+                const std::string movedName = namedVar.CallerName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                const bool namedMoveSource = !movedName.empty()
+                    && compiler->FindVariableStorage(movedName).Storage != nullptr;
+                LLVMBackend::NamedVariable castValue;
+                castValue.TypeAndValue = destTypeName;
+                castValue.BaseType = classType;
+                castValue.Primary = compiler->CreateLoad(classType, temp);
+                castValue.Storage = temp;
+                castValue.IsRvalue = true;
+                castValue.IsCxxPrvalueTemp = true;
+                // The cast owns a fresh value, but a deferred call-argument move must still
+                // mark the named source moved when ApplyMoveParamTransfer sees this result.
+                if (namedMoveSource)
+                {
+                    castValue.TypeAndValue.VariableName = namedVar.TypeAndValue.VariableName;
+                    castValue.CallerName = namedVar.CallerName;
+                    castValue.IsExplicitMove = namedVar.IsExplicitMove;
+                    castValue.FieldName = namedVar.FieldName;
+                    castValue.FieldPathText = namedVar.FieldPathText;
+                    castValue.FieldPathRoot = namedVar.FieldPathRoot;
+                    castValue.OwningStructName = namedVar.OwningStructName;
+                    castValue.IsElementAccess = namedVar.IsElementAccess;
+                    castValue.MovePathKey = namedVar.MovePathKey;
+                    castValue.MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
+                    castValue.PointeeMove = namedVar.PointeeMove;
+                    castValue.MoveSourceStorage = namedVar.MoveSourceStorage;
+                    castValue.MoveSourcePathKey = namedVar.MoveSourcePathKey;
+                    castValue.MoveSourceFieldPath = namedVar.MoveSourceFieldPath;
+                }
                 return castValue;
             }
             auto type = compiler->GetType(destTypeName);
@@ -1951,6 +2057,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
                 return {};
             }
+            if (LeadingUnaryOperator(ctx) == "&")
+            {
+                typeValue.Pointer = true;
+                typeValue.ConstArraySize = 0;
+                typeValue.ConstInnerDimensions.clear();
+                llvmType = compiler->builder->getPtrTy();
+            }
             return SizeOrAlignOfType(typeValue, llvmType, false);
         }
 
@@ -1994,6 +2107,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
             {
                 LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
                 return {};
+            }
+            if (LeadingUnaryOperator(ctx) == "&")
+            {
+                typeValue.Pointer = true;
+                typeValue.ConstArraySize = 0;
+                typeValue.ConstInnerDimensions.clear();
+                llvmType = compiler->builder->getPtrTy();
             }
             return SizeOrAlignOfType(typeValue, llvmType, true);
         }

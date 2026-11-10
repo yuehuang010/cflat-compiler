@@ -32,8 +32,5 @@ Still open:
   argument, the wrapper binds the caller's object (lref ternary 902 on master and fix, clang 702).
 - `take2(c ? default : rettw(), default)`: a bare trailing `default` into an unbound wrapper has no
   target type and stays refused.
-- Direct construction `take(Val(7))` still uses the wrapper and adds a move (b_ctor: 710120 on this
-  worktree, 710010 with clang++ -std=c++20); the direct-construction prvalue is not
-  `IsCxxPrvalueTemp` and is not switched to the selected callee's by-value ABI path.
 
 The remaining conditional-reference repro is retained at scratch/unbwrap/item3.cb.

@@ -51,11 +51,27 @@ struct T391Host
 struct T391StaticHost
 {
     static int tref(const T391Val& v) { return 50 + v.value(); }
+    static int over(const T391Val& v) { return 60 + v.value(); }
+    static int over(int v) { return 80 + v; }
+    static int def(const T391Val& v, int n = 9) { return 50 + n + v.value(); }
+    static int over2(const T391Val& v, int n) { return 60 + n + v.value(); }
+    static int over2(const T391Val& v, double n) { return 70 + v.value(); }
+    static int defValue(const T391Val& v, T391Val w = T391Val(3))
+    {
+        return 50 + w.value() + v.value();
+    }
+    template<class T> static int temp(const T391Val& v, T n) { return 50 + n + v.value(); }
 };
 struct T391Sink
 {
     int stored;
     explicit T391Sink(const T391Val& v) : stored(v.value()) {}
+    int value() const { return stored; }
+};
+struct T391SinkV
+{
+    int stored;
+    explicit T391SinkV(T391Val v) : stored(v.value()) {}
     int value() const { return stored; }
 };
 struct T391BraceHost

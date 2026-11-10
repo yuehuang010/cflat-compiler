@@ -353,6 +353,17 @@ namespace cppi
     inline int primitive_middle_alias_rank(int**) noexcept { return 1; }
     inline int primitive_middle_alias_rank(int* const*) noexcept { return 2; }
     inline int primitive_middle_alias_oracle(PrimitiveMiddleConstAlias p) noexcept { return primitive_middle_alias_rank(p); }
+    struct ArrayPointerMember
+    {
+        int apr(int (* const& p)[2]) noexcept
+        { return p == nullptr ? 69 : (*p)[0] + (*p)[1]; }
+        static int sap(int (*p)[2]) noexcept
+        { return p == nullptr ? 70 : (*p)[0] + (*p)[1]; }
+    };
+    inline int array_pointer_member_oracle(int (* const& p)[2]) noexcept
+    { ArrayPointerMember value{}; return value.apr(p); }
+    inline int array_pointer_static_oracle(int (*p)[2]) noexcept
+    { return ArrayPointerMember::sap(p); }
     inline int primitive_middle_mutable_only(int**) noexcept { return 13; }
     inline int primitive_middle_mutable_oracle(int** p) noexcept { return primitive_middle_rank(p); }
     inline int primitive_middle_const_oracle(int* const* p) noexcept { return primitive_middle_rank(p); }

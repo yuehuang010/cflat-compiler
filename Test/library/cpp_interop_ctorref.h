@@ -789,6 +789,16 @@ struct RkAmb { int chosen; RkAmb(int, int k = 5) : chosen(1) {} RkAmb(int) : cho
 struct RkFnPtr { int chosen; RkFnPtr(void (*)(), int k = 5) : chosen(k) {} RkFnPtr(int*) : chosen(2) {} };
 // Expression-position constructor thunks must preserve exact scalar lvalue addresses.
 struct ExprConstRW { long v; ExprConstRW(const long& x, long* p) { *p = 9; v = x; } };
+struct ExprTernaryRef {
+    inline static int born = 0;
+    inline static int dead = 0;
+    long v;
+    ExprTernaryRef(const long& x, long* p) { *p = 9; v = x; ++born; }
+    ~ExprTernaryRef() { ++dead; }
+    static void reset() { born = 0; dead = 0; }
+    static int born_count() { return born; }
+    static int dead_count() { return dead; }
+};
 struct ExprMutRW { long v; ExprMutRW(long& x, long* p) { *p = 9; v = x; x = 12; } };
 struct ExprConvertedRef { long v; ExprConvertedRef(const long& x, long* p) { *p = 9; v = x; } };
 inline int expr_arg_seen(ExprConstRW x) { return (int)x.v; }
@@ -799,6 +809,19 @@ struct ExprEnumPick {
     ExprEnumPick(ExprUnscoped&& x) : chosen(1), value((long)x) {}
     ExprEnumPick(const long& x) : chosen(2), value(x) {}
     ExprEnumPick(ExprScoped&& x) : chosen(3), value((long)x) {}
+};
+struct ExprEnumPickTracked {
+    inline static int born = 0;
+    inline static int dead = 0;
+    int chosen; long value;
+    ExprEnumPickTracked(ExprUnscoped&& x) : chosen(1), value((long)x) { ++born; }
+    ExprEnumPickTracked(const long& x) : chosen(2), value(x) { ++born; }
+    ExprEnumPickTracked(ExprScoped&& x) : chosen(3), value((long)x) { ++born; }
+    ExprEnumPickTracked(int&& x) : chosen(4), value(x) { ++born; }
+    ~ExprEnumPickTracked() { ++dead; }
+    static void reset() { born = 0; dead = 0; }
+    static int born_count() { return born; }
+    static int dead_count() { return dead; }
 };
 struct ExprIntRvalue { int chosen; int value;
     ExprIntRvalue(int&& x) : chosen(1), value(x) {}
@@ -895,4 +918,12 @@ struct BrcRefuseScalarOwner {
     int which;
     BrcRefuseScalarOwner(BrcRefuseScalar a, int = 7) : which(a.which) {}
 };
+// Expression-position ctor: a `const long&` argument that is a `T&` call result or an explicit
+// `move` must bind the referent's address, so the write in the body is read back (clang: 9).
+struct ScalarRefPtr {
+    long v;
+    ScalarRefPtr(const long& x, long* p) { *p = 9; v = x; }
+};
+inline const long& scalar_cref(const long& x) { return x; }
+inline long& scalar_refl(long& x) { return x; }
 }

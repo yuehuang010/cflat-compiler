@@ -160,7 +160,8 @@ public:
     static inline int copies = 0;
     static inline int moves = 0;
     static inline int dtors = 0;
-    static inline void reset() noexcept { ctors = 0; copies = 0; moves = 0; dtors = 0; }
+    static inline int which = 0;
+    static inline void reset() noexcept { ctors = 0; copies = 0; moves = 0; dtors = 0; which = 0; }
     inline CntA() noexcept : v(0) { ++ctors; }
     inline explicit CntA(int x) noexcept : v(x) { ++ctors; }
     inline CntA(const CntA& o) noexcept : v(o.v) { ++copies; }
@@ -168,8 +169,11 @@ public:
     inline CntA& operator=(const CntA& o) noexcept { v = o.v; return *this; }
     inline CntA& operator=(CntA&& o) noexcept { v = o.v; o.v = -1; return *this; }
     inline ~CntA() noexcept { v = -99; ++dtors; }
+    inline int getRvalue() const noexcept { which = 2; return v; }
     int v;
 };
+inline int takeCntAByValue(CntA value) noexcept { CntA::which = 3; return value.v; }
+inline int takeCntAByConstRef(const CntA& value) noexcept { CntA::which = 4; return value.v; }
 // T249: a member whose copy constructor may throw (an invoke splits the ternary arm block).
 class TCopy
 {

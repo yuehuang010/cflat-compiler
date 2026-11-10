@@ -3682,6 +3682,10 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             if (calleeDefaults[k].kind.empty() || calleeDefaults[k].kind == "nonconst"
                 || calleeDefaults[k].kind == "unsupported")
                 return refuse(std::format("default argument {} of the selected callee is not a constant", k + 1));
+        // An operator's selected callee (a hidden friend has no spelling) is called by its symbol.
+        const bool symbolNamed = functionName.find(".operator") != std::string::npos;
+        if (symbolNamed && wrapperSig->selectedCalleeSymbol.empty())
+            return refuse("the selected callee has no external symbol");
         auto owner = cxxFreeWrapperGroups_.find(linkage);
         if (owner == cxxFreeWrapperGroups_.end())
             return refuse("the call's C++ import group is not known");
@@ -3700,10 +3704,22 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             CxxRequestGroup group = MakeCxxRequestGroup(owner->second.first, owner->second.second);
             if (group.headers.empty()) return refuse("the call's C++ import group is not known");
             CxxRequestGroupScope groupScope(*this, &group);
-            const std::string source = "using " + name + "_t = " + calleeType + ";\n"
-                + "extern \"C\" " + name + "_t " + name + ";\n"
-                + "extern \"C\" __attribute__((weak)) void* " + getter + "() { return reinterpret_cast<void*>("
-                + "static_cast<" + name + "_t*>(&" + cxxBase + calleeTemplateArgs + ")); }\n";
+            std::string source = "using " + name + "_t = " + calleeType + ";\n"
+                + "extern \"C\" " + name + "_t " + name + ";\n";
+            if (!symbolNamed)
+                source += "extern \"C\" __attribute__((weak)) void* " + getter + "() { return reinterpret_cast<void*>("
+                    + "static_cast<" + name + "_t*>(&" + cxxBase + calleeTemplateArgs + ")); }\n";
+            else
+            {
+                // The call targets the symbol; the getter keeps k, whose ADL call reaches the selected
+                // operator, so the demand pass emits its inline definition.
+                const std::string op = functionName.find(".operator<<") != std::string::npos ? "<<" : ">>";
+                source += "template <class> struct " + name + "_k;\n"
+                    + "template <class R, class... A, bool N> struct " + name + "_k<R(A...) noexcept(N)> {\n"
+                    + "    static R k(A... a) { return (... " + op + " static_cast<A&&>(a)); }\n};\n"
+                    + "extern \"C\" __attribute__((weak)) void* " + getter + "() { return reinterpret_cast<void*>("
+                    + "&" + name + "_k<" + name + "_t>::k); }\n";
+            }
             CSigEntry direct;
             std::string requestError;
             if (!RequestGeneratedCxxWrapper(group, source, name, "BYVAL", direct, requestError))
@@ -3722,6 +3738,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             if (!known) return refuse("the selected callee could not be registered");
         }
         cxxDirectCalleeGetters_[name] = getter;
+        if (symbolNamed) cxxDirectCalleeSymbols_[name] = wrapperSig->selectedCalleeSymbol;
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             NamedVariable& a = arguments[i];
@@ -3744,6 +3761,37 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
         clearMarkers();
         registeredName = name;
         return true;
+}
+
+/*
+ * The operator form of SwitchCxxDirectByValueCall: the infix wrapper bound under registeredName (a
+ * free operator through RequestCxxFreeFunction or a template through RequestCxxFunctionTemplate)
+ * supplies its linkage name through its External symbol and its request group.
+ */
+bool LLVMBackend::SwitchCxxOperatorDirectByValueCall(const std::string& functionName,
+                                                     std::vector<NamedVariable>& arguments,
+                                                     std::string& registeredName, std::string& error)
+{
+        lastCxxFreeWrapperLinkage_.clear();
+        if (auto fit = functionTable.find(registeredName); fit != functionTable.end())
+            for (const auto& symbol : fit->second)
+                if (symbol.External && lastCxxFreeWrapperLinkage_.empty())
+                    lastCxxFreeWrapperLinkage_ = symbol.UniqueName;
+        if (lastCxxFreeWrapperLinkage_.empty()) return true;
+        if (cxxFreeWrapperGroups_.find(lastCxxFreeWrapperLinkage_) == cxxFreeWrapperGroups_.end())
+        {
+            std::string cxxBase = functionName;
+            for (size_t pos = 0; (pos = cxxBase.find('.', pos)) != std::string::npos; pos += 2)
+                cxxBase.replace(pos, 1, "::");
+            for (const std::string& key : { functionName, cxxBase })
+                if (auto owner = cxxFunctionTemplateOwnerGroup_.find(key);
+                    owner != cxxFunctionTemplateOwnerGroup_.end())
+                {
+                    cxxFreeWrapperGroups_[lastCxxFreeWrapperLinkage_] = { owner->second, {} };
+                    break;
+                }
+        }
+        return SwitchCxxDirectByValueCall(functionName, arguments, registeredName, error);
 }
 
 bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,

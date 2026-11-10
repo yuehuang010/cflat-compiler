@@ -19,8 +19,6 @@ The following extra copies are pre-existing; current counts match master and rem
 ## Left after TERNELIDE (daa3a99f, 2026-10-30 box 7; Opus reviews, repros scratch/repro_keep/ternelide/ w/x/y/z .cb + .cpp twins, w.hpp)
 - Same-class prvalue conditional (and plain prvalue) into `gen<T>(...)`, `function<>` and `Lambda<>` calls: one extra move (indirect /
   generic call path has no elision). Counts balanced.
-- Hidden-friend and function-template `operator<<` with a prvalue/conditional lhs: one extra move (`k8 kmv8 hfr kd8 kd-8` vs clang
-  `k8 hfr kd8`); same for a plain prvalue lhs.
 - Compound assignment with a conditional rhs, `a += (k ? C(1) : C(2))`, is outside the operand gate (not probed against clang).
 - `use(C(f(D(1))))`: D destroyed right after f returns (clang: end of full expression). MS ABI: `use2(k ? C(1) : C(2), b)` with a
   throwing copy ctor for b - the first slot is already handed to the callee, an unwind there leaks it (same as `use2(C(1), b)`).

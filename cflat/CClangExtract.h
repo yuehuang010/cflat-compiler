@@ -249,6 +249,7 @@ namespace cflat_cinterop
         // "<args>" when the selected callee is a function template specialization, else empty.
         std::string selectedCalleeTemplateArgs;
         std::vector<RawDefaultArg> selectedCalleeDefaults;
+        std::string selectedCalleeSymbol;  // Itanium/MSVC symbol of the selected callee, external linkage only
         bool variadic = false;
         bool isCxx = false;
         bool isInline = false;
@@ -606,6 +607,8 @@ namespace cflat_cinterop
         // argument list as written, so a fixed/reordered/partial argument survives the hop.
         std::string cxxAliasTargetBase;
         std::vector<std::string> cxxAliasArgs;
+        // Template arguments whose patterns are non-type expressions (e.g. `(N + 1)`).
+        std::vector<uint64_t> cxxAliasExpressionArgFlags;
         // Positional with cxxAliasParams; "" where the parameter declares no default.
         std::vector<std::string> cxxAliasParamDefaults;
         std::string file;

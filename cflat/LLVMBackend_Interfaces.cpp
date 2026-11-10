@@ -767,12 +767,22 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
                                        std::string* error) const
 {
         bool applied = false;
+        const std::string originalBase = base;
+        const std::vector<std::string> originalArgs = args;
+        std::string originalAlias;
+        bool hasExpressionPattern = false;
         // An alias whose pattern names another alias hops again; the bound is a cycle guard, a
         // header can chain aliases but not unboundedly.
         for (int hop = 0; hop < 8; ++hop)
         {
             const CxxAliasPattern* pattern = FindFirstVisibleScoped(cxxAliasPatterns_, base);
             if (pattern == nullptr || pattern->targetBase.empty()) break;
+            if (originalAlias.empty())
+            {
+                originalAlias = pattern->alias;
+                hasExpressionPattern = std::ranges::any_of(
+                    pattern->expressionArgFlags, [](uint64_t flag) { return flag != 0; });
+            }
             // A trailing pack accepts every remaining use-site argument, even when unused.
             const bool trailingPack = !pattern->params.empty()
                 && !pattern->paramPackFlags.empty()
@@ -909,6 +919,27 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
             base = pattern->targetBase;
             args = std::move(substituted);
             applied = true;
+        }
+        if (applied && !originalArgs.empty() && hasExpressionPattern)
+        {
+            std::string key = base + "\x1f";
+            for (const std::string& arg : args)
+                key += std::to_string(arg.size()) + ":" + arg;
+            std::string spelling = originalAlias.empty() ? originalBase : originalAlias;
+            for (size_t pos = 0; (pos = spelling.find('.', pos)) != std::string::npos; pos += 2)
+                spelling.replace(pos, 1, "::");
+            spelling += "<";
+            for (size_t i = 0; i < originalArgs.size(); ++i)
+            {
+                if (i != 0) spelling += ", ";
+                std::string arg;
+                if (CxxTemplateArgSpellingForCflatType(originalArgs[i], arg))
+                    spelling += arg;
+                else
+                    spelling += originalArgs[i];
+            }
+            spelling += ">";
+            cxxAliasUseSpellings_[std::move(key)] = std::move(spelling);
         }
         return applied;
     }

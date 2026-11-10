@@ -148,9 +148,9 @@ inline Box t334_make_box(int value) { return Box(Src(value)); }
 }
 
 namespace cpi_t42 {
-inline int t339_born = 0, t339_copies = 0, t339_moves = 0, t339_dead = 0;
+inline int t339_born = 0, t339_copies = 0, t339_moves = 0, t339_dead = 0, t339_chosen = 0;
 inline void t339_reset() {
-    t339_born = t339_copies = t339_moves = t339_dead = 0;
+    t339_born = t339_copies = t339_moves = t339_dead = t339_chosen = 0;
 }
 struct T339Box {
     int value;
@@ -162,8 +162,29 @@ struct T339Box {
     ~T339Box() { ++t339_dead; }
     int id() const { return value; }
 };
+struct T339Holder { T339Box a; };
 inline T339Box t339_make_box() { return T339Box(7); }
 inline T339Box t339_outer_box(T339Box value) { return T339Box(value.id() + 2); }
+inline void t339_take(const T339Box&) { t339_chosen = 1; }
+inline void t339_take(T339Box&&) { t339_chosen = 2; }
+inline void t339_take_value(T339Box) { t339_chosen = 3; }
+inline void t339_take_const(const T339Box&) { t339_chosen = 4; }
+// Field-reinit leg: a valid move-assignment, counted like T339Box.
+struct T339Reassign {
+    int value;
+    explicit T339Reassign(int v) : value(v) { ++t339_born; }
+    T339Reassign(const T339Reassign& other) : value(other.value) { ++t339_born; ++t339_copies; }
+    T339Reassign(T339Reassign&& other) noexcept : value(other.value) {
+        ++t339_born; ++t339_moves; other.value = -1;
+    }
+    T339Reassign& operator=(T339Reassign&& other) noexcept { value = other.value; other.value = -1; return *this; }
+    ~T339Reassign() { ++t339_dead; }
+    int id() const { return value; }
+};
+struct T339ReHolder { T339Reassign a; };
+inline T339Reassign t339_make_re() { return T339Reassign(7); }
+inline void t339_take_re(const T339Reassign&) { t339_chosen = 1; }
+inline void t339_take_re(T339Reassign&&) { t339_chosen = 2; }
 }
 
 namespace cpi_t42 {

@@ -18,7 +18,6 @@ Fix direction for the literal-0 items: none in this issue (literal 0 is out of s
   CreateCast's aggregate backstop (LLVMBackend_VariablesAndIR.cpp) takes a load of a zero macro global as nullptr for
   closure destinations only. Legs: Test/test_function_ptr.cb testLambdaSlotNullMacro; Test/errors/err_lambda_nonnull_pointer_global.cb.
 - `#define ZERO 0` / `0L` macros refused everywhere (clang accepts).
-- `import cpp`: `callit(nullptr)` into a std::function / fn-pointer param -> "no overload"; NULL accepted.
 
 RULED 2026-10-31 (main session, from precedent; maintainer confirmed 2026-10-31): the accepted `function<int(int)> f = 0;` is the DEFECT, not the
 rule - literal 0 is not a pointer constant in CFlat (pointer-is-not-a-number ruling 2026-09-26; the literal-0 note above), so the
@@ -36,6 +35,5 @@ accepted at function<> slots (direct and, after mnulljoin, in joins). `(void*)0`
 Open (ctor0fn review 1, 2026-11-01): literal 0 into a C++ ctor std::function slot by DIRECT BRACE (`cppfnptr.FunctionSink v{ 0 };`,
 `rv.G g{0}`) is refused only when an earlier postfix construction of the same class loaded its CFlat constructor list; as the first
 construction it is accepted (the brace path goes straight to RequestCxxDirectBraceConstructor and never populates info->constructors).
-Also pre-existing (master same): nullptr into a std::function ctor param fails "no constructor whose parameter types match" in postfix /
-multi-param / defaulted sets (clang accepts); `rv.G g = 0;` compiles (clang: no viable conversion); `rv.G{0}` as an expression does not parse.
+Also pre-existing (master same): `rv.G g = 0;` compiles (clang: no viable conversion); `rv.G{0}` as an expression does not parse.
 Repros: cflat-fix-ctor0fn scratch/rev_ctor0fn_opus_tmp/ (copied to scratch/repro_keep/ctor0fn/).

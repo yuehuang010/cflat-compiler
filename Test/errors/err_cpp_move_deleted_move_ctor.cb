@@ -61,6 +61,10 @@ extern int main()
         cppi.XvNoMove[2] a = { cppi.XvNoMove(12), cppi.XvNoMove(13) };
         _ = move a[0];
     }
+    // A constructed prvalue moved into a bound by-value callee is an xvalue: deleted move refused.
+    expect_error("clang: call to deleted constructor of 'cppi::XvNoMove'") {
+        int r = cppi.xv_take_nomove(move cppi.XvNoMove(7));
+    }
     // Controls: a move-only class moves; XvNoMove copies from a const source.
     cppi.XvMoveOnly m = cppi.XvMoveOnly(10);
     cppi.XvMoveOnly n = move m;

@@ -4949,6 +4949,21 @@ extern int main()
         singleLocal.v = 4;
         if (singleLocal.v != 4)                                              return 5292;
 
+        // C++ alias expression patterns are substituted and folded by clang to integral arguments.
+        alnve.PlusSeq<1,3> plusExpr = default;
+        if (plusExpr.value() != 6 || alnve.plus_seq_pick(plusExpr) != 71)     return 5293;
+        alnve.DivSeq<1> divExpr = default;
+        if (divExpr.value() != 0x5555555555555554u
+            || alnve.div_seq_pick(divExpr) != 72)                             return 5294;
+        alnve.ShlSeq<3> shiftExpr = default;
+        if (shiftExpr.value() != 6 || alnve.shl_seq_pick(shiftExpr) != 73)   return 5295;
+        alnve.GtSeq<2> compareExpr = default;
+        if (compareExpr.value() != 1 || alnve.gt_seq_pick(compareExpr) != 74)return 5296;
+        alnve.NotSeq<true,false> notExpr = default;
+        if (notExpr.value() != 1 || alnve.not_seq_pick(notExpr) != 75)       return 5297;
+        alnve.NP2<1> nonPackExpr = default;
+        if (nonPackExpr.value() != 2 || alnve.np2_pick(nonPackExpr) != 76)   return 5298;
+
         cppsopd.t455CmpMoveConstRefDtors = 0;
         {
             cppsopd.T455CmpMoveConstRef constRef_56001 = default;

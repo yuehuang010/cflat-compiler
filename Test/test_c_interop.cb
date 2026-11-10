@@ -1476,6 +1476,28 @@ extern int main()
     // Only the bare member measures 0; an expression over it sizes normally, as in C11.
     if ((int)sizeof(*zeroTail->data) != 4 || (int)sizeof(zeroTail->data[0]) != 4
         || (int)sizeof(zeroTail->data + 1) != 8) return 348;
+    CBF_ZeroRows* sizeZeroRows = (CBF_ZeroRows*)malloc(64);
+    CBF_FlexRows* flexRows = (CBF_FlexRows*)malloc(64);
+    if ((int)sizeof(*sizeZeroRows->data) != 12 || (int)sizeof(sizeZeroRows->data[0]) != 12
+        || (int)sizeof(*flexRows->data) != 12 || (int)sizeof(flexRows->data[0]) != 12) return 350;
+    free(sizeZeroRows);
+    free(flexRows);
+    int[2] addressArray = {0, 0};
+    int[2][3] addressMatrix = {{0, 0, 0}, {0, 0, 0}};
+    if ((int)sizeof(&addressArray) != 8 || (int)sizeof(&addressMatrix) != 8
+        || (int)sizeof(&addressMatrix[0]) != 8) return 351;
+    CBF_ZeroRows* flexZeroRowsArithmetic = (CBF_ZeroRows*)malloc(64);
+    flexZeroRowsArithmetic->data[1][0] = 9;
+    if ((*(flexZeroRowsArithmetic->data + 1))[0] != 9) return 352;
+    if ((int)((char*)(flexZeroRowsArithmetic->data + 1) - (char*)flexZeroRowsArithmetic) != 16) return 353;
+    CBF_FlexRows* flexRowsArithmetic = (CBF_FlexRows*)malloc(64);
+    flexRowsArithmetic->data[1][0] = 11;
+    if ((*(flexRowsArithmetic->data + 1))[0] != 11) return 354;
+    if ((int)((char*)(flexRowsArithmetic->data + 1) - (char*)flexRowsArithmetic) != 16) return 355;
+    if ((int)((flexZeroRowsArithmetic->data + 3) - flexZeroRowsArithmetic->data) != 3) return 3560;
+    if ((*(1 + flexZeroRowsArithmetic->data))[0] != 9) return 3561;
+    free(flexZeroRowsArithmetic);
+    free(flexRowsArithmetic);
     CBF_ZeroInt zeroLocal = {};
     if ((int)sizeof(zeroLocal.data) != 0 || (int)alignof(zeroLocal.data) != 4) return 349;
     zeroTail->data[0] = 41;

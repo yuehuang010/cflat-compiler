@@ -47,6 +47,38 @@ inline bool operator==(Item lhs, Item rhs) noexcept { Item::which = 7; return lh
 inline int operator<<(Item lhs, int shift) noexcept { Item::which = 8; return lhs.value << shift; }
 inline int operator-(Item operand) noexcept { Item::which = 9; return -operand.value; }
 inline int operator~(Item operand) noexcept { Item::which = 10; return ~operand.value; }
+inline int opCtors = 0, opCopies = 0, opMoves = 0, opDtors = 0, opLive = 0, opWhich = 0;
+inline void resetOpCounts() noexcept { opCtors = opCopies = opMoves = opDtors = opWhich = 0; }
+struct FriendShift {
+    explicit FriendShift(int x) noexcept : value(x) { ++opCtors; ++opLive; }
+    FriendShift(const FriendShift& other) noexcept : value(other.value) { ++opCopies; ++opLive; }
+    FriendShift(FriendShift&& other) noexcept : value(other.value) { other.value = -1; ++opMoves; ++opLive; }
+    ~FriendShift() noexcept { --opLive; ++opDtors; }
+    int value;
+    friend int operator<<(FriendShift lhs, int shift) noexcept { opWhich = 1; return lhs.value << shift; }
+};
+struct TemplateShift {
+    explicit TemplateShift(int x) noexcept : value(x) { ++opCtors; ++opLive; }
+    TemplateShift(const TemplateShift& other) noexcept : value(other.value) { ++opCopies; ++opLive; }
+    TemplateShift(TemplateShift&& other) noexcept : value(other.value) { other.value = -1; ++opMoves; ++opLive; }
+    ~TemplateShift() noexcept { --opLive; ++opDtors; }
+    int value;
+};
+template <class T> inline int operator<<(TemplateShift lhs, T shift) noexcept {
+    opWhich = 2;
+    return lhs.value << shift;
+}
+struct RefShift {
+    explicit RefShift(int x) noexcept : value(x) { ++opCtors; ++opLive; }
+    RefShift(const RefShift& other) noexcept : value(other.value) { ++opCopies; ++opLive; }
+    RefShift(RefShift&& other) noexcept : value(other.value) { other.value = -1; ++opMoves; ++opLive; }
+    ~RefShift() noexcept { --opLive; ++opDtors; }
+    int value;
+};
+inline int operator<<(const RefShift& lhs, int shift) noexcept {
+    opWhich = 3;
+    return lhs.value << shift;
+}
 struct Holder {
     inline int use(Item value) const noexcept { Item::which = 3; return value.value; }
 };

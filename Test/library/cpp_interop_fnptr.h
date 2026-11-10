@@ -34,4 +34,43 @@ struct PointerSink {
 inline int inline_callback(int (*f)(int), int x) { return f ? f(x) : -1; }
 inline int std_function_callback(std::function<int(int)> f, int x) { return f(x); }
 inline int std_function_present(std::function<int(int)> f) { return f ? 1 : 0; }
+
+inline int null_slot_pick(std::function<int(int)> f) { return f ? 71 : 72; }
+inline int null_slot_pick(int (*f)(int)) { return f ? 81 : 82; }
+inline int null_slot_pick(int value) { return 91; }
+inline int null_slot_pick_data(std::function<int(int)> f) { return f ? 101 : 102; }
+inline int null_slot_pick_data(int* p) { return p ? 111 : 112; }
+
+inline int null_ctor_born = 0;
+inline int null_ctor_died = 0;
+inline int null_ctor_fn_pick = 0;
+inline int null_ctor_int_pick = 0;
+inline int null_ctor_copy_pick = 0;
+inline int null_ctor_multi_fn_pick = 0;
+inline int null_ctor_multi_int_pick = 0;
+
+inline void reset_null_ctor_counts()
+{
+    null_ctor_born = null_ctor_died = null_ctor_fn_pick = null_ctor_int_pick = null_ctor_copy_pick = 0;
+    null_ctor_multi_fn_pick = null_ctor_multi_int_pick = 0;
+}
+
+struct NullFunctionCtorProbe {
+    int value;
+    NullFunctionCtorProbe(std::function<int(int)> f, int bump = 3)
+        : value((f ? 201 : 200) + bump) { ++null_ctor_born; ++null_ctor_fn_pick; }
+    NullFunctionCtorProbe(int n) : value(300 + n) { ++null_ctor_born; ++null_ctor_int_pick; }
+    NullFunctionCtorProbe(const NullFunctionCtorProbe& other) : value(other.value)
+        { ++null_ctor_born; ++null_ctor_copy_pick; }
+    ~NullFunctionCtorProbe() { ++null_ctor_died; }
+};
+
+struct NullFunctionMultiCtorProbe {
+    int value;
+    NullFunctionMultiCtorProbe(int tag, std::function<int(int)> f, int bump = 4)
+        : value(tag * 100 + (f ? 10 : 0) + bump) { ++null_ctor_born; ++null_ctor_multi_fn_pick; }
+    NullFunctionMultiCtorProbe(int tag, int n, int bump = 4)
+        : value(tag * 100 + n + bump) { ++null_ctor_born; ++null_ctor_multi_int_pick; }
+    ~NullFunctionMultiCtorProbe() { ++null_ctor_died; }
+};
 }

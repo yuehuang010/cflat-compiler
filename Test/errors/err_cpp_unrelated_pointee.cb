@@ -96,6 +96,11 @@ extern int main()
         t85p.amb.F t85FAmb = default;
         int r17 = t85FAmb + &t85Int;
     }
+    // OPAMB: the two equally ranked free templates remain ambiguous without a pointee drop.
+    expect_error("clang: use of overloaded operator '+' is ambiguous") {
+        t85p.freeAmb.A t85FreeAmb = default;
+        int r20 = t85FreeAmb + &t85Int;
+    }
     // Round 5: the selected template's body fails; clang's text is relayed, not CFlat's void*.
     expect_error("clang: invalid operands to binary expression ('int *' and 'int *')") {
         t85p.body.A t85BodyA = default;

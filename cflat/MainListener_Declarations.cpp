@@ -8412,10 +8412,22 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     }
                     auto* expression = element->assignmentExpression(0);
                     LLVMBackend::TypeAndValue argExpected;
+                    LLVMBackend::TypeAndValue constRefDest;
+                    std::string constRefPlaceType;
                     if (topLevel && (IsDefaultOnlyExpression(expression)
                         || HasDefaultOnlyTernaryArm(expression)))
                         compiler->GetUniqueCxxConstructorValueParameter(typeName, braceElements.size(),
                             fields.size(), argExpected);
+                    const bool constRefTernary = topLevel
+                        && IsCxxDeferrableDefaultTernary(expression, constRefPlaceType)
+                        && compiler->GetUniqueCxxConstructorValueParameter(
+                            typeName, braceElements.size(), fields.size(), constRefDest,
+                            /*constRef*/ true)
+                        && constRefPlaceType == constRefDest.TypeName
+                        && compiler->IsForeignNontrivialCxxClass(constRefDest.TypeName);
+                    // A const T& arm of the place class wins over a unique by-value int param.
+                    if (constRefTernary)
+                        argExpected = LLVMBackend::TypeAndValue();
                     const bool deferredDefault = topLevel && IsDefaultOnlyExpression(expression)
                         && !argExpected.TypeName.empty() && !argExpected.Pointer
                         && !argExpected.IsAlias && !argExpected.IsRvalueRef;
@@ -8444,7 +8456,9 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                         {
                             elementNV = [&] {
                                 CxxCallArgumentParseStateScope argumentState(compiler);
-                                auto parsed = ParseAssignmentExpressionNamed(expression);
+                                auto parsed = constRefTernary
+                                    ? ParseCxxConstRefTernaryTemp(expression, constRefDest)
+                                    : ParseAssignmentExpressionNamed(expression);
                                 llvm::Value* retTemp = compiler->lastCxxRetTemp_;
                                 llvm::Value* retValue = compiler->lastCxxRetValue_;
                                 if (retTemp != nullptr
@@ -9092,6 +9106,27 @@ cxx_dtor_ready:
                 // A C++ constructor argument is a C++ call argument: `?:` arms use the usual
                 // arithmetic conversions (T55), so `rv.C(k ? 5 : 6)` deduces int like clang.
                 CxxCallArgumentScope cxxCtorArgumentScope(inCxxCallArgument_, true);
+                // A by-value class parameter can consume a default ternary in its argument slot.
+                // Supplying the expected type lets the ternary build each arm there, avoiding a
+                // copy from its selected storage phi into the constructor's ABI argument temp.
+                LLVMBackend::TypeAndValue ctorValueDest;
+                std::string ctorValuePlaceType;
+                const bool ctorValueTernary = ctorArgExpected.TypeName.empty()
+                    && IsCxxDeferrableDefaultTernary(argAssign, ctorValuePlaceType)
+                    && compiler->GetUniqueCxxConstructorValueParameter(
+                        typeName, ctorArguments.size(), ctorArgs->argumentNamedExpression().size(),
+                        ctorValueDest, /*constRef*/ false)
+                    && ctorValuePlaceType == ctorValueDest.TypeName
+                    && compiler->IsForeignNontrivialCxxClass(ctorValueDest.TypeName);
+                std::optional<CallArgumentScope> ctorValueCallArgumentScope;
+                std::optional<DeclExpectedTypeScope> ctorValueExpectedScope;
+                std::optional<CxxCallArgumentExpectedTypeScope> ctorValueCxxExpectedScope;
+                if (ctorValueTernary)
+                {
+                    ctorValueCallArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_);
+                    ctorValueExpectedScope.emplace(&declExpectedType, ctorValueDest, true);
+                    ctorValueCxxExpectedScope.emplace(cxxCallArgumentExpectedType_, ctorValueDest);
+                }
                 // T459: a `?:` with a `default` arm into a `const T&` parameter joins a temporary of the class.
                 LLVMBackend::TypeAndValue ctorRefDest;
                 // Armed only when the place arm is that class: `int` beside the const T& ctor selects int.

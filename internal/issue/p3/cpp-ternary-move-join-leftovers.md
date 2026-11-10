@@ -9,7 +9,6 @@
   The argument-join form (`hv2(k ? mkH(1) : mkH(2), thrower)`) is fixed by T264 round 2 (owner registered in the resume block, disarmed at the adopting call).
 
 ## From T263 review 1 (pre-existing on master; Host = CFlat struct with a C++ field; repros scratch/repro_keep/t263_rev/)
-- a one-move-arm ternary as a call argument (by value / const&) or method receiver copies; `a` not moved (clang moves).
 - (T264 review 2, unwind leak, master the same) a first argument that is a call result, not a bare join, leaks when a later
   sibling throws: `hv2(gid(mkH(1)), rq.thrower(x))`, `hv2(gid(k ? mkH(1) : mkH(2)), rq.thrower(x))`. A C++ class join
   passed to a C++ function (`rq.cref(k ? mkC(1) : mkC(2))`) does one extra move+destroy vs clang (no leak).

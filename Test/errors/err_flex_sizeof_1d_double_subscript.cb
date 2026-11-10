@@ -1,0 +1,15 @@
+import "../library/c_macro_helpers.h";
+
+expect_error("cannot subscript a scalar value") {
+    void flex_zero_double_subscript() {
+        CBF_ZeroInt* zeroTail = nullptr;
+        int value = sizeof(zeroTail->data[0][1]);
+    }
+}
+
+expect_error("cannot subscript a scalar value") {
+    void flex_double_subscript() {
+        CBF_FlexInt* flexTail = nullptr;
+        int value = sizeof(flexTail->data[0][1]);
+    }
+}

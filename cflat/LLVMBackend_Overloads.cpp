@@ -17,6 +17,7 @@
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <llvm/Transforms/Instrumentation/AddressSanitizer.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Object/Binary.h>
@@ -592,6 +593,18 @@ static bool CxxParamIsConstPointerReference(const std::string& spelling,
 {
     if (spelling.empty()) return param.CxxConstRef();
     if (CxxParamIsConstRefToPointer(spelling)) return true;
+    const size_t close = spelling.find(")[");
+    if (close != std::string::npos)
+    {
+        const size_t open = spelling.rfind('(', close);
+        if (open != std::string::npos)
+        {
+            const std::string group = spelling.substr(open + 1, close - open - 1);
+            if (group.find('*') != std::string::npos && group.find('&') != std::string::npos
+                && group.find("const") != std::string::npos)
+                return true;
+        }
+    }
     return spelling.find('*') == std::string::npos
         && CxxParamIsConstLvalueReference(spelling);
 }
@@ -624,6 +637,19 @@ static std::optional<uint64_t> FixedCxxArrayReferenceExtent(std::string_view spe
                                                  spelling.data() + end, extent);
     if (error != std::errc{} || parsed != spelling.data() + end) return std::nullopt;
     return extent;
+}
+
+// The bound of a C++ pointer-to-array parameter `T (*)[N]` (any reference or cv spelling); 0 when
+// the spelling is not a pointer-to-array.
+static uint64_t CxxPointerToArrayBound(std::string_view spelling)
+{
+    const size_t close = spelling.find(")[");
+    if (close == std::string_view::npos) return 0;
+    const size_t open = spelling.rfind('(', close);
+    if (open == std::string_view::npos
+        || spelling.substr(open + 1, close - open - 1).find('*') == std::string_view::npos)
+        return 0;
+    return FixedCxxArrayReferenceExtent(spelling).value_or(0);
 }
 
 bool LLVMBackend::IsNullPointerConstantArgument(const NamedVariable& arg, bool cxx) const
@@ -4206,6 +4232,41 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     ++nullPointerConversions;
                 }
 
+                // CFlat call sites do not treat integer zero literals as pointer constants.
+                // Keep that rule for C++ pointer-to-array parameters after ABI lowering.
+                auto* integerLiteral = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary);
+                const std::string zeroPointerParamSpelling = candidate.IsCxx
+                    ? CxxReferenceParameterSpelling(candidate, paramIndex) : std::string();
+                const size_t zeroPointerParamClose = zeroPointerParamSpelling.find(")[");
+                const size_t zeroPointerParamOpen = zeroPointerParamClose == std::string::npos
+                    ? std::string::npos : zeroPointerParamSpelling.rfind('(', zeroPointerParamClose);
+                const bool zeroPointerToArrayParam = zeroPointerParamOpen != std::string::npos
+                    && zeroPointerParamSpelling.substr(zeroPointerParamOpen + 1,
+                        zeroPointerParamClose - zeroPointerParamOpen - 1).find('*') != std::string::npos;
+                if (result >= 0 && candidate.IsCxx && candidateParamItr->Pointer
+                    && zeroPointerToArrayParam && !arg.IsCxxMacroGlobal
+                    && !arg.LiteralIdentity.empty() && integerLiteral != nullptr
+                    && integerLiteral->isZero())
+                    result = -1;
+                // A C++ pointer-to-array parameter takes an address of its own bound only (clang
+                // refuses `int (*)[3]` for `int (*)[2]`).
+                if (result >= 0 && candidate.IsCxx && candidateParamItr->Pointer)
+                {
+                    const uint64_t paramBound = CxxPointerToArrayBound(
+                        CxxReferenceParameterSpelling(candidate, paramIndex));
+                    // A multi-dimensional argument decays to a row pointer whose bound is not
+                    // its outer extent; only a one-dimensional fixed array is compared here.
+                    const auto* argArrayType = llvm::dyn_cast_or_null<llvm::ArrayType>(arg.BaseType);
+                    const bool multiDimensional = !arg.TypeAndValue.ConstInnerDimensions.empty()
+                        || (argArrayType != nullptr
+                            && llvm::isa<llvm::ArrayType>(argArrayType->getElementType()));
+                    const uint64_t argBound = multiDimensional ? 0
+                        : arg.TypeAndValue.ConstArraySize > 0 ? arg.TypeAndValue.ConstArraySize
+                        : argArrayType != nullptr ? argArrayType->getNumElements() : 0;
+                    if (paramBound != 0 && argBound != 0 && argBound != paramBound)
+                        result = -1;
+                }
+
                 // Macro values are prvalues in C++, so their CFlat backing global cannot make a
                 // non-null macro viable by taking its address for a pointer parameter.
                 if (result >= 0 && candidate.IsCxx
@@ -7031,6 +7092,44 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             PrepareCxxDefaultCandidates(defaultCandidates, overloadArity);
             candidateSet = &defaultCandidates;
         }
+        std::vector<FunctionSymbol> arrayPointerCandidates;
+        bool normalizedArrayPointerCandidate = false;
+        for (const FunctionSymbol& candidate : *candidateSet)
+        {
+            FunctionSymbol normalized = candidate;
+            if (normalized.IsCxx)
+                for (size_t i = 0; i < normalized.Parameters.size(); ++i)
+                {
+                    const std::string spelling = CxxReferenceParameterSpelling(normalized, i);
+                    const size_t close = spelling.find(")[");
+                    if (close == std::string::npos) continue;
+                    const size_t open = spelling.rfind('(', close);
+                    if (open == std::string::npos
+                        || spelling.substr(open + 1, close - open - 1).find('*') == std::string::npos)
+                        continue;
+                    TypeAndValue arrayPointer;
+                    if (!MapCTypeToTypeAndValue(spelling, arrayPointer, true)
+                        || !arrayPointer.Pointer)
+                        continue;
+                    const size_t declaratorOpen = spelling.rfind('(', close);
+                    const bool constElement = declaratorOpen != std::string::npos
+                        && spelling.substr(0, declaratorOpen).find("const") != std::string::npos;
+                    arrayPointer.SetPointeeConstBit(constElement);
+                    arrayPointer.VariableName = normalized.Parameters[i].VariableName;
+                    arrayPointer.IsAlias = spelling.find('&') != std::string::npos;
+                    if (arrayPointer.IsAlias)
+                    {
+                        arrayPointer.IsCxxRefToPointer = true;
+                        arrayPointer.MarkCxxRef();
+                        arrayPointer.SetCxxConstRef(
+                            CxxParamIsConstPointerReference(spelling, arrayPointer));
+                    }
+                    normalized.Parameters[i] = std::move(arrayPointer);
+                    normalizedArrayPointerCandidate = true;
+                }
+            arrayPointerCandidates.push_back(std::move(normalized));
+        }
+        if (normalizedArrayPointerCandidate) candidateSet = &arrayPointerCandidates;
         const auto& candidates = *candidateSet;
         std::vector<NamedVariable> cxxArguments;
         if (std::any_of(candidates.begin(), candidates.end(), [](const FunctionSymbol& candidate) {
@@ -9408,8 +9507,29 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     pointerRefParam.SetCxxConstRef(constPointerReference);
                 }
                 const bool allowPointerRefTemporary = candidate.UniqueName.starts_with("__cflat_tpl_");
-                argList.push_back(LowerAliasByPointerArg(arg, pointerRefParam, false,
-                                                          allowPointerRefTemporary));
+                const size_t arrayClose = cxxReferenceSpelling.find(")[");
+                const size_t arrayOpen = arrayClose == std::string::npos
+                    ? std::string::npos : cxxReferenceSpelling.rfind('(', arrayClose);
+                const bool pointerToArrayReference = arrayOpen != std::string::npos
+                    && cxxReferenceSpelling.substr(arrayOpen + 1,
+                        arrayClose - arrayOpen - 1).find('*') != std::string::npos;
+                if (candidate.IsCxx && pointerToArrayReference && IsCxxNullTypedArgument(arg))
+                {
+                    llvm::Type* pointerType = GetType(pointerRefParam);
+                    if (pointerType == nullptr || !pointerType->isPointerTy())
+                    {
+                        LogError(std::format("cannot materialize null pointer-to-array reference argument '{}'",
+                                             candParamItr->VariableName));
+                        return nullptr;
+                    }
+                    auto* temporary = AllocaAtEntry(pointerType, nullptr, "cxx.arrayptrref.arg");
+                    builder->CreateStore(llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(pointerType)), temporary);
+                    argList.push_back(temporary);
+                }
+                else
+                    argList.push_back(LowerAliasByPointerArg(arg, pointerRefParam, false,
+                                                              allowPointerRefTemporary));
             }
             else if (TypeAndValue pointerBoolReferent;
                      !inVariadicRange && candidate.IsCxx
@@ -9551,7 +9671,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         && !CxxReferenceAllowsNullPointerConversion(*candParamItr,
                             CxxReferenceParameterSpelling(candidate, argIndex)))
                         LogError("a null pointer constant cannot bind this C++ reference parameter");
-                    auto* pointerType = GetType(*candParamItr);
+                    llvm::Type* pointerType = nullptr;
+                    if (candidate.IsCxx && candParamItr->Pointer
+                        && candParamItr->ConstArraySize > 0)
+                    {
+                        TypeAndValue arrayType = *candParamItr;
+                        arrayType.Pointer = false;
+                        arrayType.PointerDepth = 0;
+                        pointerType = cflat_llvm::PointerTo(GetType(arrayType));
+                    }
+                    else
+                        pointerType = GetType(*candParamItr);
                     if (pointerType == nullptr || !pointerType->isPointerTy())
                     {
                         LogErrorMessage("cannot lower null pointer argument for parameter '{}' of '{}'",
@@ -10883,8 +11013,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         if (cxxVirtualCallee == nullptr && candidate.IsCxx)
             if (auto getter = cxxDirectCalleeGetters_.find(candidate.UniqueName);
                 getter != cxxDirectCalleeGetters_.end())
-                cxxVirtualCallee = builder->CreateCall(module->getOrInsertFunction(
-                    getter->second, llvm::FunctionType::get(builder->getPtrTy(), false)), {}, "cxx.direct.callee");
+            {
+                llvm::FunctionCallee getterFn = module->getOrInsertFunction(
+                    getter->second, llvm::FunctionType::get(builder->getPtrTy(), false));
+                if (auto symbol = cxxDirectCalleeSymbols_.find(candidate.UniqueName);
+                    symbol != cxxDirectCalleeSymbols_.end())
+                {
+                    // An operator calls its callee's symbol; the getter stays used for the demand pass.
+                    llvm::appendToCompilerUsed(*module, { llvm::cast<llvm::GlobalValue>(getterFn.getCallee()) });
+                    cxxVirtualCallee = module->getOrInsertFunction(
+                        symbol->second, candidate.Function->getFunctionType()).getCallee();
+                }
+                else
+                    cxxVirtualCallee = builder->CreateCall(getterFn, {}, "cxx.direct.callee");
+            }
 
         const bool calleeMayUnwind = CalleeMayUnwind(candidate);
         // Only this call's own invoke treats the sink arguments as handed over; an unwind out of

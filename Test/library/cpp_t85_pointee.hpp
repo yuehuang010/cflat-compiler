@@ -85,4 +85,26 @@ inline int operator+(B, double*) { return 52; }
 inline int operator+(B, void*) { return 53; }
 template <class T> int operator+(B, T*) { static_assert(sizeof(T) == 0, "invalid operands"); return 54; }
 }
+// T85 OPAMB: a no-drop member set keeps the non-template exact winner and template winner.
+namespace noDrop {
+struct A {
+    int operator+(int*) { return 61; }
+    int operator+(void*) { return 62; }
+    template <class T> int operator+(T*) { return 63; }
+};
+}
+// T85 OPAMB: both function templates rank equally for A + int*; clang rejects the set.
+namespace freeAmb {
+struct A {};
+inline int operator+(A, double*) { return 64; }
+inline int operator+(A, void*) { return 65; }
+template <class T> int operator+(A, T*) { return 66; }
+template <class T> int operator+(T, int*) { return 67; }
+}
+// OPAMB review leg: the exact T* template beats the free void* overload.
+namespace fwWin {
+struct FW {};
+inline int operator+(FW, void*) { return 41; }
+template <class T> int operator+(FW, T*) { return 42; }
+}
 }

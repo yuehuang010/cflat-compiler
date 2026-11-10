@@ -2170,6 +2170,33 @@ namespace alnv
     inline int nestvalid_pick(const TypeList<Pair<TypeList<int, char>, int>, Pair<TypeList<int, char>, char>>&) noexcept { return 67; }
     inline int sizeofin_pick(const TypeList<Pair<int, PVal<2>>, Pair<char, PVal<2>>>&) noexcept { return 68; }
 }
+namespace alnve
+{
+    template <unsigned long... I> struct Seq
+    {
+        static constexpr unsigned long value() noexcept { return (0UL + ... + I); }
+    };
+    template <int... I> struct ISeq
+    {
+        static constexpr int value() noexcept { return (0 + ... + I); }
+    };
+    template <bool... B> struct BSeq
+    {
+        static constexpr int value() noexcept { return (0 + ... + (B ? 1 : 0)); }
+    };
+    template <unsigned long... I> using PlusSeq = Seq<(I + 1)...>;
+    template <unsigned long... I> using DivSeq = Seq<((I - 5) / 3)...>;
+    template <int... I> using ShlSeq = ISeq<(I << 1)...>;
+    template <int... I> using GtSeq = ISeq<(I > 1)...>;
+    template <bool... B> using NotSeq = BSeq<(!B)...>;
+    template <unsigned long N> using NP2 = Seq<(N + 1)>;
+    inline int plus_seq_pick(const Seq<2, 4>&) noexcept { return 71; }
+    inline int div_seq_pick(const Seq<6148914691236517204UL>&) noexcept { return 72; }
+    inline int shl_seq_pick(const ISeq<6>&) noexcept { return 73; }
+    inline int gt_seq_pick(const ISeq<1>&) noexcept { return 74; }
+    inline int not_seq_pick(const BSeq<false, true>&) noexcept { return 75; }
+    inline int np2_pick(const Seq<2>&) noexcept { return 76; }
+}
 inline int alna_take_nbdef(const alna::NBdef<int>& b) noexcept { return b.v + 1; }
 
 // A C++ signature that names a std container over a std container over a POINTER to a user class

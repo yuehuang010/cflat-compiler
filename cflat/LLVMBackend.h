@@ -4546,11 +4546,15 @@ private:
         std::vector<uint64_t> paramPackFlags;
         std::vector<std::string> paramDefaults;
         std::vector<std::string> args;
+        std::vector<uint64_t> expressionArgFlags;
         std::string alias;
     };
     std::unordered_map<std::string, std::string> genericBaseAliases_;
     // C++ alias templates only: the target's own argument pattern, keyed the same way.
     std::unordered_map<std::string, CxxAliasPattern> cxxAliasPatterns_;
+    // Use-site spellings retained while an alias pattern is expanded. The type request sends the
+    // original alias specialization to clang, which substitutes and canonicalizes its target.
+    mutable std::unordered_map<std::string, std::string> cxxAliasUseSpellings_;
     // Closure type aliases (`using Cb = function<R(Args)>;`). Cannot live in string-shaped
     // typeAliases because a closure type carries a full call signature, not a plain type name.
     std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
@@ -5287,6 +5291,7 @@ private:
         std::string selectedCalleeType;
         std::string selectedCalleeTemplateArgs;
         std::vector<cflat_cinterop::RawDefaultArg> selectedCalleeDefaults;
+        std::string selectedCalleeSymbol;
         std::string name;
         std::string linkageName; // C++ ABI symbol; empty for C
         TypeAndValue ret;
@@ -5566,6 +5571,7 @@ private:
         std::vector<uint64_t> cxxAliasParamPackFlags;
         std::string cxxAliasTargetBase;
         std::vector<std::string> cxxAliasArgs;
+        std::vector<uint64_t> cxxAliasExpressionArgFlags;
         std::vector<std::string> cxxAliasParamDefaults;
         std::string file;
         int line = 1;
@@ -8006,11 +8012,17 @@ private:
     bool SwitchCxxDirectByValueCall(const std::string& functionName,
                                     std::vector<NamedVariable>& arguments,
                                     std::string& registeredName, std::string& error);
+    // Operator form: the infix wrapper bound under registeredName (free or template).
+    bool SwitchCxxOperatorDirectByValueCall(const std::string& functionName,
+                                            std::vector<NamedVariable>& arguments,
+                                            std::string& registeredName, std::string& error);
     // T518: the free wrapper the newest successful RequestCxxFreeFunctionImpl bound (linkage name),
     // each free wrapper's request group (primary, dependencies), and by-address callee getters.
     std::string lastCxxFreeWrapperLinkage_;
     std::unordered_map<std::string, std::pair<size_t, std::vector<size_t>>> cxxFreeWrapperGroups_;
     std::unordered_map<std::string, std::string> cxxDirectCalleeGetters_;
+    // Operator selections called by the selected callee's symbol; the getter stays demanded.
+    std::unordered_map<std::string, std::string> cxxDirectCalleeSymbols_;
     std::string CxxConstPointerArgumentError(size_t argumentIndex,
                                              const std::string& argumentName,
                                              const std::string& parameterName) const;
@@ -15142,7 +15154,7 @@ public:
     // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
     // 328: conversion-function template metadata and requests are cached separately from ctor templates.
     // 330: function-type parameters record pointee const (callback overload ranking).
-    static constexpr int kCHeaderCacheVersion = 330;
+    static constexpr int kCHeaderCacheVersion = 332;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

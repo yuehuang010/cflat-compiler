@@ -670,6 +670,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.selectedCalleeType = r.selectedCalleeType;
         e.selectedCalleeTemplateArgs = r.selectedCalleeTemplateArgs;
         e.selectedCalleeDefaults = r.selectedCalleeDefaults;
+        e.selectedCalleeSymbol = r.selectedCalleeSymbol;
         e.retSpelling = r.retType;
         e.defaultArgs = r.defaultArgs;
         e.name     = r.name;
@@ -938,6 +939,7 @@ void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
             raw.selectedCalleeType = cached.selectedCalleeType;
             raw.selectedCalleeTemplateArgs = cached.selectedCalleeTemplateArgs;
             raw.selectedCalleeDefaults = cached.selectedCalleeDefaults;
+            raw.selectedCalleeSymbol = cached.selectedCalleeSymbol;
             raw.paramNames = cached.paramNames;
             raw.defaultArgs = cached.defaultArgs;
             raw.variadic = cached.variadic;
@@ -1994,6 +1996,7 @@ void LLVMBackend::CollectTypeAliases(const cflat_cinterop::ExtractResult& raw,
             entry.cxxAliasPattern = t.cxxAliasPattern;
             entry.cxxAliasTargetBase = t.cxxAliasTargetBase;
             entry.cxxAliasArgs = t.cxxAliasArgs;
+            entry.cxxAliasExpressionArgFlags = t.cxxAliasExpressionArgFlags;
             entry.cxxAliasParamDefaults = t.cxxAliasParamDefaults;
             entry.cxxAliasParams = t.cxxAliasParams;
             entry.cxxAliasParamPackFlags = t.cxxAliasParamPackFlags;
@@ -2201,7 +2204,7 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                 {
                     CxxAliasPattern pattern{ a.cxxAliasTargetBase, a.cxxAliasParams,
                                              a.cxxAliasParamPackFlags, a.cxxAliasParamDefaults,
-                                             a.cxxAliasArgs,
+                                             a.cxxAliasArgs, a.cxxAliasExpressionArgFlags,
                                              a.qualifiedName.empty() ? a.name : a.qualifiedName };
                     if (!a.qualifiedName.empty()) RegisterCxxAliasPattern(a.qualifiedName, pattern);
                     if (a.name != a.qualifiedName) RegisterCxxAliasPattern(a.name, pattern);

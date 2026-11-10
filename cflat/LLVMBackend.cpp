@@ -5592,6 +5592,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxTemplateOwnerGroup_.clear();
     cxxFreeWrapperGroups_.clear();
     cxxDirectCalleeGetters_.clear();
+    cxxDirectCalleeSymbols_.clear();
     cxxFunctionTemplates_.clear();
     cxxFunctionTemplateOwnerGroup_.clear();
     cxxFunctionSignatures_.clear();
@@ -5904,6 +5905,7 @@ void LLVMBackend::ResetForReanalysis()
     manglingPointerAliases_.clear();
     genericBaseAliases_.clear();
     cxxAliasPatterns_.clear();
+    cxxAliasUseSpellings_.clear();
     functionTypeAliases.clear();
     interfaceTable.clear();
     interfaceFields.clear();

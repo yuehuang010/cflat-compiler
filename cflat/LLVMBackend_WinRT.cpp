@@ -3942,6 +3942,19 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         auto isPointeeMove = [](const NamedVariable& arg) {
             return arg.PointeeMove;
         };
+        // A ternary whose taken arm is an explicit move (`k ? (T)(move b) : f()`) defers its source
+        // marks to the call hand-off; rvalue-ref and by-value C++ sinks both consume them here.
+        auto markConditionalMoveSources = [&](const NamedVariable& arg) {
+            for (const auto& source : arg.ConditionalMoveSources)
+            {
+                if (!source.MoveParamSinkArgument || !source.IsExplicitMove
+                    || source.CallerName.empty()) continue;
+                if (!source.MovePathKey.empty())
+                    MarkVariableFieldMoved(source.CallerName, source.MovePathKey);
+                else if (!source.IsElementAccess)
+                    MarkVariableMoved(source.CallerName, source.PointeeMove);
+            }
+        };
         // An implicit consume of a field of the borrowed receiver `this` is refused at the point
         // the source slot would be cleared (T447). True when reported.
         auto reportThisFieldConsume = [&](const NamedVariable& arg) {
@@ -3996,6 +4009,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             MarkVariableMoved(movedName, isPointeeMove(args[i]));
                     }
                 }
+                if (!beforeCall) markConditionalMoveSources(args[i]);
                 continue;
             }
             std::string sourceName = args[i].CallerName;
@@ -4010,6 +4024,13 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 sourceName = args[i].TypeAndValue.VariableName;
             if (beforeCall)
                 CheckConditionalMoveParamDiagnostics(functionName, params[i], args[i]);
+            // A ternary result carries no explicit-move flag of its own; its taken arm does.
+            if (!beforeCall && params[i].IsRvalueRef && !args[i].IsExplicitMove
+                && !args[i].ConditionalMoveSources.empty())
+            {
+                markConditionalMoveSources(args[i]);
+                continue;
+            }
             if (params[i].IsRvalueRef && args[i].IsExplicitMove)
             {
                 // C++ move construction consumes the source only at compile time. The moved-from
@@ -4024,6 +4045,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     else if (!sourceName.empty() && !args[i].IsElementAccess
                         && !explicitFunctionMove)
                         MarkVariableMoved(sourceName, isPointeeMove(args[i]));
+                    markConditionalMoveSources(args[i]);
                 }
                 continue;
             }

@@ -2873,7 +2873,6 @@ void MainListener::DecayFlexibleArrayMember(LLVMBackend::NamedVariable& namedVar
         namedVar.BaseType = address->getType();
         namedVar.UnionFieldType = nullptr;
         tv.ConstArraySize = 0;
-        tv.ConstInnerDimensions.clear();
         tv.IsArrayView = false;
         const int depth = tv.ValuePointerDepth() + 1;
         tv.Pointer = true;
@@ -3505,6 +3504,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             LLVMBackend::NamedVariable structVar;
             LLVMBackend::NamedVariable interfaceVar;
             bool receiverWasFixedArray = false;
+            bool subscriptedFlexibleArrayMember = false;
             auto hasFixedArrayShape = [](const LLVMBackend::NamedVariable& value) {
                 return value.TypeAndValue.ConstArraySize > 0
                     || (value.BaseType && llvm::isa<llvm::ArrayType>(value.BaseType));
@@ -7377,6 +7377,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // Remember the BASE's view-ness before the element branches clear it; the
                         // element slot of a user `T[]` view is LIVE storage, unlike a container's.
                         bool baseWasArrayView = namedVar.TypeAndValue.IsArrayView;
+                        if (subscriptedFlexibleArrayMember && namedVar.BaseType != nullptr
+                            && !namedVar.BaseType->isPointerTy() && !namedVar.BaseType->isArrayTy()
+                            && !namedVar.TypeAndValue.IsSimd)
+                            LogErrorContext(expressCtx, "cannot subscript a scalar value");
+                        subscriptedFlexibleArrayMember = subscriptedFlexibleArrayMember
+                            || namedVar.TypeAndValue.IsFlexibleArrayMember
+                            || namedVar.TypeAndValue.IsZeroLengthArrayMember;
                         // An element reached through a pointer field lives outside the receiver;
                         // only a fixed-array field's slot stays a this-field path (T447).
                         const bool subscriptKeepsThisField = hasFixedArrayShape(namedVar);
@@ -13170,21 +13177,50 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             return std::string();
                                         std::string parameterType;
                                         bool parameterAgrees = true;
+                                        size_t matchingStaticConstRef = 0;
                                         auto fit = Compiler(ctx)->functionTable.find(functionName);
                                         if (fit != Compiler(ctx)->functionTable.end())
                                             for (const auto& candidate : fit->second)
                                             {
                                                 const size_t slot = index + paramOffset;
-                                                if (candidate.Parameters.size() != namedArgCtx.size() + paramOffset
+                                                const size_t wantedParams = namedArgCtx.size() + paramOffset;
+                                                if ((candidate.Parameters.size() != wantedParams
+                                                        && !(cxxStaticMemberWrapper
+                                                            && candidate.Parameters.size() > wantedParams))
                                                     || slot >= candidate.Parameters.size()
                                                     || (cxxMemberReceiver && candidate.Parameters.front().TypeName
                                                         != structVar.TypeAndValue.TypeName))
                                                     continue;
+                                                bool defaultsCoverOmitted = true;
+                                                for (size_t omitted = wantedParams;
+                                                     omitted < candidate.Parameters.size(); ++omitted)
+                                                    if (omitted >= candidate.DefaultArguments.size()
+                                                        || candidate.DefaultArguments[omitted].kind.empty())
+                                                    {
+                                                        defaultsCoverOmitted = false;
+                                                        break;
+                                                    }
+                                                    else if (candidate.IsCxx
+                                                        && !candidate.Parameters[omitted].CxxConstRef()
+                                                        && Compiler(ctx)->IsForeignNontrivialCxxClass(
+                                                            candidate.Parameters[omitted].TypeName))
+                                                    {
+                                                        defaultsCoverOmitted = false;
+                                                        break;
+                                                    }
+                                                if (!defaultsCoverOmitted) continue;
                                                 const std::string& type = candidate.Parameters[slot].TypeName;
+                                                if (cxxStaticMemberWrapper && candidate.IsCxx
+                                                    && candidate.Parameters[slot].CxxConstRef()
+                                                    && type == placeType)
+                                                    ++matchingStaticConstRef;
                                                 if (!parameterType.empty() && parameterType != type)
                                                     parameterAgrees = false;
                                                 parameterType = type;
                                             }
+                                        if (cxxStaticMemberWrapper)
+                                            return matchingStaticConstRef != 0
+                                                ? placeType : std::string();
                                         const bool wrapperCallee = funcSym == nullptr
                                             || funcSym->UniqueName.starts_with("__cflat_free_");
                                         if (funcSym == nullptr)
@@ -14791,6 +14827,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.BaseType = objectType;
                                 namedVar.TypeAndValue.TypeName = functionName;
                                 namedVar.IsRvalue = true;
+                                // An owned C++ class temporary is a prvalue for the by-value switch
+                                // (SwitchCxxDirectByValueCall), which elides it into the parameter.
+                                namedVar.IsCxxPrvalueTemp =
+                                    !directSret && compiler->IsForeignNontrivialCxxClass(functionName);
                                 compiler->lastOwningResult = true;
                                 structVar = {};
                                 interfaceVar = {};
@@ -14831,9 +14871,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     TypeUntypedCtorArg(ctorTypes.back(), value,
                                         arg.LiteralIdentitySuffixed ? arg.LiteralIdentity : std::string(),
                                         &arg.TypeAndValue);
+                                    // A `T&` call result and an explicit `move` keep their address too.
                                     if (arg.TypeAndValue.TypeName.empty() && !arg.TypeAndValue.Pointer
                                         && arg.Storage != nullptr && !arg.IsRvalue
-                                        && arg.CxxLvalueKind == 1
+                                        && (arg.CxxLvalueKind == 1 || arg.CxxLvalueKind == 2
+                                            || arg.IsExplicitMove)
                                         && (!arg.InferSourceTypeName.empty()
                                             || !ctorTypes.back().TypeName.empty()))
                                         arg.TypeAndValue.TypeName = !arg.InferSourceTypeName.empty()
@@ -15066,6 +15108,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.BaseType = objectType;
                                         namedVar.TypeAndValue.TypeName = functionName;
                                         namedVar.IsRvalue = true;
+                                        namedVar.IsCxxPrvalueTemp =
+                                            !directSret && compiler->IsForeignNontrivialCxxClass(functionName);
                                         compiler->lastOwningResult = true;
                                     }
                                     else if (bodyRefused)
@@ -15131,6 +15175,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.BaseType = objectType;
                                     namedVar.TypeAndValue.TypeName = functionName;
                                     namedVar.IsRvalue = true;
+                                    namedVar.IsCxxPrvalueTemp =
+                                        !directSret && compiler->IsForeignNontrivialCxxClass(functionName);
                                     compiler->lastOwningResult = true;
                                 }
                                 structVar = {};

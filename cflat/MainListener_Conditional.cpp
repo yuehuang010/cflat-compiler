@@ -3615,7 +3615,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     probe.TypeAndValue.TypeName = typeName;
                     return compiler->IsOwnedTempValue(probe);
                 };
-                auto materializeLvalueArm = [&](bool trueArm) {
+                auto materializeArm = [&](bool trueArm, bool useMove) {
                     llvm::Value*& value = trueArm ? trueValue : falseValue;
                     llvm::Value*& storage = trueArm ? trueStorage : falseStorage;
                     LLVMBackend::TypedValue& shape = trueArm ? trueShape : falseShape;
@@ -3629,7 +3629,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         compiler->builder->SetInsertPoint(endBlock);
                     const auto mark = compiler->MarkOwnedTemps();
                     if (compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, storage,
-                            /*useMove*/ false, "into a conditional expression"))
+                            useMove, "into a conditional expression"))
                     {
                         compiler->RegisterOwnedStructTemp(temp, typeName);
                         value = compiler->builder->CreateLoad(classType, temp);
@@ -3646,12 +3646,26 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 };
                 const bool trueTemp = isOwnedCxxTemp(trueValue, trueStorage);
                 const bool falseTemp = isOwnedCxxTemp(falseValue, falseStorage);
-                if (trueTemp && trueShape.isCxxSameTypeCastCopy && !falseTemp && !falseShape.isRvalue
+                const bool trueMoveLvalueJoin = trueShape.isExplicitMove
+                    && !falseShape.isExplicitMove && !falseShape.isRvalue;
+                const bool falseMoveLvalueJoin = falseShape.isExplicitMove
+                    && !trueShape.isExplicitMove && !trueShape.isRvalue;
+                if (TernaryIsMemberReceiver(ctx) && trueMoveLvalueJoin)
+                {
+                    materializeArm(true, true);
+                    materializeArm(false, false);
+                }
+                else if (TernaryIsMemberReceiver(ctx) && falseMoveLvalueJoin)
+                {
+                    materializeArm(true, false);
+                    materializeArm(false, true);
+                }
+                else if (trueTemp && trueShape.isCxxSameTypeCastCopy && !falseTemp && !falseShape.isRvalue
                     && isAddressableLvalue(falseValue, falseStorage))
-                    materializeLvalueArm(false);
+                    materializeArm(false, false);
                 else if (falseTemp && falseShape.isCxxSameTypeCastCopy && !trueTemp && !trueShape.isRvalue
                     && isAddressableLvalue(trueValue, trueStorage))
-                    materializeLvalueArm(true);
+                    materializeArm(true, false);
             }
 
         // A C++ prvalue conditional used as a call argument (C++ or CFlat callee) or an operator operand
@@ -5746,8 +5760,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             const bool coreUniqueSource = compiler->IsCoreUniqueType(typeName);
             if (typeName.empty() || (!compiler->IsOwningValueType(typeName)
-                    && !coreUniqueSource)
-                || (!coreUniqueSource && compiler->IsCopyableType(typeName))) return;
+                    && !coreUniqueSource && !shape.isExplicitMove)
+                || (!coreUniqueSource && compiler->IsCopyableType(typeName)
+                    && !shape.isExplicitMove)) return;
             result.conditionalMoveSources.push_back({ storage, value->getType(), armBlock,
                 sourceName, shape.sourceFieldName, shape.sourceIsElementAccess });
             result.conditionalMoveSources.back().MovePathKey = shape.sourceMovePathKey;

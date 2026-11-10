@@ -4623,6 +4623,97 @@ int DefparamTernaryLeg(bool flag)
     ternref.t391_reset();
     return DefparamTernaryDefault(ternref.T391Val(1));
 }
+int T391ByValueCtorTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        ternref.T391SinkV sink = ternref.T391SinkV(c ? default : v);
+        value = sink.value();
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391ConstRefCtorBraceTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        ternref.T391Sink sink{c ? default : v};
+        value = sink.value();
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391ConstRefCtorBraceMixedTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        ternref.T391Mixed mixed{c ? default : v};
+        value = mixed.value();
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391ConstRefCtorNewTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        ternref.T391Sink* sink = new ternref.T391Sink(c ? default : v);
+        value = sink.value();
+        delete sink;
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391StaticOverloadTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391StaticHost.over(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391StaticDefaultTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391StaticHost.def(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391StaticIntOverloadTernaryLeg(bool c)
+{
+    int n = 7;
+    ternref.t391_reset();
+    return ternref.T391StaticHost.over(c ? default : n) * 100000 + ternref.t391_stats();
+}
+int T391StaticAgreeingOverloadsTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391StaticHost.over2(c ? default : v, 1);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391StaticClassDefaultTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391StaticHost.defValue(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
 int DefparamTernaryInArgument(ternref.T391Val d =
     ternref.t391_pass(defparamTernaryFlag ? ternref.T391Val(1) : ternref.T391Val(2)))
 {
@@ -9226,6 +9317,23 @@ extern int main()
     if (cppi.primitive_middle_alias_rank(primitiveMiddleAlias)
             != cppi.primitive_middle_alias_oracle(primitiveMiddleAlias)
         || cppi.primitive_middle_alias_oracle(primitiveMiddleAlias) != 2) return 9041;
+    cppi.ArrayPointerMember arrayPointerMember = default;
+    int[2] arrayPointerValues = { 31, 38 };
+    if (arrayPointerMember.apr(nullptr) != 69
+        || arrayPointerMember.apr(&arrayPointerValues)
+            != arrayPointerValues[0] + arrayPointerValues[1]
+        || arrayPointerMember.apr(true ? &arrayPointerValues : nullptr)
+            != arrayPointerValues[0] + arrayPointerValues[1]
+        || cppi.ArrayPointerMember.sap(nullptr) != 70
+        || cppi.ArrayPointerMember.sap(&arrayPointerValues)
+            != arrayPointerValues[0] + arrayPointerValues[1]
+        || cppi.array_pointer_member_oracle(nullptr) != 69
+        || cppi.array_pointer_member_oracle(&arrayPointerValues)
+            != arrayPointerValues[0] + arrayPointerValues[1]
+        || cppi.array_pointer_static_oracle(nullptr) != 70
+        || cppi.array_pointer_static_oracle(&arrayPointerValues)
+            != arrayPointerValues[0] + arrayPointerValues[1])
+        return 9044;
     if (cppi.primitive_int_rank(primitiveConstPointer)
             != cppi.primitive_int_const_oracle(primitiveConstPointer)
         || cppi.primitive_int_const_oracle(primitiveConstPointer) != 2) return 9030;
@@ -14221,6 +14329,17 @@ extern int main()
     int ctorrefLv = 41;
     cppcr.IntRef ctorrefIr = cppcr.IntRef(ctorrefLv);
     if (ctorrefLv != 42 || ctorrefIr.get() != 42)                              return 1969;
+    // Expression-position `const long&` from a `long&` call result, a `const long&` call result,
+    // and an explicit `move`: each binds L's address (clang: 9); a loaded copy reads 5.
+    long ctorrefSL = 5;
+    if (cppcr.ScalarRefPtr(cppcr.scalar_cref(ctorrefSL), &ctorrefSL).v != 9)     return 2400;
+    ctorrefSL = 5;
+    if (cppcr.ScalarRefPtr(cppcr.scalar_refl(ctorrefSL), &ctorrefSL).v != 9)     return 2401;
+    ctorrefSL = 5;
+    if (cppcr.ScalarRefPtr(move ctorrefSL, &ctorrefSL).v != 9 || ctorrefSL != 9) return 2402;
+    ctorrefSL = 5;
+    cppcr.ScalarRefPtr ctorrefSR = cppcr.ScalarRefPtr(cppcr.scalar_cref(ctorrefSL), &ctorrefSL);
+    if (ctorrefSR.v != 9)                                                       return 2403;
 
     // A raw pointer stays legal for a lone CFlat constructor reference candidate, but C++
     // overload ranking prefers an actual pointer parameter whenever that candidate is present.
@@ -14422,6 +14541,63 @@ extern int main()
     // An integer literal is a prvalue for rvalue-reference binding.
     cppcr.ExprIntRvalue ctorrefExprInt = cppcr.ExprIntRvalue(23);
     if (ctorrefExprInt.chosen != 1 || ctorrefExprInt.value != 23) return 7176;
+    // A conditional expression with two lvalue arms binds the selected caller slot.
+    cppcr.ExprTernaryRef.reset();
+    long ctorrefTernaryL = 5; long ctorrefTernaryR = 7;
+    bool ctorrefTernaryChoose = true;
+    long ctorrefTernaryExpr = cppcr.ExprTernaryRef(
+        ctorrefTernaryChoose ? ctorrefTernaryL : ctorrefTernaryR, &ctorrefTernaryL).v;
+    if (ctorrefTernaryExpr != 9 || ctorrefTernaryL != 9 || ctorrefTernaryR != 7
+        || cppcr.ExprTernaryRef.born_count() != 1
+        || cppcr.ExprTernaryRef.dead_count() != 1) return 7270;
+    ctorrefTernaryL = 5; ctorrefTernaryR = 7; ctorrefTernaryChoose = false;
+    long ctorrefTernaryExprR = cppcr.ExprTernaryRef(
+        ctorrefTernaryChoose ? ctorrefTernaryL : ctorrefTernaryR, &ctorrefTernaryL).v;
+    if (ctorrefTernaryExprR != 7 || ctorrefTernaryL != 9 || ctorrefTernaryR != 7
+        || cppcr.ExprTernaryRef.born_count() != 2
+        || cppcr.ExprTernaryRef.dead_count() != 2) return 7271;
+    ctorrefTernaryL = 5; ctorrefTernaryChoose = true;
+    long ctorrefTernaryMixedL = cppcr.ExprTernaryRef(
+        ctorrefTernaryChoose ? ctorrefTernaryL : 6L, &ctorrefTernaryL).v;
+    if (ctorrefTernaryMixedL != 5 || ctorrefTernaryL != 9
+        || cppcr.ExprTernaryRef.born_count() != 3
+        || cppcr.ExprTernaryRef.dead_count() != 3) return 7277;
+    ctorrefTernaryL = 5; ctorrefTernaryChoose = false;
+    long ctorrefTernaryMixedR = cppcr.ExprTernaryRef(
+        ctorrefTernaryChoose ? ctorrefTernaryL : 6L, &ctorrefTernaryL).v;
+    if (ctorrefTernaryMixedR != 6 || ctorrefTernaryL != 9
+        || cppcr.ExprTernaryRef.born_count() != 4
+        || cppcr.ExprTernaryRef.dead_count() != 4) return 7278;
+    ctorrefTernaryL = 5; ctorrefTernaryR = 7; ctorrefTernaryChoose = true;
+    long ctorrefTernaryDeclValue = 0;
+    {
+        cppcr.ExprTernaryRef ctorrefTernaryDecl = cppcr.ExprTernaryRef(
+            ctorrefTernaryChoose ? ctorrefTernaryL : ctorrefTernaryR, &ctorrefTernaryL);
+        ctorrefTernaryDeclValue = ctorrefTernaryDecl.v;
+    }
+    if (ctorrefTernaryDeclValue != 9 || ctorrefTernaryL != 9 || ctorrefTernaryR != 7
+        || cppcr.ExprTernaryRef.born_count() != 5
+        || cppcr.ExprTernaryRef.dead_count() != 5) return 7272;
+    ctorrefTernaryL = 5; ctorrefTernaryR = 7; ctorrefTernaryChoose = false;
+    {
+        cppcr.ExprTernaryRef ctorrefTernaryDeclR = cppcr.ExprTernaryRef(
+            ctorrefTernaryChoose ? ctorrefTernaryL : ctorrefTernaryR, &ctorrefTernaryL);
+        ctorrefTernaryDeclValue = ctorrefTernaryDeclR.v;
+    }
+    if (ctorrefTernaryDeclValue != 7 || ctorrefTernaryL != 9 || ctorrefTernaryR != 7
+        || cppcr.ExprTernaryRef.born_count() != 6
+        || cppcr.ExprTernaryRef.dead_count() != 6) return 7273;
+    // Enum enumerators and integer literals keep their prvalue categories in ctor expressions.
+    cppcr.ExprEnumPickTracked.reset();
+    int ctorrefEnumPick = cppcr.ExprEnumPickTracked(cppcr.ExprEnumValue).chosen;
+    if (ctorrefEnumPick != 1 || cppcr.ExprEnumPickTracked.born_count() != 1
+        || cppcr.ExprEnumPickTracked.dead_count() != 1) return 7274;
+    int ctorrefScopedEnumPick = cppcr.ExprEnumPickTracked(cppcr.ExprScoped.Value).chosen;
+    if (ctorrefScopedEnumPick != 3 || cppcr.ExprEnumPickTracked.born_count() != 2
+        || cppcr.ExprEnumPickTracked.dead_count() != 2) return 7275;
+    int ctorrefEnumIntPick = cppcr.ExprEnumPickTracked(4).chosen;
+    if (ctorrefEnumIntPick != 4 || cppcr.ExprEnumPickTracked.born_count() != 3
+        || cppcr.ExprEnumPickTracked.dead_count() != 3) return 7276;
     // `long` is not `long long`: the reference candidate drops and `double` wins (the wrapper
     // converts a by-value pick, as it always did); the pre-fix listed pick bound `long long&`.
     long ctorrefLL = 15;
@@ -15873,6 +16049,63 @@ extern int main()
             || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 1) return 33907;
     }
     if (cpi_t42.t339_dead != 2)                                               return 33907;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.t339_take((cpi_t42.T339Box)(move cpi_t42.t339_make_box()));
+        if (cpi_t42.t339_born != 2 || cpi_t42.t339_copies != 0
+            || cpi_t42.t339_moves != 1 || cpi_t42.t339_dead != 2
+            || cpi_t42.t339_chosen != 2) return 33908;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33908;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.t339_take_const((cpi_t42.T339Box)(move cpi_t42.t339_make_box()));
+        if (cpi_t42.t339_born != 2 || cpi_t42.t339_copies != 0
+            || cpi_t42.t339_moves != 1 || cpi_t42.t339_dead != 2
+            || cpi_t42.t339_chosen != 4) return 33909;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33909;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.t339_take_value((cpi_t42.T339Box)(move cpi_t42.t339_make_box()));
+        if (cpi_t42.t339_born != 2 || cpi_t42.t339_copies != 0
+            || cpi_t42.t339_moves != 1 || cpi_t42.t339_dead != 2
+            || cpi_t42.t339_chosen != 3) return 33910;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33910;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339ReHolder t339Field = {cpi_t42.t339_make_re()};
+        cpi_t42.t339_reset();
+        cpi_t42.t339_take_re((cpi_t42.T339Reassign)(move t339Field.a));
+        if (cpi_t42.t339_born != 1 || cpi_t42.t339_copies != 0
+            || cpi_t42.t339_moves != 1 || cpi_t42.t339_dead != 1
+            || cpi_t42.t339_chosen != 2) return 33913;
+        t339Field.a = cpi_t42.t339_make_re();
+        if (t339Field.a.id() != 7) return 33914;
+    }
+    // Clang: the cast temp, the reassigned temp, and the holder's field each die (3).
+    if (cpi_t42.t339_dead != 3)                                               return 33915;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339Box t339TernarySource = cpi_t42.t339_make_box();
+        cpi_t42.T339Box t339Ternary = (cpi_t42.T339Box)(true
+            ? cpi_t42.t339_make_box() : t339TernarySource);
+        if (t339Ternary.id() != 7 || cpi_t42.t339_born != 2
+            || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 0
+            || cpi_t42.t339_dead != 0) return 33911;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33911;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339Box t339TernarySource = cpi_t42.t339_make_box();
+        cpi_t42.T339Box t339Ternary = (cpi_t42.T339Box)(false
+            ? cpi_t42.t339_make_box() : t339TernarySource);
+        if (t339Ternary.id() != 7 || cpi_t42.t339_born != 2
+            || cpi_t42.t339_copies != 1 || cpi_t42.t339_moves != 0
+            || cpi_t42.t339_dead != 0) return 33912;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33912;
 
     // T454: same-type casts of C++ lvalues produce independent prvalue temporaries.
     cpi_t42.t454_reset();
@@ -17655,6 +17888,27 @@ extern int main()
         }
         cppfnptr.PointerSink zeroDataPointerSink = cppfnptr.PointerSink(0);
         if (zeroDataPointerSink.value != 0) return 3305;
+
+        // nullptr converts to std::function, while overload ranking keeps pointer conversions first.
+        cppfnptr.reset_null_ctor_counts();
+        if (cppfnptr.std_function_present(nullptr) != 0
+            || cppfnptr.null_slot_pick(nullptr) != 82
+            || cppfnptr.null_slot_pick_data(nullptr) != 112) return 3307;
+        {
+            cppfnptr.NullFunctionCtorProbe fnCtor = cppfnptr.NullFunctionCtorProbe(nullptr);
+            if (fnCtor.value != 203 || cppfnptr.null_ctor_born != 1
+                || cppfnptr.null_ctor_died != 0 || cppfnptr.null_ctor_fn_pick != 1
+                || cppfnptr.null_ctor_int_pick != 0 || cppfnptr.null_ctor_copy_pick != 0) return 3308;
+        }
+        if (cppfnptr.null_ctor_born != 1 || cppfnptr.null_ctor_died != 1) return 3309;
+        {
+            cppfnptr.NullFunctionMultiCtorProbe multiCtor =
+                cppfnptr.NullFunctionMultiCtorProbe(5, nullptr);
+            if (multiCtor.value != 504 || cppfnptr.null_ctor_born != 2
+                || cppfnptr.null_ctor_died != 1 || cppfnptr.null_ctor_multi_fn_pick != 1
+                || cppfnptr.null_ctor_multi_int_pick != 0) return 3310;
+        }
+        if (cppfnptr.null_ctor_born != 2 || cppfnptr.null_ctor_died != 2) return 3311;
     }
     // ---- Global C typedefs and macros through `import cpp` ---------------------------------------
     {
@@ -19688,6 +19942,63 @@ extern int main()
                 || cppternary.Item.dtors != 1 || cppternary.Item.live != 0
                 || cppternary.Item.which != 10) return 3778;
         }
+
+        // TERNELIDE operator<<: by-value free operators elide an owned prvalue lhs into the parameter.
+        cppternary.resetOpCounts();
+        int friendPlain = cppternary.FriendShift(8) << 1;
+        if (friendPlain != 16 || cppternary.opCtors != 1 || cppternary.opCopies != 0
+            || cppternary.opMoves != 0 || cppternary.opDtors != 1 || cppternary.opLive != 0
+            || cppternary.opWhich != 1) return 3781;
+
+        cppternary.resetOpCounts();
+        int templatePlain = cppternary.TemplateShift(3) << 2;
+        if (templatePlain != 12 || cppternary.opCtors != 1 || cppternary.opCopies != 0
+            || cppternary.opMoves != 0 || cppternary.opDtors != 1 || cppternary.opLive != 0
+            || cppternary.opWhich != 2) return 3782;
+
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            int friendExpected = pick != 0 ? 16 : 32;
+            cppternary.resetOpCounts();
+            int friendConditional = (pick != 0 ? cppternary.FriendShift(8)
+                                               : cppternary.FriendShift(16)) << 1;
+            if (friendConditional != friendExpected || cppternary.opCtors != 1
+                || cppternary.opCopies != 0 || cppternary.opMoves != 0 || cppternary.opDtors != 1
+                || cppternary.opLive != 0 || cppternary.opWhich != 1) return 3783;
+
+            int templateExpected = pick != 0 ? 12 : 20;
+            cppternary.resetOpCounts();
+            int templateConditional = (pick != 0 ? cppternary.TemplateShift(3)
+                                                 : cppternary.TemplateShift(5)) << 2;
+            if (templateConditional != templateExpected || cppternary.opCtors != 1
+                || cppternary.opCopies != 0 || cppternary.opMoves != 0 || cppternary.opDtors != 1
+                || cppternary.opLive != 0 || cppternary.opWhich != 2) return 3784;
+        }
+
+        {
+            cppternary.FriendShift source = cppternary.FriendShift(5);
+            cppternary.resetOpCounts();
+            int lvalue = source << 1;
+            if (lvalue != 10 || cppternary.opCtors != 0 || cppternary.opCopies != 1
+                || cppternary.opMoves != 0 || cppternary.opDtors != 1
+                || cppternary.opLive != 1 || cppternary.opWhich != 1) return 3785;
+        }
+        if (cppternary.opDtors != 2 || cppternary.opLive != 0) return 3785;
+
+        cppternary.resetOpCounts();
+        int refPrvalue = cppternary.RefShift(3) << 1;
+        if (refPrvalue != 6 || cppternary.opCtors != 1 || cppternary.opCopies != 0
+            || cppternary.opMoves != 0 || cppternary.opDtors != 1 || cppternary.opLive != 0
+            || cppternary.opWhich != 3) return 3786;
+        {
+            cppternary.RefShift source = cppternary.RefShift(4);
+            cppternary.resetOpCounts();
+            int lvalue = source << 1;
+            if (lvalue != 8 || cppternary.opCtors != 0 || cppternary.opCopies != 0
+                || cppternary.opMoves != 0 || cppternary.opDtors != 0
+                || cppternary.opLive != 1 || cppternary.opWhich != 3) return 3787;
+        }
+        if (cppternary.opDtors != 1 || cppternary.opLive != 0) return 3787;
     }
     // SHIFTCH: a chained shift on a prvalue takes no declaration slot for its intermediate
     // (clang: member 8, free 2; the destroyed intermediate is the last temporary destroyed).
@@ -23450,6 +23761,14 @@ extern int main()
     t85p.AT t85At = default;
     t85At += &t85Seven;
     if (t85At.k != 40) return 85132;
+    // OPAMB oracle (clang++ -std=c++20): int* picks non-template 61; double* picks T* template 63.
+    // These trivial records have no user-defined constructors/destructors (counts are zero).
+    t85p.noDrop.A t85NoDrop = default;
+    if (t85NoDrop + &t85Seven != 61) return 85136;
+    if (t85NoDrop + &t85Dbl != 63) return 85137;
+    // OPAMB review leg (clang++ -std=c++20): the exact free T* template wins with 42.
+    t85p.fwWin.FW t85Fw = default;
+    if (t85Fw + &t85Seven != 42) return 85138;
     t85p.AT t85At2 = default;
     t85At2 += &t85Dbl;
     if (t85At2.k != 39) return 85133;
@@ -23732,6 +24051,31 @@ extern int main()
     if (defparamTernaryTrue != 520002 || ternref.t391_stats() != 20020) return 79501;
     int defparamTernaryFalse = DefparamTernaryLeg(false);
     if (defparamTernaryFalse != 620002 || ternref.t391_stats() != 20020) return 79502;
+    // Clang++ -std=c++20: initialize the by-value ctor parameter in its slot per selected arm.
+    if (T391ByValueCtorTernaryLeg(false) != 711020) return 79508;
+    if (T391ByValueCtorTernaryLeg(true) != 20020) return 79509;
+    // clang++ -std=c++20 brace.cpp/new.cpp: false=711020, true=20020; ctor/dtor counts balance.
+    if (T391ConstRefCtorBraceTernaryLeg(false) != 711020) return 79510;
+    if (T391ConstRefCtorBraceTernaryLeg(true) != 20020) return 79511;
+    // Clang++ -std=c++20: brace init beside an int ctor still binds the const T& arm as a prvalue.
+    if (T391ConstRefCtorBraceMixedTernaryLeg(false) != 1711020) return 79514;
+    if (T391ConstRefCtorBraceMixedTernaryLeg(true) != 1020020) return 79515;
+    if (T391ConstRefCtorNewTernaryLeg(false) != 711020) return 79512;
+    if (T391ConstRefCtorNewTernaryLeg(true) != 20020) return 79513;
+    // Clang++ -std=c++20: overload-set and omitted-default static calls bind the ternary as a prvalue.
+    if (T391StaticOverloadTernaryLeg(false) != 6711020) return 79516;
+    if (T391StaticOverloadTernaryLeg(true) != 6020020) return 79517;
+    if (T391StaticDefaultTernaryLeg(false) != 6611020) return 79518;
+    if (T391StaticDefaultTernaryLeg(true) != 5920020) return 79519;
+    // The int place arm selects over(int), so the class-only deferred path must stay off.
+    if (T391StaticIntOverloadTernaryLeg(false) != 8700000) return 79520;
+    if (T391StaticIntOverloadTernaryLeg(true) != 8000000) return 79521;
+    // Clang picks the int overload when both viable declarations share const T& at slot 1.
+    if (T391StaticAgreeingOverloadsTernaryLeg(false) != 6811020) return 79522;
+    if (T391StaticAgreeingOverloadsTernaryLeg(true) != 6120020) return 79523;
+    // A non-trivial by-value default still constructs and destroys alongside the ternary copy.
+    if (T391StaticClassDefaultTernaryLeg(false) != 6021030) return 79524;
+    if (T391StaticClassDefaultTernaryLeg(true) != 5330030) return 79525;
     cppas.AssignRouteNontrivial.reset();
     int defparamBraceValue = DefparamBraceValue();
     if (defparamBraceValue != 5 || cppas.AssignRouteNontrivial.ctors != 1
@@ -24314,6 +24658,23 @@ int T518PrvalueDynDefault()
     { value = t518.dyndef(T518RetVal(), 1); }
     return T418Pack(value);
 }
+// Direct construction `Val(7)` through an unbound wrapper: built once in the selected by-value
+// parameter (no move); a reference selection keeps the caller's temporary (clang oracle).
+int T518DirectLater() { t418.reset(); int value = t518.later(t418.Val(7), 3); return T418Pack(value); }
+int T518DirectSingle() { t418.reset(); int value = t518.guarddef(t418.Val(7)); return T418Pack(value); }
+int T518DirectTernary(bool c)
+{
+    t418.reset(); int value = t518.later(c ? t418.Val(1) : t418.Val(2), 3);
+    return T418Pack(value);
+}
+int T518DirectOver() { t418.reset(); int value = t518.over(t418.Val(7), 2); return T418Pack(value); }
+int T518DirectOverDouble() { t418.reset(); int value = t518.over(t418.Val(7), 2.0); return T418Pack(value); }
+int T518DirectLref() { t418.reset(); int value = t518.lref(t418.Val(7), 3); return T418Pack(value); }
+int T518DirectDefargs() { t418.reset(); int value = t518.defargs(t418.Val(7), 2); return T418Pack(value); }
+int T518DirectTempl() { t418.reset(); int value = t518.templ(t418.Val(7), 2); return T418Pack(value); }
+int T518DirectMixed() { t418.reset(); int value = t518.mixed(t418.Val(7), 2); return T418Pack(value); }
+// An explicit `move` of a constructed temp is an xvalue move into a bound callee, never elided.
+int T518DirectMoveBound() { t418.reset(); int value = t418.take_conv(move t418.Val(7)); return T418Pack(value); }
 int T518WriteOver(bool c)
 {
     t418.reset(); int value = 0;
@@ -26618,6 +26979,44 @@ int LoweredUserDtorAssignLegs(int argc)
         if (a.items[0].h.d.v != 5 || a.items[1].h.d.v != 5) return 97006;
     }
     if (cpp_t97.made() - cpp_t97.dtor_count != 0) return 97007;
+    // T263: mixed lvalue/xvalue C++ field joins are prvalues. The chosen move arm moves into the
+    // call parameter or receiver temp; the other arm is copied, as on clang++.
+    int[6] tj = {0, 0, 0, 0, 0, 0};
+    for (int pick = 0; pick < 2; pick = pick + 1)
+    {
+        T263ArgByValueFirst(pick != 0, tj);
+        if (tj[0] != (pick != 0 ? 21 : 22) || tj[1] != 3 || tj[2] != 2
+            || tj[3] != (pick != 0 ? 0 : 1) || tj[4] != (pick != 0 ? 1 : 0)
+            || tj[5] != 3) return 26310;
+        T263ArgByValueSecond(pick != 0, tj);
+        if (tj[0] != (pick != 0 ? 22 : 21) || tj[1] != 3 || tj[2] != 2
+            || tj[3] != (pick != 0 ? 1 : 0) || tj[4] != (pick != 0 ? 0 : 1)
+            || tj[5] != 3) return 26311;
+        T263ArgByConstRefFirst(pick != 0, tj);
+        if (tj[0] != (pick != 0 ? 21 : 22) || tj[1] != 4 || tj[2] != 2
+            || tj[3] != (pick != 0 ? 0 : 1) || tj[4] != (pick != 0 ? 1 : 0)
+            || tj[5] != 3) return 26312;
+        T263ArgByConstRefSecond(pick != 0, tj);
+        if (tj[0] != (pick != 0 ? 22 : 21) || tj[1] != 4 || tj[2] != 2
+            || tj[3] != (pick != 0 ? 1 : 0) || tj[4] != (pick != 0 ? 0 : 1)
+            || tj[5] != 3) return 26313;
+        T263ReceiverFirst(pick != 0, tj);
+        if (tj[0] != (pick != 0 ? 21 : 22) || tj[1] != 2 || tj[2] != 2
+            || tj[3] != (pick != 0 ? 0 : 1) || tj[4] != (pick != 0 ? 1 : 0)
+            || tj[5] != 3) return 26314;
+        T263ReceiverSecond(pick != 0, tj);
+        if (tj[0] != (pick != 0 ? 22 : 21) || tj[1] != 2 || tj[2] != 2
+            || tj[3] != (pick != 0 ? 1 : 0) || tj[4] != (pick != 0 ? 0 : 1)
+            || tj[5] != 3) return 26315;
+    }
+    if (T263ReinitAfterJoin(true) != 71 || T263ReinitAfterJoin(false) != 72) return 26317;
+    // Native CFlat-only struct behaviour stays unchanged; reinitialization after a join compiles.
+    {
+        T263Plain pa; pa.v = 31; T263Plain pb; pb.v = 32;
+        T263Plain pz = true ? move pa : pb;
+        pa = default;
+        if (pz.v != 31 || pa.v != 0 || pb.v != 32) return 26316;
+    }
     // T263: a parenthesized holder prvalue exposes its C++ subobject receiver in place.
     if (T263ParenthesizedHolderReceiver(true) != 0) return 26301;
     if (T263ParenthesizedHolderReceiver(false) != 0) return 26302;
@@ -26896,6 +27295,17 @@ int LoweredUserDtorAssignLegs(int argc)
     int prvalueDynBorn = prvalueDynStats / 10000 + prvalueDynStats / 1000 % 10
         + prvalueDynStats / 100 % 10;
     if (prvalueDyn / 100000 != 11102 || prvalueDynBorn != prvalueDynStats / 10 % 10) return 51843;
+    if (T518DirectLater() != 70310010) return 51844;
+    if (T518DirectSingle() != 170210010) return 51845;
+    if (T518DirectTernary(true) != 10310010) return 51846;
+    if (T518DirectTernary(false) != 20310010) return 51847;
+    if (T518DirectOver() != 170210010) return 51848;
+    if (T518DirectOverDouble() != 270210010) return 51849;
+    if (T518DirectLref() != 70310010) return 51850;
+    if (T518DirectDefargs() != 170210010) return 51851;
+    if (T518DirectTempl() != 170210010) return 51852;
+    if (T518DirectMixed() != 270210010) return 51853;
+    if (T518DirectMoveBound() != 710120) return 51854;
     if (T518WriteOver(false) != 170211020) return 51825;
     if (T518WriteOver(true) != 100220020) return 51826;
     if (T518WriteTempl() != 170211020) return 51827;
@@ -27531,6 +27941,62 @@ void T249Ret(bool k, int* o)
         o[0] = hz.c.v;
     }
     T249ReadCounts(o);
+}
+struct T263Host { cppbv.CntA c = cppbv.CntA(0); };
+struct T263Plain { int v = 0; };
+void T263Counts(int* o, int value)
+{
+    o[0] = value; o[1] = cppbv.CntA.which; o[2] = cppbv.CntA.ctors;
+    o[3] = cppbv.CntA.copies; o[4] = cppbv.CntA.moves; o[5] = cppbv.CntA.dtors;
+}
+void T263ArgByValueFirst(bool k, int* o)
+{
+    cppbv.CntA.reset(); int value = 0;
+    { T263Host a; a.c.v = 21; T263Host b; b.c.v = 22;
+      value = cppbv.takeCntAByValue(k ? move a.c : b.c); }
+    T263Counts(o, value);
+}
+void T263ArgByValueSecond(bool k, int* o)
+{
+    cppbv.CntA.reset(); int value = 0;
+    { T263Host a; a.c.v = 21; T263Host b; b.c.v = 22;
+      value = cppbv.takeCntAByValue(k ? b.c : move a.c); }
+    T263Counts(o, value);
+}
+void T263ArgByConstRefFirst(bool k, int* o)
+{
+    cppbv.CntA.reset(); int value = 0;
+    { T263Host a; a.c.v = 21; T263Host b; b.c.v = 22;
+      value = cppbv.takeCntAByConstRef(k ? move a.c : b.c); }
+    T263Counts(o, value);
+}
+void T263ArgByConstRefSecond(bool k, int* o)
+{
+    cppbv.CntA.reset(); int value = 0;
+    { T263Host a; a.c.v = 21; T263Host b; b.c.v = 22;
+      value = cppbv.takeCntAByConstRef(k ? b.c : move a.c); }
+    T263Counts(o, value);
+}
+void T263ReceiverFirst(bool k, int* o)
+{
+    cppbv.CntA.reset(); int value = 0;
+    { T263Host a; a.c.v = 21; T263Host b; b.c.v = 22;
+      value = (k ? move a.c : b.c).getRvalue(); }
+    T263Counts(o, value);
+}
+void T263ReceiverSecond(bool k, int* o)
+{
+    cppbv.CntA.reset(); int value = 0;
+    { T263Host a; a.c.v = 21; T263Host b; b.c.v = 22;
+      value = (k ? b.c : move a.c).getRvalue(); }
+    T263Counts(o, value);
+}
+int T263ReinitAfterJoin(bool k)
+{
+    T263Host a; a.c.v = 21; T263Host b; b.c.v = 22;
+    int value = (k ? move a.c : b.c).getRvalue();
+    a.c = cppbv.CntA(50);
+    return value + a.c.getRvalue();
 }
 // T263: the parenthesized spelling of the same move-arm return join.
 T249Host T263RetParen(bool k)
