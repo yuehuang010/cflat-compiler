@@ -4,6 +4,7 @@
 import cpp "cpp_mix11_ctor.hpp";
 import cpp "cpp_interop_tpl.h";
 import cpp "string";
+import cpp "cpp_cvamb_conv.hpp";
 
 struct CvaBox
 {
@@ -79,6 +80,25 @@ extern int main()
     }
     expect_error("call to constructor of 'CvaCN2' is ambiguous") {
         CvaCN2 cn2 = CvaCN2(nd);
+    }
+    // CVAMB: a conversion-operator source ties a by-value and a const& overload (clang: ambiguous).
+    CvcPU cvcU = CvcPU();
+    cvcU.v = 5;
+    CvcNC cvcN = CvcNC();
+    cvcN.v = 5;
+    CvcTwo cvcT = CvcTwo();
+    cvcT.v = 5;
+    expect_error("ambiguous call to 'cvc_tie': no candidate ranks better than the others") {
+        int r = cvc_tie(cvcU);
+    }
+    expect_error("ambiguous call to 'cvc_nc': no candidate ranks better than the others") {
+        int r = cvc_nc(cvcN);
+    }
+    expect_error("ambiguous call to 'cvc_mix': no candidate ranks better than the others") {
+        int r = cvc_mix(cvcT);
+    }
+    expect_error("ambiguous call to 'cvc_ptie': no candidate ranks better than the others") {
+        int r = cvc_ptie(cvcU, 1);
     }
     return 0;
 }

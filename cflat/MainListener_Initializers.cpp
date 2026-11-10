@@ -932,7 +932,10 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
                 || sourceNV.Storage == retTemp);
         const bool sameClass = !sourceNV.TypeAndValue.Pointer
             && sourceNV.TypeAndValue.TypeName == destType.TypeName;
-        if (sourceNV.IsCxxMoveSelected && sameClass
+        // A prvalue of a trivially copyable class IS the slot's object (guaranteed elision).
+        const bool trivialPrvalue = sourceNV.IsCxxPrvalueTemp && !foreignNontrivial
+            && compiler->IsCxxTriviallyCopyableRecord(destType.TypeName);
+        if ((sourceNV.IsCxxMoveSelected || trivialPrvalue) && sameClass
             && sourceValue->getType() == compiler->GetType(destType))
         {
             compiler->builder->CreateStore(sourceValue, destination);

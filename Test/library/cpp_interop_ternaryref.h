@@ -38,6 +38,7 @@ struct T391Zero
     operator T391Val() const { return T391Val(); }
 };
 inline int t391_take(T391Val v) { return v.value(); }
+inline int t391_cref(const T391Val& v) { return v.value(); }
 inline int t391_tref(const T391Val& v) { return v.value(); }
 inline T391Val t391_pass(T391Val v) { return T391Val(v.value() + 100); }
 inline T391Val t391_global_a(7);

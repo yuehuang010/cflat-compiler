@@ -8370,6 +8370,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.ReturnsAliasOfByValueParam) o["rabv"] = true;
     if (s.ReturnsDirectByValueParam) o["rdbv"] = true;
+    if (s.ReturnsMovedByValueParam) o["rmbv"] = true;
     if (s.ReturnsGlobalBorrow) o["rgb"] = true;
     if (s.ReturnsParameterBorrow) o["rpb"] = true;
     if (s.ReturnsSingleParameterIndex >= 0) o["rpi"] = s.ReturnsSingleParameterIndex;
@@ -9365,6 +9366,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
             if (auto v = fo->getBoolean("rabv")) sym.ReturnsAliasOfByValueParam = *v;
             if (auto v = fo->getBoolean("rdbv")) sym.ReturnsDirectByValueParam = *v;
+            if (auto v = fo->getBoolean("rmbv")) sym.ReturnsMovedByValueParam = *v;
             if (auto v = fo->getBoolean("rgb")) sym.ReturnsGlobalBorrow = *v;
             if (auto v = fo->getBoolean("rpb")) sym.ReturnsParameterBorrow = *v;
             if (auto v = fo->getInteger("rpi"))

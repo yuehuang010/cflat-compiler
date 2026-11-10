@@ -538,7 +538,7 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 }
                 else
                 {
-                    auto srcType = compiler->GetType(nv.TypeAndValue);
+                    auto srcType = compiler->GetType(nv.TypeAndValue, nv.BaseType);
                     nv.Primary = compiler->CreateLoad(srcType, nv.Storage);
                 }
                 nv.Storage = nullptr;
@@ -808,6 +808,31 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                     return false;
                 };
 
+                // An explicit operator P* is registered apart from its implicit twin, so a cast
+                // reaches it under that name first (the bare name holds only the implicit one).
+                const std::string explicitName = "__cflat_explicit_" + opName;
+                if (destTypeName.Pointer && compiler->IsCxxRecord(sourceTypeName))
+                {
+                    compiler->EnsureCxxConversionOperatorsProjected(sourceTypeName);
+                    // The table is keyed across classes: only this class's own twin counts.
+                    auto explicitIt = compiler->functionTable.find(explicitName);
+                    const bool ownExplicitTwin = explicitIt != compiler->functionTable.end()
+                        && std::any_of(explicitIt->second.begin(), explicitIt->second.end(),
+                               [&](const auto& candidate) {
+                                   return candidate.Parameters.size() == 1
+                                       && candidate.Parameters[0].TypeName == sourceTypeName;
+                               });
+                    if (ownExplicitTwin)
+                    {
+                        auto argNV = namedVar;
+                        argNV.TypeAndValue.VariableName.clear();
+                        if (cxxCastStorage != nullptr) argNV.Storage = cxxCastStorage;
+                        namedVar.Primary = compiler->CreateOverloadedFunctionCall(explicitName, { argNV });
+                        namedVar.Storage = nullptr;
+                        namedVar.TypeAndValue = destTypeName;
+                        return namedVar;
+                    }
+                }
                 if (!destTypeName.IsPrimitive() && hasMatchingConversion())
                 {
                     auto argNV = namedVar;

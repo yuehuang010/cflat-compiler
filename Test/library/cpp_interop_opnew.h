@@ -179,3 +179,35 @@ namespace cppon {
 template <class T> struct Later { int v = 7; };
 template <class T> struct LaterBox { typedef Later<T>* later_ptr; };
 }
+// C++17 elision (legs 4001-4002): `new T(mk())` builds the result in the block. The move
+// constructor is deleted, so any selected move would be a compile error in clang.
+namespace cppon {
+struct ElideNM
+{
+    int v;
+    explicit ElideNM(int x) : v(x) { ++Cnt::live; }
+    ElideNM(ElideNM&&) = delete;
+    ~ElideNM() { --Cnt::live; ++Cnt::dtors; }
+};
+inline ElideNM mkElideNM(int x) { return ElideNM(x); }
+struct ElideNV
+{
+    int v;
+    explicit ElideNV(int x) : v(x) {}
+    ElideNV(ElideNV&&) = delete;
+};
+inline ElideNV mkElideNV(int x) { return ElideNV(x); }
+// Legs 4003-4005: a counting move constructor, a receiver method and a clang-matching move count.
+inline int elideMoves = 0;
+struct ElideMV
+{
+    int v;
+    explicit ElideMV(int x) : v(x) { ++Cnt::live; }
+    ElideMV(ElideMV&& o) noexcept : v(o.v) { ++elideMoves; ++Cnt::live; }
+    int val() const { return v; }
+    ~ElideMV() { --Cnt::live; ++Cnt::dtors; }
+};
+inline ElideMV mkElideMV(int x) { return ElideMV(x); }
+inline int elideMoveCount() noexcept { return elideMoves; }
+inline void elideMoveReset() noexcept { elideMoves = 0; }
+}

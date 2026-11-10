@@ -1,0 +1,21 @@
+import cpp "cpp_ucv_user_conversions.hpp";
+
+// A user conversion yielding a const pointer never binds a mutable pointer parameter (clang: no
+// viable overload). Both the exact const result and the derived const result are refused.
+expect_error("no overload of 'ucv.takeMutable' matches") {
+    int refuseConstResult() {
+        ucv.ConstSource cs = default;
+        return ucv.takeMutable(cs);
+    }
+}
+expect_error("no overload of 'ucv.takeMutable' matches") {
+    int refuseDerivedResult() {
+        ucv.ConstBaseSource cb = default;
+        return ucv.takeMutable(cb);
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

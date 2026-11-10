@@ -2995,6 +2995,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                                lhsStorage, lhsIsRvalue, lhsRefType,
                                                lhsSourceTypeName);
                         const auto& returnType = Compiler(ctx)->lastCallReturnType;
+                        lhsNativeArithmeticTypeName = FloatingOperatorReturnName(returnType);
+                        if (lhsNativeArithmeticTypeName == "longdouble") lhsArithIdentity = "longdouble";
                         lhsIsAlias = returnType.IsAlias && !returnType.Pointer
                             && !Compiler(ctx)->IsCxxRecord(returnType.TypeName);
                         if (lhsIsAlias)
@@ -7752,6 +7754,9 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                     CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), lvalue,
                                            lhsStorage, lhsIsRvalue, lhsRefType,
                                            lhsSourceTypeName);
+                    lhsNativeArithmeticTypeName = FloatingOperatorReturnName(
+                        Compiler(ctx)->lastCallReturnType);
+                    if (lhsNativeArithmeticTypeName == "longdouble") lhsArithIdentity = "longdouble";
                 }
                 else
                 {

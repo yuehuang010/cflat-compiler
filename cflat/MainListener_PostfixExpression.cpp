@@ -14842,8 +14842,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.IsRvalue = true;
                                 // An owned C++ class temporary is a prvalue for the by-value switch
                                 // (SwitchCxxDirectByValueCall), which elides it into the parameter.
-                                namedVar.IsCxxPrvalueTemp =
-                                    !directSret && compiler->IsForeignNontrivialCxxClass(functionName);
+                                namedVar.IsCxxPrvalueTemp = !directSret
+                                    && (compiler->IsForeignNontrivialCxxClass(functionName)
+                                        || (compiler->IsCxxTriviallyCopyableRecord(functionName)
+                                            && compiler->CxxMovePickNeedsClang(functionName)));
                                 compiler->lastOwningResult = true;
                                 structVar = {};
                                 interfaceVar = {};
@@ -15121,8 +15123,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.BaseType = objectType;
                                         namedVar.TypeAndValue.TypeName = functionName;
                                         namedVar.IsRvalue = true;
-                                        namedVar.IsCxxPrvalueTemp =
-                                            !directSret && compiler->IsForeignNontrivialCxxClass(functionName);
+                                        namedVar.IsCxxPrvalueTemp = !directSret
+                                            && (compiler->IsForeignNontrivialCxxClass(functionName)
+                                                || (compiler->IsCxxTriviallyCopyableRecord(functionName)
+                                                    && compiler->CxxMovePickNeedsClang(functionName)));
                                         compiler->lastOwningResult = true;
                                     }
                                     else if (bodyRefused)
@@ -17059,6 +17063,33 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
 
         // Scan body for captures from the enclosing function scope BEFORE saving builder state.
         auto captures = CollectLambdaCaptures(ctx->lambdaBody(), lambdaParamNames, compiler);
+        // A by-value capture of a borrowed pointer (foreach element, borrowed parameter) stays a borrow in
+        // the body: the env does not own it, so adopting it into a unique slot must be refused, not freed twice.
+        for (auto& cap : captures)
+        {
+            if (cap.ByReference || cap.IsThis || !cap.TV.Pointer) continue;
+            const auto outer = compiler->GetScopedLocalOrArgument(cap.Name);
+            // Storage identity, not the name: a same-named local of an enclosing lambda is no parameter.
+            const bool paramBorrow = compiler->IsFunctionParameterStorage(outer.Storage)
+                && !outer.IsOwning;
+            // Any foreach element is a store-path borrow. Only a 'unique' loop variable is owned by its container,
+            // so only it keeps the sink refusal (a raw element sinks like the direct form does).
+            bool elementDeclaredUnique = false;
+            for (auto it = rangeForStack_.rbegin(); it != rangeForStack_.rend(); ++it)
+                if (it->variableName == cap.Name)
+                {
+                    elementDeclaredUnique = it->elementDeclaredUnique;
+                    break;
+                }
+            if (!outer.IsRangeForBorrow && !outer.IsBorrowed && !paramBorrow) continue;
+            // Rebound to an owned value in this block before the lambda: a move sink may take the copy (direct
+            // rule), but adoption stays refused as for the direct source.
+            cap.OuterRetired = compiler->BorrowProofRetiredByRebind(outer) || outer.IsClosureRetiredCapture
+                || (outer.IsRangeForBorrow && !elementDeclaredUnique);
+            cap.OuterBorrow = true;
+            cap.OuterBorrowOrigin = (outer.IsRangeForBorrow || paramBorrow || outer.BorrowedOrigin.empty())
+                ? cap.Name : outer.BorrowedOrigin;
+        }
         // A by-value capture of an owning value type is DEEP-COPIED into the env, which then OWNS
         // it (its cleanup fn frees it exactly once); the invoker's unpacked local only BORROWS it.
         // Both the deep-copy-at-store and the borrow-in-body decisions key off this one predicate.
@@ -17364,6 +17395,13 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     captureNV.Storage = fieldGEP;
                     captureNV.TypeAndValue = cap.TV;
                     captureNV.BaseType     = capTy;
+                    if (cap.OuterBorrow)
+                    {
+                        captureNV.IsBorrowed = true;
+                        captureNV.IsClosureBorrowCapture = true;
+                        captureNV.IsClosureRetiredCapture = cap.OuterRetired;
+                        captureNV.BorrowedOrigin = cap.OuterBorrowOrigin;
+                    }
                     // The ENV owns an owning-value capture (its cleanup fn frees it exactly once);
                     // the body's unpacked local only BORROWS it, so suppress its scope-exit
                     // destructor - otherwise it would free the env's buffer (a double-free).

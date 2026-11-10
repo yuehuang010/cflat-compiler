@@ -2992,7 +2992,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 }
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, cxxSretDest, source.Storage,
                                                      useMove, "into the return slot", {}, false,
-                                                     directInit);
+                                                     directInit, /*forceClangPick*/ false,
+                                                     /*rvaluePickFallback*/ true);
             }
             if (useMove && !sourceName.empty()) compiler->MarkVariableMoved(sourceName);
             finishCxxSretReturn();
@@ -6275,6 +6276,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                             rangeCtx.elementStorage = elementStorage;
                             rangeCtx.elementBaseType = compiler->GetType(actualElement);
                             rangeCtx.elementType = actualElement;
+                            rangeCtx.elementDeclaredUnique = HasSoftDeclarationSpecifier(declSpecCtx, "unique");
                             rangeForStack_.push_back(std::move(rangeCtx));
                             compiler->RecordMoveGenBind(varName);
                             PrepareLoopConditionalDropFlags(bodyStmt);
@@ -6536,6 +6538,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     rangeCtx.elementStorage = elemStorage;
                     rangeCtx.elementBaseType = compiler->GetType(elemType);
                     rangeCtx.elementType = elemType;
+                    rangeCtx.elementDeclaredUnique = HasSoftDeclarationSpecifier(declSpecCtx, "unique");
                     rangeCtx.interfaceStorage = ifacePtr;
                     rangeCtx.isFixedArray = isFixedArray;
                     rangeCtx.isArrayView = isArrayView;

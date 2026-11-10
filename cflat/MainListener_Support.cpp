@@ -4454,6 +4454,40 @@ ValueStructReturnKind ClassifyValueStructReturns(
     if (borrowed == 0) return ValueStructReturnKind::NotApplicable;
     return other == 0 ? ValueStructReturnKind::AllBorrowedParam : ValueStructReturnKind::Mixed;
 }
+bool ReturnsOnlyMovedByValueParam(
+    CFlatParser::FunctionDefinitionContext* func,
+    const LLVMBackend::DeclTypeAndValue& returnType,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams)
+{
+    if (func == nullptr || func->compoundStatement() == nullptr) return false;
+    if (returnType.TypeName.empty() || returnType.Pointer || returnType.ElemPointer) return false;
+    if (returnType.IsMove || returnType.IsAlias) return false;
+    std::vector<CFlatParser::ExpressionContext*> returns;
+    CollectOwnReturnExpressions(func->compoundStatement(), returns);
+    if (returns.empty()) return false;
+    for (auto* expr : returns)
+    {
+        // Descend single-child links only: the move must be the whole returned expression.
+        antlr4::tree::ParseTree* node = expr;
+        while (node != nullptr && dynamic_cast<CFlatParser::MoveExpressionContext*>(node) == nullptr
+            && node->children.size() == 1)
+            node = node->children[0];
+        auto* move = dynamic_cast<CFlatParser::MoveExpressionContext*>(node);
+        if (move == nullptr || move->unaryExpression() == nullptr) return false;
+        const std::string name = move->unaryExpression()->getText();
+        if (!IsIdentifierText(name)) return false;
+        bool movedParam = false;
+        for (const auto& p : allParams)
+        {
+            if (p.VariableName != name || p.TypeName != returnType.TypeName) continue;
+            if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias) continue;
+            movedParam = true;
+            break;
+        }
+        if (!movedParam) return false;
+    }
+    return true;
+}
 bool IsDeclScopeNode(antlr4::tree::ParseTree* node)
 {
     return AsRuleCtx<CFlatParser::CompoundStatementContext>(node) != nullptr

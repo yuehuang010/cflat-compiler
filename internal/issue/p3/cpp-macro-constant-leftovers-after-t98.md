@@ -51,9 +51,11 @@ Open (clang value vs master/branch behaviour, all lvalues):
 - Free overloads with an anonymous-enum and an `int` parameter (`macroTypePick`): clang picks the enum one
   (81) for the enumerator, the macro and any lvalue; master and the branch refuse ("cannot choose which",
   both spelled `int`).
-- An anonymous-enum MACRO (`#define AM rw::AN`) keeps no enum identity: `C2(AM)` fails at link with
-  `undefined rw::C2::C2(rw::$_0)` (clang 31) and `tw(AM)` deduces int (2, clang 1), as on master. An r7 try
-  keyed on the macro name gave 30 for `C2(AM)` and lost the set on a warm cache, so it was dropped.
+- An anonymous-enum MACRO (`#define AM rw::AN`) in a C++ constructor call: `C2(AM)` now returns clang's
+  value (31) and `rw::C4(RWM)` returns 41, both matching clang. The old link failure
+  (`undefined rw::C2::C2(rw::$_0)`) is no longer reproduced. Function templates (`tw(AM)`, macro prvalue) are
+  fixed in macleft (identity via the macro global, legs 99318/99319). `std.min`, `retr`, `retf` and
+  `make_pair` over the macro fall back to master's int path (legs 99324-99326).
 
 Fix direction: an unnamed-enum lvalue needs its enum identity, cv and reference category spelled from its
 storage in every wrapper (the int it is lowered to cannot carry them). r2-r6 tried to track auto slots and

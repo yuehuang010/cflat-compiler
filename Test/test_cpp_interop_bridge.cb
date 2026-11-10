@@ -4652,6 +4652,13 @@ t162.ReturnDst t446_dstm_explicit_move()
     t162.ReturnSrc source = t162.ReturnSrc(5);
     return move source;
 }
+// A same-type by-value parameter returned by `move`: the result is built in the caller's slot.
+t162.ReturnSrc t446_moved_param(t162.ReturnSrc f) { return move f; }
+struct t446MovedHolder
+{
+    t162.ReturnSrc f = t162.ReturnSrc(17);
+    t162.ReturnSrc m(t162.ReturnSrc f) { return move f; }
+};
 t162.ReturnSrc t446_same_type_local()
 {
     t162.ReturnSrc source = t162.ReturnSrc(5);
@@ -4788,6 +4795,24 @@ extern int main(int argc, char** argv)
     }
     if (t446Value != 5 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
         || t162.ReturnStats.srcMove != 1 || t162.ReturnStats.srcDtor != 2) return 44606;
+
+    // Clang: a prvalue argument is built in the parameter, moved once into the result, no copy.
+    t162.ReturnStats.reset();
+    {
+        t162.ReturnSrc value = t446_moved_param(t162.ReturnSrc(5));
+        t446Value = value.value;
+    }
+    if (t446Value != 5 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
+        || t162.ReturnStats.srcMove != 1 || t162.ReturnStats.srcDtor != 2) return 44609;
+
+    t162.ReturnStats.reset();
+    {
+        t446MovedHolder holder = default;
+        t162.ReturnSrc value = holder.m(t162.ReturnSrc(5));
+        t446Value = value.value;
+    }
+    if (t446Value != 5 || t162.ReturnStats.srcCtor != 2 || t162.ReturnStats.srcCopy != 0
+        || t162.ReturnStats.srcMove != 1 || t162.ReturnStats.srcDtor != 3) return 44610;
 
     cpptw.reset_counts();
     bridge_opaque_return_discard_direct(31);

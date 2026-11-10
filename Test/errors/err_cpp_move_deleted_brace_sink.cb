@@ -1,0 +1,11 @@
+import cpp "cpp_interop_basic.h";
+
+struct DeletedMoveBox { cppi.XvTrivialNoMove item = cppi.XvTrivialNoMove(0); };
+
+expect_error("its move or copy constructor is deleted") {
+    extern int main() {
+        cppi.XvTrivialNoMove source = cppi.XvTrivialNoMove(7);
+        DeletedMoveBox box = {item = move source};
+        return box.item.v;
+    }
+}

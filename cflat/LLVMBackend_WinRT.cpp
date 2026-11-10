@@ -3384,7 +3384,10 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                             sourceFileName, currentLine, currentColumn });
             }
         }
-        if (!storageIsLocalSlot || !arg.FieldName.empty()) return;
+        // A lambda capture lives in the closure env, not a local alloca: it is still checked below.
+        const bool envCapture = arg.IsClosureBorrowCapture
+            || (live != nullptr && live->IsClosureBorrowCapture);
+        if ((!storageIsLocalSlot && !envCapture) || !arg.FieldName.empty()) return;
         const bool argOwns = arg.IsOwning || arg.IsOwningStruct || arg.IsOwningString
             || arg.OwnsInterfaceBox
             || (live != nullptr && (live->IsOwning || live->IsOwningStruct
@@ -3392,6 +3395,9 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
             || (!arg.CallerName.empty() && IsVariableOwning(arg.CallerName));
         if (argOwns || BorrowProofRetiredByRebind(arg)
             || (live != nullptr && BorrowProofRetiredByRebind(*live)))
+            return;
+        // The capture copied a value the outer binding had rebound to an owner: the direct sink is accepted.
+        if (arg.IsClosureRetiredCapture || (live != nullptr && live->IsClosureRetiredCapture))
             return;
         const bool directBorrowParam = !arg.CallerName.empty()
             && IsFunctionParameter(arg.CallerName);
@@ -3405,14 +3411,21 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                : (live != nullptr && live->IsBorrowed ? live->BorrowedOrigin : std::string()));
         const bool copiedFromBorrowParam = !directBorrowParam
             && !borrowOrigin.empty() && IsFunctionParameter(borrowOrigin);
-        if (directBorrowParam || copiedFromBorrowParam)
+        // A by-value lambda capture of a borrowed pointer (foreach element, borrowed parameter) is a
+        // borrow inside the body: the closure env does not own the pointee.
+        const bool capturedBorrow = !throughField
+            && (arg.IsClosureBorrowCapture || (live != nullptr && live->IsClosureBorrowCapture));
+        if (directBorrowParam || copiedFromBorrowParam || capturedBorrow)
         {
+            const std::string capturedName = arg.CallerName.empty() ? borrowOrigin : arg.CallerName;
             const std::string sourceName = directBorrowParam
                 ? std::format("borrowed parameter '{}'", arg.CallerName)
+                : capturedBorrow
+                    ? std::format("borrowed pointer '{}' captured by a lambda", capturedName)
                 : std::format("borrowed pointer '{}' (copied from parameter '{}')",
-                              arg.CallerName.empty() ? borrowOrigin : arg.CallerName,
-                              borrowOrigin);
-            const std::string declName = directBorrowParam ? arg.CallerName : borrowOrigin;
+                              capturedName, borrowOrigin);
+            const std::string declName = directBorrowParam ? arg.CallerName
+                : (capturedBorrow ? capturedName : borrowOrigin);
             LogBorrowedPointerMoveSinkError(sourceName, paramName,
                 SpellFunctionSymbol(*this, functionName), declName);
             return;

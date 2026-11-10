@@ -85,6 +85,8 @@ LLVM_ATTRIBUTE_NOINLINE CFlatParser::AssignmentExpressionContext* UnwrapInitiali
 
 CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
     antlr4::tree::ParseTree* node);
+bool PostfixExpressionEndsInCall(CFlatParser::PostfixExpressionContext* postfix);
+bool PostfixCallHasChainedReceiver(CFlatParser::PostfixExpressionContext* postfix);
 struct StringLiteralExpressionInfo
 {
     std::string Value;
@@ -1510,6 +1512,13 @@ ValueStructReturnKind ClassifyValueStructReturns(
     const LLVMBackend::DeclTypeAndValue& returnType,
     const std::vector<LLVMBackend::TypeAndValue>& allParams,
     std::string* outBorrowedParamName);
+
+// True when every own 'return' is `move p;` of a by-value parameter p of the return type: the
+// callee moves its argument out, so a caller's armed result slot can take the sret directly.
+bool ReturnsOnlyMovedByValueParam(
+    CFlatParser::FunctionDefinitionContext* func,
+    const LLVMBackend::DeclTypeAndValue& returnType,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams);
 
 // Nodes that open a declaration scope: a name declared under one is visible only inside it.
 bool IsDeclScopeNode(antlr4::tree::ParseTree* node);
@@ -3775,6 +3784,8 @@ private:
         llvm::Value* elementStorage = nullptr;
         llvm::Type* elementBaseType = nullptr;
         LLVMBackend::TypeAndValue elementType;
+        // The loop declaration says 'unique' (the container owns the element); elementType does not carry it.
+        bool elementDeclaredUnique = false;
         llvm::Value* interfaceStorage = nullptr;
         bool isFixedArray = false;
         bool isArrayView = false;
@@ -3898,6 +3909,8 @@ private:
     // The whole `move x` initializer of an `auto` local / operand of a register return: a
     // trivially copyable C++ class there is built through clang's pick for std::move(x).
     CFlatParser::MoveExpressionContext* trivialCxxMoveSite_ = nullptr;
+    // The `move` of a `_ = move x;` release: nothing downstream runs a pick, so it must zero.
+    CFlatParser::MoveExpressionContext* discardMoveSite_ = nullptr;
     CFlatParser::MoveExpressionContext* loweredBraceMoveSite_ = nullptr;
     std::string loweredBraceMoveTypeName_;
     llvm::Value* loweredBraceMoveDestination_ = nullptr;
@@ -7533,6 +7546,8 @@ public:
     static bool IsCallArgumentThroughParens(antlr4::ParserRuleContext* ctx);
     // True when `ctx` is an operand arm of a '?:' that is the whole of a call argument (type-blind).
     static bool IsTernaryArmOfCallArgument(antlr4::ParserRuleContext* ctx);
+    // True when ctx is, through single-child wrappers only, an arm of a `?:` or `??`.
+    static bool IsDirectConditionalArm(antlr4::ParserRuleContext* ctx);
     bool IsWholeCxxCallArgumentShape(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& expected) const;
 
@@ -7809,6 +7824,10 @@ public:
         bool IsThis = false;    // the implicit method self pointer; capture by value, re-register as 'this'
         bool SourceIsStaticLocal = false;
         std::optional<int64_t> ConstFoldInt;  // a folded const local stays foldable through the capture
+        // The outer binding is a borrow (foreach element or borrowed parameter): the body's copy stays one.
+        bool OuterBorrow = false;
+        bool OuterRetired = false;
+        std::string OuterBorrowOrigin;
     };
 
     // Walk the lambda body AST and collect variables captured from the enclosing function scope.

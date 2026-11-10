@@ -174,6 +174,25 @@ public:
 };
 inline int takeCntAByValue(CntA value) noexcept { CntA::which = 3; return value.v; }
 inline int takeCntAByConstRef(const CntA& value) noexcept { CntA::which = 4; return value.v; }
+class TernaryCnt
+{
+public:
+    static inline int ctors = 0, copies = 0, moves = 0, dtors = 0;
+    static inline int copyAssigns = 0, moveAssigns = 0;
+    static inline void reset() noexcept { ctors = copies = moves = dtors = copyAssigns = moveAssigns = 0; }
+    inline explicit TernaryCnt(int x = 0) noexcept : v(x) { ++ctors; }
+    inline TernaryCnt(const TernaryCnt& o) noexcept : v(o.v) { ++copies; }
+    inline TernaryCnt(TernaryCnt&& o) noexcept : v(o.v) { o.v = -1; ++moves; }
+    inline TernaryCnt& operator=(const TernaryCnt& o) noexcept { v = o.v; ++copyAssigns; return *this; }
+    inline TernaryCnt& operator=(TernaryCnt&& o) noexcept { v = o.v; o.v = -1; ++moveAssigns; return *this; }
+    inline ~TernaryCnt() noexcept { ++dtors; }
+    int v;
+};
+class TernaryDerived : public TernaryCnt
+{
+public:
+    inline explicit TernaryDerived(int x) noexcept : TernaryCnt(x) {}
+};
 // T249: a member whose copy constructor may throw (an invoke splits the ternary arm block).
 class TCopy
 {

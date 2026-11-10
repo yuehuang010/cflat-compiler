@@ -616,6 +616,18 @@ int r22InnerCase() { R22Box h = default; h.inner.value = r22MakeString(); return
 int r22ListCase() { R22Box h = default; h.values.add(r22MakeString()); return h.copyList(); }
 int r22ListIndexDeclCase() { R22Box h = default; h.values.add(r22MakeString()); return h.indexImplicit(); }
 int r22ListIndexAssignCase() { R22Box h = default; h.values.add(r22MakeString()); return h.indexAssignImplicit(); }
+// R23: an alias-return element copy (`string t = vals[0]`) owns its buffer and frees it once.
+struct R23Owned { string n = default; };
+struct R23Box
+{
+    list<string> vals = default;
+    int readThis() { string t = this->vals[0]; return t.length(); }
+};
+int r23ThisCase() { R23Box h = default; h.vals.add(r22MakeString()); return h.readThis(); }
+int r23ExternalCase() { R23Box h = default; h.vals.add(r22MakeString()); string t = h.vals[0]; return t.length(); }
+// R23: `t = h->name` through a borrowed pointer parameter copies a copyable owner.
+int r23AssignBorrowed(R23Owned* h) { string t = "old".copy(); t = h->n; return t.length() + h->n.length(); }
+int r23AssignCase() { R23Owned h = default; h.n = r22MakeString(); return r23AssignBorrowed(&h); }
 int r22NullableCase() { R22Box h = default; h.storage = r22MakeString(); h.nullable = &h.storage; return h.derefNullable(); }
 int r22ValueReceiverCase() { R22Box h = default; h.name = r22MakeString(); return h.readImplicit(); }
 int r22PointerReceiverCase() { R22Box h = default; h.name = r22MakeString(); R22Box* p = &h; return p->readImplicit(); }
@@ -2371,6 +2383,9 @@ extern int main()
     total++; passed += Test("r22_nullable_pointer_deref_accept", r22Clean(r22NullableCase, 92, 2u), true);
     total++; passed += Test("r22_local_shadow_accept", r22Clean(r22LocalShadowCase, 46, 3u), true);
     total++; passed += Test("r22_parameter_shadow_accept", r22Clean(r22ParameterShadowCase, 46, 3u), true);
+    total++; passed += Test("r23_explicit_this_list_index_copy_frees", r22Clean(r23ThisCase, 46, 2u), true);
+    total++; passed += Test("r23_external_list_index_copy_frees", r22Clean(r23ExternalCase, 46, 2u), true);
+    total++; passed += Test("r23_borrowed_param_field_assign_copy", r22Clean(r23AssignCase, 92, 2u), true);
     {
         u64 before = HeapAudit.reportLeaks();
         int dtorBefore = t352UniqueDtor;

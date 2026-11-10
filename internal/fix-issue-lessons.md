@@ -3634,3 +3634,4 @@ Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintaine
 - A `depth` cap does not bound a walk that re-enters through a helper without a depth parameter: FindConstWriteCause calls
   ValueConstLevels / StoredConstLevels at depth 0, so nested `?:` pointer joins were walked exponentially (2026-11-01 ternexp,
   fixed with a per-query memo). Look for re-entry before blaming the parser.
+- Native arithmetic result types (RULED 2026-10-31, from the retired arithmetic-result-names issue): follow C's usual arithmetic conversions (`s + s` is int, shift = promoted left operand, same-type ternary keeps the type, pointer difference is ptrdiff_t); C spellings are aliases of the fixed-width types, so a name is never a ranking matter; `long` follows the target. Assignment narrowing stays accepted (`short r = s + s;`).

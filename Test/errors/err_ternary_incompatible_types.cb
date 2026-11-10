@@ -224,4 +224,49 @@ expect_error("cannot convert 'double*' to 'int*' implicitly: the pointee types d
     }
 }
 
+// TERNMV: a both-moved join through a const user conversion (X/C shape) stays refused as on master;
+// clang accepts it, so this is an open refusal, not a value leg. A silent value was the regression.
+expect_error("ternary branches have incompatible types 'ternref.T391Zero' and 'ternref.T391Val'") {
+    int t391ZeroMoveJoin(bool k) {
+        ternref.T391Zero a = ternref.T391Zero();
+        ternref.T391Val b = ternref.T391Val(22);
+        ternref.T391Val z = ternref.T391Val(0);
+        z = k ? move a : move b;
+        return z.value();
+    }
+}
+
+// TERNMV: a same-class xvalue join bound to a const& parameter transfers nothing (master refuses).
+expect_error("transfers nothing") {
+    int t391CrefSameJoin(bool k) {
+        ternref.T391Val a = ternref.T391Val(21);
+        ternref.T391Val b = ternref.T391Val(22);
+        return ternref.t391_cref(k ? move a : move b);
+    }
+}
+
+// TERNMV: a field move arm joined with a different class (X/C shape) stays refused as on master.
+expect_error("ternary branches have incompatible types 'ternref.T391Zero' and 'ternref.T391Val'") {
+    struct T391Host { ternref.T391Zero s; };
+    int t391FieldZeroMoveJoin(bool k) {
+        T391Host h;
+        ternref.T391Val b = ternref.T391Val(22);
+        ternref.T391Val z = ternref.T391Val(0);
+        z = k ? move h.s : move b;
+        return z.value();
+    }
+}
+
+// TERNMV r4: a derived field arm joined with another class (no bare name) is refused as on master.
+expect_error("ternary branches have incompatible types 'ternref.T459Derived' and 'ternref.T391Val'") {
+    struct T391DerHost { ternref.T459Derived d; };
+    int t391DerFieldJoin(bool k) {
+        T391DerHost h;
+        ternref.T391Val b = ternref.T391Val(22);
+        ternref.T391Val z = ternref.T391Val(0);
+        z = k ? move h.d : move b;
+        return z.value();
+    }
+}
+
 extern int main() { return 0; }

@@ -1,0 +1,27 @@
+import "list.cb";
+import "unique.cb";
+
+// A by-value lambda capture of a foreach element stays a borrow in the body, so it cannot move
+// into a move sink: the list slot still owns the pointee. Before the fix this compiled and
+// double-freed at run time (rc 139).
+struct CapRes { int id = 0; };
+void capSink(move CapRes* q) { q->id = 1; }
+
+void capSinkElement(list<unique CapRes*>* elements)
+{
+    for (unique CapRes* p in *elements)
+    {
+        Lambda<void()> f = () => {
+            expect_error("cannot move borrowed pointer 'p' captured by a lambda");
+            capSink(p);
+        };
+        f();
+    }
+}
+
+extern int main()
+{
+    list<unique CapRes*> elements = default;
+    capSinkElement(&elements);
+    return 0;
+}

@@ -1040,6 +1040,15 @@ bool LLVMBackend::IsUnnamedEnumMacro(const NamedVariable& arg) const
             && cxxUnnamedEnumMacros_.count(arg.Storage->getName().str()) != 0;
 }
 
+bool LLVMBackend::HasUnnamedEnumMacroArgument(const std::vector<NamedVariable>& arguments) const
+{
+        // Keyed on the macro global's name: a template path may not carry IsCxxMacroGlobal.
+        return std::any_of(arguments.begin(), arguments.end(), [&](const NamedVariable& arg) {
+                auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(arg.Storage);
+                return gv != nullptr && cxxUnnamedEnumMacros_.count(gv->getName().str()) != 0;
+        });
+}
+
 std::string LLVMBackend::CxxUnnamedEnumValueSpelling(const NamedVariable& arg) const
 {
         if (!IsUnnamedEnumValue(arg)) return {};
@@ -2388,6 +2397,32 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 && !param.IsArrayView && !param.IsFunctionPointer && !param.IsInterface
                 && !param.IsCxxRefToPointer && param.PointerDepth <= 1)
             {
+                // Class value to a C++ pointer parameter via `operator T*()`: one user-defined sequence.
+                // No such (or an ambiguous) operator leaves the candidate non-viable.
+                if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
+                    && (IsCxxRecord(param.TypeName)
+                        || (IsPrimitiveTypeName(param.TypeName) && param.TypeName != "void"))
+                    && !(candidate.IsMethod && i == 0) && !fixedArrayArgument
+                    && !arg.TypeAndValue.IsArrayView && !arg.TypeAndValue.ElemPointer
+                    && arg.TypeAndValue.ConstArraySize == 0 && !arg.IsStringLiteral)
+                {
+                    bool needsStandard = false;
+                    bool ambiguous = false;
+                    std::vector<std::string> ambiguousOperators;
+                    const std::string op = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
+                        false, &needsStandard, &ambiguous, &ambiguousOperators, &arg.TypeAndValue);
+                    if (op.empty())
+                    {
+                        out.rank = kCxxNonViableRank;
+                        out.from = arg.TypeAndValue.TypeName;
+                        continue;
+                    }
+                    out.rank = 3;
+                    out.cxxViable = true;
+                    out.userFunction = op;
+                    out.second = needsStandard ? 2 : 0;
+                    continue;
+                }
                 TypeAndValue pt = arg.TypeAndValue;
                 if (fixedArrayArgument)
                 {
@@ -2718,6 +2753,29 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 if (out.ambiguousOperators.empty())
                     out.userFunction = classConversionOperator(arg, param, out.second);
                 continue;
+            }
+            // CVAMB: a by-value class parameter that only a class conversion operator reaches is a
+            // user-defined sequence like a `const T&` one; clang copy-initializes it (lazy, cached).
+            if (candidate.IsCxx && IsCxxRecord(param.TypeName) && !reference && !param.Pointer
+                && !at.Pointer && IsCxxRecord(at.TypeName) && at.TypeName != param.TypeName
+                && HasImplicitClassConversionOperator(at.TypeName))
+            {
+                out.ambiguousOperators = CxxClassConversionTies(at.TypeName, param.TypeName);
+                const std::string function = out.ambiguousOperators.empty()
+                    ? classConversionOperator(arg, param, out.second) : std::string();
+                std::string wrapperName;
+                std::string wrapperError;
+                if ((!function.empty() || !out.ambiguousOperators.empty())
+                    && RequestCxxVariadicConstructor(param.TypeName, { arg }, wrapperName, wrapperError,
+                                                     /*copyInit*/ true))
+                {
+                    out.rank = 3;
+                    out.cxxViable = true;
+                    out.from = argumentIdentity(arg);
+                    out.userFunction = function;
+                    continue;
+                }
+                out.ambiguousOperators.clear();
             }
             // nullptr has no class identity to bind through a reference directly. If the class
             // has a converting constructor, the user-defined sequence was ranked above; otherwise
@@ -5233,6 +5291,23 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         // Does CFlat's own scoring bind argument `i` of `pair` alone? Probed on a one-parameter
         // copy, without `tiedOut`, so the C++ ranking above does not recurse.
         auto cflatAccepts = [&](const Result& pair, size_t i) {
+            // CVAMB r1: a by-value class parameter reached only through a conversion operator is bound
+            // by clang's copy-initialization (the rank route); CFlat's one-parameter probe cannot see it.
+            {
+                const TypeAndValue& want = pair.second.Parameters[i];
+                const TypeAndValue& have = pair.first[i].TypeAndValue;
+                if (pair.second.IsCxx && IsCxxRecord(want.TypeName) && !want.Pointer && !want.ElemPointer
+                    && !want.IsAlias && !want.IsRvalueRef && !have.Pointer && IsCxxRecord(have.TypeName)
+                    && have.TypeName != want.TypeName && HasImplicitClassConversionOperator(have.TypeName)
+                    && CxxClassConversionTies(have.TypeName, want.TypeName).empty())
+                {
+                    std::string wrapperName;
+                    std::string wrapperError;
+                    if (RequestCxxVariadicConstructor(want.TypeName, { pair.first[i] }, wrapperName,
+                                                      wrapperError, /*copyInit*/ true))
+                        return true;
+                }
+            }
             FunctionSymbol probe = pair.second;
             probe.Parameters = { pair.second.Parameters[i] };
             probe.IsMethod = false;
@@ -5251,6 +5326,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             if (!cxxRanking || !fullyRanked(cxxRanks[winner->pair]))
                 return *winner->pair;
             const auto& won = cxxRanks[winner->pair];
+            // CVAMB r2: every candidate is compared before a pick or a tie is decided ([over.match.best]).
+            std::vector<std::pair<const Result*, std::vector<CxxConversionRank>>> strictlyPreferred;
+            std::vector<std::vector<CxxConversionRank>> incomparable;
+            const Result* firstTie = nullptr;
             for (const auto& pair : candidates)
             {
                 const auto defaultRequest = cxxDefaultWrapperRequests_.find(pair.second.UniqueName);
@@ -5282,6 +5361,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // pointee const) loses to any candidate C++ can call.
                 const int order = winner->cxxPointeeConstNotViable
                     ? 1 : CompareCxxConversionRanks(won, ranks, crossing);
+                if (order == 2)
+                    incomparable.push_back(ranks);
                 if (order == -1 || order == 2)
                     continue;
                 if (failedDefault && order == 0 && !crossing
@@ -5305,8 +5386,43 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             preferredOut->to = param.TypeName;
                         return Result{};
                     }
+                // CVAMB r1: C++ strictly prefers this candidate and CFlat binds each of its arguments.
+                if (order == 1 && preferredOut != nullptr)
+                {
+                    strictlyPreferred.emplace_back(&pair, ranks);
+                    continue;
+                }
+                if (firstTie == nullptr)
+                    firstTie = &pair;
+            }
+            for (const auto& [preferred, preferredRanks] : strictlyPreferred)
+            {
+                bool beatsRest = true;
+                for (const auto& [other, otherRanks] : strictlyPreferred)
+                {
+                    bool crossing = false;
+                    if (other != preferred && CompareCxxConversionRanks(preferredRanks, otherRanks, crossing) != -1)
+                        beatsRest = false;
+                }
+                for (const auto& otherRanks : incomparable)
+                {
+                    bool crossing = false;
+                    if (CompareCxxConversionRanks(preferredRanks, otherRanks, crossing) != -1)
+                        beatsRest = false;
+                }
+                if (beatsRest)
+                    return *preferred;
+            }
+            if (!strictlyPreferred.empty())
+            {
+                tiedOut->push_back(strictlyPreferred[0].first->second);
+                tiedOut->push_back(strictlyPreferred[1].first->second);
+                return Result{};
+            }
+            if (firstTie != nullptr)
+            {
                 tiedOut->push_back(winner->pair->second);
-                tiedOut->push_back(pair.second);
+                tiedOut->push_back(firstTie->second);
                 return Result{};
             }
             return *winner->pair;
@@ -10856,7 +10972,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 bool hasUnforwardedSameTypeCxxByValueArg = false;
                 if (!candidate.IsCxx && !pendingCxxSretReturn_
-                    && !candidate.ReturnsDirectByValueParam)
+                    && !candidate.ReturnsDirectByValueParam && !candidate.ReturnsMovedByValueParam)
                     for (size_t i = 0; i < candidate.Parameters.size()
                         && i < matched.size(); ++i)
                     {

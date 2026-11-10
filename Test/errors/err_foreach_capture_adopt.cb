@@ -1,0 +1,28 @@
+import "list.cb";
+import "unique.cb";
+
+// A by-value lambda capture of a foreach element stays a borrow in the body. The closure env does
+// not own the pointee, so adopting it into a unique field must be refused: the list slot still
+// owns and frees it. Before the fix this compiled and double-freed at run time (rc 134).
+struct CapRes { int id = 0; };
+struct CapHolder { unique CapRes* p = nullptr; };
+
+void capAdoptElement(list<unique CapRes*>* elements)
+{
+    for (unique CapRes* p in *elements)
+    {
+        CapHolder t = default;
+        Lambda<void()> f = () => {
+            expect_error("cannot store borrowed pointer 'p' captured by a lambda into unique field");
+            t.p = p;
+        };
+        f();
+    }
+}
+
+extern int main()
+{
+    list<unique CapRes*> elements = default;
+    capAdoptElement(&elements);
+    return 0;
+}

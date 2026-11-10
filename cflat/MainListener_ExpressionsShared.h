@@ -180,6 +180,15 @@ inline LLVMBackend::TypedValue NamedArithOperand(const LLVMBackend::NamedVariabl
         out.arithNarrowWidth = named.ArithNarrowWidth;
         return out;
 }
+// A floating scalar operator result keeps its name: long double and double share one LLVM type.
+inline std::string FloatingOperatorReturnName(const LLVMBackend::TypeAndValue& returnType)
+{
+    if (returnType.Pointer || returnType.IsAlias || returnType.PointerDepth != 0
+        || !returnType.ConstInnerDimensions.empty() || returnType.ConstArraySize != 0)
+        return std::string();
+    const std::string& name = returnType.TypeName;
+    return name == "float" || name == "double" || name == "longdouble" ? name : std::string();
+}
 inline std::string ScalarArithmeticResultName(LLVMBackend* compiler,
                                                const std::string& left,
                                                const std::string& right,

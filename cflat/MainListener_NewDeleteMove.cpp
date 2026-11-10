@@ -259,6 +259,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     ctorArgNodes.push_back(named);
                     ctorArgExprs.push_back(named->assignmentExpression());
                 }
+            // C++17 guaranteed elision: a sole same-class argument that a call returns by value is
+            // built straight into the new block (clang calls no constructor).
+            bool selfElided = false;
             for (size_t argIndex = 0; argIndex < ctorArgNodes.size(); ++argIndex)
                 {
                     auto* named = ctorArgNodes[argIndex];
@@ -291,12 +294,38 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         && compiler->GetUniqueCxxConstructorValueParameter(
                             typeName, argIndex, ctorArgNodes.size(), ctorRefDest,
                             /*constRef*/ true);
+                    // Only a bare call argument arms: a ternary, explicit move, or a receiver call
+                    // (`mk().v`) would let the inner call take the slot.
+                    auto* armAssign = UnwrapInitializerParens(argAssign);
+                    auto* argPostfix = SolePostfixExpressionShape(armAssign);
+                    // A call inside a receiver or callee subscript would take the slot too.
+                    const auto subscriptHasCall = [](CFlatParser::PostfixExpressionContext* postfix) {
+                        for (size_t i = 1; i + 2 < postfix->children.size(); ++i)
+                            if (dynamic_cast<antlr4::ParserRuleContext*>(postfix->children[i]) != nullptr
+                                && postfix->children[i]->getText().find('(') != std::string::npos)
+                                return true;
+                        return false;
+                    };
+                    const bool selfElisionArm = hasForeignCxxRecordArgs && ctorArgNodes.size() == 1
+                        && SoleTernaryExpression(armAssign) == nullptr
+                        && TopLevelMoveExpression(armAssign) == nullptr
+                        && PostfixExpressionEndsInCall(argPostfix)
+                        && !PostfixCallHasChainedReceiver(argPostfix)
+                        && !subscriptHasCall(argPostfix);
+                    bool armConsumed = false;
                     auto nv = [&] {
                         CxxCallArgumentParseStateScope argumentState(compiler);
+                        if (selfElisionArm)
+                        {
+                            compiler->pendingCxxSretDest_ = newBlock;
+                            compiler->pendingCxxSretTypeName_ = resolvedNewCxxType;
+                        }
                         auto parsed = ctorRefTernary
                             ? ParseCxxConstRefTernaryTemp(argAssign,
                                 LLVMBackend::TypeAndValue{ .TypeName = ctorRefPlaceType })
                             : ParseAssignmentExpressionNamed(argAssign);
+                        if (selfElisionArm)
+                            armConsumed = compiler->pendingCxxSretDest_ == nullptr;
                         llvm::Value* retTemp = compiler->lastCxxRetTemp_;
                         llvm::Value* retValue = compiler->lastCxxRetValue_;
                         if (retTemp != nullptr
@@ -308,6 +337,22 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         }
                         return parsed;
                     }();
+                    if (selfElisionArm)
+                    {
+                        // Unconsumed: a value-returned prvalue (no sret) is stored into the block.
+                        llvm::Type* newType = compiler->GetType(
+                            LLVMBackend::TypeAndValue{ .TypeName = resolvedNewCxxType });
+                        if (armConsumed)
+                            selfElided = true;
+                        else if (nv.IsRvalue && nv.Storage == nullptr && nv.Primary != nullptr
+                            && !nv.TypeAndValue.Pointer && newType != nullptr
+                            && nv.Primary->getType() == newType
+                            && compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName) == resolvedNewCxxType)
+                        {
+                            compiler->builder->CreateStore(nv.Primary, newBlock);
+                            selfElided = true;
+                        }
+                    }
                     NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                     const bool hadSourceTypeName = !nv.TypeAndValue.TypeName.empty();
                     // Same literal identity the call-argument builder records (integer -> enum refusal).
@@ -345,6 +390,23 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     nv.HasOwnedStructTempRange = true;
                     ctorArgVars.push_back(std::move(nv));
                 }
+            if (selfElided)
+            {
+                // The call already built the object in newBlock: no constructor runs here.
+                newCallPostfix.Flush();
+                newBlockScope.Release();
+                // The call's owned-return ledger named the block; it is an ordinary new result.
+                compiler->ForgetOwnedReturnTemp(newBlock);
+                LLVMBackend::NamedVariable result;
+                result.TypeAndValue = LLVMBackend::TypeAndValue{
+                    .TypeName = typeName, .Pointer = true };
+                result.Primary = newBlock;
+                result.BaseType = newBlock->getType();
+                compiler->lastOwningResult = true;
+                compiler->RegisterOwnedNewTemp(newBlock, typeName, 0);
+                compiler->RegisterValueElementTypeName(newBlock, typeName);
+                return result;
+            }
             bool trivialCopyNeedsClangResolution = false;
             const auto* newCxxInfo = hasForeignCxxRecordArgs
                 ? compiler->GetCxxClassInfo(resolvedNewCxxType) : nullptr;
@@ -1898,6 +1960,20 @@ bool MainListener::IsDirectCallArgument(antlr4::ParserRuleContext* ctx) {
         return false;
     }
 
+bool MainListener::IsDirectConditionalArm(antlr4::ParserRuleContext* ctx) {
+        for (auto* node = ctx->parent; node != nullptr; )
+        {
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (rule == nullptr) return false;
+            if (dynamic_cast<CFlatParser::ConditionalExpressionContext*>(rule) != nullptr
+                && rule->children.size() > 1)
+                return true;
+            if (rule->children.size() != 1) return false;
+            node = rule->parent;
+        }
+        return false;
+    }
+
 bool MainListener::IsBorrowedByValueParamBinding(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv) {
         if (compiler == nullptr || nv.Storage == nullptr) return false;
@@ -2243,6 +2319,8 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.IsAliasBorrow          = src.IsAliasBorrow;
         dst.BorrowsOwnedString     = src.BorrowsOwnedString;
         dst.IsClosureValueCapture  = src.IsClosureValueCapture;
+        dst.IsClosureBorrowCapture = src.IsClosureBorrowCapture;
+        dst.IsClosureRetiredCapture = src.IsClosureRetiredCapture;
         dst.IsClosureRefCapture    = src.IsClosureRefCapture;
         dst.IsMoved                = src.IsMoved;
         dst.IsRvalue               = src.IsRvalue;
@@ -2483,6 +2561,22 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(
                     return {};
                 }
             }
+            argNV.IsExplicitMove = true;
+            argNV.IsRvalue = true;
+            return argNV;
+        }
+
+        // A trivially copyable C++ class whose std::move(x) pick is not the byte copy keeps its
+        // source like any other C++ object: the sink runs that pick, nothing zeroes the slot first.
+        if (!argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
+            && !argNV.IsTempSpillStorage && ctx != trivialCxxMoveSite_ && ctx != discardMoveSite_
+            && !IsDirectConditionalArm(ctx)
+            && !(IsDirectCallArgument(ctx) && !argNV.IsElementAccess)
+            && compiler->IsCxxRecord(argNV.TypeAndValue.TypeName)
+            && !compiler->IsCppStructName(argNV.TypeAndValue.TypeName)
+            && compiler->IsCxxTriviallyCopyableRecord(argNV.TypeAndValue.TypeName)
+            && compiler->CxxTrivialMoveNeedsTransfer(argNV.TypeAndValue.TypeName, false, false))
+        {
             argNV.IsExplicitMove = true;
             argNV.IsRvalue = true;
             return argNV;

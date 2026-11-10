@@ -6006,6 +6006,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 }
                 key += "|" + t;
             }
+            // An explicit conversion keeps its own key beside an implicit one of the same spelling.
+            if (m.isConversion && m.isExplicit) key += "|explicit-conv";
             // `f(int)` and `f(int, ...)` are distinct overloads (both reach C++ ranking).
             if (m.variadic) key += "|va";
             return key;
@@ -6180,7 +6182,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
 
             // Settled BEFORE the refusal checks so a private, deleted or otherwise unbindable
             // conversion is recorded under the same key the cast site will ask for.
-            const std::string cflatName = memberRegName(m);
+            // `explicit operator P*()` beside `operator const P*()` registers apart, so implicit
+            // lookups never reach it.
+            const std::string cflatName = m.isConversion && m.isExplicit
+                && implicitConversionNames.count(memberRegName(m)) != 0
+                ? "__cflat_explicit_" + memberRegName(m) : memberRegName(m);
             const bool constrainedTwin = constrainedTwinMembers[i];
             if (memberFilter == "__copy_move_ctor" && m.kind == Member::Constructor
                 && !m.isCopyCtor && !m.isMoveCtor)
@@ -6197,7 +6203,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (m.isConversion && m.isExplicit
                 && implicitConversionNames.count(cflatName) == 0)
                 info.explicitConversions.insert(cflatName);
-            if (!memberFilter.empty() && cflatName != memberFilter
+            // A renamed explicit conversion still answers to its spelled name (projection asks by it).
+            if (!memberFilter.empty() && cflatName != memberFilter && memberRegName(m) != memberFilter
                 && !(memberFilter == "__copy_move_ctor"
                      && m.kind == Member::Constructor)) continue;
             if (m.kind == Member::Instance && generatedCxxRecords_.count(r.name) != 0)
@@ -8473,9 +8480,12 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
                     : static_cast<llvm::Constant*>(builder->getInt32((uint32_t)(int32_t)m.value));
                 valSuffix = ConstIntValueSuffix(tv.TypeName, m.value);
             }
-            CreateGlobalVariable(tv, c);
+            llvm::GlobalVariable* macroGlobal = CreateGlobalVariable(tv, c);
             cxxMacroGlobalNames_.insert(m.name);
             if (m.isUnnamedEnum) cxxUnnamedEnumMacros_.insert(m.name);
+            // An unnamed-enum macro is spelled by its own name in C++ calls, like its enumerator.
+            if (m.isUnnamedEnum && macroGlobal != nullptr)
+                cxxUnnamedEnumExpressions_.emplace(macroGlobal, m.name);
             if (activeCxxRequestGroup_ != nullptr)
             {
                 cxxConstantMacroNames_.insert(m.name);

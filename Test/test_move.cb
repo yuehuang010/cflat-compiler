@@ -19567,6 +19567,18 @@ void fe2FieldSinkParam(unique Resource* q)
     Fe2FieldHolder t = default;
     t.p = p;
 }
+void fe2RawSink(move Resource* q) { q->id = q->id + 1; }
+Resource* fe2SameNameGlobal = nullptr;
+Resource* fe2SameNameGet() { return fe2SameNameGlobal; }
+void fe2RebindCapSink(Resource* q) { Lambda<void()> g = () => { q = new Resource(); fe2RawSink(q); }; g(); }
+void fe2RebindDirectSink(Resource* q) { q = new Resource(); fe2RawSink(q); }
+void fe2OuterRebindCapSink(Resource* q) { q = new Resource(); Lambda<void()> g = () => { fe2RawSink(q); }; g(); }
+void fe2AliasRebindCapSink(Resource* q) { Resource* x = q; x = new Resource(); Lambda<void()> g = () => { fe2RawSink(x); }; g(); }
+void fe2SameNameCapSink(Resource* w)
+{
+    Lambda<void()> g = () => { Resource* w = fe2SameNameGet(); Lambda<void()> h = () => { fe2RawSink(w); }; h(); };
+    g();
+}
 bool fe2FieldPick(bool value) { return value; }
 Resource* fe2FieldNull() { return nullptr; }
 unique Resource* fe2FieldMake(int id)
@@ -20833,7 +20845,7 @@ extern int main()
     total += 21;
 
     passed += testC15DataMutHeap();
-    total += 76;
+    total += 83;
     total += 12;
     total += 6;
 
@@ -25592,6 +25604,51 @@ int testC15DataMutHeap()
         fe2FieldSinkParam(seed);
     }
     passed += Test("fe2_sink_param_decl_then_field_dtor_once", dtorCount, 1);
+
+    // Lambda captures of borrowed values that the direct form may sink: a raw element, a rebound borrow.
+    dtorCount = 0;
+    {
+        list<Resource*> rawElems = default;
+        rawElems.add(new Resource());
+        for (Resource* p in rawElems)
+        {
+            Lambda<void()> g = () => { fe2RawSink(p); };
+            g();
+        }
+    }
+    passed += Test("fe2_capture_raw_element_sink_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource*[1] rawArr = { new Resource() };
+        for (Resource* p in rawArr)
+        {
+            Lambda<void()> g = () => { fe2RawSink(p); };
+            g();
+        }
+    }
+    passed += Test("fe2_capture_raw_fixed_element_sink_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    fe2RebindCapSink(nullptr);
+    passed += Test("fe2_capture_in_body_rebind_sink_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    fe2RebindDirectSink(nullptr);
+    passed += Test("fe2_direct_rebind_sink_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    fe2OuterRebindCapSink(nullptr);
+    passed += Test("fe2_capture_outer_rebind_sink_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    fe2AliasRebindCapSink(nullptr);
+    passed += Test("fe2_capture_alias_rebind_sink_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    fe2SameNameGlobal = new Resource();
+    fe2SameNameCapSink(nullptr);
+    passed += Test("fe2_capture_same_name_local_sink_dtor_once", dtorCount, 1);
     return passed;
 }
 

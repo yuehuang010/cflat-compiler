@@ -4432,7 +4432,9 @@ bool MainListener::IsDeclaredPointerSubscriptString(
 {
         if (expression == nullptr || value == nullptr) return false;
         auto* stringType = llvm::StructType::getTypeByName(*compilerLLVM->context, "string");
-        if (stringType == nullptr || value->getType() != stringType) return false;
+        if (stringType == nullptr) return false;
+        if (value->getType() != stringType)
+            return false;
 
         auto* postfix = tryGetPostfixExpression(expression);
         // R21: `Ns.g[i]` - a `.` member path ahead of the subscript; only a global slot decides it.
@@ -4721,6 +4723,7 @@ bool MainListener::IsDeclaredPointerSubscriptString(
             bool genericOverString = false;
             for (const auto& [param, argument] : activeTypeSubstitutions)
                 genericOverString = genericOverString || argument == "string";
+            // A struct element read through a field is a container slot (list sort shuffles borrow it).
             if (globalSlot || !genericOverString) return true;
         }
         if (memberPathOnly) return false;
@@ -4854,7 +4857,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 };
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
+                discardMoveSite_ = discardMove;
                 auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+                discardMoveSite_ = nullptr;
                 if (explicitMoveDiscard && rhsNV.Storage != nullptr
                     && llvm::isa<llvm::GlobalVariable>(rhsNV.Storage)
                     && !rhsNV.TypeAndValue.Pointer
@@ -5644,13 +5649,111 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         // One explicit move arm makes a C++ prvalue: each arm builds a temp, then move-assign.
                         // Both arms moved (xvalue) or neither (copy-assign) keep the direct path.
                         auto* assignTernary = SoleTernaryExpression(assignCtx);
-                        const bool ternaryAssignTemp = !armReturnTemp && assignTernary != nullptr
+                        auto moveSource = [&](antlr4::tree::ParseTree* arm) {
+                            auto* mv = TopLevelMoveExpression(arm);
+                            if (mv == nullptr || mv->unaryExpression() == nullptr)
+                                return static_cast<LLVMBackend::NamedVariable*>(nullptr);
+                            const std::string name = mv->unaryExpression()->getText();
+                            if (!IsBareIdentifierText(name))
+                                return static_cast<LLVMBackend::NamedVariable*>(nullptr);
+                            return compiler->FindLiveNamedVariable(name);
+                        };
+                        // Any explicit move leaf counts (field, deref, index); only the class pair
+                        // below needs a bare-name lookup.
+                        std::function<bool(antlr4::tree::ParseTree*)> allArmsMoved =
+                            [&](antlr4::tree::ParseTree* arm) {
+                            if (TopLevelMoveExpression(arm) != nullptr) return true;
+                            auto* nested = SoleTernaryExpression(arm);
+                            return nested != nullptr && nested->expression() != nullptr
+                                && nested->conditionalExpression() != nullptr
+                                && allArmsMoved(nested->expression()->assignmentExpression())
+                                && allArmsMoved(nested->conditionalExpression());
+                        };
+                        auto hasXvalueJoin = [&](CFlatParser::ConditionalExpressionContext* ternary) {
+                            auto* left = moveSource(ternary->expression()->assignmentExpression());
+                            auto* right = moveSource(ternary->conditionalExpression());
+                            if (left == nullptr || right == nullptr) return true;
+                            if (left->TypeAndValue.Pointer || right->TypeAndValue.Pointer) return false;
+                            auto leftType = left->TypeAndValue;
+                            auto rightType = right->TypeAndValue;
+                            if (!compiler->IsCxxRecord(leftType.TypeName)
+                                || !compiler->IsCxxRecord(rightType.TypeName))
+                                return true;
+                            return compiler->ClassifyCxxTernary(leftType,
+                                LLVMBackend::CxxArmCategory::Xvalue, rightType,
+                                LLVMBackend::CxxArmCategory::Xvalue).kind
+                                == LLVMBackend::CxxTernaryVerdict::Kind::XvalueRef;
+                        };
+                        const bool bothSidesMoved = assignTernary != nullptr
                             && assignTernary->expression() != nullptr
                             && assignTernary->conditionalExpression() != nullptr
-                            && (TopLevelMoveExpression(assignTernary->expression()->assignmentExpression())
-                                != nullptr)
-                                != (TopLevelMoveExpression(assignTernary->conditionalExpression())
-                                    != nullptr);
+                            && allArmsMoved(assignTernary->expression()->assignmentExpression())
+                            && allArmsMoved(assignTernary->conditionalExpression());
+                        const bool cxxClassAssign = compiler->IsCxxRecord(tn);
+                        // Round 4: both arms moved, different C++ classes, and an arm that is not a bare
+                        // name (field, deref, index). Arm types come from the arm's operand expression.
+                        if (cxxClassAssign && bothSidesMoved && assignTernary != nullptr
+                            && (moveSource(assignTernary->expression()->assignmentExpression()) == nullptr
+                                || moveSource(assignTernary->conditionalExpression()) == nullptr))
+                        {
+                            auto armClassName = [&](antlr4::tree::ParseTree* arm) {
+                                auto* mv = TopLevelMoveExpression(arm);
+                                if (mv == nullptr || mv->unaryExpression() == nullptr) return std::string();
+                                auto operand = EvaluateOperandTypeOnly([&]() {
+                                    return ParseUnaryExpression(mv->unaryExpression(), ResultUse::Value);
+                                });
+                                return operand.HasValue && !operand.Type.Pointer
+                                    ? compiler->ResolveTypeAlias(operand.Type.TypeName) : std::string();
+                            };
+                            const std::string leftClass = armClassName(assignTernary->expression()->assignmentExpression());
+                            const std::string rightClass = armClassName(assignTernary->conditionalExpression());
+                            if (!leftClass.empty() && !rightClass.empty() && leftClass != rightClass
+                                && compiler->IsCxxRecord(leftClass) && compiler->IsCxxRecord(rightClass))
+                                LogErrorContext(assignTernary, std::format(
+                                    "ternary branches have incompatible types '{}' and '{}'",
+                                    compiler->DisplayCxxClassName(leftClass),
+                                    compiler->DisplayCxxClassName(rightClass)));
+                        }
+                        const bool oldMixedMoveJoin = assignTernary != nullptr
+                            && assignTernary->expression() != nullptr
+                            && assignTernary->conditionalExpression() != nullptr
+                            && ((TopLevelMoveExpression(assignTernary->expression()->assignmentExpression())
+                                    != nullptr)
+                                != (TopLevelMoveExpression(assignTernary->conditionalExpression()) != nullptr));
+                        // Two different C++ classes, both moved, with no derived/base xvalue join: the
+                        // join stays refused (master). The temp path would convert the moved source.
+                        auto differentCxxClassJoin = [&](CFlatParser::ConditionalExpressionContext* ternary) {
+                            auto* left = moveSource(ternary->expression()->assignmentExpression());
+                            auto* right = moveSource(ternary->conditionalExpression());
+                            if (left == nullptr || right == nullptr) return false;
+                            const std::string leftName = compiler->ResolveTypeAlias(left->TypeAndValue.TypeName);
+                            const std::string rightName = compiler->ResolveTypeAlias(right->TypeAndValue.TypeName);
+                            return leftName != rightName && compiler->IsCxxRecord(leftName)
+                                && compiler->IsCxxRecord(rightName);
+                        };
+                        // A join with a nested arm and a non-bare move leaf: the direct path copies it, the temp moves.
+                        std::function<bool(antlr4::tree::ParseTree*)> anyNonBareLeaf =
+                            [&](antlr4::tree::ParseTree* arm) {
+                            auto* nested = SoleTernaryExpression(arm);
+                            if (nested == nullptr) return moveSource(arm) == nullptr;
+                            return nested->expression() != nullptr && nested->conditionalExpression() != nullptr
+                                && (anyNonBareLeaf(nested->expression()->assignmentExpression())
+                                    || anyNonBareLeaf(nested->conditionalExpression()));
+                        };
+                        const bool recursiveClassMoveJoin = assignTernary != nullptr
+                            && assignTernary->expression() != nullptr
+                            && assignTernary->conditionalExpression() != nullptr
+                            && (allArmsMoved(assignTernary->expression()->assignmentExpression())
+                                != allArmsMoved(assignTernary->conditionalExpression())
+                                || (bothSidesMoved && !hasXvalueJoin(assignTernary)
+                                    && !differentCxxClassJoin(assignTernary))
+                                || (bothSidesMoved
+                                    && (SoleTernaryExpression(assignTernary->expression()->assignmentExpression()) != nullptr
+                                        || SoleTernaryExpression(assignTernary->conditionalExpression()) != nullptr)
+                                    && (anyNonBareLeaf(assignTernary->expression()->assignmentExpression())
+                                        || anyNonBareLeaf(assignTernary->conditionalExpression()))));
+                        const bool ternaryAssignTemp = !armReturnTemp
+                            && (cxxClassAssign ? recursiveClassMoveJoin : oldMixedMoveJoin);
                         if (armReturnTemp || ternaryAssignTemp)
                         {
                             forcedTemp = compiler->AllocaAtEntry(
@@ -5822,7 +5925,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     auto* assignTernaryArms = SoleTernaryExpression(assignCtx);
                     // Narrow gate (T288 r3): only a bare name of a non-const, non-pointer local or
                     // parameter counts. Fields, derefs, calls, indexes and const names keep master's path.
-                    auto plainMutableMoveArm = [&](antlr4::tree::ParseTree* arm) {
+                    auto plainMutableMoveLeaf = [&](antlr4::tree::ParseTree* arm) {
                         auto* mv = TopLevelMoveExpression(arm);
                         if (mv == nullptr || mv->unaryExpression() == nullptr) return false;
                         const std::string name = mv->unaryExpression()->getText();
@@ -5832,12 +5935,27 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             && !nv->TypeAndValue.CxxConstRef()
                             && compiler->CxxConstReceiverKind(*nv) == 0;
                     };
+                    std::function<bool(antlr4::tree::ParseTree*)> plainMutableMoveArm =
+                        [&](antlr4::tree::ParseTree* arm) {
+                        if (plainMutableMoveLeaf(arm)) return true;
+                        auto* nested = SoleTernaryExpression(arm);
+                        return nested != nullptr && nested->expression() != nullptr
+                            && nested->conditionalExpression() != nullptr
+                            && plainMutableMoveArm(nested->expression()->assignmentExpression())
+                            && plainMutableMoveArm(nested->conditionalExpression());
+                    };
                     const bool bothArmsMovedJoin = !useMove && assignTernaryArms != nullptr
                         && assignTernaryArms->expression() != nullptr
                         && assignTernaryArms->conditionalExpression() != nullptr
-                        && plainMutableMoveArm(assignTernaryArms->expression()->assignmentExpression())
-                        && plainMutableMoveArm(assignTernaryArms->conditionalExpression());
-                    const bool movedJoinSource = bothArmsMovedJoin && !adoptedRaw && rhsTemp == nullptr
+                        && (compiler->IsCxxRecord(tn)
+                            ? plainMutableMoveArm(assignTernaryArms->expression()->assignmentExpression())
+                                && plainMutableMoveArm(assignTernaryArms->conditionalExpression())
+                            : TopLevelMoveExpression(assignTernaryArms->expression()->assignmentExpression())
+                                != nullptr
+                                && TopLevelMoveExpression(assignTernaryArms->conditionalExpression())
+                                    != nullptr);
+                    const bool movedJoinSource = bothArmsMovedJoin && rhsNV.IsExplicitMove
+                        && !adoptedRaw && rhsTemp == nullptr
                         && !rhsDefault && rhsNV.Storage != nullptr && !rhsNV.TypeAndValue.Pointer
                         && rhsNV.TypeAndValue.TypeName == tn;
                     const bool xvalueSource = !useMove && !adoptedRaw && rhsTemp == nullptr
@@ -7363,10 +7481,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // binding that has just been pointed elsewhere - UNLESS the RHS binding proves an
                 // owner of its own, in which case the proof is carried across. `p = q;` between two
                 // borrowed parameters leaves p a borrow; retiring there laundered a double free.
+                // A borrowed lambda capture lives in the closure env (a GEP): its rebind is recorded
+                // too, so the same-block proof (BorrowProofRetiredByRebind) can retire the borrow.
                 if (namedVar.TypeAndValue.Pointer && namedVar.FieldName.empty()
                     && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
-                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                    && (llvm::isa<llvm::AllocaInst>(namedVar.Storage) || namedVar.IsClosureBorrowCapture))
                 {
+                    // An assignment in the body supersedes the rebind proved before the lambda.
+                    if (namedVar.IsClosureRetiredCapture)
+                        compiler->GetOrCreateStackVariable(namedVar.CallerName).IsClosureRetiredCapture = false;
                     /*
                      * '??=' is itself a JOIN: afterwards the binding holds either its OLD referent
                      * (arm not taken) or the RHS's (arm taken). So the fact survives only when BOTH
@@ -8397,9 +8520,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             RejectBorrowIntoUniqueField(
                                 rightNV, std::format("unique field '{}'", field), ctx);
                         else if (rightNV.IsBorrowed && !rightNV.BorrowedOrigin.empty())
-                            LogErrorContext(ctx, std::format(
-                                "cannot store borrowed parameter '{}' into unique field '{}'",
-                                rightNV.BorrowedOrigin, field));
+                        {
+                            // Same split as the move-sink path: a captured loop element is not a parameter.
+                            if (rightNV.IsClosureBorrowCapture && !compiler->IsFunctionParameter(rightNV.BorrowedOrigin))
+                                LogErrorContext(ctx, std::format(
+                                    "cannot store borrowed pointer '{}' captured by a lambda into unique field '{}'",
+                                    rightNV.BorrowedOrigin, field));
+                            else
+                                LogErrorContext(ctx, std::format(
+                                    "cannot store borrowed parameter '{}' into unique field '{}'",
+                                    rightNV.BorrowedOrigin, field));
+                        }
                         else if (!rightNV.CallerName.empty()
                                  && compiler->IsFunctionParameter(rightNV.CallerName))
                             LogErrorContext(ctx, std::format(
@@ -9426,6 +9557,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     || llvm::isa<llvm::GlobalVariable>(destination))
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
                 && !namedVar.TypeAndValue.Pointer
+                // A copyable destination copies a borrowed field (`t = h->name`); only a move consumes.
+                && (!compiler->IsCopyableType(namedVar.TypeAndValue.TypeName)
+                    || rightNV.TypeAndValue.IsMove)
                 && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx,
                     rightNV.IsElementAccess && !rightNV.MovePathHasDynamicIndex
                         && IsUniqueFieldRead(rightNV)))
@@ -10385,11 +10519,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // destination is destructed (self-assign is guarded by destination != rightNV.Storage
                 // above). On a Move, zero the moved-out source so its always-run scope-exit destructor
                 // is a no-op (cflat value-type move = zero the source) and mark it moved.
-                if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
-                    return finishStore(right);
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                // Only a MOVE consumes the field; a copyable owner (`t = h->name`) copies.
+                if (kind == AssignSourceKind::Move
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
                 if (kind == AssignSourceKind::Move
                     && RejectImplicitConsumeOfOutlivingOwner(
                         compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))

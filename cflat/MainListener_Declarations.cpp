@@ -5962,6 +5962,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         const bool returnsDirectByValueParam = ClassifyValueStructReturns(
             Compiler(), func, directReturnProbe, allParams, nullptr)
             == ValueStructReturnKind::AllBorrowedParam;
+        const bool returnsMovedByValueParam = ReturnsOnlyMovedByValueParam(
+            func, directReturnProbe, allParams);
         if (!returnType.external && compiler->TypeOwnsUniquePointer(returnType.TypeName))
         {
             std::string borrowedParam;
@@ -6298,6 +6300,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     sym.ReturnsAlias = returnType.IsAlias;
                     sym.ReturnsAliasOfByValueParam = aliasOfByValueParam;
                     sym.ReturnsDirectByValueParam = returnsDirectByValueParam;
+                    sym.ReturnsMovedByValueParam = returnsMovedByValueParam;
                     // Per instance: a generic free function's instances register here, not in ForwardRefScanner.
                     if (!returnType.external && returnType.Pointer)
                     {
@@ -7738,14 +7741,14 @@ static CFlatParser::PostfixExpressionContext* SolePostfixExpression(antlr4::tree
         return nullptr;
     }
 
-static bool PostfixExpressionEndsInCall(CFlatParser::PostfixExpressionContext* postfix)
+bool PostfixExpressionEndsInCall(CFlatParser::PostfixExpressionContext* postfix)
 {
         return postfix != nullptr && postfix->children.size() >= 3
             && dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(
                 postfix->children[postfix->children.size() - 2]) != nullptr;
 }
 
-static bool PostfixCallHasChainedReceiver(CFlatParser::PostfixExpressionContext* postfix)
+bool PostfixCallHasChainedReceiver(CFlatParser::PostfixExpressionContext* postfix)
 {
         if (postfix == nullptr || postfix->children.empty()) return false;
         auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(postfix->children[0]);
@@ -11550,6 +11553,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // must be suppressed (IsAliasBorrow) - otherwise it double-frees the source's buffer.
                 bool srcIsAlias = false;
                 bool srcIsAliasReturnBorrow = false;
+                // Set when an alias-return element (`string t = h.vals[0]`) was deep-copied.
+                bool srcAliasElemCopied = false;
                 // A non-pointer alias declaration is a reference binding. Keep the RHS slot instead
                 // of copying its loaded value into the declaration's temporary alloca.
                 llvm::Value* aliasStorage = nullptr;
@@ -12841,6 +12846,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && IsImplicitCopyableStringTemp(rightNV)
                                     && AdoptImplicitStringTempCopy(rightNV, right, assignmentExpression))
                                 {
+                                    srcAliasElemCopied = true;
                                     initializerSourceNV = rightNV;
                                 }
                                 // The reference ABI keeps a direct alias return's Storage, so the
@@ -12854,6 +12860,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !rightNV.TypeAndValue.IsMove)
                                 {
                                     right = compiler->EmitOwnedStringDeepCopy(right);
+                                    srcAliasElemCopied = true;
                                     initializerSourceNV = rightNV;
                                 }
                                 else if (rightNV.FromOwningTempField && !srcMovableTempField
@@ -15660,7 +15667,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // into another field is rejected as a laundered field-to-field copy. An implied
                         // move (above) makes the local a true owner, not a borrow, so skip the taint.
                         if (typeAndValue.TypeName == "string" && srcBorrowsOwnedString
-                            && !srcMovableTempField && !didDeepCopyBorrowString)
+                            && !srcMovableTempField && !didDeepCopyBorrowString && !srcAliasElemCopied)
                             compiler->SetVariableBorrowsOwnedString(name, true);
 
                         // Adopt a heap-allocating call or tracked operator result into this local.
@@ -15676,6 +15683,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->UnregisterOwnedStringTemp(right);
                             compiler->lastCallReturnsOwned = false;
                         }
+                        // The deep copy of an alias-return element is an independent buffer the local
+                        // must destroy; without the owning flag its scope-exit destructor is skipped.
+                        if (srcAliasElemCopied && typeAndValue.TypeName == "string")
+                            compiler->GetOrCreateStackVariable(name).IsOwningString = true;
 
                         // Record `new T[n]` provenance on a raw `T*` local: a DIRECT new-array
                         // initializer, or a plain copy of an already-tagged pointer local. A `T[]`

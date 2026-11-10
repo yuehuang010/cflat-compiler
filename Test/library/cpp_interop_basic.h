@@ -1988,6 +1988,7 @@ namespace cppi
         template <class U> XvTrivialTemplate(U&& x) noexcept : v(x.v + 100) { x.v = -1; ++xv_moves; }
     };
     inline int xv_take_trivial(XvTrivialTemplate x) noexcept { return x.v; }
+    struct XvTrivialTemplateHolder { XvTrivialTemplate item; };
     // Trivially copyable with a deleted move: `std::move(x)` selects the deleted constructor.
     struct XvTrivialNoMove
     {

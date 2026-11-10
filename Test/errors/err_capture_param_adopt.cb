@@ -1,0 +1,23 @@
+import "unique.cb";
+
+// A by-value lambda capture of a borrowed parameter stays a borrow in the body: adopting it into a
+// unique field must be refused, as the direct store is. Before the fix this compiled and
+// double-freed at run time (rc 134).
+struct CapRes { int id = 0; };
+struct CapHolder { unique CapRes* p = nullptr; };
+
+void capAdoptParam(CapRes* q)
+{
+    CapHolder t = default;
+    Lambda<void()> f = () => {
+        expect_error("cannot store borrowed parameter 'q' into unique field");
+        t.p = q;
+    };
+    f();
+}
+
+extern int main()
+{
+    capAdoptParam(nullptr);
+    return 0;
+}

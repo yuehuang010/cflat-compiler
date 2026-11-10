@@ -5,13 +5,21 @@ Summary: W13 (2026-09-30) made const record pointers select C++ overloads like c
 (Item 1, ambiguity in overload sets with a variadic, is fixed: an all-C++ set with a variadic
 whose ellipsis receives arguments now runs the pairwise [over.match.best] ranking, an ellipsis
 argument ranking worst. Items keep their original numbers.)
-4. User-defined conversions are never candidates at C++ call arguments: `u1(P*)`, `u1(D*)`, `u1(CA)` with `CA(const P*)` and a `const P*` argument -> clang 3, CFlat refuses; `u3(cp)` with only `u3(CA)` refuses.
+(Item 4, user-defined conversions at C++ call arguments, is fixed for C++ callees: converting
+constructors landed earlier; conversion operators returning pointers now honour const (no
+const-dropping result binds a mutable pointer), rank the qualification second, reach a
+derived-class result at its base offset, pick the base-most class when several derived results
+are bases of one another, and rank primitive pointees (`int*` over `const int*`). An explicit
+`operator P*` no longer shadows an implicit `operator const P*`. Items keep their original numbers.)
+Still open under item 4 (refused on master too): a CFlat callee taking `P*` given a class whose
+conversion yields `D*` (base `P`) is refused, where clang accepts it (oracle 7, CFlat refuses).
+Unrelated derived results (`D1*` and `D3*`, neither a base of the other) stay refused, as clang does.
 
 Ruling (maintainer, 2026-09-30): C++ call arguments keep CFlat's stricter conversion rule (no int ->
 double etc. at calls), for type safety - NOT clang's arithmetic conversions. `n1(P*, int)` /
 `n1(const P*, double)` with `n1(cp, 5)` stays an error naming the candidate; the workaround is
-`n1(cp, 5.0)` or `n1(cp, (double)n)` (verified). Item 4 (user-defined conversions) is unaffected:
-it is about class conversions, not arithmetic ones.
+`n1(cp, 5.0)` or `n1(cp, (double)n)` (verified). User-defined conversions are about class
+conversions, not arithmetic ones, so the ruling does not limit them.
 
 ## Item 1 leftovers (Q7 Sol r1, 2026-10-01; master-identical)
 - Constructor sets: `C(int, ...)` / `C(long, int)`, `C(1, 2)` - clang ambiguous, CFlat runs C(long, int). Ctor projection omits the variadic (LLVMBackend_CInterop.cpp ~12405, ~18655); CxxConstructorNeedsClangResolution is false without ctor templates.

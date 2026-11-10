@@ -277,6 +277,7 @@ import cpp "library/cpp_interop_t74.h";
 import cpp "library/cpp_dtorord.hpp";
 import cpp "library/t70_xvalue_overloads.h";
 import cpp "library/cpp_t105_conversion_operators.hpp";
+import cpp "library/cpp_ucv_user_conversions.hpp";
 import cpp "library/cpp_t97_fieldctor.h";
 import cpp "library/cpp_t68_intptr.hpp";
 import cpp "library/cpp_t62_static_auto.hpp";
@@ -335,6 +336,7 @@ import cpp "library/cpp_t48_nullptr.hpp";
 import cpp "library/cpp_t52_refnull.hpp";
 import cpp "library/cpp_t111_nullptr_t.hpp";
 import cpp "library/cpp_t98_macro_constant.hpp";
+import cpp "library/cpp_t98_macro_ref.hpp";
 import cpp "library/cpp_t28_fwdref.hpp";
 import cpp "library/cpp_t525_fnwrap_r3.hpp";
 import cpp "library/t84_conversion.hpp";
@@ -368,6 +370,7 @@ import cpp "library/cpp_t49_enum_args.hpp";
 import cpp "library/cpp_ctortpl.hpp";
 import cpp "library/cpp_t86_literals.hpp";
 import cpp "library/cpp_t100_long_double.hpp";
+import cpp "library/cpp_arithld_longdouble.hpp";
 enum T49Own : int { T49V = 6 };
 enum T64U8 : u8 { T64U8Hi = 200 };
 enum T64U16 : u16 { T64U16Hi = 40000 };
@@ -511,6 +514,8 @@ import cpp "library/cpp_mix7_fnptr_bool.hpp";
 import cpp "library/cpp_mix14_scalar_ctor.hpp";
 import cpp "library/cpp_mix18_overloads.hpp";
 import cpp "library/cpp_mix11_ctor.hpp";
+import cpp "library/cpp_cvamb_conv.hpp";
+import cpp "library/cpp_cvamb_brace.hpp";
 
 int mix7FnTwice(int x) { return x * 2; }
 int mix14Twice(int x) { return x * 2; }
@@ -691,6 +696,11 @@ import cpp "library/cpp_mixed_access.hpp";
 import cpp "library/cpp_private_overloads.hpp";
 import cpp "library/cpp_move_operand_ops.hpp";
 import cpp "library/cpp_copy_parity.hpp";
+import cpp "library/cpp_copy_ctor_pick.hpp";
+// Return of a parameter and a move fallback: clang's implicit move picks the const copy constructor.
+cpcpick.CV ctorPickReturnParam(cpcpick.CV x) { return x; }
+cpcpick.CV ctorPickMoveParam(cpcpick.CV a) { return move a; }
+int ctorPickTakeValue(cpcpick.CV x) { return x.v; }
 struct CopyFieldMutableDefaultCFlatHolder { cppcp.CopyFieldMutableDefault value = default; };
 struct CopyMoveFieldCFlatHolder { cppcp.DF value = cppcp.DF(0); };
 // T310 FLDINIT: scalar field defaults of C++ class type run the converting constructor.
@@ -2198,6 +2208,7 @@ struct EscAddrRef { int* p = nullptr; };
 struct McCppPodHolder { cppfopun.F field; };
 cppfopun.F mcMoveCppPod(McCppPodHolder* p) { return move p->field; }
 // A C++ field with a user move ctor and a trivial destructor moves (source moved-from), any spelling.
+struct XvSinkBox { cppi.XvTrivialTemplate item = cppi.XvTrivialTemplate(0); };
 struct McMoveTrivIn { cppi.XvMoveTrivDtor m = default; };
 struct McMoveTrivOuter
 {
@@ -4820,6 +4831,14 @@ int primitive_const_param_rank(const int* value)
     return cppi.primitive_int_rank(value);
 }
 
+// ARITHLD items 1-2: a native operator's floating result keeps double or long double in a chain.
+int arithldId(double x) { return 2; }
+int arithldId(longdouble x) { return 3; }
+int arithldG<T>(T x) { return arithldId(x); }
+struct ArithldSv { double v = default; };
+double operator+(ArithldSv a, ArithldSv b) { return a.v + b.v; }
+longdouble operator*(ArithldSv a, ArithldSv b) { return (longdouble)a.v * (longdouble)b.v; }
+
 extern int main()
 {
     int nullmacfnValue = 7;
@@ -5061,6 +5080,41 @@ extern int main()
         if (cntK.v != 20) return 55001;
     }
     if (mvops.Cnt.mv != 0) return 55002;
+    // Copy-ctor pick (clang++ oracle): a returned parameter or a move without a move constructor
+    // copies through the const copy constructor; a non-const lvalue argument takes T(T&).
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV pickSource = cpcpick.CV(7);
+        cpcpick.CV pickTarget = ctorPickReturnParam(pickSource);
+        if (pickTarget.v != 10 || cpcpick.CV.mutCopy != 1 || cpcpick.CV.constCopy != 1) return 55101;
+    }
+    if (cpcpick.CV.born != 3 || cpcpick.CV.dead != 3) return 55102;
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV pickTarget = ctorPickReturnParam(cpcpick.CV(7));
+        if (pickTarget.v != 9 || cpcpick.CV.mutCopy != 0 || cpcpick.CV.constCopy != 1) return 55103;
+    }
+    if (cpcpick.CV.born != 2 || cpcpick.CV.dead != 2) return 55104;
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV pickSource = cpcpick.CV(7);
+        cpcpick.CV pickTarget = ctorPickMoveParam(pickSource);
+        if (pickTarget.v != 10 || cpcpick.CV.mutCopy != 1 || cpcpick.CV.constCopy != 1) return 55105;
+    }
+    if (cpcpick.CV.born != 3 || cpcpick.CV.dead != 3) return 55106;
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV pickSource = cpcpick.CV(7);
+        cpcpick.CV pickTarget = move pickSource;
+        if (pickTarget.v != 9 || cpcpick.CV.mutCopy != 0 || cpcpick.CV.constCopy != 1) return 55107;
+    }
+    if (cpcpick.CV.born != 2 || cpcpick.CV.dead != 2) return 55108;
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV pickSource = cpcpick.CV(7);
+        if (ctorPickTakeValue(pickSource) != 8 || cpcpick.CV.mutCopy != 1 || cpcpick.CV.constCopy != 0) return 55109;
+    }
+    if (cpcpick.CV.born != 2 || cpcpick.CV.dead != 2) return 55110;
     // Copy assignment binds the overload clang picks: a const source takes operator=(const CV&),
     // a non-const lvalue takes operator=(CV&).
     const cppcp.CV cpCx = cppcp.CV(7);
@@ -5692,6 +5746,30 @@ extern int main()
     if (+t123Ref != 41 || +t123.atomicRef() != 37) return 12305;
     t123.PointerOnly t123PointerOnly = default;
     if ((+t123PointerOnly) != &t123.pointerValue) return 12306;
+    // UCV: a user conversion to a base pointer reaches the base subobject at its offset (clang: 42),
+    // identity beats the qualification-adding overload (clang: 1), and a const pointer picks const (clang: 2).
+    {
+        ucv.D2 ucvObject = default; ucvObject.v = 42;
+        ucv.ConstBaseSource ucvBase = default; ucvBase.d = &ucvObject;
+        if (ucv.takeBase(ucvBase) != 42) return 260012;
+        ucv.P2 ucvP = default; ucvP.v = 5;
+        ucv.MutableSource ucvMutable = default; ucvMutable.m = &ucvP;
+        if (ucv.pickMut(ucvMutable) != 1) return 260013;
+        ucv.P2 ucvConstP = default;
+        ucv.ConstSource ucvConst = default; ucvConst.c = &ucvConstP;
+        if (ucv.pickMut(ucvConst) != 2) return 260014;
+        ucv.P2 ucvExplP = default; ucv.ExplSource ucvExpl = default; ucvExpl.m = &ucvExplP;
+        if (ucv.pickMut(ucvExpl) != 2) return 260015;
+        if ((ucv.P2*)ucvExpl != nullptr) return 260018;
+        if ((ucv.P2*)ucvMutable != &ucvP) return 260019;
+        ucv.D2 ucvDerivedD = default; ucvDerivedD.v = 7;
+        ucv.E2 ucvDerivedE = default; ucvDerivedE.v = 8;
+        ucv.DerivedPick ucvPick = default; ucvPick.e = &ucvDerivedE; ucvPick.d = &ucvDerivedD;
+        if (ucv.takeP2(ucvPick) != 7) return 260016;
+        int ucvInt = 4;
+        ucv.IntSource ucvIntSource = default; ucvIntSource.i = &ucvInt;
+        if (ucv.pickInt(ucvIntSource) != 1) return 260017;
+    }
     t123.a.value = 1;
     t123.b.value = 2;
     if (-(true ? t123.a : t123.b) != 502 || t123.a.value != 2 || t123.b.value != 2) return 12307;
@@ -6021,6 +6099,33 @@ extern int main()
     if (t100.pick(t100D) != 2) return 98233;
     if (t100.deduce(0.25l + 1.0f) != 3) return 98234;
     if (t100.pick(t100Ld + 1.0f) != 3) return 98235;
+    // ARITHLD items 1-2 (clang++ -std=c++20 oracle): a native or C++ operator's floating result keeps
+    // its name through a further step, so the overload pick is long double, as clang picks it.
+    longdouble arithldLd = 0.5l;
+    double arithldD = 0.25;
+    ArithldSv arithldA = { v = 1.0 };
+    ArithldSv arithldB = { v = 2.0 };
+    if (arithldG(arithldA + arithldB + arithldLd) != 3) return 98236;
+    if (arithldG(arithldA + arithldB - arithldLd) != 3) return 98237;
+    if (arithldG(arithldA + arithldB) != 2) return 98238;
+    if (arithldG(arithldA * arithldB) != 3) return 98239;
+    if (arithldG(arithldA * arithldB + arithldD) != 3) return 98240;
+    if (arithldG(arithldLd * (arithldA + arithldB)) != 3) return 98241;
+    if (arithldG(arithldD * (arithldA * arithldB)) != 3) return 98242;
+    if (arithldId(arithldA * arithldB + arithldD) != 3) return 298243;
+    if (arithldId(arithldD + arithldA * arithldB) != 3) return 298244;
+    // C++ operators from cpp_arithld_longdouble.hpp; born must equal dead on every exit path.
+    arithld.LdCount.reset();
+    {
+        arithld.LdCount arithldCa = arithld.LdCount(1.0);
+        arithld.LdCount arithldCb = arithld.LdCount(2.0);
+        if (arithldG(arithldCa + arithldCb) != 3) return 98243;
+        if (arithldG(arithldCa + arithldCb + arithldLd) != 3) return 98244;
+        if (arithldG(arithldCa - arithldCb + arithldLd) != 3) return 98245;
+        if (arithld.deduce(arithldCa + arithldCb) != 3) return 98246;
+        if (arithldG(arithldCa - arithldCb) != 2) return 98247;
+    }
+    if (arithld.LdCount.born != 12 || arithld.LdCount.dead != 12) return 98248;
     // T78 (ruling 2026-10-09): integer, bool and unscoped enum arguments widen to a C++ double
     // at free, member, constructor and new calls, as clang accepts them.
     if (t78.takeD(3) != 3) return 98101;
@@ -7844,6 +7949,14 @@ extern int main()
     // the enum constructor in a brace list (71), a namespaced one too (31). Lvalues stay as master.
     if (cpi_t98.macroTypeTemplate(T98_ANON_VALUE) != 3) return 99313;
     if (cpi_t98.macroAnonFwd(T98_ANON_VALUE) != 22) return 99317;
+    // T98 macro: a macro naming an unnamed enumerator is the same prvalue (clang: T = T98AnonEnum, 22 and 3).
+    if (cpi_t98.macroAnonFwd(T98_ANON_MACRO) != 22) return 99318;
+    if (cpi_t98.macroTypeTemplate(T98_ANON_MACRO) != 3) return 99319;
+    // T98 macro: std.min, retr, retf and make_pair over the macro keep master's int path (clang: 17).
+    if (std.min(T98_ANON_MACRO, T98_ANON_MACRO) != 17) return 99324;
+    if (cpi_t98r.retr(T98_ANON_MACRO) != 17 || cpi_t98r.retf(T98_ANON_MACRO) != 17) return 99325;
+    auto t98MacroPair = std.make_pair(T98_ANON_MACRO, 1);
+    if (t98MacroPair.first != 17 || t98MacroPair.second != 1) return 99326;
     cpi_t98.MacroAnonPick t98AnonBraceEnum{T98_ANON_VALUE};
     if (t98AnonBraceEnum.n != 71) return 99321;
     cpi_t98.NsAnonPick t98NsAnonBrace{cpi_t98.NsAnonValue};
@@ -18755,6 +18868,40 @@ extern int main()
         delete onT;
         if (onV != 0 || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3366;
 
+        // C++17 elision: `new T(mk())` builds the result in the block (legs 4001-4002). The live
+        // count is 1 before delete and the destructor runs once, at delete.
+        cppon.reset();
+        cppon.ElideNM* elN = new cppon.ElideNM(cppon.mkElideNM(4));
+        int elLive = cppon.live();
+        int elV = elN->v;
+        delete elN;
+        if (elV != 4 || elLive != 1 || cppon.live() != 0 || cppon.dtors() != 1) return 4001;
+        cppon.ElideNV* elP = new cppon.ElideNV(cppon.mkElideNV(9));
+        int elP2 = elP->v;
+        delete elP;
+        if (elP2 != 9) return 4002;
+        // Elision arms only a bare call argument: a receiver call (4003), an explicit move (4004)
+        // and a discarded `new` statement (4005) keep master's behaviour and clang's counts.
+        cppon.reset();
+        cppon.ElideMV* rcV = new cppon.ElideMV(cppon.mkElideMV(1).val() + 6);
+        int rcR = rcV->v;
+        delete rcV;
+        if (rcR != 7 || cppon.live() != 0 || cppon.dtors() != 2) return 4003;
+        cppon.reset();
+        cppon.elideMoveReset();
+        cppon.ElideMV* mvP = new cppon.ElideMV(move(cppon.mkElideMV(1)));
+        int mvV = mvP->v;
+        delete mvP;
+        if (mvV != 1 || cppon.elideMoveCount() != 1 || cppon.live() != 0 || cppon.dtors() != 2) return 4004;
+        cppon.reset();
+        new cppon.ElideMV(cppon.mkElideMV(5));
+        if (cppon.live() != 1 || cppon.dtors() != 0) return 4005;
+        int parenMoves = cppon.elideMoveCount();
+        cppon.ElideMV* parenP = new cppon.ElideMV((cppon.mkElideMV(2)));
+        int parenV = parenP->v;
+        if (parenV != 2 || cppon.elideMoveCount() != parenMoves) return 4006;
+        delete parenP;
+
         // A runtime delete count destroys every polymorphic element before one array free.
         cppunw.reset();
         cppon.reset();
@@ -21330,6 +21477,43 @@ extern int main()
         if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 99003;
         T288DeclBoth(false, q);
         if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 99004;
+        int[9] q288;
+        // Const move operands form a const xvalue join: declaration copies the selected source.
+        T288DeclConstBoth(true, q288);
+        if (q288[0] != 21 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0 || q288[6] != 3) return 99019;
+        T288DeclConstBoth(false, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0 || q288[6] != 3) return 99020;
+        // Nested same-class move joins retain the xvalue assignment path (clang++ -std=c++20).
+        T288NestedOuter(true, q288);
+        if (q288[0] != 21 || q288[1] != -1 || q288[2] != 22 || q288[3] != 3 || q288[4] != 0 || q288[5] != 0 || q288[6] != 3 || q288[7] != 0 || q288[8] != 1) return 99021;
+        T288NestedOuter(false, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != -1 || q288[3] != 3 || q288[4] != 0 || q288[5] != 0 || q288[6] != 3 || q288[7] != 0 || q288[8] != 1) return 99022;
+        // Derived/base move operands keep the C&& join and select move assignment without a temp.
+        T288DerivedBase(true, q288);
+        if (q288[0] != 21 || q288[1] != -1 || q288[2] != 22 || q288[3] != 3 || q288[4] != 0 || q288[5] != 0 || q288[6] != 3 || q288[7] != 0 || q288[8] != 1) return 99023;
+        T288DerivedBase(false, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != -1 || q288[3] != 3 || q288[4] != 0 || q288[5] != 0 || q288[6] != 3 || q288[7] != 0 || q288[8] != 1) return 99024;
+        // A field move arm (not a bare name) still move-assigns, as clang does; the other arm copies.
+        T391FieldOneAsg(true, q288);
+        if (q288[0] != 31 || q288[1] != -1 || q288[2] != 22 || q288[3] != 3 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 1 || q288[8] != 4) return 99025;
+        T391FieldOneAsg(false, q288);
+        if (q288[0] != 22 || q288[1] != 31 || q288[2] != 22 || q288[3] != 3 || q288[4] != 1 || q288[5] != 0 || q288[6] != 0 || q288[7] != 1 || q288[8] != 4) return 99026;
+        // One const move arm: clang's composite is const, so the declaration copies both arms.
+        T391DeclOneConst(true, q288);
+        if (q288[0] != 21 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0) return 99027;
+        T391DeclOneConst(false, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0) return 99028;
+        // A nested join with a field move leaf still moves it; parentheses keep the const composite (clang).
+        T391NestedField(true, q288);
+        if (q288[0] != 31 || q288[1] != -1 || q288[2] != 22 || q288[6] != 0 || q288[7] != 1) return 99029;
+        T391NestedField(false, q288);
+        if (q288[0] != 22 || q288[1] != 31 || q288[2] != -1 || q288[6] != 0 || q288[7] != 1) return 99030;
+        T391TopFieldBesideNested(true, q288);
+        if (q288[0] != 31 || q288[1] != -1 || q288[2] != 22 || q288[6] != 0 || q288[7] != 1) return 99033;
+        T391DeclParenConst(true, q288);
+        if (q288[0] != 21 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0) return 99031;
+        T391DeclParenConst(false, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0) return 99032;
         T288AsgBothLoop(true, q);
         if (q[0] != -1 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99005;
         T288AsgBothLoop(false, q);
@@ -22175,6 +22359,56 @@ extern int main()
         cppi.XvTrivialTemplate tvD = cppi.XvTrivialTemplate(4);
         const int tvArg = cppi.xv_take_trivial(move tvD);
         if (tvB.v != 102 || tvC.v != 103 || tvArg != 104 || cppi.xv_move_count() != 3) return 7047;
+    }
+    // `move` of an array element or field reaches the selected constructor at every other sink
+    // (clang++ -std=c++20 oracle: value, source -1, one move per sink). Pre-fix: byte copy
+    // and zeroed source (7 / 0, no count), or a constructor reading the zeroed source (100).
+    cppi.xv_reset();
+    {
+        cppi.XvTrivialTemplate[2] skA = {cppi.XvTrivialTemplate(7), cppi.XvTrivialTemplate(8)};
+        cppi.XvTrivialTemplate skB = move skA[0];
+        if (skB.v != 107 || skA[0].v != -1 || skA[1].v != 8 || cppi.xv_move_count() != 1) return 7048;
+        const int skArg = cppi.xv_take_trivial(move skA[1]);
+        if (skArg != 108 || skA[1].v != -1 || cppi.xv_move_count() != 2) return 7049;
+    }
+    cppi.xv_reset();
+    {
+        XvSinkBox skSrc = {item = cppi.XvTrivialTemplate(7)};
+        if (skSrc.item.v != 7 || cppi.xv_move_count() != 0) return 7050;
+        auto skAuto = move skSrc.item;
+        if (skAuto.v != 107 || skSrc.item.v != -1 || cppi.xv_move_count() != 1) return 7051;
+        XvSinkBox skSrc2 = {item = cppi.XvTrivialTemplate(9)};
+        cppi.XvTrivialTemplate skTyped = move skSrc2.item;
+        if (skTyped.v != 109 || skSrc2.item.v != -1 || cppi.xv_move_count() != 2) return 7052;
+    }
+    cppi.xv_reset();
+    {
+        cppi.XvTrivialTemplate skLoc = cppi.XvTrivialTemplate(5);
+        XvSinkBox skBrace = {item = move skLoc};
+        if (skBrace.item.v != 105 || skLoc.v != -1 || cppi.xv_move_count() != 1) return 7053;
+        cppi.XvTrivialTemplate[1] skEl = {cppi.XvTrivialTemplate(6)};
+        XvSinkBox skBraceEl = {item = move skEl[0]};
+        if (skBraceEl.item.v != 106 || skEl[0].v != -1 || cppi.xv_move_count() != 2) return 7054;
+        cppi.XvTrivialTemplate skLoc2 = cppi.XvTrivialTemplate(4);
+        cppi.XvTrivialTemplate* skLoc2P = &skLoc2;
+        cppi.XvTrivialTemplateHolder skAgg = {move skLoc2};
+        if (skAgg.item.v != 104 || skLoc2P->v != -1 || cppi.xv_move_count() != 3) return 7055;
+    }
+    cppi.xv_reset();
+    {
+        std.vector<cppi.XvTrivialTemplate> skVec;
+        skVec.reserve(4);
+        cppi.XvTrivialTemplate[2] skVa = {cppi.XvTrivialTemplate(1), cppi.XvTrivialTemplate(2)};
+        skVec.push_back(move skVa[0]);
+        skVec.emplace_back(move skVa[1]);
+        if (skVec[0].v != 101 || skVec[1].v != 102 || skVa[0].v != -1 || skVa[1].v != -1
+            || cppi.xv_move_count() != 2) return 7056;
+    }
+    cppi.xv_reset();
+    {
+        cppi.XvTrivialTemplate[1] skDisc = {cppi.XvTrivialTemplate(7)};
+        _ = move skDisc[0];
+        if (skDisc[0].v != 0 || cppi.xv_move_count() != 0) return 7057;
     }
     cppi.xv_reset();
     {
@@ -28567,6 +28801,99 @@ void T288DeclBoth(bool k, int* o)
     o[0] = zv; o[1] = a.v; o[2] = b.v;
     T249ReadCounts(o);
 }
+void T288DeclConstBoth(bool k, int* o)
+{
+    int zv = 0; int av = 0; int bv = 0;
+    cppbv.TernaryCnt.reset();
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21); const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt z = k ? move a : move b;
+        zv = z.v; av = a.v; bv = b.v;
+    }
+    o[0] = zv; o[1] = av; o[2] = bv;
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+void T288NestedOuter(bool k, int* o)
+{
+    cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21); cppbv.TernaryCnt b = cppbv.TernaryCnt(22); cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        z = k ? (k ? move a : move b) : move b;
+        o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+    o[7] = cppbv.TernaryCnt.copyAssigns; o[8] = cppbv.TernaryCnt.moveAssigns;
+}
+void T288DerivedBase(bool k, int* o)
+{
+    cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryDerived a = cppbv.TernaryDerived(21); cppbv.TernaryCnt b = cppbv.TernaryCnt(22); cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        z = k ? move a : move b;
+        o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+    o[7] = cppbv.TernaryCnt.copyAssigns; o[8] = cppbv.TernaryCnt.moveAssigns;
+}
+struct T391Holder { cppbv.TernaryCnt f = cppbv.TernaryCnt(0); };
+void T391FieldOneAsg(bool k, int* o)
+{
+    cppbv.TernaryCnt.reset();
+    {
+        T391Holder s; s.f.v = 31;
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22); cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        z = k ? move s.f : b;
+        o[0] = z.v; o[1] = s.f.v; o[2] = b.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies; o[5] = cppbv.TernaryCnt.moves;
+    o[6] = cppbv.TernaryCnt.copyAssigns; o[7] = cppbv.TernaryCnt.moveAssigns; o[8] = cppbv.TernaryCnt.dtors;
+}
+void T391DeclOneConst(bool k, int* o)
+{
+    cppbv.TernaryCnt.reset();
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21); cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt z = k ? move a : move b;
+        o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies; o[5] = cppbv.TernaryCnt.moves;
+}
+void T391NestedField(bool k, int* o)
+{
+    cppbv.TernaryCnt.reset();
+    {
+        T391Holder s; s.f.v = 31;
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22); cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        z = k ? (k ? move s.f : move b) : move b;
+        o[0] = z.v; o[1] = s.f.v; o[2] = b.v;
+    }
+    o[6] = cppbv.TernaryCnt.copyAssigns; o[7] = cppbv.TernaryCnt.moveAssigns;
+}
+void T391TopFieldBesideNested(bool k, int* o)
+{
+    cppbv.TernaryCnt.reset();
+    {
+        T391Holder s; s.f.v = 31;
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21); cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        z = k ? move s.f : (k ? move a : move b);
+        o[0] = z.v; o[1] = s.f.v; o[2] = b.v;
+    }
+    o[6] = cppbv.TernaryCnt.copyAssigns; o[7] = cppbv.TernaryCnt.moveAssigns;
+}
+void T391DeclParenConst(bool k, int* o)
+{
+    cppbv.TernaryCnt.reset();
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21); cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt z = (k ? move a : move b);
+        o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies; o[5] = cppbv.TernaryCnt.moves;
+}
 void T288AsgBothLoop(bool k, int* o)
 {
     cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
@@ -28830,6 +29157,49 @@ int srctypeRound4Legs()
     if (cva_h(cvaLv4) != 2 || cva_h(cvaDv) != 3) return 69109;
     if (cvaMo.mb(cvaCv) != 2 || cvaMo.mb(CvaV(6)) != 2) return 69110;
     if (cvaMo.mb(move cvaLv4) != 2) return 69111;
+    // CVAMB: a by-value class parameter reached through a conversion operator alone, or beside an
+    // int overload, is picked as clang picks it; each temporary is born and destroyed once.
+    CvcPU cvcU = CvcPU();
+    cvcU.v = 5;
+    cvc_reset();
+    int cvcOne = cvc_one(cvcU);
+    int cvcOneBorn = cvc_born();
+    int cvcOneDied = cvc_died();
+    if (cvcOne != 8 || cvcOneBorn != 1 || cvcOneDied != 1) return 69112;
+    cvc_reset();
+    int cvcTwo = cvc_two(cvcU);
+    int cvcTwoBorn = cvc_born();
+    int cvcTwoDied = cvc_died();
+    if (cvcTwo != 4 || cvcTwoBorn != 1 || cvcTwoDied != 1) return 69113;
+    cvc_reset();
+    int cvcRef = cvc_ref(cvcU);
+    int cvcRefBorn = cvc_born();
+    int cvcRefDied = cvc_died();
+    if (cvcRef != 6 || cvcRefBorn != 1 || cvcRefDied != 1) return 69114;
+    CvcNC cvcN = CvcNC();
+    cvcN.v = 5;
+    if (cvc_nc_one(cvcN) != 8) return 69115;
+    // CVAMB: a receiver's cv / ref-qualifier and a plain int beside a braced list rank as clang ranks them.
+    CvbM cvbM = CvbM();
+    if (cvbM.mc({1, 2}) != 2 || cvbM.mrr({1, 2}) != 2 || cvbM.mvq({1, 2}) != 2) return 69116;
+    if (cvb_pd({1, 2}, 1) != 2) return 69117;
+    // CVAMB r1: reference parameters beside a braced list and a literal that cannot bind int& (clang 1, 2, 1, 1),
+    // a pointer tie decided by the defaulted parameter's absence, and a by-value conversion beside a const& overload.
+    int cvbA = 1;
+    if (cvb_ref1(cvbA, {1, 2}) != 1 || cvb_nv(1, {1, 2}) != 2) return 69118;
+    int* cvbP = &cvbA;
+    if (cvb_dp(cvbP, {1, 2}) != 2) return 69119;
+    CvbR cvbR = CvbR();
+    if (cvbR.f(cvbA, {1, 2}) != 1) return 69120;
+    CvcPU cvcMU = CvcPU();
+    cvcMU.v = 5;
+    cvc_reset();
+    int cvcMulti = cvc_multi(cvcMU, 1);
+    if (cvcMulti != 1 || cvc_born() != 1 || cvc_died() != 1) return 69121;
+    // CVAMB r2: the best of several candidates preferred over the CFlat winner, and a T*& binding (clang 3, 1).
+    short cvcS = 1;
+    if (cvc_pick(cvcMU, cvcS) != 3) return 69122;
+    if (cvb_pref(cvbP, {1, 2}) != 1) return 69123;
     // Fixed-array brace sinks select the same constructors as std::move in C++20.
     cppi.xv_reset();
     {

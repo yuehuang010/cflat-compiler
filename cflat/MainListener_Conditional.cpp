@@ -1809,6 +1809,110 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
             }
             thinValue = boxed;
         }
+        else if (tt->isStructTy() && ft->isStructTy())
+        {
+            auto* trueStruct = llvm::cast<llvm::StructType>(tt);
+            auto* falseStruct = llvm::cast<llvm::StructType>(ft);
+            if (trueStruct->hasName() && falseStruct->hasName())
+            {
+                const std::string trueName = compiler->ResolveTypeAlias(trueStruct->getName().str());
+                const std::string falseName = compiler->ResolveTypeAlias(falseStruct->getName().str());
+                if (trueName != falseName && compiler->IsCxxRecord(trueName)
+                    && compiler->IsCxxRecord(falseName))
+                {
+                    auto trueType = trueShape.hasSourceType
+                        ? trueShape.sourceType : InferTernaryArmType(trueShape);
+                    auto falseType = falseShape.hasSourceType
+                        ? falseShape.sourceType : InferTernaryArmType(falseShape);
+                    trueType.TypeName = trueName;
+                    falseType.TypeName = falseName;
+                    auto category = [](const LLVMBackend::TypedValue& shape) {
+                        using CxxArmCategory = LLVMBackend::CxxArmCategory;
+                        if (shape.isExplicitMove) return CxxArmCategory::Xvalue;
+                        if (!shape.isRvalue) return CxxArmCategory::Lvalue;
+                        if (shape.hasSourceType && shape.sourceType.IsRvalueRef)
+                            return CxxArmCategory::Xvalue;
+                        if (shape.hasSourceType && shape.sourceType.IsCxxRef())
+                            return CxxArmCategory::Lvalue;
+                        return CxxArmCategory::Prvalue;
+                    };
+                    const auto trueCategory = category(trueShape);
+                    const auto falseCategory = category(falseShape);
+                    const auto verdict = compiler->ClassifyCxxTernary(trueType,
+                        trueCategory, falseType, falseCategory);
+                    using CxxKind = LLVMBackend::CxxTernaryVerdict::Kind;
+                    // A prefix-incompatible call refuses the join as master did (no xvalue lowering).
+                    const bool prefixRefused = inCallArgument_ && cxxTernaryCallPrefixIncompatible_;
+                    const bool xvalueJoin = trueCategory == LLVMBackend::CxxArmCategory::Xvalue
+                        && falseCategory == LLVMBackend::CxxArmCategory::Xvalue;
+                    // Only a derived-to-base join is lowered: the losing arm's class must be a
+                    // base-class source of the result (D/C). A user conversion (X/C) stays refused.
+                    const bool baseJoin = verdict.kind == CxxKind::XvalueRef
+                        && compiler->IsCxxDerivedToBaseValue(verdict.resultIsTrue ? falseType : trueType,
+                            verdict.resultIsTrue ? trueType : falseType, nullptr);
+                    if (xvalueJoin && !prefixRefused && baseJoin)
+                    {
+                        const std::string resultName = compiler->ResolveTypeAlias(
+                            verdict.resultIsTrue ? trueName : falseName);
+                        auto resultType = verdict.resultIsTrue ? trueType : falseType;
+                        resultType.TypeName = resultName;
+                        resultType.Pointer = false;
+                        resultType.PointerDepth = 0;
+                        resultType.IsRvalueRef = false;
+                        if (CxxTernaryArmConst(trueType) || CxxTernaryArmConst(falseType))
+                            resultType.ConstMask = 1u;
+                        auto lowerArm = [&](bool isTrue) {
+                            LLVMBackend::TypedValue& shape = isTrue ? trueShape : falseShape;
+                            llvm::Value*& value = isTrue ? trueValue : falseValue;
+                            llvm::Value*& storage = isTrue ? trueStorage : falseStorage;
+                            const auto& armType = isTrue ? trueType : falseType;
+                            const auto armCategory = category(shape);
+                            LLVMBackend::NamedVariable arm;
+                            arm.Primary = value;
+                            arm.Storage = storage;
+                            arm.BaseType = value->getType();
+                            arm.TypeAndValue = armType;
+                            arm.IsRvalue = armCategory != LLVMBackend::CxxArmCategory::Lvalue;
+                            (isTrue ? atTrue : atFalse)();
+                            if (!compiler->LowerCxxTernaryArm(arm, trueType,
+                                    trueCategory, falseType, falseCategory, isTrue,
+                                    verdict, false))
+                                return false;
+                            value = arm.Primary;
+                            storage = arm.Storage;
+                            if (value == nullptr || value->getType()->isVoidTy())
+                            {
+                                auto* objectType = compiler->GetType(resultType);
+                                if (objectType == nullptr || storage == nullptr) return false;
+                                value = compiler->CreateLoad(objectType, storage);
+                            }
+                            shape.value = value;
+                            shape.storage = storage;
+                            shape.receiverStorage = storage;
+                            shape.sourceType = resultType;
+                            shape.sourceTypeName = resultName;
+                            shape.hasSourceType = true;
+                            shape.isRvalue = verdict.kind != CxxKind::LvalueRef;
+                            shape.isExplicitMove = verdict.kind == CxxKind::XvalueRef;
+                            shape.isAlias = false;
+                            return true;
+                        };
+                        if (!lowerArm(true) || !lowerArm(false)) return false;
+                        return true;
+                    }
+                    if (verdict.kind == LLVMBackend::CxxTernaryVerdict::Kind::Ambiguous)
+                        LogErrorContext(ctx, std::format(
+                            "ternary branches have ambiguous C++ conversions between '{}' and '{}'",
+                            compiler->DisplayCxxClassName(trueName),
+                            compiler->DisplayCxxClassName(falseName)));
+                }
+            }
+            LogErrorContext(ctx, std::format(
+                "ternary branches have incompatible types '{}' and '{}'",
+                trueStruct->hasName() ? trueStruct->getName().str() : std::string("struct"),
+                falseStruct->hasName() ? falseStruct->getName().str() : std::string("struct")));
+            return false;
+        }
         else
         {
             auto describe = [](llvm::Type* t) -> std::string {
@@ -2603,9 +2707,45 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             return true;
         };
+        // clang's composite of the move arms is const when a move leaf of the outermost ternary is
+        // const. Only bare const leaves of the declared class count (field leaves stay master's).
+        auto joinMoveConst = [&]() {
+            // Climb through parentheses and single-child rules only; a condition operand is no join.
+            auto* top = ctx;
+            antlr4::tree::ParseTree* from = ctx;
+            for (antlr4::tree::ParseTree* p = ctx->parent; p != nullptr; from = p, p = p->parent)
+            {
+                auto* up = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(p);
+                if (up != nullptr && up->expression() != nullptr && up->conditionalExpression() != nullptr)
+                {
+                    if (from == up->logicalOrExpression()) break;
+                    top = up;
+                    continue;
+                }
+                const bool parens = p->children.size() == 3 && p->children[0]->getText() == "(";
+                if (p->children.size() != 1 && !parens) break;
+            }
+            std::function<bool(antlr4::tree::ParseTree*)> leafConst =
+                [&](antlr4::tree::ParseTree* arm) -> bool {
+                if (auto* nested = SoleTernaryExpression(arm); nested != nullptr)
+                    return nested->expression() != nullptr && nested->conditionalExpression() != nullptr
+                        && (leafConst(nested->expression()->assignmentExpression())
+                            || leafConst(nested->conditionalExpression()));
+                auto* mv = TopLevelMoveExpression(arm);
+                if (mv == nullptr || mv->unaryExpression() == nullptr) return false;
+                auto* nv = compiler->FindLiveNamedVariable(mv->unaryExpression()->getText());
+                return nv != nullptr && CxxTernaryArmConst(nv->TypeAndValue)
+                    && compiler->ResolveTypeAlias(nv->TypeAndValue.TypeName) == compiler->ResolveTypeAlias(cxxTernaryDeclType);
+            };
+            return top->expression() != nullptr && top->conditionalExpression() != nullptr
+                && (leafConst(top->expression()->assignmentExpression())
+                    || leafConst(top->conditionalExpression()));
+        };
         auto moveCxxTernaryArmIntoDecl = [&](llvm::Value* armValue, llvm::Value* armStorage,
                                               const LLVMBackend::OwnedTempMark& armMark,
-                                              bool explicitMove, DerivedArmState& arm,
+                                              bool explicitMove,
+                                              const LLVMBackend::TypeAndValue& armType,
+                                              DerivedArmState& arm,
                                               bool& deferred, bool& built) {
             if (!cxxTernaryDecl) return;
             // A scalar arm (an enum value) is no producer of the class: both scalar arms join as
@@ -2631,15 +2771,16 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     slice.BaseType = armValue->getType();
                     slice.TypeAndValue.TypeName = armStruct->getName().str();
                     LLVMBackend::NamedVariable ownedProbe = slice;
+                    const bool derivedMove = explicitMove && !CxxTernaryArmConst(armType) && !joinMoveConst();
                     // A field of an owned temp (`mkH(1).d`) is an xvalue, not a place (clang).
                     const bool fieldOfTemp = !explicitMove
                         && compiler->IsFieldOfOwnedStructTemp(armStorage, armValue);
-                    slice.IsRvalue = explicitMove || fieldOfTemp || compiler->IsOwnedTempValue(ownedProbe);
+                    slice.IsRvalue = derivedMove || fieldOfTemp || compiler->IsOwnedTempValue(ownedProbe);
                     if (compiler->IsCxxDerivedToBaseValue(slice.TypeAndValue,
                             LLVMBackend::TypeAndValue{ .TypeName = cxxTernaryDeclType }, &slice))
                     {
                         arm.typeName = slice.TypeAndValue.TypeName;
-                        arm.cat = explicitMove || fieldOfTemp ? DerivedArmCat::Xvalue
+                        arm.cat = derivedMove || fieldOfTemp ? DerivedArmCat::Xvalue
                             : slice.IsRvalue ? DerivedArmCat::Prvalue : DerivedArmCat::Lvalue;
                         if (arm.cat != DerivedArmCat::Prvalue)
                         {
@@ -2697,8 +2838,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 // An explicit move zeroed its source: restore the loaded bytes, then move the C++
                 // fields (the source stays a live moved-from object, as in a plain `T x = move y;`).
                 const bool lowered = compiler->IsLoweredCFlatOnlyStruct(cxxTernaryDeclType);
+                const bool useMove = explicitMove && !joinMoveConst();
                 bool copied = false;
-                if (lowered && explicitMove)
+                if (lowered && useMove)
                 {
                     compiler->builder->CreateStore(armValue, armStorage);
                     copied = compiler->EmitLoweredMemberwiseMove(cxxTernaryDeclType, declType,
@@ -2710,8 +2852,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 else
                     copied = compiler->EmitCxxCopyOrMoveConstruct(
                         cxxTernaryDeclType, cxxTernaryDeclDest, armStorage,
-                        /*useMove*/ explicitMove, "into a ternary declaration", {}, false,
-                        false, explicitMove);
+                        /*useMove*/ useMove, "into a ternary declaration", {}, false,
+                        false, useMove);
                 if (!copied)
                 {
                     cxxTernaryDeclFailed = true;
@@ -3279,7 +3421,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     trueValue, trueStorage, trueMark);
                 if (!trueCxxTernaryDeclBuilt)
                     moveCxxTernaryArmIntoDecl(trueValue, trueStorage, trueMark,
-                        trueExplicitMove, trueDerived, trueCxxTernaryDeclDeferred,
+                        trueExplicitMove,
+                        trueShape.hasSourceType ? trueShape.sourceType : InferTernaryArmType(trueValue),
+                        trueDerived, trueCxxTernaryDeclDeferred,
                         trueCxxTernaryDeclBuilt);
             }
             if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
@@ -3488,7 +3632,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     falseValue, falseStorage, falseMark);
                 if (!falseCxxTernaryDeclBuilt)
                     moveCxxTernaryArmIntoDecl(falseValue, falseStorage, falseMark,
-                        falseExplicitMove, falseDerived, falseCxxTernaryDeclDeferred,
+                        falseExplicitMove,
+                        falseShape.hasSourceType ? falseShape.sourceType : InferTernaryArmType(falseValue),
+                        falseDerived, falseCxxTernaryDeclDeferred,
                         falseCxxTernaryDeclBuilt);
             }
             if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
@@ -3826,12 +3972,16 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             CxxArmCategory trueCategory = armCategory(trueShape);
             CxxArmCategory falseCategory = armCategory(falseShape);
             if (trueName.empty() || falseName.empty()
-                || !compiler->IsCxxRecord(trueName) || !compiler->IsCxxRecord(falseName)
-                || (trueName == falseName
-                    && !((trueCategory == CxxArmCategory::Lvalue
-                            && falseCategory == CxxArmCategory::Xvalue)
-                        || (trueCategory == CxxArmCategory::Xvalue
-                            && falseCategory == CxxArmCategory::Lvalue))))
+                || !compiler->IsCxxRecord(trueName) || !compiler->IsCxxRecord(falseName))
+                return CxxValueJoinResult::NotApplicable;
+            const bool sameClass = trueName == falseName;
+            const bool lvalueXvalueMix = (trueCategory == CxxArmCategory::Lvalue
+                    && falseCategory == CxxArmCategory::Xvalue)
+                || (trueCategory == CxxArmCategory::Xvalue
+                    && falseCategory == CxxArmCategory::Lvalue);
+            if (sameClass && !lvalueXvalueMix
+                && !(trueCategory == CxxArmCategory::Xvalue
+                    && falseCategory == CxxArmCategory::Xvalue))
                 return CxxValueJoinResult::NotApplicable;
 
             const bool callArgument = !cxxTernaryDecl && inCallArgument_
@@ -3847,6 +3997,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 && IsWholeCxxCallArgumentShape(ctx, outerExpected);
             const bool callThroughSink = callArgument && cxxTernaryCallSink_ != nullptr;
             if (!cxxTernaryDecl && !callArgument)
+                return CxxValueJoinResult::NotApplicable;
+            // Same-class xvalue/xvalue into a const& parameter: master refuses (transfers nothing).
+            if (callArgument && sameClass && trueCategory == CxxArmCategory::Xvalue
+                && falseCategory == CxxArmCategory::Xvalue && outerExpected.IsCxxRef()
+                && outerExpected.CxxConstRef())
                 return CxxValueJoinResult::NotApplicable;
             if (cxxTernaryDecl && !trueCxxTernaryDeclDeferred
                 && !falseCxxTernaryDeclDeferred)
@@ -3879,15 +4034,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
 
             using Kind = LLVMBackend::CxxTernaryVerdict::Kind;
             LLVMBackend::CxxTernaryVerdict verdict;
-            if (trueName == falseName)
-            {
-                // A same-class lvalue/xvalue conditional is a prvalue by the C++ category rules.
-                verdict.kind = Kind::Prvalue;
-                verdict.resultIsTrue = true;
-            }
-            else
-                verdict = compiler->ClassifyCxxTernary(
-                    trueType, trueCategory, falseType, falseCategory);
+            verdict = compiler->ClassifyCxxTernary(
+                trueType, trueCategory, falseType, falseCategory);
             if (verdict.kind == Kind::Ambiguous)
                 LogErrorContext(ctx, std::format(
                     "ternary branches have ambiguous C++ conversions between '{}' and '{}'",

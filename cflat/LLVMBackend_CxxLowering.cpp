@@ -3199,11 +3199,25 @@ LLVMBackend::CxxTernaryVerdict LLVMBackend::ClassifyCxxTernary(const TypeAndValu
             return verdict;
         const std::string trueName = ResolveTypeAlias(trueArm.TypeName);
         const std::string falseName = ResolveTypeAlias(falseArm.TypeName);
-        if (trueName.empty() || falseName.empty() || trueName == falseName
+        if (trueName.empty() || falseName.empty()
             || !IsCxxRecord(trueName) || !IsCxxRecord(falseName))
             return verdict;
         const bool trueConst = CxxTernaryArmConst(trueArm);
         const bool falseConst = CxxTernaryArmConst(falseArm);
+        if (trueName == falseName)
+        {
+            if (trueCategory == falseCategory)
+                verdict.kind = trueCategory == CxxArmCategory::Lvalue
+                    ? CxxTernaryVerdict::Kind::LvalueRef
+                    : trueCategory == CxxArmCategory::Xvalue
+                        ? CxxTernaryVerdict::Kind::XvalueRef
+                        : CxxTernaryVerdict::Kind::Prvalue;
+            else
+                verdict.kind = CxxTernaryVerdict::Kind::Prvalue;
+            // The composite cv is the union of both arms. The selected arm supplies the metadata.
+            verdict.resultIsTrue = trueConst || !falseConst;
+            return verdict;
+        }
         const std::string key = trueName + (trueConst ? "|const|" : "||")
             + CxxArmCategoryTag(trueCategory) + "|" + falseName + (falseConst ? "|const|" : "||")
             + CxxArmCategoryTag(falseCategory);
@@ -4698,7 +4712,7 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                                              llvm::Value* src, bool useMove, const char* context,
                                              const std::string& displayTypeName,
                                              bool constSource, bool directInit,
-                                             bool forceClangPick)
+                                             bool forceClangPick, bool rvaluePickFallback)
 {
         if (dest == nullptr || src == nullptr) return false;
         if (IsLoweredCFlatOnlyStruct(typeName))
@@ -4800,14 +4814,22 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                 return false;
             }
         }
+        // A C++ xvalue (return of a local, `move x`) with no move constructor copies through the
+        // const copy constructor first (CWG1579); T(T&) only when no const one exists.
+        auto fallbackCopyCtor = [&]() -> const CxxClassInfo::Structor* {
+            if (useMove && rvaluePickFallback)
+                if (const auto* viaRvalue = FindCxxCopyCtor(typeName, true, directInit))
+                    return viaRvalue;
+            return FindCxxCopyCtor(typeName, constSource, directInit);
+        };
         const CxxClassInfo::Structor* ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
-        if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource, directInit);
+        if (ctor == nullptr) ctor = fallbackCopyCtor();
         // A class first constructed through a generated wrapper (a CFlat closure into
         // std::function) never ran constructor selection: bind its one-argument ctors now.
         if (ctor == nullptr && TryBindRefusedCxxMember(typeName, "__ctor", 1))
         {
             ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
-            if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource, directInit);
+            if (ctor == nullptr) ctor = fallbackCopyCtor();
         }
         if (ctor == nullptr && useMove) ctor = TryBindCxxGeneratedMoveCtor(typeName);
         if (ctor == nullptr)
@@ -5310,10 +5332,12 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                                                  bool* needsStandardConversion,
                                                  bool* ambiguous,
                                                  std::vector<std::string>* ambiguousCandidates,
-                                                 const TypeAndValue* receiver) const
+                                                 const TypeAndValue* receiver,
+                                                 bool* derivedResult) const
 {
         if (needsStandardConversion != nullptr) *needsStandardConversion = false;
         if (ambiguous != nullptr) *ambiguous = false;
+        if (derivedResult != nullptr) *derivedResult = false;
         if (sourceTypeName.empty() || dest.TypeName.empty() || dest.TypeName == "void") return {};
         if (sourceTypeName == dest.TypeName) return {};
         const bool classReferenceTarget = dest.IsAlias && IsCxxRecord(dest.TypeName);
@@ -5370,6 +5394,10 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 : CanonicalPrimitiveTypeName(ResolveTypeAlias(spelling));
             std::vector<std::string> result{ "operator " + cflatSpelling,
                                              sourceTypeName + ".operator " + cflatSpelling };
+            // A cast reaches an explicit operator registered apart from its implicit twin first.
+            if (allowExplicit && dest.Pointer)
+                result.insert(result.begin(), { "__cflat_explicit_operator " + cflatSpelling,
+                    sourceTypeName + ".__cflat_explicit_operator " + cflatSpelling });
             if (!dest.Pointer && !classReferenceTarget)
             {
                 TypeAndValue refTarget = targetType;
@@ -5385,8 +5413,14 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 {
                     if (!member.isConversion) continue;
                     TypeAndValue ret;
-                    if (!self->MapCTypeToTypeAndValue(member.retType, ret, true)
-                        || CanonicalPrimitiveTypeName(ResolveTypeAlias(ret.TypeName))
+                    if (!self->MapCTypeToTypeAndValue(member.retType, ret, true)) continue;
+                    // `operator D*()` also serves a `P*` parameter when D derives from P.
+                    const bool derivedPointerReturn = dest.Pointer && ret.Pointer
+                        && IsCxxRecord(sourceTypeName) && IsCxxRecord(ret.TypeName)
+                        && IsCxxRecord(spelling)
+                        && ret.TypeName != spelling && IsCxxBaseOf(spelling, ret.TypeName);
+                    if (!derivedPointerReturn
+                        && CanonicalPrimitiveTypeName(ResolveTypeAlias(ret.TypeName))
                             != CanonicalPrimitiveTypeName(ResolveTypeAlias(spelling))) continue;
                     const bool referenceResult = member.retType.find('&') != std::string::npos;
                     const bool shapeMatches = classReferenceTarget
@@ -5394,6 +5428,13 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                         : dest.Pointer ? ret.Pointer && !referenceResult
                         : !ret.Pointer || referenceResult;
                     if (!shapeMatches) continue;
+                    if (derivedPointerReturn)
+                    {
+                        const std::string derivedSpelling = SpellType(*this,
+                            TypeAndValue{ .TypeName = ret.TypeName, .Pointer = true });
+                        result.push_back("operator " + derivedSpelling);
+                        result.push_back(sourceTypeName + ".operator " + derivedSpelling);
+                    }
                     result.push_back(member.name);
                     result.push_back(sourceTypeName + "." + member.name);
                     // A const member registers under its const twin name; a const receiver
@@ -5482,14 +5523,22 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 if ((!scalarReference && ret.Pointer != dest.Pointer) || ret.ElemPointer
                     || ret.IsArrayView || (!dest.Pointer && !scalarReference && !ret.IsPrimitive()))
                     return false;
-                if (dest.Pointer
+                const bool derivedPointerReturn = dest.Pointer && !ret.ElemPointer
+                    && IsCxxRecord(sourceTypeName) && IsCxxRecord(ret.TypeName)
+                    && IsCxxRecord(dest.TypeName)
+                    && ret.TypeName != dest.TypeName && IsCxxBaseOf(dest.TypeName, ret.TypeName);
+                if (dest.Pointer && !derivedPointerReturn
                     && CanonicalPrimitiveTypeName(ResolveTypeAlias(ret.TypeName))
                         != CanonicalPrimitiveTypeName(ResolveTypeAlias(dest.TypeName))) return false;
+                // A const pointee from `operator const T*()` never reaches a mutable T* parameter.
+                if (dest.Pointer && IsCxxRecord(sourceTypeName)
+                    && CxxRecordPointeeConstRelation(ret, dest) == CxxPointeeConstRelation::Drops)
+                    return false;
                 returnTypeName = ret.TypeName;
                 return true;
         };
         auto usable = [&](const std::string& opName, std::string& returnTypeName,
-                          int* receiverRank = nullptr) {
+                          int* receiverRank = nullptr, bool* addsConst = nullptr) {
             // "<Type>.operator <spelling>" keeps its spelling, which may hold dots ("t104.X").
             const size_t qualifier = opName.find(".operator ");
             if (info != nullptr && !allowExplicit
@@ -5500,6 +5549,7 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
             if (it == functionTable.end()) return false;
             bool found = false;
             int bestRank = 2;
+            bool bestAddsConst = false;
             for (const auto& candidate : it->second)
             {
                 std::string name;
@@ -5516,10 +5566,15 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                     found = true;
                     bestRank = rank;
                     returnTypeName = name;
+                    // The result's const-adding qualification is the second standard conversion.
+                    bestAddsConst = dest.Pointer && IsCxxRecord(sourceTypeName)
+                        && CxxRecordPointeeConstRelation(candidate.ReturnType, dest)
+                            == CxxPointeeConstRelation::Adds;
                 }
                 if (bestRank == 0) break;
             }
             if (found && receiverRank != nullptr) *receiverRank = bestRank;
+            if (found && addsConst != nullptr) *addsConst = bestAddsConst;
             return found;
         };
 
@@ -5532,18 +5587,37 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         std::string returnTypeName;
         int exactReceiverRank = 0;
         std::string exactName;
+        // (conversion name, result class) of every derived-class pointer result usable here.
+        std::vector<std::pair<std::string, std::string>> derivedCandidates;
+        bool exactAddsConst = false;
         for (const std::string& name : candidateNames(dest.TypeName))
-            if (usable(name, returnTypeName, &exactReceiverRank))
+        {
+            bool addsConst = false;
+            if (usable(name, returnTypeName, &exactReceiverRank, &addsConst))
             {
                 if (classReferenceTarget) return name;
                 if (canonical(returnTypeName) == resolvedDestType)
                 {
                     exactName = name;
+                    exactAddsConst = addsConst;
                     break;
                 }
+                // Only a qualification conversion may follow an explicit operator, never derived-to-base.
+                const size_t opQualifier = name.find(".operator ");
+                const bool explicitOperator = name.find("__cflat_explicit_") != std::string::npos
+                    || (info != nullptr && info->explicitConversions.count(
+                            opQualifier == std::string::npos ? name : name.substr(opQualifier + 1)) != 0);
+                if (dest.Pointer && !explicitOperator) derivedCandidates.emplace_back(name, returnTypeName);
             }
+        }
         if (!exactName.empty() && (exactReceiverRank == 0 || classReferenceTarget || dest.Pointer))
+        {
+            // `operator T*()` beats `operator const T*()` on a mutable T* parameter (clang
+            // ranks the identity second conversion above a qualification adjustment).
+            if (needsStandardConversion != nullptr && exactAddsConst)
+                *needsStandardConversion = true;
             return exactName;
+        }
 
         // Conversion-function templates are target-deduced by clang. The raw member table has
         // only a presence bit for them, so ask clang lazily when no exact projected candidate
@@ -5552,6 +5626,39 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
             return templateName;
 
         if (classReferenceTarget || classValueTarget) return exactName;
+        // Derived-class results: the class that is a base of every other one wins (clang's
+        // better conversion); unrelated classes are ambiguous, never taken first.
+        if (dest.Pointer && !derivedCandidates.empty())
+        {
+            if (derivedResult != nullptr) *derivedResult = true;
+            const std::pair<std::string, std::string>* chosen = nullptr;
+            for (const auto& candidate : derivedCandidates)
+            {
+                bool baseOfAll = true;
+                for (const auto& other : derivedCandidates)
+                    if (other.second != candidate.second
+                        && !IsCxxBaseOf(candidate.second, other.second))
+                    {
+                        baseOfAll = false;
+                        break;
+                    }
+                if (baseOfAll)
+                {
+                    chosen = &candidate;
+                    break;
+                }
+            }
+            if (chosen == nullptr)
+            {
+                if (ambiguous != nullptr) *ambiguous = true;
+                if (ambiguousCandidates != nullptr)
+                    for (const auto& candidate : derivedCandidates)
+                        ambiguousCandidates->push_back(candidate.first);
+                return {};
+            }
+            if (needsStandardConversion != nullptr) *needsStandardConversion = true;
+            return chosen->first;
+        }
         // Pointer conversions are exact here. Their standard pointer conversions need a richer
         // ranking than the scalar conversion table below, so do not treat them as scalar casts.
         if (dest.Pointer) return {};
@@ -5683,6 +5790,11 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
             if (referentType == nullptr) return false;
             result = builder->CreateLoad(referentType, result, "cxx.conversion.ref");
         }
+
+        // `operator D*()` into a `P*` parameter: the base subobject sits at D's base offset.
+        if (dest.Pointer && conversionReturnType.Pointer && result->getType()->isPointerTy())
+            result = AdjustCxxPointerForStore(dest, conversionReturnType, result,
+                                              "the conversion result");
 
         if (dest.IsAlias && IsCxxRecord(dest.TypeName) && !conversionReturnType.IsAlias
             && !conversionReturnType.Pointer && conversionReturnType.TypeName == dest.TypeName
@@ -5850,11 +5962,15 @@ std::string LLVMBackend::ScoreCxxConversionOperatorArgument(const NamedVariable&
 {
         needsStandardConversion = false;
         bool ambiguous = false;
+        bool derived = false;
         std::vector<std::string> ambiguousCandidates;
         std::string opName = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
                                                            false, &needsStandardConversion,
                                                            &ambiguous, &ambiguousCandidates,
-                                                           &arg.TypeAndValue);
+                                                           &arg.TypeAndValue, &derived);
+        // preserveAmbiguous is set for a CFlat callee, which gets no derived-class conversion
+        // lowering: refuse the derived shape there, as master did.
+        if (preserveAmbiguous && derived) return {};
         if (ambiguous)
         {
             if (!preserveAmbiguous) return {};

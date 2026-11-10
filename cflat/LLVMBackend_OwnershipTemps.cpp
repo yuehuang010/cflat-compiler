@@ -3885,6 +3885,14 @@ const LLVMBackend::OwnedReturnTemp* LLVMBackend::FindOwnedReturnEntryForDiagnost
         return nullptr;
     }
 
+void LLVMBackend::ForgetOwnedReturnTemp(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        std::erase_if(ownedReturnTemps_, [&](const OwnedReturnTemp& e) { return e.Value == value; });
+        std::erase_if(ownedReturnReleaseTemps_,
+                      [&](const auto& e) { return e.Value == value; });
+}
+
 const std::string* LLVMBackend::FindOwnedReturnTemp(llvm::Value* value) const
 {
         const OwnedReturnTemp* e = FindOwnedReturnEntryForDiagnostic(value);

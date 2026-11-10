@@ -3,6 +3,7 @@
 // Test/library/cpp_t63_brace_decl.hpp (t314). Positive controls with a strictly better element are
 // in Test/test_cpp_interop.cb (T314 legs).
 import cpp "cpp_t63_brace_decl.hpp";
+import cpp "cpp_cvamb_brace.hpp";
 
 extern int main()
 {
@@ -36,5 +37,27 @@ extern int main()
     expect_error("ambiguous call to 'm_ui': no candidate ranks better than the others") {
         t314.S s = t314.S();
         int r = s.m_ui({1, 2});
+    }
+    // CVAMB: two braced arguments, a plain argument beside a brace, a default-argument extra parameter,
+    // float vs long double, and receiver cv/ref ties (clang: ambiguous).
+    expect_error("ambiguous call to 'cvb_pb2': no candidate ranks better than the others") {
+        int r = cvb_pb2({1, 2}, {3, 4});
+    }
+    expect_error("ambiguous call to 'cvb_pa': no candidate ranks better than the others") {
+        int r = cvb_pa(1, {1, 2});
+    }
+    expect_error("ambiguous call to 'mq': no candidate ranks better than the others") {
+        CvbM cvbM = CvbM();
+        int r = cvbM.mq(1, {1, 2});
+    }
+    expect_error("ambiguous call to 'cvb_da': no candidate ranks better than the others") {
+        int r = cvb_da({1, 2});
+    }
+    expect_error("ambiguous call to 'cvb_fl': no candidate ranks better than the others") {
+        int r = cvb_fl({1});
+    }
+    expect_error("ambiguous call to 'mbb': no candidate ranks better than the others") {
+        CvbM cvbM = CvbM();
+        int r = cvbM.mbb({1, 2});
     }
 }

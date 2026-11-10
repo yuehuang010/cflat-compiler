@@ -1698,8 +1698,55 @@ void LLVMBackend::StageCxxOperatorScalarArguments(std::vector<NamedVariable>& ar
         }
 }
 
+namespace {
+// Restores the unnamed-enum macro suppression flag on every return path of a request.
+class MacroIdentityRestore
+{
+public:
+        explicit MacroIdentityRestore(bool& flag) : flag_(flag), saved_(flag) {}
+        ~MacroIdentityRestore() { flag_ = saved_; }
+        MacroIdentityRestore(const MacroIdentityRestore&) = delete;
+        MacroIdentityRestore& operator=(const MacroIdentityRestore&) = delete;
+
+private:
+        bool& flag_;
+        bool saved_;
+};
+}
+
+// A failed request with an unnamed-enum macro argument is retried with the macro as int (master's
+// path), so the enum-identity overload never turns a working master call into a refusal.
 bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                                              const std::string& ownerType,
+                                             const std::vector<std::string>& explicitArgs,
+                                             std::vector<NamedVariable>& arguments,
+                                             const std::vector<CxxBraceArgument>& braceArguments,
+                                             std::string& registeredName,
+                                             std::string& error,
+                                             const std::string& infixOperator,
+                                             bool uniqueRegistration)
+{
+        MacroIdentityRestore restore(cxxMacroIdentitySuppressed_);
+        // The first attempt clears argument storage, so the retry decision and the retry's
+        // arguments are taken from a snapshot made before it.
+        const bool macroRetryable = !cxxMacroIdentitySuppressed_
+            && HasUnnamedEnumMacroArgument(arguments);
+        std::vector<NamedVariable> pristine;
+        if (macroRetryable) pristine = arguments;
+        if (RequestCxxFunctionTemplateOnce(functionName, ownerType, explicitArgs, arguments,
+                                           braceArguments, registeredName, error, infixOperator,
+                                           uniqueRegistration))
+            return true;
+        if (!macroRetryable) return false;
+        arguments = std::move(pristine);
+        cxxMacroIdentitySuppressed_ = true;
+        return RequestCxxFunctionTemplateOnce(functionName, ownerType, explicitArgs, arguments,
+                                              braceArguments, registeredName, error, infixOperator,
+                                              uniqueRegistration);
+}
+
+bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName,
+                                                 const std::string& ownerType,
                                              const std::vector<std::string>& explicitArgs,
                                              std::vector<NamedVariable>& arguments,
                                              const std::vector<CxxBraceArgument>& braceArguments,
@@ -3617,10 +3664,24 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                          const std::string& memberOwnerType)
 {
         lastCxxFreeWrapperLinkage_.clear();
+        // The retry keeps the flag set through the post-processing below, like the wrapper it bound.
+        MacroIdentityRestore restore(cxxMacroIdentitySuppressed_);
+        const bool macroRetryable = !cxxMacroIdentitySuppressed_
+            && HasUnnamedEnumMacroArgument(arguments);
+        std::vector<NamedVariable> pristine;
+        if (macroRetryable) pristine = arguments;
         if (!RequestCxxFreeFunctionImpl(functionName, explicitArgs, arguments, registeredName, error,
                                         infixOperator, infixLhsName, infixRhsName, adlCall,
                                         braceGroups, memberOwnerType))
-            return false;
+        {
+            if (!macroRetryable) return false;
+            arguments = std::move(pristine);
+            cxxMacroIdentitySuppressed_ = true;
+            if (!RequestCxxFreeFunctionImpl(functionName, explicitArgs, arguments, registeredName, error,
+                                            infixOperator, infixLhsName, infixRhsName, adlCall,
+                                            braceGroups, memberOwnerType))
+                return false;
+        }
         if (!infixOperator.empty() || adlCall || !braceGroups.empty() || !memberOwnerType.empty())
             return true;
         return SwitchCxxDirectByValueCall(functionName, arguments, registeredName, error);
@@ -5750,7 +5811,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         // 0 exact, 1 integral or floating promotion, 2 any other conversion. `certain` drops to false
         // when the rank rests on a spelling this model does not classify (such a tie is never refused).
         auto isArithmeticName = [&](const std::string& name) {
-            return name == "bool" || name == "float" || name == "double" || integerBitsOf(name) > 0;
+            return name == "bool" || name == "float" || name == "double" || name == "longdouble"
+                || name == "long double" || integerBitsOf(name) > 0;
         };
         auto elementRank = [&](const NamedVariable& e, const std::string& to, bool& certain) -> size_t {
             const TypeAndValue& tv = e.TypeAndValue;
@@ -5793,35 +5855,93 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         // caller refuses it (the old first-declared pick silently chose one). `certain` is false when
         // the rank is not decidable here: several braced arguments (per-argument dominance), or an
         // element/parameter spelling outside the arithmetic model.
-        auto braceElementRank = [&](const std::vector<std::string>& params, bool& certain) {
-            size_t worst = 0;
-            certain = certain && braceArguments.size() == 1;
-            for (const auto& brace : braceArguments)
+        // CVAMB: one braced argument against a candidate's parameter: its worst element (clang ranks a
+        // list by its worst element conversion, [over.ics.list]). Unmodelled spellings are uncertain.
+        auto braceRankOf = [&](const CxxBraceArgument& brace, const std::vector<std::string>& params,
+                               bool& certain) -> size_t {
+            if (brace.parameterIndex >= params.size() || brace.hasCxxClassElements)
             {
-                if (brace.parameterIndex >= params.size() || brace.hasCxxClassElements)
-                {
-                    certain = false;
-                    continue;
-                }
-                const std::string& target = params[brace.parameterIndex];
-                std::string element;
-                std::string extent;
-                if (CxxBraceContainerKindOf(target) == CxxBraceContainerKind::InitializerList)
-                    element = CxxBraceTargetElementSpelling(target);
-                else if (!CxxArrayReferenceParameter(target, element, extent))
-                {
-                    certain = false;
-                    continue;
-                }
-                if (element.empty())
-                {
-                    certain = false;
-                    continue;
-                }
-                for (const auto& e : brace.elements)
-                    worst = std::max(worst, elementRank(e, element, certain));
+                certain = false;
+                return 0;
             }
+            const std::string& target = params[brace.parameterIndex];
+            std::string element;
+            std::string extent;
+            if (CxxBraceContainerKindOf(target) == CxxBraceContainerKind::InitializerList)
+                element = CxxBraceTargetElementSpelling(target);
+            else if (!CxxArrayReferenceParameter(target, element, extent))
+            {
+                certain = false;
+                return 0;
+            }
+            if (element.empty())
+            {
+                certain = false;
+                return 0;
+            }
+            size_t worst = 0;
+            for (const auto& e : brace.elements)
+                worst = std::max(worst, elementRank(e, element, certain));
             return worst;
+        };
+        // CVAMB: per-argument ranks from argument index `first` on ([over.best.ics]): a braced slot by its
+        // worst element, a plain scalar by identity or promotion. Other plain arguments are uncertain.
+        constexpr size_t kPlainArgumentNotViable = 1000;
+        auto argumentRanks = [&](const std::vector<std::string>& params, bool& certain, size_t first) {
+            std::vector<size_t> ranks;
+            for (size_t k = first; k < arguments.size() && k < params.size(); ++k)
+            {
+                const CxxBraceArgument* braced = nullptr;
+                for (const auto& brace : braceArguments)
+                    if (brace.parameterIndex == k) braced = &brace;
+                if (braced != nullptr)
+                {
+                    ranks.push_back(braceRankOf(*braced, params, certain));
+                    continue;
+                }
+                // CVAMB r1: a reference parameter's binding and cv are not modelled. A non-const lvalue
+                // reference binds only an lvalue of its own referent (anything else is not viable); every
+                // other reference binding is uncertain, so a tie on it is never refused.
+                const std::string& spelling = params[k];
+                if (spelling.find('&') != std::string::npos)
+                {
+                    const bool rvalueRef = spelling.find("&&") != std::string::npos;
+                    const bool constRef = spelling.find("const") != std::string::npos;
+                    const bool lvalueArg = !arguments[k].IsRvalue && arguments[k].CxxLvalueKind != 0
+                        && arguments[k].CxxLvalueKind != 3;
+                    bool referentCertain = true;
+                    const size_t referentRank = elementRank(arguments[k], spelling, referentCertain);
+                    certain = false;
+                    if ((!constRef && !rvalueRef && (!lvalueArg || (referentCertain && referentRank != 0)))
+                        || (rvalueRef && lvalueArg))
+                        ranks.push_back(kPlainArgumentNotViable);
+                    else
+                        ranks.push_back(referentCertain ? referentRank : 0);
+                    continue;
+                }
+                bool argumentCertain = true;
+                size_t rank = elementRank(arguments[k], params[k], argumentCertain);
+                if (!argumentCertain)
+                {
+                    certain = false;
+                    rank = 0;
+                }
+                ranks.push_back(rank);
+            }
+            return ranks;
+        };
+        // [over.match.best]: -1 when `a` is better (no worse anywhere, better somewhere), 1 when `b` is,
+        // 0 when equal, 2 when each is better somewhere (no best candidate: clang reports ambiguous).
+        auto compareRanks = [](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+            bool aBetter = false;
+            bool bBetter = false;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+            {
+                aBetter |= a[i] < b[i];
+                bBetter |= b[i] < a[i];
+            }
+            if (aBetter && bBetter) return 2;
+            return aBetter ? -1 : (bBetter ? 1 : 0);
         };
         // Display of one candidate for the ambiguity refusal: name(params), C++ types shown as CFlat.
         auto displayCandidate = [&](const std::string& name, const std::vector<std::string>& params) {
@@ -5835,8 +5955,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             auto it = cxxFunctionSignatures_.find(functionName);
             if (it == cxxFunctionSignatures_.end()) return false;
             int selectedBracePriority = 100;
+            std::vector<size_t> selectedRanks;
             size_t selectedExtraParameters = static_cast<size_t>(-1);
-            size_t selectedRank = static_cast<size_t>(-1);
             bool selectedCertain = false;
             bool bracesTied = false;
             std::vector<std::string> tiedCandidates;
@@ -5850,20 +5970,22 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                     || !nonBraceArgumentsFit(sig.paramSpellings, false)) continue;
                 const auto bracePriority = bracePriorityFor(sig.paramSpellings, sig.paramNames);
                 if (!bracePriority) continue;
+                // CVAMB: defaulted parameters are not ranked (clang ties a default-argument overload on its
+                // arguments alone); braced and plain arguments rank per argument.
+                bool certain = true;
+                const std::vector<size_t> ranks = argumentRanks(sig.paramSpellings, certain, 0);
                 const size_t extraParameters = sig.paramSpellings.size() - arguments.size();
-                // A plain argument is not ranked here (arguments hold the braced slots too).
-                bool certain = arguments.size() == braceArguments.size();
-                const size_t rank = braceElementRank(sig.paramSpellings, certain);
+                int order = selected.found ? compareRanks(ranks, selectedRanks) : -1;
+                // CVAMB r1: an uncertain tie keeps master's fewer-defaulted-parameters preference.
+                if (selected.found && order == 0 && !(certain && selectedCertain))
+                    order = extraParameters < selectedExtraParameters ? -1
+                        : (extraParameters > selectedExtraParameters ? 1 : 0);
                 const bool better = !selected.found
                     || *bracePriority < selectedBracePriority
-                    || (*bracePriority == selectedBracePriority
-                        && (extraParameters < selectedExtraParameters
-                            || (extraParameters == selectedExtraParameters
-                                && rank < selectedRank)));
+                    || (*bracePriority == selectedBracePriority && order == -1);
                 if (!better)
                 {
-                    if (selected.found && *bracePriority == selectedBracePriority
-                        && extraParameters == selectedExtraParameters && rank == selectedRank)
+                    if (selected.found && *bracePriority == selectedBracePriority && order != 1)
                     {
                         if (certain && selectedCertain) bracesTied = true;
                         else bracesTied = selectedCertain = false;
@@ -5883,8 +6005,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 selected.col = sig.col;
                 selected.isNoexcept = sig.isNoexcept;
                 selectedBracePriority = *bracePriority;
+                selectedRanks = ranks;
                 selectedExtraParameters = extraParameters;
-                selectedRank = rank;
                 selectedCertain = certain;
                 selected.found = true;
                 tiedCandidates = {displayCandidate(functionName, sig.paramSpellings)};
@@ -5913,11 +6035,27 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             if (record == cxxRecordEntries_.end()) return false;
             const cflat_cinterop::RawCxxMember* fallback = nullptr;
             int fallbackBracePriority = 100;
+            std::vector<size_t> fallbackRanks;
             size_t fallbackExtraParameters = static_cast<size_t>(-1);
-            size_t fallbackRank = static_cast<size_t>(-1);
             bool fallbackCertain = false;
-            bool fallbackConst = false;
-            bool fallbackQualified = false;
+            // CVAMB: the receiver's cv (bit 1 const, bit 2 volatile) and whether it is an lvalue. An
+            // rvalue receiver or a viability question is left uncertain rather than ranked here.
+            const bool receiverLvalue = !arguments.empty() && !arguments.front().IsRvalue
+                && arguments.front().CxxLvalueKind != 0 && arguments.front().CxxLvalueKind != 3;
+            const int receiverCv = arguments.empty() ? 0 : CxxReceiverCv(arguments.front());
+            // Cv bits a viable implicit object adds to the receiver ([over.ics.rank] 3.2.6): fewer is
+            // better; `&` and no ref-qualifier bind alike. Non-viable or rvalue cases are uncertain.
+            auto receiverAddedCv = [&](const cflat_cinterop::RawCxxMember& m, bool& known) -> size_t {
+                const int memberCv = (m.isConst ? 1 : 0) | (m.isVolatile ? 2 : 0);
+                if (!receiverLvalue || m.refQualifier == cflat_cinterop::CxxRefQualifierRValue
+                    || (memberCv & receiverCv) != receiverCv)
+                {
+                    known = false;
+                    return 0;
+                }
+                const int added = memberCv ^ receiverCv;
+                return static_cast<size_t>((added & 1) + ((added >> 1) & 1));
+            };
             // An instance member lists its implicit object parameter first; the display omits it.
             auto memberShownParams = [](const cflat_cinterop::RawCxxMember& member) {
                 const size_t skip = member.kind == cflat_cinterop::RawCxxMember::Instance
@@ -5941,27 +6079,29 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 if (instance != receiverLooksPresent) continue;
                 const auto bracePriority = bracePriorityFor(member.paramTypes, member.paramNames);
                 if (!bracePriority) continue;
+                // CVAMB: the receiver ranks first ([over.ics.rank] 3.2.6, see receiverAddedCv), then the arguments.
+                bool certain = true;
+                bool receiverKnown = true;
+                std::vector<size_t> ranks;
+                if (instance) ranks.push_back(receiverAddedCv(member, receiverKnown));
+                if (!receiverKnown) certain = false;
+                const std::vector<size_t> argumentRanksOf = argumentRanks(member.paramTypes, certain,
+                                                                          instance ? 1 : 0);
+                ranks.insert(ranks.end(), argumentRanksOf.begin(), argumentRanksOf.end());
                 const size_t extraParameters = member.paramTypes.size() - arguments.size();
-                // Only the receiver is ranked here; a plain argument beyond it makes a tie undecidable.
-                bool certain = arguments.size() == braceArguments.size() + (instance ? 1u : 0u);
-                const size_t rank = braceElementRank(member.paramTypes, certain);
+                int order = fallback != nullptr ? compareRanks(ranks, fallbackRanks) : -1;
+                // CVAMB r1: an uncertain tie keeps master's fewer-defaulted-parameters preference.
+                if (fallback != nullptr && order == 0 && !(certain && fallbackCertain))
+                    order = extraParameters < fallbackExtraParameters ? -1
+                        : (extraParameters > fallbackExtraParameters ? 1 : 0);
                 const bool better = fallback == nullptr
                     || *bracePriority < fallbackBracePriority
-                    || (*bracePriority == fallbackBracePriority
-                        && (extraParameters < fallbackExtraParameters
-                            || (extraParameters == fallbackExtraParameters
-                                && rank < fallbackRank)));
+                    || (*bracePriority == fallbackBracePriority && order == -1);
                 if (!better)
                 {
-                    // clang ranks an implicit object parameter by const: tied overloads that differ in
-                    // const are not a tie there, so only same-const candidates are refused.
-                    if (*bracePriority == fallbackBracePriority
-                        && extraParameters == fallbackExtraParameters && rank == fallbackRank)
+                    if (*bracePriority == fallbackBracePriority && order != 1)
                     {
-                        // A ref- or volatile-qualified receiver changes viability: never a plain tie.
-                        const bool sameConst = member.isConst == fallbackConst && !fallbackQualified
-                            && member.refQualifier == cflat_cinterop::CxxRefQualifierNone && !member.isVolatile;
-                        if (certain && fallbackCertain && sameConst) bracesTied = true;
+                        if (certain && fallbackCertain) bracesTied = true;
                         else bracesTied = fallbackCertain = false;
                         if (bracesTied)
                             tiedCandidates.push_back(displayCandidate(memberName, memberShownParams(member)));
@@ -5972,11 +6112,9 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 tiedCandidates = {displayCandidate(memberName, memberShownParams(member))};
                 fallback = &member;
                 fallbackBracePriority = *bracePriority;
+                fallbackRanks = ranks;
                 fallbackExtraParameters = extraParameters;
-                fallbackRank = rank;
                 fallbackCertain = certain;
-                fallbackConst = member.isConst;
-                fallbackQualified = member.refQualifier != cflat_cinterop::CxxRefQualifierNone || member.isVolatile;
             }
             if (bracesTied)
             {

@@ -2399,6 +2399,11 @@ public:
         // type. The closure ENV owns the buffer; this local only borrows it, so handing it to a
         // caller (a `return`) must hand over an independent copy, not the env's storage.
         bool IsClosureValueCapture = false;
+        // compile-time: this local is a lambda body's by-value capture of a borrowed pointer (foreach element or
+        // borrowed parameter). Adopting it into a unique slot or a move sink is refused: the owner still holds it.
+        bool IsClosureBorrowCapture = false;
+        // The outer binding was rebound to an owned value before the lambda: a move sink may take the copy.
+        bool IsClosureRetiredCapture = false;
         // compile-time: this local is a lambda body's unpacked BY-REFERENCE capture (or a field
         // read off one). The OUTER frame owns the storage, so a `return` must hand over a copy.
         bool IsClosureRefCapture = false;
@@ -2846,6 +2851,8 @@ public:
         // so the result is always one of the caller's alias-return copy slots.
         bool ReturnsAliasOfByValueParam = false;
         bool ReturnsDirectByValueParam = false;
+        // Every 'return' is `move p;` of a by-value parameter of the return type (serialized).
+        bool ReturnsMovedByValueParam = false;
         // Parse-tree summary: every 'return' names a module global (`return gRaw;`). Set by
         // the forward-ref scan so a caller's refusal does not depend on definition order.
         bool ReturnsGlobalBorrow = false;
@@ -4497,6 +4504,9 @@ private:
     std::unordered_set<std::string> cxxUnnamedEnumAliases_;
     // Constant macro globals whose clang-evaluated type is an unnamed enum (CMacroEntry::isUnnamedEnum).
     std::unordered_set<std::string> cxxUnnamedEnumMacros_;
+    // Set only while a failed request is retried with unnamed-enum macros passed as int (master's path).
+    bool cxxMacroIdentitySuppressed_ = false;
+    bool HasUnnamedEnumMacroArgument(const std::vector<NamedVariable>& arguments) const;
     bool IsUnnamedEnumMacro(const NamedVariable& arg) const;
     bool IsUnnamedEnumValue(const NamedVariable& arg) const;
     // The C++ type of an unnamed-enum enumerator (`decltype(ns::E)`), empty for anything else.
@@ -6278,6 +6288,8 @@ private:
 
     void UnregisterOwnedStringTemp(llvm::Value* value);
 
+    // Drop the owning-return records of a value a new-expression now owns as an ordinary result.
+    void ForgetOwnedReturnTemp(llvm::Value* value);
     // Record release metadata for an owning return; optionally add its no-discard entry.
     void RegisterOwnedReturnTemp(llvm::Value* value, const std::string& fnName,
                                  const TypeAndValue& retType, bool checkDiscard = true);
@@ -7993,6 +8005,15 @@ private:
     bool LastCxxRequestNoViableAtRequest() const { return lastCxxRequestNoViableAtRequest_; }
     // True when the newest RequestCxxFreeBraceCall refused because the list would die early.
     bool LastCxxBraceLifetimeRefused() const { return lastCxxBraceLifetimeRefused_; }
+    bool RequestCxxFunctionTemplateOnce(const std::string& functionName,
+                                        const std::string& ownerType,
+                                        const std::vector<std::string>& explicitArgs,
+                                        std::vector<NamedVariable>& arguments,
+                                        const std::vector<CxxBraceArgument>& braceArguments,
+                                        std::string& registeredName,
+                                        std::string& error,
+                                        const std::string& infixOperator,
+                                        bool uniqueRegistration);
     bool RequestCxxFunctionTemplate(const std::string& functionName,
                                     const std::string& ownerType,
                                     const std::vector<std::string>& explicitArgs,
@@ -11809,7 +11830,8 @@ public:
                                         bool* needsStandardConversion = nullptr,
                                         bool* ambiguous = nullptr,
                                         std::vector<std::string>* ambiguousCandidates = nullptr,
-                                        const TypeAndValue* receiver = nullptr) const;
+                                        const TypeAndValue* receiver = nullptr,
+                                        bool* derivedResult = nullptr) const;
     std::string ScoreCxxConversionOperatorArgument(const NamedVariable& arg,
                                                    const TypeAndValue& param,
                                                    bool preserveAmbiguous,
@@ -12153,7 +12175,8 @@ public:
                                     llvm::Value* src, bool useMove, const char* context,
                                     const std::string& displayTypeName = {},
                                     bool constSource = false, bool directInit = false,
-                                    bool forceClangPick = false);
+                                    bool forceClangPick = false,
+                                    bool rvaluePickFallback = false);
     // Same-class copy of an lvalue through the memoized wrapper request (one per class and
     // constness). False with `error` set when clang refuses; `out.requested` false when no wrapper.
     bool RequestSameClassCopy(const std::string& typeName, const NamedVariable& source,
@@ -14609,6 +14632,9 @@ public:
     {
         auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
         if (gv == nullptr) return nullptr;
+        // The int-path retry of a failed request: an unnamed-enum macro is an int, as on master.
+        if (cxxMacroIdentitySuppressed_ && cxxUnnamedEnumMacros_.count(gv->getName().str()) != 0)
+            return nullptr;
         auto it = cxxUnnamedEnumExpressions_.find(gv);
         return it == cxxUnnamedEnumExpressions_.end() ? nullptr : &it->second;
     }

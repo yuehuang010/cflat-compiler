@@ -1,0 +1,23 @@
+import cpp "cpp_ucv_user_conversions.hpp";
+
+// A derived-class pointer result from a user conversion is refused at a CFlat callee taking the
+// base pointer (no CFlat-side base pick). Two unrelated derived results are ambiguous and refused.
+int takeCflatP2(ucv.P2* p) { return p->v; }
+
+expect_error("no overload of 'takeCflatP2' matches") {
+    int refuseCflatCallee() {
+        ucv.D2Source ds = default;
+        return takeCflatP2(ds);
+    }
+}
+expect_error("no overload of 'ucv.takeP2' matches") {
+    int refuseUnrelated() {
+        ucv.UnrelSource us = default;
+        return ucv.takeP2(us);
+    }
+}
+
+extern int main()
+{
+    return 0;
+}
