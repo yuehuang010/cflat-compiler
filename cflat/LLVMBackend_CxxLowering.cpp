@@ -554,7 +554,17 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 indirectArgAddrs[i] = temp;
             }
         for (size_t i = 0; i < directDefaultSlots.size(); ++i)
-            if (directDefaultSlots[i] != nullptr) constructDirectDefault(i);
+            if (directDefaultSlots[i] != nullptr)
+            {
+                auto* defaultValue = constructDirectDefault(i);
+                if (recipe.hasLowering && i < recipe.paramSlots.size()
+                    && recipe.paramSlots[i].kind == AbiSlot::ByVal
+                    && IsForeignNontrivialCxxClass(st.params[i].TypeName))
+                {
+                    indirectArgAddrs.resize(recipe.paramSlots.size(), nullptr);
+                    indirectArgAddrs[i] = defaultValue;
+                }
+            }
         // The argument values are loaded: a by-value `move f` nulls its source BEFORE the call, so
         // a write the constructor makes to the source survives (no after-call pass nulls it).
         if (callArgVars != nullptr)
@@ -3872,6 +3882,73 @@ llvm::Value* LLVMBackend::ConvertCxxXvalueToPointer(const NamedVariable& source,
         return builder->CreateCall(function, { storage }, "cxx.xvalue.pointer.result");
 }
 
+bool LLVMBackend::CxxCopyInitNeedsClangWrapper(const NamedVariable& source,
+                                                const std::string& targetType)
+{
+        if (source.TypeAndValue.Pointer) return false;
+        const TypeAndValue argType = InferImplicitCxxArgumentType(source, *this);
+        if (!argType.Pointer && IsCxxRecord(argType.TypeName) && IsCxxRecord(targetType)
+            && ResolveTypeAlias(argType.TypeName) != ResolveTypeAlias(targetType)
+            && IsCxxDerivedToBaseValue(argType, TypeAndValue{ .TypeName = targetType }, nullptr))
+            return true;
+        if (!IsCxxRecord(targetType)) return false;
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(targetType);
+        if (info == nullptr) return false;
+        NamedVariable probe = source;
+        probe.TypeAndValue = argType;
+        probe.TypeAndValue.VariableName.clear();
+        for (const CxxClassInfo::Structor& ctor : info->constructors)
+        {
+            if (ctor.isExplicit || ctor.isDeleted || ctor.isCopyCtor || ctor.isMoveCtor
+                || ctor.isDefaultCtor || ctor.params.size() < 3
+                || ctor.defaultArgs.size() != ctor.params.size())
+                continue;
+            bool defaultsPresent = true;
+            bool nonconstantDefault = false;
+            for (size_t i = 2; i < ctor.params.size(); ++i)
+            {
+                const auto& def = ctor.defaultArgs[i];
+                defaultsPresent = defaultsPresent && !def.kind.empty();
+                const bool scalarExpression = def.kind != "int" && def.kind != "enum"
+                    && def.kind != "bool" && def.kind != "float" && def.kind != "double"
+                    && def.kind != "nullptr";
+                nonconstantDefault = nonconstantDefault
+                    || (scalarExpression && !ctor.params[i].Pointer
+                        && !IsForeignNontrivialCxxClass(ctor.params[i].TypeName));
+            }
+            // A class default built in place needs no wrapper; one passed in registers (MS x64) does.
+            if (!nonconstantDefault && defaultsPresent
+                && !CxxCtorDefaultsDirect(targetType, ctor, 2))
+                for (size_t i = 2; i < ctor.params.size(); ++i)
+                    nonconstantDefault = nonconstantDefault
+                        || (ctor.defaultArgs[i].kind == "nonconst" && !ctor.params[i].Pointer
+                            && IsForeignNontrivialCxxClass(ctor.params[i].TypeName));
+            const bool exactFirstParameter = ResolveTypeAlias(argType.TypeName)
+                == ResolveTypeAlias(ctor.params[1].TypeName);
+            const auto isArithmeticOrUnscopedEnum = [&](const TypeAndValue& type) {
+                if (type.Pointer || type.IsScopedEnum || IsCxxRecord(type.TypeName)) return false;
+                const llvm::Type* llvmType = GetType(type);
+                return llvmType != nullptr
+                    && (llvmType->isIntegerTy() || llvmType->isFloatingPointTy());
+            };
+            // Floating -> integer stays refused (it loses the fraction), as on the literal-default path.
+            const bool implicitArithmeticConversion =
+                isArithmeticOrUnscopedEnum(argType)
+                && isArithmeticOrUnscopedEnum(ctor.params[1])
+                && !(GetType(argType)->isFloatingPointTy()
+                     && GetType(ctor.params[1])->isIntegerTy()
+                     && !GetType(ctor.params[1])->isIntegerTy(1));
+            if (defaultsPresent && nonconstantDefault
+                && (exactFirstParameter || implicitArithmeticConversion
+                    || ClassifyCxxImplicitArgument(probe, ctor.params[1],
+                        /*cxxByValueParam*/ true,
+                        /*allowTemplateClassConversion*/ false,
+                        /*allowScalarNarrowing*/ true) == CxxArgConversion::Convertible))
+                return true;
+        }
+        return false;
+}
+
 LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCtor(
         NamedVariable& source, const std::string& targetType, llvm::Value* intoSlot,
         std::string& refusal, bool directInit, bool allowScalarNarrowing)
@@ -3913,6 +3990,25 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         // When the source has an implicit conversion operator, let clang resolve the whole
         // copy-initialization sequence before the listed constructor fast path can choose one.
         const TypeAndValue argType = InferImplicitCxxArgumentType(source, *this);
+        if (CxxCopyInitNeedsClangWrapper(source, targetType))
+        {
+            NamedVariable probe = source;
+            probe.TypeAndValue = argType;
+            probe.TypeAndValue.VariableName.clear();
+            std::string wrapperName;
+            std::string wrapperError;
+            if (RequestCxxVariadicConstructor(targetType, { probe }, wrapperName, wrapperError,
+                                              /*copyInit*/ true))
+            {
+                ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
+                return CxxConvertingCtorResult::Converted;
+            }
+            if (!wrapperError.empty())
+            {
+                refusal = wrapperError;
+                return CxxConvertingCtorResult::Refused;
+            }
+        }
         const std::vector<NamedVariable> scalarSource{ source };
         if (!argType.Pointer && IsCxxRecord(targetType)
             && CxxUnnamedEnumExpression(source.Storage) != nullptr

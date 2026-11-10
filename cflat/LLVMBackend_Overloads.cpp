@@ -6709,6 +6709,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             EnsureCxxMemberProjected(receiverType, bareMemberName);
         // Rank the full C++ member set together so all receiver cv-qualifiers participate.
         const std::string constTwinPrefix = CxxConstTwinName("");
+        bool rankReceiverConstTwinWithMixed = false;
         if ((!arguments.empty() || implicitReceiver != nullptr)
             && !bareMemberName.starts_with(constTwinPrefix)
             && IsCxxRecord(receiverType))
@@ -6724,25 +6725,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         twinFits = true;
                 if (twinFits)
                 {
-                    if (IsCxxStaticMethod(receiverType, bareMemberName))
-                    {
-                        std::vector<FunctionSymbol> receiverTwins;
-                        for (const auto& candidate : twin->second)
-                            if (candidate.IsCxx && candidate.IsMethod
-                                && !candidate.Parameters.empty()
-                                && candidate.Parameters.front().TypeName == receiverType)
-                                receiverTwins.push_back(candidate);
-                        auto& plainSet = functionTable[bareMemberName];
-                        for (auto& candidate : receiverTwins)
-                            if (std::none_of(plainSet.begin(), plainSet.end(),
-                                   [&](const FunctionSymbol& plain) {
-                                       return plain.UniqueName == candidate.UniqueName
-                                           && !plain.Parameters.empty()
-                                           && plain.Parameters.front().TypeName == receiverType;
-                                   }))
-                                plainSet.push_back(std::move(candidate));
-                    }
-                    else
+                    const bool hasStaticMember = IsCxxStaticMethod(receiverType, bareMemberName);
+                    if (!hasStaticMember)
                     {
                         if (auto plain = functionTable.find(bareMemberName);
                             plain != functionTable.end())
@@ -6770,6 +6754,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             allowOperatorAliasReturnStringTemp, operatorReceiverStorage,
                             implicitReceiver, lexicalAggregateScopes);
                     }
+                    rankReceiverConstTwinWithMixed = postfixMemberCall
+                        && functionName == bareMemberName;
                 }
             }
         }
@@ -6933,14 +6919,39 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     || (receiverHasCxxMember && !CxxUniquePtrPointee(receiverType).empty())))
                 candidateSet = &receiverMemberCandidates;
         }
+        // For a static/instance C++ overload name, rank this receiver's methods together.
+        // The bare-name table may also contain unrelated CFlat overloads, which disables C++ ranking.
+        if (rankReceiverConstTwinWithMixed && !receiverMemberCandidates.empty())
+            candidateSet = &receiverMemberCandidates;
         std::vector<FunctionSymbol> joinedCandidateSet;
-        if (additionalCandidate != nullptr
-            && std::none_of(candidateSet->begin(), candidateSet->end(), [&](const auto& candidate) {
-                return candidate.UniqueName == additionalCandidate->UniqueName;
-            }))
+        const auto receiverConstTwinSet = rankReceiverConstTwinWithMixed
+            ? functionTable.find(CxxConstTwinName(bareMemberName)) : functionTable.end();
+        const bool hasReceiverConstTwin = receiverConstTwinSet != functionTable.end()
+            && std::any_of(receiverConstTwinSet->second.begin(), receiverConstTwinSet->second.end(),
+                [&](const FunctionSymbol& candidate) {
+                    return candidate.IsCxx && candidate.IsMethod
+                        && !candidate.Parameters.empty()
+                        && candidate.Parameters.front().TypeName == receiverType;
+                });
+        if (additionalCandidate != nullptr || hasReceiverConstTwin)
         {
             joinedCandidateSet = *candidateSet;
-            joinedCandidateSet.push_back(*additionalCandidate);
+            if (hasReceiverConstTwin)
+                for (const auto& candidate : receiverConstTwinSet->second)
+                    if (candidate.IsCxx && candidate.IsMethod
+                        && !candidate.Parameters.empty()
+                        && candidate.Parameters.front().TypeName == receiverType
+                        && std::none_of(joinedCandidateSet.begin(), joinedCandidateSet.end(),
+                            [&](const FunctionSymbol& existing) {
+                                return existing.UniqueName == candidate.UniqueName;
+                            }))
+                        joinedCandidateSet.push_back(candidate);
+            if (additionalCandidate != nullptr
+                && std::none_of(joinedCandidateSet.begin(), joinedCandidateSet.end(),
+                    [&](const auto& candidate) {
+                        return candidate.UniqueName == additionalCandidate->UniqueName;
+                    }))
+                joinedCandidateSet.push_back(*additionalCandidate);
             candidateSet = &joinedCandidateSet;
         }
         const NamedVariable* nativeReceiverConstSource = callReceiver.has_value()

@@ -3190,6 +3190,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // optimization, so they are optimized (and inlined) with the rest of the program.
     if (!LinkCInlineDemandBodies()) return false;
     if (!LinkCxxCompanionModules()) return false;
+    // The companions hold every C++ body the program uses: nothing requests C++ past this point.
+    ReleaseCxxIncrementalGroups();
     // The C++ bodies are in the module now: answer the `this`-escape gates left false.
     ResolveCxxThisEscapeGates();
     // Every callee body is linked now, so the return-keep leaves can be answered too.
@@ -3379,7 +3381,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     {
         // The live C++ interpreters retain the shared AST until all requests finish. Release them
         // before object emission so the linker does not compete with their resident AST memory.
-        cxxIncrementalGroups_.clear();
+        ReleaseCxxIncrementalGroups();
         llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
         std::string emitPath = *exePath;
         bool isolatedOutput = isolatedPolicy_.has_value();
@@ -5480,6 +5482,23 @@ void LLVMBackend::DiscardOptimizedViewState()
     optimizedViewCache_ = OptimizedViewCache{};
     incrementalViewSnapshot_.reset();
     optimizedViewWasIncremental_ = false;
+}
+
+#if defined(CFLAT_HAS_MIMALLOC)
+extern "C" void mi_collect(bool force);
+#endif
+
+/*
+ * Destroys the live C++ interpreters (their header ASTs dominate a cold compile) and hands the
+ * freed pages back to the OS: mimalloc keeps them otherwise, so the footprint would not drop.
+ */
+void LLVMBackend::ReleaseCxxIncrementalGroups()
+{
+        if (cxxIncrementalGroups_.empty()) return;
+        cxxIncrementalGroups_.clear();
+#if defined(CFLAT_HAS_MIMALLOC)
+        mi_collect(true);
+#endif
 }
 
 void LLVMBackend::ResetForReanalysis()

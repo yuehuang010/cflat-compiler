@@ -7879,6 +7879,7 @@ private:
     void ReportCxxHeaderParseSummary(const CxxRequestGroup& group) const;
     void AttachCxxHeaderParseGuard(cflat_cinterop::ExtractRequest& req,
                                    const CxxRequestGroup& group) const;
+    void ReleaseCxxIncrementalGroups();
     CxxIncrementalGroup* GetCxxIncrementalGroup(const CxxRequestGroup& group,
                                                 std::string& error,
                                                 const std::string& initialSource = {},
@@ -7927,6 +7928,10 @@ private:
     bool IsCxxFunctionTemplateParameterByValue(const std::string& functionName,
                                                const std::string& ownerType,
                                                size_t parameterIndex, size_t arity) const;
+    // T-constst3: every static member template that fits the arity takes the slot by `const place &`.
+    bool IsCxxStaticTemplateConstRefParameter(const std::string& qualifiedName,
+                                              size_t parameterIndex, size_t arity,
+                                              const std::string& placeType) const;
     bool IsCxxFreeFunctionParameterByValue(const std::string& functionName,
                                            size_t parameterIndex, size_t arity) const;
     bool IsCxxMemberFunctionParameterByValue(const std::string& ownerType,
@@ -11856,6 +11861,8 @@ public:
      * now the T - an owned temporary, or `intoSlot` when given.
      */
     enum class CxxConvertingCtorResult { NotApplicable, Converted, Refused };
+    bool CxxCopyInitNeedsClangWrapper(const NamedVariable& source,
+                                     const std::string& targetType);
     // directInit: C++ direct-initialization (a cast); explicit constructors are candidates.
     CxxConvertingCtorResult ConvertThroughCxxConvertingCtor(NamedVariable& source,
                                                             const std::string& targetType,
@@ -15154,7 +15161,7 @@ public:
     // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
     // 328: conversion-function template metadata and requests are cached separately from ctor templates.
     // 330: function-type parameters record pointee const (callback overload ranking).
-    static constexpr int kCHeaderCacheVersion = 332;
+    static constexpr int kCHeaderCacheVersion = 333;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

@@ -68,3 +68,12 @@ array-reference / by-value-pointer ties as clang does.
   caller-slot re-spelling is `X *const &` only. Safe, but a refusal clang does not make.
 - Free path: the caller-slot re-spelling is skipped when the operator scalar retarget already
   fired (`retarget.empty()` guard in RequestCxxFreeFunction); not probed.
+
+## Attempt 2026-11-08 (PTRREF, parked)
+
+Master now matches clang on the four-line Repro (5 3 3 5); what remains is the clang-ambiguous
+tie. A Luna attempt that refused the literal tie in LLVMBackend_Overloads.cpp was parked after
+review: it falsely refused `nc("abc")` with a non-const `char (&)[4]` sibling, and
+`x2("abc", 1)` where another argument decides. Direction: decide the tie in the tie-break after
+normal ranking leaves exactly these two candidates, and only for a `const char (&)[N]` lvalue
+reference. Patch and repros: scratch/repro_keep/ptrref/parked/ (gitignored).

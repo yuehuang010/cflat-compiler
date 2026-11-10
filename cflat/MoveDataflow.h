@@ -11,6 +11,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -60,6 +61,99 @@ namespace movedf
     // Maybe-moved lattice element: whole-binding keys plus encoded field paths.
     using MovedSet = std::unordered_set<std::string>;
 
+    /*
+     * The dataflow's per-block lattice element: the same string keys as MovedSet, interned per
+     * AnalyzeFunction and kept as sorted ids. A huge function holds one per block twice over.
+     */
+    class KeyPool
+    {
+    public:
+        uint32_t Intern(const std::string& key)
+        {
+            auto [it, inserted] = ids_.try_emplace(key, static_cast<uint32_t>(names_.size()));
+            if (inserted) names_.push_back(&it->first);
+            return it->second;
+        }
+        int64_t Find(const std::string& key) const
+        {
+            auto it = ids_.find(key);
+            return it == ids_.end() ? -1 : static_cast<int64_t>(it->second);
+        }
+        const std::string& Name(uint32_t id) const { return *names_[id]; }
+        static KeyPool*& Current()
+        {
+            thread_local KeyPool* current = nullptr;
+            return current;
+        }
+        static KeyPool& Active()
+        {
+            thread_local KeyPool fallback;
+            return Current() != nullptr ? *Current() : fallback;
+        }
+    private:
+        std::unordered_map<std::string, uint32_t> ids_;
+        std::vector<const std::string*> names_;
+    };
+
+    // Installs a fresh pool for one function's analysis.
+    struct KeyPoolScope
+    {
+        KeyPool pool;
+        KeyPool* previous;
+        KeyPoolScope() : previous(KeyPool::Current()) { KeyPool::Current() = &pool; }
+        ~KeyPoolScope() { KeyPool::Current() = previous; }
+        KeyPoolScope(const KeyPoolScope&) = delete;
+        KeyPoolScope& operator=(const KeyPoolScope&) = delete;
+    };
+
+    class FlowSet
+    {
+    public:
+        class iterator
+        {
+        public:
+            iterator(const FlowSet* set, size_t index) : set_(set), index_(index) {}
+            const std::string& operator*() const
+            { return KeyPool::Active().Name(set_->ids_[index_]); }
+            const std::string* operator->() const { return &**this; }
+            iterator& operator++() { ++index_; return *this; }
+            bool operator==(const iterator& other) const { return index_ == other.index_; }
+        private:
+            friend class FlowSet;
+            const FlowSet* set_;
+            size_t index_;
+        };
+        iterator begin() const { return iterator(this, 0); }
+        iterator end() const { return iterator(this, ids_.size()); }
+        size_t count(const std::string& key) const
+        {
+            const int64_t id = KeyPool::Active().Find(key);
+            return id >= 0 && std::binary_search(ids_.begin(), ids_.end(), static_cast<uint32_t>(id))
+                ? 1 : 0;
+        }
+        void insert(const std::string& key)
+        {
+            const uint32_t id = KeyPool::Active().Intern(key);
+            auto at = std::lower_bound(ids_.begin(), ids_.end(), id);
+            if (at == ids_.end() || *at != id) ids_.insert(at, id);
+        }
+        void erase(const std::string& key)
+        {
+            const int64_t id = KeyPool::Active().Find(key);
+            if (id < 0) return;
+            auto at = std::lower_bound(ids_.begin(), ids_.end(), static_cast<uint32_t>(id));
+            if (at != ids_.end() && *at == static_cast<uint32_t>(id)) ids_.erase(at);
+        }
+        iterator erase(iterator it)
+        {
+            ids_.erase(ids_.begin() + static_cast<std::ptrdiff_t>(it.index_));
+            return iterator(this, it.index_);
+        }
+        bool operator==(const FlowSet& other) const { return ids_ == other.ids_; }
+    private:
+        std::vector<uint32_t> ids_;
+    };
+
     inline bool IsFieldPathMoved(const MovedSet& s, const std::string& field)
     {
         return !field.empty() && s.count(field) != 0;
@@ -102,7 +196,7 @@ namespace movedf
     inline std::string RevivedFieldKey(const std::string& name, const std::string& field)
     { return '!' + name + '\x1f' + field; }
 
-    inline bool IsPathMoved(const MovedSet& s, const std::string& name, const std::string& field)
+    inline bool IsPathMoved(const FlowSet& s, const std::string& name, const std::string& field)
     {
         if (s.count(name)) return true;
         if (field.empty()) return false;
@@ -111,10 +205,10 @@ namespace movedf
 
     // Positive field keys union at joins. Re-init exemptions survive only if the path is live on
     // every incoming edge, matching T266/T277's conservative maybe-moved merge.
-    inline MovedSet MergeMovedSets(const std::vector<const MovedSet*>& inputs)
+    inline FlowSet MergeFlowSets(const std::vector<const FlowSet*>& inputs)
     {
-        MovedSet merged, candidates;
-        for (const MovedSet* input : inputs)
+        FlowSet merged, candidates;
+        for (const FlowSet* input : inputs)
             if (input != nullptr)
                 for (const auto& key : *input)
                 {
@@ -128,7 +222,7 @@ namespace movedf
             const std::string name = candidate.substr(1, separator - 1);
             const std::string field = candidate.substr(separator + 1);
             bool liveEverywhere = true;
-            for (const MovedSet* input : inputs)
+            for (const FlowSet* input : inputs)
                 if (input != nullptr && IsPathMoved(*input, name, field))
                 { liveEverywhere = false; break; }
             if (liveEverywhere) merged.insert(candidate);
@@ -145,7 +239,7 @@ namespace movedf
     // USE-check rule (mirrors LLVMBackend::MovedUseSubject): a whole binding move poisons
     // everything below it, while field/index paths compare exact and dynamic index components.
     // Apply one event's gen/kill to the running set (Use is a no-op).
-    inline void ApplyEvent(MovedSet& s, const Event& e)
+    inline void ApplyEvent(FlowSet& s, const Event& e)
     {
         switch (e.kind)
         {
@@ -225,6 +319,7 @@ namespace movedf
     {
         std::vector<Divergence> out;
         if (!F || F->isDeclaration() || F->empty()) return out;
+        KeyPoolScope keyPool;
 
         // Group events by block, preserving emission (walk) order within each block.
         std::unordered_map<llvm::BasicBlock*, std::vector<const Event*>> byBlock;
@@ -254,7 +349,7 @@ namespace movedf
                 blockEvents[i] = &it->second;
         }
 
-        auto transfer = [&](int i, MovedSet& s) {
+        auto transfer = [&](int i, FlowSet& s) {
             if (blockEvents[i])
                 for (const Event* e : *blockEvents[i])
                     ApplyEvent(s, *e);
@@ -262,7 +357,7 @@ namespace movedf
 
         // Least fixpoint of a monotone gen/kill union problem, so visit order cannot change the
         // result. RPO sweeps recompute only blocks whose predecessor OUT changed (depth+2 sweeps).
-        std::vector<MovedSet> blockOut(n);
+        std::vector<FlowSet> blockOut(n);
         std::vector<char> dirty(n, 1);
         bool anyDirty = true;
         while (anyDirty)
@@ -272,11 +367,11 @@ namespace movedf
             {
                 if (!dirty[i]) continue;
                 dirty[i] = 0;
-                std::vector<const MovedSet*> incoming;
+                std::vector<const FlowSet*> incoming;
                 if (i != 0)
                     for (int p : preds[i])
                         incoming.push_back(&blockOut[p]);
-                MovedSet result = MergeMovedSets(incoming);
+                FlowSet result = MergeFlowSets(incoming);
                 transfer(i, result);
                 if (result != blockOut[i])
                 {
@@ -292,14 +387,14 @@ namespace movedf
 
         // Acyclic OUT: single pass in RPO taking only FORWARD-edge predecessors (rpo<current).
         // This reproduces the inline checker's linear + if/else merge view (no back-edges).
-        std::vector<MovedSet> acyclicOut(n);
+        std::vector<FlowSet> acyclicOut(n);
         for (int i = 0; i < n; ++i)
         {
-            std::vector<const MovedSet*> incoming;
+            std::vector<const FlowSet*> incoming;
             for (int p : preds[i])
                 if (p < i)
                     incoming.push_back(&acyclicOut[p]);
-            MovedSet result = MergeMovedSets(incoming);
+            FlowSet result = MergeFlowSets(incoming);
             transfer(i, result);
             acyclicOut[i] = std::move(result);
         }
@@ -313,7 +408,7 @@ namespace movedf
             if (rit == rpo.end()) continue;
             const int i = rit->second;
             if (!blockEvents[i]) continue;
-            std::vector<const MovedSet*> incoming, acyclicIncoming;
+            std::vector<const FlowSet*> incoming, acyclicIncoming;
             if (i != 0)
                 for (int p : preds[i])
                 {
@@ -321,8 +416,8 @@ namespace movedf
                     if (p < i)
                         acyclicIncoming.push_back(&acyclicOut[p]);
                 }
-            MovedSet running = MergeMovedSets(incoming);
-            MovedSet acyclicRunning = MergeMovedSets(acyclicIncoming);
+            FlowSet running = MergeFlowSets(incoming);
+            FlowSet acyclicRunning = MergeFlowSets(acyclicIncoming);
 
             for (const Event* e : *blockEvents[i])
             {

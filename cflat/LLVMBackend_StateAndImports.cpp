@@ -2792,6 +2792,7 @@ nlohmann::json LLVMBackend::FunctionTemplateToJson(
                  {"pn", t.parameterNames},
                  {"fr", t.forwardingReferenceParameters},
                  {"fpi", t.forwardingReferenceTemplateParameterIndices},
+                 {"cr", t.constRefClassParameters},
                  {"tk", t.templateParameterKinds},
                  {"cn", t.isConst},
                  {"nx", t.isNoexcept}, {"a", t.access},
@@ -2821,6 +2822,7 @@ cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(
         if (j.contains("fpi"))
             for (uint64_t value : j["fpi"].to_u64_vector())
                 t.forwardingReferenceTemplateParameterIndices.push_back((unsigned)value);
+        if (j.contains("cr")) t.constRefClassParameters = j["cr"].to_string_vector();
         t.templateParameterKinds = j.value("tk", std::string{});
         t.isConst = j.value("cn", false);
         t.isNoexcept = j.value("nx", false);

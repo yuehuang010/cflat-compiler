@@ -8,3 +8,10 @@ Fix direction: a prvalue class argument to an aggregate or constructor wrapper m
 parameter or member slot (guaranteed elision), not materialized and moved. Needs a design pass over wrapper argument
 passing; not a one-site change.
 
+
+Root cause (fix box 2026-11-08, Luna + Haiku rounds, no code landed): RequestCxxVariadicConstructor
+(LLVMBackend_CxxRequestTypes.cpp) emits `::new (p0) CM(static_cast<Cnt&&>(p1), ...)`, and `Cnt(5)` is built by its
+own wrapper call first, so the member is always move-constructed. The only C++-valid elision is a wrapper that
+spells the member's constructor arguments (`::new (p0) CM(Cnt(p1), p2)`, zero moves per the clang oracle), which
+needs deferred argument evaluation at every caller (declaration, `new`, brace, nested, expression, ternary phi).
+Repro: `scratch/repro_keep/parenagg/min.cb` (5 with clang, 6 in CFlat).

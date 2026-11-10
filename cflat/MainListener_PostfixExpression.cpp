@@ -13000,6 +13000,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && Compiler(ctx)->IsCxxStaticMethod(
                                             functionName.substr(0, staticOwnerDot),
                                             functionName.substr(staticOwnerDot + 1), /*staticOnly*/ true);
+                                    // T-constst3: `Owner.f()` on a C++ static member template; its `?:` may defer when
+                                    // every template candidate binds the slot as `const place &` (IsCxxStaticTemplateConstRefParameter).
+                                    const bool cxxStaticTemplateWrapper = cxxTemplateWrapper && funcSym == nullptr
+                                        && !cxxMemberReceiver && !cxxConstructorCall
+                                        && structVar.BaseType == nullptr && staticOwnerDot != std::string::npos
+                                        && Compiler(ctx)->IsCxxRecord(functionName.substr(0, staticOwnerDot));
                                     cxxDirectConstructionMemberCall = cxxDirectConstructionMemberCall
                                         || cxxNonTemplateMemberWrapper;
                                     const bool cxxFunctionWrapper =
@@ -13146,15 +13152,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // T459: `Ctor(c ? default : v)` into a `const T&` constructor parameter joins a
                                     // temporary of that class, as clang's conditional prvalue does.
                                     LLVMBackend::TypeAndValue ctorRefDest;
-                                    // Armed only when the place arm is that class: `int` beside the const T& ctor selects int.
+                                    // Resolve the unique const-ref parameter before materializing the arm class.
                                     std::string ctorRefPlaceType;
                                     const bool ctorRefTernary = cxxConstructorCall && argumentExpression != nullptr
                                         && IsCxxDeferrableDefaultTernary(argumentExpression, ctorRefPlaceType)
                                         && Compiler(ctx)->GetUniqueCxxConstructorValueParameter(
                                             functionName, argIdx, namedArgCtx.size(), ctorRefDest,
-                                            /*constRef*/ true)
-                                        && ctorRefPlaceType == ctorRefDest.TypeName
-                                        && Compiler(ctx)->IsForeignNontrivialCxxClass(ctorRefDest.TypeName);
+                                            /*constRef*/ true);
                                     llvm::SaveAndRestore<LLVMBackend::TypeAndValue>
                                         cxxCallArgumentExpectedTypeScope(
                                             cxxCallArgumentExpectedType_, cxxCallArgument && byValueExpected
@@ -13218,6 +13222,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     parameterAgrees = false;
                                                 parameterType = type;
                                             }
+                                        if (cxxStaticTemplateWrapper)
+                                            return Compiler(ctx)->IsCxxStaticTemplateConstRefParameter(
+                                                functionName, index + paramOffset, namedArgCtx.size() + paramOffset,
+                                                placeType) ? placeType : std::string();
                                         if (cxxStaticMemberWrapper)
                                             return matchingStaticConstRef != 0
                                                 ? placeType : std::string();
@@ -13237,13 +13245,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         return std::string();
                                     };
                                     std::string deferredDefaultType;
-                                    if ((cxxFreeWrapper || cxxNonTemplateMemberWrapper || cxxStaticMemberWrapper)
-                                        && !cxxConstructorCall && !cxxTemplateWrapper
+                                    if ((cxxFreeWrapper || cxxNonTemplateMemberWrapper || cxxStaticMemberWrapper
+                                            || cxxStaticTemplateWrapper)
+                                        && !cxxConstructorCall && (!cxxTemplateWrapper || cxxStaticTemplateWrapper)
                                         && argumentExpression != nullptr
                                         && (funcSym == nullptr || funcSym->IsCxx)
                                         // A set holding any function template may dispatch through the template
-                                        // emitter, which takes no deferred shape.
-                                        && !Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                        // emitter, which takes no deferred shape unless it is a static const-ref slot.
+                                        && (!Compiler(ctx)->HasCxxFunctionTemplate(functionName) || cxxStaticTemplateWrapper)
                                         && !(structVar.BaseType != nullptr
                                             && Compiler(ctx)->HasCxxFunctionTemplateMember(
                                                 structVar.TypeAndValue.TypeName, primaryIdentifier))
@@ -13295,7 +13304,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                         if (ctorRefTernary)
                                             return this->ParseCxxConstRefTernaryTemp(
-                                                namedArgument->assignmentExpression(), ctorRefDest);
+                                                namedArgument->assignmentExpression(),
+                                                LLVMBackend::TypeAndValue{ .TypeName = ctorRefPlaceType });
                                         if (castDefaultArgSlot == nullptr)
                                             return this->ParseAssignmentExpressionNamed(
                                                 namedArgument->assignmentExpression());

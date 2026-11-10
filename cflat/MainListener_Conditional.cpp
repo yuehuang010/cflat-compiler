@@ -521,6 +521,8 @@ LLVMBackend::NamedVariable MainListener::ParseCxxConstRefTernaryTemp(
         auto* backend = Compiler();
         auto* objectType = backend->GetType(LLVMBackend::TypeAndValue{ .TypeName = dest.TypeName });
         auto* slot = backend->AllocaAtEntry(objectType, nullptr, "cxx.ctor.arg.default");
+        CxxCallArgumentExpectedTypeScope callExpectedType(cxxCallArgumentExpectedType_, dest);
+        DeclExpectedTypeScope declExpectedScope(&declExpectedType, dest, true);
         llvm::SaveAndRestore<llvm::Value*> destScope(backend->pendingCxxTernaryDeclDest_, slot);
         llvm::SaveAndRestore<std::string> typeScope(backend->pendingCxxTernaryDeclTypeName_, dest.TypeName);
         backend->pendingCxxTernaryDeclConsumed_ = false;

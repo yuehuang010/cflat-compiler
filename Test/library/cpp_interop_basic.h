@@ -805,6 +805,13 @@ namespace cppi
     int variadic_exact_rank(long x) noexcept;
     int variadic_exact_rank_rev(long x) noexcept;
     int variadic_exact_rank_rev(int x, ...) noexcept;
+    inline int inline_variadic_body_free(int x, ...) noexcept { return 710 + x; }
+    inline int inline_variadic_body_free(long x, ...) noexcept { return 720 + (int)x; }
+    struct InlineVariadicBodyMember
+    {
+        int call(int x, ...) noexcept { return 730 + x; }
+        int call(long x, ...) noexcept { return 740 + (int)x; }
+    };
     // Ellipsis receiving arguments: clang ranks it pairwise against every sibling.
     int variadic_pair_rank(int x, ...) noexcept;
     int variadic_pair_rank(long x, ...) noexcept;
@@ -3185,6 +3192,9 @@ namespace cppi_entity
     inline const int dyn_const = (++dyn_counter, 27);
     template <class T> inline const int dyn_tmpl = (++dyn_counter, 27);
     inline int dynCount() noexcept { return dyn_counter; }
+    constexpr int fold_answer() noexcept { return 7; }
+    inline const int fold_plain = fold_answer();
+    template <class T> inline const int fold_tmpl = fold_answer();
     // Same name as a static and a non-static overload.
     struct Mixed
     {
@@ -4148,4 +4158,37 @@ inline int selected_values(Select* value) { return value->a() * 100 + value->b()
 inline int select_size() { return sizeof(Select); }
 inline int default_tie(int, int value = 1) { return value; }
 inline int default_tie(int, long value = 2) { return (int)value; }
+}
+// Static f(int) beside f(double) and f(double) const: a const receiver's m.f(2) picks the static.
+namespace cppi_t320
+{
+    inline int born = 0;
+    inline int dead = 0;
+
+    struct M
+    {
+        static int f(int x) noexcept { return 100 + x; }
+        int f(double x) noexcept { return 200 + (int)x; }
+        int f(double x) const noexcept { return 300 + (int)x; }
+        M() noexcept { ++born; }
+        ~M() noexcept { ++dead; }
+    };
+
+    inline void reset() noexcept { born = 0; dead = 0; }
+    inline bool oracle() noexcept
+    {
+        reset();
+        int constInt = 0, mutableInt = 0, mutableDouble = 0, constDouble = 0;
+        {
+            M n{};
+            const M m{};
+            constInt = m.f(2);
+            mutableInt = n.f(2);
+            mutableDouble = n.f(2.0);
+            constDouble = m.f(2.0);
+        }
+        return constInt == 102 && mutableInt == 102
+            && mutableDouble == 202 && constDouble == 302
+            && born == 2 && dead == 2;
+    }
 }

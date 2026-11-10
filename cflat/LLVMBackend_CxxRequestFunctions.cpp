@@ -2142,10 +2142,54 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         std::map<size_t, std::pair<size_t, std::string>> classBackedParams;
         std::string wrapperBodyPrefix;
         bool wrapperNeedsInitializerList = false;
+        /*
+         * T-constst3: a deferred `?:` into a static member template's `const place &` slot. The selector
+         * and each place leaf are wrapper parameters; the wrapper spells the conditional, so clang types it.
+         */
+        auto appendDeferredTernary = [&](NamedVariable& construction, std::string& expression) -> bool {
+            std::string defaultSpelling;
+            if (!CxxSpellingForCflatType(construction.CxxDirectConstructionType, defaultSpelling))
+                return false;
+            std::vector<std::string> childNames;
+            for (size_t c = 0; c < construction.CxxDirectConstructionArguments.size(); ++c)
+            {
+                const NamedVariable& child = construction.CxxDirectConstructionArguments[c];
+                std::string spelling = "int";
+                if (c != 0)
+                {
+                    if (IsCxxFunctionDesignatorArgument(child)) return false;
+                    if (!CxxSpellingForCflatType(child.TypeAndValue.TypeName, spelling)) return false;
+                    spelling = (child.TypeAndValue.IsConstObject() ? "const " : "") + spelling + " &";
+                }
+                childNames.push_back("p" + std::to_string(flatParameterIndex++));
+                parameterSpellings.push_back(std::move(spelling));
+            }
+            const std::string& shape = construction.CxxDeferredTernaryShape;
+            expression.clear();
+            for (size_t at = 0; at < shape.size(); )
+            {
+                if (shape[at] != '@') { expression += shape[at++]; continue; }
+                ++at;
+                if (at < shape.size() && shape[at] == 'S') { expression += childNames.front(); ++at; continue; }
+                if (at < shape.size() && shape[at] == 'D') { expression += defaultSpelling + "()"; ++at; continue; }
+                if (at < shape.size() && shape[at] == 'G') { ++at; continue; }
+                if (at < shape.size() && (shape[at] == 'F' || shape[at] == 'M')) return false;
+                size_t end = at;
+                while (end < shape.size() && std::isdigit(static_cast<unsigned char>(shape[end]))) ++end;
+                if (end == at) return false;
+                const size_t child = static_cast<size_t>(std::stoul(shape.substr(at, end - at)));
+                if (child == 0 || child >= childNames.size()) return false;
+                expression += childNames[child];
+                at = end;
+            }
+            return true;
+        };
         auto appendDirectConstruction = [&](NamedVariable& construction,
                                              auto&& self,
                                              std::string& expression) -> bool {
-            if (!construction.IsCxxDirectConstruction || !construction.CxxDeferredTernaryShape.empty()) return false;
+            if (!construction.IsCxxDirectConstruction) return false;
+            if (!construction.CxxDeferredTernaryShape.empty())
+                return appendDeferredTernary(construction, expression);
             if (const std::string refusal = CxxConstructorRvalueRefBindRefusal(
                     construction.CxxDirectConstructionType,
                     construction.CxxDirectConstructionArguments);
@@ -3014,6 +3058,16 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         bool wrapped = RequestGeneratedCxxWrapper(group, makeWrapperInput(wrapperName, callArguments),
                                                   wrapperName, "TPL", bound, wrapperError,
                                                   incompleteTypes.empty(), allowIncremental);
+        // T-constst3: clang's selected callee must take each deferred `?:` argument by const reference.
+        for (size_t i = 0; wrapped && i < arguments.size(); ++i)
+            if (arguments[i].IsCxxDirectConstruction && !arguments[i].CxxDeferredTernaryShape.empty()
+                && (i >= bound.conditionalArgumentKinds.size() || bound.conditionalArgumentKinds[i] != '='))
+            {
+                error = std::format("the '?:' argument {} of C++ '{}' takes the class of its other arm, but "
+                                    "the overload clang selects does not take that class by reference there",
+                                    i + 1, functionName);
+                return false;
+            }
         // Only a result that IS a CFlat closure (or a reference to one) takes the closure-result
         // adapters. A record holding a closure (a holder, OwnedBox) is a plain record result.
         std::string baseReturnClosureSpelling = bound.retSpelling;

@@ -81,4 +81,95 @@ static_assert(std::is_trivially_copyable_v<Away>);
 inline Forward makeForward(int x) { return Forward(x); }
 inline int takeForward(Forward x) { return x.value; }
 inline Forward returnForward() { Forward x(90); return x; }
+
+// ctorconv: derived lvalue slicing, evaluated scalar defaults, and moved subscript arguments.
+inline int sliceBaseInt = 0, sliceBaseCopy = 0, sliceBaseDtor = 0;
+inline int sliceDerivedCtor = 0, sliceDerivedDtor = 0;
+struct SliceBase {
+    int value;
+    SliceBase(int x) : value(x) { ++sliceBaseInt; }
+    SliceBase(const SliceBase& other) : value(other.value) { ++sliceBaseCopy; }
+    ~SliceBase() { ++sliceBaseDtor; }
+};
+struct SliceDerived : SliceBase {
+    SliceDerived(int x) : SliceBase(x) { ++sliceDerivedCtor; }
+    ~SliceDerived() { ++sliceDerivedDtor; }
+};
+inline void resetSlice() {
+    sliceBaseInt = sliceBaseCopy = sliceBaseDtor = 0;
+    sliceDerivedCtor = sliceDerivedDtor = 0;
+}
+
+inline int trivialSliceBaseCtor = 0, trivialSliceDerivedCtor = 0;
+inline int trivialSliceNextCount = 0;
+struct TrivialSliceBase {
+    int value;
+    TrivialSliceBase(int x) : value(x) { ++trivialSliceBaseCtor; }
+};
+struct TrivialSliceDerived : TrivialSliceBase {
+    TrivialSliceDerived(int x) : TrivialSliceBase(x) { ++trivialSliceDerivedCtor; }
+};
+struct TrivialSliceX { int value; };
+struct TrivialSliceMultiple : TrivialSliceX, TrivialSliceBase {
+    TrivialSliceMultiple(int x) : TrivialSliceX{x + 100}, TrivialSliceBase(x) {
+        ++trivialSliceDerivedCtor;
+    }
+};
+static_assert(std::is_trivially_copyable_v<TrivialSliceBase>);
+static_assert(std::is_trivially_copyable_v<TrivialSliceDerived>);
+static_assert(std::is_trivially_copyable_v<TrivialSliceMultiple>);
+inline void resetTrivialSlice() {
+    trivialSliceBaseCtor = trivialSliceDerivedCtor = trivialSliceNextCount = 0;
+}
+inline int nextTrivialSliceIndex() { return trivialSliceNextCount++; }
+
+inline int dynamicNextCount = 0, dynamicGlobal = 40;
+inline int dynamicNextCtor = 0, dynamicGlobalCtor = 0, dynamicDtor = 0;
+inline int nextDynamicDefault() { return ++dynamicNextCount; }
+struct DynamicNext {
+    int value;
+    DynamicNext(Named e, int w = nextDynamicDefault())
+        : value(static_cast<int>(e) * 100 + w) { ++dynamicNextCtor; }
+    ~DynamicNext() { ++dynamicDtor; }
+};
+struct DynamicArithmetic {
+    int value;
+    DynamicArithmetic(int x, int w = nextDynamicDefault())
+        : value(x * 100 + w) { ++dynamicNextCtor; }
+    ~DynamicArithmetic() { ++dynamicDtor; }
+};
+struct DynamicGlobal {
+    int value;
+    DynamicGlobal(Named e, int w = dynamicGlobal)
+        : value(static_cast<int>(e) * 100 + w) { ++dynamicGlobalCtor; }
+    ~DynamicGlobal() { ++dynamicDtor; }
+};
+inline void resetDynamic() {
+    dynamicNextCount = dynamicNextCtor = dynamicGlobalCtor = dynamicDtor = 0;
+    dynamicGlobal = 40;
+}
+inline int classDefaultArgCtor = 0, classDefaultArgDtor = 0;
+inline int classDefaultCtor = 0, classDefaultDtor = 0;
+struct ClassDefaultArg {
+    int value;
+    ClassDefaultArg(int x) : value(x) { ++classDefaultArgCtor; }
+    ~ClassDefaultArg() { ++classDefaultArgDtor; }
+};
+struct DynamicClassDefault {
+    int value;
+    DynamicClassDefault(Named e, ClassDefaultArg arg = ClassDefaultArg(7))
+        : value(static_cast<int>(e) * 100 + arg.value) { ++classDefaultCtor; }
+    ~DynamicClassDefault() { ++classDefaultDtor; }
+};
+inline void resetClassDefault() {
+    classDefaultArgCtor = classDefaultArgDtor = classDefaultCtor = classDefaultDtor = 0;
+}
+
+inline int moveIndexCtor = 0, moveIndexDtor = 0;
+struct MoveIndex {
+    int value;
+    MoveIndex(int x) : value(x) { ++moveIndexCtor; }
+    ~MoveIndex() { ++moveIndexDtor; }
+};
+inline void resetMoveIndex() { moveIndexCtor = moveIndexDtor = 0; }
 }

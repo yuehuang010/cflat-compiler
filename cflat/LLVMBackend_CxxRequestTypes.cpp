@@ -2458,6 +2458,9 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             && ResolveTypeAlias(arguments.front().TypeAndValue.TypeName)
                 == ResolveTypeAlias(typeName))
             declaredWrapperCtor = true;
+        if (!declaredWrapperCtor && copyInit && arguments.size() == 1
+            && CxxCopyInitNeedsClangWrapper(arguments.front(), typeName))
+            declaredWrapperCtor = true;
         // A deleted converting constructor is clang's refusal for this source: report it.
         if (!declaredWrapperCtor && copyInit && arguments.size() == 1
             && !arguments.front().TypeAndValue.Pointer

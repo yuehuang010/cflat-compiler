@@ -287,6 +287,8 @@ namespace cflat_cinterop
         std::vector<std::string> parameterNames;
         std::vector<uint8_t> forwardingReferenceParameters;
         std::vector<unsigned> forwardingReferenceTemplateParameterIndices;
+        // T-constst3: per parameter, the qualified C++ class of a `const C &` parameter (empty otherwise).
+        std::vector<std::string> constRefClassParameters;
         // One char per template parameter, in order: 'T' type, 'P' type pack,
         // 'N' non-defaulted integral non-type, 'd' defaulted non-type (SFINAE helper).
         std::string templateParameterKinds;

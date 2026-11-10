@@ -259,13 +259,12 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                             argAssign, ctorRefPlaceType)
                         && compiler->GetUniqueCxxConstructorValueParameter(
                             typeName, argIndex, ctorArgNodes.size(), ctorRefDest,
-                            /*constRef*/ true)
-                        && ctorRefPlaceType == ctorRefDest.TypeName
-                        && compiler->IsForeignNontrivialCxxClass(ctorRefDest.TypeName);
+                            /*constRef*/ true);
                     auto nv = [&] {
                         CxxCallArgumentParseStateScope argumentState(compiler);
                         auto parsed = ctorRefTernary
-                            ? ParseCxxConstRefTernaryTemp(argAssign, ctorRefDest)
+                            ? ParseCxxConstRefTernaryTemp(argAssign,
+                                LLVMBackend::TypeAndValue{ .TypeName = ctorRefPlaceType })
                             : ParseAssignmentExpressionNamed(argAssign);
                         llvm::Value* retTemp = compiler->lastCxxRetTemp_;
                         llvm::Value* retValue = compiler->lastCxxRetValue_;
@@ -2319,7 +2318,8 @@ CFlatParser::TypeCheckExpressionContext* MainListener::SoleTypeCheckExpressionOf
         return tcs.size() == 1 ? tcs[0] : nullptr;
     }
 
-LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx) {
+LLVMBackend::NamedVariable MainListener::ParseMoveExpression(
+        CFlatParser::MoveExpressionContext* ctx, const std::string& cxxBaseTarget) {
         auto* compiler = Compiler(ctx);
         const auto operandLayers = DirectOperandPostfixes(ctx->unaryExpression());
         FlexibleArrayKeepScope keep(flexibleArrayKeep_, operandLayers);
@@ -2702,6 +2702,19 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
 
         argNV.IsExplicitMove = true;
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
+        if (!cxxBaseTarget.empty() && !argNV.TypeAndValue.Pointer
+            && compiler->IsCxxTriviallyCopyableRecord(argNV.TypeAndValue.TypeName)
+            && compiler->IsCxxTriviallyCopyableRecord(cxxBaseTarget)
+            && compiler->IsCxxDerivedToBaseValue(argNV.TypeAndValue,
+                LLVMBackend::TypeAndValue{ .TypeName = cxxBaseTarget }, nullptr))
+        {
+            // The destination wrapper must read the indexed xvalue before any move-from zeroing.
+            argNV.Primary = ptrVal;
+            argNV.MoveSourceStorage = argNV.Storage;
+            argNV.TypeAndValue.IsMove = true;
+            argNV.IsRvalue = true;
+            return argNV;
+        }
         const auto* encodedClosure = compiler->GetEncodedClosureType(argNV.TypeAndValue.TypeName);
         const bool movingFatClosure = !argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
             && ((argNV.TypeAndValue.IsFunctionPointer && !argNV.TypeAndValue.IsThinFnPtr())

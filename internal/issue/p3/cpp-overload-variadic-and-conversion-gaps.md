@@ -6,7 +6,6 @@ Summary: W13 (2026-09-30) made const record pointers select C++ overloads like c
 whose ellipsis receives arguments now runs the pairwise [over.match.best] ranking, an ellipsis
 argument ranking worst. Items keep their original numbers.)
 4. User-defined conversions are never candidates at C++ call arguments: `u1(P*)`, `u1(D*)`, `u1(CA)` with `CA(const P*)` and a `const P*` argument -> clang 3, CFlat refuses; `u3(cp)` with only `u3(CA)` refuses.
-5. Inline C++ variadic definitions in a header fail to link (vf, vmv, vom in rev15).
 
 Ruling (maintainer, 2026-09-30): C++ call arguments keep CFlat's stricter conversion rule (no int ->
 double etc. at calls), for type safety - NOT clang's arithmetic conversions. `n1(P*, int)` /

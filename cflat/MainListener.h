@@ -7639,7 +7639,8 @@ public:
     static CFlatParser::TypeCheckExpressionContext* SoleTypeCheckExpressionOf(
         CFlatParser::ConditionalExpressionContext* ctx);
 
-    LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx);
+    LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx,
+                                                    const std::string& cxxBaseTarget = {});
     // [immovable] assignment source refusal; true after logging. Shared by the assignment sites.
     bool RefuseImmovableAssignSource(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
                                      const std::string& operatorText, const LLVMBackend::NamedVariable& rightNV);

@@ -72,7 +72,8 @@ Open: p2/expect-error-substring-source-check-loose (filed 2026-11-07, test-infra
 accepts nearly any text); p2/cxx-request-cache-prune-scan-doubles-buildci (filed
 2026-11-07, compile time: narrowed to one directory scan per storing process, ~25% over cold);
 p2/cold-cpp-interop-compile-peaks-23-27-gb (filed 2026-11-07, compile memory: 23-27 GB per cold
-test_cpp_interop compile; pages the Windows box).
+test_cpp_interop compile; pages the Windows box; narrowed by 4620e935 to 20.33 GB cold / 1.47 GB warm,
+candidate-group pruning parked).
 
 ## In flight
 
@@ -108,7 +109,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|----------|------|-------|
 | - | p3/cpp-using-declaration-member-access-gaps | virtual base re-exposed by `using` (USINGDECL af28ab81 landed the rest) | with P4 virtual-base layout |
 | - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | residue after MACROLEFT (af28ab81): `auto&&`, anonymous-enum lvalue deduction / joins, comma lvalue category |
-| - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | non-const trivially-copyable lvalue copy-init skips U&& template (unnamed-enum half landed 2026-10-30; CTORTPL2 cface31e: enum+nullptr, deleted ctor templates, defaulted-arg ties) |
 | - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | extra move vs clang elision; TERNELIDE (daa3a99f) covered same-class conditionals; UNARYCALL cface31e covered unary operators over calls |
 | - | p3/cpp-reference-member-leftovers-after-t47 | ref members | residue: unwind leak / extra copy / wrapper path, elided-range prvalue/array residue, REFCTX raw-pointer/self-field refusal residue, return-gate untracked spots (frame pointer via local, CFlat callee, lambda capture) after REFESC (af28ab81); opaque-fn alias refusal RULED 2026-10-29 (stays refused), `&f` element RULED (WAI) |
 | - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | integer half landed 2026-11-01 (a9e82a96); float and native-call residue |
@@ -121,7 +121,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | B5j | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | `const char *const &` overloads: constructor wrapper path and direct non-template ranking; literal at a `const char *&&` template refused | NEW 2026-10-05 (T28 round 5 matrix, pre-existing on master) |
 | B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), siblings | FLEXLEFT cface31e landed `*&` / paren sizeof and implicit-this `move data`; FLEXSZ f859ff39 landed 2-D row sizeof / arithmetic, 1-D double subscript refusal, `sizeof(&a)` |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | by-design B9 rulings (arr elem init landed ASSIGN 72073fc6) | OPEN (P2 landed 1955bd95) |
-| W13b | p3/cpp-overload-variadic-and-conversion-gaps | user conversions at C++ call args, inline variadic link | NEW 2026-09-30 (W13 reviews) |
+| W13b | p3/cpp-overload-variadic-and-conversion-gaps | user conversions at C++ call args (item 4) | inline variadic link landed VARLINK (28d26729) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 | B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
 
@@ -150,7 +150,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|-------|-------|
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | follow-up list after d59df39b / cpp-unwind2 |
 | E4 | p3/cpp-new-remaining-allocator-gaps | follow-up list after cpp-class-operator-new (5 items) |
-| E5 | p3/cflat-default-param-temporaries-leftovers + p3/cpp-member-constref-default-ternary-prvalue | default-argument temporaries: wrapper-lifetime timing, refused class/pointer/string/nested brace elements, native default leaks (DEFPARAM 08395f45 landed ternary + scalar brace defaults; CONDDEF 3bcb69b5 landed by-value ctor `?: default`; CONSTREF f7d93474 landed const T& brace / new; CONSTST 330234f6 landed static overload sets + omitted defaults) |
+| E5 | p3/cflat-default-param-temporaries-leftovers | default-argument temporaries: wrapper-lifetime timing, refused class/pointer/string/nested brace elements, native default leaks (DEFPARAM 08395f45 landed ternary + scalar brace defaults; CONDDEF 3bcb69b5 landed by-value ctor `?: default`; CONSTREF f7d93474 landed const T& brace / new; CONSTST 330234f6 landed static overload sets + omitted defaults; CONSTARM 359cde4c landed derived / converting arms; CONSTST3 68a4d76b landed the static member template, issue file deleted) |
 | E6 | p3/cflat-move-cpp-class-sink-shapes-leftovers + p3/discard-ternary-move-join-and-cxx-field-move | `move` of a C++ class: sink shapes byte-copy, discard join |
 | E7 | p3/cpp-ternary-move-join-leftovers | ternary move joins over C++ classes |
 | E8 | p3/cpp-return-named-local-implicit-move-and-byvalue-elision + p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang |
@@ -243,7 +243,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | perf |
 | N42 | p3/cpp-header-unreferenced-global-initializers-skipped | residue: root-const / qualified-const `if const` order, non-inline extern destructible shared global, same guard macro in two files | p3 |
-| N47 | p3/cpp-constant-fold-and-const-static-twin-leftovers | constexpr-call initializer refused by the fold guard; const receiver + static twin overload refused (ST4 re-review leftovers) | NEW 2026-10-01 |
 | N58 | p3/cpp-struct-identity-underscore-namespace | [cpp] identity: ns_ namespace decode, global name collision, CRTP base reading a derived field; scheduled as NSLOOKUP | NEW 2026-10-01 |
 
 ### std_full tier-2 gaps (test_libs/std_full DISABLED cases; plan internal/plan/std-library-tier2-suite.md)
@@ -281,7 +280,7 @@ this table.
 | 10 | CLIBNAME | M/M | p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | - | RULED 2026-10-21: nobuiltin on CFlat bodies |
 | 15 | ASSIGN | L/M | p3/cpp-assignment-result-leftovers-after-b9 | route + c6 landed 72073fc6 (route-leftovers deleted); residue: by-design B9 rulings only | - | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | CTOR-VIABILITY | no |
-| 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM, PTRRANK | no |
+| 18 | CTOR-VIABILITY | L/H | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM, PTRRANK | no |
 | 20 | FNWRAP-RES | L/H | p3/cpp-forwarded-closure-refusals-after-t525, p3/cpp-capturing-closure-to-std-function | residue after FNWRAP af28ab81 (see issue files) | ELIDE (P2 plan) | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, A3 | no |
 | 25 | CONSTTWIN | L/H | p3/cpp-constrained-twin-default-argument-ranking | Itanium + const twins landed 72073fc6; residue: MSVC shared-symbol body choice (Windows host) | CONSTPOINTEE | no |

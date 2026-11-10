@@ -514,6 +514,8 @@ import cpp "library/cpp_mix11_ctor.hpp";
 
 int mix7FnTwice(int x) { return x * 2; }
 int mix14Twice(int x) { return x * 2; }
+int ctorConvIndexCalls = 0;
+int CtorConvNextIndex() { ctorConvIndexCalls++; return ctorConvIndexCalls; }
 import cpp "library/cpp_mix4_conv_builtin.hpp";
 import cpp "library/cpp_interop_fixedarray.hpp";
 import cpp "library/cpp_interop_arraybool.hpp";
@@ -4668,6 +4670,48 @@ int T391ConstRefCtorNewTernaryLeg(bool c)
     }
     return value * 100000 + ternref.t391_stats();
 }
+int T459DerivedConstRefTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T459Derived v = ternref.T459Derived(7);
+        ternref.T459DerivedSink sink = ternref.T459DerivedSink(c ? default : v);
+        value = sink.value() * 10 + sink.pick();
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T459DerivedConstRefTernaryExprLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T459Derived v = ternref.T459Derived(7);
+        value = ternref.T459DerivedSink(c ? default : v).code();
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T459ConvertConstRefTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t459Reset();
+    {
+        ternref.T459Source v = ternref.T459Source(7);
+        value = ternref.T459ConvertSink(c ? default : v).value();
+    }
+    return value * 100000 + ternref.t459Stats();
+}
+int T459ConvertConstRefTernaryDeclLeg(bool c)
+{
+    int value = 0;
+    ternref.t459Reset();
+    {
+        ternref.T459Source v = ternref.T459Source(7);
+        ternref.T459ConvertSink sink = ternref.T459ConvertSink(c ? default : v);
+        value = sink.value();
+    }
+    return value * 100000 + ternref.t459Stats();
+}
 int T391StaticOverloadTernaryLeg(bool c)
 {
     int value = 0;
@@ -4685,6 +4729,27 @@ int T391StaticDefaultTernaryLeg(bool c)
     {
         ternref.T391Val v = ternref.T391Val(7);
         value = ternref.T391StaticHost.def(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+// T-constst3: a static member template taking `const T391Val&`; the `?:` joins a prvalue as clang does.
+int T391StaticTemplateTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391StaticHost.temp(c ? default : v, 9);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+int T391StaticTemplateOverloadTernaryLeg(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391StaticHost.temp(c ? default : v, 9, 1);
     }
     return value * 100000 + ternref.t391_stats();
 }
@@ -8234,6 +8299,117 @@ extern int main()
         expect_error("cannot assign to C++ class") { refused = t54.Other.OtherValue; }
     }
 
+    // ctorconv: copy-init slices derived lvalues through the base copy constructor.
+    ctortpl.resetSlice();
+    {
+        ctortpl.SliceDerived first = ctortpl.SliceDerived(17);
+        ctortpl.SliceDerived second = ctortpl.SliceDerived(29);
+        ctortpl.SliceBase direct = first;
+        ctortpl.SliceBase selected = false ? first : second;
+        if (direct.value != 17 || selected.value != 29) return 54291;
+    }
+    if (ctortpl.sliceBaseInt != 2 || ctortpl.sliceBaseCopy != 2
+        || ctortpl.sliceBaseDtor != 4 || ctortpl.sliceDerivedCtor != 2
+        || ctortpl.sliceDerivedDtor != 2) return 54292;
+
+    // ctorconv review: trivially-copyable bases slice from locals and conditional lvalues.
+    ctortpl.resetTrivialSlice();
+    {
+        ctortpl.TrivialSliceDerived first = ctortpl.TrivialSliceDerived(17);
+        ctortpl.TrivialSliceDerived second = ctortpl.TrivialSliceDerived(29);
+        ctortpl.TrivialSliceBase direct = first;
+        int sliceCondition = 1;
+        ctortpl.TrivialSliceBase selectedFirst = sliceCondition ? first : second;
+        sliceCondition = 0;
+        ctortpl.TrivialSliceBase selectedSecond = sliceCondition ? first : second;
+        if (direct.value != 17 || selectedFirst.value != 17 || selectedSecond.value != 29)
+            return 54311;
+    }
+    if (ctortpl.trivialSliceBaseCtor != 2 || ctortpl.trivialSliceDerivedCtor != 2
+        || ctortpl.trivialSliceNextCount != 0) return 54312;
+
+    // Moving an indexed derived record slices once, including a non-first base.
+    ctortpl.resetTrivialSlice();
+    {
+        ctortpl.TrivialSliceDerived[2] array = {
+            ctortpl.TrivialSliceDerived(11), ctortpl.TrivialSliceDerived(22)
+        };
+        ctortpl.trivialSliceNextCount = 0;
+        ctortpl.TrivialSliceBase moved = move array[ctortpl.nextTrivialSliceIndex()];
+        if (moved.value != 11 || array[0].value != 0
+            || ctortpl.trivialSliceNextCount != 1) return 54313;
+    }
+    if (ctortpl.trivialSliceBaseCtor != 2 || ctortpl.trivialSliceDerivedCtor != 2
+        || ctortpl.trivialSliceNextCount != 1) return 54314;
+    ctortpl.resetTrivialSlice();
+    {
+        ctortpl.TrivialSliceMultiple[2] array = {
+            ctortpl.TrivialSliceMultiple(31), ctortpl.TrivialSliceMultiple(42)
+        };
+        ctortpl.trivialSliceNextCount = 0;
+        ctortpl.TrivialSliceBase moved = move array[ctortpl.nextTrivialSliceIndex()];
+        if (moved.value != 31 || ctortpl.trivialSliceNextCount != 1) return 54315;
+    }
+    if (ctortpl.trivialSliceBaseCtor != 2 || ctortpl.trivialSliceDerivedCtor != 2
+        || ctortpl.trivialSliceNextCount != 1) return 54316;
+
+    // ctorconv: non-constant scalar defaults run once for each copy-initialized object.
+    ctortpl.resetDynamic();
+    {
+        ctortpl.DynamicNext next1 = ctortpl.NamedValue;
+        ctortpl.DynamicNext next2 = ctortpl.NamedValue;
+        ctortpl.DynamicNext next3 = ctortpl.NamedValue;
+        if (next1.value != 301 || next2.value != 302 || next3.value != 303) return 54293;
+    }
+    if (ctortpl.dynamicNextCount != 3 || ctortpl.dynamicNextCtor != 3
+        || ctortpl.dynamicDtor != 3) return 54294;
+    ctortpl.resetDynamic();
+    {
+        double explicitScalarSource = 2.5;
+        ctortpl.DynamicArithmetic explicitScalar = (int)explicitScalarSource;
+        if (explicitScalar.value != 201 || ctortpl.dynamicNextCount != 1) return 54331;
+    }
+    if (ctortpl.dynamicNextCtor != 1 || ctortpl.dynamicDtor != 1) return 54332;
+    ctortpl.resetDynamic();
+    {
+        char arithmeticChar = 4;
+        short arithmeticShort = 4;
+        long arithmeticLong = 4;
+        ctortpl.DynamicArithmetic charDefault = arithmeticChar;
+        ctortpl.DynamicArithmetic shortDefault = arithmeticShort;
+        ctortpl.DynamicArithmetic longDefault = arithmeticLong;
+        if (charDefault.value != 401 || shortDefault.value != 402
+            || longDefault.value != 403) return 54317;
+    }
+    if (ctortpl.dynamicNextCount != 3 || ctortpl.dynamicNextCtor != 3
+        || ctortpl.dynamicDtor != 3) return 54318;
+    ctortpl.resetDynamic();
+    {
+        ctortpl.DynamicGlobal global1 = ctortpl.NamedValue;
+        ctortpl.dynamicGlobal = 50;
+        ctortpl.DynamicGlobal global2 = ctortpl.NamedValue;
+        if (global1.value != 340 || global2.value != 350) return 54295;
+    }
+    if (ctortpl.dynamicGlobalCtor != 2 || ctortpl.dynamicDtor != 2) return 54296;
+    ctortpl.resetClassDefault();
+    {
+        ctortpl.DynamicClassDefault classDefault = ctortpl.NamedValue;
+        if (classDefault.value != 307) return 54299;
+    }
+    if (ctortpl.classDefaultArgCtor != 1 || ctortpl.classDefaultArgDtor != 1
+        || ctortpl.classDefaultCtor != 1 || ctortpl.classDefaultDtor != 1) return 54300;
+
+    // ctorconv: move from an indexed scalar evaluates the index once and constructs/destroys once.
+    ctortpl.resetMoveIndex();
+    ctorConvIndexCalls = 0;
+    {
+        int[4] values = { 1, 2, 3, 4 };
+        ctortpl.MoveIndex moved = move values[CtorConvNextIndex()];
+        if (moved.value != 2 || ctorConvIndexCalls != 1) return 54297;
+    }
+    if (ctorConvIndexCalls != 1 || ctortpl.moveIndexCtor != 1
+        || ctortpl.moveIndexDtor != 1) return 54298;
+
     // CTORTPL round 1: unnamed-enum Sema pick and same-class forwarding construction.
     {
         ctortpl.calls = 0; ctortpl.picked = 0;
@@ -9387,6 +9563,11 @@ extern int main()
     if (cppi.const_variadic_rank(constRankPointer, 1) != 2) return 9016;
     // Unused ellipsis: the variadic's declared `int` is exact and beats `long`, either order.
     if (cppi.variadic_exact_rank(1) != 1 || cppi.variadic_exact_rank_rev(1) != 1) return 9021;
+    // Inline header variadics called only from CFlat (no C++ TU references them), so the
+    // link needs CFlat to demand their bodies; the `int` overload is selected.
+    if (cppi.inline_variadic_body_free(7, 1) != 717) return 9060;
+    cppi.InlineVariadicBodyMember inlineVariadicBodyMember = default;
+    if (inlineVariadicBodyMember.call(7, 1) != 737) return 9061;
     // Ellipsis receiving an argument ranks pairwise (clang): the declared `int` beats `long`
     // whatever the declaration order; an ellipsis conversion loses to a declared parameter.
     if (cppi.variadic_pair_rank(1, 2) != 1 || cppi.variadic_pair_rank_rev(1, 2) != 1) return 9022;
@@ -12494,6 +12675,25 @@ extern int main()
     cppi_entity.Mixed entityMixed = default;
     if (entityMixed.f(2.0) != 202)                              return 32015;
     if (entityMixed.f(2) != 101)                                return 32016;
+    // 32018: clang constant evaluation folds constexpr calls, including variable templates.
+    if (cppi_entity.fold_plain != 7 || cppi_entity.fold_tmpl<int> != 7) return 32018;
+    // 32019: a const receiver keeps the full static/instance const-twin set for ranking.
+    if (!cppi_t320.oracle()) return 32019;
+    cppi_t320.reset();
+    bool t320StaticTwinValues = true;
+    int t320ConstInt = 0, t320MutableInt = 0, t320MutableDouble = 0, t320ConstDouble = 0;
+    {
+        cppi_t320.M t320TwinN = default;
+        const cppi_t320.M t320TwinM = default;
+        t320ConstInt = t320TwinM.f(2);
+        t320MutableInt = t320TwinN.f(2);
+        t320MutableDouble = t320TwinN.f(2.0);
+        t320ConstDouble = t320TwinM.f(2.0);
+        if (t320ConstInt != 102 || t320MutableInt != 102
+            || t320MutableDouble != 202 || t320ConstDouble != 302)
+            t320StaticTwinValues = false;
+    }
+    if (!t320StaticTwinValues || cppi_t320.born != 2 || cppi_t320.dead != 2) return 32020;
     cppi_entity.is_null_ptr<std.nullptr_t> entityNullTrait = default;
     cppi_entity.is_null_ptr<void*> entityPtrTrait = default;
     if (!entityNullTrait.value || entityPtrTrait.value)         return 32017;
@@ -24062,11 +24262,26 @@ extern int main()
     if (T391ConstRefCtorBraceMixedTernaryLeg(true) != 1020020) return 79515;
     if (T391ConstRefCtorNewTernaryLeg(false) != 711020) return 79512;
     if (T391ConstRefCtorNewTernaryLeg(true) != 20020) return 79513;
+    // clang++ -std=c++20: copy the Derived place before binding its base const-ref; both arms balance.
+    if (T459DerivedConstRefTernaryLeg(false) != 7111020) return 79526;
+    if (T459DerivedConstRefTernaryLeg(true) != 120020) return 79527;
+    if (T459DerivedConstRefTernaryExprLeg(false) != 7111020) return 79530;
+    if (T459DerivedConstRefTernaryExprLeg(true) != 120020) return 79531;
+    // clang++ -std=c++20: copy Source into the conditional prvalue before Source -> Target conversion.
+    if (T459ConvertConstRefTernaryLeg(false) != 110812110) return 79528;
+    if (T459ConvertConstRefTernaryLeg(true) != 110502110) return 79529;
+    if (T459ConvertConstRefTernaryDeclLeg(false) != 110812110) return 79532;
+    if (T459ConvertConstRefTernaryDeclLeg(true) != 110502110) return 79533;
     // Clang++ -std=c++20: overload-set and omitted-default static calls bind the ternary as a prvalue.
     if (T391StaticOverloadTernaryLeg(false) != 6711020) return 79516;
     if (T391StaticOverloadTernaryLeg(true) != 6020020) return 79517;
     if (T391StaticDefaultTernaryLeg(false) != 6611020) return 79518;
     if (T391StaticDefaultTernaryLeg(true) != 5920020) return 79519;
+    // Clang++ -std=c++20: a static member template's `const T&` slot binds the ternary as a prvalue.
+    if (T391StaticTemplateTernaryLeg(false) != 6611020) return 79534;
+    if (T391StaticTemplateTernaryLeg(true) != 5920020) return 79535;
+    if (T391StaticTemplateOverloadTernaryLeg(false) != 5711020) return 79536;
+    if (T391StaticTemplateOverloadTernaryLeg(true) != 5020020) return 79537;
     // The int place arm selects over(int), so the class-only deferred path must stay off.
     if (T391StaticIntOverloadTernaryLeg(false) != 8700000) return 79520;
     if (T391StaticIntOverloadTernaryLeg(true) != 8000000) return 79521;

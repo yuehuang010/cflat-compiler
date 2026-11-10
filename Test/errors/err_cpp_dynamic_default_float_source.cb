@@ -1,0 +1,12 @@
+// A double source into a C++ converting constructor whose trailing default is not a constant
+// stays refused: copy-init through the lazy default wrapper must not hide the fractional loss.
+import cpp "../library/cpp_ctortpl.hpp";
+
+extern int main()
+{
+    double d = 2.5;
+    expect_error("cannot initialize C++ class 'ctortpl.DynamicArithmetic'") {
+        ctortpl.DynamicArithmetic x = d;
+    }
+    return 0;
+}

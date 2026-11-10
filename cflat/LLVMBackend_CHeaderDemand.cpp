@@ -3736,6 +3736,36 @@ bool LLVMBackend::IsCxxFunctionTemplateParameterByValue(const std::string& funct
         return sawCandidate;
 }
 
+bool LLVMBackend::IsCxxStaticTemplateConstRefParameter(const std::string& qualifiedName,
+                                                       size_t parameterIndex, size_t arity,
+                                                       const std::string& placeType) const
+{
+        auto templates = cxxFunctionTemplates_.find(qualifiedName);
+        if (templates == cxxFunctionTemplates_.end() || placeType.empty()) return false;
+        // clang names the class with '::'; CFlat spells it with '.'.
+        auto dotted = [](std::string text) {
+            for (size_t at = text.find("::"); at != std::string::npos; at = text.find("::", at + 1))
+                text.replace(at, 2, ".");
+            return text;
+        };
+        const std::string wanted = dotted(placeType);
+        bool sawCandidate = false;
+        for (const auto& candidate : templates->second)
+        {
+            if (arity < candidate.minArity || arity > candidate.maxArity) continue;
+            if (candidate.kind != cflat_cinterop::RawFunctionTemplate::StaticMember) return false;
+            sawCandidate = true;
+            size_t index = parameterIndex;
+            if (candidate.hasParameterPack && !candidate.parameterTypes.empty()
+                && index >= candidate.parameterTypes.size() - 1)
+                index = candidate.parameterTypes.size() - 1;
+            if (index >= candidate.constRefClassParameters.size()
+                || dotted(candidate.constRefClassParameters[index]) != wanted)
+                return false;
+        }
+        return sawCandidate;
+}
+
 bool LLVMBackend::IsCxxFreeFunctionParameterByValue(const std::string& functionName,
                                                     size_t parameterIndex,
                                                     size_t arity) const

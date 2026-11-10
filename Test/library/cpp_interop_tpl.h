@@ -2172,9 +2172,9 @@ namespace alnv
 }
 namespace alnve
 {
-    template <unsigned long... I> struct Seq
+    template <unsigned long long... I> struct Seq
     {
-        static constexpr unsigned long value() noexcept { return (0UL + ... + I); }
+        static constexpr unsigned long long value() noexcept { return (0ULL + ... + I); }
     };
     template <int... I> struct ISeq
     {
@@ -2184,14 +2184,14 @@ namespace alnve
     {
         static constexpr int value() noexcept { return (0 + ... + (B ? 1 : 0)); }
     };
-    template <unsigned long... I> using PlusSeq = Seq<(I + 1)...>;
-    template <unsigned long... I> using DivSeq = Seq<((I - 5) / 3)...>;
+    template <unsigned long long... I> using PlusSeq = Seq<(I + 1)...>;
+    template <unsigned long long... I> using DivSeq = Seq<((I - 5) / 3)...>;
     template <int... I> using ShlSeq = ISeq<(I << 1)...>;
     template <int... I> using GtSeq = ISeq<(I > 1)...>;
     template <bool... B> using NotSeq = BSeq<(!B)...>;
-    template <unsigned long N> using NP2 = Seq<(N + 1)>;
+    template <unsigned long long N> using NP2 = Seq<(N + 1)>;
     inline int plus_seq_pick(const Seq<2, 4>&) noexcept { return 71; }
-    inline int div_seq_pick(const Seq<6148914691236517204UL>&) noexcept { return 72; }
+    inline int div_seq_pick(const Seq<6148914691236517204ULL>&) noexcept { return 72; }
     inline int shl_seq_pick(const ISeq<6>&) noexcept { return 73; }
     inline int gt_seq_pick(const ISeq<1>&) noexcept { return 74; }
     inline int not_seq_pick(const BSeq<false, true>&) noexcept { return 75; }

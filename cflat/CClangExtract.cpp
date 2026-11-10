@@ -3110,6 +3110,14 @@ namespace cflat_cinterop
                     result.forwardingReferenceParameters.push_back(forwardingReference ? 1 : 0);
                     result.forwardingReferenceTemplateParameterIndices.push_back(
                         forwardingTemplateParameterIndex);
+                    // T-constst3: the class a `const C &` parameter names, as clang canonicalizes it.
+                    std::string constRefClass;
+                    if (const auto* lvalueReference = fd->getParamDecl(i)->getType()->getAs<LValueReferenceType>();
+                        lvalueReference != nullptr && lvalueReference->getPointeeType().isConstQualified())
+                        if (const CXXRecordDecl* record = lvalueReference->getPointeeType().getCanonicalType()
+                                ->getAsCXXRecordDecl())
+                            constRefClass = record->getQualifiedNameAsString();
+                    result.constRefClassParameters.push_back(std::move(constRefClass));
                 }
                 while (result.minArity > 0
                        && fd->getParamDecl(result.minArity - 1)->hasDefaultArg())
@@ -5601,12 +5609,11 @@ namespace cflat_cinterop
              * the marker name. A variable-template specialization is instantiated first (decltype
              * is unevaluated, so Sema has not done it). Non-constant or non-scalar -> nothing.
              */
-            // constexpr, or a const whose initializer is a side-effect-free constant initializer.
+            // constexpr, or a const whose initializer clang recognizes as constant-initialized.
             bool IsFoldableConstantInit(const VarDecl* vd, const Expr* init) const
             {
                 if (vd->isConstexpr()) return true;
-                return !init->HasSideEffects(ctx)
-                    && init->isConstantInitializer(ctx, vd->getType()->isReferenceType());
+                return init->isConstantInitializer(ctx, vd->getType()->isReferenceType());
             }
 
             /*

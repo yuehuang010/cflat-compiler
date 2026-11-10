@@ -8422,10 +8422,8 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                         && IsCxxDeferrableDefaultTernary(expression, constRefPlaceType)
                         && compiler->GetUniqueCxxConstructorValueParameter(
                             typeName, braceElements.size(), fields.size(), constRefDest,
-                            /*constRef*/ true)
-                        && constRefPlaceType == constRefDest.TypeName
-                        && compiler->IsForeignNontrivialCxxClass(constRefDest.TypeName);
-                    // A const T& arm of the place class wins over a unique by-value int param.
+                            /*constRef*/ true);
+                    // Keep this path on a unique const-ref parameter; an int overload owns its slot.
                     if (constRefTernary)
                         argExpected = LLVMBackend::TypeAndValue();
                     const bool deferredDefault = topLevel && IsDefaultOnlyExpression(expression)
@@ -8457,7 +8455,8 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                             elementNV = [&] {
                                 CxxCallArgumentParseStateScope argumentState(compiler);
                                 auto parsed = constRefTernary
-                                    ? ParseCxxConstRefTernaryTemp(expression, constRefDest)
+                                    ? ParseCxxConstRefTernaryTemp(expression,
+                                        LLVMBackend::TypeAndValue{ .TypeName = constRefPlaceType })
                                     : ParseAssignmentExpressionNamed(expression);
                                 llvm::Value* retTemp = compiler->lastCxxRetTemp_;
                                 llvm::Value* retValue = compiler->lastCxxRetValue_;
@@ -9129,16 +9128,15 @@ cxx_dtor_ready:
                 }
                 // T459: a `?:` with a `default` arm into a `const T&` parameter joins a temporary of the class.
                 LLVMBackend::TypeAndValue ctorRefDest;
-                // Armed only when the place arm is that class: `int` beside the const T& ctor selects int.
+                // Keep overload selection on the declared parameter before materializing the arm class.
                 std::string ctorRefPlaceType;
                 const bool ctorRefTernary = IsCxxDeferrableDefaultTernary(argAssign, ctorRefPlaceType)
                     && compiler->GetUniqueCxxConstructorValueParameter(
                         typeName, ctorArguments.size(), ctorArgs->argumentNamedExpression().size(),
-                        ctorRefDest, /*constRef*/ true)
-                    && ctorRefPlaceType == ctorRefDest.TypeName
-                    && compiler->IsForeignNontrivialCxxClass(ctorRefDest.TypeName);
+                        ctorRefDest, /*constRef*/ true);
                 auto nv = ctorRefTernary
-                    ? ParseCxxConstRefTernaryTemp(argAssign, ctorRefDest)
+                    ? ParseCxxConstRefTernaryTemp(argAssign,
+                        LLVMBackend::TypeAndValue{ .TypeName = ctorRefPlaceType })
                     : ParseAssignmentExpressionNamed(argAssign);
                 NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                 compiler->LowerNonCapturingClosureForCxx(
@@ -9461,7 +9459,7 @@ cxx_dtor_ready:
                 // An indirect C++ lvalue stays with its real owner after move construction.
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
-                auto sourceNV = ParseMoveExpression(moveExpr);
+                auto sourceNV = ParseMoveExpression(moveExpr, typeName);
                 if (sourceNV.Storage != nullptr
                     && !sourceNV.TypeAndValue.Pointer
                     && sourceNV.TypeAndValue.TypeName == typeName)
@@ -9487,6 +9485,35 @@ cxx_dtor_ready:
                     && sourceNV.Primary->getType() == slot->getAllocatedType())
                 {
                     compiler->builder->CreateStore(sourceNV.Primary, slot);
+                    return true;
+                }
+                if (sourceNV.Storage != nullptr && !sourceNV.TypeAndValue.Pointer
+                    && sourceNV.TypeAndValue.TypeName != typeName)
+                {
+                    if (!convertInto(sourceNV)) badInit(assign);
+                    if (sourceNV.MoveSourceStorage != nullptr)
+                        compiler->builder->CreateStore(
+                            llvm::Constant::getNullValue(sourceNV.BaseType),
+                            sourceNV.MoveSourceStorage);
+                    return true;
+                }
+                if (sourceNV.Storage == nullptr && sourceNV.Primary != nullptr
+                    && !sourceNV.TypeAndValue.Pointer
+                    && sourceNV.TypeAndValue.TypeName != typeName
+                    && compiler->IsCxxTriviallyCopyableRecord(typeName)
+                    && compiler->IsCxxDerivedToBaseValue(sourceNV.TypeAndValue,
+                        LLVMBackend::TypeAndValue{ .TypeName = typeName }, nullptr)
+                    && sourceNV.BaseType != nullptr && sourceNV.BaseType->isSized())
+                {
+                    auto* spill = compiler->AllocaAtEntry(sourceNV.BaseType, nullptr,
+                                                          "cxx.move.base.source");
+                    compiler->builder->CreateStore(sourceNV.Primary, spill);
+                    sourceNV.Storage = spill;
+                    if (!convertInto(sourceNV)) badInit(assign);
+                    if (sourceNV.MoveSourceStorage != nullptr)
+                        compiler->builder->CreateStore(
+                            llvm::Constant::getNullValue(sourceNV.BaseType),
+                            sourceNV.MoveSourceStorage);
                     return true;
                 }
                 if (adoptRaw(sourceNV)) return true;

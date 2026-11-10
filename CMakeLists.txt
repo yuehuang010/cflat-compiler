@@ -396,6 +396,10 @@ elseif(UNIX)
   target_link_libraries(cflat PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 
+if(CFLAT_USE_MIMALLOC)
+  # mi_collect returns freed pages to the OS (LLVMBackend::ReleaseCxxIncrementalGroups).
+  target_compile_definitions(cflat PRIVATE CFLAT_HAS_MIMALLOC=1)
+endif()
 if(CFLAT_USE_MIMALLOC AND APPLE)
   target_link_options(cflat PRIVATE
     "-Wl,-force_load,$<TARGET_FILE:${CFLAT_MIMALLOC_TARGET}>")

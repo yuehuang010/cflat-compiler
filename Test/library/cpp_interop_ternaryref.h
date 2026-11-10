@@ -61,6 +61,7 @@ struct T391StaticHost
         return 50 + w.value() + v.value();
     }
     template<class T> static int temp(const T391Val& v, T n) { return 50 + n + v.value(); }
+    template<class T> static int temp(const T391Val& v, T n, T m) { return 40 + n + m + v.value(); }
 };
 struct T391Sink
 {
@@ -107,6 +108,62 @@ struct T391Mixed
     T391Mixed(const T391Val& v) : x(10 + v.value()) {}
     T391Mixed(int n) : x(20 + n) {}
     int value() const { return x; }
+};
+// T459 arm classes differ from the const-reference constructor parameter class.
+struct T459Derived : T391Val
+{
+    T459Derived() : T391Val() {}
+    explicit T459Derived(int n) : T391Val(n) {}
+    T459Derived(const T459Derived& v) : T391Val(v) {}
+};
+struct T459DerivedSink
+{
+    int stored;
+    int selected;
+    explicit T459DerivedSink(const T391Val& v) : stored(v.value()), selected(1) {}
+    explicit T459DerivedSink(int v) : stored(v), selected(2) {}
+    int value() const { return stored; }
+    int pick() const { return selected; }
+    int code() const { return stored * 10 + selected; }
+};
+inline int t459SourceCtor = 0;
+inline int t459SourceCopy = 0;
+inline int t459SourceDtor = 0;
+inline int t459SourceLive = 0;
+inline int t459TargetCtor = 0;
+inline int t459TargetDtor = 0;
+inline int t459TargetLive = 0;
+inline void t459Reset()
+{
+    t459SourceCtor = t459SourceCopy = t459SourceDtor = t459SourceLive = 0;
+    t459TargetCtor = t459TargetDtor = t459TargetLive = 0;
+}
+inline int t459Stats()
+{
+    return t459SourceCtor * 100000 + t459SourceCopy * 10000 + t459SourceDtor * 1000
+        + t459TargetCtor * 100 + t459TargetDtor * 10 + t459SourceLive + t459TargetLive;
+}
+struct T459Source
+{
+    int n;
+    T459Source() : n(3) { ++t459SourceCtor; ++t459SourceLive; }
+    explicit T459Source(int x) : n(x) { ++t459SourceCtor; ++t459SourceLive; }
+    T459Source(const T459Source& v) : n(v.n) { ++t459SourceCopy; ++t459SourceLive; }
+    ~T459Source() { ++t459SourceDtor; --t459SourceLive; }
+};
+struct T459Target
+{
+    int n;
+    T459Target(const T459Source& v) : n(v.n + 100) { ++t459TargetCtor; ++t459TargetLive; }
+    ~T459Target() { ++t459TargetDtor; --t459TargetLive; }
+    int value() const { return n; }
+};
+struct T459ConvertSink
+{
+    int stored;
+    explicit T459ConvertSink(const T459Target& v) : stored(v.value() + 1000) {}
+    explicit T459ConvertSink(int v) : stored(v + 2000) {}
+    int value() const { return stored; }
 };
 }
 
