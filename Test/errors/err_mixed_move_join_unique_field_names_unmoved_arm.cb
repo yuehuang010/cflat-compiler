@@ -1,0 +1,11 @@
+struct P { int value = 1; };
+struct S { unique P* p = nullptr; };
+struct T { unique P* p = nullptr; };
+
+expect_error("cannot consume field 'S.p' through borrowed parameter 'q'") {
+    void transfer(S* s, S* q, T* t, bool takeS) {
+        t->p = takeS ? move s->p : q->p;
+    }
+}
+
+int main() { return 0; }

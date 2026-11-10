@@ -23,15 +23,14 @@ Still open:
 Repro base: Test/library/cpp_interop_unwind.h / .cpp and the unwind section of Test/test_cpp_interop.cb
 (codes 3160-3198, 3261-3281).
 
-## 2026-10-16 (T313 reviews 2-3): brace `new` of a non-fresh struct gets no unwind note
+## 2026-11-09: positional `new` constructor argument ordering
 
-Item 1 (filed, NOT reproduced on master, 2026-11-08 round 2): `new S{ z = t261.bval(1) }` with a CFlat struct S holding
-`t261.Counted a` plus `int z`, no constructor (so not fresh-eligible), user `operator new(i64)` / `operator delete(void*)`,
-caught in C++. master = worktree = clang++ -std=c++20 twin: caught, user delete 1, Counted live 0. No leak, no leg added.
-The `cxxAllocator` branch it was filed against only covers C++ classes, and those reject named brace fields.
-Separate, not a leak: a positional C++ class `new Cls{ bval(1) }` with class operator new/delete and a throwing argument
-calls neither new nor delete on master (arguments evaluate before the block is allocated); clang allocates first and
-deletes on the throw (new 1 / delete 1). An evaluation-order divergence, still open.
+Resolved: for positional `new C++Class(args)`, `ParseNewExpression` evaluated constructor arguments before calling
+`EmitCxxHeapAllocate`. A throwing argument therefore skipped the class `operator new` / matching `operator delete`,
+unlike clang++ C++20. Allocation now occurs first and remains registered for unwind cleanup until construction succeeds.
+The named-brace `new S{...}` leak reported in 2026-10-16 item 1 was not reproduced and remains out of scope.
+
+## 2026-10-20: sized class deallocation
 
 Item 2 (RULED 2026-10-20, match clang; OPEN, blocked on a ruling): the sized class `operator delete(void*, N)` is recognized
 only when N is the target's size_t (`ulong` on LP64, `u64` on Win64). Unwind-path counts (`new S{ z = bval(1) }`,

@@ -7,8 +7,7 @@ balance for call literals, named tuples, lambda params, methods, generic params)
 
 ## Still open (pre-existing, master same)
 
-- `new S((nullptr,4))` with an `(int*,int)` ctor is refused "cannot find the type ''". Assignment `t = idg((3,4))` and declaration both stay refused (non-literal
-  tuple needs an exact type - ruled 2026-11-01 at tuplefts).
+- Assignment `t = idg((3,4))` and declaration both stay refused (non-literal tuple needs an exact type - ruled 2026-11-01 at tuplefts).
 - Owned unique-element shapes the plain declaration accepts are refused "from a borrowed value" (safe side, master same):
   `((D*)new D(), 4)`, `((new D()), 4)`, `(idg(new D()), 4)` (tuplefts review 3, r3_castnew / r3_parennew / r3_gennew).
 

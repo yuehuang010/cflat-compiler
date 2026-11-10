@@ -4879,6 +4879,8 @@ public:
         llvm::Instruction* FlagStore = nullptr;
         // Unwind-partial stack depth before this guard's StaticFlag entry; Close pops back to it.
         size_t UnwindMark = 0;
+        // Owned temps the initializer registers inside the guarded block; Close destroys them there.
+        LLVMBackend::OwnedTempMark TempMark;
     };
     void OpenStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName);
     void CloseStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName);

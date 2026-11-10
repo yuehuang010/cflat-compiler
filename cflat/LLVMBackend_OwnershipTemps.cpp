@@ -374,6 +374,20 @@ bool LLVMBackend::FallbackSlotMayEscape(const llvm::AllocaInst* root,
 void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage,
                                           const std::string& nullKey)
 {
+        NamedVariable variable;
+        for (const auto& entry : uniqueFieldReadValues_)
+            if (entry.second.Storage == storage && !entry.second.Variable.FieldName.empty())
+            {
+                variable = entry.second.Variable;
+                break;
+            }
+        RegisterUniqueFieldRead(value, storage, nullKey, variable);
+}
+
+void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage,
+                                          const std::string& nullKey,
+                                          const NamedVariable& variable)
+{
         if (value == nullptr || storage == nullptr) return;
         for (auto& entry : uniqueFieldReadValues_)
             if (entry.first == value)
@@ -382,14 +396,47 @@ void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* stora
                 entry.second.Block = builder != nullptr && builder->GetInsertBlock() != nullptr
                     ? builder->GetInsertBlock() : nullptr;
                 entry.second.NullKey = nullKey;
+                entry.second.Variable = variable;
                 return;
             }
         uniqueFieldReadValues_.push_back({
             value,
             { storage, builder != nullptr && builder->GetInsertBlock() != nullptr
-                ? builder->GetInsertBlock() : nullptr, nullKey }
+                ? builder->GetInsertBlock() : nullptr, nullKey, variable }
         });
     }
+
+void LLVMBackend::MarkUniqueFieldReadExplicitMove(const llvm::Value* value,
+                                                   const llvm::Value* storage,
+                                                   const llvm::BasicBlock* block)
+{
+        if (value == nullptr && storage == nullptr) return;
+        auto direct = std::find_if(uniqueFieldReadValues_.rbegin(), uniqueFieldReadValues_.rend(),
+            [&](const auto& entry) {
+                return entry.first == value
+                    || (storage != nullptr && entry.second.Storage == storage
+                        && (block == nullptr || entry.second.Block == block));
+            });
+        if (direct != uniqueFieldReadValues_.rend())
+        {
+            direct->second.IsExplicitMove = true;
+            direct->second.Variable.IsExplicitMove = true;
+        }
+        for (auto& entry : uniqueFieldReadJoins_)
+            if (entry.Joined == value)
+                for (auto& source : entry.Sources)
+                {
+                    source.IsExplicitMove = true;
+                    source.Variable.IsExplicitMove = true;
+                }
+            else if (storage != nullptr)
+                for (auto& source : entry.Sources)
+                    if (source.Storage == storage && (block == nullptr || source.Block == block))
+                    {
+                        source.IsExplicitMove = true;
+                        source.Variable.IsExplicitMove = true;
+                    }
+}
 
 std::string LLVMBackend::UniqueFieldReadNullKey(const llvm::Value* value) const
 {
@@ -409,7 +456,9 @@ void LLVMBackend::PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* 
                 if (entry.first == value)
                 {
                     out.push_back({ entry.second.Storage,
-                        block != nullptr ? block : entry.second.Block, entry.second.NullKey });
+                        block != nullptr ? block : entry.second.Block,
+                        entry.second.NullKey, entry.second.Variable,
+                        entry.second.IsExplicitMove });
                     return true;
                 }
             return false;
@@ -8781,11 +8830,34 @@ void LLVMBackend::EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp)
 {
         auto* dtor = GetOrCreateFullDestructor(temp.TypeName);
         if (dtor == nullptr || temp.Alloca == nullptr) return;
+        struct UnwindConsumedScope
+        {
+            std::vector<llvm::Value*>& Values;
+            llvm::Value* Value;
+            bool Added;
+            UnwindConsumedScope(std::vector<llvm::Value*>& values, llvm::Value* value)
+                : Values(values), Value(value),
+                  Added(std::find(values.begin(), values.end(), value) == values.end())
+            {
+                if (Added) Values.push_back(Value);
+            }
+            ~UnwindConsumedScope()
+            {
+                if (!Added) return;
+                auto it = std::find(Values.rbegin(), Values.rend(), Value);
+                if (it != Values.rend()) Values.erase(std::next(it).base());
+            }
+        };
+        auto emitDtor = [&](llvm::Value* address) {
+            UnwindConsumedScope consumed(unwindCallConsumedTemps_, temp.Alloca);
+            CreateCallOrInvoke(dtor->getFunctionType(), dtor, { address },
+                               IsCxxRecord(temp.TypeName));
+        };
         auto destroy = [&] {
             auto* array = temp.ArrayCount != 0 ? llvm::dyn_cast<llvm::AllocaInst>(temp.Alloca) : nullptr;
             if (array == nullptr)
             {
-                builder->CreateCall(dtor->getFunctionType(), dtor, { temp.Alloca });
+                emitDtor(temp.Alloca);
                 return;
             }
             for (uint64_t k = temp.ArrayCount; k-- > 0;)
@@ -8953,13 +9025,35 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
                 });
             // C++ temps are reversed in place among their ledger slots; CFlat temps retain their
             // relative order. A guarded free opens blocks, so re-read the insert block per temp.
+            // A temp freed here stays consumed for the rest of the loop: this list is not trimmed
+            // until after it, so a later temp's throwing dtor would otherwise pad-destroy it again.
+            std::vector<llvm::Value*> freedHere;
+            struct FreedHereScope
+            {
+                std::vector<llvm::Value*>& consumed;
+                const std::vector<llvm::Value*>& added;
+                ~FreedHereScope()
+                {
+                    for (auto* v : added)
+                    {
+                        auto it = std::find(consumed.rbegin(), consumed.rend(), v);
+                        if (it != consumed.rend()) consumed.erase(std::next(it).base());
+                    }
+                }
+            } freedScope{ unwindCallConsumedTemps_, freedHere };
             for (size_t i = mark.Structs; live && i < pendingOwnedStructTemps.size(); ++i)
             {
                 auto& t = pendingOwnedStructTemps[i];
                 if (t.Alloca == nullptr || isKeptStructTemp(t)) continue;
                 if (!IsInsertBlockLive()) break;
                 if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
+                llvm::Value* freed = t.Alloca;
                 EmitOwnedStructTempFree(t);
+                if (!UnwindTempConsumedByCall(freed))
+                {
+                    unwindCallConsumedTemps_.push_back(freed);
+                    freedHere.push_back(freed);
+                }
                 if (t.LiveFlag != nullptr) domTree.reset();
             }
         }
@@ -10379,7 +10473,8 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
             for (const auto& t : unwindStructTemps)
             {
                 std::optional<llvm::DominatorTree> domTree;
-                if (t.Alloca == nullptr || !IsInsertBlockLive()) continue;
+                if (t.Alloca == nullptr || UnwindTempConsumedByCall(t.Alloca)
+                    || !IsInsertBlockLive()) continue;
                 if (!OwnedTempDominatesHere(t.Block, invokeBlock, domTree)) continue;
                 EmitOwnedStructTempFree(t);
             }

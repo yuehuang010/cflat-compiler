@@ -691,6 +691,8 @@ import cpp "library/cpp_mixed_access.hpp";
 import cpp "library/cpp_private_overloads.hpp";
 import cpp "library/cpp_move_operand_ops.hpp";
 import cpp "library/cpp_copy_parity.hpp";
+struct CopyFieldMutableDefaultCFlatHolder { cppcp.CopyFieldMutableDefault value = default; };
+struct CopyMoveFieldCFlatHolder { cppcp.DF value = cppcp.DF(0); };
 // T310 FLDINIT: scalar field defaults of C++ class type run the converting constructor.
 int tFieldInitCppRead() { return 101; }
 [cpp] struct TFieldInitCppEarlier { int first = 4; int second = first + 2; };
@@ -1145,6 +1147,13 @@ int UnwNewCtorAlone(int x)
     int v = p->get();
     delete p;
     return v;
+}
+int UnwNewArgOrder(int x)
+{
+    cppunw.NewArgOrder* p = new cppunw.NewArgOrder(cppunw.thrower(x));
+    int value = p->value;
+    delete p;
+    return value;
 }
 int UnwNewBadAlloc(int x)
 {
@@ -2473,6 +2482,12 @@ int T93ThrowExplicit(int a) { static t93s.Once g = t93s.Once(a); return g.get();
 int T93ThrowTernary(int a) { static t93s.Once g = a > 0 ? t93s.Once(a) : t93s.Once(-a); return g.get(); }
 int T93ThrowAutoTernary(int a) { static auto g = a > 0 ? t93s.Once(a) : t93s.Once(-a); return g.get(); }
 int T93ThrowBrace(int a) { static t93s.Once g{a}; return g.get(); }
+int T93ThrowTempDtor(int a) { static auto g = t93s.TempDtor(t93s.TempArg(a)); return g.get(); }
+int T93TwoPlain(int a) { auto g = t93s.Two(t93s.TempArg(a), t93s.ArgCount(a + 1)); return g.get(); }
+int T93TwoStatic(int a) { static auto g = t93s.Two(t93s.TempArg(a), t93s.ArgCount(a + 1)); return g.get(); }
+int T93StaticBraceArg(int a) { static t93s.ArgOnce g{t93s.ArgCount(a)}; return g.get(); }
+int T93StaticCallArg(int a) { static int g = t93s.take(t93s.ArgCount(a)); return g; }
+int T93StaticFieldArg(int a) { static int g = t93s.ArgCount(a).v; return g; }
 // T93: an explicit-type static initialized by a C++ constructor call (or a ternary of them) is built
 // in place: clang makes 1 object, 0 copies, 0 moves; ok() == 1 proves the object sits in its slot.
 int T93TrkExplicit(int a) { static t93s.Trk g = t93s.Trk(a); return g.ok() * 100 + g.get(); }
@@ -5056,6 +5071,159 @@ extern int main()
     cppcp.CV cpNy = cppcp.CV(0);
     cpNy = cpNx;
     if (cpNy.v != 17) return 54993;
+    cppcp.DF.reset();
+    {
+        cppcp.DF cpDf = cppcp.DF(0);
+        cppcp.DF cpDfSource = cppcp.DF(7);
+        const cppcp.DF cpDfConst = cppcp.DF(7);
+        cpDf = cpDfSource;
+        if (cpDf.v != 47) return 54994;
+        cpDf = cpDfConst;
+        if (cpDf.v != 7 || cppcp.DF.mutableAssign != 1) return 54995;
+    }
+    if (cppcp.DF.born != 3 || cppcp.DF.dead != cppcp.DF.born) return 54996;
+    // clang++ -std=c++20: a by-value assignment copies each const lvalue argument (k=1),
+    // including const-reference results and pointer dereferences; the move constructor cannot steal.
+    cppcp.ByValSteal.reset();
+    {
+        const cppcp.ByValSteal byvalSource = cppcp.ByValSteal(7);
+        cppcp.ByValSteal byvalTarget = cppcp.ByValSteal(0);
+        byvalTarget = byvalSource;
+        if (byvalTarget.v != 7 || byvalSource.v != 7 || cppcp.ByValSteal.copies != 1
+            || cppcp.ByValSteal.moves != 0 || cppcp.ByValSteal.assigns != 1) return 55031;
+    }
+    cppcp.ByValSteal.reset();
+    {
+        cppcp.ByValSteal byvalTarget = cppcp.ByValSteal(0);
+        byvalTarget = cppcp.ByValSteal.cref();
+        if (byvalTarget.v != 7 || cppcp.ByValSteal.copies != 1
+            || cppcp.ByValSteal.moves != 0 || cppcp.ByValSteal.assigns != 1) return 55032;
+    }
+    cppcp.ByValSteal.reset();
+    {
+        const cppcp.ByValSteal byvalSource = cppcp.ByValSteal(7);
+        const cppcp.ByValSteal* byvalPointer = &byvalSource;
+        cppcp.ByValSteal byvalTarget = cppcp.ByValSteal(0);
+        byvalTarget = *byvalPointer;
+        if (byvalTarget.v != 7 || byvalSource.v != 7 || cppcp.ByValSteal.copies != 1
+            || cppcp.ByValSteal.moves != 0 || cppcp.ByValSteal.assigns != 1) return 55033;
+    }
+    // clang++ -std=c++20: the defaulted trivial copy wins for const lvalues even beside T& and
+    // T&& assignment overloads; the move overload must not run (direct and const-ref source).
+    {
+        const cppcp.DefaultCopyMoveAssign source = cppcp.DefaultCopyMoveAssign(7);
+        cppcp.DefaultCopyMoveAssign target = cppcp.DefaultCopyMoveAssign(0);
+        target = source;
+        if (target.v != 7 || cppcp.DefaultCopyMoveAssign.moveAssigns != 0) return 55034;
+    }
+    {
+        cppcp.DefaultCopyMoveAssign target = cppcp.DefaultCopyMoveAssign(0);
+        target = cppcp.DefaultCopyMoveAssign.cref();
+        if (target.v != 7 || cppcp.DefaultCopyMoveAssign.moveAssigns != 0) return 55035;
+    }
+    {
+        const cppcp.DefaultCopyConstMoveAssign source = cppcp.DefaultCopyConstMoveAssign(7);
+        cppcp.DefaultCopyConstMoveAssign target = cppcp.DefaultCopyConstMoveAssign(0);
+        target = source;
+        if (target.v != 7 || cppcp.DefaultCopyConstMoveAssign.moveAssigns != 0) return 55036;
+    }
+    {
+        const cppcp.DefaultCopyMoveOnlyAssign constSource = cppcp.DefaultCopyMoveOnlyAssign(7);
+        cppcp.DefaultCopyMoveOnlyAssign constTarget = cppcp.DefaultCopyMoveOnlyAssign(0);
+        constTarget = constSource;
+        cppcp.DefaultCopyMoveOnlyAssign nonconstSource = cppcp.DefaultCopyMoveOnlyAssign(9);
+        cppcp.DefaultCopyMoveOnlyAssign nonconstTarget = cppcp.DefaultCopyMoveOnlyAssign(0);
+        nonconstTarget = nonconstSource;
+        if (constTarget.v != 7 || nonconstTarget.v != 9
+            || cppcp.DefaultCopyMoveOnlyAssign.moveAssigns != 0) return 55037;
+    }
+    // clang++ -std=c++20 prefers the trivial T& default over the user const-ref overload.
+    {
+        cppcp.DefaultMutableCopyConstUser source = cppcp.DefaultMutableCopyConstUser(9);
+        cppcp.DefaultMutableCopyConstUser target = cppcp.DefaultMutableCopyConstUser(0);
+        target = source;
+        if (target.v != 9 || cppcp.DefaultMutableCopyConstUser.constAssigns != 0) return 55040;
+    }
+    // clang++ -std=c++20: member-wise copy uses the const-reference overload, or a trivial
+    // const-copy byte transfer when the defaulted overload has no emitted symbol.
+    {
+        cppcp.CopyFieldHolder fieldSource = default;
+        fieldSource.value = cppcp.CopyFieldType(7);
+        cppcp.CopyFieldHolder fieldTarget = default;
+        cppcp.CopyFieldType.mutableAssign = 0;
+        fieldTarget = fieldSource;
+        if (fieldTarget.value.v != 7 || cppcp.CopyFieldType.mutableAssign != 0) return 55038;
+    }
+    {
+        cppcp.CV.constAssign = 0;
+        cppcp.CV.mutableAssign = 0;
+        cppcp.CvFieldHolder fieldSource = default;
+        fieldSource.value = cppcp.CV(7);
+        cppcp.CvFieldHolder fieldTarget = default;
+        fieldTarget = fieldSource;
+        if (fieldTarget.value.v != 47 || cppcp.CV.constAssign != 2
+            || cppcp.CV.mutableAssign != 0) return 55039;
+    }
+    // clang++ -std=c++20 oracle: field value=7, born=2, dead=2. The public defaulted T&
+    // operator= is trivial even though a const-reference copy assignment does not exist.
+    cppcp.CopyFieldMutableDefault.reset();
+    {
+        CopyFieldMutableDefaultCFlatHolder mutableDefaultSource = default;
+        CopyFieldMutableDefaultCFlatHolder mutableDefaultTarget = default;
+        mutableDefaultSource.value.v = 7;
+        mutableDefaultTarget = mutableDefaultSource;
+        if (mutableDefaultTarget.value.v != 7 || cppcp.CopyFieldMutableDefault.born != 2)
+            return 55041;
+    }
+    if (cppcp.CopyFieldMutableDefault.dead != 2) return 55042;
+    // clang++ -std=c++20 oracle: both private-copy attempts are refused; lvalue assignment
+    // must not silently choose the public move assignment.
+    {
+        cppcp.PrivateCopyMoveAssign privateSource = default;
+        cppcp.PrivateCopyMoveAssign privateTarget = default;
+        expect_error("cannot copy-assign C++ class") { privateTarget = privateSource; }
+        const cppcp.PrivateCopyMoveAssign privateConstSource = default;
+        expect_error("cannot copy-assign C++ class") { privateTarget = privateConstSource; }
+    }
+    // clang++ -std=c++20 oracle for the equivalent templates: value=749, template pick=1.
+    // CFlat refuses because it cannot bind that template here; it must not byte-copy instead.
+    {
+        cppcp.TemplateMutableCopyAssign templateSource = default;
+        cppcp.TemplateMutableCopyAssign templateTarget = default;
+        templateSource.v = 9;
+        cppcp.TemplateMutableCopyAssign.templateAssigns = 0;
+        expect_error("cannot copy-assign C++ class") { templateTarget = templateSource; }
+        cppcp.ForwardTemplateMutableCopyAssign forwardSource = default;
+        cppcp.ForwardTemplateMutableCopyAssign forwardTarget = default;
+        forwardSource.v = 9;
+        cppcp.ForwardTemplateMutableCopyAssign.templateAssigns = 0;
+        expect_error("cannot copy-assign C++ class") { forwardTarget = forwardSource; }
+    }
+    // clang++ -std=c++20 oracle: value/picks=2709, const assignment pick count=1.
+    {
+        cppcp.UserConstThenDefaultMutable defaultOrderSource = cppcp.UserConstThenDefaultMutable(9);
+        const cppcp.UserConstThenDefaultMutable defaultOrderConstSource = cppcp.UserConstThenDefaultMutable(7);
+        cppcp.UserConstThenDefaultMutable defaultOrderTarget = cppcp.UserConstThenDefaultMutable(0);
+        cppcp.UserConstThenDefaultMutable.constAssigns = 0;
+        defaultOrderTarget = defaultOrderConstSource;
+        int defaultOrderValue = defaultOrderTarget.v * 100;
+        defaultOrderTarget = defaultOrderSource;
+        defaultOrderValue = defaultOrderValue + defaultOrderTarget.v;
+        if (defaultOrderValue != 2709 || cppcp.UserConstThenDefaultMutable.constAssigns != 1)
+            return 55045;
+    }
+    // clang++ -std=c++20 oracle: moved lowered field copies the const-trivial assignment
+    // (value=7, mutable assignment pick=0), with both field objects destroyed once.
+    cppcp.DF.reset();
+    {
+        CopyMoveFieldCFlatHolder moveFieldSource = default;
+        CopyMoveFieldCFlatHolder moveFieldTarget = default;
+        moveFieldSource.value.v = 7;
+        moveFieldTarget = move moveFieldSource;
+        if (moveFieldTarget.value.v != 7 || cppcp.DF.mutableAssign != 0
+            || cppcp.DF.born != 2) return 55046;
+    }
+    if (cppcp.DF.dead != 2) return 55047;
     // A C++ prvalue cannot bind to operator=(CV&); parentheses keep the const-CV& choice.
     cppcp.CV parenAssignCvLocal = cppcp.CV(0);
     ParenAssignCppHolder parenAssignCvHolder = default;
@@ -6715,6 +6883,37 @@ extern int main()
     t93r1 = t93s.guarded(T93ThrowBrace, 5);
     t93r2 = t93s.guarded(T93ThrowBrace, 6);
     if (t93r1 != -5 || t93r2 != 6) return 93005;
+    // clang++ -std=c++20: -9 4 made=2 dead=0 selected=2 argMade=2 argDead=2 argThrows=2.
+    t93s.resetTempDtor();
+    t93r1 = t93s.guardedTempDtor(T93ThrowTempDtor, 3);
+    t93r2 = t93s.guardedTempDtor(T93ThrowTempDtor, 4);
+    if (t93r1 != -9 || t93r2 != 4 || t93s.tempMade != 2 || t93s.tempDead != 0
+        || t93s.tempSelected != 2 || t93s.argMade != 2 || t93s.argDead != 2
+        || t93s.argThrows != 2) return 93064;
+    // F4/F5 (clang++ -std=c++20 oracle, dstatic round 2): one temp dies once in every static form.
+    t93s.resetStaticTemps();
+    t93r1 = t93s.guarded(T93TwoPlain, 3);
+    t93r2 = t93s.guarded(T93TwoPlain, 4);
+    if (t93r1 != -9 || t93r2 != 9 || t93s.cntMade != 2 || t93s.cntDead != 2 || t93s.twoMade != 2
+        || t93s.twoDead != 1 || t93s.argDead != 2 || t93s.argThrows != 2) return 93080;
+    t93s.resetStaticTemps();
+    t93r1 = t93s.guarded(T93TwoStatic, 3);
+    t93r2 = t93s.guarded(T93TwoStatic, 4);
+    if (t93r1 != -9 || t93r2 != 9 || t93s.cntMade != 2 || t93s.cntDead != 2 || t93s.twoMade != 2
+        || t93s.twoDead != 0 || t93s.argDead != 2 || t93s.argThrows != 2) return 93081;
+    t93s.resetStaticTemps();
+    int t93x1 = T93StaticBraceArg(3);
+    int t93x2 = T93StaticBraceArg(4);
+    if (t93x1 != 3 || t93x2 != 3 || t93s.cntMade != 1 || t93s.cntDead != 1
+        || t93s.onceMade != 1 || t93s.onceDead != 0) return 93082;
+    t93s.resetStaticTemps();
+    t93x1 = T93StaticCallArg(3);
+    t93x2 = T93StaticCallArg(4);
+    if (t93x1 != 3 || t93x2 != 3 || t93s.cntMade != 1 || t93s.cntDead != 1) return 93083;
+    t93s.resetStaticTemps();
+    t93x1 = T93StaticFieldArg(3);
+    t93x2 = T93StaticFieldArg(4);
+    if (t93x1 != 3 || t93x2 != 3 || t93s.cntMade != 1 || t93s.cntDead != 1) return 93084;
     // Explicit-type static from a constructor call: built in place, one object, no copy or move.
     t93s.reset();
     int t93a = T93TrkExplicit(3) + T93TrkExplicit(4);
@@ -9559,6 +9758,14 @@ extern int main()
     if ((constRankShift << mutableRankPointer) != 1) return 9013;
     if ((constRankShift + constRankPointer) != 6) return 9014;
     if ((constRankShift + mutableRankPointer) != 5) return 9015;
+    // A named pointer operand keeps its pointer level beside a reference overload (clang oracle).
+    cppi.ConstPointerRankShiftRef constRankRef = default;
+    if ((constRankRef << constRankPointer) != 72) return 90120;
+    if ((constRankRef << mutableRankPointer) != 71) return 90121;
+    if ((constRankRef << constRankValue) != 70) return 90122;
+    constRankRef.k = 80;
+    cppi.ConstPointerRankShiftRef* constRankRefPointer = &constRankRef;
+    if ((constRankRefPointer << constRankPointer) != 82) return 90123;
     // A const-dropping variadic sibling loses to the const-correct overload.
     if (cppi.const_variadic_rank(constRankPointer, 1) != 2) return 9016;
     // Unused ellipsis: the variadic's declared `int` is exact and beats `long`, either order.
@@ -12153,6 +12360,28 @@ extern int main()
     if (!(13 == opgridA))                               return 944;
     if (13 != opgridA)                                  return 945;
 
+    // A non-viable public member template must not hide the viable free operator.
+    mix7op.SFINAEFree opgridSFINAEFree = default;
+    if (opgridSFINAEFree + 2 != 2)                     return 9460;
+
+    // Reversed scalar-left comparison merges right-namespace and global <=> candidates.
+    mix7op.D opgridReverseSpaceship = default;
+    bool opgridReverseLess = 1 < opgridReverseSpaceship;
+    if (mix7op.spaceshipChoice != 84 || opgridReverseLess) return 9461;
+
+    // The split lookup checks both classes and either parameter position (clang selects 184/84).
+    mix7op.ScalarFirst opgridScalarFirst = default;
+    mix7op.L2 opgridClassLeft = default;
+    mix7op.D2 opgridClassRight = default;
+    if (!(1 < opgridScalarFirst) || mix7op.scalarFirstSpaceshipChoice != 184
+        || opgridClassLeft < opgridClassRight
+        || mix7op.classLeftSpaceshipChoice != 84) return 9462;
+
+    // A viable member <=> template beats the free double overload after rewrite (clang returns 11).
+    mix7op.RewrittenViableTemplate opgridRewrittenViableTemplate = default;
+    if (!(opgridRewrittenViableTemplate < 1)
+        || mix7op.rewrittenViableTemplateChoice != 1) return 9465;
+
     // Reversed MEMBER ==: only cppi.Rev declares one, against cppi.RevOther.
     cppi.Rev opgridRev = default;
     cppi.RevOther opgridOther = default;
@@ -12330,6 +12559,15 @@ extern int main()
     mix7op.W mix7W = default; mix7W.v = 1;
     mix7W += 1;
     if (mix7W.v != 101) return 65045;
+    // clang++ -std=c++20 rewrites < from <=> and chooses the exact global int overload (true, 84).
+    mix7op.D mix7Cmp = default;
+    if (!(mix7Cmp < 1) || mix7op.spaceshipChoice != 84) return 65049;
+    // clang++ -std=c++20 selects the global mutable U& overload (72), over the namespace const U&.
+    mix7op.U mix7Unary = default;
+    if (~mix7Unary != 72 || mix7op.unaryChoice != 72) return 65050;
+    // clang++ -std=c++20 selects the exact global int overload for scalar + right-class (12).
+    mix7op.Right mix7Right = default;
+    if (1 + mix7Right != 12 || mix7op.rightChoice != 12) return 65051;
     // MIX7: a function pointer binds a C++ bool by value: set -> true, null -> false (clang 3 and 4).
     function<int(int)> mix7Fn = mix7FnTwice;
     function<int(int)> mix7FnNull = default;
@@ -16462,6 +16700,9 @@ extern int main()
     if (t456ProtectedFreeBinary + 2.5 != 61)                                  return 45609;
     cppsopd.T456ProtectedFreeUnary t456ProtectedFreeUnary = default;
     if (+t456ProtectedFreeUnary != 63)                                        return 45610;
+    // clang++ -std=c++20 selects the int member template over the double free overload (72); no lifetime hooks run.
+    cppsopd.T456PublicTemplateFree t456TemplateFree = default;
+    if (t456TemplateFree + 2 != 72 || t456TemplateFree.useSelf() != 72) return 45612;
     // A class template specialization target; copy-assign from the temporary adds 10 to tag.
     cppexp.ConvBox<int> convBox = 3;
     if (convBox.v != 3 || convBox.tag != 1)                                    return 2247;
@@ -17670,6 +17911,40 @@ extern int main()
         r = cppunw.guarded(UnwNewCtorAlone, 5); // no other cleanup in the frame
         if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 0
             || cppunw.news() != 1 || cppunw.deletes() != 1) return 3190;
+        // Allocation precedes constructor arguments: a throwing argument frees the unconstructed
+        // block, while the successful int overload returns 40 and is destroyed exactly once.
+        cppunw.NewArgOrder.resetCounts();
+        int newArgThrowOracle = cppunw.newArgOrderOracle(5);
+        int newArgThrowNew = cppunw.NewArgOrder.allocations;
+        int newArgThrowDelete = cppunw.NewArgOrder.deallocations;
+        int newArgThrowBorn = cppunw.NewArgOrder.born;
+        int newArgThrowDtors = cppunw.NewArgOrder.dtors;
+        int newArgThrowPick = cppunw.NewArgOrder.picked;
+        cppunw.NewArgOrder.resetCounts();
+        r = cppunw.guarded(UnwNewArgOrder, 5);
+        if (r != newArgThrowOracle || r != -5 || cppunw.NewArgOrder.allocations != newArgThrowNew
+            || cppunw.NewArgOrder.allocations != 1
+            || cppunw.NewArgOrder.deallocations != newArgThrowDelete
+            || cppunw.NewArgOrder.deallocations != 1 || cppunw.NewArgOrder.born != newArgThrowBorn
+            || cppunw.NewArgOrder.born != 0 || cppunw.NewArgOrder.dtors != newArgThrowDtors
+            || cppunw.NewArgOrder.dtors != 0 || cppunw.NewArgOrder.picked != newArgThrowPick
+            || cppunw.NewArgOrder.picked != 0) return 3195;
+        cppunw.NewArgOrder.resetCounts();
+        int newArgOkOracle = cppunw.newArgOrderOracle(0);
+        int newArgOkNew = cppunw.NewArgOrder.allocations;
+        int newArgOkDelete = cppunw.NewArgOrder.deallocations;
+        int newArgOkBorn = cppunw.NewArgOrder.born;
+        int newArgOkDtors = cppunw.NewArgOrder.dtors;
+        int newArgOkPick = cppunw.NewArgOrder.picked;
+        cppunw.NewArgOrder.resetCounts();
+        r = cppunw.guarded(UnwNewArgOrder, 0);
+        if (r != newArgOkOracle || r != 40 || cppunw.NewArgOrder.allocations != newArgOkNew
+            || cppunw.NewArgOrder.allocations != 1
+            || cppunw.NewArgOrder.deallocations != newArgOkDelete
+            || cppunw.NewArgOrder.deallocations != 1 || cppunw.NewArgOrder.born != newArgOkBorn
+            || cppunw.NewArgOrder.born != 1 || cppunw.NewArgOrder.dtors != newArgOkDtors
+            || cppunw.NewArgOrder.dtors != 1 || cppunw.NewArgOrder.picked != newArgOkPick
+            || cppunw.NewArgOrder.picked != 1) return 3196;
         cppunw.reset();
         r = cppunw.guardedAlloc(UnwNewBadAlloc, 5); // std::bad_alloc, caught as -100
         if (r != -100 || cppunw.live() != 0 || cppunw.dtors() != 1 || cppunw.news() != 0)

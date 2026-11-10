@@ -96,8 +96,40 @@ namespace cflat_cinterop
     {
         for (const CXXMethodDecl* method : record->methods())
             if (method->isCopyAssignmentOperator())
-                return method->isTrivial() && !method->isDeleted();
+                return method->isTrivial() && !method->isDeleted()
+                    && method->getAccess() == AS_public;
         return record->hasSimpleCopyAssignment() && record->hasTrivialCopyAssignment();
+    }
+
+    static bool HasTrivialConstCopyAssignment(const CXXRecordDecl* record)
+    {
+        for (const CXXMethodDecl* method : record->methods())
+            if (method->isCopyAssignmentOperator()
+                && method->getParamDecl(0)->getType().getNonReferenceType().isConstQualified())
+                return method->isTrivial() && !method->isDeleted()
+                    && method->getAccess() == AS_public;
+        return record->hasCopyAssignmentWithConstParam()
+            && record->hasSimpleCopyAssignment() && record->hasTrivialCopyAssignment();
+    }
+
+    static bool HasTrivialNonConstCopyAssignment(const CXXRecordDecl* record)
+    {
+        for (const CXXMethodDecl* method : record->methods())
+            if (method->isCopyAssignmentOperator()
+                && !method->getParamDecl(0)->getType().getNonReferenceType().isConstQualified())
+                return method->isTrivial() && !method->isDeleted()
+                    && method->getAccess() == AS_public;
+        return !record->hasCopyAssignmentWithConstParam()
+            && record->hasSimpleCopyAssignment() && record->hasTrivialCopyAssignment();
+    }
+
+    static bool HasNonConstCopyAssignment(const CXXRecordDecl* record)
+    {
+        for (const CXXMethodDecl* method : record->methods())
+            if (method->isCopyAssignmentOperator()
+                && !method->getParamDecl(0)->getType().getNonReferenceType().isConstQualified())
+                return true;
+        return false;
     }
 
     std::string AliasCxxNestedSpecializationNames(const std::string& source)
@@ -4049,6 +4081,9 @@ namespace cflat_cinterop
                                 nested.hasTrivialDefaultCtor = anonCxx->hasTrivialDefaultConstructor();
                                 nested.hasTrivialCopyCtor = anonCxx->hasTrivialCopyConstructor();
                                 nested.hasTrivialCopyAssign = HasTrivialUsableCopyAssignment(anonCxx);
+                                nested.hasTrivialConstCopyAssign = HasTrivialConstCopyAssignment(anonCxx);
+                                nested.hasTrivialNonConstCopyAssign = HasTrivialNonConstCopyAssignment(anonCxx);
+                                nested.hasNonConstCopyAssign = HasNonConstCopyAssignment(anonCxx);
                                 nested.hasTrivialMoveAssign = anonCxx->hasSimpleMoveAssignment()
                                     && anonCxx->hasTrivialMoveAssignment();
                                 nested.hasTrivialDtor = !anonCxx->hasNonTrivialDestructor();
@@ -4229,6 +4264,9 @@ namespace cflat_cinterop
                 rec.hasTrivialDefaultCtor = cxx->hasTrivialDefaultConstructor();
                 rec.hasTrivialCopyCtor = cxx->hasTrivialCopyConstructor();
                 rec.hasTrivialCopyAssign = HasTrivialUsableCopyAssignment(cxx);
+                rec.hasTrivialConstCopyAssign = HasTrivialConstCopyAssignment(cxx);
+                rec.hasTrivialNonConstCopyAssign = HasTrivialNonConstCopyAssignment(cxx);
+                rec.hasNonConstCopyAssign = HasNonConstCopyAssignment(cxx);
                 rec.hasTrivialMoveAssign = cxx->hasSimpleMoveAssignment()
                                         && cxx->hasTrivialMoveAssignment();
                 rec.hasTrivialDtor = !cxx->hasNonTrivialDestructor();

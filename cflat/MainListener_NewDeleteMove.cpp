@@ -4,6 +4,24 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include "MainListener_ExpressionsShared.h"
+
+static bool IsTupleLiteralArgumentTree(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (dynamic_cast<CFlatParser::TupleExpressionContext*>(node) != nullptr) return true;
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+    {
+        if (primary->tupleExpression() != nullptr) return true;
+        return primary->expression() != nullptr
+            && IsTupleLiteralArgumentTree(primary->expression());
+    }
+    if (auto* expression = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+        return IsTupleLiteralArgumentTree(expression->assignmentExpression());
+    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    if (rule == nullptr || rule->children.size() != 1) return false;
+    return IsTupleLiteralArgumentTree(rule->children.front());
+}
+
 LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         CallPostfixScope newCallPostfix(this);
@@ -210,6 +228,19 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     compiler->DisplayCxxClassName(typeName)));
                 return {};
             }
+            // A new-expression calls operator new before evaluating any constructor argument.
+            // Keep the block on the unwind stack until the constructor finishes successfully.
+            llvm::Value* newBlock = compiler->EmitCxxHeapAllocate(newCxxClassType);
+            if (newBlock == nullptr)
+            {
+                LogErrorContext(ctx, std::format(
+                    "'new': cannot compute the size of C++ class '{}'",
+                    compiler->DisplayCxxClassName(typeName)));
+                return {};
+            }
+            LLVMBackend::UnwindPartialScope newBlockScope(*compiler);
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CxxHeap, newBlock,
+                                        newCxxClassType);
             std::vector<llvm::Value*> ctorArgs;
             std::vector<LLVMBackend::NamedVariable> ctorArgVars;
             std::vector<LLVMBackend::TypeAndValue> ctorArgTypes;
@@ -390,17 +421,6 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         sourceStorage = compiler->EmitCxxBaseAdjust(sourceStorage, baseOffset);
 
                     newCallPostfix.Flush();
-                    llvm::Value* block = compiler->EmitCxxHeapAllocate(resolvedNewCxxType);
-                    if (block == nullptr)
-                    {
-                        LogErrorContext(ctx, std::format(
-                            "'new': cannot compute the size of C++ class '{}'",
-                            compiler->DisplayCxxClassName(typeName)));
-                        return {};
-                    }
-                    LLVMBackend::UnwindPartialScope newBlockScope(*compiler);
-                    compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CxxHeap,
-                                                block, resolvedNewCxxType);
                     llvm::Type* copyType = compiler->GetType(
                         LLVMBackend::TypeAndValue{ .TypeName = resolvedNewCxxType });
                     if (copyType == nullptr || !copyType->isSized())
@@ -411,7 +431,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         return {};
                     }
                     const auto& layout = compiler->module->getDataLayout();
-                    compiler->builder->CreateMemCpy(block, layout.getABITypeAlign(copyType),
+                    compiler->builder->CreateMemCpy(newBlock, layout.getABITypeAlign(copyType),
                         sourceStorage, layout.getABITypeAlign(copyType),
                         layout.getTypeAllocSize(copyType));
                     newBlockScope.Release();
@@ -419,11 +439,11 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     LLVMBackend::NamedVariable result;
                     result.TypeAndValue = LLVMBackend::TypeAndValue{
                         .TypeName = typeName, .Pointer = true };
-                    result.Primary = block;
-                    result.BaseType = block->getType();
+                    result.Primary = newBlock;
+                    result.BaseType = newBlock->getType();
                     compiler->lastOwningResult = true;
-                    compiler->RegisterOwnedNewTemp(block, typeName, 0);
-                    compiler->RegisterValueElementTypeName(block, typeName);
+                    compiler->RegisterOwnedNewTemp(newBlock, typeName, 0);
+                    compiler->RegisterValueElementTypeName(newBlock, typeName);
                     return result;
                 }
                 if (!hasDeclaredCtor && !trivialCopyNeedsClangResolution)
@@ -574,23 +594,11 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
                 typeName, ctorArgVars, ctorArgs);
             newCallPostfix.Flush();
-            llvm::Value* block = compiler->EmitCxxHeapAllocate(typeName);
-            if (block == nullptr)
-            {
-                LogErrorContext(ctx, std::format(
-                    "'new': cannot compute the size of C++ class '{}'",
-                    compiler->DisplayCxxClassName(typeName)));
-                return {};
-            }
-            // A throwing constructor frees the block (operator delete) and never destroys it.
-            LLVMBackend::UnwindPartialScope newBlockScope(*compiler);
-            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CxxHeap, block,
-                                        typeName);
             if (wrapped)
             {
                 LLVMBackend::NamedVariable self;
-                self.Primary = block;
-                self.BaseType = block->getType();
+                self.Primary = newBlock;
+                self.BaseType = newBlock->getType();
                 self.TypeAndValue.TypeName = typeName;
                 self.TypeAndValue.Pointer = true;
                 self.IsRvalue = true;
@@ -620,16 +628,16 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                                                       compiler->DisplayCxxClassName(typeName));
             }
             else
-                compiler->EmitCxxStructorCall(typeName, *ctor, block, ctorArgs, &ctorArgVars);
+                compiler->EmitCxxStructorCall(typeName, *ctor, newBlock, ctorArgs, &ctorArgVars);
             newBlockScope.Release();
             LLVMBackend::NamedVariable result;
             result.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = typeName, .Pointer = true };
             result.TypeAndValue.NewAllocAlignment =
                 compiler->GetEffectiveAlignmentForType(typeName, elemType);
-            result.Primary = block;
-            result.BaseType = block->getType();
+            result.Primary = newBlock;
+            result.BaseType = newBlock->getType();
             compiler->lastOwningResult = true;
-            compiler->RegisterOwnedNewTemp(block, typeName, 0);
+            compiler->RegisterOwnedNewTemp(newBlock, typeName, 0);
             return result;
         }
 
@@ -844,6 +852,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     // Preserve legacy value loading while retaining metadata for core unique args.
                     size_t savedCastOcc = compiler->BeginCastOccurrence();
                     size_t thisCastOcc = compiler->CurrentCastOccurrence();
+                    std::optional<CallArgumentScope> tupleArgumentScope;
+                    if (IsTupleLiteralArgumentTree(namedArg->assignmentExpression()))
+                        tupleArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_);
                     auto argNV = ParseAssignmentExpressionNamed(namedArg->assignmentExpression());
                     llvm::Value* argVal = argNV.Primary != nullptr
                         ? argNV.Primary : LoadNamedVariable(argNV);
@@ -2083,6 +2094,15 @@ bool MainListener::RejectJoinedSourceIntoUniqueField(
         if (join == nullptr) return false;
         for (const auto& source : join->Sources)
         {
+            // Pointer-parameter arms: an unmoved arm of a plain join is refused by name. A
+            // `move` arm, or a `move` spelled over the whole join, is the caller's consent.
+            if (!rightNV.IsExplicitMove && !source.IsExplicitMove
+                && !source.Variable.FieldName.empty())
+            {
+                auto sourceVariable = source.Variable;
+                if (RejectConsumeOfBorrowedByValueParamField(compiler, sourceVariable, ctx))
+                    return true;
+            }
             if (source.Storage == nullptr) continue;
             // A (possibly nested) field of a BORROWED by-value parameter: the caller keeps the pointee.
             // Owner/field come from the leaf GEP; struct-field GEP bases lead back to the parameter.

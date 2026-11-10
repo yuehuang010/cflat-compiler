@@ -33,6 +33,24 @@ struct Tx
     ~Tx() { --Tr::live; ++Tr::dtors; }
     int get() const noexcept { return tag; }
 };
+struct NewArgOrder
+{
+    inline static int allocations = 0;
+    inline static int deallocations = 0;
+    inline static int born = 0;
+    inline static int dtors = 0;
+    inline static int picked = 0;
+    int value;
+    static void* operator new(std::size_t n) { ++allocations; return ::operator new(n); }
+    static void operator delete(void* p) noexcept { ++deallocations; ::operator delete(p); }
+    explicit NewArgOrder(int x) : value(x + 40) { ++picked; ++born; }
+    explicit NewArgOrder(long x) : value((int)x + 70) { picked += 2; ++born; }
+    ~NewArgOrder() { ++dtors; }
+    static void resetCounts() noexcept
+    {
+        allocations = deallocations = born = dtors = picked = 0;
+    }
+};
 // Instrumented moved temporary used by nested aggregate replacement unwinds.
 struct FreshReplace
 {
@@ -102,6 +120,14 @@ inline Tr makeTr(int v) { if (v > 0) throw v; return Tr(v); }
 inline int safe(int v) noexcept { return v + 1; }
 typedef int (*Cb)(int);
 inline int guarded(Cb f, int x) { try { return f(x); } catch (int e) { return -e; } }
+inline int newArgOrderBody(int x)
+{
+    NewArgOrder* p = new NewArgOrder(thrower(x));
+    int value = p->value;
+    delete p;
+    return value;
+}
+inline int newArgOrderOracle(int x) { return guarded(newArgOrderBody, x); }
 // Callbacks returning a struct reach CFlat through a reverse ABI thunk (16 bytes in registers,
 // 24 bytes through sret); a throw from the CFlat body must unwind through that thunk.
 struct S16 { long long a; long long b; };

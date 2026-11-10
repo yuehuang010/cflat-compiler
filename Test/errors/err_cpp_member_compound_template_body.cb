@@ -1,0 +1,9 @@
+import cpp "cpp_mix7_operator_rank.hpp";
+
+extern int main()
+{
+    expect_error("no instantiation of C++ function template 'mix7op.CompoundBodyError.operator+='");
+    mix7op.CompoundBodyError opgridCompoundBodyError = default;
+    opgridCompoundBodyError += 2;
+    return 0;
+}

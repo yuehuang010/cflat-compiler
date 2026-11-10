@@ -536,6 +536,9 @@ namespace cflat_cinterop
         bool hasTrivialCopyCtor = false;
         // Clang's implicit copy/move assignment is trivial AND not deleted: a byte copy, no symbol.
         bool hasTrivialCopyAssign = false;
+        bool hasTrivialConstCopyAssign = false;
+        bool hasTrivialNonConstCopyAssign = false;
+        bool hasNonConstCopyAssign = false;
         bool hasTrivialMoveAssign = false;
         bool hasTrivialDtor = true;
         // MS ABI: a by-value parameter of this class is destroyed by the CALLEE, so the caller

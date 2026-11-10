@@ -1,0 +1,30 @@
+int destroyed = 0;
+interface Sh { int area(); };
+class Sq : Sh { int area() { return 7; } ~Sq() { destroyed = destroyed + 1; } };
+struct IB { unique Sh item = default; };
+
+expect_error("dereference of moved variable 's.item'") {
+    int body(bool take) {
+        IB s = default;
+        s.item = new Sq();
+        IB s2 = default;
+        s2.item = new Sq();
+        IB t = default;
+        t.item = take ? s.item : s2.item;
+        return s.item.area();
+    }
+}
+
+expect_error("dereference of moved variable 's.item'") {
+    int bodyJoinedRead(bool take) {
+        IB s = default;
+        s.item = new Sq();
+        IB s2 = default;
+        s2.item = new Sq();
+        IB t = default;
+        t.item = take ? s.item : s2.item;
+        return (take ? s.item : s2.item).area();
+    }
+}
+
+int main() { return 0; }

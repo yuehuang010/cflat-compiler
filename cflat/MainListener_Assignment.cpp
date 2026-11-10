@@ -5564,7 +5564,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // wantConstRhs: -1 = no preference; 0/1 = the lvalue source is non-const/const.
                     // clang binds a const source only to a const reference and prefers the
                     // non-const reference for a non-const source.
-                    auto lvalueReceiverAssignment = [](const auto& overloads, const auto& fallback,
+                    auto lvalueReceiverAssignment = [&](const auto& overloads, const auto& fallback,
                                                         int wantConstRhs = -1)
                         -> const LLVMBackend::CxxClassInfo::Structor* {
                         auto viable = [](const auto& c) {
@@ -5572,9 +5572,32 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 || c.refQualifier == cflat_cinterop::CxxRefQualifierLValue;
                         };
                         if (wantConstRhs >= 0)
+                        {
                             for (const auto& candidate : overloads)
                                 if (viable(candidate) && candidate.rhsConstRef == (wantConstRhs == 1))
                                     return &candidate;
+                            if (wantConstRhs == 1)
+                                for (const auto& candidate : overloads)
+                                    if (viable(candidate) && candidate.params.size() == 2
+                                        && !candidate.params[1].Pointer
+                                        && !candidate.params[1].ElemPointer
+                                        && !candidate.params[1].IsAlias
+                                        && !candidate.params[1].IsRvalueRef
+                                        && compiler->ResolveTypeAlias(candidate.params[1].TypeName)
+                                            == compiler->ResolveTypeAlias(candidate.params[0].TypeName))
+                                        return &candidate;
+                            if (wantConstRhs == 1 && overloads.empty()
+                                && fallback.rhsConstRef == (wantConstRhs == 1)
+                                && (fallback.refQualifier == cflat_cinterop::CxxRefQualifierNone
+                                    || fallback.refQualifier == cflat_cinterop::CxxRefQualifierLValue))
+                                return &fallback;
+                            if (wantConstRhs == 1) return nullptr;
+                            if (wantConstRhs == 0 && info != nullptr
+                                && (info->hasTrivialNonConstCopyAssign
+                                    || (!info->hasNonConstCopyAssign
+                                        && info->hasTrivialConstCopyAssign)))
+                                return nullptr;
+                        }
                         for (const auto& candidate : overloads)
                             if (viable(candidate))
                                 return &candidate;
@@ -6302,7 +6325,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     }
                     // Only a move assignment exists: taking it from an lvalue would silently
                     // empty the source, which C++ refuses (its copy assignment is deleted).
-                    if (op == nullptr && sourceIsLvalue && info != nullptr && info->hasMoveAssign
+                    const bool isConstLvalueSource = rhsNV.TypeAndValue.IsConstObject();
+                    const bool hasAccessibleTrivialCopy = info != nullptr
+                        && (isConstLvalueSource ? info->hasTrivialConstCopyAssign
+                            : (info->hasTrivialNonConstCopyAssign
+                                || (!info->hasNonConstCopyAssign
+                                    && info->hasTrivialConstCopyAssign)))
+                        && (isConstLvalueSource || !info->hasAssignTemplate);
+                    const bool trivialLvalueCopy = sourceIsLvalue && hasAccessibleTrivialCopy;
+                    if (op == nullptr && sourceIsLvalue && !trivialLvalueCopy
+                        && info != nullptr && info->hasMoveAssign
                         && !destinationReleased && !destinationConditional
                         && !destinationGlobalConditional)
                         LogErrorContext(ctx, std::format(
@@ -6370,7 +6402,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                     "clang: overload resolution selected deleted operator '='");
                             if (info != nullptr && source != nullptr
                                 && (useMove ? info->hasTrivialMoveAssign
-                                            : info->hasTrivialCopyAssign))
+                                    : (sourceIsLvalue && rhsNV.TypeAndValue.IsConstObject()
+                                        ? info->hasTrivialConstCopyAssign
+                                        : (info->hasTrivialNonConstCopyAssign
+                                            || (!info->hasNonConstCopyAssign
+                                                && info->hasTrivialConstCopyAssign)))))
                             {
                                 auto* value = compiler->CreateLoad(namedVar.BaseType, source);
                                 compiler->builder->CreateStore(value, destination);
@@ -6381,7 +6417,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             std::string clangRefusal;
                             if (source != nullptr
                                 && compiler->EmitCxxXvalueTransfer(tn, destination, source,
-                                       false, true, clangRefusal))
+                                       rhsNV.TypeAndValue.CxxConstRef(), true, clangRefusal))
                                 return;
                             LogErrorContext(ctx, std::format(
                                 "C++ class '{}' has no assignment operator cflat can call (it is implicit, "
@@ -7977,7 +8013,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     srcIsOwnedForCoreUnique = true;
                 if (sourceIsUniqueField)
                 {
-                    if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    if ((compiler->FindUniqueFieldReadJoin(rightNV.Primary) == nullptr
+                            || rightNV.IsExplicitMove)
+                        && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                         return finishStore(right);
                     if (RejectJoinedSourceIntoUniqueField(compiler, rightNV, ctx))
                         return finishStore(right);
@@ -9683,7 +9721,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             {
                 if (RejectImplicitConsumeOfOutlivingOwner(compiler, rightNV, false, ctx))
                     return finishStore(right);
-                if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                if ((compiler->FindUniqueFieldReadJoin(rightNV.Primary) == nullptr
+                        || rightNV.IsExplicitMove)
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                     return finishStore(right);
                 const bool destIsUniqueIface = namedVar.TypeAndValue.IsFatInterfaceValue();
                 EmitImplicitUniqueFieldMove(
@@ -9971,7 +10011,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             {
                 // Nulling a borrowed by-value parameter's field nulls only the callee's copy, so
                 // the caller frees the pointee twice. Same reject the `move` spelling raises.
-                if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                // A plain join's arms are judged one by one below, so its representative is skipped.
+                if ((compiler->FindUniqueFieldReadJoin(rightNV.Primary) == nullptr
+                        || rightNV.IsExplicitMove)
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                     return finishStore(right);
                 if (RejectJoinedSourceIntoUniqueField(compiler, rightNV, ctx))
                     return finishStore(right);

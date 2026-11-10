@@ -3878,6 +3878,13 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         const size_t infixNames = (infixLhsName.empty() ? 0 : 1) + (infixRhsName.empty() ? 0 : 1);
         const bool infix = !infixOperator.empty() && arguments.size() + infixNames == 2
             && explicitArgs.empty();
+        const bool unaryOperator = !infixOperator.empty() && arguments.size() == 1
+            && explicitArgs.empty()
+            && functionName.substr(functionName.rfind('.') == std::string::npos
+                ? 0 : functionName.rfind('.') + 1) == "operator" + infixOperator
+            && (infixOperator == "+" || infixOperator == "-" || infixOperator == "*"
+                || infixOperator == "&" || infixOperator == "!" || infixOperator == "~"
+                || infixOperator == "++" || infixOperator == "--");
         const size_t infixRhsIndex = infixLhsName.empty() ? 1 : 0;
         error.clear();
         registeredName.clear();
@@ -4726,7 +4733,9 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                     + " " + infixOperator + " "
                     + (infixRhsName.empty() ? calls[infixRhsIndex]
                                             : CxxNameFromCflat(infixRhsName));
-            if (infix) {}
+            else if (unaryOperator)
+                target = infixOperator + calls[0];
+            if (infix || unaryOperator) {}
             else if (!cxxExplicitArgs.empty())
             {
                 target += "<";
@@ -4737,7 +4746,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                 }
                 target += ">";
             }
-            if (!infix)
+            if (!infix && !unaryOperator)
             {
                 target += "(";
                 for (size_t i = 0; i < calls.size(); ++i)
@@ -4786,7 +4795,8 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         // T518: the place guard re-forms a plain free call only; other call forms refuse.
         std::string placeGuardError;
         if (!deferredPlaceGuards.empty()
-            && (memberCall || infix || adlCall || !braceGroups.empty() || !explicitArgs.empty()))
+            && (memberCall || infix || unaryOperator || adlCall
+                || !braceGroups.empty() || !explicitArgs.empty()))
         {
             error = std::format("a '?:' argument of C++ '{}' cannot be checked against its parameter "
                                 "type in this call form", functionName);
@@ -4836,7 +4846,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             wrapper.name = std::format("__cflat_free_{:016x}", hash);
             // Literal, infix, and explicit wrappers register under their unique wrapper name. So
             // does an enum's value-construction (`std.errc()`): the enum name must stay a type.
-            wrapper.bindName = (infix || adlCall || !explicitArgs.empty() || literal
+            wrapper.bindName = (infix || unaryOperator || adlCall || !explicitArgs.empty() || literal
                                 || constSpelled || literalArrayArgument
                                 || !functionPointerCallerSlots.empty()
                                 || !ResolveEnumTypeName(functionName).empty()
@@ -4961,7 +4971,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                     return 0;
                 elements.push_back(first.braceListElementSpellings[argument]);
             }
-            if (infix || adlCall || builder == nullptr || builder->GetInsertBlock() == nullptr)
+            if (infix || unaryOperator || adlCall || builder == nullptr || builder->GetInsertBlock() == nullptr)
                 return 0;
             std::vector<TypeAndValue> elementTypes(elements.size());
             std::vector<llvm::Type*> elementTys(elements.size(), nullptr);
@@ -5133,10 +5143,12 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         // An infix request is keyed on its operands, not on the operator's name: try the groups
         // that own the operand types first, then every group declaring the namespace. The
         // per-name owner memo is neither read nor written - one pair must not steer another.
-        if (infix || adlCall)
+        if (infix || unaryOperator || adlCall)
         {
             candidateGroups = dependencyGroups;
-            const std::string lead = !infixLhsName.empty() ? infixLhsName
+            const std::string lead = unaryOperator && !arguments.empty()
+                ? arguments[0].TypeAndValue.TypeName
+                : !infixLhsName.empty() ? infixLhsName
                 : !infixRhsName.empty() ? infixRhsName : functionName;
             for (size_t group : CandidateCxxGroupsFor(CxxNameFromCflat(lead) + "::"))
                 if (std::find(candidateGroups.begin(), candidateGroups.end(), group)
@@ -5411,7 +5423,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                             registeredName = chosen.bindName;
                             lastCxxFreeWrapperLinkage_ = chosen.name;
                             cxxFreeWrapperGroups_[chosen.name] = { group.primary, group.dependencyGroups };
-                            if (!infix && !adlCall)
+                            if (!infix && !unaryOperator && !adlCall)
                                 cxxTemplateOwnerGroup_[cxxBase] = primary;
                             return true;
                         }
@@ -5421,7 +5433,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             }
         }
 
-        if (infix || adlCall)
+        if (infix || unaryOperator || adlCall)
         {
             error = lastError.empty() ? std::string("no C++ import declares it")
                                       : "clang: " + lastError;

@@ -165,6 +165,30 @@ struct Resource
     // Reads an argument only; used as the '?.' guarded-chain receiver in the arm-flush legs.
     int readId(int v) { return v; }
 };
+
+struct MsinkR2Source { unique Resource* p = nullptr; };
+struct MsinkR2Target { unique Resource* p = nullptr; };
+
+void msinkR2MoveArms(MsinkR2Source* s, MsinkR2Source* q, MsinkR2Target* t, bool takeQ)
+{
+    t->p = takeQ ? move s->p : move q->p;
+}
+
+void msinkR2MoveWholeTernary(MsinkR2Source* s, MsinkR2Target* t, bool take)
+{
+    t->p = move (take ? s->p : nullptr);
+}
+
+void msinkR2MoveWholeCoalesce(MsinkR2Source* s, MsinkR2Source* q, MsinkR2Target* t)
+{
+    t->p = move (s->p ?? q->p);
+}
+
+void msinkR2MoveCoalesceArms(MsinkR2Source* s, MsinkR2Source* q, MsinkR2Target* t)
+{
+    t->p = (move s->p) ?? (move q->p);
+}
+
 unique Resource* t486GlobalOwner = nullptr;
 unique Resource* t505GlobalArray[2] = default;
 
@@ -20832,7 +20856,7 @@ extern int main()
     passed += testT364NativeOperatorReturnFacts();
     passed += testMix9ReleaseReturn();
     passed += uqrawAcceptLegs();
-    total += 152; // UQRAW, TUPSAFE and MVSINKSLOT accept-set legs (uqrawAcceptLegs)
+    total += 155; // UQRAW, TUPSAFE and MVSINKSLOT accept-set legs (uqrawAcceptLegs)
     total += 28; // MVSLOTLEFT round 2 element and sibling-path legs
     total += 4; // release() results returned as bare pointers (heap-array gate)
     total += 97; // mvfield legs and four CALLEEREF accept-set legs
@@ -21135,6 +21159,68 @@ extern int main()
     t491Value = t505ScalarMixedJoin(false);
     passed += Test("t505_scalar_mixed_join_call_value", t491Value, 515);
     passed += Test("t505_scalar_mixed_join_call_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    i64 msinkR2HeapBase = (i64)HeapAudit.reportLeaks();
+    int msinkR2Value = 0;
+    {
+        MsinkR2Source s = default;
+        MsinkR2Source q = default;
+        MsinkR2Target t = default;
+        s.p = new Resource();
+        s.p->id = 1;
+        q.p = new Resource();
+        q.p->id = 2;
+        msinkR2MoveArms(&s, &q, &t, false);
+        msinkR2Value = t.p->id * 100 + (s.p == nullptr ? 10 : 0)
+            + (q.p == nullptr ? 1 : 0);
+    }
+    passed += Test("msink r2 move arms value and dtors", msinkR2Value * 10 + dtorCount, 2012);
+    passed += Test("msink r2 move arms heap", (i64)HeapAudit.reportLeaks() - msinkR2HeapBase, (i64)0);
+
+    dtorCount = 0;
+    msinkR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        MsinkR2Source s = default;
+        MsinkR2Target t = default;
+        s.p = new Resource();
+        s.p->id = 1;
+        msinkR2MoveWholeTernary(&s, &t, true);
+        msinkR2Value = t.p->id * 100 + (s.p == nullptr ? 10 : 0);
+    }
+    passed += Test("msink r2 move whole ternary value and dtors", msinkR2Value * 10 + dtorCount, 1101);
+    passed += Test("msink r2 move whole ternary heap", (i64)HeapAudit.reportLeaks() - msinkR2HeapBase, (i64)0);
+
+    dtorCount = 0;
+    msinkR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        MsinkR2Source s = default;
+        MsinkR2Source q = default;
+        MsinkR2Target t = default;
+        q.p = new Resource();
+        q.p->id = 1;
+        msinkR2MoveWholeCoalesce(&s, &q, &t);
+        msinkR2Value = t.p->id * 100 + (s.p == nullptr ? 10 : 0)
+            + (q.p == nullptr ? 1 : 0);
+    }
+    passed += Test("msink r2 move whole coalesce value and dtors", msinkR2Value * 10 + dtorCount, 1111);
+    passed += Test("msink r2 move whole coalesce heap", (i64)HeapAudit.reportLeaks() - msinkR2HeapBase, (i64)0);
+
+    dtorCount = 0;
+    msinkR2HeapBase = (i64)HeapAudit.reportLeaks();
+    {
+        MsinkR2Source s = default;
+        MsinkR2Source q = default;
+        MsinkR2Target t = default;
+        q.p = new Resource();
+        q.p->id = 1;
+        msinkR2MoveCoalesceArms(&s, &q, &t);
+        msinkR2Value = t.p->id * 100 + (s.p == nullptr ? 10 : 0)
+            + (q.p == nullptr ? 1 : 0);
+    }
+    passed += Test("msink r2 move coalesce arms value and dtors", msinkR2Value * 10 + dtorCount, 1111);
+    passed += Test("msink r2 move coalesce arms heap", (i64)HeapAudit.reportLeaks() - msinkR2HeapBase, (i64)0);
+    total += 8;
     total += 6;
     total += 26;
     total += 6;
@@ -27611,7 +27697,21 @@ int testMix9ReleaseReturn()
 // UQRAW accept-set: owning call results that are used without leaking, and explicit moves from
 // owning slots that stay legal next to the new borrowed-pointer refusals.
 int uqrawDtors = 0;
+int uqrawValueMakes = 0;
 struct UqrawBox { int v = 0; ~UqrawBox() { uqrawDtors = uqrawDtors + 1; } int val() { return v; } };
+UqrawBox uqrawMkValue(int n)
+{
+    UqrawBox value = default;
+    value.v = n;
+    uqrawValueMakes++;
+    return value;
+}
+class UqrawNewValueCtor
+{
+    int v = 0;
+    UqrawNewValueCtor(UqrawBox value) { v = value.v; }
+    int val() { return v; }
+};
 struct UqrawValueHolder { unique<UqrawBox> u = default; };
 struct UqrawPairHolder { unique<UqrawBox> a = default; unique<UqrawBox> b = default; };
 struct UqrawRawPairHolder { unique UqrawBox* a = default; unique UqrawBox* b = default; };
@@ -28348,6 +28448,16 @@ int uqrawAcceptLegs()
         delete holder;
     }
     passed += Test("tupsafe ctor tuple slot dtor once", uqrawDtors, 1);
+    // Ordinary new constructor arguments keep scalar ternary ownership and destroy one live temporary.
+    uqrawDtors = 0;
+    uqrawValueMakes = 0;
+    int newValuePick = 1;
+    UqrawNewValueCtor* ternaryNewValue = new UqrawNewValueCtor(
+        newValuePick ? uqrawMkValue(7) : uqrawMkValue(8));
+    passed += Test("new ternary value argument result", ternaryNewValue->val(), 7);
+    passed += Test("new ternary value argument factory once", uqrawValueMakes, 1);
+    delete ternaryNewValue;
+    passed += Test("new ternary value argument dtor once", uqrawDtors, 1);
     // TUPSAFE r8: a ternary of produced owners in a tuple slot is owned once (the PHI is not a slot owner).
     uqrawDtors = 0;
     passed += Test("tupsafe ternary produced slot value", uqrawTernaryProducedSlot(1), 7);

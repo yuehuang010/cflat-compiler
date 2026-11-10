@@ -2260,6 +2260,7 @@ public:
         bool IsStringLiteral = false;
         // True only for values produced directly by ParseTupleExpression; used to gate call conversions.
         bool IsTupleLiteral = false;
+        bool IsNullptrLiteral = false;
         std::vector<NamedVariable> TupleLiteralElements;
         // compile-time: this POINTER binding was declared or assigned from an ADDRESS-OF value, so
         // it provably borrows - `&x` never yields an owner. Positive provenance recorded where the
@@ -3235,6 +3236,9 @@ public:
         llvm::BasicBlock* Block = nullptr;
         // The consumed field's null-state key (UniqueFieldNullKey); empty when untracked.
         std::string NullKey;
+        // Preserve resolved ownership facts across joins so sink guards match direct reads.
+        NamedVariable Variable;
+        bool IsExplicitMove = false;
     };
 
     struct UniqueFieldReadJoin
@@ -3278,6 +3282,11 @@ public:
     // Record a direct unique-field load and carry the source slot(s) through a `?:` or `??` join.
     void RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage,
                                  const std::string& nullKey = {});
+    void RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage,
+                                 const std::string& nullKey, const NamedVariable& variable);
+    void MarkUniqueFieldReadExplicitMove(const llvm::Value* value,
+                                         const llvm::Value* storage,
+                                         const llvm::BasicBlock* block);
     std::string UniqueFieldReadNullKey(const llvm::Value* value) const;
     void PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* falseValue,
                                   llvm::Value* joined);
@@ -5523,6 +5532,9 @@ private:
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialCopyAssign = false;
+        bool hasTrivialConstCopyAssign = false;
+        bool hasTrivialNonConstCopyAssign = false;
+        bool hasNonConstCopyAssign = false;
         bool hasTrivialMoveAssign = false;
         bool hasTrivialDtor = true;
         bool isTriviallyRelocatable = false;
@@ -11152,6 +11164,9 @@ public:
         bool hasTrivialDefaultCtor = false;
         bool hasTrivialCopyCtor = false;
         bool hasTrivialCopyAssign = false;
+        bool hasTrivialConstCopyAssign = false;
+        bool hasTrivialNonConstCopyAssign = false;
+        bool hasNonConstCopyAssign = false;
         bool hasTrivialMoveAssign = false;
         bool hasTrivialDtor = true;
         bool isTriviallyRelocatable = false;
@@ -15161,7 +15176,7 @@ public:
     // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
     // 328: conversion-function template metadata and requests are cached separately from ctor templates.
     // 330: function-type parameters record pointee const (callback overload ranking).
-    static constexpr int kCHeaderCacheVersion = 333;
+    static constexpr int kCHeaderCacheVersion = 335;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

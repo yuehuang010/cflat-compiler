@@ -5861,6 +5861,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             info.hasTrivialCopyCtor    = r.hasTrivialCopyCtor;
             info.hasTrivialCopyAssign  = r.hasTrivialCopyAssign;
+            info.hasTrivialConstCopyAssign = r.hasTrivialConstCopyAssign;
+            info.hasTrivialNonConstCopyAssign = r.hasTrivialNonConstCopyAssign;
+            info.hasNonConstCopyAssign = r.hasNonConstCopyAssign;
             info.hasTrivialMoveAssign  = r.hasTrivialMoveAssign;
             info.hasTrivialDtor        = r.hasTrivialDtor;
             info.isTriviallyRelocatable = r.isTriviallyRelocatable;

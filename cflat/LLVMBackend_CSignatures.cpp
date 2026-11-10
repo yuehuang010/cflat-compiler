@@ -2466,6 +2466,9 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             rec.hasTrivialCopyCtor = r.hasTrivialCopyCtor;
             rec.hasTrivialCopyAssign = r.hasTrivialCopyAssign;
+            rec.hasTrivialConstCopyAssign = r.hasTrivialConstCopyAssign;
+            rec.hasTrivialNonConstCopyAssign = r.hasTrivialNonConstCopyAssign;
+            rec.hasNonConstCopyAssign = r.hasNonConstCopyAssign;
             rec.hasTrivialMoveAssign = r.hasTrivialMoveAssign;
             rec.hasTrivialDtor = r.hasTrivialDtor;
             rec.paramDestroyedInCallee = r.paramDestroyedInCallee;

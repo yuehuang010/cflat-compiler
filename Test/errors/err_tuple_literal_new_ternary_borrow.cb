@@ -1,0 +1,12 @@
+int tupleNewBorrowDtors = 0;
+struct TupleNewBorrowD { int value = 0; ~TupleNewBorrowD() { tupleNewBorrowDtors++; } };
+class TupleNewBorrowW { TupleNewBorrowD* value = default; TupleNewBorrowW(TupleNewBorrowD* p) { value = p; } };
+expect_error("allocates a value") {
+    extern int main()
+    {
+        TupleNewBorrowD local = default;
+        int condition = 1;
+        TupleNewBorrowW* wrapper = new TupleNewBorrowW(condition ? new TupleNewBorrowD() : &local);
+        return wrapper->value == nullptr ? 1 : 0;
+    }
+}

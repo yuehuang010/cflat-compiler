@@ -393,6 +393,14 @@ namespace cppi
     };
     inline int operator+(const ConstPointerRankShift& s, ConstPointerRankValue* value) noexcept { return 5; }
     inline int operator+(const ConstPointerRankShift& s, const ConstPointerRankValue* value) noexcept { return 6; }
+    // Reference beside pointer overloads: a named pointer operand never binds the reference.
+    struct ConstPointerRankShiftRef
+    {
+        int k = 70;
+        int operator<<(const ConstPointerRankValue& value) noexcept { return k; }
+        int operator<<(ConstPointerRankValue* value) noexcept { return k + 1; }
+        int operator<<(const ConstPointerRankValue* value) noexcept { return k + 2; }
+    };
     // Lone mutable operator: a const pointer operand is refused.
     struct ConstPointerRankShiftMut
     {

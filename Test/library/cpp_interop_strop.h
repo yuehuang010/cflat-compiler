@@ -401,6 +401,19 @@ protected:
     int operator+() const { return 62; }
 };
 struct T456ProtectedFreeUnary : T456ProtectedFreeUnaryBase {};
+
+struct T456ProtectedTemplateFree
+{
+protected:
+    template<class T> int operator+(T) const { return 60; }
+};
+inline int operator+(const T456ProtectedTemplateFree&, double) { return 61; }
+struct T456PublicTemplateFree
+{
+    template<class T> int operator+(T value) const { return 70 + (int)value; }
+    int useSelf() const { return *this + 2; }
+};
+inline int operator+(const T456PublicTemplateFree&, double) { return 61; }
 inline int operator+(const T456ProtectedFreeUnary&) { return 63; }
 }
 

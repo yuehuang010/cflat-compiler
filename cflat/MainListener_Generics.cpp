@@ -772,16 +772,18 @@ static std::string GenericLiteralBinaryIdentity(const std::string& leftName,
         return GenericLiteralArithmeticIdentity(leftName, rightName);
 }
 
-static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node);
+static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node,
+                                                    const std::string& typedFallback = {});
 
 enum class GenericBinaryIdentityKind { Arithmetic, Shift, Bitwise };
 
 static std::string GenericLiteralBinaryExpressionIdentity(
-    antlr4::tree::ParseTree* node, GenericBinaryIdentityKind kind)
+    antlr4::tree::ParseTree* node, GenericBinaryIdentityKind kind,
+    const std::string& typedFallback = {})
 {
         if (node == nullptr || node->children.empty()) return {};
         if (node->children.size() == 1)
-            return GenericLiteralExpressionIdentity(node->children[0]);
+            return GenericLiteralExpressionIdentity(node->children[0], typedFallback);
         if (node->children.size() < 3) return {};
         std::string identity = GenericLiteralExpressionIdentity(node->children[0]);
         if (identity.empty()) return {};
@@ -832,7 +834,8 @@ static std::string GenericLiteralBinaryExpressionIdentity(
         return identity;
 }
 
-static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node)
+static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node,
+                                                    const std::string& typedFallback)
 {
         if (node == nullptr) return {};
         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
@@ -848,7 +851,7 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
                 if (left != nullptr && right != nullptr
                     && left->getSymbol()->getType() == CFlatParser::LeftParen
                     && right->getSymbol()->getType() == CFlatParser::RightParen)
-                    return GenericLiteralExpressionIdentity(node->children[1]);
+                    return GenericLiteralExpressionIdentity(node->children[1], typedFallback);
             }
         }
         if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
@@ -862,7 +865,7 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
                 if (token != nullptr && (token->getSymbol()->getType() == CFlatParser::Plus
                     || token->getSymbol()->getType() == CFlatParser::Minus))
                 {
-                    std::string identity = GenericLiteralExpressionIdentity(operand);
+                    std::string identity = GenericLiteralExpressionIdentity(operand, typedFallback);
                     if (identity == "bool" || identity == "char" || identity == "i8"
                         || identity == "u8" || identity == "short" || identity == "i16"
                         || identity == "u16")
@@ -872,15 +875,19 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
             }
         }
         if (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node) != nullptr)
-            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Arithmetic);
+            return GenericLiteralBinaryExpressionIdentity(
+                node, GenericBinaryIdentityKind::Arithmetic, typedFallback);
         if (dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node) != nullptr)
-            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Arithmetic);
+            return GenericLiteralBinaryExpressionIdentity(
+                node, GenericBinaryIdentityKind::Arithmetic, typedFallback);
         if (dynamic_cast<CFlatParser::ShiftExpressionContext*>(node) != nullptr)
-            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Shift);
+            return GenericLiteralBinaryExpressionIdentity(
+                node, GenericBinaryIdentityKind::Shift, typedFallback);
         if (dynamic_cast<CFlatParser::AndExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node) != nullptr)
-            return GenericLiteralBinaryExpressionIdentity(node, GenericBinaryIdentityKind::Bitwise);
+            return GenericLiteralBinaryExpressionIdentity(
+                node, GenericBinaryIdentityKind::Bitwise, typedFallback);
         if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
             conditional != nullptr && conditional->children.size() == 5)
         {
@@ -892,6 +899,9 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
             {
                 std::string left = GenericLiteralExpressionIdentity(conditional->children[2]);
                 const std::string right = GenericLiteralExpressionIdentity(conditional->children[4]);
+                if (left.empty() != right.empty() && !typedFallback.empty())
+                    return GenericLiteralArithmeticIdentity(typedFallback,
+                        left.empty() ? right : left);
                 if (left.empty() || right.empty()) return {};
                 if (left == right) return left;
                 return GenericLiteralArithmeticIdentity(left, right);
@@ -899,7 +909,7 @@ static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* nod
         }
         if (node->children.size() == 1
             && dynamic_cast<antlr4::RuleContext*>(node->children[0]) != nullptr)
-            return GenericLiteralExpressionIdentity(node->children[0]);
+            return GenericLiteralExpressionIdentity(node->children[0], typedFallback);
         return {};
 }
 
@@ -1038,20 +1048,38 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 if (literalIdentity.empty() && i >= argumentOffset
                     && i - argumentOffset < argumentExpressions.size())
                     if (auto* assignment = argumentExpressions[i - argumentOffset]->assignmentExpression())
-                        literalIdentity = GenericLiteralExpressionIdentity(assignment);
+                        literalIdentity = GenericLiteralExpressionIdentity(assignment,
+                            args[i].HasOriginalArgumentType
+                                ? args[i].OriginalArgumentType.TypeName
+                                : args[i].TypeAndValue.TypeName);
                 // A function value's ABI carrier is __closure_fat_ptr / __c_fn_ptr, but C++-style
                 // T deduction binds its declared function type. Re-encode the original signature
                 // with the same key explicit Lambda<> / function<> arguments use.
                 if (nestedTypeBinding)
                 {
                     TypeSpelling argumentSpelling;
-                    const std::string resolvedPatternBase =
-                        compilerLLVM->ResolveGenericTemplateBase(nestedGenericBase);
+                    std::string resolvedPatternBase;
+                    if (nestedGenericBase.find('.') == std::string::npos)
+                    {
+                        const std::string declaringNamespace = DeclaringNamespaceOf(
+                            compilerLLVM, funcName);
+                        const std::string qualifiedPattern = declaringNamespace.empty()
+                            ? nestedGenericBase : declaringNamespace + "." + nestedGenericBase;
+                        if (compilerLLVM->IsGenericTemplateKey(qualifiedPattern))
+                            resolvedPatternBase = qualifiedPattern;
+                    }
+                    if (resolvedPatternBase.empty())
+                        resolvedPatternBase = compilerLLVM->ResolveGenericTemplateBase(nestedGenericBase);
                     if (base.empty() || !DemangleType(*compilerLLVM, base, argumentSpelling)
                         || MangledBase(base) != resolvedPatternBase
                         || argumentSpelling.args.size() != 1)
                         break;
-                    argType = MangleType(*compilerLLVM, argumentSpelling.args.front());
+                    const std::string encodedArgument =
+                        MangleType(*compilerLLVM, argumentSpelling.args.front());
+                    argType = encodedArgument.starts_with(".p$")
+                        ? SpellType(*compilerLLVM,
+                            LLVMBackend::TypeAndValue{ .TypeName = encodedArgument })
+                        : encodedArgument;
                     declared = true;
                 }
                 else if (paramStars == 0 && !paramView && !sourceTV.Pointer

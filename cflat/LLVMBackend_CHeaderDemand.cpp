@@ -3184,6 +3184,9 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.hasTrivialDefaultCtor = cached.hasTrivialDefaultCtor;
         raw.hasTrivialCopyCtor = cached.hasTrivialCopyCtor;
         raw.hasTrivialCopyAssign = cached.hasTrivialCopyAssign;
+        raw.hasTrivialConstCopyAssign = cached.hasTrivialConstCopyAssign;
+        raw.hasTrivialNonConstCopyAssign = cached.hasTrivialNonConstCopyAssign;
+        raw.hasNonConstCopyAssign = cached.hasNonConstCopyAssign;
         raw.hasTrivialMoveAssign = cached.hasTrivialMoveAssign;
         raw.hasTrivialDtor = cached.hasTrivialDtor;
         raw.paramDestroyedInCallee = cached.paramDestroyedInCallee;

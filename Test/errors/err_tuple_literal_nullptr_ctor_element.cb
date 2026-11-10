@@ -1,0 +1,11 @@
+expect_error("no overload of 'TupleLiteralNullptrMismatch' matches") {
+    class TupleLiteralNullptrMismatch
+    {
+        TupleLiteralNullptrMismatch((int, int) pair) { }
+    };
+    extern int main()
+    {
+        TupleLiteralNullptrMismatch* value = new TupleLiteralNullptrMismatch((nullptr, 4));
+        return 0;
+    }
+}

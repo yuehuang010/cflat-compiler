@@ -1654,6 +1654,12 @@ std::optional<int> LLVMBackend::TupleLiteralElementCost(const NamedVariable& arg
     {
         const auto& from = source->second.StructFields[i];
         const auto& to = target->second.StructFields[i];
+        if (i < argument.TupleLiteralElements.size()
+            && argument.TupleLiteralElements[i].IsNullptrLiteral && to.Pointer)
+        {
+            cost += 2;
+            continue;
+        }
         if (ResolveTypeAlias(from.TypeName) == ResolveTypeAlias(to.TypeName)
             && from.Pointer == to.Pointer && from.ElemPointer == to.ElemPointer)
             continue;
@@ -6493,12 +6499,19 @@ bool LLVMBackend::ConvertTupleArgument(NamedVariable& argument, const TypeAndVal
             llvm::Value* value = builder->CreateLoad(fromType, sourceField);
             if (fromType != toType)
             {
-                if (from.Pointer || to.Pointer || from.ElemPointer || to.ElemPointer
-                    || !(fromType->isIntegerTy() || fromType->isFloatingPointTy())
-                    || !(toType->isIntegerTy() || toType->isFloatingPointTy()))
-                    return false;
-                value = ConvertScalarToType(value, toType,
-                    from.IsUnsignedInteger() != -1, to.IsUnsignedInteger() != -1);
+                const bool nullPointerElement = i < argument.TupleLiteralElements.size()
+                    && argument.TupleLiteralElements[i].IsNullptrLiteral && to.Pointer;
+                if (nullPointerElement && toType->isPointerTy())
+                    value = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(toType));
+                else
+                {
+                    if (from.Pointer || to.Pointer || from.ElemPointer || to.ElemPointer
+                        || !(fromType->isIntegerTy() || fromType->isFloatingPointTy())
+                        || !(toType->isIntegerTy() || toType->isFloatingPointTy()))
+                        return false;
+                    value = ConvertScalarToType(value, toType,
+                        from.IsUnsignedInteger() != -1, to.IsUnsignedInteger() != -1);
+                }
             }
             auto* targetField = CreateStructGEP(targetType, targetStorage,
                 static_cast<unsigned>(i));
@@ -13666,6 +13679,12 @@ std::string LLVMBackend::UniqueFieldNullKey(const NamedVariable& nv) const
 
 void LLVMBackend::RecordNullDerefFor(const NamedVariable& nv, int line, int col)
 {
+        if (const auto* join = FindUniqueFieldReadJoin(nv.Primary); join != nullptr)
+        {
+            for (const auto& source : join->Sources)
+                if (!source.NullKey.empty()) RecordNullDeref(source.NullKey, line, col);
+            return;
+        }
         // A consumed `unique` field is null like a moved local, keyed by its full path ("o.b.p").
         if (!nv.FieldName.empty())
         {

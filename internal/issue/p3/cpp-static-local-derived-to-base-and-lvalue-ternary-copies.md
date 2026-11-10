@@ -10,9 +10,7 @@ derived/base lvalue join. TERNMOVE fixed the nested-field arm `rv.mkH2(1).h.d`.
 
 Still open:
 
-1. An exception from a temporary's noexcept(false) destructor inside the static's initializer does
-   not propagate: cflat prints `3 3 made=1`, clang `-9 4 made=2` (rev_t93_cleanup.cb).
-2. Global C++ class initialized from `move` of another global: cflat refuses any non-constant global
+1. Global C++ class initialized from `move` of another global: cflat refuses any non-constant global
    C++ class initializer ("global variable initializer must be a compile-time constant"), so the
    global move count cannot be compared with clang yet. Not a move bug; revisit with global init design.
 

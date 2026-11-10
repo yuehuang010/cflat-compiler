@@ -5869,7 +5869,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (IsUniqueFieldRead(namedVar))
                                         Compiler(ctx)->RegisterUniqueFieldRead(
                                             namedVar.Primary, namedVar.Storage,
-                                            Compiler(ctx)->UniqueFieldNullKey(namedVar));
+                                            Compiler(ctx)->UniqueFieldNullKey(namedVar), namedVar);
                                     if (namedVar.TypeAndValue.IsArrayView)
                                         Compiler(ctx)->AttachArrayViewFieldLengthStorage(namedVar);
                                 }
@@ -6123,7 +6123,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // If the primary is a generic instantiation (e.g. Box<MyInt>),
                         // map it to its mangled constructor name (e.g. Box$MyInt).
                         // Apply type substitutions for generic parameters.
-                        if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
+                        if (prevPrimary->genericIdentifier() != nullptr
+                            && prevPrimary->genericIdentifier()->Identifier() != nullptr
+                            && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr)
                         {
                             std::string baseName = prevPrimary->genericIdentifier()->Identifier()->getText();
                             // A BARE call inside a namespace must reach its own namespace's
@@ -6141,7 +6143,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && Compiler(ctx)->AnyGenericTypeTemplateNamed(genericTypeBase));
                             std::string mangledName = baseName;
                             std::vector<std::string> typeArgs;
-                            for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                            for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()
+                                    ->typeParameterList()->typeParameterEntry())
                             {
                                 if (TypeArgHasUnique(entry))
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
@@ -15642,6 +15645,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 const bool staticMethod = !methodTemplate.empty()
                                     && isFunctionStatic(Compiler(primaryCtx)->MaterializeGenericFunction(methodTemplate));
+                                // A static call through an object carries the syntactic receiver in
+                                // `arguments`; it is not a parameter of the static specialization.
+                                if (staticMethod && isPostfixMemberCall && !arguments.empty()
+                                    && !structTypeName.empty()
+                                    && arguments.front().TypeAndValue.TypeName == structTypeName)
+                                    arguments.erase(arguments.begin());
                                 if (bareImplicitCall && implicitCallReceiver.GetValue() == nullptr
                                     && !staticMethod)
                                     implicitReceiverGenericMethod = false;
@@ -17821,6 +17830,18 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             DeclExpectedTypeScope elementExpectedScope(&declExpectedType,
                 expectedFields.empty() ? LLVMBackend::TypeAndValue{} : expectedFields[i], true);
             auto nv = ParseAssignmentExpressionNamed(entry->assignmentExpression());
+            if (expectedFields.empty() && tupleIsCallArgument
+                && nv.TypeAndValue.TypeName.empty()
+                && IsNullptrLiteralExpressionTree(entry->assignmentExpression()))
+            {
+                nv.TypeAndValue = LLVMBackend::TypeAndValue{
+                    .TypeName = "void", .Pointer = true, .PointerDepth = 1 };
+                nv.BaseType = compiler->GetType(nv.TypeAndValue);
+                nv.Primary = llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(nv.BaseType));
+                nv.Storage = nullptr;
+                nv.IsNullptrLiteral = true;
+            }
             auto* loaded = LoadNamedVariable(nv);
             // Record the source element as a scalar call argument would carry it (width from the value).
             auto elementRecord = nv;

@@ -7459,12 +7459,18 @@ void MainListener::OpenStaticLocalGuard(StaticLocalGuard& guard, const std::stri
         // next entry retries like clang ([stmt.dcl]/4). Popped by CloseStaticLocalGuard.
         guard.UnwindMark = compiler->unwindPartial_.size();
         compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::StaticFlag, guard.Flag, "");
+        guard.TempMark = compiler->MarkOwnedTemps();
     }
 
 void MainListener::CloseStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName) {
         auto* compiler = Compiler();
         compiler->ClearStaticLocalRequest();
         if (guard.Flag == nullptr) return;
+        // Every static form's temps die here, inside the guard: ContBB is not dominated by InitBB,
+        // so a flush after the branch would skip them. The flag entry is still live, as clang's
+        // guard release follows the full-expression cleanups (a throwing dtor retries the init).
+        if (compiler->IsInsertBlockLive() && std::uncaught_exceptions() == 0)
+            compiler->FlushOwnedTempsSince(guard.TempMark, nullptr);
         if (compiler->unwindPartial_.size() > guard.UnwindMark)
             compiler->unwindPartial_.resize(guard.UnwindMark);
 
@@ -11050,6 +11056,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
         for (auto initDecl : initDeclarVec)
         {
+            // Outlives the temp flush below: a pad from that flush must not destroy this local.
+            LLVMBackend::UnwindInitScope unwindInit(*compiler);
             // Each local init-declarator is one full-expression. Bound/adopted temps have
             // already left the ledger by this scope's destructor; globals keep their old path.
             struct OwnedTempDeclScope
@@ -11074,7 +11082,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             } aliasTemps{ compiler, compiler->MarkAliasDeclTemps() };
             typeAndValue = parsedTypeAndValue;
             const LLVMBackend::TypeAndValue declaredTypeAndValue = typeAndValue;
-            LLVMBackend::UnwindInitScope unwindInit(*compiler);
             // Each init-declarator is a full expression: land its postfix ++/-- before the next
             // declarator or statement reads the operand (every `continue`/return path included).
             struct PostfixFlushScope
@@ -16651,47 +16658,43 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
         // A joined field read has no single Storage. Clear each source in its own predecessor,
         // before the destination drop at the join, so the selected arm transfers ownership and a
         // runtime self-join sees a null old destination rather than freeing its live value.
-        if (rightNV.Storage == nullptr)
+        if (const auto* join = compilerLLVM->FindUniqueFieldReadJoin(rightNV.Primary))
         {
-            if (const auto* join = compilerLLVM->FindUniqueFieldReadJoin(rightNV.Primary))
+            // A global pointer arm is not heap-allocated: refuse it as the plain move would.
+            if (std::ranges::any_of(join->Sources, [](const auto& source) {
+                    return llvm::isa_and_nonnull<llvm::GlobalVariable>(source.Storage); }))
             {
-                // A global pointer arm is not heap-allocated: refuse it as the plain move would.
-                if (std::ranges::any_of(join->Sources, [](const auto& source) {
-                        return llvm::isa_and_nonnull<llvm::GlobalVariable>(source.Storage); }))
-                {
-                    compilerLLVM->LogErrorMessage(
-                        "call to '{}': cannot pass the address of a stack or global value to {} "
-                        "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
-                        "but neither is heap-allocated and freeing it is undefined. Use '{}' to "
-                        "allocate on the heap, or drop '{}' if the callee only borrows.",
-                        { "reset", "'move'", "p", "new", "new" });
-                    return;
-                }
-                auto savedIP = compilerLLVM->builder->saveIP();
-                for (const auto& source : join->Sources)
-                {
-                    if (source.Storage == nullptr || source.Block == nullptr
-                        || cflat_llvm::GetTerminatorOrNull(source.Block) == nullptr)
-                        continue;
-                    compilerLLVM->builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(source.Block));
-                    // Each consumed arm is null-tracked on its own predecessor, as a plain consume is:
-                    // a deref after a join is refused as maybe-moved, `== nullptr` reads stay legal.
-                    if (!source.NullKey.empty())
-                        compilerLLVM->RecordNullSet(source.NullKey, false, true);
-                    if (right->getType()->isPointerTy())
-                        compilerLLVM->builder->CreateStore(
-                            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(right->getType())),
-                            source.Storage);
-                    else if (right->getType()->isStructTy())
-                        compilerLLVM->builder->CreateStore(
-                            llvm::ConstantAggregateZero::get(right->getType()), source.Storage);
-                }
-                compilerLLVM->builder->restoreIP(savedIP);
-                rightNV.TypeAndValue.IsMove = true;
+                compilerLLVM->LogErrorMessage(
+                    "call to '{}': cannot pass the address of a stack or global value to {} "
+                    "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
+                    "but neither is heap-allocated and freeing it is undefined. Use '{}' to "
+                    "allocate on the heap, or drop '{}' if the callee only borrows.",
+                    { "reset", "'move'", "p", "new", "new" });
                 return;
             }
+            auto savedIP = compilerLLVM->builder->saveIP();
+            for (const auto& source : join->Sources)
+            {
+                if (source.Storage == nullptr || source.Block == nullptr
+                    || cflat_llvm::GetTerminatorOrNull(source.Block) == nullptr)
+                    continue;
+                compilerLLVM->builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(source.Block));
+                // Each consumed arm is null-tracked on its own predecessor as a plain consume is.
+                if (!source.NullKey.empty())
+                    compilerLLVM->RecordNullSet(source.NullKey, false, true);
+                if (right->getType()->isPointerTy())
+                    compilerLLVM->builder->CreateStore(
+                        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(right->getType())),
+                        source.Storage);
+                else if (right->getType()->isStructTy())
+                    compilerLLVM->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(right->getType()), source.Storage);
+            }
+            compilerLLVM->builder->restoreIP(savedIP);
+            rightNV.TypeAndValue.IsMove = true;
             return;
         }
+        if (rightNV.Storage == nullptr) return;
         bool isFat = false;
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(right->getType()))
             compilerLLVM->builder->CreateStore(

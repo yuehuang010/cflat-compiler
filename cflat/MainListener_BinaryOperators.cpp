@@ -2231,7 +2231,10 @@ llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext*
         };
         std::vector<LLVMBackend::NamedVariable> args;
         if (lhs.cxxName.empty()) args.push_back(operand(lhs, lhsClass, lhsStorage));
-        if (rhs.cxxName.empty()) args.push_back(operand(rhs, rhsClass, rhsStorage));
+        // A named right operand's type name is its pointee: `s << p` passes the pointer, not the class.
+        const bool rhsIsPointer = rhs.named.TypeAndValue.ValuePointerDepth() == 1;
+        if (rhs.cxxName.empty())
+            args.push_back(operand(rhs, rhsIsPointer ? std::string() : rhsClass, rhsStorage));
         std::string registeredName;
         std::string error;
         if (!compiler->RequestCxxFreeFunction(sourceName, {}, args, registeredName, error, op,
@@ -2251,8 +2254,12 @@ llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext*
                                                  error));
                 return nullptr;
             }
+            // The operands were stripped of their names for the request; the diagnostic shows them.
+            std::vector<LLVMBackend::NamedVariable> namedArgs = args;
+            if (rhs.cxxName.empty()) namedArgs.back().TypeAndValue.VariableName = rhs.name;
+            if (lhs.cxxName.empty()) namedArgs.front().TypeAndValue.VariableName = lhs.name;
             if (ReportCxxConstPointerOperatorFailure(
-                    compiler, ctx, sourceName, args, op, lhs.cxxName, rhs.cxxName))
+                    compiler, ctx, sourceName, namedArgs, op, lhs.cxxName, rhs.cxxName))
                 return nullptr;
             /*
              * The wrapper hands C++ a scalar temporary as an rvalue. When the SAME operands bind
@@ -3953,8 +3960,8 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
         const size_t dot = base.rfind('.');
         const std::string ns = dot == std::string::npos ? std::string() : base.substr(0, dot);
         const std::string sourceName = ns.empty() ? opName : ns + "." + opName;
-        compiler->TryBindCxxFunction(sourceName);
         const std::string lookupName = ns.empty() ? "__cxx_free." + opName : sourceName;
+        compiler->TryBindCxxFunction(sourceName);
 
         // The operand's own storage when it has one; a copy in a temporary otherwise.
         bool operandIsRvalue = operandStorage == nullptr;
@@ -3979,6 +3986,56 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
             compiler->CreateAssignment(operand, temp);
             return temp;
         };
+
+        if (!ns.empty())
+        {
+            compiler->TryBindCxxFunction(opName);
+            auto hasExactFree = [&](const std::string& tableName, const std::string& source) {
+                auto found = compiler->functionTable.find(tableName);
+                if (found == compiler->functionTable.end()) return false;
+                return std::any_of(found->second.begin(), found->second.end(), [&](const auto& candidate) {
+                    return candidate.IsCxx && !candidate.IsMethod
+                        && candidate.SourceName == source && candidate.Parameters.size() == 1
+                        && candidate.Parameters[0].TypeName == typeName;
+                });
+            };
+            if (hasExactFree(lookupName, sourceName)
+                && hasExactFree("__cxx_free." + opName, opName))
+            {
+                LLVMBackend::NamedVariable argument;
+                argument.Primary = operand;
+                argument.Storage = operandStorage;
+                argument.BaseType = operand->getType();
+                argument.TypeAndValue.TypeName = typeName;
+                argument.TypeAndValue.SetCxxConstRef(operandIsConst);
+                argument.TypeAndValue.IsCxxPointeeVolatile = operandIsVolatile;
+                argument.IsRvalue = operandIsRvalue;
+                argument.IsExplicitMove = operandExplicitMove;
+                if (auto* unaryCtx = dynamic_cast<CFlatParser::UnaryExpressionContext*>(ctx);
+                    unaryCtx != nullptr && unaryCtx->castExpression() != nullptr)
+                    argument.CxxLvalueKind = CxxArgumentLvalueKind(unaryCtx->castExpression());
+                std::vector<LLVMBackend::NamedVariable> arguments{ argument };
+                std::string registeredName;
+                std::string requestError;
+                if (compiler->RequestCxxFreeFunction(sourceName, {}, arguments,
+                        registeredName, requestError, op) && !registeredName.empty())
+                {
+                    FlushCallPostfix();
+                    if (llvm::Value* selected = CallOperatorWithoutExcluded(
+                            compiler->functionTable, compiler, lookupName,
+                            registeredName, arguments, {}))
+                        return selected;
+                }
+                else if (compiler->LastCxxRequestClangRejected()
+                    && !compiler->LastCxxRequestNoViableAtRequest()
+                    && !requestError.empty())
+                {
+                    LogErrorContext(ctx, requestError.starts_with("clang: ")
+                        ? requestError : "clang: " + requestError);
+                    return nullptr;
+                }
+            }
+        }
 
         bool candidateFound = false;
         bool reference = false;
@@ -6196,6 +6253,34 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         };
         auto tryClangForCxx20CandidateSet = [&]() -> llvm::Value* {
             if (cxxOperatorRewriteDepth_ != 0 || cxxAdlSuppressDepth_ != 0) return nullptr;
+            // Scalar-left operators can use right-class ADL; clang ranks namespace and global
+            // sources together when both contain a candidate taking that class on the right.
+            if (!isCxxRecordValue(lvalue) && isCxxRecordValue(rvalue)
+                && !isCxxCompoundOperator(op))
+            {
+                const std::string rightName =
+                    llvm::cast<llvm::StructType>(rvalue->getType())->getName().str();
+                const std::string operatorName = "operator" + op;
+                const auto sources = CxxFreeOperatorSources(rightName, operatorName);
+                auto sourceHasRightClassCandidate = [&](const std::string& source) {
+                    compiler->TryBindCxxFunction(source);
+                    const std::string lookup = source == operatorName
+                        ? "__cxx_free." + operatorName : source;
+                    auto found = compiler->functionTable.find(lookup);
+                    if (found == compiler->functionTable.end()) return false;
+                    return std::any_of(found->second.begin(), found->second.end(),
+                        [&](const auto& candidate) {
+                            return isFreeCxxCandidate(candidate) && candidate.SourceName == source
+                                && candidate.Parameters.size() == 2
+                                && (candidate.Parameters[1].TypeName == rightName
+                                    || compiler->IsCxxBaseOf(
+                                        candidate.Parameters[1].TypeName, rightName));
+                        });
+                };
+                if (sources.size() == 2 && sourceHasRightClassCandidate(sources[0])
+                    && sourceHasRightClassCandidate(sources[1]))
+                    if (llvm::Value* resolved = tryFreeOperator(true, true)) return resolved;
+            }
             // A scalar-left equality needs C++20's reversed candidates in the same set.
             if (op == "==" && !isCxxRecordValue(lvalue) && isCxxRecordValue(rvalue))
                 return tryFreeOperator(true, true);
@@ -6259,7 +6344,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         if (isFreeCxxCandidate(candidate)
                             && candidate.SourceName == source
                             && candidate.Parameters.size() == 2
-                            && candidate.Parameters[0].TypeName == className)
+                            && (candidate.Parameters[0].TypeName == className
+                                || candidate.Parameters[1].TypeName == className))
                             return true;
                 return false;
             };
@@ -6299,15 +6385,47 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     }
                 }
             }
-            // An unregistered free function template must rank beside a member. When both are
-            // present, clang resolves the complete candidate set; the registered set is incomplete.
+            // A member template is not registered. With free overloads, clang must rank the full
+            // overload set.
             if (isCxxRecordValue(lvalue) && !isCxxCompoundOperator(op))
             {
                 const std::string leftName =
                     llvm::cast<llvm::StructType>(lvalue->getType())->getName().str();
                 const std::string operatorName = "operator" + op;
-                if (hasFreeTemplateCandidate(leftName, operatorName)
-                    && hasMemberCandidate(leftName, operatorName))
+                const bool hasRegisteredMember = hasMemberCandidate(leftName, operatorName);
+                const bool hasMemberTemplate = hasMemberTemplateCandidate(leftName, operatorName);
+                const bool hasFreeTemplate = hasFreeTemplateCandidate(leftName, operatorName);
+                const bool hasFree = hasFreeCandidate(leftName, operatorName) || hasFreeTemplate;
+                compiler->EnsureCxxRecordProjected(leftName, false);
+                const auto* classInfo = compiler->GetCxxClassInfo(leftName);
+                const bool hasUnregisteredMember = classInfo != nullptr
+                    && classInfo->memberAccess.count(operatorName) != 0
+                    && !hasRegisteredMember;
+                if ((hasMemberTemplate && hasFree)
+                    || (hasRegisteredMember && hasFreeTemplate)
+                    || (hasUnregisteredMember && hasFree && [&]() {
+                            size_t freeCount = 0;
+                            for (const std::string& source :
+                                CxxFreeOperatorSources(leftName, operatorName))
+                            {
+                                if (auto templates = compiler->cxxFunctionTemplates_.find(source);
+                                    templates != compiler->cxxFunctionTemplates_.end())
+                                    freeCount += templates->second.size();
+                                compiler->TryBindCxxFunction(source);
+                                const std::string lookup = source == operatorName
+                                    ? "__cxx_free." + operatorName : source;
+                                if (auto it = compiler->functionTable.find(lookup);
+                                    it != compiler->functionTable.end())
+                                    freeCount += std::count_if(it->second.begin(), it->second.end(),
+                                        [&](const auto& candidate) {
+                                            return isFreeCxxCandidate(candidate)
+                                                && candidate.SourceName == source
+                                                && candidate.Parameters.size() == 2
+                                                && candidate.Parameters[0].TypeName == leftName;
+                                        });
+                            }
+                            return freeCount > 1;
+                        }()))
                 {
                     const bool hasExactFree = hasFreeCandidate(leftName, operatorName);
                     adlClangRefusal.clear();
@@ -6365,8 +6483,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 ? llvm::cast<llvm::StructType>(lvalue->getType())->getName().str() : std::string();
             const std::string rightName = isCxxRecordValue(rvalue)
                 ? llvm::cast<llvm::StructType>(rvalue->getType())->getName().str() : std::string();
+            auto hasSplitFreeSpaceshipSet = [&](const std::string& className) {
+                if (className.empty()) return false;
+                const std::vector<std::string> sources =
+                    CxxFreeOperatorSources(className, "operator<=>");
+                return sources.size() == 2
+                    && sourceHasFreeCandidate(className, sources[0], "operator<=>")
+                    && sourceHasFreeCandidate(className, sources[1], "operator<=>");
+            };
+            const bool splitFreeSpaceshipSet = hasSplitFreeSpaceshipSet(leftName)
+                || (rightName != leftName && hasSplitFreeSpaceshipSet(rightName));
             if (hasCxxMemberOperator(leftName, "operator<=>")
-                || hasCxxMemberOperator(rightName, "operator<=>"))
+                || hasCxxMemberOperator(rightName, "operator<=>")
+                || splitFreeSpaceshipSet)
                 return tryFreeOperator(true, true, true);
             return nullptr;
         };
@@ -6576,6 +6705,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
+        bool triedCandidateSetBeforeMemberTemplate = false;
         if (compiler->IsCxxRecord(typeName)
             && compiler->HasCxxFunctionTemplateMember(typeName, opName))
         {
@@ -6605,6 +6735,42 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             }
             std::vector<LLVMBackend::NamedVariable> templateArguments = { receiver, operand };
             std::string registeredName, templateError;
+            bool hasFreeCandidate = false;
+            for (const std::string& source : CxxFreeOperatorSources(typeName, opName))
+            {
+                if (compiler->HasCxxFunctionTemplate(source))
+                {
+                    hasFreeCandidate = true;
+                    break;
+                }
+                if (compiler->cxxFunctionSignatures_.count(source) == 0) continue;
+                compiler->TryBindCxxFunction(source);
+                const std::string lookup = source == opName
+                    ? "__cxx_free." + opName : source;
+                if (auto it = compiler->functionTable.find(lookup);
+                    it != compiler->functionTable.end()
+                    && std::any_of(it->second.begin(), it->second.end(), [&](const auto& candidate) {
+                        return isFreeCxxCandidate(candidate) && candidate.SourceName == source
+                            && candidate.Parameters.size() == 2
+                            && candidate.Parameters[0].TypeName == typeName;
+                    }))
+                {
+                    hasFreeCandidate = true;
+                    break;
+                }
+            }
+            if (hasFreeCandidate)
+            {
+                triedCandidateSetBeforeMemberTemplate = true;
+                adlClangRefusal.clear();
+                if (llvm::Value* resolved = tryClangForCxx20CandidateSet()) return resolved;
+                if (adlClangAmbiguous) return nullptr;
+                if (!adlClangRefusal.empty())
+                {
+                    LogErrorContext(ctx, adlClangRefusal);
+                    return nullptr;
+                }
+            }
             // Clang refusing the member call itself (a selected body, an ambiguity) is the answer;
             // no viable candidate at the request leaves the non-template members to CFlat.
             if (!compiler->RequestCxxFunctionTemplate(opName, typeName, {}, templateArguments,
@@ -6618,7 +6784,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             }
         }
 
-        if (llvm::Value* exact = tryClangForCxx20CandidateSet()) return exact;
+        if (!triedCandidateSetBeforeMemberTemplate)
+            if (llvm::Value* exact = tryClangForCxx20CandidateSet()) return exact;
 
         auto isReceiverCandidate = [&](const LLVMBackend::FunctionSymbol& candidate) {
             const bool cxxFree = isFreeCxxCandidate(candidate);

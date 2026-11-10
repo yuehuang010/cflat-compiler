@@ -146,3 +146,72 @@ counts and `--error-on-cpp-reparse` unchanged.
   and its invalidation against later prelude commits is unproved.
 - Left: ~3.1 GB header ASTs + request-phase interpreters live until the last request; a sound
   prune needs a proof over the candidate+dependency TU, not the candidate's own harvest.
+
+## 2026-11-09 - lifetime-bound interpreters measured, no code landed (fix/memlife)
+
+Timeline (master 99eef28a, Mac Release, fresh CFLAT_CACHE_DIR, `-o`, phys_footprint probes; run
+peak 20.32 GB, 120.8 s; warm 1.47 GB, 51.6 s):
+
+| Phase | t (s) | footprint (GB) | live interpreters |
+|---|---|---|---|
+| harvest (walk starts) | 9.2 | 3.6 | 192 |
+| walk ends | 98.4 | 19.2 | 214 |
+| demand pass starts (the sampled peak) | 102.7 | 19.4 | 214 |
+| companions linked | 113.7 | 19.1 | 214 |
+| interpreters released | 114.3 | 1.9 | 0 |
+
+- Attribution: harvest 3.6 GB; prelude include parses 13.67 GB of the 15.8 GB walk growth; request
+  chunks 0.35 GB. 25,841 of 35,178 ParseRequest calls fail.
+- One event is 12.25 GB: 207 prelude parses of cpp_interop_basic.h at 20-57 s, driven by one infix
+  probe, `p0 << p1` on cppi::ConstPointerRankShift / ConstPointerRankValue. All 214 groups were
+  tried and all failed with "invalid operands". Every other prelude event is under 0.5 GB.
+- Per large prelude, clang's own counters: AST 43 MB, side table 2.6 MB, SourceManager data 6 MB,
+  content cache 0.5 MB, preprocessor 0.2 MB. Across all 1,070 preludes: AST 7.86 GB, side table
+  0.47 GB, SourceManager 1.0 GB. About 4.2 GB is not in those counters (not attributed).
+- Tried: defer inline bodies during prelude parses, as the header harvest does. Peak 20.32 ->
+  19.23 GB, 128.7 s; not kept (5%, far from the bar; an eager body error fails a candidate on
+  master, a deferred one does not, so it is not provably pick-neutral).
+- Why lifetime-bound teardown cannot clear the bar: the peak is reached by the end of the walk,
+  and no group can be proved finished before then. Fan-outs revisit every group, 204 of 214 have
+  demand work, and a recreated group re-parses its header (--error-on-cpp-reparse, cold = 1).
+  Releasing per group during the demand pass leaves the peak where it is (demand-start is the max).
+- Not available either: a failed probe's prelude stays visible to later probes in that group, so
+  running probes in a throwaway TU changes state master has. A skip for this one infix fan-out is
+  the rejected candidate-skip family: a candidate's headers come first and can change a dependency
+  template's lookup (`-> decltype(choose(t))` on the operator).
+
+Outcome: bar not cleared, tree unchanged. Probe patch: scratch/memlife/probe.patch in the worktree.
+The remaining lever is that one fan-out (12.25 GB of 19.4): it needs a ruling on whether a
+candidate that adds no declaration the probe can see may be skipped, with its proof obligation.
+
+## 2026-11-09 - the 12 GB fan-out's probe was mis-spelled; fixed, peak unchanged (fix/memprobe)
+
+Request (all 214 groups failed): `__cflat_free_53c6a413e4222e06(cppi::ConstPointerRankShift & p0,
+const cppi::ConstPointerRankValue & p1) ... { return p0 << p1; }`, clang: "invalid operands to binary
+expression ('cppi::ConstPointerRankShift' and 'const cppi::ConstPointerRankValue')".
+
+- Root cause: TryCxxInfixShift took a NAMED right operand's type name (the pointee of a pointer
+  variable) as its class, so `s << p` was spelled with `V &` and the pointer level was lost. It was
+  no import effect: the reduced one-group program fails the same way; the fan-out length is just
+  the group count.
+- It was also a miscompile on master, not only a cost: with a `const V&` overload beside the pointer
+  ones, `r2 << c` read 10 (clang 12), `r2 << m` 10 (clang 11), `rd << m` 7 (clang 107).
+- Fix: a depth-1 named pointer rhs keeps its pointer spelling (MainListener_BinaryOperators.cpp).
+  The refusal for a mutable-only operator now fires in TryCxxInfixShift, so the operand names are
+  restored for that diagnostic. Legs 90120-90123 + ConstPointerRankShiftRef fixture.
+- Measured (instrumented, fresh cache): before 20.36 GB, 154.9 s; after 20.37 GB, 135.4 s; warm
+  1.49 GB. Infix attempts 2167 -> 1744, all-failed requests 6 -> 4. **The peak did not move**: the
+  same preludes are now parsed by the next all-failing fan-out, `OpLeaf + OpLeaf` (+11.3 GB, was +3 MB).
+- The remaining cppi_inh fan-outs (OpLeaf, OpHideUnary, OpPrivate) are expect_error legs at
+  test_cpp_interop.cb ~22661-22680 and clang refuses them: legitimate failures, any one pays the
+  12 GB. Lowering the peak still needs the ruling above on skipping a candidate.
+- Left open: `cpp_errc_probe.operator==` fans out with `int & p0` for what looks like an enum operand
+  (separate spelling path, 9 MB, master's fallback answers correctly; the leg was not isolated).
+  A rhs of depth >= 2 keeps the old spelling because `const V**` refuses to bind `const V**&`
+  (`sib.rpp(cpp)` errors on master too, clang accepts): spelling it would break `pq << cpp`.
+
+Follow-up measurement 2026-11-09: a copy of test_cpp_interop without the three `cppi_inh` expect_error
+legs (on this fix) still peaks at 20.34 GB, 191 s under load, rc 0 - so the ~12 GB is not tied to those
+legs. It moved twice, to whichever all-failing fan-out runs next. Inference, not measured directly: the
+cost is the first fan-out that reaches every group and includes cpp_interop_basic.h there, and any later
+one reuses it. Lowering the peak needs a maintainer ruling on when a candidate group may be skipped.

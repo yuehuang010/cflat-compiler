@@ -1,15 +1,6 @@
 # C++ operator ranking leftovers after MIX7
 
 Found: MIX7 r1 opus review, 2026-10-30 box 7, PRE-EXISTING (same on master). Probes scratch/repro_keep/mix7/mix7_rev/ (main checkout).
-- `<=>` rewrite `d < 1` gives 83, clang 84; unary `~u` gives 71, clang 72 (prefers global non-const `U&` overload).
-- The namespace+global joint ranking only looks at the LEFT operand's class: `1 + x` (scalar lhs, class rhs) keeps the old lookup.
-  MIX14 re-probed (scratch/mix14_tmp/r14.cb, namespace nsx operator+(long, const X&) vs global operator+(int, const nsx::X&)):
-  clang 12, master and MIX14 11.
-- Root cause (MIX14): binary/compound free-operator lookup keys its namespace-qualified name on the LEFT class only
-  (MainListener_Expressions.cpp ~21679, ~21955, ~22177 take `dot` from the lvalue's type name), so a scalar lhs never
-  reaches the right operand's namespace. Not fixed in MIX14 (not attempted).
-- Root cause (MIX14): `<=>` and `~u` reproduced unchanged (cmp 83, U 71); the rewritten-candidate and unary joint ranking
-  were not investigated in MIX14.
 - Fixed in MIX14 (fnptr ctor): `tv.Ob(twice)` with a function pointer to a C++ `Ob(bool)` constructor now takes the
   pointer's truth (LLVMBackend_CInterop.cpp EmitCxxStructorCall); leg in Test/test_cpp_interop.cb (65055).
 - Observed (MIX14, master too): `printf("%d", ((tv.Ob)(twice)).v)` in a variadic argument list refuses with

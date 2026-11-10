@@ -5440,6 +5440,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         compiler->PropagateBondedValue(trueValue, falseValue, phi);
         if ((trueAlias || falseAlias) && !cxxRefBorrowJoin) compiler->RegisterAliasValue(phi);
         if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
+        // A `move` arm is explicit by parse shape: flag its read before the join copies it.
+        if (ArmIsExplicitMove(expressionTrueCtx))
+            compiler->MarkUniqueFieldReadExplicitMove(trueValue, nullptr, nullptr);
+        if (ArmIsExplicitMove(expressionFalseCtx))
+            compiler->MarkUniqueFieldReadExplicitMove(falseValue, nullptr, nullptr);
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
         PropagateTernaryViewElement(ctx, trueValue, trueStorage, falseValue, falseStorage, phi);
@@ -6058,6 +6063,10 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 lhs = lhsTv.value;
             }
             if (!lhs) return {};
+            // A `move` arm is explicit by parse shape: mark its join source before the join is built.
+            if (ArmIsExplicitMove(logicCtx))
+                compiler->MarkUniqueFieldReadExplicitMove(lhs, lhsTv.receiverStorage,
+                    compiler->builder->GetInsertBlock());
             auto pointerJoinDest = cxxPointerJoinDest();
             adjustCxxPointerArm(lhs, pointerJoinDest);
             const auto coalesceLeftExpected = InferTernaryArmType(lhsTv);
@@ -6261,6 +6270,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     rhsShape = rhsTv;
                     rhs = rhsTv.value;
                     rhsStorage = rhsTv.receiverStorage;
+                    if (ArmIsExplicitMove(ctx->conditionalExpression()))
+                        compiler->MarkUniqueFieldReadExplicitMove(rhs, rhsStorage,
+                            compiler->builder->GetInsertBlock());
                     rhsCxxReferencePointer = LowerCxxReferenceJoinArmToPointer(compiler, rhs, rhsStorage,
                         rhsShape, coalesceLeftExpected, "null-coalescing expression");
                     auto lhsJoinType = InferTernaryArmType(lhsTv);

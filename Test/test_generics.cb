@@ -2101,6 +2101,8 @@ bool testGenericStaticMethods()
     // Static generic method on a NON-generic class (already worked - guard against regression).
     result &= Test("generic_static_plain_class", StaticBox.twice<int>(5), 10);
     result &= Test("generic_static_plain_class_i64", StaticBox.twice<i64>(6), 12);
+    StaticBox staticBox = default;
+    result &= Test("generic_static_plain_class_via_instance", staticBox.twice(5), 10);
 
     // Static generic method on a GENERIC class, reached through the instantiated type name.
     result &= Test("generic_static_generic_class", TypedHolder<i64>.sconvert<int>(5), 6);
@@ -3533,6 +3535,14 @@ struct LitOverloadHolder
     T get<T>(T value) { return value; }
 };
 T litListFirst<T>(list<T> values) { return values.get(0); }
+int lgenListElementSize<T>(list<T> values) { return (int)sizeof(T); }
+int lgenGenericArgSize<T>(T value) { return (int)sizeof(T); }
+struct LgenGenericElem<T> { T value = default; };
+namespace LgenListNs
+{
+    struct list<T> { T value = default; };
+    T get<T>(list<T> value) { return value.value; }
+}
 
 struct GenOvlA { int value = default; };
 int genOvlPtrGenericFirst<T>(T* value) { return 9; }
@@ -4045,6 +4055,20 @@ bool testGenericArgInference()
     result &= Test("pick_int_max",  pick(3, 7),                  7);
     result &= Test("pick_int_min",  pick(9, 2),                  9);
     result &= Test("pick_i64_max",  pick((i64)10, (i64)20), (i64)20);
+    int pointerElement = 7;
+    list<int*> pointerList = default;
+    pointerList.add(&pointerElement);
+    result &= Test("generic_list_pointer_element_deduction",
+        lgenListElementSize(pointerList), 8);
+    LgenGenericElem<int> genericElement = default;
+    list<LgenGenericElem<int>> genericElementList = default;
+    genericElementList.add(genericElement);
+    result &= Test("generic_list_generic_element_deduction",
+        lgenListElementSize(genericElementList), (int)sizeof(genericElement));
+    LgenListNs.list<int> namespacedList = default;
+    namespacedList.value = 9;
+    result &= Test("generic_list_namespace_pattern_deduction",
+        LgenListNs.get(namespacedList), 9);
     // int default: value and width (pre-fix: refused / 1 byte).
     result &= Test("lit_val_300",       litFirst(300, 2),        300);
     result &= Test("lit_second_val_300", litSecond(2, 300),      300);
@@ -4057,6 +4081,12 @@ bool testGenericArgInference()
     bool litCondition = true;
     result &= Test("lit_sz_ternary", (int)sizeof(litFirst(litCondition ? 1 : 2, 3)) * 100
         + litFirst(litCondition ? 1 : 2, 3), 401);
+    i8 litNarrow = 1;
+    result &= Test("lit_sz_ternary_parenthesized_promotion",
+        lgenGenericArgSize((litCondition ? litNarrow : 2)), 4);
+    result &= Test("lit_sz_ternary_i8_promotion",
+        (int)sizeof(litFirst(litCondition ? litNarrow : 2, 3)) * 100
+            + litFirst(litCondition ? litNarrow : 2, 3), 401);
     result &= Test("lit_sz_unary_neg_paren", (int)sizeof(litUnary(-(7))) * 100
         + litUnary(-(7)), 393);
     result &= Test("lit_sz_unary_pos_paren", (int)sizeof(litUnary(+(7))) * 100
@@ -8726,6 +8756,9 @@ bool testMix8TupleTemplates()
 typedef (int, int) TupleLiteralAlias;
 T tupleLiteralIdentity<T>(T value) { return value; }
 int tupleLiteralWideCtorValue = 0;
+int tupleLiteralNullptrCtorValue = 0;
+int tupleLiteralNullptrCtorCount = 0;
+int tupleLiteralNullptrDtorCount = 0;
 class TupleLiteralWideCtor
 {
     int value = default;
@@ -8735,6 +8768,24 @@ class TupleLiteralWideCtor
         tupleLiteralWideCtorValue = value;
     }
 };
+class TupleLiteralNullptrCtor
+{
+    TupleLiteralNullptrCtor((int*, long) pair)
+    {
+        tupleLiteralNullptrCtorValue = (pair.item_0 == nullptr ? 10 : *pair.item_0) + (int)pair.item_1;
+        tupleLiteralNullptrCtorCount++;
+    }
+    TupleLiteralNullptrCtor((char*, int) pair)
+    {
+        tupleLiteralNullptrCtorValue = 24;
+        tupleLiteralNullptrCtorCount++;
+    }
+    ~TupleLiteralNullptrCtor() { tupleLiteralNullptrDtorCount++; }
+};
+int tupleLiteralNullptrCall((int*, int) pair)
+{
+    return (pair.item_0 == nullptr ? 10 : *pair.item_0) + pair.item_1;
+}
 int tupleLiteralUniqueDtorCount = 0;
 struct TupleLiteralOwned
 {
@@ -8786,6 +8837,49 @@ bool testTupleLiteralElementConversions()
     TupleLiteralWideCtor* wideCtor = new TupleLiteralWideCtor((3, 4));
     result &= Test("tuple literal wider constructor argument", tupleLiteralWideCtorValue, 7);
     delete wideCtor;
+    tupleLiteralNullptrCtorValue = 0;
+    tupleLiteralNullptrCtorCount = 0;
+    tupleLiteralNullptrDtorCount = 0;
+    TupleLiteralNullptrCtor* nullptrCtor = new TupleLiteralNullptrCtor((nullptr, 4));
+    result &= Test("tuple literal nullptr viable overload ranking", tupleLiteralNullptrCtorValue, 24);
+    result &= Test("tuple literal nullptr constructor count", tupleLiteralNullptrCtorCount, 1);
+    result &= Test("tuple literal nullptr constructor live dtor count", tupleLiteralNullptrDtorCount, 0);
+    delete nullptrCtor;
+    result &= Test("tuple literal nullptr constructor balanced dtor count", tupleLiteralNullptrDtorCount, 1);
+    int tuplePointerValue = 7;
+    int* tuplePointer = &tuplePointerValue;
+    int tuplePointerCondition = 0;
+    result &= Test("tuple literal conditional pointer live in else arm call",
+        tupleLiteralNullptrCall((tuplePointerCondition ? nullptr : tuplePointer, 4)), 11);
+    tuplePointerCondition = 1;
+    result &= Test("tuple literal conditional pointer live in then arm call",
+        tupleLiteralNullptrCall((tuplePointerCondition ? tuplePointer : nullptr, 4)), 11);
+    tuplePointerCondition = 0;
+    tupleLiteralNullptrCtorValue = 0;
+    TupleLiteralNullptrCtor* nullptrCtorElse = new TupleLiteralNullptrCtor(
+        (tuplePointerCondition ? nullptr : tuplePointer, 4));
+    result &= Test("tuple literal conditional pointer live in else arm new",
+        tupleLiteralNullptrCtorValue, 11);
+    delete nullptrCtorElse;
+    tuplePointerCondition = 1;
+    tupleLiteralNullptrCtorValue = 0;
+    TupleLiteralNullptrCtor* nullptrCtorThen = new TupleLiteralNullptrCtor(
+        (tuplePointerCondition ? tuplePointer : nullptr, 4));
+    result &= Test("tuple literal conditional pointer live in then arm new",
+        tupleLiteralNullptrCtorValue, 11);
+    delete nullptrCtorThen;
+    tuplePointerCondition = 0;
+    tupleLiteralNullptrCtorValue = 0;
+    TupleLiteralNullptrCtor nullptrStackElse = TupleLiteralNullptrCtor(
+        (tuplePointerCondition ? nullptr : tuplePointer, 4));
+    result &= Test("tuple literal conditional pointer live in else arm stack",
+        tupleLiteralNullptrCtorValue, 11);
+    tuplePointerCondition = 1;
+    tupleLiteralNullptrCtorValue = 0;
+    TupleLiteralNullptrCtor nullptrStackThen = TupleLiteralNullptrCtor(
+        (tuplePointerCondition ? tuplePointer : nullptr, 4));
+    result &= Test("tuple literal conditional pointer live in then arm stack",
+        tupleLiteralNullptrCtorValue, 11);
     tupleLiteralUniqueDtorCount = 0;
     {
         (unique<TupleLiteralOwned>, int) ownedTuple = (new TupleLiteralOwned(), 4);

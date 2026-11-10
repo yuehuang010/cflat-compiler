@@ -3164,6 +3164,9 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.hasTrivialDefaultCtor) j["tdc"] = true;
         if (r.hasTrivialCopyCtor)    j["tcc"] = true;
         if (r.hasTrivialCopyAssign)  j["tca"] = true;
+        if (r.hasTrivialConstCopyAssign) j["tcca"] = true;
+        if (r.hasTrivialNonConstCopyAssign) j["tcnca"] = true;
+        if (r.hasNonConstCopyAssign) j["hnca"] = true;
         if (r.hasTrivialMoveAssign)  j["tma"] = true;
         if (!r.hasTrivialDtor)       j["ntd"] = true;
         if (r.paramDestroyedInCallee) j["pdc"] = true;
@@ -3293,6 +3296,9 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasTrivialDefaultCtor = j.value("tdc", false);
         r.hasTrivialCopyCtor    = j.value("tcc", false);
         r.hasTrivialCopyAssign  = j.value("tca", false);
+        r.hasTrivialConstCopyAssign = j.value("tcca", false);
+        r.hasTrivialNonConstCopyAssign = j.value("tcnca", false);
+        r.hasNonConstCopyAssign = j.value("hnca", false);
         r.hasTrivialMoveAssign  = j.value("tma", false);
         r.hasTrivialDtor        = !j.value("ntd", false);
         r.paramDestroyedInCallee = j.value("pdc", false);

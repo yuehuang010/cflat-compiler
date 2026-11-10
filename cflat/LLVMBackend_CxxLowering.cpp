@@ -4508,11 +4508,22 @@ bool LLVMBackend::EmitLoweredMemberwiseAssign(const std::string& typeName, llvm:
             {
                 const auto& overloads = useMove && !info->moveAssignOverloads.empty()
                     ? info->moveAssignOverloads : info->copyAssignOverloads;
-                if (!overloads.empty()) op = &overloads.front();
+                if (!overloads.empty())
+                {
+                    if (useMove && !info->moveAssignOverloads.empty()) op = &overloads.front();
+                    else
+                        for (const auto& candidate : overloads)
+                            if (candidate.rhsConstRef)
+                            {
+                                op = &candidate;
+                                break;
+                            }
+                }
                 if (op == nullptr)
                 {
                     if (useMove && info->hasMoveAssign) op = &info->moveAssign;
-                    else if (info->hasCopyAssign) op = &info->copyAssign;
+                    else if (info->hasCopyAssign && !info->hasTrivialConstCopyAssign)
+                        op = &info->copyAssign;
                 }
             }
             if (op != nullptr && op->isDeleted)
@@ -4520,7 +4531,8 @@ bool LLVMBackend::EmitLoweredMemberwiseAssign(const std::string& typeName, llvm:
             // Clang's implicit assignment is trivial and not deleted (no symbol): a byte copy,
             // as EmitCxxCopyOrMoveConstruct byte-copies a trivial implicit copy constructor.
             if (op == nullptr && info != nullptr
-                && (info->hasTrivialCopyAssign || (useMove && info->hasTrivialMoveAssign)))
+                && (useMove ? (info->hasTrivialConstCopyAssign || info->hasTrivialMoveAssign)
+                    : (info->hasTrivialConstCopyAssign || info->hasTrivialNonConstCopyAssign)))
             {
                 auto* recordType = GetType(TypeAndValue{ .TypeName = cxxType });
                 if (recordType != nullptr && recordType->isSized())
