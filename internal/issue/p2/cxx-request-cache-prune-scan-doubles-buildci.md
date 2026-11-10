@@ -14,7 +14,7 @@ Measured (Mac, test.sh Release, test_cpp_interop / _template / _bridge seconds):
 |---|---|---|---|---|
 | fresh or cleared local cache (bar runs, typical) | 500-620 s | 280-420 | 23-33 | 23-32 |
 | stamp flip over a full cache (bar or buildci on main) | 880-1120 s | 670-900 | 136-203 | 86-120 |
-| 2026-11-07 buildci on e6af5b81 (500 MB, 76k files local cache) | 933 s | 759 | 172 | 106 |
+| 2026-11-07 buildci on d91b6671 (500 MB, 76k files local cache) | 933 s | 759 | 172 | 106 |
 
 2026-11-02 `sample`: same-stamp warm compile 34 s; first compile under a foreign stamp 170 s with
 sys ~105 s. File count alone is not the cause (a cold run refills ~66k files, 33k `.rq`, 252 owner

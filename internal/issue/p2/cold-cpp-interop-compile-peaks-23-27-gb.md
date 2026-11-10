@@ -6,7 +6,7 @@ it next to other interop tests, so a Windows box pages: the 2026-11-07 buildci o
 test_cpp_interop for 34 min (7 min alone). This was first blamed on the request-cache prune
 (p2/cxx-request-cache-prune-scan-doubles-buildci); the controls below rule the cache out.
 
-Measured 2026-11-07 (master 9bade396 on Windows, c6eb1e50 on the Mac):
+Measured 2026-11-07 (master 9bade396 on Windows, d91b6671 on the Mac):
 
 | Host | Run | wall | peak |
 |---|---|---|---|
@@ -149,7 +149,7 @@ counts and `--error-on-cpp-reparse` unchanged.
 
 ## 2026-11-09 - lifetime-bound interpreters measured, no code landed (fix/memlife)
 
-Timeline (master 99eef28a, Mac Release, fresh CFLAT_CACHE_DIR, `-o`, phys_footprint probes; run
+Timeline (master 1a702805, Mac Release, fresh CFLAT_CACHE_DIR, `-o`, phys_footprint probes; run
 peak 20.32 GB, 120.8 s; warm 1.47 GB, 51.6 s):
 
 | Phase | t (s) | footprint (GB) | live interpreters |

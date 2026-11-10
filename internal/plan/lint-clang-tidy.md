@@ -252,7 +252,7 @@ Options below kept as input; the diff-gate design notes apply to whatever runner
   wanted later, run them as a separate opt-in pass over changed functions only, with a per-file
   timeout.
 
-## Step 2 baseline (2026-11-07, Windows, master 80aae14f)
+## Step 2 baseline (2026-11-07, Windows, master d91b6671)
 
 `run-clang-tidy.py -j 2 -p build/win-x64-release/tidy "cflat[\\/][^\\/]+\.cpp$"`: 61 TUs in 4 min 25 s,
 852 unique findings, 1 parse error (`RoMetadataApi.h`: 'cor.h' not found - run from a vcvars64
