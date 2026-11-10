@@ -25,9 +25,18 @@ Repro base: Test/library/cpp_interop_unwind.h / .cpp and the unwind section of T
 
 ## 2026-10-16 (T313 reviews 2-3): brace `new` of a non-fresh struct gets no unwind note
 
-`new S{ z = rv.bval(1) }` where S holds a C++ class plus an int and is not eligible for the fresh in-place brace path:
-when the element initializer throws, no UserNewHeap unwind entry is recorded, so the block leaks (user delete count 0,
-master same). The tag form, `new T(args)` and fresh-eligible `new T{...}` are covered by T313 (EmitUserNewHeapFree).
-Also from T313 review 3, RULED 2026-10-20 match clang (fix item): the sized class `operator delete(void*, N)` is recognized for ANY non-pointer
-64-bit integer N (i64 or u64); clang accepts only std::size_t (long long / unsigned long long free nothing there).
-Fix: recognize the size parameter only when it is the target's size_t, exactly as clang does.
+Item 1 (filed, NOT reproduced on master, 2026-11-08 round 2): `new S{ z = t261.bval(1) }` with a CFlat struct S holding
+`t261.Counted a` plus `int z`, no constructor (so not fresh-eligible), user `operator new(i64)` / `operator delete(void*)`,
+caught in C++. master = worktree = clang++ -std=c++20 twin: caught, user delete 1, Counted live 0. No leak, no leg added.
+The `cxxAllocator` branch it was filed against only covers C++ classes, and those reject named brace fields.
+Separate, not a leak: a positional C++ class `new Cls{ bval(1) }` with class operator new/delete and a throwing argument
+calls neither new nor delete on master (arguments evaluate before the block is allocated); clang allocates first and
+deletes on the throw (new 1 / delete 1). An evaluation-order divergence, still open.
+
+Item 2 (RULED 2026-10-20, match clang; OPEN, blocked on a ruling): the sized class `operator delete(void*, N)` is recognized
+only when N is the target's size_t (`ulong` on LP64, `u64` on Win64). Unwind-path counts (`new S{ z = bval(1) }`,
+user deletes for i64 / u64 / ulong): master 1/1/1, fix 0/0/1, clang 0/0/1. Fix patch (not applied): scratch/repro_keep/box12/unwnew/unwnew_item2_sizet.patch.
+Blocked: (a) T313 r2 legs 25342-25343 and T320 r2 leg 3422 assert the i64 behaviour; the read-only rule keeps them unflipped.
+(b) A non-size_t delete must still hide the base class delete, but clang rejects `std::unique_ptr<T>` for a class whose
+only delete is (void*, long long) ("no suitable member 'operator delete'"), so leg 3422's unique<T320US> has no clang
+counterpart. Needs a ruling on unique<T> over such a class before the legs are rewritten.

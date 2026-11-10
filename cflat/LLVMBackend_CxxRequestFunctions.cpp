@@ -3586,8 +3586,11 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                                              std::string& registeredName, std::string& error)
 {
         if (lastCxxFreeWrapperLinkage_.empty()
-            || std::none_of(arguments.begin(), arguments.end(),
-                            [](const NamedVariable& a) { return a.CxxEarlyCopySlot != nullptr; }))
+            || std::none_of(arguments.begin(), arguments.end(), [&](const NamedVariable& a) {
+                   return a.CxxEarlyCopySlot != nullptr
+                       || (a.IsCxxPrvalueTemp && a.Storage != nullptr && !a.TypeAndValue.Pointer
+                           && IsCxxRecord(a.TypeAndValue.TypeName));
+               }))
             return true;
         const std::string linkage = lastCxxFreeWrapperLinkage_;
         const CSigEntry* wrapperSig = nullptr;
@@ -3620,7 +3623,11 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             const size_t index = flat;
             flat += leaves(leaves, arguments[i]);
             wrapperBuilt = wrapperBuilt || arguments[i].IsCxxDirectConstruction;
-            if (arguments[i].CxxEarlyCopySlot != nullptr && index < bindKinds.size() && bindKinds[index] == 'v')
+            if (index < bindKinds.size() && bindKinds[index] == 'v'
+                && (arguments[i].CxxEarlyCopySlot != nullptr
+                    || (arguments[i].IsCxxPrvalueTemp && arguments[i].Storage != nullptr
+                        && !arguments[i].TypeAndValue.Pointer
+                        && IsCxxRecord(arguments[i].TypeAndValue.TypeName))))
                 byValue.push_back(i);
         }
         auto clearMarkers = [&] {
@@ -3629,6 +3636,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                 a.CxxEarlyCopySlot = nullptr;
                 a.CxxEarlyCopyJoin = nullptr;
                 a.CxxEarlyCopyDecision = nullptr;
+                a.CxxEarlyCopyNamedLaterWrite = false;
             }
         };
         if (byValue.empty())
@@ -3640,11 +3648,23 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                     a.CxxEarlyCopySlot = nullptr;
                     a.CxxEarlyCopyJoin = nullptr;
                     a.CxxEarlyCopyDecision = nullptr;
+                    a.CxxEarlyCopyNamedLaterWrite = false;
                 }
             return true;
         }
+        const bool hasNamedEarlyCopyByValue = std::any_of(byValue.begin(), byValue.end(), [&](size_t i) {
+            return arguments[i].CxxEarlyCopySlot != nullptr
+                && arguments[i].CxxEarlyCopyNamedLaterWrite;
+        });
         const size_t first = byValue.front();
         auto refuse = [&](const std::string& reason) {
+            if (!hasNamedEarlyCopyByValue)
+            {
+                // Prvalues already use the wrapper's established move path; these refusals only
+                // apply when an early lvalue copy needs the selected callee's by-value ABI.
+                clearMarkers();
+                return true;
+            }
             error = std::format("argument {} of C++ '{}' initializes a by-value '{}' parameter, which C++ "
                                 "copies before the later arguments run; this call cannot make that copy "
                                 "in place because {}, so copy it into a local first and pass that",
@@ -3709,7 +3729,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             if (a.CxxEarlyCopyDecision != nullptr)
                 a.CxxEarlyCopyDecision->setOperand(0, builder->getInt1(
                     direct || (a.CxxEarlyCopySlot == nullptr && i < bindKinds.size() && bindKinds[i] == 'v')));
-            if (direct)
+            if (direct && a.CxxEarlyCopySlot != nullptr)
             {
                 // The early copy is the by-value parameter: an owned prvalue the call elides into.
                 llvm::AllocaInst* slot = a.CxxEarlyCopySlot;

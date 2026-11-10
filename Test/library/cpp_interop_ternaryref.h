@@ -39,6 +39,9 @@ struct T391Zero
 };
 inline int t391_take(T391Val v) { return v.value(); }
 inline int t391_tref(const T391Val& v) { return v.value(); }
+inline T391Val t391_pass(T391Val v) { return T391Val(v.value() + 100); }
+inline T391Val t391_global_a(7);
+inline T391Val t391_global_b(8);
 struct T391Host
 {
     int tref(const T391Val& v) { return 30 + v.value(); }
@@ -54,6 +57,32 @@ struct T391Sink
     int stored;
     explicit T391Sink(const T391Val& v) : stored(v.value()) {}
     int value() const { return stored; }
+};
+struct T391BraceHost
+{
+    T391Val value;
+    int tag;
+    T391BraceHost(T391Val v, int t) : value(static_cast<T391Val&&>(v)), tag(t) {}
+};
+struct T391NullHost
+{
+    int* value;
+    explicit T391NullHost(int* v) : value(v) {}
+};
+struct T391StringHost
+{
+    int value;
+    T391StringHost(const char* text, int v) : value(v)
+    {
+        while (*text != '\0') { ++value; ++text; }
+    }
+};
+struct T391BraceInner { int first; int second; };
+struct T391NestedHost
+{
+    T391BraceInner value;
+    int tag;
+    T391NestedHost(T391BraceInner v, int t) : value(v), tag(t) {}
 };
 // T459 r3: a const T391Val& constructor beside an int one; `c ? default : int local` selects the int one.
 struct T391Mixed

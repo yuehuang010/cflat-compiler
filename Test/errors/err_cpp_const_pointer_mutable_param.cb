@@ -85,5 +85,10 @@ extern int main()
     expect_error("cannot pass C++ const pointer argument 1") {
         amp2r3.free_const_pointer(&constSlot.fp);
     }
+    int primitiveValue = 0;
+    int* primitivePointer = &primitiveValue;
+    expect_error("cannot pass C++ const pointer argument 1") {
+        cppi.primitive_middle_mutable_only(cppi.primitive_middle_const(&primitivePointer));
+    }
     return 0;
 }

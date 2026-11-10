@@ -7,6 +7,3 @@ Test/test_cpp_interop.cb (T310 block) and Test/errors/err_cpp_hidden_ctor_tie.cb
 
 3. `r.SCo(300)`, `takeSCo(0 | 300)` (char-only ctor) refused by CFlat's no-implicit-narrowing rule;
    clang accepts (12 / 11 / 12). By design unless ruled otherwise.
-9. By-value equal-rank widening tie `rv.takeW(h)` (W(long)/W(double)/W(char), short h) reports
-   "no overload of 'rv.takeW'"; clang reports "conversion from 'short' to 'W' is ambiguous". The
-   refusal is right; the text differs.

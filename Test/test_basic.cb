@@ -1906,6 +1906,13 @@ bool testNameof()
     result &= Test("nameof_struct", nameof(thing), "thing");
     result &= Test("nameof_field", nameof(thing.value), "value");
     result &= Test("nameof_type", nameof(NamedThing), "NamedThing");
+    // nameof never evaluates its operand, so a move inside it moves nothing.
+    NamedThing kept = NamedThing();
+    auto movedName = nameof(thing);
+    movedName = nameof(move kept);
+    auto movedName2 = nameof(move kept);
+    result &= Test("nameof_move_unevaluated", movedName, movedName2);
+    result &= Test("nameof_move_source_kept", kept.value == 42 ? "kept" : "moved", "kept");
     return result;
 }
 

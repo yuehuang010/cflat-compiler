@@ -48,6 +48,34 @@ int lookCS(CS* p) { return p == nullptr ? -1 : p->v; }
 // -10 when the argument's temporary was already destructed before the call ran.
 int useCSLive(int* value) { if (conditionalDtorCount != 0) return -10; return useCS(value); }
 int lookCSLive(CS* p) { if (conditionalDtorCount != 0) return -10; return lookCS(p); }
+int chainJoinBorrowedDestination(bool c)
+{
+    CS* keep = new CS(61);
+    CS* raw = keep;
+    CS* other = new CS(62);
+    raw = c ? new CS(63) : other;
+    return raw->v;
+}
+int chainJoinSwappedArms(bool c)
+{
+    CS* keep = new CS(64);
+    CS* raw = keep;
+    CS* other = new CS(65);
+    raw = c ? other : new CS(66);
+    return raw->v;
+}
+void chainJoinParameterDestination(CS* raw, bool c)
+{
+    CS* other = new CS(67);
+    raw = c ? new CS(68) : other;
+    raw->v;
+}
+int chainJoinDeclaration(bool c)
+{
+    CS* other = new CS(69);
+    CS* raw = c ? new CS(70) : other;
+    return raw->v;
+}
 CS* conditionalStored = nullptr;
 void storeCS(CS* p) { conditionalStored = p; }
 int conditionalGate = 1;
@@ -15679,6 +15707,59 @@ int testTernaryArmsShortCircuit()
 {
     int passed = 0;
 
+    // A fully-owning join stored into a raw local must re-arm its runtime owner flag.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    passed += Test("chainleak borrowed destination false value", chainJoinBorrowedDestination(false), 62);
+    passed += Test("chainleak borrowed destination false balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    passed += Test("chainleak borrowed destination true value", chainJoinBorrowedDestination(true), 63);
+    passed += Test("chainleak borrowed destination true balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 33);
+
+    // Swapping the arms exercises the same transfer when the fresh allocation is unselected.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    passed += Test("chainleak swapped arms false value", chainJoinSwappedArms(false), 66);
+    passed += Test("chainleak swapped arms false balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 33);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    passed += Test("chainleak swapped arms true value", chainJoinSwappedArms(true), 65);
+    passed += Test("chainleak swapped arms true balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 22);
+
+    // Function parameters cannot own the joined value; preserve the master's behavior. The selected
+    // fresh arm remains the existing raw-parameter leak and is not adopted by this change.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    CS* paramKeepFalse = new CS(71);
+    chainJoinParameterDestination(paramKeepFalse, false);
+    delete paramKeepFalse;
+    passed += Test("chainleak parameter false balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    CS* paramKeepTrue = new CS(72);
+    chainJoinParameterDestination(paramKeepTrue, true);
+    delete paramKeepTrue;
+    passed += Test("chainleak parameter true master counts",
+        conditionalNewCount * 10 + conditionalDtorCount, 32);
+
+    // Declarations use the same all-arms-owning predicate as assignments.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    passed += Test("chainleak declaration false value", chainJoinDeclaration(false), 69);
+    passed += Test("chainleak declaration false balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 11);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    passed += Test("chainleak declaration true value", chainJoinDeclaration(true), 70);
+    passed += Test("chainleak declaration true balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 22);
+
     // False condition: the `move` arm never runs, so the source keeps its object and frees
     // it exactly once at scope exit.
     dtorCount = 0;
@@ -20239,6 +20320,7 @@ extern int main()
     total += 6;
 
     passed += testTernaryArmsShortCircuit();
+    total += 14;
     total += 55;
 
     passed += testUniqueInterfaceReassign();
@@ -20648,7 +20730,7 @@ extern int main()
     passed += testChainedRawIntoUnique();
     total += 7;
     passed += testChainedRawShapes();
-    total += 8;
+    total += 14;
     passed += testT447ExplicitMoveThisField();
     total++;
     passed += testT376ChainedUniqueField();
@@ -22140,6 +22222,11 @@ struct ChainRawBox
     int v = 0;
     ~ChainRawBox() { chainRawDtors = chainRawDtors + 1; }
 };
+unique ChainRawBox* t250ReturnAssignedRaw()
+{
+    ChainRawBox* raw = nullptr;
+    return (raw = new ChainRawBox());
+}
 struct ChainRawHolder { unique ChainRawBox* owner = nullptr; };
 unique ChainRawBox* chainRawGlobal = nullptr;
 
@@ -24163,6 +24250,33 @@ int testChainedRawShapes()
         owner = raw = new ChainRawBox();
     }
     passed += Test("chain_decl_reset_frees_old_one", chainRawDtors, 2);
+    chainRawDtors = 0;
+    useNew = true;
+    {
+        ChainRawBox* raw = nullptr;
+        ChainRawBox* other = new ChainRawBox();
+        other->v = 7;
+        raw = (useNew ? new ChainRawBox() : other);
+        passed += Test("chain_owned_ternary_true_value", raw->v, 0);
+    }
+    passed += Test("chain_owned_ternary_true_two_dtors", chainRawDtors, 2);
+    chainRawDtors = 0;
+    useNew = false;
+    {
+        ChainRawBox* raw = nullptr;
+        ChainRawBox* other = new ChainRawBox();
+        other->v = 7;
+        raw = (useNew ? new ChainRawBox() : other);
+        passed += Test("chain_owned_ternary_false_value", raw->v, 7);
+    }
+    passed += Test("chain_owned_ternary_false_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = t250ReturnAssignedRaw();
+        owner->v = 8;
+        passed += Test("chain_return_assigned_value", owner->v, 8);
+    }
+    passed += Test("chain_return_assigned_one_dtor", chainRawDtors, 1);
     chainRawDtors = 0;
     return passed;
 }

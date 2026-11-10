@@ -1688,6 +1688,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             const bool cxxClassLvalueReference = cxxLvalueReference
                 && IsCxxRecord(ResolveTypeAlias(ptv.TypeName));
             fp.IsAlias = cxxPointerReference || cxxClassLvalueReference;
+            fp.IsCxxLvalueRef = cxxLvalueReference;
             // Leading const qualifies the innermost pointee (`const void *`).
             fp.IsPointeeConst = ptv.Pointer && parameterSpelling.starts_with("const ");
             if (!cxxBoundary)

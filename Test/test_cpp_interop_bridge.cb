@@ -4325,6 +4325,9 @@ int bridge_global_field_static_value()
 using T473UQ = unique;
 using T473UQW = unique<uqp.W>;
 using T473UQW64 = unique<uqp.W64, 64>;
+using T473UQFunction = function<int(unique<uqp.W>)>;
+using T473SpelledUQFunction = function<int(std.unique_ptr<uqp.W>)>;
+using T473UQParam = std.unique_ptr<uqp.W>;
 namespace T473UQNs { using UQ = unique; }
 struct T473Native { int v = 0; };
 struct UqHolder { unique cpuq.Widget* w = default; int tag = 0; };
@@ -4561,6 +4564,50 @@ int uq_alias_base()
         if (q.v != 17) return 4749;
     }
     return 0;
+}
+
+int T473TakeUQ(unique<uqp.W> p) { return p->v; }
+int T473PickUQ(unique<uqp.W> p) { return 100 + p->v; }
+int T473PickUQ(uqp.W* p) { return 200 + p->v; }
+int uq_function_type_params()
+{
+    uqp.reset_counts();
+    T473UQFunction byAlias = T473TakeUQ;
+    T473SpelledUQFunction bySpelled = T473TakeUQ;
+    T473UQFunction lambdaAlias = (move T473UQParam p) => { return p->v; };
+    T473SpelledUQFunction lambdaSpelled = (move T473UQParam p) => { return p->v; };
+    T473UQFunction selected = T473PickUQ;
+
+    unique uqp.W* source = new uqp.W(41);
+    int aliasValue = byAlias(move source);
+    if (aliasValue != 41) return 4750;
+    if (source != nullptr) return 4756;
+    if (uqp.dtors() != 1) return 4757;
+    source = new uqp.W(42);
+    int spelledValue = bySpelled(move source);
+    if (spelledValue != 42) return 4751;
+    if (source != nullptr) return 4758;
+    if (uqp.dtors() != 2) return 4759;
+    source = new uqp.W(43);
+    int lambdaAliasValue = lambdaAlias(move source);
+    if (lambdaAliasValue != 43) return 4752;
+    if (source != nullptr) return 4760;
+    if (uqp.dtors() != 3) return 4761;
+    source = new uqp.W(44);
+    int lambdaSpelledValue = lambdaSpelled(move source);
+    if (lambdaSpelledValue != 44) return 4753;
+    if (source != nullptr) return 4762;
+    if (uqp.dtors() != 4) return 4763;
+    source = new uqp.W(45);
+    int selectedValue = selected(move source);
+    if (selectedValue != 145) return 4754;
+    if (source != nullptr) return 4764;
+    if (uqp.dtors() != 5) return 4765;
+    return uqp.moves() == 0 && uqp.dtors() == 5 ? 0 : 4755;
+}
+
+expect_error("cannot bind function") {
+    function<int(uqp.W*)> raw = T473TakeUQ;
 }
 
 // T177: returns use copy-initialization for distinct C++ class specializations.
@@ -8376,6 +8423,7 @@ extern int main(int argc, char** argv)
     if (uqResult == 0) uqResult = uq_reinit_after_consume();
     if (uqResult == 0) uqResult = uq_reinit_spelled_after_consume();
     if (uqResult == 0) uqResult = uq_alias_base();
+    if (uqResult == 0) uqResult = uq_function_type_params();
     if (uqResult != 0) return uqResult;
 
     // ---- CFlat method before protected C++ base member (3570-3579) ---------------------

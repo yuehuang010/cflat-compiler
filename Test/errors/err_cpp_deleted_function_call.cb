@@ -40,6 +40,34 @@ expect_error("clang: overload resolution selected deleted operator '='") {
     lhs = rhs;
 }
 
+expect_error("clang: overload resolution selected deleted operator '='") {
+    bool k = true;
+    cppdel.MoveAssignDeleted a = cppdel.MoveAssignDeleted(41);
+    cppdel.MoveAssignDeleted b = cppdel.MoveAssignDeleted(42);
+    cppdel.MoveAssignDeleted z = cppdel.MoveAssignDeleted(0);
+    z = k ? move a : b;
+}
+
+expect_error("clang: overload resolution selected deleted operator '='") {
+    cppdel.MoveAssignDeleted z = cppdel.MoveAssignDeleted(0);
+    z = cppdel.MoveAssignDeleted(5);
+}
+
+expect_error("clang: overload resolution selected deleted operator '='") {
+    cppdelrv.ConstRvalueAssign z = cppdelrv.ConstRvalueAssign(0);
+    z = cppdelrv.ConstRvalueAssign(5);
+}
+
+expect_error("clang: use of overloaded operator '=' is ambiguous (with operand types 'cppdelrv::ByValueAmbiguous' and 'cppdelrv::ByValueAmbiguous')") {
+    cppdelrv.ByValueAmbiguous z = cppdelrv.ByValueAmbiguous(0);
+    z = cppdelrv.ByValueAmbiguous(5);
+}
+
+expect_error("clang: use of overloaded operator '=' is ambiguous (with operand types 'cppdelrv::ConstByValueAmbiguous' and 'cppdelrv::ConstByValueAmbiguous')") {
+    cppdelrv.ConstByValueAmbiguous z = cppdelrv.ConstByValueAmbiguous(0);
+    z = cppdelrv.ConstByValueAmbiguous(5);
+}
+
 expect_error("deleted function") {
     function<int(int)> pointer = cppdel.free_deleted;
 }

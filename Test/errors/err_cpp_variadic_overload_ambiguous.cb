@@ -15,5 +15,12 @@ extern int main()
     expect_error("ambiguous call to 'cppi.variadic_ambig_ptr'") {
         int b = cppi.variadic_ambig_ptr(mutablePointer, 1);
     }
+    // clang++ -std=c++20 also rejects both zero-argument overload sets as ambiguous.
+    expect_error("ambiguous call to 'cppi.variadic_zero_min'") {
+        int c = cppi.variadic_zero_min();
+    }
+    expect_error("ambiguous call to 'cppi.variadic_zero_default'") {
+        int d = cppi.variadic_zero_default();
+    }
     return 0;
 }

@@ -102,6 +102,77 @@ int t60LocalEnumIfConst<T>()
 }
 int t60PlainLocalEnum() { enum PlainE : int { V = 13 }; return (int)PlainE.V; }
 
+// The field sink accepts these global borrows; the destructor must balance every spelling.
+int gifTransferDtorCount = 0;
+struct GifTransferRes { int value=7; ~GifTransferRes() { gifTransferDtorCount+=1; } };
+struct GifTransferHolder { unique GifTransferRes* value=nullptr; };
+GifTransferRes* gifTransferGlobal=nullptr;
+GifTransferRes* gifTransferGenericIfConst<T>(GifTransferRes* p)
+{
+    if const (sizeof(T)==4) return gifTransferGlobal;
+    else return nullptr;
+}
+GifTransferRes* gifTransferGenericPlain<T>(GifTransferRes* p) { return gifTransferGlobal; }
+GifTransferRes* gifTransferConcreteIfConst(GifTransferRes* p)
+{
+    if const (sizeof(int)==4) return gifTransferGlobal;
+    else return p;
+}
+GifTransferRes* gifTransferConcrete(GifTransferRes* p) { return gifTransferGlobal; }
+
+bool testGenericIfConstBorrowedGlobalTransfer()
+{
+    bool result = true;
+    gifTransferDtorCount = 0;
+    gifTransferGlobal = new GifTransferRes();
+    {
+        GifTransferHolder holder = default;
+        holder.value = gifTransferGenericIfConst<i64>(nullptr);
+        result &= Test("gif transfer generic i64 branch value", holder.value == nullptr, true);
+    }
+    delete gifTransferGlobal;
+    gifTransferGlobal = nullptr;
+    result &= Test("gif transfer generic i64 branch balanced", gifTransferDtorCount, 1);
+
+    gifTransferGlobal = new GifTransferRes();
+    {
+        GifTransferHolder holder = default;
+        holder.value = gifTransferGenericIfConst<int>(nullptr);
+        result &= Test("gif transfer generic if const value", holder.value->value, 7);
+        result &= Test("gif transfer generic if const live", gifTransferDtorCount, 1);
+        gifTransferGlobal = nullptr;
+    }
+    result &= Test("gif transfer generic if const dtor", gifTransferDtorCount, 2);
+
+    gifTransferGlobal = new GifTransferRes();
+    {
+        GifTransferHolder holder = default;
+        holder.value = gifTransferGenericPlain<int>(nullptr);
+        result &= Test("gif transfer generic plain value", holder.value->value, 7);
+        gifTransferGlobal = nullptr;
+    }
+    result &= Test("gif transfer generic plain dtor", gifTransferDtorCount, 3);
+
+    gifTransferGlobal = new GifTransferRes();
+    {
+        GifTransferHolder holder = default;
+        holder.value = gifTransferConcreteIfConst(nullptr);
+        result &= Test("gif transfer concrete if const value", holder.value->value, 7);
+        gifTransferGlobal = nullptr;
+    }
+    result &= Test("gif transfer concrete if const dtor", gifTransferDtorCount, 4);
+
+    gifTransferGlobal = new GifTransferRes();
+    {
+        GifTransferHolder holder = default;
+        holder.value = gifTransferConcrete(nullptr);
+        result &= Test("gif transfer concrete plain value", holder.value->value, 7);
+        gifTransferGlobal = nullptr;
+    }
+    result &= Test("gif transfer concrete plain dtor", gifTransferDtorCount, 5);
+    return result;
+}
+
 bool testGenericLocalEnums()
 {
     bool result = true;
@@ -8446,6 +8517,7 @@ extern int main()
     total++; passed += testNamespaceTupleAndGenericAlias()           ? 1 : 0;
     total++; passed += testGenericFunctions()                      ? 1 : 0;
     total++; passed += testGenericLocalEnums()                       ? 1 : 0;
+    total++; passed += testGenericIfConstBorrowedGlobalTransfer()    ? 1 : 0;
     total++; passed += testGenericSizeof()                          ? 1 : 0;
     total++; passed += testNsgNamespacedGenericSpellings()          ? 1 : 0;
     total++; passed += testStructScopeUsingAliases()                ? 1 : 0;

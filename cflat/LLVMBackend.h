@@ -1256,6 +1256,7 @@ public:
             bool IsAlias = false;
             // A named C++ T*& parameter needs its pointer slot passed through a function value.
             bool IsCxxRefToPointer = false;
+            bool IsCxxLvalueRef = false;
             bool IsPointeeConst = false;  // spelled `const T*` (a C++ signature: ConstMask is -1)
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
@@ -1778,6 +1779,7 @@ public:
             bool IsRvalueRef = false;
             bool IsAlias = false;
             bool IsCxxRefToPointer = false;
+            bool IsCxxLvalueRef = false;
             bool IsPointeeConst = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
@@ -1869,6 +1871,7 @@ public:
                 q.IsRvalueRef = p.IsRvalueRef;
                 q.IsAlias = p.IsAlias;
                 q.IsCxxRefToPointer = p.IsCxxRefToPointer;
+                q.IsCxxLvalueRef = p.IsCxxLvalueRef;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
@@ -1961,6 +1964,7 @@ public:
                 q.IsRvalueRef = p.IsRvalueRef;
                 q.IsAlias = p.IsAlias;
                 q.IsCxxRefToPointer = p.IsCxxRefToPointer;
+                q.IsCxxLvalueRef = p.IsCxxLvalueRef;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
@@ -2178,8 +2182,12 @@ public:
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
-        // Argument written as `move <call>(...)` with no `?:` between (set by ParseAssignmentExpressionNamed).
+        // Argument is an explicit move of a lowered call result or its call-result join.
         bool IsDirectMoveCall = false;
+        // The explicit move applies to a CFlat join of call-result storage.
+        // Its selected arm is already shell-cleaned when it is itself written as `move call`.
+        bool IsMoveCallResultJoin = false;
+        bool IsMovedArmCallResultJoin = false;
         // The generated constructor wrapper hides an underlying C++ reference parameter behind
         // a by-value adapter; retain its selected reference category for move transfer.
         bool IsCxxReferenceSink = false;
@@ -2218,6 +2226,7 @@ public:
         // own position, named only when clang's SELECTED callee takes it by value; this entry store
         // of the i1 decision is set once the wrapper is bound (CSigEntry::paramBindKinds).
         llvm::StoreInst* CxxEarlyCopyDecision = nullptr;
+        bool CxxEarlyCopyNamedLaterWrite = false;
         // T518: for a non-trivially-copyable class, the copy built at the argument's position (live
         // only once the decision is set): the parameter of a by-value selection called by address.
         llvm::AllocaInst* CxxEarlyCopySlot = nullptr;
@@ -6679,6 +6688,9 @@ private:
     // or a join has already dropped half the provenance. MainListener delegates to this copy.
     static std::string DescribeUniqueFieldAccess(const NamedVariable& nv);
     static std::string BorrowedSourceName(const NamedVariable& nv);
+    std::string DisplayDiagnosticName(std::string_view raw) const;
+    std::string DisplayDiagnosticName(std::string_view raw, const FunctionSymbol* symbol) const;
+    std::string BorrowedSourceDiagnosticName(const NamedVariable& nv) const;
     // Diagnostic spelling of a borrow source: 'f<T>' for a generic instance, 'S.m' for a
     // method call (decided from the resolved callee symbol), else the plain source name.
     std::string BorrowedSourceDisplayName(const NamedVariable& nv) const;
@@ -11565,6 +11577,8 @@ public:
     std::string CxxDeletedOperatorError(const std::string& typeName,
                                         const std::string& operatorName) const;
     bool CxxHasDeletedAssignment(const std::string& typeName, bool useMove) const;
+    bool CxxHasDeletedRvalueAssignment(const std::string& typeName) const;
+    bool CxxHasByValueAssignment(const std::string& typeName) const;
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
     // Access of the SELECTED overload (by its linkage name), searched in the class then its bases;
@@ -15127,7 +15141,8 @@ public:
     // 324: function-pointer cache entries keep array-reference result spellings and stripped inner dimensions (FNREFCTOR).
     // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
     // 328: conversion-function template metadata and requests are cached separately from ctor templates.
-    static constexpr int kCHeaderCacheVersion = 329;
+    // 330: function-type parameters record pointee const (callback overload ranking).
+    static constexpr int kCHeaderCacheVersion = 330;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

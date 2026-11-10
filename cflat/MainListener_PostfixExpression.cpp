@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Support/SaveAndRestore.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -11077,7 +11078,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             functionName, std::format("{}", i),
                                             funcPtrTV.FuncPtrParams[i].TypeName,
                                             funcPtrTV.FuncPtrParams[i].IsMove
-                                                || funcPtrTV.FuncPtrParams[i].IsOwningSink,
+                                                || funcPtrTV.FuncPtrParams[i].IsOwningSink
+                                                || (!funcPtrTV.FuncPtrParams[i].Pointer
+                                                    && Compiler(ctx)->IsCxxUniquePtrPointee(
+                                                        Compiler(ctx)->CxxUniquePtrPointee(
+                                                            funcPtrTV.FuncPtrParams[i].TypeName))),
                                             argNVs[i]);
                                 }
                                 // The call RESULT is a fresh value, not a read of the callee, so it must
@@ -11459,6 +11464,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsDirectMoveCall = argNV.IsDirectMoveCall;
+                                    argVar.IsMoveCallResultJoin = argNV.IsMoveCallResultJoin;
+                                    argVar.IsMovedArmCallResultJoin = argNV.IsMovedArmCallResultJoin;
                                     argVar.ClosureEnvKnownFree = argNV.ClosureEnvKnownFree;
                                     argVar.ClosureEnvProvenanceTainted =
                                         argNV.ClosureEnvProvenanceTainted;
@@ -11561,6 +11568,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions =
                                         argNV.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
+                                    argVar.TypeAndValue.FuncPtrReturnConstMask = argNV.TypeAndValue.FuncPtrReturnConstMask;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
                                     argVar.TypeAndValue.FuncPtrNoPrototype = argNV.TypeAndValue.FuncPtrNoPrototype;
@@ -13357,7 +13365,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                      */
                                     if (cxxFreeWrapper && !cxxTemplateWrapper && !cxxConstructorCall
                                         && (funcSym == nullptr || funcSym->UniqueName.starts_with("__cflat_free_"))
-                                        && !argNV.IsRvalue && !argNV.IsExplicitMove && argNV.Storage != nullptr
+                                        && !argNV.IsRvalue && !argNV.IsExplicitMove
+                                        && argNV.Storage != nullptr
                                         && !argNV.IsCxxDirectConstruction && argNV.CxxClosureSignature.empty()
                                         && !argNV.TypeAndValue.Pointer && argNV.TypeAndValue.PointerDepth == 0
                                         && !argNV.TypeAndValue.IsInterface
@@ -13377,12 +13386,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                          * so C++'s single copy happens in evaluation order.
                                          */
                                         size_t laterIndex = 0;
+                                        bool namedLaterWrite = false;
+                                        const bool globalStorage = llvm::isa<llvm::GlobalVariable>(
+                                            llvm::getUnderlyingObject(argNV.Storage));
                                         for (size_t later = argIdx + 1; later < namedArgCtx.size() && laterIndex == 0; ++later)
-                                            if (!IsCxxInertCallArgument(namedArgCtx[later]->assignmentExpression())
-                                                && BareIdentifierInExpression(namedArgCtx[later]->assignmentExpression()) == nullptr
-                                                && ArgumentNamesStorageRoot(namedArgCtx[later]->assignmentExpression(),
-                                                    argNV.Storage))
+                                        {
+                                            if (IsCxxInertCallArgument(namedArgCtx[later]->assignmentExpression())
+                                                || BareIdentifierInExpression(namedArgCtx[later]->assignmentExpression()) != nullptr)
+                                                continue;
+                                            bool laterMayWrite = false;
+                                            namedLaterWrite = !globalStorage && ArgumentNamesStorageRoot(
+                                                namedArgCtx[later]->assignmentExpression(),
+                                                argNV.Storage, argNV.ThisFieldPath, &laterMayWrite,
+                                                namedArgCtx[argIdx]->assignmentExpression());
+                                            if (globalStorage || namedLaterWrite || laterMayWrite)
                                                 laterIndex = later + 1;
+                                        }
                                         const bool laterMayWrite = laterIndex != 0;
                                         auto* backend = Compiler(ctx);
                                         const std::string typeName = argNV.TypeAndValue.TypeName;
@@ -13510,6 +13529,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 backend->RegisterOwnedStructTemp(slot, typeName, live);
                                                 argNV.CxxEarlyCopyDecision = decision;
                                                 argNV.CxxEarlyCopySlot = slot;
+                                                argNV.CxxEarlyCopyNamedLaterWrite = namedLaterWrite;
                                             }
                                         }
                                         else if (laterMayWrite)
@@ -13687,6 +13707,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CxxEarlyCopyDecision = argNV.CxxEarlyCopyDecision;
                                     argVar.CxxEarlyCopySlot = argNV.CxxEarlyCopySlot;
                                     argVar.CxxEarlyCopyJoin = argNV.CxxEarlyCopyJoin;
+                                    argVar.CxxEarlyCopyNamedLaterWrite = argNV.CxxEarlyCopyNamedLaterWrite;
                                     argVar.FromOwningTempField = argNV.FromOwningTempField;
                                     argVar.OwningTempParent = argNV.OwningTempParent;
                                     argVar.MovableTempField = argNV.MovableTempField;
@@ -13737,6 +13758,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsDirectMoveCall = argNV.IsDirectMoveCall;
+                                    argVar.IsMoveCallResultJoin = argNV.IsMoveCallResultJoin;
+                                    argVar.IsMovedArmCallResultJoin = argNV.IsMovedArmCallResultJoin;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.IsCxxAddressOfPointerValue = argNV.IsCxxAddressOfPointerValue;
@@ -13801,6 +13824,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions =
                                         argNV.TypeAndValue.FuncPtrReturnHasStrippedInnerDimensions;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
+                                    argVar.TypeAndValue.FuncPtrReturnConstMask = argNV.TypeAndValue.FuncPtrReturnConstMask;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
                                     argVar.TypeAndValue.FuncPtrNoPrototype = argNV.TypeAndValue.FuncPtrNoPrototype;

@@ -66,10 +66,24 @@ expect_error("cannot assign unique") {
     }
 }
 
+expect_error("cannot assign unique<N> 'a' from borrowed value 'pick<i64>'") {
+    void rejectGenericParameterReturnDiagnostic() {
+        unique N* a = nullptr;
+        a = pick<i64>(nullptr);
+    }
+}
+
 expect_error("cannot initialize unique") {
     void rejectGenericGlobalReturn(bool choose) {
         unique N* owner = nullptr;
         owner = choose ? pick<int>(nullptr) : nullptr;
+    }
+}
+
+expect_error("cannot initialize unique") {
+    void rejectGenericGlobalReturnDirect() {
+        unique N* owner = nullptr;
+        owner = pick<int>(nullptr);
     }
 }
 
@@ -82,5 +96,41 @@ expect_error("cannot initialize unique") {
     void rejectDeadIfConstReturn(bool choose) {
         unique N* owner = nullptr;
         owner = choose ? deadPick(nullptr) : nullptr;
+    }
+}
+
+struct Box<T> { N* pk<U>(N* q) { return q; } };
+struct Plain { N* gp<U>(N* q) { return q; } };
+namespace ns { struct Leaf { int id = 0; }; }
+
+expect_error("cannot assign unique<N> 'a' from borrowed value 'Box<i64>.pk<i64>'") {
+    void rejectGenericMethodAssignment(Box<i64>* b, N* q) {
+        unique N* a = nullptr;
+        a = b.pk<i64>(q);
+    }
+}
+
+expect_error("cannot return borrowed value 'Box<i64>.pk<i64>'") {
+    unique N* rejectGenericMethodReturn(Box<i64>* b, N* q) {
+        return b.pk<i64>(q);
+    }
+}
+
+expect_error("cannot initialize unique<N> 'a' from borrowed value 'Box<i64>.pk<i64>'") {
+    void rejectGenericMethodDeclaration(Box<i64>* b, N* q) {
+        unique N* a = b.pk<i64>(q);
+    }
+}
+
+expect_error("cannot initialize unique<N> 'a' from borrowed value 'Plain.gp<i64>'") {
+    void rejectPlainGenericMethodDeclaration(Plain* b, N* q) {
+        unique N* a = b.gp<i64>(q);
+    }
+}
+
+expect_error("cannot assign unique<N> 'a' from borrowed value 'Box<i64>.pk<ns.Leaf>'") {
+    void rejectMethodWithNamespacedGenericArgument(Box<i64>* b) {
+        unique N* a = nullptr;
+        a = b.pk<ns.Leaf>(nullptr);
     }
 }

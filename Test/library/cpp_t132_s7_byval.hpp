@@ -32,4 +32,6 @@ struct SSH { int v; SSH(char) : v(11) {} SSH(short) : v(33) {} };
 struct SUO { int v; SUO(unsigned short) : v(33) {} };
 struct SIN { int v; SIN(char) : v(11) {} SIN(int) : v(33) {} };
 struct SEN { int v; SEN(char) : v(11) {} SEN(long) : v(33) {} };
+struct TieW { int v; TieW(long) : v(1) {} TieW(double) : v(2) {} TieW(char) : v(3) {} };
+inline int takeTieW(TieW value) { return value.v; }
 }

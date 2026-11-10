@@ -10,8 +10,6 @@
 
 ## From T263 review 1 (pre-existing on master; Host = CFlat struct with a C++ field; repros scratch/repro_keep/t263_rev/)
 - a one-move-arm ternary as a call argument (by value / const&) or method receiver copies; `a` not moved (clang moves).
-- a deleted move-assign is not refused when the rhs is a temp (`z = k ? move a : b`, `z = DM(5)`); `z = move a` refuses.
-- a parenthesized move arm `k ? (move a) : b` is not recognized (assignment and the T246 declaration form copy).
 - (T264 review 2, unwind leak, master the same) a first argument that is a call result, not a bare join, leaks when a later
   sibling throws: `hv2(gid(mkH(1)), rq.thrower(x))`, `hv2(gid(k ? mkH(1) : mkH(2)), rq.thrower(x))`. A C++ class join
   passed to a C++ function (`rq.cref(k ? mkC(1) : mkC(2))`) does one extra move+destroy vs clang (no leak).

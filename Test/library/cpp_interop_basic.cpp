@@ -137,6 +137,33 @@ namespace cppi
     int variadic_conv_rank(int x, double y) noexcept { return 2; }
     int variadic_ptr_rank(ConstPointerRankValue* value, ...) noexcept { return 1; }
     int variadic_ptr_rank(ConstPointerRankValue* value, int a) noexcept { return 2; }
+    int variadic_defaulted_rank(int x, int y, ...) noexcept { return 1; }
+    int variadic_defaulted_rank(long x) noexcept { return 2; }
+    int variadic_defaulted_oracle(int x) noexcept { return variadic_defaulted_rank(x); }
+    int VariadicMemberRank::rank(int x, ...) noexcept { return 1; }
+    int VariadicMemberRank::rank(long x) noexcept { return 2; }
+    int VariadicMemberRankRev::rank(long x) noexcept { return 2; }
+    int VariadicMemberRankRev::rank(int x, ...) noexcept { return 1; }
+    int variadic_member_oracle_empty(int x) noexcept
+    {
+        VariadicMemberRank value;
+        return value.rank(x);
+    }
+    int variadic_member_oracle_tail(int x, int y) noexcept
+    {
+        VariadicMemberRank value;
+        return value.rank(x, y);
+    }
+    int variadic_member_rev_oracle_empty(int x) noexcept
+    {
+        VariadicMemberRankRev value;
+        return value.rank(x);
+    }
+    int variadic_member_rev_oracle_tail(int x, int y) noexcept
+    {
+        VariadicMemberRankRev value;
+        return value.rank(x, y);
+    }
     int variadic_ambig(int x, ...) noexcept { return 1; }
     int variadic_ambig(long x, int y) noexcept { return 2; }
     int variadic_ambig_ptr(ConstPointerRankValue* value, ...) noexcept { return 1; }

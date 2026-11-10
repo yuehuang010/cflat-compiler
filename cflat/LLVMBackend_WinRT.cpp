@@ -1596,6 +1596,8 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         bool paramIsSink = param.IsMove
             || param.IsRvalueRef
             || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName))
+            || (!param.Pointer && !param.IsAlias
+                && IsCxxUniquePtrPointee(CxxUniquePtrPointee(param.TypeName)))
             // A foreign C++ class or holder taken by value gets a constructed parameter temp.
             // Explicit `move x` transfers its fields with their C++ move constructors.
             || (!param.Pointer && !param.IsAlias
@@ -3149,7 +3151,7 @@ void LLVMBackend::CheckOwnFlagLoopBackEdge()
                 || (live->BorrowsOwningLocal && !owningLocalCopyWasRebound);
             if (!localMayBeBorrowed) continue;
             ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
-            const std::string sourceName = BorrowedSourceName(*live);
+            const std::string sourceName = BorrowedSourceDiagnosticName(*live);
             if (!sink.IsUnique)
             {
                 if (sourceName.empty())
@@ -3192,7 +3194,7 @@ void LLVMBackend::CheckOwnFlagLoopBackEdge()
             if (!localMayBeBorrowed) continue;
             ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
             const std::string sourceName = FindVariableNameByStorage(sink.Storage);
-            const std::string borrowedSource = BorrowedSourceName(*live);
+            const std::string borrowedSource = BorrowedSourceDiagnosticName(*live);
             LogError(std::format(
                 "cannot pass borrowed pointer '{}' to move parameter '{}' of '{}' - it may "
                 "refer to borrowed storage '{}', which the sink does not own",
@@ -3978,6 +3980,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     std::string movedName = args[i].CallerName.empty()
                         ? args[i].TypeAndValue.VariableName : args[i].CallerName;
                     const std::string movePath = FieldMoveKey(args[i]);
+                    const bool cxxUniqueOwner = IsCxxUniquePtrPointee(
+                        CxxUniquePtrPointee(params[i].TypeName));
                     // A lowered CFlat struct is marked moved only by a `move` parameter, like the plain
                     // struct sink (diagnostic only: storage not zeroed); a copy param keeps it readable.
                     const bool loweredStructMoveSink = !IsForeignNontrivialCxxClass(params[i].TypeName)
@@ -3986,6 +3990,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         && !movedName.empty())
                     {
                         if (!movePath.empty()) MarkVariableFieldMoved(movedName, movePath);
+                        else if (!args[i].IsElementAccess && cxxUniqueOwner)
+                            MarkVariableExplicitlyMovedNull(movedName);
                         else if (!args[i].IsElementAccess)
                             MarkVariableMoved(movedName, isPointeeMove(args[i]));
                     }

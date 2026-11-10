@@ -4740,7 +4740,38 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
                 return CxxPointeeConstRelationOf(decayedFrom, CxxSpellingHasConstPointee(pointeeSpelling));
             }
         }
-        const auto relation = CxxRecordPointeeConstRelation(decayedFrom, to);
+        auto relation = CxxRecordPointeeConstRelation(decayedFrom, to);
+        // Multi-level pointers need every pointee qualifier compared. Looking only at bit 0
+        // makes `T* const*` indistinguishable from `T**` during overload selection.
+        if (candidate.IsCxx && relation != CxxPointeeConstRelation::Unrelated
+            && decayedFrom.Pointer && to.Pointer
+            && !decayedFrom.IsFunctionPointer && !to.IsFunctionPointer
+            && !IsCxxRecord(decayedFrom.TypeName) && !IsCxxRecord(to.TypeName)
+            && decayedFrom.ValuePointerDepth() > 1
+            && decayedFrom.ValuePointerDepth() == to.ValuePointerDepth()
+            && !decayedFrom.TypeName.empty() && !to.TypeName.empty()
+            && ResolveTypeAlias(decayedFrom.TypeName) == ResolveTypeAlias(to.TypeName))
+        {
+            const int depth = decayedFrom.ValuePointerDepth();
+            const uint32_t sourceMask = decayedFrom.PointeeConstMask();
+            uint32_t targetMask = to.PointeeConstMask();
+            const std::string spelling = CxxReferenceParameterSpelling(candidate, index);
+            if (!spelling.empty() && spelling.find_first_of("()[]&") == std::string::npos)
+                targetMask = CxxSpellingPointeeConstMask(spelling, depth);
+            if ((sourceMask & ~targetMask) != 0)
+                return CxxPointeeConstRelation::Drops;
+            const uint32_t addedMask = targetMask & ~sourceMask;
+            for (int level = 0; level < depth; ++level)
+            {
+                if ((addedMask & TypeAndValue::ConstBitAt(level)) == 0) continue;
+                const uint32_t higherLevels = TypeAndValue::ConstBitsBelow(depth)
+                    & ~TypeAndValue::ConstBitsThrough(level);
+                if ((targetMask & higherLevels) != higherLevels)
+                    return CxxPointeeConstRelation::Drops;
+            }
+            relation = addedMask == 0 ? CxxPointeeConstRelation::Same
+                                      : CxxPointeeConstRelation::Adds;
+        }
         if (!decayedFrom.Pointer || !to.Pointer) return relation;
         const std::string referenceSpelling = candidate.IsCxx
             ? CxxReferenceParameterSpelling(candidate, index) : std::string();
@@ -5108,7 +5139,7 @@ bool LLVMBackend::TryAdoptRawPointerIntoCxxUniquePtr(const std::string& typeName
         {
             // Same owned/borrowed split as core unique<T>'s `move T*` ctor: adopting a borrow
             // would free the pointee twice.
-            const std::string borrowed = BorrowedSourceName(source);
+            const std::string borrowed = BorrowedSourceDiagnosticName(source);
             TypeAndValue fallbackType{ .TypeName = typeName };
             const std::string uniqueType = SpellDiagnosticType(*this,
                 targetTypeInfo != nullptr ? *targetTypeInfo : fallbackType);
@@ -5347,6 +5378,58 @@ bool LLVMBackend::CxxHasDeletedAssignment(const std::string& typeName, bool useM
         return std::any_of(record->second.members.begin(), record->second.members.end(),
                            [&](const auto& member) {
             return member.isDeleted && (useMove ? member.isMoveAssign : member.isCopyAssign);
+        });
+}
+
+// The operator=(T&&) clang picks for any non-const rvalue when an lvalue destination can use it: a
+// deleted, not defaulted, non-const T&& with no `&&` ref-qualifier. A defaulted move that a member
+// deletes is ignored by overload resolution, so it is not counted.
+bool LLVMBackend::CxxHasDeletedRvalueAssignment(const std::string& typeName) const
+{
+        auto record = cxxRecordEntries_.find(typeName);
+        if (record == cxxRecordEntries_.end()) return false;
+        return std::any_of(record->second.members.begin(), record->second.members.end(),
+                           [&](const auto& member) {
+            return member.isMoveAssign && member.isDeleted && !member.isDefaulted
+                && (member.refQualifier == cflat_cinterop::CxxRefQualifierNone
+                    || member.refQualifier == cflat_cinterop::CxxRefQualifierLValue)
+                && member.paramTypes.size() > 1 && member.paramTypes[1].ends_with("&&")
+                && !member.paramTypes[1].starts_with("const ");
+        });
+}
+
+// Top-level cv on a by-value parameter spelling ("const T", "T const") does not change its type.
+static std::string StripTopLevelCvSpelling(std::string text)
+{
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            for (const char* q : { "const ", "volatile " })
+                if (text.rfind(q, 0) == 0) { text.erase(0, std::strlen(q)); changed = true; }
+            for (const char* q : { " const", " volatile" })
+            {
+                const size_t n = std::strlen(q);
+                if (text.size() > n && text.compare(text.size() - n, n, q) == 0)
+                { text.erase(text.size() - n); changed = true; }
+            }
+        }
+        return text;
+}
+
+// A usable operator=(T) taking the class by value: it ties with operator=(T&&) for a prvalue.
+bool LLVMBackend::CxxHasByValueAssignment(const std::string& typeName) const
+{
+        auto record = cxxRecordEntries_.find(typeName);
+        if (record == cxxRecordEntries_.end()) return false;
+        const std::string spelling = CxxRecordCanonicalSpelling(typeName);
+        return std::any_of(record->second.members.begin(), record->second.members.end(),
+                           [&](const auto& member) {
+            // A by-value parameter is recorded as a copy assignment, so only the spelling decides.
+            return member.name == "operator=" && !member.isDeleted && !member.isMoveAssign
+                && member.paramTypes.size() == 2
+                && StripTopLevelCvSpelling(member.paramTypes[1]) == spelling
+                && (member.refQualifier == cflat_cinterop::CxxRefQualifierNone
+                    || member.refQualifier == cflat_cinterop::CxxRefQualifierLValue);
         });
 }
 

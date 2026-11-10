@@ -15,18 +15,25 @@ conditional is refused, located). A class lvalue argument that a later non-inert
   construction, in evaluation order, ctor/dtor counts equal clang. A reference selection keeps
   the caller's object and constructs nothing.
 
-Refused (located) where that call is unavailable: a non-constant default argument the call
-omits, a variadic callee given extra arguments, another argument that only the wrapper can build
-(deferred `?:` / direct construction), a selected callee whose address cannot be taken.
+The wrapper is refused (located) when the selected callee's address cannot be taken or another
+argument can only be built by the wrapper (including a non-constant omitted default, a variadic
+extra argument, deferred `?:`, or direct construction). Global writes, implicit-this writes,
+and writes through a returned pointer can instead fall back to the wrapper and read the
+post-write value; a native CFlat callee reads a later-written global after the write.
 
 Still open:
-- A later argument that writes the object without naming its local/parameter root is not
-  detected: an implicit-this field or a global reads 902 where clang reads 702. Same on master.
-- Wrapper cost (not ternary-specific): a by-value C++ class argument moves once more through the
-  CFlat wrapper (`take(rettw())`, `take(default)` 1010020 vs clang 1000010).
+- A global written later into a callee that refuses falls back to the wrapper and reads the
+  post-write value (g_var_write, g_var_named; cflat 90201010, clang 70201010).
+- An implicit-this method write is not snapshotted (t_self_meth; cflat 90221030, clang 70221030).
+- A write through a returned pointer is not snapshotted (t_chain_ret; cflat 90221030, clang 70221030).
+- A global written by a later argument of a native CFlat callee is read after the write
+  (g_native_write `nlater(rv.gv, rv.mutglobal())`; cflat 90201010, clang 70201010; counts match).
 - A `?:` with a `default` arm into a REFERENCE parameter: C++ materializes the leaf's copy at the
   argument, the wrapper binds the caller's object (lref ternary 902 on master and fix, clang 702).
 - `take2(c ? default : rettw(), default)`: a bare trailing `default` into an unbound wrapper has no
   target type and stays refused.
+- Direct construction `take(Val(7))` still uses the wrapper and adds a move (b_ctor: 710120 on this
+  worktree, 710010 with clang++ -std=c++20); the direct-construction prvalue is not
+  `IsCxxPrvalueTemp` and is not switched to the selected callee's by-value ABI path.
 
-Repro: scratch/rev_t518_sol_tmp/{name_field,name_global}.cb in the T518 worktree.
+The remaining conditional-reference repro is retained at scratch/unbwrap/item3.cb.

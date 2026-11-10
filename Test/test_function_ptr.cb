@@ -6085,6 +6085,22 @@ bool testInferTernaryFunctionVariables()
     return result;
 }
 
+int t_r3ReadConst((const int)* p) { return *p + 1; }
+int t_r3ReadMutable(int* p) { return *p + 2; }
+
+bool testTernaryNativePointeeConstFunctionValues()
+{
+    bool result = true;
+    int k = 1;
+    int x = 3;
+    function<int((const int)*)> a = t_r3ReadConst;
+    function<int(int*)> b = t_r3ReadMutable;
+    auto v = k ? a : b;
+    result &= Test("native function-value ternary auto call", v(&x), 4) != 0;
+    result &= Test("native function-value ternary immediate call", (0 ? a : b)(&x), 5) != 0;
+    return result;
+}
+
 bool testInferTernaryVariadicFunctionPointer()
 {
     bool result = true;
@@ -8328,6 +8344,7 @@ extern int main(int argc, char** argv)
     total++; passed += testInferFromVariadicFunctionPointer() ? 1 : 0;
     total++; passed += testInferTernaryFunctionNames()     ? 1 : 0;
     total++; passed += testInferTernaryFunctionVariables() ? 1 : 0;
+    total++; passed += testTernaryNativePointeeConstFunctionValues() ? 1 : 0;
     total++; passed += testInferTernaryVariadicFunctionPointer() ? 1 : 0;
     total++; passed += testTernaryArmKinds()               ? 1 : 0;
     total++; passed += testFunctionSlotAccepts()           ? 1 : 0;

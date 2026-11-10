@@ -2012,8 +2012,10 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     p.Pointer  = pPtr;
                     p.IsArrayView = pIsArrayView;
                     p.IsMove   = param->Move() != nullptr;
+                    std::string cxxUniqueError;
                     CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName, p.Pointer,
-                                                   p.PointerDepth);
+                        p.PointerDepth, &cxxUniqueError);
+                    if (!cxxUniqueError.empty()) Compiler(param)->LogError(cxxUniqueError);
                     p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                     MarkSubstitutedPointeeConst(p, param->typeSpecifier(), param->multiWordTypeSuffix(), pStars);
                     tv.FuncPtrParams.push_back(p);

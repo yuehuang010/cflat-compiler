@@ -75,6 +75,7 @@ namespace t418
     // A condition whose operator bool writes an earlier argument's local.
     inline Val* aimed = nullptr;
     inline void aim(Val& v) { aimed = &v; }
+    inline Val globalValue = Val(7);
     struct Flag
     {
         Flag() {}

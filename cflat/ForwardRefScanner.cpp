@@ -518,12 +518,14 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                                             p.FunctionTypeSignature =
                                                 std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                                     p.ConstMask = pConst;
+                                    p.IsPointeeConst = (pConst & 1) != 0;
                                     p.Pointer = pPtr;
                                     p.IsArrayView = pIsArrayView;
                                     p.IsMove = param->Move() != nullptr;
                                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                                    std::string cxxUniqueError;
                                     CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName,
-                                                                   p.Pointer, p.PointerDepth);
+                                        p.Pointer, p.PointerDepth, &cxxUniqueError);
                                     p.ResolvedTypeKey = SigComponentResolvedKeyScanner(p.TypeName);
                                     declType.FuncPtrParams.push_back(p);
                                 }
@@ -3668,11 +3670,15 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
                 p.PointerDepth = pDepth;
                 p.IsArrayView = pIsArrayView;
                 p.ConstMask = pConst;
+                p.IsPointeeConst = (pConst & 1) != 0;
                 p.AliasSpelling = pSpelling;
                 p.IsMove = param->Move() != nullptr;
-                p.ResolvedTypeKey = SigComponentResolvedKeyScanner(pName);
+                std::string cxxUniqueError;
+                CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName, p.Pointer,
+                    p.PointerDepth, &cxxUniqueError);
+                p.ResolvedTypeKey = SigComponentResolvedKeyScanner(p.TypeName);
                 if (!pPtr)
-                    if (const auto* nested = compilerLLVM->GetEncodedClosureType(pName))
+                    if (const auto* nested = compilerLLVM->GetEncodedClosureType(p.TypeName))
                         p.FunctionTypeSignature =
                             std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                 sig.FuncPtrParams.push_back(p);
@@ -3717,10 +3723,14 @@ std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(
                         p.FunctionTypeSignature =
                             std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                 p.ConstMask = pConst;
+                p.IsPointeeConst = (pConst & 1) != 0;
                 p.Pointer = pPtr;
                 p.IsArrayView = pIsArrayView;
                 p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
                 p.IsMove = param->Move() != nullptr;
+                std::string cxxUniqueError;
+                CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName, p.Pointer,
+                    p.PointerDepth, &cxxUniqueError);
                 sig.FuncPtrParams.push_back(p);
             }
         std::string encoded = MainListener::EncodeClosureFromSig(compilerLLVM, sig);
@@ -4413,10 +4423,14 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
                             p.FunctionTypeSignature =
                                 std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                     p.ConstMask = pConst;
+                    p.IsPointeeConst = (pConst & 1) != 0;
                     p.Pointer  = pPtr;
                     p.IsArrayView = pIsArrayView;
                     p.IsMove   = param->Move() != nullptr;
                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                    std::string cxxUniqueError;
+                    CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName, p.Pointer,
+                        p.PointerDepth, &cxxUniqueError);
                     p.ResolvedTypeKey = SigComponentResolvedKeyScanner(p.TypeName);
                     tv.FuncPtrParams.push_back(p);
                 }

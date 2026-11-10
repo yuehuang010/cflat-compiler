@@ -116,16 +116,14 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | - | p3/arithmetic-result-type-names-vs-clang | arithmetic result types | RULED 2026-10-31; usual conversions landed (3deaad3e), naming residue |
 | - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | const copy assignment picks differently; extra copies at return init |
 | - | p3/cpp-free-operator-conversion-vs-builtin-ambiguity + p3/template-member-operators-not-ranked + p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in; member operator templates not ranked; MIX7 residue (RULED 2026-10-31) |
-| - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | take with NULLCTOR |
+| - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left; tie diagnostic landed 532018aa |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | Itanium landed CONSTTWIN (72073fc6); clang-cl residue only |
-| B5g | p3/cpp-callback-pointee-const-ranking-gaps | function-pointer values lose pointee const; clang-refused callback sets accepted | NEW 2026-10-03 (T25 rounds 3-5, pre-existing on master) |
 | B5j | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | `const char *const &` overloads: constructor wrapper path and direct non-template ranking; literal at a `const char *&&` template refused | NEW 2026-10-05 (T28 round 5 matrix, pre-existing on master) |
 | B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), `sizeof(*z->data)` 2-D row, siblings | FLEXLEFT cface31e landed `*&` / paren sizeof and implicit-this `move data` |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | by-design B9 rulings (arr elem init landed ASSIGN 72073fc6) | OPEN (P2 landed 1955bd95) |
-| W13b | p3/cpp-overload-variadic-and-conversion-gaps | variadic-set ambiguity, defaulted param before ellipsis, member variadics, user conversions at C++ call args, inline variadic link, non-record const pointers | NEW 2026-09-30 (W13 reviews) |
+| W13b | p3/cpp-overload-variadic-and-conversion-gaps | user conversions at C++ call args, inline variadic link | NEW 2026-09-30 (W13 reviews) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 | B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
-| B3 | p3/cpp-single-level-pointer-unproven-at-call-argument | IsProvenPrimitiveSinglePointerArg / CompareUpconvert | Pointer-is-not-a-number ruling; scheduled as PTRRANK below |
 
 ### C - wrongly accepted (adds a rejection)
 
@@ -153,11 +151,11 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|-------|-------|
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | follow-up list after d59df39b / cpp-unwind2 |
 | E4 | p3/cpp-new-remaining-allocator-gaps | follow-up list after cpp-class-operator-new (5 items) |
-| E5 | p3/cflat-default-param-temporaries-leftovers + p3/conditional-default-byvalue-cpp-ctor-extra-copy + p3/cpp-member-constref-default-ternary-prvalue | default-argument temporaries (DEFCLS / CDEFARG residue): timing, ternary `default`, extra copy, leak |
-| E6 | p3/cflat-move-cpp-class-sink-shapes-leftovers + p3/move-call-temp-subfield-return-argument-miss-member-move + p3/discard-ternary-move-join-and-cxx-field-move | `move` of a C++ class: sink shapes byte-copy, call-result subfield skips member move, discard join |
+| E5 | p3/cflat-default-param-temporaries-leftovers + p3/conditional-default-byvalue-cpp-ctor-extra-copy + p3/cpp-member-constref-default-ternary-prvalue | default-argument temporaries: wrapper-lifetime timing, refused class/pointer/string/nested brace elements, by-value ctor conditional copy, native default leaks (DEFPARAM 08395f45 landed ternary + scalar brace defaults) |
+| E6 | p3/cflat-move-cpp-class-sink-shapes-leftovers + p3/discard-ternary-move-join-and-cxx-field-move | `move` of a C++ class: sink shapes byte-copy, discard join |
 | E7 | p3/cpp-ternary-move-join-leftovers + p3/cpp-cast-move-temp-arg-and-mixed-ternary-cast-copy | ternary / cast move joins over C++ classes |
 | E8 | p3/cpp-return-named-local-implicit-move-and-byvalue-elision + p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang |
-| E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | T518 residue |
+| E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue after UNBWRAP (fa063352): direct-construction extra move, refusing-callee global writes, implicit-this method / returned-pointer writes, native-callee global order, ref-param `?: default` |
 | E11 | p3/lowered-cxx-field-structs-leftovers-after-t528 | with P2 (cflat-struct-nontrivial-cxx-fields) |
 
 ### F - diagnostics only
@@ -190,7 +188,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | N-VIEW | p3/borrowed-view-fields-passed-through-retaining-calls + p3/move-borrowed-view-field-refused | view fields through retaining calls; `move` of a borrowed view field refused |
 | N-COPY | p3/field-subscript-and-borrowed-param-field-copy-leftovers-after-r22 + p3/pointer-subscript-owning-element-copy-leftovers-after-r21 + p3/raw-delete-string-array-skips-element-dtors | R21 / R22 copy residue; `delete[]` of string* skips element dtors |
 | N-BORROW | p3/consolidate-named-variable-borrow-provenance + p3/iface-return-call-borrow-precision + p3/deref-of-moved-pointer-guard-inside-callee | borrow provenance of named variables; interface return precision; false positive behind a terminating callee |
-| N-UNIQUE | p3/unique-array-dynamic-index-move-untracked + p3/unique-alias-function-type-parameter-lowering + p3/generic-ifconst-borrowed-global-transfer-skips-dtor | dynamic-index field moves untracked; unique in function types lowered raw; generic if-const transfer skips dtor |
+| N-UNIQUE | p3/unique-array-dynamic-index-move-untracked | dynamic-index field moves untracked |
 | N-RULED | p3/chained-assign-raw-inner-into-unique-refused + p3/method-on-global-receiver-consumes-field | RULED 2026-10-21, buildable |
 | N-TEMP | p3/statement-temp-gep-leaks | two conservative retention cases, no free |
 | N-CONST | p3/native-auto-copy-drops-transitive-const + p3/const-gaps-c-depth-auto-copy-and-named-alias-signatures + p3/trailing-const-leftovers-after-c08 | PARKED (branch fix/t348-autoconst); C global exact levels; const plan phase 8 residue |
@@ -249,7 +247,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | N41 | p3/cpp-variadic-alias-template-refused | pack patterns landed 43eceb08 (VARALIAS); residue: non-type EXPRESSION alias arguments (pack and non-pack) refused | NEW 2026-10-01 |
 | N42 | p3/cpp-header-unreferenced-global-initializers-skipped | residue: root-const / qualified-const `if const` order, non-inline extern destructible shared global, same guard macro in two files | p3 |
 | N47 | p3/cpp-constant-fold-and-const-static-twin-leftovers | constexpr-call initializer refused by the fold guard; const receiver + static twin overload refused (ST4 re-review leftovers) | NEW 2026-10-01 |
-| N52 | p3/cpp-range-for-member-name-lookup-and-count-probe | range-for member lookup misses enum/nested-type begin/end (accepts invalid); count/get clients pay a failed ADL probe; ST6 follow-up | NEW 2026-10-01 |
 | N58 | p3/cpp-struct-identity-underscore-namespace | [cpp] identity: ns_ namespace decode, global name collision, CRTP base reading a derived field; scheduled as NSLOOKUP | NEW 2026-10-01 |
 
 ### std_full tier-2 gaps (test_libs/std_full DISABLED cases; plan internal/plan/std-library-tier2-suite.md)
@@ -283,7 +280,7 @@ this table.
 | 1 | DIAG-TEXT | M/L | p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | shared KIND only (relayed clang / refusal text) (u) | F1 | yes |
 | 3 | NULLCTOR | L/M | p3/cpp-null-constant-ctor-leftovers-after-t132 | scalar-ref + nullptr_t&& + tdp<int>(0) landed 72073fc6; function-like zero macros landed cface31e | CTOR-VIABILITY, PTRRANK | no |
 | 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | CRTP field item landed 72073fc6; residue: [cpp] struct vs same-named imported global class (identity table, direction coexist) | - | yes, careful on identity |
-| 8 | PTRRANK | M/H | p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg, TryBinaryOperatorOverload | NULLCTOR, CTOR-VIABILITY | no |
+| 8 | PTRRANK | M/H | p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg, TryBinaryOperatorOverload | NULLCTOR, CTOR-VIABILITY | no |
 | 10 | CLIBNAME | M/M | p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | - | RULED 2026-10-21: nobuiltin on CFlat bodies |
 | 15 | ASSIGN | L/M | p3/cpp-assignment-result-leftovers-after-b9 | route + c6 landed 72073fc6 (route-leftovers deleted); residue: by-design B9 rulings only | - | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | CTOR-VIABILITY | no |
@@ -295,9 +292,8 @@ this table.
 | 27 | CACHE-KEY | L/H | p3/cpp-wrapper-request-group-omits-type-dependencies, p3/cpp-wrapper-request-misses-template-argument-headers, p3/cpp-candidate-tier-differs-cold-vs-warm | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; partial patch scratch/repro_keep/t70_groupfix.patch | CHUNK, G3 | no |
 | 28 | BORROW-PROV | L/H | p3/consolidate-named-variable-borrow-provenance | borrow provenance of named variables through helpers; design first (N-BORROW) | N runs | no |
 
-Pairs: CONSTPOINTEE = p3/cpp-callback-pointee-const-ranking-gaps (typed-null half closed by C05B).
 Cheap singletons (S, risk L): p3/os-abstraction-process-cb-not-converted, p3/view-element-gate-diagnostic-gaps.
-Overload/ctor selection family (never two at once): NULLCTOR, PTRRANK, CTOR-VIABILITY, CONSTTWIN, CONSTPOINTEE.
+Overload/ctor selection family (never two at once): NULLCTOR, PTRRANK, CTOR-VIABILITY, CONSTTWIN.
 Stale references found by the regroup: the std_full table named a static-auto prvalue / copy-initializer storage issue that was never filed (no file in git history, checked 2026-11-06);
 
 ### Parked - needs a maintainer ruling before any work

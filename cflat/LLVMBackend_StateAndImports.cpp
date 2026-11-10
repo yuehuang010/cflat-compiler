@@ -2476,6 +2476,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.IsWriteInferredSink) pj["wis"] = true;
                 if (p.IsRvalueRef) pj["rr"] = true;
                 if (p.IsAlias) pj["ia"] = true;
+                if (p.IsCxxLvalueRef) pj["lr"] = true;
                 if (p.IsPointeeConst) pj["pc"] = true;
                 if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
                 if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
@@ -2561,6 +2562,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.IsWriteInferredSink = pj.value("wis", false);
                     p.IsRvalueRef = pj.value("rr", false);
                     p.IsAlias = pj.value("ia", false);
+                    p.IsCxxLvalueRef = pj.value("lr", false);
                     p.IsPointeeConst = pj.value("pc", false);
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});

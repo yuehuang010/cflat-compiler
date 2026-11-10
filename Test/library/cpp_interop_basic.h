@@ -323,6 +323,42 @@ namespace cppi
     };
     inline int const_pointer_rank(ConstPointerRankValue* value) noexcept { return 1; }
     inline int const_pointer_rank(const ConstPointerRankValue* value) noexcept { return 2; }
+    using PrimitiveConstRankAlias = int;
+    struct PrimitiveConstRankHolder { const int* value; };
+    inline int primitive_int_rank(int*) noexcept { return 1; }
+    inline int primitive_int_rank(const int*) noexcept { return 2; }
+    inline int primitive_int_mutable_oracle(int* p) noexcept { return primitive_int_rank(p); }
+    inline int primitive_int_const_oracle(const int* p) noexcept { return primitive_int_rank(p); }
+    inline int primitive_char_rank(char*) noexcept { return 3; }
+    inline int primitive_char_rank(const char*) noexcept { return 4; }
+    inline int primitive_char_mutable_oracle(char* p) noexcept { return primitive_char_rank(p); }
+    inline int primitive_char_const_oracle(const char* p) noexcept { return primitive_char_rank(p); }
+    inline int primitive_double_rank(double*) noexcept { return 5; }
+    inline int primitive_double_rank(const double*) noexcept { return 6; }
+    inline int primitive_double_const_oracle(const double* p) noexcept { return primitive_double_rank(p); }
+    inline int primitive_alias_rank(PrimitiveConstRankAlias*) noexcept { return 7; }
+    inline int primitive_alias_rank(const PrimitiveConstRankAlias*) noexcept { return 8; }
+    inline int primitive_alias_const_oracle(const PrimitiveConstRankAlias* p) noexcept
+    { return primitive_alias_rank(p); }
+    inline int primitive_pp_rank(int**) noexcept { return 9; }
+    inline int primitive_pp_rank(const int**) noexcept { return 10; }
+    inline int primitive_pp_const_oracle(const int** p) noexcept { return primitive_pp_rank(p); }
+    inline int primitive_middle_rank(int**) noexcept { return 11; }
+    inline int primitive_middle_rank(int* const*) noexcept { return 12; }
+    inline int* const* primitive_middle_const(int* const* p) noexcept { return p; }
+    inline int primitive_middle_outer_rank(int* const*) noexcept { return 3; }
+    inline int primitive_middle_outer_rank(const int* const*) noexcept { return 4; }
+    inline int primitive_middle_outer_oracle(int** p) noexcept { return primitive_middle_outer_rank(p); }
+    using PrimitiveMiddleConstAlias = int* const*;
+    inline int primitive_middle_alias_rank(int**) noexcept { return 1; }
+    inline int primitive_middle_alias_rank(int* const*) noexcept { return 2; }
+    inline int primitive_middle_alias_oracle(PrimitiveMiddleConstAlias p) noexcept { return primitive_middle_alias_rank(p); }
+    inline int primitive_middle_mutable_only(int**) noexcept { return 13; }
+    inline int primitive_middle_mutable_oracle(int** p) noexcept { return primitive_middle_rank(p); }
+    inline int primitive_middle_const_oracle(int* const* p) noexcept { return primitive_middle_rank(p); }
+    inline int primitive_param_rank(const int* p) noexcept { return primitive_int_rank(p); }
+    inline int primitive_field_rank(const PrimitiveConstRankHolder* h) noexcept
+    { return primitive_int_rank(h->value); }
     // Dropping pointee const is not viable: const Derived* skips D* / P* for const P*.
     struct ConstPointerRankDerived : ConstPointerRankValue {};
     inline int const_derived_rank(ConstPointerRankDerived* value) noexcept { return 70; }
@@ -767,11 +803,33 @@ namespace cppi
     int variadic_conv_rank(int x, double y) noexcept;
     int variadic_ptr_rank(ConstPointerRankValue* value, ...) noexcept;
     int variadic_ptr_rank(ConstPointerRankValue* value, int a) noexcept;
+    // A default before the ellipsis must not make the exact int overload lose to long.
+    int variadic_defaulted_rank(int x, int y = 0, ...) noexcept;
+    int variadic_defaulted_rank(long x) noexcept;
+    int variadic_defaulted_oracle(int x) noexcept;
+    struct VariadicMemberRank
+    {
+        int rank(int x, ...) noexcept;
+        int rank(long x) noexcept;
+    };
+    struct VariadicMemberRankRev
+    {
+        int rank(long x) noexcept;
+        int rank(int x, ...) noexcept;
+    };
+    int variadic_member_oracle_empty(int x) noexcept;
+    int variadic_member_oracle_tail(int x, int y) noexcept;
+    int variadic_member_rev_oracle_empty(int x) noexcept;
+    int variadic_member_rev_oracle_tail(int x, int y) noexcept;
     // Ambiguous in clang: each is better at one argument (err_cpp_variadic_overload_ambiguous).
     int variadic_ambig(int x, ...) noexcept;
     int variadic_ambig(long x, int y) noexcept;
     int variadic_ambig_ptr(ConstPointerRankValue* value, ...) noexcept;
     int variadic_ambig_ptr(const ConstPointerRankValue* value, long a) noexcept;
+    int variadic_zero_min(...);
+    int variadic_zero_min();
+    int variadic_zero_default(...);
+    int variadic_zero_default(int x = 0);
 
     class Counter
     {

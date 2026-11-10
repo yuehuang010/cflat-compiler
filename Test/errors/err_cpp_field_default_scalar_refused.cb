@@ -16,3 +16,11 @@ expect_error("cannot initialize C++ class 't310.KP' from this expression") {
 expect_error("C++ variadic constructor call 't132.S7' does not match (clang: conversion from 'int' to 't132::S7' is ambiguous)") {
     struct T310TieField { t132.S7 s = 0; };
 }
+extern int main()
+{
+    short h = 5;
+    expect_error("clang: conversion from 'short' to 't140::TieW' is ambiguous") {
+        int refused = t140.takeTieW(h);
+    }
+    return 0;
+}

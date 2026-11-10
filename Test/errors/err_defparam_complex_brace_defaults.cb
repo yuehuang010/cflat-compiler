@@ -1,0 +1,26 @@
+import cpp "cpp_interop_ternaryref.h";
+
+expect_error("scalar, non-null, non-string brace elements only") {
+    int classElement(ternref.T391BraceHost value = {ternref.t391_global_a, 4})
+    {
+        return value.tag;
+    }
+}
+expect_error("scalar, non-null, non-string brace elements only") {
+    int nullElement(ternref.T391NullHost value = {nullptr})
+    {
+        return value.value == nullptr ? 0 : 1;
+    }
+}
+expect_error("scalar, non-null, non-string brace elements only") {
+    int stringElement(ternref.T391StringHost value = {"abc", 5})
+    {
+        return value.value;
+    }
+}
+expect_error("scalar, non-null, non-string brace elements only") {
+    int nestedEmpty(ternref.T391NestedHost value = {{}, 3})
+    {
+        return value.tag;
+    }
+}

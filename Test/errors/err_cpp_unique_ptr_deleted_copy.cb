@@ -2,11 +2,27 @@
 import cpp "cpp_interop_basic.h";
 import cpp "memory";
 
+int cpp_unique_ptr_take(std.unique_ptr<cppi.Tracked> p) { return 1; }
+
 extern int main()
 {
     expect_error("its copy constructor is deleted") {
         std.unique_ptr<cppi.Tracked> a = cppi.make_tracked_ptr(1);
         std.unique_ptr<cppi.Tracked> b = a;
+    }
+    expect_error("cannot copy C++ class 'std.unique_ptr<cppi.Tracked>'") {
+        function<int(std.unique_ptr<cppi.Tracked>)> f = cpp_unique_ptr_take;
+        std.unique_ptr<cppi.Tracked> p = cppi.make_tracked_ptr(2);
+        int value = f(p);
+    }
+    expect_error("cannot copy C++ class 'std.unique_ptr<cppi.Tracked>'") {
+        function<int(unique<cppi.Tracked>)> g = cpp_unique_ptr_take;
+        std.unique_ptr<cppi.Tracked> p = cppi.make_tracked_ptr(3);
+        int value = g(p);
+    }
+    expect_error("cannot copy C++ class 'std.unique_ptr<cppi.Tracked>'") {
+        std.unique_ptr<cppi.Tracked> q = cppi.make_tracked_ptr(4);
+        int value = cpp_unique_ptr_take(q);
     }
     return 0;
 }

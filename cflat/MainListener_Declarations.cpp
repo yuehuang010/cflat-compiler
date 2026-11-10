@@ -1498,6 +1498,10 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 std::string pName = ResolveSigComponentConstCodegen(param->typeSpecifier(), pPtr,
                                                                     pStars, pConst, param->multiWordTypeSuffix(),
                                                                     false, &pSpelling);
+                std::string cxxUniqueError;
+                CanonicalizeUniqueSigComponent(Compiler(fpSpec), pName, pPtr, pStars,
+                    &cxxUniqueError);
+                if (!cxxUniqueError.empty()) LogErrorContext(param, cxxUniqueError);
                 validateSignatureComponent(pName, pPtr);
                 const int pDepth = ReconcilePointerDepth(pPtr, pStars);
                 encParams.push_back({ pName, pDepth });
@@ -1506,8 +1510,9 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 fp.TypeName = pName; fp.Pointer = pPtr; fp.IsMove = param->Move() != nullptr;
                 fp.IsArrayView = pIsArrayView;
                 fp.PointerDepth = pDepth;
-                fp.ResolvedTypeKey = SigComponentResolvedKey(pName);
+                fp.ResolvedTypeKey = SigComponentResolvedKey(fp.TypeName);
                 fp.ConstMask = pConst;
+                fp.IsPointeeConst = (pConst & 1) != 0;
                 fp.AliasSpelling = pSpelling;
                 sig.FuncPtrParams.push_back(fp);
             }
@@ -1562,10 +1567,15 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
                         p.FunctionTypeSignature =
                             std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                 p.ConstMask = pConst;
+                p.IsPointeeConst = (pConst & 1) != 0;
                 p.Pointer = pPtr;
                 p.IsArrayView = pIsArrayView;
                 p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
                 p.IsMove = param->Move() != nullptr;
+                std::string cxxUniqueError;
+                CanonicalizeUniqueSigComponent(Compiler(fnSpec), p.TypeName, p.Pointer,
+                    p.PointerDepth, &cxxUniqueError);
+                if (!cxxUniqueError.empty()) LogErrorContext(param, cxxUniqueError);
                 p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                 sig.FuncPtrParams.push_back(p);
             }
@@ -1914,6 +1924,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                         p.FunctionTypeSignature =
                                             std::make_shared<LLVMBackend::TypeAndValue>(*nested);
                                 p.ConstMask = pConst;
+                                p.IsPointeeConst = (pConst & 1) != 0;
                                 const int pDepth = ReconcilePointerDepth(pPtr, pStars);
                                 LLVMBackend::TypeAndValue pType;
                                 pType.TypeName = p.TypeName;
@@ -1925,8 +1936,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 p.IsArrayView = pIsArrayView;
                                 p.IsMove   = param->Move() != nullptr;
                                 p.PointerDepth = pDepth;
+                                std::string cxxUniqueError;
                                 CanonicalizeUniqueSigComponent(Compiler(declSpecs), p.TypeName,
-                                                               p.Pointer, p.PointerDepth);
+                                    p.Pointer, p.PointerDepth, &cxxUniqueError);
+                                if (!cxxUniqueError.empty())
+                                    LogErrorContext(param, cxxUniqueError);
                                 p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                                 MarkSubstitutedPointeeConst(p, param->typeSpecifier(),
                                     param->multiWordTypeSuffix(), pStars);
@@ -7680,6 +7694,13 @@ CFlatParser::MoveExpressionContext* MainListener::TopLevelMoveExpression(antlr4:
         {
             if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
                 return mv;
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                primary != nullptr && primary->expression() != nullptr
+                && primary->NameOf() == nullptr && primary->TypeOf() == nullptr)
+            {
+                node = primary->expression();
+                continue;
+            }
             if (node->children.size() != 1) return nullptr;
             node = node->children[0];
         }
@@ -7912,6 +7933,37 @@ bool MainListener::HasUninitializedForeignCxxAggregateReferenceMember(
         auto* compiler = Compiler(context);
         return !compiler->CxxElementNeedsDefaultConstruction(ownerTypeName)
             && HasForeignCxxAggregateReferenceMember(ownerTypeName, context);
+}
+
+void MainListener::PrepareCxxBraceElement(LLVMBackend::NamedVariable& element,
+                                           llvm::Value* value,
+                                           bool deferredDefault,
+                                           bool targetIsReference,
+                                           const std::string& targetSpelling,
+                                           std::vector<std::string>& targetTypes)
+{
+    auto* compiler = compilerLLVM;
+    element.Primary = value;
+    element.TypeAndValue.VariableName.clear();
+    element.BaseType = value != nullptr ? value->getType() : nullptr;
+    if (deferredDefault)
+    {
+        element.Primary = nullptr;
+        element.BaseType = nullptr;
+    }
+    else if (element.TypeAndValue.Pointer && !targetIsReference)
+        element.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(element);
+    else if (!compiler->IsCxxRecord(element.TypeAndValue.TypeName) && !targetIsReference)
+    {
+        element.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(element);
+        compiler->RecordCxxConstantBraceElement(element, value);
+        element.Storage = nullptr;
+        element.IsRvalue = true;
+    }
+    if (targetIsReference && !deferredDefault
+        && compiler->IsCxxRecord(element.TypeAndValue.TypeName) && element.Storage != nullptr)
+        compiler->DeferAliasDeclStructTemp(element.Storage);
+    targetTypes.push_back(targetSpelling);
 }
 
 bool MainListener::TryEmitForeignCxxAggregateBraceInit(
@@ -8525,37 +8577,10 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                                 fieldName));
                         }
                     }
-                    elementNV.Primary = elementValue;
-                    elementNV.TypeAndValue.VariableName.clear();
-                    elementNV.BaseType = elementValue != nullptr ? elementValue->getType() : nullptr;
-                    // A C++ class element keeps its storage: the thunk binds it by reference and
-                    // clang copies (lvalue) or moves (rvalue, `move x`) it into the list.
-                    if (deferredDefault)
-                    {
-                        elementNV.Primary = nullptr;
-                        elementNV.BaseType = nullptr;
-                    }
-                    else if (elementNV.TypeAndValue.Pointer && !targetIsReference)
-                    {
-                        elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
-                    }
-                    else if (!compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName)
-                        && !targetIsReference)
-                    {
-                        elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
-                        compiler->RecordCxxConstantBraceElement(elementNV, elementValue);
-                        elementNV.Storage = nullptr;
-                        elementNV.IsRvalue = true;
-                    }
-                    // Only storage present on the owned-temp ledger is extended below; a named
-                    // C++ lvalue reference therefore keeps its existing owner.
-                    if (targetIsReference && !deferredDefault
-                        && compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName)
-                        && elementNV.Storage != nullptr)
-                        compiler->DeferAliasDeclStructTemp(elementNV.Storage);
                     out += "__cflat_arg_" + std::to_string(braceElements.size()) + "__";
+                    PrepareCxxBraceElement(elementNV, elementValue, deferredDefault,
+                        targetIsReference, targetSpelling, braceElementTargetTypes);
                     braceElements.push_back(std::move(elementNV));
-                    braceElementTargetTypes.push_back(std::move(targetSpelling));
                     ProcessPlusPlus();
                 }
             };
@@ -11402,6 +11427,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // adoption is answered from this by value identity, never from a sticky flag.
                 llvm::Value* srcPrimary = nullptr;
                 bool srcIsUniquePointerJoin = false;
+                bool srcIsOwningRawPointerJoin = false;
                 // The adopted '?:' join, kept before the unique ctor reassigns `right`.
                 llvm::Value* uniquePointerJoin = nullptr;
                 // A direct auto initializer can adopt this sret slot as its local storage.
@@ -12416,6 +12442,51 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     srcIsUniquePointerJoin = compiler->CanAdoptUniquePointerJoin(right);
                                     if (srcIsUniquePointerJoin) uniquePointerJoin = right;
+                                }
+                                else if (!global_scope && typeAndValue.Pointer
+                                    && !typeAndValue.IsUnique && !typeAndValue.IsArrayView
+                                    && !typeAndValue.IsInterface)
+                                {
+                                    const auto arms = compiler->JoinArmValues(right);
+                                    bool hasFreshOwner = false;
+                                    bool hasNamedOwner = false;
+                                    bool allArmsProven = true;
+                                    for (llvm::Value* arm : arms)
+                                    {
+                                        if (auto* constant = llvm::dyn_cast<llvm::Constant>(arm);
+                                            constant != nullptr && constant->isNullValue()) continue;
+                                        if (JoinArmIsProvablyNull(arm)) continue;
+                                        if (compiler->IsMovedOutPtrValue(arm)
+                                            || compiler->FindRawArrayResult(arm) != nullptr)
+                                        {
+                                            allArmsProven = false;
+                                            break;
+                                        }
+                                        if (compiler->IsOwnedNewTemp(arm)
+                                            || compiler->IsOwningPtrTempValue(arm)
+                                            || compiler->FindOwnedReturnTemp(arm) != nullptr)
+                                        {
+                                            hasFreshOwner = true;
+                                            continue;
+                                        }
+                                        auto* load = llvm::dyn_cast<llvm::LoadInst>(arm);
+                                        const auto* local = load == nullptr ? nullptr
+                                            : compiler->FindVariableByStorage(
+                                                load->getPointerOperand());
+                                        if (local == nullptr || !local->TypeAndValue.Pointer
+                                            || !local->IsOwning || local->IsBorrowed
+                                            || local->IsAliasBorrow || local->BorrowsOwningLocal
+                                            || local->TypeAndValue.IsAlias)
+                                        {
+                                            allArmsProven = false;
+                                            hasFreshOwner = false;
+                                            hasNamedOwner = false;
+                                            break;
+                                        }
+                                        hasNamedOwner = true;
+                                    }
+                                    srcIsOwningRawPointerJoin = allArmsProven && !arms.empty() && hasFreshOwner
+                                        && (hasNamedOwner || arms.size() > 1);
                                 }
                                 bool uniqueFieldAssignmentResult = initializer
                                     && !global_scope && assignmentExpression != nullptr
@@ -15622,7 +15693,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                          * own release paths and keep the channel's plain reading.
                          */
                         auto* initAssignExprOwn = initializer ? initializer->assignmentExpression() : nullptr;
-                        bool initResultOwns = srcIsUniquePointerJoin || (compiler->lastOwningResult
+                        bool initResultOwns = srcIsUniquePointerJoin || srcIsOwningRawPointerJoin
+                            || (compiler->lastOwningResult
                             && (!typeAndValue.Pointer
                                 || (initAssignExprOwn != nullptr
                                     && (AsDirectNew(initAssignExprOwn) != nullptr
@@ -15705,6 +15777,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                         if (srcIsUniquePointerJoin)
                             compiler->ConsumeOwningLocalJoinArms(uniquePointerJoin, true, alloc);
+                        if (srcIsOwningRawPointerJoin)
+                        {
+                            compiler->ConsumeOwningLocalJoinArms(srcPrimary, true, alloc);
+                            for (llvm::Value* arm : compiler->JoinArmValues(srcPrimary))
+                                compiler->ConsumeOwnedNewTemp(arm);
+                        }
                         if (typeAndValue.IsArrayView)
                             compiler->SetArrayViewOwnFlagFromRawArrayResult(name, srcPrimary);
                         // Borrow provenance for the DECLARATION door: `T* p = &x;` binds an

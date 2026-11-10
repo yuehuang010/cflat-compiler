@@ -228,6 +228,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_rangeadl.hpp";
 import cpp "library/cpp_raw_string_base.hpp";
 import cpp "library/cpp_bracefold_base.hpp";
 import "application.cb";
@@ -503,6 +504,7 @@ namespace T469AliasShadowNS
 }
 import cpp "library/cpp_interop_varctor.h";
 import cpp "library/cpp_interop_freeoptpl.h";
+import cpp "library/cpp_interop_deleted.h";
 import cpp "library/cpp_t460_operator_lookup.hpp";
 import cpp "library/cpp_mix7_operator_rank.hpp";
 import cpp "library/cpp_mix7_fnptr_bool.hpp";
@@ -2797,7 +2799,9 @@ struct T253FallbackHolder { t253.Fallback f; };
 T253HV t330MakeHV() { T253HV r = default; r.m.value = 5; return r; }
 T253HV t330MakeHV9() { T253HV r = default; r.m.value = 9; return r; }
 int t483TakeHV(T253HV h) { return h.m.value; }
+int t483ReadHV(alias (const T253HV) h) { return h.m.value; }
 T253HV t483ReturnHV() { return move t330MakeHV(); }
+T253HV t483ReturnParenHV() { return (move t330MakeHV()); }
 T483W t483MakeW() { T483W w = { h = t330MakeHV() }; return w; }
 T253Plain t483MakePlain() { T253Plain p = default; p.value = 17; return p; }
 int t483TakePlain(T253Plain p) { return p.value; }
@@ -4606,6 +4610,44 @@ struct NullmacfnShadowField
     int CFLAT_NULLMACFN_ZERO;
     int get() { return cpp_nullmacfn.pi(CFLAT_NULLMACFN_ID(CFLAT_NULLMACFN_ZERO)); }
 };
+
+bool defparamTernaryFlag = true;
+int DefparamTernaryDefault(ternref.T391Val a,
+    ternref.T391Val d = defparamTernaryFlag ? ternref.T391Val(5) : ternref.T391Val(6))
+{
+    return d.value() * 100000 + ternref.t391_stats();
+}
+int DefparamTernaryLeg(bool flag)
+{
+    defparamTernaryFlag = flag;
+    ternref.t391_reset();
+    return DefparamTernaryDefault(ternref.T391Val(1));
+}
+int DefparamTernaryInArgument(ternref.T391Val d =
+    ternref.t391_pass(defparamTernaryFlag ? ternref.T391Val(1) : ternref.T391Val(2)))
+{
+    return d.value();
+}
+int DefparamTernaryCopyArgument(ternref.T391Val d =
+    ternref.T391Val(defparamTernaryFlag ? ternref.t391_global_a : ternref.t391_global_b))
+{
+    return d.value();
+}
+int DefparamBraceValue(cppas.AssignRouteNontrivial value = {5})
+{
+    return value.value();
+}
+int defparamBraceGlobal = 7;
+int DefparamBraceNonconstant(cppas.AssignRouteNontrivial value = {defparamBraceGlobal})
+{
+    return value.value() * 100 + cppas.AssignRouteNontrivial.ctors * 10
+        + cppas.AssignRouteNontrivial.copies;
+}
+
+int primitive_const_param_rank(const int* value)
+{
+    return cppi.primitive_int_rank(value);
+}
 
 extern int main()
 {
@@ -9169,6 +9211,63 @@ extern int main()
     cppi.ConstPointerPointerRank constRankPPObject = default;
     if (constRankPPObject.pick(constRankPP) != 40 || constRankPPObject.pick(mutableRankPP) != 41)
         return 9011;
+    // Primitive pointer overloads use every ConstMask level; each oracle performs the same call
+    // in clang++ so the return value pins the selected C++ overload.
+    int primitiveConstValue = 0;
+    (const int)* primitiveConstPointer = &primitiveConstValue;
+    int primitiveMutableValue = 0;
+    int* primitiveMutablePointer = &primitiveMutableValue;
+    int** primitiveMutablePP = &primitiveMutablePointer;
+    if (cppi.primitive_middle_outer_rank(primitiveMutablePP)
+            != cppi.primitive_middle_outer_oracle(primitiveMutablePP)
+        || cppi.primitive_middle_outer_oracle(primitiveMutablePP) != 3) return 9035;
+    // A multi-level alias variable keeps its const levels: the oracle picks int* const* (2).
+    cppi.PrimitiveMiddleConstAlias primitiveMiddleAlias = nullptr;
+    if (cppi.primitive_middle_alias_rank(primitiveMiddleAlias)
+            != cppi.primitive_middle_alias_oracle(primitiveMiddleAlias)
+        || cppi.primitive_middle_alias_oracle(primitiveMiddleAlias) != 2) return 9041;
+    if (cppi.primitive_int_rank(primitiveConstPointer)
+            != cppi.primitive_int_const_oracle(primitiveConstPointer)
+        || cppi.primitive_int_const_oracle(primitiveConstPointer) != 2) return 9030;
+    if (cppi.primitive_int_rank(primitiveMutablePointer)
+            != cppi.primitive_int_mutable_oracle(primitiveMutablePointer)
+        || cppi.primitive_int_mutable_oracle(primitiveMutablePointer) != 1) return 9031;
+    char primitiveChar = 'x';
+    char* primitiveCharPointer = &primitiveChar;
+    if (cppi.primitive_char_rank(primitiveCharPointer)
+            != cppi.primitive_char_mutable_oracle(primitiveCharPointer)
+        || cppi.primitive_char_mutable_oracle(primitiveCharPointer) != 3) return 9032;
+    if (cppi.primitive_char_rank("x") != cppi.primitive_char_const_oracle("x")
+        || cppi.primitive_char_const_oracle("x") != 4) return 9033;
+    double primitiveDouble = 0.0;
+    (const double)* primitiveConstDoublePointer = &primitiveDouble;
+    if (cppi.primitive_double_rank(primitiveConstDoublePointer)
+            != cppi.primitive_double_const_oracle(primitiveConstDoublePointer)
+        || cppi.primitive_double_const_oracle(primitiveConstDoublePointer) != 6) return 9034;
+    (const cppi.PrimitiveConstRankAlias)* primitiveConstAliasPointer = &primitiveConstValue;
+    if (cppi.primitive_alias_rank(primitiveConstAliasPointer)
+            != cppi.primitive_alias_const_oracle(primitiveConstAliasPointer)
+        || cppi.primitive_alias_const_oracle(primitiveConstAliasPointer) != 8) return 9035;
+    (const int)** primitiveConstPointerPointer = &primitiveConstPointer;
+    if (cppi.primitive_pp_rank(primitiveConstPointerPointer)
+            != cppi.primitive_pp_const_oracle(primitiveConstPointerPointer)
+        || cppi.primitive_pp_const_oracle(primitiveConstPointerPointer) != 10) return 9036;
+    if (cppi.primitive_middle_rank(&primitiveMutablePointer)
+            != cppi.primitive_middle_mutable_oracle(&primitiveMutablePointer)
+        || cppi.primitive_middle_mutable_oracle(&primitiveMutablePointer) != 11) return 9037;
+    if (cppi.primitive_middle_rank(cppi.primitive_middle_const(&primitiveMutablePointer))
+            != cppi.primitive_middle_const_oracle(
+                cppi.primitive_middle_const(&primitiveMutablePointer))
+        || cppi.primitive_middle_const_oracle(
+            cppi.primitive_middle_const(&primitiveMutablePointer)) != 12) return 9038;
+    cppi.PrimitiveConstRankHolder primitiveConstHolder = default;
+    primitiveConstHolder.value = primitiveConstPointer;
+    if (cppi.primitive_int_rank(primitiveConstHolder.value)
+            != cppi.primitive_field_rank(&primitiveConstHolder)
+        || cppi.primitive_field_rank(&primitiveConstHolder) != 2) return 9039;
+    if (primitive_const_param_rank(primitiveConstPointer)
+            != cppi.primitive_int_const_oracle(primitiveConstPointer)
+        || cppi.primitive_int_const_oracle(primitiveConstPointer) != 2) return 9040;
     // Operators: member `<<` and free `+` siblings rank on pointee const (declaration order
     // never decides).
     cppi.ConstPointerRankShift constRankShift = default;
@@ -9186,6 +9285,20 @@ extern int main()
     if (cppi.variadic_conv_rank(1, 2.5) != 2 || cppi.variadic_conv_rank(1, 2, 3) != 1) return 9023;
     if (cppi.variadic_ptr_rank(mutableRankPointer, 1) != 2
         || cppi.variadic_ptr_rank(mutableRankPointer, 1, 2) != 1) return 9024;
+    // A defaulted fixed parameter before an unused ellipsis does not erase the exact int match.
+    // Each member call is checked against a direct clang++-compiled call oracle.
+    cppi.VariadicMemberRank variadicMemberRank = default;
+    cppi.VariadicMemberRankRev variadicMemberRankRev = default;
+    if (cppi.variadic_defaulted_rank(1) != cppi.variadic_defaulted_oracle(1)
+        || cppi.variadic_defaulted_oracle(1) != 1) return 9025;
+    if (variadicMemberRank.rank(1) != cppi.variadic_member_oracle_empty(1)
+        || variadicMemberRank.rank(1, 2) != cppi.variadic_member_oracle_tail(1, 2)
+        || variadicMemberRankRev.rank(1) != cppi.variadic_member_rev_oracle_empty(1)
+        || variadicMemberRankRev.rank(1, 2) != cppi.variadic_member_rev_oracle_tail(1, 2)
+        || cppi.variadic_member_oracle_empty(1) != 1
+        || cppi.variadic_member_oracle_tail(1, 2) != 1
+        || cppi.variadic_member_rev_oracle_empty(1) != 1
+        || cppi.variadic_member_rev_oracle_tail(1, 2) != 1) return 9026;
     // Template beside non-template: const pointer deduces T = const Rec / takes const T*.
     if (cppi.const_tpl_rank(constRankPointer) != 1) return 9017;
     if (cppi.const_tpl_rank(mutableRankPointer) != 2) return 9018;
@@ -14139,6 +14252,49 @@ extern int main()
     cppcr.PtrRankOperator ptrRankOperator = default;
     if (ptrRankMember.pick(ptrRankP) != 317 || ptrRankOperator(ptrRankP) != 517)
                                                                             return 1971;
+
+    // T? pointer-depth proof is preserved through auto, &*, and a C++ pointer return.
+    // PtrRankDeep stays trivially destructible so the C++ by-value ABI remains supported.
+    int ptrRankDeepValue = 23;
+    cppcr.ptr_rank_deep_born = 0;
+    {
+        auto ptrRankDeepAuto = &ptrRankDeepValue;
+        if (cppcr.ptr_rank_deep(ptrRankDeepAuto) != 123) return 1972;
+    }
+    if (cppcr.ptr_rank_deep_born != 1) return 1973;
+    cppcr.ptr_rank_deep_born = 0;
+    {
+        int* ptrRankDeepPointer = &ptrRankDeepValue;
+        if (cppcr.ptr_rank_deep(&*ptrRankDeepPointer) != 123) return 1974;
+    }
+    if (cppcr.ptr_rank_deep_born != 1) return 1975;
+    cppcr.ptr_rank_deep_born = 0;
+    {
+        if (cppcr.ptr_rank_deep(cppcr.ptr_rank_make_ip(&ptrRankDeepValue)) != 123) return 1976;
+    }
+    if (cppcr.ptr_rank_deep_born != 1) return 1977;
+    cppcr.ptr_rank_deep_born = 0;
+    {
+        if (cppcr.ptr_rank_deep(cppcr.PtrRankDeep(&ptrRankDeepValue)) != 123) return 1978;
+    }
+    if (cppcr.ptr_rank_deep_born != 1) return 1979;
+    cppcr.ptr_rank_deep_tracked_born = 0; cppcr.ptr_rank_deep_tracked_dtors = 0;
+    {
+        auto ptrRankTrackedAuto = &ptrRankDeepValue;
+        if (cppcr.ptr_rank_deep_ref(ptrRankTrackedAuto) != 123) return 1980;
+    }
+    if (cppcr.ptr_rank_deep_tracked_born != 1 || cppcr.ptr_rank_deep_tracked_dtors != 1) return 1981;
+    cppcr.ptr_rank_deep_tracked_born = 0; cppcr.ptr_rank_deep_tracked_dtors = 0;
+    {
+        int* ptrRankTrackedPointer = &ptrRankDeepValue;
+        if (cppcr.ptr_rank_deep_ref(&*ptrRankTrackedPointer) != 123) return 1982;
+    }
+    if (cppcr.ptr_rank_deep_tracked_born != 1 || cppcr.ptr_rank_deep_tracked_dtors != 1) return 1983;
+    cppcr.ptr_rank_deep_tracked_born = 0; cppcr.ptr_rank_deep_tracked_dtors = 0;
+    {
+        if (cppcr.ptr_rank_deep_ref(cppcr.ptr_rank_make_ip(&ptrRankDeepValue)) != 123) return 1984;
+    }
+    if (cppcr.ptr_rank_deep_tracked_born != 1 || cppcr.ptr_rank_deep_tracked_dtors != 1) return 1985;
 
     // T452: imported C++ overload ranking for pointer/function bool and converting constructors.
     if (ptrbool.t452_c1("x") != 3) return 4520;
@@ -19689,6 +19845,57 @@ extern int main()
             }
             if (cppbv.Cnt.dtors != 1) return 3716;
         }
+        // T263: a parenthesized move arm matches clang for assignment and declaration.
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            {
+                cppbv.CntA a = cppbv.CntA(21);
+                cppbv.CntA b = cppbv.CntA(22);
+                cppbv.CntA z = cppbv.CntA(0);
+                cppbv.CntA.reset();
+                z = pick != 0 ? (move a) : b;
+                if (z.v != (pick != 0 ? 21 : 22) || a.v != (pick != 0 ? -1 : 21)
+                    || b.v != 22 || cppbv.CntA.ctors != 0
+                    || cppbv.CntA.copies != (pick != 0 ? 0 : 1)
+                    || cppbv.CntA.moves != (pick != 0 ? 1 : 0) || cppbv.CntA.dtors != 1)
+                    return 3718;
+            }
+            if (cppbv.CntA.dtors != 4) return 3720;
+        }
+        for (int pick = 0; pick < 2; pick = pick + 1)
+        {
+            {
+                cppbv.CntA a = cppbv.CntA(21);
+                cppbv.CntA b = cppbv.CntA(22);
+                cppbv.CntA.reset();
+                {
+                    cppbv.CntA z = pick != 0 ? (move a) : b;
+                    if (z.v != (pick != 0 ? 21 : 22) || a.v != (pick != 0 ? -1 : 21)
+                        || b.v != 22 || cppbv.CntA.ctors != 0
+                        || cppbv.CntA.copies != (pick != 0 ? 0 : 1)
+                        || cppbv.CntA.moves != (pick != 0 ? 1 : 0) || cppbv.CntA.dtors != 0)
+                        return 3719;
+                }
+            }
+            if (cppbv.CntA.dtors != 3) return 3721;
+        }
+        // A const prvalue, a `&&`-qualified deleted move-assign and a defaulted move that a member
+        // deletes are not refused: each copy-assigns (clang), as on master.
+        {
+            cppdelrv.ConstPrvalueAssign z = cppdelrv.ConstPrvalueAssign(0);
+            z = cppdelrv.makeConstPrvalueAssign(5);
+            if (z.v != 105) return 38108;
+        }
+        {
+            cppdelrv.RvalueQualAssign z = cppdelrv.RvalueQualAssign(0);
+            z = cppdelrv.RvalueQualAssign(5);
+            if (z.v != 105) return 38109;
+        }
+        {
+            cppdelrv.DefaultedDeletedAssign z = cppdelrv.DefaultedDeletedAssign(0);
+            z = cppdelrv.DefaultedDeletedAssign(5);
+            if (z.v != 105) return 38110;
+        }
         {
             cppbv.Cnt sh = cppbv.Cnt(5);
             cppbv.Cnt.reset();
@@ -23520,6 +23727,29 @@ extern int main()
             t350mTakeP(t350mFmD);
         }
     }
+    // Clang++ -std=c++20: the prvalue ternary default is elided into its by-value parameter.
+    int defparamTernaryTrue = DefparamTernaryLeg(true);
+    if (defparamTernaryTrue != 520002 || ternref.t391_stats() != 20020) return 79501;
+    int defparamTernaryFalse = DefparamTernaryLeg(false);
+    if (defparamTernaryFalse != 620002 || ternref.t391_stats() != 20020) return 79502;
+    cppas.AssignRouteNontrivial.reset();
+    int defparamBraceValue = DefparamBraceValue();
+    if (defparamBraceValue != 5 || cppas.AssignRouteNontrivial.ctors != 1
+        || cppas.AssignRouteNontrivial.copies != 0 || cppas.AssignRouteNontrivial.dtors != 1)
+        return 79503;
+    defparamTernaryFlag = true;
+    ternref.t391_reset();
+    if (DefparamTernaryInArgument() != 101 || ternref.t391_stats() != 20020) return 79504;
+    defparamTernaryFlag = false;
+    ternref.t391_reset();
+    if (DefparamTernaryInArgument() != 102 || ternref.t391_stats() != 20020) return 79505;
+    defparamTernaryFlag = true;
+    ternref.t391_reset();
+    if (DefparamTernaryCopyArgument() != 7 || ternref.t391_stats() != 1010) return 79506;
+    cppas.AssignRouteNontrivial.reset();
+    if (DefparamBraceNonconstant() != 710 || cppas.AssignRouteNontrivial.ctors != 1
+        || cppas.AssignRouteNontrivial.copies != 0 || cppas.AssignRouteNontrivial.dtors != 1)
+        return 79507;
     return 0;
 }
 
@@ -24042,10 +24272,46 @@ int T518IncWrapperRead() { t518.Inc n = t518.Inc(7); return t518.inctake(n, t518
 int T518IncLiteral() { t518.Inc n = t518.Inc(7); int y = 2; return t518.inctake(n, y); }
 // Later arguments that WRITE a non-trivial by-value argument: C++ copies it at its own position,
 // so CFlat copy-constructs it there and calls clang's selected callee by address (one copy).
+struct T518FieldHost
+{
+    t418.Val value = t418.Val(7);
+    int run() { return t518.later(value, t418.mutate(value)); }
+};
+int T518WriteThisField()
+{
+    t418.reset(); int value = 0;
+    { T518FieldHost h = default; value = h.run(); }
+    return T418Pack(value);
+}
 int T518WriteLater()
 {
     t418.reset(); int value = 0;
     { t418.Val v = t418.Val(7); value = t518.later(v, t418.mutate(v)); }
+    return T418Pack(value);
+}
+int T518WriteGlobal()
+{
+    t418.reset(); int value = 0;
+    { value = t518.later(t418.globalValue, t418.mutate(t418.globalValue)); }
+    return T418Pack(value);
+}
+int T518ExtraMoveReturn()
+{
+    cpptw.reset_counts(); int base = cpptw.live_allocations(); int value = 0;
+    { value = t518.take(T518RetTw()); }
+    return T420Pack(value, base);
+}
+int T518ExtraMoveDefault()
+{
+    cpptw.reset_counts(); int base = cpptw.live_allocations(); int value = 0;
+    { value = t518.take(default); }
+    return T420Pack(value, base);
+}
+t418.Val T518RetVal() { return default; }
+int T518PrvalueDynDefault()
+{
+    t418.reset(); int value = 0;
+    { value = t518.dyndef(T518RetVal(), 1); }
     return T418Pack(value);
 }
 int T518WriteOver(bool c)
@@ -24508,6 +24774,29 @@ int LoweredUserDtorAssignLegs(int argc)
         || t25surface.pick(t25surface.Callbacks.by_const) != 1
         || t25surface.pick(t25surface.Callbacks.by_mutable) != 2)
         return 25012;
+    // Callback return const: a named `const int*` result picks RetConstC; function-pointer values agree.
+    if (t25surface.pick_ret(t25surface.ret_const) != 72) return 25013;
+    auto t25RetPlain = t25surface.ret_plain;
+    auto t25RetConst = t25surface.ret_const;
+    if (t25surface.pick_ret(t25RetPlain) != 71 || t25surface.pick_ret(t25RetConst) != 72)
+        return 25014;
+    // Callback reference-parameter const still ranks overloads for names and pointer values.
+    if (t25surface.rpick(t25surface.ref_mutable) != 2
+        || t25surface.rpick(t25surface.ref_const) != 1) return 25017;
+    auto t25RefMut = t25surface.ref_mutable;
+    auto t25RefConst = t25surface.ref_const;
+    if (t25surface.rpick(t25RefMut) != 2 || t25surface.rpick(t25RefConst) != 1)
+        return 25018;
+    t25surface.CompareM t25MutValue = t25surface.cb_mutable;
+    t25surface.CompareC t25ConstValue = t25surface.cb_const;
+    if (t25surface.pick(t25MutValue) != 2 || t25surface.pick(t25ConstValue) != 1)
+        return 25015;
+    // Function-pointer closure values retain nested pointee const for C++ overload ranking.
+    function<int(void*, void*)> t25MutClosure = (void* a, void* b) => { return 8; };
+    function<int((const void)*, (const void)*)> t25ConstClosure =
+        ((const void)* a, (const void)* b) => { return 7; };
+    if (t25surface.pick(t25MutClosure) != 2 || t25surface.pick(t25ConstClosure) != 1)
+        return 25016;
     // Inner variable-template CPO named like the outer stream type (std.views.istream<T> shape).
     cpp_t61.probe t61Input = cpp_t61.probe("4 5 6");
     i64 t61Sum = 0;
@@ -25704,6 +25993,46 @@ int LoweredUserDtorAssignLegs(int argc)
     { t258A = t483TakePlain(move t483MakePlain()); }
     if (t258A != 17 || t253.ctors() != 0 || t253.copies() != 0 || t253.moves() != 0
         || t253.dtors() != 0) return 25446;
+    // T534: parenthesized call moves and call-result joins transfer the C++ member exactly once.
+    t253.reset();
+    { t258A = t483TakeHV(move (t330MakeHV())); }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25447;
+    t253.reset();
+    { t258A = t483TakeHV((move t330MakeHV())); }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25448;
+    t253.reset();
+    {
+        T253HV d = (move t330MakeHV());
+        t258A = d.m.value;
+    }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25449;
+    t253.reset();
+    { T253HV d = t483ReturnParenHV(); t258A = d.m.value; }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25450;
+    t253.reset();
+    { t258A = t483TakeHV(true ? move t330MakeHV() : move t330MakeHV9()); }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25451;
+    t253.reset();
+    { t258A = t483TakeHV(false ? move t330MakeHV() : move t330MakeHV9()); }
+    if (t258A != 1009 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25452;
+    t253.reset();
+    { t258A = t483TakeHV(move (true ? t330MakeHV() : t330MakeHV9())); }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25453;
+    t253.reset();
+    { t258A = t483TakeHV(move (false ? t330MakeHV() : t330MakeHV9())); }
+    if (t258A != 1009 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25454;
+    t253.reset();
+    { t258A = t483ReadHV(t330MakeHV()); }
+    if (t258A != 5 || t253.ctors() != 1 || t253.copies() != 0 || t253.moves() != 0
+        || t253.dtors() != 1) return 25455;
     // T261: a field initializer that throws unwinds the fields already built, once each.
     t261.reset();
     t258A = t261.guarded(t261Pair, 1);
@@ -26557,7 +26886,16 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T518GuardTmpl(false) != 1702) return 51816;
     if (T518GuardDef(false) != 1702) return 51817;
     if (T518GuardDef(true) != 1002) return 51818;
+    if (T518WriteThisField() != 70211020) return 51842;
     if (T518WriteLater() != 70211020) return 51824;
+    if (T518WriteGlobal() != 70201010) return 51839;
+    if (T518ExtraMoveReturn() != 1000010) return 51840;
+    if (T518ExtraMoveDefault() != 1000010) return 51841;
+    int prvalueDyn = T518PrvalueDynDefault();
+    int prvalueDynStats = prvalueDyn % 100000;
+    int prvalueDynBorn = prvalueDynStats / 10000 + prvalueDynStats / 1000 % 10
+        + prvalueDynStats / 100 % 10;
+    if (prvalueDyn / 100000 != 11102 || prvalueDynBorn != prvalueDynStats / 10 % 10) return 51843;
     if (T518WriteOver(false) != 170211020) return 51825;
     if (T518WriteOver(true) != 100220020) return 51826;
     if (T518WriteTempl() != 170211020) return 51827;
@@ -27560,5 +27898,45 @@ int srctypeRound4Legs()
         cppi.XvTrivialTemplate[1] dst = {src};
         if (dst[0].v != 109 || srcPtr->v != -1 || cppi.xv_move_count() != 1) return 70423;
     }
+    // Count/get selects get(int); the ADL case still calls its free begin/end pair.
+    rangeadl_counted.reset();
+    int rangeadlCountSum = 0;
+    {
+        rangeadl_counted.Counted counted = rangeadl_counted.Counted();
+        for (int value in counted) rangeadlCountSum += value;
+    }
+    if (rangeadlCountSum != 6 || rangeadl_counted.int_get_calls() != 3
+        || rangeadl_counted.unsigned_get_calls() != 0 || rangeadl_counted.born() != 1
+        || rangeadl_counted.died() != rangeadl_counted.born()) return 71201;
+    rangeadl_adl.reset();
+    int rangeadlAdlSum = 0;
+    {
+        rangeadl_adl.AdlRange adl = rangeadl_adl.AdlRange();
+        for (int value in adl) rangeadlAdlSum += value;
+    }
+    if (rangeadlAdlSum != 13 || rangeadl_adl.begin_calls() != 1
+        || rangeadl_adl.end_calls() != 1 || rangeadl_adl.born() != 1
+        || rangeadl_adl.died() != rangeadl_adl.born()) return 71202;
+    // Hidden friends in an enclosing record are associated for a nested range type.
+    int rangeadlNestedPlainSum = 0;
+    {
+        rangeadl_nested.PlainOuter.Inner nested = rangeadl_nested.PlainOuter.Inner();
+        for (int value in nested) rangeadlNestedPlainSum += value;
+    }
+    if (rangeadlNestedPlainSum != 3) return 71203;
+    // The enclosing-record lookup also sees hidden friend function templates.
+    int rangeadlNestedTemplateSum = 0;
+    {
+        rangeadl_nested.TemplateOuter.Inner nested = rangeadl_nested.TemplateOuter.Inner();
+        for (int value in nested) rangeadlNestedTemplateSum += value;
+    }
+    if (rangeadlNestedTemplateSum != 9) return 71204;
+    // A global-namespace enclosing record is associated for a nested range type.
+    int rangeadlGlobalNestedSum = 0;
+    {
+        RangeAdlGlobalOuter.Inner nested = RangeAdlGlobalOuter.Inner();
+        for (int value in nested) rangeadlGlobalNestedSum += value;
+    }
+    if (rangeadlGlobalNestedSum != 3) return 71205;
     return 0;
 }

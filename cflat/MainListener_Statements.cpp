@@ -2900,7 +2900,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     && !adoptSource.TypeAndValue.Pointer
                     && compiler->ResolveTypeAlias(adoptSource.TypeAndValue.TypeName) == uqPointee)
                 {
-                    const std::string borrowed = LLVMBackend::BorrowedSourceName(adoptSource);
+                    const std::string borrowed = compiler->BorrowedSourceDiagnosticName(adoptSource);
                     LogErrorContext(errCtx, std::format(
                         "cannot return borrowed value '{}' as '{}'; the return type owns the pointee - "
                         "use 'new', a move source, or a move-returning call",
@@ -3576,6 +3576,20 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         const bool coreUniqueValueReturn = !aliasRefReturn
             && !compiler->currentFunctionReturnTV.Pointer
             && compiler->IsCoreUniqueType(compiler->currentFunctionReturnTV.TypeName);
+        if (coreUniqueValueReturn && returnNV.IsBorrowed
+            && returnNV.ChainedAssignSlot != nullptr
+            && IsChainedAssignmentShape(assignExpr))
+        {
+            if (const auto* slotVar = compiler->FindVariableByStorage(returnNV.ChainedAssignSlot);
+                slotVar != nullptr && slotVar->IsOwning)
+            {
+                llvm::Value* assignmentValue = right;
+                const std::string slotName = returnNV.ChainedAssignName;
+                returnNV = *slotVar;
+                returnNV.Primary = assignmentValue;
+                returnNV.CallerName = slotName;
+            }
+        }
         const bool rawPointerReturn = coreUniqueValueReturn
             && right != nullptr && right->getType()->isPointerTy()
             && (returnNV.TypeAndValue.Pointer
@@ -3603,8 +3617,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     && compiler->IsVariableOwning(returnNV.CallerName));
             if (!returnedNull && (sourceBorrowed || !sourceOwned))
             {
-                const std::string sourceName = LLVMBackend::BorrowedSourceName(returnNV).empty()
-                    ? retText : LLVMBackend::BorrowedSourceName(returnNV);
+                const std::string borrowedSourceName = compiler->BorrowedSourceDiagnosticName(returnNV);
+                const std::string sourceName = borrowedSourceName.empty() ? retText : borrowedSourceName;
                 LogErrorContext(errCtx, std::format(
                     "cannot return borrowed value '{}' as '{}'; the return type owns the "
                     "pointee - use 'new', a move source, or a move-returning call",
@@ -5711,15 +5725,166 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     const auto* foreignInfo = compiler->GetCxxClassInfo(collTypeName);
                     const bool hasBegin = hasMethod("begin");
                     const bool hasEnd = hasMethod("end");
+                    const bool hasCountGetProtocol =
+                        compiler->CxxClassHasMemberNamed(collTypeName, "count")
+                        && compiler->CxxClassHasMemberNamed(collTypeName, "get");
                     std::string freeBeginName;
                     std::string freeEndName;
                     std::string freeError;
-                    if (cxxRangeCandidate && !cxxMemberRange && !collNV.TypeAndValue.Pointer)
+                    const std::string cflatBase =
+                        collTypeName.substr(0, collTypeName.find('$'));
+                    const size_t cflatDot = cflatBase.rfind('.');
+                    const std::string adlScope = cflatDot == std::string::npos
+                        ? std::string("__cxx_free") : cflatBase.substr(0, cflatDot);
+                    std::set<std::string> associatedNamespaces;
+                    bool hasAssociatedHiddenFriend = false;
+                    bool associatedSetNeedsClang = false;
+                    std::set<std::string> visitedAssociatedTypes;
+                    std::function<void(const std::string&)> collectAssociatedTypes =
+                        [&](const std::string& typeName) {
+                            if (!visitedAssociatedTypes.insert(typeName).second) return;
+                            const std::string mappedBase = typeName.substr(0, typeName.find('$'));
+                            const size_t mappedDot = mappedBase.rfind('.');
+                            const std::string typeNamespace = mappedDot == std::string::npos
+                                ? "__cxx_free" : mappedBase.substr(0, mappedDot);
+                            // Standard-library range access templates may be visible to Clang but
+                            // absent from the extracted signature index.
+                            if (typeNamespace == "std" || typeNamespace.starts_with("std."))
+                                associatedSetNeedsClang = true;
+                            std::string mappedScope = typeNamespace;
+                            while (!mappedScope.empty())
+                            {
+                                associatedNamespaces.insert(mappedScope);
+                                const size_t parentDot = mappedScope.rfind('.');
+                                if (parentDot == std::string::npos) break;
+                                mappedScope.resize(parentDot);
+                            }
+                            std::string canonical = compiler->CxxRecordCanonicalSpelling(typeName);
+                            if (canonical.empty())
+                            {
+                                associatedSetNeedsClang = true;
+                                return;
+                            }
+                            for (std::string_view prefix : { "class ", "struct ", "union " })
+                                if (canonical.starts_with(prefix))
+                                {
+                                    canonical.erase(0, prefix.size());
+                                    break;
+                                }
+                            const size_t templateArgs = canonical.find('<');
+                            if (templateArgs != std::string::npos)
+                                associatedSetNeedsClang = true;
+                            const std::string recordName = canonical.substr(0, templateArgs);
+                            const size_t scopeEnd = recordName.rfind("::");
+                            const std::string canonicalNamespace = scopeEnd == std::string::npos
+                                ? "__cxx_free" : recordName.substr(0, scopeEnd);
+                            std::string canonicalMapped = canonicalNamespace;
+                            for (size_t separator = canonicalMapped.find("::");
+                                 separator != std::string::npos;
+                                 separator = canonicalMapped.find("::", separator + 1))
+                                canonicalMapped.replace(separator, 2, ".");
+                            if (canonicalMapped != typeNamespace)
+                                associatedSetNeedsClang = true;
+                            std::string scope = scopeEnd == std::string::npos
+                                ? "__cxx_free" : recordName.substr(0, scopeEnd);
+                            for (size_t separator = scope.find("::"); separator != std::string::npos;
+                                 separator = scope.find("::", separator + 1))
+                                scope.replace(separator, 2, ".");
+                            while (!scope.empty())
+                            {
+                                associatedNamespaces.insert(scope);
+                                const size_t parentSeparator = scope.rfind('.');
+                                if (parentSeparator == std::string::npos) break;
+                                scope.resize(parentSeparator);
+                            }
+                            const auto hasRangeFriend = [](const auto& entry) {
+                                return std::find(entry.friendNames.begin(), entry.friendNames.end(), "begin")
+                                        != entry.friendNames.end()
+                                    || std::find(entry.friendNames.begin(), entry.friendNames.end(), "end")
+                                        != entry.friendNames.end();
+                            };
+                            if (auto record = compiler->cxxRecordEntries_.find(typeName);
+                                record != compiler->cxxRecordEntries_.end())
+                                hasAssociatedHiddenFriend = hasAssociatedHiddenFriend
+                                    || hasRangeFriend(record->second);
+
+                            // A nested class also associates every enclosing class for ADL.
+                            // Split only namespace separators outside template arguments.
+                            std::vector<size_t> enclosingSeparators;
+                            int templateDepth = 0;
+                            for (size_t i = 0; i + 1 < recordName.size(); ++i)
+                            {
+                                if (recordName[i] == '<') ++templateDepth;
+                                else if (recordName[i] == '>') --templateDepth;
+                                else if (templateDepth == 0 && recordName[i] == ':'
+                                         && recordName[i + 1] == ':')
+                                {
+                                    enclosingSeparators.push_back(i);
+                                    ++i;
+                                }
+                            }
+                            for (size_t i = 0; i < enclosingSeparators.size(); ++i)
+                            {
+                                const std::string enclosing = recordName.substr(0, enclosingSeparators[i]);
+                                bool foundRecord = false;
+                                for (const auto& [_, entry] : compiler->cxxRecordEntries_)
+                                {
+                                    std::string entryName = entry.canonicalCtype;
+                                    for (std::string_view prefix : { "class ", "struct ", "union " })
+                                        if (entryName.starts_with(prefix))
+                                        {
+                                            entryName.erase(0, prefix.size());
+                                            break;
+                                        }
+                                    if (entryName == enclosing)
+                                    {
+                                        foundRecord = true;
+                                        hasAssociatedHiddenFriend = hasAssociatedHiddenFriend
+                                            || hasRangeFriend(entry);
+                                        break;
+                                    }
+                                }
+                                if (!foundRecord)
+                                {
+                                    std::string mappedNamespace = enclosing;
+                                    for (size_t separator = mappedNamespace.find("::");
+                                         separator != std::string::npos;
+                                         separator = mappedNamespace.find("::", separator + 1))
+                                        mappedNamespace.replace(separator, 2, ".");
+                                    if (!compiler->namespaceTable.count(mappedNamespace))
+                                        associatedSetNeedsClang = true;
+                                }
+                            }
+                            if (const auto* info = compiler->GetCxxClassInfo(typeName))
+                                for (const auto& base : info->bases)
+                                    collectAssociatedTypes(base.name);
+                        };
+                    collectAssociatedTypes(collTypeName);
+                    const bool hasAssociatedFreeRangeCandidate = associatedSetNeedsClang
+                        || hasAssociatedHiddenFriend
+                        || std::any_of(associatedNamespaces.begin(), associatedNamespaces.end(),
+                            [&](const std::string& scope) {
+                                const std::string beginName = scope == "__cxx_free"
+                                    ? "begin" : scope + ".begin";
+                                const std::string endName = scope == "__cxx_free"
+                                    ? "end" : scope + ".end";
+                                return compiler->cxxFunctionSignatures_.count(beginName) != 0
+                                    || compiler->cxxFunctionSignatures_.count(endName) != 0
+                                    || compiler->HasCxxFunctionTemplate(beginName)
+                                    || compiler->HasCxxFunctionTemplate(endName);
+                            });
+                    const bool needsAssociatedFreeRangeLookup = cxxRangeCandidate
+                        && !cxxMemberRange && !collNV.TypeAndValue.Pointer;
+                    const bool shouldProbeAssociatedFreeRange = needsAssociatedFreeRangeLookup
+                        && (!hasCountGetProtocol || hasAssociatedFreeRangeCandidate);
+                    if (compiler->verbose && needsAssociatedFreeRangeLookup)
                     {
-                        const std::string base = collTypeName.substr(0, collTypeName.find('$'));
-                        const size_t dot = base.rfind('.');
-                        const std::string adlScope =
-                            dot == std::string::npos ? std::string("__cxx_free") : base.substr(0, dot);
+                        std::cout << std::format(
+                            "[verbose] C++ range-for ADL probe {}: candidate={}, count/get={}\n",
+                            collTypeName, hasAssociatedFreeRangeCandidate, hasCountGetProtocol);
+                    }
+                    if (shouldProbeAssociatedFreeRange)
+                    {
                         auto requestFree = [&](const char* name) {
                             // __range is a named reference: begin/end see an LVALUE even for a
                             // temporary collection. Only the type and value category matter here.
@@ -5734,6 +5899,10 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                             std::vector<LLVMBackend::NamedVariable> args{ rangeArg };
                             std::string registeredName;
                             std::string error;
+                            if (compiler->verbose)
+                                std::cout << std::format(
+                                    "[verbose] C++ range-for ADL wrapper request {}\n",
+                                    adlScope + "." + name);
                             if (!compiler->RequestCxxFreeFunction(adlScope + "." + name, {}, args,
                                                                   registeredName, error, {}, {}, {},
                                                                   /*adlCall*/ true))
@@ -7312,6 +7481,144 @@ void MainListener::GenerateDefaultParamOverloads(
                     defaultArg.IsCxxPrvalueTemp = true;
                     defaultVal = compiler->CreateLoad(objectType, slot);
                 };
+                auto buildCxxBraceDefaultSlot = [&](CFlatParser::InitializerContext* where,
+                                                     CFlatParser::InitializerListContext* list) {
+                    const std::string& typeName = params[i].TypeName;
+                    std::vector<LLVMBackend::NamedVariable> elements;
+                    std::vector<std::string> braceElementTargetTypes;
+                    std::string braceSource;
+                    bool unsupportedBraceShape = false;
+                    std::function<void(CFlatParser::InitializerListContext*, const std::string&)>
+                        collectElements;
+                    std::function<bool(antlr4::tree::ParseTree*)> containsStringLiteral;
+                    containsStringLiteral = [&](antlr4::tree::ParseTree* node) {
+                        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+                            return terminal->getSymbol()->getType() == CFlatParser::StringLiteral;
+                        for (auto* child : node->children)
+                            if (containsStringLiteral(child)) return true;
+                        return false;
+                    };
+                    collectElements = [&](CFlatParser::InitializerListContext* current,
+                                          const std::string& currentType) {
+                        braceSource += "{";
+                        bool first = true;
+                        size_t fieldIndex = 0;
+                        for (auto* field : current->fieldInit())
+                        {
+                            if (!first) braceSource += ",";
+                            first = false;
+                            if (field->Identifier() != nullptr)
+                                LogErrorContext(field,
+                                    "C++ class parameter defaults support positional brace elements only");
+                            if (field->initializerList() != nullptr)
+                            {
+                                unsupportedBraceShape = true;
+                                std::string fieldType;
+                                const std::string fieldName = compiler->CxxAggregateFlattenedFieldNameAt(
+                                    currentType, fieldIndex);
+                                if (!fieldName.empty())
+                                    compiler->CxxRecordFieldTypeSpelling(currentType, fieldName, fieldType);
+                                collectElements(field->initializerList(), fieldType);
+                                ++fieldIndex;
+                                continue;
+                            }
+                            if (field->LeftBrace() != nullptr
+                                && field->assignmentExpression().empty())
+                            {
+                                unsupportedBraceShape = true;
+                                braceSource += "{}";
+                                ++fieldIndex;
+                                continue;
+                            }
+                            auto fieldExpressions = field->assignmentExpression();
+                            if (fieldExpressions.size() != 1)
+                                LogErrorContext(field,
+                                    "C++ class parameter defaults support positional brace elements only");
+                            auto* expression = fieldExpressions.front();
+                            braceSource += "__cflat_arg_" + std::to_string(elements.size()) + "__";
+                            CxxCallArgumentParseStateScope argumentState(compiler);
+                            CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
+                            CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
+                            CxxCallArgumentExpectedTypeScope elementExpectedType(
+                                cxxCallArgumentExpectedType_, {});
+                            auto element = ParseAssignmentExpressionNamed(expression);
+                            llvm::Value* retTemp = compiler->lastCxxRetTemp_;
+                            llvm::Value* retValue = compiler->lastCxxRetValue_;
+                            if (retTemp != nullptr
+                                && (element.Storage == retTemp || element.Primary == retValue))
+                            {
+                                element.Storage = retTemp;
+                                element.IsRvalue = true;
+                                element.IsCxxPrvalueTemp = !element.IsExplicitMove;
+                            }
+                            NormalizeCxxRvalueReferenceArgument(expression, element);
+                            element.Primary = LoadNamedVariable(element);
+                            element.BaseType = element.Primary != nullptr ? element.Primary->getType() : nullptr;
+                            element.IsDefaultArgument = false;
+                            if (element.TypeAndValue.TypeName.empty() && element.BaseType != nullptr)
+                                element.TypeAndValue.TypeName = compiler->LlvmTypeToTypeName(element.BaseType);
+                            const bool scalarElement = !element.TypeAndValue.Pointer
+                                && !element.TypeAndValue.ElemPointer
+                                && !element.TypeAndValue.IsCxxNullptrT
+                                && !containsStringLiteral(expression)
+                                && !llvm::isa_and_nonnull<llvm::ConstantPointerNull>(element.Primary)
+                                && !compiler->IsCxxRecord(element.TypeAndValue.TypeName)
+                                && (element.TypeAndValue.IsInteger() != -1
+                                    || element.TypeAndValue.IsFloatingPoint() != -1);
+                            if (!scalarElement) unsupportedBraceShape = true;
+                            std::string targetSpelling;
+                            bool targetIsReference = false;
+                            const std::string fieldName = compiler->CxxAggregateFlattenedFieldNameAt(
+                                currentType, fieldIndex);
+                            if (!fieldName.empty())
+                                compiler->CxxRecordFieldTypeSpelling(currentType, fieldName,
+                                    targetSpelling, &targetIsReference);
+                            PrepareCxxBraceElement(element, element.Primary, false, targetIsReference,
+                                targetSpelling, braceElementTargetTypes);
+                            elements.push_back(std::move(element));
+                            ++fieldIndex;
+                        }
+                        braceSource += "}";
+                    };
+                    collectElements(list, typeName);
+                    if (unsupportedBraceShape)
+                        LogErrorContext(where,
+                            "C++ class parameter defaults support scalar, non-null, non-string brace elements only");
+                    std::string wrapperName;
+                    std::string constructorError;
+                    std::vector<size_t> forwardedElements;
+                    if (!compiler->RequestCxxDirectBraceConstructor(
+                            typeName, elements, braceSource, true, wrapperName, constructorError,
+                            true, &forwardedElements, &braceElementTargetTypes))
+                    {
+                        if (constructorError.empty())
+                            constructorError = std::format(
+                                "C++ class '{}' has no constructor accepting this brace list",
+                                compiler->DisplayCxxClassName(typeName));
+                        LogErrorContext(where, constructorError);
+                    }
+                    auto* objectType = compiler->GetType(
+                        LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                    auto* slot = compiler->AllocaAtEntry(objectType, nullptr, "cxx.default.brace");
+                    LLVMBackend::NamedVariable self;
+                    self.Primary = slot;
+                    self.BaseType = slot->getType();
+                    self.TypeAndValue.TypeName = typeName;
+                    self.TypeAndValue.Pointer = true;
+                    self.IsRvalue = true;
+                    std::vector<LLVMBackend::NamedVariable> wrapperArguments{ self };
+                    for (size_t index : forwardedElements)
+                        wrapperArguments.push_back(elements[index]);
+                    compiler->SetCurrentDebugLocation(where->getStart()->getLine());
+                    compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+                    compiler->RegisterOwnedStructTemp(slot, typeName);
+                    defaultArg = {};
+                    defaultArg.BaseType = objectType;
+                    defaultArg.Storage = slot;
+                    defaultArg.IsRvalue = true;
+                    defaultArg.IsCxxPrvalueTemp = true;
+                    defaultVal = compiler->CreateLoad(objectType, slot);
+                };
                 if (auto* ae = initCtx->assignmentExpression())
                 {
                     // Default arguments are lowered in a synthesized forwarding wrapper, but a
@@ -7323,9 +7630,55 @@ void MainListener::GenerateDefaultParamOverloads(
                         lambdaExpectedType = params[i];
                     else if (const auto* encoded = compiler->GetEncodedClosureType(params[i].TypeName))
                         lambdaExpectedType = *encoded;
+                    llvm::Value* defaultTernarySlot = nullptr;
+                    if (cxxClassDefault && SoleTernaryExpression(ae) != nullptr)
+                        defaultTernarySlot = compiler->AllocaAtEntry(
+                            compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = params[i].TypeName }),
+                            nullptr, "cxx.default.ternary");
+                    struct DefaultTernaryDestinationScope
+                    {
+                        LLVMBackend* compiler;
+                        llvm::Value* savedDest;
+                        std::string savedType;
+                        bool savedConsumed;
+                        bool savedFailed;
+                        DefaultTernaryDestinationScope(LLVMBackend* c, llvm::Value* dest,
+                                                       const std::string& typeName)
+                            : compiler(c), savedDest(c->pendingCxxTernaryDeclDest_),
+                              savedType(c->pendingCxxTernaryDeclTypeName_),
+                              savedConsumed(c->pendingCxxTernaryDeclConsumed_),
+                              savedFailed(c->pendingCxxTernaryDeclFailed_)
+                        {
+                            if (dest == nullptr) return;
+                            compiler->pendingCxxTernaryDeclDest_ = dest;
+                            compiler->pendingCxxTernaryDeclTypeName_ = typeName;
+                            compiler->pendingCxxTernaryDeclConsumed_ = false;
+                            compiler->pendingCxxTernaryDeclFailed_ = false;
+                        }
+                        ~DefaultTernaryDestinationScope()
+                        {
+                            compiler->pendingCxxTernaryDeclDest_ = savedDest;
+                            compiler->pendingCxxTernaryDeclTypeName_ = std::move(savedType);
+                            compiler->pendingCxxTernaryDeclConsumed_ = savedConsumed;
+                            compiler->pendingCxxTernaryDeclFailed_ = savedFailed;
+                        }
+                    } defaultTernaryDestination(compiler, defaultTernarySlot, params[i].TypeName);
                     // Parameter-DEFAULT leg of the code-value store gate: `f(Rec* p = ro)` put a
                     // code address in the omitted argument's slot and the body wrote through it.
                     auto defNV = ParseAssignmentExpressionNamed(ae);
+                    if (defaultTernarySlot != nullptr && compiler->pendingCxxTernaryDeclConsumed_
+                        && !compiler->pendingCxxTernaryDeclFailed_)
+                    {
+                        auto* objectType = compiler->GetType(
+                            LLVMBackend::TypeAndValue{ .TypeName = params[i].TypeName });
+                        defNV.Primary = compiler->CreateLoad(objectType, defaultTernarySlot);
+                        defNV.BaseType = objectType;
+                        defNV.Storage = defaultTernarySlot;
+                        defNV.IsRvalue = true;
+                        defNV.IsCxxPrvalueTemp = true;
+                        defNV.IsDefaultParamForward = true;
+                        compiler->RegisterOwnedStructTemp(defaultTernarySlot, params[i].TypeName);
+                    }
                     defaultArg = defNV;
                     defaultVal = LoadNamedVariable(defNV);
                     defaultIsUnsigned = defNV.TypeAndValue.IsUnsignedInteger() != -1;
@@ -7411,8 +7764,9 @@ void MainListener::GenerateDefaultParamOverloads(
 
                     // Field initializer default: build the struct, apply overrides, pass by value.
                     if (cxxClassDefault && initList == nullptr) buildCxxDefaultSlot(initCtx, true);
+                    else if (cxxClassDefault) buildCxxBraceDefaultSlot(initCtx, initList);
                     else defaultVal = GenerateDefaultValue(params[i]);
-                    if (defaultVal && initList != nullptr)
+                    if (defaultVal && initList != nullptr && !cxxClassDefault)
                     {
                         auto* alloca = compiler->CreateAlloca(defaultVal->getType());
                         compiler->CreateAssignment(defaultVal, alloca);

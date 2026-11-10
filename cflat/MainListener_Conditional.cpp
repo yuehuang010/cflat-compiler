@@ -1,4 +1,6 @@
 #include "MainListener.h"
+#include <charconv>
+#include <optional>
 #include <llvm/Support/SaveAndRestore.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Intrinsics.h>
@@ -545,12 +547,151 @@ LLVMBackend::NamedVariable MainListener::ParseCxxConstRefTernaryTemp(
         return parsed;
 }
 
-bool MainListener::ArgumentNamesStorageRoot(antlr4::ParserRuleContext* ctx, llvm::Value* storage)
+bool MainListener::ArgumentNamesStorageRoot(antlr4::ParserRuleContext* ctx, llvm::Value* storage,
+                                             const std::string& thisFieldPath, bool* mayWrite,
+                                             antlr4::ParserRuleContext* targetCtx)
 {
+        if (mayWrite != nullptr) *mayWrite = false;
         if (ctx == nullptr || storage == nullptr) return false;
         llvm::SmallVector<const llvm::Value*, 4> roots;
         llvm::getUnderlyingObjects(storage, roots);
         bool named = false;
+        auto fieldPathsOverlap = [](const std::string& a, const std::string& b) {
+            auto prefix = [](const std::string& x, const std::string& y) {
+                return !x.empty() && x.size() <= y.size() && y.compare(0, x.size(), x) == 0
+                    && (x.size() == y.size() || y[x.size()] == '.' || y[x.size()] == '[');
+            };
+            return prefix(a, b) || prefix(b, a);
+        };
+        std::string fieldPathForComparison = thisFieldPath;
+        struct MemberPathInfo { std::string path; bool mayWrite = false; bool cut = false; };
+        auto memberPathBeforeCallOrIndex = [&](CFlatParser::PostfixExpressionContext* postfix) {
+            MemberPathInfo result;
+            std::string path;
+            if (postfix == nullptr) return result;
+            bool pastPrimary = false;
+            for (size_t i = 0; i < postfix->children.size(); ++i)
+            {
+                auto* child = postfix->children[i];
+                if (!pastPrimary)
+                {
+                    if (dynamic_cast<CFlatParser::PrimaryExpressionContext*>(child) != nullptr)
+                        pastPrimary = true;
+                    continue;
+                }
+                auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(child);
+                if (terminal != nullptr && terminal->getText() == "[")
+                {
+                    auto* index = i + 1 < postfix->children.size()
+                        ? dynamic_cast<CFlatParser::ExpressionContext*>(postfix->children[i + 1]) : nullptr;
+                    bool integerLiteral = false;
+                    if (index != nullptr)
+                    {
+                        size_t terminalCount = 0;
+                        auto inspect = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                            if (auto* token = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+                            {
+                                ++terminalCount;
+                                const std::string literal = token->getText();
+                                integerLiteral = token->getSymbol()->getType() == CFlatParser::Constant
+                                    && !literal.empty() && literal[0] >= '0' && literal[0] <= '9';
+                            }
+                            else if (node != nullptr)
+                                for (auto* nested : node->children) self(self, nested);
+                        };
+                        inspect(inspect, index);
+                        integerLiteral = integerLiteral && terminalCount == 1;
+                    }
+                    // Compare the value, not the spelling (`arr[1]` == `arr[0x1]`); a Constant whose
+                    // integer value is not proven (float, overflow) cuts the path like any other index.
+                    std::optional<unsigned long long> literalValue;
+                    if (integerLiteral)
+                    {
+                        std::string digits = index->getText();
+                        while (!digits.empty() && (digits.back() == 'u' || digits.back() == 'U'
+                                                   || digits.back() == 'l' || digits.back() == 'L'))
+                            digits.pop_back();
+                        int base = 10;
+                        size_t start = 0;
+                        if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
+                            base = 16, start = 2;
+                        else if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B'))
+                            base = 2, start = 2;
+                        else if (digits.size() > 1 && digits[0] == '0')
+                            base = 8, start = 1;
+                        unsigned long long value = 0;
+                        const char* first = digits.data() + start;
+                        const char* last = digits.data() + digits.size();
+                        auto [end, ec] = std::from_chars(first, last, value, base);
+                        if (first != last && ec == std::errc() && end == last) literalValue = value;
+                    }
+                    if (literalValue)
+                    {
+                        path += "[" + std::to_string(*literalValue) + "]";
+                        i += 2;
+                        continue;
+                    }
+                    result.cut = true;
+                    result.mayWrite = !path.empty() && fieldPathsOverlap(path, fieldPathForComparison);
+                    break;
+                }
+                if (terminal != nullptr && terminal->getText() == "(")
+                {
+                    result.cut = true;
+                    result.mayWrite = !path.empty() && fieldPathsOverlap(path, fieldPathForComparison);
+                    break;
+                }
+                auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(child);
+                if (member == nullptr) continue;
+                size_t next = i + 1;
+                if (next < postfix->children.size()
+                    && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(postfix->children[next]) != nullptr)
+                    ++next;
+                if (next < postfix->children.size())
+                    if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[next]);
+                        terminal != nullptr && terminal->getText() == "(")
+                    {
+                        result.cut = true;
+                        result.mayWrite = !path.empty() && fieldPathsOverlap(path, fieldPathForComparison);
+                        break;
+                    }
+                path += (path.empty() ? "" : ".") + member->getText();
+            }
+            result.path = path;
+            return result;
+        };
+        if (targetCtx != nullptr)
+        {
+            CFlatParser::PrimaryExpressionContext* targetPrimary = nullptr;
+            auto findPrimary = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                if (targetPrimary != nullptr || node == nullptr) return;
+                if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                    primary != nullptr && primary->genericIdentifier() != nullptr
+                    && primary->genericIdentifier()->Identifier() != nullptr)
+                {
+                    targetPrimary = primary;
+                    return;
+                }
+                for (auto* child : node->children) self(self, child);
+            };
+            findPrimary(findPrimary, targetCtx);
+            if (targetPrimary != nullptr)
+            {
+                const std::string rootName = targetPrimary->genericIdentifier()->Identifier()->getText();
+                auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(targetPrimary->parent);
+                const auto targetPath = memberPathBeforeCallOrIndex(postfix);
+                if (targetPath.path.find('[') != std::string::npos)
+                {
+                    if (rootName == "this")
+                        fieldPathForComparison = targetPath.path;
+                    else if (Compiler()->GetScopedLocalOrArgument(rootName).Storage == nullptr
+                        && Compiler()->HasMemberVariable(rootName))
+                        fieldPathForComparison = rootName
+                            + (targetPath.path.empty() || targetPath.path[0] == '[' ? "" : ".")
+                            + targetPath.path;
+                }
+            }
+        }
         auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
             if (named || node == nullptr) return;
             if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
@@ -558,9 +699,63 @@ bool MainListener::ArgumentNamesStorageRoot(antlr4::ParserRuleContext* ctx, llvm
                     generic != nullptr && generic->Identifier() != nullptr)
                 {
                     // Resolved as codegen resolves a bare name: the innermost local or parameter.
-                    auto local = Compiler()->GetScopedLocalOrArgument(generic->Identifier()->getText());
-                    const llvm::Value* root = local.Storage != nullptr
-                        ? llvm::getUnderlyingObject(local.Storage) : nullptr;
+                    const std::string name = generic->Identifier()->getText();
+                    auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(primary->parent);
+                    const auto memberInfo = memberPathBeforeCallOrIndex(postfix);
+                    const std::string& memberPath = memberInfo.path;
+                    if (memberInfo.mayWrite && mayWrite != nullptr) *mayWrite = true;
+                    if (!memberInfo.mayWrite && !fieldPathForComparison.empty() && name == "this" && !memberPath.empty()
+                        && fieldPathsOverlap(memberPath, fieldPathForComparison))
+                    {
+                        named = true;
+                        return;
+                    }
+                    auto local = Compiler()->GetScopedLocalOrArgument(name);
+                    llvm::Value* namedStorage = local.Storage;
+                    if (namedStorage == nullptr && Compiler()->HasMemberVariable(name))
+                    {
+                        auto member = Compiler()->GetMemberVariable(name);
+                        const std::string separator = memberPath.empty() || memberPath[0] == '[' ? "" : ".";
+                        const std::string fullMemberPath = member.ThisFieldPath.empty()
+                            ? name + separator + memberPath
+                            : member.ThisFieldPath + separator + memberPath;
+                        // A path cut at a call or a non-literal subscript may reach any sub-object:
+                        // an overlap is a may-write, never a named write.
+                        if (memberInfo.cut && !fieldPathForComparison.empty())
+                        {
+                            if (mayWrite != nullptr && fieldPathsOverlap(fullMemberPath, fieldPathForComparison))
+                                *mayWrite = true;
+                            return;
+                        }
+                        if (!memberInfo.mayWrite && !fieldPathForComparison.empty()
+                            && fieldPathsOverlap(fullMemberPath, fieldPathForComparison))
+                        {
+                            named = true;
+                            return;
+                        }
+                        namedStorage = member.Storage;
+                    }
+                    if (namedStorage == nullptr)
+                    {
+                        auto global = Compiler()->GetGlobalVariableNV(name);
+                        namedStorage = global.Storage;
+                        if (namedStorage == nullptr && postfix != nullptr)
+                        {
+                            std::string qualifiedName = name;
+                            for (auto* member : postfix->memberNameToken())
+                            {
+                                qualifiedName += "." + member->getText();
+                                global = Compiler()->GetGlobalVariableNV(qualifiedName);
+                                if (global.Storage != nullptr)
+                                {
+                                    namedStorage = global.Storage;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    const llvm::Value* root = namedStorage != nullptr
+                        ? llvm::getUnderlyingObject(namedStorage) : nullptr;
                     if (root != nullptr && std::find(roots.begin(), roots.end(), root) != roots.end())
                     {
                         named = true;
@@ -1701,7 +1896,8 @@ static bool SameClosureSignature(const LLVMBackend::TypeAndValue& a, const LLVMB
         const auto& q = b.FuncPtrParams[i];
         if (p.TypeName != q.TypeName || p.Pointer != q.Pointer || p.PointerDepth != q.PointerDepth
             || p.IsMove != q.IsMove || p.IsRvalueRef != q.IsRvalueRef
-            || p.IsPointeeConst != q.IsPointeeConst || p.ResolvedTypeKey != q.ResolvedTypeKey
+            || ((p.ConstMask == -1 || q.ConstMask == -1) && p.IsPointeeConst != q.IsPointeeConst)
+            || p.ResolvedTypeKey != q.ResolvedTypeKey
             || p.IsOwningSink != q.IsOwningSink || p.IsConsumeInferredSink != q.IsConsumeInferredSink
             || p.IsReturnInferredSink != q.IsReturnInferredSink
             || p.IsWriteInferredSink != q.IsWriteInferredSink)
@@ -1711,13 +1907,12 @@ static bool SameClosureSignature(const LLVMBackend::TypeAndValue& a, const LLVMB
 }
 
 /*
- * `auto b = t ? f : g;` over two closures of ONE signature keeps that signature (the same fat
- * closure type as `Lambda<..> b = ...`), so the declaration stays callable. Arms that disagree
- * record nothing and the join stays refused, as before.
+ * `auto b = t ? f : g;` over two function values of ONE signature keeps that signature, so the
+ * declaration stays callable. Arms that disagree record nothing and the join stays refused.
  */
-static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::TypedValue& result,
-                                        const LLVMBackend::TypedValue& trueShape,
-                                        const LLVMBackend::TypedValue& falseShape)
+static void CarryCommonFunctionSignature(LLVMBackend* compiler, LLVMBackend::TypedValue& result,
+                                         const LLVMBackend::TypedValue& trueShape,
+                                         const LLVMBackend::TypedValue& falseShape)
 {
     auto carryLenders = [&](const auto& lenders) {
         for (const auto& lender : lenders)
@@ -1727,16 +1922,22 @@ static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::Type
     };
     carryLenders(trueShape.cxxClosureLenders);
     carryLenders(falseShape.cxxClosureLenders);
-    if (result.value == nullptr || result.value->getType() != compiler->GetClosureFatPtrType()) return;
-    auto isClosure = [](const LLVMBackend::TypedValue& shape) {
-        return shape.hasSourceType && shape.sourceType.TypeName == "__closure_fat_ptr"
+    if (result.value == nullptr) return;
+    auto isFunctionValue = [](const LLVMBackend::TypedValue& shape) {
+        return shape.hasSourceType
+            && (shape.sourceType.TypeName == "__closure_fat_ptr" || shape.sourceType.IsThinFnPtr())
             && shape.sourceType.IsFunctionPointer && !shape.sourceType.Pointer;
     };
-    if (!isClosure(trueShape) || !isClosure(falseShape)) return;
+    if (!isFunctionValue(trueShape) || !isFunctionValue(falseShape)) return;
+    const bool fatClosure = trueShape.sourceType.TypeName == "__closure_fat_ptr";
+    if ((fatClosure && (falseShape.sourceType.TypeName != "__closure_fat_ptr"
+            || result.value->getType() != compiler->GetClosureFatPtrType()))
+        || (!fatClosure && (!falseShape.sourceType.IsThinFnPtr()
+            || !result.value->getType()->isPointerTy()))) return;
     const auto& t = trueShape.sourceType;
     if (!SameClosureSignature(t, falseShape.sourceType)) return;
     LLVMBackend::TypeAndValue type;
-    type.TypeName = "__closure_fat_ptr";
+    type.TypeName = t.TypeName;
     type.IsFunctionPointer = true;
     type.FuncPtrReturnTypeName = t.FuncPtrReturnTypeName;
     type.FuncPtrReturnAliasSpelling = t.FuncPtrReturnAliasSpelling;
@@ -5347,7 +5548,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 result.hasSourceType = true;
             }
         }
-        CarryCommonClosureSignature(compiler, result, trueShape, falseShape);
+        CarryCommonFunctionSignature(compiler, result, trueShape, falseShape);
         if (resultValue != nullptr
             && (resultValue->getType()->isIntegerTy()
                 || resultValue->getType()->isFloatingPointTy()))
@@ -5770,6 +5971,20 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             };
             auto left = sourceType(trueShape, trueValue);
             auto right = sourceType(falseShape, falseValue);
+            auto hasRecordedConstMasks = [](const LLVMBackend::TypeAndValue& type) {
+                return std::all_of(type.FuncPtrParams.begin(), type.FuncPtrParams.end(),
+                    [](const auto& param) { return param.ConstMask >= 0; });
+            };
+            if (hasRecordedConstMasks(left) && hasRecordedConstMasks(right))
+            {
+                if (SameClosureSignature(left, right))
+                {
+                    result.sourceType = std::move(left);
+                    result.sourceTypeName = result.sourceType.TypeName;
+                    result.hasSourceType = true;
+                }
+                return;
+            }
             std::string leftSpelling;
             std::string rightSpelling;
             if (compiler->CxxThinFunctionPointerSpelling(left, leftSpelling)
@@ -6681,7 +6896,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 JoinConditionalStackCharBufferBorrow(result, trueShape, falseShape);
                 carryCommonThinFunctionPointerType(result, trueShape, falseShape,
                                                     trueValue, falseValue);
-                CarryCommonClosureSignature(compiler, result, trueShape, falseShape);
+                CarryCommonFunctionSignature(compiler, result, trueShape, falseShape);
                 if (eagerLifted) result.isRvalue = true;
                 return result;
             }

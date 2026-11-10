@@ -43,6 +43,16 @@ struct Assignment {
     Assignment& operator=(const Assignment&) = delete;
 };
 
+struct MoveAssignDeleted {
+    int v;
+    MoveAssignDeleted(int x) : v(x) {}
+    MoveAssignDeleted(const MoveAssignDeleted&) = default;
+    MoveAssignDeleted(MoveAssignDeleted&&) noexcept = default;
+    MoveAssignDeleted& operator=(const MoveAssignDeleted& other) { v = other.v; return *this; }
+    MoveAssignDeleted& operator=(MoveAssignDeleted&&) = delete;
+    ~MoveAssignDeleted() {}
+};
+
 struct RvalueArg { int x; };
 struct RvalueSibling {
     int f(RvalueArg&&) = delete;
@@ -90,3 +100,81 @@ CPPDEL_T122_RECEIVERS(VolRecvEDeleted)
 namespace rv { namespace a {
 inline int del(int) = delete;
 } }
+
+namespace cppdelrv {
+// A const prvalue cannot bind T&&: clang copy-assigns it.
+struct ConstPrvalueAssign {
+    int v;
+    ConstPrvalueAssign(int x) : v(x) {}
+    ConstPrvalueAssign(const ConstPrvalueAssign&) = default;
+    ConstPrvalueAssign(ConstPrvalueAssign&&) = default;
+    ConstPrvalueAssign& operator=(const ConstPrvalueAssign& other) { v = 100 + other.v; return *this; }
+    ConstPrvalueAssign& operator=(ConstPrvalueAssign&&) = delete;
+    ~ConstPrvalueAssign() {}
+};
+inline const ConstPrvalueAssign makeConstPrvalueAssign(int x) { return ConstPrvalueAssign(x); }
+
+// The deleted move-assign is `&&`-qualified: it is not viable for an lvalue destination, so clang copies.
+struct RvalueQualAssign {
+    int v;
+    RvalueQualAssign(int x) : v(x) {}
+    RvalueQualAssign(const RvalueQualAssign&) = default;
+    RvalueQualAssign(RvalueQualAssign&&) = default;
+    RvalueQualAssign& operator=(const RvalueQualAssign& other) & { v = 100 + other.v; return *this; }
+    RvalueQualAssign& operator=(RvalueQualAssign&&) && = delete;
+    ~RvalueQualAssign() {}
+};
+
+// A member deletes the defaulted move-assign: overload resolution ignores it, so clang copies.
+struct NoMoveBlock {
+    NoMoveBlock() = default;
+    NoMoveBlock(const NoMoveBlock&) = default;
+    NoMoveBlock(NoMoveBlock&&) = default;
+    NoMoveBlock& operator=(const NoMoveBlock&) { return *this; }
+    NoMoveBlock& operator=(NoMoveBlock&&) = delete;
+};
+struct DefaultedDeletedAssign {
+    int v;
+    NoMoveBlock b;
+    DefaultedDeletedAssign(int x) : v(x) {}
+    DefaultedDeletedAssign(const DefaultedDeletedAssign&) = default;
+    DefaultedDeletedAssign(DefaultedDeletedAssign&&) = default;
+    DefaultedDeletedAssign& operator=(const DefaultedDeletedAssign& other) { v = 100 + other.v; return *this; }
+    DefaultedDeletedAssign& operator=(DefaultedDeletedAssign&&) = default;
+    ~DefaultedDeletedAssign() {}
+};
+
+// The deleted non-const T&& is the better match for a non-const rvalue, over the usable const T&& one.
+struct ConstRvalueAssign {
+    int v;
+    ConstRvalueAssign(int x) : v(x) {}
+    ConstRvalueAssign(const ConstRvalueAssign&) = default;
+    ConstRvalueAssign(ConstRvalueAssign&&) = default;
+    ConstRvalueAssign& operator=(const ConstRvalueAssign& other) { v = 100 + other.v; return *this; }
+    ConstRvalueAssign& operator=(ConstRvalueAssign&&) = delete;
+    ConstRvalueAssign& operator=(const ConstRvalueAssign&& other) & { v = 200 + other.v; return *this; }
+    ~ConstRvalueAssign() {}
+};
+
+// A by-value operator=(T) ties with the deleted operator=(T&&) for a prvalue: clang reports ambiguity.
+struct ByValueAmbiguous {
+    int v;
+    ByValueAmbiguous(int x) : v(x) {}
+    ByValueAmbiguous(const ByValueAmbiguous&) = default;
+    ByValueAmbiguous(ByValueAmbiguous&&) = default;
+    ByValueAmbiguous& operator=(ByValueAmbiguous other) { v = 100 + other.v; return *this; }
+    ByValueAmbiguous& operator=(ByValueAmbiguous&&) = delete;
+    ~ByValueAmbiguous() {}
+};
+
+// Same tie with a top-level const by-value parameter.
+struct ConstByValueAmbiguous {
+    int v;
+    ConstByValueAmbiguous(int x) : v(x) {}
+    ConstByValueAmbiguous(const ConstByValueAmbiguous&) = default;
+    ConstByValueAmbiguous(ConstByValueAmbiguous&&) = default;
+    ConstByValueAmbiguous& operator=(const ConstByValueAmbiguous other) { v = 100 + other.v; return *this; }
+    ConstByValueAmbiguous& operator=(ConstByValueAmbiguous&&) = delete;
+    ~ConstByValueAmbiguous() {}
+};
+}

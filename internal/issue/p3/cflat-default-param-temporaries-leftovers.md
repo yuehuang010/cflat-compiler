@@ -1,14 +1,27 @@
-# CFlat default-parameter temporaries: leftovers after DEFCLS
+# CFlat default-parameter temporaries: remaining caller lifetime
 
-DEFCLS (daa3a99f, 2026-10-30 box 7) accepted C++-class-typed defaults on CFlat functions (expression, `default`, `{}`) via the
-default-param wrapper. Found by its Opus reviews; shapes inline (probe folder was removed with the worktree), header = any traced C++
-class `B` with a by-value ctor and dtor counter, `N` = native struct with a counting dtor.
-- Destroy timing: the default temp is destroyed when the wrapper returns, not at the end of the caller's full expression
-  (`wdefB(rv.mkB(1))`: clang `b1 b5 =1005 live=3 ~b5 ~b1`, cflat `b1 b5 ~b5 =1005 live=2 ~b1`). Counts and order vs other args are right.
-- Ternary default `rv.B d = flag ? rv.B(5) : rv.B(6)` takes one extra move (`b5 mb5 ~b5 ~b5`; clang elides). Live count balanced.
-- Native defaults (master behaviour, kept on purpose): `int f(N a, N d = N(5))` never destroys the default temp (leak, live stays up);
-  `N fRd(N a, N d = N(5)) { return d; }` called explicitly as `fRd(mkN(1), N(5))` destroys `n5` twice (live -1). Native or unique temps
-  created INSIDE a C++ class default (`rv.B d = rv.B(mkN(7).v)`) leak the same way.
-- Non-empty brace default `rv.B d = {5}` on a C++ class is still refused.
-Related: C++ functions with an OMITTED class-typed default landed as CDEFARG (daa3a99f, caller-slot initializer); shapes whose
-re-read default fails the declaration-identity check fall back to the forwarding wrapper (extra move, early destroy) by design.
+DEFCLS (daa3a99f, 2026-10-30 box 7) supports C++-class defaults on CFlat functions through a
+default-param wrapper. Class defaults in these wrappers still die before the caller's full
+expression ends: `wdefB(rv.mkB(1))` logs CFlat `b1 b5 ~b5 =1005 live=2 ~b1`, while clang logs
+`b1 b5 =1005 live=3 ~b5 ~b1`.
+
+Root cause: the wrapper evaluates the default expression in its own stack frame and flushes the
+owned temporary before returning. Keeping the destructor obligation in the wrapper cannot extend
+the object's lifetime into the caller. A caller-owned destination or call-site lowering is needed.
+Three destination-slot attempts did not move the destructor past the wrapper return; leave this
+item open rather than masking it with a leaked object.
+
+Native defaults remain intentionally unchanged: a native `N` default temp can leak, explicit
+`fRd(mkN(1), N(5))` can destroy `n5` twice, and native/unique temps built inside a C++ class
+default can leak. They are outside this class-temporary timing item.
+
+Related: omitted defaults on C++ functions use CDEFARG caller-slot initialization. Defaults that
+fail declaration-identity re-read still use the forwarding wrapper, with its existing early-destroy
+behavior.
+
+Round 3 residue: C++ class-typed, pointer/nullptr, string-literal, and nested-brace elements in
+C++ class parameter defaults are refused with a clean diagnostic. Three shared-helper attempts
+preserved class storage but still trapped or produced an extra constructor, and did not match
+clang for nullptr/string arguments. Scalar non-null non-string brace elements remain supported;
+the refused shapes match master's prior clean-refusal behavior. Earlier-parameter brace defaults
+remain accepted because scalar `int f(int a, int b = a)` is also accepted by CFlat.

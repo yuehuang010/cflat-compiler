@@ -2160,10 +2160,16 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                     if (mapped && mappedTarget.IsFunctionPointer)
                         RegisterFunctionTypeAlias(a.qualifiedName, mappedTarget);
                     else
-                        // `using Name = const char*` keeps its pointee const (a `(const char)*`).
-                        RegisterTypeAlias(a.qualifiedName, qualifiedTarget,
-                            mapped && cxxBoundary && mappedTarget.Pointer && !mappedTarget.ElemPointer
-                                && !mappedTarget.IsFunctionPointer && CxxSpellingHasConstPointee(a.target) ? 1 : 0);
+                    {
+                        // `using Name = const char*` keeps its pointee const (a `(const char)*`);
+                        // a multi-level alias keeps every pointee const level (`int* const*` -> 2).
+                        uint32_t aliasConstMask = 0;
+                        if (mapped && cxxBoundary && mappedTarget.Pointer && !mappedTarget.IsFunctionPointer)
+                            aliasConstMask = !mappedTarget.ElemPointer
+                                ? (CxxSpellingHasConstPointee(a.target) ? 1u : 0u)
+                                : CxxSpellingPointeeConstMask(a.target, mappedTarget.ValuePointerDepth());
+                        RegisterTypeAlias(a.qualifiedName, qualifiedTarget, aliasConstMask);
+                    }
                     if (mapped && mappedTarget.IsCxxNullptrT) cxxNullptrTAliases_.insert(a.qualifiedName);
                 }
                 // A global C++ typedef of a non-record type binds by its plain name, as clang sees

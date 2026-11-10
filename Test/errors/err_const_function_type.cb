@@ -4,6 +4,8 @@
 using C14ECStr = (const char)*;
 int c14eLen(const char* s) { return 1; }
 int c14ePoke(char* s) { s[0] = 'X'; return 7; }
+int c14eR3ReadConst((const int)* p) { return *p; }
+int c14eR3ReadMutable(int* p) { return *p; }
 (const char)* c14eName() { return "name"; }
 char* c14eMutName() { return nullptr; }
 int c14eTakeC(function<int((const char)*)> f) { return f("abcd"); }
@@ -28,6 +30,12 @@ expect_error("cannot convert 'Lambda<int((const char)*)>' to 'Lambda<int(char*)>
 
 extern int main()
 {
+    int r3k = 1;
+    function<int((const int)*)> r3a = c14eR3ReadConst;
+    function<int(int*)> r3b = c14eR3ReadMutable;
+    expect_error("the conversion discards const") {
+        function<int(int*)> r3w = r3k ? r3a : r3b;
+    }
     function<int((const char)*)> f = c14eLen;
     function<int(char*)> g = c14ePoke;
     function<(const char)*()> h = c14eName;

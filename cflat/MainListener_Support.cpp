@@ -2277,12 +2277,24 @@ void ShapeCoreUniqueCtorArg(const LLVMBackend* compiler,
     ctorArg.TypeAndValue.ElemPointer = false;
     ctorArg.TypeAndValue.PointerDepth = 0;
 }
-void CanonicalizeUniqueSigComponent(const LLVMBackend* compiler, std::string& typeName,
-                                           bool& pointer, int& pointerDepth)
+void CanonicalizeUniqueSigComponent(LLVMBackend* compiler, std::string& typeName,
+                                           bool& pointer, int& pointerDepth,
+                                           std::string* cxxUniqueError)
 {
     if (compiler == nullptr || pointer || !compiler->IsCoreUniqueType(typeName)) return;
     std::string pointee = MangledGenericArgument(*compiler, typeName);
     if (compiler->IsInterfaceType(pointee)) return;
+    if (compiler->IsCxxUniquePtrPointee(pointee))
+    {
+        std::string localError;
+        std::string& error = cxxUniqueError != nullptr ? *cxxUniqueError : localError;
+        std::string cxxUniqueType = compiler->CxxUniquePtrForUniqueKeyword(pointee, error);
+        if (!cxxUniqueType.empty())
+        {
+            typeName = std::move(cxxUniqueType);
+            return;
+        }
+    }
     typeName = pointee;
     pointer = true;
     pointerDepth = 1;

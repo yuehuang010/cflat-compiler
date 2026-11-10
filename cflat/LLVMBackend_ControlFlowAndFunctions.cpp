@@ -863,6 +863,15 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                                                    "into a by-value function parameter",
                                                    CxxConstReceiverKind((*argNVs)[i]) != 0))
                     continue;
+                if ((*argNVs)[i].IsExplicitMove
+                    && IsCxxUniquePtrPointee(CxxUniquePtrPointee(params[i].TypeName))
+                    && !(*argNVs)[i].IsElementAccess
+                    && (*argNVs)[i].FieldName.empty())
+                {
+                    auto* sourceType = GetType(TypeAndValue{ .TypeName = params[i].TypeName });
+                    builder->CreateStore(llvm::Constant::getNullValue(sourceType),
+                                         (*argNVs)[i].Storage);
+                }
                 const bool cflatHolder = !IsForeignNontrivialCxxClass(params[i].TypeName)
                     && HasForeignNontrivialCxxField(params[i].TypeName);
                 if (!cflatHolder && !IsCxxParamDestroyedInCallee(params[i].TypeName))

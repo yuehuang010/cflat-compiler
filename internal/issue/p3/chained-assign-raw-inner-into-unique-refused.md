@@ -14,18 +14,9 @@ form. Still open:
 Global inner `owner = gRaw = new PS()` stays refused (a global is never a consumable slot).
 
 ## T250 review 1 (repros scratch/repro_keep/t250_rev/)
-- Still refused while the two-statement form compiles: a `??` arm, a `(PS*)0` arm, `owner = (raw = mkU())`,
-  `return (raw = new PS())`.
-- Pre-existing leaks in the TWO-statement form (master and T250 alike): `raw = mkU(); owner = raw;` 0 dtors
-  (cases/mk_two.cb); `raw = (c ? new PS[3] : nullptr); owner = raw;` into `unique PS*` 1 of 3 dtors
-  (cases/arr_tern_two.cb - should refuse an array into a scalar unique); `PS* other = new PS();
-  raw = (c ? new PS() : other);` 1 dtor where 2 are expected (cases3/tern_owned_two_nouse.cb).
-
-## Ruling 2026-10-15 (T250): two-statement form refused
-`r.raw = new PS(); owner = r.raw;` is refused exactly like `unique PS* owner = r.raw;` and the chained form - assignment
-and declaration agree. Steer: `owner = move r.raw;` or `owner = new PS();`.
-
-## T443 (2026-10-23): ternary into unique + borrowed-global call landed; open below
-Fixed: `owner = k ? raw : nullptr` (decl and assign) consumes the selected arm like if/else; `owner = pick()` is refused when
-every return of the callee is a module global (parse-tree summary, order-independent, per generic instance).
-- `j_field` residual (T266) unchanged.
+- Still refused while the two-statement form compiles: a `??` arm and a `(PS*)0` arm (three attempts, 2026-11-08).
+- `return (raw = (c ? new PS() : other))` into `unique PS*` is refused ("cannot return borrowed value 'raw'"),
+  while `raw = (c ? new PS() : other); return raw;` compiles (2026-11-08).
+- Parameter destination leak (master the same): `void f(PS* raw, bool c) { PS* other = new PS(); raw = (c ? new PS() : other); }`
+  with c true frees `other` but not the fresh block (3 births, 2 dtors). Argument slots carry no owner bit, so the
+  join is not adopted there.

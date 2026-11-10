@@ -155,6 +155,26 @@ struct PtrRankRecordCtor {
     PtrRankRecordCtor(const PtrRankRecord* p, int) : chosen(1), seen(p->v) {}
     PtrRankRecordCtor(const PtrRankRecord& v, int) : chosen(2), seen(v.v) {}
 };
+inline int ptr_rank_deep_born = 0;
+typedef int* PtrRankIP;
+inline PtrRankIP ptr_rank_make_ip(int* p) { return p; }
+struct PtrRankDeep {
+    int chosen;
+    int seen;
+    PtrRankDeep(const int* p) : chosen(1), seen(*p) { ++ptr_rank_deep_born; }
+    PtrRankDeep(const int& v) : chosen(2), seen(v) { ++ptr_rank_deep_born; }
+};
+inline int ptr_rank_deep(PtrRankDeep p) { return p.chosen * 100 + p.seen; }
+inline int ptr_rank_deep_tracked_born = 0;
+inline int ptr_rank_deep_tracked_dtors = 0;
+struct PtrRankDeepTracked {
+    int chosen;
+    int seen;
+    PtrRankDeepTracked(const int* p) : chosen(1), seen(*p) { ++ptr_rank_deep_tracked_born; }
+    PtrRankDeepTracked(const int& v) : chosen(2), seen(v) { ++ptr_rank_deep_tracked_born; }
+    ~PtrRankDeepTracked() { ++ptr_rank_deep_tracked_dtors; }
+};
+inline int ptr_rank_deep_ref(const PtrRankDeepTracked& p) { return p.chosen * 100 + p.seen; }
 inline int ptr_rank_free(const int* p) { return p[1] + 100; }
 inline int ptr_rank_free(const int& v) { return v + 200; }
 struct PtrRankMember {

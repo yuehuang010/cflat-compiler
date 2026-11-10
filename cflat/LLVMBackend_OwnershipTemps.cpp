@@ -1820,14 +1820,14 @@ void LLVMBackend::RecordOwnFlagLoopBreakState()
             const auto* live = FindVariableByStorage(sink.Storage);
             if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
                 || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
-                frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceName(*live));
+                frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceDiagnosticName(*live));
         }
         for (const auto& sink : frame.moveOwnerSinks)
         {
             const auto* live = FindVariableByStorage(sink.Storage);
             if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
                 || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
-                frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceName(*live));
+                frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceDiagnosticName(*live));
         }
         for (size_t i = 0; i + 1 < ownFlagLoopReownSnapshots_.size(); ++i)
         {
@@ -1838,7 +1838,7 @@ void LLVMBackend::RecordOwnFlagLoopBreakState()
                     const auto* live = FindVariableByStorage(sink.Storage);
                     if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
                         || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
-                        frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceName(*live));
+                        frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceDiagnosticName(*live));
                 }
             };
             captureOuterSinkBorrow(outerFrame.uniqueOwnerSinks);
@@ -6220,6 +6220,41 @@ std::string LLVMBackend::BorrowedSourceName(const NamedVariable& nv)
         return nv.TypeAndValue.VariableName;
     }
 
+std::string LLVMBackend::DisplayDiagnosticName(std::string_view raw) const
+{
+        if (raw.find('$') == std::string_view::npos) return std::string(raw);
+        for (const auto& [_, symbols] : functionTable)
+            for (const auto& symbol : symbols)
+                if (symbol.IsMethod && symbol.SourceName == raw)
+                    return DisplayDiagnosticName(raw, &symbol);
+        return SpellType(*this, TypeAndValue{ .TypeName = std::string(raw) });
+}
+
+std::string LLVMBackend::DisplayDiagnosticName(std::string_view raw,
+                                                const FunctionSymbol* symbol) const
+{
+        if (symbol != nullptr && symbol->IsMethod && !symbol->IsCxx
+            && !symbol->Parameters.empty() && !symbol->SourceName.empty())
+        {
+            TypeAndValue self = symbol->Parameters.front();
+            self.Pointer = false;
+            self.IsAlias = false;
+            const std::string ownerPrefix = self.TypeName + ".";
+            std::string_view member = symbol->SourceName;
+            if (symbol->SourceName.starts_with(ownerPrefix))
+                member.remove_prefix(ownerPrefix.size());
+            if (!member.empty())
+                return SpellType(*this, self) + "." + DisplayDiagnosticName(member);
+        }
+        if (raw.find('$') == std::string_view::npos) return std::string(raw);
+        return SpellType(*this, TypeAndValue{ .TypeName = std::string(raw) });
+}
+
+std::string LLVMBackend::BorrowedSourceDiagnosticName(const NamedVariable& nv) const
+{
+        return DisplayDiagnosticName(BorrowedSourceName(nv));
+}
+
 std::string LLVMBackend::BorrowedSourceDisplayName(const NamedVariable& nv) const
 {
         // A method call resolved to a symbol with a self parameter names its owner type.
@@ -6229,14 +6264,10 @@ std::string LLVMBackend::BorrowedSourceDisplayName(const NamedVariable& nv) cons
                     sym != nullptr && sym->IsMethod && !sym->IsCxx && !sym->Parameters.empty()
                     && !sym->SourceName.empty())
                 {
-                    TypeAndValue self = sym->Parameters.front();
-                    self.Pointer = false;
-                    self.IsAlias = false;
-                    return SpellType(*this, self) + "." + sym->SourceName;
+                    return DisplayDiagnosticName(sym->SourceName, sym);
                 }
         std::string raw = BorrowedSourceName(nv);
-        if (raw.find('$') == std::string::npos) return raw;
-        return SpellType(*this, TypeAndValue{ .TypeName = raw });
+        return DisplayDiagnosticName(raw);
     }
 
 void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,

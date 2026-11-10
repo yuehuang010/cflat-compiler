@@ -80,4 +80,35 @@ namespace t25surface
             if (cmp(key, b + i * size) == 0) return const_cast<char*>(b + i * size);
         return nullptr;
     }
+
+    // Return-type const on a callback: `int*(*)(const int*)` vs `const int*(*)(int*)`.
+    typedef int* (*RetMutC)(const int*);
+    typedef const int* (*RetConstC)(int*);
+    inline int pick_ret(RetMutC) { return 71; }
+    inline int pick_ret(RetConstC) { return 72; }
+    typedef int (*RefConst)(const int&);
+    typedef int (*RefMutable)(int&);
+    inline int rpick(RefConst) { return 1; }
+    inline int rpick(RefMutable) { return 2; }
+    inline int ref_const(const int& x) { return x; }
+    inline int ref_mutable(int& x) { return x; }
+    inline int* ret_mut_int(int* p) { return p; }
+    inline const int* ret_const(int* p) { return p; }
+    inline int* ret_plain(const int* p) { return const_cast<int*>(p); }
+    inline const int* ret_const_only(const int* p) { return p; }
+    // A single candidate: clang refuses a callback whose pointee const or return const differs.
+    inline int only_const(CompareC) { return 1; }
+    inline int only_mut(CompareM) { return 2; }
+    inline int only_ret_mut(RetMutC) { return 71; }
+
+    typedef int (*ScopeConst)(const int*);
+    typedef int (*ScopeVoid)(void*);
+    inline int pick_scope(ScopeConst) { return 61; }
+    inline int pick_scope(ScopeVoid) { return 62; }
+    inline int scope_cb(int* p) { return p == nullptr; }
+    typedef int* (*ReturnConstParam)(const int*);
+    typedef const int* (*ReturnConstResult)(int*);
+    inline int pick_return(ReturnConstParam) { return 71; }
+    inline int pick_return(ReturnConstResult) { return 72; }
+    inline int* return_cb(int* p) { return p; }
 }

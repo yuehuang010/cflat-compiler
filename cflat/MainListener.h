@@ -690,8 +690,9 @@ void ShapeCoreUniqueCtorArg(const LLVMBackend* compiler,
 // A function-pointer SIGNATURE keeps the raw pointee spelling a desugared `unique X*` element
 // had before the desugar, so a user lambda stays spelled `X*` and the indirect-call adaptation
 // borrows the wrapper into it. The interface arm has no pointer spelling and is left alone.
-void CanonicalizeUniqueSigComponent(const LLVMBackend* compiler, std::string& typeName,
-                                           bool& pointer, int& pointerDepth);
+void CanonicalizeUniqueSigComponent(LLVMBackend* compiler, std::string& typeName,
+                                           bool& pointer, int& pointerDepth,
+                                           std::string* cxxUniqueError = nullptr);
 
 // True when `unique X*` / `unique IFace` in GENERIC-ARGUMENT position spells the core
 // `unique<X>` value. Unsupported forms are rejected before a type-argument spelling is mangled.
@@ -5695,6 +5696,10 @@ public:
                                                               ResultUse use = ResultUse::Value);
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamedBody(CFlatParser::AssignmentExpressionContext* ctx,
                                                                   ResultUse use);
+    void PrepareCxxBraceElement(LLVMBackend::NamedVariable& element, llvm::Value* value,
+                                bool deferredDefault, bool targetIsReference,
+                                const std::string& targetSpelling,
+                                std::vector<std::string>& targetTypes);
 
     /*
      * Provable shape mismatch on a DIRECT class->interface upcast (decl-init, '=', return, and
@@ -7883,7 +7888,9 @@ public:
                                    LLVMBackend::TypeAndValue& returnType);
     bool IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool condition = false);
     // T518: whether `ctx` names a local or parameter whose storage is one of `storage`'s roots.
-    bool ArgumentNamesStorageRoot(antlr4::ParserRuleContext* ctx, llvm::Value* storage);
+    bool ArgumentNamesStorageRoot(antlr4::ParserRuleContext* ctx, llvm::Value* storage,
+                                 const std::string& thisFieldPath, bool* mayWrite = nullptr,
+                                 antlr4::ParserRuleContext* targetCtx = nullptr);
     // T518: the `?:` of a call argument whose every leaf is `default`; nullptr otherwise.
     antlr4::ParserRuleContext* CxxDefaultOnlyTernary(antlr4::ParserRuleContext* ctx);
     bool IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx);
