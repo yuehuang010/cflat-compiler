@@ -369,6 +369,7 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 if (IsSameTypeCastOfDefault(ctx, destTypeName.TypeName))
                 {
                     namedVar.IsRvalue = true;
+                    namedVar.IsCxxPrvalueTemp = true;
                     return namedVar;
                 }
                 // A same-type cast of an lvalue is a prvalue copy in C++; consuming destinations

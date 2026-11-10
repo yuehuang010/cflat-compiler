@@ -1,4 +1,5 @@
 // cflat-twin-args: -O2
+import cpp "compare";
 
 // ── Vec2: 2D vector with full arithmetic ────────────────────────────────────
 
@@ -323,6 +324,88 @@ import "list.cb";
 import "string.cb";
 import "tuple.cb";
 
+int defEqObservedCalls = 0;
+struct DefEqObserved
+{
+    int value = default;
+    bool operator==(DefEqObserved other)
+    {
+        defEqObservedCalls++;
+        return value == other.value;
+    }
+};
+
+struct DefEqShortCircuit
+{
+    int first = default;
+    DefEqObserved later = default;
+    bool operator==(DefEqShortCircuit other) = default;
+};
+
+struct DefEqInner
+{
+    int value = default;
+    bool operator==(DefEqInner other) = default;
+};
+
+struct DefEqMixed
+{
+    int id = default;
+    string name = default;
+    DefEqInner inner = default;
+    int[2] values = default;
+    int* address = nullptr;
+    bool operator==(DefEqMixed other) = default;
+};
+
+struct DefEqBox<T>
+{
+    T value = default;
+    bool operator==(DefEqBox<T> other) = default;
+};
+
+int defaultedEqualityLegs()
+{
+    int passed = 0;
+    int* p = new int();
+    int* q = new int();
+    DefEqMixed a = default;
+    DefEqMixed b = default;
+    a.id = 7; b.id = 7;
+    a.name = "alpha"; b.name = "alpha";
+    a.inner.value = 4; b.inner.value = 4;
+    a.values[0] = 2; b.values[0] = 2;
+    a.values[1] = 9; b.values[1] = 9;
+    a.address = p; b.address = p;
+    passed += Test("defaulted equality all fields", a == b, true);
+    passed += Test("defaulted inequality all fields", a != b, false);
+    b.id = 8;
+    passed += Test("defaulted equality scalar mismatch", a == b, false);
+    passed += Test("defaulted inequality scalar mismatch", a != b, true);
+    b.id = 7; b.name = "beta";
+    passed += Test("defaulted equality string mismatch", a == b, false);
+    b.name = "alpha"; b.inner.value = 5;
+    passed += Test("defaulted equality nested mismatch", a == b, false);
+    b.inner.value = 4; b.values[1] = 10;
+    passed += Test("defaulted equality array mismatch", a == b, false);
+    b.values[1] = 9; b.address = q;
+    passed += Test("defaulted equality pointer address", a == b, false);
+    DefEqBox<int> bi = default; DefEqBox<int> bj = default;
+    bi.value = 11; bj.value = 11;
+    passed += Test("defaulted generic equality", bi == bj, true);
+    bj.value = 12;
+    passed += Test("defaulted generic inequality", bi != bj, true);
+    DefEqShortCircuit sa = default; DefEqShortCircuit sb = default;
+    sa.first = 1; sb.first = 2;
+    sa.later.value = 3; sb.later.value = 3;
+    defEqObservedCalls = 0;
+    passed += Test("defaulted equality first mismatch", sa == sb, false);
+    passed += Test("defaulted equality short circuits", defEqObservedCalls, 0);
+    delete p;
+    delete q;
+    return passed;
+}
+
 int g_userAtollCalls = 0;
 extern i64 atoll(const char* s) { g_userAtollCalls++; return 777; }
 bool userLibcAtollWins()
@@ -444,6 +527,7 @@ int OpUnwStructCtorFields(int x)
 // stay unwindable (it was nounwind: the throw terminated even at -O0).
 import cpp "library/cpp_interop_override_abi.h";
 import cpp "library/cpp_t78_scalar_table.h";
+import cpp "library/cpp_spaceship_bases.h";
 [cpp] struct OpUnwOverride : cppoa.Base
 {
     int k = 0;
@@ -492,6 +576,66 @@ int*[2][2] dixGlobalPointers;
 int srctypeTag(i64 value) { return 5; }
 int srctypeTag(u64 value) { return 6; }
 int srctypeTag(u32 value) { return 7; }
+
+struct SpaceshipNative
+{
+    int value = 0;
+    std.strong_ordering operator<=>(SpaceshipNative other) { return value <=> other.value; }
+};
+struct SpaceshipScalar
+{
+    int value = 0;
+    std.strong_ordering operator<=>(int other) { return value <=> other; }
+};
+struct SpaceshipNested
+{
+    int value = 0;
+    auto operator<=>(SpaceshipNested other) = default;
+};
+struct SpaceshipDefaultAuto
+{
+    int first = 0;
+    SpaceshipNested nested = default;
+    auto operator<=>(SpaceshipDefaultAuto other) = default;
+};
+struct SpaceshipDefaultSpelled
+{
+    int value = 0;
+    std.strong_ordering operator<=>(SpaceshipDefaultSpelled other) = default;
+};
+struct SpaceshipDefaultPartial
+{
+    int value = 0;
+    std.partial_ordering operator<=>(SpaceshipDefaultPartial other) = default;
+};
+struct SpaceshipDefaultBool
+{
+    bool value = false;
+    auto operator<=>(SpaceshipDefaultBool other) = default;
+};
+struct SpaceshipCustomEquality
+{
+    int value = 0;
+    auto operator<=>(SpaceshipCustomEquality other) = default;
+    bool operator==(SpaceshipCustomEquality other) { return true; }
+};
+struct SpaceshipCustomEqualityBefore
+{
+    int value = 0;
+    bool operator==(SpaceshipCustomEqualityBefore other) { return value == other.value; }
+    auto operator<=>(SpaceshipCustomEqualityBefore other) = default;
+};
+int spaceshipForwardDefaultedUse()
+{
+    SpaceshipForwardDefault left = default;
+    SpaceshipForwardDefault right = default;
+    return left == right;
+}
+struct SpaceshipForwardDefault
+{
+    int value = 7;
+    auto operator<=>(SpaceshipForwardDefault other) = default;
+};
 
 extern int main()
 {
@@ -1211,10 +1355,13 @@ extern int main()
     if (ternaddrLegs() != 15) return 81;
     if (ternaddrDeepLegs() != 10) return 82;
     if (nestedReceiverLegs() != 10) return 83;
+    if (defaultedEqualityLegs() != 12) return 84;
 
     if (t484CallableVariableLegs() != 2) return 63;
     if (t484MemberFieldCallLegs() != 1) return 64;
     if (shiftNativeCallResultLegs() != 6) return 79;
+    if (spaceshipLegs() != 54) return 101;
+    if (spaceshipForwardDefaultedUse() != 1) return 102;
     return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
@@ -3092,5 +3239,137 @@ int nestedReceiverLegs()
     passed += Test("nr_three_deep_selects_b", nrThreeDeep(true, true, false), 1934);
     passed += Test("nr_three_deep_selects_c", nrThreeDeep(true, false, true), 1294);
     passed += Test("nr_three_deep_selects_d", nrThreeDeep(false, true, true), 1239);
+    return passed;
+}
+
+// A user type that merely shares a category's name keeps its own declared operators (review r4).
+namespace SpaceshipSpoof {
+    struct strong_ordering
+    {
+        int value = 1;
+        bool operator<(int other) { return true; }
+        bool operator==(int other) { return true; }
+    };
+}
+
+int spaceshipLegs()
+{
+    int passed = 0;
+    SpaceshipSpoof.strong_ordering spoofOrder;
+    passed += Test("spaceship user strong_ordering keeps its operators", spoofOrder < 0 && spoofOrder == 0, true);
+    // A non-negative constant against an unsigned operand is not narrowing (C++ [dcl.init.list]).
+    uint constantUnsigned = 2u;
+    passed += Test("spaceship constant vs unsigned", std.is_lt(1 <=> constantUnsigned), true);
+    passed += Test("spaceship unsigned vs constant", std.is_gt(constantUnsigned <=> 1), true);
+    // First builtin use in a function: the category is demanded, not assumed absent (review r4).
+    passed += Test("spaceship first use demands the category", std.is_lt(1 <=> 2), true);
+    // A typed null pointer is a pointer operand, not nullptr_t (clang++ -std=c++20: accepted).
+    int typedNullTarget = 0;
+    int* typedNullPointer = &typedNullTarget;
+    passed += Test("spaceship typed null pointer", (typedNullPointer <=> (int*)nullptr) > 0, true);
+    // A ternary with one nullptr arm is a pointer, not nullptr_t (clang++ -std=c++20: accepted).
+    bool typedNullPick = typedNullTarget == 0;
+    passed += Test("spaceship conditional null arm", ((typedNullPick ? typedNullPointer : nullptr) <=> typedNullPointer) == 0, true);
+    // A non-primary base pointer compares after the derived-to-base adjustment (clang: equal).
+    cppss.M spaceshipDerived = default;
+    cppss.M* spaceshipDerivedPointer = &spaceshipDerived;
+    cppss.B* spaceshipBasePointer = cppss.base(spaceshipDerivedPointer);
+    passed += Test("spaceship derived vs non-primary base",
+        (spaceshipDerivedPointer <=> spaceshipBasePointer) == 0
+            && (spaceshipBasePointer <=> spaceshipDerivedPointer) == 0, true);
+    auto lessInt = 1 <=> 2;
+    auto equalInt = 2 <=> 2;
+    auto greaterInt = 3 <=> 2;
+    passed += Test("spaceship int less", std.is_lt(lessInt), true);
+    passed += Test("spaceship builtin category type", typeof(lessInt), "std.strong_ordering");
+    passed += Test("spaceship int equal zero", equalInt == 0, true);
+    passed += Test("spaceship int greater zero", greaterInt > 0, true);
+
+    auto lessDouble = 1.25 <=> 2.5;
+    auto equalDouble = 2.5 <=> 2.5;
+    passed += Test("spaceship floating category type", typeof(lessDouble), "std.partial_ordering");
+    passed += Test("spaceship double partial less", std.is_lt(lessDouble), true);
+    passed += Test("spaceship double partial equal", std.is_eq(equalDouble), true);
+    int negativeOne = -1;
+    auto mixedFloatOrder = negativeOne <=> 0.5;
+    passed += Test("spaceship mixed int double", std.is_lt(mixedFloatOrder), true);
+    i64 signedWide = -1;
+    u32 unsignedNarrow = 1u;
+    auto mixedWidthOrder = signedWide <=> unsignedNarrow;
+    passed += Test("spaceship signed wider than unsigned", std.is_lt(mixedWidthOrder), true);
+    double nanValue = 0.0 / 0.0;
+    auto nanOrder = nanValue <=> 1.0;
+    passed += Test("spaceship nan not less", std.is_lt(nanOrder), false);
+    passed += Test("spaceship nan not equal", std.is_eq(nanOrder), false);
+    passed += Test("spaceship nan differs from zero", nanOrder != 0, true);
+    passed += Test("spaceship nan < zero", nanOrder < 0, false);
+    passed += Test("spaceship nan <= zero", nanOrder <= 0, false);
+    passed += Test("spaceship nan > zero", nanOrder > 0, false);
+    passed += Test("spaceship nan >= zero", nanOrder >= 0, false);
+    passed += Test("spaceship less < zero", lessInt < 0, true);
+    passed += Test("spaceship less <= zero", lessInt <= 0, true);
+    passed += Test("spaceship greater > zero", greaterInt > 0, true);
+    passed += Test("spaceship greater >= zero", greaterInt >= 0, true);
+
+    int[2] values = { 10, 20 };
+    int* first = values;
+    int* second = values + 1;
+    auto pointerOrder = first <=> second;
+    auto samePointerOrder = first <=> first;
+    passed += Test("spaceship pointer array order", std.is_lt(pointerOrder), true);
+    passed += Test("spaceship pointer equality", std.is_eq(samePointerOrder), true);
+
+    SpaceshipNative left; left.value = 4;
+    SpaceshipNative right; right.value = 7;
+    auto nativeOrder = left <=> right;
+    passed += Test("spaceship CFlat member <", left < right, true);
+    passed += Test("spaceship CFlat member <=", left <= right, true);
+    passed += Test("spaceship CFlat member >", right > left, true);
+    passed += Test("spaceship CFlat member >=", right >= left, true);
+    passed += Test("spaceship CFlat member result", std.is_lt(nativeOrder), true);
+
+    SpaceshipScalar scalar; scalar.value = 3;
+    passed += Test("spaceship reversed member less", 2 < scalar, true);
+    passed += Test("spaceship reversed member false", 4 < scalar, false);
+    passed += Test("spaceship reversed member greater", 4 > scalar, true);
+    auto scalarReverseOrder = 2 <=> scalar;
+    passed += Test("spaceship direct reversed member result", std.is_lt(scalarReverseOrder), true);
+
+    SpaceshipDefaultAuto defaultLeft; defaultLeft.first = 1; defaultLeft.nested.value = 5;
+    SpaceshipDefaultAuto defaultRight; defaultRight.first = 1; defaultRight.nested.value = 8;
+    passed += Test("defaulted spaceship auto <", defaultLeft < defaultRight, true);
+    passed += Test("defaulted spaceship auto <=", defaultLeft <= defaultRight, true);
+    passed += Test("defaulted spaceship auto >", defaultRight > defaultLeft, true);
+    passed += Test("defaulted spaceship auto >=", defaultRight >= defaultLeft, true);
+    passed += Test("defaulted spaceship implies == true", defaultLeft == defaultLeft, true);
+    passed += Test("defaulted spaceship implies != false", defaultLeft != defaultLeft, false);
+    passed += Test("defaulted spaceship implies == false", defaultLeft == defaultRight, false);
+    passed += Test("defaulted spaceship implies != true", defaultLeft != defaultRight, true);
+
+    SpaceshipDefaultSpelled spelledLeft; spelledLeft.value = 1;
+    SpaceshipDefaultSpelled spelledRight; spelledRight.value = 2;
+    auto spelledOrder = spelledLeft <=> spelledRight;
+    passed += Test("defaulted spaceship spelled result", std.is_lt(spelledOrder), true);
+    passed += Test("defaulted spaceship spelled relation", spelledLeft < spelledRight, true);
+
+    SpaceshipDefaultPartial partialLeft; partialLeft.value = 1;
+    SpaceshipDefaultPartial partialRight; partialRight.value = 2;
+    auto partialOrder = partialLeft <=> partialRight;
+    passed += Test("defaulted spaceship spelled partial conversion", std.is_lt(partialOrder), true);
+
+    SpaceshipDefaultBool falseBool; falseBool.value = false;
+    SpaceshipDefaultBool trueBool; trueBool.value = true;
+    passed += Test("defaulted spaceship bool member promotion", falseBool < trueBool, true);
+
+    SpaceshipCustomEquality customLeft; customLeft.value = 1;
+    SpaceshipCustomEquality customRight; customRight.value = 2;
+    passed += Test("defaulted spaceship keeps declared ==", customLeft == customRight, true);
+    passed += Test("defaulted spaceship keeps declared != rewrite", customLeft != customRight, false);
+
+    SpaceshipCustomEqualityBefore equalityBeforeLeft; equalityBeforeLeft.value = 1;
+    SpaceshipCustomEqualityBefore equalityBeforeRight; equalityBeforeRight.value = 2;
+    passed += Test("declared == before defaulted spaceship", equalityBeforeLeft == equalityBeforeRight, false);
+    passed += Test("declared == before spaceship does not mask order", equalityBeforeLeft < equalityBeforeRight, true);
+
     return passed;
 }

@@ -1,0 +1,59 @@
+struct EqNoOperator
+{
+    int value = default;
+};
+
+struct EqDeleted
+{
+    EqNoOperator f = default;
+    bool operator==(EqDeleted other) = default;
+};
+
+struct EqGeneric<T>
+{
+    T value = default;
+    bool operator==(EqGeneric<T> other) = default;
+};
+
+expect_error("defaulted operator== of 'EqDeleted' is deleted: field 'f' of type 'EqNoOperator' has no operator '=='") {
+    bool compareDeletedEquality()
+    {
+        EqDeleted a = default;
+        EqDeleted b = default;
+        return a == b;
+    }
+}
+
+expect_error("field 'value' of type 'EqNoOperator' has no operator '=='") {
+    bool compareDeletedGenericEquality()
+    {
+        EqGeneric<EqNoOperator> a = default;
+        EqGeneric<EqNoOperator> b = default;
+        return a == b;
+    }
+}
+
+union EqUnion
+{
+    int i;
+    float f;
+    bool operator==(EqUnion other) = default;
+};
+
+expect_error("defaulted operator== of 'EqUnion' is deleted: it is a union") {
+    bool compareUnionEquality()
+    {
+        EqUnion a = default;
+        EqUnion b = default;
+        return a == b;
+    }
+}
+
+expect_error("operator== of 'EqTwice' is both defaulted and defined") {
+    struct EqTwice
+    {
+        int v = default;
+        bool operator==(EqTwice other) = default;
+        bool operator==(EqTwice other) { return false; }
+    };
+}

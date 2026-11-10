@@ -752,3 +752,20 @@ expect_error("the view may be borrowed on a runtime path") {
         t377MoveViewSink(move q->hs[0].view);
     }
 }
+
+// A view field may own its buffer: `move p->view` into a move sink is a transfer, refused through a borrow.
+expect_error("cannot 'move' field 'T387FieldHolder.view' through borrowed parameter 'p'") {
+    void t531SinkThroughBorrow(T387FieldHolder* p)
+    {
+        t377MoveViewSink(move p->view);
+    }
+}
+
+// An explicit `move` of the local copy into a sink is refused: the local holds a borrowed view.
+expect_error("cannot 'move' field 'T387FieldHolder.view' through borrowed parameter 'p'") {
+    void t531LocalThenSink(T387FieldHolder* p)
+    {
+        T377MoveView[] r = move p->view;
+        t377MoveViewSink(move r);
+    }
+}

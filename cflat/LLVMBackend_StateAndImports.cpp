@@ -3166,6 +3166,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.hasDefaultCtor)        j["hdc"] = true;
         if (r.hasCopyCtor)           j["hcc"] = true;
         if (r.hasCtorTemplate)       j["hct"] = true;
+        if (r.hasConversionTemplate) j["hcv"] = true;
         if (r.hasAssignTemplate)     j["hat"] = true;
         if (r.moveAssignBindsConstRef) j["mab"] = true;
         if (r.moveAssignConstSourceBindsConstRef) j["mabc"] = true;
@@ -3294,6 +3295,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasDefaultCtor        = j.value("hdc", false);
         r.hasCopyCtor           = j.value("hcc", false);
         r.hasCtorTemplate       = j.value("hct", false);
+        r.hasConversionTemplate = j.value("hcv", false);
         r.hasAssignTemplate     = j.value("hat", false);
         r.moveAssignBindsConstRef = j.value("mab", false);
         r.moveAssignConstSourceBindsConstRef = j.value("mabc", false);

@@ -1687,6 +1687,10 @@ bool ViewFieldAliasProvesParam(antlr4::tree::ParseTree* bodyRoot,
         const LLVMBackend::TypeAndValue& param,
         const CFlatParser::LambdaExpressionContext* functionLambda);
 
+// True when the `move` is the whole initializer of a LOCAL declaration (`T[] r = move p->v;`): the one
+// destination where moving a borrowed view copies it. Sinks and owning slots keep the refusal.
+bool MoveIsLocalDeclInitializer(antlr4::tree::ParseTree* move);
+
 std::string ViewFieldMovePath(CFlatParser::UnaryExpressionContext* source,
         antlr4::tree::ParseTree* bodyRoot,
         const LLVMBackend::TypeAndValue& param,
@@ -2423,6 +2427,7 @@ private:
     antlr4::BufferedTokenStream* tokens_ = nullptr;
     std::vector<ViewFieldMoveInferenceEntry> viewFieldMoveInferenceEntries_;
     std::vector<DeferredFunctionDefinition> deferredIncompleteFunctionDefinitions_;
+    std::unordered_set<std::string> namespaceFunctionValueNames_;
     std::unordered_map<std::string, size_t> functionSourceOrder_;
     std::unordered_map<std::string, size_t> forwardDeclaredStructTypeSourceOrder_;
     // The eager generic-use scan runs before scoped expect_error handlers are armed.
@@ -3116,6 +3121,11 @@ private:
         CFlatParser::FunctionDefinitionContext* function);
 
 public:
+    void enterEveryRule(antlr4::ParserRuleContext* ctx) override
+    {
+        RequireStackHeadroom(ctx);
+    }
+
     void enterTranslationUnit(CFlatParser::TranslationUnitContext* ctx) override
     {
         cxxReferenceMemberProvenance_.clear();
@@ -3337,6 +3347,8 @@ private:
 
     // Variadic forwarding: true when the current function being codegen'd accepts '...'
     bool currentFunctionIsVariadic = false;
+    std::unordered_set<const antlr4::tree::ParseTree*> namespaceFunctionIdentifierNodes_;
+    std::unordered_set<std::string> namespaceLambdaFunctionNames_;
 
     // Lock-set analysis: the canonical lock expressions currently held, and HOW each is held.
     // Cleared at function entry, seeded from the function's lock clause, and pushed/popped
@@ -6498,6 +6510,9 @@ public:
                                   const LLVMBackend::NamedVariable* srcBinding = nullptr,
                                   const std::string& srcTypeNameIn = {});
 
+    LLVMBackend::TypedValue ParseSpaceshipExpression(CFlatParser::SpaceshipExpressionContext* ctx,
+                                                       ResultUse use = ResultUse::Value);
+    static llvm::StructType* OrderingCategoryStruct(LLVMBackend* compiler, const std::string& category);
     LLVMBackend::TypedValue ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx,
                                                        ResultUse use = ResultUse::Value);
 
@@ -6811,7 +6826,10 @@ public:
         // An alias-returned native struct is already an addressable receiver, not a value to copy.
         bool lhsIsAlias = false,
         bool refuseConstWriteOnNoViable = false,
-        const LLVMBackend::NamedVariable* lhsSourceNV = nullptr);
+        const LLVMBackend::NamedVariable* lhsSourceNV = nullptr,
+        antlr4::ParserRuleContext* rhsOperandRule = nullptr,
+        // Bitfield word of a bitfield rhs operand: a non-const reference never binds it.
+        llvm::Value* rhsBitfieldStorage = nullptr);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -8195,6 +8213,8 @@ public:
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage);
 
     void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage);
+    static void LogErrorContext(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+                                std::string errorMessage, const std::string& fileName = {});
     bool NativeTemplateNeedsTypeArgs(const std::string& spelledBase,
                                     std::vector<std::string>& parameterNames);
     void RejectMissingNativeTemplateTypeArgs(antlr4::ParserRuleContext* site,

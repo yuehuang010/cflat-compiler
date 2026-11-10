@@ -15959,6 +15959,8 @@ McPlain mcMoveAssign(McHolder* p) { McPlain result = default; result = move p->f
 McPlain mcTakePlain(McPlain value) { return value; }
 McPlain mcMoveArg(McHolder* p) { return mcTakePlain(move p->field); }
 int mcMoveScalar(McHolder* p) { return move p->scalar; }
+struct McViewHolder { int[] view = default; };
+int mcMoveView(McViewHolder* p) { int[] r = move p->view; return r[0] * 10 + r[2]; }
 struct McFnHolder { function<int()> fn = default; };
 int mcMoveFnField(McFnHolder* p) { function<int()> fn = move p->fn; return fn(); }
 struct McReceiverHolder
@@ -16220,6 +16222,14 @@ int testReturnOfOwningField()
         McPlain implicitReceiver = receiver.takeImplicit();
         passed += Test("mc_move_receiver_implicit_value", implicitReceiver.value, 7);
         passed += Test("mc_move_receiver_implicit_source_live", receiver.field.value, 7);
+    }
+    // A `T[]` view field is copied through a borrowed pointer too: the source view stays readable.
+    {
+        int[3] viewStorage = {4, 5, 6};
+        McViewHolder viewHolder = default;
+        viewHolder.view = viewStorage;
+        passed += Test("mc_move_view_value", mcMoveView(&viewHolder), 46);
+        passed += Test("mc_move_view_source_live", viewHolder.view[0] * 10 + viewHolder.view[2], 46);
     }
     // 7. The `string` FIELD sibling. Every leg below returned the EMPTY string before the fix
     // (rc 0), because the frame's destructor freed the buffer the caller was handed. The value
@@ -20336,7 +20346,7 @@ extern int main()
     total += 83;
 
     passed += testReturnOfOwningField();
-    total += 109;
+    total += 111;
     passed += testForInOverFixedArrayElement();
     total += 45;
 

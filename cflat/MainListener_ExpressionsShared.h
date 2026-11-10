@@ -337,8 +337,10 @@ inline bool IsBinaryExpressionRuleWithOperator(antlr4::tree::ParseTree* node)
         return p->multiplicativeExpression().size() > 1;
     if (auto* p = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node))
         return p->additiveExpression().size() > 1;
-    if (auto* p = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+    if (auto* p = dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(node))
         return p->shiftExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+        return p->spaceshipExpression().size() > 1;
     if (auto* p = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
         return p->typeCheckExpression().size() > 1;
     if (auto* p = dynamic_cast<CFlatParser::AndExpressionContext*>(node))
@@ -466,6 +468,7 @@ inline bool IsParenthesizedBinaryOperandShape(antlr4::ParserRuleContext* ctx)
         if (dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::ShiftExpressionContext*>(node) != nullptr
+            || dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::RelationalExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::EqualityExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::AndExpressionContext*>(node) != nullptr

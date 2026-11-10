@@ -1490,7 +1490,9 @@ CFlatParser::PostfixExpressionContext* MainListener::FindFirstCall(antlr4::tree:
 void MainListener::ScanComparisons(antlr4::tree::ParseTree* node, bool& hasRelational, bool& hasEquality) {
         if (node == nullptr) return;
         if (auto* rel = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
-            if (rel->shiftExpression().size() > 1) hasRelational = true;   // < <= > >=
+            if (rel->spaceshipExpression().size() > 1
+                || (rel->spaceshipExpression().size() == 1
+                    && rel->spaceshipExpression(0)->Spaceship() != nullptr)) hasRelational = true;
         if (auto* eq = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
             if (eq->typeCheckExpression().size() > 1) hasEquality = true;  // == !=
         for (auto* child : node->children)
@@ -1510,6 +1512,8 @@ void MainListener::PrepareLoopConditionalDropFlags(CFlatParser::StatementContext
                 if (node == nullptr
                     || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
                     return;
+                if (auto* context = dynamic_cast<antlr4::ParserRuleContext*>(node))
+                    RequireStackHeadroom(context);
                 if (auto* move = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
                 {
                     auto* unary = move->unaryExpression();

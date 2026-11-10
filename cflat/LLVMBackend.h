@@ -63,6 +63,18 @@ inline std::string CanonicalPrimitiveTypeName(std::string_view type)
     return std::string(type);
 }
 
+// The canonical C++20 comparison category ("std.strong_ordering") a type name spells, or "" for any
+// other type. Anchored to namespace std (plus libc++'s inline `std.__1.`): `mine.strong_ordering` is not one.
+inline std::string StdOrderingCategoryOf(std::string_view name)
+{
+    if (name.starts_with("std.__1.")) name.remove_prefix(8);
+    else if (name.starts_with("std.")) name.remove_prefix(4);
+    else return {};
+    if (name == "strong_ordering" || name == "weak_ordering" || name == "partial_ordering")
+        return "std." + std::string(name);
+    return {};
+}
+
 // Whitespace-free C++ integer spelling (e.g. "unsignedlonglong") -> CFlat type name, or nullptr.
 // Shared by member ranking and contiguous-view element deduction so the two cannot drift.
 inline const char* CxxCompactIntegerSpellingToCflat(std::string_view compact)
@@ -159,6 +171,31 @@ inline bool IsNullptrLiteralExpressionTree(antlr4::tree::ParseTree* node)
             onlyRuleChild = childRule;
         }
     return onlyRuleChild != nullptr && IsNullptrLiteralExpressionTree(onlyRuleChild);
+}
+// True when the expression's C++ type is std::nullptr_t: a nullptr literal, its parentheses, or a
+// ternary whose BOTH value arms are. `c ? p : nullptr` is a pointer, unlike the helper above.
+inline bool IsNullptrTypedExpressionTree(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+        conditional != nullptr && conditional->expression() != nullptr)
+        return IsNullptrTypedExpressionTree(conditional->expression())
+            && IsNullptrTypedExpressionTree(conditional->conditionalExpression());
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+    {
+        if (primary->NullPtrConstant() != nullptr) return true;
+        return primary->Constant() == nullptr && primary->expression() != nullptr
+            && IsNullptrTypedExpressionTree(primary->expression());
+    }
+    if (dynamic_cast<antlr4::RuleContext*>(node) == nullptr) return false;
+    antlr4::RuleContext* onlyRuleChild = nullptr;
+    for (auto* child : node->children)
+        if (auto* childRule = dynamic_cast<antlr4::RuleContext*>(child))
+        {
+            if (onlyRuleChild != nullptr) return false;
+            onlyRuleChild = childRule;
+        }
+    return onlyRuleChild != nullptr && IsNullptrTypedExpressionTree(onlyRuleChild);
 }
 #include <fstream>
 #include "ArgParser.h"
@@ -1086,6 +1123,9 @@ public:
         // fat values, not one of them - it must take the pointer paths, so it is excluded here.
         // Prefer this over spelling `IsInterface && !IsInterfacePointer` at a new site.
         bool IsFatInterfaceValue() const { return IsInterface && !IsInterfacePointer && !IsArrayView; }
+        // A `T[]` view. It CAN own its buffer (`v = new T[n]`), so a `move` of it transfers
+        // ownership unless the destination is a plain local (see MoveIsLocalDeclInitializer).
+        bool IsArrayViewValue() const { return IsArrayView && !ElemPointer && !IsUnique; }
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         // Callee summary: this move pointer parameter is adopted by a unique<T> owner.
@@ -2167,6 +2207,7 @@ public:
         bool IsCxxSameTypeCastCopy = false;
         // Direct foreign C++ construction deferred into a generated call wrapper.
         bool IsCxxDirectConstruction = false;
+        bool IsCxxMoveSelected = false; // the move constructor has already built this temporary
         bool CxxDirectConstructionUsesBraces = false;
         std::string CxxDirectConstructionType;
         std::vector<NamedVariable> CxxDirectConstructionArguments;
@@ -2579,6 +2620,7 @@ public:
         uint8_t      arithNarrowWidth = 0;
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
         llvm::Value* receiverStorage = nullptr; // lvalue storage retained for synthesized method calls
+        llvm::Value* bitfieldStorage = nullptr; // NamedVariable::BitfieldStorage of a bitfield operand
         // Non-null when `value` is the POINTER a C++ operator returned for a `T&` result: the
         // referenced value type, so an outer precedence level can reload the real object.
         llvm::Type*  cxxRefValueType = nullptr;
@@ -2654,6 +2696,9 @@ public:
         std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // Only used by classes
         llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
         bool IsUnion = false;
+        bool HasDefaultedEquality = false;
+        bool HasDefaultedSpaceship = false;
+        std::string DefaultedSpaceshipCategory;
         // User-requested alignment from `alignas(N)` on the struct definition. 0 = unset.
         // Effective alignment is max of this and ABI alignment from LLVM field types.
         uint64_t UserRequestedAlignment = 0;
@@ -2790,6 +2835,7 @@ public:
         // Inferred 'alias': every return hands back a by-value parameter (ClassifyValueStructReturns),
         // so the result is always one of the caller's alias-return copy slots.
         bool ReturnsAliasOfByValueParam = false;
+        bool ReturnsDirectByValueParam = false;
         // Parse-tree summary: every 'return' names a module global (`return gRaw;`). Set by
         // the forward-ref scan so a caller's refusal does not depend on definition order.
         bool ReturnsGlobalBorrow = false;
@@ -4523,6 +4569,7 @@ private:
     // plans above. Consulted where the heuristic lowering would otherwise be used silently.
     std::unordered_map<std::string, std::string> cxxFunctionPointerAbiRefusals_;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
+    std::unordered_map<const llvm::Function*, bool> cxxNoexceptByFunction_;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     // Interface fields (parents' fields first, then own), parallel to interfaceTable. Each entry's
     // VariableName is the field name; every implementor must expose a field of the same name/type.
@@ -5471,6 +5518,7 @@ private:
         bool hasDefaultCtor = false;
         bool hasCopyCtor = false;
         bool hasCtorTemplate = false;
+        bool hasConversionTemplate = false;
         bool hasAssignTemplate = false;
         bool moveAssignBindsConstRef = false;
         bool moveAssignConstSourceBindsConstRef = false;
@@ -7321,6 +7369,8 @@ private:
                                          const std::string& ifaceName);
 
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName, bool membersOnly = false);
+    void EmitReplacementDestructor(llvm::Function* dtor, llvm::Value* destination,
+                                   const std::string& typeName);
     // A lowered struct moved out field by field: destroys only the moved-from C++ objects.
     llvm::Function* GetOrCreateMovedFromShellDestructor(const std::string& typeName);
     void EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b, const std::string& typeName,
@@ -8033,6 +8083,9 @@ private:
                                        bool copyInit = false,
                                        bool* noViableCandidate = nullptr);
     bool RequestCxxOperatorArrow(const std::string& typeName, std::string& error);
+    bool RequestCxxConversionOperatorTemplate(const std::string& typeName,
+        const std::string& targetType, bool receiverConst, bool allowExplicit,
+        std::string& wrapperName, std::string& error);
     std::vector<size_t> CandidateCxxGroupsFor(const std::string& cxxBase);
     void CollectCxxTypeOwnerGroups(const std::string& cflatTypeName,
                                    std::vector<size_t>& groups,
@@ -11160,6 +11213,15 @@ public:
         auto it = cxxClasses_.find(typeName);
         return it == cxxClasses_.end() ? nullptr : &it->second;
     }
+    bool CxxMovePickNeedsClang(const std::string& typeName) const
+    {
+        const auto* info = GetCxxClassInfo(typeName);
+        return info != nullptr && (info->hasDeletedMoveCtor || info->hasCtorTemplate
+            || std::any_of(info->constructors.begin(), info->constructors.end(),
+                [](const CxxClassInfo::Structor& ctor) {
+                    return ctor.isMoveCtor && ctor.isExplicit;
+                }));
+    }
     // A decision over the constructor SET (empty? forwards a scalar reference?) must see the
     // full set: the by-value gate projects only the destructor and copy/move constructors.
     const CxxClassInfo* GetCxxClassInfoWithConstructors(const std::string& typeName) const
@@ -12042,7 +12104,8 @@ public:
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                     llvm::Value* src, bool useMove, const char* context,
                                     const std::string& displayTypeName = {},
-                                    bool constSource = false, bool directInit = false);
+                                    bool constSource = false, bool directInit = false,
+                                    bool forceClangPick = false);
     // Same-class copy of an lvalue through the memoized wrapper request (one per class and
     // constness). False with `error` set when clang refuses; `out.requested` false when no wrapper.
     bool RequestSameClassCopy(const std::string& typeName, const NamedVariable& source,
@@ -15063,7 +15126,8 @@ public:
     // 323: the ambiguity names cover every access level (clang looks up names before access).
     // 324: function-pointer cache entries keep array-reference result spellings and stripped inner dimensions (FNREFCTOR).
     // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
-    static constexpr int kCHeaderCacheVersion = 327;
+    // 328: conversion-function template metadata and requests are cached separately from ctor templates.
+    static constexpr int kCHeaderCacheVersion = 329;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

@@ -555,10 +555,12 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                                     if (tcs.size() == 1 && tcs[0]->typeSpecifier().empty())
                                     {
                                         auto* relCtx = tcs[0]->relationalExpression();
-                                        auto rels = relCtx ? relCtx->shiftExpression() : std::vector<CFlatParser::ShiftExpressionContext*>{};
-                                        if (rels.size() == 1)
+                                        auto rels = relCtx ? relCtx->spaceshipExpression()
+                                                           : std::vector<CFlatParser::SpaceshipExpressionContext*>{};
+                                        if (rels.size() == 1 && rels[0]->Spaceship() == nullptr
+                                            && rels[0]->shiftExpression().size() == 1)
                                         {
-                                            auto shs = rels[0]->additiveExpression();
+                                            auto shs = rels[0]->shiftExpression(0)->additiveExpression();
                                             if (shs.size() == 1)
                                             {
                                                 auto adds = shs[0]->multiplicativeExpression();
@@ -634,9 +636,11 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                                     if (typeCheck->Is().empty() && typeCheck->As().empty())
                                     {
                                         auto* relational = typeCheck->relationalExpression();
-                                        if (relational->shiftExpression().size() == 1)
+                                        if (relational->spaceshipExpression().size() == 1
+                                            && relational->spaceshipExpression(0)->Spaceship() == nullptr
+                                            && relational->spaceshipExpression(0)->shiftExpression().size() == 1)
                                         {
-                                            auto* shift = relational->shiftExpression(0);
+                                            auto* shift = relational->spaceshipExpression(0)->shiftExpression(0);
                                             if (shift->additiveExpression().size() == 1)
                                             {
                                                 auto* additive = shift->additiveExpression(0);
@@ -676,6 +680,10 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 result.JoinClassPointee = tv.joinClassPointee;
                 result.JoinClassPointeeDepth = tv.joinClassPointeeDepth;
                 result.TypeAndValue.IsAlias = tv.isAlias;
+                if (tv.hasSourceType && (tv.sourceTypeName == "std.strong_ordering"
+                                         || tv.sourceTypeName == "std.partial_ordering"
+                                         || tv.sourceTypeName == "std.weak_ordering"))
+                    result.TypeAndValue = tv.sourceType;
                 // A `?:` join reading a container-owned element (see TypedValue::borrowsOwnedElement).
                 result.BorrowsOwnedElement = tv.borrowsOwnedElement;
                 result.BorrowedElementExternallyOwned = tv.borrowedElementExternallyOwned;
@@ -723,7 +731,12 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                         && tv.cxxRefValueType != nullptr
                         && compilerLLVM->IsCxxRecord(tv.sourceTypeName))
                         result.TypeAndValue.TypeName = tv.sourceTypeName;
-                    if (result.Primary->getType()->isIntegerTy()
+                    auto isComparisonCategory = [](const std::string& name) {
+                        return !StdOrderingCategoryOf(name).empty();
+                    };
+                    const bool comparisonCategory = isComparisonCategory(tv.sourceTypeName)
+                        || isComparisonCategory(result.TypeAndValue.TypeName);
+                    if (result.Primary->getType()->isIntegerTy() && !comparisonCategory
                         && !(inCxxCallArgument_ && joinShape.hasSourceType))
                     {
                         unsigned bits = result.Primary->getType()->getIntegerBitWidth();

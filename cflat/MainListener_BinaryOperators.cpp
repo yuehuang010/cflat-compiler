@@ -114,6 +114,7 @@ CFlatParser::CastExpressionContext* MainListener::FindValueCastHazard(antlr4::tr
         if (dynamic_cast<CFlatParser::EqualityExpressionContext*>(node) == nullptr
             && dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node) == nullptr
             && dynamic_cast<CFlatParser::RelationalExpressionContext*>(node) == nullptr
+            && dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(node) == nullptr
             && dynamic_cast<CFlatParser::ShiftExpressionContext*>(node) == nullptr
             && dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node) == nullptr
             && dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node) == nullptr
@@ -241,7 +242,8 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                                                            rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
                                                            false, acc == lv.value && lv.cxxPointeeConst,
                                                            acc == lv.value ? lv.cxxObjectCv : 0,
-                                                           rv.cxxObjectCv);
+                                                           rv.cxxObjectCv, false, false, nullptr,
+                                                           nextCtxs[i], rv.bitfieldStorage);
                 if (overload == nullptr && acc != nullptr && rv.value != nullptr
                     && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
                     LogErrorContext(ctx, "no overload of 'operator&' matches the given arguments.");
@@ -321,6 +323,67 @@ void MainListener::LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
             rv.value = compiler->builder->CreateExtractValue(rv.value, { 1u }, "iface_data");
     }
 
+// A C++ comparison category value (`std::strong_ordering` and friends), by its spelled type.
+static bool IsOrderingCategoryName(const std::string& name) {
+        return !StdOrderingCategoryOf(name).empty();
+}
+
+// The i8 ordering code of a category value: the one field of its named struct, unwrapped.
+static llvm::Value* OrderingCodeOf(llvm::IRBuilderBase& builder, llvm::Value* value) {
+        while (value != nullptr && (value->getType()->isStructTy() || value->getType()->isArrayTy()))
+        {
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(value->getType()))
+            {
+                if (st->getNumElements() != 1) return nullptr;
+            }
+            else if (llvm::cast<llvm::ArrayType>(value->getType())->getNumElements() != 1)
+                return nullptr;
+            value = builder.CreateExtractValue(value, { 0 }, "ordering.code");
+        }
+        return value != nullptr && value->getType()->isIntegerTy() ? value : nullptr;
+}
+
+// The named struct of a category (`%std.weak_ordering`), the shape a C++ return slot uses. A
+// record nobody has demanded yet is requested once, lazily, from its spelling.
+llvm::StructType* MainListener::OrderingCategoryStruct(LLVMBackend* compiler, const std::string& category) {
+        compiler->EnsureCxxRecordProjected(category, false);
+        auto found = compiler->dataStructures.find(category);
+        if (found == compiler->dataStructures.end() || found->second.StructType == nullptr)
+        {
+            std::string error;
+            if (!compiler->RequestCxxType(category, {}, category, error)) return nullptr;
+            found = compiler->dataStructures.find(category);
+        }
+        return found != compiler->dataStructures.end() ? found->second.StructType : nullptr;
+}
+
+// True once the category record is known, demanding it from the imported headers first: no use
+// may have projected it yet even though `<compare>` is imported.
+static bool OrderingCategoryAvailable(LLVMBackend* compiler, const std::string& category) {
+        if (compiler->IsCxxRecord(category)) return true;
+        return MainListener::OrderingCategoryStruct(compiler, category) != nullptr
+            && compiler->IsCxxRecord(category);
+}
+
+// Wraps an i8 ordering code back into the one-field shape of a category value (`{ [1 x i8] }`).
+static llvm::Value* WrapOrderingCodeLike(llvm::IRBuilderBase& builder, llvm::Value* code,
+                                         llvm::Type* shape) {
+        if (shape == code->getType()) return code;
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(shape); st != nullptr && st->getNumElements() == 1)
+        {
+            llvm::Value* element = WrapOrderingCodeLike(builder, code, st->getElementType(0));
+            return element != nullptr && element->getType() == st->getElementType(0)
+                ? builder.CreateInsertValue(llvm::UndefValue::get(st), element, { 0 }) : nullptr;
+        }
+        if (auto* at = llvm::dyn_cast<llvm::ArrayType>(shape); at != nullptr && at->getNumElements() == 1)
+        {
+            llvm::Value* element = WrapOrderingCodeLike(builder, code, at->getElementType());
+            return element != nullptr && element->getType() == at->getElementType()
+                ? builder.CreateInsertValue(llvm::UndefValue::get(at), element, { 0 }) : nullptr;
+        }
+        return nullptr;
+}
+
 LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx, ResultUse use) {
         CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
@@ -390,6 +453,31 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             settleMovedReads(lvMovedReads, lv, rvIsNull);
             settleMovedReads(rvMovedReads, rv, lvIsNull);
             std::string op = ctx->children[1]->getText();
+
+            // `ordering == 0` / `!= 0`: the category compares its code with 0 (C++ operator==
+            // against the literal), before any overload lookup over the imported <compare> types.
+            {
+                const bool lvOrdering = IsOrderingCategoryName(lv.sourceTypeName);
+                const bool rvOrdering = IsOrderingCategoryName(rv.sourceTypeName);
+                auto zeroConstant = [](llvm::Value* value) {
+                    auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
+                    return constant != nullptr && constant->isZero();
+                };
+                if (((lvOrdering && zeroConstant(rv.value)) || (rvOrdering && zeroConstant(lv.value)))
+                    && (op == "==" || op == "!="))
+                {
+                    llvm::Value* code = OrderingCodeOf(*Compiler(ctx)->builder,
+                        lvOrdering ? lv.value : rv.value);
+                    if (code != nullptr)
+                    {
+                        llvm::Value* zero = llvm::ConstantInt::get(code->getType(), 0);
+                        return LLVMBackend::TypedValue{ op == "=="
+                            ? Compiler(ctx)->builder->CreateICmpEQ(code, zero, "ordering.equal.zero")
+                            : Compiler(ctx)->builder->CreateICmpNE(code, zero, "ordering.notequal.zero"),
+                            false };
+                    }
+                }
+            }
 
             Compiler(ctx)->RejectImplicitIntegerPointeePointerConversion(
                 InferTernaryArmType(lv), InferTernaryArmType(rv));
@@ -489,7 +577,8 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
                                                        lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
                                                        rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
                                                        false, lv.cxxPointeeConst,
-                                                       lv.cxxObjectCv, rv.cxxObjectCv);
+                                                       lv.cxxObjectCv, rv.cxxObjectCv,
+                                                       false, false, nullptr, nullptr, rv.bitfieldStorage);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -559,6 +648,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.sourceCallerName = namedVar.CallerName.empty()
             ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
         result.sourceFieldName = namedVar.FieldName;
+        result.bitfieldStorage = namedVar.BitfieldStorage;
         result.sourceMovePathKey = namedVar.MovePathKey;
         result.sourceMovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
         result.sourceIsElementAccess = namedVar.IsElementAccess;
@@ -629,7 +719,9 @@ void MainListener::OperandPointerDepth(const LLVMBackend::NamedVariable& namedVa
 
 CFlatParser::CastExpressionContext* MainListener::SoleCastOperandOf(CFlatParser::RelationalExpressionContext* relCtx) {
         if (relCtx == nullptr) return nullptr;
-        auto shifts = relCtx->shiftExpression();
+        auto spaceship = relCtx->spaceshipExpression();
+        if (spaceship.size() != 1) return nullptr;
+        auto shifts = spaceship[0]->shiftExpression();
         if (shifts.size() != 1) return nullptr;
         auto adds = shifts[0]->additiveExpression();
         if (adds.size() != 1) return nullptr;
@@ -1257,10 +1349,10 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
 LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx, ResultUse use) {
         CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
-        auto nextCtxs = ctx->shiftExpression();
+        auto nextCtxs = ctx->spaceshipExpression();
         if (nextCtxs.size() == 1)
         {
-            return ParseShiftExpression(nextCtxs[0], use);
+            return ParseSpaceshipExpression(nextCtxs[0], use);
         }
         else if (nextCtxs.size() == 2)
         {
@@ -1270,16 +1362,61 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
             // operand for end-of-statement cleanup (see RegisterBorrowedStringOperandTemp).
             // Owning-POINTER operands are registered here too - see ParseEqualityExpression.
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto lv = ParseShiftExpression(nextCtxs[0], ResultUse::Value);
+            auto lv = ParseSpaceshipExpression(nextCtxs[0], ResultUse::Value);
             NormalizeCxxReferenceOperand(ctx, lv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto rv = ParseShiftExpression(nextCtxs[1], ResultUse::Value);
+            auto rv = ParseSpaceshipExpression(nextCtxs[1], ResultUse::Value);
             NormalizeCxxReferenceOperand(ctx, rv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
+
+            auto orderingCategory = [](const std::string& name) {
+                return !StdOrderingCategoryOf(name).empty();
+            };
+            const bool leftOrdering = orderingCategory(lv.sourceTypeName);
+            const bool rightOrdering = orderingCategory(rv.sourceTypeName);
+            auto isZero = [](llvm::Value* value) {
+                auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
+                return constant != nullptr && constant->isZero();
+            };
+            if ((leftOrdering && isZero(rv.value)) || (rightOrdering && isZero(lv.value)))
+            {
+                const std::string_view relationSpelling = leftOrdering
+                    ? std::string_view(op) : MirrorRelationSpelling(op);
+                const SpaceshipRelation* relation = nullptr;
+                for (const auto& candidate : kSpaceshipRelations)
+                    if (candidate.spelling == relationSpelling) { relation = &candidate; break; }
+                llvm::Value* order = leftOrdering ? lv.value : rv.value;
+                while (order != nullptr && (order->getType()->isStructTy() || order->getType()->isArrayTy()))
+                {
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(order->getType()))
+                    {
+                        if (st->getNumElements() != 1) break;
+                    }
+                    else if (llvm::cast<llvm::ArrayType>(order->getType())->getNumElements() != 1)
+                        break;
+                    order = Compiler(ctx)->builder->CreateExtractValue(order, { 0 }, "ordering.zero.value");
+                }
+                if (relation != nullptr && order != nullptr && order->getType()->isIntegerTy())
+                {
+                    llvm::Type* type = order->getType();
+                    llvm::Value* shifted = Compiler(ctx)->builder->CreateSub(
+                        order, llvm::ConstantInt::getSigned(type, relation->low), "ordering.zero.base");
+                    llvm::Value* compared = Compiler(ctx)->builder->CreateICmpULT(shifted,
+                        llvm::ConstantInt::get(type, relation->high - relation->low + 1),
+                        "ordering.zero.compare");
+                    return LLVMBackend::TypedValue{ compared, false };
+                }
+            }
+            else if (leftOrdering || rightOrdering)
+            {
+                LogErrorContext(ctx,
+                    "comparison ordering values can only be compared with 0");
+                return {};
+            }
 
             Compiler(ctx)->RejectImplicitIntegerPointeePointerConversion(
                 InferTernaryArmType(lv), InferTernaryArmType(rv));
@@ -1295,7 +1432,8 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
                                                        lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
                                                        rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
                                                        false, lv.cxxPointeeConst,
-                                                       lv.cxxObjectCv, rv.cxxObjectCv);
+                                                       lv.cxxObjectCv, rv.cxxObjectCv,
+                                                       false, false, nullptr, nullptr, rv.bitfieldStorage);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -1321,6 +1459,278 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
         LogErrorContext(ctx, "Relational expression has unexpected operand count.");
         return {};
     }
+
+LLVMBackend::TypedValue MainListener::ParseSpaceshipExpression(
+        CFlatParser::SpaceshipExpressionContext* ctx, ResultUse use) {
+        CallPostfixScope operatorPostfix(this);
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
+        const auto operands = ctx->shiftExpression();
+        if (operands.size() == 1) return ParseShiftExpression(operands[0], use);
+        if (operands.size() != 2)
+        {
+            LogErrorContext(ctx, "Spaceship expression has unexpected operand count.");
+            return {};
+        }
+
+        auto* compiler = Compiler(ctx);
+        compiler->lastCallReturnsOwned = false;
+        auto left = ParseShiftExpression(operands[0], ResultUse::Value);
+        NormalizeCxxReferenceOperand(ctx, left);
+        RegisterBorrowedStringOperandTemp(compiler, left.value);
+        compiler->RegisterOwnedPtrTemp(left.value);
+        compiler->lastCallReturnsOwned = false;
+        auto right = ParseShiftExpression(operands[1], ResultUse::Value);
+        NormalizeCxxReferenceOperand(ctx, right);
+        RegisterBorrowedStringOperandTemp(compiler, right.value);
+        compiler->RegisterOwnedPtrTemp(right.value);
+
+        lastRewriteWasReversed_ = false;
+        llvm::Value* ordering = TryBinaryOperatorOverload(
+            left, "<=>", right, ctx, left.elemType, right.pointerDepth, right.elemPointer,
+            left.receiverStorage, right.receiverStorage, true, true, left.isRvalue, right.isRvalue,
+            left.sourceTypeName, right.sourceTypeName, left.pointerDepth, left.elemPointer,
+            {}, {}, false, {}, {}, false, {}, {}, right.cxxPointeeConst,
+            left.cxxArithIdentity, right.cxxArithIdentity, right.isExplicitMove, left.isExplicitMove,
+            left.hasSourceType && left.sourceType.IsCxxNullptrT,
+            right.hasSourceType && right.sourceType.IsCxxNullptrT,
+            false, left.cxxPointeeConst, left.cxxObjectCv, right.cxxObjectCv);
+
+        LLVMBackend::TypedValue result;
+        if (ordering != nullptr)
+        {
+            if (lastRewriteWasReversed_)
+            {
+                llvm::Value* value = ordering;
+                while (value->getType()->isStructTy() || value->getType()->isArrayTy())
+                {
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(value->getType()))
+                    {
+                        if (st->getNumElements() != 1) break;
+                    }
+                    else if (llvm::cast<llvm::ArrayType>(value->getType())->getNumElements() != 1)
+                        break;
+                    value = compiler->builder->CreateExtractValue(value, { 0 }, "spaceship.reverse.value");
+                }
+                if (value->getType()->isIntegerTy())
+                {
+                    auto* less = compiler->builder->CreateICmpEQ(value,
+                        llvm::ConstantInt::getSigned(value->getType(), -1), "spaceship.reverse.less");
+                    auto* greater = compiler->builder->CreateICmpEQ(value,
+                        llvm::ConstantInt::get(value->getType(), 1), "spaceship.reverse.greater");
+                    value = compiler->builder->CreateSelect(less,
+                        llvm::ConstantInt::get(value->getType(), 1),
+                        compiler->builder->CreateSelect(greater,
+                            llvm::ConstantInt::getSigned(value->getType(), -1), value,
+                            "spaceship.reverse.gt"), "spaceship.reverse.lt");
+                    // The mirrored code keeps the operator's category shape for the caller.
+                    if (llvm::Value* wrapped = WrapOrderingCodeLike(*compiler->builder, value,
+                                                                    ordering->getType()))
+                        ordering = wrapped;
+                }
+            }
+            // A C++ operator<=> returns its code as a bare i8 ABI value; the category is the struct.
+            if (ordering->getType()->isIntegerTy() && IsOrderingCategoryName(
+                    compiler->lastCallReturnType.DiagnosticTypeName.empty()
+                        ? compiler->lastCallReturnType.TypeName
+                        : compiler->lastCallReturnType.DiagnosticTypeName))
+            {
+                const std::string category = compiler->lastCallReturnType.DiagnosticTypeName.empty()
+                    ? compiler->lastCallReturnType.TypeName
+                    : compiler->lastCallReturnType.DiagnosticTypeName;
+                if (llvm::StructType* shape = OrderingCategoryStruct(compiler, category))
+                    if (llvm::Value* wrapped = WrapOrderingCodeLike(*compiler->builder, ordering, shape))
+                        ordering = wrapped;
+            }
+            result.value = ordering;
+            result.isRvalue = true;
+            result.sourceTypeName = compiler->lastCallReturnType.DiagnosticTypeName.empty()
+                ? compiler->lastCallReturnType.TypeName
+                : compiler->lastCallReturnType.DiagnosticTypeName;
+            result.sourceType = compiler->lastCallReturnType;
+            if (!compiler->lastCallReturnType.DiagnosticTypeName.empty())
+                result.sourceType.TypeName = compiler->lastCallReturnType.DiagnosticTypeName;
+            result.hasSourceType = !result.sourceTypeName.empty();
+            return result;
+        }
+
+        const std::string orderingType = (left.value != nullptr && left.value->getType()->isFloatingPointTy())
+            || (right.value != nullptr && right.value->getType()->isFloatingPointTy())
+            ? "std.partial_ordering" : "std.strong_ordering";
+        if (!OrderingCategoryAvailable(compiler, orderingType))
+        {
+            LogErrorContext(ctx, "'<=>' needs import \"compare\"");
+            return {};
+        }
+        if (left.value == nullptr || right.value == nullptr)
+        {
+            LogErrorContext(ctx, "no builtin '<=>' is defined for these operands");
+            return {};
+        }
+
+        llvm::Value* lhs = left.value;
+        llvm::Value* rhs = right.value;
+        llvm::Value* less = nullptr;
+        llvm::Value* greater = nullptr;
+        llvm::Value* unordered = nullptr;
+        bool commonUnsigned = false;
+        const bool pointerOperands = lhs->getType()->isPointerTy() && rhs->getType()->isPointerTy();
+        if (lhs->getType()->isIntegerTy() || lhs->getType()->isFloatingPointTy())
+        {
+            if (!(rhs->getType()->isIntegerTy() || rhs->getType()->isFloatingPointTy()))
+            {
+                LogErrorContext(ctx, "no builtin '<=>' is defined for these operands");
+                return {};
+            }
+            const bool lhsFloat = lhs->getType()->isFloatingPointTy();
+            const bool rhsFloat = rhs->getType()->isFloatingPointTy();
+            if (lhsFloat || rhsFloat)
+            {
+                llvm::Type* common = lhsFloat ? lhs->getType() : rhs->getType();
+                if (lhsFloat && rhsFloat
+                    && rhs->getType()->getScalarSizeInBits() > lhs->getType()->getScalarSizeInBits())
+                    common = rhs->getType();
+                lhs = compiler->Upconvert(lhs, common, left.isUnsigned);
+                rhs = compiler->Upconvert(rhs, common, right.isUnsigned);
+                less = compiler->builder->CreateFCmpOLT(lhs, rhs, "spaceship.lt");
+                greater = compiler->builder->CreateFCmpOGT(lhs, rhs, "spaceship.gt");
+                unordered = compiler->builder->CreateFCmpUNO(lhs, rhs, "spaceship.unordered");
+            }
+            else
+            {
+                unsigned lhsBits = lhs->getType()->getIntegerBitWidth();
+                unsigned rhsBits = rhs->getType()->getIntegerBitWidth();
+                bool lhsUnsigned = left.isUnsigned;
+                bool rhsUnsigned = right.isUnsigned;
+                if (lhsBits < 32) { lhs = compiler->Upconvert(lhs, compiler->builder->getInt32Ty(), lhsUnsigned); lhsBits = 32; lhsUnsigned = false; }
+                if (rhsBits < 32) { rhs = compiler->Upconvert(rhs, compiler->builder->getInt32Ty(), rhsUnsigned); rhsBits = 32; rhsUnsigned = false; }
+                unsigned commonBits = std::max(lhsBits, rhsBits);
+                // A constant whose value the unsigned type represents is not narrowing (C++
+                // [dcl.init.list]), so `1 <=> u` compares as unsigned.
+                auto representableConstant = [](llvm::Value* value) {
+                    auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+                    return constant != nullptr && !constant->isNegative();
+                };
+                if (lhsUnsigned == rhsUnsigned)
+                    commonUnsigned = lhsUnsigned;
+                else if (lhsUnsigned)
+                {
+                    if (lhsBits >= rhsBits)
+                    {
+                        if (!representableConstant(rhs))
+                        {
+                            LogErrorContext(ctx, "builtin '<=>' would narrow a signed operand to unsigned");
+                            return {};
+                        }
+                        commonUnsigned = true;
+                    }
+                }
+                else
+                {
+                    if (rhsBits >= lhsBits)
+                    {
+                        if (!representableConstant(lhs))
+                        {
+                            LogErrorContext(ctx, "builtin '<=>' would narrow a signed operand to unsigned");
+                            return {};
+                        }
+                        commonUnsigned = true;
+                    }
+                }
+                llvm::Type* common = llvm::IntegerType::get(*compiler->context, commonBits);
+                lhs = compiler->Upconvert(lhs, common, lhsUnsigned);
+                rhs = compiler->Upconvert(rhs, common, rhsUnsigned);
+                less = commonUnsigned ? compiler->builder->CreateICmpULT(lhs, rhs, "spaceship.lt")
+                                      : compiler->builder->CreateICmpSLT(lhs, rhs, "spaceship.lt");
+                greater = commonUnsigned ? compiler->builder->CreateICmpUGT(lhs, rhs, "spaceship.gt")
+                                         : compiler->builder->CreateICmpSGT(lhs, rhs, "spaceship.gt");
+            }
+        }
+        else if (pointerOperands)
+        {
+            // C++ needs a composite pointer type: the same pointee, a void* side, or a class
+            // pointer to its base. A bare nullptr is nullptr_t, not a pointer; `(int*)nullptr` is.
+            const LLVMBackend::TypeAndValue lhsType = InferTernaryArmType(left);
+            const LLVMBackend::TypeAndValue rhsType = InferTernaryArmType(right);
+            const std::string lhsPointee = compiler->ResolveTypeAlias(lhsType.TypeName);
+            const std::string rhsPointee = compiler->ResolveTypeAlias(rhsType.TypeName);
+            const int lhsDepth = lhsType.ValuePointerDepth();
+            const int rhsDepth = rhsType.ValuePointerDepth();
+            const bool nullOperand = IsNullptrTypedExpressionTree(operands[0])
+                || IsNullptrTypedExpressionTree(operands[1])
+                || (left.hasSourceType && left.sourceType.IsCxxNullptrT)
+                || (right.hasSourceType && right.sourceType.IsCxxNullptrT);
+            const bool composite = !nullOperand && lhsDepth > 0 && rhsDepth > 0
+                && ((lhsDepth == rhsDepth
+                     && (LLVMBackend::CanonicalPointeeTypeName(lhsPointee)
+                             == LLVMBackend::CanonicalPointeeTypeName(rhsPointee)
+                         || (lhsDepth == 1 && (compiler->IsCxxBaseOf(lhsPointee, rhsPointee)
+                                               || compiler->IsCxxBaseOf(rhsPointee, lhsPointee)))))
+                    || (lhsDepth == 1 && lhsPointee == "void")
+                    || (rhsDepth == 1 && rhsPointee == "void"));
+            if (!composite)
+            {
+                LogErrorContext(ctx, std::format(
+                    "builtin '<=>' needs pointers to the same type or void*, not '{}' and '{}'",
+                    SpellType(*compiler, lhsType), SpellType(*compiler, rhsType)));
+                return {};
+            }
+            // Derived-to-base first, so both addresses name the same subobject (C++ composite type).
+            if (lhsDepth == 1 && rhsDepth == 1 && lhsPointee != rhsPointee)
+            {
+                bool refused = false;
+                if (compiler->IsCxxBaseOf(rhsPointee, lhsPointee))
+                    lhs = compiler->LowerCxxPointerToBase(lhsPointee, rhsPointee, false, lhs,
+                        SpellType(*compiler, lhsType), SpellType(*compiler, rhsType),
+                        "the '<=>' comparison", &refused);
+                else if (compiler->IsCxxBaseOf(lhsPointee, rhsPointee))
+                    rhs = compiler->LowerCxxPointerToBase(rhsPointee, lhsPointee, false, rhs,
+                        SpellType(*compiler, rhsType), SpellType(*compiler, lhsType),
+                        "the '<=>' comparison", &refused);
+                if (refused) return {};
+            }
+            less = compiler->builder->CreateICmpULT(lhs, rhs, "spaceship.lt");
+            greater = compiler->builder->CreateICmpUGT(lhs, rhs, "spaceship.gt");
+        }
+        else
+        {
+            LogErrorContext(ctx, "no builtin '<=>' is defined for these operands");
+            return {};
+        }
+
+        auto* i8 = llvm::Type::getInt8Ty(*compiler->context);
+        llvm::Value* code = compiler->builder->CreateSelect(
+            less, llvm::ConstantInt::getSigned(i8, -1),
+            compiler->builder->CreateSelect(greater, llvm::ConstantInt::get(i8, 1),
+                                             llvm::ConstantInt::get(i8, 0)));
+        if (unordered != nullptr)
+            code = compiler->builder->CreateSelect(unordered, llvm::ConstantInt::getSigned(i8, -127), code);
+        // The C++ ordering is the one-field named struct (`%std.strong_ordering`) and C++ calls
+        // bind by that type; a bare i8 would be spelled `signed char` at the call.
+        {
+            // The same named struct the C++ return slot uses (ControlFlowAndFunctions recipe).
+            if (llvm::StructType* st = OrderingCategoryStruct(compiler, orderingType);
+                st != nullptr && st->getNumElements() == 1)
+            {
+                // libc++ holds `{ [1 x i8] }`; wrap the code in the same element layout.
+                llvm::Value* element = code;
+                if (auto* arrayTy = llvm::dyn_cast<llvm::ArrayType>(st->getElementType(0));
+                    arrayTy != nullptr && arrayTy->getNumElements() == 1)
+                    element = compiler->builder->CreateInsertValue(
+                        llvm::UndefValue::get(arrayTy), code, { 0 }, "spaceship.array");
+                if (element->getType() == st->getElementType(0))
+                    code = compiler->builder->CreateInsertValue(
+                        llvm::UndefValue::get(st), element, { 0 }, "spaceship.value");
+            }
+        }
+        result.value = code;
+        result.isRvalue = true;
+        result.sourceTypeName = orderingType;
+        result.sourceType.TypeName = orderingType;
+        result.sourceType.DiagnosticTypeName = orderingType;
+        result.hasSourceType = true;
+        compiler->lastCallReturnType = result.sourceType;
+        return result;
+}
 
 std::string MainListener::TryGetSimpleIdentifier(antlr4::ParserRuleContext* ctx) {
         if (!ctx) return "";
@@ -2002,10 +2412,15 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
                     && !lhsClass.empty() && compiler->IsCxxRecord(lhsClass) && lhsStorage != nullptr
                     && compiler->IsOwnedCxxPrvalueArgument(ownedLhsProbe,
                         compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = lhsClass }));
+                const bool defaultMemberShift = op == "<<"
+                    && IsSameTypeCastOfDefault(rhs.expr, rhsClass)
+                    && !lhsClass.empty()
+                    && HasOperatorOverloadForFirstParam("operator" + op, lhsClass);
                 if ((namedOperand || (!lhsClass.empty() && compiler->IsCxxRecord(lhsClass)))
                     && !movedOperand && !ownedClassLhs)
-                    overload = TryCxxInfixShift(ctx, op, lhs, lhsClass, lhsStorage,
-                                                rhs, rhsClass, rhsStorage);
+                    if (!defaultMemberShift)
+                        overload = TryCxxInfixShift(ctx, op, lhs, lhsClass, lhsStorage,
+                                                    rhs, rhsClass, rhsStorage);
                 if (namedOperand && overload == nullptr) return {};
                 if (overload == nullptr)
                     overload = TryBinaryOperatorOverload(
@@ -2017,7 +2432,10 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
                         rv.cxxPointeeConst, lv.cxxArithIdentity, rv.cxxArithIdentity, rv.isExplicitMove, lv.isExplicitMove,
                         lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
                         rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
-                        false, lv.cxxPointeeConst, lv.cxxObjectCv, rv.cxxObjectCv);
+                        false, lv.cxxPointeeConst, lv.cxxObjectCv, rv.cxxObjectCv,
+                        false, false, nullptr,
+                        op == "<<" && !defaultMemberShift ? nullptr : rhs.expr,
+                        rv.bitfieldStorage);
                 if (overload != nullptr)
                 {
                     LLVMBackend::NamedVariable resultNV;
@@ -2501,7 +2919,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                                                false, lvalue == lv.value && lv.cxxPointeeConst,
                                                                lvalue == lv.value ? lv.cxxObjectCv : 0,
                                                                rv.cxxObjectCv,
-                                                               lhsIsAlias);
+                                                               lhsIsAlias, false, nullptr, nextCtxs[i],
+                                                               rv.bitfieldStorage);
 
                 // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
@@ -3960,7 +4379,8 @@ void MainListener::RegisterBorrowedStringOperandTemp(LLVMBackend* compiler, llvm
     }
 
 bool MainListener::IsComparisonOperatorText(const std::string& op) {
-        return op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=";
+        return op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">="
+            || op == "<=>";
     }
 
 llvm::Value* MainListener::TryPointerLhsOperatorOverload(
@@ -4045,9 +4465,321 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         bool lhsCxxNullptrT, bool rhsCxxNullptrT, bool lhsMaterializedPrvalue,
         bool lhsCxxPointeeConst, int lhsObjectCv, int rhsObjectCv, bool lhsIsAlias,
         bool refuseConstWriteOnNoViable,
-        const LLVMBackend::NamedVariable* lhsSourceNV) {
+        const LLVMBackend::NamedVariable* lhsSourceNV,
+        antlr4::ParserRuleContext* rhsOperandRule, llvm::Value* rhsBitfieldStorage) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
+        if (op == "<=>" && lvalue->getType()->isStructTy()
+            && rvalue != nullptr && rvalue->getType() == lvalue->getType())
+        {
+            auto* recordType = llvm::cast<llvm::StructType>(lvalue->getType());
+            std::string recordName = lhsTypeName.empty()
+                ? recordType->getName().str() : compiler->ResolveTypeAlias(lhsTypeName);
+            auto record = compiler->dataStructures.find(recordName);
+            if (record == compiler->dataStructures.end() || record->second.StructType != recordType)
+                record = std::find_if(compiler->dataStructures.begin(), compiler->dataStructures.end(),
+                    [&](const auto& entry) { return entry.second.StructType == recordType; });
+            if (record != compiler->dataStructures.end() && record->second.HasDefaultedSpaceship)
+            {
+                if (record->second.IsUnion)
+                {
+                    LogErrorContext(ctx, std::format("defaulted operator<=> of '{}' is deleted: it is a union",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = recordName })));
+                    return nullptr;
+                }
+                if (!OrderingCategoryAvailable(compiler, "std.strong_ordering"))
+                {
+                    LogErrorContext(ctx, "'<=>' needs import \"compare\"");
+                    return nullptr;
+                }
+                std::string category = "std.strong_ordering";
+                auto* i8 = llvm::Type::getInt8Ty(*compiler->context);
+                using CompareStep = std::function<llvm::Value*()>;
+                auto emitSequence = [&](const std::vector<CompareStep>& steps) -> llvm::Value* {
+                    if (steps.empty()) return llvm::ConstantInt::get(i8, 0);
+                    auto* endBlock = llvm::BasicBlock::Create(*compiler->context,
+                        "default.spaceship.end", compiler->currentFunction);
+                    std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
+                    for (const auto& step : steps)
+                    {
+                        llvm::Value* order = step();
+                        if (order == nullptr) return nullptr;
+                        while (order->getType()->isStructTy() || order->getType()->isArrayTy())
+                        {
+                            if (auto* st = llvm::dyn_cast<llvm::StructType>(order->getType()))
+                            {
+                                if (st->getNumElements() != 1) break;
+                            }
+                            else if (llvm::cast<llvm::ArrayType>(order->getType())->getNumElements() != 1)
+                                break;
+                            order = compiler->builder->CreateExtractValue(order, { 0 }, "spaceship.value");
+                        }
+                        if (!order->getType()->isIntegerTy()) return nullptr;
+                        if (order->getType() != i8)
+                            order = compiler->builder->CreateIntCast(order, i8, true, "spaceship.cast");
+                        auto* current = compiler->builder->GetInsertBlock();
+                        auto* nextBlock = llvm::BasicBlock::Create(*compiler->context,
+                            "default.spaceship.next", compiler->currentFunction);
+                        auto* isEqual = compiler->builder->CreateICmpEQ(order,
+                            llvm::ConstantInt::get(i8, 0), "spaceship.equal");
+                        compiler->builder->CreateCondBr(isEqual, nextBlock, endBlock);
+                        incoming.emplace_back(current, order);
+                        compiler->builder->SetInsertPoint(nextBlock);
+                    }
+                    auto* last = compiler->builder->GetInsertBlock();
+                    compiler->builder->CreateBr(endBlock);
+                    incoming.emplace_back(last, llvm::ConstantInt::get(i8, 0));
+                    compiler->builder->SetInsertPoint(endBlock);
+                    auto* result = compiler->builder->CreatePHI(i8, incoming.size(), "default.spaceship");
+                    for (const auto& [block, value] : incoming) result->addIncoming(value, block);
+                    return result;
+                };
+                std::function<llvm::Value*(llvm::Value*, llvm::Value*, const std::string&,
+                                           const std::string&)> compare;
+                compare = [&](llvm::Value* left, llvm::Value* right,
+                              const std::string& fieldType,
+                              const std::string& fieldName) -> llvm::Value* {
+                    if (auto* array = llvm::dyn_cast<llvm::ArrayType>(left->getType()))
+                    {
+                        std::vector<CompareStep> elements;
+                        elements.reserve(array->getNumElements());
+                        for (unsigned i = 0; i < array->getNumElements(); ++i)
+                            elements.push_back([&, left, right, i, fieldType, fieldName] {
+                                return compare(compiler->builder->CreateExtractValue(left, { i }),
+                                    compiler->builder->CreateExtractValue(right, { i }), fieldType, fieldName);
+                            });
+                        return emitSequence(elements);
+                    }
+                    if (left->getType()->isIntegerTy())
+                    {
+                        LLVMBackend::TypeAndValue fieldTv{ .TypeName = fieldType };
+                        bool isUnsigned = fieldTv.IsUnsignedInteger() != -1 || fieldType == "bool";
+                        if (left->getType()->getIntegerBitWidth() < 32)
+                        {
+                            auto* intType = compiler->builder->getInt32Ty();
+                            left = compiler->Upconvert(left, intType, isUnsigned);
+                            right = compiler->Upconvert(right, intType, isUnsigned);
+                            isUnsigned = false;
+                        }
+                        auto* lt = isUnsigned ? compiler->builder->CreateICmpULT(left, right, "field.lt")
+                                              : compiler->builder->CreateICmpSLT(left, right, "field.lt");
+                        auto* gt = isUnsigned ? compiler->builder->CreateICmpUGT(left, right, "field.gt")
+                                              : compiler->builder->CreateICmpSGT(left, right, "field.gt");
+                        return compiler->builder->CreateSelect(lt, llvm::ConstantInt::getSigned(i8, -1),
+                            compiler->builder->CreateSelect(gt, llvm::ConstantInt::get(i8, 1),
+                                llvm::ConstantInt::get(i8, 0), "field.order"), "field.order");
+                    }
+                    if (left->getType()->isFloatingPointTy())
+                    {
+                        category = "std.partial_ordering";
+                        auto* lt = compiler->builder->CreateFCmpOLT(left, right, "field.lt");
+                        auto* gt = compiler->builder->CreateFCmpOGT(left, right, "field.gt");
+                        auto* unordered = compiler->builder->CreateFCmpUNO(left, right, "field.unordered");
+                        auto* order = compiler->builder->CreateSelect(lt,
+                            llvm::ConstantInt::getSigned(i8, -1),
+                            compiler->builder->CreateSelect(gt, llvm::ConstantInt::get(i8, 1),
+                                llvm::ConstantInt::get(i8, 0), "field.order"), "field.order");
+                        return compiler->builder->CreateSelect(unordered,
+                            llvm::ConstantInt::getSigned(i8, -127), order, "field.partial.order");
+                    }
+                    if (left->getType()->isPointerTy())
+                    {
+                        auto* lt = compiler->builder->CreateICmpULT(left, right, "field.lt");
+                        auto* gt = compiler->builder->CreateICmpUGT(left, right, "field.gt");
+                        return compiler->builder->CreateSelect(lt, llvm::ConstantInt::getSigned(i8, -1),
+                            compiler->builder->CreateSelect(gt, llvm::ConstantInt::get(i8, 1),
+                                llvm::ConstantInt::get(i8, 0), "field.order"), "field.order");
+                    }
+                    if (left->getType()->isStructTy())
+                    {
+                        auto* nested = TryBinaryOperatorOverload(left, "<=>", right, ctx, nullptr,
+                            0, false, nullptr, nullptr, false, false, false, false,
+                            fieldType, fieldType);
+                        if (nested != nullptr)
+                        {
+                            const std::string nestedCategory = compiler->lastCallReturnType.DiagnosticTypeName.empty()
+                                ? compiler->lastCallReturnType.TypeName
+                                : compiler->lastCallReturnType.DiagnosticTypeName;
+                            const std::string nestedCanonical = StdOrderingCategoryOf(nestedCategory);
+                            if (nestedCanonical == "std.partial_ordering")
+                                category = "std.partial_ordering";
+                            else if (nestedCanonical == "std.weak_ordering"
+                                     && category == "std.strong_ordering")
+                                category = "std.weak_ordering";
+                            return nested;
+                        }
+                    }
+                    LogErrorContext(ctx, std::format(
+                        "defaulted operator<=> of '{}' is deleted: field '{}' of type '{}' has no operator '<=>'",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = recordName }),
+                        fieldName, SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = fieldType })));
+                    return nullptr;
+                };
+                std::vector<CompareStep> fields;
+                fields.reserve(record->second.StructFields.size());
+                for (size_t i = 0; i < record->second.StructFields.size(); ++i)
+                {
+                    const auto& field = record->second.StructFields[i];
+                    const std::string fieldName = field.VariableName;
+                    const std::string fieldType = field.TypeName;
+                    fields.push_back([&, i, fieldName, fieldType] {
+                        return compare(compiler->builder->CreateExtractValue(lvalue, { (unsigned)i }),
+                            compiler->builder->CreateExtractValue(rvalue, { (unsigned)i }), fieldType, fieldName);
+                    });
+                }
+                llvm::Value* result = emitSequence(fields);
+                if (result != nullptr)
+                {
+                    const std::string declaredCategory = record->second.DefaultedSpaceshipCategory;
+                    if (!declaredCategory.empty())
+                    {
+                        auto categoryRank = [](const std::string& name) {
+                            return name == "std.strong_ordering" ? 0
+                                : name == "std.weak_ordering" ? 1
+                                : name == "std.partial_ordering" ? 2 : -1;
+                        };
+                        if (categoryRank(category) > categoryRank(declaredCategory))
+                        {
+                            LogErrorContext(ctx, std::format(
+                                "defaulted operator<=> of '{}' is deleted: inferred '{}' cannot convert to declared '{}'",
+                                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = recordName }),
+                                category, declaredCategory));
+                            return nullptr;
+                        }
+                        category = declaredCategory;
+                    }
+                    compiler->lastCallReturnType = {};
+                    compiler->lastCallReturnType.TypeName = category;
+                    compiler->lastCallReturnType.DiagnosticTypeName = category;
+                    // The synthesized code is an i8; the value is the category's named struct.
+                    if (llvm::StructType* shape = OrderingCategoryStruct(compiler, category))
+                        if (llvm::Value* wrapped = WrapOrderingCodeLike(*compiler->builder, result, shape))
+                            result = wrapped;
+                }
+                return result;
+            }
+        }
+        if (op == "==" && lvalue->getType()->isStructTy()
+            && rvalue != nullptr && rvalue->getType() == lvalue->getType())
+        {
+            auto* recordType = llvm::cast<llvm::StructType>(lvalue->getType());
+            std::string recordName = lhsTypeName.empty()
+                ? recordType->getName().str() : compiler->ResolveTypeAlias(lhsTypeName);
+            auto record = compiler->dataStructures.find(recordName);
+            if (record == compiler->dataStructures.end() || record->second.StructType != recordType)
+                record = std::find_if(compiler->dataStructures.begin(), compiler->dataStructures.end(),
+                    [&](const auto& entry) { return entry.second.StructType == recordType; });
+            bool userDeclaredEquality = false;
+            if (record != compiler->dataStructures.end() && record->second.HasDefaultedSpaceship)
+                if (auto functions = compiler->functionTable.find("operator==");
+                    functions != compiler->functionTable.end())
+                    for (const auto& candidate : functions->second)
+                        if (!candidate.IsCxx && candidate.Parameters.size() == 2
+                            && candidate.Parameters[0].TypeName == recordName
+                            && candidate.Parameters[1].TypeName == recordName)
+                        {
+                            userDeclaredEquality = true;
+                            break;
+                        }
+            if (record != compiler->dataStructures.end()
+                && (record->second.HasDefaultedEquality
+                    || (record->second.HasDefaultedSpaceship && !userDeclaredEquality)))
+            {
+                if (record->second.IsUnion)
+                {
+                    // C++20: a defaulted operator== of a union is deleted.
+                    LogErrorContext(ctx, std::format("defaulted operator== of '{}' is deleted: it is a union",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = recordName })));
+                    return nullptr;
+                }
+                using EqualityCheck = std::function<llvm::Value*()>;
+                auto emitChecks = [&](const std::vector<EqualityCheck>& checks) -> llvm::Value* {
+                    if (checks.empty())
+                        return llvm::ConstantInt::getTrue(*compiler->context);
+                    llvm::BasicBlock* falseBlock = llvm::BasicBlock::Create(
+                        *compiler->context, "default.eq.false", compiler->currentFunction);
+                    llvm::BasicBlock* mergeBlock = llvm::BasicBlock::Create(
+                        *compiler->context, "default.eq.end", compiler->currentFunction);
+                    for (const auto& check : checks)
+                    {
+                        llvm::Value* equal = check();
+                        if (equal == nullptr) return nullptr;
+                        if (!equal->getType()->isIntegerTy(1))
+                            equal = compiler->builder->CreateICmpNE(equal,
+                                llvm::ConstantInt::get(equal->getType(), 0));
+                        llvm::BasicBlock* nextBlock = llvm::BasicBlock::Create(
+                            *compiler->context, "default.eq.next", compiler->currentFunction);
+                        compiler->builder->CreateCondBr(equal, nextBlock, falseBlock);
+                        compiler->builder->SetInsertPoint(nextBlock);
+                    }
+                    llvm::BasicBlock* trueBlock = compiler->builder->GetInsertBlock();
+                    compiler->builder->CreateBr(mergeBlock);
+                    compiler->builder->SetInsertPoint(falseBlock);
+                    compiler->builder->CreateBr(mergeBlock);
+                    compiler->builder->SetInsertPoint(mergeBlock);
+                    auto* result = compiler->builder->CreatePHI(
+                        llvm::Type::getInt1Ty(*compiler->context), 2, "default.eq");
+                    result->addIncoming(llvm::ConstantInt::getTrue(*compiler->context), trueBlock);
+                    result->addIncoming(llvm::ConstantInt::getFalse(*compiler->context), falseBlock);
+                    return result;
+                };
+                std::function<llvm::Value*(llvm::Value*, llvm::Value*, const std::string&,
+                                           const std::string&)> compare;
+                compare = [&](llvm::Value* left, llvm::Value* right,
+                              const std::string& fieldType,
+                              const std::string& fieldName) -> llvm::Value* {
+                    if (auto* array = llvm::dyn_cast<llvm::ArrayType>(left->getType()))
+                    {
+                        std::vector<EqualityCheck> elements;
+                        elements.reserve(array->getNumElements());
+                        for (unsigned i = 0; i < array->getNumElements(); ++i)
+                            elements.push_back([&, left, right, i, fieldType] {
+                                return compare(compiler->builder->CreateExtractValue(left, { i }),
+                                               compiler->builder->CreateExtractValue(right, { i }),
+                                               fieldType, fieldName);
+                            });
+                        return emitChecks(elements);
+                    }
+                    if (left->getType()->isIntegerTy())
+                        return compiler->builder->CreateICmpEQ(left, right);
+                    if (left->getType()->isFloatingPointTy())
+                        return compiler->builder->CreateFCmpOEQ(left, right);
+                    if (left->getType()->isPointerTy())
+                        return compiler->builder->CreateICmpEQ(left, right);
+                    if (left->getType()->isStructTy())
+                    {
+                        llvm::Value* overloaded = TryBinaryOperatorOverload(
+                            left, "==", right, ctx, nullptr, 0, false, nullptr, nullptr,
+                            false, false, false, false, fieldType, fieldType);
+                        if (overloaded != nullptr) return overloaded;
+                    }
+                    // Element of an array field: name the element's own struct, not the array.
+                    const std::string displayedType = left->getType()->isStructTy()
+                        ? llvm::cast<llvm::StructType>(left->getType())->getName().str() : fieldType;
+                    LogErrorContext(ctx, std::format(
+                        "defaulted operator== of '{}' is deleted: field '{}' of type '{}' has no operator '=='",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = recordName }),
+                        fieldName,
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = displayedType })));
+                    return nullptr;
+                };
+                std::vector<EqualityCheck> fields;
+                for (size_t i = 0; i < record->second.StructFields.size(); ++i)
+                {
+                    const auto& field = record->second.StructFields[i];
+                    const std::string fieldName = field.VariableName;
+                    const std::string fieldType = field.TypeName;
+                    fields.push_back([&, i, fieldName, fieldType] {
+                        llvm::Value* left = compiler->builder->CreateExtractValue(lvalue, { (unsigned)i });
+                        llvm::Value* right = compiler->builder->CreateExtractValue(rvalue, { (unsigned)i });
+                        llvm::Value* equal = compare(left, right, fieldType, fieldName);
+                        if (equal == nullptr) return static_cast<llvm::Value*>(nullptr);
+                        return equal;
+                    });
+                }
+                return emitChecks(fields);
+            }
+        }
         // An ADL request for this expression was ambiguous and refused: nested rewrites stay silent.
         if (ctx != nullptr && ctx == cxxAdlAmbiguousCtx_) return nullptr;
         // The marker covers one outermost resolution only: a generic body re-walks the same ctx.
@@ -4139,6 +4871,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)
             && !(isCxxRecordValue(rvalue) && isParallelStorageJoin(rvalue, rhsStorage)))
             rhsStorage = nullptr;
+        auto collectOperatorOperandRules = [&]() {
+            std::vector<antlr4::ParserRuleContext*> operands;
+            if (ctx == nullptr) return operands;
+            for (auto* child : ctx->children)
+                if (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(child))
+                    if (!dynamic_cast<CFlatParser::AssignmentOperatorContext*>(rule))
+                        operands.push_back(rule);
+            return operands;
+        };
+        const auto operandRules = collectOperatorOperandRules();
+        auto* currentRhsOperandRule = rhsOperandRule;
+        if (currentRhsOperandRule == nullptr && operandRules.size() == 2)
+            currentRhsOperandRule = operandRules[1];
         /*
          * An explicit `move` of a non-trivial C++ record keeps its source slot (ParseMoveExpression):
          * the rvalue read straight from it is an xvalue. When a candidate takes that operand as a
@@ -4149,7 +4894,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         if (rhsIsRvalue && rhsStorage != nullptr && isCxxRecordValue(rvalue))
             if (auto* load = llvm::dyn_cast<llvm::LoadInst>(rvalue);
                 load != nullptr && load->getPointerOperand() == rhsStorage)
-                rhsXvalueType = llvm::cast<llvm::StructType>(rvalue->getType())->getName().str();
+                if (currentRhsOperandRule == nullptr
+                    || !IsSameTypeCastOfDefault(currentRhsOperandRule, rhsTypeName))
+                    rhsXvalueType = llvm::cast<llvm::StructType>(rvalue->getType())->getName().str();
         auto rhsXvalueSink = [&](const LLVMBackend::TypeAndValue& param) {
             return !rhsXvalueType.empty() && param.TypeName == rhsXvalueType
                 && (param.IsRvalueRef || (!param.Pointer && !param.IsAlias));
@@ -4353,14 +5100,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         // True when that refusal is clang's "is ambiguous" diagnostic: refused, never a fallback.
         bool adlClangAmbiguous = false;
         // clangDecides: the ADL form asks clang even for a class hiding nothing (T85 template rank).
-        auto collectOperatorOperandRules = [&]() {
-            std::vector<antlr4::ParserRuleContext*> operands;
-            if (ctx == nullptr) return operands;
-            for (auto* child : ctx->children)
-                if (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(child))
-                    if (!dynamic_cast<CFlatParser::AssignmentOperatorContext*>(rule))
-                        operands.push_back(rule);
-            return operands;
+        const auto& operands = operandRules;
+        // The rhs operand's C++ value category (CxxArgumentLvalueKind), read from this one place.
+        auto rhsOperandCategory = [&]() -> int8_t {
+            return currentRhsOperandRule != nullptr ? CxxArgumentLvalueKind(currentRhsOperandRule)
+                                                    : int8_t(-1);
         };
         std::set<std::string> binaryExcludedLinkages;
         std::string binaryExcludedTable;
@@ -5327,13 +6071,20 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         auto reversedCandidate = [&]() -> llvm::Value* {
             if (!allowReversed || rvalue == nullptr) return nullptr;
             if (op != "==" && op != "<=>") return nullptr;
-            auto isCxxOperand = [&](llvm::Value* value) {
+            auto isStructOperand = [&](llvm::Value* value) {
                 if (value == nullptr || !value->getType()->isStructTy()) return false;
                 auto* st = llvm::cast<llvm::StructType>(value->getType());
-                if (st->isLiteral() || !st->hasName()) return false;
-                return compiler->IsCxxRecord(st->getName().str());
+                return !st->isLiteral() && st->hasName();
             };
-            if (!isCxxOperand(lvalue) && !isCxxOperand(rvalue)) return nullptr;
+            if (!isStructOperand(lvalue) && !isStructOperand(rvalue)) return nullptr;
+            if (op == "==")
+            {
+                auto isCxxOperand = [&](llvm::Value* value) {
+                    return isStructOperand(value)
+                        && compiler->IsCxxRecord(llvm::cast<llvm::StructType>(value->getType())->getName().str());
+                };
+                if (!isCxxOperand(lvalue) && !isCxxOperand(rvalue)) return nullptr;
+            }
             RewriteDepthScope rewriteScope(cxxOperatorRewriteDepth_);
             llvm::Value* reversed = TryBinaryOperatorOverload(
                 rvalue, op, lvalue, ctx, nullptr,
@@ -5767,9 +6518,51 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         // Fat-ptr types compare by extracted field - let CreateOperation handle it.
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
+        std::string opName = "operator" + op;
+        if (compiler->IsCxxRecord(typeName)
+            && compiler->HasCxxFunctionTemplateMember(typeName, opName))
+        {
+            LLVMBackend::NamedVariable receiver;
+            receiver.Primary = lhsStorage != nullptr ? lhsStorage : lvalue;
+            receiver.Storage = receiver.Primary;
+            receiver.BaseType = receiver.Primary->getType();
+            receiver.TypeAndValue.TypeName = typeName;
+            receiver.TypeAndValue.Pointer = true;
+            receiver.IsRvalue = lhsIsRvalue;
+            LLVMBackend::NamedVariable operand;
+            operand.Primary = rvalue;
+            operand.Storage = rhsStorage;
+            operand.BaseType = rvalue != nullptr ? rvalue->getType() : nullptr;
+            operand.TypeAndValue.TypeName = rhsTypeName;
+            operand.IsRvalue = rhsIsRvalue;
+            operand.IsExplicitMove = rhsExplicitMove;
+            operand.CxxLvalueKind = rhsOperandCategory();
+            operand.BitfieldStorage = rhsBitfieldStorage;
+            // A pointer operand deduces `T*&` / `T*` from its pointee, as a named call argument does.
+            if (rhsPointerDepth >= 1 && rvalue != nullptr && rvalue->getType()->isPointerTy())
+            {
+                operand.TypeAndValue.Pointer = true;
+                operand.TypeAndValue.PointerDepth = rhsPointerDepth;
+                operand.TypeAndValue.ElemPointer = rhsElemPointer;
+                operand.TypeAndValue.SetPointeeConstBit(rhsCxxPointeeConst);
+            }
+            std::vector<LLVMBackend::NamedVariable> templateArguments = { receiver, operand };
+            std::string registeredName, templateError;
+            // Clang refusing the member call itself (a selected body, an ambiguity) is the answer;
+            // no viable candidate at the request leaves the non-template members to CFlat.
+            if (!compiler->RequestCxxFunctionTemplate(opName, typeName, {}, templateArguments,
+                    {}, registeredName, templateError)
+                && compiler->LastCxxRequestClangRejected() && !templateError.empty()
+                && !compiler->LastCxxRequestNoViableAtRequest())
+            {
+                LogErrorContext(ctx, templateError.starts_with("clang: ")
+                    ? templateError : "clang: " + templateError);
+                return nullptr;
+            }
+        }
+
         if (llvm::Value* exact = tryClangForCxx20CandidateSet()) return exact;
 
-        std::string opName = "operator" + op;
         auto isReceiverCandidate = [&](const LLVMBackend::FunctionSymbol& candidate) {
             const bool cxxFree = isFreeCxxCandidate(candidate);
             return candidate.SourceName == opName && !cxxFree;
@@ -6182,6 +6975,18 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 }
             }
             rightNV.IsRvalue = rhsIsRvalue;
+            if (currentRhsOperandRule != nullptr
+                && IsSameTypeCastOfDefault(currentRhsOperandRule, rhsTypeName)
+                && compiler->IsForeignNontrivialCxxClass(rightNV.TypeAndValue.TypeName)
+                && rightNV.Storage != nullptr)
+            {
+                rightNV.IsCxxPrvalueTemp = true;
+                LLVMBackend::NamedVariable tempProbe = rightNV;
+                tempProbe.Primary = rvalue;
+                if (!compiler->IsOwnedTempValue(tempProbe))
+                    if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(rightNV.Storage))
+                        compiler->RegisterOwnedStructTemp(slot, rightNV.TypeAndValue.TypeName);
+            }
             if (rhsIsRvalue && !rhsExplicitMove && rightNV.Storage != nullptr
                 && compiler->IsForeignNontrivialCxxClass(rightNV.TypeAndValue.TypeName))
             {
@@ -6211,6 +7016,26 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         auto rightNV = makeRightNV();
         if (rhsExplicitMove) rightNV.IsExplicitMove = true;
+        rightNV.CxxLvalueKind = rhsOperandCategory();
+        rightNV.BitfieldStorage = rhsBitfieldStorage;
+        // A bitfield reads as its storage width; its declared type names the C++ referent.
+        if (rhsBitfieldStorage != nullptr && rightNV.TypeAndValue.TypeName.empty()
+            && IsCflatArithmeticName(rhsTypeName))
+            rightNV.TypeAndValue.TypeName = rhsTypeName;
+        // A scalar (or, for a C++ receiver, pointer) lvalue operand keeps its own slot: a `T&&` / `T&`
+        // parameter binds the variable; a slotless one reads as a temporary (refused, or a worse pick).
+        const bool rhsPointerValue = rvalue != nullptr && rvalue->getType()->isPointerTy();
+        if (rightNV.CxxLvalueKind == 1 && rhsStorage != nullptr
+            && (rightNV.Storage == nullptr || rightNV.Storage == rhsStorage)
+            && !rhsIsRvalue && rvalue != nullptr && !rvalue->getType()->isStructTy()
+            && (!rhsPointerValue || compiler->IsCxxRecord(typeName)))
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(rvalue);
+                load != nullptr && load->getPointerOperand() == rhsStorage)
+            {
+                rightNV.Storage = rhsStorage;
+                if (!rhsPointerValue && rightNV.TypeAndValue.TypeName.empty())
+                    rightNV.TypeAndValue.TypeName = rightNV.CxxArithIdentity;
+            }
         // C++ class receiver: members and frees compete on the whole argument list, as the unary rule does
         // (T275). A free-only winner goes to the free path; a member winner pins the member set; a member
         // and a free that tie are ambiguous (clang). Not inside a C++20 rewrite (operands are reversed).
@@ -6687,7 +7512,9 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                                                               rightNV.TypeAndValue.IsCxxNullptrT,
                                                               false, i == 1 && firstNV.TypeAndValue.PointeeConstBit(),
                                                               i == 1 ? Compiler(ctx)->CxxOperandObjectCv(firstNV) : 0,
-                                                              Compiler(ctx)->CxxOperandObjectCv(rightNV));
+                                                              Compiler(ctx)->CxxOperandObjectCv(rightNV),
+                                                              false, false, nullptr, nextCtxs[i],
+                                                              rightNV.BitfieldStorage);
                 if (overload)
                 {
                     LLVMBackend::NamedVariable resultNV;

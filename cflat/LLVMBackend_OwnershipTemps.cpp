@@ -7938,6 +7938,143 @@ bool LLVMBackend::IsFieldOfOwnedStructTemp(const llvm::Value* storage,
         return false;
     }
 
+void LLVMBackend::EmitReplacementDestructor(llvm::Function* dtor, llvm::Value* destination,
+                                           const std::string& typeName)
+{
+        if (dtor == nullptr) return;
+        llvm::Value* base = destination;
+        std::vector<llvm::GetElementPtrInst*> destinationPath;
+        while (true)
+        {
+            if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(base))
+            {
+                destinationPath.push_back(gep);
+                base = gep->getPointerOperand();
+            }
+            else if (auto* cast = llvm::dyn_cast<llvm::BitCastInst>(base))
+                base = cast->getOperand(0);
+            else
+                break;
+        }
+        auto savedTemps = pendingOwnedStructTemps;
+        auto savedPartial = unwindPartial_;
+        if (base != destination)
+        {
+            const size_t erasedTemps = std::erase_if(pendingOwnedStructTemps,
+                [&](const auto& temp) { return temp.Alloca == base; });
+            const size_t erasedPartial = std::erase_if(unwindPartial_,
+                [&](const auto& entry) { return entry.V == base; });
+            const size_t erasedPathPartial = std::erase_if(unwindPartial_, [&](const auto& entry)
+            {
+                return std::ranges::any_of(destinationPath,
+                    [&](const auto* gep) { return entry.V == gep; });
+            });
+            const size_t erasedPathTemps = std::erase_if(pendingOwnedStructTemps, [&](const auto& temp)
+            {
+                return std::ranges::any_of(destinationPath,
+                    [&](const auto* gep) { return temp.Alloca == gep; });
+            });
+            if (erasedTemps != 0 || erasedPartial != 0
+                || erasedPathPartial != 0 || erasedPathTemps != 0)
+            {
+                auto typeNameFor = [&](llvm::Type* type) -> std::string
+                {
+                    while (auto* arrayTy = llvm::dyn_cast<llvm::ArrayType>(type))
+                        type = arrayTy->getElementType();
+                    auto* structTy = llvm::dyn_cast<llvm::StructType>(type);
+                    if (structTy == nullptr || !structTy->hasName()) return {};
+                    const std::string name = structTy->getName().str();
+                    return dataStructures.contains(name) ? name : std::string{};
+                };
+                auto sameSlot = [](llvm::Value* left, llvm::Value* right)
+                {
+                    if (left == right) return true;
+                    auto* leftGep = llvm::dyn_cast<llvm::GetElementPtrInst>(left);
+                    auto* rightGep = llvm::dyn_cast<llvm::GetElementPtrInst>(right);
+                    if (leftGep == nullptr || rightGep == nullptr
+                        || leftGep->getPointerOperand() != rightGep->getPointerOperand()
+                        || leftGep->getSourceElementType() != rightGep->getSourceElementType()
+                        || leftGep->getNumIndices() != rightGep->getNumIndices()) return false;
+                    return std::equal(leftGep->idx_begin(), leftGep->idx_end(), rightGep->idx_begin());
+                };
+                for (auto it = destinationPath.rbegin(); it != destinationPath.rend(); ++it)
+                {
+                    llvm::GetElementPtrInst* gep = *it;
+                    llvm::Type* sourceTy = gep->getSourceElementType();
+                    llvm::Value* parent = gep->getPointerOperand();
+                    if (auto* arrayTy = llvm::dyn_cast<llvm::ArrayType>(sourceTy))
+                    {
+                        if (gep->getNumIndices() != 2) continue;
+                        auto* index = llvm::dyn_cast<llvm::ConstantInt>(gep->idx_end()[-1]);
+                        const std::string elementTypeName = typeNameFor(arrayTy->getElementType());
+                        if (index == nullptr || elementTypeName.empty()
+                            || !HasNonTrivialDestructor(elementTypeName)) continue;
+                        for (uint64_t i = 0; i < arrayTy->getNumElements(); ++i)
+                        {
+                            if (i == index->getZExtValue()) continue;
+                            llvm::Value* sibling = builder->CreateInBoundsGEP(arrayTy, parent,
+                                { builder->getInt32(0), builder->getInt32(i) },
+                                "replacement.sibling");
+                            if (std::ranges::any_of(unwindPartial_, [&](const auto& entry)
+                                { return sameSlot(entry.V, sibling); })) continue;
+                            unwindPartial_.push_back({ UnwindPartialEntry::Kind::Slot,
+                                sibling, elementTypeName, builder->GetInsertBlock()->getParent() });
+                        }
+                    }
+                    else if (auto* structTy = llvm::dyn_cast<llvm::StructType>(sourceTy))
+                    {
+                        if (gep->getNumIndices() != 2) continue;
+                        auto* first = llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()[0]);
+                        auto* index = llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()[1]);
+                        if (first == nullptr || !first->isZero() || index == nullptr) continue;
+                        for (uint64_t i = 0; i < structTy->getNumElements(); ++i)
+                        {
+                            if (i == index->getZExtValue()) continue;
+                            const TypeAndValue* field = FindDeclaredFieldOfStructType(structTy, i);
+                            if (field == nullptr || field->TypeName.empty()
+                                || !HasNonTrivialDestructor(field->TypeName)) continue;
+                            llvm::Value* sibling = builder->CreateInBoundsGEP(structTy, parent,
+                                { builder->getInt32(0), builder->getInt32(i) },
+                                "replacement.sibling");
+                            // An array-typed sibling field registers every element (nested arrays
+                            // flattened), each as a slot of the field's element type.
+                            std::vector<llvm::Value*> slots{ sibling };
+                            for (llvm::Type* slotTy = structTy->getElementType(i);
+                                 auto* fieldArrayTy = llvm::dyn_cast<llvm::ArrayType>(slotTy);
+                                 slotTy = fieldArrayTy->getElementType())
+                            {
+                                std::vector<llvm::Value*> elements;
+                                for (llvm::Value* slot : slots)
+                                    for (uint64_t e = 0; e < fieldArrayTy->getNumElements(); ++e)
+                                        elements.push_back(builder->CreateInBoundsGEP(fieldArrayTy, slot,
+                                            { builder->getInt32(0), builder->getInt32(e) },
+                                            "replacement.sibling"));
+                                slots = std::move(elements);
+                            }
+                            for (llvm::Value* slot : slots)
+                            {
+                                if (std::ranges::any_of(unwindPartial_, [&](const auto& entry)
+                                    { return sameSlot(entry.V, slot); })) continue;
+                                unwindPartial_.push_back({ UnwindPartialEntry::Kind::Slot,
+                                    slot, field->TypeName, builder->GetInsertBlock()->getParent() });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        const auto* symbol = FindSymbolForFunction(dtor);
+        const auto cxxNoexcept = cxxNoexceptByFunction_.find(dtor);
+        const CxxClassInfo* cxxInfo = GetCxxClassInfo(typeName);
+        const bool isNoexcept = cxxNoexcept != cxxNoexceptByFunction_.end()
+            ? cxxNoexcept->second : symbol != nullptr ? symbol->IsNoexcept
+            : cxxInfo != nullptr && cxxInfo->hasDtor && cxxInfo->destructor.isNoexcept;
+        const bool mayUnwind = !isNoexcept && !dtor->doesNotThrow();
+        CreateCallOrInvoke(dtor->getFunctionType(), dtor, { destination }, mayUnwind);
+        pendingOwnedStructTemps = std::move(savedTemps);
+        unwindPartial_ = std::move(savedPartial);
+}
+
 bool LLVMBackend::IsOwnedClosureTemp(llvm::Value* value) const
 {
         for (const auto& e : pendingOwnedClosureTemps)

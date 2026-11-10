@@ -477,6 +477,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
         sym.External = true;
         sym.IsCxx = true;
         sym.IsNoexcept = st.isNoexcept;
+        cxxNoexceptByFunction_[fn] = sym.IsNoexcept;
         sym.Recipe = recipe;
         /*
          * Same rule the ordinary call path applies (M4b): a foreign NONTRIVIAL C++ class crossing
@@ -3113,6 +3114,7 @@ bool LLVMBackend::HasImplicitClassConversionOperator(const std::string& sourceTy
             EnsureCxxRecordProjected(type, false);
             auto record = cxxRecordEntries_.find(type);
             if (record == cxxRecordEntries_.end()) return false;
+            if (record->second.hasConversionTemplate) return true;
             for (const auto& member : record->second.members)
             {
                 if (!member.isConversion || member.isExplicit || member.isDeleted) continue;
@@ -4587,7 +4589,8 @@ bool LLVMBackend::RequestSameClassCopy(const std::string& typeName, const NamedV
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                              llvm::Value* src, bool useMove, const char* context,
                                              const std::string& displayTypeName,
-                                             bool constSource, bool directInit)
+                                             bool constSource, bool directInit,
+                                             bool forceClangPick)
 {
         if (dest == nullptr || src == nullptr) return false;
         if (IsLoweredCFlatOnlyStruct(typeName))
@@ -4636,6 +4639,57 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                 }
                 builder->CreateCall(wrapper->getFunctionType(), wrapper, { dest, src });
                 return true;
+            }
+        }
+        // A move expression can select a forwarding constructor template (or be rejected by a
+        // deleted move) ahead of the listed move/copy constructors. Ask clang for those sets;
+        // the simple ctor table cannot represent template partial ordering or deleted ties.
+        const bool movePickNeedsClang = useMove && forceClangPick
+            && CxxMovePickNeedsClang(typeName);
+        if (movePickNeedsClang)
+        {
+            sourceObject.IsRvalue = true;
+            sourceObject.IsExplicitMove = true;
+            std::string wrapperName;
+            std::string wrapperError;
+            bool noViableCandidate = false;
+            if (RequestCxxVariadicConstructor(typeName, { sourceObject }, wrapperName,
+                    wrapperError, /*copyInit*/ !directInit, &noViableCandidate))
+            {
+                if (llvm::Function* wrapper = FindCxxWrapperFunction(wrapperName))
+                {
+                    builder->CreateCall(wrapper->getFunctionType(), wrapper, { dest, src });
+                    return true;
+                }
+                LogError(std::format(
+                    "cannot move C++ class '{}' {}: clang selected a constructor but its "
+                    "generated wrapper could not be called",
+                    displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName,
+                    context));
+                return false;
+            }
+            if (noViableCandidate)
+            {
+                LogError(std::format(
+                    "cannot move C++ class '{}' {}: clang found no usable constructor",
+                    displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName,
+                    context));
+                return false;
+            }
+            if (!wrapperError.empty())
+            {
+                if (implicitInfo->hasDeletedMoveCtor
+                    && wrapperError.find("deleted constructor") != std::string::npos)
+                {
+                    LogError(std::format(
+                        "cannot move C++ class '{}' {}: its move or copy constructor is deleted - "
+                        "pass or hold it by pointer instead",
+                        displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName,
+                        context));
+                    return false;
+                }
+                LogError(wrapperError);
+                return false;
             }
         }
         const CxxClassInfo::Structor* ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
@@ -4762,9 +4816,10 @@ bool LLVMBackend::EmitCxxByValueParamConstruct(const std::string& typeName, llvm
                                                 llvm::Value* src, bool useMove,
                                                 const char* context, bool constSource)
 {
-        if (IsForeignNontrivialCxxClass(typeName))
+        const bool movePickNeedsClang = useMove && CxxMovePickNeedsClang(typeName);
+        if (IsForeignNontrivialCxxClass(typeName) || movePickNeedsClang)
             return EmitCxxCopyOrMoveConstruct(typeName, dest, src, useMove, context, {},
-                                              constSource);
+                                              constSource, false, movePickNeedsClang);
         if (!HasForeignNontrivialCxxField(typeName)) return false;
         if (!useMove)
         {
@@ -5154,11 +5209,14 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         if (sourceTypeName.empty() || dest.TypeName.empty() || dest.TypeName == "void") return {};
         if (sourceTypeName == dest.TypeName) return {};
         const bool classReferenceTarget = dest.IsAlias && IsCxxRecord(dest.TypeName);
+        const bool classValueTarget = !dest.Pointer && !dest.IsAlias
+            && IsCxxRecord(dest.TypeName);
         if (dest.ElemPointer
             || dest.IsArrayView || dest.IsInterface
             || dest.IsFunctionPointer)
             return {};
-        if (!dest.IsPrimitive() && !dest.Pointer && !classReferenceTarget) return {};
+        if (!dest.IsPrimitive() && !dest.Pointer && !classReferenceTarget && !classValueTarget)
+            return {};
         if (IsPrimitiveTypeName(sourceTypeName)) return {};
         // A CFlat-native `operator T` is EXPLICIT-only by ruling (Test/errors/err_operator_
         // conversion.cb pins it), so only an imported C++ record converts implicitly - there
@@ -5246,6 +5304,32 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         const bool receiverKnown = receiver != nullptr && IsCxxRecord(sourceTypeName);
         const bool receiverConst = receiverKnown
             && (receiver->IsConstObject() || receiver->CxxConstRef());
+        auto hasConversionTemplate = [&](auto&& self, const std::string& type) -> bool {
+            auto record = cxxRecordEntries_.find(type);
+            if (record == cxxRecordEntries_.end()) return false;
+            if (record->second.hasConversionTemplate) return true;
+            for (const auto& base : record->second.bases)
+                if (base.access == cflat_cinterop::AccessPublic)
+                {
+                    const std::string baseName = ResolveCxxBaseRecordName(base);
+                    if (!baseName.empty() && self(self, baseName)) return true;
+                }
+            return false;
+        };
+        // Class-by-value template conversions are resolved by clang on demand. Keep the older
+        // non-template class-value conversion boundary unchanged.
+        if (classValueTarget && !hasConversionTemplate(hasConversionTemplate, sourceTypeName))
+            return {};
+        auto requestTemplateConversion = [&]() -> std::string {
+            if (!receiverKnown || !hasConversionTemplate(hasConversionTemplate, sourceTypeName))
+                return {};
+            std::string wrapperName;
+            std::string wrapperError;
+            if (self->RequestCxxConversionOperatorTemplate(sourceTypeName, dest.TypeName,
+                    receiverConst, allowExplicit, wrapperName, wrapperError))
+                return wrapperName;
+            return {};
+        };
         // One candidate's return type; false when its shape cannot reach dest.
         auto fits = [&](const auto& candidate, std::string& returnTypeName) {
                 if (candidate.Parameters.size() != 1) return false;
@@ -5262,6 +5346,15 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                     if (ret.CxxConstRef() && !dest.CxxConstRef()) return false;
                     if (ret.TypeName == dest.TypeName && !ret.ElemPointer
                         && ret.IsAlias)
+                    {
+                        returnTypeName = ret.TypeName;
+                        return true;
+                    }
+                    return false;
+                }
+                if (classValueTarget)
+                {
+                    if (!ret.Pointer && ret.TypeName == dest.TypeName)
                     {
                         returnTypeName = ret.TypeName;
                         return true;
@@ -5344,7 +5437,13 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         if (!exactName.empty() && (exactReceiverRank == 0 || classReferenceTarget || dest.Pointer))
             return exactName;
 
-        if (classReferenceTarget) return {};
+        // Conversion-function templates are target-deduced by clang. The raw member table has
+        // only a presence bit for them, so ask clang lazily when no exact projected candidate
+        // settled this destination.
+        if (std::string templateName = requestTemplateConversion(); !templateName.empty())
+            return templateName;
+
+        if (classReferenceTarget || classValueTarget) return exactName;
         // Pointer conversions are exact here. Their standard pointer conversions need a richer
         // ranking than the scalar conversion table below, so do not treat them as scalar casts.
         if (dest.Pointer) return {};
@@ -5477,6 +5576,30 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
             result = builder->CreateLoad(referentType, result, "cxx.conversion.ref");
         }
 
+        if (dest.IsAlias && IsCxxRecord(dest.TypeName) && !conversionReturnType.IsAlias
+            && !conversionReturnType.Pointer && conversionReturnType.TypeName == dest.TypeName
+            && result->getType()->isStructTy())
+        {
+            llvm::Value* slot = StorageOfLoadedCxxObject(result);
+            if (slot == nullptr)
+            {
+                llvm::Type* objectType = GetType(TypeAndValue{ .TypeName = dest.TypeName });
+                if (objectType == nullptr) return false;
+                slot = CreateAlloca(objectType);
+                builder->CreateStore(result, slot);
+                if (IsForeignNontrivialCxxClass(dest.TypeName))
+                    RegisterOwnedStructTemp(slot, dest.TypeName);
+            }
+            nv.Primary = slot;
+            nv.Storage = nullptr;
+            nv.BaseType = GetType(const_cast<TypeAndValue&>(dest));
+            nv.TypeAndValue = dest;
+            nv.TypeAndValue.SetCxxConstRef(dest.CxxConstRef()
+                || conversionReturnType.CxxConstRef());
+            nv.TypeAndValue.VariableName.clear();
+            return true;
+        }
+
         if (dest.IsAlias && IsCxxRecord(dest.TypeName)
             && conversionReturnType.IsAlias
             && result->getType()->isPointerTy())
@@ -5488,6 +5611,32 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
             // The referent stays const through lowering: a const result never reaches a mutable dest.
             nv.TypeAndValue.SetCxxConstRef(dest.CxxConstRef() || conversionReturnType.CxxConstRef());
             nv.TypeAndValue.VariableName.clear();
+            return true;
+        }
+
+        if (!dest.Pointer && !dest.IsAlias && IsCxxRecord(dest.TypeName)
+            && !conversionReturnType.IsAlias && !conversionReturnType.Pointer
+            && conversionReturnType.TypeName == dest.TypeName
+            && result->getType()->isStructTy())
+        {
+            llvm::Value* slot = StorageOfLoadedCxxObject(result);
+            if (slot == nullptr)
+            {
+                llvm::Type* objectType = GetType(TypeAndValue{ .TypeName = dest.TypeName });
+                if (objectType == nullptr) return false;
+                slot = CreateAlloca(objectType);
+                builder->CreateStore(result, slot);
+                if (IsForeignNontrivialCxxClass(dest.TypeName))
+                    RegisterOwnedStructTemp(slot, dest.TypeName);
+            }
+            nv.Storage = slot;
+            nv.BaseType = GetType(TypeAndValue{ .TypeName = dest.TypeName });
+            if (nv.BaseType == nullptr) return false;
+            nv.Primary = CreateLoad(nv.BaseType, slot);
+            nv.TypeAndValue = dest;
+            nv.TypeAndValue.VariableName.clear();
+            nv.IsRvalue = true;
+            nv.IsCxxPrvalueTemp = true;
             return true;
         }
 

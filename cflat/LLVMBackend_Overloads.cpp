@@ -7625,6 +7625,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             // sibling is not viable for an lvalue, so clang may pick a conversion.
                             deferredRvalueRef = std::pair{ param.VariableName, shownFunctionName };
                     }
+                    // A bitfield has no address: a non-const lvalue reference never binds it (clang).
+                    if (param.IsAlias && !param.IsRvalueRef && !param.CxxConstRef()
+                        && arguments[i].BitfieldStorage != nullptr)
+                        LogErrorMessage("parameter '{}' of '{}' is a non-const reference and cannot bind "
+                                        "a bitfield", { param.VariableName, shownFunctionName });
                     if (param.IsAlias && !param.IsRvalueRef && !param.CxxConstRef() && rvalue)
                         LogErrorMessage(
                             "parameter '{}' of '{}' is a non-const lvalue reference and cannot bind an rvalue; pass an lvalue",
@@ -8664,7 +8669,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const bool referenceConversionOperator = candidate.IsCxx
                 && param.IsAlias && !param.IsCxxRefToPointer
                 && IsCxxRecord(param.TypeName) && !arg.TypeAndValue.Pointer
-                && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false).empty();
+                && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false,
+                    nullptr, nullptr, nullptr, &arg.TypeAndValue).empty();
             if (referenceConversionOperator)
             {
                 if (!ApplyCxxConversionOperator(matched[i], param, false))
@@ -8675,7 +8681,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const bool pointerConversionOperator = candidate.IsCxx && param.Pointer
                 && !param.IsAlias && !param.IsCxxRefToPointer && !param.IsFunctionPointer
                 && !arg.TypeAndValue.Pointer
-                && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false).empty();
+                && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false,
+                    nullptr, nullptr, nullptr, &arg.TypeAndValue).empty();
             if (pointerConversionOperator)
             {
                 if (!ApplyCxxConversionOperator(matched[i], param, false))
@@ -8693,7 +8700,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // Conversion-OPERATOR direction, selected by the same rank above.
                 if (!matched[i].TypeAndValue.Pointer
                     && !CxxConversionOperatorTo(matched[i].TypeAndValue.TypeName,
-                                                candidate.Parameters[i], false).empty()
+                        candidate.Parameters[i], false, nullptr, nullptr, nullptr,
+                        &matched[i].TypeAndValue).empty()
                     && !ApplyCxxConversionOperator(matched[i], candidate.Parameters[i], false))
                     LogErrorMessage("cannot materialize implicit C++ class argument for '{}'",
                                     { diagnosticFunctionName });
@@ -10547,7 +10555,23 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             if (cxxClassReturn)
             {
+                bool hasUnforwardedSameTypeCxxByValueArg = false;
+                if (!candidate.IsCxx && !pendingCxxSretReturn_
+                    && !candidate.ReturnsDirectByValueParam)
+                    for (size_t i = 0; i < candidate.Parameters.size()
+                        && i < matched.size(); ++i)
+                    {
+                        const auto& param = candidate.Parameters[i];
+                        if (!param.Pointer && IsCxxRecord(param.TypeName)
+                            && param.TypeName == candidate.ReturnType.TypeName
+                            && matched[i].IsRvalue && !matched[i].IsExplicitMove)
+                        {
+                            hasUnforwardedSameTypeCxxByValueArg = true;
+                            break;
+                        }
+                    }
                 if (pendingCxxSretDest_ != nullptr
+                    && !hasUnforwardedSameTypeCxxByValueArg
                     && candidate.ReturnType.TypeName == pendingCxxSretTypeName_)
                 {
                     cxxSretDest = pendingCxxSretDest_;

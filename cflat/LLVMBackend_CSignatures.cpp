@@ -2464,6 +2464,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.hasDeletedCopyCtor = r.hasDeletedCopyCtor;
             rec.hasDefaultCtor = r.hasDefaultCtor; rec.hasCopyCtor = r.hasCopyCtor;
             rec.hasCtorTemplate = r.hasCtorTemplate;
+            rec.hasConversionTemplate = r.hasConversionTemplate;
             rec.hasAssignTemplate = r.hasAssignTemplate;
             rec.moveAssignBindsConstRef = r.moveAssignBindsConstRef;
             rec.moveAssignConstSourceBindsConstRef = r.moveAssignConstSourceBindsConstRef;

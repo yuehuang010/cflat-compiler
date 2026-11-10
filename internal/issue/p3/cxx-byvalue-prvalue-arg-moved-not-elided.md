@@ -1,22 +1,20 @@
-# C++ by-value prvalue wrapper and mixed-arm leftovers
+# C++ by-value prvalue argument gets an extra move in template wrapper
 
-The T239 parenthesized ternary init/return cases and operator-result declaration cases are
-resolved. These out-of-scope discrepancies remain active:
+Remaining discrepancy: the generated CFlat template wrapper moves its by-value C++ class
+parameter into the imported C++ function-template specialization. Leg 9359 measures one move;
+clang++ -std=c++20 measures none. The wrapper creates a local temporary from its by-value
+parameter before forwarding it to the C++ call.
 
-- A template wrapper moves its by-value parameter before the C++ template call. Existing test leg
-  9359 pins the extra move; clang++ performs no move.
-- `rv.C kk = keep(rv.make(8))`, where CFlat `keep` returns its by-value parameter, has one extra
-  copy at the declaration (1113 vs clang++ 1012).
-- `{ l = c ? L(1) : move lv }` copies the move arm; clang++ moves it.
+Three implementation approaches were tried against the focused repro; none changed the count.
+Keep leg 9359 unchanged until a clean forwarding fix is found.
 
-Root cause is not verified for these remaining cases. Fix direction: isolate the result object and
-destination ownership at the CFlat wrapper boundary or mixed ternary arm, then compare counts with
-clang++ -std=c++20 before changing the transfer path.
+The following extra copies are pre-existing; current counts match master and remain balanced
+(dead == born), but clang++ -std=c++20 elides one copy in each case:
 
-## Left after T239 (Opus review 1; repros scratch/repro_keep/t239_rev/, oracle.cpp + r.hpp)
-- (T246 review 1, pre-existing; repros scratch/repro_keep/t246_rev/cases/) subscript operands of a by-value operator
-  keep one extra temp: `(vv[0] + b)` 1,2,1,3 (clang 1,2,0,2), `(vv[0] * b)`, `(vr[0] * b)`; `auto z = k ? move a : C(2)`
-  and `k ? (move a) : C(2)` still copy (paren hides move). Unary operators over calls and subscripts are fixed (UNARYCALL).
+- A non-direct callee returning a conditional: 2,2,0,3 (clang 2,1,0,2).
+- A non-direct callee returning a field: 1,2,0,2 (clang 1,1,0,1).
+- A recursive callee: 3,2,0,4 (clang 3,0,1,3).
+- `mk2(make(1))`: 2,1,0,2 (clang 2,0,0,1).
 
 ## Left after TERNELIDE (daa3a99f, 2026-10-30 box 7; Opus reviews, repros scratch/repro_keep/ternelide/ w/x/y/z .cb + .cpp twins, w.hpp)
 - Same-class prvalue conditional (and plain prvalue) into `gen<T>(...)`, `function<>` and `Lambda<>` calls: one extra move (indirect /

@@ -1,0 +1,22 @@
+// A bitfield has no address, so a C++ operator whose right operand is a non-const reference refuses
+// it, as clang does: a forwarding `U&&` template deduces `int&`, and a declared `int&` parameter.
+import cpp "cpp_move_operand_ops.hpp";
+
+extern int main()
+{
+    mvops.TBin6 a = mvops.TBin6(3);
+    mvops.TBits6 s;
+    expect_error("is a non-const reference and cannot bind a bitfield") {
+        int r = a * s.bits;
+    }
+    expect_error("is a non-const reference and cannot bind a bitfield") {
+        int r = a - s.bits;
+    }
+    expect_error("is a non-const reference and cannot bind a bitfield") {
+        int r = a | s.bits;
+    }
+    expect_error("is a non-const reference and cannot bind a bitfield") {
+        int r = a ^ s.bits;
+    }
+    return 0;
+}

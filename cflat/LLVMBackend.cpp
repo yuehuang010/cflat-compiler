@@ -8346,6 +8346,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.ReturnsAliasOfByValueParam) o["rabv"] = true;
+    if (s.ReturnsDirectByValueParam) o["rdbv"] = true;
     if (s.ReturnsGlobalBorrow) o["rgb"] = true;
     if (s.ReturnsParameterBorrow) o["rpb"] = true;
     if (s.ReturnsSingleParameterIndex >= 0) o["rpi"] = s.ReturnsSingleParameterIndex;
@@ -8669,6 +8670,12 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
                 so["user_align"] = static_cast<int64_t>(sd.UserRequestedAlignment);
             if (sd.StoresThisClosure)
                 so["stores_this_closure"] = true;
+            if (sd.HasDefaultedEquality)
+                so["defaulted_equality"] = true;
+            if (sd.HasDefaultedSpaceship)
+                so["defaulted_spaceship"] = true;
+            if (!sd.DefaultedSpaceshipCategory.empty())
+                so["defaulted_spaceship_category"] = sd.DefaultedSpaceshipCategory;
             if (sd.Destructor)
                 so["destructor"] = std::string(sd.Destructor->getName());
             if (sd.typeDescriptor)
@@ -9334,6 +9341,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
             if (auto v = fo->getBoolean("rabv")) sym.ReturnsAliasOfByValueParam = *v;
+            if (auto v = fo->getBoolean("rdbv")) sym.ReturnsDirectByValueParam = *v;
             if (auto v = fo->getBoolean("rgb")) sym.ReturnsGlobalBorrow = *v;
             if (auto v = fo->getBoolean("rpb")) sym.ReturnsParameterBorrow = *v;
             if (auto v = fo->getInteger("rpi"))
@@ -9378,6 +9386,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                     if (auto n = element.getAsInteger()) sd.CxxFieldElements.push_back(static_cast<unsigned>(*n));
             if (auto v = so->getInteger("user_align"))  sd.UserRequestedAlignment = static_cast<uint64_t>(*v);
             if (auto v = so->getBoolean("stores_this_closure")) sd.StoresThisClosure = *v;
+            if (auto v = so->getBoolean("defaulted_equality")) sd.HasDefaultedEquality = *v;
+            if (auto v = so->getBoolean("defaulted_spaceship")) sd.HasDefaultedSpaceship = *v;
+            if (auto v = so->getString("defaulted_spaceship_category")) sd.DefaultedSpaceshipCategory = *v;
             if (auto v = so->getString("destructor"))   sd.Destructor = module->getFunction(v->str());
             if (auto v = so->getString("type_desc"))    sd.typeDescriptor = module->getNamedGlobal(v->str());
 

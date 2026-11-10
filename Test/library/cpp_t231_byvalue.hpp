@@ -93,6 +93,37 @@ public:
     inline UnaryCnt& operator[](int i) noexcept { return i ? e1 : e0; }
     UnaryCnt e0, e1;
 };
+class SubCnt
+{
+public:
+    static inline int ctors = 0;
+    static inline int copies = 0;
+    static inline int moves = 0;
+    static inline int dtors = 0;
+    static inline void reset() noexcept { ctors = 0; copies = 0; moves = 0; dtors = 0; }
+    inline SubCnt() noexcept : v(0) { ++ctors; }
+    inline explicit SubCnt(int x) noexcept : v(x) { ++ctors; }
+    inline SubCnt(const SubCnt& o) noexcept : v(o.v) { ++copies; }
+    inline SubCnt(SubCnt&& o) noexcept : v(o.v) { o.v = -1; ++moves; }
+    inline ~SubCnt() noexcept { v = -99; ++dtors; }
+    inline SubCnt operator*(const SubCnt& o) const noexcept { return SubCnt(v * o.v); }
+    int v;
+};
+inline SubCnt operator+(SubCnt a, SubCnt b) noexcept { return SubCnt(a.v + b.v); }
+class SubVV
+{
+public:
+    inline SubVV() noexcept : e0(10), e1(11) {}
+    inline SubCnt operator[](int i) const noexcept { return i ? e1 : e0; }
+    SubCnt e0, e1;
+};
+class SubVR
+{
+public:
+    inline SubVR() noexcept : e0(10), e1(11) {}
+    inline SubCnt& operator[](int i) noexcept { return i ? e1 : e0; }
+    SubCnt e0, e1;
+};
 // Reference-returning free operator (T246: a parenthesized lvalue result copies from it).
 inline Cnt& operator<<(Cnt& a, int x) noexcept { a.v = a.v * 10 + x; return a; }
 // Derived class whose base is the by-value parameter type.

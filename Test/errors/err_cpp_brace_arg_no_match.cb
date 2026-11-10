@@ -113,3 +113,21 @@ expect_error("brace-list element 1 of 't63.VecPick' narrows to the C++ construct
         return p.first;
     }
 }
+
+// A copy-list-initialized parameter may not take an explicit list constructor (clang: no matching
+// constructor), so the fallback that backs the list must refuse rather than direct-initialize it.
+expect_error("C++ brace constructor call 'cppcr.BrcRefuseOwner' does not match") {
+    int explicit_list_ctor_probe()
+    {
+        return cppcr.BrcRefuseOwner({2L}).tag;
+    }
+}
+
+// Two scalar overloads make the owner's brace call ambiguous (clang: call is ambiguous); the
+// fallback must not pick one of them.
+expect_error("C++ brace constructor call 'cppcr.BrcRefuseScalarOwner' does not match") {
+    int ambiguous_scalar_probe()
+    {
+        return cppcr.BrcRefuseScalarOwner({2}).which;
+    }
+}

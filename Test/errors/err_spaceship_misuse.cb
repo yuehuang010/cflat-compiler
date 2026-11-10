@@ -1,0 +1,63 @@
+import cpp "compare";
+
+expect_error("builtin '<=>' would narrow a signed operand to unsigned") {
+    int spaceshipNarrowing(int value, uint other)
+    {
+        auto order = value <=> other;
+        return 0;
+    }
+}
+
+expect_error("builtin '<=>' would narrow a signed operand to unsigned") {
+    int spaceshipNegativeConstant(uint other)
+    {
+        auto order = -1 <=> other;
+        return 0;
+    }
+}
+
+expect_error("builtin '<=>' needs pointers to the same type or void*, not 'int*' and 'double*'") {
+    int spaceshipIncompatiblePointers()
+    {
+        int a = 1;
+        double b = 2.0;
+        int* p = &a;
+        double* q = &b;
+        auto order = p <=> q;
+        return 0;
+    }
+}
+
+expect_error("builtin '<=>' needs pointers to the same type or void*") {
+    int spaceshipNullLiteral(int* p)
+    {
+        auto order = p <=> nullptr;
+        return 0;
+    }
+}
+
+expect_error("no operator '==' for type 'SpaceshipOnly'") {
+    struct SpaceshipOnly
+    {
+        int value = 0;
+        std.strong_ordering operator<=>(SpaceshipOnly other) { return value <=> other.value; }
+    };
+    int useSpaceshipWithoutEquality()
+    {
+        SpaceshipOnly left = default;
+        SpaceshipOnly right = default;
+        return left == right;
+    }
+}
+
+extern int main()
+{
+    auto less = 1 <=> 2;
+    expect_error("comparison ordering values can only be compared with 0") {
+        bool invalid = less < 1;
+    }
+    expect_error("comparison ordering values can only be compared with 0") {
+        bool invalid = less < (1 <=> 2);
+    }
+    return 0;
+}

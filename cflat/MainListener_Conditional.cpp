@@ -2358,10 +2358,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     == ternaryBondedSources.end())
                     ternaryBondedSources.push_back(source);
         };
-        const bool trueExplicitMove = expressionTrueCtx != nullptr
-            && TopLevelMoveExpression(expressionTrueCtx->assignmentExpression()) != nullptr;
-        const bool falseExplicitMove = expressionFalseCtx != nullptr
-            && TopLevelMoveExpression(expressionFalseCtx) != nullptr;
         // Both arms explicit moves, parentheses included (`c ? (move a) : move b`): the shape only.
         auto armIsMove = [](antlr4::tree::ParseTree* node) {
             while (node != nullptr)
@@ -2379,8 +2375,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             return false;
         };
+        const bool trueExplicitMove = expressionTrueCtx != nullptr
+            && armIsMove(expressionTrueCtx->assignmentExpression());
+        const bool falseExplicitMove = expressionFalseCtx != nullptr
+            && armIsMove(expressionFalseCtx);
         const bool bothArmsMoved = expressionTrueCtx != nullptr && expressionFalseCtx != nullptr
-            && armIsMove(expressionTrueCtx) && armIsMove(expressionFalseCtx);
+            && trueExplicitMove && falseExplicitMove;
         // Slices one derived arm into the declared base through the base's move (rvalue) or copy
         // constructor. The arm's temporaries die here, after the one construction.
         auto sliceDerivedArmInto = [&](llvm::Value* armValue, llvm::Value* armStorage, bool isRvalue) {
@@ -2507,7 +2507,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 else
                     copied = compiler->EmitCxxCopyOrMoveConstruct(
                         cxxTernaryDeclType, cxxTernaryDeclDest, armStorage,
-                        /*useMove*/ explicitMove, "into a ternary declaration");
+                        /*useMove*/ explicitMove, "into a ternary declaration", {}, false,
+                        false, explicitMove);
                 if (!copied)
                 {
                     cxxTernaryDeclFailed = true;
@@ -2527,7 +2528,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             if (!compiler->EmitCxxCopyOrMoveConstruct(cxxTernaryDeclType, cxxTernaryDeclDest,
                                                        temp, /*useMove*/ true,
-                                                       "into a ternary declaration"))
+                                                       "into a ternary declaration", {}, false,
+                                                       false, true))
             {
                 cxxTernaryDeclFailed = true;
                 return;
@@ -3117,20 +3119,23 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
          */
         // A reference-returning C++ call is an alias arm with real storage, so it copies too.
         auto isCopyableCxxLvalueArm = [&](llvm::Value* value, llvm::Value* storage,
-                                          llvm::Type* joinType) {
+                                          llvm::Type* joinType, bool explicitMove) {
             return !cxxTernaryDecl && use != ResultUse::Discard && !trueDefault
                 && autoDeclTernary && !outerExpected.IsAlias && !compiler->currentFunctionReturnTV.IsAlias
                 && value != nullptr && value->getType() == joinType
-                && isAddressableLvalue(value, storage) && !compiler->IsTempFieldValue(value);
+                && isAddressableLvalue(value, storage)
+                && (explicitMove || !compiler->IsTempFieldValue(value));
         };
         auto materializeCxxLvalueArm = [&]() {
             if (sharedCxxRetTemp != nullptr || trueValue == nullptr || falseValue == nullptr)
                 return;
             if (trueCxxRetTemp != nullptr
-                && isCopyableCxxLvalueArm(falseValue, falseStorage, trueValue->getType()))
+                && isCopyableCxxLvalueArm(falseValue, falseStorage, trueValue->getType(),
+                                           falseExplicitMove))
             {
                 if (!compiler->EmitCxxCopyOrMoveConstruct(sharedCxxRetType, trueCxxRetTemp,
-                        falseStorage, /*useMove*/ false, "into a conditional expression"))
+                        falseStorage, /*useMove*/ falseExplicitMove,
+                        "into a conditional expression"))
                     return;
                 sharedCxxRetTemp = trueCxxRetTemp;
                 compiler->RegisterOwnedStructTemp(sharedCxxRetTemp, sharedCxxRetType);
@@ -3145,7 +3150,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (trueCxxRetTemp != nullptr || falseTemp == nullptr
                 || falseStorage != compiler->lastCxxRetTemp_ || st == nullptr || !st->hasName()
                 || !compiler->IsForeignNontrivialCxxReturnClass(st->getName().str())
-                || !isCopyableCxxLvalueArm(trueValue, trueStorage, st)
+                || !isCopyableCxxLvalueArm(trueValue, trueStorage, st, trueExplicitMove)
                 || trueEnd == nullptr || cflat_llvm::GetTerminatorOrNull(trueEnd) != nullptr)
                 return;
             const std::string typeName = st->getName().str();
@@ -3153,7 +3158,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             compiler->builder->SetInsertPoint(trueEnd);
             const auto mark = compiler->MarkOwnedTemps();
             if (compiler->EmitCxxCopyOrMoveConstruct(typeName, falseTemp, trueStorage,
-                    /*useMove*/ false, "into a conditional expression"))
+                    /*useMove*/ trueExplicitMove, "into a conditional expression"))
             {
                 sharedCxxRetTemp = falseTemp;
                 compiler->RegisterOwnedStructTemp(falseTemp, typeName);
@@ -3391,6 +3396,63 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             throw;
         }
 
+        // C++ makes a same-type conditional a prvalue when one arm is a prvalue. Copy the
+        // corresponding lvalue arm into its own branch temporary before the join.
+        if (!cxxTernaryDecl && use != ResultUse::Discard && trueValue != nullptr
+            && falseValue != nullptr && trueValue->getType() == falseValue->getType())
+            if (auto* classType = llvm::dyn_cast<llvm::StructType>(trueValue->getType());
+                classType != nullptr && classType->hasName()
+                && compiler->IsCxxRecord(classType->getName().str()))
+            {
+                const std::string typeName = classType->getName().str();
+                auto isOwnedCxxTemp = [&](llvm::Value* value, llvm::Value* storage) {
+                    if (storage == nullptr || value == nullptr) return false;
+                    LLVMBackend::NamedVariable probe;
+                    probe.Primary = value;
+                    probe.Storage = storage;
+                    probe.BaseType = value->getType();
+                    probe.TypeAndValue.TypeName = typeName;
+                    return compiler->IsOwnedTempValue(probe);
+                };
+                auto materializeLvalueArm = [&](bool trueArm) {
+                    llvm::Value*& value = trueArm ? trueValue : falseValue;
+                    llvm::Value*& storage = trueArm ? trueStorage : falseStorage;
+                    LLVMBackend::TypedValue& shape = trueArm ? trueShape : falseShape;
+                    bool& alias = trueArm ? trueAlias : falseAlias;
+                    llvm::BasicBlock*& endBlock = trueArm ? trueEnd : falseEnd;
+                    auto* temp = compiler->CreateAlloca(classType);
+                    auto savedIP = compiler->builder->saveIP();
+                    if (auto* term = cflat_llvm::GetTerminatorOrNull(endBlock))
+                        compiler->builder->SetInsertPoint(term);
+                    else
+                        compiler->builder->SetInsertPoint(endBlock);
+                    const auto mark = compiler->MarkOwnedTemps();
+                    if (compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, storage,
+                            /*useMove*/ false, "into a conditional expression"))
+                    {
+                        compiler->RegisterOwnedStructTemp(temp, typeName);
+                        value = compiler->builder->CreateLoad(classType, temp);
+                        storage = temp;
+                        shape.value = value;
+                        shape.storage = temp;
+                        shape.receiverStorage = temp;
+                        shape.isRvalue = true;
+                        alias = false;
+                        compiler->FlushOwnedTempsSince(mark, value, branchBlock);
+                        endBlock = compiler->builder->GetInsertBlock();
+                    }
+                    compiler->builder->restoreIP(savedIP);
+                };
+                const bool trueTemp = isOwnedCxxTemp(trueValue, trueStorage);
+                const bool falseTemp = isOwnedCxxTemp(falseValue, falseStorage);
+                if (trueTemp && trueShape.isCxxSameTypeCastCopy && !falseTemp && !falseShape.isRvalue
+                    && isAddressableLvalue(falseValue, falseStorage))
+                    materializeLvalueArm(false);
+                else if (falseTemp && falseShape.isCxxSameTypeCastCopy && !trueTemp && !trueShape.isRvalue
+                    && isAddressableLvalue(trueValue, trueStorage))
+                    materializeLvalueArm(true);
+            }
+
         // A C++ prvalue conditional used as a call argument (C++ or CFlat callee) or an operator operand
         // is the by-value parameter object: redirect every selected-arm producer to one slot.
         const bool nativeCxxByValueArgument = !outerExpected.TypeName.empty()
@@ -3473,63 +3535,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 }
             }
         }
-
-        // C++ makes a same-type conditional a prvalue when one arm is a prvalue. Copy the
-        // corresponding lvalue arm into its own branch temporary before the join.
-        if (!cxxTernaryDecl && use != ResultUse::Discard && trueValue != nullptr
-            && falseValue != nullptr && trueValue->getType() == falseValue->getType())
-            if (auto* classType = llvm::dyn_cast<llvm::StructType>(trueValue->getType());
-                classType != nullptr && classType->hasName()
-                && compiler->IsCxxRecord(classType->getName().str()))
-            {
-                const std::string typeName = classType->getName().str();
-                auto isOwnedCxxTemp = [&](llvm::Value* value, llvm::Value* storage) {
-                    if (storage == nullptr || value == nullptr) return false;
-                    LLVMBackend::NamedVariable probe;
-                    probe.Primary = value;
-                    probe.Storage = storage;
-                    probe.BaseType = value->getType();
-                    probe.TypeAndValue.TypeName = typeName;
-                    return compiler->IsOwnedTempValue(probe);
-                };
-                auto materializeLvalueArm = [&](bool trueArm) {
-                    llvm::Value*& value = trueArm ? trueValue : falseValue;
-                    llvm::Value*& storage = trueArm ? trueStorage : falseStorage;
-                    LLVMBackend::TypedValue& shape = trueArm ? trueShape : falseShape;
-                    bool& alias = trueArm ? trueAlias : falseAlias;
-                    llvm::BasicBlock*& endBlock = trueArm ? trueEnd : falseEnd;
-                    auto* temp = compiler->CreateAlloca(classType);
-                    auto savedIP = compiler->builder->saveIP();
-                    if (auto* term = cflat_llvm::GetTerminatorOrNull(endBlock))
-                        compiler->builder->SetInsertPoint(term);
-                    else
-                        compiler->builder->SetInsertPoint(endBlock);
-                    const auto mark = compiler->MarkOwnedTemps();
-                    if (compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, storage,
-                            /*useMove*/ false, "into a conditional expression"))
-                    {
-                        compiler->RegisterOwnedStructTemp(temp, typeName);
-                        value = compiler->builder->CreateLoad(classType, temp);
-                        storage = temp;
-                        shape.value = value;
-                        shape.storage = temp;
-                        shape.receiverStorage = temp;
-                        shape.isRvalue = true;
-                        alias = false;
-                        compiler->FlushOwnedTempsSince(mark, value, branchBlock);
-                        endBlock = compiler->builder->GetInsertBlock();
-                    }
-                    compiler->builder->restoreIP(savedIP);
-                };
-                const bool trueTemp = isOwnedCxxTemp(trueValue, trueStorage);
-                const bool falseTemp = isOwnedCxxTemp(falseValue, falseStorage);
-                if (trueTemp && trueShape.isCxxSameTypeCastCopy && !falseTemp && !falseShape.isRvalue
-                    && isAddressableLvalue(falseValue, falseStorage))
-                    materializeLvalueArm(false);
-                else if (falseTemp && falseShape.isCxxSameTypeCastCopy && !trueTemp && !trueShape.isRvalue
-                    && isAddressableLvalue(trueValue, trueStorage))
-                    materializeLvalueArm(true);
-            }
 
         // T306 r3: a default-only argument joins into the destination only when the other arm IS
         // that class. Any other arm type (a derived class, or a cast to another class) refuses here.
@@ -6735,7 +6740,8 @@ LLVMBackend::TypedValue MainListener::TryClassLogicalOperatorChain(
                                             rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
                                             false, false,
                                             accumulator == first.value ? first.cxxObjectCv : 0,
-                                            rv.cxxObjectCv)
+                                            rv.cxxObjectCv, false, false, nullptr, nullptr,
+                                            rv.bitfieldStorage)
                 : nullptr;
             if (folded == nullptr)
             {
@@ -6990,7 +6996,8 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                                                            rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
                                                            false, acc == lv.value && lv.cxxPointeeConst,
                                                            acc == lv.value ? lv.cxxObjectCv : 0,
-                                                           rv.cxxObjectCv);
+                                                           rv.cxxObjectCv, false, false, nullptr,
+                                                           exclusiveCtxs[i], rv.bitfieldStorage);
                 if (overload == nullptr && acc != nullptr && rv.value != nullptr
                     && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
                     LogErrorContext(ctx, "no overload of 'operator|' matches the given arguments.");
@@ -7107,7 +7114,8 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                                                            rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
                                                            false, acc == lv.value && lv.cxxPointeeConst,
                                                            acc == lv.value ? lv.cxxObjectCv : 0,
-                                                           rv.cxxObjectCv);
+                                                           rv.cxxObjectCv, false, false, nullptr,
+                                                           andCtxs[i], rv.bitfieldStorage);
                 if (overload == nullptr && acc != nullptr && rv.value != nullptr
                     && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
                     LogErrorContext(ctx, "no overload of 'operator^' matches the given arguments.");

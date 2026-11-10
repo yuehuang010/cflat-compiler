@@ -1,0 +1,15 @@
+expect_error("Undefined variable missing.") {
+    namespace QualRootUndefined { int read() { return missing; } }
+}
+
+expect_error("Undefined variable g.") {
+    int read() { return g; }
+    namespace QualRootLeak { int unrelated() { int g = 2; return g; } }
+    int g = 7;
+}
+
+expect_error("Undefined variable bx.") {
+    struct QualRootBox<T> { T value = default; };
+    namespace QualRootGeneric { int read() { return bx.value; } }
+    QualRootBox<int> bx = default;
+}

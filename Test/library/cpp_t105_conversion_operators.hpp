@@ -135,3 +135,33 @@ struct PB { int value = 19; operator W() const { ++W::op; return W{value + 1}; }
 struct PD : PB {};
 inline PD makePD() { return PD{}; }
 }
+
+namespace t122 {
+inline int conversionHit = 0;
+struct W {
+    int value;
+    inline static int born = 0, copy = 0, assign = 0, dtor = 0;
+    W(int value = 0) : value(value) { ++born; }
+    W(const W& other) : value(other.value) { ++born; ++copy; }
+    W& operator=(const W& other) { value = other.value; ++assign; return *this; }
+    ~W() { ++dtor; }
+};
+struct T {
+    template<class U> operator U() { conversionHit = 42; return U(42); }
+};
+inline int acceptInt(int value) { return value + 100; }
+inline int acceptLong(long value) { return (int)value + 100; }
+inline int acceptDouble(double value) { return (int)value + 100; }
+inline int acceptBool(bool value) { return value ? 142 : 141; }
+inline int acceptW(const W& value) { return value.value + 100; }
+inline int takeWv(W value) { return value.value; }
+struct V {
+    operator int() { conversionHit = 1; return 1; }
+    template<class U> operator U() const { conversionHit = 7; return U(7); }
+};
+inline const V& constV()
+{
+    static const V value{};
+    return value;
+}
+}

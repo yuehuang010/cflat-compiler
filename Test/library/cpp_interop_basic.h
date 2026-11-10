@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -1344,6 +1345,13 @@ namespace cppi
         operator double() const noexcept { return (double)value + 0.5; }
     };
 
+    struct SpaceshipWeak
+    {
+        int value;
+        std::weak_ordering operator<=>(const SpaceshipWeak& other) const noexcept
+        { return value <=> other.value; }
+    };
+
     // Reversed scalar comparison: only `int == Ops` exists as a free function.
     inline bool operator==(int lhs, const Ops& rhs) noexcept { return lhs == rhs.value + 1; }
 
@@ -2218,6 +2226,77 @@ namespace cppi_expr
         }
         double sum() const { return total; }
     };
+}
+
+// Constructor-template and temporary-lifetime coverage for expression-like arguments.
+namespace cppi_exprgap
+{
+    template <class D> struct ExprBase { const D& derived() const { return *static_cast<const D*>(this); } };
+    struct Expr : ExprBase<Expr>
+    {
+        inline static int born = 0, dtors = 0;
+        int value;
+        explicit Expr(int v) : value(v) { ++born; }
+        Expr(const Expr& other) : value(other.value) { ++born; }
+        ~Expr() { ++dtors; }
+        int read() const { return value; }
+    };
+    struct RequiresTarget
+    {
+        inline static int born = 0, dtors = 0;
+        int value;
+        template <class D> requires requires(const D& d) { d.read(); }
+        RequiresTarget(const ExprBase<D>& e) : value(e.derived().read() + 100) { ++born; }
+        ~RequiresTarget() { ++dtors; }
+    };
+    struct EnableTarget
+    {
+        inline static int born = 0, dtors = 0;
+        int value;
+        template <class D, std::enable_if_t<std::is_same_v<D, Expr>, int> = 0>
+        EnableTarget(const ExprBase<D>& e) : value(e.derived().read() + 200) { ++born; }
+        ~EnableTarget() { ++dtors; }
+    };
+    struct Life
+    {
+        inline static int born = 0, copies = 0, moves = 0, dtors = 0;
+        int value;
+        explicit Life(int v) : value(v) { ++born; }
+        Life(const Life& other) : value(other.value) { ++born; ++copies; }
+        Life(Life&& other) noexcept : value(other.value) { ++born; ++moves; other.value = -1; }
+        ~Life() { ++dtors; }
+    };
+    inline Life makeLife(int v) { return Life(v); }
+    struct ByValueAssign
+    {
+        inline static int born = 0, copies = 0, moves = 0, assigns = 0, dtors = 0;
+        int value;
+        explicit ByValueAssign(int v) : value(v) { ++born; }
+        ByValueAssign(const ByValueAssign& other) : value(other.value) { ++born; ++copies; }
+        ByValueAssign(ByValueAssign&& other) noexcept : value(other.value) { ++born; ++moves; other.value = -1; }
+        ~ByValueAssign() { ++dtors; }
+        ByValueAssign& operator=(ByValueAssign other) { value = other.value; ++assigns; return *this; }
+    };
+    namespace left
+    {
+        struct Twin
+        {
+            inline static int born = 0, dtors = 0;
+            int value;
+            explicit Twin(int v) : value(v + 10) { ++born; }
+            ~Twin() { ++dtors; }
+        };
+    }
+    namespace right
+    {
+        struct Twin
+        {
+            inline static int born = 0, dtors = 0;
+            int value;
+            explicit Twin(int v) : value(v + 20) { ++born; }
+            ~Twin() { ++dtors; }
+        };
+    }
 }
 
 // A function template body odr-uses static constexpr members of an explicit specialization that

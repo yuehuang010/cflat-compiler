@@ -2335,7 +2335,9 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 "cannot move an array member; take its address or copy the elements");
             return {};
         }
-        if (namesImplicitThisField && !argNV.TypeAndValue.Pointer
+        // A view moves into a plain local only as a copy; any other destination is a transfer.
+        const bool viewCopy = argNV.TypeAndValue.IsArrayViewValue() && MoveIsLocalDeclInitializer(ctx);
+        if (namesImplicitThisField && (!argNV.TypeAndValue.Pointer || viewCopy)
             && !argNV.TypeAndValue.ElemPointer && copiesAsPlainValue(argNV))
         {
             argNV.TypeAndValue.IsMove = false;
@@ -2525,7 +2527,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             && !argNV.FieldName.empty()
             && !argNV.IsElementAccess
             && !argNV.TypeAndValue.ElemPointer
-            && !argNV.TypeAndValue.Pointer
+            && (!argNV.TypeAndValue.Pointer || viewCopy)
             && copiesAsPlainValue(argNV))
         {
             argNV.TypeAndValue.IsMove = false;

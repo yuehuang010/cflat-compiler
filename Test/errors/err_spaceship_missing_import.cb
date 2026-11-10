@@ -1,0 +1,22 @@
+expect_error("'<=>' needs import \"compare\"") {
+    int spaceshipWithoutCompare()
+    {
+        auto order = 1 <=> 2;
+        return 0;
+    }
+}
+
+expect_error("'<=>' needs import \"compare\"") {
+    struct SpaceshipNoCompare
+    {
+        int value = 0;
+        auto operator<=>(SpaceshipNoCompare other) = default;
+    };
+    int useSpaceshipWithoutCompare()
+    {
+        SpaceshipNoCompare left = default;
+        SpaceshipNoCompare right = default;
+        auto order = left <=> right;
+        return 0;
+    }
+}

@@ -2087,14 +2087,14 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
         // Anchored to namespace std (plus libc++'s inline `std.__1.`): a user type that merely
         // ends in `weak_ordering` is a different class with a different layout and must not be
         // lowered to one byte.
-        if (ptr == 0 && base.starts_with("std."))
-            for (const char* ordering : { ".strong_ordering", ".weak_ordering",
-                                          ".partial_ordering" })
-                if (base.size() > std::strlen(ordering) && base.ends_with(ordering))
-                {
-                    out.TypeName = "i8";
-                    return true;
-                }
+        if (ptr == 0)
+            if (std::string category = StdOrderingCategoryOf(base); !category.empty())
+            {
+                out.TypeName = "i8";
+                // The category stays visible for `a <=> b` results and C++ overload binding.
+                out.DiagnosticTypeName = std::move(category);
+                return true;
+            }
 
         // enum decays to int. struct/union by-value: look up in dataStructures for ABI lowering.
         // struct/union pointers become opaque void* (only a pointer-sized slot is needed).

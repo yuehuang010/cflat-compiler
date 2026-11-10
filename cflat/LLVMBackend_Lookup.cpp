@@ -367,6 +367,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
             }
         }
 
+        const bool isComparisonCategory = !StdOrderingCategoryOf(resolvedTypeName).empty();
         // Type lookup needs imported layout, while members are demanded at their use sites.
         if (!registeringCxxProjection_ && !typeAndValue.Pointer && !typeAndValue.ElemPointer
             && aliasPtrDepth == 0
@@ -429,6 +430,12 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
                 else if (dsIt != dataStructures.end())
                 {
                     type = dsIt->second.StructType;
+                }
+                // A comparison category whose record is not demanded yet (an overload parameter of an
+                // imported <compare> function) is the one signed byte the C ABI passes it.
+                else if (isComparisonCategory)
+                {
+                    type = builder->getInt8Ty();
                 }
                 else
                 {

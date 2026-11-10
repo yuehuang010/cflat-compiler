@@ -1,8 +1,7 @@
 # Ternary move-join leftovers after T249 and T263 (lowered-struct and C++ shapes)
 
 ## Lowered-struct ternary leftovers after T249 (repros scratch/repro_keep/t249_rev/cases3/, clang twins .cpp)
-- (unwind leak) `take2T(h2, k ? mkHT() : move h1)` where a LATER sibling argument's copy throws: the join temp
-  leaks (made 4, dt 3; clang 3/3) - e3.cb. Master refused the call. The join temp needs an unwind cleanup.
+- (counts differ from clang; no leak on current binaries) `take2T(h2, k ? mkHT() : move h1)` with a later sibling copy throwing (e3.cb): worktree/master construct the `mkHT()` join before copying `h2` (rv.C 4/4, th.T 3/3); clang copies `h2` first, throws, and never evaluates `mkHT()` (rv.C 3/3, th.T 2/2). The join owner is already registered in the resume block. Root cause is delayed by-value argument materialization after later arguments; preserve clang's evaluated order.
 - (pre-existing) `k ? move h1 : h2;` as an expression statement does no move/copy and zeroes h1 (disc.cb).
 - (pre-existing) by-value first-argument unwind leak (e2b.cb, e2c.cb), master the same.
   Sret CALL result as the first by-value argument with a throwing later sibling: `hv2(mkH(1), rq.thrower(x))`
@@ -10,8 +9,6 @@
   The argument-join form (`hv2(k ? mkH(1) : mkH(2), thrower)`) is fixed by T264 round 2 (owner registered in the resume block, disarmed at the adopting call).
 
 ## From T263 review 1 (pre-existing on master; Host = CFlat struct with a C++ field; repros scratch/repro_keep/t263_rev/)
-- `z = (k ? mkH(1) : mkH(2));` parenthesized copy-assigns and never destroys the join temp (bare form exact).
-- `(k ? mkH(1) : mkH(2)).c.get()` -> "internal: nontrivial C++ receiver reached register-return temporary lowering".
 - a one-move-arm ternary as a call argument (by value / const&) or method receiver copies; `a` not moved (clang moves).
 - a deleted move-assign is not refused when the rhs is a temp (`z = k ? move a : b`, `z = DM(5)`); `z = move a` refuses.
 - a parenthesized move arm `k ? (move a) : b` is not recognized (assignment and the T246 declaration form copy).

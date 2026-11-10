@@ -1859,6 +1859,64 @@ int bridge_t453_cpp_member_nested_copy()
     return bridge_t299_pack_result(value, baseLive);
 }
 
+int bridge_t453_cpp_member_cast_default()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Adder ad = default;
+    int value = ad + (cpptw.Twin)(default);
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+// clang++ -std=c++20 oracle: value=2, ctor=2, copy=0, move=0, dtor=2, operator&=2.
+int bridge_t453_cpp_member_chain_cast_default()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Adder ad = default;
+    int value = (ad & (cpptw.Twin)(default) & (cpptw.Twin)(default)).k;
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+// clang++ -std=c++20 oracle for each chain: value=2, ctor=2, move=0, dtor=2, calls=2.
+int bridge_t453_cpp_chain_add()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Chain chain = default;
+    int value = (chain + (cpptw.Twin)(default) + (cpptw.Twin)(default)).k;
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_chain_multiply()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Chain chain = default;
+    int value = (chain * (cpptw.Twin)(default) * (cpptw.Twin)(default)).k;
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_chain_shift()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Chain chain = default;
+    int value = (chain << (cpptw.Twin)(default) << (cpptw.Twin)(default)).k;
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_chain_or()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Chain chain = default;
+    int value = (chain | (cpptw.Twin)(default) | (cpptw.Twin)(default)).k;
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_chain_xor()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Chain chain = default;
+    int value = (chain ^ (cpptw.Twin)(default) ^ (cpptw.Twin)(default)).k;
+    return bridge_t299_pack_result(value, baseLive);
+}
+
 int bridge_t453_cpp_new_holder()
 {
     int baseLive = cpptw.live_allocations();
@@ -4530,6 +4588,8 @@ t162.ReturnConv<int> t446_cm_local()
     return source;
 }
 t162.ReturnConv<int> t446_cm_param(t162.ReturnConv<long> source) { return source; }
+t162.ReturnDst t446_dstm_param(t162.ReturnSrc source) { return source; }
+t162.ReturnConv<int> t446_cm_generic<T>(T source) { return move source; }
 t162.ReturnDst t446_dstm_local()
 {
     t162.ReturnSrc source = t162.ReturnSrc(5);
@@ -4623,9 +4683,29 @@ extern int main(int argc, char** argv)
         t446Value = value.value;
     }
     if (t446Value != 207 || t162.Stats<int>.ctor != 0 || t162.Stats<int>.conversion != 0
-        || t162.Stats<int>.copy != 1 || t162.Stats<int>.move != 1 || t162.Stats<int>.dtor != 2
+        || t162.Stats<int>.copy != 0 || t162.Stats<int>.move != 1 || t162.Stats<int>.dtor != 1
         || t162.Stats<long>.ctor != 1 || t162.Stats<long>.copy != 0
         || t162.Stats<long>.move != 0 || t162.Stats<long>.dtor != 1) return 44602;
+
+    t162.ReturnStats.reset();
+    {
+        t162.ReturnDst value = t446_dstm_param(t162.ReturnSrc(5));
+        t446Value = value.value;
+    }
+    if (t446Value != 7 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
+        || t162.ReturnStats.srcMove != 0 || t162.ReturnStats.srcDtor != 1
+        || t162.ReturnStats.lvalueCtor != 0 || t162.ReturnStats.rvalueCtor != 1) return 44607;
+
+    t162.reset();
+    {
+        t162.ReturnConv<int> value = t446_cm_generic<t162.ReturnConv<long>>(
+            t162.ReturnConv<long>(7));
+        t446Value = value.value;
+    }
+    if (t446Value != 207 || t162.Stats<int>.ctor != 0 || t162.Stats<int>.conversion != 0
+        || t162.Stats<int>.copy != 0 || t162.Stats<int>.move != 1 || t162.Stats<int>.dtor != 1
+        || t162.Stats<long>.ctor != 1 || t162.Stats<long>.copy != 0
+        || t162.Stats<long>.move != 0 || t162.Stats<long>.dtor != 1) return 44608;
 
     t162.ReturnStats.reset();
     {
@@ -6864,6 +6944,38 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_check("bridge T453 nested member operator default has no extra copy",
         bridge_t453_cpp_member_nested_copy(), 2000020);
+    cpptw.reset_counts();
+    cppt453.reset_plus_count();
+    bridge_check("bridge T453 direct member operator cast default lifetime",
+        bridge_t453_cpp_member_cast_default(), 1000010);
+    bridge_check("bridge T453 direct member operator selected once",
+        cppt453.plus_count(), 1);
+    cpptw.reset_counts();
+    cppt453.reset_and_count();
+    bridge_check("bridge T453 unparenthesized member operator chain cast default lifetime",
+        bridge_t453_cpp_member_chain_cast_default(), 22000020);
+    bridge_check("bridge T453 unparenthesized member operator chain selected twice",
+        cppt453.and_count(), 2);
+    cpptw.reset_counts();
+    cppt453.reset_chain_count();
+    bridge_check("bridge T453 additive chain default lifetime", bridge_t453_cpp_chain_add(), 22000020);
+    bridge_check("bridge T453 additive chain selected twice", cppt453.chain_count(), 2);
+    cpptw.reset_counts();
+    cppt453.reset_chain_count();
+    bridge_check("bridge T453 multiplicative chain default lifetime", bridge_t453_cpp_chain_multiply(), 22000020);
+    bridge_check("bridge T453 multiplicative chain selected twice", cppt453.chain_count(), 2);
+    cpptw.reset_counts();
+    cppt453.reset_chain_count();
+    bridge_check("bridge T453 shift chain default lifetime", bridge_t453_cpp_chain_shift(), 22000020);
+    bridge_check("bridge T453 shift chain selected twice", cppt453.chain_count(), 2);
+    cpptw.reset_counts();
+    cppt453.reset_chain_count();
+    bridge_check("bridge T453 inclusive-or chain default lifetime", bridge_t453_cpp_chain_or(), 22000020);
+    bridge_check("bridge T453 inclusive-or chain selected twice", cppt453.chain_count(), 2);
+    cpptw.reset_counts();
+    cppt453.reset_chain_count();
+    bridge_check("bridge T453 exclusive-or chain default lifetime", bridge_t453_cpp_chain_xor(), 22000020);
+    bridge_check("bridge T453 exclusive-or chain selected twice", cppt453.chain_count(), 2);
     cpptw.reset_counts();
     bridge_check("bridge T453 new Holder parenthesized default argument",
         bridge_t453_cpp_new_holder(), 1100020);

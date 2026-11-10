@@ -1782,6 +1782,7 @@ void MainListener::PreparseAggregateDefinitions(
         std::function<void(CFlatParser::IfConstDeclarationContext*, const std::string&)> collectIfConstUses;
         collectIfConstUses = [&](CFlatParser::IfConstDeclarationContext* ifConst,
                                  const std::string& namespaceName) {
+            RequireStackHeadroom(ifConst);
             auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ifConst);
             if (!recorded) return;
             const int decision = *recorded;
@@ -1797,6 +1798,7 @@ void MainListener::PreparseAggregateDefinitions(
                 for (auto* child : blocks[index]->externalDeclaration()) collectUses(child, namespaceName);
         };
         collectUses = [&](CFlatParser::ExternalDeclarationContext* ext, const std::string& namespaceName) {
+            RequireStackHeadroom(ext);
             if (auto* ns = ext->namespaceDefinition())
             {
                 std::string nested;
@@ -1856,74 +1858,104 @@ void MainListener::PreparseAggregateDefinitions(
                     }
                     return result;
                 };
-                auto scanFunction = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-                    if (node == nullptr) return;
-                    if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+                auto scanFunction = [&](antlr4::tree::ParseTree* root) {
+                    std::vector<antlr4::tree::ParseTree*> pending;
+                    if (root != nullptr) pending.push_back(root);
+                    while (!pending.empty())
                     {
-                        if (declaration->declarationSpecifiers() != nullptr)
-                            recordDeclarationTypes(declaration->declarationSpecifiers(), namespaceName, sourceIndex);
-                        if (declaration->initDeclaratorList() != nullptr)
-                            for (auto* item : declaration->initDeclaratorList()->initDeclarator())
-                                if (item->declarator() != nullptr)
-                                    if (std::string name = getDirectDeclName(
-                                            item->declarator()->directDeclarator()); !name.empty())
-                                    {
-                                        localNames.insert(name);
-                                        if (declaration->declarationSpecifiers() != nullptr)
-                                            for (auto* spec : declaration->declarationSpecifiers()->declarationSpecifier())
-                                                if ((spec->pointer() != nullptr || IsArrayViewArg(spec))
-                                                    && spec->typeSpecifier() != nullptr)
-                                                    if (std::string typeName = nominalTypeName(
-                                                            spec->typeSpecifier(), namespaceName);
-                                                        !typeName.empty())
-                                                        localPointerAggregateTypes[name] = typeName;
-                                    }
-                    }
-                    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-                    {
-                        auto* primary = postfix->primaryExpression();
-                        auto* base = primary != nullptr ? primary->genericIdentifier() : nullptr;
-                        if (base != nullptr && base->Identifier() != nullptr)
-                            if (auto pointerType = localPointerAggregateTypes.find(
-                                    base->Identifier()->getText());
-                                pointerType != localPointerAggregateTypes.end())
-                            {
-                                auto members = getMemberAccesses(postfix);
-                                if (std::any_of(members.begin(), members.end(), [](const auto& member) {
-                                        return !member.Called;
-                                    }))
+                        antlr4::tree::ParseTree* node = pending.back();
+                        pending.pop_back();
+                        if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+                        {
+                            if (declaration->declarationSpecifiers() != nullptr)
+                                recordDeclarationTypes(declaration->declarationSpecifiers(), namespaceName, sourceIndex);
+                            if (declaration->initDeclaratorList() != nullptr)
+                                for (auto* item : declaration->initDeclaratorList()->initDeclarator())
+                                    if (item->declarator() != nullptr)
+                                        if (std::string name = getDirectDeclName(
+                                                item->declarator()->directDeclarator()); !name.empty())
+                                        {
+                                            localNames.insert(name);
+                                            if (declaration->declarationSpecifiers() != nullptr)
+                                                for (auto* spec : declaration->declarationSpecifiers()->declarationSpecifier())
+                                                    if ((spec->pointer() != nullptr || IsArrayViewArg(spec))
+                                                        && spec->typeSpecifier() != nullptr)
+                                                        if (std::string typeName = nominalTypeName(
+                                                                spec->typeSpecifier(), namespaceName);
+                                                            !typeName.empty())
+                                                            localPointerAggregateTypes[name] = typeName;
+                                        }
+                        }
+                        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+                        {
+                            auto* primary = postfix->primaryExpression();
+                            auto* base = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                            const auto members = getMemberAccesses(postfix);
+                            if (base != nullptr && base->Identifier() != nullptr)
+                                if (auto pointerType = localPointerAggregateTypes.find(
+                                        base->Identifier()->getText());
+                                    pointerType != localPointerAggregateTypes.end())
                                 {
-                                    earlierAggregateUses[pointerType->second].push_back(sourceIndex);
-                                    pointerFieldAccessPaths.push_back({ pointerType->second,
-                                        std::move(members) });
+                                    if (std::any_of(members.begin(), members.end(), [](const auto& member) {
+                                            return !member.Called;
+                                        }))
+                                    {
+                                        earlierAggregateUses[pointerType->second].push_back(sourceIndex);
+                                        pointerFieldAccessPaths.push_back({ pointerType->second,
+                                            std::move(members) });
+                                    }
+                                }
+                            if (base != nullptr && base->Identifier() != nullptr
+                                && base->genericTypeParameters() == nullptr
+                                && localNames.count(base->Identifier()->getText()) == 0
+                                && !members.empty() && members.front().OperatorToken == CFlatParser::Arrow)
+                            {
+                                const std::string bare = base->Identifier()->getText();
+                                const std::string qualified = compilerLLVM->ResolveQualifiedName(bare);
+                                auto global = compilerLLVM->GetGlobalVariableNV(qualified);
+                                if (global.Storage == nullptr && qualified != bare)
+                                    global = compilerLLVM->GetGlobalVariableNV(bare);
+                                if (global.Storage != nullptr && global.TypeAndValue.PointerDepth > 0)
+                                {
+                                    const std::string typeName = compilerLLVM->ResolveTypeAlias(
+                                        global.TypeAndValue.TypeName);
+                                    auto type = compilerLLVM->dataStructures.find(typeName);
+                                    if (type != compilerLLVM->dataStructures.end()
+                                        && type->second.StructType != nullptr && type->second.StructType->isOpaque())
+                                    {
+                                        earlierAggregateUses[typeName].push_back(sourceIndex);
+                                        pointerFieldAccessPaths.push_back({ typeName, members });
+                                    }
                                 }
                             }
-                        if (base != nullptr && base->Identifier() != nullptr
-                            && base->genericTypeParameters() == nullptr
-                            && localNames.count(base->Identifier()->getText()) == 0)
-                        {
-                            std::string candidate = base->Identifier()->getText();
-                            for (auto* member : postfix->memberNameToken())
+                            if (base != nullptr && base->Identifier() != nullptr
+                                && base->genericTypeParameters() == nullptr
+                                && localNames.count(base->Identifier()->getText()) == 0)
                             {
-                                candidate += "." + member->getText();
-                                auto global = compilerLLVM->GetGlobalVariableNV(candidate);
-                                if (global.Storage == nullptr) continue;
-                                const std::string typeName = compilerLLVM->ResolveTypeAlias(
-                                    global.TypeAndValue.TypeName);
-                                auto type = compilerLLVM->dataStructures.find(typeName);
-                                if (type != compilerLLVM->dataStructures.end()
-                                    && type->second.StructType != nullptr && type->second.StructType->isOpaque())
-                                    earlierAggregateUses[typeName].push_back(sourceIndex);
-                                break;
+                                std::string candidate = base->Identifier()->getText();
+                                for (auto* member : postfix->memberNameToken())
+                                {
+                                    candidate += "." + member->getText();
+                                    auto global = compilerLLVM->GetGlobalVariableNV(candidate);
+                                    if (global.Storage == nullptr) continue;
+                                    const std::string typeName = compilerLLVM->ResolveTypeAlias(
+                                        global.TypeAndValue.TypeName);
+                                    auto type = compilerLLVM->dataStructures.find(typeName);
+                                    if (type != compilerLLVM->dataStructures.end()
+                                        && type->second.StructType != nullptr && type->second.StructType->isOpaque())
+                                        earlierAggregateUses[typeName].push_back(sourceIndex);
+                                    break;
+                                }
                             }
                         }
+                        for (auto it = node->children.rbegin(); it != node->children.rend(); ++it)
+                            pending.push_back(*it);
                     }
-                    for (antlr4::tree::ParseTree* child : node->children) self(self, child);
                 };
                 LLVMBackend::NamespaceScope scope(Compiler(func), namespaceName);
                 recordDeclarationTypes(func->declarationSpecifiers(), namespaceName, sourceIndex);
-                scanFunction(scanFunction, func->parameterTypeList());
-                scanFunction(scanFunction, func->compoundStatement());
+                scanFunction(func->parameterTypeList());
+                scanFunction(func->compoundStatement());
                 return;
             }
             if (auto* decl = ext->declaration())
@@ -1966,6 +1998,7 @@ void MainListener::PreparseAggregateDefinitions(
         std::function<void(CFlatParser::IfConstDeclarationContext*, const std::string&)> collectIfConstDefinitions;
         collectIfConstDefinitions = [&](CFlatParser::IfConstDeclarationContext* ifConst,
                                         const std::string& namespaceName) {
+            RequireStackHeadroom(ifConst);
             auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ifConst);
             if (!recorded) return;
             const int decision = *recorded;
@@ -1983,6 +2016,7 @@ void MainListener::PreparseAggregateDefinitions(
         };
         collectDefinitions = [&](CFlatParser::ExternalDeclarationContext* ext,
                                  const std::string& namespaceName) {
+            RequireStackHeadroom(ext);
             if (auto* ns = ext->namespaceDefinition())
             {
                 std::string nested;
@@ -2014,6 +2048,7 @@ void MainListener::PreparseAggregateDefinitions(
         };
         collectStructDefinition = [&](CFlatParser::StructDefinitionContext* str,
                                       const std::string& namespaceName) {
+            RequireStackHeadroom(str);
             const std::string typeName = namespaceName.empty()
                 ? str->directDeclarator()->getText()
                 : namespaceName + "." + str->directDeclarator()->getText();
@@ -2031,6 +2066,7 @@ void MainListener::PreparseAggregateDefinitions(
         };
         collectClassDefinition = [&](CFlatParser::ClassDefinitionContext* cls,
                                      const std::string& namespaceName) {
+            RequireStackHeadroom(cls);
             const std::string typeName = namespaceName.empty()
                 ? cls->directDeclarator()->getText()
                 : namespaceName + "." + cls->directDeclarator()->getText();
@@ -8338,4 +8374,26 @@ void MainListener::LogErrorContext(antlr4::ParserRuleContext* ctx, std::string e
         compilerLLVM->currentLine = static_cast<int>(ctx->getStart()->getLine());
         compilerLLVM->currentColumn = static_cast<int>(ctx->getStart()->getCharPositionInLine());
         compilerLLVM->LogError(std::move(errorMessage));
+    }
+
+void MainListener::LogErrorContext(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+                                   std::string errorMessage, const std::string& fileName) {
+        struct RestoreLocation
+        {
+            LLVMBackend* Compiler;
+            std::string File;
+            size_t Line;
+            size_t Column;
+            ~RestoreLocation()
+            {
+                Compiler->sourceFileName = std::move(File);
+                Compiler->currentLine = Line;
+                Compiler->currentColumn = Column;
+            }
+        } restore{ compiler, compiler->sourceFileName, compiler->currentLine,
+                   compiler->currentColumn };
+        if (!fileName.empty()) compiler->sourceFileName = fileName;
+        compiler->SetSourceLocation(ctx->getStart()->getLine(),
+                                     ctx->getStart()->getCharPositionInLine());
+        compiler->LogError(std::move(errorMessage));
     }

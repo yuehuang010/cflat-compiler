@@ -1102,6 +1102,7 @@ std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
     if (opId->Assign())           return "operator=";
     if (opId->Equal())        return "operator==";
     if (opId->NotEqual())     return "operator!=";
+    if (opId->Spaceship())    return "operator<=>";
     if (opId->Less())         return "operator<";
     if (opId->LessEqual())    return "operator<=";
     if (opId->GreaterEqual()) return "operator>=";
@@ -1632,6 +1633,12 @@ std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antlr4::tre
         }
         if (auto* n = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
         {
+            auto ops = n->spaceshipExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(node))
+        {
+            if (n->Spaceship() != nullptr) return std::nullopt;
             auto ops = n->shiftExpression();
             return foldChain({ops.begin(), ops.end()}, n);
         }
@@ -5232,6 +5239,32 @@ bool ViewFieldAliasProvesParam(antlr4::tree::ParseTree* bodyRoot,
     verifyStores(verifyStores, bodyRoot);
     return everyStoreAgrees;
 }
+bool MoveIsLocalDeclInitializer(antlr4::tree::ParseTree* move)
+{
+    // Climb single-child expression wrappers; any other shape is not a bare initializer.
+    antlr4::tree::ParseTree* node = move != nullptr ? move->parent : nullptr;
+    while (node != nullptr && node->children.size() == 1
+        && dynamic_cast<CFlatParser::InitializerContext*>(node) == nullptr)
+        node = node->parent;
+    auto* initializer = dynamic_cast<CFlatParser::InitializerContext*>(node);
+    if (initializer == nullptr) return false;
+    auto* declarator = dynamic_cast<CFlatParser::InitDeclaratorContext*>(initializer->parent);
+    if (declarator == nullptr || declarator->parent == nullptr) return false;
+    auto* list = dynamic_cast<CFlatParser::InitDeclaratorListContext*>(declarator->parent);
+    if (list == nullptr || list->parent == nullptr) return false;
+    if (dynamic_cast<CFlatParser::DeclarationContext*>(list->parent) == nullptr) return false;
+    // Local only: a function or lambda body encloses it before any struct or class does.
+    for (auto* scope = list->parent; scope != nullptr; scope = scope->parent)
+    {
+        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(scope) != nullptr
+            || dynamic_cast<CFlatParser::LambdaExpressionContext*>(scope) != nullptr)
+            return true;
+        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(scope) != nullptr
+            || dynamic_cast<CFlatParser::ClassDefinitionContext*>(scope) != nullptr)
+            return false;
+    }
+    return false;
+}
 std::string ViewFieldMovePath(CFlatParser::UnaryExpressionContext* source,
         antlr4::tree::ParseTree* bodyRoot,
         const LLVMBackend::TypeAndValue& param,
@@ -5345,7 +5378,9 @@ void InferViewFieldMovePaths(antlr4::tree::ParseTree* node,
         && (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)
             || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)))
         return;
-    if (auto* move = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
+    // A local-declaration move copies a view (no sink), so it names no sink path.
+    if (auto* move = AsRuleCtx<CFlatParser::MoveExpressionContext>(node);
+        move != nullptr && !MoveIsLocalDeclInitializer(move))
         for (auto& param : allParams)
         {
             const std::string path = ViewFieldMovePath(

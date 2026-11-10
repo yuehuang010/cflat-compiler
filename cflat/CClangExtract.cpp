@@ -2093,9 +2093,19 @@ namespace cflat_cinterop
             return AccessPublic;
         }
 
-        bool DeclIsNoexcept(const FunctionDecl* fd)
+        bool DeclIsNoexcept(const FunctionDecl* fd, Sema& sema)
         {
-            ExceptionSpecificationType est = fd->getExceptionSpecType();
+            const auto* fpt = fd->getType()->getAs<FunctionProtoType>();
+            const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(fd);
+            const auto* parent = dtor != nullptr ? dtor->getParent() : nullptr;
+            const bool templateRecord = parent != nullptr
+                && (parent->isDependentContext()
+                    || parent->getTemplateSpecializationKind() != TSK_Undeclared);
+            if (fpt != nullptr && dtor != nullptr && !templateRecord
+                && clang::isUnresolvedExceptionSpec(fpt->getExceptionSpecType()))
+                fpt = sema.ResolveExceptionSpec(fd->getLocation(), fpt);
+            ExceptionSpecificationType est = fpt != nullptr
+                ? fpt->getExceptionSpecType() : fd->getExceptionSpecType();
             return est == EST_BasicNoexcept || est == EST_NoexceptTrue || est == EST_NoThrow;
         }
 
@@ -3107,7 +3117,7 @@ namespace cflat_cinterop
                 result.typeParameterCount = typeParameterCount;
                 result.templateParameterKinds = std::move(templateParameterKinds);
                 result.isConst = md != nullptr && !md->isStatic() && md->isConst();
-                result.isNoexcept = DeclIsNoexcept(fd);
+                result.isNoexcept = DeclIsNoexcept(fd, st.ci->getSema());
                 result.access = md == nullptr ? AccessPublic : MapAccess(md->getAccess());
                 result.file = file;
                 result.physicalFile = PhysicalFileOf(fd, file);
@@ -4234,6 +4244,10 @@ namespace cflat_cinterop
                         rec.hasAssignTemplate = true;
                     const auto* ctor = ftd != nullptr
                         ? llvm::dyn_cast<CXXConstructorDecl>(ftd->getTemplatedDecl()) : nullptr;
+                    const auto* conversion = ftd != nullptr
+                        ? llvm::dyn_cast<CXXConversionDecl>(ftd->getTemplatedDecl()) : nullptr;
+                    if (conversion != nullptr && ftd->getAccess() == AS_public)
+                        rec.hasConversionTemplate = true;
                     if (ctor == nullptr) continue;
                     if (ftd->getAccess() == AS_public && !ctor->isDeleted())
                         rec.hasCtorTemplate = true;
@@ -4600,7 +4614,7 @@ namespace cflat_cinterop
                     m.isImplicit = md->isImplicit();
                     m.isUsingShadow = usingAccess.count(md) != 0;
                     m.isTemplateSpecialization = md->getPrimaryTemplate() != nullptr;
-                    m.isNoexcept = DeclIsNoexcept(md);
+                    m.isNoexcept = DeclIsNoexcept(md, st.ci->getSema());
                     m.access = MapAccess(usingAccess.count(md) != 0 ? usingAccess.at(md)
                                                                     : md->getAccess());
                     m.variadic = md->isVariadic();

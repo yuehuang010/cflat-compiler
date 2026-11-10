@@ -273,6 +273,7 @@ static bool CallUnderOperatorAncestor(antlr4::tree::ParseTree* call)
             dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::ShiftExpressionContext*>(node) != nullptr
+            || dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::RelationalExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node) != nullptr
             || dynamic_cast<CFlatParser::EqualityExpressionContext*>(node) != nullptr
@@ -1780,6 +1781,7 @@ static bool InAliasDeclaration(antlr4::tree::ParseTree* node, bool* crossedAddit
         }
         if ((dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(p)
                 || dynamic_cast<CFlatParser::ShiftExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(p)
                 || dynamic_cast<CFlatParser::RelationalExpressionContext*>(p)
                 || dynamic_cast<CFlatParser::EqualityExpressionContext*>(p)
                 || dynamic_cast<CFlatParser::AndExpressionContext*>(p)
@@ -16936,6 +16938,31 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // Keep lambda counter in sync: closure name matches lambda name index.
         size_t lambdaIdx  = compiler->lambdaCounter;
         std::string lambdaName = compiler->CreateAnonFunctionName(); // post-increments lambdaCounter
+        bool lexicallyInsideNamespaceFunction = false;
+        bool lexicallyInsideFunction = false;
+        for (auto* parent = ctx->parent; parent != nullptr; parent = parent->parent)
+        {
+            if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+                lexicallyInsideFunction = true;
+            if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) != nullptr
+                || dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) != nullptr)
+                break;
+            if (lexicallyInsideFunction
+                && dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(parent) != nullptr)
+            {
+                lexicallyInsideNamespaceFunction = true;
+                break;
+            }
+        }
+        const auto* enclosingFunction = compiler->GetCurrentFunctionSymbol();
+        const bool enclosingNamespacedFunction = enclosingFunction != nullptr
+            && !enclosingFunction->IsMethod
+            && enclosingFunction->UniqueName.find('.') != std::string::npos;
+        if (lexicallyInsideNamespaceFunction || enclosingNamespacedFunction
+            || !compiler->GetCurrentNamespace().empty()
+            || (compiler->currentFunction != nullptr
+                && namespaceLambdaFunctionNames_.count(compiler->currentFunction->getName().str()) != 0))
+            namespaceLambdaFunctionNames_.insert(lambdaName);
 
         std::set<std::string> lambdaParamNames;
         for (const auto& p : params)
@@ -19594,6 +19621,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 return (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent) != nullptr
                         || dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(parent) != nullptr
                         || dynamic_cast<CFlatParser::ShiftExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(parent) != nullptr
                         || dynamic_cast<CFlatParser::RelationalExpressionContext*>(parent) != nullptr
                         || dynamic_cast<CFlatParser::EqualityExpressionContext*>(parent) != nullptr
                         || dynamic_cast<CFlatParser::AndExpressionContext*>(parent) != nullptr
@@ -19835,6 +19863,12 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         // try getting global variable
         {
             auto globalNV = compiler->GetGlobalVariableNV(name);
+            const bool inNamespaceLambda = compiler->currentFunction != nullptr
+                && namespaceLambdaFunctionNames_.count(compiler->currentFunction->getName().str()) != 0;
+            if (namespaceFunctionIdentifierNodes_.count(node) == 0 && !inNamespaceLambda)
+                if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(globalNV.Storage);
+                    global != nullptr && global->getMetadata("cflat.forward_definition") != nullptr)
+                    globalNV = {};
             if (globalNV.Storage != nullptr)
             {
                 if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(globalNV.Storage))
@@ -20525,6 +20559,15 @@ void MainListener::RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
         if (!compiler->IsOwningValueType(typeName)) return;
         if (MethodConsumesReceiver(functionName, typeName)) return;
 
+        // A C++ field reached through a parenthesized holder temp is a subobject of that
+        // already-owned holder. Bind the method to its field address without a second owner.
+        if (parenthesizedSpill && receiver.Storage != nullptr
+            && !receiver.OwningStructName.empty())
+        {
+            thisArg.Storage = receiver.Storage;
+            return;
+        }
+
         // A nontrivial C++ value returned through sret already lives in the tracked temporary
         // slot. Reuse that slot for a chained member call; a raw aggregate store would duplicate
         // the handle without running its copy constructor, so both slots would later destruct it.
@@ -20578,6 +20621,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
     const std::unordered_set<std::string>* localEnumNames, bool insideScopedExpectation,
     bool afterBareExpectation) {
         if (!ctx) return;
+        if (auto* context = dynamic_cast<antlr4::ParserRuleContext*>(ctx))
+            RequireStackHeadroom(context);
         std::unordered_set<std::string> discoveredLocalEnumNames;
         if (localEnumNames == nullptr)
             for (antlr4::tree::ParseTree* parent = ctx; parent != nullptr; parent = parent->parent)

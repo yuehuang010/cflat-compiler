@@ -1,4 +1,5 @@
 #pragma once
+#include <new>
 // Instrumented fixture for a C++ exception unwinding THROUGH CFlat frames: every Tr
 // construction and destruction is counted, so a skipped or doubled destructor shows up.
 namespace cppunw {
@@ -32,6 +33,48 @@ struct Tx
     ~Tx() { --Tr::live; ++Tr::dtors; }
     int get() const noexcept { return tag; }
 };
+// Instrumented moved temporary used by nested aggregate replacement unwinds.
+struct FreshReplace
+{
+    inline static int born = 0;
+    inline static int dead = 0;
+    inline static int moves = 0;
+    inline static bool throwOld = false;
+    int tag;
+    FreshReplace(int t) : tag(t) { ++born; }
+    FreshReplace(const FreshReplace&) = delete;
+    FreshReplace(FreshReplace&& other) noexcept : tag(other.tag)
+    { ++born; ++moves; other.tag = 0; }
+    FreshReplace& operator=(FreshReplace&& other) noexcept
+    { tag = other.tag; other.tag = 0; return *this; }
+    ~FreshReplace() noexcept(false)
+    {
+        ++dead;
+        if (tag == 1 && !throwOld) { throwOld = true; throw 71; }
+    }
+    static void reset() noexcept { born = dead = moves = 0; throwOld = false; }
+};
+inline int freshReplaceBorn() noexcept { return FreshReplace::born; }
+inline int freshReplaceDead() noexcept { return FreshReplace::dead; }
+inline int freshReplaceMoves() noexcept { return FreshReplace::moves; }
+inline void resetFreshReplace() noexcept { FreshReplace::reset(); }
+struct FreshReplaceArrayItem { FreshReplace value = FreshReplace(1); };
+struct FreshReplaceArrayOwner { FreshReplaceArrayItem arr[2]; };
+inline bool freshReplaceArrayOracle()
+{
+    FreshReplace::reset();
+    alignas(FreshReplace) unsigned char storage[sizeof(FreshReplace) * 2];
+    auto* arr = reinterpret_cast<FreshReplace*>(storage);
+    new (&arr[0]) FreshReplace(1);
+    new (&arr[1]) FreshReplace(1);
+    try
+    {
+        FreshReplace rhs(2);
+        arr[0].~FreshReplace();
+    }
+    catch (int) { arr[1].~FreshReplace(); }
+    return FreshReplace::born == 3 && FreshReplace::dead == 3;
+}
 inline void setArm(int v) noexcept { Tx::arm = v; }
 // The global operator new/delete and new[]/delete[] replacements in cpp_interop_unwind.cpp count
 // calls while counting is on; failNew(1) makes the next operator new throw std::bad_alloc.

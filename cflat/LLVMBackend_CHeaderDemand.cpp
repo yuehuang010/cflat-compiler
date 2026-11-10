@@ -780,6 +780,14 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
         std::string base = cflatType;
         int ptr = 0;
         while (!base.empty() && base.back() == '*') { base.pop_back(); ++ptr; }
+        if (ptr == 0 && !StdOrderingCategoryOf(base).empty())
+        {
+            out = base;
+            for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; pos += 2)
+                out.replace(pos, 1, "::");
+            for (int i = 0; i < ptr; ++i) out += " *";
+            return true;
+        }
         if (!base.empty() && (std::isdigit((unsigned char)base.front())
                               || (base.front() == '-' && base.size() > 1)))
         {
@@ -3184,6 +3192,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.hasDefaultCtor = cached.hasDefaultCtor;
         raw.hasCopyCtor = cached.hasCopyCtor;
         raw.hasCtorTemplate = cached.hasCtorTemplate;
+        raw.hasConversionTemplate = cached.hasConversionTemplate;
         raw.hasAssignTemplate = cached.hasAssignTemplate;
         raw.moveAssignBindsConstRef = cached.moveAssignBindsConstRef;
         raw.moveAssignConstSourceBindsConstRef = cached.moveAssignConstSourceBindsConstRef;

@@ -961,6 +961,10 @@
       "x",
       "member_l"
     ],
+    "parameterarg0ofarg1i...dcannotbindabitfield09f6586d5c0f4b95": [
+      "p1",
+      "operator*"
+    ],
     "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": [
       "t",
       "cppi.take_rvalue"
@@ -2290,6 +2294,7 @@
     "parameterarg0cannotp...emaynotbetransferreddd908812a4374611": "parameter '{0}': cannot pass a value of type '{1}' to a by-value or 'move' parameter of '{2}' - the type is [immovable], so its value may not be transferred",
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": "parameter '{0}': cannot pass bonded value to '{1}' parameter - bonded values cannot be transferred out of their source's scope",
     "parameterarg0ofarg1i...anrvaluepassanlvalueec25f7364020bcfb": "parameter '{0}' of '{1}' is a non-const lvalue reference and cannot bind an rvalue; pass an lvalue",
+    "parameterarg0ofarg1i...dcannotbindabitfield09f6586d5c0f4b95": "parameter '{0}' of '{1}' is a non-const reference and cannot bind a bitfield",
     "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": "parameter '{0}' of '{1}' is an rvalue reference; pass 'move <arg>' or a temporary",
     "passinganewarg0byval...landpassapointertoit7f1a0c05acf35f5a": "passing a new '{0}' by value would leave its stored closure pointing at the temporary ('this' captured in {1}'s constructor); declare it as a local and pass a pointer to it",
     "programdefinitionsrequireatrailing": "program definitions require a trailing ';'",

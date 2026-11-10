@@ -59,3 +59,26 @@ compares member-wise AND implies a defaulted `==`. A field type with no `==` / `
 deleted -> LogError at the use site. No implicit `==` on undeclared structs (C++ parity). Acceptance adds:
 defaulted `==` / `!=` on a struct with int, string and nested-struct fields; defaulted `<=>` gives all six
 relationals; a field without `==` refused.
+
+LANDED 2026-11-07 (fix box 12): defaulted member-wise `bool operator==(T other) = default;` on CFlat
+structs, generic structs per instantiation; `!=` derives. A field without `==` deletes the default
+(LogError at the use site, naming struct and field); a union's default is deleted; a struct may not
+both default and define `operator==(T)`. Legs: Test/test_operators.cb, Test/errors/
+err_defaulted_equality_deleted_field.cb.
+Pre-existing, not changed: `int f() = default;` in a struct parses as a member with initializer
+`default` and is silently accepted (master too).
+
+LANDED 2026-11-07 (fix box 12): the `<=>` surface. `<=>` is one token between shift and relational.
+Builtin `<=>` on integers and pointers gives `std.strong_ordering`, on floating `std.partial_ordering`
+(NaN unordered); it needs `import cpp "compare"` (LogError otherwise, as C++ needs the header). The
+result is the named category struct, so it crosses into C++ (`std.is_lt`) like a C++-returned
+ordering. Imported C++ `operator<=>` (member, free, reversed) keeps its category. A CFlat struct
+member `operator<=>` synthesizes `<` `<=` `>` `>=` (not `==`); a defaulted `<=>` (auto or a spelled
+category) compares member-wise and implies `==`, deleted on a field without `<=>` and on unions.
+Only `std.` / `std.__1.` categories count. A non-negative constant against an unsigned operand is
+not narrowing; builtin pointer `<=>` needs a composite pointer type (base/derived adjusted, void*),
+a bare nullptr is refused like clang's nullptr_t. Legs: Test/test_operators.cb,
+Test/test_cpp_interop.cb, Test/errors/err_spaceship_{missing_import,defaulted_invalid,misuse}.cb.
+
+Still open: std_full legs for `<=>` in std_full_20_bit_numbers_compare_span and
+std_full_11_utility_tuple (and their C++ twins) in test_libs.

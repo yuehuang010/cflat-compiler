@@ -1,5 +1,14 @@
 #include "MainListener.h"
 
+static void RequireRecursiveWalkHeadroom(LLVMBackend* compiler,
+                                         antlr4::ParserRuleContext* context)
+{
+    if (StackBytesRemaining() < kMinStackHeadroomBytes)
+        MainListener::LogErrorContext(compiler, context,
+            "expression or statement is nested too deeply; split it into named temporaries",
+            compiler->GetSourceFilePath());
+}
+
 LLVMBackend* ForwardRefScanner::Compiler(antlr4::ParserRuleContext* ctx) {
         compilerLLVM->SetSourceLocation(ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
         return compilerLLVM;
@@ -1041,8 +1050,41 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         if (func->genericTypeParameters() != nullptr)
             return;
 
+        if (!namespaceName.empty() && structName.empty() && func->compoundStatement() != nullptr)
+        {
+            std::vector<antlr4::tree::ParseTree*> pending{ func->compoundStatement() };
+            while (!pending.empty())
+            {
+                auto* node = pending.back();
+                pending.pop_back();
+                if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+                    if (auto* identifier = primary->genericIdentifier(); identifier != nullptr
+                        && identifier->Identifier() != nullptr)
+                        namespaceFunctionValueNames_.insert(identifier->Identifier()->getText());
+                for (auto it = node->children.rbegin(); it != node->children.rend(); ++it)
+                    pending.push_back(*it);
+            }
+        }
+
         const std::string rawFuncName = getFunctionName(func, compiler);
         std::string name = namespaceName.empty() ? rawFuncName : namespaceName + "." + rawFuncName;
+
+        // Defaulted comparisons have no body or prototype, so record their metadata before
+        // function bodies are scanned; codegen will synthesize each use.
+        if (func->Default() != nullptr)
+        {
+            auto structure = compiler->dataStructures.find(structName);
+            if (rawFuncName == "operator==" && structure != compiler->dataStructures.end())
+                structure->second.HasDefaultedEquality = true;
+            if (rawFuncName == "operator<=>" && structure != compiler->dataStructures.end())
+            {
+                structure->second.HasDefaultedSpaceship = true;
+                const std::string result = compiler->ResolveTypeAlias(
+                    ParseDeclarationSpecifiers(func->declarationSpecifiers()).TypeName);
+                structure->second.DefaultedSpaceshipCategory = StdOrderingCategoryOf(result);
+            }
+            return;
+        }
 
         auto returnType = ParseDeclarationSpecifiers(func->declarationSpecifiers());
         // 'auto' return type is only supported on generic function templates (already
@@ -1262,6 +1304,20 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         // free the result. The unique-ownership gate is applied when the queue is resolved.
         {
             std::string borrowedParam;
+            auto directReturnProbe = returnType;
+            directReturnProbe.IsAlias = false;
+            const bool returnsDirectByValueParam = ClassifyValueStructReturns(
+                compiler, func, directReturnProbe, allParams, nullptr)
+                == ValueStructReturnKind::AllBorrowedParam;
+            if (returnsDirectByValueParam)
+                if (auto it = compiler->functionTable.find(name); it != compiler->functionTable.end())
+                    for (auto& sym : it->second)
+                        if (sym.Parameters.size() == allParams.size()
+                            && std::equal(allParams.begin(), allParams.end(), sym.Parameters.begin(),
+                                [](const auto& a, const auto& b) {
+                                    return a.TypeName == b.TypeName && a.Pointer == b.Pointer;
+                                }))
+                            sym.ReturnsDirectByValueParam = true;
             if (!returnType.external
                 && ClassifyValueStructReturns(compiler, func, returnType, allParams, &borrowedParam)
                 == ValueStructReturnKind::AllBorrowedParam)
@@ -3689,6 +3745,8 @@ int ForwardRefScanner::ScannerDecideIfConst(CFlatParser::ExpressionContext* expr
 
 void ForwardRefScanner::CollectGenericTemplateDeclsIfConst(CFlatParser::IfConstDeclarationContext* ctx, bool certain,
                                             bool ifConstUnfoldable, const std::string& ns) {
+        RequireRecursiveWalkHeadroom(compilerLLVM,
+            dynamic_cast<antlr4::ParserRuleContext*>(ctx));
         int decision = ScannerDecideIfConst(ctx->expression());
         if (auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ctx))
             decision = *recorded;
@@ -3714,6 +3772,8 @@ void ForwardRefScanner::CollectGenericTemplateDeclsIfConst(CFlatParser::IfConstD
 void ForwardRefScanner::CollectGenericTemplateDeclsIfConstMember(CFlatParser::IfConstMemberContext* ctx, bool certain,
                                                  bool ifConstUnfoldable, const std::string& ns,
                                                  const std::string& typePath, bool unkeyable) {
+        RequireRecursiveWalkHeadroom(compilerLLVM,
+            dynamic_cast<antlr4::ParserRuleContext*>(ctx));
         int decision = ScannerDecideIfConst(ctx->expression());
         auto ifBlocks = ctx->ifConstMemberBlock();
         if (ifBlocks.empty()) return;
@@ -4038,6 +4098,8 @@ void ForwardRefScanner::PreRegisterCppStructNames(antlr4::RuleContext* ctx)
 
 void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
                                             const std::unordered_set<std::string>* localEnumNames) {
+        RequireRecursiveWalkHeadroom(compilerLLVM,
+            dynamic_cast<antlr4::ParserRuleContext*>(ctx));
         struct ScanScope
         {
             unsigned& depth;
@@ -4958,6 +5020,7 @@ void ForwardRefScanner::PreRegisterAggregateTypeShells(
         std::function<void(CFlatParser::ExternalDeclarationContext*, const std::string&)> visitExternal;
         std::function<void(CFlatParser::IfConstDeclarationContext*, const std::string&)> visitIfConst;
         visitStruct = [&](CFlatParser::StructDefinitionContext* str, const std::string& ns) {
+            RequireRecursiveWalkHeadroom(compilerLLVM, str);
             std::string name = QualifyName(ns, str->directDeclarator()->getText());
             if (str->genericTypeParameters() == nullptr)
             {
@@ -4968,6 +5031,7 @@ void ForwardRefScanner::PreRegisterAggregateTypeShells(
             for (auto* nested : MemberClassDefinitions(str)) visitClass(nested, name);
         };
         visitClass = [&](CFlatParser::ClassDefinitionContext* cls, const std::string& ns) {
+            RequireRecursiveWalkHeadroom(compilerLLVM, cls);
             std::string name = QualifyName(ns, cls->directDeclarator()->getText());
             if (cls->genericTypeParameters() == nullptr)
             {
@@ -4978,6 +5042,7 @@ void ForwardRefScanner::PreRegisterAggregateTypeShells(
             for (auto* nested : MemberClassDefinitions(cls)) visitClass(nested, name);
         };
         visitIfConst = [&](CFlatParser::IfConstDeclarationContext* ifConst, const std::string& ns) {
+            RequireRecursiveWalkHeadroom(compilerLLVM, ifConst);
             int decision = ScannerDecideIfConst(ifConst->expression());
             if (auto recorded = compilerLLVM->GetSourceOrderedIfConstDecision(ifConst))
                 decision = *recorded;
@@ -4993,6 +5058,7 @@ void ForwardRefScanner::PreRegisterAggregateTypeShells(
                 for (auto* decl : blocks[index]->externalDeclaration()) visitExternal(decl, ns);
         };
         visitExternal = [&](CFlatParser::ExternalDeclarationContext* ext, const std::string& ns) {
+            RequireRecursiveWalkHeadroom(compilerLLVM, ext);
             if (auto* nestedNs = ext->namespaceDefinition())
             {
                 const std::string nested = NestedNamespaceName(ns, nestedNs);
@@ -5032,6 +5098,7 @@ void ForwardRefScanner::PreRegisterAggregateTypeShells(
 
 void ForwardRefScanner::PreRegisterEnums(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName)
 {
+        RequireRecursiveWalkHeadroom(compilerLLVM, ctx);
         if (auto* ns = ctx->namespaceDefinition())
         {
             const std::string nested = NestedNamespaceName(namespaceName, ns);
@@ -5046,6 +5113,7 @@ void ForwardRefScanner::PreRegisterEnums(CFlatParser::ExternalDeclarationContext
 
 void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName)
 {
+        RequireRecursiveWalkHeadroom(compilerLLVM, ctx);
         if (auto* ns = ctx->namespaceDefinition())
         {
             const std::string nested = NestedNamespaceName(namespaceName, ns);
@@ -5109,15 +5177,31 @@ void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationConte
                     params != nullptr && params->Ellipsis() != nullptr, false, false, type.CallConv, linkage);
                 continue;
             }
-            // Root globals remain source-ordered; root function declarations can safely be
-            // published now so a later aggregate's generated bodies see their prototypes.
-            if (namespaceName.empty()) continue;
+            // Publish global storage shells in the scan pass so namespace bodies can resolve
+            // a later root global. Initializers are still applied by the source-ordered walk.
+            if (namespaceName.empty()
+                && namespaceFunctionValueNames_.count(getDirectDeclName(direct)) == 0)
+                continue;
             auto itemType = type;
             if (direct->assignmentExpression() != nullptr)
             {
                 auto size = FoldCompileTimeInt(compilerLLVM, direct->assignmentExpression());
                 if (!itemType.Pointer || !size || *size <= 0) continue;
                 itemType.ConstArraySize = static_cast<uint64_t>(*size);
+            }
+            const std::string resolvedTypeName = compilerLLVM->ResolveTypeAlias(itemType.TypeName);
+            bool genericType = false;
+            for (auto* spec : specs->declarationSpecifier())
+                if (auto* typeSpec = spec->typeSpecifier(); typeSpec != nullptr)
+                    if (auto* generic = typeSpec->genericIdentifier(); generic != nullptr
+                        && generic->genericTypeParameters() != nullptr)
+                        genericType = true;
+            if (namespaceName.empty() && genericType)
+            {
+                auto typeData = compilerLLVM->dataStructures.find(resolvedTypeName);
+                if (typeData == compilerLLVM->dataStructures.end()
+                    || typeData->second.StructType == nullptr || typeData->second.StructType->isOpaque())
+                    continue;
             }
             const std::string name = QualifyName(namespaceName, getDirectDeclName(direct));
             if (compilerLLVM->GetGlobalVariableNV(name).Storage != nullptr)
@@ -5147,6 +5231,7 @@ void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationConte
 }
 
 void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName) {
+        RequireRecursiveWalkHeadroom(compilerLLVM, ctx);
         if (auto annDef = ctx->annotationDefinition())
             ScanAnnotationDefinition(annDef);
         else if (auto ns = ctx->namespaceDefinition())
@@ -5278,6 +5363,7 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
     }
 
 void ForwardRefScanner::ScanNamespace(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace) {
+        RequireRecursiveWalkHeadroom(compilerLLVM, ctx);
         std::string namespaceName;
         for (auto* id : ctx->Identifier())
             namespaceName += (namespaceName.empty() ? "" : ".") + id->getText();
@@ -5294,6 +5380,8 @@ void ForwardRefScanner::ScanNamespace(CFlatParser::NamespaceDefinitionContext* c
 
 void ForwardRefScanner::PrepareWinrtClasses(antlr4::RuleContext* ctx, const std::string& namespaceName)
 {
+        if (auto* context = dynamic_cast<antlr4::ParserRuleContext*>(ctx))
+            RequireRecursiveWalkHeadroom(compilerLLVM, context);
         if (auto* tu = dynamic_cast<CFlatParser::TranslationUnitContext*>(ctx))
         {
             for (auto* decl : tu->externalDeclaration())

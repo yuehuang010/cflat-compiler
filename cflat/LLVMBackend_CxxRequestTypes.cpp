@@ -105,8 +105,10 @@ bool LLVMBackend::RequestCxxBraceConstructor(
         const cflat_cinterop::RawCxxMember* selected = nullptr;
         for (const auto& member : record->second.members)
         {
+            const bool trailingPack = !member.paramTypes.empty()
+                && member.paramTypes.back().ends_with("...");
             if (member.kind != cflat_cinterop::RawCxxMember::Constructor
-                || member.paramTypes.size() < arguments.size() + 1)
+                || (member.paramTypes.size() < arguments.size() + 1 && !trailingPack))
                 continue;
             bool fits = true;
             for (const auto& brace : braceArguments)
@@ -156,6 +158,9 @@ bool LLVMBackend::RequestCxxBraceConstructor(
         };
         std::vector<std::string> parameterSpellings{ ownerSpelling + " *" };
         std::vector<std::string> callArguments;
+        // Template-list-backed braces keep their original `{..}` spelling here, so the viability
+        // check sees the complete original call (every argument, every brace position).
+        std::vector<std::pair<size_t, std::string>> originalBraceSpellings;
         std::string wrapperBodyPrefix;
         std::string selectorSource;
         std::map<size_t, bool> selectorElements;
@@ -173,6 +178,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
         // Which braced arguments are backed, and as what: an initializer_list candidate outranks
         // an array for a braced list ([over.ics.list]), so arrays count only without one.
         std::map<size_t, bool> backedList;
+        std::set<size_t> templateListBackedBraces;
         auto scalarElement = [&](const std::string& element) { return IsCxxScalarOrBoolBraceElement(element); };
         // The parameter as a selector declares it (an array's extent is the list's own count, a
         // deduced `N` included); empty when it cannot take the backed list of that kind.
@@ -192,13 +198,15 @@ bool LLVMBackend::RequestCxxBraceConstructor(
             return parameter.substr(0, parameter.rfind('[')) + "[" + std::to_string(count) + "]";
         };
         auto fitsArity = [&](const cflat_cinterop::RawCxxMember& member) {
+            const bool trailingPack = !member.paramTypes.empty()
+                && member.paramTypes.back().ends_with("...");
             if (member.kind != cflat_cinterop::RawCxxMember::Constructor
-                || member.paramTypes.size() < arguments.size() + 1)
+                || (member.paramTypes.size() < arguments.size() + 1 && !trailingPack))
                 return false;
             // A trailing parameter pack left without arguments is empty, as in C++.
             for (size_t n = arguments.size() + 1; n < member.paramTypes.size(); ++n)
                 if ((n >= member.defaultArgs.size() || member.defaultArgs[n].kind.empty())
-                    && !(n + 1 == member.paramTypes.size() && member.paramTypes[n].ends_with("...")))
+                    && !(n + 1 == member.paramTypes.size() && trailingPack))
                     return false;
             return true;
         };
@@ -411,6 +419,18 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                         candidateTypes.push_back(TrimCxxBraceType(StripCxxRefAndCv(candidate.params[i])));
                     const NamedVariable& arg = arguments[i];
                     one = CxxBraceSelectorElement(arg, candidateTypes);
+                    const bool referencePack = std::any_of(selectorCandidates.begin(),
+                        selectorCandidates.end(), [&](const SelectorCandidate& candidate) {
+                            return i < candidate.params.size()
+                                && candidate.params[i].find('&') != std::string::npos;
+                        });
+                    if (referencePack && (arg.CxxLvalueKind == 1 || arg.CxxLvalueKind == 2))
+                    {
+                        std::string sourceSpelling;
+                        const std::string identity = CxxBraceElementIdentity(arg);
+                        if (CxxSpellingForCflatType(identity, sourceSpelling))
+                            one = "declval<" + sourceSpelling + " &>()";
+                    }
                     if (IsNullPointerConstantArgument(arg, true))
                     {
                         if (arg.IsCxxMacroGlobal && !arg.CallerName.empty())
@@ -420,6 +440,8 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                             one = zero;
                     }
                     std::string spelling;
+                    llvm::Type* argumentValueType = arg.Primary != nullptr ? arg.Primary->getType()
+                                                                              : arg.BaseType;
                     auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
                     // A string literal ranks as the `const char[N]` lvalue it is in C++.
                     if (one.empty() && constant != nullptr && IsStringLiteralConstant(constant))
@@ -437,11 +459,14 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                             || !arg.IsRvalue;
                         one = "declval<" + spelling + (named && !arg.IsExplicitMove ? " &" : "") + ">()";
                     }
-                    else if (one.empty() && arg.TypeAndValue.Pointer)
+                    else if (one.empty() && (arg.TypeAndValue.Pointer
+                                               || (argumentValueType != nullptr
+                                                   && argumentValueType->isPointerTy())))
                     {
-                        std::string pointee = arg.TypeAndValue.TypeName;
+                        std::string pointee = arg.TypeAndValue.TypeName.empty()
+                            ? arg.InferSourceTypeName : arg.TypeAndValue.TypeName;
                         if (arg.TypeAndValue.ElemPointer) pointee += "*";
-                        if (CxxSpellingForCflatType(pointee, spelling))
+                        if (!pointee.empty() && CxxSpellingForCflatType(pointee, spelling))
                             one = "declval<" + spelling + " *>()";
                     }
                     if (one.empty())
@@ -576,22 +601,73 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                 // when every constructor that fits takes that one class there.
                 std::string classElement;
                 std::string classSpelling;
+                bool unknownListCtor = false;
+                bool sawClassParameter = false;
+                auto isRegisteredClassTarget = [&](const std::string& parameter) {
+                    if (CxxBraceContainerKindOf(parameter) != CxxBraceContainerKind::Unsupported)
+                        return false;
+                    const std::string container = StripCxxRefAndCv(parameter);
+                    TypeAndValue targetType;
+                    if (MapCTypeToTypeAndValue(container, targetType, true) && !targetType.Pointer
+                        && cxxRecordEntries_.contains(targetType.TypeName))
+                        return true;
+                    auto known = cxxForeignTypeSpellings_.find(SqueezeCxxSpelling(container));
+                    return known != cxxForeignTypeSpellings_.end()
+                        && cxxRecordEntries_.contains(known->second);
+                };
                 if (backedList.empty() && !brace->hasCxxClassElements && !brace->elements.empty()
                     && CxxBraceElementsAllScalar(*brace))
                     for (const auto& member : record->second.members)
                     {
-                        const std::string target = fitsArity(member)
-                            ? StripCxxRefAndCv(member.paramTypes[rawIndex]) : ownerSpelling;
-                        if (target == ownerSpelling) continue;
-                        const std::string e = CxxClassBraceListElement(member.paramTypes[rawIndex]);
-                        if (e.empty() || (!classSpelling.empty() && target != classSpelling))
+                        if (!fitsArity(member)) continue;
+                        if (rawIndex >= member.paramTypes.size())
                         {
                             classElement.clear();
+                            unknownListCtor = false;
+                            break;
+                        }
+                        const std::string& rawParameter = member.paramTypes[rawIndex];
+                        const std::string target = StripCxxRefAndCv(rawParameter);
+                        if (target == ownerSpelling) continue;
+                        if (!sawClassParameter)
+                        {
+                            classSpelling = target;
+                            sawClassParameter = true;
+                        }
+                        else if (classSpelling != target)
+                        {
+                            classElement.clear();
+                            unknownListCtor = false;
+                            break;
+                        }
+                        const std::string e = CxxClassBraceListElement(rawParameter);
+                        if (e.empty())
+                        {
+                            // Only a registered class may hide a templated list constructor; any
+                            // other unlisted parameter declines as before.
+                            if (!isRegisteredClassTarget(rawParameter))
+                            {
+                                classElement.clear();
+                                unknownListCtor = false;
+                                break;
+                            }
+                            classElement.clear();
+                            unknownListCtor = true;
+                            continue;
+                        }
+                        if (unknownListCtor || (!classElement.empty() && e != classElement))
+                        {
+                            classElement.clear();
+                            unknownListCtor = false;
                             break;
                         }
                         classElement = e;
-                        classSpelling = target;
                     }
+                // A class can have a templated initializer_list constructor that the header
+                // extractor omits. Preserve the source element type and let clang select that
+                // constructor from the caller-backed list in the generated thunk.
+                if (classElement.empty() && unknownListCtor && sawClassParameter)
+                    classElement = CxxBraceElementSpelling(*brace, classSpelling);
                 if (!classElement.empty())
                 {
                     BackedBrace backed;
@@ -604,10 +680,42 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                     wrapperBodyPrefix += CxxInitializerListOverStorage(
                         "std::initializer_list<" + classElement + ">", il,
                         "p" + std::to_string(backed.flatIndex), count);
-                    // Copy-list-initialized as the list was; a bare `{il}` would also reach the
-                    // owner's copy constructor through a nested conversion (ambiguous).
-                    callArguments.push_back("[&]() -> " + classSpelling + " { return { " + il
-                                            + " }; }()");
+                    if (unknownListCtor)
+                    {
+                        std::string directElements;
+                        for (size_t element = 0; element < brace->elements.size(); ++element)
+                        {
+                            const std::string parameter = "p" + std::to_string(flatParameterIndex++);
+                            parameterSpellings.push_back(classElement);
+                            directElements += std::string(element == 0 ? "" : ", ") + parameter;
+                        }
+                        // The original call must stay viable (copy-list-init, so an explicit list
+                        // constructor and an ambiguous overload refuse); filled in after the loop.
+                        const std::string bracedCall = "__CFLAT_ORIGINAL_CALL__";
+                        originalBraceSpellings.emplace_back(callArguments.size(),
+                                                            "{" + directElements + "}");
+                        callArguments.push_back("[&]<class __C = " + classSpelling + ">() -> __C { "
+                            "if constexpr (!requires { " + bracedCall + "; }) return " + bracedCall + "; "
+                            "else if constexpr (requires { __C(" + il + "); }) return __C(" + il
+                            + "); else return __C{" + directElements + "}; }()");
+                    }
+                    else
+                    {
+                        // Copy-list-initialized as the list was; a bare `{il}` would also reach the
+                        // owner's copy constructor through a nested conversion (ambiguous).
+                        // The viability call re-spells it as the original `{p[0], ...}` (a lambda
+                        // may not appear there).
+                        std::string originalElements;
+                        const std::string storage = "p" + std::to_string(backed.flatIndex);
+                        for (size_t element = 0; element < count; ++element)
+                            originalElements += std::string(element == 0 ? "" : ", ") + storage + "["
+                                                + std::to_string(element) + "]";
+                        originalBraceSpellings.emplace_back(callArguments.size(),
+                                                            "{" + originalElements + "}");
+                        callArguments.push_back("[&]() -> " + classSpelling + " { return { " + il
+                                                + " }; }()");
+                    }
+                    if (unknownListCtor) templateListBackedBraces.insert(i);
                     backedBraces.push_back(std::move(backed));
                     continue;
                 }
@@ -696,6 +804,23 @@ bool LLVMBackend::RequestCxxBraceConstructor(
             targetCall += callArguments[i];
         }
         targetCall += ")";
+        if (!templateListBackedBraces.empty())
+        {
+            std::vector<std::string> originalArguments = callArguments;
+            for (const auto& [index, spelling] : originalBraceSpellings)
+                originalArguments[index] = spelling;
+            std::string originalCall = ownerSpelling + "(";
+            for (size_t i = 0; i < originalArguments.size(); ++i)
+            {
+                if (i != 0) originalCall += ", ";
+                originalCall += originalArguments[i];
+            }
+            originalCall += ")";
+            const std::string placeholder = "__CFLAT_ORIGINAL_CALL__";
+            for (size_t pos = targetCall.find(placeholder); pos != std::string::npos;
+                 pos = targetCall.find(placeholder, pos + originalCall.size()))
+                targetCall.replace(pos, placeholder.size(), originalCall);
+        }
         std::string hashKey = "ctor" + typeName + targetCall;
         for (const auto& param : parameterSpellings) hashKey += param;
         for (const auto& brace : braceArguments)
@@ -816,6 +941,9 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                 return false;
             brace->wrapperArguments.clear();
             brace->wrapperArguments.push_back(std::move(data));
+            if (templateListBackedBraces.count(backed.argumentIndex) != 0)
+                brace->wrapperArguments.insert(brace->wrapperArguments.end(), brace->elements.begin(),
+                                               brace->elements.end());
         }
         ExpandCxxBraceArguments(arguments, braceArguments);
         return true;
@@ -3097,6 +3225,58 @@ bool LLVMBackend::RequestCxxOperatorArrow(const std::string& typeName, std::stri
                 if (symbol.External && symbol.UniqueName == wrapperName)
                     return true;
         error = "the generated C++ operator-> wrapper could not be registered";
+        return false;
+}
+
+bool LLVMBackend::RequestCxxConversionOperatorTemplate(const std::string& typeName,
+        const std::string& targetType, bool receiverConst, bool allowExplicit,
+        std::string& wrapperName, std::string& error)
+{
+        wrapperName.clear();
+        error.clear();
+        auto ownerGroup = cxxTypeOwnerGroup_.find(typeName);
+        if (ownerGroup == cxxTypeOwnerGroup_.end())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        std::string ownerSpelling;
+        std::string targetSpelling;
+        if (!CxxSpellingForCflatType(typeName, ownerSpelling)
+            || !CxxSpellingForCflatType(targetType, targetSpelling))
+        {
+            error = "the C++ conversion type is not spellable";
+            return false;
+        }
+        const std::string key = typeName + "|conversion-template|" + targetType + "|"
+            + (receiverConst ? "const|" : "mutable|")
+            + (allowExplicit ? "explicit" : "implicit");
+        wrapperName = std::format("__cflat_convop_{:016x}", HashWrapperKey(key));
+        const std::string receiverType = receiverConst ? "const " + ownerSpelling : ownerSpelling;
+        const std::string body = allowExplicit
+            ? "return static_cast<" + targetSpelling + ">(p0);"
+            : "return p0;";
+        const std::string wrapperSource = "extern \"C\" __attribute__((weak)) "
+            + targetSpelling + " " + wrapperName + "(" + receiverType + "& p0) { "
+            + body + " }\n";
+        CxxRequestGroup group = MakeCxxClassRequestGroup(ownerGroup->second, typeName);
+        if (group.headers.empty())
+        {
+            error = "the C++ class's import group is unavailable";
+            return false;
+        }
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry bound;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
+                                        "CONVERSION_OPERATOR_TEMPLATE", bound, error))
+            return false;
+        bound.name = wrapperName;
+        RegisterCSignatures({ bound }, group.headers.front());
+        if (auto it = functionTable.find(wrapperName); it != functionTable.end())
+            for (const auto& symbol : it->second)
+                if (symbol.External && symbol.UniqueName == wrapperName)
+                    return true;
+        error = "the generated C++ conversion operator wrapper could not be registered";
         return false;
 }
 

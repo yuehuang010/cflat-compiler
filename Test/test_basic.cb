@@ -2075,6 +2075,25 @@ namespace Qo2RootUse
     int genericPointer(Qo2RootG<int>* p) { return p->value; }
     Qo2RootI interfacePass(Qo2RootI value) { return value; }
 }
+namespace QualRootUse
+{
+    int read() { return qualRootValue; }
+    int write(int value) { qualRootValue = value; return qualRootValue; }
+    int* address() { return &qualRootValue; }
+    int member() { return qualRootPtr->v; }
+    int callRoot() { return qualRootLaterFunction(); }
+    namespace Deep { int read() { return qualRootValue; } }
+}
+namespace QualRootShadow
+{
+    int qualRootShadow = 19;
+    int read() { return qualRootShadow; }
+}
+int qualRootValue = 17;
+int qualRootShadow = 23;
+struct QualRootRecord { int v = default; };
+QualRootRecord* qualRootPtr = nullptr;
+int qualRootLaterFunction() { return 29; }
 Qo2RootLater Qo2RootValue = default;
 namespace Qo2Later
 {
@@ -2402,6 +2421,16 @@ bool testNamespace()
     qo2rootimpl.v = 45;
     Qo2RootI qo2rootiface = qo2rootimpl;
     result &= Test("qualorder2_root_interface_signature", Qo2RootUse.interfacePass(qo2rootiface).get(), 45);
+    result &= Test("qualroot_later_root_read", QualRootUse.read(), 17);
+    result &= Test("qualroot_later_root_write", QualRootUse.write(21), 21);
+    result &= Test("qualroot_later_root_address", QualRootUse.address() == &qualRootValue, 1);
+    QualRootRecord qualRootRecord = default;
+    qualRootRecord.v = 25;
+    qualRootPtr = &qualRootRecord;
+    result &= Test("qualroot_later_root_member", QualRootUse.member(), 25);
+    result &= Test("qualroot_later_root_function", QualRootUse.callRoot(), 29);
+    result &= Test("qualroot_nested_namespace_root_read", QualRootUse.Deep.read(), 21);
+    result &= Test("qualroot_namespace_local_shadows_root", QualRootShadow.read(), 19);
     Qo2RootValue.v = 46;
     result &= Test("qualorder2_root_global_byvalue", Qo2RootValue.v, 46);
     result &= Test("qualorder2_r2_pointer_only_use", Qo2R2PointerUse.run(), 3);

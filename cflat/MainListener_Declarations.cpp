@@ -76,8 +76,10 @@ static bool IsTernaryArmOfBinaryOperand(antlr4::ParserRuleContext* arm)
                 p != nullptr && p->multiplicativeExpression().size() > 1) return true;
             if (auto* p = dynamic_cast<CFlatParser::ShiftExpressionContext*>(parent);
                 p != nullptr && p->additiveExpression().size() > 1) return true;
-            if (auto* p = dynamic_cast<CFlatParser::RelationalExpressionContext*>(parent);
+            if (auto* p = dynamic_cast<CFlatParser::SpaceshipExpressionContext*>(parent);
                 p != nullptr && p->shiftExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::RelationalExpressionContext*>(parent);
+                p != nullptr && p->spaceshipExpression().size() > 1) return true;
             if (auto* p = dynamic_cast<CFlatParser::EqualityExpressionContext*>(parent);
                 p != nullptr && p->typeCheckExpression().size() > 1) return true;
             if (auto* p = dynamic_cast<CFlatParser::AndExpressionContext*>(parent);
@@ -5504,6 +5506,118 @@ void MainListener::enterExternalDeclaration(CFlatParser::ExternalDeclarationCont
 
 void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, const std::string& namespaceName, const std::string& nameOverride, std::optional<std::string> bodyNamespace) {
         auto* compiler = Compiler(func);
+        if (!namespaceName.empty() && structName.empty() && func->compoundStatement() != nullptr)
+        {
+            std::vector<antlr4::tree::ParseTree*> pending{ func->compoundStatement() };
+            while (!pending.empty())
+            {
+                auto* node = pending.back();
+                pending.pop_back();
+                if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                    primary != nullptr && primary->genericIdentifier() != nullptr
+                    && primary->genericIdentifier()->Identifier() != nullptr)
+                    namespaceFunctionIdentifierNodes_.insert(
+                        primary->genericIdentifier()->Identifier());
+                for (auto it = node->children.rbegin(); it != node->children.rend(); ++it)
+                    pending.push_back(*it);
+            }
+        }
+        if (func->Default() != nullptr)
+        {
+            const std::string memberName = ::getFunctionName(func, compiler);
+            const auto resultType = getFunctionReturnType(func);
+            const auto parameters = ParseParameterTypeList(func->parameterTypeList());
+            if (memberName == "operator<=>")
+            {
+                const std::string resolvedResult = compiler->ResolveTypeAlias(resultType.TypeName);
+                const std::string spelledCategory = StdOrderingCategoryOf(resolvedResult);
+                const bool orderingResult = !resultType.Pointer && !resultType.ElemPointer
+                    && (resolvedResult == "auto" || !spelledCategory.empty());
+                if (structName.empty() || !orderingResult
+                    || parameters.size() != 1 || parameters.front().Pointer
+                    || parameters.front().IsAlias || parameters.front().IsRvalueRef
+                    || compiler->ResolveTypeAlias(parameters.front().TypeName)
+                        != compiler->ResolveTypeAlias(structName))
+                {
+                    LogErrorContext(func,
+                        "only an auto or std ordering member 'operator<=>(T other)' can be defaulted");
+                    return;
+                }
+                auto structure = compiler->dataStructures.find(structName);
+                if (structure == compiler->dataStructures.end())
+                {
+                    LogErrorContext(func, "cannot default operator<=> for an unknown struct");
+                    return;
+                }
+                if (auto functions = compiler->functionTable.find("operator<=>");
+                    functions != compiler->functionTable.end())
+                    for (const auto& candidate : functions->second)
+                        if (!candidate.IsCxx && candidate.Parameters.size() == 2
+                            && candidate.Parameters[0].TypeName == structName
+                            && candidate.Parameters[1].TypeName == structName)
+                        {
+                            LogErrorContext(func, std::format(
+                                "operator<=> of '{}' is both defaulted and defined",
+                                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
+                            return;
+                        }
+                structure->second.HasDefaultedSpaceship = true;
+                structure->second.DefaultedSpaceshipCategory = spelledCategory;
+                return;
+            }
+            if (structName.empty() || memberName != "operator=="
+                || resultType.TypeName != "bool" || resultType.Pointer
+                || parameters.size() != 1 || parameters.front().Pointer
+                || parameters.front().IsAlias || parameters.front().IsRvalueRef
+                || compiler->ResolveTypeAlias(parameters.front().TypeName)
+                    != compiler->ResolveTypeAlias(structName))
+            {
+                LogErrorContext(func,
+                    "only a bool member 'operator==(T other)' can be defaulted");
+                return;
+            }
+            auto structure = compiler->dataStructures.find(structName);
+            if (structure == compiler->dataStructures.end())
+            {
+                LogErrorContext(func, "cannot default operator== for an unknown struct");
+                return;
+            }
+            structure->second.HasDefaultedEquality = true;
+            return;
+        }
+        if (!structName.empty() && ::getFunctionName(func, compiler) == "operator<=>")
+        {
+            auto structure = compiler->dataStructures.find(structName);
+            if (structure != compiler->dataStructures.end() && structure->second.HasDefaultedSpaceship)
+            {
+                const auto parameters = ParseParameterTypeList(func->parameterTypeList());
+                if (parameters.size() == 1 && !parameters.front().Pointer
+                    && compiler->ResolveTypeAlias(parameters.front().TypeName)
+                        == compiler->ResolveTypeAlias(structName))
+                {
+                    LogErrorContext(func, std::format("operator<=> of '{}' is both defaulted and defined",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
+                    return;
+                }
+            }
+        }
+        // A defaulted operator==(T) and a user-written one on the same struct redefine each other.
+        if (!structName.empty() && ::getFunctionName(func, compiler) == "operator==")
+        {
+            auto structure = compiler->dataStructures.find(structName);
+            if (structure != compiler->dataStructures.end() && structure->second.HasDefaultedEquality)
+            {
+                const auto parameters = ParseParameterTypeList(func->parameterTypeList());
+                if (parameters.size() == 1 && !parameters.front().Pointer
+                    && compiler->ResolveTypeAlias(parameters.front().TypeName)
+                        == compiler->ResolveTypeAlias(structName))
+                {
+                    LogErrorContext(func, std::format("operator== of '{}' is both defaulted and defined",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
+                    return;
+                }
+            }
+        }
         LexicalLocalTypeScope lexicalLocalTypeScope(compiler);
         // A body compiled mid-expression (first-use generic instantiation) must not flush the
         // caller's pending postfix ++/-- into itself.
@@ -5829,6 +5943,11 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // infer 'alias'; paths that disagree give the caller no answer at all, so reject.
         // Copyable returns are untouched - a copy duplicates no ownership.
         bool aliasOfByValueParam = false;
+        auto directReturnProbe = returnType;
+        directReturnProbe.IsAlias = false;
+        const bool returnsDirectByValueParam = ClassifyValueStructReturns(
+            Compiler(), func, directReturnProbe, allParams, nullptr)
+            == ValueStructReturnKind::AllBorrowedParam;
         if (!returnType.external && compiler->TypeOwnsUniquePointer(returnType.TypeName))
         {
             std::string borrowedParam;
@@ -6164,6 +6283,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     sym.ReturnsOwned = returnsOwned;
                     sym.ReturnsAlias = returnType.IsAlias;
                     sym.ReturnsAliasOfByValueParam = aliasOfByValueParam;
+                    sym.ReturnsDirectByValueParam = returnsDirectByValueParam;
                     // Per instance: a generic free function's instances register here, not in ForwardRefScanner.
                     if (!returnType.external && returnType.Pointer)
                     {
@@ -7591,6 +7711,36 @@ static CFlatParser::PostfixExpressionContext* SolePostfixExpression(antlr4::tree
         return nullptr;
     }
 
+static bool PostfixExpressionEndsInCall(CFlatParser::PostfixExpressionContext* postfix)
+{
+        return postfix != nullptr && postfix->children.size() >= 3
+            && dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(
+                postfix->children[postfix->children.size() - 2]) != nullptr;
+}
+
+static bool PostfixCallHasChainedReceiver(CFlatParser::PostfixExpressionContext* postfix)
+{
+        if (postfix == nullptr || postfix->children.empty()) return false;
+        auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(postfix->children[0]);
+        if (primary != nullptr && primary->expression() != nullptr) return true;
+
+        const size_t finalArgs = postfix->children.size() - 2;
+        for (size_t i = 1; i < finalArgs; ++i)
+            if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(postfix->children[i]) != nullptr)
+                return true;
+        return false;
+}
+
+static size_t CountOpenParenTokens(antlr4::tree::ParseTree* node)
+{
+        if (node == nullptr) return 0;
+        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+            return terminal->getText() == "(" ? 1 : 0;
+        size_t count = 0;
+        for (auto* child : node->children) count += CountOpenParenTokens(child);
+        return count;
+}
+
 CFlatParser::AssignmentExpressionContext* MainListener::SoleAssignmentExpression(
     antlr4::tree::ParseTree* node)
 {
@@ -8524,11 +8674,8 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
 
         // A trivial record can skip construction only when its default constructor is public.
         auto* directCall = assign != nullptr ? SolePostfixExpression(assign) : nullptr;
-        const std::string directCallText = directCall != nullptr
-            ? directCall->getText() : std::string();
-        const bool directCallReturn = !directCallText.empty()
-            && directCallText.back() == ')'
-            && std::count(directCallText.begin(), directCallText.end(), '(') == 1;
+        const bool directCallReturn = PostfixExpressionEndsInCall(directCall)
+            && CountOpenParenTokens(directCall) == 1;
         if (ctorArgs == nullptr && moveExpr == nullptr
             && !compiler->IsForeignNontrivialCxxClass(typeName)
             && !(directCallReturn
@@ -9479,7 +9626,8 @@ cxx_dtor_ready:
             // would build its result before the slot exists.
             else if (!directCxxSubscript && !IsBareIdentifierText(srcText)
                 && srcText.find('[') != std::string::npos
-                && !IsSoleUnaryExpression(assign))
+                && !IsSoleUnaryExpression(assign)
+                && !IsSoleOperatorExpression(assign))
             {
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
@@ -9604,7 +9752,7 @@ cxx_dtor_ready:
             // An assignment hides the slot from its operands and shows it only to its own
             // operator call (CxxAssignSretScope), so nested calls cannot take it.
             const bool armed = !hasParsedArrayInitializer && !castInit
-                && (std::count(pfText.begin(), pfText.end(), '(') == 1
+                && ((PostfixExpressionEndsInCall(pf) && !PostfixCallHasChainedReceiver(pf))
                     || SoleAssignmentExpression(assign) != nullptr);
             compiler->SetCurrentDebugLocation(line);
             compiler->lastCxxRetTemp_ = nullptr;
@@ -9758,8 +9906,9 @@ cxx_dtor_ready:
         // slot for it: ParseTernaryBranches moves each arm's own return temporary into the slot.
         // A trivially copyable class (admitted for its converting ctor) joins its '?:' arms as
         // a value: a class arm is a plain copy, an enum join converts below.
+        const bool ternaryNeedsClangMovePick = compiler->CxxMovePickNeedsClang(typeName);
         const bool ternaryInit = SoleTernaryExpression(assign) != nullptr
-            && compiler->IsForeignNontrivialCxxClass(typeName);
+            && (compiler->IsForeignNontrivialCxxClass(typeName) || ternaryNeedsClangMovePick);
         // A call-free initializer (`x[0]`, `a.b`, `-a`) has no inner call to take the slot.
         const bool armedOperator = SoleTernaryExpression(assign) == nullptr
             && (!SubtreeContainsCall(assign) || IsSoleOperatorExpression(assign)

@@ -497,6 +497,28 @@ struct BrcOwnerR {
     ~BrcOwnerR() {}
     __attribute__((noinline)) long probe() const { CPPCR_BRC_CLOBBER; return p[0] * 10 + p[1]; }
 };
+struct BrcTemplateOnlyView {
+    const long* d;
+    inline static int made = 0;
+    inline static int gone = 0;
+    template <class T> BrcTemplateOnlyView(std::initializer_list<T> l)
+        : d((const long*)l.begin()) { ++made; }
+    BrcTemplateOnlyView(const BrcTemplateOnlyView& other) : d(other.d) { ++made; }
+    ~BrcTemplateOnlyView() { ++gone; }
+};
+struct BrcOptionalViewOwner {
+    BrcTemplateOnlyView view;
+    int tag;
+    inline static int made = 0;
+    inline static int gone = 0;
+    BrcOptionalViewOwner(BrcTemplateOnlyView v, int t = 7) : view(v), tag(t) { ++made; }
+    ~BrcOptionalViewOwner() { ++gone; }
+    __attribute__((noinline)) long probe() const
+    {
+        CPPCR_BRC_CLOBBER;
+        return view.d[0] * 10 + tag;
+    }
+};
 inline BrcRef brc_keep(BrcRef r) { return r; }
 inline BrcArrayRef<long> brc_keep_a(BrcArrayRef<long> r) { return r; }
 inline const long* brc_first(std::initializer_list<long> l) { return l.begin(); }
@@ -563,6 +585,35 @@ template <class T> struct BrcPackConstRef {
     int which;
     BrcPackConstRef(std::initializer_list<T>, const int&) : which(1) {}
     template <class... A> BrcPackConstRef(std::initializer_list<T>, const A&...) : which(2) {}
+};
+template <class T> struct BrcPackConstRefCounted {
+    int which;
+    long value;
+    inline static int made = 0;
+    inline static int gone = 0;
+    BrcPackConstRefCounted(std::initializer_list<T>, const int& a, double b)
+        : which(1), value(a + (long)b) { ++made; }
+    template <class... A> BrcPackConstRefCounted(std::initializer_list<T>, const A&... args)
+        : which(2), value((long)0) { ((value += (long)args), ...); ++made; }
+    ~BrcPackConstRefCounted() { ++gone; }
+};
+template <class T> struct BrcPackPtrProbe {
+    int which = 0;
+    inline static int made = 0;
+    inline static int gone = 0;
+    BrcPackPtrProbe(std::initializer_list<T>, const void*) : which(1) { ++made; }
+    template <class... A> BrcPackPtrProbe(std::initializer_list<T>, A*...) : which(2) { ++made; }
+    ~BrcPackPtrProbe() { ++gone; }
+};
+template <class T> struct BrcPackPtrCounted {
+    int which;
+    int value;
+    inline static int made = 0;
+    inline static int gone = 0;
+    BrcPackPtrCounted(std::initializer_list<T>, const void*) : which(1), value(0) { ++made; }
+    template <class... A> BrcPackPtrCounted(std::initializer_list<T>, A*... pointers)
+        : which(2), value(((pointers != nullptr ? 1 : 0) + ... + 0)) { ++made; }
+    ~BrcPackPtrCounted() { ++gone; }
 };
 // A pack pattern naming a second template parameter (pair<U, A>) cannot be mirrored per element.
 inline std::pair<int, long> brc_pack_pair() { return {1, 2L}; }
@@ -800,4 +851,28 @@ struct T502CtorSExact { int chosen; T502CtorSExact(int) : chosen(1) {} T502CtorS
 inline int T502FnSExact(int) { return 1; } inline int T502FnSExact(T502SColor) { return 2; }
 struct T502ObjSExact { int method(int) { return 1; } int method(T502SColor) { return 2; } };
 
+}
+
+// Brace-list refusals: an explicit list constructor (copy-list-init bans it) and a scalar overload
+// set that makes the owner's brace call ambiguous. Both are refused, as clang refuses them.
+namespace cppcr {
+struct BrcRefuseView {
+    const long* d;
+    template <class T> explicit BrcRefuseView(std::initializer_list<T> l) : d((const long*)l.begin()) {}
+    BrcRefuseView(const BrcRefuseView& other) : d(other.d) {}
+};
+struct BrcRefuseOwner {
+    BrcRefuseView view;
+    int tag;
+    BrcRefuseOwner(BrcRefuseView v, int t = 7) : view(v), tag(t) {}
+};
+struct BrcRefuseScalar {
+    int which;
+    BrcRefuseScalar(int) : which(1) {}
+    BrcRefuseScalar(long) : which(2) {}
+};
+struct BrcRefuseScalarOwner {
+    int which;
+    BrcRefuseScalarOwner(BrcRefuseScalar a, int = 7) : which(a.which) {}
+};
 }

@@ -923,7 +923,8 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
         const bool trivialCtorTemplateCopy = !foreignNontrivial
             && compiler->IsCxxTriviallyCopyableRecord(destType.TypeName)
             && classInfo != nullptr && classInfo->hasCtorTemplate;
-        if (!foreignNontrivial && !trivialCtorTemplateCopy) return false;
+        const bool clangMovePick = compiler->CxxMovePickNeedsClang(destType.TypeName);
+        if (!foreignNontrivial && !trivialCtorTemplateCopy && !clangMovePick) return false;
 
         auto* retTemp = compiler->lastCxxRetTemp_;
         const bool outermostTemp = retTemp != nullptr
@@ -931,6 +932,13 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
                 || sourceNV.Storage == retTemp);
         const bool sameClass = !sourceNV.TypeAndValue.Pointer
             && sourceNV.TypeAndValue.TypeName == destType.TypeName;
+        if (sourceNV.IsCxxMoveSelected && sameClass
+            && sourceValue->getType() == compiler->GetType(destType))
+        {
+            compiler->builder->CreateStore(sourceValue, destination);
+            compiler->FlushOwnedTempsSince(ownedTempMark, nullptr, nullptr);
+            return true;
+        }
         if (outermostTemp)
         {
             compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination, retTemp,
@@ -971,8 +979,15 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
         {
             compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination,
                                                  sourceNV.Storage,
-                                                 sourceNV.IsRvalue || sourceNV.CxxParamLastUse,
-                                                 context);
+                                                 sourceNV.IsRvalue || sourceNV.CxxParamLastUse
+                                                     || sourceNV.IsExplicitMove
+                                                     || sourceNV.TypeAndValue.IsMove,
+                                                 context, {}, false, false,
+                                                 (sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove)
+                                                     && sourceNV.FieldName.empty()
+                                                     && sourceNV.OwningStructName.empty()
+                                                     && !sourceNV.IsCxxMoveSelected
+                                                     && !compiler->IsOwnedTempValue(sourceNV));
             if (sourceNV.IsElementAccess && sourceNV.IsRvalue)
                 DestroyForeignCxxRelocationSource(sourceNV);
             // A moved-from C++ object remains alive and still needs its destructor. A CFlat move
@@ -1021,8 +1036,7 @@ bool MainListener::EmitForeignCxxValueIntoSlot(
                 {
                     if (replaceExistingAfterConversion)
                         if (auto* dtor = compiler->GetOrCreateFullDestructor(destType.TypeName))
-                            compiler->builder->CreateCall(dtor->getFunctionType(), dtor,
-                                                          { destination });
+                            compiler->EmitReplacementDestructor(dtor, destination, destType.TypeName);
                     compiler->EmitCxxCopyOrMoveConstruct(destType.TypeName, destination,
                                                          converted.Storage, /*useMove*/ true,
                                                          context);
@@ -1156,9 +1170,21 @@ bool MainListener::EmitOneFieldInit(
             && !fieldType.Pointer
             && RejectStackCharBufferEscape(rightNV, errCtx))
             return false;
+        const bool fieldNeedsClangMovePick = compiler->CxxMovePickNeedsClang(fieldType.TypeName);
         const bool isForeignCxxField = !fieldType.Pointer && !fieldType.ElemPointer
             && !fieldType.IsArrayView && fieldType.ConstArraySize == 0
-            && compiler->IsForeignNontrivialCxxClass(fieldType.TypeName);
+            && (compiler->IsForeignNontrivialCxxClass(fieldType.TypeName)
+                || fieldNeedsClangMovePick);
+        llvm::Value* loweredFieldTemp = nullptr;
+        if (!destinationIsFresh && compiler->IsLoweredCFlatOnlyStruct(fieldType.TypeName)
+            && !rightNV.TypeAndValue.Pointer && rightNV.Primary != nullptr)
+        {
+            loweredFieldTemp = compiler->LoweredSretTempOf(
+                rightNV.Primary, compiler->GetType(rightNV.TypeAndValue));
+            if (loweredFieldTemp != nullptr
+                && !compiler->IsOwnedStructTempSince(ownedTempMark, loweredFieldTemp))
+                compiler->RegisterOwnedStructTemp(loweredFieldTemp, fieldType.TypeName);
+        }
 
         // Ahead of every store rule: a single object bound to a VIEW field is not one element of
         // it, and the store below would leave the slot pointing at something that is not an array.
@@ -1610,7 +1636,7 @@ bool MainListener::EmitOneFieldInit(
                 // A converting-constructor source (plan converting-constructors.md) is scalar
                 // but still replaces the seed object, so the seed is released first too.
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(fieldType.TypeName))
-                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { gep });
+                    compiler->EmitReplacementDestructor(dtor, gep, fieldType.TypeName);
             }
             if (isForeignCxxField
                 && EmitForeignCxxValueIntoSlot(fieldType, gep, rightNV, val, ownedTempMark,
@@ -1626,6 +1652,8 @@ bool MainListener::EmitOneFieldInit(
             compiler->builder->CreateStore(val, gep);
             destination = gep;
         }
+        if (loweredFieldTemp != nullptr)
+            compiler->UnregisterOwnedStructTemp(loweredFieldTemp);
 
         // In a by-value brace argument, this aggregate's cleanup takes over an owning field temp.
         if (inCallArgument_ && !fieldType.Pointer && !fieldType.IsAlias
@@ -2747,10 +2775,12 @@ bool MainListener::EmitDeferredLoweredMoveIntoField(
         || srcTV.Pointer || srcTV.ElemPointer || srcTV.IsArrayView || srcTV.ConstArraySize != 0
         || compiler->ResolveTypeAlias(srcTV.TypeName) != compiler->ResolveTypeAlias(typeName))
         return false;
+    if (moveCallTemp && !compiler->IsOwnedStructTempSince(ownedTempMark, producedSlot))
+        compiler->RegisterOwnedStructTemp(producedSlot, typeName);
     // An update replaces the seeded value, so its destructor runs first (as in the element path).
     if (!destinationIsFresh)
         if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
-            compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { slot });
+            compiler->EmitReplacementDestructor(dtor, slot, typeName);
     // Re-arm the moved-from source first, so a throwing move ctor still unwinds it.
     if (namedMove)
     {
@@ -4073,7 +4103,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 builtElemPtr = updateExistingElements ? nullptr : elemPtr;
                 if (updateExistingElements)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor(tv.TypeName))
-                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
+                        compiler->EmitReplacementDestructor(dtor, elemPtr, tv.TypeName);
                 if (group.size() == 1 && first->LeftBrace() != nullptr
                     && first->initializerList() != nullptr
                     && !first->initializerList()->fieldInit().empty())
@@ -4178,9 +4208,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 continue;
             }
             auto* assignment = fi->assignmentExpression(0);
+            const bool clangMovePick = compiler->CxxMovePickNeedsClang(tv.TypeName);
             const bool cxxElement = !fixedElemTV.Pointer && !fixedElemTV.ElemPointer
                 && !fixedElemTV.IsArrayView
-                && compiler->IsForeignNontrivialCxxClass(tv.TypeName);
+                && (compiler->IsForeignNontrivialCxxClass(tv.TypeName) || clangMovePick);
             const bool loweredCxxElement = !fixedElemTV.Pointer && !fixedElemTV.ElemPointer
                 && !fixedElemTV.IsArrayView && compiler->IsLoweredCFlatOnlyStruct(tv.TypeName);
             auto* moveExpr = TopLevelMoveExpression(assignment);
@@ -4208,7 +4239,8 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                             compiler->SetCurrentDebugLocation(moveExpr->getStart()->getLine());
                             compiler->EmitCxxCopyOrMoveConstruct(
                                 tv.TypeName, elemPtr, source->Storage, /*useMove*/ true,
-                                "into a fixed-array element");
+                                "into a fixed-array element", {}, false, false,
+                                /*forceClangPick*/ true);
                             compiler->MarkVariableMoved(sourceName);
                         }
                         continue;
@@ -4282,7 +4314,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             {
                 if (updateExistingElements)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor(tv.TypeName))
-                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
+                        compiler->EmitReplacementDestructor(dtor, elemPtr, tv.TypeName);
                 const std::string movedName = compiler->FindVariableNameByStorage(nv.Storage);
                 if (!movedName.empty()) compiler->MarkVariableNotExplicitlyMovedNull(movedName);
                 compiler->EmitCxxCopyOrMoveConstruct(tv.TypeName, elemPtr, nv.Storage,

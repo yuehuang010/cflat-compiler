@@ -649,8 +649,37 @@ namespace cppt306
 // T453: a member by-value Twin operand used by ternary and nested constructor expressions.
 namespace cppt453
 {
+    inline int& plus_count_ref() { static int value = 0; return value; }
+    inline int plus_count() { return plus_count_ref(); }
+    inline void reset_plus_count() { plus_count_ref() = 0; }
+    inline int& and_count_ref() { static int value = 0; return value; }
+    inline int and_count() { return and_count_ref(); }
+    inline void reset_and_count() { and_count_ref() = 0; }
+
     struct Adder
     {
-        int operator+(cpptw::Twin value) const { return value.value(); }
+        int k = 0;
+        int operator+(cpptw::Twin value) const { ++plus_count_ref(); return value.value(); }
+        Adder operator&(cpptw::Twin value) const
+        {
+            ++and_count_ref();
+            Adder result;
+            result.k = k + value.value() + 1;
+            return result;
+        }
+    };
+
+    inline int& chain_count_ref() { static int value = 0; return value; }
+    inline int chain_count() { return chain_count_ref(); }
+    inline void reset_chain_count() { chain_count_ref() = 0; }
+
+    struct Chain
+    {
+        int k = 0;
+        Chain operator+(cpptw::Twin value) const { ++chain_count_ref(); Chain r; r.k = k + value.value() + 1; return r; }
+        Chain operator*(cpptw::Twin value) const { ++chain_count_ref(); Chain r; r.k = k + value.value() + 1; return r; }
+        Chain operator<<(cpptw::Twin value) const { ++chain_count_ref(); Chain r; r.k = k + value.value() + 1; return r; }
+        Chain operator|(cpptw::Twin value) const { ++chain_count_ref(); Chain r; r.k = k + value.value() + 1; return r; }
+        Chain operator^(cpptw::Twin value) const { ++chain_count_ref(); Chain r; r.k = k + value.value() + 1; return r; }
     };
 }

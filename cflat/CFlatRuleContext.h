@@ -1,5 +1,6 @@
 #pragma once
 #include "antlr4-runtime.h"
+#include <vector>
 
 // Base of every generated CFlatParser context (CFlat.g4 option contextSuperClass). Overrides
 // getText: the runtime's version builds a std::stringstream per subtree level, and each stream
@@ -20,12 +21,21 @@ public:
 private:
     static void AppendText(antlr4::tree::ParseTree& tree, std::string& out)
     {
-        for (antlr4::tree::ParseTree* child : tree.children)
+        std::vector<antlr4::tree::ParseTree*> pending;
+        for (auto it = tree.children.rbegin(); it != tree.children.rend(); ++it)
+            pending.push_back(*it);
+        while (!pending.empty())
         {
-            if (antlr4::RuleContext::is(*child))
-                AppendText(*child, out);
+            auto* node = pending.back();
+            pending.pop_back();
+            if (antlr4::RuleContext::is(*node))
+            {
+                const auto& children = node->children;
+                for (auto it = children.rbegin(); it != children.rend(); ++it)
+                    pending.push_back(*it);
+            }
             else
-                out += child->getText();
+                out += node->getText();
         }
     }
 };

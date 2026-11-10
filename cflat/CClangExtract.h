@@ -545,6 +545,7 @@ namespace cflat_cinterop
         // A public, non-deleted constructor TEMPLATE. Its specializations are never listed as
         // members, so only a clang-resolved `T(args)` wrapper can reach them.
         bool hasCtorTemplate = false;
+        bool hasConversionTemplate = false;
         // A non-deleted `operator=` TEMPLATE: it can beat the bound copy / move assignment.
         bool hasAssignTemplate = false;
         // Clang's overload resolution for `dst = src` on a non-const lvalue dst: true when the

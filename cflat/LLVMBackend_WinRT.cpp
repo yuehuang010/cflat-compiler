@@ -4676,6 +4676,13 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
                                                  bool allowPointerRefTemporary)
 {
         RejectCxxConstLvalueReferenceBinding(param, arg);
+        // A bitfield has no address: a non-const lvalue reference never binds it (clang).
+        if (arg.BitfieldStorage != nullptr && !param.IsRvalueRef && !param.CxxConstRef())
+        {
+            LogErrorMessage("the parameter '{}' is a non-const reference and cannot bind a bitfield",
+                            { param.VariableName });
+            return nullptr;
+        }
         auto* paramTy = GetType(param);
         // A named nullptr_t lvalue already has the object slot a C++ reference must borrow.
         if (param.IsCxxNullptrT && arg.TypeAndValue.IsCxxNullptrT

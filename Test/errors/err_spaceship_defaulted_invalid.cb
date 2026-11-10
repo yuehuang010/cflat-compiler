@@ -1,0 +1,73 @@
+import cpp "compare";
+
+expect_error("operator<=> of 'SpaceshipConflict' is both defaulted and defined") {
+    struct SpaceshipConflict
+    {
+        int value = 0;
+        auto operator<=>(SpaceshipConflict other) = default;
+        std.strong_ordering operator<=>(SpaceshipConflict other) { return value <=> other.value; }
+    };
+}
+
+expect_error("operator<=> of 'SpaceshipConflictReverse' is both defaulted and defined") {
+    struct SpaceshipConflictReverse
+    {
+        int value = 0;
+        std.strong_ordering operator<=>(SpaceshipConflictReverse other) { return value <=> other.value; }
+        auto operator<=>(SpaceshipConflictReverse other) = default;
+    };
+}
+
+expect_error("inferred 'std.partial_ordering' cannot convert to declared 'std.strong_ordering'") {
+    struct SpaceshipStrongDouble
+    {
+        double value = 0.0;
+        std.strong_ordering operator<=>(SpaceshipStrongDouble other) = default;
+    };
+    int useStrongDoubleSpaceship()
+    {
+        SpaceshipStrongDouble left = default;
+        SpaceshipStrongDouble right = default;
+        auto order = left <=> right;
+        return 0;
+    }
+}
+
+expect_error("only an auto or std ordering member 'operator<=>(T other)' can be defaulted") {
+    struct SpaceshipPointerReturn
+    {
+        int value = 0;
+        std.strong_ordering* operator<=>(SpaceshipPointerReturn other) = default;
+    };
+}
+
+expect_error("defaulted operator<=> of 'SpaceshipDeleted' is deleted: field 'value' of type 'SpaceshipNoOrder' has no operator '<=>'") {
+    struct SpaceshipNoOrder { int value = 0; };
+    struct SpaceshipDeleted
+    {
+        SpaceshipNoOrder value = default;
+        auto operator<=>(SpaceshipDeleted other) = default;
+    };
+    int useDeletedSpaceship()
+    {
+        SpaceshipDeleted left = default;
+        SpaceshipDeleted right = default;
+        auto order = left <=> right;
+        return 0;
+    }
+}
+
+expect_error("defaulted operator<=> of 'SpaceshipUnion' is deleted: it is a union") {
+    union SpaceshipUnion
+    {
+        int value;
+        auto operator<=>(SpaceshipUnion other) = default;
+    };
+    int useDeletedUnionSpaceship()
+    {
+        SpaceshipUnion left = default;
+        SpaceshipUnion right = default;
+        auto order = left <=> right;
+        return 0;
+    }
+}

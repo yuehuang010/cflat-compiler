@@ -210,7 +210,11 @@ shiftExpression
     ;
 
 relationalExpression
-    : shiftExpression (('<' | '>' | '<=' | '>=') shiftExpression)?
+    : spaceshipExpression (('<' | '>' | '<=' | '>=') spaceshipExpression)?
+    ;
+
+spaceshipExpression
+    : shiftExpression (Spaceship shiftExpression)?
     ;
 
 typeCheckExpression
@@ -908,7 +912,7 @@ namespaceDefinition
     ;
 
 functionDefinition
-    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' trailingConst? (':' baseSpecifier '(' argumentExpressionList? ')')? whereClause? lockClause? compoundStatement
+    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' trailingConst? (':' baseSpecifier '(' argumentExpressionList? ')')? whereClause? lockClause? (compoundStatement | '=' Default ';')
     ;
 
 structDefinition
@@ -1122,6 +1126,7 @@ operatorFunctionId
                | PlusAssign | MinusAssign | StarAssign | DivAssign | ModAssign
                | LeftShiftAssign | RightShiftAssign | AndAssign | XorAssign | OrAssign
                | Assign | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
+               | Spaceship
                | LeftShift | Greater Greater
                | LeftBracket RightBracket
                | LeftParen RightParen
@@ -1447,6 +1452,10 @@ RightBrace
 
 Less
     : '<'
+    ;
+
+Spaceship
+    : '<=>'
     ;
 
 LessEqual

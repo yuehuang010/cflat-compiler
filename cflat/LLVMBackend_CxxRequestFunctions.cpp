@@ -1385,6 +1385,7 @@ bool LLVMBackend::MaterializeTrivialCxxExplicitMove(NamedVariable& nv,
             return false;
         nv.Storage = temp;
         nv.Primary = builder->CreateLoad(recordType, temp);
+        nv.IsCxxMoveSelected = true;
         return true;
 }
 
@@ -2424,15 +2425,6 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 && !arg.IsRvalue && !arg.TypeAndValue.IsRvalueRef
                 && ((arg.CxxLvalueKind == 1 && arg.Storage != nullptr)
                     || (arg.CxxLvalueKind == 2 && arg.TypeAndValue.IsAlias));
-            // A wrapped CFlat closure variable is its own caller-frame slot: an lvalue.
-            const bool provenLvalue = !arg.CxxClosureSignature.empty() ? arg.CxxClosureBorrowed
-                : decayedArray ? provenArrayLvalue
-                : classArgument ? !IsCxxRvalueReferenceArgument(arg) : IsProvenCxxScalarLvalue(arg);
-            // Any reference (`const T&` included) binds the CALLER's object: a returned
-            // reference then aliases it, never a wrapper copy.
-            const bool bindsCallerLvalue = (anyReference || uniqueRegistration)
-                && !braceForArgument(i)
-                && !stringLiteralArgument && provenLvalue;
             size_t forwardingIndex = declaredIndex;
             if (selected->hasParameterPack && !selected->parameterTypes.empty()
                 && forwardingIndex >= selected->parameterTypes.size() - 1)
@@ -2440,6 +2432,21 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             const bool forwardingPosition = forwardingIndex
                 < selected->forwardingReferenceParameters.size()
                 && selected->forwardingReferenceParameters[forwardingIndex] != 0;
+            // A named bitfield is an addressless lvalue: a `U&&` / `U&` deduces `T&` and the binding
+            // is refused if selected; a const reference or a value parameter copies it as a prvalue.
+            const bool bitfieldLvalue = !classArgument && arg.BitfieldStorage != nullptr
+                && arg.CxxLvalueKind == 1 && !arg.IsExplicitMove
+                && (forwardingPosition || anyLvalueReference);
+            // A wrapped CFlat closure variable is its own caller-frame slot: an lvalue.
+            const bool provenLvalue = !arg.CxxClosureSignature.empty() ? arg.CxxClosureBorrowed
+                : decayedArray ? provenArrayLvalue
+                : classArgument ? !IsCxxRvalueReferenceArgument(arg)
+                : IsProvenCxxScalarLvalue(arg) || bitfieldLvalue;
+            // Any reference (`const T&` included) binds the CALLER's object: a returned
+            // reference then aliases it, never a wrapper copy.
+            const bool bindsCallerLvalue = (anyReference || uniqueRegistration)
+                && !braceForArgument(i)
+                && !stringLiteralArgument && provenLvalue;
             // Read before the rvalue marking below drops the storage that identifies it.
             const std::string unnamedEnumType = classArgument ? std::string()
                                                               : CxxUnnamedEnumValueSpelling(arg);

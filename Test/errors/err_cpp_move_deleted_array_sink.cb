@@ -1,0 +1,9 @@
+import cpp "cpp_interop_basic.h";
+
+expect_error("its move or copy constructor is deleted") {
+    extern int main() {
+        cppi.XvTrivialNoMove source = cppi.XvTrivialNoMove(7);
+        cppi.XvTrivialNoMove[1] destination = {move source};
+        return destination[0].v;
+    }
+}
