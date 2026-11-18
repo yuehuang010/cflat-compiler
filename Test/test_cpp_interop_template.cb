@@ -4149,6 +4149,42 @@ extern int main()
         if (&cpptrr.first_of(ucs, 0) != &ucs || cpptrr.lit_len("hello") != 6
             || cpptrr.read_late_cstr(cpptrr.first_of(cpptrr.lit_tail(), 0))[1] != (char)97)
                                                                             return 2764;
+        // Literal joins spell as pointers by value, but equal-sized arms stay array lvalues at refs.
+        bool lc = true; bool ld = false;
+        char[4] lcpBuf = "m"; char* lcp = lcpBuf;
+        char[4] lcqBuf = "n"; char* lcq = lcqBuf;
+        const char* lccp = lcp; const char* lccq = lcq;
+        if (cpptrr.conditional_byval(lc ? "a" : "b") != 17)             return 2769;
+        if (cpptrr.conditional_constref(lc ? "a" : "b") != 57)          return 2770;
+        if (cpptrr.conditional_rref(lc ? "a" : "b") != 67)              return 2771;
+        if (cpptrr.conditional_lref(lc ? "a" : "b") != 77)              return 2772;
+        if (cpptrr.conditional_byval(lc ? "a" : "long") != 17)          return 2773;
+        if (cpptrr.conditional_constref(lc ? "a" : "long") != 17)       return 2774;
+        if (cpptrr.conditional_rref(lc ? "a" : "long") != 17)           return 2775;
+        if (cpptrr.conditional_byval(lc ? "a" : lcp) != 17)              return 2776;
+        if (cpptrr.conditional_constref(lc ? "a" : lcp) != 17)           return 2777;
+        if (cpptrr.conditional_rref(lc ? "a" : lcp) != 17)               return 2778;
+        if (cpptrr.conditional_byval(lc ? lcp : lcq) != 39)               return 2779;
+        if (cpptrr.conditional_constref(lc ? lcp : lcq) != 39)            return 2780;
+        if (cpptrr.conditional_rref(lc ? lcp : lcq) != 119)               return 2781;
+        if (cpptrr.conditional_lref(lc ? lcp : lcq) != 39)                 return 2782;
+        if (cpptrr.conditional_byval(lc ? (ld ? "a" : "b") : "c") != 18)
+                                                                            return 2783;
+        if (cpptrr.conditional_constref(lc ? (ld ? "a" : "b") : "c") != 58)
+                                                                            return 2784;
+        if (cpptrr.conditional_rref(lc ? (ld ? "a" : "b") : "c") != 68)
+                                                                            return 2785;
+        if (cpptrr.conditional_lref(lc ? (ld ? "a" : "b") : "c") != 78)
+                                                                            return 2786;
+        if (cpptrr.conditional_byval(lc ? (ld ? "a" : "long") : "b") != 18)
+                                                                            return 2787;
+        if (cpptrr.conditional_byval(lc ? lccp : lccq) != 19)             return 2788;
+        if (cpptrr.conditional_constref(lc ? lccp : lccq) != 19)          return 2789;
+        if (cpptrr.conditional_rref(lc ? lccp : lccq) != 99)              return 2790;
+        if (cpptrr.conditional_lref(lc ? lccp : lccq) != 19)              return 2791;
+        if (cpptrr.conditional_byval(lc ? lcp : lccp) != 19)              return 2792;
+        if (cpptrr.conditional_constref(lc ? lcp : lccp) != 19)            return 2793;
+        if (cpptrr.conditional_rref(lc ? lcp : lccp) != 19)                return 2794;
         // A literal in a `const R&...` pack and one at `const U&` in a loop live in the caller
         // too; ranking is master's, `const U&` over `const U&&` as clang picks (2767 guard).
         if (cpptrr.read_late_cstr(cpptrr.pack_first("pk", ua))[1] != (char)107) return 2765;

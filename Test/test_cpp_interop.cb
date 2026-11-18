@@ -668,6 +668,24 @@ import cpp "library/cpp_t26_ios_shapes.hpp";
 import cpp "library/cpp_t26_ios_shapes.cpp";
 import cpp "library/cpp_t138_tplglobal.hpp";
 import cpp "library/cpp_t138_tplglobal_r2.hpp";
+
+int[3] arrcv2Global = {7, 8, 9};
+int arrcv2Drops = 0;
+struct Arrcv2ArrayHolder { int[3] arr; };
+struct Arrcv2NativePointer {
+    int base = 10;
+    int operator[](int* p) { p[0] = 5; return base + p[1]; }
+};
+struct Arrcv2Own {
+    int v = 0;
+    ~Arrcv2Own() { arrcv2Drops++; }
+};
+struct Arrcv2OwnSubscript { int operator[](Arrcv2Own* p) { return p[1].v; } };
+struct Arrcv2ImplicitThis {
+    cpp_ptrref.ArraySubscriptRowMember row;
+    int[3] arr;
+    int get() { arr[0] = 1; arr[1] = 2; arr[2] = 3; return row[arr]; }
+};
 import cpp "library/cpp_t26_vbase.hpp";
 int t26FinalAliasRead(alias t26v.final_shift value)
 {
@@ -2429,6 +2447,15 @@ int EopFloatCompound()
     x += 2.0;
     return (int)x;
 }
+struct EopIncrementHolder
+{
+    cppi_scope.eop.SE value = default;
+    int Increment()
+    {
+        int old = (int)value++;
+        return old * 16 + (int)value;
+    }
+};
 // A `static` local initialized from a T&& result is move-constructed on first entry, like clang.
 int T45StaticXvalue(int seed)
 {
@@ -4913,6 +4940,13 @@ int NeThrDirect(int x)
     int r = p->v;
     delete p;
     return r;
+}
+// Declnest (legs 4021-4024): a declaration whose sole argument is a same-class cast builds into the
+// declared object; the throwing one never builds the outer object or destroys an unbuilt one.
+int NeThrDecl(int x)
+{
+    cppne.Thr neThrDecl = cppne.Thr(cppne.Thr(x));
+    return neThrDecl.v;
 }
 
 extern int main()
@@ -13218,6 +13252,85 @@ extern int main()
     cppi_scope.eop.N eopPointerOffset = cppi_scope.eop.n0;
     cppi_scope.eop.E* eopPointerFromOtherEnum = eopPointerOffset + &eopPointerArray[0];
     if ((int)*eopPointerFromOtherEnum != (int)cppi_scope.eop.e2) return 9826;
+    // Unary free operators must beat the integral built-ins for imported enum identities.
+    if (~eopA != 1505) return 9830;
+    if (-eopA != 1605) return 9831;
+    if (+eopA != 1705) return 9832;
+    if (!eopA != 1805) return 9833;
+    if (~eopUa != 2005) return 9834;
+    if (-eopUa != 2105) return 9835;
+    if (+eopUa != 2205) return 9836;
+    if (!eopUa != 2305) return 9837;
+    cppi_scope.eop.UnaryHolder eopUnaryHolder = default;
+    eopUnaryHolder.scoped = cppi_scope.eop.SE.a;
+    if (~eopUnaryHolder.scoped != 1505) return 9838;
+    if (-cppi_scope.eop.unarySE() != 1605) return 9839;
+    cppi_scope.eop.SE[2] eopUnaryArray = {cppi_scope.eop.SE.a, cppi_scope.eop.SE.b};
+    if (+eopUnaryArray[1] != 1707) return 9840;
+    if (+cppi_scope.eop.GlobalUnary.value != 4004) return 9841;
+    cppi_scope.eop.UnaryChain eopUnaryChain = cppi_scope.eop.UnaryChain.first;
+    if (~eopUnaryChain + 1 != 116) return 9842;
+    // These enum-naming candidates leave clang's built-in result selected.
+    cppi_scope.enumrelay.BuiltinLoses eopBuiltinLoses = cppi_scope.enumrelay.builtinLoses;
+    if (eopBuiltinLoses + 1 != 6) return 9843;
+    cppi_scope.enumrelay.NoViable eopNoViable = cppi_scope.enumrelay.noViable;
+    if (eopNoViable + 1 != 6) return 9844;
+    enum EopNativeRelay : int { Value = 5 };
+    EopNativeRelay eopNativeRelay = EopNativeRelay.Value;
+    if ((int)eopNativeRelay + 1 != 6) return 9845;
+    // CFlat postfix syntax binds C++ prefix; expression and storage both see the new value.
+    cppi_scope.eop.SE eopIncScoped = cppi_scope.eop.SE.a;
+    int eopIncNew = (int)eopIncScoped++;
+    if (eopIncNew != 15 || (int)eopIncScoped != 15) return 9850;
+    eopIncScoped = cppi_scope.eop.SE.a;
+    int eopDecNew = (int)eopIncScoped--;
+    if (eopDecNew != -5 || (int)eopIncScoped != -5) return 9851;
+    cppi_scope.eop.UE eopIncUnscoped = cppi_scope.eop.ua;
+    eopIncNew = (int)eopIncUnscoped++;
+    if (eopIncNew != 15 || (int)eopIncUnscoped != 15) return 9852;
+    eopIncUnscoped = cppi_scope.eop.ua;
+    eopDecNew = (int)eopIncUnscoped--;
+    if (eopDecNew != -5 || (int)eopIncUnscoped != -5) return 9853;
+    cppi_scope.eop.PrefixOnly eopPrefixOnly = cppi_scope.eop.PrefixOnly.a;
+    eopIncNew = (int)eopPrefixOnly++;
+    if (eopIncNew != 15 || (int)eopPrefixOnly != 15) return 9854;
+    eopPrefixOnly = cppi_scope.eop.PrefixOnly.a;
+    eopDecNew = (int)eopPrefixOnly--;
+    if (eopDecNew != -5 || (int)eopPrefixOnly != -5) return 9855;
+    cppi_scope.eop.PostfixOnly eopPostfixOnly = cppi_scope.eop.PostfixOnly.a;
+    int eopIncOld = (int)eopPostfixOnly++;
+    if (eopIncOld != 5 || (int)eopPostfixOnly != 6) return 9856;
+    eopPostfixOnly = cppi_scope.eop.PostfixOnly.a;
+    int eopDecOld = (int)eopPostfixOnly--;
+    if (eopDecOld != 5 || (int)eopPostfixOnly != 4) return 9857;
+    EopIncrementHolder eopIncHolder = default;
+    eopIncHolder.value = cppi_scope.eop.SE.a;
+    eopIncNew = (int)eopIncHolder.value++;
+    if (eopIncNew != 15 || (int)eopIncHolder.value != 15) return 9858;
+    eopIncHolder.value = cppi_scope.eop.SE.a;
+    if (eopIncHolder.Increment() != 255) return 9859;
+    cppi_scope.eop.SE[1] eopIncArray = {cppi_scope.eop.SE.a};
+    eopIncNew = (int)eopIncArray[0]++;
+    if (eopIncNew != 15 || (int)eopIncArray[0] != 15) return 9860;
+    cppi_scope.eop.SE eopIncPointee = cppi_scope.eop.SE.a;
+    cppi_scope.eop.SE* eopIncPointer = &eopIncPointee;
+    eopIncNew = (int)(*eopIncPointer)++;
+    if (eopIncNew != 15 || (int)eopIncPointee != 15) return 9861;
+    cppi_scope.eop.SE eopIncBinary = cppi_scope.eop.SE.a;
+    if (eopIncBinary++ + 1 != 36 || (int)eopIncBinary != 15) return 9862;
+    cppi_scope.eop.SE eopIncLoop = cppi_scope.eop.SE.a;
+    for (int eopIncIndex = 0; eopIncIndex < 2; eopIncLoop++, eopIncIndex++) { }
+    if ((int)eopIncLoop != 25) return 9863;
+    // Enums without a prefix overload retain CFlat's built-in increment path.
+    cppi_scope.eop.Plain eopNoInc = cppi_scope.eop.p2;
+    eopIncOld = (int)eopNoInc++;
+    if (eopIncOld != 2 || (int)eopNoInc != 3) return 9864;
+    cppi_scope.eop.PlainS eopNoIncScoped = cppi_scope.eop.PlainS.s2;
+    eopIncOld = (int)eopNoIncScoped++;
+    if (eopIncOld != 2 || (int)eopNoIncScoped != 3) return 9864;
+    eopNativeRelay = EopNativeRelay.Value;
+    eopIncOld = (int)eopNativeRelay++;
+    if (eopIncOld != 5 || (int)eopNativeRelay != 6) return 9864;
     if (cppi_scope.onlyDev(senumDev) != 3107) return 1629;
     if (cppi_scope.devA(senumDevA) != 6207) return 1630;
     std.vector<cppi_scope.A> senumEnumVector = default;
@@ -18622,6 +18735,32 @@ extern int main()
         cppfnptr.PointerSink zeroDataPointerSink = cppfnptr.PointerSink(0);
         if (zeroDataPointerSink.value != 0) return 3305;
 
+        // FNZERO accept-set: literal-zero rejection keeps nullptr and callable ctor paths intact.
+        cppfnptr.FunctionSink fnzeroNull{ nullptr };
+        if (fnzeroNull.value != 0) return 3312;
+        cppfnptr.FunctionSink fnzeroNullTwo{ nullptr, 5 };
+        if (fnzeroNullTwo.value != -5) return 3313;
+        cppfnptr.FunctionSink* fnzeroNewNull = new cppfnptr.FunctionSink{ nullptr };
+        if (fnzeroNewNull->value != 0) return 3314;
+        delete fnzeroNewNull;
+        cppfnptr.FunctionSink fnzeroInc = cppfnptr.FunctionSink(fnptr_add_one);
+        if (fnzeroInc.value != 1) return 3315;
+        Lambda<int(int)> fnzeroLambda = (int x) => x + 1;
+        cppfnptr.FunctionSink fnzeroLambdaSink = cppfnptr.FunctionSink(fnzeroLambda);
+        if (fnzeroLambdaSink.value != 1) return 3316;
+        cppfnptr.reset_null_ctor_counts();
+        {
+            cppfnptr.NullFunctionCtorProbe fnzeroInt{ 0 };
+            if (fnzeroInt.value != 300 || cppfnptr.null_ctor_int_pick != 1
+                || cppfnptr.null_ctor_fn_pick != 0) return 3317;
+        }
+        cppfnptr.PointerSink fnzeroPointer{ 0 };
+        if (fnzeroPointer.value != 0) return 3318;
+        fnzero.G fnzeroOnlyNull{ nullptr };
+        if (fnzeroOnlyNull.value != 0) return 3319;
+        fnzero.G fnzeroOnlyInc = fnzero.G(fnptr_add_one);
+        if (fnzeroOnlyInc.value != 2) return 3320;
+
         // nullptr converts to std::function, while overload ranking keeps pointer conversions first.
         cppfnptr.reset_null_ctor_counts();
         if (cppfnptr.std_function_present(nullptr) != 0
@@ -19107,6 +19246,92 @@ extern int main()
         delete neCw;
         if (neCwv != 102 || neCwl != 1 || cppne.nCtors() != 1 || cppne.nCopies() != 0
             || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4015;
+
+        // NEWCAST r2: direct prvalues elide into new, while nested casts keep master's copies.
+        cppne.reset();
+        cppne.NM* neDirectDefault = new cppne.NM(cppne.NM());
+        int neDirectDefaultV = neDirectDefault->v;
+        delete neDirectDefault;
+        if (neDirectDefaultV != 0 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4016;
+        cppne.reset();
+        cppne.NM* neDirectBraced = new cppne.NM{cppne.NM(4)};
+        int neDirectBracedV = neDirectBraced->v;
+        delete neDirectBraced;
+        if (neDirectBracedV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4017;
+        cppne.reset();
+        cppne.Sx* neDirectCopy = new cppne.Sx(cppne.Sx(4));
+        int neDirectCopyV = neDirectCopy->v;
+        delete neDirectCopy;
+        if (neDirectCopyV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4018;
+        cppne.reset();
+        cppne.MO* neMoveOnly = new cppne.MO(cppne.MO(13));
+        int neMoveOnlyV = neMoveOnly->v;
+        delete neMoveOnly;
+        if (neMoveOnlyV != 13 || cppne.nCtors() != 1 || cppne.nDtors() != 1
+            || cppne.nLive() != 0) return 4019;
+        cppne.reset();
+        cppne.Sx* neNested = new cppne.Sx(cppne.Sx(cppne.Sx(4)));
+        int neNestedV = neNested->v;
+        delete neNested;
+        if (neNestedV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4020;
+        // Declnest legs 4021-4024: `T s = T(T(x))` builds once into s (no copy, one dtor).
+        cppne.reset();
+        int neDeclV = 0;
+        {
+            cppne.Sx neDecl = cppne.Sx(cppne.Sx(4));
+            neDeclV = neDecl.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4021;
+        cppne.reset();
+        {
+            cppne.Sx neDecl3 = cppne.Sx(cppne.Sx(cppne.Sx(4)));
+            neDeclV = neDecl3.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4022;
+        cppne.reset();
+        {
+            cppne.MO neDeclMo = cppne.MO(cppne.MO(9));
+            neDeclV = neDeclMo.v;
+        }
+        if (neDeclV != 9 || cppne.nCtors() != 1 || cppne.nDtors() != 1
+            || cppne.nLive() != 0) return 4023;
+        cppne.reset();
+        if (cppne.neGuarded(NeThrDecl, -3) != -3 || cppne.nCtors() != 0 || cppne.nDtors() != 0
+            || cppne.nLive() != 0) return 4024;
+        // Declnest collision (leg 4025): `cppnecol.X(cppnecol.X(4))` where the function X(int)
+        // returns an lvalue keeps master's single copy; the destination is not armed.
+        cppnecol.reset();
+        {
+            cppnecol.X neColl = cppnecol.X(cppnecol.X(4));
+            neDeclV = neColl.v;
+        }
+        if (neDeclV != 4 || cppnecol.nCopies() != 1) return 4025;
+        // Declnest unrelated-leaf control (leg 4026): a local `int Sx` does not disarm the qualified
+        // `cppne.Sx(cppne.Sx(4))`, which still builds once with no copy.
+        cppne.reset();
+        {
+            int Sx = 7;
+            cppne.Sx neLeaf = cppne.Sx(cppne.Sx(4));
+            neDeclV = neLeaf.v + Sx - 7;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4026;
+        // Declnest deleted-copy control (leg 4027): a local `int MO` does not turn the copy-and-move
+        // deleted `cppne.MO(cppne.MO(9))` into a false refusal; it builds once.
+        cppne.reset();
+        {
+            int MO = 7;
+            cppne.MO neLeafMo = cppne.MO(cppne.MO(9));
+            neDeclV = neLeafMo.v + MO - 7;
+        }
+        if (neDeclV != 9 || cppne.nCtors() != 1 || cppne.nDtors() != 1
+            || cppne.nLive() != 0) return 4027;
 
         // A runtime delete count destroys every polymorphic element before one array free.
         cppunw.reset();
@@ -29690,5 +29915,183 @@ int deepPtrLegs()
     if (cpp_ptrref.cv_array_pick(cvArray) != 1 || cpp_ptrref.cv_array_pick(cvConstArray) != 2
         || cvArrayMember.pick(cvArray) != 1 || cpp_ptrref.CvArrayCtor(cvArray).r != 1)
         return 96017;
+    // Member overload pair: a const source takes the const array-reference overload (clang: 34).
+    cpp_ptrref.ArrayMember arrayMember = cpp_ptrref.ArrayMember();
+    if (arrayMember.farr_both1(cvArray) != 33 || arrayMember.farr_both1(cvConstArray) != 34)
+        return 96018;
+    // The 2-D const-source call selects the const array-reference overload (clang: 24).
+    const int[2][3] cvConstGrid = {{1, 2, 3}, {4, 5, 6}};
+    if (cpp_ptrref.farr_both2(cvConstGrid) != 24) return 96019;
+    if (arrayMember.farr_both2(cvConstGrid) != 44) return 96020;
+    // Mixed set: the scalar overload takes 5, the array-reference one takes an `int[2]` (clang: 2, 1).
+    int[2] mixArray = {1, 2};
+    if (cpp_ptrref.farr_mix(5) != 2 || cpp_ptrref.farr_mix(mixArray) != 1) return 96021;
+    cpp_ptrref.ArraySubscriptMember subscriptMember = cpp_ptrref.ArraySubscriptMember();
+    int[3] subscriptMutable = {1, 2, 3};
+    const int[3] subscriptConst = {1, 2, 3};
+    // The mutable call distinguishes the array-reference overloads; the const call pins its sibling.
+    if (subscriptMember[subscriptMutable] != 31 || subscriptMember[subscriptConst] != 32)
+        return 96022;
+    cpp_ptrref.ArraySubscriptGridMember subscriptGrid = cpp_ptrref.ArraySubscriptGridMember();
+    int[2][3] subscriptGridMutable = {{1, 2, 3}, {4, 5, 6}};
+    const int[2][3] subscriptGridConst = {{1, 2, 3}, {4, 5, 6}};
+    if (subscriptGrid[subscriptGridMutable] != 41 || subscriptGrid[subscriptGridConst] != 42)
+        return 96023;
+    cpp_ptrref.ArraySubscriptPointerMember subscriptPointer = cpp_ptrref.ArraySubscriptPointerMember();
+    cpp_ptrref.ArraySubscriptMutablePointerMember subscriptMutablePointer =
+        cpp_ptrref.ArraySubscriptMutablePointerMember();
+    int[3] subscriptPointerMutable = {1, 2, 3};
+    const int[3] subscriptPointerConst = {4, 5, 6};
+    if (subscriptPointer[subscriptPointerMutable] != 103
+        || subscriptPointer[subscriptPointerConst] != 106
+        || subscriptMutablePointer[subscriptPointerMutable] != 202
+        || subscriptPointerMutable[0] != 9)
+        return 96024;
+    cpp_ptrref.ArraySubscriptRowPointerMember subscriptRowPointer =
+        cpp_ptrref.ArraySubscriptRowPointerMember();
+    int[2][3] subscriptRows = {{1, 2, 3}, {4, 5, 6}};
+    if (subscriptRowPointer[subscriptRows] != 56) return 96025;
+    cpp_ptrref.ArraySubscriptExtentMember subscriptExtent = cpp_ptrref.ArraySubscriptExtentMember();
+    int[3] subscriptExtent3 = {1, 2, 3};
+    int[4] subscriptExtent4 = {1, 2, 3, 4};
+    if (subscriptExtent[subscriptExtent3] != 62 || subscriptExtent[subscriptExtent4] != 61)
+        return 96026;
+    cpp_ptrref.ArraySubscriptRowMember subscriptRow = cpp_ptrref.ArraySubscriptRowMember();
+    int[2][3] subscriptRowGrid = {{1, 2, 3}, {4, 5, 6}};
+    const int[2][3] subscriptConstRowGrid = {{7, 8, 9}, {1, 2, 3}};
+    if (subscriptRow[subscriptRowGrid[1]] != 456
+        || subscriptRow[subscriptConstRowGrid[0]] != 789)
+        return 96027;
+    Arrcv2ArrayHolder subscriptHolder;
+    subscriptHolder.arr[0] = 3; subscriptHolder.arr[1] = 4; subscriptHolder.arr[2] = 5;
+    Arrcv2ArrayHolder* subscriptHolderPtr = &subscriptHolder;
+    if (subscriptRow[subscriptHolder.arr] != 345
+        || subscriptRow[subscriptHolderPtr->arr] != 345)
+        return 96028;
+    cpp_ptrref.ArraySubscriptRowWriteMember subscriptRowWrite =
+        cpp_ptrref.ArraySubscriptRowWriteMember();
+    int[3] subscriptWriteLocal = {1, 2, 3};
+    if (subscriptRowWrite[subscriptWriteLocal] != 127 || subscriptWriteLocal[2] != 7
+        || subscriptRowWrite[arrcv2Global] != 787 || arrcv2Global[2] != 7)
+        return 96029;
+    Arrcv2NativePointer subscriptNativePointer;
+    int[3] subscriptNativeArray = {1, 2, 3};
+    if (subscriptNativePointer[subscriptNativeArray] != 12 || subscriptNativeArray[0] != 5)
+        return 96030;
+    Arrcv2OwnSubscript subscriptOwn;
+    arrcv2Drops = 0;
+    {
+        Arrcv2Own[2] subscriptOwnedArray;
+        subscriptOwnedArray[0].v = 1; subscriptOwnedArray[1].v = 2;
+        if (subscriptOwn[subscriptOwnedArray] != 2 || subscriptOwn[subscriptOwnedArray] != 2)
+            return 96031;
+    }
+    if (arrcv2Drops != 2) return 96032;
+    Arrcv2ImplicitThis subscriptImplicitThis;
+    if (subscriptImplicitThis.get() != 123) return 96033;
+    cpp_ptrref.ArraySubscriptBoolMember subscriptBool = cpp_ptrref.ArraySubscriptBoolMember();
+    int[3] subscriptBoolArray = {1, 2, 3};
+    if (subscriptBool[subscriptBoolArray] != 84) return 96034;
+    // An enum-element array index decays to `const E*`, not an enum scalar.
+    cpp_ptrref.ArraySubscriptEnumPointerMember subscriptEnumPtr = cpp_ptrref.ArraySubscriptEnumPointerMember();
+    cpp_ptrref.ArraySubscriptElem[3] subscriptEnumArray = {cpp_ptrref.ArraySubscriptElemA,
+        cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC};
+    if (subscriptEnumPtr[subscriptEnumArray] != 103) return 96035;
+    // A 2-D enum array index keeps its row shape for `const E (*)[3]`.
+    cpp_ptrref.ArraySubscriptEnumRowMember subscriptEnumRow = cpp_ptrref.ArraySubscriptEnumRowMember();
+    cpp_ptrref.ArraySubscriptElem[2][3] subscriptEnumGrid = {
+        {cpp_ptrref.ArraySubscriptElemA, cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC},
+        {cpp_ptrref.ArraySubscriptElemA, cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC}};
+    if (subscriptEnumRow[subscriptEnumGrid] != 303) return 96036;
+    cpp_ptrref.ArraySubscriptEnumCvMember subscriptEnumCv = cpp_ptrref.ArraySubscriptEnumCvMember();
+    const cpp_ptrref.ArraySubscriptElem[3] subscriptEnumConst = {cpp_ptrref.ArraySubscriptElemA,
+        cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC};
+    if (subscriptEnumCv[subscriptEnumArray] != 31 || subscriptEnumCv[subscriptEnumConst] != 32)
+        return 96037;
+    if (subscriptEnumCv.array_subscript_enum_cv_member(subscriptEnumArray) != 41
+        || subscriptEnumCv.array_subscript_enum_cv_member(subscriptEnumConst) != 42)
+        return 96038;
+    if (cpp_ptrref.array_subscript_enum_cv(subscriptEnumArray) != 51
+        || cpp_ptrref.array_subscript_enum_cv(subscriptEnumConst) != 52)
+        return 96039;
+    cpp_ptrref.ArraySubscriptScopedElem[3] subscriptScopedEnum = {
+        cpp_ptrref.ArraySubscriptScopedElem.A, cpp_ptrref.ArraySubscriptScopedElem.B,
+        cpp_ptrref.ArraySubscriptScopedElem.C};
+    const cpp_ptrref.ArraySubscriptScopedElem[3] subscriptScopedEnumConst = {
+        cpp_ptrref.ArraySubscriptScopedElem.A, cpp_ptrref.ArraySubscriptScopedElem.B,
+        cpp_ptrref.ArraySubscriptScopedElem.C};
+    if (subscriptEnumCv[subscriptScopedEnum] != 33
+        || subscriptEnumCv[subscriptScopedEnumConst] != 34) return 96040;
+    if (subscriptEnumCv.array_subscript_enum_cv_member(subscriptScopedEnum) != 43
+        || subscriptEnumCv.array_subscript_enum_cv_member(subscriptScopedEnumConst) != 44) return 96041;
+    if (cpp_ptrref.array_subscript_enum_cv(subscriptScopedEnum) != 53
+        || cpp_ptrref.array_subscript_enum_cv(subscriptScopedEnumConst) != 54) return 96042;
+    cpp_ptrref.ArraySubscriptSmallElem[3] subscriptSmallEnum = {
+        cpp_ptrref.ArraySubscriptSmallElem.A, cpp_ptrref.ArraySubscriptSmallElem.B,
+        cpp_ptrref.ArraySubscriptSmallElem.C};
+    const cpp_ptrref.ArraySubscriptSmallElem[3] subscriptSmallEnumConst = {
+        cpp_ptrref.ArraySubscriptSmallElem.A, cpp_ptrref.ArraySubscriptSmallElem.B,
+        cpp_ptrref.ArraySubscriptSmallElem.C};
+    if (subscriptEnumCv[subscriptSmallEnum] != 35
+        || subscriptEnumCv[subscriptSmallEnumConst] != 36) return 96043;
+    if (subscriptEnumCv.array_subscript_enum_cv_member(subscriptSmallEnum) != 45
+        || subscriptEnumCv.array_subscript_enum_cv_member(subscriptSmallEnumConst) != 46) return 96044;
+    if (cpp_ptrref.array_subscript_enum_cv(subscriptSmallEnum) != 55
+        || cpp_ptrref.array_subscript_enum_cv(subscriptSmallEnumConst) != 56) return 96045;
+    cpp_ptrref.ArraySubscriptEnumOnlyMutable subscriptEnumOnlyMut =
+        cpp_ptrref.ArraySubscriptEnumOnlyMutable();
+    cpp_ptrref.ArraySubscriptEnumOnlyConst subscriptEnumOnlyConst =
+        cpp_ptrref.ArraySubscriptEnumOnlyConst();
+    cpp_ptrref.ArraySubscriptEnumConstPointer subscriptEnumConstPointer =
+        cpp_ptrref.ArraySubscriptEnumConstPointer();
+    cpp_ptrref.ArraySubscriptEnumMutablePointer subscriptEnumMutablePointer =
+        cpp_ptrref.ArraySubscriptEnumMutablePointer();
+    cpp_ptrref.ArraySubscriptEnumLong subscriptEnumLong = cpp_ptrref.ArraySubscriptEnumLong();
+    cpp_ptrref.ArraySubscriptEnumByValue subscriptEnumValue = cpp_ptrref.ArraySubscriptEnumByValue();
+    if (subscriptEnumOnlyMut[subscriptEnumArray] != 61
+        || subscriptEnumOnlyMut[subscriptScopedEnum] != 61
+        || subscriptEnumOnlyMut[subscriptSmallEnum] != 61
+        || subscriptEnumOnlyConst[subscriptEnumArray] != 62
+        || subscriptEnumOnlyConst[subscriptEnumConst] != 62
+        || subscriptEnumOnlyConst[subscriptScopedEnum] != 62
+        || subscriptEnumOnlyConst[subscriptScopedEnumConst] != 62
+        || subscriptEnumOnlyConst[subscriptSmallEnum] != 62
+        || subscriptEnumOnlyConst[subscriptSmallEnumConst] != 62
+        || subscriptEnumConstPointer[subscriptEnumArray] != 63
+        || subscriptEnumConstPointer[subscriptEnumConst] != 63
+        || subscriptEnumConstPointer[subscriptScopedEnum] != 63
+        || subscriptEnumConstPointer[subscriptScopedEnumConst] != 63
+        || subscriptEnumConstPointer[subscriptSmallEnum] != 63
+        || subscriptEnumConstPointer[subscriptSmallEnumConst] != 63)
+        return 96046;
+    cpp_ptrref.ArraySubscriptElem[3] subscriptEnumWrite = {cpp_ptrref.ArraySubscriptElemA,
+        cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC};
+    if (subscriptEnumMutablePointer[subscriptEnumWrite] != 64
+        || subscriptEnumWrite[0] != cpp_ptrref.ArraySubscriptElemC) return 96047;
+    cpp_ptrref.ArraySubscriptScopedElem[3] subscriptScopedWrite = {
+        cpp_ptrref.ArraySubscriptScopedElem.A, cpp_ptrref.ArraySubscriptScopedElem.B,
+        cpp_ptrref.ArraySubscriptScopedElem.C};
+    cpp_ptrref.ArraySubscriptSmallElem[3] subscriptSmallWrite = {
+        cpp_ptrref.ArraySubscriptSmallElem.A, cpp_ptrref.ArraySubscriptSmallElem.B,
+        cpp_ptrref.ArraySubscriptSmallElem.C};
+    if (subscriptEnumMutablePointer[subscriptScopedWrite] != 64
+        || subscriptScopedWrite[0] != cpp_ptrref.ArraySubscriptScopedElem.C
+        || subscriptEnumMutablePointer[subscriptSmallWrite] != 64
+        || subscriptSmallWrite[0] != cpp_ptrref.ArraySubscriptSmallElem.C) return 96048;
+    expect_error("no overload") { subscriptEnumOnlyMut[subscriptEnumConst]; }
+    expect_error("no overload") { subscriptEnumLong[subscriptEnumArray]; }
+    expect_error("no overload") { subscriptEnumLong[subscriptEnumConst]; }
+    expect_error("no overload") { subscriptEnumValue[subscriptEnumArray]; }
+    expect_error("no overload") { subscriptEnumValue[subscriptEnumConst]; }
+    expect_error("no overload") { subscriptEnumOnlyMut[subscriptScopedEnumConst]; }
+    expect_error("no overload") { subscriptEnumLong[subscriptScopedEnum]; }
+    expect_error("no overload") { subscriptEnumLong[subscriptScopedEnumConst]; }
+    expect_error("no overload") { subscriptEnumValue[subscriptScopedEnum]; }
+    expect_error("no overload") { subscriptEnumValue[subscriptScopedEnumConst]; }
+    expect_error("no overload") { subscriptEnumOnlyMut[subscriptSmallEnumConst]; }
+    expect_error("no overload") { subscriptEnumLong[subscriptSmallEnum]; }
+    expect_error("no overload") { subscriptEnumLong[subscriptSmallEnumConst]; }
+    expect_error("no overload") { subscriptEnumValue[subscriptSmallEnum]; }
+    expect_error("no overload") { subscriptEnumValue[subscriptSmallEnumConst]; }
     return 0;
 }

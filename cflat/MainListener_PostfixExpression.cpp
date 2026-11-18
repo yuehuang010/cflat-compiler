@@ -3779,6 +3779,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             {
                 if (namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.TypeName.empty()) return false;
                 auto* compiler = Compiler(ctx);
+                if (!CxxImportedEnumKey(compiler, namedVar.TypeAndValue.TypeName,
+                        namedVar.TypeAndValue.Pointer ? 1 : 0, nullptr).empty())
+                    return false;
                 compiler->EnsureCxxMemberProjected(namedVar.TypeAndValue.TypeName, opName);
                 auto structData = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
                 if (structData.StructType == nullptr) return false;
@@ -4564,6 +4567,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         RefuseConstWrite(ctx, namedVar, incrementStorage, "increment", "increment");
                         if (incrementStorage)
                         {
+                            if (TryImportedEnumPostfixOperator(
+                                    namedVar, incrementStorage, "++", ctx))
+                            {
+                                namedVar.Primary = nullptr;
+                                namedVar.Storage = incrementStorage;
+                                break;
+                            }
                             namedVar.Primary = namedVar.Primary
                                 ? namedVar.Primary : LoadNamedVariable(namedVar);
                             if (!namedVar.TypeAndValue.Pointer)
@@ -4649,6 +4659,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         RefuseConstWrite(ctx, namedVar, decrementStorage, "decrement", "decrement");
                         if (decrementStorage)
                         {
+                            if (TryImportedEnumPostfixOperator(
+                                    namedVar, decrementStorage, "--", ctx))
+                            {
+                                namedVar.Primary = nullptr;
+                                namedVar.Storage = decrementStorage;
+                                break;
+                            }
                             namedVar.Primary = namedVar.Primary
                                 ? namedVar.Primary : LoadNamedVariable(namedVar);
                             if (!namedVar.TypeAndValue.Pointer)
@@ -7355,6 +7372,35 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 idxNV.Primary  = rvalue;
                                 idxNV.BaseType = rvalue->getType();
                                 // A non-empty VariableName is a NAMED-argument request.
+                                idxNV.TypeAndValue.VariableName = "";
+                            }
+                            // Match the call-argument carrier: the value is decayed, while the
+                            // original type, extent, cv and storage remain for array-reference ranking.
+                            // A multi-dimensional enum array keeps the legacy path: the flattened
+                            // `E*` below would lose the row shape `const E (*)[N]` binds.
+                            else if (!idxNamed.TypeAndValue.IsArrayView
+                                     && !((idxNamed.TypeAndValue.IsScopedEnum
+                                           || !idxNamed.TypeAndValue.EnumBacking.empty())
+                                          && !idxNamed.TypeAndValue.ConstInnerDimensions.empty())
+                                     && (idxNamed.TypeAndValue.ConstArraySize > 0
+                                         || llvm::isa_and_nonnull<llvm::ArrayType>(idxNamed.BaseType)))
+                            {
+                                idxNV = idxNamed;
+                                idxNV.Primary = rvalue;
+                                idxNV.BaseType = rvalue->getType();
+                                idxNV.OriginalArgumentType = idxNamed.TypeAndValue;
+                                idxNV.HasOriginalArgumentType = true;
+                                idxNV.InferSourceTypeName = idxNamed.TypeAndValue.TypeName;
+                                // An enum element keeps its name for `const E*`, marked as the decayed
+                                // pointer; other element names would rank the pointer as a scalar.
+                                if (!idxNV.TypeAndValue.IsScopedEnum && idxNV.TypeAndValue.EnumBacking.empty())
+                                    idxNV.TypeAndValue.TypeName.clear();
+                                else
+                                {
+                                    idxNV.TypeAndValue.Pointer = true;
+                                    idxNV.TypeAndValue.ConstArraySize = 0;
+                                    idxNV.TypeAndValue.ConstInnerDimensions.clear();
+                                }
                                 idxNV.TypeAndValue.VariableName = "";
                             }
                             // A POINTER index keeps its pointee type too: `m[cp]` with `char* cp`
@@ -14049,6 +14095,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
 
+                                    // Keep the class identity of a constructor prvalue built in the `new` slot.
+                                    if (argVar.TypeAndValue.TypeName.empty()
+                                        && newCxxFunctionalElisionDest_ != nullptr
+                                        && newCxxFunctionalElisionCandidate_ != nullptr
+                                        && SolePostfixExpressionShape(UnwrapInitializerParens(
+                                            argumentExpression)) == newCxxFunctionalElisionCandidate_
+                                        && argNV.Storage == newCxxFunctionalElisionDest_
+                                        && argNV.IsRvalue && !argNV.IsExplicitMove
+                                        && !argNV.TypeAndValue.Pointer
+                                        && !argNV.TypeAndValue.IsCxxRef()
+                                        && argNV.Primary != nullptr)
+                                    {
+                                        const std::string targetName = Compiler(ctx)->ResolveTypeAlias(
+                                            newCxxFunctionalElisionType_);
+                                        const auto targetType = Compiler(ctx)->GetType(
+                                            LLVMBackend::TypeAndValue{ .TypeName = targetName });
+                                        if (!targetName.empty() && targetType != nullptr
+                                            && argNV.Primary->getType() == targetType)
+                                            argVar.TypeAndValue.TypeName = targetName;
+                                    }
+
                                     // Propagate struct TypeName for pointer args (e.g. move expressions, new)
                                     // so struct*->interface* upcast matching works in ComputeOverloadFunction.
                                     // Only propagate for known struct types - primitive TypeNames (char, bool,
@@ -14136,6 +14203,64 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 pendingJoinArguments.clear();
                             }
                             };
+                            bool newFunctionalElisionHere = false;
+                            struct NewFunctionalCandidateScope
+                            {
+                                MainListener* listener;
+                                CFlatParser::PostfixExpressionContext* saved;
+                                bool savedNested;
+                                ~NewFunctionalCandidateScope()
+                                {
+                                    listener->newCxxFunctionalElisionCandidate_ = saved;
+                                    listener->newCxxFunctionalElisionCandidateNested_ = savedNested;
+                                }
+                            } newFunctionalCandidateScope{
+                                this, newCxxFunctionalElisionCandidate_,
+                                newCxxFunctionalElisionCandidateNested_ };
+                            if (ctx == newCxxFunctionalElisionCandidate_
+                                && functionArgCounter == 0
+                                && namedVar.Primary == nullptr && namedVar.Storage == nullptr
+                                && structVar.BaseType == nullptr
+                                && ctx->argumentExpressionList().size() == 1
+                                && PostfixExpressionEndsInCall(ctx))
+                            {
+                                auto* compiler = Compiler(ctx);
+                                const std::string targetName = compiler->ResolveTypeAlias(
+                                    newCxxFunctionalElisionType_);
+                                const std::string callTypeName = compiler->ResolveTypeAlias(functionName);
+                                const auto targetType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = targetName });
+                                const auto callType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = callTypeName });
+                                newFunctionalElisionHere = !targetName.empty()
+                                    && callTypeName == targetName && targetType != nullptr
+                                    && callType == targetType && callType->isStructTy()
+                                    && compiler->IsForeignCxxClassWithConstructors(callTypeName);
+                                CFlatParser::PostfixExpressionContext* nestedCandidate = nullptr;
+                                if (newFunctionalElisionHere)
+                                {
+                                    auto callArgs = ctx->argumentExpressionList().front()
+                                        ->argumentNamedExpression();
+                                    if (callArgs.size() == 1
+                                        && callArgs.front()->assignmentExpression() != nullptr)
+                                    {
+                                        auto* child = SolePostfixExpressionShape(
+                                            UnwrapInitializerParens(
+                                                callArgs.front()->assignmentExpression()));
+                                        if (child != nullptr && child != ctx
+                                            && child->argumentExpressionList().size() == 1
+                                            && PostfixExpressionEndsInCall(child))
+                                            nestedCandidate = child;
+                                    }
+                                }
+                                newCxxFunctionalElisionCandidate_ = nestedCandidate;
+                                newCxxFunctionalElisionCandidateNested_ = nestedCandidate != nullptr;
+                            }
+                            else if (ctx == newCxxFunctionalElisionCandidate_)
+                            {
+                                newCxxFunctionalElisionCandidate_ = nullptr;
+                                newCxxFunctionalElisionCandidateNested_ = false;
+                            }
                             bool deferHresultChainArguments = hresultChainPending && winrtSlot != nullptr;
                             if (!deferHresultChainArguments)
                                 evaluateCallArguments();
@@ -14806,6 +14931,60 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             };
                             bool foreignCxxConstructor =
                                 compiler->IsForeignCxxClassWithConstructors(functionName);
+                            auto isNewFunctionalDestination = [&]() {
+                                if (!newFunctionalElisionHere
+                                    || newCxxFunctionalElisionDest_ == nullptr)
+                                    return false;
+                                const std::string targetName = compiler->ResolveTypeAlias(
+                                    newCxxFunctionalElisionType_);
+                                const std::string callTypeName = compiler->ResolveTypeAlias(functionName);
+                                const auto targetType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = targetName });
+                                const auto callType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = callTypeName });
+                                return foreignCxxConstructor && !targetName.empty()
+                                    && callTypeName == targetName && targetType != nullptr
+                                    && callType == targetType && callType->isStructTy();
+                            };
+                            auto isExactNewFunctionalPrvalue = [&](const LLVMBackend::NamedVariable& value) {
+                                if (newCxxFunctionalElisionDest_ == nullptr
+                                    || value.Storage != newCxxFunctionalElisionDest_
+                                    || !value.IsRvalue || value.IsExplicitMove
+                                    || value.TypeAndValue.Pointer || value.TypeAndValue.IsCxxRef())
+                                    return false;
+                                const std::string targetName = compiler->ResolveTypeAlias(
+                                    newCxxFunctionalElisionType_);
+                                const auto targetType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = targetName });
+                                return !targetName.empty() && targetType != nullptr
+                                    && targetType->isStructTy();
+                            };
+                            if (foreignCxxConstructor && newFunctionalElisionHere
+                                && arguments.size() == 1
+                                && isExactNewFunctionalPrvalue(arguments.front()))
+                            {
+                                newCxxFunctionalElisionConsumed_ = true;
+                                auto* slot = newCxxFunctionalElisionDest_;
+                                auto* objectType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{
+                                        .TypeName = newCxxFunctionalElisionType_ });
+                                callArgumentPostfix.Flush();
+                                braceArgumentUnwind.Release();
+                                namedVar = arguments.front();
+                                namedVar.Primary = compiler->CreateLoad(slot);
+                                namedVar.Storage = slot;
+                                namedVar.BaseType = objectType;
+                                namedVar.TypeAndValue.TypeName = newCxxFunctionalElisionType_;
+                                namedVar.IsRvalue = true;
+                                namedVar.IsCxxPrvalueTemp = false;
+                                compiler->lastCallReturnType = namedVar.TypeAndValue;
+                                compiler->lastOwningResult = true;
+                                structVar = {};
+                                interfaceVar = {};
+                                clearNamespaceContext();
+                                functionArgCounter++;
+                                break;
+                            }
                             auto canDeferCxxConstruction = [&](llvm::Type* objectType) {
                                 if (!cxxDirectConstructionCanDefer_
                                     || cxxDirectConstructionHasLaterSibling_
@@ -14818,7 +14997,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     return true;
                                 return compiler->GetType(cxxDirectConstructionTargetType_) == objectType;
                             };
-                            if (foreignCxxConstructor && arguments.size() == 1
+                            if (foreignCxxConstructor && !newFunctionalElisionHere
+                                && arguments.size() == 1
                                 && arguments.front().TypeAndValue.TypeName == "__cflat_brace_arg"
                                 && cxxBraceArguments.size() == 1
                                 && cxxBraceArguments.front().argumentIndex == 0
@@ -14854,7 +15034,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     break;
                                 }
                             }
-                            if (foreignCxxConstructor && cxxBraceArguments.empty()
+                            if (foreignCxxConstructor && !newFunctionalElisionHere
+                                && cxxBraceArguments.empty()
                                 && cxxDirectConstructionArgument_ != nullptr
                                 && SoleCxxConstructionPostfix(cxxDirectConstructionArgument_) == ctx)
                             {
@@ -14905,14 +15086,23 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         || compiler->pendingCxxSretReturn_)
                                     && compiler->pendingCxxSretDest_ != nullptr
                                     && compiler->pendingCxxSretTypeName_ == functionName;
-                                auto* slot = directSret ? compiler->pendingCxxSretDest_
-                                                         : compiler->CreateAlloca(objectType);
-                                if (directSret)
+                                const bool directNewFunctionalSret = isNewFunctionalDestination();
+                                const bool useDirectSret = directSret || directNewFunctionalSret;
+                                auto* slot = directNewFunctionalSret
+                                    ? newCxxFunctionalElisionDest_
+                                    : useDirectSret ? compiler->pendingCxxSretDest_
+                                                    : compiler->CreateAlloca(objectType);
+                                if (useDirectSret)
                                 {
-                                    compiler->pendingCxxSretDest_ = nullptr;
-                                    compiler->pendingCxxSretTypeName_.clear();
-                                    compiler->pendingCxxSretForFixedArray_ = false;
-                                    compiler->pendingCxxSretReturn_ = false;
+                                    if (directNewFunctionalSret)
+                                        newCxxFunctionalElisionConsumed_ = true;
+                                    if (directSret)
+                                    {
+                                        compiler->pendingCxxSretDest_ = nullptr;
+                                        compiler->pendingCxxSretTypeName_.clear();
+                                        compiler->pendingCxxSretForFixedArray_ = false;
+                                        compiler->pendingCxxSretReturn_ = false;
+                                    }
                                 }
                                 LLVMBackend::NamedVariable self;
                                 self.Primary = slot;
@@ -14928,7 +15118,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgumentPostfix.Flush();
                                 compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
                                 cxxBraceArguments.clear();
-                                if (!directSret && compiler->IsForeignNontrivialCxxClass(functionName))
+                                if (!useDirectSret && compiler->IsForeignNontrivialCxxClass(functionName))
                                     compiler->RegisterOwnedStructTemp(slot, functionName);
                                 namedVar = {};
                                 namedVar.Primary = compiler->CreateLoad(slot);
@@ -14938,7 +15128,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.IsRvalue = true;
                                 // An owned C++ class temporary is a prvalue for the by-value switch
                                 // (SwitchCxxDirectByValueCall), which elides it into the parameter.
-                                namedVar.IsCxxPrvalueTemp = !directSret
+                                namedVar.IsCxxPrvalueTemp = !useDirectSret
                                     && (compiler->IsForeignNontrivialCxxClass(functionName)
                                         || (compiler->IsCxxTriviallyCopyableRecord(functionName)
                                             && compiler->CxxMovePickNeedsClang(functionName)));
@@ -15184,14 +15374,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 || compiler->pendingCxxSretReturn_)
                                             && compiler->pendingCxxSretDest_ != nullptr
                                             && compiler->pendingCxxSretTypeName_ == functionName;
-                                        auto* slot = directSret ? compiler->pendingCxxSretDest_
-                                                                 : compiler->CreateAlloca(objectType);
-                                        if (directSret)
+                                        const bool directNewFunctionalSret =
+                                            isNewFunctionalDestination();
+                                        const bool useDirectSret = directSret || directNewFunctionalSret;
+                                        auto* slot = directNewFunctionalSret
+                                            ? newCxxFunctionalElisionDest_
+                                            : useDirectSret ? compiler->pendingCxxSretDest_
+                                                            : compiler->CreateAlloca(objectType);
+                                        if (useDirectSret)
                                         {
-                                            compiler->pendingCxxSretDest_ = nullptr;
-                                            compiler->pendingCxxSretTypeName_.clear();
-                                            compiler->pendingCxxSretForFixedArray_ = false;
-                                            compiler->pendingCxxSretReturn_ = false;
+                                            if (directNewFunctionalSret)
+                                                newCxxFunctionalElisionConsumed_ = true;
+                                            if (directSret)
+                                            {
+                                                compiler->pendingCxxSretDest_ = nullptr;
+                                                compiler->pendingCxxSretTypeName_.clear();
+                                                compiler->pendingCxxSretForFixedArray_ = false;
+                                                compiler->pendingCxxSretReturn_ = false;
+                                            }
                                         }
                                         LLVMBackend::NamedVariable self;
                                         self.Primary = slot;
@@ -15210,7 +15410,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         compiler->CreateOverloadedFunctionCall(wrapperName,
                                                                                 wrapperArguments, false,
                                                                                 compiler->DisplayCxxClassName(functionName));
-                                        if (!directSret
+                                        if (!useDirectSret
                                             && compiler->IsForeignNontrivialCxxClass(functionName))
                                             compiler->RegisterOwnedStructTemp(slot, functionName);
                                         namedVar = {};
@@ -15219,7 +15419,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.BaseType = objectType;
                                         namedVar.TypeAndValue.TypeName = functionName;
                                         namedVar.IsRvalue = true;
-                                        namedVar.IsCxxPrvalueTemp = !directSret
+                                        namedVar.IsCxxPrvalueTemp = !useDirectSret
                                             && (compiler->IsForeignNontrivialCxxClass(functionName)
                                                 || (compiler->IsCxxTriviallyCopyableRecord(functionName)
                                                     && compiler->CxxMovePickNeedsClang(functionName)));
@@ -15267,20 +15467,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             || compiler->pendingCxxSretReturn_)
                                         && compiler->pendingCxxSretDest_ != nullptr
                                         && compiler->pendingCxxSretTypeName_ == functionName;
-                                    auto* slot = directSret ? compiler->pendingCxxSretDest_
-                                                             : compiler->CreateAlloca(objectType);
-                                    if (directSret)
+                                    const bool directNewFunctionalSret =
+                                        isNewFunctionalDestination();
+                                    const bool useDirectSret = directSret || directNewFunctionalSret;
+                                    auto* slot = directNewFunctionalSret
+                                        ? newCxxFunctionalElisionDest_
+                                        : useDirectSret ? compiler->pendingCxxSretDest_
+                                                        : compiler->CreateAlloca(objectType);
+                                    if (useDirectSret)
                                     {
-                                        compiler->pendingCxxSretDest_ = nullptr;
-                                        compiler->pendingCxxSretTypeName_.clear();
-                                        compiler->pendingCxxSretForFixedArray_ = false;
-                                        compiler->pendingCxxSretReturn_ = false;
+                                        if (directNewFunctionalSret)
+                                            newCxxFunctionalElisionConsumed_ = true;
+                                        if (directSret)
+                                        {
+                                            compiler->pendingCxxSretDest_ = nullptr;
+                                            compiler->pendingCxxSretTypeName_.clear();
+                                            compiler->pendingCxxSretForFixedArray_ = false;
+                                            compiler->pendingCxxSretReturn_ = false;
+                                        }
                                     }
                                     callArgumentPostfix.Flush();
                                     braceArgumentUnwind.Release();
                                     compiler->EmitCxxStructorCall(functionName, *ctor, slot, ctorValues,
                                                                   &arguments);
-                                    if (!directSret && compiler->IsForeignNontrivialCxxClass(functionName))
+                                    if (!useDirectSret && compiler->IsForeignNontrivialCxxClass(functionName))
                                         compiler->RegisterOwnedStructTemp(slot, functionName);
                                     namedVar = {};
                                     namedVar.Primary = compiler->CreateLoad(slot);
@@ -15289,7 +15499,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.TypeAndValue.TypeName = functionName;
                                     namedVar.IsRvalue = true;
                                     namedVar.IsCxxPrvalueTemp =
-                                        !directSret && compiler->IsForeignNontrivialCxxClass(functionName);
+                                        !useDirectSret && compiler->IsForeignNontrivialCxxClass(functionName);
                                     compiler->lastOwningResult = true;
                                 }
                                 structVar = {};

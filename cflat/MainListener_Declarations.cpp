@@ -8799,6 +8799,43 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         // Redundant parentheses take the bare initializer's route (in-place elision).
         auto* assign = CastCallInitializer(UnwrapInitializerParens(
             initializer != nullptr ? initializer->assignmentExpression() : nullptr));
+        // The constructor list may still be unprojected on a first copy-init. Resolve a lone
+        // integer token before the trivial-record escape so literal zero reaches the slot guard.
+        if (!declType.IsAlias && !declType.Pointer && declType.ConstArraySize == 0
+            && declType.ConstInnerDimensions.empty() && !declType.IsArrayView
+            && !declType.IsInterface && declType.ArraySize == nullptr
+            && compiler->IsCxxRecord(typeName) && assign != nullptr)
+        {
+            auto* primary = SolePrimaryExpression(assign);
+            if (primary != nullptr && primary->Constant() != nullptr)
+            {
+                bool suffixedLiteral = false;
+                const std::string literalIdentity = LLVMBackend::LiteralIdentityForOverload(
+                    primary->Constant()->getText(), &suffixedLiteral);
+                const bool integerLiteral = literalIdentity == "int" || literalIdentity == "u32"
+                    || literalIdentity == "long" || literalIdentity == "ulong"
+                    || literalIdentity == "i64" || literalIdentity == "u64";
+                if (integerLiteral)
+                {
+                    auto source = ParseAssignmentExpressionNamed(assign);
+                    llvm::Value* sourceValue = source.Primary != nullptr
+                        ? source.Primary : LoadNamedVariable(source);
+                    if (sourceValue != nullptr && sourceValue->getType()->isIntegerTy())
+                    {
+                        auto* constant = llvm::dyn_cast<llvm::ConstantInt>(sourceValue);
+                        if (constant != nullptr && constant->isZero())
+                        {
+                            source.Primary = sourceValue;
+                            source.LiteralIdentity = literalIdentity;
+                            source.LiteralIdentitySuffixed = suffixedLiteral;
+                            if (compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                                    typeName, { source }, { sourceValue }))
+                                return true;
+                        }
+                    }
+                }
+            }
+        }
         auto* declarationBraceList = initDeclarator->initializerList();
         if (declarationBraceList == nullptr && initializer != nullptr
             && initializer->LeftBrace() != nullptr)
@@ -9331,10 +9368,74 @@ cxx_dtor_ready:
                     && compiler->GetUniqueCxxConstructorValueParameter(
                         typeName, ctorArguments.size(), ctorArgs->argumentNamedExpression().size(),
                         ctorRefDest, /*constRef*/ true);
+                // `Sx s = Sx(Sx(x))`: a sole same-class cast argument builds straight into the
+                // declared slot, so the outer copy is elided (C++17), as the `new` path does.
+                auto* elidableCast = ctorArgs->argumentNamedExpression().size() == 1
+                    ? SolePostfixExpressionShape(argAssign) : nullptr;
+                // The callee spelling before '(' must name this class (alias included), so an
+                // ordinary call such as `std.f(x)` keeps the copy path.
+                const std::string elidableCallee = elidableCast != nullptr
+                    ? elidableCast->getText().substr(0, elidableCast->getText().find('('))
+                    : std::string();
+                // The spelled callee (qualified or not) is looked up as the call would resolve it:
+                // a function or callable value of that name may return an lvalue, so keep the copy.
+                const bool calleeNamesCallable = elidableCast != nullptr
+                    && (compiler->GetFunction(elidableCallee) != nullptr
+                        || NamesVisibleVariable(compiler, elidableCallee));
+                const bool elideCastArgument = !ctorRefTernary && elidableCast != nullptr
+                    && elidableCast->argumentExpressionList().size() == 1
+                    && PostfixExpressionEndsInCall(elidableCast)
+                    && !calleeNamesCallable
+                    && (compiler->ResolveTypeAlias(elidableCallee) == compiler->ResolveTypeAlias(typeName)
+                        || elidableCallee == compiler->DisplayCxxClassName(
+                            compiler->ResolveTypeAlias(typeName)))
+                    && compiler->IsForeignCxxClassWithConstructors(typeName);
+                struct SlotElisionScope
+                {
+                    MainListener* listener;
+                    CFlatParser::PostfixExpressionContext* savedCandidate;
+                    bool savedNested;
+                    llvm::Value* savedDest;
+                    std::string savedType;
+                    bool savedConsumed;
+                    SlotElisionScope(MainListener* listener, bool active,
+                        CFlatParser::PostfixExpressionContext* candidate,
+                        llvm::Value* dest, const std::string& type)
+                        : listener(listener),
+                          savedCandidate(listener->newCxxFunctionalElisionCandidate_),
+                          savedNested(listener->newCxxFunctionalElisionCandidateNested_),
+                          savedDest(listener->newCxxFunctionalElisionDest_),
+                          savedType(listener->newCxxFunctionalElisionType_),
+                          savedConsumed(listener->newCxxFunctionalElisionConsumed_)
+                    {
+                        if (!active) return;
+                        listener->newCxxFunctionalElisionCandidate_ = candidate;
+                        listener->newCxxFunctionalElisionCandidateNested_ = false;
+                        listener->newCxxFunctionalElisionDest_ = dest;
+                        listener->newCxxFunctionalElisionType_ = type;
+                        listener->newCxxFunctionalElisionConsumed_ = false;
+                    }
+                    ~SlotElisionScope()
+                    {
+                        listener->newCxxFunctionalElisionCandidate_ = savedCandidate;
+                        listener->newCxxFunctionalElisionCandidateNested_ = savedNested;
+                        listener->newCxxFunctionalElisionDest_ = savedDest;
+                        listener->newCxxFunctionalElisionType_ = std::move(savedType);
+                        listener->newCxxFunctionalElisionConsumed_ = savedConsumed;
+                    }
+                } slotElision(this, elideCastArgument, elidableCast, slotValue, typeName);
                 auto nv = ctorRefTernary
                     ? ParseCxxConstRefTernaryTemp(argAssign,
                         LLVMBackend::TypeAndValue{ .TypeName = ctorRefPlaceType })
                     : ParseAssignmentExpressionNamed(argAssign);
+                // The cast built into the slot: nothing left for the copy constructor to do.
+                if (elideCastArgument && newCxxFunctionalElisionConsumed_
+                    && nv.Storage == slotValue && nv.IsRvalue)
+                {
+                    compiler->SetCurrentDebugLocation(line);
+                    ctorArgumentPostfix.Flush();
+                    return true;
+                }
                 NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                 compiler->LowerNonCapturingClosureForCxx(
                     nv, compiler->StdFunctionClosureSignature(typeName));

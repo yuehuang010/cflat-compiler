@@ -1824,6 +1824,48 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
         }
 
         // A fixed array argument reaches C++ decayed as a prvalue pointer to element zero.
+        auto cxxCharPointerJoinIsConst = [&](const NamedVariable& arg) {
+            if (arg.TypeAndValue.Pointer && arg.TypeAndValue.PointeeConstBit()) return true;
+            if (arg.Primary == nullptr || !JoinIsCharPointer(arg.Primary)) return false;
+            for (const llvm::Value* arm : JoinArmValues(arg.Primary))
+            {
+                if (const auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arm);
+                    constant != nullptr
+                    && IsStringLiteralConstant(const_cast<llvm::Constant*>(constant)))
+                    return true;
+                const auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arm);
+                if (load == nullptr) continue;
+                const TypeAndValue* declared =
+                    FindDeclaredTypeAndValueForStorage(load->getPointerOperand());
+                if (declared != nullptr && declared->Pointer && declared->PointeeConstBit())
+                    return true;
+            }
+            return false;
+        };
+        auto cxxCharPointerJoinHasMixedPointeeConst = [&](const NamedVariable& arg) {
+            if (arg.Primary == nullptr || !JoinIsCharPointer(arg.Primary)) return false;
+            std::optional<bool> firstPointeeConst;
+            for (const llvm::Value* arm : JoinArmValues(arg.Primary))
+            {
+                bool pointeeConst = false;
+                if (const auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arm);
+                    constant != nullptr
+                    && IsStringLiteralConstant(const_cast<llvm::Constant*>(constant)))
+                    pointeeConst = true;
+                else
+                {
+                    const auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arm);
+                    if (load == nullptr) return false;
+                    const TypeAndValue* declared =
+                        FindDeclaredTypeAndValueForStorage(load->getPointerOperand());
+                    if (declared == nullptr || !declared->Pointer) return false;
+                    pointeeConst = declared->PointeeConstBit();
+                }
+                if (firstPointeeConst && *firstPointeeConst != pointeeConst) return true;
+                firstPointeeConst = pointeeConst;
+            }
+            return false;
+        };
         auto cflatTypeOf = [&](const NamedVariable& arg) {
             if (IsCxxNullTypedArgument(arg)) return std::string("std.nullptr_t");
             std::string type = !arg.LiteralIdentity.empty()
@@ -1850,6 +1892,15 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
             // The declared primitive identity outranks the machine-type guess below, which
             // cannot tell `char` from `i8` or `long` from `i64`.
             if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(arg, valueType);
+            // A conditional can have a pointer LLVM value but no source TypeName; infer its C++
+            // character-pointer identity from the join arms, as InferImplicitCxxArgumentType does.
+            if (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()
+                && JoinIsCharPointer(arg.Primary))
+            {
+                // Keep an identity already proven (`c8` for u8 literal arms).
+                if (type.empty()) type = "char";
+                pointer = true;
+            }
             if (type.empty())
             {
                 if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -1890,6 +1941,38 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 type += "*";
             }
             return type;
+        };
+        auto cxxStringLiteralArrayForArgument = [&](const NamedVariable& arg,
+                                                   size_t parameterIndex) {
+            if (std::string direct = CxxStringLiteralArrayLvalue(arg, parameterIndex);
+                !direct.empty())
+                return direct;
+            // A u8 join keeps the decayed `const char8_t *` spelling: the slot below is `const char *`.
+            if (arg.Primary == nullptr || arg.TypeAndValue.TypeName == "c8"
+                || (!llvm::isa<llvm::SelectInst>(arg.Primary)
+                    && !llvm::isa<llvm::PHINode>(arg.Primary)))
+                return std::string();
+            std::optional<size_t> literalLength;
+            for (const llvm::Value* arm : JoinArmValues(arg.Primary))
+            {
+                const auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arm);
+                if (constant == nullptr
+                    || !IsStringLiteralConstant(const_cast<llvm::Constant*>(constant)))
+                    return std::string();
+                auto length = stringLiteralLenByPtr.find(const_cast<llvm::Constant*>(constant));
+                if (length == stringLiteralLenByPtr.end())
+                    if (const auto* global = llvm::dyn_cast<llvm::GlobalVariable>(
+                            constant->stripPointerCasts()))
+                        length = stringLiteralLenByPtr.find(
+                            const_cast<llvm::GlobalVariable*>(global));
+                if (length == stringLiteralLenByPtr.end()
+                    || (literalLength && *literalLength != length->second))
+                    return std::string();
+                literalLength = length->second;
+            }
+            if (!literalLength) return std::string();
+            return std::format("(*reinterpret_cast<const char (*)[{}]>(p{}))", *literalLength + 1,
+                               parameterIndex);
         };
         auto cxxTemplateArgumentSpelling = [&](const std::string& type,
                                                std::string& spelling) {
@@ -2529,10 +2612,13 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 anyPointerConstRef = anyPointerConstRef || pointerConstRef;
                 allPointerConstRef = allPointerConstRef && pointerConstRef;
             });
-            const bool stringLiteralArgument = [&] {
+            const bool stringLiteral = [&] {
                 auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
                 return constant != nullptr && IsStringLiteralConstant(constant);
             }();
+            const std::string stringLiteralArray =
+                cxxStringLiteralArrayForArgument(arg, flatParameterIndex);
+            const bool stringLiteralArgument = stringLiteral || !stringLiteralArray.empty();
             // A class keeps its storage-based category; a scalar needs positive lvalue proof.
             const bool decayedArray = IsCxxFixedArrayArgument(arg);
             const bool classArgument = !arg.TypeAndValue.Pointer && !decayedArray
@@ -2554,10 +2640,11 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 && arg.CxxLvalueKind == 1 && !arg.IsExplicitMove
                 && (forwardingPosition || anyLvalueReference);
             // A wrapped CFlat closure variable is its own caller-frame slot: an lvalue.
-            const bool provenLvalue = !arg.CxxClosureSignature.empty() ? arg.CxxClosureBorrowed
+            const bool provenLvalue = (!arg.CxxClosureSignature.empty() ? arg.CxxClosureBorrowed
                 : decayedArray ? provenArrayLvalue
                 : classArgument ? !IsCxxRvalueReferenceArgument(arg)
-                : IsProvenCxxScalarLvalue(arg) || bitfieldLvalue;
+                : IsProvenCxxScalarLvalue(arg) || bitfieldLvalue)
+                && !cxxCharPointerJoinHasMixedPointeeConst(arg);
             // Any reference (`const T&` included) binds the CALLER's object: a returned
             // reference then aliases it, never a wrapper copy.
             const bool bindsCallerLvalue = (anyReference || uniqueRegistration)
@@ -2686,10 +2773,6 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
             std::string literalSpelling;
             const bool inlineStringLiteral = CxxStringLiteralSpelling(arg, literalSpelling);
             std::string spelling;
-            const bool stringLiteral = [&] {
-                auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
-                return constant != nullptr && IsStringLiteralConstant(constant);
-            }();
             if (!arg.CxxClosureSignature.empty())
             {
                 // A CFlat closure: F deduces to the owning __cflat_closure<> prvalue.
@@ -2717,7 +2800,7 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
              * Only when EVERY candidate (non-templates too) takes that; a mixed set is resolved
              * by clang over the literal's array and re-spelled after (literalArrayParams).
              */
-            if (stringLiteral && anyPointerConstRef && allPointerConstRef
+            if (stringLiteralArgument && anyPointerConstRef && allPointerConstRef
                 && CxxNonTemplateOverloadsTakePointerConstRef(lookupName, {},
                                                               arguments.size() - (i - declaredIndex),
                                                               declaredIndex)
@@ -2730,13 +2813,11 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 literalArrayArgument = true;
                 continue;
             }
-            if (std::string literalArray = stringLiteral
-                    ? CxxStringLiteralArrayLvalue(arg, flatParameterIndex) : std::string();
-                !literalArray.empty())
+            if (!stringLiteralArray.empty())
             {
                 literalArrayParams.push_back(parameterSpellings.size());
                 parameterSpellings.push_back("const char *");
-                callArguments.push_back(std::move(literalArray));
+                callArguments.push_back(stringLiteralArray);
                 ++flatParameterIndex;
                 literalArrayArgument = true;
                 if (inlineStringLiteral)
@@ -2800,7 +2881,8 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 spelling = "const " + spelling;
                 constSpelled = true;
             }
-            else if (arg.TypeAndValue.PointeeConstBit() && arg.TypeAndValue.Pointer
+            else if ((arg.TypeAndValue.PointeeConstBit() && arg.TypeAndValue.Pointer
+                      || cxxCharPointerJoinIsConst(arg))
                      && !arg.TypeAndValue.IsFunctionPointer && spelling.ends_with("*")
                      && !spelling.starts_with("const "))
             {
@@ -2880,13 +2962,9 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
             else if (!forwardingReference && anyReference && !classArgument && !provenLvalue
                      && !stringLiteralArgument && spelling != "const char *")
                 spelling += " &&";
-            /*
-             * A string literal at a const reference lives in the caller too, but reaches C++ as a
-             * NAMED `const char *` as on master, so overload ranking (`const U&` over `const U&&`)
-             * is unchanged. A non-const `U&` keeps the by-value lvalue for the literal retry.
-             */
+            /* A pointer-valued join uses a named pointer for `const U&`, preserving its ranking. */
             else if (!forwardingReference && anyReference && !classArgument && !provenLvalue
-                     && !anyLvalueReference)
+                     && !anyLvalueReference && !JoinIsCharPointer(arg.Primary))
                 spelling += " &";
             const std::string valueSpelling = spelling.ends_with(" &&")
                 ? spelling.substr(0, spelling.size() - 3) : spelling;

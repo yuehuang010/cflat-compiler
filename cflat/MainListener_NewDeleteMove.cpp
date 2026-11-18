@@ -321,6 +321,45 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     bool armConsumed = false;
                     auto nv = [&] {
                         CxxCallArgumentParseStateScope argumentState(compiler);
+                        struct FunctionalElisionScope
+                        {
+                            MainListener* listener;
+                            CFlatParser::PostfixExpressionContext* savedCandidate;
+                            bool savedCandidateNested;
+                            llvm::Value* savedDest;
+                            std::string savedType;
+                            bool savedConsumed;
+                            FunctionalElisionScope(MainListener* listener, bool active,
+                                CFlatParser::PostfixExpressionContext* candidate,
+                                llvm::Value* dest, const std::string& type)
+                                : listener(listener),
+                                  savedCandidate(listener->newCxxFunctionalElisionCandidate_),
+                                  savedCandidateNested(listener->newCxxFunctionalElisionCandidateNested_),
+                                  savedDest(listener->newCxxFunctionalElisionDest_),
+                                  savedType(listener->newCxxFunctionalElisionType_),
+                                  savedConsumed(listener->newCxxFunctionalElisionConsumed_)
+                            {
+                                if (!active) return;
+                                listener->newCxxFunctionalElisionCandidate_ = candidate;
+                                listener->newCxxFunctionalElisionCandidateNested_ = false;
+                                listener->newCxxFunctionalElisionDest_ = dest;
+                                listener->newCxxFunctionalElisionType_ = type;
+                                listener->newCxxFunctionalElisionConsumed_ = false;
+                            }
+                            bool Consumed() const
+                            {
+                                return listener->newCxxFunctionalElisionConsumed_;
+                            }
+                            ~FunctionalElisionScope()
+                            {
+                                listener->newCxxFunctionalElisionCandidate_ = savedCandidate;
+                                listener->newCxxFunctionalElisionCandidateNested_ = savedCandidateNested;
+                                listener->newCxxFunctionalElisionDest_ = savedDest;
+                                listener->newCxxFunctionalElisionType_ = std::move(savedType);
+                                listener->newCxxFunctionalElisionConsumed_ = savedConsumed;
+                            }
+                        } functionalElision(this, selfElisionArm, argPostfix, newBlock,
+                            resolvedNewCxxType);
                         if (selfElisionArm)
                         {
                             compiler->pendingCxxSretDest_ = newBlock;
@@ -385,7 +424,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         if (ternaryElisionArm)
                             armConsumed = ternarySlot.Consumed();
                         if (selfElisionArm)
-                            armConsumed = compiler->pendingCxxSretDest_ == nullptr;
+                            armConsumed = compiler->pendingCxxSretDest_ == nullptr
+                                || functionalElision.Consumed();
                         llvm::Value* retTemp = compiler->lastCxxRetTemp_;
                         llvm::Value* retValue = compiler->lastCxxRetValue_;
                         if (retTemp != nullptr

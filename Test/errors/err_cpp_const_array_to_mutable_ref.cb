@@ -1,0 +1,121 @@
+import cpp "cpp_ptrref.hpp";
+
+struct Arrcv2NativeScalar { int operator[](long i) { return (int)i; } };
+struct Arrcv2NativeScalarPair {
+    int operator[](long i) { return (int)i; }
+    int operator[](double i) { return (int)i; }
+};
+
+expect_error("no overload") {
+    int free_mut_ref1_error() {
+        const int[3] a = {1, 2, 3};
+        int result = cpp_ptrref.farr_mut1(a);
+        return result;
+    }
+}
+expect_error("no overload") {
+    int free_mut_ref2_error() {
+        const int[2][3] a = {{1, 2, 3}, {4, 5, 6}};
+        int result = cpp_ptrref.farr_mut2(a);
+        return result;
+    }
+}
+expect_error("no overload") {
+    int member_mut_ref1_error() {
+        const int[3] a = {1, 2, 3};
+        cpp_ptrref.ArrayMember s = cpp_ptrref.ArrayMember();
+        return s.farr_mut1(a);
+    }
+}
+expect_error("no overload") {
+    int member_mut_ref2_error() {
+        const int[2][3] a = {{1, 2, 3}, {4, 5, 6}};
+        cpp_ptrref.ArrayMember s = cpp_ptrref.ArrayMember();
+        return s.farr_mut2(a);
+    }
+}
+expect_error("const") {
+    int ctor_mut_ref1_error() {
+        const int[3] a = {1, 2, 3};
+        cpp_ptrref.ArrayCtorMut1 value = cpp_ptrref.ArrayCtorMut1(a);
+        return value.r;
+    }
+}
+expect_error("const") {
+    int ctor_mut_ref2_error() {
+        const int[2][3] a = {{1, 2, 3}, {4, 5, 6}};
+        cpp_ptrref.ArrayCtorMut2 value = cpp_ptrref.ArrayCtorMut2(a);
+        return value.r;
+    }
+}
+expect_error("no overload") {
+    int view_free_mut_ref1_error() {
+        int[3] a = {1, 2, 3};
+        int[] v = a;
+        return cpp_ptrref.farr_mut1(v);
+    }
+}
+expect_error("no overload") {
+    int view_member_mut_ref1_error() {
+        int[3] a = {1, 2, 3};
+        int[] v = a;
+        cpp_ptrref.ArrayMember s = cpp_ptrref.ArrayMember();
+        return s.farr_mut1(v);
+    }
+}
+expect_error("no overload") {
+    int mixed_array_ref_error() {
+        int[3] a = {1, 2, 3};
+        return cpp_ptrref.farr_mix(a);
+    }
+}
+expect_error("no overload") {
+    int cpp_scalar_subscript_array_error() {
+        int[3] a = {1, 2, 3};
+        cpp_ptrref.ArrayScalarSubscriptMember s = cpp_ptrref.ArrayScalarSubscriptMember();
+        return s[a];
+    }
+}
+expect_error("no overload") {
+    int cpp_scalar_pair_subscript_array_error() {
+        int[3] a = {1, 2, 3};
+        cpp_ptrref.ArrayScalarPairSubscriptMember s = cpp_ptrref.ArrayScalarPairSubscriptMember();
+        return s[a];
+    }
+}
+expect_error("no overload") {
+    int cpp_scalar_subscript_const_grid_error() {
+        const int[2][3] a = {{1, 2, 3}, {4, 5, 6}};
+        cpp_ptrref.ArrayScalarSubscriptMember s = cpp_ptrref.ArrayScalarSubscriptMember();
+        return s[a];
+    }
+}
+expect_error("no overload") {
+    int native_scalar_subscript_array_error() {
+        int[3] a = {1, 2, 3};
+        Arrcv2NativeScalar s;
+        return s[a];
+    }
+}
+expect_error("no overload") {
+    int native_scalar_pair_subscript_array_error() {
+        int[3] a = {1, 2, 3};
+        Arrcv2NativeScalarPair s;
+        return s[a];
+    }
+}
+expect_error("no overload") {
+    int cpp_scalar_subscript_unsigned_array_error() {
+        unsigned int[3] a = {1, 2, 3};
+        cpp_ptrref.ArrayScalarSubscriptMember s = cpp_ptrref.ArrayScalarSubscriptMember();
+        return s[a];
+    }
+}
+expect_error("no overload") {
+    int cpp_scalar_subscript_enum_array_error() {
+        cpp_ptrref.ArraySubscriptElem[3] a = {cpp_ptrref.ArraySubscriptElemA,
+            cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC};
+        cpp_ptrref.ArrayScalarSubscriptMember s = cpp_ptrref.ArrayScalarSubscriptMember();
+        return s[a];
+    }
+}

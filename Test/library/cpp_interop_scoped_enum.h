@@ -129,6 +129,8 @@ namespace cppi_scope
     {
         enum class SE : int { a = 5, b = 7 };
         enum UE : int { ua = 5, ub = 7 };
+        enum class PrefixOnly : int { a = 5 };
+        enum class PostfixOnly : int { a = 5 };
         enum Plain : int { p2 = 2, p3 = 3 };      // no overloads: built-in arithmetic only
         enum class PlainS : int { s2 = 2 };       // no overloads
         struct Unrel { int v = 1; };
@@ -139,13 +141,25 @@ namespace cppi_scope
         inline int operator+(SE e, double d) { return 300 + (int)e + (int)d; }
         inline int operator+(double d, SE e) { return 400 + (int)d + (int)e; }
         inline int operator*(SE x, SE y) { return 60 + (int)x * (int)y; }
+        inline SE& operator++(SE& e) { e = (SE)((int)e + 10); return e; }
+        inline SE operator++(SE& e, int) { SE old = e; e = (SE)((int)e + 20); return old; }
+        inline SE& operator--(SE& e) { e = (SE)((int)e - 10); return e; }
+        inline SE operator--(SE& e, int) { SE old = e; e = (SE)((int)e - 20); return old; }
         inline SE& operator+=(SE& e, int i) { e = (SE)((int)e + i * 10); return e; }
         inline SE& operator+=(SE& e, double d) { e = (SE)((int)e + (int)d * 30); return e; }
         inline SE& operator^(SE& e, int i) { e = (SE)((int)e + i * 20); return e; }
         inline bool operator<(SE x, SE y) { return (int)x > (int)y; }
+        inline UE& operator++(UE& e) { e = (UE)((int)e + 10); return e; }
+        inline UE operator++(UE& e, int) { UE old = e; e = (UE)((int)e + 20); return old; }
+        inline UE& operator--(UE& e) { e = (UE)((int)e - 10); return e; }
+        inline UE operator--(UE& e, int) { UE old = e; e = (UE)((int)e - 20); return old; }
         inline int operator+(UE e, int i) { return 80 + (int)e + i; }
         inline int operator-(int i, UE e) { return 100 + i - (int)e; }
         inline bool operator==(UE x, UE y) { return (int)x != (int)y; }
+        inline PrefixOnly& operator++(PrefixOnly& e) { e = (PrefixOnly)((int)e + 10); return e; }
+        inline PrefixOnly& operator--(PrefixOnly& e) { e = (PrefixOnly)((int)e - 10); return e; }
+        inline PostfixOnly operator++(PostfixOnly& e, int) { PostfixOnly old = e; e = (PostfixOnly)((int)e + 20); return old; }
+        inline PostfixOnly operator--(PostfixOnly& e, int) { PostfixOnly old = e; e = (PostfixOnly)((int)e - 20); return old; }
         struct Mem
         {
             int v = 3;
@@ -159,8 +173,49 @@ namespace cppi_scope
         enum N : int { n0 = 2 };
         inline int operator+(E e, int i) { return 800 + (int)e + i; }
         inline int operator+(N n, int i) { return 1000 + (int)n + i; }
+        // Unary overload markers differ from the integral built-ins for both enum kinds.
+        inline constexpr int operator~(SE e) { return 1500 + (int)e; }
+        inline constexpr int operator-(SE e) { return 1600 + (int)e; }
+        inline constexpr int operator+(SE e) { return 1700 + (int)e; }
+        inline constexpr int operator!(SE e) { return 1800 + (int)e; }
+        inline constexpr int operator~(UE e) { return 2000 + (int)e; }
+        inline constexpr int operator-(UE e) { return 2100 + (int)e; }
+        inline constexpr int operator+(UE e) { return 2200 + (int)e; }
+        inline constexpr int operator!(UE e) { return 2300 + (int)e; }
+        struct UnaryHolder { SE scoped; UE unscoped; };
+        inline SE unarySE() { return SE::a; }
+        enum class UnaryChain : int { first = 5 };
+        inline constexpr UnaryChain operator~(UnaryChain e)
+        { return (UnaryChain)((int)e + 10); }
+        inline int operator+(UnaryChain e, int i) { return 100 + (int)e + i; }
+        enum class GlobalUnary : int { value = 4 };
+        enum OtherUnary : int { value2 = 5 };
+    }
+    namespace enumrelay
+    {
+        enum class GlobalAmbiguous : int { value = 5 };
+        inline int operator+(GlobalAmbiguous, int) { return 11; }
+        namespace EqualConversions
+        {
+            enum class E : int { value = 5 };
+            inline int operator+(E, long) { return 21; }
+            inline int operator+(E, unsigned long) { return 22; }
+        }
+        enum class Deleted : int { value = 5 };
+        inline int operator+(Deleted, int) = delete;
+        enum BuiltinLoses : int { builtinLoses = 5 };
+        inline int operator+(int, BuiltinLoses) { return 207; }
+        enum NoViable : int { noViable = 5 };
+        inline int operator+(NoViable, const char*) { return 99; }
     }
 }
 
+inline int operator+(cppi_scope::enumrelay::GlobalAmbiguous, int) { return 12; }
+
 // A global-namespace operator on a namespaced enum: found by ordinary lookup, not ADL.
 inline int operator%(cppi_scope::eop::SE e, int i) { return 700 + (int)e + i; }
+inline constexpr int operator+(cppi_scope::eop::GlobalUnary e) { return 4000 + (int)e; }
+namespace cppi_scope::unrelated
+{
+    inline constexpr int operator~(eop::OtherUnary e) { return 9000 + (int)e; }
+}

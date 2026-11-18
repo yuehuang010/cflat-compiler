@@ -228,10 +228,19 @@ struct NM
     int v;
     NM() : v(0) { ++ctors; ++live; }
     explicit NM(int x) : v(x) { ++ctors; ++live; }
+    NM(const NM& o) : v(o.v) { ++copies; ++live; }
     NM(NM&&) = delete;
     ~NM() { --live; ++dtors; }
 };
 inline NM mkNM(int x) { return NM(x); }
+struct MO
+{
+    int v;
+    explicit MO(int x) : v(x) { ++ctors; ++live; }
+    MO(const MO&) = delete;
+    MO(MO&&) = delete;
+    ~MO() { --live; ++dtors; }
+};
 struct ConvU { int v; explicit ConvU(int x) : v(x) {} };
 struct ConvV
 {
@@ -289,4 +298,19 @@ inline void neShow(int row, int v)
     std::printf("row %d v=%d ctors=%d copies=%d dtors=%d live=%d allocs=%d frees=%d\n", row, v,
         ctors, copies, dtors, live, allocs, frees);
 }
+}
+// Declnest collision (leg 4025): a class and free functions of the same spelling. `X(X(4))` calls
+// the function X(int), which returns an lvalue, so the outer copy constructor must still run.
+namespace cppnecol {
+inline int copies = 0;
+inline void reset() noexcept { copies = 0; }
+inline int nCopies() noexcept { return copies; }
+struct X
+{
+    int v;
+    explicit X(int x) : v(x) {}
+    X(const X& x) : v(x.v) { ++copies; }
+};
+inline struct X& X(int n) { static struct X x(n); return x; }
+inline struct X& X(const struct X& x) { return X(x.v); }
 }

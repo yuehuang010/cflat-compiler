@@ -11987,7 +11987,7 @@ public:
                              const std::vector<NamedVariable>* extraArgVars = nullptr,
                              bool assignmentOperator = false,
                              llvm::Value* assignmentResultLiveFlag = nullptr);
-    void RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+    bool RejectLiteralZeroCxxConstructorFunctionSlotArgs(
         const std::string& typeName, const std::vector<NamedVariable>& args,
         const std::vector<llvm::Value*>& values) const;
     /*
@@ -13067,6 +13067,7 @@ public:
         // Element cv for a direct array-reference binding; kept separate from `cv` so it ranks
         // against another array reference without changing its existing comparison to decay paths.
         int arrayReferenceCv = -1;
+        bool arrayReferenceBinding = false;
         std::string toClass;
         int objectRef = 0;
         bool objectIsRvalue = false;

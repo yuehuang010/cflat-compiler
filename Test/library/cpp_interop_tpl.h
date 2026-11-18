@@ -2459,6 +2459,30 @@ namespace cppt_lo
 // rvalue, so an overload that can take one (`const U&`, a non-template sibling) wins.
 namespace cpptrr
 {
+    inline int conditional_pointer_tag(const char* p)
+    { return 10 + ((unsigned char)p[0] % 10); }
+    inline int conditional_pointer_tag(char* p)
+    { return 30 + ((unsigned char)p[0] % 10); }
+    template <class P> int conditional_byval(P p) { return conditional_pointer_tag(p); }
+    template <class P> int conditional_constref(const P& p)
+    {
+        if constexpr (std::is_array_v<P>) return 50 + ((unsigned char)p[0] % 10);
+        else return conditional_pointer_tag(p);
+    }
+    template <class P> int conditional_rref(P&& p)
+    {
+        if constexpr (std::is_lvalue_reference_v<P>
+            && std::is_array_v<std::remove_reference_t<P>>)
+            return 60 + ((unsigned char)p[0] % 10);
+        else if constexpr (std::is_lvalue_reference_v<P>)
+            return 80 + conditional_pointer_tag(p);
+        else return conditional_pointer_tag(p);
+    }
+    template <class U> int conditional_lref(U& p)
+    {
+        if constexpr (std::is_array_v<U>) return 70 + ((unsigned char)p[0] % 10);
+        else return conditional_pointer_tag(p);
+    }
     template <class U> int bump(U& x) { x = x + 1; return (int)x; }
     template <class U> int bumpc(const U& x) { return (int)x + 1000; }
     template <class U> int fwd(U&& x) { return (int)x + 2000; }

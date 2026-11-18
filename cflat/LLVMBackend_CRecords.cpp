@@ -6013,8 +6013,11 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 // referent const of `T&` / `T&&` is (`f(R&&)` and `f(const R&&)` both rank).
                 const bool constReferent = t.rfind("const ", 0) == 0;
                 if (constReferent) t = t.substr(6);
+                // `E (&)[N]` keeps its element const in the spelling (no trailing `&` to strip),
+                // so `const E (&)[N]` and `E (&)[N]` would share one key without this tag.
                 if (constReferent && (refKind == CxxReferenceKind::Lvalue
-                                      || refKind == CxxReferenceKind::Rvalue))
+                                      || refKind == CxxReferenceKind::Rvalue
+                                      || IsCxxArrayReferenceSpelling(m.paramTypes[p])))
                     t += "|const-referent";
                 // CFlat drops pointee cv from its surface type, but C++ distinguishes `T*`
                 // from `const T*` overloads. Keep both in the candidate set for C++ ranking.

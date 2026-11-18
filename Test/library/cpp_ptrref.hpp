@@ -59,6 +59,137 @@ struct CvArrayCtor {
     CvArrayCtor(int (&)[3]) : r(1) {}
     CvArrayCtor(const int (&)[3]) : r(2) {}
 };
+inline int farr_mut1(int (&)[3]) { return 11; }
+inline int farr_const1(const int (&)[3]) { return 12; }
+inline int farr_both1(int (&)[3]) { return 13; }
+inline int farr_both1(const int (&)[3]) { return 14; }
+inline int farr_mut2(int (&)[2][3]) { return 21; }
+inline int farr_const2(const int (&)[2][3]) { return 22; }
+inline int farr_both2(int (&)[2][3]) { return 23; }
+inline int farr_both2(const int (&)[2][3]) { return 24; }
+inline int farr_mix(const int (&)[2]) { return 1; }
+inline int farr_mix(int) { return 2; }
+struct ArrayMember {
+    int farr_mut1(int (&)[3]) { return 31; }
+    int farr_const1(const int (&)[3]) { return 32; }
+    int farr_both1(int (&)[3]) { return 33; }
+    int farr_both1(const int (&)[3]) { return 34; }
+    int farr_mut2(int (&)[2][3]) { return 41; }
+    int farr_const2(const int (&)[2][3]) { return 42; }
+    int farr_both2(int (&)[2][3]) { return 43; }
+    int farr_both2(const int (&)[2][3]) { return 44; }
+};
+struct ArraySubscriptMember {
+    int operator[](int (&)[3]) { return 31; }
+    int operator[](const int (&)[3]) { return 32; }
+};
+struct ArraySubscriptPointerMember { int operator[](const int* p) { return p[2] + 100; } };
+struct ArraySubscriptMutablePointerMember { int operator[](int* p) { p[0] = 9; return p[1] + 200; } };
+struct ArraySubscriptGridMember {
+    int operator[](int (&)[2][3]) { return 41; }
+    int operator[](const int (&)[2][3]) { return 42; }
+};
+struct ArraySubscriptRowPointerMember { int operator[](int (*p)[3]) { return 50 + p[1][2]; } };
+struct ArraySubscriptExtentMember {
+    int operator[](const int (&)[4]) { return 61; }
+    int operator[](const int*) { return 62; }
+};
+struct ArraySubscriptRowMember {
+    int operator[](const int (&a)[3]) { return a[0] * 100 + a[1] * 10 + a[2]; }
+};
+struct ArraySubscriptRowWriteMember {
+    int operator[](int (&a)[3]) { a[2] = 7; return a[0] * 100 + a[1] * 10 + a[2]; }
+};
+struct ArraySubscriptBoolMember { int operator[](bool) { return 84; } };
+struct ArrayScalarSubscriptMember { int operator[](long) { return 81; } };
+enum ArraySubscriptElem { ArraySubscriptElemA = 1, ArraySubscriptElemB = 2, ArraySubscriptElemC = 3 };
+struct ArraySubscriptEnumPointerMember {
+    int operator[](const ArraySubscriptElem* p) { return 100 + (int)p[2]; }
+};
+struct ArraySubscriptEnumRowMember {
+    int operator[](const ArraySubscriptElem (*p)[3]) { return 300 + (int)p[1][2]; }
+};
+enum class ArraySubscriptScopedElem { A = 1, B = 2, C = 3 };
+enum class ArraySubscriptSmallElem : unsigned char { A = 1, B = 2, C = 3 };
+struct ArraySubscriptEnumCvMember {
+    int operator[](ArraySubscriptElem (&)[3]) { return 31; }
+    int operator[](const ArraySubscriptElem (&)[3]) { return 32; }
+    int operator[](ArraySubscriptScopedElem (&)[3]) { return 33; }
+    int operator[](const ArraySubscriptScopedElem (&)[3]) { return 34; }
+    int operator[](ArraySubscriptSmallElem (&)[3]) { return 35; }
+    int operator[](const ArraySubscriptSmallElem (&)[3]) { return 36; }
+    int array_subscript_enum_cv_member(ArraySubscriptElem (&)[3]) { return 41; }
+    int array_subscript_enum_cv_member(const ArraySubscriptElem (&)[3]) { return 42; }
+    int array_subscript_enum_cv_member(ArraySubscriptScopedElem (&)[3]) { return 43; }
+    int array_subscript_enum_cv_member(const ArraySubscriptScopedElem (&)[3]) { return 44; }
+    int array_subscript_enum_cv_member(ArraySubscriptSmallElem (&)[3]) { return 45; }
+    int array_subscript_enum_cv_member(const ArraySubscriptSmallElem (&)[3]) { return 46; }
+};
+inline int array_subscript_enum_cv(ArraySubscriptElem (&)[3]) { return 51; }
+inline int array_subscript_enum_cv(const ArraySubscriptElem (&)[3]) { return 52; }
+inline int array_subscript_enum_cv(ArraySubscriptScopedElem (&)[3]) { return 53; }
+inline int array_subscript_enum_cv(const ArraySubscriptScopedElem (&)[3]) { return 54; }
+inline int array_subscript_enum_cv(ArraySubscriptSmallElem (&)[3]) { return 55; }
+inline int array_subscript_enum_cv(const ArraySubscriptSmallElem (&)[3]) { return 56; }
+struct ArraySubscriptEnumOnlyMutable {
+    int operator[](ArraySubscriptElem (&)[3]) { return 61; }
+    int operator[](ArraySubscriptScopedElem (&)[3]) { return 61; }
+    int operator[](ArraySubscriptSmallElem (&)[3]) { return 61; }
+};
+struct ArraySubscriptEnumOnlyConst {
+    int operator[](const ArraySubscriptElem (&)[3]) { return 62; }
+    int operator[](const ArraySubscriptScopedElem (&)[3]) { return 62; }
+    int operator[](const ArraySubscriptSmallElem (&)[3]) { return 62; }
+};
+struct ArraySubscriptEnumConstPointer {
+    int operator[](const ArraySubscriptElem*) { return 63; }
+    int operator[](const ArraySubscriptScopedElem*) { return 63; }
+    int operator[](const ArraySubscriptSmallElem*) { return 63; }
+};
+struct ArraySubscriptEnumMutablePointer {
+    int operator[](ArraySubscriptElem* p) { p[0] = ArraySubscriptElemC; return 64; }
+    int operator[](ArraySubscriptScopedElem* p) { p[0] = ArraySubscriptScopedElem::C; return 64; }
+    int operator[](ArraySubscriptSmallElem* p) { p[0] = ArraySubscriptSmallElem::C; return 64; }
+};
+struct ArraySubscriptEnumLong { int operator[](long) { return 65; } };
+struct ArraySubscriptEnumByValue {
+    int operator[](ArraySubscriptElem) { return 66; }
+    int operator[](ArraySubscriptScopedElem) { return 66; }
+    int operator[](ArraySubscriptSmallElem) { return 66; }
+};
+struct ArrayScalarPairSubscriptMember {
+    int operator[](long) { return 1; }
+    int operator[](double) { return 2; }
+};
+struct ArrayConversion { ArrayConversion(const int*) {} };
+inline int array_conversion_pick(ArrayConversion) { return 61; }
+inline int array_conversion_pick(const int (&)[2]) { return 60; }
+struct ArrayCtorMut1 {
+    int r;
+    ArrayCtorMut1(int (&)[3]) : r(51) {}
+};
+struct ArrayCtorConst1 {
+    int r;
+    ArrayCtorConst1(const int (&)[3]) : r(52) {}
+};
+struct ArrayCtorBoth1 {
+    int r;
+    ArrayCtorBoth1(int (&)[3]) : r(53) {}
+    ArrayCtorBoth1(const int (&)[3]) : r(54) {}
+};
+struct ArrayCtorMut2 {
+    int r;
+    ArrayCtorMut2(int (&)[2][3]) : r(61) {}
+};
+struct ArrayCtorConst2 {
+    int r;
+    ArrayCtorConst2(const int (&)[2][3]) : r(62) {}
+};
+struct ArrayCtorBoth2 {
+    int r;
+    ArrayCtorBoth2(int (&)[2][3]) : r(63) {}
+    ArrayCtorBoth2(const int (&)[2][3]) : r(64) {}
+};
 // A literal at a template `const char *&&` that keeps its address: the caller's slot, as clang.
 __attribute__((noinline)) inline int scribble() { volatile char b[2048]; for (int i = 0; i < 2048; ++i) b[i] = 0x5a; return b[0]; }
 __attribute__((noinline)) inline int consume(const char* const* p, int) { return (int)std::strlen(*p); }

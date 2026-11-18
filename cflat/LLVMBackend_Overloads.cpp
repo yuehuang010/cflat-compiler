@@ -639,6 +639,28 @@ static std::optional<uint64_t> FixedCxxArrayReferenceExtent(std::string_view spe
     return extent;
 }
 
+static std::optional<std::vector<uint64_t>> FixedCxxArrayReferenceDimensions(
+    std::string_view spelling)
+{
+    const size_t close = spelling.find(")[");
+    if (close == std::string_view::npos) return std::nullopt;
+    std::vector<uint64_t> dimensions;
+    for (size_t at = close + 1; at < spelling.size(); )
+    {
+        if (spelling[at] != '[') return std::nullopt;
+        const size_t end = spelling.find(']', at + 1);
+        if (end == std::string_view::npos || end == at + 1) return std::nullopt;
+        uint64_t extent = 0;
+        const auto [parsed, error] = std::from_chars(spelling.data() + at + 1,
+                                                     spelling.data() + end, extent);
+        if (error != std::errc{} || parsed != spelling.data() + end) return std::nullopt;
+        dimensions.push_back(extent);
+        at = end + 1;
+    }
+    return dimensions.empty() ? std::nullopt
+                              : std::optional<std::vector<uint64_t>>(std::move(dimensions));
+}
+
 /*
  * A string literal at `const char (&)[N]` beside a reference of another shape (`const char *const &`):
  * identity vs array-to-pointer, an lvalue transformation [over.ics.rank] 3.2.1 ignores, so the two
@@ -2244,46 +2266,80 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
              * decays to a pointer prvalue bound through a temporary, ranked like the by-value
              * `const E *` (array-to-pointer, then qualification), so the two tie as in clang.
              */
-            if (candidate.IsCxx && !(candidate.IsMethod && i == 0) && IsCxxFixedArrayArgument(arg)
-                && !arg.TypeAndValue.IsArrayView && !arg.TypeAndValue.Pointer
-                && arg.TypeAndValue.ConstInnerDimensions.empty())
+            const bool carrierHasArrayExtent = arg.TypeAndValue.ConstArraySize != 0
+                || !arg.TypeAndValue.ConstInnerDimensions.empty()
+                || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType);
+            const TypeAndValue& arraySourceType = arg.HasOriginalArgumentType && !carrierHasArrayExtent
+                ? arg.OriginalArgumentType : arg.TypeAndValue;
+            const bool fixedArraySource = !arraySourceType.Pointer && !arraySourceType.IsArrayView
+                && (arraySourceType.ConstArraySize != 0
+                    || !arraySourceType.ConstInnerDimensions.empty()
+                    || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType));
+            const std::string arraySourceEnumName = fixedArraySource
+                ? ResolveEnumTypeName(arraySourceType.TypeName.empty()
+                    ? arg.InferSourceTypeName : arraySourceType.TypeName)
+                : std::string();
+            const bool fixedEnumArraySource = fixedArraySource && !arraySourceEnumName.empty()
+                && arraySourceType.ConstInnerDimensions.empty();
+            // A view has no fixed extent: like clang's pointer argument, it binds no `E (&)[N]`.
+            if (candidate.IsCxx && !(candidate.IsMethod && i == 0)
+                && (arg.TypeAndValue.IsArrayView || arraySourceType.IsArrayView)
+                && CxxArrayReferenceSpelling(candidate, i))
+            {
+                out.rank = kCxxNonViableRank;
+                out.arrayReferenceBinding = true;
+                continue;
+            }
+            if (candidate.IsCxx && !(candidate.IsMethod && i == 0) && fixedArraySource)
             {
                 const std::string sourceElement = CanonicalPrimitiveTypeName(
-                    !arg.TypeAndValue.TypeName.empty() ? arg.TypeAndValue.TypeName : arg.InferSourceTypeName);
-                const uint64_t sourceExtent = arg.TypeAndValue.ConstArraySize != 0
-                    ? arg.TypeAndValue.ConstArraySize
-                    : (llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType)
-                        ? llvm::cast<llvm::ArrayType>(arg.BaseType)->getNumElements() : 0);
+                    !arraySourceType.TypeName.empty() ? arraySourceType.TypeName : arg.InferSourceTypeName);
+                std::vector<uint64_t> sourceDimensions;
+                if (arraySourceType.ConstArraySize != 0)
+                {
+                    sourceDimensions.push_back(arraySourceType.ConstArraySize);
+                    sourceDimensions.insert(sourceDimensions.end(),
+                        arraySourceType.ConstInnerDimensions.begin(),
+                        arraySourceType.ConstInnerDimensions.end());
+                }
+                else if (!arg.HasOriginalArgumentType)
+                    for (llvm::Type* arrayType = arg.BaseType;
+                         llvm::isa_and_nonnull<llvm::ArrayType>(arrayType); )
+                    {
+                        auto* fixedArray = llvm::cast<llvm::ArrayType>(arrayType);
+                        sourceDimensions.push_back(fixedArray->getNumElements());
+                        arrayType = fixedArray->getElementType();
+                    }
                 const std::string spelled = CxxReferenceParameterSpelling(candidate, i);
-                std::string element;
-                std::string extentText;
-                if (CxxArrayReferenceSpelling(candidate, i)
-                    && CxxArrayReferenceParameter(spelled, element, extentText)
-                    && IsPrimitiveTypeName(sourceElement) && sourceExtent != 0)
+                const size_t declarator = spelled.find("(&");
+                if (CxxArrayReferenceSpelling(candidate, i) && declarator != std::string::npos
+                    && !sourceDimensions.empty()
+                    && (IsPrimitiveTypeName(sourceElement) || !arraySourceEnumName.empty()))
                 {
                     TypeAndValue mappedElement;
-                    const auto extent = FixedCxxArrayReferenceExtent(spelled);
-                    if (extent && MapCTypeToTypeAndValue(element, mappedElement, true)
-                        && !mappedElement.Pointer && IsPrimitiveTypeName(mappedElement.TypeName))
+                    const std::string element = spelled.substr(0, declarator);
+                    const auto dimensions = FixedCxxArrayReferenceDimensions(spelled);
+                    if (dimensions && MapCTypeToTypeAndValue(element, mappedElement, true)
+                        && !mappedElement.Pointer)
                     {
-                        const std::string declaredElement = spelled.substr(0, spelled.find("(&"));
-                        const int sourceElementCv = (arg.TypeAndValue.PointeeConstBit() ? 1 : 0)
-                            | (arg.TypeAndValue.IsCxxPointeeVolatile ? 2 : 0);
-                        int targetElementCv = 0;
-                        if (declaredElement.starts_with("const ")
-                            || declaredElement.find(" const") != std::string::npos)
-                            targetElementCv |= 1;
-                        if (declaredElement.starts_with("volatile ")
-                            || declaredElement.find(" volatile") != std::string::npos)
-                            targetElementCv |= 2;
-                        const bool binds = CanonicalPrimitiveTypeName(mappedElement.TypeName) == sourceElement
+                        const std::string mappedEnumName = ResolveEnumTypeName(mappedElement.TypeName);
+                        const bool samePrimitive = IsPrimitiveTypeName(sourceElement)
+                            && IsPrimitiveTypeName(mappedElement.TypeName)
+                            && CanonicalPrimitiveTypeName(mappedElement.TypeName) == sourceElement;
+                        const bool sameEnum = !arraySourceEnumName.empty()
+                            && arraySourceEnumName == mappedEnumName;
+                        const int sourceElementCv = (arraySourceType.PointeeConstBit() ? 1 : 0)
+                            | (arraySourceType.IsCxxPointeeVolatile ? 2 : 0);
+                        const int targetElementCv = spellingCv(element);
+                        const bool binds = (samePrimitive || sameEnum)
                             && (sourceElementCv & targetElementCv) == sourceElementCv
-                            && *extent == sourceExtent && spelled.find("(&&)[") == std::string::npos;
+                            && *dimensions == sourceDimensions && spelled.find("(&&)[") == std::string::npos;
                         out.rank = binds ? 0 : kCxxNonViableRank;
                         out.cxxViable = binds;
                         out.cvBase = sourceElement;
                         out.cv = 0;
                         out.arrayReferenceCv = targetElementCv;
+                        out.arrayReferenceBinding = true;
                         out.from = sourceElement;
                         continue;
                     }
@@ -3648,6 +3704,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             std::vector<int> integerCosts;
             bool enumToIntegerConversion = false;
             integerCosts.reserve(arguments.size());
+            std::optional<std::vector<CxxConversionRank>> enumArrayRanks;
 
             auto candidateParamItr = candidate.Parameters.begin();
             for (const auto& arg : arguments)
@@ -4738,6 +4795,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                 const auto& originalArgType = arg.HasOriginalArgumentType
                     ? arg.OriginalArgumentType : arg.TypeAndValue;
+                const bool fixedArrayArgumentType = !originalArgType.Pointer
+                    && !originalArgType.IsArrayView && originalArgType.ConstInnerDimensions.empty()
+                    && (originalArgType.ConstArraySize != 0
+                        || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType));
+                const std::string originalEnumName = fixedArrayArgumentType
+                    ? ResolveEnumTypeName(originalArgType.TypeName.empty()
+                        ? arg.InferSourceTypeName : originalArgType.TypeName)
+                    : std::string();
+                const bool fixedEnumArrayArgument = fixedArrayArgumentType && !originalEnumName.empty();
                 // T85: the same predicate refuses C++ candidates; a lone candidate is refused too.
                 if (IsUnrelatedPointeeArgument(arg, candidate, (size_t)std::distance(
                         candidate.Parameters.begin(), candidateParamItr)))
@@ -5075,6 +5141,23 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             CxxReferenceParameterSpelling(candidate, paramIndex))))
                     standardCosts.back() = kIntegerConversionCost;
 
+                // Preserve the original enum array for C++ ranking after normal matching has
+                // lowered it to a pointer, including the fixed-extent and element-cv checks.
+                const bool hasEnumArraySource = fixedEnumArrayArgument
+                    && (IsCxxFixedArrayArgument(arg)
+                        || (arg.HasOriginalArgumentType
+                            && CxxArrayReferenceSpelling(candidate, paramIndex)));
+                if (candidate.IsCxx && candidateParamItr != candidate.Parameters.end()
+                    && hasEnumArraySource)
+                {
+                    if (!enumArrayRanks)
+                        enumArrayRanks = RankCxxConversionSequences(arguments, candidate);
+                    if (paramIndex < enumArrayRanks->size())
+                    {
+                        result = (*enumArrayRanks)[paramIndex].cxxViable
+                            ? (*enumArrayRanks)[paramIndex].rank : -1;
+                    }
+                }
                 if (result != 0)
                 {
                     perfectMatch = false;
@@ -5377,6 +5460,22 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                                 || rank.implicitObjectCvNonViable;
                         });
             };
+            auto hasNonViableArrayReferenceBinding = [&](const Ranked* r) {
+                const auto rankIt = cxxRanks.find(r->pair);
+                return rankIt != cxxRanks.end()
+                    && std::any_of(rankIt->second.begin(), rankIt->second.end(),
+                        [](const CxxConversionRank& rank) {
+                            return rank.arrayReferenceBinding && !rank.cxxViable;
+                        });
+            };
+            if (!viable.empty() && std::all_of(viable.begin(), viable.end(),
+                                                hasNonViableArrayReferenceBinding))
+                return Result{};
+            // A mixed set (`ip(const E (&)[2])` + `ip(int)` for `E[3]`): every candidate proven
+            // non-viable and one of them an array reference, so clang refuses too.
+            if (!viable.empty() && std::all_of(viable.begin(), viable.end(), hasKnownNonViableArgument)
+                && std::any_of(viable.begin(), viable.end(), hasNonViableArrayReferenceBinding))
+                return Result{};
             // A C++ candidate with one proven non-viable argument is not in the viable set. Keep
             // the legacy fallback only when every admitted candidate is proven non-viable.
             if (std::any_of(viable.begin(), viable.end(), [&](const Ranked* r) {
@@ -7695,6 +7794,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 ? cxxArguments : arguments;
             if (usesImplicitReceiver(candidate))
                 candidateArguments.insert(candidateArguments.begin(), *implicitReceiver);
+            if (candidate.IsCxx)
+                for (size_t i = 0; i < candidateArguments.size()
+                     && i < candidate.Parameters.size(); ++i)
+                    if (IsCxxFixedArrayArgument(candidateArguments[i])
+                        && CxxArrayReferenceSpelling(candidate, i))
+                    {
+                        candidateArguments[i].OriginalArgumentType =
+                            candidateArguments[i].TypeAndValue;
+                        candidateArguments[i].HasOriginalArgumentType = true;
+                    }
             if (receiverHasCflatArrowMember
                 && hasImplicitIntegerPointerArg(candidate, candidateArguments))
                 continue;

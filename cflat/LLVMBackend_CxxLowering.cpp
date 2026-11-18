@@ -87,19 +87,28 @@ llvm::Value* LLVMBackend::MaterializeCxxDefaultArgument(const cflat_cinterop::Ra
         return nullptr;
 }
 
-void LLVMBackend::RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+bool LLVMBackend::RejectLiteralZeroCxxConstructorFunctionSlotArgs(
         const std::string& typeName, const std::vector<NamedVariable>& args,
         const std::vector<llvm::Value*>& values) const
 {
         const CxxClassInfo* info = nullptr;
+        bool constructorsChecked = false;
         for (size_t i = 0; i < args.size() && i < values.size(); ++i)
         {
             if (args[i].LiteralIdentity.empty() && !args[i].IsCxxMacroGlobal) continue;
             llvm::Value* source = args[i].Primary != nullptr ? args[i].Primary : values[i];
             if (!IsLiteralZeroIntegerToPointer(source, args[i])) continue;
             // A constructor template may take the zero (clang deduces T = int), so its set stays with clang.
-            if (info == nullptr) info = GetCxxClassInfoWithConstructors(typeName);
-            if (info == nullptr || info->hasCtorTemplate) return;
+            if (!constructorsChecked)
+            {
+                // Constructor projection can be partial (e.g. only the one-arg std::function
+                // overload was requested); zero needs the complete candidate set for this arity.
+                const_cast<LLVMBackend*>(this)->TryBindRefusedCxxMember(
+                    typeName, "__ctor", args.size());
+                info = GetCxxClassInfoWithConstructors(typeName);
+                constructorsChecked = true;
+            }
+            if (info == nullptr || info->hasCtorTemplate) return false;
             bool hasApplicableCtor = false;
             bool everyCandidateUsesFunctionSlot = true;
             for (const auto& ctor : info->constructors)
@@ -124,8 +133,12 @@ void LLVMBackend::RejectLiteralZeroCxxConstructorFunctionSlotArgs(
                 }
             }
             if (hasApplicableCtor && everyCandidateUsesFunctionSlot)
+            {
                 RejectLiteralZeroFunctionSlot(source, args[i]);
+                return true;
+            }
         }
+        return false;
 }
 
 bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
@@ -4047,6 +4060,10 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         if (source.Primary == nullptr) return CxxConvertingCtorResult::NotApplicable;
         // A literal reaches here with only its value; type it the way a call argument is typed.
         if (source.BaseType == nullptr) source.BaseType = source.Primary->getType();
+        if (IsCxxRecord(targetType)
+            && (!source.LiteralIdentity.empty() || source.IsCxxMacroGlobal))
+            RejectLiteralZeroCxxConstructorFunctionSlotArgs(
+                targetType, { source }, { source.Primary });
         // Direct-initialization (`T(x)`, a cast): explicit constructors are candidates and clang
         // ranks them, so the wrapper is spelled as the constructor call (literals as const char*).
         if (directInit)

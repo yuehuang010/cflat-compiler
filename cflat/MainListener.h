@@ -3897,6 +3897,11 @@ private:
     CFlatParser::ConditionalExpressionContext* newCxxTernaryElisionCandidate_ = nullptr;
     llvm::Value* newCxxTernaryElisionDest_ = nullptr;
     std::string newCxxTernaryElisionType_;
+    CFlatParser::PostfixExpressionContext* newCxxFunctionalElisionCandidate_ = nullptr;
+    bool newCxxFunctionalElisionCandidateNested_ = false;
+    llvm::Value* newCxxFunctionalElisionDest_ = nullptr;
+    std::string newCxxFunctionalElisionType_;
+    bool newCxxFunctionalElisionConsumed_ = false;
     CFlatParser::AssignmentExpressionContext* cxxDirectConstructionArgument_ = nullptr;
     LLVMBackend::TypeAndValue cxxDirectConstructionTargetType_;
     bool cxxDirectConstructionCanDefer_ = true;
@@ -6730,6 +6735,8 @@ public:
     // If lvalue is a struct type with a user-defined operator, dispatch to it.
     bool ReportMissingUnaryStructOperator(antlr4::ParserRuleContext* ctx, llvm::Value* operand,
                                           const std::string& op);
+    static std::string CxxImportedEnumKey(LLVMBackend* compiler, const std::string& name,
+                                          int pointerDepth, llvm::Value* value);
     // Returns the result Value*, or nullptr to fall back to built-in CreateOperation.
     // Returns a non-null value if a user-defined operator overload was found and called,
     // nullptr if the operand type has no matching operator (fall back to primitive handling).
@@ -6749,7 +6756,11 @@ public:
         antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage,
         bool operandIsConst = false, bool operandExplicitMove = false,
         bool operandIsConstPrvalue = false, bool operandIsVolatile = false,
-        bool operandIsVolatileLvalue = false, bool operandIsLvalueRefResult = false);
+        bool operandIsVolatileLvalue = false, bool operandIsLvalueRefResult = false,
+        std::string importedEnumKey = {});
+    bool TryImportedEnumPostfixOperator(
+        const LLVMBackend::NamedVariable& operand, llvm::Value* operandStorage,
+        const std::string& op, antlr4::ParserRuleContext* ctx);
 
     // If an operator overload (e.g. operator+) just returned an owned heap string as an
     // unnamed SSA temporary, register it for end-of-full-expression cleanup. This is the
@@ -6864,7 +6875,9 @@ public:
         const LLVMBackend::NamedVariable* lhsSourceNV = nullptr,
         antlr4::ParserRuleContext* rhsOperandRule = nullptr,
         // Bitfield word of a bitfield rhs operand: a non-const reference never binds it.
-        llvm::Value* rhsBitfieldStorage = nullptr);
+        llvm::Value* rhsBitfieldStorage = nullptr,
+        antlr4::ParserRuleContext* enumCompoundRefusalCtx = nullptr,
+        const std::string& enumCompoundOperator = std::string());
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);

@@ -53,6 +53,16 @@ static llvm::Value* CallOperatorWithoutExcluded(
     return result;
 }
 
+std::string MainListener::CxxImportedEnumKey(
+        LLVMBackend* compiler, const std::string& name, int pointerDepth, llvm::Value* value)
+{
+        if (name.empty() || LLVMBackend::IsPrimitiveTypeName(name)
+            || pointerDepth > 0 || (value != nullptr && value->getType()->isPointerTy()))
+            return {};
+        std::string key = compiler->ResolveEnumTypeName(name);
+        return compiler->importedEnumTypes_.count(key) != 0 ? key : std::string();
+}
+
 bool MainListener::CastTypeNameNamesValue(CFlatParser::CastTypeNameContext* typeName) {
         if (typeName == nullptr || typeName->typeQualifier() != nullptr
             || typeName->abstractDeclarator() != nullptr || typeName->typeSpecifier().size() != 1)
@@ -3455,6 +3465,20 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         const bool operandExplicitMove = operandSource != nullptr && operandSource->IsExplicitMove;
         auto* compiler = Compiler(ctx);
 
+        static const std::set<std::string> enumUnaryOperators = { "~", "-", "+", "!" };
+        if (nativeConstantFoldDepth_ == 0 && operandSource != nullptr
+            && enumUnaryOperators.count(op) != 0)
+        {
+            const std::string enumKey = CxxImportedEnumKey(compiler,
+                operandSource->TypeAndValue.TypeName,
+                operandSource->TypeAndValue.Pointer ? 1 : 0, operand);
+            if (!enumKey.empty())
+                if (llvm::Value* overloaded = TryUnaryFreeOperatorOverload(
+                        operand, op, ctx, operandStorage, operandIsConst,
+                        operandExplicitMove, false, false, false, false, enumKey))
+                    return overloaded;
+        }
+
         auto* ty = operand->getType();
         if (!ty->isStructTy()) return nullptr;
         auto* structTy = llvm::cast<llvm::StructType>(ty);
@@ -3937,16 +3961,107 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         }
     }
 
-// Unary `- + ! ~` on an imported C++ class whose operator is a FREE function (or a free function
-// template) in the class's namespace: `W operator-(const W&)`. Mirrors the binary free-operator
-// lookup: bind the namespace's operator lazily, then call the one-parameter candidate. Anything
-// that is not a C++ class, or has no such candidate, answers nullptr and keeps the old fallbacks.
+// Unary `- + ! ~` on imported C++ classes and enums with a FREE operator. Mirrors the binary
+// free-operator lookup: bind a namespace candidate lazily, then call the one-parameter overload.
+// Anything without such a candidate answers nullptr and keeps the old fallbacks.
 llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
         llvm::Value* operand, const std::string& op,
         antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage, bool operandIsConst, bool operandExplicitMove,
         bool operandIsConstPrvalue, bool operandIsVolatile, bool operandIsVolatileLvalue,
-        bool operandIsLvalueRefResult) {
+        bool operandIsLvalueRefResult, std::string importedEnumKey) {
         auto* compiler = Compiler(ctx);
+        if (operand != nullptr && !importedEnumKey.empty()
+            && compiler->importedEnumTypes_.count(importedEnumKey) != 0
+            && operand->getType()->isIntegerTy()
+            && nativeConstantFoldDepth_ == 0)
+        {
+            static const std::set<std::string> enumUnaryOperators = {
+                "~", "-", "+", "!"
+            };
+            if (enumUnaryOperators.count(op) == 0) return nullptr;
+            const std::string opName = "operator" + op;
+            const std::string base = importedEnumKey.substr(0, importedEnumKey.find('$'));
+            const size_t dot = base.rfind('.');
+            const std::string ns = dot == std::string::npos ? std::string() : base.substr(0, dot);
+            auto hasUnboundEnumCandidate = [&](const std::string& sourceName) {
+                auto signatures = compiler->cxxFunctionSignatures_.find(sourceName);
+                if (signatures == compiler->cxxFunctionSignatures_.end()) return false;
+                return std::any_of(signatures->second.begin(), signatures->second.end(),
+                    [&](const LLVMBackend::CSigEntry& signature) {
+                        if (!signature.isCxx || signature.params.size() != 1
+                            || signature.paramSpellings.size() != 1
+                            || compiler->ResolveEnumTypeName(
+                                signature.params[0].TypeName) != importedEnumKey)
+                            return false;
+                        return true;
+                    });
+            };
+            auto hasBoundEnumCandidate = [&](const std::string& tableName,
+                                             const std::string& sourceName) {
+                auto functions = compiler->functionTable.find(tableName);
+                if (functions == compiler->functionTable.end()) return false;
+                return std::any_of(functions->second.begin(), functions->second.end(),
+                    [&](const LLVMBackend::FunctionSymbol& candidate) {
+                        if (!candidate.IsCxx || candidate.IsMethod
+                            || candidate.SourceName != sourceName
+                            || candidate.Parameters.size() != 1
+                            || compiler->ResolveEnumTypeName(
+                                candidate.Parameters[0].TypeName) != importedEnumKey)
+                            return false;
+                        return true;
+                    });
+            };
+            bool candidateFound = false;
+            const std::vector<std::string> namespaces = ns.empty()
+                ? std::vector<std::string>{ std::string() }
+                : std::vector<std::string>{ ns, std::string() };
+            for (const std::string& candidateNamespace : namespaces)
+            {
+                const std::string candidateSource = candidateNamespace.empty()
+                    ? opName : candidateNamespace + "." + opName;
+                if (!hasUnboundEnumCandidate(candidateSource)) continue;
+                compiler->TryBindCxxFunction(candidateSource);
+                const std::string candidateTable = candidateNamespace.empty()
+                    ? "__cxx_free." + opName : candidateSource;
+                if (hasBoundEnumCandidate(candidateTable, candidateSource))
+                    candidateFound = true;
+            }
+            if (!candidateFound) return nullptr;
+
+            const std::string requestName = (ns.empty()
+                ? std::string("__cxx_free") : ns) + "." + opName;
+            LLVMBackend::NamedVariable argument;
+            argument.Primary = operand;
+            argument.Storage = operandStorage;
+            argument.BaseType = operand->getType();
+            argument.TypeAndValue.TypeName = importedEnumKey;
+            argument.TypeAndValue.IsScopedEnum = compiler->IsScopedEnumTypeName(importedEnumKey);
+            argument.TypeAndValue.EnumBacking = compiler->GetEnumBackingType(importedEnumKey);
+            argument.TypeAndValue.SetCxxConstRef(operandIsConst);
+            argument.IsRvalue = operandStorage == nullptr;
+            argument.IsExplicitMove = operandExplicitMove;
+            std::vector<LLVMBackend::NamedVariable> arguments{ argument };
+            std::string registeredName;
+            std::string requestError;
+            if (compiler->RequestCxxFreeFunction(requestName, {}, arguments,
+                    registeredName, requestError, op)
+                && !registeredName.empty())
+            {
+                FlushCallPostfix();
+                const std::string lookupName = ns.empty()
+                    ? "__cxx_free." + opName : requestName;
+                return CallOperatorWithoutExcluded(compiler->functionTable, compiler,
+                    lookupName, registeredName, arguments, {});
+            }
+            if (compiler->LastCxxRequestClangRejected()
+                && !compiler->LastCxxRequestNoViableAtRequest() && !requestError.empty())
+            {
+                LogErrorContext(ctx, requestError.starts_with("clang: ")
+                    ? requestError : "clang: " + requestError);
+                return nullptr;
+            }
+            return nullptr;
+        }
         if (operand == nullptr || !operand->getType()->isStructTy()) return nullptr;
         auto* structTy = llvm::cast<llvm::StructType>(operand->getType());
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
@@ -4236,6 +4351,94 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
             result = CallOperatorWithoutExcluded(compiler->functionTable, compiler, lookupName, lookupName, { arg }, excludedLinkages);
         if (result != nullptr) TrackOwnedStringOperatorResult(compiler, result);
         return result;
+    }
+
+bool MainListener::TryImportedEnumPostfixOperator(
+        const LLVMBackend::NamedVariable& operandSource, llvm::Value* operandStorage,
+        const std::string& op, antlr4::ParserRuleContext* ctx)
+{
+        if (nativeConstantFoldDepth_ != 0 || operandStorage == nullptr
+            || (op != "++" && op != "--"))
+            return false;
+
+        auto* compiler = Compiler(ctx);
+        const std::string enumKey = CxxImportedEnumKey(compiler,
+            operandSource.TypeAndValue.TypeName,
+            operandSource.TypeAndValue.Pointer ? 1 : 0, nullptr);
+        if (enumKey.empty()) return false;
+
+        const std::string opName = "operator" + op;
+        const std::string base = enumKey.substr(0, enumKey.find('$'));
+        const size_t dot = base.rfind('.');
+        const std::string ns = dot == std::string::npos ? std::string() : base.substr(0, dot);
+        const std::vector<std::string> namespaces = ns.empty()
+            ? std::vector<std::string>{ std::string() }
+            : std::vector<std::string>{ ns, std::string() };
+        bool candidateFound = false;
+        for (const std::string& candidateNamespace : namespaces)
+        {
+            const std::string sourceName = candidateNamespace.empty()
+                ? opName : candidateNamespace + "." + opName;
+            auto signatures = compiler->cxxFunctionSignatures_.find(sourceName);
+            if (signatures == compiler->cxxFunctionSignatures_.end()) continue;
+            candidateFound = std::any_of(signatures->second.begin(), signatures->second.end(),
+                [&](const LLVMBackend::CSigEntry& signature) {
+                    return signature.isCxx && signature.params.size() == 1
+                        && signature.params[0].IsAlias && signature.params[0].Pointer
+                        && signature.params[0].PointerDepth == 0
+                        && !signature.params[0].IsRvalueRef
+                        && !signature.params[0].CxxConstRef()
+                        && compiler->ResolveEnumTypeName(signature.params[0].TypeName) == enumKey;
+                });
+            if (candidateFound) break;
+        }
+        if (!candidateFound) return false;
+
+        LLVMBackend::NamedVariable lvalueSource = operandSource;
+        lvalueSource.Primary = nullptr;
+        lvalueSource.Storage = operandStorage;
+        llvm::Value* operand = LoadNamedVariable(lvalueSource);
+        if (operand == nullptr || operand->getType()->isPointerTy())
+            return false;
+
+        LLVMBackend::NamedVariable argument;
+        argument.Primary = operand;
+        argument.Storage = operandStorage;
+        argument.BaseType = operand->getType();
+        argument.TypeAndValue = operandSource.TypeAndValue;
+        argument.TypeAndValue.TypeName = enumKey;
+        argument.TypeAndValue.VariableName.clear();
+        argument.TypeAndValue.Pointer = false;
+        argument.TypeAndValue.ElemPointer = false;
+        argument.TypeAndValue.PointerDepth = 0;
+        argument.TypeAndValue.IsScopedEnum = compiler->IsScopedEnumTypeName(enumKey);
+        argument.TypeAndValue.EnumBacking = compiler->GetEnumBackingType(enumKey);
+        argument.CxxLvalueKind = argument.TypeAndValue.IsAlias
+                && !argument.TypeAndValue.IsRvalueRef ? 2
+            : operandSource.IsRvalue ? 0 : 1;
+        argument.IsRvalue = argument.CxxLvalueKind == 0;
+        argument.IsExplicitMove = operandSource.IsExplicitMove;
+
+        std::vector<LLVMBackend::NamedVariable> arguments{ argument };
+
+        const std::string requestName = (ns.empty() ? "__cxx_free" : ns) + "." + opName;
+        std::string registeredName;
+        std::string requestError;
+        if (compiler->RequestCxxFreeFunction(requestName, {}, arguments,
+                registeredName, requestError, op)
+            && !registeredName.empty())
+        {
+            FlushCallPostfix();
+            const std::string lookupName = ns.empty() ? "__cxx_free." + opName : requestName;
+            CallOperatorWithoutExcluded(compiler->functionTable, compiler,
+                lookupName, registeredName, arguments, {});
+            return true;
+        }
+        if (requestError.empty())
+            requestError = std::format("C++ prefix operator '{}' could not be bound", opName);
+        LogErrorContext(ctx, requestError.starts_with("clang: ")
+            ? requestError : "clang: " + requestError);
+        return true;
     }
 
 // Built-in unary `- + ~ !` on an imported C++ class reaches its operand through ONE implicit
@@ -4547,7 +4750,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         bool lhsCxxPointeeConst, int lhsObjectCv, int rhsObjectCv, bool lhsIsAlias,
         bool refuseConstWriteOnNoViable,
         const LLVMBackend::NamedVariable* lhsSourceNV,
-        antlr4::ParserRuleContext* rhsOperandRule, llvm::Value* rhsBitfieldStorage) {
+        antlr4::ParserRuleContext* rhsOperandRule, llvm::Value* rhsBitfieldStorage,
+        antlr4::ParserRuleContext* enumCompoundRefusalCtx,
+        const std::string& enumCompoundOperator) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
         if (op == "<=>" && lvalue->getType()->isStructTy()
@@ -5482,11 +5687,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (enumOperators.count(op) == 0) return nullptr;
                 auto cxxEnumKey = [&](const std::string& name, int pointerDepth,
                                       llvm::Value* value) {
-                    if (name.empty() || LLVMBackend::IsPrimitiveTypeName(name)
-                        || pointerDepth > 0 || (value != nullptr && value->getType()->isPointerTy()))
-                        return std::string();
-                    std::string key = compiler->ResolveEnumTypeName(name);
-                    return compiler->importedEnumTypes_.count(key) != 0 ? key : std::string();
+                    return CxxImportedEnumKey(compiler, name, pointerDepth, value);
                 };
                 const std::string leftEnum = cxxEnumKey(lhsTypeName, lhsPointerDepth, lvalue);
                 const std::string rightEnum = cxxEnumKey(rhsTypeName, rhsPointerDepth, rvalue);
@@ -5539,8 +5740,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 // Unqualified `p0 OP p1` from the first enum's namespace: clang's own lookup.
                 enumOperandRequest = true;
                 const std::string& requestNamespace = enumNamespaces.front();
-                return callOperatorTemplate((requestNamespace.empty()
+                llvm::Value* enumResult = callOperatorTemplate((requestNamespace.empty()
                     ? std::string("__cxx_free") : requestNamespace) + "." + opName, true);
+                if (enumResult != nullptr) return enumResult;
+                if (!adlClangRefusal.empty() && !enumCompoundOperator.empty())
+                    LogErrorContext(enumCompoundRefusalCtx != nullptr ? enumCompoundRefusalCtx : ctx,
+                        std::format("in compound assignment '{}': {}", enumCompoundOperator,
+                            adlClangRefusal));
+                else if (!adlClangRefusal.empty())
+                    LogErrorContext(ctx, adlClangRefusal);
+                return nullptr;
             }
 
             /*

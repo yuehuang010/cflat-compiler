@@ -1,0 +1,14 @@
+// A mixed-CV char pointer conditional is a prvalue and cannot bind to C++ U&.
+import cpp "cpp_interop_tpl.h";
+
+extern int main()
+{
+    char[4] mutableBuffer = "m";
+    char* mutablePointer = mutableBuffer;
+    const char* constPointer = mutableBuffer;
+    bool chooseMutable = true;
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") {
+        cpptrr.conditional_lref(chooseMutable ? mutablePointer : constPointer);
+    }
+    return 0;
+}

@@ -74,3 +74,11 @@ struct NullFunctionMultiCtorProbe {
     ~NullFunctionMultiCtorProbe() { ++null_ctor_died; }
 };
 }
+
+// FNZERO: the class's only converting ctor takes std::function; literal 0 is refused at it.
+namespace fnzero {
+struct G {
+    int value;
+    G(std::function<int(int)> f) : value(f ? f(1) : 0) {}
+};
+}

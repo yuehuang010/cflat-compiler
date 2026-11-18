@@ -1,0 +1,65 @@
+import cpp "cpp_interop_scoped_enum.h";
+
+expect_error("clang: use of overloaded operator '+' is ambiguous") {
+    int cppEnumAmbiguous()
+    {
+        cppi_scope.enumrelay.GlobalAmbiguous e = cppi_scope.enumrelay.GlobalAmbiguous.value;
+        return e + 1;
+    }
+}
+
+expect_error("in compound assignment '+=': clang: use of overloaded operator '+' is ambiguous") {
+    int cppEnumAmbiguousCompoundLocal()
+    {
+        cppi_scope.enumrelay.GlobalAmbiguous e = default;
+        e += 1;
+        return 0;
+    }
+}
+
+expect_error("in compound assignment '+=': clang: use of overloaded operator '+' is ambiguous") {
+    struct EnumAmbiguousCompoundField { cppi_scope.enumrelay.GlobalAmbiguous value = default; };
+    int cppEnumAmbiguousCompoundField()
+    {
+        EnumAmbiguousCompoundField holder = default;
+        holder.value += 1;
+        return 0;
+    }
+}
+
+expect_error("in compound assignment '+=': clang: use of overloaded operator '+' is ambiguous") {
+    int cppEnumAmbiguousCompoundArray()
+    {
+        cppi_scope.enumrelay.GlobalAmbiguous[1] values = default;
+        values[0] += 1;
+        return 0;
+    }
+}
+
+expect_error("in compound assignment '+=': clang: overload resolution selected deleted operator '+'") {
+    int cppEnumDeletedCompoundLocal()
+    {
+        cppi_scope.enumrelay.Deleted e = default;
+        e += 1;
+        return 0;
+    }
+}
+
+expect_error("in compound assignment '+=': clang: overload resolution selected deleted operator '+'") {
+    struct EnumDeletedCompoundField { cppi_scope.enumrelay.Deleted value = default; };
+    int cppEnumDeletedCompoundField()
+    {
+        EnumDeletedCompoundField holder = default;
+        holder.value += 1;
+        return 0;
+    }
+}
+
+expect_error("in compound assignment '+=': clang: overload resolution selected deleted operator '+'") {
+    int cppEnumDeletedCompoundArray()
+    {
+        cppi_scope.enumrelay.Deleted[1] values = default;
+        values[0] += 1;
+        return 0;
+    }
+}

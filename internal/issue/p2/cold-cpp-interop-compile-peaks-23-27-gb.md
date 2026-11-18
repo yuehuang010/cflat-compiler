@@ -4,7 +4,7 @@ Summary: one cold compile of Test/test_cpp_interop.cb (empty cache, `--check` or
 on the Mac and 27 GB on Windows. No result is wrong; it is compile memory. test.sh / test.bat run
 it next to other interop tests, so a Windows box pages: the 2026-11-07 buildci on MyCompiler ran
 test_cpp_interop for 34 min (7 min alone). This was first blamed on the request-cache prune
-(p2/cxx-request-cache-prune-scan-doubles-buildci); the controls below rule the cache out.
+(the request-cache prune scan, fixed 2026-11-14); the controls below rule the cache out.
 
 Measured 2026-11-07 (master 9bade396 on Windows, d91b6671 on the Mac):
 

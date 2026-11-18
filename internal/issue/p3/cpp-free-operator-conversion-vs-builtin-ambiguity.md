@@ -1,35 +1,8 @@
 # Imported enum free operator resolution - leftovers
 
-Binary free C++ operators on imported enums now rank against built-in arithmetic as clang does
-(legs 9800-9823 and 9825-9826 in Test/test_cpp_interop.cb, header namespace `cppi_scope::eop` in
-Test/library/cpp_interop_scoped_enum.h). Four cases remain.
-
-## 1. Unary free operators on enums use the built-in
-
-Repro (header already in tree):
-
-```cpp
-// add to cppi_scope::eop in Test/library/cpp_interop_scoped_enum.h
-inline int operator~(SE e) { return 500 + (int)e; }
-inline int operator-(UE e) { return 600 + (int)e; }
-```
-
-```cflat
-import cpp "library/cpp_interop_scoped_enum.h";
-extern int main()
-{
-    int a = ~cppi_scope.eop.SE.a;   // clang: 505
-    int b = -cppi_scope.eop.ua;     // clang: 605
-    return a == 505 && b == 605 ? 0 : 1;
-}
-```
-
-CFlat runs the built-in for both. Root cause: `TryUnaryFreeOperatorOverload`
-(cflat/MainListener_BinaryOperators.cpp) has the same struct-only gate the binary `tryFreeOperator`
-had. Fix direction: pass the operand's resolved imported-enum identity (`ResolveEnumTypeName`,
-checked against `importedEnumTypes_`) into the unary path at each call site, and send a clang
-request only when a free operator whose parameter resolves to that enum exists; skip while
-`nativeConstantFoldDepth_ > 0`.
+Free C++ operators on imported enums (binary, unary `~ - + !`, prefix `++`/`--` bound by CFlat `e++`)
+rank against built-in arithmetic as clang does (legs 9800-9864 in Test/test_cpp_interop.cb, header
+namespace `cppi_scope::eop` in Test/library/cpp_interop_scoped_enum.h). Two cases remain.
 
 ## 2. File-scope int initializer folds the built-in
 
@@ -42,13 +15,6 @@ const int gc = cppi_scope.eop.ua + 1;   // same
 Master is the same. A file-scope initializer is folded natively before the overload path runs.
 Fix direction: either evaluate a file-scope initializer that names an enum operator through the
 call path (dynamic init), or refuse it like clang refuses it in a constant context.
-
-## 3. A clang refusal falls back silently to the built-in
-
-When clang rejects the operator request (for example two equally good enum overloads, ambiguous),
-the enum branch in `tryFreeOperator` falls back to built-in arithmetic with no diagnostic. clang
-reports the ambiguity as an error. Fix direction: relay the clang refusal (prefixed "clang: ", per
-the clang-prefix ruling) instead of falling back, once a candidate naming the enum was found.
 
 ## 4. Enum plus pointer operand overloads
 

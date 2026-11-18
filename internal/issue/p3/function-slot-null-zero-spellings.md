@@ -1,4 +1,4 @@
-# Null spellings into function slots: open residue (typed null joins, C++ ctor brace, literal-0 messages)
+# Null spellings into function slots: open residue (typed null joins, literal-0 messages)
 
 Pre-existing, all same on master (T185 Opus r1 + r2, 2026-10-14). Repros: scratch/repro_keep/t185_rv1/ (a21, r14, a17, a16), scratch/repro_keep/t185_rv2/.
 T311 fixed the C `NULL` macro item (see Test/test_function_ptr.cb testFunctionSlotNullMacro).
@@ -26,10 +26,8 @@ Open, no ruling yet (stays here):
   generic T = function<> parameter (`isNull<function<int(int)>>(0)`, `Box<function<..>>.set(0)`) refused with "no overload
   matches". Refused as ruled; the wording does not name the null-spelling rule. No ruling on the wording.
 
-Open (ctor0fn review 1, 2026-11-01): literal 0 into a C++ ctor std::function slot by DIRECT BRACE (`cppfnptr.FunctionSink v{ 0 };`,
-`rv.G g{0}`) is refused only when an earlier postfix construction of the same class loaded its CFlat constructor list; as the first
-construction it is accepted (the brace path goes straight to RequestCxxDirectBraceConstructor and never populates info->constructors).
-Also pre-existing (master same): `rv.G g = 0;` compiles (clang: no viable conversion); `rv.G{0}` as an expression does not parse.
-Repro shape: a C++ class with a std::function<int(int)> converting constructor (Test/library/cpp_interop_fnptr.h FunctionSink);
-the first statement constructing it is `FunctionSink v{ 0 };`. Second root cause (brace path skips the constructor list), so not in
-the ternary fix.
+Open (ctor0fn review 1, 2026-11-01): `rv.G{0}` as an expression still does not parse; this grammar form remains out of scope. The
+declaration form `rv.G value{0};` and copy-init form `rv.G value = 0;` are covered by the FNZERO fix. The remaining inline repro is:
+```cflat
+extern int main() { rv.G{0}; return 0; }
+```

@@ -2,6 +2,25 @@ import "../library/c_variadic_fnptr.h";
 import cpp "../library/cpp_interop_fnptr.h";
 
 expect_error("integer constant zero is not a null spelling for a function slot") {
+    int fnzeroFunctionSinkFirstBrace() {
+        cppfnptr.FunctionSink value{ 0 };
+        return value.value;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int fnzeroFirstBrace() {
+        fnzero.G value{ 0 };
+        return value.value;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int fnzeroCopyInit() {
+        fnzero.G value = 0;
+        return value.value;
+    }
+}
+
+expect_error("integer constant zero is not a null spelling for a function slot") {
     int t185ZeroDeclaration() {
         function<int(int)> fn = 0;
         return 0;

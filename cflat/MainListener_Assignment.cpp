@@ -9312,6 +9312,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         && left != nullptr && !left->getType()->isStructTy()
                         && isCxxClassValue(right);
                     const bool cxxClassCompoundAttempted = cxxClassLeft || cxxClassRight;
+                    const bool cxxImportedEnumLeft = !binaryOp.empty() && left != nullptr
+                        && left->getType()->isIntegerTy() && !isCxxClassValue(right)
+                        && !LLVMBackend::IsPrimitiveTypeName(namedVar.TypeAndValue.TypeName)
+                        && compiler->importedEnumTypes_.count(
+                            compiler->ResolveEnumTypeName(namedVar.TypeAndValue.TypeName)) != 0;
                     /*
                      * The WRITTEN compound operator of a C++ class operand, as C++ looks it up
                      * (members, associated namespaces, hidden friends): C++ never rewrites
@@ -9375,11 +9380,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         overload = emitCxxCompound();
                     // An imported C++ enum left operand: the written compound first, as C++ looks
                     // it up; no `operator@=` naming the enum leaves the desugared form below.
-                    else if (!binaryOp.empty() && left != nullptr && left->getType()->isIntegerTy()
-                        && !isCxxClassValue(right)
-                        && !LLVMBackend::IsPrimitiveTypeName(namedVar.TypeAndValue.TypeName)
-                        && compiler->importedEnumTypes_.count(
-                            compiler->ResolveEnumTypeName(namedVar.TypeAndValue.TypeName)) != 0)
+                    else if (cxxImportedEnumLeft)
                         overload = emitCxxCompound();
                     if (!cxxClassCompoundAttempted && !binaryOp.empty() && left != nullptr
                         && left->getType()->isStructTy())
@@ -9448,7 +9449,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 namedVar.TypeAndValue.IsCxxNullptrT,
                                 rightNV.TypeAndValue.IsCxxNullptrT, false, false,
                                 compiler->CxxOperandObjectCv(namedVar),
-                                compiler->CxxOperandObjectCv(rightNV), false, false, &namedVar);
+                                compiler->CxxOperandObjectCv(rightNV), false, false, &namedVar,
+                                nullptr, nullptr,
+                                cxxImportedEnumLeft ? assignmentOp : nullptr,
+                                cxxImportedEnumLeft ? operatorText : std::string());
                     adlSuppress.Release();
                     // Scalar left, C++ class right with no builtin answer: the written compound.
                     if (!cxxClassCompoundAttempted && overload == nullptr

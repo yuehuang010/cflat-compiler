@@ -38,9 +38,8 @@ say so in the report".
 Every C++ behaviour leg is checked against a `clang++ -std=c++20` oracle program (value AND overload
 pick), per the skill. Cache-touching rows (type G) add a cold + warm torch run to the gate.
 
-Timing note (2026-11-02): a build-stamp change over a full main-checkout local cache inflates buildci ~2x
-(PruneCxxTypeRequestDiskCache scan, p2/cxx-request-cache-prune-scan-doubles-buildci); clear the local cache
-before a timed run.
+Timing note (2026-11-14): a build-stamp flip over a full local cache now costs ~1% (test.sh 545 s vs 542 s
+cleared); clearing before a timed run is no longer needed.
 
 ## How to read the groups
 
@@ -69,9 +68,7 @@ Empty: p1 = 0, p2 = 0 (box 9 closed green 2026-11-02, master 16102f79, pushed). 
 once per box.
 
 Open: p2/expect-error-substring-source-check-loose (filed 2026-11-07, test-infra: the leg lint's check 2
-accepts nearly any text); p2/cxx-request-cache-prune-scan-doubles-buildci (filed
-2026-11-07, compile time: narrowed to one directory scan per storing process, ~25% over cold);
-p2/cold-cpp-interop-compile-peaks-23-27-gb (filed 2026-11-07, compile memory: 23-27 GB per cold
+accepts nearly any text); p2/cold-cpp-interop-compile-peaks-23-27-gb (filed 2026-11-07, compile memory: 23-27 GB per cold
 test_cpp_interop compile; pages the Windows box; narrowed by 1a702805 to 20.33 GB cold / 1.47 GB warm,
 candidate-group pruning parked).
 
@@ -121,7 +118,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | by-design B9 rulings (arr elem init landed ASSIGN 72073fc6) | OPEN (P2 landed 1955bd95) |
 | W13b | p3/cpp-overload-variadic-and-conversion-gaps | conversion operators at C++ callees landed 723b0440; residue CFlat callee with a derived-pointer result | inline variadic link landed VARLINK (1a702805) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
-| B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
 
 ### C - wrongly accepted (adds a rejection)
 
