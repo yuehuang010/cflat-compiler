@@ -1,6 +1,7 @@
 #include <set>
 #include <tuple>
 #include "MainListener.h"
+#include "MainListener_ExpressionsShared.h"
 #include <llvm/Analysis/ValueTracking.h>
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -593,6 +594,57 @@ bool MainListener::MentionsSignatureTypeParam(const std::string& name) const {
             start = end;
         }
         return false;
+}
+
+static const void* SoleOperatorCallSite(antlr4::tree::ParseTree* node)
+{
+        if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            if (HasAssignmentOperator(assign)) return nullptr;
+            return SoleOperatorCallSite(assign->conditionalExpression());
+        }
+        if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        {
+            if (cond->Question() != nullptr || cond->QuestionQuestion() != nullptr)
+                return nullptr;
+            return SoleOperatorCallSite(cond->logicalOrExpression());
+        }
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->expression() != nullptr
+                && primary->children.size() == 3)
+            return SoleOperatorCallSite(primary->expression());
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+            unary != nullptr && unary->unaryOperator() != nullptr)
+            return unary->Sizeof().empty() ? unary : nullptr;
+        if (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            ctx != nullptr && ctx->children.size() == 1)
+            return SoleOperatorCallSite(ctx->children[0]);
+        auto isOperatorNode = [](antlr4::ParserRuleContext* ctx) {
+            return ctx != nullptr && ctx->children.size() > 1;
+        };
+        if (auto* ctx = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::AndExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        if (auto* ctx = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node);
+            isOperatorNode(ctx)) return ctx;
+        return nullptr;
 }
 
 void MainListener::ReportUnknownSignatureTupleElements(CFlatParser::TupleTypeSpecifierContext* tts) {
@@ -4184,6 +4236,11 @@ MainListener::MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const
                                                         std::string message) {
             LogErrorContext(ctx, std::move(message));
         };
+        savedCflatDefaultArgumentEvaluator_ = compilerLLVM->cflatDefaultArgumentEvaluator;
+        compilerLLVM->cflatDefaultArgumentEvaluator = [this](const std::string& functionName,
+                size_t parameterIndex, const LLVMBackend::TypeAndValue& parameterType) {
+            return EvaluateCFlatDefaultArgument(functionName, parameterIndex, parameterType);
+        };
         savedDrainWaitingInstance_ = compilerLLVM->gts.drainWaitingInstance;
         compilerLLVM->gts.drainWaitingInstance = [this](const std::string& name) { DrainWaitingPointerInstance(name); };
         // The forward-ref scan for this file is complete, so every struct's fields are
@@ -4238,6 +4295,7 @@ bool MainListener::NativeTemplateNeedsTypeArgs(const std::string& spelledBase,
 MainListener::~MainListener()
 {
         compilerLLVM->gts.drainWaitingInstance = savedDrainWaitingInstance_;
+        compilerLLVM->cflatDefaultArgumentEvaluator = std::move(savedCflatDefaultArgumentEvaluator_);
         compilerLLVM->contextualErrorReporter = std::move(savedContextualErrorReporter_);
 }
 
@@ -5428,6 +5486,8 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
         for (auto* extDecl : branchDecls)
             scanner.PreRegisterGlobals(extDecl, namespaceName);
         scanner.FinalizeViewFieldMoveInference();
+        RegisterForeignCxxNrvoReturnFunctionNames(
+            scanner.ForeignCxxNrvoReturnFunctionNames());
 
         // Second pass: generate code for the taken branch
         for (auto* extDecl : branchDecls)
@@ -7753,6 +7813,101 @@ bool PostfixExpressionEndsInCall(CFlatParser::PostfixExpressionContext* postfix)
                 postfix->children[postfix->children.size() - 2]) != nullptr;
 }
 
+static std::string DirectPostfixTypeCallName(
+    CFlatParser::PostfixExpressionContext* postfix)
+{
+        auto* primary = postfix != nullptr ? postfix->primaryExpression() : nullptr;
+        auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+        if (generic == nullptr || generic->Identifier() == nullptr
+            || generic->genericTypeParameters() != nullptr)
+            return {};
+        std::string name = generic->Identifier()->getText();
+        for (size_t i = 1; i < postfix->children.size();)
+        {
+            auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+            if (terminal == nullptr) return {};
+            const auto tokenType = terminal->getSymbol()->getType();
+            if (tokenType == CFlatParser::LeftParen)
+            {
+                // The call must be the last suffix: `T(4).m()` is not a spelled `T(...)` call.
+                if (i + 3 == postfix->children.size()
+                    && dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(
+                        postfix->children[i + 1]) != nullptr
+                    && postfix->children[i + 2] != nullptr
+                    && dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i + 2]) != nullptr
+                    && dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i + 2])
+                        ->getSymbol()->getType() == CFlatParser::RightParen)
+                    return name;
+                return {};
+            }
+            if (tokenType != CFlatParser::Dot || i + 1 >= postfix->children.size()) return {};
+            auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i + 1]);
+            if (member == nullptr) return {};
+            name += "." + member->getText();
+            i += 2;
+        }
+        return {};
+}
+
+static bool IsSameClassFunctionalCast(LLVMBackend* compiler,
+    CFlatParser::PostfixExpressionContext* postfix, const std::string& targetName,
+    bool hasFunctionTemplate)
+{
+        const std::string callee = DirectPostfixTypeCallName(postfix);
+        if (callee.empty()) return false;
+        const auto dot = callee.find('.');
+        const std::string rootName = callee.substr(0, dot);
+        if (NamesVisibleVariable(compiler, rootName)) return false;
+        const std::string qualified = compiler->ResolveQualifiedName(callee);
+        for (const std::string& candidate : {callee, qualified})
+            if (compiler->GetFunction(candidate) != nullptr
+                || compiler->GetReturnBlock(candidate) != nullptr)
+                return false;
+        if (hasFunctionTemplate) return false;
+        const std::string resolvedCallee = compiler->ResolveTypeAlias(qualified);
+        const std::string resolvedTarget = compiler->ResolveTypeAlias(targetName);
+        return !resolvedTarget.empty() && resolvedCallee == resolvedTarget
+            && compiler->IsForeignCxxClassWithConstructors(resolvedCallee);
+}
+
+// A spelled `T(...)` of the target class that a function of the same name shadows is a call
+// to that function (lookup: function before class), so its result is not built in the slot.
+bool SpelledCallShadowedByFunction(LLVMBackend* compiler,
+    CFlatParser::PostfixExpressionContext* postfix, const std::string& targetName)
+{
+        const std::string callee = DirectPostfixTypeCallName(postfix);
+        if (callee.empty()) return false;
+        if (NamesVisibleVariable(compiler, callee.substr(0, callee.find('.')))) return false;
+        const std::string qualified = compiler->ResolveQualifiedName(callee);
+        const std::string resolvedCallee = compiler->ResolveTypeAlias(qualified);
+        if (resolvedCallee != compiler->ResolveTypeAlias(targetName)
+            || !compiler->IsForeignCxxClassWithConstructors(resolvedCallee))
+            return false;
+        for (const std::string& candidate : {callee, qualified})
+            if (compiler->GetFunction(candidate) != nullptr
+                || compiler->GetReturnBlock(candidate) != nullptr)
+                return true;
+        return false;
+}
+
+static const void* CxxSretResultCallSite(LLVMBackend* compiler,
+    antlr4::tree::ParseTree* node, const std::string& targetName)
+{
+        auto* postfix = SolePostfixExpression(node);
+        if (PostfixExpressionEndsInCall(postfix))
+        {
+            if (SpelledCallShadowedByFunction(compiler, postfix, targetName)) return nullptr;
+            auto leftParens = postfix->LeftParen();
+            auto rightParens = postfix->RightParen();
+            if (leftParens.empty() || rightParens.empty()
+                || postfix->children.back() != rightParens.back())
+                return nullptr;
+            return leftParens.back();
+        }
+        return IsSoleOperatorExpression(node) ? SoleOperatorCallSite(node) : nullptr;
+}
+
+
 bool PostfixCallHasChainedReceiver(CFlatParser::PostfixExpressionContext* postfix)
 {
         if (postfix == nullptr || postfix->children.empty()) return false;
@@ -8033,12 +8188,15 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInit(
         bool copyListInit,
         bool rejectEscapingReferences,
         llvm::GlobalVariable* referenceLifetimeOwner,
-        bool rejectFrameBoundReferences)
+        bool rejectFrameBoundReferences,
+        CFlatParser::FieldInitContext* preParsedElement,
+        const LLVMBackend::NamedVariable* preParsedValue)
 {
         if (list == nullptr) return false;
         return TryEmitForeignCxxAggregateBraceInitFields(typeName, list->fieldInit(),
             errorContext, slotValue, copyListInit, rejectEscapingReferences,
-            referenceLifetimeOwner, rejectFrameBoundReferences);
+            referenceLifetimeOwner, rejectFrameBoundReferences,
+            preParsedElement, preParsedValue);
 }
 
 bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
@@ -8049,7 +8207,9 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
         bool copyListInit,
         bool rejectEscapingReferences,
         llvm::GlobalVariable* referenceLifetimeOwner,
-        bool rejectFrameBoundReferences)
+        bool rejectFrameBoundReferences,
+        CFlatParser::FieldInitContext* preParsedElement,
+        const LLVMBackend::NamedVariable* preParsedValue)
 {
         auto* compiler = Compiler(errorContext);
         rejectEscapingReferences = rejectEscapingReferences
@@ -8062,6 +8222,8 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
             std::vector<std::string> braceElementTargetTypes;
             std::unordered_map<CFlatParser::FieldInitContext*, LLVMBackend::NamedVariable>
                 prefetchedBraceElements;
+            if (preParsedElement != nullptr && preParsedValue != nullptr)
+                prefetchedBraceElements.emplace(preParsedElement, *preParsedValue);
             std::string braceExpression = "{";
             bool valid = true;
             /*
@@ -8790,6 +8952,40 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
         return false;
 }
 
+std::string MainListener::AutoDeducedCxxFunctionalClass(CFlatParser::InitDeclaratorContext* initDeclarator)
+{
+        auto* compiler = Compiler(initDeclarator);
+        auto* initializer = initDeclarator->initializer();
+        auto* assign = CastCallInitializer(UnwrapInitializerParens(
+            initializer != nullptr ? initializer->assignmentExpression() : nullptr));
+        auto* postfix = SolePostfixExpression(assign);
+        if (!PostfixExpressionEndsInCall(postfix)) return {};
+        // Only a call argument (`C(C(x))`, `C(f(x))`) takes the typed route; other arguments keep
+        // auto's path, which accepts pointer/lvalue args the typed ctor path refuses (Amp2RequiresCtorFallback).
+        const auto argLists = postfix->argumentExpressionList();
+        if (argLists.size() != 1) return {};
+        const auto named = argLists[0]->argumentNamedExpression();
+        if (named.size() != 1 || named[0]->assignmentExpression() == nullptr) return {};
+        if (!PostfixExpressionEndsInCall(
+                SolePostfixExpression(UnwrapInitializerParens(named[0]->assignmentExpression()))))
+            return {};
+        const std::string callee = DirectPostfixTypeCallName(postfix);
+        if (callee.empty()
+            || NamesVisibleVariable(compiler, callee.substr(0, callee.find('.')))) return {};
+        const std::string qualified = compiler->ResolveQualifiedName(callee);
+        for (const std::string& candidate : {callee, qualified})
+            if (compiler->GetFunction(candidate) != nullptr
+                || compiler->GetReturnBlock(candidate) != nullptr) return {};
+        // A function template of that name decides its own result type: not a class construction.
+        if (compiler->HasCxxFunctionTemplate(callee) || compiler->HasCxxFunctionTemplate(qualified)
+            || genericFunctionTemplates.count(compiler->ResolveGenericFunctionBase(callee)) != 0
+            || genericFunctionTemplates.count(compiler->ResolveGenericFunctionBase(qualified)) != 0)
+            return {};
+        const std::string resolved = compiler->ResolveTypeAlias(qualified);
+        if (resolved.empty() || !compiler->IsForeignCxxClassWithConstructors(resolved)) return {};
+        return resolved;
+}
+
 bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext* initDeclarator,
                                              CFlatParser::DirectDeclaratorContext* direct,
                                              const LLVMBackend::DeclTypeAndValue& declType,
@@ -8852,6 +9048,67 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
                     || initializer->initializerList()->fieldInit().empty()));
         const bool hasNonemptyDeclarationBrace = declarationBraceList != nullptr
             && !declarationBraceList->fieldInit().empty();
+        CFlatParser::FieldInitContext* braceCallElement = nullptr;
+        if (hasNonemptyDeclarationBrace && declarationBraceList->fieldInit().size() == 1)
+        {
+            auto* field = declarationBraceList->fieldInit().front();
+            if (field->Identifier() == nullptr && field->Colon() == nullptr
+                && field->LeftBrace() == nullptr && field->initializerList() == nullptr
+                && field->assignmentExpression().size() == 1)
+            {
+                auto isSimpleCall = [&](antlr4::tree::ParseTree* node) {
+                    auto* postfix = SolePostfixExpression(node);
+                    return PostfixExpressionEndsInCall(postfix)
+                        && CountOpenParenTokens(postfix) == 1
+                        && !IsCxxBraceDeferrableConstruction(node);
+                };
+                auto callReturnsDeclaredClass = [&](antlr4::tree::ParseTree* node) {
+                    auto* postfix = SolePostfixExpression(node);
+                    auto* primary = postfix != nullptr ? postfix->primaryExpression() : nullptr;
+                    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                    if (!isSimpleCall(node) || generic == nullptr || generic->Identifier() == nullptr
+                        || generic->genericTypeParameters() != nullptr
+                        || !postfix->Arrow().empty() || !postfix->QuestionDot().empty()
+                        || !postfix->LeftBracket().empty()
+                        || postfix->Dot().size() != postfix->memberNameToken().size())
+                        return false;
+                    const std::string rootName = generic->Identifier()->getText();
+                    if (NamesVisibleVariable(compiler, rootName)) return false;
+                    std::string calleeName = rootName;
+                    for (auto* member : postfix->memberNameToken())
+                        calleeName += "." + member->getText();
+                    auto* overloads = compiler->FindCFlatCallCandidates(calleeName);
+                    if (overloads == nullptr)
+                        overloads = compiler->FindCFlatCallCandidates(
+                            compiler->ResolveQualifiedName(calleeName));
+                    return overloads != nullptr && !overloads->empty()
+                        && std::all_of(overloads->begin(), overloads->end(), [&](const auto& symbol) {
+                            const auto& result = symbol.ReturnType;
+                            return !result.Pointer && result.PointerDepth == 0 && !result.ElemPointer
+                                && !result.TypeName.empty()
+                                && compiler->ResolveTypeAlias(result.TypeName)
+                                    == compiler->ResolveTypeAlias(typeName);
+                        });
+                };
+                auto* expression = field->assignmentExpression(0);
+                auto* unwrapped = UnwrapInitializerParens(expression);
+                auto* ternary = SoleTernaryExpression(unwrapped);
+                const bool directCall = isSimpleCall(unwrapped);
+                const bool callTernary = ternary != nullptr
+                    && ternary->expression() != nullptr
+                    && ternary->expression()->assignmentExpression() != nullptr
+                    && ternary->conditionalExpression() != nullptr
+                    && isSimpleCall(ternary->expression()->assignmentExpression())
+                    && isSimpleCall(ternary->conditionalExpression())
+                    && callReturnsDeclaredClass(ternary->expression()->assignmentExpression())
+                    && callReturnsDeclaredClass(ternary->conditionalExpression());
+                if (directCall || callTernary)
+                {
+                    braceCallElement = field;
+                    assign = CastCallInitializer(unwrapped);
+                }
+            }
+        }
         if (!hasCxxConstructors
             && !(compiler->IsCxxRecord(typeName) && hasNonemptyDeclarationBrace))
             return false;
@@ -9079,8 +9336,25 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         }
 cxx_dtor_ready:
 
+        auto emitBraceCallFallback = [&](LLVMBackend::NamedVariable parsed) {
+            llvm::Value* retTemp = compiler->lastCxxRetTemp_;
+            llvm::Value* retValue = compiler->lastCxxRetValue_;
+            if (retTemp != nullptr
+                && (parsed.Storage == retTemp || parsed.Primary == retValue))
+            {
+                parsed.Storage = retTemp;
+                parsed.IsRvalue = true;
+                parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
+            }
+            return TryEmitForeignCxxAggregateBraceInit(typeName, declarationBraceList,
+                direct, slotValue,
+                initializer != nullptr && initializer->LeftBrace() != nullptr,
+                false, nullptr, false, braceCallElement, &parsed);
+        };
+
         // Direct-list initialization uses the shared reference-aware C++ aggregate wrapper.
-        if (declarationBraceList != nullptr && !declarationBraceList->fieldInit().empty())
+        if (declarationBraceList != nullptr && !declarationBraceList->fieldInit().empty()
+            && braceCallElement == nullptr)
             return TryEmitForeignCxxAggregateBraceInit(
                 typeName, declarationBraceList, direct, slotValue,
                 initializer != nullptr && initializer->LeftBrace() != nullptr);
@@ -9095,7 +9369,7 @@ cxx_dtor_ready:
         };
 
         // ---- `= default`, or no initializer at all: the default constructor ----------------
-        if (initializer == nullptr || isDefaultForm)
+        if ((initializer == nullptr && braceCallElement == nullptr) || isDefaultForm)
         {
             std::string implicitCtorError;
             compiler->TryBindCxxImplicitDefaultCtor(typeName, implicitCtorError);
@@ -9376,24 +9650,21 @@ cxx_dtor_ready:
                 // declared slot, so the outer copy is elided (C++17), as the `new` path does.
                 auto* elidableCast = ctorArgs->argumentNamedExpression().size() == 1
                     ? SolePostfixExpressionShape(argAssign) : nullptr;
-                // The callee spelling before '(' must name this class (alias included), so an
-                // ordinary call such as `std.f(x)` keeps the copy path.
-                const std::string elidableCallee = elidableCast != nullptr
-                    ? elidableCast->getText().substr(0, elidableCast->getText().find('('))
-                    : std::string();
-                // The spelled callee (qualified or not) is looked up as the call would resolve it:
-                // a function or callable value of that name may return an lvalue, so keep the copy.
-                const bool calleeNamesCallable = elidableCast != nullptr
-                    && (compiler->GetFunction(elidableCallee) != nullptr
-                        || NamesVisibleVariable(compiler, elidableCallee));
+                const std::string elidableCallee = DirectPostfixTypeCallName(elidableCast);
+                const std::string qualifiedElidableCallee =
+                    compiler->ResolveQualifiedName(elidableCallee);
+                const bool elidableHasFunctionTemplate =
+                    compiler->HasCxxFunctionTemplate(elidableCallee)
+                    || compiler->HasCxxFunctionTemplate(qualifiedElidableCallee)
+                    || genericFunctionTemplates.count(
+                        compiler->ResolveGenericFunctionBase(elidableCallee)) != 0
+                    || genericFunctionTemplates.count(
+                        compiler->ResolveGenericFunctionBase(qualifiedElidableCallee)) != 0;
                 const bool elideCastArgument = !ctorRefTernary && elidableCast != nullptr
                     && elidableCast->argumentExpressionList().size() == 1
                     && PostfixExpressionEndsInCall(elidableCast)
-                    && !calleeNamesCallable
-                    && (compiler->ResolveTypeAlias(elidableCallee) == compiler->ResolveTypeAlias(typeName)
-                        || elidableCallee == compiler->DisplayCxxClassName(
-                            compiler->ResolveTypeAlias(typeName)))
-                    && compiler->IsForeignCxxClassWithConstructors(typeName);
+                    && IsSameClassFunctionalCast(compiler, elidableCast, typeName,
+                        elidableHasFunctionTemplate);
                 struct SlotElisionScope
                 {
                     MainListener* listener;
@@ -9428,6 +9699,13 @@ cxx_dtor_ready:
                         listener->newCxxFunctionalElisionConsumed_ = savedConsumed;
                     }
                 } slotElision(this, elideCastArgument, elidableCast, slotValue, typeName);
+                const void* resultCallSite = ctorArgs->argumentNamedExpression().size() == 1
+                    ? CxxSretResultCallSite(compiler, argAssign, typeName) : nullptr;
+                CxxSretResultSlotScope resultSret(compiler,
+                    resultCallSite != nullptr
+                        && compiler->IsForeignNontrivialCxxClass(typeName)
+                        && compiler->ReturnsViaCxxSret(typeName),
+                    resultCallSite, slotValue, typeName);
                 auto nv = ctorRefTernary
                     ? ParseCxxConstRefTernaryTemp(argAssign,
                         LLVMBackend::TypeAndValue{ .TypeName = ctorRefPlaceType })
@@ -9435,6 +9713,22 @@ cxx_dtor_ready:
                 // The cast built into the slot: nothing left for the copy constructor to do.
                 if (elideCastArgument && newCxxFunctionalElisionConsumed_
                     && nv.Storage == slotValue && nv.IsRvalue)
+                {
+                    compiler->SetCurrentDebugLocation(line);
+                    ctorArgumentPostfix.Flush();
+                    return true;
+                }
+                auto* sretResultLoad = llvm::dyn_cast_or_null<llvm::LoadInst>(nv.Primary);
+                // A call result already built in the armed slot is the slot itself (no storage).
+                const bool sretResultFromSlot = nv.Storage == slotValue || nv.Primary == slotValue
+                    || (sretResultLoad != nullptr
+                        && sretResultLoad->getPointerOperand() == slotValue);
+                const bool sretCallBuiltInSlot = resultSret.Consumed()
+                    || (resultCallSite != nullptr && sretResultFromSlot && nv.IsRvalue
+                        && !nv.TypeAndValue.Pointer
+                        && compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName)
+                            == compiler->ResolveTypeAlias(typeName));
+                if (sretCallBuiltInSlot)
                 {
                     compiler->SetCurrentDebugLocation(line);
                     ctorArgumentPostfix.Flush();
@@ -9482,6 +9776,29 @@ cxx_dtor_ready:
                         return true;
                     }
                     if (soleArgument) return true;
+                }
+                // DIRORD: a by-value class lvalue with a later sibling that may have an effect is
+                // copied at its position (clang's order). The selected constructor decides the copy
+                // at the call below; an unselected or by-reference parameter never runs it.
+                const auto& namedArgs = ctorArgs->argumentNamedExpression();
+                const auto namedPos = std::find(namedArgs.begin(), namedArgs.end(), named);
+                if (!ctorRefTernary && !elideCastArgument
+                    && !nv.IsRvalue && !nv.IsExplicitMove && nv.Storage != nullptr
+                    && !nv.IsCxxDirectConstruction && nv.CxxClosureSignature.empty()
+                    && !nv.TypeAndValue.Pointer && nv.TypeAndValue.PointerDepth == 0
+                    && !nv.TypeAndValue.IsInterface && compiler->IsCxxRecord(nv.TypeAndValue.TypeName)
+                    && std::none_of(namedArgs.begin(), namedArgs.end(),
+                                    [](auto* na) { return na->Identifier() != nullptr; })
+                    && namedPos != namedArgs.end()
+                    && std::any_of(std::next(namedPos), namedArgs.end(), [&](auto* later) {
+                        return !IsCxxInertCallArgument(later->assignmentExpression())
+                            && BareIdentifierInExpression(later->assignmentExpression()) == nullptr;
+                    }))
+                {
+                    if (!compiler->EmitCxxEarlyArgumentCopy(nv, nv.TypeAndValue.TypeName,
+                                                            /*earlyCopyRequired*/ true,
+                                                            /*earlyCopyHeuristic*/ false))
+                        return true;
                 }
                 // Same literal identity the call-argument builder records (integer -> enum refusal).
                 bool suffixedLiteral = false;
@@ -9744,6 +10061,25 @@ cxx_dtor_ready:
                 LogErrorContext(direct, refusal);
                 return true;
             }
+            // DIRORD: the selected constructor's by-value class parameters take their early copy
+            // (copied at position above); a by-reference or unselected candidate keeps its lvalue.
+            std::vector<bool> earlyCopyCandidate(ctorArgumentAddresses.size(), false);
+            std::vector<bool> selectedByValue(ctorArgumentAddresses.size(), false);
+            for (size_t i = 0; i < ctorArgumentAddresses.size(); ++i)
+            {
+                earlyCopyCandidate[i] = ctorArgumentAddresses[i].CxxEarlyCopyDecision != nullptr;
+                if (i + 1 >= ctor->params.size()) continue;
+                const auto& parameter = ctor->params[i + 1];
+                selectedByValue[i] = earlyCopyCandidate[i] && !parameter.Pointer && !parameter.IsAlias
+                    && !parameter.IsRvalueRef && !parameter.IsInterface
+                    && compiler->IsCxxRecord(parameter.TypeName)
+                    && compiler->ResolveTypeAlias(parameter.TypeName)
+                        == compiler->ResolveTypeAlias(ctorArgumentAddresses[i].TypeAndValue.TypeName);
+            }
+            compiler->FinalizeCxxEarlyCopyArguments(ctorArgumentAddresses, selectedByValue);
+            for (size_t i = 0; i < argValues.size() && i < selectedByValue.size(); ++i)
+                if (selectedByValue[i])
+                    argValues[i] = LoadNamedVariable(ctorArgumentAddresses[i]);
             compiler->SetCurrentDebugLocation(line);
             ctorArgumentPostfix.Flush();
             compiler->EmitCxxStructorCall(typeName, *ctor, slotValue, argValues,
@@ -10117,10 +10453,7 @@ cxx_dtor_ready:
         }
 
         // ---- a call returning T by value ---------------------------------------------------
-        // A single call with no nested call constructs straight into the slot (the armed
-        // destination cannot be consumed by an inner call of the same type). Otherwise, or when
-        // the class is returned in registers, the returned value is stored (trivially copyable)
-        // or move-constructed from the outermost call's return temporary.
+        // A matching result call may construct in this slot; otherwise store or move from its result.
         auto* pf = SolePostfixExpression(assign);
         const std::string pfText = pf != nullptr ? pf->getText() : std::string();
         auto* castInitContext = tryGetCastExpression(assign);
@@ -10144,21 +10477,71 @@ cxx_dtor_ready:
             const bool armed = !hasParsedArrayInitializer && !castInit
                 && ((PostfixExpressionEndsInCall(pf) && !PostfixCallHasChainedReceiver(pf))
                     || SoleAssignmentExpression(assign) != nullptr);
+            const void* resultCallSite = armed || castInit
+                ? CxxSretResultCallSite(compiler, assign, typeName) : nullptr;
+            auto isCFlatNrvoResultCall = [&]() {
+                if (!PostfixExpressionEndsInCall(pf)) return false;
+                auto* primary = pf != nullptr ? pf->primaryExpression() : nullptr;
+                auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                if (generic == nullptr || generic->Identifier() == nullptr
+                    || generic->genericTypeParameters() != nullptr
+                    || !pf->Arrow().empty() || !pf->QuestionDot().empty()
+                    || !pf->LeftBracket().empty()
+                    || pf->Dot().size() != pf->memberNameToken().size())
+                    return false;
+                const std::string rootName = generic->Identifier()->getText();
+                if (NamesVisibleVariable(compiler, rootName)) return false;
+                std::string calleeName = rootName;
+                for (auto* member : pf->memberNameToken())
+                    calleeName += "." + member->getText();
+                auto* candidates = compiler->FindCFlatCallCandidates(calleeName);
+                if (candidates == nullptr)
+                    candidates = compiler->FindCFlatCallCandidates(
+                        compiler->ResolveQualifiedName(calleeName));
+                if (candidates == nullptr || candidates->empty()) return false;
+                auto isImplicitThisMethod = [&](const auto& symbol) {
+                    return symbol.IsMethod
+                        && !compiler->GetCppStructAccessContext().empty()
+                        && !symbol.Parameters.empty()
+                        && compiler->ResolveTypeAlias(symbol.Parameters.front().TypeName)
+                            == compiler->ResolveTypeAlias(
+                                compiler->GetCppStructAccessContext());
+                };
+                if (pf->Dot().empty()
+                    && std::any_of(candidates->begin(), candidates->end(), isImplicitThisMethod))
+                    return false;
+                return std::all_of(candidates->begin(), candidates->end(), [&](const auto& symbol) {
+                    const auto& result = symbol.ReturnType;
+                    if (symbol.IsMethod) return true;
+                    return symbol.Function != nullptr
+                        && foreignCxxNrvoReturnFunctionNames_.count(symbol.UniqueName) != 0
+                        && !result.Pointer && result.PointerDepth == 0 && !result.ElemPointer
+                        && !result.TypeName.empty()
+                        && compiler->ResolveTypeAlias(result.TypeName)
+                            == compiler->ResolveTypeAlias(typeName);
+                });
+            };
+            const bool scopedCallSret = resultCallSite != nullptr
+                && !declType.Pointer && !declType.IsAlias
+                && compiler->IsForeignNontrivialCxxClass(typeName)
+                && compiler->ReturnsViaCxxSret(typeName)
+                && (IsSoleOperatorExpression(assign) || isCFlatNrvoResultCall());
             compiler->SetCurrentDebugLocation(line);
             compiler->lastCxxRetTemp_ = nullptr;
             compiler->lastCxxRetValue_ = nullptr;
-            if (armed)
+            if (armed && !scopedCallSret)
             {
                 compiler->pendingCxxSretDest_ = slot;
                 compiler->pendingCxxSretTypeName_ = typeName;
             }
-            else if (castInit)
+            else if (castInit && !scopedCallSret)
             {
                 compiler->pendingCxxSretDest_ = slot;
                 compiler->pendingCxxSretTypeName_ = typeName;
             }
             LLVMBackend::NamedVariable rightNV;
             bool castSlotConsumed = false;
+            bool callSlotConsumed = false;
             {
                 struct RestoreCastInitContext
                 {
@@ -10166,6 +10549,7 @@ cxx_dtor_ready:
                     CFlatParser::CastExpressionContext* saved;
                     ~RestoreCastInitContext() { slot = saved; }
                 } restore{ pendingCxxCastInitContext_, pendingCxxCastInitContext_ };
+                std::optional<CxxSretResultSlotScope> resultSlot;
                 struct ClearUnconsumedCastSlot
                 {
                     LLVMBackend* compiler;
@@ -10180,15 +10564,23 @@ cxx_dtor_ready:
                         }
                     }
                 } clearSlot{ compiler, slot, castInit };
+                if (scopedCallSret)
+                    resultSlot.emplace(compiler, true, resultCallSite, slot, typeName);
                 pendingCxxCastInitContext_ = castInit ? castInitContext : nullptr;
                 rightNV = parseInitializerOnce();
+                callSlotConsumed = resultSlot.has_value() && resultSlot->Consumed();
                 castSlotConsumed = castInit && compiler->pendingCxxSretDest_ == nullptr;
             }
-            const bool consumed = (armed && compiler->pendingCxxSretDest_ == nullptr)
+            const bool consumed = (scopedCallSret && callSlotConsumed)
+                || (armed && !scopedCallSret && compiler->pendingCxxSretDest_ == nullptr)
                 || castSlotConsumed;
-            compiler->pendingCxxSretDest_ = nullptr;
-            compiler->pendingCxxSretTypeName_.clear();
+            if (!scopedCallSret)
+            {
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+            }
             if (consumed) return true;
+            if (braceCallElement != nullptr) return emitBraceCallFallback(rightNV);
             const bool sameType = rightNV.TypeAndValue.TypeName == typeName
                                && !rightNV.TypeAndValue.Pointer
                                && ((rightNV.Primary != nullptr
@@ -10335,6 +10727,8 @@ cxx_dtor_ready:
             badInit(assign);
             return true;
         }
+        if (braceCallElement != nullptr && !consumed && !ternaryConsumed)
+            return emitBraceCallFallback(rightNV);
         if (rightNV.CxxRefValueType != nullptr && rightNV.Primary != nullptr
             && rightNV.Primary->getType()->isPointerTy()
             && rightNV.TypeAndValue.TypeName == typeName)
@@ -11748,10 +12142,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                 }
 
+                // `auto x = C(...)` has the type of that construction, so it takes the typed route.
+                LLVMBackend::DeclTypeAndValue cxxDeclType = typeAndValue;
+                if (typeAndValue.TypeName == "auto" && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                    && !typeAndValue.staticStorage && typeAndValue.ConstArraySize == 0
+                    && typeAndValue.ArraySize == nullptr)
+                    if (const std::string deduced = AutoDeducedCxxFunctionalClass(initDecl);
+                        !deduced.empty())
+                        cxxDeclType.TypeName = deduced;
                 if (!global_scope && paramTypeList == nullptr && !hasParens && direct != nullptr
                     && (!typeAndValue.staticStorage || staticHasValues)
                     && direct->assignmentExpression() == nullptr
-                    && TryDeclareForeignCxxLocal(initDecl, direct, typeAndValue, name,
+                    && TryDeclareForeignCxxLocal(initDecl, direct, cxxDeclType, name,
                                                  line, allocList))
                     continue;
 
@@ -12094,6 +12496,39 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // a compile-time constant we emit an error and discard the temp IR.
                 llvm::Function* globalInitTempFn = nullptr;
                 LLVMBackend::BuilderState globalInitSavedState;
+                struct GlobalInitTempFunctionCleanup
+                {
+                    LLVMBackend* Compiler = nullptr;
+                    llvm::Function** Function = nullptr;
+                    LLVMBackend::BuilderState* SavedState = nullptr;
+                    void Attach(LLVMBackend* compiler, llvm::Function*& function,
+                        LLVMBackend::BuilderState& savedState)
+                    {
+                        Compiler = compiler;
+                        Function = &function;
+                        SavedState = &savedState;
+                    }
+                    void Cleanup()
+                    {
+                        if (Function == nullptr || *Function == nullptr) return;
+                        auto* function = *Function;
+                        for (auto& block : *function)
+                            if (block.getTerminator() == nullptr)
+                                llvm::ReturnInst::Create(*Compiler->context, &block);
+                        function->eraseFromParent();
+                        *Function = nullptr;
+                        Compiler->RestoreBuilderState(*SavedState);
+                        Compiler = nullptr;
+                        Function = nullptr;
+                        SavedState = nullptr;
+                    }
+                    ~GlobalInitTempFunctionCleanup() { Cleanup(); }
+                } globalInitTempCleanup;
+                bool foldedGlobalIntegerInit = false;
+                std::optional<int64_t> globalIntegerFoldCandidate;
+                bool probeGlobalIntegerCppOperator = false;
+                FileScopeIntegerCppOperatorProbe cppOperatorProbe(
+                    fileScopeIntegerCppOperatorSelected_);
                 if (global_scope && initializer != nullptr && initializer->assignmentExpression() != nullptr)
                 {
                     globalInitSavedState = compiler->SaveBuilderState();
@@ -12102,6 +12537,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         voidTy, llvm::Function::PrivateLinkage, "__global_init_tmp", compiler->module.get());
                     auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", globalInitTempFn);
                     compiler->builder->SetInsertPoint(tmpBB);
+                    globalInitTempCleanup.Attach(compiler, globalInitTempFn, globalInitSavedState);
                 }
 
                 if (initializer != nullptr && freshBraceInit)
@@ -12123,21 +12559,38 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && IsNullptrLiteralExpressionTree(assignmentExpression))
                         LogErrorContext(assignmentExpression, std::format(
                             "cannot initialize string '{}' from nullptr", name));
-                    bool foldedGlobalIntegerInit = false;
                     if (globalInitTempFn != nullptr && assignmentExpression != nullptr)
                     {
+                        auto hasDottedPostfix = [](auto&& self,
+                            antlr4::tree::ParseTree* node) -> bool {
+                            if (node == nullptr) return false;
+                            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+                                postfix != nullptr && !postfix->Dot().empty())
+                                return true;
+                            auto* context = dynamic_cast<antlr4::ParserRuleContext*>(node);
+                            if (context == nullptr) return false;
+                            for (auto* child : context->children)
+                                if (self(self, child)) return true;
+                            return false;
+                        };
+                        auto* initType = typeAndValue.TypeName == "auto"
+                            ? nullptr : compiler->GetType(typeAndValue);
+                        probeGlobalIntegerCppOperator = initType != nullptr && initType->isIntegerTy()
+                            && hasDottedPostfix(hasDottedPostfix, assignmentExpression);
                         if (IsGroupedFoldCandidate(assignmentExpression))
-                            if (auto folded = FoldCompileTimeInt(compiler, assignmentExpression))
-                                if (auto* initType = compiler->GetType(typeAndValue);
-                                    initType != nullptr && initType->isIntegerTy())
-                                {
-                                    right = llvm::ConstantInt::get(initType,
-                                        llvm::APInt(initType->getIntegerBitWidth(),
-                                            static_cast<uint64_t>(*folded), false, true));
-                                    foldedGlobalIntegerInit = true;
-                                }
+                        {
+                            globalIntegerFoldCandidate = FoldCompileTimeInt(compiler, assignmentExpression);
+                            if (globalIntegerFoldCandidate && initType != nullptr && initType->isIntegerTy())
+                            {
+                                right = llvm::ConstantInt::get(initType,
+                                    llvm::APInt(initType->getIntegerBitWidth(),
+                                        static_cast<uint64_t>(*globalIntegerFoldCandidate), false, true));
+                                foldedGlobalIntegerInit = true;
+                            }
+                        }
                         // A cast group skips the int64 folder; its &&/|| lowering needs a function.
-                        if (!foldedGlobalIntegerInit && IsStructurallyGrouped(assignmentExpression)
+                        if (!foldedGlobalIntegerInit && !probeGlobalIntegerCppOperator
+                            && IsStructurallyGrouped(assignmentExpression)
                             && !HasNoTypedCast(assignmentExpression) && HasShortCircuit(assignmentExpression))
                         {
                             LogErrorContext(assignmentExpression,
@@ -12147,6 +12600,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 right = llvm::Constant::getNullValue(initType);
                             foldedGlobalIntegerInit = right != nullptr;
                         }
+                    }
+                    if (probeGlobalIntegerCppOperator)
+                    {
+                        compiler->currentFunction = globalInitTempFn;
+                        cppOperatorProbe.Activate();
                     }
                     // Inbound alloc-align channel: an align-declared local whose initializer is a
                     // DIRECT `new` hands the declared allocation alignment down so the bare `new`
@@ -12158,7 +12616,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         compiler->pendingInitAllocAlign = typeAndValue.AllocAlignValue;
                     if (assignmentExpression != nullptr && !foldedGlobalIntegerInit)
                         ArmArrayNewDesugar(assignmentExpression, typeAndValue);
-                    if (assignmentExpression != nullptr && !foldedGlobalIntegerInit)
+                    if (assignmentExpression != nullptr
+                        && (!foldedGlobalIntegerInit || probeGlobalIntegerCppOperator))
                     {
                         std::optional<DeclExpectedTypeScope> coreUniqueExpectedScope;
                         if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
@@ -14243,16 +14702,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                 if (globalInitTempFn != nullptr)
                 {
+                    const bool cppOperatorSelected = cppOperatorProbe.Selected;
                     // Check that the initializer reduced to a compile-time constant.
                     if (right != nullptr && llvm::dyn_cast_or_null<llvm::Constant>(right) == nullptr
                         && initializer != nullptr && initializer->assignmentExpression() != nullptr)
                     {
-                        auto folded = FoldCompileTimeInt(compiler, initializer->assignmentExpression());
-                        auto* initType = compiler->GetType(typeAndValue);
-                        if (folded && initType != nullptr && initType->isIntegerTy())
-                            right = llvm::ConstantInt::get(initType,
-                                llvm::APInt(initType->getIntegerBitWidth(), static_cast<uint64_t>(*folded),
-                                            false, true));
+                        if (!cppOperatorSelected)
+                        {
+                            auto folded = globalIntegerFoldCandidate
+                                ? globalIntegerFoldCandidate
+                                : FoldCompileTimeInt(compiler, initializer->assignmentExpression());
+                            auto* initType = compiler->GetType(typeAndValue);
+                            if (folded && initType != nullptr && initType->isIntegerTy())
+                                right = llvm::ConstantInt::get(initType,
+                                    llvm::APInt(initType->getIntegerBitWidth(), static_cast<uint64_t>(*folded),
+                                                false, true));
+                        }
                     }
                     if (right != nullptr && llvm::dyn_cast_or_null<llvm::Constant>(right) == nullptr)
                     {
@@ -14260,7 +14725,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         const bool isCxxClassGlobal = compiler->IsCxxRecord(declaredTypeAndValue.TypeName)
                             && !declaredTypeAndValue.Pointer && !declaredTypeAndValue.ElemPointer
                             && !declaredTypeAndValue.IsArrayView;
-                        if (isCxxClassGlobal)
+                        if (isCxxClassGlobal || cppOperatorSelected)
                             LogErrorContext(initializer->assignmentExpression(), compiler->LocalizeMessage(
                                 "native global '{}' of type '{}' has an initializer that could not be "
                                 "reduced to a compile-time constant; initialize it in main or hold a pointer",
@@ -14271,9 +14736,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         right = nullptr;
                     }
                     // Discard the temp function (and all IR emitted into it) then restore the builder.
-                    globalInitTempFn->eraseFromParent();
-                    globalInitTempFn = nullptr;
-                    compiler->RestoreBuilderState(globalInitSavedState);
+                    globalInitTempCleanup.Cleanup();
                 }
 
                 if (right == nullptr && typeAndValue.IsNullable)

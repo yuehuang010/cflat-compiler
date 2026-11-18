@@ -5,12 +5,16 @@ class CxxAssignSretScope
     LLVMBackend* compiler_;
     CxxAssignSretScope* outer_;
     llvm::Value* savedDest_;
+    llvm::Value* savedTargetDest_;
+    const void* savedCallSite_;
     std::string savedType_;
     bool consumed_ = false;
     static inline thread_local CxxAssignSretScope* current_ = nullptr;
 public:
     explicit CxxAssignSretScope(LLVMBackend* compiler)
         : compiler_(compiler), outer_(current_), savedDest_(compiler->pendingCxxSretDest_),
+          savedTargetDest_(compiler->pendingCxxSretTargetDest_),
+          savedCallSite_(compiler->pendingCxxSretCallSite_),
           savedType_(compiler->pendingCxxSretTypeName_)
     {
         compiler_->pendingCxxSretDest_ = nullptr;
@@ -22,6 +26,8 @@ public:
         current_ = outer_;
         if (consumed_) return;
         compiler_->pendingCxxSretDest_ = savedDest_;
+        compiler_->pendingCxxSretTargetDest_ = savedTargetDest_;
+        compiler_->pendingCxxSretCallSite_ = savedCallSite_;
         compiler_->pendingCxxSretTypeName_ = std::move(savedType_);
     }
     CxxAssignSretScope(const CxxAssignSretScope&) = delete;
@@ -74,11 +80,15 @@ class CxxFoldSretScope
 {
     LLVMBackend* compiler_;
     llvm::Value* savedDest_;
+    llvm::Value* savedTargetDest_;
+    const void* savedCallSite_;
     std::string savedType_;
 public:
     CxxFoldSretScope(LLVMBackend* compiler, bool intermediate)
         : compiler_(intermediate ? compiler : nullptr),
           savedDest_(intermediate ? compiler->pendingCxxSretDest_ : nullptr),
+          savedTargetDest_(intermediate ? compiler->pendingCxxSretTargetDest_ : nullptr),
+          savedCallSite_(intermediate ? compiler->pendingCxxSretCallSite_ : nullptr),
           savedType_(intermediate ? compiler->pendingCxxSretTypeName_ : std::string())
     {
         if (compiler_ != nullptr)
@@ -92,8 +102,57 @@ public:
         if (compiler_ != nullptr)
         {
             compiler_->pendingCxxSretDest_ = savedDest_;
+            compiler_->pendingCxxSretTargetDest_ = savedTargetDest_;
+            compiler_->pendingCxxSretCallSite_ = savedCallSite_;
             compiler_->pendingCxxSretTypeName_ = std::move(savedType_);
         }
+    }
+};
+
+// Arm one C++ result destination for a specific call site so nested calls keep their own slots.
+class CxxSretResultSlotScope
+{
+    LLVMBackend* compiler_;
+    llvm::Value* savedDest_;
+    llvm::Value* savedTargetDest_;
+    const void* savedCallSite_;
+    std::string savedType_;
+    bool savedForFixedArray_;
+    bool savedReturn_;
+    llvm::Value* dest_;
+    bool active_;
+public:
+    CxxSretResultSlotScope(LLVMBackend* compiler, bool active, const void* callSite,
+        llvm::Value* dest, const std::string& type)
+        : compiler_(compiler), savedDest_(compiler->pendingCxxSretDest_),
+          savedTargetDest_(compiler->pendingCxxSretTargetDest_),
+          savedCallSite_(compiler->pendingCxxSretCallSite_),
+          savedType_(compiler->pendingCxxSretTypeName_),
+          savedForFixedArray_(compiler->pendingCxxSretForFixedArray_),
+          savedReturn_(compiler->pendingCxxSretReturn_), dest_(dest), active_(active)
+    {
+        if (!active_) return;
+        compiler_->pendingCxxSretDest_ = dest_;
+        compiler_->pendingCxxSretTargetDest_ = callSite != nullptr ? dest_ : nullptr;
+        compiler_->pendingCxxSretCallSite_ = callSite;
+        compiler_->pendingCxxSretTypeName_ = compiler_->ResolveTypeAlias(type);
+        compiler_->pendingCxxSretForFixedArray_ = true;
+        compiler_->pendingCxxSretReturn_ = true;
+    }
+    ~CxxSretResultSlotScope()
+    {
+        compiler_->pendingCxxSretDest_ = savedDest_;
+        compiler_->pendingCxxSretTargetDest_ = savedTargetDest_;
+        compiler_->pendingCxxSretCallSite_ = savedCallSite_;
+        compiler_->pendingCxxSretTypeName_ = std::move(savedType_);
+        compiler_->pendingCxxSretForFixedArray_ = savedForFixedArray_;
+        compiler_->pendingCxxSretReturn_ = savedReturn_;
+    }
+    CxxSretResultSlotScope(const CxxSretResultSlotScope&) = delete;
+    CxxSretResultSlotScope& operator=(const CxxSretResultSlotScope&) = delete;
+    bool Consumed() const
+    {
+        return active_ && compiler_->pendingCxxSretDest_ != dest_;
     }
 };
 
@@ -434,7 +493,11 @@ inline bool TernaryIsMemberReceiver(CFlatParser::ConditionalExpressionContext* c
         {
             // A one-child postfix is a pass-through (a parenthesized arm's own postfix node).
             if (postfix->children.size() > 1)
-                return postfix->children[0] == from && postfix->children[1]->getText() == ".";
+            {
+                auto* op = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[1]);
+                return postfix->children[0] == from && op != nullptr
+                    && op->getSymbol()->getType() == CFlatParser::Dot;
+            }
             continue;
         }
         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
@@ -446,6 +509,124 @@ inline bool TernaryIsMemberReceiver(CFlatParser::ConditionalExpressionContext* c
             if (cond->Question() == nullptr || cond->children[0] == from) return false;
             continue;
         }
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (rule == nullptr || rule->children.size() != 1) return false;
+    }
+    return false;
+}
+inline bool TernaryMemberReceiverIsAssignmentTarget(
+    LLVMBackend* compiler, CFlatParser::ConditionalExpressionContext* ctx, llvm::Type* ternaryType)
+{
+    auto* ternaryStruct = llvm::dyn_cast_or_null<llvm::StructType>(ternaryType);
+    if (compiler == nullptr || ternaryStruct == nullptr || !ternaryStruct->hasName()) return false;
+    LLVMBackend::TypeAndValue currentType;
+    currentType.TypeName = ternaryStruct->getName().str();
+
+    auto advancePostfix = [&](CFlatParser::PostfixExpressionContext* postfix,
+                              antlr4::tree::ParseTree* base) {
+        if (postfix == nullptr || postfix->children.size() < 2 || postfix->children[0] != base)
+            return false;
+        for (size_t i = 1; i < postfix->children.size();)
+        {
+            auto* op = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+            if (op == nullptr) return false;
+            const size_t token = op->getSymbol()->getType();
+            if (token == CFlatParser::Dot)
+            {
+                if (i + 1 >= postfix->children.size()) return false;
+                auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i + 1]);
+                if (member == nullptr || currentType.Pointer || currentType.PointerDepth != 0
+                    || currentType.IsArrayView || currentType.ConstArraySize != 0
+                    || currentType.AliasArraySize != 0)
+                    return false;
+                auto structure = compiler->GetDataStructure(compiler->ResolveTypeAlias(currentType.TypeName));
+                auto field = std::find_if(structure.StructFields.begin(), structure.StructFields.end(),
+                    [&](const auto& candidate) { return candidate.VariableName == member->getText(); });
+                if (field == structure.StructFields.end()) return false;
+                currentType = static_cast<const LLVMBackend::TypeAndValue&>(*field);
+                i += 2;
+                continue;
+            }
+            if (token == CFlatParser::LeftBracket)
+            {
+                if (i + 2 >= postfix->children.size()
+                    || dynamic_cast<CFlatParser::ExpressionContext*>(postfix->children[i + 1]) == nullptr)
+                    return false;
+                auto* close = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i + 2]);
+                if (close == nullptr || close->getSymbol()->getType() != CFlatParser::RightBracket
+                    || currentType.IsArrayView || currentType.IsFlexibleArrayMember
+                    || (currentType.ConstArraySize == 0 && currentType.AliasArraySize == 0))
+                    return false;
+                if (currentType.ConstArraySize != 0)
+                {
+                    currentType.ConstArraySize = currentType.ConstInnerDimensions.empty()
+                        ? 0 : currentType.ConstInnerDimensions.front();
+                    if (!currentType.ConstInnerDimensions.empty())
+                        currentType.ConstInnerDimensions.erase(currentType.ConstInnerDimensions.begin());
+                }
+                if (currentType.AliasArraySize != 0)
+                {
+                    currentType.AliasArraySize = currentType.AliasInnerDims.empty()
+                        ? 0 : currentType.AliasInnerDims.front();
+                    if (!currentType.AliasInnerDims.empty())
+                        currentType.AliasInnerDims.erase(currentType.AliasInnerDims.begin());
+                }
+                i += 3;
+                continue;
+            }
+            return false;
+        }
+        return true;
+    };
+
+    antlr4::tree::ParseTree* from = ctx;
+    CFlatParser::PostfixExpressionContext* memberPostfix = nullptr;
+    for (antlr4::tree::ParseTree* node = ctx != nullptr ? ctx->parent : nullptr;
+         node != nullptr; from = node, node = node->parent)
+    {
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            if (postfix->children.size() > 1)
+            {
+                auto* op = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[1]);
+                if (postfix->children[0] != from || op == nullptr
+                    || op->getSymbol()->getType() != CFlatParser::Dot
+                    || !advancePostfix(postfix, from))
+                    return false;
+                memberPostfix = postfix;
+                break;
+            }
+            continue;
+        }
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->children.size() == 3 && primary->expression() != nullptr)
+            continue;
+        if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+            cond != nullptr && cond->children.size() > 1)
+        {
+            if (cond->Question() == nullptr || cond->children[0] == from) return false;
+            continue;
+        }
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (rule == nullptr || rule->children.size() != 1) return false;
+    }
+    if (memberPostfix == nullptr) return false;
+
+    from = memberPostfix;
+    for (antlr4::tree::ParseTree* node = memberPostfix->parent;
+         node != nullptr; from = node, node = node->parent)
+    {
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+            assignment != nullptr && HasAssignmentOperator(assignment))
+            return assignment->unaryExpression() == from;
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            if (postfix->children.size() > 1 && !advancePostfix(postfix, from)) return false;
+            continue;
+        }
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->expression() != nullptr && primary->LeftParen() != nullptr)
+            continue;
         auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
         if (rule == nullptr || rule->children.size() != 1) return false;
     }

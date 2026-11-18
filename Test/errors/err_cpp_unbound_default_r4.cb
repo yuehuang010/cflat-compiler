@@ -1,0 +1,22 @@
+import cpp "cpp_unbdef_r4.hpp";
+import cpp "cpp_unbdef_r5.hpp";
+
+unbdef5.C RetC5() { return unbdef5.C(2); }
+
+extern int main()
+{
+    bool c = false;
+    unbdef5.C a = unbdef5.C(1);
+    expect_error("'default' needs a known target type here") { unbdef4.va(1, default); }
+    expect_error("'default' needs a known target type here") { unbdef4.o1(1, default); }
+    expect_error("'default' needs a known target type here") { unbdef4.o1(c ? 1 : 2, default); }
+    expect_error("'default' needs a known target type here") { unbdef4.o2(1, default); }
+    expect_error("'default' needs a known target type here") { unbdef4.lr(unbdef4.C(1), default); }
+    expect_error("default constructor") {
+        unbdef4.nd(1, default);
+    }
+    expect_error("'default' needs a known target type here") { unbdef4.fa(1, default); }
+    expect_error("'default' needs a known target type here") { unbdef5.fl(c ? default : a, default); }
+    expect_error("'default' needs a known target type here") { unbdef5.am(c ? default : RetC5(), default); }
+    return 0;
+}

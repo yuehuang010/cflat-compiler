@@ -4720,6 +4720,18 @@ std.unique_ptr<cppinl.Base> t177_unique_move_return()
 int braceprv_twice(int v) { return v * 2; }
 int braceprv_throw1(int t) { braceprv.Thrower th = { braceprv.BS(1), braceprv.BT(1), 2 }; return th.a.value; }
 int braceprv_throw0(int t) { braceprv.Thrower th = { braceprv.BS(1), braceprv.BT(0), 2 }; return th.a.value; }
+braceprv.BS bracecall_flat_mk(int n) { return braceprv.mk(n); }
+struct BraceCallFlatMaker { braceprv.BS mk(int n) { return braceprv.BS(n); } };
+int bracecall_throw_mk(int n)
+{
+    braceprv.BS x = { braceprv.throwingMk(9) };
+    return x.value;
+}
+int bracecall_throw_later(int n)
+{
+    braceprv.Thrower x = { braceprv.mkWrite(3), braceprv.BT(1), 2 };
+    return x.a.value;
+}
 extern int main(int argc, char** argv)
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -9298,6 +9310,36 @@ extern int main(int argc, char** argv)
     { braceprv.LAgg bpf = { braceprv.BL(braceprv_twice), 1 }; if (braceprv.code() != 1000 || bpf.l.value != 6) return 44657; }
     braceprv.BS_Stats.reset();
     { braceprv.LAgg bpu = { braceprv.BL(u8"abc"), 1 }; if (braceprv.code() != 1000 || bpu.l.value != 53) return 44658; }
+    braceprv.BS_Stats.reset();
+    { int value = 0; { braceprv.BS bca = { braceprv.mk(7) }; value = bca.value; } if (value != 7 || braceprv.code() != 1001) return 44660; }
+    braceprv.BS_Stats.reset();
+    { int value = 0; { braceprv.BS bcb = { (braceprv.mk(7)) }; value = bcb.value; } if (value != 7 || braceprv.code() != 1001) return 44661; }
+    braceprv.BS_Stats.reset();
+    { int value = 0; { braceprv.BS bcc { braceprv.mk(7) }; value = bcc.value; } if (value != 7 || braceprv.code() != 1001) return 44662; }
+    braceprv.BS_Stats.reset();
+    { int value = 0; { braceprv.BS bcd = { bracecall_flat_mk(7) }; value = bcd.value; } if (value != 7 || braceprv.code() != 1001) return 44663; }
+    braceprv.BS_Stats.reset();
+    { braceprv.BSMaker maker = braceprv.BSMaker(); int value = 0; { braceprv.BS bce = { maker.mk(7) }; value = bce.value; } if (value != 7 || braceprv.code() != 1001) return 44664; }
+    braceprv.BS_Stats.reset();
+    { BraceCallFlatMaker maker; int value = 0; { braceprv.BS bcn = { maker.mk(7) }; value = bcn.value; } if (value != 7 || braceprv.code() != 1001) return 44665; }
+    braceprv.BS_Stats.reset();
+    { int k = 1; int value = 0; { braceprv.BS bcf = { k != 0 ? braceprv.mk(1) : braceprv.mk(2) }; value = bcf.value; } if (value != 1 || braceprv.code() != 1001) return 44666; }
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(bracecall_throw_mk, 0) != -1 || braceprv.code() != 1001) return 44667;
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(bracecall_throw_later, 0) != -1 || braceprv.code() != 1001 || braceprv.BS_Stats.order != 83) return 44668;
+    braceprv.BS_Stats.reset();
+    { int value = 0; braceprv.callShared = 0; { braceprv.Outer bch = { braceprv.mkWrite(3), braceprv.readShared() }; value = bch.x; } if (value != 3 || braceprv.BS_Stats.order != 839) return 44669; }
+    braceprv.BS_Stats.reset();
+    { int value = 0; braceprv.callShared = 0; { braceprv.Reverse bci = { braceprv.readShared(), braceprv.mkWrite(3) }; value = bci.head; } if (value != 0 || braceprv.BS_Stats.order != 983) return 44670; }
+    braceprv.BC_Stats.reset();
+    { int value = 0; int k = 0; { braceprv.BC_S bcr0 { k != 0 ? braceprv.bc_mkT(3) : braceprv.bc_mkT(4) }; value = bcr0.value; } if (value != 104 || braceprv.BC_Stats.code() != 1001) return 44671; }
+    braceprv.BC_Stats.reset();
+    { int value = 0; int k = 1; { braceprv.BC_S bcr1 { k != 0 ? braceprv.bc_mkT(3) : braceprv.bc_mkT(4) }; value = bcr1.value; } if (value != 103 || braceprv.BC_Stats.code() != 1001) return 44672; }
+    braceprv.BC_Stats.reset();
+    { int value = 0; int k = 0; { braceprv.BC_S bcr2 = { k != 0 ? braceprv.bc_mkT(3) : braceprv.bc_mkT(4) }; value = bcr2.value; } if (value != 104 || braceprv.BC_Stats.code() != 1001) return 44673; }
+    braceprv.BC_Stats.reset();
+    { int value = 0; int k = 1; { braceprv.BC_S bcr3 = { k != 0 ? braceprv.bc_mkT(3) : braceprv.bc_mkT(4) }; value = bcr3.value; } if (value != 103 || braceprv.BC_Stats.code() != 1001) return 44674; }
     // Guard (master equal): an element constructor still runs before a later element with side effects.
     braceprv.BS_Stats.reset();
     { braceprv.Outer bpq = { braceprv.BS(braceprv.BS_Stats.note(3)), braceprv.BS_Stats.note(4) }; if (braceprv.BS_Stats.order != 334) return 44651; }

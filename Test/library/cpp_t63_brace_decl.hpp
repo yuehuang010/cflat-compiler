@@ -141,7 +141,23 @@ struct CallHost {
     int overloaded(CallEvent x, int y) { return 400 + x.value + y; }
     int overloaded(CallEvent x, double y) { return 500 + x.value + (int)y; }
     template<class T> int template_event(T x, int y) { return x.value * 1000 + y; }
+    template<class T, class U> int template_event_two(T x, U y) { return x.value * 1000 + y; }
+    template<class T> int template_event_convert(T x, long long y) { return x.value * 1000 + (int)y; }
+    template<class T> int template_event_const(T x, int y) const { return x.value * 1000 + y; }
+    // Overloaded and ref-qualified member templates: the direct route names the selected one.
+    template<class T> int over_event(T x, int y) { return 100000 + x.value * 1000 + y; }
+    template<class T> int over_event(T x, double y) { return 200000 + x.value * 1000 + (int)y; }
+    template<class T> int qual_event(T x, int y) & { return 300000 + x.value * 1000 + y; }
+    template<class T> int qual_event(T x, int y) && { return 400000 + x.value * 1000 + y; }
 };
+struct CallHostHolder { CallHost host; };
+// A member template that reads `this`, reached on its own class and through a non-first base.
+struct CallScaleBase {
+    int scale;
+    template<class T> int scaled(T x, int y) { return x.value * scale + y; }
+};
+struct CallScalePad { int pad; };
+struct CallScaleDerived : CallScalePad, CallScaleBase {};
 // A class-scope operator new hides the global placement form unless the thunk spells ::new.
 struct ClassNew {
     int count;

@@ -15,6 +15,9 @@ Settled (refusal stands, no fix item):
   ("a closure that may carry captured state cannot become a C function pointer 'function<T>'; call .toFunction() instead").
   Same refusals, only the wording changed. Legs: Test/errors/err_function_slot_literal_zero.cb (ternary blocks at the end),
   Test/errors/err_function_slot_ternary_closure.cb.
+- FIXED (wording, ruled 2026-11-16 from precedent): literal 0 at a function<> parameter of an interface call (`i.run(0, 0)`) or a
+  generic T = function<> call (`isNull<function<int(int)>>(0)`, `Box<function<..>>.set(0)`) reports the null-spelling message at the
+  argument. Same refusals. Legs: Test/errors/err_function_slot_literal_zero.cb (last three blocks).
 
 Open, no ruling yet (stays here):
 - Typed null pointer constants `(void*)0`, `(int*)0`, `(int*)nullptr` are accepted at function<> and Lambda<> slots, direct
@@ -22,9 +25,6 @@ Open, no ruling yet (stays here):
   null spelling for a function slot needs a maintainer ruling. Repro (accepts, returns 6 at -O0 and -O2):
     int inc(int x) { return x + 1; }
     int main() { int k = 1; function<int(int)> f = k ? inc : (void*)0; return f == nullptr ? 0 : f(5); }
-- Literal 0 into a function<> parameter through an interface call `i.run(0, 0)` refused with "no method matches", and into a
-  generic T = function<> parameter (`isNull<function<int(int)>>(0)`, `Box<function<..>>.set(0)`) refused with "no overload
-  matches". Refused as ruled; the wording does not name the null-spelling rule. No ruling on the wording.
 
 Open (ctor0fn review 1, 2026-11-01): `rv.G{0}` as an expression still does not parse; this grammar form remains out of scope. The
 declaration form `rv.G value{0};` and copy-init form `rv.G value = 0;` are covered by the FNZERO fix. The remaining inline repro is:

@@ -1180,9 +1180,47 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         const std::string linkageName = returnType.external && !namespaceName.empty()
             ? rawFuncName : std::string();
         const std::string uniqueName = compiler->ComputeMangledName(name, returnType, allParams, varargs);
+        if (!returnType.Pointer && !returnType.IsAlias && !returnType.IsMove
+            && compiler->IsForeignNontrivialCxxClass(returnType.TypeName)
+            && compiler->IsDataStructure(returnType.TypeName)
+            && compiler->HasForeignNontrivialCxxField(returnType.TypeName)
+            && compiler->ReturnsViaCxxSret(returnType.TypeName)
+            && !ClassifyNamedLocalReturnCandidates(func).empty())
+                foreignCxxNrvoReturnFunctionNames_.insert(uniqueName);
         functionSourceOrder_[uniqueName] = func->getStart()->getStartIndex();
+        auto& defaultContexts = compiler->cflatDefaultArgumentContexts[uniqueName];
+        defaultContexts.clear();
+        defaultContexts.resize(params.size());
+        for (size_t i = 0; i < params.size(); ++i)
+            if (params[i].DefaultValue != nullptr)
+                defaultContexts[i] = { params[i].DefaultValue, namespaceName };
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs,
                                             returnsOwned, isMethod, returnType.CallConv, linkageName);
+        if (!returnType.external)
+        {
+            auto functions = compiler->functionTable.find(name);
+            if (functions != compiler->functionTable.end())
+                for (auto& symbol : functions->second)
+                    if (symbol.UniqueName == uniqueName)
+                    {
+                        for (size_t i = 0; i < params.size(); ++i)
+                        {
+                            auto* initializer = params[i].DefaultValue;
+                            if (initializer == nullptr || initializer->assignmentExpression() == nullptr
+                                || isMethod
+                                || params[i].Pointer || params[i].IsAlias || params[i].IsRvalueRef
+                                || !compiler->HasCxxClassMember(params[i].TypeName)
+                                || !compiler->IsCxxRecord(params[i].TypeName))
+                                continue;
+                            if (symbol.DefaultArguments.size() < params.size())
+                                symbol.DefaultArguments.resize(params.size());
+                            // Earlier free callers can inline this default in their full expression.
+                            // Main codegen later supplies the factory name for calls below the definition.
+                            symbol.DefaultArguments[i].kind = "cflat_callsite";
+                        }
+                        break;
+                    }
+        }
         if (!returnType.external && func->compoundStatement() != nullptr)
         {
             std::unordered_map<std::string, size_t> viewParams;
@@ -5196,11 +5234,7 @@ void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationConte
                     params != nullptr && params->Ellipsis() != nullptr, false, false, type.CallConv, linkage);
                 continue;
             }
-            // Publish global storage shells in the scan pass so namespace bodies can resolve
-            // a later root global. Initializers are still applied by the source-ordered walk.
-            if (namespaceName.empty()
-                && namespaceFunctionValueNames_.count(getDirectDeclName(direct)) == 0)
-                continue;
+            // Keep namespace storage shells in the scan map; record root types for default lookup.
             auto itemType = type;
             if (direct->assignmentExpression() != nullptr)
             {
@@ -5226,6 +5260,23 @@ void ForwardRefScanner::PreRegisterGlobals(CFlatParser::ExternalDeclarationConte
             if (compilerLLVM->GetGlobalVariableNV(name).Storage != nullptr)
                 continue;
             itemType.VariableName = name;
+            if (namespaceName.empty()
+                && namespaceFunctionValueNames_.count(getDirectDeclName(direct)) == 0)
+            {
+                auto scannedType = itemType;
+                const bool externalDeclOnly = itemType.external && item->initializer() == nullptr
+                    && item->initializerList() == nullptr;
+                if (itemType.external && !externalDeclOnly)
+                    scannedType.external = false;
+                const auto* token = direct->getStart();
+                auto* input = token != nullptr ? token->getInputStream() : nullptr;
+                compilerLLVM->scannedDefaultGlobals_.try_emplace(name,
+                    LLVMBackend::ScannedDefaultGlobal{
+                        scannedType,
+                        token != nullptr ? token->getTokenIndex() : 0,
+                        input != nullptr ? input->getSourceName() : std::string() });
+                continue;
+            }
             const bool externOnly = itemType.external && item->initializer() == nullptr
                 && item->initializerList() == nullptr;
             auto* global = compilerLLVM->CreateGlobalVariable(itemType, nullptr, itemType.threadLocal,

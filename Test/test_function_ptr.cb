@@ -6287,6 +6287,8 @@ bool testTernaryGenericFunctionArm()
 }
 
 struct T185Box<T> { T v = default; };
+int t185ZeroOverload(function<int(int)> fn) { return fn(5); }
+int t185ZeroOverload(int value)              { return 180 + value; }
 
 // T185: a function<> slot takes the values it may hold - a named function, nullptr,
 // a function-pointer variable or field, a call result, and a ternary of those. Refusals of
@@ -6315,6 +6317,8 @@ bool testFunctionSlotAccepts()
     result &= Test("generic field assigned a function", bx.v(3), 9);
     bx.v = nullptr;
     result &= Test("generic field nullptr", bx.v == nullptr, true);
+    result &= Test("literal zero selects int overload beside function slot",
+        t185ZeroOverload(0), 180);
     return result;
 }
 

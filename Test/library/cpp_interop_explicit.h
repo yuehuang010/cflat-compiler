@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace cppexp {
@@ -377,8 +378,20 @@ struct Retelide {
     Retelide(Retelide&& other) noexcept : v(other.v + 1000) { ++retelide_ctors; ++retelide_moves; }
     Retelide& operator=(const Retelide& other) { v = other.v + 10000; return *this; }
     Retelide& operator=(Retelide&& other) noexcept { v = other.v + 20000; return *this; }
+    Retelide operator[](int index) const { return Retelide(v + index); }
     ~Retelide() { ++retelide_dtors; }
 };
+inline Retelide retelide_mk(int x) { return Retelide(x); }
+inline int retelide_ival(int x) { return x; }
+inline Retelide operator+(const Retelide& lhs, const Retelide& rhs)
+{
+    return Retelide(lhs.v + rhs.v);
+}
+inline Retelide retelide_c2(Retelide p)
+{
+    Retelide g = std::move(p);
+    return g;
+}
 // T272: a maker and a taker for ConvCnt (parenthesized-initializer legs). ConvNoDefault has no
 // default constructor, so a CFlat struct holding it has no implicit no-arg construction.
 inline ConvCnt conv_mk(int x) { return ConvCnt(x); }

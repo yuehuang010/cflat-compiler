@@ -28,10 +28,12 @@ inaccessible; (5) run test_cpp_interop on Windows.
 - `new CVA(4)` through a `using` alias of a class with a converting ctor fails "has no imported constructors"; clang 8, cv_alias.
 - `new DM(vref())` from a `volatile DM&` source is accepted by a stack declaration too (`DM q = vref();`), so the
   gap is general volatile-copy acceptance, not new-specific; CFlat drops volatile by design. Needs a ruling.
-- Same-class nested functional casts in a DECLARATION: the sole-argument path (TryDeclareForeignCxxLocal, MainListener_Declarations.cpp ~9336) now builds the inner cast into the declared slot, as the `new` path does (legs 4021-4024). Still open, all probed with clang 0 / master-equal:
-  - Call between, `Sx s = Sx(f(Sx(4)))` with `Sx f(Sx x) { return x; }`: copies 2, clang 1.
-  - Method returning the same class, `Sx s = Sx(Sx(4).m())`: copies 1, clang 0.
-  - Alias spelled inside an argument: `using SA = Sx; SA s = SA(SA(4));` refused "Undefined variable SA" (single-level `SA s = SA(4)` works; `new SA(SA(4))` refused the same way).
+- (fixed NESTCAST r2) Same-class nested functional casts in a DECLARATION: the call-between, method-result
+  and function-name collision shapes now match clang (legs 4025, 4030-4037). Still open, by design or out of scope:
   - File-scope `Sx g = Sx(Sx(4));` refused "not a compile-time constant" (by design).
   - Assignment `s = Sx(Sx(4));` copies 1, clang 0: assignment is not elision, unchanged.
+  - A same-class call result routed through a generated `__cflat_free_` wrapper (a C++ `f` whose overload set needs the
+    wrapper, e.g. `cppne.f` after the t460 header import in Test/test_cpp_interop.cb): `Sx s = Sx(f(Sx(4)))` copies 2,
+    clang 1; the sret slot does not survive the wrapper (NESTCAST residue, no worse than master).
+  - Bare `Sx(...)` inside a reopened namespace that also sees a global function `Sx` is refused; clang accepts (pre-existing).
 - Not reproduced 2026-11-09: `new CVA(4)` through a `using` alias (master and fix both run 8, clang 8).

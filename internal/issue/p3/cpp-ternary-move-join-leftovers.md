@@ -20,7 +20,3 @@
 
 ## Ternary move-join open items after the ternmv round 3-4 review (fix/ternmv)
 - OPEN: `b4_r_c1_rev` (`C h(bool k) { const C a; C b; C c = k ? move b : move a; return c; }`, then `z = h(k)`): the const-arm value matches clang (z=22), but the return of local `c` moves once more and dtor +1 (clang: copy, no move; move-assign into z). Master differs too (r=-1). Return-of-local count only; not in the decl path.
-
-OPEN (2026-11-09): a one-const-arm move join as a constructor argument inside an outer ternary arm,
-`z = k ? C(k ? move a : move b) : move c`, makes one extra copy (cp2 dt5; master and clang cp1 dt4). Value and sources are
-right, ctors and dtors balance. Repros: p_ctor_nest and q_asg in scratch/repro_keep/ternmv/.

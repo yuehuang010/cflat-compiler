@@ -3301,6 +3301,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
             llvm::TimeTraceScope codegenScope("CodeGeneration", sourceFileName);
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
+            myListener->RegisterForeignCxxNrvoReturnFunctionNames(
+                scanner.ForeignCxxNrvoReturnFunctionNames());
             myListener->PreparseAggregateDefinitions(computeUnit->translationUnit(),
                 scanner.DeferredFunctionDefinitionContexts());
             myListener->PrepareDeferredFunctionDefinitions(scanner.DeferredFunctionDefinitionContexts());
@@ -4624,6 +4626,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             llvm::TimeTraceScope codegenScope("CodeGeneration", importFilename);
             auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
+            myListener->RegisterForeignCxxNrvoReturnFunctionNames(
+                scanner.ForeignCxxNrvoReturnFunctionNames());
             myListener->PreparseAggregateDefinitions(computeUnit->translationUnit(),
                 scanner.DeferredFunctionDefinitionContexts());
             myListener->PrepareDeferredFunctionDefinitions(scanner.DeferredFunctionDefinitionContexts());
@@ -5633,6 +5637,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         {
             llvm::TimeTraceScope codegenScope("CodeGeneration", sourceFileName);
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
+            myListener->RegisterForeignCxxNrvoReturnFunctionNames(
+                scanner.ForeignCxxNrvoReturnFunctionNames());
             myListener->PreparseAggregateDefinitions(computeUnit->translationUnit(),
                 scanner.DeferredFunctionDefinitionContexts());
             myListener->PrepareDeferredFunctionDefinitions(scanner.DeferredFunctionDefinitionContexts());
@@ -5756,6 +5762,7 @@ void LLVMBackend::ReleaseCxxIncrementalGroups()
 void LLVMBackend::ResetForReanalysis()
 {
     movedStateMergeStack_.reset();
+    cflatDefaultArgumentContexts.clear();
     scanTimeGlobalVariableTypes_.clear();
     scanTimeVariableTypeScopes_.clear();
     arrayViewFieldLengths_.clear();
@@ -6081,6 +6088,8 @@ void LLVMBackend::ResetForReanalysis()
     // An aborted declaration could leave a slot armed; the next file's first call of that type
     // would then construct into storage from a discarded module.
     pendingCxxSretDest_ = nullptr;
+    pendingCxxSretTargetDest_ = nullptr;
+    pendingCxxSretCallSite_ = nullptr;
     pendingCxxSretTypeName_.clear();
     pendingCxxSretForFixedArray_ = false;
     pendingCxxSretReturn_ = false;
@@ -6202,6 +6211,7 @@ void LLVMBackend::ResetForReanalysis()
     typeAnnotations_.clear();
     globalNamedVariable.clear();
     globalVariableTypes.clear();
+    scannedDefaultGlobals_.clear();
     globalCxxLiveFlags_.clear();
     globalDeclSite.clear();
     namespaceTable.clear();

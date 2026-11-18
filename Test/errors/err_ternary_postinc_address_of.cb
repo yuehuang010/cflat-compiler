@@ -6,6 +6,7 @@ int m21Call()
 
 extern int main()
 {
+    // TERNRES: a redundant scalar cast keeps storage in IR but is still a prvalue.
     expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
         int i = 1;
         int j = 4;
@@ -27,6 +28,18 @@ extern int main()
         int i = 3;
         bool t = false;
         int* p = &(t ? i : m21Call());
+    }
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        int i = 3;
+        int j = 4;
+        bool t = true;
+        int* p = &(t ? i : (int)j);
+    }
+    expect_error("cannot take the address of a '?:' unless both arms are lvalues") {
+        int x = 1;
+        int y = 2;
+        bool t = true;
+        int* p = &(t ? x : ((int)y));
     }
     return 0;
 }

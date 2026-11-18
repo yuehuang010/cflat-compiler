@@ -76,6 +76,8 @@ namespace t418
     inline Val* aimed = nullptr;
     inline void aim(Val& v) { aimed = &v; }
     inline Val globalValue = Val(7);
+    inline Val namedGlobal = Val(7);
+    inline Val* globalValuePointer() { return &globalValue; }
     struct Flag
     {
         Flag() {}
@@ -228,8 +230,27 @@ namespace t518
     namespace
     {
         inline int take(cpptw::Twin value) { return value.value(); }
-        inline int take2(cpptw::Twin first, cpptw::Twin second) { return first.value() + second.value(); }
+        inline int take2(cpptw::Twin first, cpptw::Twin second)
+        { return first.value() + second.value(); }
+        inline int f1(cpptw::Twin first, cpptw::Twin second)
+        { return first.value() * 10 + second.value(); }
+        inline int f2(cpptw::Twin first, int second)
+        { return first.value() * 10 + second; }
+        inline int f3(cpptw::Twin first, const cpptw::Twin& second)
+        { return first.value() * 10 + second.value(); }
+        inline int f5(cpptw::Twin first, cpptw::Twin second)
+        { return first.value() * 10 + second.value(); }
+        inline int g1(int first, int second) { return first * 10 + second; }
+        inline int h3(int first) { return first; }
+        inline int h3(long first, int second) { return (int)first * 10 + second; }
+        template <class T> inline int tf(T first, int second) { return (int)first * 10 + second; }
+        inline int ambiguous(cpptw::Twin first, int second = 3)
+        { return first.value() + second; }
+        inline int ambiguous(cpptw::Twin first, double second = 4.0)
+        { return first.value() + (int)second; }
         inline int later(t418::Val v, int b) { return v.value() * 100 + b; }
+        inline int laterRefuse(t418::Val v, int b, int ignored = t418::stats())
+        { return v.value() * 100 + b; }
         inline int lref(const t418::Val& v, int b) { return v.value() * 100 + b; }
         // Review families: overloads, templates and default arguments decide by the SELECTED callee.
         inline int mixed(t418::Val x, double n) { return 1000 + x.value() * 100 + (int)n; }
@@ -325,5 +346,90 @@ namespace t518
     {
         inline int tatake8(Ta8 x, int b) { return 1000 + (int)x.n * 100 + b; }
         inline int tatake16(Ta16 x, int b) { return 1000 + (int)x.n * 100 + b; }
+    }
+}
+
+// Bound twins for the anonymous free functions above. Their C++ defaults are intentionally absent.
+namespace t518bound
+{
+    inline int take2(cpptw::Twin first, cpptw::Twin second)
+    { return first.value() + second.value(); }
+    inline int f1(cpptw::Twin first, cpptw::Twin second)
+    { return first.value() * 10 + second.value(); }
+    inline int f2(cpptw::Twin first, int second)
+    { return first.value() * 10 + second; }
+    inline int f3(cpptw::Twin first, const cpptw::Twin& second)
+    { return first.value() * 10 + second.value(); }
+    inline int f5(cpptw::Twin first, cpptw::Twin second)
+    { return first.value() * 10 + second.value(); }
+    inline int g1(int first, int second) { return first * 10 + second; }
+    inline int h3(int first) { return first; }
+    inline int h3(long first, int second) { return (int)first * 10 + second; }
+    template <class T> inline int tf(T first, int second) { return (int)first * 10 + second; }
+}
+
+// UNBSNAP: later-argument nonlocal writes into by-value C++ calls (legs 51861-51870).
+
+namespace rv
+{
+    inline t418::Val g1{7};
+    inline int pure() { return 2; }
+    inline int wam() { *t418::aimed->p = 9; return 2; }
+    namespace
+    {
+        inline int fcls(t418::Val v, int b, t418::Val z = t418::globalValue)
+        { return v.value() * 1000 + b * 100 + z.value(); }
+        inline int fv(t418::Val v, int b, ...)
+        { return v.value() * 100 + b; }
+        inline int fc2(t418::Val v, int b, t418::Val z = t418::Val(1))
+        { return v.value() * 100 + b; }
+        inline int f(t418::Val v, int b, int z = t418::stats())
+        { return v.value() * 100 + b; }
+        inline int f2(t418::Val v, int b)
+        { return v.value() * 100 + b; }
+    }
+}
+
+// DIRORD: a by-value C++ class lvalue argument of a constructor is copied at its position, before a
+// later argument runs (clang order). Events: ctor v, copy 10+v, move 20+v, dtor 30+v, T ctor 40, T dtor 41.
+namespace dirord
+{
+    inline int events[32];
+    inline int count = 0;
+    inline int throwSecond = 0;
+    inline int allocations = 0;
+    inline int frees = 0;
+    inline int live = 0;
+    inline void record(int v) { events[count++] = v; }
+    inline int size() { return count; }
+    inline int at(int i) { return events[i]; }
+    inline void reset(int shouldThrow)
+    {
+        count = 0;
+        throwSecond = shouldThrow;
+        allocations = 0;
+        frees = 0;
+    }
+    struct C
+    {
+        int v;
+        explicit C(int x) : v(x) { if (x == 2 && throwSecond) throw 2; ++live; record(x); }
+        C(const C& other) : v(other.v) { ++live; record(10 + v); }
+        C(C&& other) noexcept : v(other.v) { ++live; record(20 + v); }
+        ~C() { --live; record(30 + v); }
+    };
+    struct T
+    {
+        T(C first, C second) { record(40); }
+        ~T() { record(41); }
+        static void* operator new(unsigned long n) { ++allocations; return ::operator new(n); }
+        static void operator delete(void* p) noexcept { ++frees; ::operator delete(p); }
+    };
+    struct Host { C s; Host() : s(1) {} };
+    inline C global(1);
+    using Callback = int (*)();
+    inline int guard(Callback fn)
+    {
+        try { return fn(); } catch (...) { return -1; }
     }
 }

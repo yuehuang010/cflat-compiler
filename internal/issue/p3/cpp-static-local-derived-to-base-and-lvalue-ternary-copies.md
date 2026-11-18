@@ -8,6 +8,7 @@ class, `static T g = move *p`, and the moved-source refusal for a second static 
 93025-93035). T231 fixed the call-argument double slice `takeb(D(3))`. TERNBASE (af28ab81) fixed the
 derived/base lvalue join. TERNMOVE fixed the nested-field arm `rv.mkH2(1).h.d`. STATELEM fixed the
 array element of a class temporary as a ternary arm in typed and `auto` locals (legs 93085-93100).
+STATCONST fixed a const field of a temporary (or a move of one) as a derived arm joining a base local: the join copies as clang (legs 93109-93116).
 
 Still open:
 
@@ -21,8 +22,7 @@ Still open:
 through a copy-only variadic-ctor wrapper (its `sl::D&` parameter copies). C++20 treats it as an xvalue,
 so clang moves. The fix requests that wrapper with the returned name as an rvalue first (clang's
 copy-init overload resolution on the xvalue) and falls back to the lvalue wrapper (legs 93061-93063:
-`B(const D&)` only, `B(const D&)` + `B(D&&)`, explicit `B(B&&)`). Explicit `return move d` with
-`B(D&&)` still calls `B(B&&)` (clang `B(D&&)`; master too): the `!explicitMove` guard skips the wrapper. Matrix in scratch/statleft_matrix.md. Parenthesized returns and
+`B(const D&)` only, `B(const D&)` + `B(D&&)`, explicit `B(B&&)`). Matrix in scratch/statleft_matrix.md. Parenthesized returns and
 reference returns already matched clang and are guarded by legs.
 
 ## Not fixed here: refusals and notes (STATELEM scope left out)
@@ -34,10 +34,6 @@ ownership", the STATELEM build words it "'?:' arms handle ownership differently"
 Accepted since STATELEM, matching clang's counts, not legged: `sl.D g = c ? sl.D(2) : mkHA(1).a[0]` (refused
 on master; element-selected `1 2 0 1 3`) and `sl.D g = c ? mkH(1).d : sl.D(2)` (refused on master;
 `1 1 0 1 2` / `2 1 0 0 1`).
-
-Pre-existing, differs from clang on master too (not in STATELEM r3): `B g = c ? mkDCF(1).cd : D(2)` where
-`cd` is a `const D` field of a temporary moves from the const field (2 moves, clang copies twice on
-c=true; `1 1 2 0 3` vs cflat `1 1 0 2 3`). The derived block uses the field xvalue without the const check.
 
 Same-class NRVO (not a derived-to-base item; master kept): `B b = B(6); return b;` and `D d = D(6);
 return d;` move on master, clang elides (0 moves). Same for `DC d; return d;` with a copy-only class.

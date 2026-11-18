@@ -777,11 +777,20 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             auto* structTy = GetType(retTV);
             if (structTy == nullptr || !structTy->isStructTy()) return { nullptr, nullptr };
             llvm::Value* dest = nullptr;
-            if (pendingCxxSretDest_ != nullptr && pendingCxxSretTypeName_ == retTV.TypeName)
+            const bool pendingCallSiteMatches = pendingCxxSretTargetDest_ == nullptr
+                || pendingCxxSretDest_ != pendingCxxSretTargetDest_
+                || pendingCxxSretCallSite_ == pendingCallSite_;
+            if (pendingCxxSretDest_ != nullptr && pendingCxxSretTypeName_ == retTV.TypeName
+                && pendingCallSiteMatches)
             {
                 dest = pendingCxxSretDest_;
                 pendingCxxSretDest_ = nullptr;
                 pendingCxxSretTypeName_.clear();
+                if (pendingCxxSretTargetDest_ == dest)
+                {
+                    pendingCxxSretTargetDest_ = nullptr;
+                    pendingCxxSretCallSite_ = nullptr;
+                }
             }
             else
             {

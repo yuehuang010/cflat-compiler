@@ -254,8 +254,11 @@ struct Sx
     int v;
     explicit Sx(int x) : v(x) { ++ctors; ++live; }
     Sx(const Sx& o) : v(o.v) { ++copies; ++live; }
+    Sx m() const { return Sx(v); }
     ~Sx() { --live; ++dtors; }
 };
+inline Sx f(Sx x) { return x; }
+inline Sx sretPass(Sx x) { return x; }
 inline Sx mkSx(int x) { return Sx(x); }
 struct Base
 {

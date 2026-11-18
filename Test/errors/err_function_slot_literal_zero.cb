@@ -235,3 +235,84 @@ expect_error("integer constant zero is not a null spelling for a function slot")
         return 0;
     }
 }
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    interface FnZeroWordIface { int run(function<int(int)> fn, int value); };
+    class FnZeroWordImpl : FnZeroWordIface {
+        int run(function<int(int)> fn, int value) { return value; }
+    };
+    int fnZeroWordIfaceCall() {
+        FnZeroWordImpl impl;
+        FnZeroWordIface iface = impl;
+        return iface.run(0, 0);
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int fnZeroWordGeneric<T>(T value) { return 0; }
+    int fnZeroWordGenericCall() { return fnZeroWordGeneric<function<int(int)>>(0); }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    struct FnZeroWordBox<T> { T value = default; void set(T item) { value = item; } };
+    int fnZeroWordGenericMethod() {
+        FnZeroWordBox<function<int(int)>> box;
+        box.set(0);
+        return 0;
+    }
+}
+
+// Misdirection shapes (FNZEROWORD r3): a second argument is the real mismatch, so the master message stays.
+expect_error("no overload of 'fnZeroWordMisOvl' matches the given arguments") {
+    int fnZeroWordMisOvl(function<int(int)> fn, int v) { return 1; }
+    int fnZeroWordMisOvl(int a, int b) { return 2; }
+    int fnZeroWordMisOvlCall() { return fnZeroWordMisOvl(0, "x"); }
+}
+expect_error("no overload of 'fnZeroWordMisHead' matches the given arguments") {
+    int fnZeroWordMisHead(function<int(int)> fn, int v) { return 1; }
+    int fnZeroWordMisHeadCall() { return fnZeroWordMisHead(0, "x"); }
+}
+expect_error("no overload of 'fnZeroWordMisTail' matches the given arguments") {
+    int fnZeroWordMisTail(int v, function<int(int)> fn) { return 1; }
+    int fnZeroWordMisTailCall() { return fnZeroWordMisTail("x", 0); }
+}
+expect_error("no overload of 'fnZeroWordMisGen2<function<int(int)>>' matches the given arguments") {
+    int fnZeroWordMisGen2<T>(T v, int x) { return x; }
+    int fnZeroWordMisGen2Call() { return fnZeroWordMisGen2<function<int(int)>>(0, "x"); }
+}
+expect_error("no method of 'FnZeroWordMisIface.run' matches the given arguments") {
+    interface FnZeroWordMisIface { int run(function<int(int)> fn, int value); };
+    class FnZeroWordMisImpl : FnZeroWordMisIface {
+        int run(function<int(int)> fn, int value) { return value; }
+    };
+    int fnZeroWordMisIfaceCall() {
+        FnZeroWordMisImpl impl;
+        FnZeroWordMisIface iface = impl;
+        return iface.run(0, "x");
+    }
+}
+expect_error("no method of 'FnZeroWordMisBoolIface.run' matches the given arguments") {
+    interface FnZeroWordMisBoolIface { int run(function<int(int)> fn, int value); };
+    class FnZeroWordMisBoolImpl : FnZeroWordMisBoolIface {
+        int run(function<int(int)> fn, int value) { return value; }
+    };
+    int fnZeroWordMisBoolCall() {
+        FnZeroWordMisBoolImpl impl;
+        FnZeroWordMisBoolIface iface = impl;
+        return iface.run(false, 0);
+    }
+}
+
+// A data pointer at another function<> slot is the real mismatch (FNZEROWORD r4): master message stays.
+expect_error("no overload of 'fnZeroWordMisF2' matches the given arguments") {
+    int fnZeroWordMisF2(function<int(int)> a, function<int(int)> b) { return 1; }
+    int fnZeroWordMisF2Call() { return fnZeroWordMisF2(0, "x"); }
+}
+expect_error("no method of 'FnZeroWordMisPairIface.run' matches the given arguments") {
+    interface FnZeroWordMisPairIface { int run(function<int(int)> a, function<int(int)> b); };
+    class FnZeroWordMisPairImpl : FnZeroWordMisPairIface {
+        int run(function<int(int)> a, function<int(int)> b) { return 1; }
+    };
+    int fnZeroWordMisPairCall() {
+        FnZeroWordMisPairImpl impl;
+        FnZeroWordMisPairIface iface = impl;
+        return iface.run(0, "x");
+    }
+}

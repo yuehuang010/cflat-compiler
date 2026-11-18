@@ -236,6 +236,7 @@ import cpp "library/cpp_defarg_trace.hpp";
 import cpp "library/cpp_cdefarg.hpp";
 import cpp "library/cpp_mixs2.hpp";
 import cpp "library/cpp_defcls.hpp";
+import cpp "library/cpp_braceprv.hpp";
 import cpp "library/cpp_interop_mixcond3.h";
 import cpp {"library/cpp_hdrglob_a.hpp", "library/cpp_hdrglob_b.hpp"};
 import cpp "library/cpp_hdrglob_r3_a.hpp";
@@ -585,6 +586,11 @@ import cpp "library/cpp_t46_smartdot.hpp";
 import cpp "library/cpp_interop_uniqueptr.h";
 import cpp "library/cpp_t492_fieldmove.hpp";
 
+using NestCastSxAlias = cppne.Sx;
+namespace NestCastAliasNs { using SA = cppne.Sx; }
+using NestCastCppAlias = CastAssignBoxAlias;
+cppne.Sx nestCastCflatF(cppne.Sx x) { return x; }
+
 int fpabiR2Which = 0;
 short fpabiR2H(cppbv.FpabiR2NT n) { fpabiR2Which = 1; return (short)n.v; }
 short fpabiR2H2(cppbv.FpabiR2NT n) { fpabiR2Which = 2; return (short)(n.v + 1); }
@@ -668,6 +674,7 @@ import cpp "library/cpp_t26_ios_shapes.hpp";
 import cpp "library/cpp_t26_ios_shapes.cpp";
 import cpp "library/cpp_t138_tplglobal.hpp";
 import cpp "library/cpp_t138_tplglobal_r2.hpp";
+import cpp "library/cpp_unbdef_r4.hpp";
 
 int[3] arrcv2Global = {7, 8, 9};
 int arrcv2Drops = 0;
@@ -1542,6 +1549,7 @@ int StrmThrowingInsert(int v)
     f << b;
     return 0;
 }
+
 // Class-scope allocation functions (legs 3350-3368). cppon counts every class-level operator,
 // cppunw every global one (new[] / delete[] apart from new / delete), heap_audit every CFlat block.
 int OnUniqueCls(int x) { unique cppon.Cls* p = new cppon.Cls(x); return p->get(); }
@@ -2461,6 +2469,12 @@ int T45IntCase(int v)
 }
 // An imported enum with a free operator: constant contexts still fold built-in arithmetic.
 enum EopFold : int { Over = cppi_scope.eop.ua + 1, Fixed = cppi_scope.eop.p2 * 4 };
+// File-scope built-in arithmetic on imported enums still folds when no C++ operator binds.
+int EopBuiltinFileScopeFold = cppi_scope.eop.p2 * 4;
+enum EopFreeopinitColor : int { R = 1, G = 2 };
+int EopFreeopinitNativeAnd = EopFreeopinitColor.G == 2 && EopFreeopinitColor.R == 1;
+int EopFreeopinitImportedAnd = (cppi_scope.eop.p2 == 2 && cppi_scope.eop.p3 == 3);
+bool EopFreeopinitNativeOr = (EopFreeopinitColor.G > 1 || EopFreeopinitColor.R > 5);
 int EopCase(int v)
 {
     switch (v) { case cppi_scope.eop.ua + 1: return 1; }
@@ -2749,6 +2763,11 @@ int TConstFieldAuto(bool c) { auto g = c ? t226s.mkHC(1).cd : t226s.B(2); return
 int TConstFieldTyped(bool c) { t226s.B g = c ? t226s.mkHC(1).cd : t226s.B(2); return g.get(); }
 int TConstRootAuto(bool c) { auto g = c ? t226s.mkHM(1).m : t226s.B(2); return g.get(); }
 int TConstRootTyped(bool c) { t226s.B g = c ? t226s.mkHM(1).m : t226s.B(2); return g.get(); }
+// STATCONST: a const derived field of a temporary joins a derived base as clang copies (never moves).
+int TConstDerivedBase(bool c) { t226s.B g = c ? t226s.mkDCF(1).cd : t226s.D(2); return g.get(); }
+int TConstDerivedBaseRev(bool c) { t226s.B g = c ? t226s.D(2) : t226s.mkDCF(1).cd; return g.get(); }
+int TConstDerivedXvalueJoin(bool c) { t226s.B g = c ? t226s.mkH(1).d : t226s.mkDCF(2).cd; return g.get(); }
+int TConstDerivedExplicitMove(bool c) { t226s.B g = c ? move t226s.mkDCF(1).cd : t226s.D(2); return g.get(); }
 int T226CallLvalueMove(bool c)
 {
     t226s.T a = t226s.T(1);
@@ -3414,6 +3433,45 @@ int T224ThrowWrapper(int x)
 {
     T130ThrowHolder s = T224ThrowNested(x);
     return s.t.get();
+}
+int TNestelideValue(int x) { return x + 2; }
+bool TNestelideYes(int x) { return x > 0; }
+T TNestelideGenericFunction<T>(T x) { return x; }
+T TNestelideGenericIndex<T>(T x) { return x; }
+T TNestelideGenericNested<T>(T x) { return x; }
+struct TNestelideGenericMethod { T echo<T>(T x) { return x; } };
+cppexp.Retelide* TNestelideThrowSlot = nullptr;
+cppexp.Retelide TNestelideLater(cppexp.Retelide p);
+cppexp.Retelide TNestelideDeclC2(cppexp.Retelide p)
+{
+    cppexp.Retelide g = move p;
+    return g;
+}
+cppexp.Retelide TNestelideCollision(cppexp.Retelide p)
+{
+    cppexp.Retelide g = move p;
+    return g;
+}
+struct TNestelideCollisionNoise
+{
+    cppexp.Retelide TNestelideCollision(cppexp.Retelide p) { return p; }
+};
+int TNestelideThrowArg(int x)
+{
+    cppexp.Retelide local = cppexp.Retelide(90);
+    return cppunw.thrower(x);
+}
+int TNestelideThrowBody(int x)
+{
+    construct_at(TNestelideThrowSlot,
+        cppexp.Retelide(TNestelideThrowArg(x)));
+    return 0;
+}
+int TNestelideDeclThrowBody(int x)
+{
+    cppexp.Retelide result = TNestelideDeclC2(
+        cppexp.Retelide(TNestelideThrowArg(x)));
+    return result.v;
 }
 cppexp.ConvCnt T224Mk(int x) { return x; }
 struct TNRVOHolder { cppexp.Retelide c; int k = 1; };
@@ -4643,6 +4701,14 @@ int DefClsTrace(cppdefcls.Trace first, cppdefcls.Trace last = cppdefcls.Trace(5)
 {
     return first.value * 1000 + last.value;
 }
+int DefClsTraceOnly(cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return last.value;
+}
+int DefClsNativeDefault(int first, int last = 5)
+{
+    return first * 100 + last;
+}
 int DefClsTraceNoDefault(cppdefcls.Trace first, cppdefcls.Trace last)
 {
     return first.value * 1000 + last.value;
@@ -4665,9 +4731,125 @@ int DefClsTraceAfterInt(cppdefcls.Trace first, int extra = 3,
 {
     return first.value * 1000 + last.value + extra;
 }
+int DefClsTraceEarlier(cppdefcls.Trace first,
+                       cppdefcls.Trace last = cppdefcls.Trace(first.value + 5))
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsTracePositive(cppdefcls.Trace first,
+                        cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return first.value > 0 && last.value > 0;
+}
+int DefClsTraceFnPtrTarget(cppdefcls.Trace first,
+                           cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return first.value * 1000 + last.value;
+}
+int DefClsTraceThrow(cppdefcls.Trace first, braceprv.BT last = braceprv.BT(1))
+{
+    return first.value + last.value;
+}
+int DefClsTraceThrowCaller(int value)
+{
+    return DefClsTraceThrow(cppdefcls.make(value));
+}
 int DefClsTraceGeneric<T>(T first, cppdefcls.Trace last = cppdefcls.Trace(5))
 {
     return first.value * 1000 + last.value;
+}
+int defClsCallsiteBase = 0;
+int defClsCallsiteLoopCount = 0;
+int defClsCallsiteLoopErrors = 0;
+int DefClsCallsiteObserve(int actual, int expected, int liveExtra,
+                          const char* trace, int failure)
+{
+    if (actual != expected || cppdefcls.live_count() != defClsCallsiteBase + liveExtra
+        || !cppdefcls.trace_is(trace)) return failure;
+    return 0;
+}
+bool DefClsCallsiteLoopObserve(int actual)
+{
+    if (actual != (defClsCallsiteLoopCount + 1) * 1000 + 5
+        || cppdefcls.live_count() != defClsCallsiteBase + 2
+        || !cppdefcls.trace_is("bb"))
+        defClsCallsiteLoopErrors++;
+    defClsCallsiteLoopCount++;
+    return defClsCallsiteLoopCount < 3;
+}
+int DefClsTraceGenericSize<T>(T value,
+                              cppdefcls.Trace last = cppdefcls.Trace((int)sizeof(T)))
+{
+    return last.value;
+}
+class DefClsTraceGenericMethod<T>
+{
+    T value = default;
+    int take(cppdefcls.Trace last = cppdefcls.Trace((int)sizeof(T)))
+    {
+        return last.value;
+    }
+};
+int DefClsTraceForwardCaller()
+{
+    return DefClsCallsiteObserve(DefClsTraceForwardTarget(), 5, 1, "b", 86149);
+}
+int DefClsTraceForwardTarget(cppdefcls.Trace last = cppdefcls.Trace(5))
+{
+    return last.value;
+}
+int DefClsTraceLateScalarCaller()
+{
+    return DefClsCallsiteObserve(DefClsTraceLateScalar(), 9, 1, "b", 86169);
+}
+int defClsLateScalar = 9;
+int DefClsTraceLateScalar(cppdefcls.Trace last = cppdefcls.Trace(defClsLateScalar))
+{
+    return last.value;
+}
+int DefClsTraceLateClassCaller()
+{
+    return DefClsCallsiteObserve(DefClsTraceLateClass(), 8, 1, "p", 86170);
+}
+cppdefcls.Trace* defClsLateClass = &cppdefcls.global;
+int DefClsTraceLateClass(cppdefcls.Trace last = *defClsLateClass)
+{
+    return last.value;
+}
+int DefClsTraceLateConstCaller()
+{
+    return DefClsCallsiteObserve(DefClsTraceLateConst(), 15, 1, "b", 86171);
+}
+const int defClsLateConst = 15;
+int DefClsTraceLateConst(cppdefcls.Trace last = cppdefcls.Trace(defClsLateConst))
+{
+    return last.value;
+}
+int DefClsTraceLateExternScalarCaller()
+{
+    return DefClsCallsiteObserve(DefClsTraceLateExternScalar(), 11, 1, "b", 86172);
+}
+extern int defClsLateExternScalar;
+int DefClsTraceLateExternScalar(cppdefcls.Trace last = cppdefcls.Trace(defClsLateExternScalar))
+{
+    return last.value;
+}
+int defClsLateExternScalar = 11;
+int DefClsTraceLateCppExternClassCaller()
+{
+    return DefClsTraceLateCppExternClass();
+}
+int DefClsTraceLateCppExternClass(t26.inner.Probe value = t26.inner.probe)
+{
+    return value.get();
+}
+int DefClsTraceEarlyCppGlobalCaller()
+{
+    return DefClsCallsiteObserve(DefClsTraceEarlyCppGlobal(), 8, 1, "p", 86174);
+}
+int DefClsTraceEarlyCppGlobal(cppdefcls.Trace last = cppdefcls.global)
+{
+    return last.value;
 }
 class DefClsTraceMethod
 {
@@ -7202,8 +7384,67 @@ extern int main()
         t63.CallEvent(t63.call_next_side()), t63.call_next_side());
     if (t146Template != 1012) return 9358;
     if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
-        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
         || t63.callSideCount() != 12) return 9359;
+    // A member template by-value prvalue binds its parameter directly through `->`, a field
+    // receiver and two deduced parameters; a converting later argument keeps the wrapper.
+    t63.resetCallCounts();
+    t63.CallHost* t146HostPtr = &t146Host;
+    if (t146HostPtr->template_event(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 1012)
+        return 47101;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 12) return 47102;
+    t63.resetCallCounts();
+    t63.CallHostHolder t146Holder = default;
+    if (t146Holder.host.template_event(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 1012)
+        return 47103;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 12) return 47105;
+    t63.resetCallCounts();
+    if (t146Host.template_event_two(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 1012)
+        return 47106;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 12) return 47107;
+    t63.resetCallCounts();
+    if (t146Host.template_event_convert(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 1012)
+        return 47108;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callSideCount() != 12)
+        return 47109;
+    t63.resetCallCounts();
+    if (t146Host.template_event_const(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 1012)
+        return 47114;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 12) return 47115;
+    t63.resetCallCounts();
+    if (t146Host.over_event(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 101012)
+        return 47116;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 12) return 47117;
+    t63.resetCallCounts();
+    if (t146Host.qual_event(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 301012)
+        return 47118;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 12) return 47119;
+    t63.resetCallCounts();
+    if (t63.CallHost().qual_event(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 401012)
+        return 47120;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 12) return 47121;
+    // The member reads `this`: on its own class, and through a base at a nonzero offset.
+    t63.resetCallCounts();
+    t63.CallScaleBase t146Scale = default;
+    t146Scale.scale = 100;
+    if (t146Scale.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 112)
+        return 47110;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47111;
+    t63.resetCallCounts();
+    t63.CallScaleDerived t146ScaleDerived = default;
+    t146ScaleDerived.pad = 5;
+    t146ScaleDerived.scale = 10;
+    if (t146ScaleDerived.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47112;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0) return 47113;
     t63.resetCallCounts();
     int t146Member = t146Host.member(t63.CallEvent(3));
     if (t146Member != 203) return 9360;
@@ -8251,6 +8492,22 @@ extern int main()
     if (TConstRootTyped(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93107;
     t226s.reset();
     if (TConstRootTyped(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93108;
+    t226s.reset();
+    if (TConstDerivedBase(true) != 1 || t226s.made != 1 || t226s.copies != 2 || t226s.moves != 0 || t226s.dead != 3) return 93109;
+    t226s.reset();
+    if (TConstDerivedBase(false) != 2 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93110;
+    t226s.reset();
+    if (TConstDerivedBaseRev(false) != 1 || t226s.made != 1 || t226s.copies != 2 || t226s.moves != 0 || t226s.dead != 3) return 93111;
+    t226s.reset();
+    if (TConstDerivedBaseRev(true) != 2 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93112;
+    t226s.reset();
+    if (TConstDerivedXvalueJoin(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93113;
+    t226s.reset();
+    if (TConstDerivedXvalueJoin(false) != 2 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93114;
+    t226s.reset();
+    if (TConstDerivedExplicitMove(true) != 1 || t226s.made != 1 || t226s.copies != 2 || t226s.moves != 0 || t226s.dead != 3) return 93115;
+    t226s.reset();
+    if (TConstDerivedExplicitMove(false) != 2 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93116;
     if (T62StaticAutoGlobalCopy() != 1) return 62010;
     cpp_t62.set_global_string("changed");
     if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
@@ -11045,6 +11302,175 @@ extern int main()
             || cppdefcls.live_count() != defClsBase) return 86121;
     }
 
+    defClsCallsiteBase = cppdefcls.live_count();
+    int defClsCallsiteStatus = 0;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(DefClsTraceOnly(), 5, 1, "b", 86124);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86124;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(DefClsTraceTwo(), 2005, 2, "bb", 86125);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86125;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTrace(cppdefcls.make(1)), 1005, 2, "bb", 86126);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86126;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTraceAfterInt(cppdefcls.make(20)), 20008, 2, "bb", 86127);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86127;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTraceReturn(cppdefcls.make(20)), 20007, 2, "bb", 86139);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86139;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTraceCopy(cppdefcls.make(20)), 20008, 2, "bp", 86140);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bpyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86140;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsDefaultTrace(cppdefcls.make(20)), 20000, 2, "bb", 86141);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86141;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsBraceTrace(cppdefcls.make_implicit(20)), 20009, 2, "bb", 86142);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86142;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTraceConstructor(cppdefcls.make(20)).value, 20005, 2, "bb", 86143);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86143;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTrace(cppdefcls.make(1), cppdefcls.make(2)), 1002, 2, "bb", 86128);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86128;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(DefClsTrace(cppdefcls.make(1))
+        + DefClsTrace(cppdefcls.make(2)), 3010, 4, "bbbb", 86129);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbbbyyyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86129;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(true ? DefClsTrace(cppdefcls.make(3))
+        : DefClsTrace(cppdefcls.make(9)), 3005, 2, "bb", 86130);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86130;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(DefClsTracePositive(cppdefcls.make(1))
+        && DefClsTracePositive(cppdefcls.make(2)), 1, 4, "bbbb", 86131);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbbbyyyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86131;
+
+    int defClsLoopValue = 1;
+    defClsCallsiteLoopCount = 0;
+    defClsCallsiteLoopErrors = 0;
+    cppdefcls.reset_trace();
+    while (DefClsCallsiteLoopObserve(DefClsTrace(cppdefcls.make(defClsLoopValue))))
+    {
+        cppdefcls.reset_trace();
+        defClsLoopValue++;
+    }
+    if (defClsCallsiteLoopCount != 3 || defClsCallsiteLoopErrors != 0
+        || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86132;
+
+    DefClsTraceMethod defClsCallsiteMethod;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        defClsCallsiteMethod.take(cppdefcls.make(20)), 20005, 2, "bb", 86133);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86133;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTraceGeneric<cppdefcls.Trace>(cppdefcls.make(20)), 20005, 2, "bb", 86134);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86134;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(DefClsTraceGenericSize(1.0), 8, 1, "b", 86167);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86167;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(DefClsTraceGenericSize('a'), 1, 1, "b", 86168);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86168;
+    DefClsTraceGenericMethod<double> defClsGenericMethod;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(defClsGenericMethod.take(), 8, 1, "b", 86148);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86148;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsTraceForwardCaller();
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86149;
+    // Early callers must read later globals and keep class defaults in the call-site lifetime.
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsTraceLateScalarCaller();
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86169;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsTraceLateClassCaller();
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("py")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86170;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsTraceLateConstCaller();
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86171;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsTraceLateExternScalarCaller();
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86172;
+    if (DefClsTraceLateCppExternClassCaller() != 73) return 86173;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsTraceEarlyCppGlobalCaller();
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("py")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86174;
+
+    cppdefcls.reset_trace();
+    int defClsCaught = braceprv.guarded(DefClsTraceThrowCaller, 1);
+    if (defClsCaught != -1 || !cppdefcls.trace_is("by")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86135;
+    cppdefcls.reset_trace();
+    defClsCallsiteStatus = DefClsCallsiteObserve(
+        DefClsTraceEarlier(cppdefcls.make(1)), 1006, 1, "bby", 86136);
+    if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("bbyy")
+        || cppdefcls.live_count() != defClsCallsiteBase) return 86136;
+
+    function<int(cppdefcls.Trace)> defClsFnPtr = DefClsTraceFnPtrTarget;
+    cppdefcls.reset_trace();
+    int defClsFnPtrValue = defClsFnPtr(cppdefcls.make(1));
+    if (defClsFnPtrValue != 1005 || !cppdefcls.trace_is("bmbyyy")
+        || cppdefcls.live_count() != defClsCallsiteBase)
+        return 86137;
+    if (DefClsNativeDefault(7) != 705) return 86138;
+
+    {
+        cppdefcls.Trace defClsCallsiteLocal = cppdefcls.make(20);
+        defClsCallsiteBase = cppdefcls.live_count();
+        cppdefcls.reset_trace();
+        defClsCallsiteStatus = DefClsCallsiteObserve(
+            DefClsTrace(defClsCallsiteLocal), 20005, 2, "pb", 86144);
+        if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("pbyy")
+            || cppdefcls.live_count() != defClsCallsiteBase) return 86144;
+        cppdefcls.reset_trace();
+        defClsCallsiteStatus = DefClsCallsiteObserve(
+            DefClsTrace(move defClsCallsiteLocal), 20005, 2, "mb", 86145);
+        if (defClsCallsiteStatus != 0 || !cppdefcls.trace_is("mbyy")
+            || cppdefcls.live_count() != defClsCallsiteBase) return 86145;
+    }
+
+    defparamTernaryFlag = true;
+    ternref.t391_reset();
+    if (DefparamTernaryInArgument() != 101 || ternref.t391_stats() != 20002)
+        return 86146;
+    if (ternref.t391_stats() != 20020) return 86147;
+
     int defArgNativeBase = defArgRoundNativeDtors;
     defArgValue = DefArgRoundNativeOne(DefArgRoundMakeNative(20));
     if (defArgValue != 23 || defArgRoundNativeDtors - defArgNativeBase != 2) return 86109;
@@ -13792,6 +14218,10 @@ extern int main()
     if (eopUn + 4 != 904 || 4 - eopUn != 954) return 9816;
     // Constant contexts fold natively even where an operator names the enum.
     if (EopFold.Over != 6 || EopFold.Fixed != 8 || EopCase(6) != 1) return 9817;
+    if (EopBuiltinFileScopeFold != 8) return 9846;
+    if (EopFreeopinitNativeAnd != 1) return 9850;
+    if (EopFreeopinitImportedAnd != 1) return 9851;
+    if (!EopFreeopinitNativeOr) return 9852;
     if const (cppi_scope.eop.ua + 1 == 6) {} else { return 9818; }
     if (EopRefIdentity() != 5) return 9819;
     if (EopRefValue() != 45 || EopRefReturn() != 90) return 9820;
@@ -19918,6 +20348,132 @@ extern int main()
         cppne.reset();
         if (cppne.neGuarded(NeThrDecl, -3) != -3 || cppne.nCtors() != 0 || cppne.nDtors() != 0
             || cppne.nLive() != 0) return 4024;
+        // Declnest alias legs: the aliases used in the declaration and nested cast resolve to one C++ class.
+        cppne.reset();
+        {
+            NestCastSxAlias aliasDecl = NestCastSxAlias(NestCastSxAlias(4));
+            neDeclV = aliasDecl.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4030;
+        cppne.reset();
+        NestCastSxAlias* aliasNew = new NestCastSxAlias(NestCastSxAlias(4));
+        neDeclV = aliasNew->v;
+        delete aliasNew;
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4031;
+        cppne.reset();
+        {
+            NestCastAliasNs.SA aliasNsDecl = NestCastAliasNs.SA(NestCastAliasNs.SA(4));
+            neDeclV = aliasNsDecl.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4032;
+        castasg_test.reset();
+        int aliasCppValue = 0;
+        {
+            NestCastCppAlias aliasCppDecl = NestCastCppAlias(NestCastCppAlias(4));
+            aliasCppValue = aliasCppDecl.value;
+        }
+        if (aliasCppValue != 4 || castasg_test.ctor_count() != 1
+            || castasg_test.copy_count() != 0 || castasg_test.dtor_count() != 1) return 4033;
+        // Declnest result legs (4034-4036): a nested call result built into the declared slot copies
+        // as clang does: a method result is built in place, function results cost one copy.
+        cppne.reset();
+        {
+            cppne.Sx sretMethod = cppne.Sx(cppne.Sx(4).m());
+            neDeclV = sretMethod.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 2 || cppne.nCopies() != 0
+            || cppne.nDtors() != 2 || cppne.nLive() != 0) return 4034;
+        cppne.reset();
+        {
+            cppne.Sx sretCppF = cppne.Sx(cppne.sretPass(cppne.Sx(4)));
+            neDeclV = sretCppF.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 1
+            || cppne.nDtors() != 2 || cppne.nLive() != 0) return 4035;
+        cppne.reset();
+        {
+            cppne.Sx sretCflatF = cppne.Sx(nestCastCflatF(cppne.Sx(4)));
+            neDeclV = sretCflatF.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 1
+            || cppne.nDtors() != 2 || cppne.nLive() != 0) return 4036;
+        // Declnest collision new (leg 4037): `new cppnecol.X(cppnecol.X(4))` where the function
+        // X(int) shadows the class returns an lvalue, so the outer copy runs once, as clang does.
+        cppnecol.reset();
+        {
+            cppnecol.X* neCollNew = new cppnecol.X(cppnecol.X(4));
+            neDeclV = neCollNew->v;
+            delete neCollNew;
+        }
+        if (neDeclV != 4 || cppnecol.nCopies() != 1) return 4037;
+        // Auto nest legs (4038-4048): `auto w = C(C(x))` deduces C and takes the typed route, so the
+        // nested construction is built in the declared slot with clang's values and counts.
+        cppne.reset();
+        {
+            auto autoNest = cppne.Sx(cppne.Sx(4));
+            neDeclV = autoNest.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4038;
+        cppne.reset();
+        {
+            auto autoAlias = NestCastSxAlias(NestCastSxAlias(4));
+            neDeclV = autoAlias.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4039;
+        cppne.reset();
+        {
+            auto autoNs = NestCastAliasNs.SA(NestCastAliasNs.SA(4));
+            neDeclV = autoNs.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4040;
+        cppne.reset();
+        {
+            auto autoTriple = cppne.Sx(cppne.Sx(cppne.Sx(4)));
+            neDeclV = autoTriple.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4042;
+        cppne.reset();
+        {
+            const auto autoConst = cppne.Sx(cppne.Sx(4));
+            neDeclV = autoConst.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4043;
+        cppne.reset();
+        {
+            auto autoMethod = cppne.Sx(cppne.Sx(4).m());
+            neDeclV = autoMethod.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 2 || cppne.nCopies() != 0
+            || cppne.nDtors() != 2 || cppne.nLive() != 0) return 4044;
+        cppne.reset();
+        {
+            auto autoSret = cppne.Sx(cppne.sretPass(cppne.Sx(4)));
+            neDeclV = autoSret.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 1
+            || cppne.nDtors() != 2 || cppne.nLive() != 0) return 4045;
+        cppne.reset();
+        {
+            auto autoMk = cppne.Sx(cppne.mkSx(4));
+            neDeclV = autoMk.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4046;
+        cppne.reset();
+        {
+            auto autoCflatF = cppne.Sx(nestCastCflatF(cppne.Sx(4)));
+            neDeclV = autoCflatF.v;
+        }
+        if (neDeclV != 4 || cppne.nCtors() != 1 || cppne.nCopies() != 1
+            || cppne.nDtors() != 2 || cppne.nLive() != 0) return 4048;
         // Declnest collision (leg 4025): `cppnecol.X(cppnecol.X(4))` where the function X(int)
         // returns an lvalue keeps master's single copy; the destination is not armed.
         cppnecol.reset();
@@ -22528,6 +23084,155 @@ extern int main()
         if (q288[0] != 21 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0 || q288[6] != 3) return 99019;
         T288DeclConstBoth(false, q288);
         if (q288[0] != 22 || q288[1] != 21 || q288[2] != 22 || q288[3] != 2 || q288[4] != 1 || q288[5] != 0 || q288[6] != 3) return 99020;
+        int[10] qtn;
+// TERNNEST: nested C++ constructor arguments preserve the selected xvalue reference.
+        TernNestA0(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99410;
+        TernNestA0(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99411;
+        TernNestA0(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, -1, 23, 0, 0, 1, 0, 1, 5)) return 99412;
+        TernNestA0(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, -1, 22, 23, 0, 0, 1, 0, 1, 5)) return 99413;
+        TernNestA1(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99414;
+        TernNestA1(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99415;
+        TernNestA1(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99416;
+        TernNestA1(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99417;
+        TernNestA2(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99418;
+        TernNestA2(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99419;
+        TernNestA2(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99420;
+        TernNestA2(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99421;
+        TernNestA3(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99422;
+        TernNestA3(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 1, 5)) return 99423;
+        TernNestA3(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99424;
+        TernNestA3(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99425;
+        TernNestD0(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99426;
+        TernNestD0(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99427;
+        TernNestD0(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, -1, 23, 0, 0, 1, 0, 0, 4)) return 99428;
+        TernNestD0(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, -1, 22, 23, 0, 0, 1, 0, 0, 4)) return 99429;
+        TernNestD1(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99430;
+        TernNestD1(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99431;
+        TernNestD1(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99432;
+        TernNestD1(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99433;
+        TernNestD2(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99434;
+        TernNestD2(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99435;
+        TernNestD2(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99436;
+        TernNestD2(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99437;
+        TernNestD3(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99438;
+        TernNestD3(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99439;
+        TernNestD3(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99440;
+        TernNestD3(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99441;
+        TernNestF0(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99442;
+        TernNestF0(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99443;
+        TernNestF0(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, -1, 23, 0, 0, 1, 0, 0, 4)) return 99444;
+        TernNestF0(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, -1, 22, 23, 0, 0, 1, 0, 0, 4)) return 99445;
+        TernNestF1(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99446;
+        TernNestF1(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99447;
+        TernNestF1(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99448;
+        TernNestF1(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99449;
+        TernNestF2(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99450;
+        TernNestF2(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99451;
+        TernNestF2(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99452;
+        TernNestF2(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99453;
+        TernNestF3(false, false, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99454;
+        TernNestF3(false, true, qtn);
+        if (!TernNestMatches(qtn, 23, 21, 22, -1, 0, 0, 1, 0, 0, 4)) return 99455;
+        TernNestF3(true, false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99456;
+        TernNestF3(true, true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 0, 4)) return 99457;
+        TernNestC0(false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, -1, 23, 0, 0, 1, 0, 1, 5)) return 99458;
+        TernNestC0(true, qtn);
+        if (!TernNestMatches(qtn, 21, -1, 22, 23, 0, 0, 1, 0, 1, 5)) return 99459;
+        TernNestC1(false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99460;
+        TernNestC1(true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99461;
+        TernNestC2(false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99462;
+        TernNestC2(true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99463;
+        TernNestC3(false, qtn);
+        if (!TernNestMatches(qtn, 22, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99464;
+        TernNestC3(true, qtn);
+        if (!TernNestMatches(qtn, 21, 21, 22, 23, 0, 1, 0, 0, 1, 5)) return 99465;
+        // TERNNEST r2: direct by-value move joins retain post-call source reads (clang++ -std=c++20).
+        for (int tnPick = 0; tnPick < 2; tnPick++)
+        {
+            bool k = tnPick != 0;
+            {
+                cppbv.TernaryCnt a = cppbv.TernaryCnt(1);
+                cppbv.TernaryCnt b = cppbv.TernaryCnt(2);
+                int value = TernNestCflatByValue(k ? move a : move b);
+                if (value != (k ? 1 : 2) || a.v != (k ? -1 : 1) || b.v != (k ? 2 : -1)) return 99466;
+            }
+            {
+                cppbv.TernaryCnt a = cppbv.TernaryCnt(1);
+                cppbv.TernaryCnt b = cppbv.TernaryCnt(2);
+                int value = cppbv.takeTernaryCnt(k ? move a : move b);
+                if (value != (k ? 1 : 2) || a.v != (k ? -1 : 1) || b.v != (k ? 2 : -1)) return 99467;
+            }
+            {
+                cppbv.TernaryCnt a = cppbv.TernaryCnt(1);
+                cppbv.TernaryCnt b = cppbv.TernaryCnt(2);
+                cppbv.TernaryCnt m = cppbv.TernaryCnt(9);
+                int value = m.takeV(k ? move a : move b);
+                if (value != (k ? 1 : 2) || a.v != (k ? -1 : 1) || b.v != (k ? 2 : -1)) return 99468;
+            }
+            {
+                cppbv.TernaryCnt b = cppbv.TernaryCnt(2);
+                int value = cppbv.takeTernaryCnt(k ? move cppbv.mkTernaryHost().a : move b);
+                if (value != (k ? 31 : 2) || b.v != (k ? 2 : -1)) return 99469;
+            }
+            {
+                cppbv.TernaryHost h = cppbv.mkTernaryHost();
+                cppbv.TernaryCnt c = cppbv.TernaryCnt(3);
+                int value = cppbv.takeTernaryCnt(k ? move h.a : move c);
+                if (value != (k ? 31 : 3) || h.a.v != (k ? -1 : 31) || c.v != (k ? 3 : -1)) return 99470;
+            }
+        }
         // Nested same-class move joins retain the xvalue assignment path (clang++ -std=c++20).
         T288NestedOuter(true, q288);
         if (q288[0] != 21 || q288[1] != -1 || q288[2] != 22 || q288[3] != 3 || q288[4] != 0 || q288[5] != 0 || q288[6] != 3 || q288[7] != 0 || q288[8] != 1) return 99021;
@@ -25927,17 +26632,20 @@ extern int main()
         || cppas.AssignRouteNontrivial.copies != 0 || cppas.AssignRouteNontrivial.dtors != 1)
         return 79503;
     defparamTernaryFlag = true;
+    // Read inside the full expression: the class default temp is still live there (clang 20002).
     ternref.t391_reset();
-    if (DefparamTernaryInArgument() != 101 || ternref.t391_stats() != 20020) return 79504;
+    if (DefparamTernaryInArgument() != 101 || ternref.t391_stats() != 20002) return 79504;
     defparamTernaryFlag = false;
     ternref.t391_reset();
-    if (DefparamTernaryInArgument() != 102 || ternref.t391_stats() != 20020) return 79505;
+    if (DefparamTernaryInArgument() != 102 || ternref.t391_stats() != 20002) return 79505;
     defparamTernaryFlag = true;
     ternref.t391_reset();
-    if (DefparamTernaryCopyArgument() != 7 || ternref.t391_stats() != 1010) return 79506;
+    if (DefparamTernaryCopyArgument() != 7 || ternref.t391_stats() != 1001) return 79506;
     cppas.AssignRouteNontrivial.reset();
     if (DefparamBraceNonconstant() != 710 || cppas.AssignRouteNontrivial.ctors != 1
-        || cppas.AssignRouteNontrivial.copies != 0 || cppas.AssignRouteNontrivial.dtors != 1)
+        || cppas.AssignRouteNontrivial.copies != 0 || cppas.AssignRouteNontrivial.dtors != 0)
+        return 79507;
+    if (cppas.AssignRouteNontrivial.dtors != 1)
         return 79507;
     return 0;
 }
@@ -26440,6 +27148,95 @@ int T518CallArmNested(bool c, bool d)
     { value = t518.take(c ? default : (d ? T518RetTw() : default)); }
     return T420Pack(value, baseLive);
 }
+int T518UnboundDefaultTail(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { value = t518.take2(c ? default : T518RetTw(), default); }
+    return T420Pack(value, baseLive);
+}
+int Ubd4RvalueRef()
+{
+    unbdef4.reset(); int value = unbdef4.rr(unbdef4.C(1), default);
+    if (value != 10) return 1;
+    if (unbdef4.stats() != 202) return 2;
+    return 0;
+}
+int Ubd4DefaultShapes()
+{
+    if (unbdef4.tw(1, default) != 11) return 1;
+    if (unbdef4.ex(1, default) != 13) return 2;
+    if (unbdef4.pt(1, default) != 11) return 3;
+    if (unbdef4.db(1, default) != 11) return 4;
+    if (unbdef4bound.rr(unbdef4.C(1), default) != 10) return 5;
+    if (unbdef4bound.tw(1, default) != 11) return 6;
+    if (unbdef4bound.ex(1, default) != 13) return 7;
+    if (unbdef4bound.pt(1, default) != 11) return 8;
+    if (unbdef4bound.db(1, default) != 11) return 9;
+    if (unbdef4bound.o1(1, default) != 100) return 10;
+    if (unbdef4bound.o2(1, default) != 1) return 11;
+    return 0;
+}
+int T518BoundDefaultTail(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { value = t518bound.take2(c ? default : T518RetTw(), default); }
+    return T420Pack(value, baseLive);
+}
+int T518DefaultTernaryPairs(bool c)
+{
+    int failed = 0; int value = 0; int actual = 0; int expected = 0; int baseLive = 0;
+    cpptw.reset_counts(); baseLive = cpptw.live_allocations();
+    { value = t518.f1(c ? default : T518RetTw(), default); }
+    actual = T420Pack(value, baseLive);
+    cpptw.reset_counts(); baseLive = cpptw.live_allocations();
+    { value = t518bound.f1(c ? default : T518RetTw(), default); }
+    expected = T420Pack(value, baseLive);
+    if (actual != expected) failed = failed + 1;
+    cpptw.reset_counts(); baseLive = cpptw.live_allocations();
+    { value = t518.f2(c ? default : T518RetTw(), default); }
+    actual = T420Pack(value, baseLive);
+    cpptw.reset_counts(); baseLive = cpptw.live_allocations();
+    { value = t518bound.f2(c ? default : T518RetTw(), default); }
+    expected = T420Pack(value, baseLive);
+    if (actual != expected) failed = failed + 1;
+    cpptw.reset_counts(); baseLive = cpptw.live_allocations();
+    { value = t518.f3(c ? default : T518RetTw(), default); }
+    actual = T420Pack(value, baseLive);
+    cpptw.reset_counts(); baseLive = cpptw.live_allocations();
+    { value = t518bound.f3(c ? default : T518RetTw(), default); }
+    expected = T420Pack(value, baseLive);
+    if (actual != expected) failed = failed + 1;
+    return failed;
+}
+int T518DefaultValuePairs(bool c)
+{
+    int actual = 0; int expected = 0;
+    actual = t518.f1(cpptw.Twin(1), default);
+    expected = t518bound.f1(cpptw.Twin(1), default);
+    if (actual != expected) return 1;
+    actual = t518.f1(cpptw.Twin(1), (default));
+    expected = t518bound.f1(cpptw.Twin(1), (default));
+    if (actual != expected) return 2;
+    actual = t518.f2(cpptw.Twin(1), default);
+    expected = t518bound.f2(cpptw.Twin(1), default);
+    if (actual != expected) return 3;
+    actual = t518.f3(cpptw.Twin(1), default);
+    expected = t518bound.f3(cpptw.Twin(1), default);
+    if (actual != expected) return 4;
+    actual = t518.f5(cpptw.Twin(1), default);
+    expected = t518bound.f5(cpptw.Twin(1), default);
+    if (actual != expected) return 5;
+    { cpptw.Twin a = cpptw.Twin(1); actual = t518.f1(a, default); }
+    { cpptw.Twin a = cpptw.Twin(1); expected = t518bound.f1(a, default); }
+    if (actual != expected) return 6;
+    actual = t518.g1(1, default);
+    expected = t518bound.g1(1, default);
+    if (actual != expected) return 7;
+    actual = t518.h3(c ? 1 : 2, default);
+    expected = t518bound.h3(c ? 1 : 2, default);
+    if (actual != expected) return 8;
+    return 0;
+}
 // A reference parameter binds the caller's object, so it sees the later write (no early copy).
 int T518LaterRef() { t418.Val x = t418.Val(7); return t518.lref(x, t418.mutate(x)); }
 // The SELECTED overload decides: mixed(const Val&, int) wins for an int, so it sees the write.
@@ -26482,6 +27279,79 @@ int T518WriteGlobal()
 {
     t418.reset(); int value = 0;
     { value = t518.later(t418.globalValue, t418.mutate(t418.globalValue)); }
+    return T418Pack(value);
+}
+int T518WriteGlobalDefault()
+{
+    t418.reset(); *t418.globalValue.p = 7; int value = 0;
+    { value = t518.laterRefuse(t418.globalValue, t418.mutate(t418.globalValue)); }
+    return T418Pack(value);
+}
+int T518WriteNamedGlobalDefault()
+{
+    t418.reset(); *t418.namedGlobal.p = 7; int value = 0;
+    { value = t518.laterRefuse(t418.namedGlobal, t418.mutate(t418.namedGlobal)); }
+    return T418Pack(value);
+}
+struct T518DefaultFieldHost
+{
+    t418.Val value = t418.Val(7);
+    int write() { return t418.mutate(this.value); }
+    int run() { return t518.laterRefuse(this.value, this.write()); }
+};
+int T518WriteThisFieldDefault()
+{
+    t418.reset(); int value = 0;
+    { T518DefaultFieldHost h = default; value = h.run(); }
+    return T418Pack(value);
+}
+int T518WriteReturnedPointerDefault()
+{
+    t418.reset(); *t418.globalValue.p = 7; int value = 0;
+    { value = t518.laterRefuse(t418.globalValue, t418.mutate(*t418.globalValuePointer())); }
+    return T418Pack(value);
+}
+int T518UnbsnapRefA()
+{
+    t418.reset(); *rv.g1.p = 7; *t418.globalValue.p = 5;
+    return T418Pack(rv.fcls(rv.g1, rv.pure()));
+}
+int T518UnbsnapRefC()
+{
+    t418.reset(); *rv.g1.p = 7;
+    return T418Pack(rv.fv(rv.g1, rv.pure(), 1));
+}
+int T518UnbsnapRefD()
+{
+    t418.reset(); *rv.g1.p = 7;
+    return T418Pack(rv.fc2(rv.g1, rv.pure()));
+}
+struct T518UnbsnapHost { t418.Val v = t418.Val(7); };
+int T518UnbsnapPointerDotCall(T518UnbsnapHost* hp) { return rv.f(hp.v, rv.wam()); }
+int T518UnbsnapPointerArrowCall(T518UnbsnapHost* hp) { return rv.f(hp->v, rv.wam()); }
+int T518UnbsnapPointerDot()
+{
+    t418.reset(); int value = 0;
+    { T518UnbsnapHost h = default; t418.aim(h.v); value = T518UnbsnapPointerDotCall(&h); }
+    return T418Pack(value);
+}
+int T518UnbsnapPointerArrow()
+{
+    t418.reset(); int value = 0;
+    { T518UnbsnapHost h = default; t418.aim(h.v); value = T518UnbsnapPointerArrowCall(&h); }
+    return T418Pack(value);
+}
+int T518DynamicDefaultLaterWrite()
+{
+    t418.reset(); t418.Val value = t418.Val(7);
+    int result = t518.dyndef(value, t418.mutate(value));
+    return T418Pack(result);
+}
+int T518NativeLater(t418.Val value, int later) { return value.value() * 100 + later; }
+int T518NativeGlobal()
+{
+    t418.reset(); *t418.globalValue.p = 7; int value = 0;
+    { value = T518NativeLater(t418.globalValue, t418.mutate(t418.globalValue)); }
     return T418Pack(value);
 }
 int T518ExtraMoveReturn()
@@ -26567,6 +27437,125 @@ int T518TrivialAbi16()
 int T518Guard(bool c) { t418.Val x = t418.Val(7); return t518.over(c ? default : x, 2); }
 int T518GuardTmpl(bool c) { t418.Val x = t418.Val(7); return t518.guardtmpl(c ? default : x, 2); }
 int T518GuardDef(bool c) { t418.Val x = t418.Val(7); return t518.guarddef(c ? default : x); }
+// DIRORD: a direct constructor with a by-value class lvalue argument copies it at its position
+// (clang order, fixture dirord in cpp_interop_lastuse.h). Each leg returns its own code on mismatch.
+bool DirordSame(int* want, int n)
+{
+    if (dirord.size() != n) return false;
+    for (int i = 0; i < n; i++)
+        if (dirord.at(i) != want[i]) return false;
+    return true;
+}
+int DirordLocal() { dirord.C s = dirord.C(1); dirord.T t = dirord.T(s, dirord.C(2)); return 0; }
+int DirordReverse() { dirord.C s = dirord.C(1); dirord.T t = dirord.T(dirord.C(2), s); return 0; }
+int DirordNew() { dirord.C s = dirord.C(1); dirord.T* t = new dirord.T(s, dirord.C(2)); delete t; return 0; }
+int DirordField() { dirord.Host h = default; dirord.T t = dirord.T(h.s, dirord.C(2)); return 0; }
+int DirordParam(dirord.C s) { dirord.T t = dirord.T(s, dirord.C(2)); return 0; }
+int DirordParamWrap() { return DirordParam(dirord.C(1)); }
+int DirordGlobal() { dirord.T t = dirord.T(dirord.global, dirord.C(2)); return 0; }
+int DirordPrvalues() { dirord.T t = dirord.T(dirord.C(1), dirord.C(2)); return 0; }
+int DirordLegLocal()
+{
+    int[8] want = { 1, 11, 2, 40, 32, 31, 41, 31 };
+    dirord.reset(0);
+    int r = dirord.guard(DirordLocal);
+    if (r != 0 || !DirordSame(want, 8) || dirord.live != 1) return 57001;
+    int[4] wantThrow = { 1, 11, 31, 31 };
+    dirord.reset(1);
+    r = dirord.guard(DirordLocal);
+    if (r != -1 || !DirordSame(wantThrow, 4) || dirord.live != 1) return 57002;
+    return 0;
+}
+int DirordLegReverse()
+{
+    int[8] want = { 1, 2, 11, 40, 31, 32, 41, 31 };
+    dirord.reset(0);
+    int r = dirord.guard(DirordReverse);
+    if (r != 0 || !DirordSame(want, 8) || dirord.live != 1) return 57003;
+    int[2] wantThrow = { 1, 31 };
+    dirord.reset(1);
+    r = dirord.guard(DirordReverse);
+    if (r != -1 || !DirordSame(wantThrow, 2) || dirord.live != 1) return 57004;
+    return 0;
+}
+int DirordLegNew()
+{
+    int[8] want = { 1, 11, 2, 40, 32, 31, 41, 31 };
+    dirord.reset(0);
+    int r = dirord.guard(DirordNew);
+    if (r != 0 || !DirordSame(want, 8) || dirord.allocations != 1 || dirord.frees != 1
+        || dirord.live != 1) return 57005;
+    int[4] wantThrow = { 1, 11, 31, 31 };
+    dirord.reset(1);
+    r = dirord.guard(DirordNew);
+    if (r != -1 || !DirordSame(wantThrow, 4) || dirord.allocations != 1 || dirord.frees != 1
+        || dirord.live != 1) return 57006;
+    return 0;
+}
+int DirordLegField()
+{
+    int[8] want = { 1, 11, 2, 40, 32, 31, 41, 31 };
+    dirord.reset(0);
+    int r = dirord.guard(DirordField);
+    if (r != 0 || !DirordSame(want, 8) || dirord.live != 1) return 57007;
+    int[4] wantThrow = { 1, 11, 31, 31 };
+    dirord.reset(1);
+    r = dirord.guard(DirordField);
+    if (r != -1 || !DirordSame(wantThrow, 4) || dirord.live != 1) return 57008;
+    return 0;
+}
+int DirordLegParam()
+{
+    int[8] want = { 1, 11, 2, 40, 32, 31, 41, 31 };
+    dirord.reset(0);
+    int r = dirord.guard(DirordParamWrap);
+    if (r != 0 || !DirordSame(want, 8) || dirord.live != 1) return 57009;
+    int[4] wantThrow = { 1, 11, 31, 31 };
+    dirord.reset(1);
+    r = dirord.guard(DirordParamWrap);
+    if (r != -1 || !DirordSame(wantThrow, 4) || dirord.live != 1) return 57010;
+    return 0;
+}
+int DirordLegGlobal()
+{
+    int[6] want = { 11, 2, 40, 32, 31, 41 };
+    dirord.reset(0);
+    int r = dirord.guard(DirordGlobal);
+    if (r != 0 || !DirordSame(want, 6) || dirord.live != 1) return 57011;
+    int[2] wantThrow = { 11, 31 };
+    dirord.reset(1);
+    r = dirord.guard(DirordGlobal);
+    if (r != -1 || !DirordSame(wantThrow, 2) || dirord.live != 1) return 57012;
+    return 0;
+}
+int DirordLegPrvalues()
+{
+    int[6] want = { 1, 2, 40, 32, 31, 41 };
+    dirord.reset(0);
+    int r = dirord.guard(DirordPrvalues);
+    if (r != 0 || !DirordSame(want, 6) || dirord.live != 1) return 57013;
+    int[2] wantThrow = { 1, 31 };
+    dirord.reset(1);
+    r = dirord.guard(DirordPrvalues);
+    if (r != -1 || !DirordSame(wantThrow, 2) || dirord.live != 1) return 57014;
+    return 0;
+}
+int DirordLegs()
+{
+    int r = DirordLegLocal();
+    if (r != 0) return r;
+    r = DirordLegReverse();
+    if (r != 0) return r;
+    r = DirordLegNew();
+    if (r != 0) return r;
+    r = DirordLegField();
+    if (r != 0) return r;
+    r = DirordLegParam();
+    if (r != 0) return r;
+    r = DirordLegGlobal();
+    if (r != 0) return r;
+    return DirordLegPrvalues();
+}
 int LoweredUserDtorAssignLegs(int argc)
 {
     LdtHolder a; a.id = 1;
@@ -28604,6 +29593,286 @@ int LoweredUserDtorAssignLegs(int argc)
         if (cppunw.live() != 1 || cppunw.dtors() != 0 || txSlot->get() != 0) return 13065;
         free(txSlot);
     }
+    // NESTELIDE: nested argument calls cannot consume the outer construct_at result slot.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.Retelide(TNestelideValue(5)));
+        if (slot->v != 7 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13120;
+        free(slot);
+    }
+    // A nested same-class call still returns into the outer slot: 3 constructors, 2 moves.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.retelide_c2(
+            cppexp.retelide_c2(cppexp.Retelide(5))));
+        if (slot->v != 2005 || cppexp.retelide_ctor_count() != 3
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 2
+            || cppexp.retelide_dtor_count() != 2) return 13121;
+        free(slot);
+    }
+    // The operator result is a same-class prvalue and becomes the constructed object.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide a = cppexp.Retelide(2);
+        cppexp.Retelide b = cppexp.Retelide(3);
+        cppexp.retelide_reset();
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.Retelide(a + b));
+        if (slot->v != 5 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13122;
+        free(slot);
+    }
+    // Calls under && and ?: build only the selected arm into the final slot.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.Retelide(cppexp.retelide_c2(
+            (TNestelideYes(1) && TNestelideYes(2))
+                ? cppexp.retelide_c2(cppexp.Retelide(5))
+                : cppexp.retelide_c2(cppexp.Retelide(6)))));
+        if (slot->v != 2005 || cppexp.retelide_ctor_count() != 3
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 2
+            || cppexp.retelide_dtor_count() != 2) return 13123;
+        free(slot);
+    }
+    // A throwing inner call leaves only the already constructed local to destroy.
+    cppunw.reset();
+    cppexp.retelide_reset();
+    cppexp.Retelide* throwSlot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+    TNestelideThrowSlot = throwSlot;
+    if (cppunw.guarded(TNestelideThrowBody, 5) != -5) return 13124;
+    if (cppexp.retelide_ctor_count() != 1 || cppexp.retelide_copy_count() != 0
+        || cppexp.retelide_move_count() != 0 || cppexp.retelide_dtor_count() != 1) return 13125;
+    TNestelideThrowSlot = nullptr;
+    free(throwSlot);
+    // A trailing subscript uses the maker result, so it cannot consume the construct_at slot.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.retelide_mk(1)[cppexp.retelide_ival(2)]);
+        if (slot->v != 3 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 1) return 13126;
+        free(slot);
+    }
+    // A literal index has the same trailing-subscript shape.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.retelide_mk(1)[2]);
+        if (slot->v != 3 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 1) return 13127;
+        free(slot);
+    }
+    // A first-use generic function in the receiver argument preserves the indexable maker temp.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.retelide_mk(TNestelideGenericFunction<int>(1))[2]);
+        if (slot->v != 3 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 1) return 13128;
+        free(slot);
+    }
+    // The same receiver argument shape restores state after a first-use generic method.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        TNestelideGenericMethod genericMethod;
+        construct_at(slot, cppexp.retelide_mk(genericMethod.echo<int>(1))[2]);
+        if (slot->v != 3 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 1) return 13129;
+        free(slot);
+    }
+    // A first-use generic index is a preserved boundary: the trailing operator still owns the slot.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.retelide_mk(1)[TNestelideGenericIndex<int>(2)]);
+        if (slot->v != 3 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 1) return 13130;
+        free(slot);
+    }
+    // A generic nested inside another receiver argument keeps both subscript results indexable.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide* slot = (cppexp.Retelide*)malloc((i64)sizeof(cppexp.Retelide));
+        construct_at(slot, cppexp.retelide_mk(
+            cppexp.retelide_mk(TNestelideGenericNested<int>(1))[2].v)[2]);
+        if (slot->v != 5 || cppexp.retelide_ctor_count() != 4
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 3) return 13131;
+        free(slot);
+    }
+    // DECLNEST: a sole C++ operator result initializes the declared object directly.
+    cppexp.retelide_reset();
+    int declNestValue = 0;
+    {
+        cppexp.Retelide a = cppexp.Retelide(2);
+        cppexp.Retelide b = cppexp.Retelide(3);
+        cppexp.retelide_reset();
+        {
+            cppexp.Retelide c = cppexp.Retelide(a + b);
+            declNestValue = c.v;
+        }
+    }
+    if (declNestValue != 5 || cppexp.retelide_ctor_count() != 1
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+        || cppexp.retelide_dtor_count() != 3) return 13132;
+    // A CFlat caller's result slot survives its nested constructor argument.
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideDeclC2(cppexp.Retelide(5));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13133;
+    // The C++ callee keeps its caller-side result elision.
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = cppexp.retelide_c2(cppexp.Retelide(5));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13141;
+    // A C++ maker and scalar-producing constructor arguments preserve the caller path.
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideDeclC2(cppexp.retelide_mk(5));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13134;
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = cppexp.retelide_c2(cppexp.retelide_mk(5));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13142;
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideDeclC2(
+            cppexp.Retelide(TNestelideValue(1)));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1003 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13135;
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = cppexp.retelide_c2(
+            cppexp.Retelide(cppexp.retelide_ival(1)));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1001 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13143;
+    // A caller can elide through a prototype whose NRVO body appears later in the file.
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideLater(cppexp.Retelide(5));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13144;
+    // A same-named method on an unrelated struct does not block the free function's elision.
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideCollision(cppexp.Retelide(5));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13145;
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideCollision(
+            TNestelideCollision(cppexp.Retelide(5)));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 2005 || cppexp.retelide_ctor_count() != 3
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 2
+        || cppexp.retelide_dtor_count() != 3) return 13146;
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = (TNestelideCollision(cppexp.Retelide(5)));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13147;
+    // Inner same-class results, ?:, and && arguments cannot consume the outer result slot.
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideDeclC2(
+            TNestelideDeclC2(cppexp.Retelide(5)));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 2005 || cppexp.retelide_ctor_count() != 3
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 2
+        || cppexp.retelide_dtor_count() != 3) return 13136;
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideDeclC2(
+            (TNestelideYes(1) && TNestelideYes(2))
+                ? cppexp.retelide_mk(5) : cppexp.retelide_mk(6));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13137;
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideDeclC2(cppexp.Retelide(
+            (TNestelideYes(1) && cppexp.retelide_mk(5).v == 5) ? 5 : 6));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 3
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 3) return 13138;
+    cppunw.reset();
+    cppexp.retelide_reset();
+    if (cppunw.guarded(TNestelideDeclThrowBody, 5) != -5
+        || cppexp.retelide_ctor_count() != 1 || cppexp.retelide_copy_count() != 0
+        || cppexp.retelide_move_count() != 0 || cppexp.retelide_dtor_count() != 1)
+        return 13139;
+    // A successful declaration after unwinding still uses the caller's result slot.
+    cppexp.retelide_reset();
+    declNestValue = 0;
+    {
+        cppexp.Retelide value = TNestelideDeclC2(cppexp.Retelide(5));
+        declNestValue = value.v;
+    }
+    if (declNestValue != 1005 || cppexp.retelide_ctor_count() != 2
+        || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+        || cppexp.retelide_dtor_count() != 2) return 13140;
     // T272: parentheses add no copy. Each leg's counts are the clang++ -std=c++20 oracle values.
     cppexp.conv_reset();
     {
@@ -29283,6 +30552,24 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T518CallArm(true) != 1000010) return 51802;
     if (T518CallArmNested(false, true) != 1000010) return 51803;
     if (T518CallArmNested(true, true) != 1000010) return 51804;
+    int defaultPairResult = T518DefaultValuePairs(false);
+    if (Ubd4RvalueRef() != 0) return 53101;
+    if (Ubd4DefaultShapes() != 0) return 53102;
+    if (T518UnboundDefaultTail(false) != T518BoundDefaultTail(false)) return 51871;
+    if (T518UnboundDefaultTail(true) != T518BoundDefaultTail(true)) return 51872;
+    if (T518DefaultTernaryPairs(false) != 0) return 51873;
+    if (T518DefaultTernaryPairs(true) != 0) return 51874;
+    if (defaultPairResult == 1) return 51875;
+    if (defaultPairResult == 2) return 51876;
+    if (defaultPairResult == 3) return 51877;
+    if (defaultPairResult == 4) return 51878;
+    if (defaultPairResult == 5) return 51879;
+    if (defaultPairResult == 6) return 51880;
+    if (defaultPairResult == 7) return 51881;
+    if (defaultPairResult == 8) return 51882;
+    expect_error("'default' needs a known target type here") { t518.tf(1, default); }
+    expect_error("'default' needs a known target type here") { t518bound.tf(1, default); }
+    expect_error("'default' needs a known target type here") { t518.ambiguous(T518RetTw(), default); }
     if (T518LaterRef() != 902) return 51808;
     if (T518Mixed() != 2902) return 51809;
     if (T518Pod(false) != 1702) return 51810;
@@ -29305,6 +30592,17 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T518WriteThisField() != 70211020) return 51842;
     if (T518WriteLater() != 70211020) return 51824;
     if (T518WriteGlobal() != 70201010) return 51839;
+    if (T518WriteGlobalDefault() != 70201010) return 51861;
+    if (T518WriteNamedGlobalDefault() != 70201010) return 51862;
+    if (T518WriteThisFieldDefault() != 70211020) return 51863;
+    if (T518WriteReturnedPointerDefault() != 70201010) return 51864;
+    if (T518DynamicDefaultLaterWrite() != 1270411011) return 51865;
+    if (T518UnbsnapRefA() != 720502020) return 51866;
+    if (T518UnbsnapRefC() != 70201010) return 51867;
+    if (T518UnbsnapRefD() != 70211020) return 51868;
+    if (T518UnbsnapPointerDot() != 70211020) return 51869;
+    if (T518UnbsnapPointerArrow() != 70211020) return 51870;
+    if (T518NativeGlobal() != 70201010) return 51860;
     if (T518ExtraMoveReturn() != 1000010) return 51840;
     if (T518ExtraMoveDefault() != 1000010) return 51841;
     int prvalueDyn = T518PrvalueDynDefault();
@@ -29337,6 +30635,9 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T518TrivialAbi8() != 170212) return 51836;
     if (T518TrivialAbi16() != 170212) return 51837;
     if (T518AnonymousSpecialization() != 28053806) return 51838;
+    // DIRORD: a direct constructor with a by-value class lvalue argument copies it at its position.
+    int dirordR = DirordLegs();
+    if (dirordR != 0) return dirordR;
     // SRCTYPE round 2: unscoped C++ enums promote by their registered C++ type.
     if (srctypeEnumPromotionRound2() != 0) return 27089;
     // SRCTYPE round 4: identity-only sources reach free operators and C++ templates (clang oracle).
@@ -30250,6 +31551,260 @@ void T288FieldJoin(bool k, int* o)
     o[0] = z.v; o[1] = s.a.v; o[2] = s.b.v;
     T249ReadCounts(o);
 }
+// TERNNEST counters are captured after all locals in the tested full-expression die.
+void TernNestReadCounts(int* o, int value, int av, int bv, int cv)
+{
+    o[0] = value; o[1] = av; o[2] = bv; o[3] = cv;
+    o[4] = cppbv.TernaryCnt.ctors; o[5] = cppbv.TernaryCnt.copies;
+    o[6] = cppbv.TernaryCnt.moves; o[7] = cppbv.TernaryCnt.copyAssigns;
+    o[8] = cppbv.TernaryCnt.moveAssigns; o[9] = cppbv.TernaryCnt.dtors;
+}
+bool TernNestMatches(int* o, int value, int av, int bv, int cv,
+                     int ctors, int copies, int moves, int copyAssigns,
+                     int moveAssigns, int dtors)
+{
+    return o[0] == value && o[1] == av && o[2] == bv && o[3] == cv
+        && o[4] == ctors && o[5] == copies && o[6] == moves
+        && o[7] == copyAssigns && o[8] == moveAssigns && o[9] == dtors;
+}
+int TernNestCflatByValue(cppbv.TernaryCnt value) { return value.v; }
+void TernNestA0(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestD0(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt.reset();
+        {
+            cppbv.TernaryCnt z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+            value = z.v; av = a.v; bv = b.v; cv = c.v;
+        }
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestF0(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        const cppbv.TernaryCnt* ap = &a;
+        const cppbv.TernaryCnt* bp = &b;
+        const cppbv.TernaryCnt* cp = &c;
+        cppbv.TernaryCnt.reset();
+        value = cppbv.takeTernaryCnt(outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c);
+        value = value; av = cppbv.readTernaryCnt(ap); bv = cppbv.readTernaryCnt(bp); cv = cppbv.readTernaryCnt(cp);
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestC0(bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = cppbv.TernaryCnt(inner ? move a : move b);
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestA1(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestD1(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt.reset();
+        {
+            cppbv.TernaryCnt z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+            value = z.v; av = a.v; bv = b.v; cv = c.v;
+        }
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestF1(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        const cppbv.TernaryCnt* ap = &a;
+        const cppbv.TernaryCnt* bp = &b;
+        const cppbv.TernaryCnt* cp = &c;
+        cppbv.TernaryCnt.reset();
+        value = cppbv.takeTernaryCnt(outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c);
+        value = value; av = cppbv.readTernaryCnt(ap); bv = cppbv.readTernaryCnt(bp); cv = cppbv.readTernaryCnt(cp);
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestC1(bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = cppbv.TernaryCnt(inner ? move a : move b);
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestA2(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestD2(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt.reset();
+        {
+            cppbv.TernaryCnt z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+            value = z.v; av = a.v; bv = b.v; cv = c.v;
+        }
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestF2(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        const cppbv.TernaryCnt* ap = &a;
+        const cppbv.TernaryCnt* bp = &b;
+        const cppbv.TernaryCnt* cp = &c;
+        cppbv.TernaryCnt.reset();
+        value = cppbv.takeTernaryCnt(outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c);
+        value = value; av = cppbv.readTernaryCnt(ap); bv = cppbv.readTernaryCnt(bp); cv = cppbv.readTernaryCnt(cp);
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestC2(bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = cppbv.TernaryCnt(inner ? move a : move b);
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestA3(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestD3(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt.reset();
+        {
+            cppbv.TernaryCnt z = outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c;
+            value = z.v; av = a.v; bv = b.v; cv = c.v;
+        }
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestF3(bool outer, bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        const cppbv.TernaryCnt* ap = &a;
+        const cppbv.TernaryCnt* bp = &b;
+        const cppbv.TernaryCnt* cp = &c;
+        cppbv.TernaryCnt.reset();
+        value = cppbv.takeTernaryCnt(outer ? cppbv.TernaryCnt(inner ? move a : move b) : move c);
+        value = value; av = cppbv.readTernaryCnt(ap); bv = cppbv.readTernaryCnt(bp); cv = cppbv.readTernaryCnt(cp);
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+void TernNestC3(bool inner, int* o)
+{
+    int value = 0; int av = 0; int bv = 0; int cv = 0;
+    {
+        const cppbv.TernaryCnt a = cppbv.TernaryCnt(21);
+        const cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt c = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt z = cppbv.TernaryCnt(0);
+        cppbv.TernaryCnt.reset();
+        z = cppbv.TernaryCnt(inner ? move a : move b);
+        value = z.v; av = a.v; bv = b.v; cv = c.v;
+    }
+    TernNestReadCounts(o, value, av, bv, cv);
+}
+
 // TERNFLD r2 helpers (legs 99034-99039). o[3..7] = ctors, copies, moves, copy-assign, move-assign.
 struct T13Node { e6mv.MvCnt f = e6mv.MvCnt(21); };
 struct T13XHost { e6mv.MvX x = e6mv.MvX(21); };
@@ -31338,4 +32893,10 @@ int deepPtrLegs()
         || castasg_test.event_at(3) != 40 || castasg_test.event_at(4) != 60
         || castasg_test.event_at(5) != 60) return 11812;
     return 0;
+}
+
+cppexp.Retelide TNestelideLater(cppexp.Retelide p)
+{
+    cppexp.Retelide g = move p;
+    return g;
 }

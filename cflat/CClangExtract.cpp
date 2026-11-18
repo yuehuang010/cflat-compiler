@@ -1741,12 +1741,13 @@ namespace cflat_cinterop
         };
 
         /*
-         * A by-value class default as "<enclosing namespace>\x1f<source text>", so the backend can
-         * re-evaluate it in its own scope (a generated initializer, see BuildCxxDefaultInitHelpers).
+         * A re-readable default as "<enclosing namespace>\x1f<source text>", so the backend can
+         * evaluate it in its original scope. Empty when the text cannot be re-read there.
          * Empty when the text cannot be re-read there (DefaultReReadGate), in an anonymous
          * namespace, or for a member of a final or nested class (the initializer derives from it).
          */
-        std::string ClassDefaultInitializerText(const ParmVarDecl* p, ASTContext& ctx)
+        std::string ClassDefaultInitializerText(const ParmVarDecl* p, ASTContext& ctx,
+                                               bool allowAnonymousNamespace = false)
         {
             const auto* fd = llvm::dyn_cast_or_null<FunctionDecl>(p->getDeclContext());
             if (fd == nullptr) return {};
@@ -1760,12 +1761,18 @@ namespace cflat_cinterop
             else if (!fd->getDeclContext()->getRedeclContext()->isFileContext())
                 return {};
             std::string scope;
+            bool anonymousNamespace = false;
             for (const DeclContext* dc = fd->getEnclosingNamespaceContext();
                  dc != nullptr && !dc->isTranslationUnit(); dc = dc->getParent())
             {
                 const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc);
                 if (ns == nullptr) continue;   // a linkage spec block
-                if (ns->isAnonymousNamespace()) return {};
+                if (ns->isAnonymousNamespace())
+                {
+                    if (!allowAnonymousNamespace) return {};
+                    anonymousNamespace = true;
+                    continue;
+                }
                 scope = ns->getNameAsString() + (scope.empty() ? "" : "::" + scope);
             }
             if (p->hasUninstantiatedDefaultArg() || p->getDefaultArg() == nullptr) return {};
@@ -1795,10 +1802,12 @@ namespace cflat_cinterop
                 ++first;
             text.erase(0, first);
             if (text.empty() || text.find('\x1f') != std::string::npos) return {};
+            if (anonymousNamespace) scope += '\x1e';
             return scope + '\x1f' + text;
         }
 
-        RawDefaultArg DefaultArgumentOf(const ParmVarDecl* p, ASTContext& ctx)
+        RawDefaultArg DefaultArgumentOf(const ParmVarDecl* p, ASTContext& ctx,
+                                        bool captureScalarExpression = false)
         {
             RawDefaultArg result;
             if (p == nullptr || !p->hasDefaultArg()) return result;
@@ -1827,6 +1836,22 @@ namespace cflat_cinterop
             if (p->getType()->isAnyPointerType() || p->getType()->isMemberPointerType())
             {
                 result.kind = "nonconst";
+                if (captureScalarExpression && p->getType()->isScalarType()
+                    && !llvm::isa<CXXMethodDecl>(p->getDeclContext()))
+                {
+                    if (std::string expression = ClassDefaultInitializerText(p, ctx, true);
+                        !expression.empty())
+                    {
+                        const size_t split = expression.find('\x1f');
+                        if (split != std::string::npos)
+                        {
+                            result.kind = "nonconst_scalar";
+                            result.value = expression.substr(0, split) + '\x1f'
+                                + CanonicalSpelling(ctx, p->getType()) + '\x1f'
+                                + expression.substr(split + 1);
+                        }
+                    }
+                }
                 return result;
             }
             if (p->getType()->isRecordType())
@@ -1839,6 +1864,22 @@ namespace cflat_cinterop
             if (!valueInit->EvaluateAsRValue(ev, ctx))
             {
                 result.kind = "nonconst";
+                if (captureScalarExpression && p->getType()->isScalarType()
+                    && !llvm::isa<CXXMethodDecl>(p->getDeclContext()))
+                {
+                    if (std::string expression = ClassDefaultInitializerText(p, ctx, true);
+                        !expression.empty())
+                    {
+                        const size_t split = expression.find('\x1f');
+                        if (split != std::string::npos)
+                        {
+                            result.kind = "nonconst_scalar";
+                            result.value = expression.substr(0, split) + '\x1f'
+                                + CanonicalSpelling(ctx, p->getType()) + '\x1f'
+                                + expression.substr(split + 1);
+                        }
+                    }
+                }
                 return result;
             }
             if (ev.Val.isInt())
@@ -3586,11 +3627,33 @@ namespace cflat_cinterop
                             for (const Stmt* child : s->children()) self(self, child);
                         };
                         findCall(findCall, wrapperBody);
-                        const FunctionDecl* callee = outer != nullptr && !llvm::isa<CXXMemberCallExpr>(outer)
+                        const FunctionDecl* callee = outer != nullptr
                                 && !llvm::isa<UserDefinedLiteral>(outer)
                             ? outer->getDirectCallee() : nullptr;
-                        if (callee != nullptr && callee->getBuiltinID() == 0
-                            && !llvm::isa<CXXMethodDecl>(callee))
+                        /*
+                         * A method is only a selected callee as an instance member template
+                         * specialization of the receiver's own class called with `.`/`->`, whose ABI
+                         * is a free call with the receiver first; MSVC returns a class after `this`.
+                         */
+                        const auto* memberCall = llvm::dyn_cast_or_null<CXXMemberCallExpr>(outer);
+                        // The receiver before any derived-to-base cast: a base member needs `this` adjusted.
+                        QualType objectType = memberCall != nullptr
+                            ? memberCall->getImplicitObjectArgument()->IgnoreParenImpCasts()->getType()
+                            : QualType();
+                        if (!objectType.isNull() && objectType->isPointerType())
+                            objectType = objectType->getPointeeType();
+                        const CXXRecordDecl* objectRecord = objectType.isNull()
+                            ? nullptr : objectType->getAsCXXRecordDecl();
+                        if (const auto* method = llvm::dyn_cast_or_null<CXXMethodDecl>(callee))
+                            if (memberCall == nullptr || objectRecord == nullptr
+                                || objectRecord->getCanonicalDecl() != method->getParent()->getCanonicalDecl()
+                                || method->isStatic()
+                                || method->isOverloadedOperator() || method->isVirtual()
+                                || method->getPrimaryTemplate() == nullptr
+                                || (ctx.getTargetInfo().getCXXABI().isMicrosoft()
+                                    && method->getReturnType()->isRecordType()))
+                                callee = nullptr;
+                        if (callee != nullptr && callee->getBuiltinID() == 0)
                         {
                             /*
                              * Source-valid C++ for the getter TU (which includes the same headers): an
@@ -3603,6 +3666,8 @@ namespace cflat_cinterop
                             policy.SuppressUnwrittenScope = true;
                             policy.AnonymousTagNameStyle = llvm::to_underlying(PrintingPolicy::AnonymousTagMode::Plain);
                             policy.PrintAsCanonical = true;
+                            // A method keeps its cv/ref qualifiers: the getter's typed member pointer
+                            // selects that exact overload.
                             sig.selectedCalleeType = callee->getType().getCanonicalType().getAsString(policy);
                             // The selected specialization's own arguments: the getter names exactly it.
                             if (const TemplateArgumentList* targs = callee->getTemplateSpecializationArgs())
@@ -3653,7 +3718,7 @@ namespace cflat_cinterop
                                 sig.selectedCalleeTemplateArgs = spelled;
                             }
                             for (const ParmVarDecl* p : callee->parameters())
-                                sig.selectedCalleeDefaults.push_back(DefaultArgumentOf(p, ctx));
+                                sig.selectedCalleeDefaults.push_back(DefaultArgumentOf(p, ctx, true));
                             if (callee->hasExternalFormalLinkage())
                                 sig.selectedCalleeSymbol = CxxLinkageName(ctx, callee);
                         }

@@ -1706,6 +1706,11 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
         }
         std::unordered_set<llvm::BasicBlock*> existing;
         for (auto& block : *host) existing.insert(&block);
+        // Allocas the region adds to the entry block (a call's return temporary) outlive its blocks.
+        std::unordered_set<llvm::AllocaInst*> entryAllocas;
+        if (tmpFn == nullptr && !host->empty())
+            for (auto& inst : host->getEntryBlock())
+                if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(&inst)) entryAllocas.insert(alloca);
         auto* scratch = llvm::BasicBlock::Create(*compiler->context, "unevaluated", host);
         compiler->builder->SetInsertPoint(scratch);
         // Flow-sensitive per-variable state (IsMoved / MovedFields, explicit-move null, address
@@ -1769,6 +1774,17 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
                         if (!inst.use_empty()) inst.replaceAllUsesWith(llvm::PoisonValue::get(inst.getType()));
                 for (auto* block : created) block->dropAllReferences();
                 for (auto* block : created) block->eraseFromParent();
+                // An entry-block alloca the region added is dead once its blocks are gone.
+                if (!host->empty())
+                    for (auto& inst : llvm::make_early_inc_range(host->getEntryBlock()))
+                        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(&inst);
+                            alloca != nullptr && entryAllocas.count(alloca) == 0
+                            && alloca->use_empty())
+                        {
+                            if (compiler->unwindScratchAllocas_ != nullptr)
+                                std::erase(*compiler->unwindScratchAllocas_, alloca);
+                            alloca->eraseFromParent();
+                        }
             }
             compiler->RestoreBuilderState(state);
             compiler->RestoreDetectionLedgers(std::move(detection));

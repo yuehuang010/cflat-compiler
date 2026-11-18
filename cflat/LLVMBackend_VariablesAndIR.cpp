@@ -203,11 +203,14 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         if (!externalDecl && gVar == nullptr)
         {
             auto* declared = module->getNamedGlobal(symbolName);
-            if (declared != nullptr && declared->getMetadata("cflat.forward_external")
-                && declared->isDeclaration() && declared->getValueType() == destinationType)
+            if (declared != nullptr && declared->getValueType() == destinationType
+                && ((declared->getMetadata("cflat.forward_external") && declared->isDeclaration())
+                    || declared->getMetadata("cflat.forward_definition")))
             {
                 gVar = declared;
                 gVar->setInitializer(initValue);
+                gVar->setMetadata("cflat.forward_external", nullptr);
+                gVar->setMetadata("cflat.forward_definition", nullptr);
             }
         }
         // A C++ companion may already carry the definition of an inline template static. Reuse

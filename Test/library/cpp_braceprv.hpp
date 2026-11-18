@@ -24,6 +24,35 @@ struct BS {
     ~BS() { ++BS_Stats::dtor; }
 };
 
+struct BC_Stats {
+    inline static int ctor = 0;
+    inline static int copy = 0;
+    inline static int move = 0;
+    inline static int dtor = 0;
+    static void reset() { ctor = copy = move = dtor = 0; }
+    static int code() { return ctor * 1000 + copy * 100 + move * 10 + dtor; }
+};
+struct BC_T { int value; BC_T(int x) : value(x) {} };
+struct BC_S {
+    int value;
+    BC_S(BC_T x) : value(x.value + 100) { ++BC_Stats::ctor; }
+    BC_S(const BC_S& x) : value(x.value) { ++BC_Stats::copy; }
+    BC_S(BC_S&& x) : value(x.value) { ++BC_Stats::move; }
+    ~BC_S() { ++BC_Stats::dtor; }
+};
+inline BC_T bc_mkT(int x) { return BC_T(x); }
+
+struct BSMaker {
+    BSMaker() {}
+    BS mk(int x) const { return BS(x); }
+};
+struct Reverse { int head; BS member; };
+inline int callShared = 0;
+inline BS mkWrite(int x) { callShared = x; BS_Stats::note(8); return BS(x); }
+inline int readShared() { BS_Stats::note(9); return callShared; }
+inline BS throwingMk(int x) { BS value(x); throw 7; }
+inline int throwingRead() { throw 8; }
+
 // Throws from its constructor when asked, after the earlier elements were built.
 struct BT {
     int value;

@@ -311,7 +311,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         && TopLevelMoveExpression(armAssign) == nullptr
                         && PostfixExpressionEndsInCall(argPostfix)
                         && !PostfixCallHasChainedReceiver(argPostfix)
-                        && !subscriptHasCall(argPostfix);
+                        && !subscriptHasCall(argPostfix)
+                        && !SpelledCallShadowedByFunction(compiler, argPostfix, resolvedNewCxxType);
                     // `new T(c ? mk() : mk())`: each '?:' arm builds into the block (decl mechanism).
                     const bool ternaryElisionArm = hasForeignCxxRecordArgs && ctorArgNodes.size() == 1
                         && SoleTernaryExpression(armAssign) != nullptr
@@ -454,6 +455,31 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                             compiler->builder->CreateStore(nv.Primary, newBlock);
                             selfElided = true;
                         }
+                    }
+                    // DIRORD: a by-value class lvalue with a later sibling that may have an effect is
+                    // copied at its position (clang's order); the selected constructor decides at the call.
+                    if (!braceCxxArgs && !ctorRefTernary && !ternaryElisionArm && !selfElisionArm
+                        && !nv.IsRvalue && !nv.IsExplicitMove && nv.Storage != nullptr
+                        && !nv.IsCxxDirectConstruction && nv.CxxClosureSignature.empty()
+                        && !nv.TypeAndValue.Pointer && nv.TypeAndValue.PointerDepth == 0
+                        && !nv.TypeAndValue.IsInterface && compiler->IsCxxRecord(nv.TypeAndValue.TypeName)
+                        && [&]() {
+                            auto* argList = ctx->argumentExpressionList();
+                            if (argList == nullptr) return false;
+                            for (auto* na : argList->argumentNamedExpression())
+                                if (na->Identifier() != nullptr) return false;
+                            return true;
+                        }()
+                        && std::any_of(ctorArgExprs.begin() + static_cast<std::ptrdiff_t>(argIndex + 1),
+                                       ctorArgExprs.end(), [&](auto* later) {
+                                           return !IsCxxInertCallArgument(later)
+                                               && BareIdentifierInExpression(later) == nullptr;
+                                       }))
+                    {
+                        if (!compiler->EmitCxxEarlyArgumentCopy(nv, nv.TypeAndValue.TypeName,
+                                                                /*earlyCopyRequired*/ true,
+                                                                /*earlyCopyHeuristic*/ false))
+                            return {};
                     }
                     NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                     const bool hadSourceTypeName = !nv.TypeAndValue.TypeName.empty();
@@ -792,7 +818,25 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                                                       compiler->DisplayCxxClassName(typeName));
             }
             else
+            {
+                // DIRORD: the selected constructor's by-value class parameters take their early copy.
+                std::vector<bool> selectedByValue(ctorArgVars.size(), false);
+                for (size_t i = 0; i < ctorArgVars.size() && i + 1 < ctor->params.size(); ++i)
+                {
+                    if (ctorArgVars[i].CxxEarlyCopyDecision == nullptr) continue;
+                    const auto& parameter = ctor->params[i + 1];
+                    selectedByValue[i] = !parameter.Pointer && !parameter.IsAlias
+                        && !parameter.IsRvalueRef && !parameter.IsInterface
+                        && compiler->IsCxxRecord(parameter.TypeName)
+                        && compiler->ResolveTypeAlias(parameter.TypeName)
+                            == compiler->ResolveTypeAlias(ctorArgVars[i].TypeAndValue.TypeName);
+                }
+                compiler->FinalizeCxxEarlyCopyArguments(ctorArgVars, selectedByValue);
+                for (size_t i = 0; i < ctorArgs.size() && i < selectedByValue.size(); ++i)
+                    if (selectedByValue[i])
+                        ctorArgs[i] = LoadNamedVariable(ctorArgVars[i]);
                 compiler->EmitCxxStructorCall(typeName, *ctor, newBlock, ctorArgs, &ctorArgVars);
+            }
             newBlockScope.Release();
             LLVMBackend::NamedVariable result;
             result.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = typeName, .Pointer = true };

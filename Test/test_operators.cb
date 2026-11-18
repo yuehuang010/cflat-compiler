@@ -1354,6 +1354,9 @@ extern int main()
     if (cppUnwindThroughHelperLegs() != 0) return 60;
     if (ternaddrLegs() != 15) return 81;
     if (ternaddrDeepLegs() != 10) return 82;
+    if (ternresAcceptLegs() != 7) return 67067;
+    if (ternresPrvalueMemberReadLegs() != 4) return 67068;
+    if (ternresMemberChainLegs() != 3) return 67069;
     if (nestedReceiverLegs() != 10) return 83;
     if (defaultedEqualityLegs() != 12) return 84;
 
@@ -2891,6 +2894,8 @@ struct AdrO { AdrS f1; AdrS f2; };
 struct AdrD { int a; ~AdrD() { } };
 AdrS adrG1;
 AdrS adrG2;
+char ternresGlobalCharA;
+char ternresGlobalCharB;
 void adrBump(AdrS* s) { s.a += 100; }
 void adrBumpD(AdrD* d) { d.a += 100; }
 AdrS* adrPick(bool t) { return &(t ? adrG1 : adrG2); }
@@ -2971,6 +2976,149 @@ int ternaddrLegs()
     **pp = 5;
     passed += Test("adr_nested_pointer_slot", ia, 5);
     passed += Test("adr_nested_pointer_others", ib + ic, 5);
+    return passed;
+}
+
+struct TernresRecord { int value; };
+struct TernresCharField { char value; };
+TernresRecord makeTernresRecord()
+{
+    TernresRecord result;
+    result.value = 3;
+    return result;
+}
+int ternresAcceptLegs()
+{
+    int passed = 0;
+    int a = 1;
+    int b = 2;
+    int c = 3;
+    bool t = true;
+    bool u = false;
+    int* address = &(t ? (u ? a : b) : c);
+    *address = 9;
+    passed += Test("ternres_nested_lvalue_address", a * 100 + b * 10 + c, 193);
+
+    TernresRecord recordA;
+    TernresRecord recordB;
+    recordA.value = 1;
+    recordB.value = 2;
+    t = false;
+    (t ? recordA : recordB).value = 9;
+    passed += Test("ternres_member_lvalue_write", recordA.value * 10 + recordB.value, 19);
+    TernresRecord readRecord;
+    readRecord.value = 1;
+    passed += Test("ternres_member_prvalue_read", (t ? readRecord : makeTernresRecord()).value, 3);
+
+    int derefA = 1;
+    int derefB = 2;
+    int* pointerA = &derefA;
+    int* pointerB = &derefB;
+    t = false;
+    *(t ? pointerA : pointerB) = 9;
+    passed += Test("ternres_pointer_deref_lvalue_write", derefA * 10 + derefB, 19);
+
+    char localA = 'a';
+    char localB = 'b';
+    t = true;
+    char* charAddress = &(t ? localA : localB);
+    *charAddress = 'z';
+    t = false;
+    charAddress = &(t ? localA : localB);
+    *charAddress = 'y';
+    passed += Test("ternres_char_local_address", localA == 'z' && localB == 'y', true);
+
+    ternresGlobalCharA = 'a';
+    ternresGlobalCharB = 'b';
+    t = true;
+    charAddress = &(t ? ternresGlobalCharA : ternresGlobalCharB);
+    *charAddress = 'z';
+    t = false;
+    charAddress = &(t ? ternresGlobalCharA : ternresGlobalCharB);
+    *charAddress = 'y';
+    passed += Test("ternres_char_global_address",
+        ternresGlobalCharA == 'z' && ternresGlobalCharB == 'y', true);
+
+    TernresCharField fieldA;
+    TernresCharField fieldB;
+    fieldA.value = 'a';
+    fieldB.value = 'b';
+    t = true;
+    charAddress = &(t ? fieldA.value : fieldB.value);
+    *charAddress = 'z';
+    t = false;
+    charAddress = &(t ? fieldA.value : fieldB.value);
+    *charAddress = 'y';
+    passed += Test("ternres_char_field_address", fieldA.value == 'z' && fieldB.value == 'y', true);
+    return passed;
+}
+
+int ternresPrvalueMemberReadLegs()
+{
+    int passed = 0;
+    TernresRecord a;
+    a.value = 7;
+    bool t = true;
+    int r = 0;
+    r = (t ? a : makeTernresRecord()).value;
+    passed += Test("ternres prvalue member read in assignment", r, 7);
+
+    TernresRecord b;
+    b.value = 0;
+    b.value = (t ? a : makeTernresRecord()).value + 1;
+    passed += Test("ternres prvalue member read on assignment rhs", b.value, 8);
+
+    r = 1;
+    r += (t ? a : makeTernresRecord()).value;
+    passed += Test("ternres prvalue member read in compound assignment", r, 8);
+
+    int[8] arr;
+    arr[(t ? a : makeTernresRecord()).value] = 5;
+    passed += Test("ternres prvalue member read in array index", arr[7], 5);
+    return passed;
+}
+
+struct TernresNestedValue { int g; };
+struct TernresNestedRecord { TernresNestedValue inn; int arr[2]; };
+TernresNestedRecord makeTernresNestedRecord()
+{
+    TernresNestedRecord result;
+    result.inn.g = 50;
+    result.arr[0] = 60;
+    result.arr[1] = 61;
+    return result;
+}
+struct TernresPointee { int g; };
+struct TernresPointerRecord { TernresPointee* p; };
+TernresPointerRecord mk2()
+{
+    TernresPointerRecord result;
+    result.p = nullptr;
+    return result;
+}
+int ternresMemberChainLegs()
+{
+    int passed = 0;
+    TernresNestedRecord a;
+    a.inn.g = 5;
+    a.arr[0] = 4;
+    a.arr[1] = 6;
+    bool t = true;
+    int r = (t ? a : makeTernresNestedRecord()).inn.g;
+    passed += Test("ternres prvalue nested member read", r, 5);
+    r = (t ? a : makeTernresNestedRecord()).arr[1];
+    passed += Test("ternres prvalue array field read", r, 6);
+
+    TernresPointee selected;
+    selected.g = 5;
+    TernresPointee other;
+    other.g = 2;
+    TernresPointerRecord pa;
+    pa.p = &selected;
+    TernresPointerRecord pb;
+    pb.p = &other;
+    (t ? pa : mk2()).p->g = 1;
+    passed += Test("ternres prvalue pointer field write", selected.g * 10 + other.g, 12);
     return passed;
 }
 

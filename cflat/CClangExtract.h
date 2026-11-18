@@ -191,7 +191,7 @@ namespace cflat_cinterop
 
     struct RawDefaultArg
     {
-        std::string kind;  // int, bool, enum, float, double, nullptr, or nonconst
+        std::string kind;  // int, bool, enum, float, double, nullptr, nonconst, nonconst_scalar
         std::string value;
     };
 

@@ -7198,7 +7198,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         const NamedVariable* implicitReceiver,
         const std::vector<std::string>& lexicalAggregateScopes,
         const FunctionSymbol* additionalCandidate,
-        bool reportNullPointerTemplateAmbiguity)
+        bool reportNullPointerTemplateAmbiguity,
+        const std::vector<antlr4::ParserRuleContext*>* argumentContexts)
 {
         std::vector<NamedVariable> arguments(inputArguments);
         // These describe only the call being lowered. Clear them before overload probing so a
@@ -7910,6 +7911,64 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && candidate.Parameters.front().TypeName
                     == implicitReceiver->TypeAndValue.TypeName;
         };
+        auto isCFlatDefaultParamWrapper = [](const FunctionSymbol& candidate) {
+            return candidate.DefaultArguments.size() > candidate.Parameters.size()
+                && candidate.DefaultArguments[candidate.Parameters.size()].kind
+                    == "cflat_default_param_wrapper";
+        };
+        auto hasCallerEvaluableClassDefault = [&](const FunctionSymbol& wrapper,
+                                                   const std::vector<NamedVariable>& callArguments) {
+            std::vector<std::string> argumentNames;
+            argumentNames.reserve(callArguments.size());
+            for (const NamedVariable& argument : callArguments)
+                argumentNames.push_back(argument.TypeAndValue.VariableName);
+            for (const FunctionSymbol& declaration : candidates)
+            {
+                if (declaration.IsCxx || isCFlatDefaultParamWrapper(declaration)
+                    || declaration.SourceName != wrapper.SourceName
+                    || declaration.IsMethod != wrapper.IsMethod
+                    || declaration.Parameters.size() <= wrapper.Parameters.size())
+                    continue;
+                std::vector<TypeAndValue> prefix(
+                    declaration.Parameters.begin(),
+                    declaration.Parameters.begin() + wrapper.Parameters.size());
+                if (ComputeMangledName(declaration.SourceName, declaration.ReturnType,
+                        prefix, wrapper.Variadic) != wrapper.UniqueName)
+                    continue;
+
+                const ArgumentBinding binding = ComputeArgumentPositions(
+                    argumentNames, declaration.Parameters, declaration.Variadic, 0,
+                    &declaration.DefaultArguments);
+                if (!binding.Ok) continue;
+                std::vector<bool> supplied(declaration.Parameters.size(), false);
+                for (int64_t position : binding.PosMap)
+                    if (position >= 0 && static_cast<size_t>(position) < supplied.size())
+                        supplied[static_cast<size_t>(position)] = true;
+                bool hasOmittedClassDefault = false;
+                bool allOmittedHaveFactories = true;
+                for (size_t i = 0; i < declaration.Parameters.size(); ++i)
+                {
+                    if (supplied[i]) continue;
+                    if (i >= declaration.DefaultArguments.size()
+                        || declaration.DefaultArguments[i].kind != "cflat_callsite")
+                    {
+                        allOmittedHaveFactories = false;
+                        break;
+                    }
+                    const TypeAndValue& param = declaration.Parameters[i];
+                    if (!param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                        && HasCxxClassMember(param.TypeName))
+                        hasOmittedClassDefault = true;
+                }
+                if (!allOmittedHaveFactories || !hasOmittedClassDefault) continue;
+                if (!callArguments.empty()
+                    && MatchFunction(callArguments, declaration.Parameters, declaration.Variadic,
+                                     true, &declaration.DefaultArguments).empty())
+                    continue;
+                return true;
+            }
+            return false;
+        };
 
         for (const auto& candidate : candidates)
         {
@@ -7917,6 +7976,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 ? cxxArguments : arguments;
             if (usesImplicitReceiver(candidate))
                 candidateArguments.insert(candidateArguments.begin(), *implicitReceiver);
+            if (isCFlatDefaultParamWrapper(candidate)
+                && hasCallerEvaluableClassDefault(candidate, candidateArguments))
+                continue;
             if (candidate.IsCxx)
                 for (size_t i = 0; i < candidateArguments.size()
                      && i < candidate.Parameters.size(); ++i)
@@ -8870,6 +8932,66 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogErrorMessage("no overload of '{}' matches function type '{}'",
                     { fnPtrMismatchName, fnPtrMismatchType });
 
+            const size_t contextOffset = argumentContexts != nullptr
+                && arguments.size() >= argumentContexts->size()
+                ? arguments.size() - argumentContexts->size() : arguments.size();
+            for (const auto& candidate : candidates)
+            {
+                if (candidate.IsCxx) continue;
+                std::vector<std::string> names;
+                names.reserve(arguments.size());
+                for (const auto& arg : arguments)
+                    names.push_back(arg.TypeAndValue.VariableName);
+                const auto binding = ComputeArgumentPositions(names, candidate.Parameters,
+                                                               candidate.Variadic);
+                if (!binding.Ok) continue;
+                size_t zeroArgIndex = arguments.size();
+                for (size_t argIndex = contextOffset; argIndex < arguments.size(); ++argIndex)
+                {
+                    if (argIndex >= binding.PosMap.size() || binding.PosMap[argIndex] < 0)
+                        continue;
+                    const size_t paramIndex = static_cast<size_t>(binding.PosMap[argIndex]);
+                    if (paramIndex < candidate.Parameters.size()
+                        && IsFunctionValueType(candidate.Parameters[paramIndex])
+                        && IsLiteralZeroSource(arguments[argIndex]))
+                    {
+                        zeroArgIndex = argIndex;
+                        break;
+                    }
+                }
+                if (zeroArgIndex == arguments.size()) continue;
+                // Null-spelling message only when the zero is this candidate's sole mismatch.
+                const auto matched = MatchFunction(arguments, candidate.Parameters,
+                                                   candidate.Variadic, /*probe*/ true);
+                if (matched.empty() || !LiteralZeroSlotIsSoleMismatch(matched, candidate)) continue;
+                // Another overload that takes the same 0 at a non-function parameter keeps the master message.
+                bool otherAcceptsZero = false;
+                for (const auto& other : candidates)
+                {
+                    if (&other == &candidate || other.IsCxx || otherAcceptsZero) continue;
+                    const auto otherMatched = MatchFunction(arguments, other.Parameters,
+                                                            other.Variadic, /*probe*/ true);
+                    for (size_t p = 0; p < otherMatched.size() && p < other.Parameters.size(); ++p)
+                        if (!IsFunctionValueType(other.Parameters[p])
+                            && IsLiteralZeroSource(otherMatched[p])
+                            && LiteralZeroAcceptedAt(otherMatched[p], other.Parameters[p]))
+                        {
+                            otherAcceptsZero = true;
+                            break;
+                        }
+                }
+                if (otherAcceptsZero) continue;
+                antlr4::ParserRuleContext* context = nullptr;
+                const size_t contextIndex = zeroArgIndex - contextOffset;
+                if (argumentContexts != nullptr && contextIndex < argumentContexts->size())
+                    context = (*argumentContexts)[contextIndex];
+                NamedVariable originalArg = arguments[zeroArgIndex];
+                if (originalArg.HasOriginalArgumentType)
+                    originalArg.TypeAndValue = originalArg.OriginalArgumentType;
+                RejectLiteralZeroFunctionSlot(originalArg.Primary, originalArg, context);
+                return nullptr;
+            }
+
             // A C++ member of a private/protected base reached through the receiver: name the base.
             if (!receiverType.empty() && IsCxxRecord(receiverType)
                 && ReportCxxMemberThroughNonPublicBase(receiverType, bareMemberName))
@@ -9473,6 +9595,82 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 NamedVariable value;
                 value.TypeAndValue = candidate.Parameters[i];
                 value.TypeAndValue.VariableName = candidate.Parameters[i].VariableName;
+                if (def.kind == "cflat_callsite")
+                {
+                    value.IsDefaultParamForward = true;
+                    auto hasInlineDefaultExpression = [&]() {
+                        auto contexts = cflatDefaultArgumentContexts.find(candidate.UniqueName);
+                        return contexts != cflatDefaultArgumentContexts.end()
+                            && i < contexts->second.size()
+                            && contexts->second[i].Initializer != nullptr
+                            && contexts->second[i].Initializer->assignmentExpression() != nullptr;
+                    };
+                    bool deferFactory = false;
+                    for (size_t argIndex = 0; argIndex < matched.size()
+                         && argIndex < candidate.Parameters.size()
+                         && argIndex < candidate.Recipe.paramSlots.size(); ++argIndex)
+                    {
+                        const auto& argParam = candidate.Parameters[argIndex];
+                        const auto& slot = candidate.Recipe.paramSlots[argIndex];
+                        if (slot.kind == AbiSlot::ByVal
+                            && IsForeignNontrivialCxxClass(argParam.TypeName)
+                            && !IsOwnedCxxPrvalueArgument(matched[argIndex], slot.structTy))
+                        {
+                            deferFactory = true;
+                            break;
+                        }
+                    }
+                    if (deferFactory)
+                    {
+                        value.CallerName = def.value;
+                        value.CxxDefaultInitIndex = hasInlineDefaultExpression() ? -3 : -2;
+                    }
+                    else
+                    {
+                        bool evaluatedInline = false;
+                        if (hasInlineDefaultExpression() && cflatDefaultArgumentEvaluator)
+                        {
+                            auto parsed = cflatDefaultArgumentEvaluator(
+                                candidate.UniqueName, i, candidate.Parameters[i]);
+                            if (parsed.Primary != nullptr || parsed.Storage != nullptr)
+                            {
+                                parsed.IsDefaultParamForward = parsed.IsRvalue || parsed.IsCxxPrvalueTemp;
+                                if (parsed.Storage == nullptr && parsed.Primary == lastCxxRetValue_
+                                    && lastCxxRetTemp_ != nullptr)
+                                {
+                                    parsed.Storage = lastCxxRetTemp_;
+                                    parsed.IsCxxPrvalueTemp = true;
+                                }
+                                else if (parsed.Storage == nullptr
+                                    && parsed.Primary == lastLoweredRetValue_
+                                    && lastLoweredRetTemp_ != nullptr)
+                                {
+                                    parsed.Storage = lastLoweredRetTemp_;
+                                    parsed.IsCxxPrvalueTemp = true;
+                                }
+                                value = std::move(parsed);
+                                evaluatedInline = true;
+                            }
+                        }
+                        if (!evaluatedInline)
+                        {
+                            llvm::Value* generated = CreateOverloadedFunctionCall(def.value, {});
+                            if (generated == nullptr)
+                                LogErrorMessage("cannot evaluate default argument for parameter '{}' of '{}'",
+                                                { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                            value.Primary = generated;
+                            value.BaseType = generated->getType();
+                            value.IsRvalue = true;
+                            if (lastCxxRetValue_ == generated && lastCxxRetTemp_ != nullptr)
+                                value.Storage = lastCxxRetTemp_;
+                            else if (lastLoweredRetValue_ == generated && lastLoweredRetTemp_ != nullptr)
+                                value.Storage = lastLoweredRetTemp_;
+                            value.IsCxxPrvalueTemp = true;
+                        }
+                    }
+                    matched.push_back(std::move(value));
+                    continue;
+                }
                 value.BaseType = GetType(candidate.Parameters[i]);
                 if (value.BaseType == nullptr)
                     LogErrorMessage("cannot lower default argument for parameter '{}' of '{}'",
@@ -11380,6 +11578,77 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 const bool cxxObject = IsForeignNontrivialCxxClass(pn);
                 const bool cflatHolder = !cxxObject && HasForeignNontrivialCxxField(pn);
                 if (!cxxObject && !cflatHolder) continue;
+                if (cxxObject && i < matched.size()
+                    && matched[i].CxxDefaultInitIndex == -3)
+                {
+                    NamedVariable parsed;
+                    if (cflatDefaultArgumentEvaluator)
+                        parsed = cflatDefaultArgumentEvaluator(
+                            candidate.UniqueName, i, candidate.Parameters[i]);
+                    if (parsed.Primary == nullptr && parsed.Storage == nullptr)
+                    {
+                        llvm::Value* generated =
+                            CreateOverloadedFunctionCall(matched[i].CallerName, {});
+                        if (generated == nullptr)
+                            LogErrorMessage("cannot evaluate default argument for parameter '{}' of '{}'",
+                                            { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                        parsed.TypeAndValue = candidate.Parameters[i];
+                        parsed.Primary = generated;
+                        parsed.BaseType = generated->getType();
+                        parsed.IsRvalue = true;
+                        if (lastCxxRetValue_ == generated) parsed.Storage = lastCxxRetTemp_;
+                        else if (lastLoweredRetValue_ == generated) parsed.Storage = lastLoweredRetTemp_;
+                        parsed.IsCxxPrvalueTemp = parsed.Storage != nullptr;
+                    }
+                    if (!parsed.IsRvalue && !parsed.IsCxxPrvalueTemp)
+                    {
+                        matched[i] = std::move(parsed);
+                    }
+                    else
+                    {
+                        llvm::Value* storage = parsed.Storage;
+                        if (storage == nullptr && parsed.Primary == lastCxxRetValue_)
+                            storage = lastCxxRetTemp_;
+                        if (storage == nullptr && parsed.Primary == lastLoweredRetValue_)
+                            storage = lastLoweredRetTemp_;
+                        if (storage == nullptr)
+                            LogErrorMessage("cannot retain default argument for parameter '{}' of '{}'",
+                                            { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                        parsed.Storage = storage;
+                        parsed.IsDefaultParamForward = true;
+                        parsed.CallerName.clear();
+                        matched[i] = std::move(parsed);
+                        if (IsCxxParamDestroyedInCallee(pn)) UnregisterOwnedStructTemp(storage);
+                        cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                        cxxIndirectArgAddrs[i] = storage;
+                        continue;
+                    }
+                }
+                if (cxxObject && i < matched.size()
+                    && matched[i].CxxDefaultInitIndex == -2)
+                {
+                    llvm::Value* generated =
+                        CreateOverloadedFunctionCall(matched[i].CallerName, {});
+                    if (generated == nullptr)
+                        LogErrorMessage("cannot evaluate default argument for parameter '{}' of '{}'",
+                                        { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                    llvm::Value* storage = nullptr;
+                    if (lastCxxRetValue_ == generated) storage = lastCxxRetTemp_;
+                    else if (lastLoweredRetValue_ == generated) storage = lastLoweredRetTemp_;
+                    if (storage == nullptr)
+                        LogErrorMessage("cannot retain default argument for parameter '{}' of '{}'",
+                                        { candidate.Parameters[i].VariableName, diagnosticFunctionName });
+                    matched[i].CallerName.clear();
+                    matched[i].Primary = generated;
+                    matched[i].Storage = storage;
+                    matched[i].BaseType = generated->getType();
+                    matched[i].IsRvalue = true;
+                    matched[i].IsCxxPrvalueTemp = true;
+                    if (IsCxxParamDestroyedInCallee(pn)) UnregisterOwnedStructTemp(storage);
+                    cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                    cxxIndirectArgAddrs[i] = storage;
+                    continue;
+                }
                 if (cxxObject && i < matched.size() && matched[i].CxxEarlyCopySlot != nullptr)
                 {
                     llvm::AllocaInst* slot = matched[i].CxxEarlyCopySlot;
@@ -11605,11 +11874,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     }
                 if (pendingCxxSretDest_ != nullptr
                     && !hasUnforwardedSameTypeCxxByValueArg
+                    && (pendingCxxSretDest_ != pendingCxxSretTargetDest_
+                        || pendingCxxSretCallSite_ == receiverCallSite)
                     && candidate.ReturnType.TypeName == pendingCxxSretTypeName_)
                 {
                     cxxSretDest = pendingCxxSretDest_;
                     pendingCxxSretDest_ = nullptr;
                     pendingCxxSretTypeName_.clear();
+                    if (pendingCxxSretTargetDest_ == cxxSretDest)
+                    {
+                        pendingCxxSretTargetDest_ = nullptr;
+                        pendingCxxSretCallSite_ = nullptr;
+                    }
                 }
                 else
                 {
@@ -11626,11 +11902,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         if (nativeValueConstructor)
         {
             if (pendingCxxSretDest_ != nullptr
+                && (pendingCxxSretDest_ != pendingCxxSretTargetDest_
+                    || pendingCxxSretCallSite_ == receiverCallSite)
                 && candidate.ReturnType.TypeName == pendingCxxSretTypeName_)
             {
                 cxxSretDest = pendingCxxSretDest_;
                 pendingCxxSretDest_ = nullptr;
                 pendingCxxSretTypeName_.clear();
+                if (pendingCxxSretTargetDest_ == cxxSretDest)
+                {
+                    pendingCxxSretTargetDest_ = nullptr;
+                    pendingCxxSretCallSite_ = nullptr;
+                }
             }
             else
             {

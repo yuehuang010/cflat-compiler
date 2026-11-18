@@ -1,0 +1,59 @@
+struct TernaryMemberWriteCell { int f; };
+TernaryMemberWriteCell makeTernaryMemberWriteCell()
+{
+    TernaryMemberWriteCell result;
+    result.f = 3;
+    return result;
+}
+
+struct TernaryNestedWriteInner { int g; };
+struct TernaryNestedWriteCell { TernaryNestedWriteInner inn; int arr[2]; };
+TernaryNestedWriteCell makeTernaryNestedWriteCell()
+{
+    TernaryNestedWriteCell result;
+    result.inn.g = 3;
+    result.arr[0] = 4;
+    result.arr[1] = 5;
+    return result;
+}
+
+extern int main()
+{
+    expect_error("cannot assign to a member of a '?:' unless both arms are lvalues") {
+        TernaryMemberWriteCell value;
+        value.f = 1;
+        bool t = false;
+        (t ? value : makeTernaryMemberWriteCell()).f = 9;
+    }
+    expect_error("cannot assign to a member of a '?:' unless both arms are lvalues") {
+        TernaryMemberWriteCell value;
+        value.f = 1;
+        bool t = true;
+        (t ? makeTernaryMemberWriteCell() : value).f = 9;
+    }
+    expect_error("cannot assign to a member of a '?:' unless both arms are lvalues") {
+        TernaryNestedWriteCell value;
+        value.inn.g = 1;
+        bool t = true;
+        (t ? value : makeTernaryNestedWriteCell()).inn.g = 9;
+    }
+    expect_error("cannot assign to a member of a '?:' unless both arms are lvalues") {
+        TernaryNestedWriteCell value;
+        value.inn.g = 1;
+        bool t = true;
+        (t ? value : makeTernaryNestedWriteCell()).inn.g += 1;
+    }
+    expect_error("cannot assign to a member of a '?:' unless both arms are lvalues") {
+        TernaryNestedWriteCell value;
+        value.inn.g = 1;
+        bool t = true;
+        ((t ? value : makeTernaryNestedWriteCell()).inn).g = 9;
+    }
+    expect_error("cannot assign to a member of a '?:' unless both arms are lvalues") {
+        TernaryNestedWriteCell value;
+        value.arr[0] = 1;
+        bool t = true;
+        (t ? value : makeTernaryNestedWriteCell()).arr[0] = 9;
+    }
+    return 0;
+}

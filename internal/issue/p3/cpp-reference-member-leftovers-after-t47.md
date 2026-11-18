@@ -36,15 +36,14 @@ clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch
      name the temporary first, `C c(2); alias r = pickref(c, 0);`). Optional refinement: honour clang `[[clang::lifetimebound]]`
      when the callee carries it; never inspect inline bodies. `alias r = pickref(C(2), 0)` (clang 7) stays refused. Pre-existing: `alias r = *C(6).ptr();` (raw-pointer provenance) dangles.
      Repros scratch/repro_keep/aliastmp/.
-   - A by-value copy of an lvalue is never destroyed when a later constructor in the same call throws (thrlv: 3210,
-     clang 13210). BVPARAM did not resolve the direct C++ constructor-argument path after three targeted attempts:
-     matrix row 10 (a / constructor / direct / throw) still copies the lvalue after the later `D` constructor; the
-     worktree records `1/0/0/1`, while clang records `2/1/0/2` (`corder=12`, `dorder=21`). Repro shape:
-     `T t = T(s, C(2))` with `s` a C++ class lvalue and `C(2)`'s constructor throwing; the fix prints `c1 d1`, clang
-     `c1 k1 d1 d1` (the copy of `s` is ordered after the throwing constructor and never made).
-   - The same direct constructor path also has a no-throw order mismatch: `T t = T(s, C(2))` (BVPARAM p.cb f13)
-     records `c1 c2 k1 d1 d2 d1`; clang++ -std=c++20 records `c1 k1 c2 d2 d1 d1`. This remained after three
-     targeted BVPARAM attempts and is documented residue for this round.
+   - Brace form residue (DIRORD r2): `T t{s, C(2)}` with `s` a C++ class lvalue still differs from clang. The aggregate
+     brace route (TryEmitForeignCxxAggregateBraceInitFields -> RequestCxxDirectBraceConstructor ->
+     CreateOverloadedFunctionCall) copies `s` after `C(2)` is built, and the wrapper takes class prvalues by move.
+     Probe (fixture dirord, Test/library/cpp_interop_lastuse.h): `T t{s, C(2)}` prints `c1 c2 k1 m2 T d2 d1 d2 ~T d1`,
+     clang `c1 k1 c2 T d2 d1 ~T d1`. An all-prvalue brace `T t{C(1), C(2)}` also differs (`c1 c2 m1 m2 T d2 d1 d2 d1 ~T`,
+     clang `c1 c2 T d2 d1 ~T`), so the fix needs prvalue elision into the brace wrapper's by-value parameters as well as
+     the copy-at-position. The paren direct-constructor cells (local, field, param, global, new; with and without
+     throw) now match clang (DIRORD r2, Test/test_cpp_interop.cb DIRORD legs 57001-57014).
    - The reviewed `tone<T>(T)` free-function template path now uses the direct-construction guard. The guard stays
      off member-template wrappers: broadening it changed `PvHost::byVal(PvCount<T,F>)` from the existing no-move
      prvalue route to an extra move (`Test/test_cpp_interop_template.cb`, leg 2856). That member path matches both

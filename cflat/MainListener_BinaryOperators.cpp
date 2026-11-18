@@ -4190,8 +4190,10 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
                 FlushCallPostfix();
                 const std::string lookupName = ns.empty()
                     ? "__cxx_free." + opName : requestName;
-                return CallOperatorWithoutExcluded(compiler->functionTable, compiler,
+                llvm::Value* result = CallOperatorWithoutExcluded(compiler->functionTable, compiler,
                     lookupName, registeredName, arguments, {});
+                if (result != nullptr) RecordFileScopeIntegerCppOperatorSelection();
+                return result;
             }
             if (compiler->LastCxxRequestClangRejected()
                 && !compiler->LastCxxRequestNoViableAtRequest() && !requestError.empty())
@@ -5930,7 +5932,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 const std::string& requestNamespace = enumNamespaces.front();
                 llvm::Value* enumResult = callOperatorTemplate((requestNamespace.empty()
                     ? std::string("__cxx_free") : requestNamespace) + "." + opName, true);
-                if (enumResult != nullptr) return enumResult;
+                if (enumResult != nullptr)
+                {
+                    RecordFileScopeIntegerCppOperatorSelection();
+                    return enumResult;
+                }
                 if (!adlClangRefusal.empty() && !enumCompoundOperator.empty())
                     LogErrorContext(enumCompoundRefusalCtx != nullptr ? enumCompoundRefusalCtx : ctx,
                         std::format("in compound assignment '{}': {}", enumCompoundOperator,
@@ -7195,11 +7201,23 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         if (!ty->isStructTy())
         {
-            if (llvm::Value* exact = tryClangForCxx20CandidateSet()) return exact;
+            if (llvm::Value* exact = tryClangForCxx20CandidateSet())
+            {
+                RecordFileScopeIntegerCppOperatorSelection();
+                return exact;
+            }
             if (mixedFriendOperands())
-                if (llvm::Value* adl = tryFreeOperator(true)) return adl;
+                if (llvm::Value* adl = tryFreeOperator(true))
+                {
+                    RecordFileScopeIntegerCppOperatorSelection();
+                    return adl;
+                }
             llvm::Value* freeResult = tryFreeOperator();
-            if (freeResult != nullptr) return freeResult;
+            if (freeResult != nullptr)
+            {
+                RecordFileScopeIntegerCppOperatorSelection();
+                return freeResult;
+            }
             if (cxxCompoundStrictLookup && !lvalue->getType()->isStructTy()
                 && isCxxRecordValue(rvalue))
             {

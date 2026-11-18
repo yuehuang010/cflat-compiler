@@ -109,6 +109,9 @@ LLVM_ATTRIBUTE_NOINLINE CFlatParser::AssignmentExpressionContext* UnwrapInitiali
 CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
     antlr4::tree::ParseTree* node);
 bool PostfixExpressionEndsInCall(CFlatParser::PostfixExpressionContext* postfix);
+// True when the spelled `T(...)` callee names the target class but a function of that name wins lookup.
+bool SpelledCallShadowedByFunction(LLVMBackend* compiler,
+    CFlatParser::PostfixExpressionContext* postfix, const std::string& targetName);
 bool PostfixCallHasChainedReceiver(CFlatParser::PostfixExpressionContext* postfix);
 struct StringLiteralExpressionInfo
 {
@@ -2467,6 +2470,7 @@ private:
     antlr4::BufferedTokenStream* tokens_ = nullptr;
     std::vector<ViewFieldMoveInferenceEntry> viewFieldMoveInferenceEntries_;
     std::vector<DeferredFunctionDefinition> deferredIncompleteFunctionDefinitions_;
+    std::unordered_set<std::string> foreignCxxNrvoReturnFunctionNames_;
     std::unordered_set<std::string> namespaceFunctionValueNames_;
     std::unordered_map<std::string, size_t> functionSourceOrder_;
     std::unordered_map<std::string, size_t> forwardDeclaredStructTypeSourceOrder_;
@@ -2815,6 +2819,10 @@ public:
     void FinalizeDeferredFunctionDefinitions();
     std::vector<CFlatParser::FunctionDefinitionContext*> DeferredFunctionDefinitionContexts() const;
     void FinalizeViewFieldMoveInference();
+    const std::unordered_set<std::string>& ForeignCxxNrvoReturnFunctionNames() const
+    {
+        return foreignCxxNrvoReturnFunctionNames_;
+    }
     void CollectGlobalArrayViewNonInitializerStores(CFlatParser::TranslationUnitContext* tu,
                                                       bool allowUnresolvedGlobals = false);
 
@@ -3047,6 +3055,10 @@ private:
     CFlatParser* parser;
     LLVMBackend* compilerLLVM;
     std::function<void(antlr4::ParserRuleContext*, std::string)> savedContextualErrorReporter_;
+    std::function<LLVMBackend::NamedVariable(const std::string&, size_t,
+        const LLVMBackend::TypeAndValue&)> savedCflatDefaultArgumentEvaluator_;
+    bool evaluatingCFlatDefaultArgument_ = false;
+    std::vector<std::string> cflatDefaultInjectedGlobals_;
     std::string sourceFileName;
     std::string importNamespace_;
     unsigned addressOfOperandDepth_ = 0;
@@ -3427,6 +3439,8 @@ private:
         CFlatParser::TypeCheckExpressionContext* lastRedundantAsCtx = nullptr;
         LLVMBackend::NamedVariable lastRedundantAsNamed;
         llvm::Value* pendingCxxSretDest = nullptr;
+        llvm::Value* pendingCxxSretTargetDest = nullptr;
+        const void* pendingCxxSretCallSite = nullptr;
         std::string pendingCxxSretTypeName;
         bool pendingCxxSretForFixedArray = false;
         bool pendingCxxSretReturn = false;
@@ -3771,6 +3785,9 @@ private:
     // break/continue - see straightLineJumped_); loops/switch restore it (they fall through).
     bool straightLineReturned_ = false;
     llvm::BasicBlock* expectErrorRecoveryBlock_ = nullptr;
+    std::function<void(const LLVMBackend::NamedVariable&, bool)>
+        defaultParamResolutionObserver_;
+    size_t defaultCallSiteFactoryCounter_ = 0;
 
     struct NamedReturnElisionContext
     {
@@ -3780,6 +3797,7 @@ private:
         std::vector<CFlatParser::DirectDeclaratorContext*> declarators;
         llvm::Value* sretStorage = nullptr;
     } namedReturnElision_;
+    std::unordered_set<std::string> foreignCxxNrvoReturnFunctionNames_;
 
     struct NamedReturnElisionScope
     {
@@ -4040,26 +4058,79 @@ private:
         llvm::Value* savedRetTemp;
         llvm::Value* savedRetValue;
         llvm::Value* savedSretDest;
+        llvm::Value* savedSretTargetDest;
+        const void* savedSretCallSite;
         std::string savedSretType;
         bool savedSretForFixedArray;
+        bool savedSretReturn;
+        llvm::Value* savedTernaryDest;
+        std::string savedTernaryType;
+        bool savedTernaryConsumed;
+        bool savedTernaryFailed;
+        std::string savedTernaryArmType;
+        int savedTernaryArmCat;
+        llvm::Value* savedLoweredRetTemp;
+        llvm::Value* savedLoweredRetValue;
+        llvm::Value* savedLoweredInPlaceRetTemp;
         explicit CxxCallArgumentParseStateScope(LLVMBackend* b)
             : backend(b), savedRetTemp(b->lastCxxRetTemp_), savedRetValue(b->lastCxxRetValue_),
-              savedSretDest(b->pendingCxxSretDest_), savedSretType(b->pendingCxxSretTypeName_),
-              savedSretForFixedArray(b->pendingCxxSretForFixedArray_)
+              savedSretDest(b->pendingCxxSretDest_),
+              savedSretTargetDest(b->pendingCxxSretTargetDest_),
+              savedSretCallSite(b->pendingCxxSretCallSite_),
+              savedSretType(b->pendingCxxSretTypeName_),
+              savedSretForFixedArray(b->pendingCxxSretForFixedArray_),
+              savedSretReturn(b->pendingCxxSretReturn_),
+              savedTernaryDest(b->pendingCxxTernaryDeclDest_),
+              savedTernaryType(b->pendingCxxTernaryDeclTypeName_),
+              savedTernaryConsumed(b->pendingCxxTernaryDeclConsumed_),
+              savedTernaryFailed(b->pendingCxxTernaryDeclFailed_),
+              savedTernaryArmType(b->pendingCxxTernaryDeclArmType_),
+              savedTernaryArmCat(b->pendingCxxTernaryDeclArmCat_),
+              savedLoweredRetTemp(b->lastLoweredRetTemp_),
+              savedLoweredRetValue(b->lastLoweredRetValue_),
+              savedLoweredInPlaceRetTemp(b->lastLoweredInPlaceRetTemp_)
         {
             backend->lastCxxRetTemp_ = nullptr;
             backend->lastCxxRetValue_ = nullptr;
             backend->pendingCxxSretDest_ = nullptr;
             backend->pendingCxxSretTypeName_.clear();
             backend->pendingCxxSretForFixedArray_ = false;
+            backend->pendingCxxSretReturn_ = false;
+            backend->pendingCxxTernaryDeclDest_ = nullptr;
+            backend->pendingCxxTernaryDeclTypeName_.clear();
+            backend->pendingCxxTernaryDeclConsumed_ = false;
+            backend->pendingCxxTernaryDeclFailed_ = false;
+            backend->pendingCxxTernaryDeclArmType_.clear();
+            backend->pendingCxxTernaryDeclArmCat_ = 0;
+            backend->lastLoweredRetTemp_ = nullptr;
+            backend->lastLoweredRetValue_ = nullptr;
+            backend->lastLoweredInPlaceRetTemp_ = nullptr;
         }
         ~CxxCallArgumentParseStateScope()
         {
+            const bool argumentProducedLoweredResult = backend->lastLoweredRetTemp_ != nullptr
+                || backend->lastLoweredRetValue_ != nullptr
+                || backend->lastLoweredInPlaceRetTemp_ != nullptr;
             backend->lastCxxRetTemp_ = savedRetTemp;
             backend->lastCxxRetValue_ = savedRetValue;
             backend->pendingCxxSretDest_ = savedSretDest;
+            backend->pendingCxxSretTargetDest_ = savedSretTargetDest;
+            backend->pendingCxxSretCallSite_ = savedSretCallSite;
             backend->pendingCxxSretTypeName_ = std::move(savedSretType);
             backend->pendingCxxSretForFixedArray_ = savedSretForFixedArray;
+            backend->pendingCxxSretReturn_ = savedSretReturn;
+            backend->pendingCxxTernaryDeclDest_ = savedTernaryDest;
+            backend->pendingCxxTernaryDeclTypeName_ = std::move(savedTernaryType);
+            backend->pendingCxxTernaryDeclConsumed_ = savedTernaryConsumed;
+            backend->pendingCxxTernaryDeclFailed_ = savedTernaryFailed;
+            backend->pendingCxxTernaryDeclArmType_ = std::move(savedTernaryArmType);
+            backend->pendingCxxTernaryDeclArmCat_ = savedTernaryArmCat;
+            if (!argumentProducedLoweredResult)
+            {
+                backend->lastLoweredRetTemp_ = savedLoweredRetTemp;
+                backend->lastLoweredRetValue_ = savedLoweredRetValue;
+                backend->lastLoweredInPlaceRetTemp_ = savedLoweredInPlaceRetTemp;
+            }
         }
     };
 
@@ -4338,6 +4409,10 @@ public:
         const std::vector<CFlatParser::FunctionDefinitionContext*>& deferredFunctions = {});
     void PrepareDeferredFunctionDefinitions(
         const std::vector<CFlatParser::FunctionDefinitionContext*>& functions);
+    void RegisterForeignCxxNrvoReturnFunctionNames(const std::unordered_set<std::string>& names)
+    {
+        foreignCxxNrvoReturnFunctionNames_.insert(names.begin(), names.end());
+    }
 
     // Returns the BufferedTokenStream that backs this listener's parser, so that
     // helpers like ExtractLeadingDoc can reach the hidden-channel comment tokens.
@@ -4983,9 +5058,13 @@ public:
         antlr4::tree::ParseTree* node);
     // True when a move leaf of the join (ctx, climbed to its outermost ternary) is const: a
     // const field, deref or bare name root. clang's composite is then const and never moves.
-    bool JoinMoveLeafConst(CFlatParser::ConditionalExpressionContext* ctx);
+    // inspectMemberLeaves also reads the resolved type of an unmoved member leaf (`mkH(1).cd`).
+    bool JoinMoveLeafConst(CFlatParser::ConditionalExpressionContext* ctx,
+                           bool inspectMemberLeaves = false);
     // Const-ness of the object a move operand moves, from its unevaluated resolved type.
     bool MoveOperandConst(CFlatParser::MoveExpressionContext* mv);
+    // Const-ness of an unmoved member leaf's resolved type (see JoinMoveLeafConst).
+    bool MemberLeafConst(antlr4::tree::ParseTree* arm);
     // Signature of one arm of a bare `function f = c ? a : b;`: a plain local/argument name (its
     // declared function type) or a plain function name with exactly one overload. False otherwise.
     bool ResolveBareFunctionArmSignature(antlr4::ParserRuleContext* arm,
@@ -5015,7 +5094,9 @@ public:
         bool copyListInit,
         bool rejectEscapingReferences = false,
         llvm::GlobalVariable* referenceLifetimeOwner = nullptr,
-        bool rejectFrameBoundReferences = false);
+        bool rejectFrameBoundReferences = false,
+        CFlatParser::FieldInitContext* preParsedElement = nullptr,
+        const LLVMBackend::NamedVariable* preParsedValue = nullptr);
     bool TryEmitForeignCxxAggregateBraceInitFields(const std::string& typeName,
         const std::vector<CFlatParser::FieldInitContext*>& fields,
         antlr4::ParserRuleContext* errorContext,
@@ -5023,12 +5104,19 @@ public:
         bool copyListInit,
         bool rejectEscapingReferences = false,
         llvm::GlobalVariable* referenceLifetimeOwner = nullptr,
-        bool rejectFrameBoundReferences = false);
+        bool rejectFrameBoundReferences = false,
+        CFlatParser::FieldInitContext* preParsedElement = nullptr,
+        const LLVMBackend::NamedVariable* preParsedValue = nullptr);
     bool TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext* initDeclarator,
                                    CFlatParser::DirectDeclaratorContext* direct,
                                    const LLVMBackend::DeclTypeAndValue& declType,
                                    const std::string& name, size_t line,
                                    std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
+    /*
+     * `auto x = C(...)` deduces C: the resolved name of the C++ class the spelled call builds, or
+     * empty when the call is not a plain class construction (shadowed by a function or template).
+     */
+    std::string AutoDeducedCxxFunctionalClass(CFlatParser::InitDeclaratorContext* initDeclarator);
     /*
      * `auto x = <lvalue of foreign nontrivial C++ class T>` after the initializer is evaluated:
      * behaves as `T x = <lvalue>` - a slot of T, copy-constructed (move-constructed for `move`,
@@ -5756,6 +5844,8 @@ public:
     // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use = ResultUse::Value);
+    LLVMBackend::NamedVariable EvaluateCFlatDefaultArgument(const std::string& functionName,
+        size_t parameterIndex, const LLVMBackend::TypeAndValue& parameterType);
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamedBody(CFlatParser::AssignmentExpressionContext* ctx,
                                                                   ResultUse use);
     // BRACEPRV: a sole C++ class construction element, and a later element that cannot observe a
@@ -6860,6 +6950,28 @@ public:
     // > 0 while an enum initializer, case label or `if const` condition is folded: built-in
     // enum arithmetic stays native there and never becomes a C++ operator call.
     int nativeConstantFoldDepth_ = 0;
+    // Active only while probing a dotted file-scope integer fold candidate through codegen.
+    bool* fileScopeIntegerCppOperatorSelected_ = nullptr;
+    struct FileScopeIntegerCppOperatorProbe
+    {
+        bool*& Slot;
+        bool* Previous;
+        bool Selected = false;
+        bool Active = false;
+        explicit FileScopeIntegerCppOperatorProbe(bool*& slot) : Slot(slot), Previous(slot) {}
+        void Activate()
+        {
+            if (Active) return;
+            Previous = Slot;
+            Slot = &Selected;
+            Active = true;
+        }
+        ~FileScopeIntegerCppOperatorProbe() { if (Active) Slot = Previous; }
+        FileScopeIntegerCppOperatorProbe(const FileScopeIntegerCppOperatorProbe&) = delete;
+        FileScopeIntegerCppOperatorProbe& operator=(const FileScopeIntegerCppOperatorProbe&) = delete;
+    };
+    void RecordFileScopeIntegerCppOperatorSelection()
+    { if (fileScopeIntegerCppOperatorSelected_ != nullptr) *fileScopeIntegerCppOperatorSelected_ = true; }
     // The operator expression whose clang ADL request was AMBIGUOUS (refused, logged): its
     // registered and rewritten fallbacks stay silent so no overload is picked behind clang's back.
     const antlr4::ParserRuleContext* cxxAdlAmbiguousCtx_ = nullptr;

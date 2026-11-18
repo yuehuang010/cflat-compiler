@@ -2042,6 +2042,12 @@ public:
         std::vector<AnnotationValue> Annotations;
     };
 
+    struct CFlatDefaultArgumentContext
+    {
+        CFlatParser::InitializerContext* Initializer = nullptr;
+        std::string NamespaceName;
+    };
+
     struct ManifestFragment
     {
         std::string SourceFile;
@@ -2229,11 +2235,12 @@ public:
         // T418: a `c ? default : local` argument evaluated inside the C++ wrapper; the shape spells
         // the conditional over the children (@S = selector, @D = default arm, @<n> = child n).
         std::string CxxDeferredTernaryShape;
-        // T518: an unbound C++ free wrapper's trivially copyable class lvalue argument snapshot at its
-        // own position, named only when clang's SELECTED callee takes it by value; this entry store
-        // of the i1 decision is set once the wrapper is bound (CSigEntry::paramBindKinds).
+        // T518: a snapshot required to preserve this argument before a later write; the flag
+        // makes an unavailable by-value dispatch a diagnostic instead of a stale wrapper fallback.
         llvm::StoreInst* CxxEarlyCopyDecision = nullptr;
-        bool CxxEarlyCopyNamedLaterWrite = false;
+        bool CxxEarlyCopyRequiredByLaterWrite = false;
+        // A nonlocal read followed by a call is only a snapshot heuristic, not proof of a write.
+        bool CxxEarlyCopyHeuristicByLaterCall = false;
         // T518: for a non-trivially-copyable class, the copy built at the argument's position (live
         // only once the decision is set): the parameter of a by-value selection called by address.
         llvm::AllocaInst* CxxEarlyCopySlot = nullptr;
@@ -2245,6 +2252,8 @@ public:
         // T142: the value of a `default` call argument. Overload ranking refuses it for reference and
         // move/owning-sink parameters (only a by-value parameter takes it).
         bool IsDefaultArgument = false;
+        // An unbound free-wrapper tail `default` is materialized from the selected parameter type.
+        bool IsUnboundCxxTypeDefault = false;
         // A `p + n` / `p - n` pointer result. Transient; read only by the interface-return refusal.
         bool IsPointerArithmeticResult = false;
         // Set by the front-end when this expression is the last proven use of a foreign C++
@@ -4449,6 +4458,13 @@ private:
     nulldf::NoReturnSet provenNoReturn_;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
+    struct ScannedDefaultGlobal
+    {
+        DeclTypeAndValue Type;
+        size_t SourceIndex = 0;
+        std::string SourceName;
+    };
+    std::unordered_map<std::string, ScannedDefaultGlobal> scannedDefaultGlobals_;
     struct ArrayViewFieldLength
     {
         llvm::Value* Storage = nullptr;
@@ -4621,6 +4637,11 @@ private:
     // plans above. Consulted where the heuristic lowering would otherwise be used silently.
     std::unordered_map<std::string, std::string> cxxFunctionPointerAbiRefusals_;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
+    // These parse trees live for the current analysis only and are never cache-serialized.
+    std::unordered_map<std::string, std::vector<CFlatDefaultArgumentContext>>
+        cflatDefaultArgumentContexts;
+    std::function<NamedVariable(const std::string&, size_t, const TypeAndValue&)>
+        cflatDefaultArgumentEvaluator;
     std::unordered_map<const llvm::Function*, bool> cxxNoexceptByFunction_;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     // Interface fields (parents' fields first, then own), parallel to interfaceTable. Each entry's
@@ -6782,6 +6803,7 @@ private:
         CppStructAccessScope(const CppStructAccessScope&) = delete;
         CppStructAccessScope& operator=(const CppStructAccessScope&) = delete;
     };
+    const std::string& GetCppStructAccessContext() const { return cppStructAccessContext_; }
 
     /*
      * Declares that every generic instantiation is drained, so an instantiated interface's
@@ -8083,12 +8105,15 @@ private:
                                     const std::string& infixRhsName,
                                     bool adlCall,
                                     const std::vector<std::pair<size_t, size_t>>& braceGroups,
-                                    const std::string& memberOwnerType);
+                                    const std::string& memberOwnerType,
+                                    bool typeDefaultTrailing,
+                                    bool& selectedCalleeIsTemplate);
     // T518: after a free wrapper binds, call clang's selected callee by address when it takes an
     // early-copied class argument by value (see the definition).
     bool SwitchCxxDirectByValueCall(const std::string& functionName,
                                     std::vector<NamedVariable>& arguments,
-                                    std::string& registeredName, std::string& error);
+                                    std::string& registeredName, std::string& error,
+                                    bool typeDefaultTrailing = false);
     // Operator form: the infix wrapper bound under registeredName (free or template).
     bool SwitchCxxOperatorDirectByValueCall(const std::string& functionName,
                                             std::vector<NamedVariable>& arguments,
@@ -10331,7 +10356,13 @@ public:
     // as the worse failure; a missed diagnostic only restores the pre-existing behaviour.
     bool ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedVariable& arg) const;
     bool IsLiteralZeroIntegerToPointer(llvm::Value* value, const NamedVariable& arg) const;
-    void RejectLiteralZeroFunctionSlot(llvm::Value* value, const NamedVariable& arg) const;
+    void RejectLiteralZeroFunctionSlot(llvm::Value* value, const NamedVariable& arg,
+        antlr4::ParserRuleContext* context = nullptr) const;
+    // Null-spelling judgement for call mismatches (FNZEROWORD): literal-0 source, its one-argument
+    // acceptance at a non-function parameter, and whether the zero function slots are the sole mismatch.
+    bool IsLiteralZeroSource(const NamedVariable& arg) const;
+    bool LiteralZeroAcceptedAt(const NamedVariable& zeroArg, const TypeAndValue& param);
+    bool LiteralZeroSlotIsSoleMismatch(const std::vector<NamedVariable>& matched, const FunctionSymbol& sym);
 
     // Name a data-pointer argument for the closure-parameter rejection. The interface argument
     // loop propagates shape flags but NOT TypeName, so this often has to stay generic - that is
@@ -10487,12 +10518,14 @@ public:
      */
     int ResolveInterfaceMethodSlot(const std::string& ifaceName, const std::string& methodName,
         const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
-        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot, bool constReceiver);
+        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot, bool constReceiver,
+        const std::vector<antlr4::ParserRuleContext*>* argumentContexts = nullptr);
 
     // receiver: the user's receiver expression, judged for #8 (a const one needs a const method).
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs,
-        const NullIfaceDispatchSite* site = nullptr, const NamedVariable* receiver = nullptr);
+        const NullIfaceDispatchSite* site = nullptr, const NamedVariable* receiver = nullptr,
+        const std::vector<antlr4::ParserRuleContext*>* argumentContexts = nullptr);
 
     // Helper for building string NamedVariables for reflection visitor calls.
     // Wraps a string literal pointer into a string struct value.
@@ -12005,6 +12038,14 @@ public:
     llvm::Function* GetOrCreateCxxStructor(const std::string& typeName,
                                            const CxxClassInfo::Structor& st,
                                            AbiRecipe& recipeOut);
+    // DIRORD: copy-at-position slot for a by-value C++ class lvalue argument (definition beside
+    // EmitCxxStructorCall). Shared by the postfix call path and the direct constructor path.
+    bool EmitCxxEarlyArgumentCopy(NamedVariable& argNV, const std::string& typeName,
+                                  bool earlyCopyRequired, bool earlyCopyHeuristic);
+    // Sets each early-copy candidate's decision from the selected category; a selected by-value
+    // argument becomes the owned prvalue slot the call elides into.
+    void FinalizeCxxEarlyCopyArguments(std::vector<NamedVariable>& arguments,
+                                       const std::vector<bool>& selectedByValue);
     // Emit `st(slot, extraArgs...)`. The structor's own result (`this`) is discarded.
     // `extraArgVars`, when given, parallels `extraArgs` and supplies each argument's ADDRESS.
     // A nontrivial C++ class parameter passed by value needs it: the argument must be copy- or
@@ -12266,12 +12307,14 @@ public:
                                      const char* context);
     /*
      * Destination slot that a foreign nontrivial C++ result must be constructed INTO, armed by
-     * the declaration site for the duration of one initializer and consumed by the first call
-     * whose return type matches `pendingCxxSretTypeName_`. The declaration site only arms it for
-     * an initializer that is a single call with no nested call, so "first match" is "the call".
+     * the declaration site for the duration of one initializer and consumed only at the postfix
+     * suffix that produces its result. Earlier matching calls cannot consume it; argument parsing
+     * suspends the slot around nested calls.
      * Transient per-call state: ResetForReanalysis must clear it.
      */
     llvm::Value* pendingCxxSretDest_ = nullptr;
+    llvm::Value* pendingCxxSretTargetDest_ = nullptr;
+    const void* pendingCxxSretCallSite_ = nullptr;
     std::string pendingCxxSretTypeName_;
     bool pendingCxxSretForFixedArray_ = false;
     bool pendingCxxSretReturn_ = false;
@@ -13246,7 +13289,8 @@ public:
                                               const NamedVariable* implicitReceiver = nullptr,
                                               const std::vector<std::string>& lexicalAggregateScopes = {},
                                               const FunctionSymbol* additionalCandidate = nullptr,
-                                              bool reportNullPointerTemplateAmbiguity = false);
+                                              bool reportNullPointerTemplateAmbiguity = false,
+                                              const std::vector<antlr4::ParserRuleContext*>* argumentContexts = nullptr);
 
     llvm::Function* GetFunction(const std::string& functionName);
 
@@ -15317,7 +15361,8 @@ public:
     // 341: a C++ throw() declaration is recorded as noexcept.
     // 342: C-variadic function templates are cached with unbounded maxArity.
     // 343: function-template cache entries preserve type parameter names for brace deduction.
-    static constexpr int kCHeaderCacheVersion = 343;
+    // 345: generated member-template wrappers record the selected member callee type.
+    static constexpr int kCHeaderCacheVersion = 345;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

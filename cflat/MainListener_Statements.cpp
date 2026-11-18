@@ -387,6 +387,8 @@ MainListener::ExpectErrorRecoveryMark MainListener::MarkExpectErrorRecoveryState
         mark.lastRedundantAsCtx = lastRedundantAsCtx_;
         mark.lastRedundantAsNamed = lastRedundantAsNamed_;
         mark.pendingCxxSretDest = compilerLLVM->pendingCxxSretDest_;
+        mark.pendingCxxSretTargetDest = compilerLLVM->pendingCxxSretTargetDest_;
+        mark.pendingCxxSretCallSite = compilerLLVM->pendingCxxSretCallSite_;
         mark.pendingCxxSretTypeName = compilerLLVM->pendingCxxSretTypeName_;
         mark.pendingCxxSretForFixedArray = compilerLLVM->pendingCxxSretForFixedArray_;
         mark.pendingCxxSretReturn = compilerLLVM->pendingCxxSretReturn_;
@@ -444,6 +446,8 @@ void MainListener::RestoreExpectErrorRecoveryState(const ExpectErrorRecoveryMark
         lastRedundantAsCtx_ = mark.lastRedundantAsCtx;
         lastRedundantAsNamed_ = mark.lastRedundantAsNamed;
         compilerLLVM->pendingCxxSretDest_ = mark.pendingCxxSretDest;
+        compilerLLVM->pendingCxxSretTargetDest_ = mark.pendingCxxSretTargetDest;
+        compilerLLVM->pendingCxxSretCallSite_ = mark.pendingCxxSretCallSite;
         compilerLLVM->pendingCxxSretTypeName_ = mark.pendingCxxSretTypeName;
         compilerLLVM->pendingCxxSretForFixedArray_ = mark.pendingCxxSretForFixedArray;
         compilerLLVM->pendingCxxSretReturn_ = mark.pendingCxxSretReturn;
@@ -7467,6 +7471,65 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
         return;
     }
 
+LLVMBackend::NamedVariable MainListener::EvaluateCFlatDefaultArgument(
+        const std::string& functionName, size_t parameterIndex,
+        const LLVMBackend::TypeAndValue& parameterType)
+{
+    auto* compiler = compilerLLVM;
+    auto found = compiler->cflatDefaultArgumentContexts.find(functionName);
+    if (found == compiler->cflatDefaultArgumentContexts.end()
+        || parameterIndex >= found->second.size())
+        return {};
+    const auto& defaultContext = found->second[parameterIndex];
+    auto* initializer = defaultContext.Initializer;
+    if (initializer == nullptr || initializer->assignmentExpression() == nullptr)
+        return {};
+
+    auto savedStack = std::move(compiler->stackNamedVariable);
+    compiler->stackNamedVariable.clear();
+    struct RestoreDefaultLookupStack
+    {
+        std::vector<LLVMBackend::StackState>& Slot;
+        std::vector<LLVMBackend::StackState> Saved;
+        ~RestoreDefaultLookupStack() { Slot = std::move(Saved); }
+    } restoreStack{ compiler->stackNamedVariable, std::move(savedStack) };
+    struct RestoreExpectedType
+    {
+        LLVMBackend::TypeAndValue& Slot;
+        LLVMBackend::TypeAndValue Saved;
+        ~RestoreExpectedType() { Slot = std::move(Saved); }
+    } restoreExpectedType{ declExpectedType, declExpectedType };
+    declExpectedType = parameterType;
+    LLVMBackend::NamespaceScope namespaceScope(compiler, defaultContext.NamespaceName);
+    struct RestoreDefaultArgumentLookup
+    {
+        bool& Slot;
+        bool Saved;
+        ~RestoreDefaultArgumentLookup() { Slot = Saved; }
+    } restoreDefaultArgumentLookup{
+        evaluatingCFlatDefaultArgument_, evaluatingCFlatDefaultArgument_ };
+    evaluatingCFlatDefaultArgument_ = true;
+    struct RestoreDefaultArgumentGlobals
+    {
+        LLVMBackend& Backend;
+        std::vector<std::string>& Names;
+        size_t Mark;
+        ~RestoreDefaultArgumentGlobals()
+        {
+            for (size_t i = Mark; i < Names.size(); ++i)
+            {
+                Backend.globalNamedVariable.erase(Names[i]);
+                Backend.globalVariableTypes.erase(Names[i]);
+            }
+            Names.resize(Mark);
+        }
+    } restoreDefaultArgumentGlobals{
+        *compiler, cflatDefaultInjectedGlobals_, cflatDefaultInjectedGlobals_.size() };
+
+    auto value = ParseAssignmentExpressionNamed(initializer->assignmentExpression());
+    return value;
+}
+
 void MainListener::GenerateDefaultParamOverloads(
         const std::string& name,
         const LLVMBackend::DeclTypeAndValue& returnType,
@@ -7488,6 +7551,20 @@ void MainListener::GenerateDefaultParamOverloads(
         if (firstDefault < 0)
             return;
 
+        std::vector<LLVMBackend::TypeAndValue> fullParams(params.begin(), params.end());
+        const std::string fullMangledName =
+            compiler->ComputeMangledName(name, returnType, fullParams, varargs);
+        auto& defaultContexts = compiler->cflatDefaultArgumentContexts[fullMangledName];
+        defaultContexts.clear();
+        defaultContexts.resize(params.size());
+        const bool hasActiveTypeSubstitutions = !activeTypeSubstitutions.empty();
+        for (size_t i = 0; i < params.size(); ++i)
+            if (params[i].DefaultValue != nullptr)
+                defaultContexts[i] = {
+                    hasActiveTypeSubstitutions ? nullptr : params[i].DefaultValue,
+                    compiler->GetCurrentNamespace() };
+
+        std::vector<bool> defaultParamNeedsWrapper(params.size(), false);
         for (int cutoff = firstDefault; cutoff < (int)params.size(); cutoff++)
         {
             std::vector<LLVMBackend::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
@@ -7516,6 +7593,17 @@ void MainListener::GenerateDefaultParamOverloads(
 
             auto wrapperFn = compiler->CreateFunctionDefinition(
                 name, returnType, wrapperParams, false, false, line, false, isMethod);
+            if (auto table = compiler->functionTable.find(name);
+                table != compiler->functionTable.end())
+                for (auto& symbol : table->second)
+                    if (symbol.Function == wrapperFn)
+                    {
+                        if (symbol.DefaultArguments.size() <= symbol.Parameters.size())
+                            symbol.DefaultArguments.resize(symbol.Parameters.size() + 1);
+                        symbol.DefaultArguments[symbol.Parameters.size()].kind =
+                            "cflat_default_param_wrapper";
+                        break;
+                    }
             compiler->InitializeBlock(&wrapperFn->front(), false);
             // Fresh straight-line for the wrapper body; restore the enclosing walk's flag on exit.
             ReturnFlagGuard wrapperReturnFlagGuard(&straightLineReturned_);
@@ -7778,7 +7866,22 @@ void MainListener::GenerateDefaultParamOverloads(
                     } defaultTernaryDestination(compiler, defaultTernarySlot, params[i].TypeName);
                     // Parameter-DEFAULT leg of the code-value store gate: `f(Rec* p = ro)` put a
                     // code address in the omitted argument's slot and the body wrote through it.
-                    auto defNV = ParseAssignmentExpressionNamed(ae);
+                    LLVMBackend::NamedVariable defNV;
+                    {
+                        struct RestoreDefaultParamObserver
+                        {
+                            std::function<void(const LLVMBackend::NamedVariable&, bool)>& Slot;
+                            std::function<void(const LLVMBackend::NamedVariable&, bool)> Saved;
+                            ~RestoreDefaultParamObserver() { Slot = std::move(Saved); }
+                        } restore{ defaultParamResolutionObserver_, defaultParamResolutionObserver_ };
+                        if (cutoff == i)
+                            defaultParamResolutionObserver_ =
+                                [&](const LLVMBackend::NamedVariable&, bool callerContextBinding) {
+                                    if (callerContextBinding)
+                                        defaultParamNeedsWrapper[i] = true;
+                                };
+                        defNV = ParseAssignmentExpressionNamed(ae);
+                    }
                     if (defaultTernarySlot != nullptr && compiler->pendingCxxTernaryDeclConsumed_
                         && !compiler->pendingCxxTernaryDeclFailed_)
                     {
@@ -8002,6 +8105,110 @@ void MainListener::GenerateDefaultParamOverloads(
             compiler->CreateBlockBreak(nullptr, true);
             compiler->ClearCurrentSubprogram();
         }
+
+        const bool hasDirectCxxClassDefault = std::any_of(params.begin(), params.end(), [&](const auto& param) {
+            return param.DefaultValue != nullptr && !param.Pointer && !param.IsAlias
+                && !param.IsRvalueRef && compiler->HasCxxClassMember(param.TypeName)
+                && compiler->IsCxxRecord(param.TypeName);
+        });
+        if (!hasDirectCxxClassDefault)
+            return;
+
+        std::vector<std::string> factoryNames(params.size());
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            auto* initCtx = params[i].DefaultValue;
+            if (initCtx == nullptr || defaultParamNeedsWrapper[i]) continue;
+            const bool cxxHolderDefault = !params[i].Pointer && !params[i].IsAlias
+                && !params[i].IsRvalueRef && compiler->HasCxxClassMember(params[i].TypeName);
+            const bool cxxClassDefault = cxxHolderDefault && compiler->IsCxxRecord(params[i].TypeName);
+            if (cxxHolderDefault && !cxxClassDefault) continue;
+            const bool hasExpression = initCtx->assignmentExpression() != nullptr;
+            const bool isDefault = initCtx->Default() != nullptr;
+            const bool emptyBrace = initCtx->LeftBrace() != nullptr
+                && initCtx->initializerList() == nullptr;
+            const bool cxxEmptyBrace = cxxClassDefault && emptyBrace
+                && compiler->ReturnsViaInPlaceSret(params[i].TypeName);
+            const bool cxxBraceDefault = cxxClassDefault && initCtx->LeftBrace() != nullptr
+                && initCtx->initializerList() != nullptr
+                && compiler->ReturnsViaInPlaceSret(params[i].TypeName);
+            if (!hasExpression && !isDefault
+                && !cxxBraceDefault
+                && !(emptyBrace && (!cxxClassDefault || cxxEmptyBrace)))
+                continue;
+
+            std::string qualifiedName = compiler->ResolveQualifiedName(name);
+            const size_t namespaceEnd = qualifiedName.rfind('.');
+            const std::string namespacePrefix = namespaceEnd == std::string::npos
+                ? std::string() : qualifiedName.substr(0, namespaceEnd + 1);
+            std::string helperName;
+            do
+            {
+                helperName = namespacePrefix + "__cflat_callsite_default_"
+                    + std::to_string(++defaultCallSiteFactoryCounter_);
+            }
+            while (compiler->functionTable.contains(helperName));
+
+            LLVMBackend::TypeAndValue helperReturn = params[i];
+            helperReturn.VariableName.clear();
+            auto* helperFn = compiler->CreateFunctionDefinition(
+                helperName, helperReturn, {}, false, false, initCtx->getStart()->getLine());
+            compiler->InitializeBlock(&helperFn->front(), false);
+            ReturnFlagGuard helperReturnFlagGuard(&straightLineReturned_);
+            straightLineReturned_ = false;
+            if (hasExpression)
+                EmitReturnExpression(initCtx, initCtx->assignmentExpression(), initCtx->getText());
+            else if (isDefault)
+                EmitReturnExpression(initCtx, nullptr, "", true);
+            else if (cxxEmptyBrace)
+            {
+                const auto& recipe = compiler->currentFunctionAbiRecipe;
+                if (recipe.hasLowering && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn)
+                {
+                    auto* destination = compiler->currentFunction->getArg(
+                        compiler->SRetArgIndex(recipe));
+                    EmitCxxEmptyBraceConstruct(destination, params[i].TypeName, initCtx, true);
+                    compiler->CreateReturnCall(nullptr);
+                }
+                else
+                    LogErrorContext(initCtx, "cannot build the C++ class default in its caller slot");
+            }
+            else if (cxxBraceDefault)
+            {
+                const auto& recipe = compiler->currentFunctionAbiRecipe;
+                if (recipe.hasLowering && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn)
+                {
+                    auto* destination = compiler->currentFunction->getArg(
+                        compiler->SRetArgIndex(recipe));
+                    if (!TryEmitForeignCxxAggregateBraceInit(params[i].TypeName,
+                            initCtx->initializerList(), initCtx, destination, true))
+                        LogErrorContext(initCtx, "cannot build the C++ class default in its caller slot");
+                    compiler->CreateReturnCall(nullptr);
+                }
+                else
+                    LogErrorContext(initCtx, "cannot build the C++ class default in its caller slot");
+            }
+            else
+                EmitReturnExpression(initCtx, nullptr, "", true);
+            compiler->CreateBlockBreak(nullptr, true);
+            compiler->ClearCurrentSubprogram();
+            factoryNames[i] = std::move(helperName);
+        }
+
+        if (auto table = compiler->functionTable.find(name); table != compiler->functionTable.end())
+            for (auto& symbol : table->second)
+                if (symbol.UniqueName == fullMangledName)
+                {
+                    symbol.DefaultArguments.assign(
+                        params.size(), cflat_cinterop::RawDefaultArg{});
+                    for (size_t i = 0; i < factoryNames.size(); ++i)
+                        if (!factoryNames[i].empty())
+                        {
+                            symbol.DefaultArguments[i].kind = "cflat_callsite";
+                            symbol.DefaultArguments[i].value = factoryNames[i];
+                        }
+                    break;
+                }
     }
 
 int MainListener::EvaluateIfConstForSink(CFlatParser::ExpressionContext* expr) {

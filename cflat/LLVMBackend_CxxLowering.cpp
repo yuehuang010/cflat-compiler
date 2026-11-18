@@ -141,6 +141,205 @@ bool LLVMBackend::RejectLiteralZeroCxxConstructorFunctionSlotArgs(
         return false;
 }
 
+/*
+ * Copy-at-position for a by-value C++ class lvalue argument whose later sibling may have an effect
+ * (DIRORD, from the UNBSNAP postfix path). Builds the owned slot behind an i1 decision and a live
+ * flag, registered for unwind; the copy runs at the current insertion point only when the decision
+ * is set (FinalizeCxxEarlyCopyArguments). Returns false after LogError or a refused slot.
+ */
+bool LLVMBackend::EmitCxxEarlyArgumentCopy(NamedVariable& argNV, const std::string& typeName,
+                                           bool earlyCopyRequired, bool earlyCopyHeuristic)
+{
+        auto* backend = this;
+        if (!backend->IsCxxTriviallyCopyableRecord(typeName))
+                {
+                    const auto* copyCtor = backend->FindCxxCopyCtor(typeName);
+                    auto* builder = backend->builder.get();
+                    auto* objectType = backend->GetType(LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                    if (copyCtor != nullptr && !copyCtor->isDeleted && objectType != nullptr)
+                    {
+                        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                            backend->AllocaAtEntry(objectType, nullptr, "cxx.arg.early.copy"));
+                        auto* decide = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                            backend->AllocaAtEntry(builder->getInt1Ty(), nullptr, "cxx.arg.early.decide"));
+                        auto* live = backend->AllocaAtEntry(builder->getInt1Ty(), nullptr, "cxx.arg.early.live");
+                        if (slot == nullptr || decide == nullptr || live == nullptr)
+                        {
+                            return false;
+                        }
+                        llvm::StoreInst* decision = nullptr;
+                        {
+                            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                            builder->SetInsertPoint(decide->getParent(), std::next(decide->getIterator()));
+                            decision = builder->CreateStore(builder->getInt1(false), decide);
+                        }
+                        // Copies `source` into the slot when the decision is set, then jumps to `resume`.
+                        auto emitCopy = [&](llvm::Value* source, llvm::BasicBlock* resume) {
+                            builder->CreateStore(builder->getInt1(false), live);
+                            auto* copyBlock = backend->CreateBasicBlock("cxx.arg.early.copy.do");
+                            builder->CreateCondBr(
+                                builder->CreateLoad(builder->getInt1Ty(), decide, "cxx.arg.early.copy.now"),
+                                copyBlock, resume);
+                            backend->SwitchToBlock(copyBlock);
+                            if (!backend->EmitCxxCopyOrMoveConstruct(typeName, slot, source, false, "argument"))
+                                return false;
+                            builder->CreateStore(builder->getInt1(true), live);
+                            backend->CreateJump(resume);
+                            return true;
+                        };
+                        /*
+                         * A `c ? default : x` join whose default arm is an owned temp: clang
+                         * builds the parameter from the default arm directly, so only the
+                         * lvalue arms copy, each on its own edge, and the parameter is a join
+                         * of owned slots (the by-value path elides into either).
+                         */
+                        auto isOwnedSlot = [&](llvm::Value* value) {
+                            auto* a = llvm::dyn_cast_or_null<llvm::AllocaInst>(value);
+                            return a != nullptr && a->getAllocatedType() == objectType
+                                && std::any_of(backend->pendingOwnedStructTemps.begin(),
+                                    backend->pendingOwnedStructTemps.end(),
+                                    [&](const auto& e) { return e.Alloca == a; });
+                        };
+                        auto* join = llvm::dyn_cast<llvm::PHINode>(argNV.Storage);
+                        bool splitJoin = join != nullptr && join->getType()->isPointerTy();
+                        if (splitJoin)
+                        {
+                            bool anyOwned = false;
+                            for (unsigned in = 0; in < join->getNumIncomingValues(); ++in)
+                            {
+                                anyOwned = anyOwned || isOwnedSlot(join->getIncomingValue(in));
+                                auto* pred = join->getIncomingBlock(in);
+                                splitJoin = splitJoin && pred->getTerminator() != nullptr
+                                    && llvm::isa<llvm::BranchInst>(pred->getTerminator());
+                            }
+                            splitJoin = splitJoin && anyOwned;
+                        }
+                        if (splitJoin)
+                        {
+                            auto* current = builder->GetInsertBlock();
+                            auto* joinBlock = join->getParent();
+                            std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incoming;
+                            incoming.reserve(incoming.size() + join->getNumIncomingValues());
+                            for (unsigned in = 0; in < join->getNumIncomingValues(); ++in)
+                                incoming.emplace_back(join->getIncomingValue(in), join->getIncomingBlock(in));
+                            std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> exactIncoming;
+                            for (const auto& [value, pred] : incoming)
+                            {
+                                auto* edge = backend->CreateBasicBlock("cxx.arg.early.edge");
+                                pred->getTerminator()->replaceSuccessorWith(joinBlock, edge);
+                                backend->SwitchToBlock(edge);
+                                llvm::BasicBlock* last = edge;
+                                if (isOwnedSlot(value))
+                                {
+                                    builder->CreateStore(builder->getInt1(false), live);
+                                    exactIncoming.emplace_back(value, edge);
+                                }
+                                else
+                                {
+                                    auto* merge = backend->CreateBasicBlock("cxx.arg.early.edge.done");
+                                    if (!emitCopy(value, merge))
+                                    {
+                                        return false;
+                                    }
+                                    backend->SwitchToBlock(merge);
+                                    last = merge;
+                                    exactIncoming.emplace_back(slot, merge);
+                                }
+                                builder->CreateBr(joinBlock);
+                                joinBlock->replacePhiUsesWith(pred, last);
+                            }
+                            llvm::PHINode* exact = nullptr;
+                            {
+                                llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                                builder->SetInsertPoint(joinBlock, joinBlock->getFirstNonPHIIt());
+                                exact = builder->CreatePHI(join->getType(),
+                                    static_cast<unsigned>(exactIncoming.size()), "cxx.arg.early.join");
+                            }
+                            for (const auto& [value, block] : exactIncoming) exact->addIncoming(value, block);
+                            builder->SetInsertPoint(current);
+                            backend->RegisterCxxDefaultTernaryStorageJoin(exact);
+                            argNV.CxxEarlyCopyJoin = exact;
+                        }
+                        else
+                        {
+                            auto* resumeBlock = backend->CreateBasicBlock("cxx.arg.early.copy.done");
+                            if (!emitCopy(argNV.Storage, resumeBlock))
+                            {
+                                return false;
+                            }
+                            backend->SwitchToBlock(resumeBlock);
+                        }
+                        backend->RegisterOwnedStructTemp(slot, typeName, live);
+                        argNV.CxxEarlyCopyDecision = decision;
+                        argNV.CxxEarlyCopySlot = slot;
+                        argNV.CxxEarlyCopyRequiredByLaterWrite = earlyCopyRequired;
+                        argNV.CxxEarlyCopyHeuristicByLaterCall = earlyCopyHeuristic;
+                    }
+                }
+        else
+                {
+                    auto* builder = backend->builder.get();
+                    auto* objectType = backend->GetType(LLVMBackend::TypeAndValue{ .TypeName = typeName });
+                    auto* slot = objectType != nullptr
+                        ? backend->AllocaAtEntry(objectType, nullptr, "cxx.arg.early.copy") : nullptr;
+                    auto* decide = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                        backend->AllocaAtEntry(builder->getInt1Ty(), nullptr, "cxx.arg.early.decide"));
+                    if (slot == nullptr || decide == nullptr)
+                    {
+                        return false;
+                    }
+                    llvm::StoreInst* decision = nullptr;
+                    {
+                        llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                        builder->SetInsertPoint(decide->getParent(), std::next(decide->getIterator()));
+                        decision = builder->CreateStore(builder->getInt1(false), decide);
+                    }
+                    const llvm::DataLayout& layout = backend->module->getDataLayout();
+                    builder->CreateMemCpy(slot, layout.getABITypeAlign(objectType), argNV.Storage,
+                        layout.getABITypeAlign(objectType), layout.getTypeAllocSize(objectType));
+                    auto* copyNow = builder->CreateLoad(builder->getInt1Ty(), decide, "cxx.arg.early.copy.now");
+                    argNV.Storage = builder->CreateSelect(copyNow, slot, argNV.Storage, "cxx.arg.early.place");
+                    argNV.Primary = backend->CreateLoad(objectType, argNV.Storage);
+                    argNV.CxxEarlyCopyDecision = decision;
+                    argNV.CxxEarlyCopyRequiredByLaterWrite = earlyCopyRequired;
+                    argNV.CxxEarlyCopyHeuristicByLaterCall = earlyCopyHeuristic;
+                }
+        return true;
+}
+
+/*
+ * DIRORD: once the selected callee's parameter categories are known, each early-copy candidate's
+ * decision is set. A by-value selection makes its owned slot the argument (an owned prvalue the call
+ * elides into); any other selection keeps the original lvalue and the copy never runs.
+ */
+void LLVMBackend::FinalizeCxxEarlyCopyArguments(std::vector<NamedVariable>& arguments,
+                                                const std::vector<bool>& selectedByValue)
+{
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            NamedVariable& argument = arguments[i];
+            const bool byValue = i < selectedByValue.size() && selectedByValue[i];
+            if (argument.CxxEarlyCopyDecision != nullptr)
+                argument.CxxEarlyCopyDecision->setOperand(0, builder->getInt1(byValue));
+            if (byValue && argument.CxxEarlyCopySlot != nullptr)
+            {
+                llvm::AllocaInst* slot = argument.CxxEarlyCopySlot;
+                argument.Storage = argument.CxxEarlyCopyJoin != nullptr
+                    ? static_cast<llvm::Value*>(argument.CxxEarlyCopyJoin) : slot;
+                argument.BaseType = slot->getAllocatedType();
+                argument.Primary = builder->CreateLoad(slot->getAllocatedType(), argument.Storage);
+                argument.IsRvalue = true;
+                argument.IsCxxPrvalueTemp = true;
+                argument.TypeAndValue.VariableName.clear();
+            }
+            argument.CxxEarlyCopySlot = nullptr;
+            argument.CxxEarlyCopyJoin = nullptr;
+            argument.CxxEarlyCopyDecision = nullptr;
+            argument.CxxEarlyCopyRequiredByLaterWrite = false;
+            argument.CxxEarlyCopyHeuristicByLaterCall = false;
+        }
+}
+
 bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                       const CxxClassInfo::Structor& selected,
                                       llvm::Value* slot,

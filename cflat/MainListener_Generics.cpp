@@ -601,6 +601,8 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         {
             LLVMBackend* backend;
             llvm::Value* sret;
+            llvm::Value* sretTargetDest;
+            const void* sretCallSite;
             std::string sretType;
             bool sretReturn;
             llvm::Value* ternary;
@@ -610,6 +612,8 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             ~PendingCxxReturnScope()
             {
                 backend->pendingCxxSretDest_ = sret;
+                backend->pendingCxxSretTargetDest_ = sretTargetDest;
+                backend->pendingCxxSretCallSite_ = sretCallSite;
                 backend->pendingCxxSretTypeName_ = std::move(sretType);
                 backend->pendingCxxSretReturn_ = sretReturn;
                 backend->pendingCxxTernaryDeclDest_ = ternary;
@@ -619,11 +623,14 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             }
         } pendingCxxReturnScope{
             instCompiler, instCompiler->pendingCxxSretDest_,
+            instCompiler->pendingCxxSretTargetDest_, instCompiler->pendingCxxSretCallSite_,
             instCompiler->pendingCxxSretTypeName_, instCompiler->pendingCxxSretReturn_,
             instCompiler->pendingCxxTernaryDeclDest_,
             instCompiler->pendingCxxTernaryDeclTypeName_,
             instCompiler->pendingCxxTernaryDeclConsumed_, instCompiler->pendingCxxTernaryDeclFailed_};
         instCompiler->pendingCxxSretDest_ = nullptr;
+        instCompiler->pendingCxxSretTargetDest_ = nullptr;
+        instCompiler->pendingCxxSretCallSite_ = nullptr;
         instCompiler->pendingCxxSretTypeName_.clear();
         instCompiler->pendingCxxSretReturn_ = false;
         instCompiler->pendingCxxTernaryDeclDest_ = nullptr;

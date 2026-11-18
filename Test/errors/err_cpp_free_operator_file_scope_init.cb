@@ -1,0 +1,25 @@
+import cpp "cpp_interop_scoped_enum.h";
+
+// The selected C++ free operator makes a native scalar global non-constant.
+expect_error("compile-time constant") {
+    int g_direct = cppi_scope.eop.ua + 1;
+}
+
+expect_error("compile-time constant") {
+    const int g_const = cppi_scope.eop.ua + 1;
+}
+
+// Selection in the nested add still matters when the outer multiply is built-in.
+expect_error("compile-time constant") {
+    int g_compound = (cppi_scope.eop.ua + 1) * 2;
+}
+
+// The fixture's unary operator+(UE) also beats built-in unary plus.
+expect_error("compile-time constant") {
+    int g_unary = +cppi_scope.eop.ua;
+}
+
+// Native global struct default construction uses a separate field-fold path.
+expect_error("must be constructed in main or made foldable");
+struct EopFreeFieldHolder { int value = cppi_scope.eop.ua + 1; };
+EopFreeFieldHolder g_field = default;

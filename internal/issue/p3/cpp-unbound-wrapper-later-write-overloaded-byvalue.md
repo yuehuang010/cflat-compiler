@@ -15,22 +15,55 @@ conditional is refused, located). A class lvalue argument that a later non-inert
   construction, in evaluation order, ctor/dtor counts equal clang. A reference selection keeps
   the caller's object and constructs nothing.
 
-The wrapper is refused (located) when the selected callee's address cannot be taken or another
-argument can only be built by the wrapper (including a non-constant omitted default, a variadic
-extra argument, deferred `?:`, or direct construction). Global writes, implicit-this writes,
-and writes through a returned pointer can instead fall back to the wrapper and read the
-post-write value; a native CFlat callee reads a later-written global after the write.
+The selected callee's address is used for a required nontrivial early copy. A re-readable scalar
+default is evaluated by a lazy cached helper, so the direct by-value call still supplies the
+selected callee's runtime default. The native CFlat callee case below is fixed and covered by
+`T518NativeGlobal`.
+
+UNBDEF round 3: a bare trailing CFlat `default` passed to an unbound free wrapper is an explicit
+value with the selected parameter type's default value. The wrapper uses a conversion proxy so
+clang can select the overload, then constructs the selected parameter type's default. It does not
+omit the argument or use a C++ default argument; ambiguity remains clang's located diagnostic.
+
+UNBDEF round 4 accepts a bare trailing `default` only when clang can identify one non-template
+free-function candidate by arity, with a named value / `const T&` / `T&&` slot whose type can be
+default-constructed. Same-arity overload sets remain a known gap: the bound twin selects by CFlat's
+`default` ranking, while the unbound wrapper reports the located known-target-type error.
+
+```cflat
+rv2.o1(1, default) // bound rb2.o1(1, default) returns 100
+rv2.o2(1, default) // bound rb2.o2(1, default) returns 1
+```
+
+Round 3 also confirmed two refused shapes that the bound call accepts:
+
+```cpp
+int ld(int, rv::C, int = 4); // rv3.ld(1, default); bound result 104/101
+int mx(int, rv::C);          // beside template<class T> mx(T)
+                              // rv3.mx(1, default); bound result 70/101
+```
 
 Still open:
-- A global written later into a callee that refuses falls back to the wrapper and reads the
-  post-write value (g_var_write, g_var_named; cflat 90201010, clang 70201010).
-- An implicit-this method write is not snapshotted (t_self_meth; cflat 90221030, clang 70221030).
-- A write through a returned pointer is not snapshotted (t_chain_ret; cflat 90221030, clang 70221030).
-- A global written by a later argument of a native CFlat callee is read after the write
-  (g_native_write `nlater(rv.gv, rv.mutglobal())`; cflat 90201010, clang 70201010; counts match).
-- A `?:` with a `default` arm into a REFERENCE parameter: C++ materializes the leaf's copy at the
-  argument, the wrapper binds the caller's object (lref ternary 902 on master and fix, clang 702).
-- `take2(c ? default : rettw(), default)`: a bare trailing `default` into an unbound wrapper has no
-  target type and stays refused.
+- A `?:` with a `default` arm into a REFERENCE parameter: C++ materializes the selected leaf's
+  copy at the argument, but the wrapper binds the caller's object (CFlat 902, clang 702).
 
-The remaining conditional-reference repro is retained at scratch/unbwrap/item3.cb.
+Rebuilt fixture repro (the original `scratch/unbwrap/item3.cb` was lost):
+
+```cflat
+t418.reset();
+int value = 0;
+{ t418.Val x = t418.Val(7); value = t518.lref(false ? default : x, t418.mutate(x)); }
+```
+
+```cpp
+t418::reset();
+int value = 0;
+{ t418::Val x(7); value = t518::lref(false ? t418::Val{} : x, t418::mutate(x)); }
+```
+
+With `Test/library/cpp_interop_lastuse.h`, clang returns `702` with `t418::stats() == 11020`;
+the current compiler returns `902` with `t418.stats() == 10010`. Leg `T518LaterRef` (code 51808) pins 902; flip
+it to clang's 702 in the change that fixes this. UNBDEF round 2 (3 attempts, reverted): marking the default-arm
+conditional for an early copy behind deferredPlaceGuard compiled, but SwitchCxxDirectByValueCall discards early-copy
+slots when the selected parameter is a reference, so the copy is never consumed; an overloaded `T&` / `const T&`
+pair also still selects `T&` (20002/2011, clang 10002/2011). The copy must survive a reference-only selection.

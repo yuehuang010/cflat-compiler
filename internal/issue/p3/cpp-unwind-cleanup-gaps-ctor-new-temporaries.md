@@ -32,6 +32,14 @@ The named-brace `new S{...}` leak reported in 2026-10-16 item 1 was not reproduc
 
 ## 2026-10-20: sized class deallocation
 
+RULED 2026-11-16 (main session, from precedent; maintainer may veto): REFUSE, as clang. A class whose only member
+`operator delete` is not a usual deallocation function (second parameter not the target's size_t) has no suitable delete:
+`delete p` and `unique<T>` / `unique T*` of it are a located error, the member still hides the base and global delete, and
+the unwind path calls nothing. Precedent: the 2026-10-20 size_t line this item already carries, T333 (unusable class-scope
+delete refused as clang), R5 2026-09-23 (`unique` on a C++ class is std::unique_ptr). Test consequence (sanctioned edits):
+legs 25342-25343 expect t313SdDel == 0 for the i64 delete (ulong stays 1); leg 3422 (unique<T320US>) moves to a new err_
+file; apply scratch/repro_keep/box12/unwnew/unwnew_item2_sizet.patch.
+
 Item 2 (RULED 2026-10-20, match clang; OPEN, blocked on a ruling): the sized class `operator delete(void*, N)` is recognized
 only when N is the target's size_t (`ulong` on LP64, `u64` on Win64). Unwind-path counts (`new S{ z = bval(1) }`,
 user deletes for i64 / u64 / ulong): master 1/1/1, fix 0/0/1, clang 0/0/1. Fix patch (not applied): scratch/repro_keep/box12/unwnew/unwnew_item2_sizet.patch.

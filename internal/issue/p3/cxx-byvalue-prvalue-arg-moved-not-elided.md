@@ -31,13 +31,29 @@ Repro for the free template shape (clang m0 d1, fixed m0 d1 when the arguments a
 
 Still open:
 
-1. Member function templates (`obj.tmpl(Cls(...), later_call())`, by-value `T`): one extra move
-   and one extra dtor. Leg 9359 (Test/test_cpp_interop.cb:6633) pins move == 1; clang++ gives 0.
-   Changing 9359 needs maintainer authorization (tests are read-only for the fix box).
+1. A member function template inherited from a base class (`d.scaled(Cls(...), later_call())` with
+   `scaled` declared in a base of `d`'s class): one extra move and one extra dtor (clang 1/0/0/1).
+   The member direct route (fix/mtplelide round 3) only takes a specialization of the receiver's
+   OWN class: a base member needs `this` adjusted, and the route calls the member through its
+   address with the receiver as a plain first argument. Leg 47112/47113 (Test/test_cpp_interop.cb)
+   pins only value and ctor/copy. A member template whose later argument converts keeps the
+   wrapper like the free route (bullet above, legs 47108/47109).
 2. A deleted or private move ctor at a prvalue argument of a function template: CFlat refuses
    with "call to deleted constructor" where clang++ -std=c++20 accepts (guaranteed elision).
    Master behaviour; the template wrapper's body must move the argument, so the refusal comes from
    wrapper generation, not from the call lowering.
+
+Member-template route (2026-11-16, fix/mtplelide round 3): an instance member template
+specialization is called on its own ABI (receiver first) through the `_fp` getter, which returns
+the first word of `&Owner::member<Args>` (non-virtual member pointer), typed with the selected
+member's own cv/ref-qualified function type so overloaded and `&`/`&&` pairs pick it. The earlier rounds failed to
+link because the getter never value-used the member (an `__asm__` alias, `(void)&X<A>`, or a
+folded `m != nullptr`), so CodeGen never asked for its body; once the address flows into the
+return value, clang's first-reference lookup emits the in-class instantiation. Neither the
+SkippedMember exemption nor the record re-listing turned out necessary (verified by toggling).
+The selected method is recorded only for a non-static, non-virtual, non-operator member template
+of the receiver's own class (its cv/ref qualifiers kept in the recorded type and split off for
+the receiver-first call type); under the MS ABI not when it returns a class (sret after `this`).
 
 Root cause: a call to a function TEMPLATE with a by-value class prvalue argument and a later call
 argument (`f(C(7), next())`) cannot build the prvalue inside the wrapper (the later argument's

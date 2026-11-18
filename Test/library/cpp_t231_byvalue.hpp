@@ -185,9 +185,14 @@ public:
     inline TernaryCnt(TernaryCnt&& o) noexcept : v(o.v) { o.v = -1; ++moves; }
     inline TernaryCnt& operator=(const TernaryCnt& o) noexcept { v = o.v; ++copyAssigns; return *this; }
     inline TernaryCnt& operator=(TernaryCnt&& o) noexcept { v = o.v; o.v = -1; ++moveAssigns; return *this; }
+    inline int takeV(TernaryCnt value) const noexcept { return value.v; }
     inline ~TernaryCnt() noexcept { ++dtors; }
     int v;
 };
+inline int takeTernaryCnt(TernaryCnt value) noexcept { return value.v; }
+inline int readTernaryCnt(const TernaryCnt* value) noexcept { return value->v; }
+struct TernaryHost { TernaryCnt a; };
+inline TernaryHost mkTernaryHost() noexcept { return TernaryHost{TernaryCnt(31)}; }
 class TernaryDerived : public TernaryCnt
 {
 public:

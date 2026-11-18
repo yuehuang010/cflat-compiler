@@ -4571,15 +4571,82 @@ bool LLVMBackend::IsLiteralZeroIntegerToPointer(llvm::Value* value, const NamedV
         return constant != nullptr && constant->isZero();
     }
 
-void LLVMBackend::RejectLiteralZeroFunctionSlot(llvm::Value* value, const NamedVariable& arg) const
+void LLVMBackend::RejectLiteralZeroFunctionSlot(llvm::Value* value, const NamedVariable& arg,
+        antlr4::ParserRuleContext* context) const
 {
         if (IsLiteralZeroIntegerToPointer(value, arg))
         {
             const std::string destination = arg.TypeAndValue.VariableName.empty()
                 ? "a function slot" : std::format("a function slot '{}'", arg.TypeAndValue.VariableName);
-            LogError(std::format(
-                "integer constant zero is not a null spelling for {}; use 'nullptr'", destination));
+            const std::string message = std::format(
+                "integer constant zero is not a null spelling for {}; use 'nullptr'", destination);
+            if (context != nullptr)
+                MainListener::LogErrorContext(const_cast<LLVMBackend*>(this), context, message);
+            else
+                LogError(message);
         }
+    }
+
+// An integer constant zero argument (bool false is not one) - the literal-0 source of the null-spelling message.
+bool LLVMBackend::IsLiteralZeroSource(const NamedVariable& arg) const
+{
+        NamedVariable source = arg;
+        if (source.HasOriginalArgumentType)
+            source.TypeAndValue = source.OriginalArgumentType;
+        if (source.TypeAndValue.TypeName == "bool"
+            || (source.Primary != nullptr && source.Primary->getType()->isIntegerTy(1)))
+            return false;
+        return IsLiteralZeroIntegerToPointer(source.Primary, source);
+    }
+
+// Does the literal 0 bind this non-function parameter on its own? One-argument scoring probe.
+bool LLVMBackend::LiteralZeroAcceptedAt(const NamedVariable& zeroArg, const TypeAndValue& param)
+{
+        NamedVariable source = zeroArg;
+        if (source.HasOriginalArgumentType)
+            source.TypeAndValue = source.OriginalArgumentType;
+        FunctionSymbol probe;
+        probe.Parameters = { param };
+        probe.IsMethod = false;
+        probe.UniqueName = "__cflat_zero_probe";   // no declared C++ spelling to look up
+        probe.CxxAbi.valid = false;
+        probe.Recipe.paramSlots.clear();
+        std::vector<NamedVariable> one{ source };
+        return !ComputeOverloadFunction({ { std::move(one), probe } }).second.Parameters.empty();
+    }
+
+// True when the literal-0 function slots are the candidate's only mismatches: with a null function
+// value in each such slot (positional `matched[i]` binds `sym.Parameters[i]`), the call scores viable.
+bool LLVMBackend::LiteralZeroSlotIsSoleMismatch(const std::vector<NamedVariable>& matched, const FunctionSymbol& sym)
+{
+        std::vector<NamedVariable> probeArgs = matched;
+        bool substituted = false;
+        for (size_t i = 0; i < probeArgs.size() && i < sym.Parameters.size(); ++i)
+        {
+            const TypeAndValue& param = sym.Parameters[i];
+            if (!IsFunctionValueType(param)) continue;
+            // Scoring accepts a data pointer at a function<> slot; the refusal comes later, so it is a mismatch.
+            if (!IsLiteralZeroSource(probeArgs[i]))
+            {
+                llvm::Value* value = probeArgs[i].Primary;
+                if (value != nullptr && value->getType()->isPointerTy()
+                    && ArgumentIsProvablyDataPointer(value, probeArgs[i]))
+                    return false;
+                continue;
+            }
+            auto* slotType = llvm::dyn_cast_or_null<llvm::PointerType>(GetType(param));
+            if (slotType == nullptr) return false;
+            NamedVariable nullSlot = probeArgs[i];
+            nullSlot.TypeAndValue = param;
+            nullSlot.TypeAndValue.VariableName.clear();
+            nullSlot.HasOriginalArgumentType = false;
+            nullSlot.BaseType = slotType;
+            nullSlot.Primary = llvm::ConstantPointerNull::get(slotType);
+            probeArgs[i] = std::move(nullSlot);
+            substituted = true;
+        }
+        if (!substituted) return false;
+        return !ComputeOverloadFunction({ { std::move(probeArgs), sym } }).second.Parameters.empty();
     }
 
 std::string LLVMBackend::DescribeNonFunctionArgument(const NamedVariable& arg) const
@@ -5464,7 +5531,8 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
 
 int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const std::string& methodName,
         const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
-        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot, bool constReceiver)
+        std::vector<NamedVariable>& matchedArgs, int& fallbackDefaultSlot, bool constReceiver,
+        const std::vector<antlr4::ParserRuleContext*>* argumentContexts)
 {
         matchedArgs = args;
         fallbackDefaultSlot = -1;
@@ -5707,6 +5775,42 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                 }
                 if (!candidates.empty())
                 {
+                    // A literal 0 at a function<> slot gets the null-spelling message only when it is
+                    // the sole mismatch of a candidate and no other candidate takes that 0 at a non-function slot.
+                    for (size_t ci = 0; ci < candidates.size(); ++ci)
+                    {
+                        const auto& [matched, sym] = candidates[ci];
+                        if (!LiteralZeroSlotIsSoleMismatch(matched, sym)) continue;
+                        bool otherAcceptsZero = false;
+                        for (size_t cj = 0; cj < candidates.size() && !otherAcceptsZero; ++cj)
+                        {
+                            if (cj == ci) continue;
+                            const auto& [otherMatched, otherSym] = candidates[cj];
+                            for (size_t p = 0; p < otherMatched.size() && p < otherSym.Parameters.size(); ++p)
+                                if (!IsFunctionValueType(otherSym.Parameters[p])
+                                    && IsLiteralZeroSource(otherMatched[p])
+                                    && LiteralZeroAcceptedAt(otherMatched[p], otherSym.Parameters[p]))
+                                {
+                                    otherAcceptsZero = true;
+                                    break;
+                                }
+                        }
+                        if (otherAcceptsZero) continue;
+                        for (size_t p = 0; p < matched.size() && p < sym.Parameters.size(); ++p)
+                        {
+                            if (!IsFunctionValueType(sym.Parameters[p]) || !IsLiteralZeroSource(matched[p]))
+                                continue;
+                            // matched[0] is the receiver; argumentContexts covers the explicit arguments.
+                            antlr4::ParserRuleContext* context = nullptr;
+                            if (argumentContexts != nullptr && p >= 1 && p - 1 < argumentContexts->size())
+                                context = (*argumentContexts)[p - 1];
+                            NamedVariable originalArg = matched[p];
+                            if (originalArg.HasOriginalArgumentType)
+                                originalArg.TypeAndValue = originalArg.OriginalArgumentType;
+                            RejectLiteralZeroFunctionSlot(originalArg.Primary, originalArg, context);
+                            return -1;
+                        }
+                    }
                     if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, diagnosticArgs,
                                                               firstMethod.Parameters))
                         return -1;
@@ -5865,7 +5969,8 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
 
 llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs,
-        const NullIfaceDispatchSite* site, const NamedVariable* userReceiver)
+        const NullIfaceDispatchSite* site, const NamedVariable* userReceiver,
+        const std::vector<antlr4::ParserRuleContext*>* argumentContexts)
 {
         auto fatTy = GetFatPtrType();
         auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
@@ -5955,7 +6060,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         int fallbackDefaultSlot = -1;
         int methodIdx = ResolveInterfaceMethodSlot(ifaceName, methodName, *ifaceMethods,
                                                    extraArgNVs, callArgNVs, fallbackDefaultSlot,
-                                                   constReceiver);
+                                                   constReceiver, argumentContexts);
         if (methodIdx < 0)
         {
             if (fallbackDefaultSlot >= 0)

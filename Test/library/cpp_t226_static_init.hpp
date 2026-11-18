@@ -83,6 +83,12 @@ struct HA {
 };
 inline H2 mkH2(int x) { return H2(x); }
 inline HA mkHA(int x) { return HA(x); }
+// STATCONST: a const derived member of a temporary used in a derived-to-base ternary.
+struct DCF {
+    const D cd;
+    DCF(int x) : cd(x) {}
+};
+inline DCF mkDCF(int x) { return DCF(x); }
 // STATELEM r3: a const member of a class temporary, and a mutable member under a const root.
 struct HC {
     const B cd;

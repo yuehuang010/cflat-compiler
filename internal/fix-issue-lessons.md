@@ -3638,3 +3638,8 @@ Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintaine
 - C++ request-cache prune (closed 2026-11-14, prune2 c8030bc1a + e6f88e955): a store skips the prune when its owner+scope
   sentinel (`<owner>_<scope>.prn`) holds the current validity; demand-verdict cohorts take real owner/scope
   (CxxRequestPruneScopeFor). A stamp flip over a full cache costs ~1% of test.sh. Do not reintroduce a per-store dir scan.
+
+## Design record 2026-11-16: by-value parameter last use in a declaration moves (T229 R1, issue retired with AUTONEST)
+`void f(S s) { S y = s; }` with `s` dead afterwards MOVES (copy 1 + move 1), typed and `auto` alike, ruled 2026-10-15: the
+compiler infers copy vs move (design north star); clang's copy here is not a parity target. Legs Test/test_cpp_interop.cb
+7340/7341 pin it. The rest of the issue (R2 `f(S(5))`, R3 `S w = S(S(6))` typed and `auto`) matches clang (1/0/0/1).

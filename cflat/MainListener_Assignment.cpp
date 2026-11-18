@@ -6174,6 +6174,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                     if (resultSlot != nullptr)
                                     {
                                         auto* savedDest = compiler->pendingCxxSretDest_;
+                                        auto* savedTargetDest = compiler->pendingCxxSretTargetDest_;
+                                        const void* savedCallSite = compiler->pendingCxxSretCallSite_;
                                         auto savedType = compiler->pendingCxxSretTypeName_;
                                         compiler->pendingCxxSretDest_ = resultSlot;
                                         compiler->pendingCxxSretTypeName_ = tn;
@@ -6183,6 +6185,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                                 ctx, namedVar, tn, rhsNV, conversionRefusal);
                                         }
                                         compiler->pendingCxxSretDest_ = savedDest;
+                                        compiler->pendingCxxSretTargetDest_ = savedTargetDest;
+                                        compiler->pendingCxxSretCallSite_ = savedCallSite;
                                         compiler->pendingCxxSretTypeName_ = std::move(savedType);
                                     }
                                     else
