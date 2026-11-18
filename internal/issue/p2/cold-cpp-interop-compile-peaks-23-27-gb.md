@@ -215,3 +215,12 @@ legs (on this fix) still peaks at 20.34 GB, 191 s under load, rc 0 - so the ~12 
 legs. It moved twice, to whichever all-failing fan-out runs next. Inference, not measured directly: the
 cost is the first fan-out that reaches every group and includes cpp_interop_basic.h there, and any later
 one reuses it. Lowering the peak needs a maintainer ruling on when a candidate group may be skipped.
+
+## Ruling (maintainer, 2026-11-18)
+
+No candidate-group skip. A group may not be dropped from a fan-out on the grounds that its closure declares
+nothing the probe can see: a candidate's headers come first and can change a dependency template's lookup, so a
+skip can change a pick. The 12 GB fan-out is lowered only by the 2026-11-08 direction - cpp_interop_basic.h is
+reached through its own module instead of being included into ~207 groups - which needs a plan. Until that
+lands the ~20 GB cold peak is accepted (warm ~1.5 GB). Rejected: skip + negative memo + pick-parity run (the
+box 15 recommendation). No test consequence; the next step is the plan `internal/plan/cpp-import-module-reuse.md` (phase 1 = design spike), not a fix run.

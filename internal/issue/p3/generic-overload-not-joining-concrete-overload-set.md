@@ -22,7 +22,7 @@ Kept by main-session decision: `f(const int*)` + `f<T>(T*)` with an `int*` picks
 Note 2026-10-31: the "pre-existing, kept" expression-typing lines above are SUPERSEDED in part by the 2026-10-31 maintainer ruling in
 internal/fix-issue-lessons.md (native arithmetic follows C usual conversions): `1 << 2L` is `int` (promoted LEFT operand),
 and char/u8/short variable arithmetic promotes to `int`, so `'a' + 'b'` into a generic deduces `int` and is no longer refused. `1.5 + x`
-stays float (literal typing DEFERRED 2026-10-13). The `f(const int*)` + `f<T>(T*)` concrete pick stands as a main-session decision
-(maintainer may veto).
+stays float (literal typing DEFERRED 2026-10-13). The `f(const int*)` + `f<T>(T*)` concrete pick stands. CONFIRMED 2026-11-18 (maintainer: "land the rest", on the main session's recommendation):
+with an `int*` argument CFlat picks `f(const int*)` (clang: the generic); a known divergence, pinned, not a gap.
 Fixed in ARITH (2026-10-31): both shapes now pass, checked against clang: `gsz('a' + 'b')` deduces int (4 bytes) and
 `gsz(1 << 2L)` deduces int (4 bytes). The char-literal identity no longer accepts `'a'+'b'` as a char literal.

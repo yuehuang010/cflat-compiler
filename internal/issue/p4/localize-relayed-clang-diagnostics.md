@@ -80,3 +80,11 @@ prefix it. The cflat sentence around a quoted clause stays localized as today.
 Clang's own clauses are now marked: the C compiler / clang-cl relays and "clang rejected the call through ..." carry `(clang: ...)`
 (leg Test/errors/err_cpp_relayed_clang_clause_prefix.cb). Linker and dsymutil stderr stay unprefixed because that text is not clang's.
 Still open: the text itself stays English in every locale, and the list of unprefixed clang sinks has not been audited in full.
+
+## Ruling (maintainer, 2026-11-18) - amends 2026-09-27
+
+Linker and dsymutil stderr carries a `linker: ` prefix, not `clang: ` and not bare: the text is not cflat's and not
+clang's (ld64.lld / lld-link / dsymutil are run by cflat itself). The 2026-09-27 wording "or clang-cl / the linker
+it drives" is narrowed to text that really comes from clang or clang-cl. Test consequence: an undefined-symbol link
+failure leg expects `linker: ` before the tool's line (extend the closest existing link-error leg); the
+`(clang: ...)` clause legs are unchanged. The audit of unprefixed clang sinks stays open.

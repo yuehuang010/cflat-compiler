@@ -19,7 +19,14 @@ Settled (refusal stands, no fix item):
   generic T = function<> call (`isNull<function<int(int)>>(0)`, `Box<function<..>>.set(0)`) reports the null-spelling message at the
   argument. Same refusals. Legs: Test/errors/err_function_slot_literal_zero.cb (last three blocks).
 
-Open, no ruling yet (stays here):
+RULED 2026-11-18 (maintainer): REFUSE ALL THREE cast spellings - `(void*)0`, `(int*)0`, `(int*)nullptr` are not null
+spellings for a function<> or Lambda<> slot, direct or in a `?:` join, as C++ (a void* / data pointer does not convert
+to a function pointer). `nullptr` and the C `NULL` macro (T311) stay. Rejected: keeping `(void*)0` as the C NULL body
+(the main session's pick) - where C and C++ disagree, C++ wins. Test consequence: the repro below becomes an err_ block
+in Test/errors/err_function_slot_literal_zero.cb for each spelling x {declaration, assignment, `?:` join}; message names
+`nullptr`; `NULL` legs in testFunctionSlotNullMacro stay green.
+
+Question as filed (was: Open, no ruling yet):
 - Typed null pointer constants `(void*)0`, `(int*)0`, `(int*)nullptr` are accepted at function<> and Lambda<> slots, direct
   and in `?:` joins (mnulljoin review 1, 2026-11-01). `(void*)0` is the C NULL body; whether a DATA-pointer-typed null is a
   null spelling for a function slot needs a maintainer ruling. Repro (accepts, returns 6 at -O0 and -O2):

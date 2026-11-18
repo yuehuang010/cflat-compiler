@@ -3635,7 +3635,7 @@ Probes in scratch/rulings_1027/; the veto list is scratch/rulings_1027/maintaine
   ValueConstLevels / StoredConstLevels at depth 0, so nested `?:` pointer joins were walked exponentially (2026-11-01 ternexp,
   fixed with a per-query memo). Look for re-entry before blaming the parser.
 - Native arithmetic result types (RULED 2026-10-31, from the retired arithmetic-result-names issue): follow C's usual arithmetic conversions (`s + s` is int, shift = promoted left operand, same-type ternary keeps the type, pointer difference is ptrdiff_t); C spellings are aliases of the fixed-width types, so a name is never a ranking matter; `long` follows the target. Assignment narrowing stays accepted (`short r = s + s;`).
-- C++ request-cache prune (closed 2026-11-14, prune2 c8030bc1a + e6f88e955): a store skips the prune when its owner+scope
+- C++ request-cache prune (closed 2026-11-14, prune2 caddcf883 + caddcf883): a store skips the prune when its owner+scope
   sentinel (`<owner>_<scope>.prn`) holds the current validity; demand-verdict cohorts take real owner/scope
   (CxxRequestPruneScopeFor). A stamp flip over a full cache costs ~1% of test.sh. Do not reintroduce a per-store dir scan.
 

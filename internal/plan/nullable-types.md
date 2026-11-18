@@ -240,6 +240,9 @@ Recommend (a) now (keeps (c) open).
 **Q6. `string?`.** (a) nullable borrow forever, empty `string` for "no text"; (b) owning
 optional `string` (p4 option 2) - makes `?` mean two things; (c) (a) now plus generic
 `optional<T>` library type later. Recommend (c).
+RULED 2026-11-18 (maintainer): (a). `T?` is a BUILT-IN checked nullable `T*`, not sugar for a library
+`optional<T>`; `string?` stays a nullable borrow. Owning optional values are deferred with no plan
+(if ever wanted: C# model, `?` on a value type over a small struct; `?` on a pointer stays built in).
 
 **Q7. Moved-from retyping.** Does `move x` on a `T*` make `x` checked like `T?` afterwards? (a) no,
 nulldf's must-null report stays the `T*` rule; (b) yes. Recommend (a): (b) is the fail-closed

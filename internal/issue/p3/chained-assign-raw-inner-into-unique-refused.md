@@ -37,3 +37,11 @@ Still open:
    }
    ```
    Owner bit on raw field/global slots is the same design call as above; not fixed by the chain work.
+
+   OPEN 2026-11-18 (put to the maintainer, not ruled): first reply "destructor of ptr should check if not null", then
+   "need more information". The crux given back: non-null is not owned - a raw field can hold a fresh object
+   (`h.raw = new PS()`) or a borrow (`h.raw = &other`), so a destructor that deletes on non-null double frees the
+   borrow. Candidates for fields / globals: a runtime owned flag beside the pointer; a compile-time rule that a
+   field which ever receives a fresh object is owning everywhere (that is `unique`); C manual delete. A borrowed
+   parameter receiving a fresh object always leaks (no caller can see it). The main session's pick, not accepted:
+   refuse the fresh store into a parameter, fields and globals stay manual.

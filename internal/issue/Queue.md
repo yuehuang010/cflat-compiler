@@ -64,29 +64,47 @@ concurrent runs on the same function). Line numbers in old rows predate the 2026
 
 ## Ship gate (p1 + p2)
 
-Empty: p1 = 0, p2 = 0 (box 9 closed green 2026-11-02, master 16102f79, pushed). Run the Windows gate on the master tip
-once per box.
+p1 = 0. p2 = 3 open, none blocks on a ruling:
 
-Open: p2/expect-error-substring-source-check-loose (filed 2026-11-07, test-infra: the leg lint's check 2
-accepts nearly any text); p2/cold-cpp-interop-compile-peaks-23-27-gb (filed 2026-11-07, compile memory: 23-27 GB per cold
-test_cpp_interop compile; pages the Windows box; narrowed by 1a702805 to 20.33 GB cold / 1.47 GB warm,
-candidate-group pruning parked).
+- p2/expect-error-substring-source-check-loose - READY (run LINT, see Ready to start).
+- p2/cold-cpp-interop-compile-peaks-23-27-gb - 20.33 GB cold / 1.47 GB warm; accepted until plan P10 lands (RULED 2026-11-18).
+- p2/test-suite-over-time-budget - run G7: phase timing first; a fixture split needs the maintainer's OK.
+
+Run the Windows gate on the master tip once per box.
 
 ## In flight
 
-None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as is): `fix/t345-ctorlambda`
-(p3/ctor-lambda-this-closure-relocation), `fix/t348-autoconst` (p3/native-auto-copy-drops-transitive-const),
-`fix/t396-viewalias` (mixed owned/borrowed view field moved through an alias). Rebase or drop before reuse.
+None. No parked branch or worktree exists (the old parked branches were deleted 2026-11-18; only `fix/movedtor` is left).
 
-## Partly landed - residue open
+## Ready to start (ruled, nothing open - schedule from here first)
 
-| Issue | Landed | Open |
-|-------|--------|------|
-| p3/moved-from-struct-leftovers-after-t490 | MVFIELD (af5834ad3), MOVEDTOR2 (value dtors always run on the zero-filled source, ruling 2026-10-31) | callee destroys by-value params always (RULED 2026-10-29, CFlat ABI; T499 attempt backed out), conditional consumes need the callee drop flag |
-| p3/interface-call-overload-ranking-and-conversion | IFACEOVL (483f3b83d), IFCONST (5344802ed) | native ConstMask hole (needs core const annotations), first-not-ambiguous picks, interface single-slot widen, native pointer-field const carry, const twin mangling (all pre-existing) |
-| p3/ctor-lambda-this-closure-relocation | T515 | by-value return of a this-capturing-closure holder awaits the native return-ABI ruling; branch fix/t345-ctorlambda |
-| p3/self-pointer-struct-return-not-in-place | - | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
-| p3/cpp-mixed-class-conditional-value-return-argument-refused | MIXCOND1-3 (8844053c8), MIXS2 (S2 re-admitted) | S3 sret copy, lv_bv, nested mixed, CFlat/C++ temp order, win64 cross-compile refusal |
+Each ruling is in the issue file, which is the brief's source. One run = one worktree. Pick top down; rows that share a site are marked.
+
+| Run | Issue | Mode | Work | Not concurrent with |
+|-----|-------|------|------|---------------------|
+| ARRBOUND | p3/non-constant-array-bound-silently-one-element | full (type C) | `int[n] a` with a non-constant `n` is silently one element; refuse it (RULED 2026-11-18) until p4/runtime-sized-arrays-vla is built; accept-set of constant bounds first; new err_array_bound_not_constant.cb | READY - see Ready to start |
+| FNSLOT | p3/function-slot-null-zero-spellings | full (type C) | refuse `(void*)0`, `(int*)0`, `(int*)nullptr` at function slots (RULED 2026-11-18, C++ wins); `nullptr` and `NULL` stay accepted; function-slot ternary join RULED 2026-10-20 | NULLCTOR |
+| UNWDEL | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries item 2 | full (type C/E) | a class whose only member operator delete is not a usual deallocation function is refused as clang, `[cpp]` struct included (CONFIRMED 2026-11-18); sanctioned leg flips are listed in the file; the old patch is gone | E runs |
+| CPPMOVE | p3/cflat-move-cpp-class-sink-shapes-leftovers item 2 | full (type E, opus-tier) | `Box b = move a` of a `[cpp]` struct: ask clang for the whole-record move (RULED 2026-11-18); two regressions of the dropped E6SINK attempt are in the file | E runs |
+| LINKPFX | p4/localize-relayed-clang-diagnostics | batch (type F) | linker / dsymutil stderr gets the `linker: ` prefix (RULED 2026-11-18, amends 2026-09-27); 3 relayed-clang legs re-pinned | DIAG-TEXT |
+| LINT | p2/expect-error-substring-source-check-loose | test-infra | leg lint check 2 anchors both substring ends on cflat literal text, no vendoring (RULED 2026-11-18) | - |
+| CLIBNAME | p3/core-defines-externally-visible-libc-functions | full | RULED 2026-10-21: `nobuiltin` on CFlat bodies of libc names | - |
+| DEPTH2B | p3/new-pointer-depth-carrier | full | RULED 2026-11-04: step 2b, C / C++ interop pointer depth > 2 | - |
+| - | p4/three-way-comparison-operator | plan-sized | `<=>` in the CFlat language RULED 2026-10-02; `= default` member-wise `<=>` still needs a ruling | operator runs |
+| P10 phase 1 | plan cpp-import-module-reuse | read-only spike | design spike for "dependency reached through its own module"; nothing lands | - |
+
+Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the plan), P8 runtime-sized arrays (zero bound and owning elements not ruled; optional).
+
+## Residue open (rest of the issue landed)
+
+| Issue | Open |
+|-------|------|
+| p3/moved-from-struct-leftovers-after-t490 | callee destroys by-value params always (RULED 2026-10-29, CFlat ABI; T499 attempt backed out), conditional consumes need the callee drop flag |
+| p3/interface-call-overload-ranking-and-conversion | native ConstMask hole (needs core const annotations), first-not-ambiguous picks, interface single-slot widen, native pointer-field const carry, const twin mangling (all pre-existing) |
+| p3/ctor-lambda-this-closure-relocation | by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
+| p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
+| p3/cpp-mixed-class-conditional-value-return-argument-refused | S3 sret copy, lv_bv, nested mixed, CFlat/C++ temp order, win64 cross-compile refusal |
+| p3/alias-return-byvalue-param-leftovers-after-b21 | items 1, 2, 4, 6 open; item 3 on hold (2026-10-15); item 5 ratified, no code |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds)
 
@@ -104,32 +122,34 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| - | p3/cpp-using-declaration-member-access-gaps | virtual base re-exposed by `using` (USINGDECL af28ab81 landed the rest) | with P4 virtual-base layout |
-| - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | unnamed-enum macro deduction landed 723b0440; residue after MACROLEFT (af28ab81): `auto&&`, anonymous-enum lvalue deduction / joins, comma lvalue category |
-| - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | extra move vs clang elision; TERNELIDE (daa3a99f) covered same-class conditionals; UNARYCALL cface31e covered unary operators over calls; member function templates (own class, overloaded, cv/ref-qualified) landed MTPLELIDE |
-| - | p3/cpp-reference-member-leftovers-after-t47 | ref members | BVPARAM landed wrapper by-value param destroy order (inert ctor args) + wrapper dtor order; direct-ctor lvalue copy order + unwind landed DIRORD; residue: brace-form ctor args / extra copy / non-inert-arg wrapper path, elided-range prvalue/array residue, REFCTX raw-pointer/self-field refusal residue, return-gate untracked spots (frame pointer via local, CFlat callee, lambda capture) after REFESC (af28ab81); opaque-fn alias refusal RULED 2026-10-29 (stays refused), `&f` element RULED (WAI) |
-| - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | integer half landed 2026-11-01 (a9e82a96); float and native-call residue |
-| - | p3/cpp-wrapper-request-misses-template-argument-headers | `std.unique_ptr<cppon.Cls>` wrappers | WRAPGRP cface31e landed member-type template-argument headers + pointer typedefs; open: noinc implicit dtor, unpublished-specialization pointer binding |
-| - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | COPYPAR landed the trivial defaulted copy-assign pick, 723b0440 the const copy at a return with no move ctor; residue: forwarding template ctor pick, CFlat-callee return elision, leftovers file |
-| - | p3/template-member-operators-not-ranked + p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in; compound and rewritten member templates not ranked, protected member template; public member templates and both-class free ranking landed 62b0d331 (RULED 2026-10-31); file-scope C++ operator init refused landed FREEOPINIT (issue closed) |
-| - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left; tie diagnostic landed 9356d941 |
-| B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | Itanium landed CONSTTWIN (72073fc6); clang-cl residue only |
-| B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), siblings | FLEXLEFT cface31e landed `*&` / paren sizeof and implicit-this `move data`; FLEXSZ 31d380ba landed 2-D row sizeof / arithmetic, 1-D double subscript refusal, `sizeof(&a)` |
-| B18 | p3/cpp-assignment-result-leftovers-after-b9 | by-design B9 rulings (arr elem init landed ASSIGN 72073fc6) | OPEN (P2 landed 1955bd95) |
+| - | p3/cpp-using-declaration-member-access-gaps | virtual base re-exposed by `using` | with P4 virtual-base layout |
+| - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | residue: `auto&&`, anonymous-enum lvalue deduction / joins, comma lvalue category |
+| - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | residue: a later converting argument beside a deleted / private-move prvalue (refused, clang accepts) |
+| - | p3/cpp-reference-member-leftovers-after-t47 | ref members | residue: brace-form ctor args / extra copy / non-inert-arg wrapper path, elided-range prvalue/array, REFCTX raw-pointer/self-field refusal, return-gate untracked spots (frame pointer via local, CFlat callee, lambda capture); opaque-fn alias refusal and `&f` element RULED 2026-10-29 (stay as is) |
+| - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | float and native-call residue |
+| - | p3/cpp-wrapper-request-misses-template-argument-headers | `std.unique_ptr<cppon.Cls>` wrappers | open: noinc implicit dtor, unpublished-specialization pointer binding |
+| - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | residue: forwarding template ctor pick, CFlat-callee return elision, leftovers file |
+| - | p3/template-member-operators-not-ranked + p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in; compound and rewritten member templates not ranked, protected member template |
+| - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left |
+| B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | clang-cl residue only |
+| B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), siblings | residue in the issue file |
+| B18 | p3/cpp-assignment-result-leftovers-after-b9 | by-design B9 rulings | residue: by-design B9 rulings only |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
+| G7 | p2/test-suite-over-time-budget | test.sh phases / test_cpp_interop critical path | NEW 2026-11-17: idle warm 357 s, cold 675 s vs ~200/~300 budget; phase timing first, fixture split needs OK |
 
 ### C - wrongly accepted (adds a rejection)
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| - | p3/cpp-brace-overload-ambiguity-leftovers-after-t314 | C++ call / brace-arg ranking | 723b0440 landed conversion-operator and brace-argument ties; open: template candidate with a braced list, a tie across two conversion operators by value, cosmetic candidate-list spelling |
+| ARRBOUND | p3/non-constant-array-bound-silently-one-element | local array dimension fold (MainListener_Initializers.cpp, both passes) | READY. RULED 2026-11-18: `int[n] a` with a non-constant `n` (silently one element, overrun) is a compiler error until p4/runtime-sized-arrays-vla is built; accept-set of constant bounds first; new err_array_bound_not_constant.cb |
+| - | p3/cpp-brace-overload-ambiguity-leftovers-after-t314 | C++ call / brace-arg ranking | open: template candidate with a braced list, a tie across two conversion operators by value, cosmetic candidate-list spelling |
 
 ### D - wrongly refused (acceptance gaps)
 
 | Run | Issue(s) | Site | Mode |
 |-----|----------|------|------|
-| - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | C++ class ternary + static init leftovers | array element of a temp as an arm landed STATELEM; derived-to-base const field of a temp landed STATCONST; residue global move init; static-init temp destruction and throwing temp dtor landed 62b0d331; moved-arm + nested temp field landed 2026-11-04, mixed-class lvalue join landed 2026-11-06 (af28ab81); derived local return implicit move landed STATLEFT cface31e (explicit `return move d` residue) |
-| - | p3/function-slot-null-zero-spellings | null-constant classifier | function-like zero macros landed NULLMACFN (cface31e); residue: function-slot ternary join (RULED 2026-10-20); interface / generic call null-spelling wording landed FNZEROWORD |
+| - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | C++ class ternary + static init leftovers | residue: global move init; explicit `return move d` |
+| - | p3/function-slot-null-zero-spellings | null-constant classifier | READY (run FNSLOT) - see Ready to start |
 | - | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused | converting-ctor path | absorbed by P1 (converting constructors); land there |
 | - | p3/cpp-class-pointer-converting-ctor-leftovers | converting-ctor path | T305 residue; with P1 |
 | - | p3/cpp-inherited-operator-diamond-and-protected-access | virtual inheritance in imported classes | with P4 virtual-base layout |
@@ -138,20 +158,20 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 
 | Run | Issue | Notes |
 |-----|-------|-------|
-| E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | follow-up list after d59df39b / cpp-unwind2; positional `new` argument order landed 62b0d331 |
-| E4 | p3/cpp-new-remaining-allocator-gaps | follow-up list after cpp-class-operator-new; same-class prvalue into `new` landed 723b0440; nested same-class casts in a declaration (alias argument, method / function result in place) landed NESTCAST |
-| E5 | p3/cflat-default-param-temporaries-leftovers | default-argument temporaries: call-site evaluation of CFlat C++ class defaults landed DEFCALL (temp lives to the caller's full expression); refused class/pointer/string/nested brace elements, native default leaks (DEFPARAM 9356d941 landed ternary + scalar brace defaults; CONDDEF 31d380ba landed by-value ctor `?: default`; CONSTREF 31d380ba landed const T& brace / new; CONSTST 31d380ba landed static overload sets + omitted defaults; CONSTARM 1a702805 landed derived / converting arms; CONSTST3 1a702805 landed the static member template, issue file deleted) |
-| E6 | p3/cflat-move-cpp-class-sink-shapes-leftovers + p3/discard-ternary-move-join-and-cxx-field-move | `move` of a C++ class: element, field, brace and container sinks landed 723b0440, ternary move-arm joins landed TERNSINK 1bd5f1f37; residue [cpp] whole-object move, prvalue through the foreign brace wrapper, discard join |
-| E7 | p3/cpp-ternary-move-join-leftovers | ternary move joins over C++ classes: same-class and derived-to-base joins landed, field leaves (mutable field move-assign, resolved leaf const) landed TERNFLD; one-const-arm join as a ctor argument inside an outer arm landed TERNNEST; residue lowered-struct shapes, b4_r_c1_rev return-of-local |
-| E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; `return move param` landed 723b0440; named locals built in the caller landed RETELIDE 03da49d3c; single-element call-prvalue brace init landed BRACECALL; nested call / operator / trailing-`[]` arguments into construct_at landed NESTELIDE; declaration `C c = T(f(x))` and caller-side `c2(S(5))` landed DECLNEST |
-| E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue after UNBWRAP (9356d941) and UNBSNAP (global/implicit-this/returned-pointer snapshots, native-callee global order landed): ref-param `?: default` (pinned 902 leg); bare trailing `default` into a single-candidate unbound wrapper landed UNBDEF, residue: same-arity overload sets, later C++ default param, mixed template arity |
+| E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | item 2 READY (run UNWDEL) - see Ready to start; item 3 Windows funclet cleanup not exercised |
+| E4 | p3/cpp-new-remaining-allocator-gaps | by-design / out-of-scope residue only (bare `Sx(...)` in a reopened namespace beside a global function), Windows MS-ABI array new / delete names; volatile copy closed by ruling 2026-11-18 |
+| E5 | p3/cflat-default-param-temporaries-leftovers | default-argument temporaries: refused class / pointer / string / nested brace elements, native default leaks |
+| E6 | p3/cflat-move-cpp-class-sink-shapes-leftovers + p3/discard-ternary-move-join-and-cxx-field-move | item 2 READY (run CPPMOVE) - see Ready to start; residue: item 3 brace-element prvalue deferral, discard join |
+| E7 | p3/cpp-ternary-move-join-leftovers | ternary move joins over C++ classes; residue: lowered-struct shapes, b4_r_c1_rev return-of-local |
+| E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; residue: later non-literal aggregate element, call-argument calls, const above pointee |
+| E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue: same-arity overload sets, later C++ default param, mixed template arity (bound-wrapper divergences recorded) |
 | E11 | p3/lowered-cxx-field-structs-leftovers-after-t528 | with P2 (cflat-struct-nontrivial-cxx-fields) |
 
 ### F - diagnostics only
 
 | Run | Issue(s) | Mode |
 |-----|----------|------|
-| F1 | p4/localize-relayed-clang-diagnostics + p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | one run: every relayed clang cause surfaces, prefixed `clang: ` (2026-09-27 ruling, no translation). Batch for the prefix sites; the harvest-suppression half is full-mode review |
+| F1 | p4/localize-relayed-clang-diagnostics + p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | `linker: ` prefix READY (run LINKPFX) - see Ready to start; open: audit of unprefixed clang sinks (batch), harvest-suppression half (full-mode review) |
 
 ### G - request cache and incremental infrastructure
 
@@ -161,26 +181,21 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | G3 | p3/cpp-check-mode-cannot-repopulate-type-request-cache | full | design: --check writing the cache |
 | G4 | p3/cpp-noinc-mode-divergences | full | CFLAT_CPP_INCREMENTAL=0 kept (RULED 2026-10-31); fallback must bind what incremental binds; two crashes fixed |
 
-### H - coverage only (no known defect)
-
-| Run | Issue | Notes |
-|-----|-------|-------|
-
 ### N - native ownership, move, borrow (opus-tier area)
 
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
-| N-MOVESINK | p3/move-sink-leftovers-after-t128 + p3/unique-field-assign-source-not-marked-moved | ternary / `??` / indirect sinks, unique-field consume gaps (box 9 closed items 14-15; field-chain leftovers and move-join arm checks landed 62b0d331) |
-| N-FOREACH | p3/unique-foreach-element-adoption-leftovers | capturing-lambda adoption narrowed (capture borrow landed); residue 1a/1b, removeAt shift, read after growth, other containers |
+| N-MOVESINK | p3/move-sink-leftovers-after-t128 + p3/unique-field-assign-source-not-marked-moved | ternary / `??` / indirect sinks, unique-field consume gaps |
+| N-FOREACH | p3/unique-foreach-element-adoption-leftovers | items 1 (1a / 1b), 4, 5 open: capturing-lambda adoption, other containers; items 2-3 closed by ruling 2026-11-18 |
 | N-RAWOWN | p3/raw-local-owner-bit-leftovers + p3/owning-pointer-release-withheld-when-alias-may-reach + p3/runtime-null-coalesce-new-into-local-leaks | raw owner bit: counter-dependent first-iteration sink, alias-withheld release (leak only), `g ?? new T` leak |
-| N-JOIN | p3/owned-borrowed-ternary-join-rejects-and-misclassifies + p3/moved-raw-heap-array-ternary-destroys-one-element | owned/borrowed `?:` joins; branch fix/t415-heaparrmove parked |
+| N-JOIN | p3/owned-borrowed-ternary-join-rejects-and-misclassifies + p3/moved-raw-heap-array-ternary-destroys-one-element | owned/borrowed `?:` joins; moved raw heap array ternary |
 | N-VIEW | p3/borrowed-view-fields-passed-through-retaining-calls + p3/move-borrowed-view-field-refused | view fields through retaining calls; `move` of a borrowed view field refused |
-| N-COPY | p3/pointer-subscript-owning-element-copy-leftovers-after-r21 + p3/raw-delete-string-array-skips-element-dtors | R22 residue landed 723b0440; R21 residue (element store needs the destructor first); `delete[]` of string* skips element dtors |
+| N-COPY | p3/pointer-subscript-owning-element-copy-leftovers-after-r21 + p3/raw-delete-string-array-skips-element-dtors | R21 residue (element store needs the destructor first); `delete[]` of string* skips element dtors |
 | N-BORROW | p3/consolidate-named-variable-borrow-provenance + p3/iface-return-call-borrow-precision + p3/deref-of-moved-pointer-guard-inside-callee | borrow provenance of named variables; interface return precision; false positive behind a terminating callee |
 | N-UNIQUE | p3/unique-array-dynamic-index-move-untracked | dynamic-index field moves untracked |
-| N-RULED | p3/chained-assign-raw-inner-into-unique-refused + p3/method-on-global-receiver-consumes-field | RULED 2026-10-21, buildable |
+| N-RULED | p3/chained-assign-raw-inner-into-unique-refused | NEEDS RULING: who frees a fresh object stored into a raw field, global or borrowed parameter (discussion open 2026-11-18) |
 | N-TEMP | p3/statement-temp-gep-leaks | two conservative retention cases, no free |
-| N-CONST | p3/native-auto-copy-drops-transitive-const + p3/const-gaps-c-depth-auto-copy-and-named-alias-signatures + p3/trailing-const-leftovers-after-c08 | PARKED (branch fix/t348-autoconst); C global exact levels; const plan phase 8 residue |
+| N-CONST | p3/native-auto-copy-drops-transitive-const + p3/const-gaps-c-depth-auto-copy-and-named-alias-signatures + p3/trailing-const-leftovers-after-c08 | no branch (deleted 2026-11-18, redo from the issue files); C global exact levels; const plan phase 8 residue |
 | - | p3/uninitialized-new-array-reads | ruled 2026-09-03; no detection today |
 | - | p3/null-safe-new-temp-chain-leftovers | pointer results leak by design; record only |
 
@@ -188,20 +203,23 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
-| L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; TUPALIAS 43eceb08 + TUPLEFT 43eceb08 landed; `new S((nullptr,4))` landed 62b0d331; residue: owned unique-element refusals, R133/R134 |
-| L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | overload sets landed 72073fc6, typed-ternary literal and `list<T*>` deduction landed 62b0d331, literal joins + enclosing-namespace patterns + compound pointer elements landed GENLIT; C++ template instance as value; ctor deduction (ruled 2026-10-13) |
+| L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; residue: owned unique-element refusals, R133/R134 |
+| L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | C++ template instance as value; ctor deduction (ruled 2026-10-13) |
 
 ### P - plans and staged work
 
 | Id | Item | Notes |
 |----|------|-------|
 | P1 | plan converting-constructors (`internal/plan/converting-constructors.md`) | ruled 2026-09-26; eigen_05; absorbs D-row converting-ctor rows. Largest item, own staging |
-| P2 | plan cflat-struct-nontrivial-cxx-fields (`internal/plan/cflat-struct-nontrivial-cxx-fields.md`) | ruled A 2026-09-27. Phases 1-4 one per branch. Absorbs E11 (p3/cpp-typed-local-extra-copy-from-param-and-ctor-arms closed by AUTONEST 2026-11-16) |
+| P2 | plan cflat-struct-nontrivial-cxx-fields (`internal/plan/cflat-struct-nontrivial-cxx-fields.md`) | ruled A 2026-09-27. Phases 1-4 one per branch. Absorbs E11 |
 | P3 | p3/cpp-std-header-survey-refresh | re-run the std header L0/L1 survey on macOS and Windows to refresh the gap list; untouched headers need a CFlat-surface ruling |
 | P4 | virtual-base layout (item 2 of p3/cpp-inherited-member-access-and-virtual-base-diagnostics) + p3/cpp-new-virtual-base-class-unsized | refused today ("layout cannot be reproduced"; `new VB()` RULED 2026-10-25 by design until the layout lands); needs a plan |
-| P5 | p4/owning-nullable-string | RULED 2026-10-21: finish `T?` as a planned feature, plan `internal/plan/nullable-types.md` |
+| P5 | p4/owning-nullable-string | RULED 2026-10-21: finish `T?` as a planned feature, plan `internal/plan/nullable-types.md`; RULED 2026-11-18: `T?` stays a built-in nullable pointer, `string?` a borrow, optional values deferred |
 | P6 | p3/no-incremental-build-and-no-up-to-date-check | RULED 2026-08-22; whole-program builds |
 | P7 | plan cpp-one-allocator-family (`internal/plan/cpp-one-allocator-family.md`) | RULED 2026-11-04: one new/delete family so C++ allocates from a `program` thread's allocator; two families until it lands |
+| P8 | p4/runtime-sized-arrays-vla | RULED 2026-11-18: `T[n] a` with a runtime bound = C VLA, optional feature; zero bound and owning elements not ruled; refused until built (run ARRBOUND) |
+| P9 | plan cflat-static-fields (`internal/plan/cflat-static-fields.md`) | RULED 2026-11-18: `static` struct field = shared storage (C++ / C# meaning); 4 phases, not started; issue p3/member-type-path-remaining-gaps section 1 |
+| P10 | plan cpp-import-module-reuse (`internal/plan/cpp-import-module-reuse.md`) | RULED 2026-11-08 + 2026-11-18: dependency reached through its own module, no candidate skip; phase 1 design spike; issue p2/cold-cpp-interop-compile-peaks-23-27-gb |
 
 ### Platform, runtime library, tooling
 
@@ -215,13 +233,13 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | p3/generated-code-is-roughly-twice-the-size-msvc-emits | codegen size vs MSVC |
 | p3/lsp-slow-after-aborted-interop-compile | LSP ~491 s after an aborted interop compile |
 | p3/edge-fill-winui + p3/listview-dark-column-rules | Windows UI; Windows box only |
-| p3/clang-tidy-performance-backlog | ~232 string building left; profile-gated or turn the check off (other perf checks landed 2026-11-07) |
+| p3/clang-tidy-performance-backlog | ~232 string building left; profile-gated or turn the check off |
 
 ### New or rewritten 2026-09-29 (leftovers from landed rows)
 
 | Run | Issue | Summary | Status |
 |---|---|---|---|
-| N3 | p3/cpp-const-object-nonconst-member-call-writes-readonly | loop back-edge const-pointer dataflow, virtual-base twin | W13 landed const auto copy, const globals, const-pointer overload selection 2026-09-30; rest open |
+| N3 | p3/cpp-const-object-nonconst-member-call-writes-readonly | loop back-edge const-pointer dataflow, virtual-base twin | open |
 | N10 | p3/cpp-brace-argument-backing-remaining-shapes | Brace-list backing: reference packs, multi-parameter and non-type pack patterns, class-prvalue element copies | NEW 2026-09-29 |
 | N15 | p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | C++ header default-wrapper batch chunk stores a stripped prefix (latent replay failure) | scheduled as CHUNK |
 | N24 | p3/cpp-unrequested-specialization-pointer-eager-request | C++ interop compile time; left by D6 | perf |
@@ -240,55 +258,38 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | Issue | DISABLED case | Summary |
 |---|---|---|
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
-| p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (ef83ffa02); ruled picks landed GENOVLR (5344802ed); leftovers landed GENLEFT (named args, const pointee deduction, UFCS free generic); open: main-session `f(const int*)` + `f<T>(T*)` pick (maintainer may veto) |
-| p3/member-type-path-remaining-gaps | (none) | `Outer<int>.Inner<long>.type`, closure-alias members, CFlat static data members, C++ statics as value template args (T37 follow-up) |
+| p3/generic-overload-not-joining-concrete-overload-set | (none) | `f(const int*)` + `f<T>(T*)` concrete pick CONFIRMED 2026-11-18; residue in the issue file |
+| p3/member-type-path-remaining-gaps | (none) | item 1 CFlat `static` field -> plan P9; item 2 open: `if const` C++ static above int32 |
 
-### Ruled - ready to schedule (rulings recorded in each issue file)
-
-| Issue | Work |
-|---|---|
-| p3/alias-return-byvalue-param-leftovers-after-b21 | item 5 ratified (extern C callee owns by-value params) - no code |
-| p4/three-way-comparison-operator | `<=>` in the CFlat language RULED 2026-10-02; defaulted member-wise `==` landed 2026-11-07 |
-| p3/new-pointer-depth-carrier | RULED 2026-11-04: lift the depth-2 cap; step 1 (spelled depth <= 31) and step 2a (`new`, generic substitution, const deduction; 43eceb08) landed, step 2b (C/C++ interop depth > 2) open |
-
-### Grouped runs 2026-10-10 (ranked; source scratch/issue_groups_2026-10-10.md; landed rows removed)
+### Grouped runs 2026-10-10 (ranked; landed rows removed; ready runs are listed under Ready to start)
 
 Score = value / (complexity x risk), value 1.5 per p2 + 1 per p3; C = S/M/L, R = L/M/H (H = C++ overload / CInterop
 wrappers / request cache / ownership, or torch). Cheap = fits a Haiku implementer (anchored, risk L-M). Sites marked (u)
-come from issue text only - confirm by grep before the run. The sections above stay the per-issue record; schedule from
+come from issue text only - confirm by grep before the run. The sections above stay the per-issue record; after Ready to start, schedule from
 this table.
 
 | # | Run | C/R | Issues | Shared site / root cause | Not concurrent with | Cheap |
 |---|-----|-----|--------|--------------------------|---------------------|-------|
 | 1 | DIAG-TEXT | M/L | p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | shared KIND only (relayed clang / refusal text) (u) | F1 | yes |
-| 3 | NULLCTOR | L/M | p3/cpp-null-constant-ctor-leftovers-after-t132 | scalar-ref + nullptr_t&& + tdp<int>(0) landed 72073fc6; function-like zero macros landed cface31e | CTOR-VIABILITY, PTRRANK | no |
-| 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | CRTP field item landed 72073fc6; residue: [cpp] struct vs same-named imported global class (identity table, direction coexist) | - | yes, careful on identity |
-| 10 | CLIBNAME | M/M | p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | - | RULED 2026-10-21: nobuiltin on CFlat bodies |
-| 15 | ASSIGN | L/M | p3/cpp-assignment-result-leftovers-after-b9 | route + c6 landed 72073fc6 (route-leftovers deleted); residue: by-design B9 rulings only | - | no |
+| 3 | NULLCTOR | L/M | p3/cpp-null-constant-ctor-leftovers-after-t132 | residue: item 3 only (char-only ctor narrowing) | CTOR-VIABILITY, PTRRANK | no |
+| 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | residue: [cpp] struct vs same-named imported global class (identity table, direction coexist) | - | yes, careful on identity |
+| 15 | ASSIGN | L/M | p3/cpp-assignment-result-leftovers-after-b9 | residue: by-design B9 rulings only | - | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | CTOR-VIABILITY | no |
-| 20 | FNWRAP-RES | L/H | p3/cpp-forwarded-closure-refusals-after-t525, p3/cpp-capturing-closure-to-std-function | residue after FNWRAP af28ab81 (see issue files) | ELIDE (P2 plan) | no |
+| 20 | FNWRAP-RES | L/H | p3/cpp-forwarded-closure-refusals-after-t525, p3/cpp-capturing-closure-to-std-function | residue after FNWRAP (see issue files) | ELIDE (P2 plan) | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, A3 | no |
-| 25 | CONSTTWIN | L/H | p3/cpp-constrained-twin-default-argument-ranking | Itanium + const twins landed 72073fc6; residue: MSVC shared-symbol body choice (Windows host) | CONSTPOINTEE | no |
-| 26 | SRCTYPE | L/H | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | integer + enum half landed 72073fc6; residue: floating auto local (float/double) at C++ calls | - | no |
+| 25 | CONSTTWIN | L/H | p3/cpp-constrained-twin-default-argument-ranking | residue: MSVC shared-symbol body choice (Windows host) | CONSTPOINTEE | no |
+| 26 | SRCTYPE | L/H | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | residue: floating auto local (float/double) at C++ calls | - | no |
 | 27 | CACHE-KEY | L/H | p3/cpp-wrapper-request-group-omits-type-dependencies, p3/cpp-wrapper-request-misses-template-argument-headers, p3/cpp-candidate-tier-differs-cold-vs-warm | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; partial patch scratch/repro_keep/t70_groupfix.patch | CHUNK, G3 | no |
 | 28 | BORROW-PROV | L/H | p3/consolidate-named-variable-borrow-provenance | borrow provenance of named variables through helpers; design first (N-BORROW) | N runs | no |
 
 Cheap singletons (S, risk L): p3/os-abstraction-process-cb-not-converted, p3/view-element-gate-diagnostic-gaps.
 Overload/ctor selection family (never two at once): NULLCTOR, PTRRANK, CTOR-VIABILITY, CONSTTWIN.
-Stale references found by the regroup: the std_full table named a static-auto prvalue / copy-initializer storage issue that was never filed (no file in git history, checked 2026-11-06);
 
 ### Parked - needs a maintainer ruling before any work
 
 | Issue | Question |
 |-------|----------|
-| p2/cold-cpp-interop-compile-peaks-23-27-gb | may a candidate group that adds no probe-visible declaration be skipped (cpp_interop_basic.h fan-out ~12 GB) |
-| p2/expect-error-substring-source-check-loose | anchor both substring ends on cflat literal text, or vendor clang diagnostic strings |
-| p3/cflat-move-cpp-class-sink-shapes-leftovers | item 2: `[cpp]` struct move of a ctor-needing field - clang whole-record move, clang run rule, or record |
-| p3/cpp-new-remaining-allocator-gaps | volatile copy from `volatile DM&` accepted (clang refuses) - by design or volatile mask |
-| p3/function-slot-null-zero-spellings | typed null `(void*)0` / `(int*)0` / `(int*)nullptr` at function slots - keep (void*)0 only? |
-| p3/unique-foreach-element-adoption-leftovers | items 2-3: container mutated inside the loop body - fixed core mutator list, mutator attribute, or re-find |
-| p4/owning-nullable-string | plan nullable-types Q6: `string?` borrow now + optional<T> later? |
-| p4/localize-relayed-clang-diagnostics | linker / dsymutil stderr: unprefixed (amend 2026-09-27 wording), `clang: `, or `linker: ` |
+| p3/chained-assign-raw-inner-into-unique-refused | item 2: owner bit on argument / raw field / global slots - runtime owned flag, compile-time owning field (= unique), or C manual delete; discussion open 2026-11-18 |
 
 ### Conflict map (never concurrent)
 

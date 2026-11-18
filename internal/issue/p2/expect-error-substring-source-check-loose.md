@@ -26,7 +26,7 @@ allowed free text). Placeholder text matching a type spelling may need a type-na
 Acceptance: the probes above are refused; 0 false refusals over the current Test/ corpus; mutation-proven
 like the other checks; runtime of the static phase stays under ~10 s.
 
-## Two attempts 2026-11-07 (box 12, Codex Luna; not landed, patches scratch/box12/lintsub_r2.patch, gitignored)
+## Two attempts 2026-11-07 (box 12, Codex Luna; not landed; the scratch patch was not kept, gone 2026-11-18)
 
 - Recursive placeholder expansion (a placeholder expands only to another template or a bounded
   type/identifier atom): over 30 s per static run, and '{} {} {}' still absorbs 'zzqq wwvv kkjj'
@@ -48,3 +48,11 @@ Open decisions before another round: where relayed clang text comes from on ever
 has no LLVM source tree; vendoring a generated list of Diagnostic*Kinds.td strings into utilities/
 needs a ruling), and whether check 2 should anchor both ends of the substring on literal text
 (refuse placeholder absorption at the head and tail), which the 7% figure points at.
+
+RULED 2026-11-18 (maintainer): check 2 anchors BOTH ends of the substring on literal text of a cflat format string -
+a substring may not begin or end inside a placeholder. No vendoring of clang's Diagnostic*Kinds.td strings.
+(Clarified at the ruling: check 2 has no key or hash, it is a text match of free `expect_error` text against
+format-string expansions; the hole is a `{}` absorbing anything.) Test consequence: the 3 legs that pin relayed
+clang text ('invokes a deleted function', 'failed to instantiate ...') are re-pinned onto the cflat half of
+their message; the value-only rule (substring occurs in its own fixture or a direct Test/ import) from the
+2026-11-07 attempt stays. Acceptance as above: 4/4 nonsense probes refused, 0 false refusals, mutation-proven.

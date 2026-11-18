@@ -2,6 +2,13 @@
 
 **RULED 2026-10-21:** The maintainer wants the nullable `T?` feature finished as a planned feature tied into the safety checks (do NOT remove `T?`); a plan is being drafted at internal/plan/nullable-types.md. Today T? == T* except default-null on no initializer (~37 test lines, 16 compiler sites). See fix-issue-lessons.md digest.
 
+**RULED 2026-11-18 (maintainer):** option 1. `T?` stays a BUILT-IN nullable `T*` with `?` as the null check (finished
+by plan nullable-types, Q6 answer (a)); `string?` is a nullable borrow and `string? c = "nn"` stays an error. `T?` as
+sugar for a library `optional<T>` was ruled the same morning and WITHDRAWN: the check is a compiler flow analysis a
+library cannot express, a pointer payload would need a built-in niche anyway, and the flip would turn `Box? q = &b`
+from a borrow into a value. Owning optional values (option 2, `int?`) are deferred with no plan. Consequence: no
+compiler work here; this file closes with the `T?` section of doc/LANGUAGE.md (empty `string` for "no text").
+
 Moved from p3 2026-08-23. Not a bug: `T?` is a nullable pointer by definition; `string?` holding
 text is a convenience the type system does not offer yet.
 

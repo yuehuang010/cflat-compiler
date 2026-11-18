@@ -39,6 +39,14 @@ Open:
    containers) get no slot clear (master behaviour). Not reproduced in native CFlat (no CFlat core container has
    begin()); needs a C++ header probe and a ruling on adopting out of a C++-owned container.
 
-Fix direction: for 2-3 the borrow rule says a container must not be mutated while a binding into it is live -
+RULED 2026-11-18 (maintainer): items 2 and 3 are LEFT AS IS, C++ behaviour. Mutating the iterated container inside
+the loop body (removeAt / add / insert / clear / resize) invalidates the loop binding and is the user's bug, as
+iterator invalidation in C++; no compile-time refusal, no mutator list or attribute, no version counter. Prior art
+put to the maintainer: C/C++ undefined behaviour, C# runtime InvalidOperationException, Rust compile error.
+Precedent: memory safety at function boundaries only (borrowed-pointer lifetimes inside a function are untracked).
+Rejected: refusing a fixed core mutator list (the main session's pick). Consequence: items 2-3 are closed.
+No doc/LANGUAGE.md paragraph (maintainer 2026-11-18: skip it); items 1, 4, 5 stay open.
+
+Fix direction (superseded for 2-3 by the ruling above): for 2-3 the borrow rule says a container must not be mutated while a binding into it is live -
 refuse growth/removal of the iterated container inside the body (Rust's borrow of the iterator), or re-find the
 element by value; 1 and 4 route through the same adoption hook.

@@ -28,6 +28,9 @@ inaccessible; (5) run test_cpp_interop on Windows.
 - `new CVA(4)` through a `using` alias of a class with a converting ctor fails "has no imported constructors"; clang 8, cv_alias.
 - `new DM(vref())` from a `volatile DM&` source is accepted by a stack declaration too (`DM q = vref();`), so the
   gap is general volatile-copy acceptance, not new-specific; CFlat drops volatile by design. Needs a ruling.
+  RULED 2026-11-18 (maintainer): KEEP ACCEPTING, by design. CFlat has no volatile, so a copy from a `volatile DM&`
+  source is an ordinary copy; the divergence from clang is recorded here and no volatile mask is planned. This
+  bullet and the dm_vol bullet above are closed (no legs flip); pin the accept as a value leg when this file is next touched.
 - (fixed NESTCAST r2) Same-class nested functional casts in a DECLARATION: the call-between, method-result
   and function-name collision shapes now match clang (legs 4025, 4030-4037). Still open, by design or out of scope:
   - File-scope `Sx g = Sx(Sx(4));` refused "not a compile-time constant" (by design).

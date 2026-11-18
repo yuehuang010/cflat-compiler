@@ -16,5 +16,5 @@ Review direction:
 ## Preserved behavior
 
 - `szl<T>(list<int*>)`, namespaced `list<T>` patterns, `i8` conditional promotion, and static generic calls through an instance remain covered and supported.
-- (BY DESIGN, ruled 2026-10-13) For `i8 pick(i8)` beside `T pick<T>(T)`, `pick(7)` selects the non-generic `i8` overload. Keep the current result.
+- For `i8 pick(i8)` beside `T pick<T>(T)`, `pick(7)` selects the GENERIC (T = int), as clang: an exact match beats a narrowing one. Measured on master 2026-11-18 (prints 2). The earlier line here said the `i8` overload is selected; that was a wording error, never the behaviour (found by the GENLIT review). CONFIRMED 2026-11-18 (maintainer: "land the rest", on the main session's recommendation): keep the current result.
 - Two unsuffixed literals that need different types continue to widen to the wider default type, e.g. `first(5000000000, 2)` deduces `long`.
