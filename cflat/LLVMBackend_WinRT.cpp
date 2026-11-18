@@ -6082,6 +6082,53 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             auto& nv = callArgNVs[i];
             const auto& param = methodInfo->Parameters[i];
             ConvertTupleArgument(nv, param);
+            if (!nv.TypeAndValue.Pointer && (param.Pointer || param.IsAlias)
+                && IsCxxRecord(param.TypeName)
+                && HasImplicitClassConversionOperator(nv.TypeAndValue.TypeName,
+                                                       /*includePointerTargets*/ true))
+            {
+                bool ambiguous = false;
+                std::vector<std::string> ambiguousCandidates;
+                CxxConversionOperatorTo(nv.TypeAndValue.TypeName, param, false, nullptr,
+                    &ambiguous, &ambiguousCandidates, &nv.TypeAndValue, nullptr,
+                    /*allowTemplateRequest*/ false);
+                if (ambiguous)
+                    ReportAmbiguousCxxConversion(nv.TypeAndValue.TypeName, param,
+                                                 ambiguousCandidates);
+            }
+            const std::string argumentType = SpellType(*this, nv.TypeAndValue);
+            const bool referenceConversionOperator = param.IsAlias
+                && !param.IsCxxRefToPointer && IsCxxRecord(param.TypeName)
+                && !nv.TypeAndValue.Pointer
+                && !CxxConversionOperatorTo(nv.TypeAndValue.TypeName, param, false,
+                    nullptr, nullptr, nullptr, &nv.TypeAndValue).empty();
+            if (referenceConversionOperator)
+            {
+                if (!ApplyCxxConversionOperator(nv, param, false))
+                {
+                    LogError(std::format(
+                        "cannot bind C++ reference argument '{}' to interface method '{}.{}'",
+                        argumentType, ifaceName, methodName));
+                    return nullptr;
+                }
+            }
+            else
+            {
+                const bool pointerConversionOperator = param.Pointer
+                    && !param.IsAlias && !param.IsCxxRefToPointer && !param.IsFunctionPointer
+                    && !nv.TypeAndValue.Pointer
+                    && !CxxConversionOperatorTo(nv.TypeAndValue.TypeName, param, false,
+                        nullptr, nullptr, nullptr, &nv.TypeAndValue).empty();
+                if (pointerConversionOperator
+                    && !ApplyCxxConversionOperator(nv, param, false))
+                {
+                    LogError(std::format(
+                        "cannot materialize implicit C++ pointer conversion for argument '{}' "
+                        "to interface method '{}.{}'",
+                        argumentType, ifaceName, methodName));
+                    return nullptr;
+                }
+            }
             const size_t firstCallArg = callArgs.size();
 
             const size_t recipeIndex = i + 1; // slot zero is the interface receiver
@@ -6247,11 +6294,9 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             }
             else if (param.Pointer)
             {
-                // Storage may be a promoted-param alloca holding the pointer; load to get the value.
-                if (nv.Primary == nullptr && nv.Storage != nullptr && llvm::isa<llvm::AllocaInst>(nv.Storage))
-                    callArgs.push_back(CreateLoad(nv.Storage));
-                else
-                    callArgs.push_back(nv.GetValue());
+                // Keep pointer arguments on the direct-call borrowing path: addressable values
+                // pass their storage, while pointer values pass the pointer they already hold.
+                callArgs.push_back(LowerPointerParamArg(nv));
             }
             else
             {

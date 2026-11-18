@@ -2658,9 +2658,9 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 && (arg.TypeAndValue.ConstArraySize > 0
                     || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType));
             if (fixedArrayArgument && !param.Pointer && param.ConstArraySize == 0
-                && param.TypeName != "bool")
+                && param.TypeName != "bool" && !IsCxxRecord(param.TypeName))
             {
-                // C++ array-to-pointer decay cannot make an array argument scalar.
+                // A fixed array cannot decay to a scalar; a class parameter may use a converting ctor.
                 out.rank = kCxxNonViableRank;
                 out.from = arg.TypeAndValue.TypeName;
                 continue;
@@ -2744,6 +2744,26 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     pt.Pointer = true;
                     pt.ConstArraySize = 0;
                     pt.ConstInnerDimensions.clear();
+                }
+                if (fixedArrayArgument && candidate.IsCxx && param.Pointer
+                    && !param.IsAlias && !param.IsRvalueRef && !param.IsCxxRefToPointer
+                    && !param.ElemPointer && !param.IsFunctionPointer
+                    && param.ValuePointerDepth() == 1 && param.TypeName == "void")
+                {
+                    const std::string spelling = CxxReferenceParameterSpelling(candidate, i);
+                    const uint32_t sourceMask = arg.TypeAndValue.PointeeConst()
+                        || CxxArgumentPointeeConst(arg) ? 1u : 0u;
+                    const uint32_t targetMask = param.PointeeConstMask()
+                        | CxxSpellingPointeeConstMask(spelling, 1);
+                    out.rank = (sourceMask & 1u) != 0 && (targetMask & 1u) == 0
+                        ? kCxxNonViableRank : 2;
+                    out.cxxViable = out.rank != kCxxNonViableRank;
+                    out.from = arg.TypeAndValue.TypeName.empty()
+                        ? arg.InferSourceTypeName : arg.TypeAndValue.TypeName;
+                    out.toClass = "void";
+                    out.cvBase = "void";
+                    out.cv = static_cast<int>(targetMask & 1u);
+                    continue;
                 }
                 // A narrow string literal is `const char[N]`: `const char*` is its identity after
                 // array-to-pointer; `char*` is non-viable (accepted only when no candidate is viable, as clang).
@@ -4424,6 +4444,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 0;
                     if (IsRawPointerToCoreUnique(arg, *candidateParamItr))
                         result = 0;
+                    // A class pointer may have no TypeName on the call value; its source
+                    // spelling survives in InferSourceTypeName. Keep void* below that pointer.
+                    if (result == 0 && candidates.size() > 1 && arg.TypeAndValue.Pointer
+                        && candidateParamItr->Pointer && !candidateParamItr->ElemPointer
+                        && candidateParamItr->TypeName == "void"
+                        && IsDataStructure(inferredTypeName))
+                        result = 1;
                     const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
                     const bool cxxByValueParam = candidate.IsCxx
                         && ((paramIndex < candidate.Recipe.paramSlots.size()
@@ -9495,8 +9522,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     == cflat_cinterop::RawAbiSlot::Indirect;
             if (candidate.IsCxx && candidate.IsMethod && i == 0) continue;  // receiver: no UDC
             const auto& arg = matched[i];
-            const bool referenceConversionOperator = candidate.IsCxx
-                && param.IsAlias && !param.IsCxxRefToPointer
+            if (!candidate.IsCxx && !arg.TypeAndValue.Pointer
+                && (param.Pointer || param.IsAlias) && IsCxxRecord(param.TypeName)
+                && HasImplicitClassConversionOperator(arg.TypeAndValue.TypeName,
+                                                       /*includePointerTargets*/ true))
+            {
+                bool ambiguous = false;
+                std::vector<std::string> ambiguousCandidates;
+                CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false, nullptr,
+                    &ambiguous, &ambiguousCandidates, &arg.TypeAndValue, nullptr,
+                    /*allowTemplateRequest*/ false);
+                if (ambiguous)
+                    ReportAmbiguousCxxConversion(arg.TypeAndValue.TypeName, param,
+                                                 ambiguousCandidates);
+            }
+            const bool referenceConversionOperator = param.IsAlias && !param.IsCxxRefToPointer
                 && IsCxxRecord(param.TypeName) && !arg.TypeAndValue.Pointer
                 && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false,
                     nullptr, nullptr, nullptr, &arg.TypeAndValue).empty();
@@ -9507,7 +9547,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                     { diagnosticFunctionName });
                 continue;
             }
-            const bool pointerConversionOperator = candidate.IsCxx && param.Pointer
+            const bool pointerConversionOperator = param.Pointer
                 && !param.IsAlias && !param.IsCxxRefToPointer && !param.IsFunctionPointer
                 && !arg.TypeAndValue.Pointer
                 && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false,
@@ -9746,8 +9786,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
                 // `&L` of a whole const object is #16; an array decaying to its element pointer is #6.
                 const auto root = passed != nullptr && !arrayDecay ? FindConstObjectRoot(passed) : std::nullopt;
+                const TypeAndValue& source = arg.HasOriginalArgumentType
+                    ? arg.OriginalArgumentType : arg.TypeAndValue;
                 if (ConversionDiscardsConst(passed,
-                        arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue,
+                        source,
                         target, from, to, ParameterHasExactLevels(candidate, param)))
                 {
                     nativeConstRefused = true;
@@ -14022,6 +14064,7 @@ bool LLVMBackend::RetireAssignBorrow(const std::string& name, llvm::BasicBlock* 
         // The statement block proves same-statement retirement; loop depth also allows a fresh
         // owning store after an inner-loop join, without crossing a possibly-zero-trip loop.
         llvm::BasicBlock* here = statementBlock != nullptr ? statementBlock : builder->GetInsertBlock();
+        llvm::BasicBlock* continuation = builder->GetInsertBlock();
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             NamedVariable* nv = nullptr;
@@ -14044,8 +14087,11 @@ bool LLVMBackend::RetireAssignBorrow(const std::string& name, llvm::BasicBlock* 
                 && borrowLoopDepth->second != 0
                 && borrowLoopDepth->second == ownFlagLoopReownSnapshots_.size()
                 && !ownFlagLoopReownSnapshots_.back().borrowedContinueStorages.contains(nv->Storage);
+            // An invoke or owning cleanup can retarget straight-line facts to this normal continuation.
+            const bool sameStatement = nv->AssignBorrowBlock == here
+                || (statementBlock != nullptr && nv->AssignBorrowBlock == continuation);
             if (nv->AssignBorrowBlock == nullptr
-                || (nv->AssignBorrowBlock != here && !sameLoopDepth))
+                || (!sameStatement && !sameLoopDepth))
                 return false;
             nv->IsBorrowed = false;
             nv->BorrowedOrigin.clear();

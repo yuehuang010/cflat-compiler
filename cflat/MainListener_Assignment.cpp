@@ -853,6 +853,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                         result.Primary = nullptr;
                     result.ChainedAssignSlot = assignmentResult.ChainedAssignSlot;
                     result.ChainedAssignName = assignmentResult.ChainedAssignName;
+                    result.ChainedAssignJoinRhs = assignmentResult.ChainedAssignJoinRhs;
                     result.IsUniqueFieldAssignmentResult =
                         assignmentResult.IsUniqueFieldAssignmentResult;
                     // All of it: an owning struct destination carries its borrow provenance.
@@ -7011,8 +7012,33 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             bool uniqueFieldAssignmentResultProduced = false;
             llvm::Value* assignmentRhsValue = nullptr;
             const LLVMBackend::NamedVariable* storeSource = nullptr;
-            auto chainedAssignmentJoinOwns = [&](llvm::Value* value) {
+            auto isAssignmentRhsOfAssignment = [&]() {
+                antlr4::tree::ParseTree* child = ctx;
+                for (auto* parent = ctx != nullptr ? ctx->parent : nullptr;
+                     parent != nullptr; child = parent, parent = parent->parent)
+                {
+                    if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
+                        assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                        return assignment->assignmentExpression() == child;
+                    if (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(parent);
+                        rule != nullptr && rule->children.size() == 1)
+                        continue;
+                    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parent);
+                        primary != nullptr && primary->expression() != nullptr
+                        && primary->children.size() == 3)
+                        continue;
+                    return false;
+                }
+                return false;
+            };
+            const bool assignmentCanCarryChainOwnership = operatorText == "="
+                && (namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.IsUnique
+                    || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName));
+            const bool assignmentIsChainMiddle = assignmentCanCarryChainOwnership
+                && isAssignmentRhsOfAssignment();
+            auto chainedAssignmentJoinOwns = [&](llvm::Value* value, bool* hasNamedOwnerOut) {
                 const auto arms = compiler->JoinArmValues(value);
+                if (hasNamedOwnerOut != nullptr) *hasNamedOwnerOut = false;
                 if (arms.empty()) return false;
                 bool hasFreshOwner = false;
                 bool hasNamedOwner = false;
@@ -7039,11 +7065,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         return false;
                     hasNamedOwner = true;
                 }
+                if (hasNamedOwnerOut != nullptr) *hasNamedOwnerOut = hasNamedOwner;
                 return hasFreshOwner && (hasNamedOwner || arms.size() > 1);
             };
             // Chained-'=' inputs read BEFORE the store consumes the RHS: finishStore runs after the
             // consume side effects, which clear the fresh-owner ledger on the join arms.
             bool rawJoinOwnsArms = false;
+            bool rawJoinHasNamedOwner = false;
+            bool chainRhsIsJoin = false;
             llvm::Value* rawAliasChainSlot = nullptr;
             bool middleKeepsBorrow = false;
             bool chainMiddleAdoptsInArm = false;
@@ -7079,6 +7108,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // The stored owner now belongs to the LHS; the assignment rvalue is only an alias.
                     compiler->lastCallReturnsOwned = false;
                     *assignmentResult = {};
+                    assignmentResult->ChainedAssignJoinRhs = chainRhsIsJoin;
                     assignmentResult->TypeAndValue = namedVar.TypeAndValue;
                     assignmentResult->TypeAndValue.VariableName.clear();
                     assignmentResult->TypeAndValue.IsMove = false;
@@ -7116,15 +7146,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     {
                         assignmentResult->IsBorrowed = true;
                         assignmentResult->BorrowedOrigin = namedVar.CallerName;
-                        // T203/T250: a local slot fed by `new` (or ?: of new/nullptr) is recorded for an
-                        // outer unique '='. Any other RHS keeps the borrow.
+                        // A chain middle carries its named slot outward without changing its store ownership.
+                        // A local slot fed by `new` or ?: of new/nullptr is also recorded for unique '='.
                         bool sawNewArm = false;
                         const bool localRawDest = llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
                             && namedVar.FieldName.empty() && !namedVar.CallerName.empty();
                         if (localRawDest
                             && ((OwnedOrNullArms(assignCtx, sawNewArm) && sawNewArm
                                     && RawNewArrayValueOf(assignCtx) == nullptr)
-                                || rawJoinOwnsArms))
+                            || rawJoinOwnsArms
+                            || (assignmentIsChainMiddle && rawJoinHasNamedOwner
+                                && RawNewArrayValueOf(assignCtx) == nullptr)))
                         {
                             assignmentResult->ChainedAssignSlot = destination;
                             assignmentResult->ChainedAssignName = namedVar.CallerName;
@@ -7142,6 +7174,48 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                     resultValue->getType(), rawAliasChainSlot);
                                 resultValue = assignmentResult->Primary;
                             }
+                        }
+                    }
+                    if (assignmentIsChainMiddle && operatorText == "=" && destination != nullptr
+                        && !namedVar.TypeAndValue.IsAlias && !namedVar.IsAliasBorrow
+                        && compiler->FindStackArgumentByStorage(destination) == nullptr
+                        && RawNewArrayValueOf(assignCtx) == nullptr)
+                    {
+                        const bool localMiddle = llvm::isa<llvm::AllocaInst>(destination)
+                            && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                            && (!namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.IsUnique
+                                || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName));
+                        const bool localRawNamedOwnerMiddle = llvm::isa<llvm::AllocaInst>(destination)
+                            && namedVar.FieldName.empty() && namedVar.TypeAndValue.Pointer
+                            && !namedVar.TypeAndValue.IsUnique
+                            && !compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                            && storeSource != nullptr && storeSource->IsOwning
+                            && llvm::isa_and_nonnull<llvm::AllocaInst>(storeSource->Storage)
+                            && compiler->FindStackArgumentByStorage(storeSource->Storage) == nullptr;
+                        const bool rawNonLocalMiddle = namedVar.TypeAndValue.Pointer
+                            && !namedVar.TypeAndValue.IsUnique
+                            && !compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName);
+                        const bool globalMiddle = rawNonLocalMiddle
+                            && llvm::isa<llvm::GlobalVariable>(destination);
+                        const bool fieldMiddle = rawNonLocalMiddle
+                            && llvm::isa<llvm::GetElementPtrInst>(destination);
+                        if ((localMiddle || localRawNamedOwnerMiddle || globalMiddle || fieldMiddle)
+                            && !(globalMiddle && AsDirectNew(assignCtx) != nullptr))
+                        {
+                            assignmentResult->Storage = destination;
+                            assignmentResult->CallerName = namedVar.CallerName;
+                            assignmentResult->FieldName = namedVar.FieldName;
+                            assignmentResult->FieldPathText = namedVar.FieldPathText;
+                            assignmentResult->MovePathKey = namedVar.MovePathKey;
+                            assignmentResult->MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
+                            assignmentResult->IsElementAccess = namedVar.IsElementAccess;
+                            assignmentResult->IsInterfaceField = namedVar.IsInterfaceField;
+                            assignmentResult->BaseType = namedVar.BaseType;
+                            assignmentResult->ChainedAssignSlot = destination;
+                            assignmentResult->ChainedAssignName = !namedVar.CallerName.empty()
+                                ? namedVar.CallerName
+                                : !namedVar.FieldName.empty() ? namedVar.FieldName
+                                : namedVar.TypeAndValue.VariableName;
                         }
                     }
                 }
@@ -7246,6 +7320,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
+            // A join the middle does not own (named owner plus null, or a borrowed arm) is the master-path case.
+            chainRhsIsJoin = assignmentIsChainMiddle && operatorText == "="
+                && (rightNV.ChainedAssignJoinRhs
+                    || (!compiler->JoinArmValues(rightNV.Primary).empty()
+                        && !chainedAssignmentJoinOwns(rightNV.Primary, nullptr)));
             if (operatorText == "=" && coalesceResume == nullptr && namedVar.TypeAndValue.Pointer
                 && !namedVar.TypeAndValue.IsUnique && llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty())
@@ -7281,7 +7360,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     compiler->NoteChainBorrowMiddle(rightNV.Primary, namedVar.CallerName);
                 }
                 else
-                    rawJoinOwnsArms = chainedAssignmentJoinOwns(rightNV.Primary);
+                    rawJoinOwnsArms = chainedAssignmentJoinOwns(rightNV.Primary, &rawJoinHasNamedOwner);
             }
             // A move argument is read without IsMove (ParseIdentifier). A string argument arrives
             // owned (LowerByValueArg), so a global/field/deref store transfers it; a deref always does.
@@ -7320,7 +7399,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             }
             if (RefuseImmovableAssignSource(compiler, ctx, operatorText, rightNV)) return nullptr;
             // A '?:' or '??' arm that is a chain through such a middle is a borrow of e, as `a = p;` is.
-            if (operatorText == "=" && (namedVar.TypeAndValue.IsUnique
+            if (operatorText == "=" && rightNV.ChainedAssignSlot == nullptr
+                && (namedVar.TypeAndValue.IsUnique
                     || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)))
                 if (const std::string middle = compiler->ChainBorrowMiddleArmName(rightNV.Primary); !middle.empty())
                 {
@@ -7332,15 +7412,24 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         uniqueType, namedVar.CallerName, middle));
                     return finishStore(nullptr);
                 }
-            // T203: `owner = raw = new T()` - the inner '=' left its local slot owning the object.
-            // A unique destination takes that slot as its RHS, exactly as `owner = raw;` does.
-            if (operatorText == "=" && !namedVar.TypeAndValue.Pointer
-                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
-                && rightNV.IsBorrowed && rightNV.ChainedAssignSlot != nullptr
+            // Read a chained store's middle as a name, exactly like `owner = middle;`. This
+            // preserves local ownership and keeps global/field slots non-consumable.
+            // A global or field destination takes a join middle through the store path, as `g = b;` does.
+            const bool nonLocalJoinMiddle = destination != nullptr
+                && !llvm::isa<llvm::AllocaInst>(destination) && rightNV.ChainedAssignJoinRhs;
+            if (operatorText == "=" && (namedVar.TypeAndValue.IsUnique
+                    || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
+                && !nonLocalJoinMiddle
+                && rightNV.ChainedAssignSlot != nullptr
                 && IsChainedAssignmentShape(assignCtx))
             {
-                const auto* slotVar = compiler->FindVariableByStorage(rightNV.ChainedAssignSlot);
-                if (slotVar != nullptr && compiler->ChainSlotReadsAsNamed(*slotVar, rightNV.Primary))
+                llvm::Value* chainSlot = rightNV.ChainedAssignSlot;
+                const auto* slotVar = compiler->FindVariableByStorage(chainSlot);
+                if (slotVar != nullptr
+                    && compiler->FindStackArgumentByStorage(chainSlot) == nullptr
+                    && !slotVar->TypeAndValue.IsAlias
+                    && (!slotVar->IsAliasBorrow
+                        || compiler->IsCoreUniqueType(slotVar->TypeAndValue.TypeName)))
                 {
                     const std::string slotName = rightNV.ChainedAssignName;
                     const bool readThroughVoidMiddle = !slotVar->IsOwning && !slotVar->BorrowsOwningLocal
@@ -7348,8 +7437,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     rightNV = *slotVar;
                     rightNV.CallerName = slotName;
                     rightNV.Primary = slotVar->IsOwning ? nullptr : LoadNamedVariable(rightNV);
+                    rightNV.ChainedAssignSlot = nullptr;
                     // `a = v;` refuses by type; the borrow of e recorded on v is not this error.
                     if (readThroughVoidMiddle) { rightNV.IsBorrowed = false; rightNV.BorrowedOrigin.clear(); }
+                }
+                else if (llvm::isa<llvm::GlobalVariable>(chainSlot))
+                {
+                    auto globalRead = compiler->GetGlobalVariableNV(rightNV.ChainedAssignName);
+                    if (globalRead.Storage == chainSlot)
+                        rightNV = globalRead;
+                }
+                else if (rightNV.Storage == chainSlot
+                    && llvm::isa<llvm::GetElementPtrInst>(chainSlot))
+                {
+                    rightNV.Primary = nullptr;
+                    rightNV.ChainedAssignSlot = nullptr;
                 }
             }
             // `t = std.move(x)` of a trivially copyable C++ class: the xvalue's referent is
@@ -7601,7 +7703,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         && !namedVar.TypeAndValue.IsArrayView
                         && !namedVar.TypeAndValue.IsInterface
                         && compiler->FindStackArgumentByStorage(namedVar.Storage) == nullptr
-                        && chainedAssignmentJoinOwns(rightNV.Primary);
+                        && chainedAssignmentJoinOwns(rightNV.Primary, nullptr);
                     bool reboundToOwnedStore = coalesceResume == nullptr
                         && !assignmentBorrowsOwningLocal
                         && (srcIsOwnedPtrRhs || rightNV.IsOwning || adoptsOwningPointerJoin)
@@ -11867,6 +11969,27 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // Reassignment to a bonded variable breaks the bond (per design: bond is to the instance).
             if (operatorText == "=" && coalesceResume == nullptr && !namedVar.CallerName.empty())
                 compiler->ClearVariableBond(namedVar.CallerName);
+            if (!namedVar.CallerName.empty() && namedVar.FieldName.empty()
+                && namedVar.OwningStructName.empty() && !namedVar.IsStaticLocal
+                && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.ElemPointer
+                && namedVar.TypeAndValue.PointerDepth == 1 && !namedVar.TypeAndValue.IsUnique
+                && !namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.IsFunctionPointer
+                && llvm::isa<llvm::AllocaInst>(destination))
+            {
+                const bool rhsIsThisAlias = operatorText == "=" && rightNV.IsThisReceiver
+                    && rightNV.FieldName.empty() && rightNV.OwningStructName.empty()
+                    && rightNV.TypeAndValue.Pointer && !rightNV.TypeAndValue.ElemPointer
+                    && rightNV.TypeAndValue.PointerDepth <= 1 && !rightNV.TypeAndValue.IsUnique;
+                for (auto scope = compiler->stackNamedVariable.rbegin();
+                     scope != compiler->stackNamedVariable.rend(); ++scope)
+                {
+                    auto binding = scope->namedVariable.find(namedVar.CallerName);
+                    if (binding == scope->namedVariable.end()
+                        || binding->second.Storage != destination) continue;
+                    binding->second.IsThisReceiver = binding->second.IsThisReceiver && rhsIsThisAlias;
+                    break;
+                }
+            }
             // Refresh the field-borrow taint on a reassigned whole-variable string local: it now
             // borrows a field iff the new RHS does (so `t = "lit"` after `t = b.name` clears it).
             if (operatorText == "=" && !namedVar.CallerName.empty() && namedVar.FieldName.empty()

@@ -2725,11 +2725,32 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 {
                     const bool classElements = brace->hasCxxClassElements
                         && !brace->hasMixedElements && !brace->cxxElementType.empty();
+                    const std::string rawElement = CxxBraceTargetElementSpelling(*rawParameter);
+                    std::string rawElementSpelling;
+                    const bool dependentElement = !rawElement.empty()
+                        && !CxxTemplateArgSpellingForCflatType(rawElement, rawElementSpelling);
+                    const std::string firstBraceIdentity = brace->elements.empty()
+                        ? std::string() : CxxBraceElementIdentity(brace->elements.front());
+                    const bool homogeneousScalarElements = !classElements
+                        && !firstBraceIdentity.empty()
+                        && std::all_of(brace->elements.begin(), brace->elements.end(), [&](const auto& item) {
+                            return CxxBraceElementIdentity(item) == firstBraceIdentity;
+                        });
                     std::string element;
                     if (classElements)
                     {
                         if (!CxxSpellingForCflatType(brace->cxxElementType, element))
                             return noMatch("a C++ brace-list class element has no C++ spelling");
+                    }
+                    else if (explicitArgs.size() == 1 && selected->typeParameterCount == 1
+                        && (selected->templateParameterKinds.empty()
+                            || selected->templateParameterKinds == "T")
+                        && dependentElement
+                        && homogeneousScalarElements
+                        && !explicitArgs.front().starts_with("#"))
+                    {
+                        if (!CxxTemplateArgSpellingForCflatType(explicitArgs.front(), element))
+                            return noMatch("an explicit type argument cannot be spelled in C++");
                     }
                     else element = braceElementSpelling(*brace, {});
                     if (element.empty())
@@ -6058,10 +6079,13 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             std::string retType;
             std::string target;
             std::vector<std::string> paramNames;
+            std::vector<std::string> templatePatternTypes;
             std::string file;
             int line = 1;
             int col = 0;
             bool isNoexcept = false;
+            bool isTemplate = false;
+            bool hasConstListPattern = false;
             bool instance = false;
             bool isConst = false;
             bool found = false;
@@ -6427,6 +6451,7 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             std::vector<size_t> ranks;
             bool certain = false;
             std::vector<std::string> shownParams;
+            bool isTemplate = false;
             bool unranked = false;   // holds a function pointer that may not fit (see ClassifyCxxPointerArgument)
         };
         auto isNotViable = [&](const std::vector<size_t>& ranks) {
@@ -6434,6 +6459,7 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         };
         auto noteRivalsOfPick = [&](const std::vector<SeenBraceCandidate>& seen, int priority,
                                     const std::vector<size_t>& pickRanks, bool pickCertain,
+                                    bool pickIsTemplate,
                                     const std::vector<std::string>& pickParams, const std::string& name,
                                     bool& tied, std::vector<std::string>& tiedList) {
             bool pickUnranked = false;
@@ -6453,7 +6479,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             for (const auto& rival : seen)
             {
                 if (rival.priority != priority || !rival.certain || rival.shownParams == pickParams
-                    || compareRanks(pickRanks, rival.ranks) == -1)
+                    || compareRanks(pickRanks, rival.ranks) == -1
+                    || (rival.isTemplate && compareRanks(pickRanks, rival.ranks) == 0))
                     continue;
                 tied = true;
                 std::string shown = displayCandidate(name, rival.shownParams);
@@ -6461,10 +6488,189 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                     tiedList.push_back(std::move(shown));
             }
         };
+        struct FreeCandidate
+        {
+            std::vector<std::string> paramTypes;
+            std::string retType;
+            std::vector<std::string> paramNames;
+            std::vector<std::string> templatePatternTypes;
+            std::string file;
+            int line = 1;
+            int col = 0;
+            bool isNoexcept = false;
+            bool isTemplate = false;
+            bool hasConstListPattern = false;
+        };
+        enum class BraceTemplateDeduction { Deduced, NoMatch, Unsupported };
+        auto deduceBraceTemplate = [&](const cflat_cinterop::RawFunctionTemplate& functionTemplate,
+                                       std::vector<std::string>& parameterTypes,
+                                       std::vector<std::string>& templatePatternTypes) {
+            if (arguments.size() < functionTemplate.minArity
+                || arguments.size() > functionTemplate.maxArity)
+                return BraceTemplateDeduction::NoMatch;
+            if (functionTemplate.typeParameterCount == 0 || functionTemplate.hasParameterPack)
+                return BraceTemplateDeduction::Unsupported;
+            const std::vector<std::string>& typeParameters = functionTemplate.typeParameterNames;
+            if (typeParameters.size() != functionTemplate.typeParameterCount
+                || std::any_of(typeParameters.begin(), typeParameters.end(),
+                               [](const std::string& name) { return name.empty(); }))
+                return BraceTemplateDeduction::Unsupported;
+
+            auto matchingToken = [](const std::string& spelling, const std::string& wanted) {
+                for (size_t at = 0; at < spelling.size(); )
+                {
+                    if (!std::isalpha((unsigned char)spelling[at]) && spelling[at] != '_')
+                    { ++at; continue; }
+                    const size_t begin = at++;
+                    while (at < spelling.size()
+                           && (std::isalnum((unsigned char)spelling[at]) || spelling[at] == '_'))
+                        ++at;
+                    if (spelling.compare(begin, at - begin, wanted) == 0) return true;
+                }
+                return false;
+            };
+            auto simpleTypeParameter = [&](std::string spelling) {
+                spelling = TrimCxxBraceType(spelling);
+                while (spelling.starts_with("const ") || spelling.starts_with("volatile "))
+                    spelling.erase(0, spelling.find(' ') + 1);
+                for (const std::string& parameter : typeParameters)
+                    if (spelling == parameter) return parameter;
+                return std::string();
+            };
+            std::map<std::string, std::string> deduced;
+            auto addDeduction = [&](const std::string& parameter, const std::string& identity) {
+                std::string spelling;
+                if (identity.empty() || !CxxSpellingForCflatType(identity, spelling))
+                    return BraceTemplateDeduction::Unsupported;
+                auto [it, inserted] = deduced.emplace(parameter, spelling);
+                return inserted || SqueezeCxxSpelling(it->second) == SqueezeCxxSpelling(spelling)
+                    ? BraceTemplateDeduction::Deduced : BraceTemplateDeduction::NoMatch;
+            };
+            for (size_t index = 0; index < functionTemplate.parameterTypes.size()
+                                  && index < arguments.size(); ++index)
+            {
+                const std::string& pattern = functionTemplate.parameterTypes[index];
+                std::vector<std::string> occurringParameters;
+                for (const std::string& parameter : typeParameters)
+                    if (matchingToken(pattern, parameter)) occurringParameters.push_back(parameter);
+                if (occurringParameters.empty()) continue;
+
+                const CxxBraceArgument* brace = nullptr;
+                for (const auto& candidateBrace : braceArguments)
+                    if (candidateBrace.parameterIndex == index)
+                    { brace = &candidateBrace; break; }
+                if (brace != nullptr)
+                {
+                    if (CxxBraceContainerKindOf(pattern) != CxxBraceContainerKind::InitializerList
+                        || brace->hasCxxClassElements)
+                        return BraceTemplateDeduction::Unsupported;
+                    const std::string elementParameter = simpleTypeParameter(
+                        CxxBraceTargetElementSpelling(pattern));
+                    if (elementParameter.empty()
+                        || std::find(occurringParameters.begin(), occurringParameters.end(),
+                                     elementParameter) == occurringParameters.end())
+                        return BraceTemplateDeduction::Unsupported;
+                    // An empty list is a non-deduced context ([temp.deduct.call]/1), not a failure.
+                    if (brace->elements.empty()) continue;
+                    if (brace->hasMixedElements) return BraceTemplateDeduction::NoMatch;
+                    const std::string identity = CxxBraceElementIdentity(brace->elements.front());
+                    for (const auto& element : brace->elements)
+                        if (CxxBraceElementIdentity(element) != identity)
+                            return BraceTemplateDeduction::NoMatch;
+                    const BraceTemplateDeduction result = addDeduction(elementParameter, identity);
+                    if (result != BraceTemplateDeduction::Deduced) return result;
+                    continue;
+                }
+
+                const std::string valueParameter = simpleTypeParameter(pattern);
+                if (valueParameter.empty()
+                    || std::find(occurringParameters.begin(), occurringParameters.end(), valueParameter)
+                        == occurringParameters.end())
+                    return BraceTemplateDeduction::Unsupported;
+                const BraceTemplateDeduction result = addDeduction(
+                    valueParameter, CxxBraceElementIdentity(arguments[index]));
+                if (result != BraceTemplateDeduction::Deduced) return result;
+            }
+            if (deduced.size() != typeParameters.size()) return BraceTemplateDeduction::NoMatch;
+
+            auto substitute = [&](const std::string& pattern) {
+                std::string result;
+                for (size_t at = 0; at < pattern.size(); )
+                {
+                    if (!std::isalpha((unsigned char)pattern[at]) && pattern[at] != '_')
+                    { result += pattern[at++]; continue; }
+                    const size_t begin = at++;
+                    while (at < pattern.size()
+                           && (std::isalnum((unsigned char)pattern[at]) || pattern[at] == '_'))
+                        ++at;
+                    const std::string token = pattern.substr(begin, at - begin);
+                    auto found = deduced.find(token);
+                    result += found == deduced.end() ? token : found->second;
+                }
+                return result;
+            };
+            parameterTypes.clear();
+            for (const std::string& parameter : functionTemplate.parameterTypes)
+                parameterTypes.push_back(substitute(parameter));
+            templatePatternTypes = functionTemplate.parameterTypes;
+            return BraceTemplateDeduction::Deduced;
+        };
         if (ownerType.empty())
         {
             auto it = cxxFunctionSignatures_.find(functionName);
-            if (it == cxxFunctionSignatures_.end()) return false;
+            auto templateIt = cxxFunctionTemplates_.find(functionName);
+            if (it == cxxFunctionSignatures_.end() && templateIt == cxxFunctionTemplates_.end())
+                return false;
+            const bool hasNonTemplateSignature = it != cxxFunctionSignatures_.end()
+                && std::any_of(it->second.begin(), it->second.end(), [](const auto& signature) {
+                    return !signature.linkageName.starts_with("__cflat_tpl_");
+                });
+            const bool hasTemplateOverloadSet = templateIt != cxxFunctionTemplates_.end()
+                && templateIt->second.size() > 1;
+            if (!hasNonTemplateSignature && !hasTemplateOverloadSet) return false;
+            std::vector<FreeCandidate> candidates;
+            if (it != cxxFunctionSignatures_.end())
+                for (const auto& sig : it->second)
+                {
+                    // A brace wrapper registered by an earlier call is not a C++ overload: its
+                    // backed-list `const E *` parameter would take a later list in the wrong slot.
+                    if (sig.linkageName.starts_with("__cflat_tpl_")) continue;
+                    FreeCandidate candidate;
+                    candidate.paramTypes = sig.paramSpellings;
+                    candidate.retType = sig.retSpelling;
+                    candidate.paramNames = sig.paramNames;
+                    candidate.file = sig.file;
+                    candidate.line = sig.line;
+                    candidate.col = sig.col;
+                    candidate.isNoexcept = sig.isNoexcept;
+                    candidates.push_back(std::move(candidate));
+                }
+            if (templateIt != cxxFunctionTemplates_.end())
+                for (const auto& functionTemplate : templateIt->second)
+                {
+                    if (functionTemplate.kind != cflat_cinterop::RawFunctionTemplate::Free) continue;
+                    std::vector<std::string> parameterTypes;
+                    std::vector<std::string> patternTypes;
+                    const BraceTemplateDeduction deduction = deduceBraceTemplate(
+                        functionTemplate, parameterTypes, patternTypes);
+                    if (deduction == BraceTemplateDeduction::Unsupported) return false;
+                    if (deduction == BraceTemplateDeduction::NoMatch) continue;
+                    FreeCandidate candidate;
+                    candidate.paramTypes = std::move(parameterTypes);
+                    candidate.paramNames = functionTemplate.parameterNames;
+                    candidate.templatePatternTypes = std::move(patternTypes);
+                    candidate.file = functionTemplate.file;
+                    candidate.line = functionTemplate.line;
+                    candidate.col = functionTemplate.col;
+                    candidate.isNoexcept = functionTemplate.isNoexcept;
+                    candidate.isTemplate = true;
+                    candidate.hasConstListPattern = std::any_of(
+                        functionTemplate.parameterTypes.begin(), functionTemplate.parameterTypes.end(),
+                        [](const std::string& parameter) {
+                            return parameter.find("initializer_list<const ") != std::string::npos;
+                        });
+                    candidates.push_back(std::move(candidate));
+                }
             int selectedBracePriority = 100;
             std::vector<size_t> selectedRanks;
             size_t selectedExtraParameters = static_cast<size_t>(-1);
@@ -6475,62 +6681,93 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             std::vector<std::string> selectedShownParams;
             // CVTIE: a known non-viable candidate leaves the set; pass 1 keeps clang's refusal when none is viable.
             for (int pass = 0; pass < 2 && !selected.found; ++pass)
-            for (const auto& sig : it->second)
+            for (const auto& sig : candidates)
             {
-                // A brace wrapper registered by an earlier call is not a C++ overload: its
-                // backed-list `const E *` parameter would take a later list in the wrong slot.
-                if (sig.linkageName.starts_with("__cflat_tpl_")) continue;
-                if (sig.paramSpellings.size() < arguments.size()
-                    || !fitsBraces(sig.paramSpellings)
-                    || !nonBraceArgumentsFit(sig.paramSpellings, false)) continue;
-                const auto bracePriority = bracePriorityFor(sig.paramSpellings, sig.paramNames);
+                if (sig.paramTypes.size() < arguments.size()
+                    || !fitsBraces(sig.paramTypes)
+                    || !nonBraceArgumentsFit(sig.paramTypes, false)) continue;
+                const auto bracePriority = bracePriorityFor(sig.paramTypes, sig.paramNames);
                 if (!bracePriority) continue;
                 // CVAMB: defaulted parameters are not ranked (clang ties a default-argument overload on its
                 // arguments alone); braced and plain arguments rank per argument.
                 bool certain = true;
-                const std::vector<size_t> ranks = argumentRanks(sig.paramSpellings, certain, 0);
+                const std::vector<size_t> ranks = argumentRanks(sig.paramTypes, certain, 0);
                 if (pass == 0 && isNotViable(ranks)) continue;
-                seenCandidates.push_back({ *bracePriority, ranks, certain, sig.paramSpellings, unranked });
-                const size_t extraParameters = sig.paramSpellings.size() - arguments.size();
+                seenCandidates.push_back({ *bracePriority, ranks, certain, sig.paramTypes,
+                                           sig.isTemplate, unranked });
+                const size_t extraParameters = sig.paramTypes.size() - arguments.size();
                 int order = selected.found ? compareRanks(ranks, selectedRanks) : -1;
                 // CVAMB r1: an uncertain tie keeps master's fewer-defaulted-parameters preference.
                 if (selected.found && order == 0 && !(certain && selectedCertain))
                     order = extraParameters < selectedExtraParameters ? -1
                         : (extraParameters > selectedExtraParameters ? 1 : 0);
+                if (selected.found && order == 0 && certain && selectedCertain
+                    && sig.isTemplate != selected.isTemplate)
+                    order = sig.isTemplate ? 1 : -1;
+                if (selected.found && order == 0 && certain && selectedCertain
+                    && sig.isTemplate && selected.isTemplate)
+                {
+                    auto normalizedConstList = [](std::vector<std::string> patterns, bool& hadConst) {
+                        for (std::string& pattern : patterns)
+                            for (size_t at; (at = pattern.find("initializer_list<const "))
+                                                 != std::string::npos; )
+                            {
+                                hadConst = true;
+                                pattern.replace(at, std::string("initializer_list<const ").size(),
+                                                "initializer_list<");
+                            }
+                        return patterns;
+                    };
+                    bool candidateConst = false;
+                    bool selectedConst = false;
+                    const auto candidatePattern = normalizedConstList(sig.templatePatternTypes,
+                                                                       candidateConst);
+                    const auto selectedPattern = normalizedConstList(
+                        selected.templatePatternTypes, selectedConst);
+                    if (candidatePattern == selectedPattern && candidateConst != selectedConst)
+                        order = candidateConst ? -1 : 1;
+                }
+                const bool deferTemplateTie = selected.found && order == 0 && certain && selectedCertain
+                    && sig.isTemplate && selected.isTemplate;
                 const bool better = !selected.found
                     || *bracePriority < selectedBracePriority
                     || (*bracePriority == selectedBracePriority && order == -1);
                 if (!better)
                 {
-                    if (selected.found && *bracePriority == selectedBracePriority && order != 1)
+                    if (selected.found && *bracePriority == selectedBracePriority && order != 1
+                        && !deferTemplateTie)
                     {
                         if (certain && selectedCertain) bracesTied = true;
                         else bracesTied = selectedCertain = false;
-                        if (bracesTied) tiedCandidates.push_back(displayCandidate(functionName, sig.paramSpellings));
+                        if (bracesTied) tiedCandidates.push_back(displayCandidate(functionName, sig.paramTypes));
                     }
                     continue;
                 }
                 // A strictly better candidate replaces any earlier tie.
                 bracesTied = false;
                 tiedCandidates.clear();
-                selected.paramTypes = sig.paramSpellings;
+                selected.paramTypes = sig.paramTypes;
                 selected.paramNames = sig.paramNames;
-                selected.retType = sig.retSpelling;
+                selected.retType = sig.retType;
                 selected.target = CxxNameFromCflat(functionName);
+                selected.templatePatternTypes = sig.templatePatternTypes;
                 selected.file = sig.file;
                 selected.line = sig.line;
                 selected.col = sig.col;
                 selected.isNoexcept = sig.isNoexcept;
+                selected.isTemplate = sig.isTemplate;
+                selected.hasConstListPattern = sig.hasConstListPattern;
                 selectedBracePriority = *bracePriority;
                 selectedRanks = ranks;
                 selectedExtraParameters = extraParameters;
                 selectedCertain = certain;
                 selected.found = true;
-                selectedShownParams = sig.paramSpellings;
-                tiedCandidates = {displayCandidate(functionName, sig.paramSpellings)};
+                selectedShownParams = sig.paramTypes;
+                tiedCandidates = {displayCandidate(functionName, sig.paramTypes)};
             }
             if (selected.found)
                 noteRivalsOfPick(seenCandidates, selectedBracePriority, selectedRanks, selectedCertain,
+                                 selected.isTemplate,
                                  selectedShownParams, functionName, bracesTied, tiedCandidates);
             if (bracesTied)
             {
@@ -6614,7 +6851,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                                                                           instance ? 1 : 0);
                 ranks.insert(ranks.end(), argumentRanksOf.begin(), argumentRanksOf.end());
                 if (pass == 0 && isNotViable(ranks)) continue;
-                seenCandidates.push_back({ *bracePriority, ranks, certain, memberShownParams(member), unranked });
+                seenCandidates.push_back({ *bracePriority, ranks, certain,
+                                           memberShownParams(member), false, unranked });
                 const size_t extraParameters = member.paramTypes.size() - arguments.size();
                 int order = fallback != nullptr ? compareRanks(ranks, fallbackRanks) : -1;
                 // CVAMB r1: an uncertain tie keeps master's fewer-defaulted-parameters preference.
@@ -6646,6 +6884,7 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             }
             if (fallback != nullptr)
                 noteRivalsOfPick(seenCandidates, fallbackBracePriority, fallbackRanks, fallbackCertain,
+                                 false,
                                  fallbackShownParams, memberName, bracesTied, tiedCandidates);
             if (bracesTied)
             {
@@ -7077,6 +7316,10 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         {
             auto it = cxxFunctionOwnerGroup_.find(functionName);
             if (it != cxxFunctionOwnerGroup_.end()) groupIndex = it->second;
+            else if (selected.isTemplate)
+                if (auto templateOwner = cxxFunctionTemplateOwnerGroup_.find(functionName);
+                    templateOwner != cxxFunctionTemplateOwnerGroup_.end())
+                    groupIndex = templateOwner->second;
         }
         else
         {

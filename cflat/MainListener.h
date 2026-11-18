@@ -1501,6 +1501,10 @@ void NamedLocalReturnVisit(antlr4::tree::ParseTree* node, NamedLocalReturnScan& 
 std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandidates(
     CFlatParser::FunctionDefinitionContext* func);
 
+// Locals whose initializer and every whole-variable assignment resolve to this or another such local.
+std::unordered_set<CFlatParser::DirectDeclaratorContext*> ClassifyThisReceiverAliasLocals(
+    CFlatParser::FunctionDefinitionContext* func);
+
 enum class ValueStructReturnKind { NotApplicable, AllBorrowedParam, Mixed };
 
 // Classify the by-value STRUCT returns of a function whose return type carries no ownership
@@ -3051,6 +3055,7 @@ private:
         bool HasPendingCallValue = false;
     };
     std::vector<ArrowOwnedTemp> arrowOwnedTemps_;
+    std::unordered_set<CFlatParser::DirectDeclaratorContext*> thisReceiverAliasDeclarators_;
     std::unordered_map<CFlatParser::FunctionDefinitionContext*,
         std::unordered_set<std::string>> functionLocalEnumNamesCache_;
     struct ReturnedStructFrameCandidate

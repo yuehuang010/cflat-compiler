@@ -1132,6 +1132,102 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             return scalarFamily(want) == scalarFamily(got);
         };
 
+        auto fixedArrayPointerCompatible = [&](const CxxClassInfo::Structor& ctor,
+                                               size_t parameterIndex,
+                                               const TypeAndValue& want,
+                                               const NamedVariable& argument) {
+            auto* self = const_cast<LLVMBackend*>(this);
+            if (!want.Pointer || want.IsCxxRefToPointer || want.IsFunctionPointer)
+                return false;
+            FunctionSymbol spelledCtor;
+            spelledCtor.IsCxx = true;
+            spelledCtor.UniqueName = ctor.linkageName;
+            const std::string spelling = CxxReferenceParameterSpelling(spelledCtor, parameterIndex);
+            if (spelling.empty() || CxxArrayReferenceSpelling(spelledCtor, parameterIndex))
+                return false;
+
+            std::vector<uint64_t> sourceDimensions;
+            if (argument.TypeAndValue.ConstArraySize != 0)
+            {
+                sourceDimensions.push_back(argument.TypeAndValue.ConstArraySize);
+                sourceDimensions.insert(sourceDimensions.end(),
+                    argument.TypeAndValue.ConstInnerDimensions.begin(),
+                    argument.TypeAndValue.ConstInnerDimensions.end());
+            }
+            else
+                for (llvm::Type* arrayType = argument.BaseType;
+                     llvm::isa_and_nonnull<llvm::ArrayType>(arrayType); )
+                {
+                    auto* fixedArray = llvm::cast<llvm::ArrayType>(arrayType);
+                    sourceDimensions.push_back(fixedArray->getNumElements());
+                    arrayType = fixedArray->getElementType();
+                }
+            if (sourceDimensions.empty()) return false;
+
+            const std::string compact = SqueezeCxxSpelling(spelling);
+            const size_t compactPointerArray = compact.find("(*)[");
+            const size_t rawPointerArray = spelling.find("(*)");
+            std::string elementSpelling;
+            if (compactPointerArray != std::string::npos)
+            {
+                if (rawPointerArray == std::string::npos || sourceDimensions.size() < 2)
+                    return false;
+                elementSpelling = spelling.substr(0, rawPointerArray);
+                std::string expectedDimensions;
+                for (size_t dimension = 1; dimension < sourceDimensions.size(); ++dimension)
+                    expectedDimensions += std::format("[{}]", sourceDimensions[dimension]);
+                if (compact.substr(compactPointerArray + 3) != expectedDimensions)
+                    return false;
+            }
+            else
+            {
+                if (sourceDimensions.size() != 1) return false;
+                TypeAndValue target;
+                if (!self->MapCTypeToTypeAndValue(spelling, target, true)
+                    || !target.Pointer || target.ValuePointerDepth() != 1
+                    || target.ElemPointer || target.IsFunctionPointer)
+                    return false;
+                if (target.TypeName == "void")
+                {
+                    const bool sourceConst = argument.TypeAndValue.PointeeConst()
+                        || CxxArgumentPointeeConst(argument);
+                    return !sourceConst || target.PointeeConstBit();
+                }
+                const size_t pointer = spelling.find('*');
+                if (pointer == std::string::npos) return false;
+                elementSpelling = spelling.substr(0, pointer);
+            }
+
+            TypeAndValue targetElement;
+            if (!self->MapCTypeToTypeAndValue(elementSpelling, targetElement, true)
+                || targetElement.Pointer || targetElement.ElemPointer
+                || targetElement.IsFunctionPointer)
+                return false;
+            std::string sourceName = argument.InferSourceTypeName;
+            if (sourceName.empty()) sourceName = argument.TypeAndValue.TypeName;
+            const std::string sourceEnum = ResolveEnumTypeName(sourceName);
+            const std::string targetEnum = ResolveEnumTypeName(targetElement.TypeName);
+            bool sameElement = false;
+            if (!sourceEnum.empty() || !targetEnum.empty())
+                sameElement = !sourceEnum.empty() && !targetEnum.empty()
+                    && ResolveTypeAlias(sourceEnum) == ResolveTypeAlias(targetEnum);
+            else if (IsCxxRecord(sourceName) || IsCxxRecord(targetElement.TypeName))
+                sameElement = IsCxxRecord(sourceName) && IsCxxRecord(targetElement.TypeName)
+                    && ResolveTypeAlias(sourceName) == ResolveTypeAlias(targetElement.TypeName);
+            else
+                sameElement = !CanonicalPrimitiveTypeName(sourceName).empty()
+                    && CanonicalPrimitiveTypeName(sourceName)
+                        == CanonicalPrimitiveTypeName(targetElement.TypeName);
+            if (!sameElement) return false;
+
+            const bool sourceConst = argument.TypeAndValue.PointeeConst()
+                || CxxArgumentPointeeConst(argument);
+            const bool targetConst = compactPointerArray != std::string::npos
+                ? CxxSpellingHasTopLevelConst(elementSpelling)
+                : (CxxSpellingPointeeConstMask(spelling, 1) & 1u) != 0;
+            return !sourceConst || targetConst;
+        };
+
         bool rejectedIntegerFunctionPointer = false;
         bool rejectedFunctionPointerToInteger = false;
         size_t rejectedFunctionPointerIntegerParameter = 0;
@@ -1321,6 +1417,16 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             for (size_t i = 0; i < argTypes.size(); ++i)
             {
                 const auto& want = c.params[i + 1];
+                if (argVars != nullptr && i < argVars->size())
+                {
+                    FunctionSymbol spelledCtor;
+                    spelledCtor.IsCxx = true;
+                    spelledCtor.UniqueName = c.linkageName;
+                    const std::string spelling = CxxReferenceParameterSpelling(spelledCtor, i + 1);
+                    if (SqueezeCxxSpelling(spelling).find("(*)[") != std::string::npos
+                        && !IsCxxFixedArrayArgument((*argVars)[i]))
+                    { ok = false; break; }
+                }
                 TypeAndValue got = argTypes[i];
                 if (argVars != nullptr && i < argVars->size()
                     && IsCxxFixedArrayArgument((*argVars)[i]))
@@ -1600,8 +1706,20 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     && want.Pointer && (want.IsRvalueRef || want.CxxConstRef())
                     && !want.ElemPointer && !want.IsCxxRefToPointer && want.IsInteger() != -1
                     && !got.Pointer && IsNullPointerConstantArgument((*argVars)[i], true);
+                bool fixedArrayPointerParam = false;
+                if (argVars != nullptr && i < argVars->size()
+                    && IsCxxFixedArrayArgument((*argVars)[i]) && want.Pointer
+                    && !want.IsCxxRefToPointer && !want.IsFunctionPointer)
+                {
+                    FunctionSymbol spelledCtor;
+                    spelledCtor.IsCxx = true;
+                    spelledCtor.UniqueName = c.linkageName;
+                    fixedArrayPointerParam = !CxxArrayReferenceSpelling(spelledCtor, i + 1);
+                }
                 const bool compatibleArg = namedFunctionMatches || nullScalarReference
-                    || compatible(want, got);
+                    || (fixedArrayPointerParam
+                        ? fixedArrayPointerCompatible(c, i + 1, want, (*argVars)[i])
+                        : compatible(want, got));
                 // The slice ties like any by-value base, but refuses when C++ picks it.
                 if (compatibleArg && !want.Pointer && !got.Pointer && want.TypeName != got.TypeName
                     && IsCxxRecord(want.TypeName) && IsCxxDerivedToBaseValue(got, want, nullptr))
@@ -3202,7 +3320,8 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         return true;
 }
 
-bool LLVMBackend::HasImplicitClassConversionOperator(const std::string& sourceType)
+bool LLVMBackend::HasImplicitClassConversionOperator(const std::string& sourceType,
+                                                     bool includePointerTargets)
 {
         std::set<std::string> visited;
         auto hasOperator = [&](auto&& self, const std::string& type) -> bool {
@@ -3217,7 +3336,7 @@ bool LLVMBackend::HasImplicitClassConversionOperator(const std::string& sourceTy
                 TypeAndValue returnType;
                 if (MapCTypeToTypeAndValue(member.retType, returnType, /*cxxBoundary*/ true)
                     && !returnType.IsPrimitive() && !returnType.ElemPointer
-                    && (!returnType.Pointer || returnType.IsAlias))
+                    && (includePointerTargets || !returnType.Pointer || returnType.IsAlias))
                     return true;
             }
             for (const auto& base : record->second.bases)
@@ -5423,7 +5542,9 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                                                  bool* ambiguous,
                                                  std::vector<std::string>* ambiguousCandidates,
                                                  const TypeAndValue* receiver,
-                                                 bool* derivedResult) const
+                                                 bool* derivedResult,
+                                                 bool allowTemplateRequest,
+                                                 bool allowNonzeroDerivedOffset) const
 {
         if (needsStandardConversion != nullptr) *needsStandardConversion = false;
         if (ambiguous != nullptr) *ambiguous = false;
@@ -5473,8 +5594,23 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 // EnsureCxxConversionOperatorsProjected.
                 const std::string cflatSpelling =
                     SpellType(*this, TypeAndValue{ .TypeName = spelling, .Pointer = true });
-                return std::vector<std::string>{ "operator " + cflatSpelling,
+                std::vector<std::string> result{ "operator " + cflatSpelling,
                                                  sourceTypeName + ".operator " + cflatSpelling };
+                if (auto record = cxxRecordEntries_.find(sourceTypeName);
+                    record != cxxRecordEntries_.end())
+                    for (const auto& member : record->second.members)
+                    {
+                        if (!member.isConversion) continue;
+                        TypeAndValue ret;
+                        if (!self->MapCTypeToTypeAndValue(member.retType, ret, true)
+                            || member.retType.find('&') == std::string::npos
+                            || !IsCxxRecord(ret.TypeName)
+                            || (ret.TypeName != spelling
+                                && !IsCxxBaseOf(spelling, ret.TypeName)))
+                            continue;
+                        result.push_back(member.name);
+                    }
+                return result;
             }
             TypeAndValue targetType;
             targetType.TypeName = spelling;
@@ -5589,6 +5725,13 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                         returnTypeName = ret.TypeName;
                         return true;
                     }
+                    if (ret.IsAlias && IsCxxRecord(ret.TypeName)
+                        && IsCxxRecord(dest.TypeName) && ret.TypeName != dest.TypeName
+                        && IsCxxBaseOf(dest.TypeName, ret.TypeName))
+                    {
+                        returnTypeName = ret.TypeName;
+                        return true;
+                    }
                     return false;
                 }
                 if (classValueTarget)
@@ -5677,7 +5820,7 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         std::string returnTypeName;
         int exactReceiverRank = 0;
         std::string exactName;
-        // (conversion name, result class) of every derived-class pointer result usable here.
+        // (conversion name, result class) of every derived-class result usable here.
         std::vector<std::pair<std::string, std::string>> derivedCandidates;
         std::vector<int> derivedReceiverRanks;
         bool exactAddsConst = false;
@@ -5687,7 +5830,8 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
             int receiverRankOfName = 0;
             if (usable(name, returnTypeName, &receiverRankOfName, &addsConst))
             {
-                if (classReferenceTarget) return name;
+                if (classReferenceTarget && canonical(returnTypeName) == resolvedDestType)
+                    return name;
                 if (canonical(returnTypeName) == resolvedDestType)
                 {
                     if (exactName.empty())
@@ -5703,8 +5847,21 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 const bool explicitOperator = name.find("__cflat_explicit_") != std::string::npos
                     || (info != nullptr && info->explicitConversions.count(
                             opQualifier == std::string::npos ? name : name.substr(opQualifier + 1)) != 0);
-                if (dest.Pointer && !explicitOperator)
+                const bool derivedClassResult = (dest.Pointer || classReferenceTarget)
+                    && IsCxxRecord(returnTypeName) && IsCxxRecord(dest.TypeName)
+                    && returnTypeName != dest.TypeName
+                    && IsCxxBaseOf(dest.TypeName, returnTypeName);
+                if (derivedClassResult && !explicitOperator)
                 {
+                    if (!allowNonzeroDerivedOffset)
+                    {
+                        uint64_t baseOffset = 0;
+                        bool inaccessible = false;
+                        if (!FindCxxBaseOffset(returnTypeName, dest.TypeName,
+                                               baseOffset, inaccessible)
+                            || inaccessible || baseOffset != 0)
+                            continue;
+                    }
                     derivedCandidates.emplace_back(name, returnTypeName);
                     derivedReceiverRanks.push_back(receiverRankOfName);
                 }
@@ -5735,13 +5892,16 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         // Conversion-function templates are target-deduced by clang. The raw member table has
         // only a presence bit for them, so ask clang lazily when no exact projected candidate
         // settled this destination.
-        if (std::string templateName = requestTemplateConversion(); !templateName.empty())
-            return templateName;
+        if (allowTemplateRequest)
+        {
+            if (std::string templateName = requestTemplateConversion(); !templateName.empty())
+                return templateName;
+        }
 
-        if (classReferenceTarget || classValueTarget) return exactName;
+        if (classValueTarget) return exactName;
         // Derived-class results: the class that is a base of every other one wins (clang's
         // better conversion); unrelated classes are ambiguous, never taken first.
-        if (dest.Pointer && !derivedCandidates.empty())
+        if ((dest.Pointer || classReferenceTarget) && !derivedCandidates.empty())
         {
             if (derivedResult != nullptr) *derivedResult = true;
             const std::pair<std::string, std::string>* chosen = nullptr;
@@ -6080,10 +6240,8 @@ std::string LLVMBackend::ScoreCxxConversionOperatorArgument(const NamedVariable&
         std::string opName = CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param,
                                                            false, &needsStandardConversion,
                                                            &ambiguous, &ambiguousCandidates,
-                                                           &arg.TypeAndValue, &derived);
-        // preserveAmbiguous is set for a CFlat callee, which gets no derived-class conversion
-        // lowering: refuse the derived shape there, as master did.
-        if (preserveAmbiguous && derived) return {};
+                                                           &arg.TypeAndValue, &derived, true,
+                                                           !preserveAmbiguous);
         if (ambiguous)
         {
             if (!preserveAmbiguous) return {};

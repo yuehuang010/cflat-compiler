@@ -4201,3 +4201,58 @@ namespace cppi_t320
             && born == 2 && dead == 2;
     }
 }
+
+namespace w13b
+{
+    struct P { int value = 41; };
+    struct D : P {};
+    struct D1 : P {};
+    struct D3 : P {};
+    inline int read(P* p) { return p->value; }
+    inline int read(const P* p) { return p->value; }
+    inline int read(P& p) { return p.value; }
+    inline int read(const P& p) { return p.value; }
+    struct Conv
+    {
+        char pad[64] = {};
+        D d;
+        mutable int hit = 0;
+        operator D*() { hit = 1; return &d; }
+        operator const D*() const { hit = 2; return &d; }
+        operator D&() { hit = 3; return d; }
+        operator const D&() const { hit = 4; return d; }
+    };
+    struct ConvExact
+    {
+        char pad[64] = {};
+        P p;
+        mutable int hit = 0;
+        operator P*() { hit = 2; return &p; }
+    };
+    struct Unrelated
+    {
+        D1 d1;
+        D3 d3;
+        operator D1*() { return &d1; }
+        operator D3*() { return &d3; }
+    };
+    struct CtorAmbig
+    {
+        int which;
+        CtorAmbig(int, ...) : which(1) {}
+        CtorAmbig(long, int) : which(2) {}
+    };
+    struct CtorAccept
+    {
+        int which;
+        CtorAccept(int, ...) : which(1) {}
+        CtorAccept(long, double) : which(2) {}
+    };
+    struct VariadicMember
+    {
+        template<class T> int pick(T, ...) { return 9; }
+        int pick(long, ...) { return 10; }
+    };
+    template<class T> inline int variadic_template(T, ...) { return 1; }
+    inline int variadic_template(long, ...) { return 2; }
+}

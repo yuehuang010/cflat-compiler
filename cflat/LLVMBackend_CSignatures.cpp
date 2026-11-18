@@ -821,7 +821,10 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     ptv.Pointer = true;
                     ptv.ElemPointer = false;
                     ptv.PointerDepth = 1;
-                    ptv.ConstArraySize = arrayExtent;
+                    // `T (*)[N]` is one pointer parameter; its row extent is a pointee type
+                    // constraint, not array storage around the pointer value.
+                    if (SqueezeCxxSpelling(r.paramTypes[i]).find("(*)[") == std::string::npos)
+                        ptv.ConstArraySize = arrayExtent;
                 }
                 else if (r.isCxx && r.paramTypes[i].find("function<") != std::string::npos)
                 {

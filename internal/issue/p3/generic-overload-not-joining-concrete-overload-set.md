@@ -5,6 +5,9 @@ resolves the call on its own, so every call master REFUSED and clang accepts now
 namespace, both declaration orders). Matrix and probes: scratch/repro_keep/genovl/ (genovl_report.md, genovl_review1.md,
 review1/cases/).
 
+GENLEFT item 3's depth-2 half is accepted for CFlat `(const int)**` -> `T**`; master already handled that spelling.
+Fully-const CFlat `const int**` remains refused for `T**`, because that would drop const from an intermediate pointer.
+
 ## RULED 2026-10-29, landed GENOVLR (5344802ed)
 
 Exact generic beats a concrete candidate reached by widening (C++/C# non-template tiebreak on the deduced parameter types,
@@ -15,13 +18,6 @@ operand is wider keeps CFlat's own wider type (`1 << 2L` -> long, see below).
 Pre-existing, kept (expression typing, not ranking): CFlat types `1 << 2L` as long (clang int); `1.5 + x` with int x is
 float (clang double); char/u8/short variable arithmetic is not promoted to int; `'a' + 'b'` into a generic is refused.
 Kept by main-session decision: `f(const int*)` + `f<T>(T*)` with an `int*` picks f(const int*) (clang: the generic).
-
-## Leftovers (no ruling needed; clang accepts, CFlat refuses)
-
-- `f(char*)` + `f<T>(T)` with a string literal: ranking ignores pointee const, so f(char*) wins and is then refused.
-- Named arguments into a generic (`f<T>(T a, T* b)` called `f(b: q, a: l)`): inference is positional.
-- Generic-only `T get<T>(T* p)` from a `const int*`, and `h<T>(T** p)` from a `const int**`.
-- UFCS `p.f()` with a free generic `f<T>(T*)` reports "function 'f' is not known".
 
 Note 2026-10-31: the "pre-existing, kept" expression-typing lines above are SUPERSEDED in part by the 2026-10-31 maintainer ruling in
 internal/fix-issue-lessons.md (native arithmetic follows C usual conversions): `1 << 2L` is `int` (promoted LEFT operand),

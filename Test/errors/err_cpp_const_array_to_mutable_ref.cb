@@ -119,3 +119,78 @@ expect_error("no overload") {
         return s[a];
     }
 }
+expect_error("const") {
+    int array_to_mutable_pointer_ctor_error() {
+        const int[3] a = {1, 2, 3};
+        cpp_ptrref.ArrayConversionMutable value = cpp_ptrref.ArrayConversionMutable(a);
+        return 0;
+    }
+}
+expect_error("no overload") {
+    int array_to_explicit_pointer_ctor_error() {
+        int[3] a = {1, 2, 3};
+        return cpp_ptrref.array_conversion_explicit_pick(a);
+    }
+}
+expect_error("no overload") {
+    int array_to_long_pointer_ctor_error() {
+        int[3] a = {1, 2, 3};
+        return cpp_ptrref.array_conversion_long_pick(a);
+    }
+}
+expect_error("no overload") {
+    int array_to_intpp_ctor_error() {
+        int[3] a = {1, 2, 3};
+        return cpp_ptrref.array_conversion_intpp_pick(a);
+    }
+}
+expect_error("no overload") {
+    int array_to_char_pointer_ctor_error() {
+        int[3] a = {1, 2, 3};
+        return cpp_ptrref.array_conversion_char_pick(a);
+    }
+}
+expect_error("no overload") {
+    int array_grid_to_flat_pointer_ctor_error() {
+        int[2][3] a = {{1, 2, 3}, {4, 5, 6}};
+        return cpp_ptrref.array_conversion_only_pick(a);
+    }
+}
+expect_error("no overload") {
+    int pointer_to_row_ctor_error() {
+        int value = 1;
+        int* p = &value;
+        return cpp_ptrref.array_conversion_row_pick(p);
+    }
+}
+expect_error("no overload") {
+    int const_grid_to_mutable_row_ctor_error() {
+        const int[2][3] a = {{1, 2, 3}, {4, 5, 6}};
+        return cpp_ptrref.array_conversion_mutable_row_pick(a);
+    }
+}
+expect_error("no overload") {
+    int unsigned_array_to_enum_pointer_ctor_error() {
+        unsigned int[3] a = {1, 2, 3};
+        return cpp_ptrref.array_conversion_enum_pick(a);
+    }
+}
+expect_error("no overload") {
+    int enum_array_to_unsigned_pointer_ctor_error() {
+        cpp_ptrref.ArraySubscriptElem[3] a = {cpp_ptrref.ArraySubscriptElemA,
+            cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC};
+        return cpp_ptrref.array_conversion_unsigned_pick(a);
+    }
+}
+expect_error("array_conversion_twins") {
+    int array_to_ambiguous_classes_error() {
+        int[3] a = {1, 2, 3};
+        return cpp_ptrref.array_conversion_twins(a);
+    }
+}
+expect_error("array_conversion_dual") {
+    int array_to_byvalue_or_constref_error() {
+        int[3] a = {1, 2, 3};
+        return cpp_ptrref.array_conversion_dual(a);
+    }
+}

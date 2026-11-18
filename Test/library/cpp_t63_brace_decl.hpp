@@ -428,3 +428,64 @@ struct S {
 inline int pb(int, std::initializer_list<int>) { return 1; }
 inline int pb(long, std::initializer_list<int>) { return 2; }
 }
+
+template<class T> inline int tbr_tp(std::initializer_list<T>) { return 2; }
+inline int tbr_tp(std::initializer_list<long>) { return 1; }
+template<class T> inline int tbr_ts(T, std::initializer_list<T>) { return 2; }
+inline int tbr_ts(int, std::initializer_list<long>) { return 1; }
+template<class T> inline int tbr_tr(std::initializer_list<T>, int) { return 2; }
+inline int tbr_tr(std::initializer_list<long>, int) { return 1; }
+template<class T> inline int tbr_tn(std::initializer_list<T>) { return 2; }
+inline int tbr_tn(std::initializer_list<int>) { return 1; }
+template<class T> inline int tbr_only(std::initializer_list<T>) { return 3; }
+inline int tbr_only_nt(std::initializer_list<long>) { return 4; }
+template<class T> inline int tbr_twospec(std::initializer_list<T>) { return 5; }
+template<class T> inline int tbr_twospec(std::initializer_list<const T>) { return 6; }
+template<class T> inline int tbr_twoamb(T, std::initializer_list<int>) { return 7; }
+template<class T> inline int tbr_twoamb(int, std::initializer_list<T>) { return 8; }
+template<class T> inline int tbr_tq(std::initializer_list<T>) { return 9; }
+
+namespace nn {
+template<class T> inline int tbr_tp(std::initializer_list<T>) { return 2; }
+inline int tbr_tp(std::initializer_list<long>) { return 1; }
+template<class T> inline int tbr_ts(T, std::initializer_list<T>) { return 2; }
+inline int tbr_ts(int, std::initializer_list<long>) { return 1; }
+template<class T> inline int tbr_tr(std::initializer_list<T>, int) { return 2; }
+inline int tbr_tr(std::initializer_list<long>, int) { return 1; }
+template<class T> inline int tbr_tn(std::initializer_list<T>) { return 2; }
+inline int tbr_tn(std::initializer_list<int>) { return 1; }
+template<class T> inline int tbr_only(std::initializer_list<T>) { return 3; }
+inline int tbr_only_nt(std::initializer_list<long>) { return 4; }
+template<class T> inline int tbr_twospec(std::initializer_list<T>) { return 5; }
+template<class T> inline int tbr_twospec(std::initializer_list<const T>) { return 6; }
+template<class T> inline int tbr_twoamb(T, std::initializer_list<int>) { return 7; }
+template<class T> inline int tbr_twoamb(int, std::initializer_list<T>) { return 8; }
+template<class T> inline int tbr_tq(std::initializer_list<T>) { return 9; }
+}
+
+// BRACETPL r2 fixtures
+namespace btr2 {
+struct ClassElement { int value = 0; };
+
+template<class T> inline int pb(T*, std::initializer_list<int>) { return 2; }
+inline int pb(void*, std::initializer_list<int>) { return 1; }
+
+template<class T> inline int pc(const T&, std::initializer_list<int>) { return 2; }
+inline int pc(long, std::initializer_list<int>) { return 1; }
+
+template<class Elem> inline int pa(std::initializer_list<Elem>) { return 2; }
+inline int pa(std::initializer_list<long>) { return 1; }
+
+template<class T> inline int pj(std::initializer_list<T>) { return 2; }
+inline int pj(std::initializer_list<ClassElement>) { return 1; }
+
+template<class T> inline int pe0(T, std::initializer_list<T>) { return 2; }
+inline int pe0(long, std::initializer_list<int>) { return 1; }
+template<class T> inline int pe1(std::initializer_list<T>) { return 2; }
+inline int pe1(std::initializer_list<int>) { return 1; }
+
+namespace q {
+template<class T> inline int pz(T*, std::initializer_list<int>) { return 2; }
+inline int pz(void*, std::initializer_list<int>) { return 1; }
+}
+}

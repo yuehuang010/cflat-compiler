@@ -84,6 +84,8 @@ LLVMBackend::TypeAndValue LLVMBackend::CxxFixedArrayDecayType(const NamedVariabl
 {
         LLVMBackend::TypeAndValue type = arg.TypeAndValue;
         if (!IsCxxFixedArrayArgument(arg)) return type;
+        if (type.TypeName.empty())
+            type.TypeName = arg.InferSourceTypeName;
         type.PointerDepth = type.PointerDepth > 0 ? type.PointerDepth + 1
             : (type.Pointer ? 2 : 1);
         type.ElemPointer = type.ElemPointer || type.Pointer;

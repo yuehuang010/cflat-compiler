@@ -2789,7 +2789,8 @@ nlohmann::json LLVMBackend::FunctionTemplateToJson(
 {
         nlohmann::json j = { {"n", t.name}, {"o", t.owner}, {"m", t.memberName},
                  {"c", t.cxxSpelling}, {"k", t.kind}, {"mi", t.minArity},
-                 {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"pp", t.hasParameterPack},
+                 {"ma", t.maxArity}, {"tp", t.typeParameterCount}, {"tn", t.typeParameterNames},
+                 {"pp", t.hasParameterPack},
                  {"pt", t.parameterTypes},
                  {"pn", t.parameterNames},
                  {"fr", t.forwardingReferenceParameters},
@@ -2815,6 +2816,7 @@ cflat_cinterop::RawFunctionTemplate LLVMBackend::FunctionTemplateFromJson(
         t.minArity = (unsigned)j.value("mi", (uint64_t)0);
         t.maxArity = (unsigned)j.value("ma", (uint64_t)0);
         t.typeParameterCount = (unsigned)j.value("tp", (uint64_t)0);
+        if (j.contains("tn")) t.typeParameterNames = j["tn"].to_string_vector();
         t.hasParameterPack = j.value("pp", false);
         if (j.contains("pt")) t.parameterTypes = j["pt"].to_string_vector();
         if (j.contains("pn")) t.parameterNames = j["pn"].to_string_vector();

@@ -37,11 +37,7 @@ Found by T325 review 1 (2026-10-16), PRE-EXISTING on master. T475 (2026-10-24) f
 
 ## Open residue (TERNADDR)
 
-- The ANTLR parser overflows the 8 MB stack at roughly 6000 nested parentheses; no guard runs before
-  compilationUnit(). Fix direction: a nesting pre-scan on the token stream before the parse.
-- Paren-only deep input overflows in the ForwardRefScanner walkers (see nested-ternary-compile-time.md residue).
 - Accepted where clang refuses (pre-existing, master and fix alike): `&(t ? x : (int)y)` (same-type cast arm,
   a prvalue in clang); `(t ? a : mk()).f = 9` (clang: "expression is not assignable").
 - Refused where clang accepts (pre-existing): `&(t ? c1 : c2)` on char globals into `char*`; both refuse
   `i8*` vs `char*`, clang compiles it.
-- Compile time of nested `?:` grows about 2x per level on master (see internal/issue/p3/nested-ternary-compile-time.md).

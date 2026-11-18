@@ -3,6 +3,8 @@
 // sibling better at the ellipsis position are ambiguous, as clang reports.
 import cpp "cpp_interop_basic.h";
 
+int w13b_cflat_take(w13b.P* p) { return w13b.read(p); }
+
 extern int main()
 {
     cppi.ConstPointerRankValue value = default;
@@ -21,6 +23,21 @@ extern int main()
     }
     expect_error("ambiguous call to 'cppi.variadic_zero_default'") {
         int d = cppi.variadic_zero_default();
+    }
+    // W13B A: unrelated derived conversion results are still ambiguous.
+    w13b.Unrelated unrelatedConversion = w13b.Unrelated();
+    expect_error("conversion from") {
+        int e = w13b_cflat_take(unrelatedConversion);
+    }
+    // W13B B: constructor projection sends variadic call shapes to clang.
+    expect_error("C++ variadic constructor call") {
+        w13b.CtorAmbig paren = w13b.CtorAmbig(1, 2);
+    }
+    expect_error("C++ brace constructor call") {
+        w13b.CtorAmbig brace = {1, 2};
+    }
+    expect_error("C++ variadic constructor call") {
+        w13b.CtorAmbig* allocated = new w13b.CtorAmbig(1, 2);
     }
     return 0;
 }

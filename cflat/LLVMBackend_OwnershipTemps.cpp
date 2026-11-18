@@ -6390,7 +6390,7 @@ std::string LLVMBackend::BorrowedSourceDisplayName(const NamedVariable& nv) cons
 void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,
                                             const std::vector<NamedVariable>& args)
 {
-        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callResult);
         if (call == nullptr) return;
         const llvm::Function* callee = call->getCalledFunction();
         if (callee == nullptr) return;
@@ -6524,13 +6524,13 @@ bool LLVMBackend::EveryImplementorMayReturnInterfaceArg(const std::string& iface
 
 /*
  * The interface-dispatch twin of RecordTempUniqueFieldArgs. Runs at the same point in the virtual
- * call as the direct path's recorder: after the move transfer, on the emitted CallInst.
+ * call as the direct path's recorder: after the move transfer, on the emitted CallBase.
  */
 void LLVMBackend::RecordTempUniqueFieldInterfaceArgs(llvm::Value* callResult,
         const std::string& ifaceName, const InterfaceMethod& method,
         const std::vector<NamedVariable>& args)
 {
-        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callResult);
         if (call == nullptr) return;
         for (size_t i = 0; i < method.Parameters.size(); i++)
         {

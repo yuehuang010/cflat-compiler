@@ -3005,7 +3005,7 @@ namespace cflat_cinterop
                     || !st.emittedFunctionTemplates.insert(ftd).second)
                     return true;
                 const auto* fd = ftd->getTemplatedDecl();
-                if (fd == nullptr || fd->isVariadic() || !fd->hasExternalFormalLinkage())
+                if (fd == nullptr || !fd->hasExternalFormalLinkage())
                     return true;
                 if (IsHiddenFriend(fd)) return true;
                 // A FREE binary operator template has no identifier, so the ordinary gate below
@@ -3029,6 +3029,7 @@ namespace cflat_cinterop
                     && !isMemberAssignmentOperatorTemplate) return true;
 
                 unsigned typeParameterCount = 0;
+                std::vector<std::string> typeParameterNames;
                 std::string templateParameterKinds;
                 for (const NamedDecl* tp : *ftd->getTemplateParameters())
                 {
@@ -3036,6 +3037,7 @@ namespace cflat_cinterop
                     if (typeParam != nullptr)
                     {
                         ++typeParameterCount;
+                        typeParameterNames.push_back(typeParam->getNameAsString());
                         templateParameterKinds += typeParam->isParameterPack() ? 'P' : 'T';
                         continue;
                     }
@@ -3122,7 +3124,7 @@ namespace cflat_cinterop
                 result.hasParameterPack = declaredArity > 0
                     && llvm::isa<PackExpansionType>(fd->getParamDecl(declaredArity - 1)->getType());
                 result.minArity = declaredArity - (result.hasParameterPack ? 1u : 0u);
-                result.maxArity = result.hasParameterPack
+                result.maxArity = result.hasParameterPack || fd->isVariadic()
                     ? std::numeric_limits<unsigned>::max() : result.minArity;
                 for (unsigned i = 0; i < declaredArity; ++i)
                 {
@@ -3162,6 +3164,7 @@ namespace cflat_cinterop
                        && fd->getParamDecl(result.minArity - 1)->hasDefaultArg())
                     --result.minArity;
                 result.typeParameterCount = typeParameterCount;
+                result.typeParameterNames = std::move(typeParameterNames);
                 result.templateParameterKinds = std::move(templateParameterKinds);
                 result.isConst = md != nullptr && !md->isStatic() && md->isConst();
                 result.isNoexcept = DeclIsNoexcept(fd, st.ci->getSema());

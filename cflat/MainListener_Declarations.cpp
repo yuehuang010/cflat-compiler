@@ -6188,6 +6188,10 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
 
         CopyWrittenCopyableParams(func, allParams);
 
+        llvm::SaveAndRestore<std::unordered_set<CFlatParser::DirectDeclaratorContext*>>
+            receiverAliasScope(thisReceiverAliasDeclarators_);
+        thisReceiverAliasDeclarators_ = ClassifyThisReceiverAliasLocals(func);
+
         auto blockItemList = func->compoundStatement()->blockItemList();
         auto recoveryMark = MarkExpectErrorRecoveryState();
 
@@ -14919,6 +14923,20 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto alloc = compiler->CreateLocalVariable(typeAndValue,
                         right ? right->getType() : nullptr, arraySize, line,
                         typeAndValue.UserAlignValue, localTargetStorage);
+                    if (!global_scope && !isStaticLocal && alloc != nullptr
+                        && llvm::isa<llvm::AllocaInst>(alloc)
+                        && typeAndValue.Pointer && !typeAndValue.ElemPointer
+                        && typeAndValue.PointerDepth == 1 && !typeAndValue.IsUnique
+                        && !typeAndValue.IsArrayView && !typeAndValue.IsFunctionPointer
+                        && haveInitializerSourceNV && initializerSourceNV.IsThisReceiver
+                        && initializerSourceNV.FieldName.empty()
+                        && initializerSourceNV.OwningStructName.empty()
+                        && initializerSourceNV.TypeAndValue.Pointer
+                        && !initializerSourceNV.TypeAndValue.ElemPointer
+                        && initializerSourceNV.TypeAndValue.PointerDepth <= 1
+                        && !initializerSourceNV.TypeAndValue.IsUnique
+                        && thisReceiverAliasDeclarators_.contains(direct))
+                        compiler->GetOrCreateStackVariable(name).IsThisReceiver = true;
                     if (!global_scope && isStaticLocal)
                         compiler->ApplyStaticArrayViewFieldUnknownLengthStores(
                             compiler->StaticArrayViewDeclaratorKey(initDecl->getStart()), name);

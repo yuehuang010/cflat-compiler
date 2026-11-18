@@ -35,6 +35,62 @@ struct LocalEnumScopeParkGuard
     LocalEnumScopeParkGuard& operator=(const LocalEnumScopeParkGuard&) = delete;
 };
 
+static std::vector<size_t> GenericParameterArgumentMap(
+        const std::vector<CFlatParser::ParameterDeclarationContext*>& parameters,
+        const std::vector<LLVMBackend::NamedVariable>& arguments,
+        CFlatParser::ArgumentExpressionListContext* argList, bool variadic)
+{
+    const size_t missing = std::numeric_limits<size_t>::max();
+    std::vector<size_t> map(parameters.size(), missing);
+    if (argList == nullptr)
+    {
+        for (size_t i = 0; i < parameters.size() && i < arguments.size(); ++i)
+            map[i] = i;
+        return map;
+    }
+
+    const auto expressions = argList->argumentNamedExpression();
+    if (arguments.size() < expressions.size()) return map;
+    const size_t prefix = arguments.size() - expressions.size();
+    if (prefix > parameters.size()) return map;
+
+    std::vector<LLVMBackend::TypeAndValue> targets(parameters.size());
+    std::vector<cflat_cinterop::RawDefaultArg> defaults(parameters.size());
+    for (size_t i = 0; i < parameters.size(); ++i)
+    {
+        auto* declarator = parameters[i]->declarator();
+        targets[i].VariableName = declarator != nullptr
+            ? getDirectDeclName(declarator->directDeclarator()) : std::string{};
+        if (parameters[i]->initializer() != nullptr)
+            defaults[i].kind = "nonconst";
+        if (i < prefix) map[i] = i;
+    }
+
+    std::vector<std::string> names;
+    names.reserve(expressions.size());
+    for (auto* expression : expressions)
+        names.push_back(expression->Identifier() != nullptr
+            ? expression->Identifier()->getText() : std::string{});
+    if (std::all_of(names.begin(), names.end(), [](const std::string& name) {
+            return name.empty();
+        }))
+    {
+        for (size_t i = 0; i < expressions.size() && prefix + i < parameters.size(); ++i)
+            map[prefix + i] = prefix + i;
+        return map;
+    }
+    const auto binding = LLVMBackend::ComputeArgumentPositions(
+        names, targets, variadic, prefix, &defaults);
+    if (!binding.Ok) return map;
+    for (size_t i = 0; i < binding.PosMap.size(); ++i)
+    {
+        const int64_t parameter = binding.PosMap[i];
+        if (parameter >= 0 && static_cast<size_t>(parameter) < map.size())
+            map[parameter] = prefix + i;
+    }
+    return map;
+}
+
 }
 
 
@@ -964,15 +1020,21 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
         if (argList != nullptr) argumentExpressions = argList->argumentNamedExpression();
         const size_t argumentOffset = args.size() >= argumentExpressions.size()
             ? args.size() - argumentExpressions.size() : 0;
-        for (size_t i = 0; i < paramDecls.size() && i < args.size(); i++)
+        const size_t implicitArgumentPrefix = argList != nullptr ? argumentOffset : 0;
+        const bool variadic = paramTypeList->Ellipsis() != nullptr;
+        const auto argumentMap = GenericParameterArgumentMap(paramDecls, args, argList, variadic);
+        for (size_t i = 0; i < paramDecls.size(); i++)
         {
             if (deductionConflict) break;
+            if (argumentMap[i] == std::numeric_limits<size_t>::max()) continue;
+            const size_t argumentIndex = argumentMap[i];
+            const auto& argument = args[argumentIndex];
             // A tuple parameter '(int, U)' binds each bare type-parameter element from the matching
             // element of a tuple argument (`h((1, 2))` binds U = int), before any LLVM-type fallback.
             if (auto* paramTuple = ParameterTupleSpecifier(paramDecls[i]))
             {
                 const auto& entries = paramTuple->tupleTypeEntry();
-                auto argTuple = tupleTypeArgs.find(args[i].TypeAndValue.TypeName);
+                auto argTuple = tupleTypeArgs.find(argument.TypeAndValue.TypeName);
                 if (paramTuple->tupleTypePackEntry() == nullptr && argTuple != tupleTypeArgs.end()
                     && argTuple->second.size() == entries.size())
                     for (size_t j = 0; j < entries.size(); ++j)
@@ -1035,23 +1097,23 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 const bool nestedTypeBinding = paramTypeName.empty() && nestedParamTypeName == tp;
                 if (paramTypeName != tp && !nestedTypeBinding)
                     continue;
-                const auto& tv = args[i].TypeAndValue;
-                const auto& sourceTV = args[i].HasOriginalArgumentType
-                    ? args[i].OriginalArgumentType : tv;
+                const auto& tv = argument.TypeAndValue;
+                const auto& sourceTV = argument.HasOriginalArgumentType
+                    ? argument.OriginalArgumentType : tv;
                 // The call site drops TypeName for primitives, so the declared name arrives on
                 // the side channel; the reference-kind flags are propagated either way.
-                std::string base = tv.TypeName.empty() ? args[i].InferSourceTypeName : tv.TypeName;
+                std::string base = tv.TypeName.empty() ? argument.InferSourceTypeName : tv.TypeName;
                 bool declared = false;
                 bool fromLiteral = false;
                 std::string argType;
-                std::string literalIdentity = args[i].LiteralIdentity;
-                if (literalIdentity.empty() && i >= argumentOffset
-                    && i - argumentOffset < argumentExpressions.size())
-                    if (auto* assignment = argumentExpressions[i - argumentOffset]->assignmentExpression())
+                std::string literalIdentity = argument.LiteralIdentity;
+                if (literalIdentity.empty() && argumentIndex >= argumentOffset
+                    && argumentIndex - argumentOffset < argumentExpressions.size())
+                    if (auto* assignment = argumentExpressions[argumentIndex - argumentOffset]->assignmentExpression())
                         literalIdentity = GenericLiteralExpressionIdentity(assignment,
-                            args[i].HasOriginalArgumentType
-                                ? args[i].OriginalArgumentType.TypeName
-                                : args[i].TypeAndValue.TypeName);
+                            argument.HasOriginalArgumentType
+                                ? argument.OriginalArgumentType.TypeName
+                                : argument.TypeAndValue.TypeName);
                 // A function value's ABI carrier is __closure_fat_ptr / __c_fn_ptr, but C++-style
                 // T deduction binds its declared function type. Re-encode the original signature
                 // with the same key explicit Lambda<> / function<> arguments use.
@@ -1117,7 +1179,9 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                     // ELEMENT's stars ('int*[]'), a plain pointer its own depth.
                     int argStars = tv.IsArrayView
                         ? (tv.ElemPointer ? std::max(tv.PointerDepth, 1) : 0)
-                        : (tv.Pointer ? std::max(tv.PointerDepth, 1) : 0);
+                        : tv.ValuePointerDepth();
+                    if (argumentIndex < implicitArgumentPrefix && argStars == 0 && paramStars > 0)
+                        argStars = 1;
                     bool argView = tv.IsArrayView;
                     if (paramView)
                     {
@@ -1131,7 +1195,7 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                             LLVMBackend::TypeAndValue viewParam;
                             viewParam.IsArrayView = true;
                             std::string elementType;
-                            if (!compilerLLVM->IsCxxContiguousViewSource(args[i], viewParam,
+                            if (!compilerLLVM->IsCxxContiguousViewSource(argument, viewParam,
                                                                         nullptr, &elementType))
                                 break;
                             argType = elementType;
@@ -1166,7 +1230,7 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                         {
                             std::string constName;
                             const uint32_t levels = compilerLLVM->StoredConstLevels(
-                                compilerLLVM->ArgumentPointerValue(args[i]), constName);
+                                compilerLLVM->ArgumentPointerValue(argument), constName);
                             if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
                         }
                         // A view of const elements deduces T = `(const int)[]` (ruling 2026-10-19).
@@ -1174,7 +1238,7 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                         {
                             std::string constName;
                             const uint32_t levels = compilerLLVM->StoredConstLevels(
-                                compilerLLVM->ArgumentPointerValue(args[i]), constName);
+                                compilerLLVM->ArgumentPointerValue(argument), constName);
                             if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
                         }
                         // `T*` drops one pointer level, but T can itself be a const base type.
@@ -1182,7 +1246,7 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                         {
                             std::string constName;
                             const uint32_t levels = compilerLLVM->StoredConstLevels(
-                                compilerLLVM->ArgumentPointerValue(args[i]), constName);
+                                compilerLLVM->ArgumentPointerValue(argument), constName);
                             const uint32_t baseConstBit = uint32_t{ 1 } << (paramStars - 1);
                             if ((levels & baseConstBit) != 0)
                                 argType = "(const " + argType + ")";
@@ -1191,9 +1255,9 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 }
                 // A narrow string literal is a `(const char)*` (R2), as `auto s = "x"` deduces.
                 if (argType.empty() && paramStars == 0 && !paramView
-                    && compilerLLVM->IsStringLiteralGlobal(args[i].Primary))
+                    && compilerLLVM->IsStringLiteralGlobal(argument.Primary))
                     if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(
-                            args[i].Primary->stripPointerCasts());
+                            argument.Primary->stripPointerCasts());
                         global != nullptr && global->getValueType()->isArrayTy()
                         && global->getValueType()->getArrayElementType()->isIntegerTy(8))
                     {
@@ -1203,9 +1267,9 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 // Free-function calls drop TypeName for signed-int args. Fall back to the LLVM
                 // BaseType so literals infer; NOT for a view, whose opaque pointer recovers as
                 // a bogus 'i8' ELEMENT name that then fails the element-match gate.
-                if (argType.empty() && args[i].BaseType != nullptr
-                    && !args[i].TypeAndValue.IsArrayView)
-                    argType = Compiler()->LlvmTypeToTypeName(args[i].BaseType);
+                if (argType.empty() && argument.BaseType != nullptr
+                    && !argument.TypeAndValue.IsArrayView)
+                    argType = Compiler()->LlvmTypeToTypeName(argument.BaseType);
                 if (argType.empty()) break;
                 auto prev = inferred.find(tp);
                 if (prev == inferred.end())
@@ -1586,9 +1650,15 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 &candidate.parameterTypes, &candidate.typeArgs, false,
                 &candidate.parameterValues, true);
             if (candidate.typeArgs.empty()) continue;
+            const auto argumentMap = GenericParameterArgumentMap(
+                declarations, args, argList, variadic);
+            const size_t implicitArgumentPrefix = argList != nullptr
+                ? args.size() - argList->argumentNamedExpression().size() : 0;
             bool pointerShapesMatch = true;
-            for (size_t i = 0; i < args.size() && i < declarations.size(); ++i)
+            for (size_t i = 0; i < declarations.size(); ++i)
             {
+                if (argumentMap[i] == std::numeric_limits<size_t>::max()) continue;
+                const size_t argumentIndex = argumentMap[i];
                 size_t patternPointerDepth = 0;
                 for (auto* specifier : declarations[i]->declarationSpecifiers()->declarationSpecifier())
                     if (specifier->typeSpecifier() != nullptr)
@@ -1597,10 +1667,12 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         break;
                     }
                 if (patternPointerDepth == 0) continue;
-                const auto& argumentType = args[i].TypeAndValue;
-                size_t argumentDepth = argumentType.Pointer
-                    ? static_cast<size_t>(std::max(argumentType.PointerDepth, 1)) : 0;
-                if (args[i].IsStringLiteral)
+                const auto& argumentType = args[argumentIndex].TypeAndValue;
+                size_t argumentDepth = argumentType.IsArrayView ? 0
+                    : static_cast<size_t>(std::max(argumentType.ValuePointerDepth(), 0));
+                if (argumentIndex < implicitArgumentPrefix && argumentDepth == 0)
+                    argumentDepth = 1;
+                if (args[argumentIndex].IsStringLiteral)
                     argumentDepth = std::max(argumentDepth, size_t{1});
                 const bool arrayDecay = argumentType.IsArrayView || argumentType.ConstArraySize > 0;
                 const bool nullPointer = argumentType.TypeName == "nullptr_t"
@@ -1622,7 +1694,7 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             auto matched = compilerLLVM->MatchFunction(args, rankCandidate.Parameters,
                 rankCandidate.Variadic, true);
             if (matched.size() != args.size()) continue;
-            candidate.conversionRanks = compilerLLVM->RankCxxConversionSequences(args, rankCandidate);
+            candidate.conversionRanks = compilerLLVM->RankCxxConversionSequences(matched, rankCandidate);
             candidate.conversionRanks.resize(args.size());
             bool conversionViable = true;
             for (size_t i = 0; i < candidate.conversionRanks.size(); ++i)
@@ -1641,10 +1713,10 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 }
                 if (rank.rank < 0)
                 {
-                    const std::string sourceType = !args[i].TypeAndValue.TypeName.empty()
-                        ? args[i].TypeAndValue.TypeName
-                        : !args[i].LiteralIdentity.empty() ? args[i].LiteralIdentity
-                        : args[i].InferSourceTypeName;
+                    const std::string sourceType = !matched[i].TypeAndValue.TypeName.empty()
+                        ? matched[i].TypeAndValue.TypeName
+                        : !matched[i].LiteralIdentity.empty() ? matched[i].LiteralIdentity
+                        : matched[i].InferSourceTypeName;
                     const std::string targetType = candidate.parameterTypes[i];
                     rank.rank = !sourceType.empty() && !targetType.empty()
                         && compilerLLVM->ResolveTypeAlias(sourceType)

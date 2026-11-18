@@ -2401,6 +2401,18 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
                 }
             }
         }
+        // The normal constructor projection omits C ellipsis constructors. If this call supplies
+        // arguments beyond a public variadic constructor's fixed parameters, let clang rank it.
+        if (auto raw = cxxRecordEntries_.find(typeName); raw != cxxRecordEntries_.end())
+            for (const auto& member : raw->second.members)
+                if (member.kind == cflat_cinterop::RawCxxMember::Constructor
+                    && member.variadic && !member.isDeleted
+                    && member.access == cflat_cinterop::AccessPublic)
+                {
+                    const size_t fixedCount = member.paramTypes.empty()
+                        ? 0 : member.paramTypes.size() - 1;
+                    if (argTypes.size() > fixedCount) return true;
+                }
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr || !info->hasCtorTemplate) return false;
         if (selected == nullptr) return true;

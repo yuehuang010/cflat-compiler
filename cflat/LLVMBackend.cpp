@@ -1832,6 +1832,253 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
     }
 }
 
+bool LLVMBackend::CheckParseNestingDepth(antlr4::CommonTokenStream& tokens,
+                                        const std::string& fileName)
+{
+    constexpr size_t kMaxExpressionNesting = 400;
+    constexpr size_t kMaxTotalNesting = 816;
+    constexpr size_t kMaxIfChainNesting = 768;
+    constexpr const char* kNestingError =
+        "expression or statement is nested too deeply; split it into named temporaries";
+    const auto& allTokens = tokens.getTokens();
+    std::vector<size_t> delimiters;
+    // Initializer braces use the total-depth ceiling, separate from recursive expression scopes.
+    std::vector<bool> initializerDelimiters;
+    std::vector<size_t> ternaries;
+    std::vector<size_t> expectedBlockDepths;
+    antlr4::Token* history[4] = {};
+    size_t structuralDepth = 0;
+    size_t initializerDepth = 0;
+    size_t ifChainDepth = 0;
+    auto isExpectErrorToken = [](antlr4::Token* token)
+    {
+        auto* lexer = token == nullptr ? nullptr
+            : dynamic_cast<CFlatLexer*>(token->getTokenSource());
+        return lexer != nullptr
+            && lexer->getVocabulary().getLiteralName(token->getType()) == "'expect_error'";
+    };
+
+    auto currentExpressionDepth = [&]()
+    {
+        return structuralDepth + ternaries.size();
+    };
+    auto currentTotalDepth = [&]()
+    {
+        return structuralDepth + initializerDepth + ternaries.size();
+    };
+    auto currentIfChainDepth = [&]()
+    {
+        // An if recursively contains both its condition and child statement.
+        return structuralDepth + ifChainDepth * 2;
+    };
+    auto insideAggregateInitializer = [&]()
+    {
+        for (size_t i = delimiters.size(); i > 0; --i)
+        {
+            if (delimiters[i - 1] == CFlatLexer::LeftBrace)
+                return static_cast<bool>(initializerDelimiters[i - 1]);
+        }
+        return false;
+    };
+    auto opensAggregateInitializer = [&]()
+    {
+        const auto previous = history[3] == nullptr ? 0 : history[3]->getType();
+        if (previous == CFlatLexer::RightParen || previous == CFlatLexer::FatArrow
+            || previous == CFlatLexer::Else || previous == CFlatLexer::Do)
+            return false;
+        if (insideAggregateInitializer()) return true;
+        if (previous == CFlatLexer::Assign || previous == CFlatLexer::Return
+            || previous == CFlatLexer::LeftParen || previous == CFlatLexer::RightBracket
+            || previous == CFlatLexer::Comma)
+            return true;
+        if (previous == CFlatLexer::Identifier)
+        {
+            const auto beforePrevious = history[2] == nullptr ? 0 : history[2]->getType();
+            return beforePrevious != CFlatLexer::Struct
+                && beforePrevious != CFlatLexer::Class
+                && beforePrevious != CFlatLexer::Union
+                && beforePrevious != CFlatLexer::Enum
+                && beforePrevious != CFlatLexer::Namespace
+                && beforePrevious != CFlatLexer::Interface
+                && beforePrevious != CFlatLexer::Annotation;
+        }
+        return false;
+    };
+    auto prefixExpectation = [&]() -> std::string
+    {
+        std::vector<antlr4::Token*> prefix;
+        for (auto* token : allTokens)
+        {
+            if (token->getChannel() != antlr4::Token::DEFAULT_CHANNEL) continue;
+            if (token->getType() == cflat::kTokenEOF) break;
+            prefix.push_back(token);
+            if (prefix.size() == 4) break;
+        }
+        if (prefix.size() == 4 && isExpectErrorToken(prefix[0])
+            && prefix[1]->getType() == CFlatLexer::LeftParen
+            && prefix[2]->getType() == CFlatLexer::StringLiteral
+            && prefix[3]->getType() == CFlatLexer::RightParen)
+        {
+            size_t fifth = 0;
+            size_t seen = 0;
+            for (; fifth < allTokens.size(); ++fifth)
+            {
+                if (allTokens[fifth]->getChannel() != antlr4::Token::DEFAULT_CHANNEL) continue;
+                if (seen++ == 4) break;
+            }
+            if (fifth < allTokens.size() && allTokens[fifth]->getType() == CFlatLexer::Semi)
+                return DequoteStringLiteral(prefix[2]->getText());
+        }
+        return {};
+    };
+    std::string bareExpectation;
+
+    auto refuseAt = [&](antlr4::Token* token)
+    {
+        const std::string savedExpectedError = expectedError;
+        const std::string savedFileName = sourceFileName;
+        const std::string savedSourcePath = currentSourceFilePath_;
+        bool localExpectation = false;
+        if (expectedError.empty())
+        {
+            if (bareExpectation.empty()) bareExpectation = prefixExpectation();
+            if (!bareExpectation.empty())
+            {
+                expectedError = bareExpectation;
+                localExpectation = true;
+            }
+        }
+        sourceFileName = fileName;
+        currentSourceFilePath_ = fileName;
+        SetSourceLocation(token->getLine(), token->getCharPositionInLine());
+        try
+        {
+            LogError(kNestingError);
+        }
+        catch (const ExpectedErrorReceived&)
+        {
+            expectedError = savedExpectedError;
+            sourceFileName = savedFileName;
+            currentSourceFilePath_ = savedSourcePath;
+            if (localExpectation) return true;
+            throw;
+        }
+        catch (...)
+        {
+            expectedError = savedExpectedError;
+            sourceFileName = savedFileName;
+            currentSourceFilePath_ = savedSourcePath;
+            throw;
+        }
+        expectedError = savedExpectedError;
+        sourceFileName = savedFileName;
+        currentSourceFilePath_ = savedSourcePath;
+        return false;
+    };
+
+    auto resetIfChainUnlessElseFollows = [&](size_t index)
+    {
+        size_t next = index + 1;
+        while (next < allTokens.size()
+               && allTokens[next]->getChannel() != antlr4::Token::DEFAULT_CHANNEL)
+            ++next;
+        while (next < allTokens.size() && allTokens[next]->getType() == CFlatLexer::RightBrace)
+        {
+            ++next;
+            while (next < allTokens.size()
+                   && allTokens[next]->getChannel() != antlr4::Token::DEFAULT_CHANNEL)
+                ++next;
+        }
+        if (next >= allTokens.size() || allTokens[next]->getType() != CFlatLexer::Else)
+            ifChainDepth = 0;
+    };
+
+    for (size_t i = 0; i < allTokens.size(); ++i)
+    {
+        auto* token = allTokens[i];
+        if (token->getChannel() != antlr4::Token::DEFAULT_CHANNEL) continue;
+        const bool opensExpectedBlock = token->getType() == CFlatLexer::LeftBrace
+            && isExpectErrorToken(history[0])
+            && history[1] != nullptr && history[1]->getType() == CFlatLexer::LeftParen
+            && history[2] != nullptr && history[2]->getType() == CFlatLexer::StringLiteral
+            && history[3] != nullptr && history[3]->getType() == CFlatLexer::RightParen;
+        switch (token->getType())
+        {
+        case CFlatLexer::LeftParen:
+        case CFlatLexer::LeftBracket:
+            delimiters.push_back(token->getType());
+            initializerDelimiters.push_back(false);
+            ++structuralDepth;
+            break;
+        case CFlatLexer::LeftBrace:
+        {
+            const bool initializerBrace = opensAggregateInitializer();
+            if (!initializerBrace)
+                std::erase_if(ternaries, [&](size_t depth) { return depth >= delimiters.size(); });
+            delimiters.push_back(token->getType());
+            initializerDelimiters.push_back(initializerBrace);
+            if (initializerBrace) ++initializerDepth;
+            else ++structuralDepth;
+            if (opensExpectedBlock) expectedBlockDepths.push_back(delimiters.size());
+            break;
+        }
+        case CFlatLexer::RightParen:
+        case CFlatLexer::RightBracket:
+        case CFlatLexer::RightBrace:
+        {
+            bool closesScopeBlock = false;
+            if (!delimiters.empty())
+            {
+                const size_t delimiter = delimiters.back();
+                const bool initializerBrace = initializerDelimiters.back();
+                closesScopeBlock = token->getType() == CFlatLexer::RightBrace
+                    && delimiter == CFlatLexer::LeftBrace && !initializerBrace;
+                if (initializerBrace) --initializerDepth;
+                else --structuralDepth;
+                delimiters.pop_back();
+                initializerDelimiters.pop_back();
+            }
+            std::erase_if(ternaries, [&](size_t depth)
+            {
+                return depth > delimiters.size() || (closesScopeBlock && depth >= delimiters.size());
+            });
+            while (!expectedBlockDepths.empty()
+                   && expectedBlockDepths.back() > delimiters.size())
+                expectedBlockDepths.pop_back();
+            break;
+        }
+        // Keep '?' after ':' because the parser nests each false arm recursively.
+        case CFlatLexer::Question:
+            ternaries.push_back(delimiters.size());
+            break;
+        case CFlatLexer::Comma:
+        case CFlatLexer::Semi:
+            std::erase_if(ternaries, [&](size_t depth) { return depth >= delimiters.size(); });
+            if (token->getType() == CFlatLexer::Semi) resetIfChainUnlessElseFollows(i);
+            break;
+        case CFlatLexer::If:
+            // Scoped error bodies keep their existing listener-time expectation behavior.
+            if (expectedBlockDepths.empty()) ++ifChainDepth;
+            break;
+        case CFlatLexer::Else:
+            break;
+        default:
+            break;
+        }
+        if ((currentExpressionDepth() > kMaxExpressionNesting
+             || currentTotalDepth() > kMaxTotalNesting
+             || currentIfChainDepth() > kMaxIfChainNesting)
+            && refuseAt(token)) return true;
+        if (token->getType() == CFlatLexer::RightBrace)
+            resetIfChainUnlessElseFollows(i);
+        history[0] = history[1];
+        history[1] = history[2];
+        history[2] = history[3];
+        history[3] = token;
+    }
+    return false;
+}
+
 bool LLVMBackend::CheckGrammar(const std::string& filename)
 {
     if (!std::filesystem::exists(filename))
@@ -1864,6 +2111,7 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
     parser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
 
     tokens.fill();
+    if (CheckParseNestingDepth(tokens, filename)) return true;
     auto* compilationUnit = parser.compilationUnit();
     NormalizeForInitTree(parser, compilationUnit);
 
@@ -2633,6 +2881,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
             llvm::TimeTraceScope parseScope("Parse", sourceFileName);
             tokens.fill();
+            if (CheckParseNestingDepth(tokens, filename)) return true;
             computeUnit = parser.compilationUnit();
             NormalizeForInitTree(parser, computeUnit);
         }
@@ -3657,6 +3906,7 @@ std::shared_ptr<LLVMBackend::CachedParseTree> LLVMBackend::ParseFileForCache(con
     {
         llvm::TimeTraceScope parseScope("Parse", displayName);
         entry->tokens->fill();
+        if (CheckParseNestingDepth(*entry->tokens, canonicalPath)) return nullptr;
         entry->unit = entry->parser->compilationUnit();
         NormalizeForInitTree(*entry->parser, entry->unit);
     }
@@ -4460,6 +4710,7 @@ void LLVMBackend::ProcessPendingMacroSources()
             if (verbose) std::cout << std::format("[verbose]   lex failed for {}, dropping batch\n", state.label);
             continue;
         }
+        if (CheckParseNestingDepth(*state.tokens, state.label)) continue;
         CFlatParser::CompilationUnitContext* cu = nullptr;
         try { cu = state.parser->compilationUnit(); NormalizeForInitTree(*state.parser, cu); } catch (...) {
             if (verbose) std::cout << std::format("[verbose]   parse failed for {}, dropping batch\n", state.label);
@@ -5248,6 +5499,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 llvm::TimeTraceScope lexScope("Lex", sourceFileName);
                 tokens.fill();
             }
+            if (CheckParseNestingDepth(tokens, filePath)) return true;
             computeUnit = parser.compilationUnit();
             NormalizeForInitTree(parser, computeUnit);
         }
@@ -9883,6 +10135,7 @@ CFlatParser::FunctionDefinitionContext* LLVMBackend::MaterializeGenericFunction(
     auto localizeMessage = MakeDiagnosticLocalizer();
     state.parser->setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
     state.tokens->fill();
+    if (CheckParseNestingDepth(*state.tokens, state.label)) return nullptr;
     auto* unit = state.parser->compilationUnit();
     NormalizeForInitTree(*state.parser, unit);
     CFlatParser::FunctionDefinitionContext* context = nullptr;

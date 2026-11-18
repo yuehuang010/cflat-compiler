@@ -4968,7 +4968,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         // wrapper through release in its own arm so the selected source is empty at scope exit;
         // the returned pointer/fat value then goes through the ordinary interface boxing path.
         auto lowerUniqueMoveReturnArm = [&](llvm::Value*& value, llvm::Value*& storage,
-                                            llvm::BasicBlock* block, bool explicitMove) {
+                                            llvm::BasicBlock*& block, bool explicitMove) {
             auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(
                 value == nullptr ? nullptr : value->getType());
             // Explicit `move` expressions already detach their wrapper in ParseMoveExpression.
@@ -5055,6 +5055,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             compiler->lastOwningResult = true;
             storage = nullptr;
+            block = compiler->builder->GetInsertBlock();
             return true;
         };
         lowerUniqueMoveReturnArm(trueValue, trueStorage, trueEnd, trueExplicitMove);

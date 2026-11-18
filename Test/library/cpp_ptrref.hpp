@@ -162,8 +162,40 @@ struct ArrayScalarPairSubscriptMember {
     int operator[](double) { return 2; }
 };
 struct ArrayConversion { ArrayConversion(const int*) {} };
+inline int array_conversion_only_pick(ArrayConversion) { return 61; }
 inline int array_conversion_pick(ArrayConversion) { return 61; }
 inline int array_conversion_pick(const int (&)[2]) { return 60; }
+inline int array_conversion_exact_pick(ArrayConversion) { return 61; }
+inline int array_conversion_exact_pick(const int (&)[3]) { return 62; }
+inline int array_conversion_void_pick(ArrayConversion) { return 61; }
+inline int array_conversion_void_pick(void*) { return 90; }
+struct ArrayConversionMutable { ArrayConversionMutable(int*) {} };
+inline int array_conversion_mutable_pick(ArrayConversionMutable) { return 64; }
+struct ArrayConversionExplicit { explicit ArrayConversionExplicit(const int*) {} };
+inline int array_conversion_explicit_pick(ArrayConversionExplicit) { return 65; }
+struct ArrayConversionLong { ArrayConversionLong(long*) {} };
+inline int array_conversion_long_pick(ArrayConversionLong) { return 66; }
+struct ArrayConversionIntPtrPtr { ArrayConversionIntPtrPtr(int**) {} };
+inline int array_conversion_intpp_pick(ArrayConversionIntPtrPtr) { return 69; }
+struct ArrayConversionChar { ArrayConversionChar(char*) {} };
+inline int array_conversion_char_pick(ArrayConversionChar) { return 70; }
+struct ArrayConversionTwinA { ArrayConversionTwinA(const int*) {} };
+struct ArrayConversionTwinB { ArrayConversionTwinB(const int*) {} };
+inline int array_conversion_twins(ArrayConversionTwinA) { return 67; }
+inline int array_conversion_twins(ArrayConversionTwinB) { return 68; }
+inline int array_conversion_dual(ArrayConversion) { return 71; }
+inline int array_conversion_dual(const ArrayConversion&) { return 72; }
+struct ArrayConversionUnsigned { ArrayConversionUnsigned(const unsigned int*) {} };
+inline int array_conversion_unsigned_pick(ArrayConversionUnsigned) { return 101; }
+struct ArrayConversionEnum { ArrayConversionEnum(const ArraySubscriptElem*) {} };
+inline int array_conversion_enum_pick(ArrayConversionEnum) { return 102; }
+struct ArrayConversionRow { ArrayConversionRow(const int (*)[3]) {} };
+inline int array_conversion_row_pick(ArrayConversionRow) { return 103; }
+struct ArrayConversionMutableRow { ArrayConversionMutableRow(int (*)[3]) {} };
+inline int array_conversion_mutable_row_pick(ArrayConversionMutableRow) { return 104; }
+inline int array_conversion_free(ArrayConversion) { return 81; }
+struct ArrayConversionMember { int call(ArrayConversion) { return 82; } };
+struct ArrayConversionOuter { int value; ArrayConversionOuter(ArrayConversion) : value(83) {} };
 struct ArrayCtorMut1 {
     int r;
     ArrayCtorMut1(int (&)[3]) : r(51) {}

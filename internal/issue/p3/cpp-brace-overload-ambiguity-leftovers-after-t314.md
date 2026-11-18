@@ -1,36 +1,7 @@
-# C++ braced-list overload: template beside a non-template still picked wrongly
+# C++ brace-overload ambiguity leftovers after T314
 
-CVTIE (2026-11-10) fixed the conversion-operator ties, the braced-route ranking review findings, the
-global-namespace template callee (`tq({1,2})` was "Undefined variable" for ANY global template, braces
-were not the cause) and the `std.` spelling in the candidate list. What is left:
-
-Repro header (global or inside a namespace, `nn.` prefix on the call; `IL(T)` = `std::initializer_list<T>`):
-
-    template <class T> int tp(IL(T)) { return 2; }   int tp(IL(long)) { return 1; }
-    template <class T> int ts(T, IL(T)) { return 2; } int ts(int, IL(long)) { return 1; }
-    template <class T> int tr(IL(T), int) { return 2; } int tr(IL(long), int) { return 1; }
-    template <class T> int tn(IL(T)) { return 2; }   int tn(IL(int)) { return 1; }
-
-Calls and answers (clang++ -std=c++20 vs CFlat):
-- `tp({1,2})`: clang 2 (deduced `il<int>` is identity, `il<long>` a conversion), CFlat 1.
-- `ts(1,{1,2})`: clang 2, CFlat 1. `tr({1,2},3)`: clang 2, CFlat 1.
-- `tn({1,2})`: clang 1 (equal ranks, the non-template wins), CFlat 2.
-
-## Root cause
-
-A template beside non-templates is not ranked against them. The brace scan in
-RequestCxxBraceFunction walks `cxxFunctionSignatures_` (declared non-templates) only, while the
-template route requests the template alone, so each route answers without seeing the other.
-
-## Fix direction
-
-Give the brace scan a deduced candidate per function template: element identity for an `il<T>` slot
-(homogeneous list), the plain argument's identity for a `T` slot, conflicts not viable; then rank it with
-`argumentRanks` and prefer the non-template on an equal rank ([over.match.best] 2.5). A list whose
-elements disagree deduces nothing and stays with the non-template.
-
-Also: explicit `tq<int>({1,2})` on a global-namespace template still reports "unknown generic function";
-the namespace form `nn.tq<int>({1,2})` works.
+The function-template ranking issue and the global explicit-template lookup item were fixed in the
+BRACETPL round. The following notes remain out of scope.
 
 Cosmetic: the ambiguity list names a member unqualified (`'m'`); Test/errors pins that spelling.
 

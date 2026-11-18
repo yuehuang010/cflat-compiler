@@ -60,4 +60,11 @@ extern int main()
         CvbM cvbM = CvbM();
         int r = cvbM.mbb({1, 2});
     }
+    // BRACETPL: both deduced templates are viable; clang reports an ambiguity in each namespace.
+    expect_error("ambiguous") {
+        int r = tbr_twoamb(1, {1});
+    }
+    expect_error("ambiguous") {
+        int r = nn.tbr_twoamb(1, {1});
+    }
 }

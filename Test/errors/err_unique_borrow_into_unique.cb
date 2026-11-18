@@ -424,6 +424,50 @@ expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'p'") {
     }
 }
 
+expect_error("unique field") {
+    void t250UniqueFieldMiddleJoin(bool c)
+    {
+        T250Owner h;
+        T250Link* other = new T250Link();
+        T250Link* b = nullptr;
+        h.u = b = (c ? other : nullptr);
+    }
+}
+
+expect_error("unique field") {
+    struct T250ImplicitUniqueField
+    {
+        unique T250Link* u = nullptr;
+        void assign(bool c)
+        {
+            T250Link* other = new T250Link();
+            T250Link* b = nullptr;
+            u = b = (c ? other : nullptr);
+        }
+    };
+}
+
+expect_error("unique field") {
+    void t250DeepUniqueFieldMiddleJoin(bool c)
+    {
+        T250Owner h;
+        T250Link* other = new T250Link();
+        T250Link* d = nullptr;
+        T250Link* b = nullptr;
+        h.u = b = d = (c ? other : nullptr);
+    }
+}
+
+expect_error("cannot reset unique<T250Link> from borrowed value 'b'") {
+    unique T250Link* t250GJoinU = nullptr;
+    void t250GlobalJoinMiddle(bool c)
+    {
+        T250Link* other = new T250Link();
+        T250Link* b = nullptr;
+        t250GJoinU = b = (c ? other : nullptr);
+    }
+}
+
 expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'p'") {
     void t250ArmParamMiddleNested(T250Link* p, bool c)
     {
@@ -570,4 +614,35 @@ expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
         T250Link* src = nullptr;
         for (int i = 0; i < 2; i++) { a = b = (src ?? new T250Link()); if (i == 0) src = new T250Link(); }
     }
+}
+
+expect_error("cannot store an 'alias' value 'mid' into an owning variable") {
+    void t250UniqueNullMiddle()
+    {
+        unique T250BorrowBox* owner = nullptr;
+        unique T250BorrowBox* mid = nullptr;
+        owner = mid = nullptr;
+    }
+}
+
+expect_error("cannot pass the address of a stack or global value to 'move' parameter 'p'") {
+    void t250GlobalMiddleChain()
+    {
+        unique T250BorrowBox* owner = nullptr;
+        T250BorrowBox* e = nullptr;
+        owner = t250Global = e = new T250BorrowBox();
+    }
+}
+
+expect_error("cannot reset unique<T250BorrowBox> 'owner' from a borrowed value") {
+    struct T250ImplicitFieldChain
+    {
+        T250BorrowBox* raw = nullptr;
+        void assign()
+        {
+            unique T250BorrowBox* owner = nullptr;
+            T250BorrowBox* e = nullptr;
+            owner = raw = e = new T250BorrowBox();
+        }
+    };
 }

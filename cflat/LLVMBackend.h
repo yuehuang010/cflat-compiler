@@ -2426,6 +2426,9 @@ public:
         // name). An outer unique '=' takes that slot as its RHS, as `owner = raw;` does.
         llvm::Value* ChainedAssignSlot = nullptr;
         std::string ChainedAssignName;
+        // Transient: the chain's value came from a '?:' join. A global or field outer refuses it as its
+        // two-statement form does, so the store path decides.
+        bool ChainedAssignJoinRhs = false;
         // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
         // borrowed parameter, so the delete/store diagnostics can name the real owner (Trap B).
         std::string BorrowedUniqueField;
@@ -5971,6 +5974,7 @@ private:
     // isCore selects the process-wide shared cache; a user import is cached per backend.
     CachedParseTree* GetOrParseFile(const std::string& canonicalPath, const std::string& displayName,
                                     bool isCore);
+    bool CheckParseNestingDepth(antlr4::CommonTokenStream& tokens, const std::string& fileName);
     // Parser ecosystem must outlive instantiation: genericFunctionTemplates holds raw
     // FunctionDefinitionContext pointers into these trees.
     struct SyntheticParseState
@@ -11865,7 +11869,9 @@ public:
                                         bool* ambiguous = nullptr,
                                         std::vector<std::string>* ambiguousCandidates = nullptr,
                                         const TypeAndValue* receiver = nullptr,
-                                        bool* derivedResult = nullptr) const;
+                                        bool* derivedResult = nullptr,
+                                        bool allowTemplateRequest = true,
+                                        bool allowNonzeroDerivedOffset = true) const;
     std::string ScoreCxxConversionOperatorArgument(const NamedVariable& arg,
                                                    const TypeAndValue& param,
                                                    bool preserveAmbiguous,
@@ -11943,7 +11949,8 @@ public:
                                                             bool allowScalarNarrowing = false);
     // A C++ record with a non-explicit conversion operator to a non-primitive type (libc++
     // `__val_expr::operator valarray<T>()`): copy-initializing a class from it is clang's call.
-    bool HasImplicitClassConversionOperator(const std::string& sourceType);
+    bool HasImplicitClassConversionOperator(const std::string& sourceType,
+                                            bool includePointerTargets = false);
     // A non-explicit DELETED converting constructor (template included): clang must decide the
     // copy-initialization of a class source, since CFlat's ranking never sees a deleted candidate.
     bool HasDeletedConvertingCtor(const std::string& targetType);
@@ -15283,7 +15290,9 @@ public:
     // 330: function-type parameters record pointee const (callback overload ranking).
     // 336: C and C++ pointer depth 3+ is recorded ("pd") instead of collapsing to void**.
     // 341: a C++ throw() declaration is recorded as noexcept.
-    static constexpr int kCHeaderCacheVersion = 341;
+    // 342: C-variadic function templates are cached with unbounded maxArity.
+    // 343: function-template cache entries preserve type parameter names for brace deduction.
+    static constexpr int kCHeaderCacheVersion = 343;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
@@ -15772,6 +15781,7 @@ private:
         auto localizeMessage = MakeDiagnosticLocalizer();
         state.parser->setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
         state.tokens->fill();
+        if (CheckParseNestingDepth(*state.tokens, state.label)) return nullptr;
         auto* cu = state.parser->compilationUnit();
         NormalizeForInitTree(*state.parser, cu);
         CtxT* ctx = extract(cu);

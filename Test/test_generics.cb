@@ -3723,6 +3723,45 @@ int genovlrStringLiteral(char* value) { return 2; }
 int genovlrStringLiteral<T>(T value) { return 9; }
 int genovlrConstPtr(int* value) { return 2; }
 int genovlrConstPtr<T>(T* value) { return 9; }
+int genovlrNamedFree<T>(T a, T* b) { return a * 10 + *b; }
+namespace GenOvlRNamed
+{
+    int call<T>(T a, T* b) { return a * 10 + *b; }
+}
+struct GenOvlRNamedMethod { int call<T>(T a, T* b) { return a * 10 + *b; } };
+T genovlrConstGet<T>(T* p) { return *p; }
+T genovlrConstH<T>(T** p) { return **p; }
+int genovlrConstDepthPick<T>(T** p) { return 22; }
+int genovlrConstDepthPick(const int** p) { return 11; }
+namespace GenOvlRConst
+{
+    T get<T>(T* p) { return *p; }
+    T h<T>(T** p) { return **p; }
+}
+struct GenOvlRConstMethods
+{
+    T get<T>(T* p) { return *p; }
+    T h<T>(T** p) { return **p; }
+};
+struct GenOvlRUFCSBox { int value = default; };
+int genovlrUfcsFree<T>(T* p) { return p->value + 10; }
+namespace GenOvlRUFCS
+{
+    int f<T>(T* p) { return p->value + 10; }
+    int call(GenOvlRUFCSBox* p) { return p.f(); }
+}
+struct GenOvlRUFCSMethodGenericFirst
+{
+    int value = default;
+    int ufcsMethod<T>(T* p) { return p->value + 10; }
+    int ufcsMethod(void* p) { return 77; }
+};
+struct GenOvlRUFCSMethodConcreteFirst
+{
+    int value = default;
+    int ufcsMethod(void* p) { return 77; }
+    int ufcsMethod<T>(T* p) { return p->value + 10; }
+};
 int genovlrFloatGenericFirst<T>(T value) { return 9; }
 int genovlrFloatGenericFirst(double value) { return 3; }
 int genovlrFloatConcreteFirst(double value) { return 3; }
@@ -4173,6 +4212,57 @@ bool testGenericArgInference()
     result &= Test("genovlr_static_pair_accept_set", genovlrStaticPairControls(), 11);
     result &= Test("genovlr_strlit_exact_generic", genovlrStringLiteral("hi"), 9);
     result &= Test("genovlr_const_pointee_exact_generic", genovlrConstPtr(genOvlConstPtr), 9);
+    int genovlrNamedValue = 3;
+    int* genovlrNamedPointer = &genovlrNamedValue;
+    result &= Test("genovlr_named_free_generic",
+        genovlrNamedFree(b: genovlrNamedPointer, a: 4), 43);
+    result &= Test("genovlr_named_namespace_generic",
+        GenOvlRNamed.call(b: genovlrNamedPointer, a: 4), 43);
+    GenOvlRNamedMethod genovlrNamedMethod;
+    result &= Test("genovlr_named_method_generic",
+        genovlrNamedMethod.call(b: genovlrNamedPointer, a: 4), 43);
+
+    const int genovlrConstValue = 23;
+    const int* genovlrConstPointer = &genovlrConstValue;
+    (const int)* genovlrConstPointeePointer = &genovlrConstValue;
+    (const int)** genovlrConstPointerPointer = &genovlrConstPointeePointer;
+    const int* genovlrFullConstPointer = &genovlrConstValue;
+    const int** genovlrFullConstPointerPointer = &genovlrFullConstPointer;
+    result &= Test("genovlr_const_get_result_type",
+        (int)sizeof(genovlrConstGet(genovlrConstPointer)) * 100
+            + genovlrConstGet(genovlrConstPointer), 423);
+    result &= Test("genovlr_const_h_result_type",
+        (int)sizeof(genovlrConstH(genovlrConstPointerPointer)) * 100
+            + genovlrConstH(genovlrConstPointerPointer), 423);
+    result &= Test("genovlr_full_const_concrete_fallback",
+        genovlrConstDepthPick(genovlrFullConstPointerPointer), 11);
+    result &= Test("genovlr_const_namespace_result_types",
+        (int)sizeof(GenOvlRConst.get(genovlrConstPointer)) * 100
+            + GenOvlRConst.get(genovlrConstPointer)
+            + (int)sizeof(GenOvlRConst.h(genovlrConstPointerPointer)) * 100
+            + GenOvlRConst.h(genovlrConstPointerPointer), 846);
+    GenOvlRConstMethods genovlrConstMethods;
+    result &= Test("genovlr_const_method_result_types",
+        (int)sizeof(genovlrConstMethods.get(genovlrConstPointer)) * 100
+            + genovlrConstMethods.get(genovlrConstPointer)
+            + (int)sizeof(genovlrConstMethods.h(genovlrConstPointerPointer)) * 100
+            + genovlrConstMethods.h(genovlrConstPointerPointer), 846);
+
+    GenOvlRUFCSBox genovlrUfcsBox = default;
+    genovlrUfcsBox.value = 31;
+    GenOvlRUFCSBox* genovlrUfcsPointer = &genovlrUfcsBox;
+    result &= Test("genovlr_ufcs_free_generic",
+        genovlrUfcsPointer.genovlrUfcsFree(), 41);
+    result &= Test("genovlr_ufcs_namespace_generic",
+        GenOvlRUFCS.call(genovlrUfcsPointer), 41);
+    GenOvlRUFCSMethodGenericFirst genovlrUfcsMethodGenericFirst = default;
+    genovlrUfcsMethodGenericFirst.value = 31;
+    result &= Test("genovlr_ufcs_method_generic_first",
+        genovlrUfcsMethodGenericFirst.ufcsMethod(&genovlrUfcsMethodGenericFirst), 41);
+    GenOvlRUFCSMethodConcreteFirst genovlrUfcsMethodConcreteFirst = default;
+    genovlrUfcsMethodConcreteFirst.value = 31;
+    result &= Test("genovlr_ufcs_method_concrete_first",
+        genovlrUfcsMethodConcreteFirst.ufcsMethod(&genovlrUfcsMethodConcreteFirst), 41);
     result &= Test("genovlr_neg_int_generic_first", genovlrNegIntGenericFirst(-(1)), 2);
     result &= Test("genovlr_neg_int_concrete_first", genovlrNegIntConcreteFirst(-(1)), 2);
     result &= Test("genovlr_neg_double_generic_first", genovlrNegDoubleGenericFirst(-(1.5)), 3);

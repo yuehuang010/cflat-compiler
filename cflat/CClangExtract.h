@@ -283,6 +283,7 @@ namespace cflat_cinterop
         unsigned minArity = 0;
         unsigned maxArity = 0;
         unsigned typeParameterCount = 0;
+        std::vector<std::string> typeParameterNames;
         std::vector<std::string> parameterTypes;
         std::vector<std::string> parameterNames;
         std::vector<uint8_t> forwardingReferenceParameters;

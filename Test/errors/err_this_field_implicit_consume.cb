@@ -139,3 +139,120 @@ expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this
         void bad(int i, int j) { p[i] = p[j]; }
     };
 }
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasAssignArrow {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasAssignArrow* self = this; unique T447ConsumePS* o = nullptr; o = self->p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasAssignDeref {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasAssignDeref* self = this; unique T447ConsumePS* o = nullptr; o = (*self).p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasAssignDot {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasAssignDot* self = this; unique T447ConsumePS* o = nullptr; o = self.p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasAssignChain {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasAssignChain* self = this; T447AliasAssignChain* relay = self; unique T447ConsumePS* o = nullptr; o = relay->p; }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasReturnArrow {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* bad() { T447AliasReturnArrow* self = this; return self->p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasReturnDeref {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* bad() { T447AliasReturnDeref* self = this; return (*self).p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasReturnDot {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* bad() { T447AliasReturnDot* self = this; return self.p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasReturnChain {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* bad() { T447AliasReturnChain* self = this; T447AliasReturnChain* relay = self; return relay->p; }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasSinkArrow {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasSinkArrow* self = this; t447_consume_sink(self->p); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasSinkDeref {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasSinkDeref* self = this; t447_consume_sink((*self).p); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasSinkDot {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasSinkDot* self = this; t447_consume_sink(self.p); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasSinkChain {
+        unique T447ConsumePS* p = default;
+        void bad() { T447AliasSinkChain* self = this; T447AliasSinkChain* relay = self; t447_consume_sink(relay->p); }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasTernaryArrow {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { T447AliasTernaryArrow* self = this; t447_consume_sink(c ? self->p : self->q); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasTernaryDeref {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { T447AliasTernaryDeref* self = this; t447_consume_sink(c ? (*self).p : (*self).q); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasTernaryDot {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { T447AliasTernaryDot* self = this; t447_consume_sink(c ? self.p : self.q); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasTernaryChain {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { T447AliasTernaryChain* self = this; T447AliasTernaryChain* relay = self; t447_consume_sink(c ? relay->p : relay->q); }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasArrayAssign {
+        unique T447ConsumePS*[2] p;
+        void bad() { T447AliasArrayAssign* self = this; self->p[0] = self->p[1]; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447AliasArraySink {
+        unique T447ConsumePS*[2] p;
+        void bad() { T447AliasArraySink* self = this; t447_consume_sink(self->p[0]); }
+    };
+}

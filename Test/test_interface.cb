@@ -6160,6 +6160,89 @@ bool testAutoCopyInterface()
     return result;
 }
 
+struct IfaceValueArg { int value = 7; };
+struct IfaceValueHolder { IfaceValueArg field = default; };
+int ifaceValueDtorCount = 0;
+struct IfaceDtorArg
+{
+    int value = 7;
+    ~IfaceDtorArg() { ifaceValueDtorCount++; }
+};
+interface IIfaceValueArg
+{
+    int write(IfaceValueArg* value);
+    int read(const IfaceValueArg* value);
+    int writeDtor(IfaceDtorArg* value);
+};
+class IfaceValueArgImpl : IIfaceValueArg
+{
+    int write(IfaceValueArg* value) { value->value = 99; return value->value; }
+    int read(const IfaceValueArg* value) { return value->value; }
+    int writeDtor(IfaceDtorArg* value) { value->value = 99; return value->value; }
+};
+interface IIfaceGenericValueArg<T> { int write(T* value); };
+class IfaceGenericValueArgImpl : IIfaceGenericValueArg<IfaceValueArg>
+{
+    int write(IfaceValueArg* value) { value->value = 99; return value->value; }
+};
+int ifaceValueArgDirect(IfaceValueArg* value) { value->value = 99; return value->value; }
+int ifaceDtorArgDirect(IfaceDtorArg* value) { value->value = 99; return value->value; }
+
+bool testInterfaceValuePointerArguments()
+{
+    bool result = true;
+    IfaceValueArgImpl impl = default;
+    IIfaceValueArg iface = &impl;
+
+    IfaceValueArg directLocal = default;
+    result &= Test("iface_valueptr_direct_value", ifaceValueArgDirect(directLocal), 99);
+    result &= Test("iface_valueptr_direct_writeback", directLocal.value, 99);
+    IfaceValueArg local = default;
+    result &= Test("iface_valueptr_local_value", iface.write(local), 99);
+    result &= Test("iface_valueptr_local_writeback", local.value, 99);
+
+    IfaceValueHolder holder = default;
+    result &= Test("iface_valueptr_field_value", iface.write(holder.field), 99);
+    result &= Test("iface_valueptr_field_writeback", holder.field.value, 99);
+    IfaceValueArg[1] values = default;
+    result &= Test("iface_valueptr_array_value", iface.write(values[0]), 99);
+    result &= Test("iface_valueptr_array_writeback", values[0].value, 99);
+    IfaceValueArg constValue = default;
+    result &= Test("iface_valueptr_const_value", iface.read(constValue), 7);
+
+    IfaceGenericValueArgImpl genericImpl = default;
+    IIfaceGenericValueArg<IfaceValueArg> genericIface = &genericImpl;
+    IfaceValueArg genericValue = default;
+    result &= Test("iface_valueptr_generic_value", genericIface.write(genericValue), 99);
+    result &= Test("iface_valueptr_generic_writeback", genericValue.value, 99);
+
+    ifaceValueDtorCount = 0;
+    int directDtorResult = 0;
+    int directDtorWriteback = 0;
+    {
+        IfaceDtorArg value = default;
+        directDtorResult = ifaceDtorArgDirect(value);
+        directDtorWriteback = value.value;
+    }
+    int directDtorCount = ifaceValueDtorCount;
+    ifaceValueDtorCount = 0;
+    int ifaceDtorResult = 0;
+    int ifaceDtorWriteback = 0;
+    {
+        IfaceDtorArg value = default;
+        ifaceDtorResult = iface.writeDtor(value);
+        ifaceDtorWriteback = value.value;
+    }
+    int ifaceDtorCount = ifaceValueDtorCount;
+    result &= Test("iface_valueptr_dtor_direct_value", directDtorResult, 99);
+    result &= Test("iface_valueptr_dtor_direct_writeback", directDtorWriteback, 99);
+    result &= Test("iface_valueptr_dtor_value", ifaceDtorResult, 99);
+    result &= Test("iface_valueptr_dtor_writeback", ifaceDtorWriteback, 99);
+    result &= Test("iface_valueptr_dtor_count", ifaceDtorCount, directDtorCount);
+    result &= Test("iface_valueptr_dtor_once", ifaceDtorCount, 1);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -6277,6 +6360,7 @@ extern int main()
     total++; passed += testInterfaceReturnCallBorrowAcceptSet()          ? 1 : 0;
 
     total++; passed += testAutoCopyInterface()                          ? 1 : 0;
+    total++; passed += testInterfaceValuePointerArguments()              ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

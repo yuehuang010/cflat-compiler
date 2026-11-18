@@ -4547,6 +4547,45 @@ int InteropElementReassignDelete()
     return value;
 }
 
+int InteropInvokeReownDtorCount = 0;
+class InteropInvokeReownProbe
+{
+    int value = 41;
+    ~InteropInvokeReownProbe()
+    {
+        InteropInvokeReownDtorCount = InteropInvokeReownDtorCount + 1;
+    }
+};
+int InteropInvokeReownFromBorrow(InteropInvokeReownProbe* borrowed)
+{
+    unique InteropInvokeReownProbe* owner = nullptr;
+    InteropInvokeReownProbe* raw = nullptr;
+    raw = borrowed;
+    raw = new InteropInvokeReownProbe();
+    owner = raw;
+    return owner->value;
+}
+
+int InteropInvokeTernaryDtorCount = 0;
+interface InteropInvokeTernaryShape { int area(); };
+class InteropInvokeTernaryItem : InteropInvokeTernaryShape
+{
+    int value = 0;
+    int area() { return value + 7; }
+    ~InteropInvokeTernaryItem()
+    {
+        InteropInvokeTernaryDtorCount = InteropInvokeTernaryDtorCount + 1;
+    }
+};
+move InteropInvokeTernaryShape InteropInvokeTernaryOwner(bool c)
+{
+    unique InteropInvokeTernaryItem* p = new InteropInvokeTernaryItem();
+    p->value = 1;
+    unique InteropInvokeTernaryItem* q = new InteropInvokeTernaryItem();
+    q->value = 20;
+    return c ? p : q;
+}
+
 int InteropJoinReassignDtorCount = 0;
 interface InteropJoinReassignShape { int area(); };
 class InteropJoinReassignItem : InteropJoinReassignShape
@@ -4949,6 +4988,29 @@ int NeThrDecl(int x)
     return neThrDecl.v;
 }
 
+int w13b_take_mut(w13b.P* p) { return w13b.read(p); }
+int w13b_take_const(const w13b.P* p) { return w13b.read(p); }
+int w13b_take_ref(alias w13b.P p) { return w13b.read(p); }
+int w13b_take_cref(const alias w13b.P p) { return w13b.read(p); }
+struct W13BReceiver
+{
+    int take_mut(w13b.P* p) { return w13b.read(p); }
+    int take_const(const w13b.P* p) { return w13b.read(p); }
+    int take_ref(alias w13b.P p) { return w13b.read(p); }
+    int take_cref(const alias w13b.P p) { return w13b.read(p); }
+};
+interface W13BConvIface { int read(w13b.P* p); };
+class W13BConvImpl : W13BConvIface
+{
+    int read(w13b.P* p) { return p.value + 2; }
+};
+interface W13BPlainValueIface { int write(immt90.Plain* p); };
+class W13BPlainValueImpl : W13BPlainValueIface
+{
+    int write(immt90.Plain* p) { p->v = 99; return p->v; }
+};
+int w13b_plain_value_direct(immt90.Plain* p) { p->v = 99; return p->v; }
+
 extern int main()
 {
     int nullmacfnValue = 7;
@@ -4994,6 +5056,26 @@ extern int main()
     if (InteropElementReassignBox() != 7 || InteropElementReassignDtorCount != 2) return 54014;
     InteropElementReassignDtorCount = 0;
     if (InteropElementReassignDelete() != 68 || InteropElementReassignDtorCount != 2) return 54017;
+    InteropInvokeReownDtorCount = 0;
+    int reownValue = 0;
+    {
+        InteropInvokeReownProbe borrowed = default;
+        reownValue = InteropInvokeReownFromBorrow(&borrowed);
+        if (reownValue != 41 || InteropInvokeReownDtorCount != 1) return 54180;
+    }
+    if (InteropInvokeReownDtorCount != 2) return 54181;
+    InteropInvokeTernaryDtorCount = 0;
+    {
+        unique InteropInvokeTernaryShape shape = InteropInvokeTernaryOwner(true);
+        if (shape.area() != 8 || InteropInvokeTernaryDtorCount != 1) return 54182;
+    }
+    if (InteropInvokeTernaryDtorCount != 2) return 54183;
+    InteropInvokeTernaryDtorCount = 0;
+    {
+        unique InteropInvokeTernaryShape shape = InteropInvokeTernaryOwner(false);
+        if (shape.area() != 27 || InteropInvokeTernaryDtorCount != 1) return 54184;
+    }
+    if (InteropInvokeTernaryDtorCount != 2) return 54185;
     InteropJoinReassignDtorCount = 0;
     {
         InteropJoinReassignShape shape = InteropJoinReassign();
@@ -9582,6 +9664,46 @@ extern int main()
     if (t314.fd({1.5f, 2.5f}) != 1) return 27068;
     // A plain argument or a ref-qualified receiver decides these; a braced-element tie must not refuse.
     if (t314.pb(1, {1, 2}) != 1 || t314S.m_pb(1, {1, 2}) != 1 || t314S.m_rq({1, 2}) != 1) return 27069;
+    // BRACETPL: clang's braced-list ranking when function templates share the overload set.
+    if (tbr_tp({1, 2}) != 2) return 27100;
+    if (tbr_tp({1, 2L}) != 1) return 27101;
+    if (tbr_tp({1}) != 2) return 27102;
+    if (tbr_ts(1, {1, 2}) != 2) return 27103;
+    if (tbr_ts(1, {1, 2L}) != 1) return 27104;
+    if (tbr_ts(1, {1}) != 2) return 27105;
+    if (tbr_tr({1, 2}, 3) != 2) return 27106;
+    if (tbr_tr({1, 2L}, 3) != 1) return 27107;
+    if (tbr_tr({1}, 3) != 2) return 27108;
+    if (tbr_tn({1, 2}) != 1) return 27109;
+    if (tbr_tn({1, 2L}) != 1) return 27110;
+    if (tbr_tn({1}) != 1) return 27111;
+    if (nn.tbr_tp({1, 2}) != 2) return 27112;
+    if (nn.tbr_tp({1}) != 2) return 27113;
+    if (nn.tbr_ts(1, {1, 2}) != 2) return 27114;
+    if (nn.tbr_ts(1, {1}) != 2) return 27115;
+    if (nn.tbr_tr({1, 2}, 3) != 2) return 27116;
+    if (nn.tbr_tr({1}, 3) != 2) return 27117;
+    if (nn.tbr_tn({1, 2}) != 1) return 27118;
+    if (nn.tbr_tn({1}) != 1) return 27119;
+    if (tbr_twospec({1}) != 6) return 27120;
+    if (nn.tbr_twospec({1}) != 6) return 27121;
+    if (tbr_tq<int>({1, 2}) != 9) return 27122;
+    int bracetplR2Int = 0;
+    // BRACETPL r2: T* beats void* beside a braced list (clang 2).
+    if (btr2.pb(&bracetplR2Int, {1, 2}) != 2) return 27123;
+    // BRACETPL r2: const T& deduces beside a braced list (clang 2).
+    if (btr2.pc(1, {1, 2}) != 2) return 27124;
+    // BRACETPL r2: the full parameter name Elem is deduced (clang 2).
+    if (btr2.pa({1, 2}) != 2) return 27125;
+    btr2.ClassElement bracetplR2Element = btr2.ClassElement();
+    // BRACETPL r2: class elements retain the non-template tie winner (clang 1).
+    if (btr2.pj({bracetplR2Element, bracetplR2Element}) != 1) return 27126;
+    // BRACETPL r2: namespace-qualified T* still beats void* (clang 2).
+    if (btr2.q.pz(&bracetplR2Int, {1, 2}) != 2) return 27127;
+    // BRACETPL r3: an empty list is non-deduced; T comes from the other argument (clang 2).
+    if (btr2.pe0(1, {}) != 2) return 27128;
+    // BRACETPL r3: an empty list deduces no T, so the non-template wins (clang 1).
+    if (btr2.pe1({}) != 1) return 27129;
     if (t3lookup.f1() != 1) return 13001;
     if (t3lookup.f2() != 1) return 13002;
     if (t3lookup.f3() != 1) return 13003;
@@ -29932,6 +30054,49 @@ int deepPtrLegs()
     // The mutable call distinguishes the array-reference overloads; the const call pins its sibling.
     if (subscriptMember[subscriptMutable] != 31 || subscriptMember[subscriptConst] != 32)
         return 96022;
+    // Frozen ARRPTR accept-set: array-reference, void-pointer and constructor paths keep their values.
+    int[3] arrptrMutable = {1, 2, 3};
+    const int[3] arrptrConst = {1, 2, 3};
+    int[2][3] arrptrGrid = {{1, 2, 3}, {4, 5, 6}};
+    const int[2][3] arrptrConstGrid = {{1, 2, 3}, {4, 5, 6}};
+    unsigned int[3] arrptrUnsigned = {1, 2, 3};
+    cpp_ptrref.ArraySubscriptElem[3] arrptrEnum = {cpp_ptrref.ArraySubscriptElemA,
+        cpp_ptrref.ArraySubscriptElemB, cpp_ptrref.ArraySubscriptElemC};
+    if (cpp_ptrref.array_conversion_exact_pick(arrptrMutable) != 62) return 96200;
+    if (cpp_ptrref.array_conversion_void_pick(arrptrMutable) != 90) return 96201;
+    if (cpp_ptrref.ArrayConversionOuter(arrptrMutable).value != 83) return 96202;
+    if (cpp_ptrref.array_conversion_exact_pick(arrptrConst) != 62) return 96203;
+    if (cpp_ptrref.ArrayConversionOuter(arrptrConst).value != 83) return 96204;
+    if (cpp_ptrref.array_conversion_void_pick(arrptrGrid) != 90) return 96205;
+    if (cpp_ptrref.array_conversion_void_pick(arrptrUnsigned) != 90) return 96206;
+    if (cpp_ptrref.array_conversion_unsigned_pick(arrptrUnsigned) != 101) return 96207;
+    if (cpp_ptrref.array_conversion_enum_pick(arrptrEnum) != 102) return 96208;
+    int arrptrPointerTarget = 1;
+    int* arrptrPointer = &arrptrPointerTarget;
+    if (cpp_ptrref.array_conversion_only_pick(arrptrPointer) != 61) return 96209;
+    if (cpp_ptrref.array_conversion_pick(arrptrPointer) != 61) return 96210;
+    if (cpp_ptrref.array_conversion_exact_pick(arrptrPointer) != 61) return 96211;
+    if (cpp_ptrref.array_conversion_mutable_pick(arrptrPointer) != 64) return 96212;
+    if (cpp_ptrref.array_conversion_void_pick(arrptrPointer) != 90) return 96213;
+    if (cpp_ptrref.array_conversion_free(arrptrPointer) != 81) return 96214;
+    cpp_ptrref.ArrayConversionMember arrptrMember = cpp_ptrref.ArrayConversionMember();
+    if (arrptrMember.call(arrptrPointer) != 82) return 96215;
+    if (cpp_ptrref.ArrayConversionOuter(arrptrPointer).value != 83) return 96216;
+    // Fixed arrays use one standard decay plus a non-explicit converting constructor.
+    if (cpp_ptrref.array_conversion_only_pick(arrptrMutable) != 61) return 96217;
+    if (cpp_ptrref.array_conversion_pick(arrptrMutable) != 61) return 96218;
+    if (cpp_ptrref.array_conversion_mutable_pick(arrptrMutable) != 64) return 96219;
+    if (cpp_ptrref.array_conversion_free(arrptrMutable) != 81) return 96220;
+    if (arrptrMember.call(arrptrMutable) != 82) return 96221;
+    if (cpp_ptrref.array_conversion_only_pick(arrptrConst) != 61) return 96222;
+    if (cpp_ptrref.array_conversion_pick(arrptrConst) != 61) return 96223;
+    if (cpp_ptrref.array_conversion_void_pick(arrptrConst) != 61) return 96224;
+    if (cpp_ptrref.array_conversion_free(arrptrConst) != 81) return 96225;
+    if (arrptrMember.call(arrptrConst) != 82) return 96226;
+    if (cpp_ptrref.array_conversion_row_pick(arrptrGrid) != 103) return 96227;
+    if (cpp_ptrref.array_conversion_mutable_row_pick(arrptrGrid) != 104) return 96228;
+    if (cpp_ptrref.array_conversion_row_pick(arrptrConstGrid) != 103) return 96229;
+    if (cpp_ptrref.array_conversion_void_pick(arrptrEnum) != 90) return 96230;
     cpp_ptrref.ArraySubscriptGridMember subscriptGrid = cpp_ptrref.ArraySubscriptGridMember();
     int[2][3] subscriptGridMutable = {{1, 2, 3}, {4, 5, 6}};
     const int[2][3] subscriptGridConst = {{1, 2, 3}, {4, 5, 6}};
@@ -30093,5 +30258,59 @@ int deepPtrLegs()
     expect_error("no overload") { subscriptEnumLong[subscriptSmallEnumConst]; }
     expect_error("no overload") { subscriptEnumValue[subscriptSmallEnum]; }
     expect_error("no overload") { subscriptEnumValue[subscriptSmallEnumConst]; }
+
+    // W13B A: implicit C++ derived pointer/reference results reach CFlat free and member callees.
+    w13b.Conv w13bConv = w13b.Conv();
+    W13BReceiver w13bReceiver = default;
+    if (w13b_take_mut(w13bConv) != 41 || w13bConv.hit != 1) return 87101;
+    if (w13b_take_const(w13bConv) != 41 || w13bConv.hit != 1) return 87102;
+    if (w13b_take_ref(w13bConv) != 41 || w13bConv.hit != 3) return 87103;
+    if (w13b_take_cref(w13bConv) != 41 || w13bConv.hit != 3) return 87104;
+    if (w13bReceiver.take_mut(w13bConv) != 41 || w13bConv.hit != 1) return 87105;
+    if (w13bReceiver.take_const(w13bConv) != 41 || w13bConv.hit != 1) return 87106;
+    if (w13bReceiver.take_ref(w13bConv) != 41 || w13bConv.hit != 3) return 87107;
+    if (w13bReceiver.take_cref(w13bConv) != 41 || w13bConv.hit != 3) return 87108;
+    // Exact class pointer/reference arguments remain identity bindings.
+    w13b.P w13bExact = w13b.P();
+    if (w13b_take_mut(&w13bExact) != 41 || w13b_take_const(&w13bExact) != 41
+        || w13b_take_ref(w13bExact) != 41 || w13b_take_cref(w13bExact) != 41) return 87109;
+    if (w13bReceiver.take_mut(&w13bExact) != 41
+        || w13bReceiver.take_const(&w13bExact) != 41
+        || w13bReceiver.take_ref(w13bExact) != 41
+        || w13bReceiver.take_cref(w13bExact) != 41) return 87110;
+
+    // W13B r2: interface dispatch materializes derived and exact pointer conversions.
+    W13BConvImpl w13bConvImpl = default;
+    W13BConvIface w13bConvIface = w13bConvImpl;
+    if (w13bConvIface.read(w13bConv) != 43 || w13bConv.hit != 1) return 87116;
+    w13b.ConvExact w13bConvExact = w13b.ConvExact();
+    if (w13bConvIface.read(w13bConvExact) != 43 || w13bConvExact.hit != 2) return 87117;
+    W13BPlainValueImpl w13bPlainImpl = default;
+    W13BPlainValueIface w13bPlainIface = &w13bPlainImpl;
+    immt90.Plain w13bPlainDirect = default;
+    if (w13b_plain_value_direct(w13bPlainDirect) != 99 || w13bPlainDirect.v != 99) return 87118;
+    immt90.Plain w13bPlainIfaceValue = default;
+    if (w13bPlainIface.write(w13bPlainIfaceValue) != 99 || w13bPlainIfaceValue.v != 99) return 87119;
+
+    // W13B B: an unambiguous variadic constructor set stays available in all three forms.
+    w13b.CtorAccept w13bCtorParen = w13b.CtorAccept(1);
+    w13b.CtorAccept w13bCtorBrace = {1};
+    w13b.CtorAccept* w13bCtorNew = new w13b.CtorAccept(1);
+    if (w13bCtorParen.which != 1 || w13bCtorBrace.which != 1
+        || w13bCtorNew.which != 1) return 87111;
+    delete w13bCtorNew;
+
+    // W13B C: C-variadic templates win for zero, one, and two ellipsis arguments.
+    if (w13b.variadic_template(1) != 1
+        || w13b.variadic_template(1, 9) != 1
+        || w13b.variadic_template(1, 9, 10) != 1) return 87112;
+    if (w13b.variadic_template((long)1) != 2
+        || w13b.variadic_template((long)1, 9) != 2
+        || w13b.variadic_template((long)1, 9, 10) != 2) return 87113;
+    w13b.VariadicMember w13bMember = w13b.VariadicMember();
+    if (w13bMember.pick(1) != 9 || w13bMember.pick(1, 9) != 9
+        || w13bMember.pick(1, 9, 10) != 9) return 87114;
+    if (w13bMember.pick((long)1) != 10 || w13bMember.pick((long)1, 9) != 10
+        || w13bMember.pick((long)1, 9, 10) != 10) return 87115;
     return 0;
 }

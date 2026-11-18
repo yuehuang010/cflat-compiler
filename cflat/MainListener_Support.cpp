@@ -2448,8 +2448,12 @@ bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node)
 {
     if (node == nullptr) return false;
     if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
-        assign != nullptr && assign->assignmentOperator() != nullptr)
-        return true;
+        assign != nullptr)
+    {
+        if (assign->assignmentOperator() != nullptr) return true;
+        if (assign->assignmentExpression() != nullptr)
+            return IsChainedAssignmentShape(assign->assignmentExpression());
+    }
     if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
         primary != nullptr)
         return primary->expression() != nullptr && primary->children.size() == 3
@@ -5193,16 +5197,252 @@ bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
     if (p.IsBorrowOfAliasElement) return false;
     return true;
 }
+std::string SimpleIdentifierPrimaryName(CFlatParser::PrimaryExpressionContext* primary);
 std::string SimpleIdentifierExpressionName(antlr4::tree::ParseTree* expression)
 {
     auto* postfix = SolePostfixExpressionShape(expression);
     if (postfix == nullptr || postfix->children.size() != 1) return {};
-    auto* primary = postfix->primaryExpression();
+    return SimpleIdentifierPrimaryName(postfix->primaryExpression());
+}
+std::string SimpleIdentifierPrimaryName(CFlatParser::PrimaryExpressionContext* primary)
+{
     auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
     if (primary == nullptr || primary->children.size() != 1 || generic == nullptr
         || generic->genericTypeParameters() != nullptr || generic->Identifier() == nullptr)
         return {};
     return generic->Identifier()->getText();
+}
+std::unordered_set<CFlatParser::DirectDeclaratorContext*> ClassifyThisReceiverAliasLocals(
+    CFlatParser::FunctionDefinitionContext* func)
+{
+    constexpr size_t kNoCandidate = static_cast<size_t>(-1);
+    struct Candidate
+    {
+        CFlatParser::DirectDeclaratorContext* Declarator = nullptr;
+        bool InitValid = false;
+        bool InitReceiver = false;
+        size_t InitAlias = kNoCandidate;
+        bool WritesValid = true;
+        std::vector<size_t> WriteAliases;
+    };
+    struct ScopeEntry
+    {
+        std::string Name;
+        size_t CandidateIndex = kNoCandidate;
+    };
+    struct Scan
+    {
+        std::vector<std::vector<ScopeEntry>> Scopes;
+        std::vector<Candidate> Candidates;
+
+        size_t Resolve(const std::string& name, bool& found) const
+        {
+            for (auto scope = Scopes.rbegin(); scope != Scopes.rend(); ++scope)
+                for (auto entry = scope->rbegin(); entry != scope->rend(); ++entry)
+                    if (entry->Name == name)
+                    {
+                        found = true;
+                        return entry->CandidateIndex;
+                    }
+            found = false;
+            return kNoCandidate;
+        }
+        size_t Bind(const std::string& name, CFlatParser::DirectDeclaratorContext* direct)
+        {
+            if (Scopes.empty()) return kNoCandidate;
+            size_t index = kNoCandidate;
+            if (direct != nullptr)
+            {
+                index = Candidates.size();
+                Candidates.push_back(Candidate{direct});
+            }
+            Scopes.back().push_back({name, index});
+            return index;
+        }
+        struct Source
+        {
+            bool Valid = false;
+            bool Receiver = false;
+            size_t Alias = kNoCandidate;
+        };
+        Source ResolveSource(antlr4::tree::ParseTree* expression) const
+        {
+            const std::string name = SimpleIdentifierExpressionName(expression);
+            if (name.empty()) return {};
+            bool found = false;
+            const size_t local = Resolve(name, found);
+            if (found)
+                return local == kNoCandidate ? Source{} : Source{true, false, local};
+            // `this` is recognized only as a bare identifier after local/parameter lookup.
+            return name == "this" ? Source{true, true, kNoCandidate} : Source{};
+        }
+        void InvalidateTarget(antlr4::tree::ParseTree* target)
+        {
+            InvalidateName(SimpleIdentifierExpressionName(target));
+        }
+        void InvalidateName(const std::string& name)
+        {
+            if (name.empty()) return;
+            bool found = false;
+            const size_t local = Resolve(name, found);
+            if (found && local != kNoCandidate) Candidates[local].WritesValid = false;
+        }
+        void RecordAssignment(CFlatParser::AssignmentExpressionContext* assignment)
+        {
+            if (assignment == nullptr || assignment->assignmentOperator() == nullptr) return;
+            const std::string name = SimpleIdentifierExpressionName(assignment->unaryExpression());
+            if (name.empty()) return;
+            bool found = false;
+            const size_t local = Resolve(name, found);
+            if (!found || local == kNoCandidate) return;
+            auto& candidate = Candidates[local];
+            if (assignment->assignmentOperator()->getText() != "="
+                || assignment->assignmentExpression() == nullptr)
+            {
+                candidate.WritesValid = false;
+                return;
+            }
+            const Source source = ResolveSource(assignment->assignmentExpression());
+            if (!source.Valid)
+                candidate.WritesValid = false;
+            else if (!source.Receiver)
+                candidate.WriteAliases.push_back(source.Alias);
+        }
+        void BindDeclaration(CFlatParser::InitDeclaratorListContext* list,
+            bool automatic)
+        {
+            if (list == nullptr) return;
+            for (auto* init : list->initDeclarator())
+            {
+                auto* declarator = init->declarator();
+                auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                auto* identifier = LexicalDirectDeclaratorIdentifier(direct);
+                if (identifier == nullptr) continue;
+                const size_t index = Bind(identifier->getText(), automatic ? direct : nullptr);
+                if (index != kNoCandidate)
+                {
+                    auto& candidate = Candidates[index];
+                    auto* initializer = init->initializer();
+                    const Source source = initializer != nullptr
+                        ? ResolveSource(initializer->assignmentExpression()) : Source{};
+                    candidate.InitValid = source.Valid;
+                    candidate.InitReceiver = source.Receiver;
+                    candidate.InitAlias = source.Alias;
+                }
+                Visit(init);
+            }
+        }
+        void Visit(antlr4::tree::ParseTree* node)
+        {
+            if (node == nullptr) return;
+            if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr
+                || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node) != nullptr)
+                return;
+            if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(node))
+            {
+                Scopes.emplace_back();
+                if (compound->blockItemList() != nullptr)
+                    for (auto* item : compound->blockItemList()->blockItem()) Visit(item);
+                Scopes.pop_back();
+                return;
+            }
+            if (auto* loop = AsRuleCtx<CFlatParser::IterationStatementContext>(node))
+            {
+                Scopes.emplace_back();
+                if (loop->In() != nullptr && loop->Identifier() != nullptr)
+                    Bind(loop->Identifier()->getText(), nullptr);
+                for (auto* child : loop->children) Visit(child);
+                Scopes.pop_back();
+                return;
+            }
+            if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+            {
+                BindDeclaration(declaration->initDeclaratorList(),
+                    !HasNonAutomaticStorageClass(declaration->declarationSpecifiers()));
+                return;
+            }
+            if (auto* declaration = dynamic_cast<CFlatParser::ForDeclarationContext*>(node))
+            {
+                BindDeclaration(declaration->initDeclaratorList(), true);
+                return;
+            }
+            if (auto* destructuring = dynamic_cast<CFlatParser::DestructuringDeclarationContext*>(node))
+            {
+                for (auto* entry : destructuring->destructuringEntry())
+                    if (entry->Identifier() != nullptr) Bind(entry->Identifier()->getText(), nullptr);
+                for (auto* child : destructuring->children) Visit(child);
+                return;
+            }
+            if (auto* labeled = AsRuleCtx<CFlatParser::LabeledStatementContext>(node);
+                labeled != nullptr && labeled->typeSpecifier() != nullptr
+                && labeled->Identifier() != nullptr)
+            {
+                Scopes.emplace_back();
+                Bind(labeled->Identifier()->getText(), nullptr);
+                for (auto* child : labeled->children) Visit(child);
+                Scopes.pop_back();
+                return;
+            }
+            if (auto* assignment = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
+                RecordAssignment(assignment);
+            if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+                unary != nullptr && unary->unaryOperator() != nullptr
+                && unary->unaryOperator()->getText() == "&")
+                InvalidateTarget(unary->castExpression());
+            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+                postfix != nullptr && postfix->children.size() == 2
+                && (postfix->children.back()->getText() == "++"
+                    || postfix->children.back()->getText() == "--"))
+                InvalidateName(SimpleIdentifierPrimaryName(postfix->primaryExpression()));
+            for (auto* child : node->children) Visit(child);
+        }
+    } scan;
+
+    if (func == nullptr || func->compoundStatement() == nullptr) return {};
+    scan.Scopes.emplace_back();
+    auto* params = func->parameterTypeList() != nullptr
+        ? func->parameterTypeList()->parameterList() : nullptr;
+    if (params != nullptr)
+        for (auto* param : params->parameterDeclaration())
+        {
+            auto* declarator = param->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            auto* identifier = LexicalDirectDeclaratorIdentifier(direct);
+            if (identifier != nullptr) scan.Bind(identifier->getText(), nullptr);
+        }
+    scan.Visit(func->compoundStatement());
+
+    std::vector<bool> viable(scan.Candidates.size(), false);
+    for (size_t i = 0; i < scan.Candidates.size(); ++i)
+    {
+        const auto& candidate = scan.Candidates[i];
+        viable[i] = candidate.InitValid && candidate.WritesValid
+            && (candidate.InitReceiver
+                || (candidate.InitAlias != kNoCandidate && viable[candidate.InitAlias]));
+    }
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (size_t i = 0; i < scan.Candidates.size(); ++i)
+        {
+            if (!viable[i]) continue;
+            const auto& candidate = scan.Candidates[i];
+            const auto invalid = [&](size_t dependency) {
+                return dependency >= viable.size() || !viable[dependency];
+            };
+            if ((candidate.InitAlias != kNoCandidate && invalid(candidate.InitAlias))
+                || std::any_of(candidate.WriteAliases.begin(), candidate.WriteAliases.end(), invalid))
+            {
+                viable[i] = false;
+                changed = true;
+            }
+        }
+    }
+    std::unordered_set<CFlatParser::DirectDeclaratorContext*> result;
+    for (size_t i = 0; i < scan.Candidates.size(); ++i)
+        if (viable[i]) result.insert(scan.Candidates[i].Declarator);
+    return result;
 }
 bool NameIsImplicitThisField(antlr4::tree::ParseTree* bodyRoot,
         const std::string& name)

@@ -5939,7 +5939,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (!tag.empty() && ptrLevels <= 2 && dataStructures.find(tag) != dataStructures.end())
                     tv.TypeName = tag;
             }
-            if (!dims.empty())
+            if (!dims.empty()
+                && SqueezeCxxSpelling(spelling).find("(*)[") == std::string::npos)
             {
                 tv.ConstArraySize = dims[0];
                 tv.ConstInnerDimensions.assign(dims.begin() + 1, dims.end());
@@ -5997,6 +5998,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (!m.isConversion) return m.name;
             TypeAndValue convRet;
             if (!mapType(m.retType, convRet)) return m.name;
+            if (m.retType.find('&') != std::string::npos
+                && IsCxxRecord(convRet.TypeName))
+                return m.name;
             std::string spelling = convRet.IsPrimitive() && !convRet.Pointer
                 ? CanonicalPrimitiveTypeName(ResolveTypeAlias(convRet.TypeName))
                 : SpellType(*this, convRet);
@@ -6004,6 +6008,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         };
         auto cflatSigKey = [&](const Member& m) {
             std::string key = memberRegName(m);
+            // Conversion operators with different target reference/pointer shapes can share a
+            // CFlat spelling; retain each target for conversion-sequence ranking.
+            if (m.isConversion) key += "|convret=" + SqueezeCxxSpelling(m.retType);
             key += "|thisrq=" + std::to_string(m.refQualifier);
             for (size_t p = 1; p < m.paramTypes.size(); ++p)
             {

@@ -20765,6 +20765,12 @@ extern int main()
     total += 17;
     passed += testChainedRawIntoUnique();
     total += 7;
+    passed += testChainedAssignItem3();
+    total += 2;
+    passed += testChainedAssignParenthesized();
+    total += 3;
+    passed += testChainedAssignFreshNonlocal();
+    total += 8;
     passed += testChainedRawShapes();
     total += 14;
     total += 16;
@@ -20779,6 +20785,14 @@ extern int main()
     passed += testChainMiddleThatCannotOwn();
     passed += testT447ExplicitMoveThisField();
     total++;
+    passed += testT447AliasAcceptSet();
+    total += 5;
+    passed += testT447ReviewAcceptSet();
+    total += 9;
+    passed += testT447ExplicitMoveSelfField();
+    total += 2;
+    passed += testT447AliasArraySelfAssignment();
+    total += 2;
     passed += testT376ChainedUniqueField();
     total += 12;
     passed += testT476AutoUniqueFieldAcceptSet();
@@ -24705,6 +24719,318 @@ int testT447ExplicitMoveThisField()
     i64 after = (i64)HeapAudit.reportLeaks() - before;
     return Test("t447_explicit_move_this_field_global_receiver",
         value == 447 && t447GlobalReceiver.p == nullptr && t376ChainDtors == 1 && after == 0, true);
+}
+
+int t447AliasConsumedValue = 0;
+void t447AliasSink(move T376PS* value)
+{
+    t447AliasConsumedValue = value == nullptr ? -1 : value->v;
+}
+
+struct T447AliasReceiver
+{
+    unique T376PS* p = default;
+    unique T376PS* q = default;
+    T447AliasReceiver* next = nullptr;
+    int consumeReassignedSink()
+    {
+        T447AliasReceiver target = default;
+        target.p = new T376PS(448);
+        T447AliasReceiver* self = this;
+        self = &target;
+        t447AliasSink(self->p);
+        return target.p == nullptr ? 1 : 0;
+    }
+    int consumeReassignedTernary()
+    {
+        T447AliasReceiver target = default;
+        target.p = new T376PS(449);
+        target.q = new T376PS(450);
+        T447AliasReceiver* self = this;
+        self = &target;
+        t447AliasSink(true ? self->p : self->q);
+        return target.p == nullptr && target.q != nullptr ? 1 : 0;
+    }
+    int consumeParamSink(T447AliasReceiver* source)
+    {
+        T447AliasReceiver* self = source;
+        t447AliasSink(self->p);
+        return source->p == nullptr ? 1 : 0;
+    }
+    int consumeParamTernary(T447AliasReceiver* source, bool c)
+    {
+        T447AliasReceiver* self = source;
+        t447AliasSink(c ? self->p : self->q);
+        return source->q == nullptr ? 1 : 0;
+    }
+    int consumeNextViaThis(T447AliasReceiver* other)
+    {
+        next = other;
+        t447AliasSink(this->next->p);
+        return p != nullptr && next->p == nullptr ? 1 : 0;
+    }
+    int consumeNextDereferenced(T447AliasReceiver* other)
+    {
+        next = other;
+        t447AliasSink((*this->next).p);
+        return p != nullptr && next->p == nullptr ? 1 : 0;
+    }
+    int moveNextField(T447AliasReceiver* other, int expected)
+    {
+        next = other;
+        unique T376PS* owner = nullptr;
+        owner = this->next->p;
+        return p != nullptr && owner != nullptr && owner->v == expected
+            && next->p == nullptr ? 1 : 0;
+    }
+    int consumeNextTernary(T447AliasReceiver* other, bool c)
+    {
+        next = other;
+        t447AliasSink(c ? this->next->p : this->next->q);
+        return p != nullptr && next->p == nullptr && next->q != nullptr ? 1 : 0;
+    }
+    int consumeNextViaAlias(T447AliasReceiver* other)
+    {
+        next = other;
+        T447AliasReceiver* self = this;
+        t447AliasSink(self->next->p);
+        return p != nullptr && next->p == nullptr ? 1 : 0;
+    }
+    int consumeNextFromDeclaration(T447AliasReceiver* other)
+    {
+        next = other;
+        T447AliasReceiver* n = this->next;
+        t447AliasSink(n->p);
+        return p != nullptr && next->p == nullptr ? 1 : 0;
+    }
+    int consumeAfterIncrement()
+    {
+        T447AliasReceiver* it = this;
+        it++;
+        t447AliasSink(it->p);
+        return p != nullptr ? 1 : 0;
+    }
+    int consumeAfterLoopRebind(T447AliasReceiver* other)
+    {
+        T447AliasReceiver* self = this;
+        int i = 0;
+        while (i < 2)
+        {
+            if (i == 1)
+            {
+                t447AliasSink(self->p);
+                return p != nullptr && other->p == nullptr ? 1 : 0;
+            }
+            self = other;
+            i++;
+        }
+        return 0;
+    }
+    void takeExplicitAlias()
+    {
+        T447AliasReceiver* self = this;
+        t447AliasSink(move self->p);
+    }
+};
+
+struct T447AliasArrayReceiver
+{
+    unique T376PS*[2] p;
+    void sameSlot()
+    {
+        T447AliasArrayReceiver* self = this;
+        self->p[0] = self->p[0];
+    }
+};
+
+int testT447AliasAcceptSet()
+{
+    int passed = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    t376ChainDtors = 0;
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(447);
+        int reassignedSink = receiver.consumeReassignedSink();
+        passed += Test("t447_alias_reassigned_sink_preserves_receiver",
+            reassignedSink == 1 && t447AliasConsumedValue == 448
+                && receiver.p != nullptr && receiver.p->v == 447 && t376ChainDtors == 1, true);
+
+        int reassignedTernary = receiver.consumeReassignedTernary();
+        passed += Test("t447_alias_reassigned_ternary_preserves_receiver",
+            reassignedTernary == 1 && t447AliasConsumedValue == 449
+                && receiver.p != nullptr && receiver.p->v == 447 && t376ChainDtors == 3, true);
+
+        T447AliasReceiver source = default;
+        source.p = new T376PS(451);
+        source.q = new T376PS(452);
+        int paramSink = receiver.consumeParamSink(&source);
+        passed += Test("t447_alias_param_sink_preserves_receiver",
+            paramSink == 1 && t447AliasConsumedValue == 451
+                && receiver.p != nullptr && receiver.p->v == 447
+                && source.p == nullptr && source.q != nullptr && source.q->v == 452
+                && t376ChainDtors == 4, true);
+
+        source.p = new T376PS(453);
+        int paramTernary = receiver.consumeParamTernary(&source, false);
+        passed += Test("t447_alias_param_ternary_preserves_receiver",
+            paramTernary == 1 && t447AliasConsumedValue == 452
+                && receiver.p != nullptr && receiver.p->v == 447
+                && source.p != nullptr && source.p->v == 453 && source.q == nullptr
+                && t376ChainDtors == 5, true);
+    }
+    i64 after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t447_alias_accept_set_births_dtors_heap",
+        t376ChainDtors == 7 && after == 0, true);
+    return passed;
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447RepeatedThisAliasRefusal
+    {
+        unique T376PS* p = default;
+        void bad()
+        {
+            T447RepeatedThisAliasRefusal* s = this;
+            s = this;
+            t447AliasSink(s->p);
+        }
+    };
+}
+
+int testT447ReviewAcceptSet()
+{
+    int passed = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    t376ChainDtors = 0;
+    bool ok = false;
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(460);
+        T447AliasReceiver other = default;
+        other.p = new T376PS(461);
+        ok = receiver.consumeNextViaThis(&other) == 1
+            && t447AliasConsumedValue == 461 && receiver.p != nullptr
+            && t376ChainDtors == 1;
+    }
+    ok = ok && t376ChainDtors == 2;
+    passed += Test("t447_review_next_via_this_value_dtor", ok, true);
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(462);
+        T447AliasReceiver other = default;
+        other.p = new T376PS(463);
+        ok = receiver.consumeNextDereferenced(&other) == 1
+            && t447AliasConsumedValue == 463 && receiver.p != nullptr
+            && t376ChainDtors == 3;
+    }
+    ok = ok && t376ChainDtors == 4;
+    passed += Test("t447_review_next_deref_value_dtor", ok, true);
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(464);
+        T447AliasReceiver other = default;
+        other.p = new T376PS(465);
+        ok = receiver.moveNextField(&other, 465) == 1 && receiver.p != nullptr
+            && t376ChainDtors == 5;
+    }
+    ok = ok && t376ChainDtors == 6;
+    passed += Test("t447_review_next_assign_value_dtor", ok, true);
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(466);
+        T447AliasReceiver other = default;
+        other.p = new T376PS(467);
+        other.q = new T376PS(468);
+        ok = receiver.consumeNextTernary(&other, true) == 1
+            && t447AliasConsumedValue == 467 && receiver.p != nullptr
+            && t376ChainDtors == 7;
+    }
+    ok = ok && t376ChainDtors == 9;
+    passed += Test("t447_review_next_ternary_value_dtor", ok, true);
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(469);
+        T447AliasReceiver other = default;
+        other.p = new T376PS(470);
+        ok = receiver.consumeNextViaAlias(&other) == 1
+            && t447AliasConsumedValue == 470 && receiver.p != nullptr
+            && t376ChainDtors == 10;
+    }
+    ok = ok && t376ChainDtors == 11;
+    passed += Test("t447_review_next_via_alias_value_dtor", ok, true);
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(471);
+        T447AliasReceiver other = default;
+        other.p = new T376PS(472);
+        ok = receiver.consumeNextFromDeclaration(&other) == 1
+            && t447AliasConsumedValue == 472 && receiver.p != nullptr
+            && t376ChainDtors == 12;
+    }
+    ok = ok && t376ChainDtors == 13;
+    passed += Test("t447_review_decl_from_field_value_dtor", ok, true);
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(473);
+        T447AliasReceiver other = default;
+        other.p = new T376PS(474);
+        ok = receiver.consumeAfterLoopRebind(&other) == 1
+            && t447AliasConsumedValue == 474 && receiver.p != nullptr
+            && t376ChainDtors == 14;
+    }
+    ok = ok && t376ChainDtors == 15;
+    passed += Test("t447_review_loop_once_value_dtor", ok, true);
+    {
+        T447AliasReceiver* arr = new T447AliasReceiver[2];
+        arr[0].p = new T376PS(475);
+        arr[1].p = new T376PS(476);
+        ok = arr[0].consumeAfterIncrement() == 1 && t447AliasConsumedValue == 476
+            && arr[1].p == nullptr && t376ChainDtors == 16;
+        delete[2] arr;
+    }
+    ok = ok && t376ChainDtors == 17;
+    passed += Test("t447_review_increment_alias_value_dtor", ok, true);
+    i64 after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t447_review_accept_set_births_dtors_heap",
+        t376ChainDtors == 17 && after == 0, true);
+    return passed;
+}
+
+int testT447ExplicitMoveSelfField()
+{
+    int passed = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    t376ChainDtors = 0;
+    {
+        T447AliasReceiver receiver = default;
+        receiver.p = new T376PS(454);
+        receiver.takeExplicitAlias();
+        passed += Test("t447_explicit_move_self_field_nulls_and_destroys",
+            t447AliasConsumedValue == 454
+                && receiver.p == nullptr && t376ChainDtors == 1, true);
+    }
+    i64 after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t447_explicit_move_self_field_heap", after, (i64)0);
+    return passed;
+}
+
+int testT447AliasArraySelfAssignment()
+{
+    int passed = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    t376ChainDtors = 0;
+    {
+        T447AliasArrayReceiver receiver = default;
+        receiver.p[0] = new T376PS(455);
+        receiver.sameSlot();
+        passed += Test("t447_alias_array_same_slot_keeps_value",
+            receiver.p[0] != nullptr && receiver.p[0]->v == 455 && t376ChainDtors == 0, true);
+    }
+    i64 after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t447_alias_array_same_slot_dtor_heap",
+        t376ChainDtors == 1 && after == 0, true);
+    return passed;
 }
 
 int testT376ChainedUniqueField()
@@ -29242,5 +29568,160 @@ int uqrawAcceptLegs()
         mvslotR2Result * 100 + mvslotR2NullCount * 10 + uqrawDtors, 3422);
     passed += Test("mvslotleft r2 scalar sibling fields twin heap",
         (i64)HeapAudit.reportLeaks() - mvslotR2HeapBase, (i64)0);
+    return passed;
+}
+
+// Chain/middle acceptance matrix legs; packed result is value*10000 + births*100 + dtors.
+int chainAssignBirths = 0;
+int chainAssignDtors = 0;
+struct ChainAssignPS
+{
+    int v = 0;
+    ChainAssignPS() { chainAssignBirths++; v = chainAssignBirths; }
+    ~ChainAssignPS() { chainAssignDtors++; }
+};
+
+int chainAssignItem3(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        unique ChainAssignPS* a = nullptr;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        a = b = (c ? other : nullptr);
+        value = a == nullptr ? -1 : a->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int testChainedAssignItem3()
+{
+    int passed = 0;
+    passed += Test("chain_item3_c0_chain", chainAssignItem3(false), -9899);
+    passed += Test("chain_item3_c1_chain", chainAssignItem3(true), 10101);
+    return passed;
+}
+
+int chainAssignParenthesizedAssignment()
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        unique ChainAssignPS* a = nullptr;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        a = (b = other);
+        value = a == nullptr ? -1 : a->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int chainAssignParenthesizedJoin(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        unique ChainAssignPS* a = nullptr;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        a = (b = (c ? other : nullptr));
+        value = a == nullptr ? -1 : a->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int testChainedAssignParenthesized()
+{
+    int passed = 0;
+    passed += Test("chain_parenthesized_assignment_value_and_dtor",
+        chainAssignParenthesizedAssignment(), 10101);
+    passed += Test("chain_parenthesized_join_null_value_and_dtor",
+        chainAssignParenthesizedJoin(false), -9899);
+    passed += Test("chain_parenthesized_join_owner_value_and_dtor",
+        chainAssignParenthesizedJoin(true), 10101);
+    return passed;
+}
+
+// Fresh-or-owned ternary chains into nonlocal unique destinations: the middle owns the join, so
+// the outer takes it as its two-statement form does. Packed result as above; c false is 10101, c true 20202.
+struct ChainAssignHolder { unique ChainAssignPS* u = nullptr; };
+unique ChainAssignPS* chainAssignGlobalU = nullptr;
+
+int chainAssignArrayFresh(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        unique ChainAssignPS*[1] arr = default;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        arr[0] = b = (c ? new ChainAssignPS() : other);
+        value = arr[0] == nullptr ? -1 : arr[0]->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int chainAssignFieldFresh(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        ChainAssignHolder h;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        h.u = b = (c ? new ChainAssignPS() : other);
+        value = h.u == nullptr ? -1 : h.u->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int chainAssignGlobalFresh(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        chainAssignGlobalU = b = (c ? new ChainAssignPS() : other);
+        value = chainAssignGlobalU == nullptr ? -1 : chainAssignGlobalU->v;
+        chainAssignGlobalU = nullptr;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int chainAssignDerefFresh(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        unique ChainAssignPS* a = nullptr;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        auto pp = &a;
+        *pp = b = (c ? new ChainAssignPS() : other);
+        value = a == nullptr ? -1 : a->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int testChainedAssignFreshNonlocal()
+{
+    int passed = 0;
+    passed += Test("chain_fresh_array_outer_c0", chainAssignArrayFresh(false), 10101);
+    passed += Test("chain_fresh_array_outer_c1", chainAssignArrayFresh(true), 20202);
+    passed += Test("chain_fresh_field_outer_c0", chainAssignFieldFresh(false), 10101);
+    passed += Test("chain_fresh_field_outer_c1", chainAssignFieldFresh(true), 20202);
+    passed += Test("chain_fresh_global_outer_c0", chainAssignGlobalFresh(false), 10101);
+    passed += Test("chain_fresh_global_outer_c1", chainAssignGlobalFresh(true), 20202);
+    passed += Test("chain_fresh_deref_outer_c0", chainAssignDerefFresh(false), 10101);
+    passed += Test("chain_fresh_deref_outer_c1", chainAssignDerefFresh(true), 20202);
     return passed;
 }

@@ -116,7 +116,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | Itanium landed CONSTTWIN (72073fc6); clang-cl residue only |
 | B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), siblings | FLEXLEFT cface31e landed `*&` / paren sizeof and implicit-this `move data`; FLEXSZ 31d380ba landed 2-D row sizeof / arithmetic, 1-D double subscript refusal, `sizeof(&a)` |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | by-design B9 rulings (arr elem init landed ASSIGN 72073fc6) | OPEN (P2 landed 1955bd95) |
-| W13b | p3/cpp-overload-variadic-and-conversion-gaps | conversion operators at C++ callees landed 723b0440; residue CFlat callee with a derived-pointer result | inline variadic link landed VARLINK (1a702805) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 
 ### C - wrongly accepted (adds a rejection)
@@ -193,7 +192,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|----------|-------|
 | L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; TUPALIAS 43eceb08 + TUPLEFT 43eceb08 landed; `new S((nullptr,4))` landed 62b0d331; residue: owned unique-element refusals, R133/R134 |
 | L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | overload sets landed 72073fc6, typed-ternary literal and `list<T*>` deduction landed 62b0d331; C++ template instance as value; ctor deduction (ruled 2026-10-13) |
-| L-PERF | p3/nested-ternary-compile-time | 2x per `?:` level and walker overflows fixed; residue: ANTLR parse / teardown overflow on ~950+ nested parens, no pre-parse guard |
 
 ### P - plans and staged work
 
@@ -218,7 +216,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | p3/pools-no-destructor-shutdown-ordering | manual by design; record only |
 | p3/generated-code-is-roughly-twice-the-size-msvc-emits | codegen size vs MSVC |
 | p3/lsp-slow-after-aborted-interop-compile | LSP ~491 s after an aborted interop compile |
-| p3/test-move-with-cpp-import-self-return-proof-refused | test_move with a C++ import reaches a later unique reset refusal |
 | p3/edge-fill-winui + p3/listview-dark-column-rules | Windows UI; Windows box only |
 | p3/clang-tidy-performance-backlog | ~232 string building left; profile-gated or turn the check off (other perf checks landed 2026-11-07) |
 
@@ -245,7 +242,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | Issue | DISABLED case | Summary |
 |---|---|---|
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
-| p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (ef83ffa02); ruled picks landed GENOVLR (5344802ed); leftovers: CFlat expression typing (1 << 2L, 1.5 + x, char arithmetic), strlit vs char*, named-arg inference, generic-only const pointee return, UFCS free generic |
+| p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (ef83ffa02); ruled picks landed GENOVLR (5344802ed); leftovers landed GENLEFT (named args, const pointee deduction, UFCS free generic); open: main-session `f(const int*)` + `f<T>(T*)` pick (maintainer may veto) |
 | p3/member-type-path-remaining-gaps | (none) | `Outer<int>.Inner<long>.type`, closure-alias members, CFlat static data members, C++ statics as value template args (T37 follow-up) |
 
 ### Ruled - ready to schedule (rulings recorded in each issue file)
