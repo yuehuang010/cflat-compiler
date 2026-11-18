@@ -246,6 +246,10 @@ namespace cflat_cinterop
         // Generated wrappers only (T518): the outermost free call's selected callee - canonical
         // function type and its default arguments - for the by-address by-value call.
         std::string selectedCalleeType;
+        // Generated member-template wrappers only (T518): the selected member's declaring class.
+        std::string selectedCalleeOwner;
+        // True when Clang resolved the declaring class as the receiver's exact record.
+        bool selectedCalleeOwnerIsReceiver = false;
         // "<args>" when the selected callee is a function template specialization, else empty.
         std::string selectedCalleeTemplateArgs;
         std::vector<RawDefaultArg> selectedCalleeDefaults;

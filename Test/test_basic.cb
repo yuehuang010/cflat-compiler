@@ -13500,6 +13500,105 @@ struct T471BareGenericStatic<T>
     static int fromStatic() { return t471BareGenericStaticPick(6); }
 };
 
+Lambda<int(int)> t471FileGlobalCallable = (int k) => { return k + 20; };
+namespace T471FileGlobalCallableNS
+{
+    struct S
+    {
+        int t471FileGlobalCallable(int k) { return k + 10; }
+        int call() { return t471FileGlobalCallable(5); }
+    };
+    int run() { S s = default; return s.call(); }
+};
+namespace T471NamespaceCallableNS
+{
+    Lambda<int(int)> t471NamespaceCallable = (int k) => { return k + 20; };
+    struct S
+    {
+        int t471NamespaceCallable(int k) { return k + 10; }
+        int call() { return t471NamespaceCallable(5); }
+    };
+    int run() { S s = default; return s.call(); }
+};
+namespace T471NamespaceFreeNS
+{
+    int t471NamespaceFree(int k) { return k + 20; }
+    struct S
+    {
+        int t471NamespaceFree(int k) { return k + 10; }
+        int call() { return t471NamespaceFree(5); }
+    };
+    int run() { S s = default; return s.call(); }
+};
+namespace T471NamespaceIntNS
+{
+    int t471NamespaceInt = 99;
+    struct S
+    {
+        int t471NamespaceInt(int k) { return k + 10; }
+        int call() { return t471NamespaceInt(5); }
+    };
+    int run() { S s = default; return s.call(); }
+};
+struct T471LocalCallableMethod
+{
+    int t471LocalCallable(int k) { return k + 10; }
+    int call()
+    {
+        Lambda<int(int)> t471LocalCallable = (int k) => { return k + 20; };
+        return t471LocalCallable(5);
+    }
+};
+int t471ImplicitCallableFieldTarget(int k) { return k + 20; }
+struct T471ImplicitCallableField
+{
+    Lambda<int(int)> t471ImplicitCallableField = t471ImplicitCallableFieldTarget;
+    int call() { return t471ImplicitCallableField(5); }
+};
+int t471LambdaGenericStructPick(int k) { return k + 20; }
+struct T471LambdaGenericStruct<T>
+{
+    static int t471LambdaGenericStructPick(int k) { return k + 10; }
+    int call(T tag)
+    {
+        Lambda<int(int)> f = (int k) => { return t471LambdaGenericStructPick(k); };
+        return f(5);
+    }
+};
+int t471LambdaGenericMethodPick(int k) { return k + 20; }
+struct T471LambdaGenericMethod
+{
+    static int t471LambdaGenericMethodPick(int k) { return k + 10; }
+    int call<T>(T tag)
+    {
+        Lambda<int(int)> f = (int k) => { return t471LambdaGenericMethodPick(k); };
+        return f(5);
+    }
+};
+int t471LambdaNestedPick(int k) { return k + 20; }
+struct T471LambdaNestedGeneric<T>
+{
+    static int t471LambdaNestedPick(int k) { return k + 10; }
+    int call(T tag)
+    {
+        Lambda<int(int)> outer = (int a) => {
+            Lambda<int(int)> inner = (int k) => { return t471LambdaNestedPick(k); };
+            return inner(a);
+        };
+        return outer(5);
+    }
+};
+int t471LambdaNonGenericPick(int k) { return k + 20; }
+struct T471LambdaNonGeneric
+{
+    static int t471LambdaNonGenericPick(int k) { return k + 10; }
+    int call()
+    {
+        Lambda<int(int)> f = (int k) => { return t471LambdaNonGenericPick(k); };
+        return f(5);
+    }
+};
+
 int t504InitializerHelper(int value) { return value + 3; }
 int t504ValidCallInitializer() { int x0 = 2; int x = x0 + t504InitializerHelper(1); return x; }
 struct T504InitBox { int value = 0; };
@@ -14619,6 +14718,29 @@ bool testT471BareCalls()
     T471BareGenericStatic<int> genericStatic = default;
     result &= Test("t471_bare_generic_static_hides_free", genericStatic.fromInstance(), 15);
     result &= Test("t471_bare_generic_static_from_static", T471BareGenericStatic<int>.fromStatic(), 16);
+    result &= Test("t471_file_global_callable_yields_to_namespace_method",
+        T471FileGlobalCallableNS.run(), 15);
+    result &= Test("t471_namespace_callable_yields_to_method",
+        T471NamespaceCallableNS.run(), 15);
+    result &= Test("t471_namespace_free_yields_to_method",
+        T471NamespaceFreeNS.run(), 15);
+    result &= Test("t471_namespace_int_yields_to_method",
+        T471NamespaceIntNS.run(), 15);
+    T471LocalCallableMethod localCallableMethod = default;
+    result &= Test("t471_local_callable_hides_method", localCallableMethod.call(), 25);
+    T471ImplicitCallableField implicitCallableField = default;
+    result &= Test("t471_implicit_this_callable_field", implicitCallableField.call(), 25);
+    T471LambdaGenericStruct<int> lambdaGenericStruct = default;
+    result &= Test("t471_generic_struct_method_lambda_static_hides_free",
+        lambdaGenericStruct.call(0), 15);
+    T471LambdaGenericMethod lambdaGenericMethod = default;
+    result &= Test("t471_generic_method_lambda_static_hides_free",
+        lambdaGenericMethod.call<int>(0), 15);
+    T471LambdaNestedGeneric<int> lambdaNestedGeneric = default;
+    result &= Test("t471_nested_lambda_generic_static_hides_free",
+        lambdaNestedGeneric.call(0), 15);
+    T471LambdaNonGeneric lambdaNonGeneric = default;
+    result &= Test("t471_non_generic_lambda_static_hides_free", lambdaNonGeneric.call(), 15);
     return result;
 }
 

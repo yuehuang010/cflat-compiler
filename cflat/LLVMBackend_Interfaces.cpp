@@ -330,6 +330,8 @@ std::string LLVMBackend::ResolveMemberType(const std::string& owner, const std::
                 for (const auto& field : ds->second.StructFields)
                     if (field.VariableName == member) isValueMember = true;
             result = isValueMember ? MemberTypeResult::NotAType : MemberTypeResult::NotFound;
+            if (result == MemberTypeResult::NotFound)
+                return MainListener::ResolveFunctionTypeAliasMember(this, owner, member, &result);
             return {};
         }
         // C++ record: a member typedef / nested type, requested once under `owner.member`.
@@ -398,6 +400,20 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::s
         if (!cxxLazyGlobalTypedefs_.empty() && cxxLazyGlobalTypedefs_.count(name) != 0
             && const_cast<LLVMBackend*>(this)->MaterializeCxxGlobalTypedef(name))
             return FindFirstVisibleScoped(functionTypeAliases, name);
+        if (size_t dot = name.rfind('.'); dot != std::string::npos && dot > 0 && dot + 1 < name.size())
+        {
+            std::string owner = name.substr(0, dot);
+            auto frame = aggregateAliasScopes_.find(owner);
+            if (frame == aggregateAliasScopes_.end())
+            {
+                owner = ResolveTypeAlias(ResolveQualifiedName(owner));
+                frame = aggregateAliasScopes_.find(owner);
+            }
+            if (frame != aggregateAliasScopes_.end())
+                if (auto it = frame->second.functionTypeAliases.find(name.substr(dot + 1));
+                    it != frame->second.functionTypeAliases.end())
+                    return &it->second;
+        }
         return nullptr;
     }
 

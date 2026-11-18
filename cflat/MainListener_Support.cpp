@@ -1268,6 +1268,231 @@ std::optional<int64_t> FoldCompileTimeInt(LLVMBackend* compiler, antlr4::tree::P
         return FoldCompileTimeIntLeaf(compiler, node);
     }
 
+namespace {
+struct StaticPathSegment
+{
+    std::string Name;
+    CFlatParser::GenericTypeParametersContext* TypeArgs = nullptr;
+};
+
+static bool ResolveStaticPathTypeArgs(LLVMBackend* compiler,
+    CFlatParser::GenericTypeParametersContext* params, std::vector<std::string>& args)
+{
+    if (params == nullptr) return true;
+    for (auto* entry : params->typeParameterList()->typeParameterEntry())
+    {
+        if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr)
+        {
+            auto value = FoldCompileTimeInt(compiler, entry->shiftExpression());
+            if (!value) return false;
+            args.push_back(std::to_string(*value));
+            continue;
+        }
+        auto* typeSpec = entry->typeSpecifier();
+        if (typeSpec == nullptr || typeSpec->memberTypeSpecifier() != nullptr
+            || entry->pointer() != nullptr || entry->arrayTypeSuffix() != nullptr)
+            return false;
+        std::string genericBase;
+        if (auto* generic = GenericSpecOf(typeSpec, genericBase))
+        {
+            std::vector<std::string> innerArgs;
+            if (!ResolveStaticPathTypeArgs(compiler, generic, innerArgs)) return false;
+            genericBase = compiler->ResolveQualifiedName(genericBase);
+            compiler->CompleteCxxTemplateTypeArgs(genericBase, innerArgs);
+            std::string cxxError;
+            const std::string candidate = MangleGenericInstance(*compiler, genericBase, innerArgs);
+            if (!compiler->TryRequestCxxType(genericBase, innerArgs, candidate, cxxError)) return false;
+            args.push_back(compiler->ResolveTypeAlias(candidate));
+            continue;
+        }
+        PrimitiveTypeError error;
+        std::string typeName = CanonicalTemplateTypeArgument(entry, &error);
+        if (HasPrimitiveTypeError(error) || typeName.empty()) return false;
+        typeName = compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(typeName));
+        args.push_back(std::move(typeName));
+    }
+    return true;
+}
+
+static bool RequestStaticPathTemplate(LLVMBackend* compiler, const std::string& baseName,
+    CFlatParser::GenericTypeParametersContext* params, std::string& owner)
+{
+    std::vector<std::string> args;
+    if (!ResolveStaticPathTypeArgs(compiler, params, args)) return false;
+    const std::string base = compiler->ResolveQualifiedName(baseName);
+    compiler->CompleteCxxTemplateTypeArgs(base, args);
+    const std::string candidate = MangleGenericInstance(*compiler, base, args);
+    std::string cxxError;
+    if (!compiler->TryRequestCxxType(base, args, candidate, cxxError)) return false;
+    owner = compiler->ResolveTypeAlias(candidate);
+    return compiler->IsImportedCxxTypeRegistered(owner);
+}
+
+static bool RequestStaticPathMemberTemplate(LLVMBackend* compiler, const std::string& parent,
+    const StaticPathSegment& segment, std::string& owner)
+{
+    std::vector<std::string> args;
+    if (!ResolveStaticPathTypeArgs(compiler, segment.TypeArgs, args)) return false;
+    const std::string base = parent + "." + segment.Name;
+    compiler->CompleteCxxTemplateTypeArgs(base, args);
+    const std::string candidate = MangleGenericInstance(*compiler, base, args);
+    std::string cxxError;
+    if (!compiler->TryRequestCxxMemberTemplateType(parent, segment.Name, args, candidate, cxxError))
+        return false;
+    owner = compiler->ResolveTypeAlias(candidate);
+    return compiler->IsImportedCxxTypeRegistered(owner);
+}
+
+static StaticMemberFoldResult ResolveStaticPath(LLVMBackend* compiler, const std::string& root,
+    CFlatParser::GenericTypeParametersContext* rootArgs,
+    const std::vector<StaticPathSegment>& segments, const std::string& shadowName)
+{
+    StaticMemberFoldResult result;
+    if (compiler == nullptr || root.empty() || segments.empty()
+        || segments.back().TypeArgs != nullptr || NamesVisibleVariable(compiler, shadowName))
+        return result;
+
+    std::string owner;
+    std::string prefix = compiler->ResolveQualifiedName(root);
+    if (rootArgs != nullptr)
+    {
+        if (!RequestStaticPathTemplate(compiler, prefix, rootArgs, owner)) return result;
+        prefix.clear();
+    }
+    else
+    {
+        const std::string aliased = compiler->ResolveTypeAlias(prefix);
+        if (compiler->IsImportedCxxTypeRegistered(aliased))
+        {
+            owner = aliased;
+            prefix.clear();
+        }
+    }
+
+    for (size_t i = 0; i + 1 < segments.size(); ++i)
+    {
+        const auto& segment = segments[i];
+        if (segment.TypeArgs != nullptr)
+        {
+            std::string nested;
+            const bool resolved = owner.empty()
+                ? RequestStaticPathTemplate(compiler,
+                    prefix.empty() ? segment.Name : prefix + "." + segment.Name,
+                    segment.TypeArgs, nested)
+                : RequestStaticPathMemberTemplate(compiler, owner, segment, nested);
+            if (!resolved) return result;
+            owner = std::move(nested);
+            prefix.clear();
+            continue;
+        }
+        if (owner.empty())
+        {
+            prefix += (prefix.empty() ? "" : ".") + segment.Name;
+            const std::string aliased = compiler->ResolveTypeAlias(prefix);
+            if (compiler->IsImportedCxxTypeRegistered(aliased)) owner = aliased;
+            continue;
+        }
+        LLVMBackend::MemberTypeResult memberResult = LLVMBackend::MemberTypeResult::NotARecord;
+        const std::string nested = compiler->ResolveMemberType(owner, segment.Name, memberResult);
+        if (nested.empty()) return result;
+        owner = compiler->ResolveTypeAlias(nested);
+        if (!compiler->IsImportedCxxTypeRegistered(owner)) return result;
+    }
+
+    if (owner.empty())
+    {
+        owner = compiler->ResolveTypeAlias(prefix);
+        if (!compiler->IsImportedCxxTypeRegistered(owner))
+        {
+            std::string cxxError;
+            const std::string candidate = prefix;
+            if (!compiler->TryRequestCxxType(candidate, {}, candidate, cxxError)) return result;
+            owner = compiler->ResolveTypeAlias(candidate);
+        }
+    }
+    if (!compiler->IsImportedCxxTypeRegistered(owner)) return result;
+
+    int64_t value = 0;
+    const auto status = compiler->LookupCxxStaticDataValue(owner, segments.back().Name, value);
+    if (status == LLVMBackend::CxxStaticDataValueStatus::NotFound) return result;
+    result.Found = true;
+    result.Accessible = status != LLVMBackend::CxxStaticDataValueStatus::Inaccessible;
+    result.IsIntegerConstant = status == LLVMBackend::CxxStaticDataValueStatus::IntegerConstant;
+    result.Value = value;
+    return result;
+}
+}
+
+antlr4::ParserRuleContext* CxxStaticMemberArgSpelling(CFlatParser::TypeSpecifierContext* typeSpec)
+{
+    if (typeSpec == nullptr) return nullptr;
+    if (typeSpec->memberTypeSpecifier() != nullptr) return typeSpec->memberTypeSpecifier();
+    return typeSpec->qualifiedGenericIdentifier();
+}
+
+std::string CxxStaticMemberArgName(antlr4::ParserRuleContext* spelling)
+{
+    if (auto* member = dynamic_cast<CFlatParser::MemberTypeSpecifierContext*>(spelling))
+        return member->memberTypeMember().back()->memberNameToken()->getText();
+    auto* qualified = dynamic_cast<CFlatParser::QualifiedGenericIdentifierContext*>(spelling);
+    return qualified != nullptr ? qualified->memberNameToken().back()->getText() : std::string{};
+}
+
+StaticMemberFoldResult ResolveCxxStaticMemberPath(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (compiler == nullptr || node == nullptr) return {};
+    if (auto* memberType = dynamic_cast<CFlatParser::MemberTypeSpecifierContext*>(node))
+    {
+        auto* ownerCtx = memberType->memberTypeOwner();
+        if (ownerCtx == nullptr || ownerCtx->Identifier() == nullptr) return {};
+        std::string root = ownerCtx->Identifier()->getText();
+        for (auto* part : ownerCtx->memberNameToken()) root += "." + part->getText();
+        std::vector<StaticPathSegment> segments;
+        for (auto* member : memberType->memberTypeMember())
+            segments.push_back({ member->memberNameToken()->getText(), member->genericTypeParameters() });
+        return ResolveStaticPath(compiler, root, ownerCtx->genericTypeParameters(), segments,
+                                 ownerCtx->Identifier()->getText());
+    }
+    if (auto* qualified = dynamic_cast<CFlatParser::QualifiedGenericIdentifierContext*>(node))
+    {
+        // `Alias.kind` / `ns.Owner.kind`: the qualified-type shape with no type args on the path.
+        auto members = qualified->memberNameToken();
+        if (qualified->Identifier() == nullptr || qualified->genericTypeParameters() != nullptr
+            || members.empty())
+            return {};
+        std::string root = qualified->Identifier()->getText();
+        for (size_t i = 0; i + 1 < members.size(); ++i) root += "." + members[i]->getText();
+        // Only a root that already names an imported C++ type (or an alias of one) can own a
+        // static member here; a CFlat namespace path stays a type and never reaches clang.
+        const std::string target = compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(root));
+        if (!compiler->IsImportedCxxTypeRegistered(target)) return {};
+        const std::vector<StaticPathSegment> segments{ { members.back()->getText(), nullptr } };
+        return ResolveStaticPath(compiler, root, nullptr, segments, qualified->Identifier()->getText());
+    }
+    auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+    auto* primary = postfix != nullptr ? postfix->primaryExpression() : nullptr;
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    if (postfix == nullptr || generic == nullptr || generic->Identifier() == nullptr) return {};
+    std::vector<StaticPathSegment> segments;
+    for (size_t i = 1; i < postfix->children.size();)
+    {
+        auto* op = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+        if (op == nullptr || op->getText() != "." || i + 1 >= postfix->children.size()) return {};
+        auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i + 1]);
+        if (member == nullptr) return {};
+        CFlatParser::GenericTypeParametersContext* args = nullptr;
+        size_t next = i + 2;
+        if (next < postfix->children.size())
+            args = dynamic_cast<CFlatParser::GenericTypeParametersContext*>(postfix->children[next]);
+        if (args != nullptr) ++next;
+        segments.push_back({ member->getText(), args });
+        i = next;
+    }
+    return ResolveStaticPath(compiler, generic->Identifier()->getText(),
+        generic->genericTypeParameters(), segments, generic->Identifier()->getText());
+}
+
 static std::optional<LLVMBackend::TypeAndValue> ScanTimeGlobalVariableType(
     LLVMBackend* compiler, const std::string& name)
 {
@@ -1720,6 +1945,11 @@ std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antlr4::tre
         if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
         {
             if (auto count = FoldScanTimeCountof(compiler, n)) return count;
+            const auto staticMember = ResolveCxxStaticMemberPath(compiler, n);
+            if (staticMember.Found)
+                return staticMember.Accessible && staticMember.IsIntegerConstant
+                    && InScannerInt32Range(staticMember.Value)
+                    ? std::optional<int64_t>(staticMember.Value) : std::nullopt;
             if (compiler != nullptr && n->primaryExpression() != nullptr
                 && n->primaryExpression()->genericIdentifier() != nullptr
                 && n->primaryExpression()->genericIdentifier()->Identifier() != nullptr
@@ -2597,6 +2827,27 @@ CFlatParser::GenericTypeParametersContext* GenericSpecOf(
     }
     return nullptr;
 }
+std::string ResolveAliasedNestedGenericBase(
+    LLVMBackend* compiler, CFlatParser::TypeSpecifierContext* typeSpec, const std::string& spelledBase)
+{
+    if (compiler == nullptr || typeSpec == nullptr) return spelledBase;
+    auto* qualified = typeSpec->qualifiedGenericIdentifier();
+    if (qualified == nullptr || qualified->genericTypeParameters() == nullptr
+        || qualified->Identifier() == nullptr)
+        return spelledBase;
+    std::vector<std::string> parts{ qualified->Identifier()->getText() };
+    for (auto* component : qualified->memberNameToken())
+        parts.push_back(component->getText());
+    if (parts.size() < 2) return spelledBase;
+    std::string ownerSpelling;
+    for (size_t i = 0; i + 1 < parts.size(); ++i)
+        ownerSpelling += (ownerSpelling.empty() ? "" : ".") + parts[i];
+    const std::string qualifiedOwner = compiler->ResolveQualifiedName(ownerSpelling);
+    const std::string owner = compiler->ResolveTypeAlias(qualifiedOwner);
+    if (owner == qualifiedOwner && !compiler->IsDataStructure(owner))
+        return spelledBase;
+    return owner + "." + parts.back();
+}
 std::string NamespaceNameFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node)
 {
@@ -3342,9 +3593,15 @@ bool TypeSpecifierNamesFunctionLocalEnum(
         for (auto* entry : nested->typeParameterList()->typeParameterEntry())
             if (TypeArgumentNamesFunctionLocalEnum(entry, localEnumNames)) return true;
     if (auto* memberType = typeSpec->memberTypeSpecifier())
+    {
         if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
             for (auto* entry : ownerParams->typeParameterList()->typeParameterEntry())
                 if (TypeArgumentNamesFunctionLocalEnum(entry, localEnumNames)) return true;
+        for (auto* member : memberType->memberTypeMember())
+            if (auto* params = member->genericTypeParameters())
+                for (auto* entry : params->typeParameterList()->typeParameterEntry())
+                    if (TypeArgumentNamesFunctionLocalEnum(entry, localEnumNames)) return true;
+    }
     const std::string simpleName = SimpleTypeSpecifierName(typeSpec);
     return !simpleName.empty() && localEnumNames.count(simpleName) != 0;
 }
@@ -3388,12 +3645,21 @@ bool TypeSpecifierNeedsFunctionLocalEnumDeferral(
                     scannedNonLocalEnumNames, scannedTypeNames))
                 return true;
     if (auto* memberType = typeSpec->memberTypeSpecifier())
+    {
         if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
             for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
                 if (TypeArgumentNeedsFunctionLocalEnumDeferral(
                         nestedEntry, localEnumNames, compiler,
                         scannedNonLocalEnumNames, scannedTypeNames))
                     return true;
+        for (auto* member : memberType->memberTypeMember())
+            if (auto* params = member->genericTypeParameters())
+                for (auto* nestedEntry : params->typeParameterList()->typeParameterEntry())
+                    if (TypeArgumentNeedsFunctionLocalEnumDeferral(
+                            nestedEntry, localEnumNames, compiler,
+                            scannedNonLocalEnumNames, scannedTypeNames))
+                        return true;
+    }
 
     const std::string spelling = SimpleTypeSpecifierName(typeSpec);
     if (spelling.empty() || localEnumNames.count(spelling) == 0) return false;
@@ -3460,10 +3726,17 @@ bool TypeSpecifierUsesRegisteredLocalEnum(
         for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
             if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions)) return true;
     if (auto* memberType = typeSpec->memberTypeSpecifier())
+    {
         if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
             for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
                 if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions))
                     return true;
+        for (auto* member : memberType->memberTypeMember())
+            if (auto* params = member->genericTypeParameters())
+                for (auto* nestedEntry : params->typeParameterList()->typeParameterEntry())
+                    if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions))
+                        return true;
+    }
 
     std::string spelling = SimpleTypeSpecifierName(typeSpec);
     if (spelling.empty()) return false;

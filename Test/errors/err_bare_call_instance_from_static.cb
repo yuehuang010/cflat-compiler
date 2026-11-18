@@ -58,3 +58,12 @@ expect_error("call to non-static member function 'm' without an object argument"
         static int g() { return m(); }
     };
 }
+
+expect_error("call to non-static member function 'm' without an object argument") {
+    struct T471NestedOuterInstanceCall
+    {
+        int m(int k) { return k + 10; }
+        struct Inner { int call() { return m(5); } };
+        int run() { Inner value = default; return value.call(); }
+    };
+}

@@ -3322,6 +3322,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         for (auto* typeSpec : sizeofHeadIsVariable ? std::vector<CFlatParser::TypeSpecifierContext*>{}
                                                                    : specList->typeSpecifier())
                         {
+                            const std::string typeSpelling = CanonicalTypeSpecifierText(
+                                typeSpec, nullptr, false);
+                            if (compiler->FindFunctionTypeAlias(typeSpelling) != nullptr)
+                            {
+                                resolvesAsType = true;
+                                break;
+                            }
                             static const std::unordered_set<std::string> primitiveWords = {
                                 "void", "char", "i8", "u8", "c8", "short", "i16", "u16", "c16",
                                 "int", "i32", "u32", "uint", "c32", "long", "ulong", "i64", "u64",

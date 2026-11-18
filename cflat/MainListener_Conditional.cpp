@@ -787,6 +787,43 @@ bool MainListener::IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx)
         return DeferrableTernaryNode(ctx) != nullptr;
 }
 
+bool MainListener::CanMaterializeMixedDefault(const std::string& defaultType)
+{
+    auto* compiler = Compiler();
+    std::string ctorError;
+    compiler->TryBindCxxImplicitDefaultCtor(defaultType, ctorError);
+    return compiler->FindCxxDefaultCtor(defaultType) != nullptr
+        || !compiler->CxxElementNeedsDefaultConstruction(defaultType);
+}
+
+/*
+ * REFDEF: C++ makes `c ? default : place` a prvalue, so the caller copies the selected place at the
+ * argument's position. Only this exact shape is materialized that way; any call or move leaf keeps
+ * the deferred path.
+ */
+bool MainListener::IsCxxMixedDefaultPlaceTernary(antlr4::ParserRuleContext* ctx)
+{
+        auto* root = DeferrableTernaryNode(ctx);
+        if (root == nullptr) return false;
+        bool hasDefault = false;
+        bool hasPlace = false;
+        bool hasOther = false;
+        auto walk = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (auto* conditional = DeferrableTernaryNode(node))
+            {
+                self(self, conditional->expression());
+                self(self, conditional->conditionalExpression());
+                return;
+            }
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (rule != nullptr && IsDefaultOnlyExpression(rule)) hasDefault = true;
+            else if (BareIdentifierInExpression(node) != nullptr) hasPlace = true;
+            else hasOther = true;
+        };
+        walk(walk, root);
+        return hasDefault && hasPlace && !hasOther;
+}
+
 /*
  * T418: every other argument must be inert because the wrapper reads the selected place after the
  * caller's arguments. A class prvalue beside it also pays the wrapper's extra copy.
@@ -980,7 +1017,8 @@ bool MainListener::IsCxxSideEffectFreeScalarExpression(antlr4::tree::ParseTree* 
 }
 
 bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx,
-        const std::string& defaultType, LLVMBackend::NamedVariable& out, bool guardPlace)
+        const std::string& defaultType, LLVMBackend::NamedVariable& out, bool guardPlace,
+        bool callOnly, bool materializeMixed)
 {
         auto* compiler = Compiler();
         auto* root = DeferrableTernaryNode(ctx);
@@ -991,24 +1029,58 @@ bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx
         std::vector<LLVMBackend::NamedVariable> children(1);
         int leafCount = 0;
         bool ok = true;
+        bool sawCall = false;
+        bool onlyCalls = true;
         std::unordered_map<antlr4::tree::ParseTree*, LLVMBackend::NamedVariable> deferredFieldPlaces;
+        bool hasDefaultLeaf = false;
+        bool hasPlaceLeaf = false;
+        bool hasCallLeaf = false;
+        bool hasMoveLeaf = false;
         auto prepareFieldPlaces = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
             if (auto* conditional = DeferrableTernaryNode(node))
                 return self(self, conditional->expression())
                     && self(self, conditional->conditionalExpression());
             auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
-            if ((rule != nullptr && IsDefaultOnlyExpression(rule))
-                || TopLevelMoveExpression(node) != nullptr
-                || BareIdentifierInExpression(node) != nullptr)
-                return true;
+            if (rule != nullptr && IsDefaultOnlyExpression(rule))
+            {
+                hasDefaultLeaf = true;
+                onlyCalls = false;
+                return !callOnly;
+            }
+            if (TopLevelMoveExpression(node) != nullptr)
+            {
+                hasMoveLeaf = true;
+                onlyCalls = false;
+                return !callOnly;
+            }
+            if (BareIdentifierInExpression(node) != nullptr)
+            {
+                hasPlaceLeaf = true;
+                onlyCalls = false;
+                return !callOnly;
+            }
             LLVMBackend::NamedVariable callable;
             LLVMBackend::TypeAndValue callReturn;
-            if (ResolveCxxDeferredCallArm(node, callable, callReturn)) return true;
+            if (ResolveCxxDeferredCallArm(node, callable, callReturn))
+            {
+                if (compiler->ResolveTypeAlias(callReturn.TypeName)
+                    != compiler->ResolveTypeAlias(defaultType))
+                    return false;
+                hasCallLeaf = true;
+                sawCall = true;
+                return true;
+            }
             LLVMBackend::NamedVariable container;
             LLVMBackend::DeclTypeAndValue field;
             CFlatParser::PostfixExpressionContext* fieldPostfix = nullptr;
             if (!ResolveCxxDeferredLocalField(compiler, node, container, field, &fieldPostfix))
-                return true;
+            {
+                onlyCalls = false;
+                return !callOnly;
+            }
+            onlyCalls = false;
+            hasPlaceLeaf = true;
+            if (callOnly) return false;
             if (field.TypeName.empty()) return false;
             auto place = ParsePostfixExpression(fieldPostfix, true);
             if (place.Storage == nullptr) return false;
@@ -1016,7 +1088,40 @@ bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx
             deferredFieldPlaces.emplace(node, std::move(place));
             return true;
         };
-        if (!prepareFieldPlaces(prepareFieldPlaces, root)) return false;
+        if (!prepareFieldPlaces(prepareFieldPlaces, root)
+            || (callOnly && (!sawCall || !onlyCalls))) return false;
+        const bool materializeMixedPlace = guardPlace && materializeMixed && hasDefaultLeaf && hasPlaceLeaf
+            && !hasCallLeaf && !hasMoveLeaf && CanMaterializeMixedDefault(defaultType);
+        llvm::AllocaInst* earlyValueSlot = nullptr;
+        llvm::AllocaInst* earlyValueLive = nullptr;
+        if (materializeMixedPlace)
+        {
+            earlyValueSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                compiler->AllocaAtEntry(objectType, nullptr, "cxx.ternary.prvalue"));
+            earlyValueLive = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                compiler->AllocaAtEntry(compiler->builder->getInt1Ty(), nullptr,
+                                        "cxx.ternary.prvalue.live"));
+            if (earlyValueSlot == nullptr || earlyValueLive == nullptr) return false;
+            compiler->builder->CreateStore(compiler->builder->getInt1(false), earlyValueLive);
+        }
+        auto constructDefaultValue = [&]() {
+            std::string ctorError;
+            compiler->TryBindCxxImplicitDefaultCtor(defaultType, ctorError);
+            const LLVMBackend::CxxClassInfo::Structor* ctor =
+                compiler->FindCxxDefaultCtor(defaultType);
+            if (ctor != nullptr)
+            {
+                if (!compiler->EmitCxxStructorCall(defaultType, *ctor, earlyValueSlot, {}))
+                    return false;
+            }
+            else if (compiler->CxxElementNeedsDefaultConstruction(defaultType))
+                return false;
+            else
+                compiler->builder->CreateStore(llvm::Constant::getNullValue(objectType),
+                                                earlyValueSlot);
+            compiler->builder->CreateStore(compiler->builder->getInt1(true), earlyValueLive);
+            return true;
+        };
         // Leaves are numbered left to right; a subtree covers a contiguous range, so `sel < m` picks its true side.
         auto emit = [&](auto&& self, antlr4::ParserRuleContext* node) -> std::string {
             if (!ok) return {};
@@ -1045,7 +1150,12 @@ bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx
                 return std::format("(@S < {} ? {} : {})", split, trueShape, falseShape);
             }
             compiler->builder->CreateStore(compiler->builder->getInt32(leafCount++), selector);
-            if (IsDefaultOnlyExpression(node)) return "@D";
+            if (IsDefaultOnlyExpression(node))
+            {
+                if (materializeMixedPlace && !constructDefaultValue())
+                { ok = false; return {}; }
+                return "@D";
+            }
             LLVMBackend::NamedVariable place;
             LLVMBackend::TypeAndValue callReturn;
             if (ResolveCxxDeferredCallArm(node, place, callReturn))
@@ -1065,6 +1175,14 @@ bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx
             if (loaded == nullptr || place.Storage == nullptr) { ok = false; return {}; }
             place.Primary = loaded;
             place.BaseType = loaded->getType();
+            if (materializeMixedPlace)
+            {
+                if (!compiler->EmitCxxCopyOrMoveConstruct(defaultType, earlyValueSlot,
+                        place.Storage, false, "argument"))
+                { ok = false; return {}; }
+                compiler->builder->CreateStore(compiler->builder->getInt1(true), earlyValueLive);
+                return "@0";
+            }
             const bool movedLeaf = place.IsExplicitMove;
             place.IsExplicitMove = false; // the wrapper parameter receives the caller's lvalue
             place.IsRvalue = false;
@@ -1085,6 +1203,21 @@ bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx
         sel.BaseType = int32;
         sel.TypeAndValue.TypeName = "int";
         sel.IsRvalue = true;
+        if (materializeMixedPlace)
+        {
+            // REFDEF: the caller's copy is an ordinary class prvalue temporary, as `T(args)` is.
+            out = {};
+            out.Primary = compiler->builder->CreateLoad(objectType, earlyValueSlot,
+                                                         "cxx.ternary.prvalue.value");
+            out.BaseType = objectType;
+            out.Storage = earlyValueSlot;
+            out.TypeAndValue.TypeName = defaultType;
+            out.IsRvalue = true;
+            out.IsCxxPrvalueTemp = true;
+            out.CxxPlaceGuardType = defaultType;
+            compiler->RegisterOwnedStructTemp(earlyValueSlot, defaultType, earlyValueLive);
+            return true;
+        }
         out = {};
         out.Primary = llvm::UndefValue::get(objectType);
         out.BaseType = objectType;
@@ -5330,6 +5463,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 source.RootIsAliasBorrowLocal = shape.sourceRootIsAliasBorrowLocal;
                 source.IsAliasBorrow = shape.isAlias;
                 source.TypeAndValue = shape.sourceType;
+                // This read was lowered from a core unique wrapper, so the wrapper still owns
+                // the pointer until a move explicitly consumes this field read.
+                source.IsUniqueFieldAlias = true;
                 // The owning struct of a field arm, as the field-read ledger records it (consume checks need it).
                 if (auto* fieldGep = llvm::dyn_cast<llvm::GetElementPtrInst>(storage);
                     fieldGep != nullptr && fieldGep->getNumIndices() == 2
@@ -5468,8 +5604,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 if (compiler->IsInterfaceType(MangledGenericArgument(*compiler, uniqueName))) return false;
                 return compiler->IsUniqueFieldReadValue(value)
                     || llvm::isa_and_nonnull<llvm::AllocaInst>(storage)
-                    || (uniquePointerDestination
-                        && llvm::isa_and_nonnull<llvm::GlobalVariable>(storage));
+                    || llvm::isa_and_nonnull<llvm::GlobalVariable>(storage);
             }
             return value->getType()->isPointerTy()
                 && llvm::isa_and_nonnull<llvm::GlobalVariable>(storage);

@@ -7598,6 +7598,131 @@ bool testMemberTypeNames()
     return true;
 }
 
+// T37: nested CFlat member templates and closure-alias members in each type position.
+struct Mt37NestedOuter<T> { struct Inner<U> { using type = U; U value = default; }; };
+struct Mt37TypeKindOuter<T> { struct In<U> { using kind = U; U value = default; }; };
+namespace Mt37NestedNs
+{
+    struct Outer<T> { struct Inner<U> { using type = U; U value = default; }; };
+}
+using Mt37NestedOuterInt = Mt37NestedOuter<int>;
+int Inner = 3;
+long mt37NestedTypeParam(Mt37NestedOuter<int>.Inner<long>.type value) { return value + 1; }
+Mt37NestedOuter<int>.Inner<long>.type mt37NestedTypeReturn() { return 17; }
+struct Mt37NestedTypeHolder { Mt37NestedOuter<int>.Inner<long>.type value = default; };
+
+struct Mt37CbHost { using Cb = function<int(int)>; };
+int Cb = 8;
+int mt37CbTwice(int value) { return value * 2; }
+int mt37InvokeCb(Mt37CbHost.Cb callback) { return callback(9); }
+Mt37CbHost.Cb mt37MakeCb() { return mt37CbTwice; }
+struct Mt37CbHolder { Mt37CbHost.Cb value = default; };
+
+int mt37ForwardAliasRead(Mt37ForwardAlias<int>.type value) { return value; }
+int mt37ForwardCbApply(Mt37ForwardCb<int>.Cb callback) { return callback(9); }
+struct Mt37ForwardAlias<T> { using type = T; };
+struct Mt37ForwardCb<T> { using Cb = function<T(T)>; };
+struct Mt37GenericCb<T> { using Cb = function<T(T)>; };
+struct Mt37ConcreteCb<T> { using Cb = function<int(int)>; };
+struct Mt37LambdaCb<T> { using Cb = Lambda<T(T)>; };
+struct Mt37CbOuter<T> { struct In<U> { using Cb = function<T(U)>; }; };
+namespace Mt37CbNs { struct G<T> { using Cb = function<T(T)>; }; }
+int mt37GenericCbApply(Mt37GenericCb<int>.Cb callback) { return callback(9); }
+Mt37GenericCb<int>.Cb mt37GenericCbMake() { return mt37CbTwice; }
+int mt37ConcreteCbApply(Mt37ConcreteCb<int>.Cb callback) { return callback(9); }
+Mt37ConcreteCb<int>.Cb mt37ConcreteCbMake() { return mt37CbTwice; }
+int mt37LambdaCbApply(Mt37LambdaCb<int>.Cb callback) { return callback(9); }
+Mt37LambdaCb<int>.Cb mt37LambdaCbMake() { return (int value) => value * 2; }
+int mt37NestedCbApply(Mt37CbOuter<int>.In<i64>.Cb callback) { return callback(9); }
+int mt37NestedCbTwice(i64 value) { return (int)(value * 2); }
+int mt37NamespacedCbApply(Mt37CbNs.G<int>.Cb callback) { return callback(9); }
+struct Mt37GenericCbHolder { Mt37GenericCb<int>.Cb value = default; };
+struct Mt37ConcreteCbHolder { Mt37ConcreteCb<int>.Cb value = default; };
+struct Mt37LambdaCbHolder { Mt37LambdaCb<int>.Cb value = default; };
+struct Mt37ClosureWrap<T> { T value = default; };
+
+bool testMemberNestedTemplatePaths()
+{
+    Mt37NestedOuter<int>.Inner<long>.type local = 17;
+    Mt37NestedOuter<int>.Inner<long> nestedRecord; nestedRecord.value = 18;
+    Mt37NestedOuterInt.Inner<long> aliasNestedRecord; aliasNestedRecord.value = 19;
+    Mt37NestedOuterInt.Inner<long>.type aliasNested = 20;
+    Mt37NestedNs.Outer<int>.Inner<long>.type namespaced = 21;
+    Mt37NestedTypeHolder holder; holder.value = 22;
+    long raw = 22;
+    Mt37NestedOuter<int>.Inner<long>.type casted =
+        (Mt37NestedOuter<int>.Inner<long>.type)raw;
+    Mt37Wrap<Mt37NestedOuter<int>.Inner<long>.type> wrapped; wrapped.w = 23;
+    long* allocated = new Mt37NestedOuter<int>.Inner<long>.type;
+    *allocated = 24;
+    bool newOk = *allocated == 24;
+    delete allocated;
+    int Inner = 4;
+    Mt37NestedOuter<int>.Inner<long>.type shadowed = 25;
+    if (local + nestedRecord.value + aliasNestedRecord.value + aliasNested + namespaced + holder.value + casted
+        + wrapped.w + mt37NestedTypeParam(26) + mt37NestedTypeReturn() + shadowed != 231)
+        return false;
+    if (!newOk || Inner != 4 || sizeof(Mt37NestedOuter<int>.Inner<long>.type) != sizeof(long))
+        return false;
+
+    int kind = 31;
+    Mt37TypeKindOuter<int>.In<long>.kind kindType = 32;
+    if (kind != 31 || kindType != 32 || sizeof(Mt37TypeKindOuter<int>.In<long>.kind) != sizeof(long))
+        return false;
+
+    int Cb = 7;
+    Mt37CbHost.Cb callback = mt37CbTwice;
+    Mt37CbHolder cbHolder; cbHolder.value = callback;
+    Mt37CbHost.Cb castCallback = (Mt37CbHost.Cb)mt37CbTwice;
+    Mt37Wrap<Mt37CbHost.Cb> cbWrapped; cbWrapped.w = mt37MakeCb();
+    auto cbAllocated = new Mt37CbHost.Cb;
+    *cbAllocated = mt37CbTwice;
+    bool cbNewOk = (*cbAllocated)(9) == 18;
+    delete cbAllocated;
+    if (callback(9) + cbHolder.value(9) + castCallback(9) + cbWrapped.w(9)
+        + mt37InvokeCb(mt37MakeCb()) != 90)
+        return false;
+    if (!cbNewOk || Cb != 7 || sizeof(Mt37CbHost.Cb) != sizeof(function<int(int)>)) return false;
+
+    Mt37GenericCb<int>.Cb genericLocal = mt37CbTwice;
+    Mt37ConcreteCb<int>.Cb concreteLocal = mt37CbTwice;
+    Lambda<int(int)> lambdaOriginal = (int value) => value * 2;
+    Mt37LambdaCb<int>.Cb lambdaLocal = lambdaOriginal;
+    Mt37GenericCb<int>.Cb genericReturned = mt37GenericCbMake();
+    Mt37ConcreteCb<int>.Cb concreteReturned = mt37ConcreteCbMake();
+    Mt37LambdaCb<int>.Cb lambdaReturned = mt37LambdaCbMake();
+    Mt37GenericCbHolder genericHolder; genericHolder.value = mt37CbTwice;
+    Mt37ConcreteCbHolder concreteHolder; concreteHolder.value = mt37CbTwice;
+    Mt37LambdaCbHolder lambdaHolder; lambdaHolder.value = (int value) => value * 2;
+    Mt37ClosureWrap<Mt37GenericCb<int>.Cb> genericWrapped; genericWrapped.value = mt37CbTwice;
+    Mt37ClosureWrap<Mt37ConcreteCb<int>.Cb> concreteWrapped; concreteWrapped.value = mt37CbTwice;
+    Mt37ClosureWrap<Mt37LambdaCb<int>.Cb> lambdaWrapped; lambdaWrapped.value = (int value) => value * 2;
+    Mt37GenericCb<int>.Cb genericCasted = (Mt37GenericCb<int>.Cb)mt37CbTwice;
+    Mt37ConcreteCb<int>.Cb concreteCasted = (Mt37ConcreteCb<int>.Cb)mt37CbTwice;
+    Mt37LambdaCb<int>.Cb lambdaCasted = (Mt37LambdaCb<int>.Cb)lambdaOriginal;
+    if (genericLocal(9) != 18 || mt37GenericCbApply(mt37CbTwice) != 18
+        || genericReturned(9) != 18 || genericHolder.value(9) != 18
+        || genericWrapped.value(9) != 18 || genericCasted(9) != 18
+        || sizeof(Mt37GenericCb<int>.Cb) != sizeof(function<int(int)>))
+        return false;
+    if (concreteLocal(9) != 18 || mt37ConcreteCbApply(mt37CbTwice) != 18
+        || concreteReturned(9) != 18 || concreteHolder.value(9) != 18
+        || concreteWrapped.value(9) != 18 || concreteCasted(9) != 18
+        || sizeof(Mt37ConcreteCb<int>.Cb) != sizeof(function<int(int)>))
+        return false;
+    if (lambdaLocal(9) != 18 || mt37LambdaCbApply((int value) => value * 2) != 18
+        || lambdaReturned(9) != 18 || lambdaHolder.value(9) != 18
+        || lambdaWrapped.value(9) != 18 || lambdaCasted(9) != 18
+        || sizeof(Mt37LambdaCb<int>.Cb) != sizeof(Lambda<int(int)>))
+        return false;
+    if (mt37NestedCbApply(mt37NestedCbTwice) != 18
+        || mt37NamespacedCbApply(mt37CbTwice) != 18
+        || mt37ForwardCbApply(mt37CbTwice) != 18
+        || mt37ForwardAliasRead(17) != 17 || Cb != 7)
+        return false;
+    return true;
+}
+
 // T37 round 2: `(X) op y` is a cast only when X names a TYPE (lookup decides). A value in the
 // parentheses keeps C precedence: `(a) - 1 * 3` is a - 3, `(a) & 1 + 2` is a & 3.
 struct Mt37Rec { int x = default; };
@@ -8709,6 +8834,7 @@ extern int main()
     total++; passed += testQ16ForwardAcceptSet()                     ? 1 : 0;
     total++; passed += testFaenNsGenericFunctionForward()           ? 1 : 0;
     total++; passed += testMemberTypeNames()                         ? 1 : 0;
+    total++; passed += testMemberNestedTemplatePaths()                ? 1 : 0;
     total++; passed += testMemberTypeValueParens()                   ? 1 : 0;
     total++; passed += testMemberTypeForwardRecords()                ? 1 : 0;
     total++; passed += testGenericLaterRecords()                      ? 1 : 0;

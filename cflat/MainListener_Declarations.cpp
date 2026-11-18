@@ -878,6 +878,29 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
         else
         {
             // Simple type or type parameter: look up in activeTypeSubstitutions
+            if (auto* staticSpelling = CxxStaticMemberArgSpelling(typeSpec))
+            {
+                const auto staticMember = ResolveCxxStaticMemberPath(Compiler(entry), staticSpelling);
+                if (staticMember.Found)
+                {
+                    if (!staticMember.Accessible)
+                    {
+                        LogErrorContext(staticSpelling, std::format(
+                            "C++ static data member '{}' is inaccessible",
+                            CxxStaticMemberArgName(staticSpelling)));
+                        return "0";
+                    }
+                    if (!staticMember.IsIntegerConstant)
+                    {
+                        if (reportConstArg)
+                            LogErrorContext(staticSpelling, std::format(
+                                "C++ static data member '{}' is not a compile-time constant integer",
+                                CxxStaticMemberArgName(staticSpelling)));
+                        return "0";
+                    }
+                    return std::to_string(staticMember.Value);
+                }
+            }
             PrimitiveTypeError canonicalError;
             resolved = CanonicalTemplateTypeArgument(entry, &canonicalError);
             if (forceRootType) resolved = RootQualifiedTypeSpelling(typeSpec);
@@ -1657,6 +1680,19 @@ std::string MainListener::EncodeClosureFromSig(LLVMBackend* compiler, const LLVM
         return encoded;
     }
 
+std::string MainListener::ResolveFunctionTypeAliasMember(
+    LLVMBackend* compiler, const std::string& owner, const std::string& member,
+    LLVMBackend::MemberTypeResult* result)
+{
+        if (compiler == nullptr) return {};
+        if (const auto* alias = compiler->FindFunctionTypeAlias(owner + "." + member))
+        {
+            if (result != nullptr) *result = LLVMBackend::MemberTypeResult::Found;
+            return EncodeClosureFromSig(compiler, *alias);
+        }
+        return {};
+    }
+
 LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs) {
         // Same defensive guard as the ForwardRefScanner copy above.
         if (declSpecs == nullptr)
@@ -2076,6 +2112,15 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // Generic type instantiation: Box<MyType> -> Box$MyType
                     // Hopped here only for the in-loop `tuple` check; the authoritative
                     // resolution runs on the SPELLED name once the argument list exists.
+                    const std::string originalBase = baseName;
+                    baseName = ResolveAliasedNestedGenericBase(
+                        Compiler(declSpecs), typeSpec, baseName);
+                    const bool aliasedNestedGenericBase = baseName != originalBase;
+                    if (aliasedNestedGenericBase)
+                    {
+                        LLVMBackend::BuilderStateGuard savedState(Compiler(declSpecs));
+                        ProcessPendingInstantiations();
+                    }
                     const std::string spelledBase = baseName;
                     baseName = Compiler(declSpecs)->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
@@ -2161,6 +2206,13 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (Compiler(declSpecs)->AnyGenericTypeTemplateNamed(baseName))
                         QueueAndProcessLocalEnumInstantiation(
                             genParams, baseName, typeArgs, mangledName, genParams);
+                    if (aliasedNestedGenericBase && Compiler(declSpecs)->AnyGenericTypeTemplateNamed(baseName))
+                    {
+                        QueueGenericInstantiation(baseName, typeArgs, mangledName, genParams);
+                        LLVMBackend::BuilderStateGuard savedState(Compiler(declSpecs));
+                        ProcessPendingInstantiations();
+                        declType.TypeName = Compiler(declSpecs)->ResolveTypeAlias(mangledName);
+                    }
                     // Queue instantiation of nested generic types discovered during field/param parsing.
                     // Only do this when inside an active instantiation context (substitutions are set),
                     // to avoid treating unresolved type parameters (e.g. "T") as concrete types.
@@ -8212,6 +8264,36 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
         const LLVMBackend::NamedVariable* preParsedValue)
 {
         auto* compiler = Compiler(errorContext);
+        auto simpleBraceCall = [&](antlr4::tree::ParseTree* node)
+            -> CFlatParser::PostfixExpressionContext* {
+            auto* postfix = SolePostfixExpression(node);
+            if (postfix == nullptr || !PostfixExpressionEndsInCall(postfix)
+                || CountOpenParenTokens(postfix) != 1
+                || postfix->LeftParen().size() != 1
+                || postfix->argumentExpressionList().size() != 1)
+                return nullptr;
+            return postfix;
+        };
+        auto quietCallTernary = [&](antlr4::tree::ParseTree* node,
+                                    const std::string& targetType) {
+            auto* root = SoleTernaryExpression(node);
+            if (root == nullptr) return false;
+            bool sawCall = false;
+            auto visit = [&](auto&& self, antlr4::ParserRuleContext* branch) -> bool {
+                if (auto* conditional = SoleTernaryExpression(branch))
+                    return self(self, conditional->expression())
+                        && self(self, conditional->conditionalExpression());
+                LLVMBackend::NamedVariable callable;
+                LLVMBackend::TypeAndValue result;
+                if (!ResolveCxxDeferredCallArm(branch, callable, result)
+                    || compiler->ResolveTypeAlias(result.TypeName)
+                        != compiler->ResolveTypeAlias(targetType))
+                    return false;
+                sawCall = true;
+                return true;
+            };
+            return visit(visit, root) && sawCall;
+        };
         rejectEscapingReferences = rejectEscapingReferences
             || (rejectCxxReferenceMemberReturnBrace_
                 && !InsideCallArgumentBeforeReturnBrace(errorContext));
@@ -8239,6 +8321,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                 && (compiler->IsForeignCxxAggregateClass(typeName) || soleElement))
             {
                 std::vector<CFlatParser::FieldInitContext*> leaves;
+                std::unordered_map<CFlatParser::FieldInitContext*, std::string> leafTargetTypes;
                 auto collectLeaves = [&](auto&& self,
                     const std::vector<CFlatParser::FieldInitContext*>& list) -> void {
                     for (auto* element : list)
@@ -8249,6 +8332,89 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     }
                 };
                 collectLeaves(collectLeaves, fields);
+                auto collectTargetTypes = [&](auto&& self,
+                    const std::vector<CFlatParser::FieldInitContext*>& list,
+                    const std::string& ownerType) -> void {
+                    const auto owner = compiler->GetDataStructure(ownerType);
+                    size_t fieldIndex = 0;
+                    for (auto* element : list)
+                    {
+                        const std::string fieldName = compiler->CxxAggregateFlattenedFieldNameAt(
+                            ownerType, fieldIndex++);
+                        auto field = std::find_if(owner.StructFields.begin(), owner.StructFields.end(),
+                            [&](const auto& value) { return value.VariableName == fieldName; });
+                        if (field == owner.StructFields.end()) continue;
+                        const std::string fieldType = compiler->ResolveTypeAlias(field->TypeName);
+                        if (element->initializerList() != nullptr)
+                        {
+                            if (!field->Pointer && !field->ElemPointer
+                                && field->ConstArraySize <= 0
+                                && field->ConstInnerDimensions.empty())
+                                self(self, element->initializerList()->fieldInit(), fieldType);
+                            continue;
+                        }
+                        if (element->LeftBrace() == nullptr && !field->Pointer
+                            && !field->ElemPointer && field->ConstArraySize <= 0
+                            && field->ConstInnerDimensions.empty())
+                            leafTargetTypes[element] = fieldType;
+                    }
+                };
+                collectTargetTypes(collectTargetTypes, fields, typeName);
+                auto quietClassCall = [&](antlr4::tree::ParseTree* node,
+                                          const std::string& targetType) {
+                    if (!compiler->IsForeignNontrivialCxxClass(targetType)) return false;
+                    auto* postfix = simpleBraceCall(node);
+                    if (postfix == nullptr) return false;
+                    auto* primary = postfix->primaryExpression();
+                    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                    if (generic == nullptr || generic->Identifier() == nullptr
+                        || generic->genericTypeParameters() != nullptr)
+                        return false;
+                    if (compiler->IsCFlatVariableBinding(generic->Identifier()->getText()))
+                        return false;
+                    std::string calleeName = generic->Identifier()->getText();
+                    for (auto* member : postfix->memberNameToken())
+                        calleeName += "." + member->getText();
+                    auto* overloads = compiler->FindCFlatCallCandidates(calleeName);
+                    if (overloads == nullptr || overloads->empty())
+                    {
+                        compiler->TryBindCxxFunction(calleeName);
+                        overloads = compiler->FindCFlatCallCandidates(calleeName);
+                    }
+                    if (overloads == nullptr || overloads->empty())
+                        return false;
+                    for (auto* argument : postfix->argumentExpressionList().front()->argumentNamedExpression())
+                        if (argument->Identifier() != nullptr || argument->assignmentExpression() == nullptr
+                            || !IsQuietCxxBraceElement(argument->assignmentExpression()))
+                            return false;
+                    return std::all_of(overloads->begin(), overloads->end(), [&](const auto& symbol) {
+                        LLVMBackend::TypeAndValue signature;
+                        return compiler->CxxBraceCallCaptureSignature(symbol,
+                            postfix->argumentExpressionList().front()->argumentNamedExpression().size(),
+                            targetType, signature);
+                    });
+                };
+                std::vector<bool> quietCallTernaryByLeaf(leaves.size(), false);
+                std::vector<bool> potentialDeferrableByLeaf(leaves.size(), false);
+                std::vector<bool> earlierPotentialDeferrable(leaves.size(), false);
+                bool earlierPotential = false;
+                for (size_t i = 0; i < leaves.size(); ++i)
+                {
+                    auto* leaf = leaves[i];
+                    auto* expression = leaf->Colon() == nullptr
+                        && leaf->assignmentExpression().size() == 1
+                        ? leaf->assignmentExpression(0) : nullptr;
+                    const bool callTernary = expression != nullptr
+                        && quietCallTernary(expression, leafTargetTypes[leaf]);
+                    quietCallTernaryByLeaf[i] = callTernary;
+                    potentialDeferrableByLeaf[i] = expression != nullptr
+                        && (IsCxxBraceDeferrableConstruction(expression)
+                            || (compiler->IsForeignNontrivialCxxClass(leafTargetTypes[leaf])
+                                && simpleBraceCall(expression) != nullptr)
+                            || callTernary);
+                    earlierPotentialDeferrable[i] = earlierPotential;
+                    earlierPotential = earlierPotential || potentialDeferrableByLeaf[i];
+                }
                 bool laterQuiet = true;
                 for (size_t i = leaves.size(); i-- > 0;)
                 {
@@ -8256,21 +8422,53 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     auto* expression = leaf->Colon() == nullptr
                         && leaf->assignmentExpression().size() == 1
                         ? leaf->assignmentExpression(0) : nullptr;
-                    if (laterQuiet && expression != nullptr
-                        && IsCxxBraceDeferrableConstruction(expression))
+                    const bool callTernary = quietCallTernaryByLeaf[i];
+                    const bool quietCall = laterQuiet && earlierPotentialDeferrable[i]
+                        && expression != nullptr && simpleBraceCall(expression) != nullptr
+                        && quietClassCall(expression, leafTargetTypes[leaf]);
+                    if (laterQuiet && potentialDeferrableByLeaf[i])
                         deferrableBraceLeaves.insert(leaf);
                     laterQuiet = laterQuiet && expression != nullptr
-                        && (IsQuietCxxBraceElement(expression) || IsDefaultOnlyExpression(expression));
+                        && (IsQuietCxxBraceElement(expression) || IsDefaultOnlyExpression(expression)
+                            || quietCall || callTernary);
                 }
             }
             // A class prvalue already built in a CFlat temp keeps later elements eager: a deferred
             // constructor that throws would otherwise destroy the moved-in copy and the temp.
             bool eagerClassPrvalueSeen = false;
+            size_t activeBraceCallCaptureMark = 0;
             auto noteParsedBraceLeaf = [&](const LLVMBackend::NamedVariable& parsed) {
+                if (compiler->cxxBraceCallCaptures_.size() > activeBraceCallCaptureMark)
+                    return;
                 if (!parsed.IsCxxDirectConstruction && !parsed.TypeAndValue.Pointer
                     && (parsed.IsRvalue || parsed.IsCxxPrvalueTemp)
                     && compiler->IsCxxRecord(compiler->ResolveTypeAlias(parsed.TypeAndValue.TypeName)))
                     eagerClassPrvalueSeen = true;
+            };
+            auto makeDeferredBraceCall = [&](LLVMBackend::DeferredCxxBraceCall call,
+                                             const std::string& resultType) {
+                LLVMBackend::NamedVariable deferred;
+                auto* objectType = compiler->GetType(
+                    LLVMBackend::TypeAndValue{ .TypeName = resultType });
+                deferred.Primary = llvm::UndefValue::get(objectType);
+                deferred.BaseType = objectType;
+                deferred.TypeAndValue.TypeName = resultType;
+                deferred.IsRvalue = true;
+                deferred.IsCxxDirectConstruction = true;
+                deferred.CxxDirectConstructionType = resultType;
+                deferred.CxxDeferredTernaryShape = "@F1";
+                LLVMBackend::NamedVariable selector;
+                selector.Primary = compiler->builder->getInt32(0);
+                selector.BaseType = selector.Primary->getType();
+                selector.TypeAndValue.TypeName = "int";
+                selector.IsRvalue = true;
+                deferred.CxxDirectConstructionArguments.push_back(std::move(selector));
+                deferred.CxxDirectConstructionArguments.push_back(std::move(call.Callable));
+                deferred.CxxDirectConstructionArguments.insert(
+                    deferred.CxxDirectConstructionArguments.end(),
+                    std::make_move_iterator(call.Arguments.begin()),
+                    std::make_move_iterator(call.Arguments.end()));
+                return deferred;
             };
             auto armBraceDeferral = [&](CFlatParser::FieldInitContext* element) {
                 return !eagerClassPrvalueSeen && deferrableBraceLeaves.count(element) != 0;
@@ -8731,10 +8929,29 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     CxxCallArgumentExpectedTypeScope cxxArgumentExpected(
                         cxxCallArgumentExpectedType_, argExpected);
                     LLVMBackend::NamedVariable elementNV;
+                    bool capturedBraceCall = false;
                     if (deferredDefault)
                     {
                         elementNV.TypeAndValue = argExpected;
                         elementNV.IsDefaultArgument = true;
+                    }
+                    else if (!constRefTernary && armBraceDeferral(element)
+                        && targetField != nullptr && !targetField->Pointer
+                        && !targetField->ElemPointer
+                        && !targetField->IsAlias && !targetField->IsRvalueRef
+                        && compiler->IsForeignNontrivialCxxClass(
+                            compiler->ResolveTypeAlias(targetField->TypeName))
+                        && quietCallTernary(expression,
+                            compiler->ResolveTypeAlias(targetField->TypeName)))
+                    {
+                        const std::string callResultType = compiler->ResolveTypeAlias(
+                            targetField->TypeName);
+                        if (!BuildCxxDeferredDefaultTernary(expression, callResultType,
+                                elementNV, false, true))
+                        {
+                            valid = false;
+                            break;
+                        }
                     }
                     else
                     {
@@ -8748,6 +8965,24 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                         }
                         else
                         {
+                            const size_t braceCallCaptureMark =
+                                compiler->cxxBraceCallCaptures_.size();
+                            activeBraceCallCaptureMark = braceCallCaptureMark;
+                            const std::string braceCallTargetType = targetField != nullptr
+                                && !targetField->Pointer && !targetField->ElemPointer
+                                ? compiler->ResolveTypeAlias(targetField->TypeName) : std::string();
+                            auto* callPostfix = simpleBraceCall(expression);
+                            const bool captureBraceCall = !constRefTernary
+                                && armBraceDeferral(element) && callPostfix != nullptr
+                                && !braceCallTargetType.empty()
+                                && compiler->IsForeignNontrivialCxxClass(braceCallTargetType);
+                            const void* braceCallSite = captureBraceCall
+                                ? callPostfix->LeftParen().back() : nullptr;
+                            llvm::SaveAndRestore<const void*> pendingBraceCallSite(
+                                compiler->pendingCxxBraceCallCaptureSite_, braceCallSite);
+                            llvm::SaveAndRestore<std::string> pendingBraceCallType(
+                                compiler->pendingCxxBraceCallCaptureType_,
+                                captureBraceCall ? braceCallTargetType : std::string());
                             elementNV = [&] {
                                 CxxCallArgumentParseStateScope argumentState(compiler);
                                 BraceDeferralScope deferral(*this, expression,
@@ -8768,8 +9003,22 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                                 noteParsedBraceLeaf(parsed);
                                 return parsed;
                             }();
+                            if (compiler->cxxBraceCallCaptures_.size() == braceCallCaptureMark + 1
+                                && compiler->cxxBraceCallCaptures_.back().CallSite == braceCallSite
+                                && compiler->ResolveTypeAlias(
+                                    compiler->cxxBraceCallCaptures_.back().ReturnType.TypeName)
+                                    == braceCallTargetType)
+                            {
+                                auto captured = std::move(compiler->cxxBraceCallCaptures_.back());
+                                compiler->cxxBraceCallCaptures_.resize(braceCallCaptureMark);
+                                elementNV = makeDeferredBraceCall(std::move(captured),
+                                    braceCallTargetType);
+                                capturedBraceCall = true;
+                            }
+                            activeBraceCallCaptureMark = compiler->cxxBraceCallCaptures_.size();
                         }
-                        NormalizeCxxRvalueReferenceArgument(expression, elementNV);
+                        if (!capturedBraceCall)
+                            NormalizeCxxRvalueReferenceArgument(expression, elementNV);
                     }
                     if (rejectFrameBoundReferences && targetIsReference
                         && !IsProgramLifetimeStorage(elementNV))
@@ -13269,6 +13518,33 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         if (!movedName.empty()) compiler->MarkVariableMoved(movedName);
                                     }
                                     continue;
+                                }
+                                // Treat a chained initializer as a read of the completed inner slot.
+                                if (rightNV.ChainedAssignSlot != nullptr)
+                                {
+                                    llvm::Value* chainSlot = rightNV.ChainedAssignSlot;
+                                    const std::string slotName = rightNV.ChainedAssignName;
+                                    if (const auto* slotVar = compiler->FindVariableByStorage(chainSlot);
+                                        slotVar != nullptr)
+                                    {
+                                        auto slotRead = compiler->GetScopedLocalOrArgument(slotName);
+                                        rightNV = slotRead.Storage == chainSlot ? slotRead : *slotVar;
+                                        rightNV.CallerName = slotName;
+                                        rightNV.Primary = nullptr;
+                                    }
+                                    else if (llvm::isa<llvm::GlobalVariable>(chainSlot))
+                                    {
+                                        auto globalRead = compiler->GetGlobalVariableNV(slotName);
+                                        if (globalRead.Storage == chainSlot) rightNV = globalRead;
+                                    }
+                                    else if (rightNV.Storage == chainSlot
+                                        && llvm::isa<llvm::GetElementPtrInst>(chainSlot))
+                                    {
+                                        rightNV.Primary = nullptr;
+                                        rightNV.Primary = LoadNamedVariable(rightNV);
+                                    }
+                                    rightNV.ChainedAssignSlot = nullptr;
+                                    rightNV.ChainedAssignJoinRhs = false;
                                 }
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
@@ -19565,35 +19841,74 @@ bool MainListener::EnsureAggregateAliases(const std::string& owner) {
 
 std::string MainListener::ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx,
         uint32_t* constMask) {
+        auto* compiler = Compiler(ctx);
         auto* ownerCtx = ctx->memberTypeOwner();
-        const std::string ownerText = ownerCtx->getText();
-        std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> members;
-        for (auto* member : ctx->memberNameToken())
-            members.emplace_back(member->getText(), member);
+        std::vector<std::string> ownerParts{ ownerCtx->Identifier()->getText() };
+        for (auto* part : ownerCtx->memberNameToken()) ownerParts.push_back(part->getText());
+        std::string base;
+        for (const auto& part : ownerParts)
+            base += (base.empty() ? "" : ".") + part;
+        std::string ownerText = base + ownerCtx->genericTypeParameters()->getText();
+        if (ownerParts.size() >= 2)
+        {
+            std::string aliasOwnerSpelling;
+            for (size_t i = 0; i + 1 < ownerParts.size(); ++i)
+                aliasOwnerSpelling += (aliasOwnerSpelling.empty() ? "" : ".") + ownerParts[i];
+            const std::string aliasOwner = compiler->ResolveTypeAlias(
+                compiler->ResolveQualifiedName(aliasOwnerSpelling));
+            if (aliasOwner != compiler->ResolveQualifiedName(aliasOwnerSpelling)
+                || compiler->IsDataStructure(aliasOwner) || compiler->IsCxxForeignTypeRegistered(aliasOwner))
+            {
+                base = aliasOwner + "." + ownerParts.back();
+                ownerText = base + ownerCtx->genericTypeParameters()->getText();
+            }
+        }
+        std::vector<MemberTypeSegment> members;
+        for (auto* member : ctx->memberTypeMember())
+            members.push_back({ member->memberNameToken()->getText(), member->genericTypeParameters(), member });
         std::string lastOwner;
-        std::string resolved = ResolveMemberTypeChain(ownerText.substr(0, ownerText.find('<')),
+        std::string resolved = ResolveMemberTypeChain(base,
                                                       ownerCtx->genericTypeParameters(), ownerText,
                                                       members, ownerCtx, /*report*/ memberTypeSilentDepth_ == 0,
                                                       &lastOwner);
         if (constMask != nullptr && !members.empty() && !resolved.empty())
-            *constMask = Compiler(ctx)->ResolveTypeAliasConstMask(lastOwner + "." + members.back().first);
+            *constMask = compiler->ResolveTypeAliasConstMask(lastOwner + "." + members.back().Name);
         return resolved.empty() ? "int" : resolved;   // recover as a scalar so the error does not cascade
 }
 
 bool MainListener::MemberTypeSpecifierNamesType(CFlatParser::MemberTypeSpecifierContext* ctx) {
         auto* ownerCtx = ctx->memberTypeOwner();
-        const std::string ownerText = ownerCtx->getText();
-        std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> members;
-        for (auto* member : ctx->memberNameToken())
-            members.emplace_back(member->getText(), member);
-        return !ResolveMemberTypeChain(ownerText.substr(0, ownerText.find('<')),
+        std::vector<std::string> ownerParts{ ownerCtx->Identifier()->getText() };
+        for (auto* part : ownerCtx->memberNameToken()) ownerParts.push_back(part->getText());
+        std::string base;
+        for (const auto& part : ownerParts)
+            base += (base.empty() ? "" : ".") + part;
+        std::string ownerText = base + ownerCtx->genericTypeParameters()->getText();
+        if (ownerParts.size() >= 2)
+        {
+            std::string aliasOwnerSpelling;
+            for (size_t i = 0; i + 1 < ownerParts.size(); ++i)
+                aliasOwnerSpelling += (aliasOwnerSpelling.empty() ? "" : ".") + ownerParts[i];
+            const std::string qualifiedOwner = Compiler(ownerCtx)->ResolveQualifiedName(aliasOwnerSpelling);
+            const std::string aliasOwner = Compiler(ownerCtx)->ResolveTypeAlias(qualifiedOwner);
+            if (aliasOwner != qualifiedOwner || Compiler(ownerCtx)->IsDataStructure(aliasOwner)
+                || Compiler(ownerCtx)->IsCxxForeignTypeRegistered(aliasOwner))
+            {
+                base = aliasOwner + "." + ownerParts.back();
+                ownerText = base + ownerCtx->genericTypeParameters()->getText();
+            }
+        }
+        std::vector<MemberTypeSegment> members;
+        for (auto* member : ctx->memberTypeMember())
+            members.push_back({ member->memberNameToken()->getText(), member->genericTypeParameters(), member });
+        return !ResolveMemberTypeChain(base,
                                        ownerCtx->genericTypeParameters(), ownerText, members, ownerCtx,
                                        /*report*/ false).empty();
 }
 
 std::string MainListener::ResolveMemberTypeChain(
     std::string base, CFlatParser::GenericTypeParametersContext* ownerArgs, const std::string& ownerText,
-    const std::vector<std::pair<std::string, antlr4::ParserRuleContext*>>& members,
+    const std::vector<MemberTypeSegment>& members,
     antlr4::ParserRuleContext* site, bool report, std::string* lastOwner) {
         auto* compiler = Compiler(site);
         std::vector<std::string> args;
@@ -19611,28 +19926,103 @@ std::string MainListener::ResolveMemberTypeChain(
             return {};
         }
         compiler->CompleteCxxTemplateTypeArgs(base, args);
-        std::string owner = MangledGenericName(base, args);
+        std::string owner;
+        bool nestedCxxTemplate = false;
+        if (const size_t dot = base.rfind('.'); dot != std::string::npos && dot > 0
+            && dot + 1 < base.size())
         {
+            const std::string parent = compiler->ResolveTypeAlias(
+                compiler->ResolveQualifiedName(base.substr(0, dot)));
+            if (compiler->IsCxxForeignTypeRegistered(parent))
+            {
+                const std::string member = base.substr(dot + 1);
+                const std::string nestedType = MangledGenericName(base, args);
+                std::string cxxError;
+                if (compiler->TryRequestCxxMemberTemplateType(
+                        parent, member, args, nestedType, cxxError))
+                {
+                    owner = compiler->ResolveTypeAlias(nestedType);
+                    nestedCxxTemplate = true;
+                }
+                else if (!cxxError.empty() && report)
+                    LogCxxErrorContext(site, cxxError);
+            }
+        }
+        if (!nestedCxxTemplate)
+        {
+            owner = MangledGenericName(base, args);
             std::string cxxError;
             if (!compiler->TryRequestCxxType(base, args, owner, cxxError) && !cxxError.empty() && report)
                 LogCxxErrorContext(site, cxxError);
             owner = compiler->ResolveTypeAlias(owner);
         }
-        QueueGenericInstantiation(base, args, owner, site);
+        if (!nestedCxxTemplate) QueueGenericInstantiation(base, args, owner, site);
         AggregateAliasHookScope hook(compiler, this);
         std::string display = ownerText;
-        for (const auto& [name, memberSite] : members)
+        for (const auto& member : members)
         {
+            const std::string& name = member.Name;
             if (lastOwner != nullptr) *lastOwner = owner;
-            LLVMBackend::MemberTypeResult result;
-            std::string next = compiler->ResolveMemberType(owner, name, result);
+            LLVMBackend::MemberTypeResult result = LLVMBackend::MemberTypeResult::Found;
+            std::string next;
+            if (member.TypeArgs == nullptr)
+            {
+                next = compiler->ResolveMemberType(owner, name, result);
+                if (next.empty() && result == LLVMBackend::MemberTypeResult::NotFound)
+                    next = ResolveFunctionTypeAliasMember(compiler, owner, name, &result);
+            }
+            else
+            {
+                std::vector<std::string> memberArgs;
+                for (auto* entry : member.TypeArgs->typeParameterList()->typeParameterEntry())
+                    memberArgs.push_back(ResolveTypeArgEntry(entry));
+                ResolveEnumTypeArguments(memberArgs);
+                const std::string memberBase = owner + "." + name;
+                if (compiler->IsCxxForeignTypeRegistered(owner))
+                {
+                    compiler->CompleteCxxTemplateTypeArgs(memberBase, memberArgs);
+                    const std::string memberType = MangleGenericInstance(*compiler, memberBase, memberArgs);
+                    std::string cxxError;
+                    if (compiler->TryRequestCxxMemberTemplateType(
+                            owner, name, memberArgs, memberType, cxxError))
+                        next = compiler->ResolveTypeAlias(memberType);
+                    else if (!cxxError.empty() && report)
+                        LogCxxErrorContext(member.Site, cxxError);
+                    if (next.empty()) result = LLVMBackend::MemberTypeResult::NotFound;
+                }
+                else
+                {
+                    if (std::any_of(pendingInstantiations.begin(), pendingInstantiations.end(),
+                            [&](const auto& pending) { return pending.mangledName == owner; }))
+                    {
+                        LLVMBackend::BuilderStateGuard savedState(compiler);
+                        ProcessPendingInstantiations();
+                    }
+                    const std::string nestedBase = compiler->ResolveGenericTemplateBase(memberBase);
+                    if (compiler->AnyGenericTypeTemplateNamed(nestedBase))
+                    {
+                        const std::string memberType = MangledGenericName(nestedBase, memberArgs, member.Site);
+                        QueueGenericInstantiation(nestedBase, memberArgs, memberType, member.Site);
+                        {
+                            LLVMBackend::BuilderStateGuard savedState(compiler);
+                            ProcessPendingInstantiations();
+                        }
+                        next = memberType;
+                    }
+                    else
+                    {
+                        result = LLVMBackend::MemberTypeResult::NotFound;
+                    }
+                }
+            }
             if (next.empty())
             {
                 if (report)
-                    LogErrorContext(memberSite, compiler->MemberTypeErrorMessage(display, name, result));
+                    LogErrorContext(member.Site, compiler->MemberTypeErrorMessage(display, name, result));
                 return {};
             }
             display += "." + name;
+            if (member.TypeArgs != nullptr) display += member.TypeArgs->getText();
             owner = next;
         }
         return owner;
@@ -19663,10 +20053,8 @@ std::string MainListener::TryPostfixAsMemberType(CFlatParser::PostfixExpressionC
         auto* head = chain->primaryExpression()->genericIdentifier();
         if (head->Identifier() == nullptr) return {};
         // Segments `name<args>?`; anything but `.name` (a call, an index, `->`) is a value.
-        std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> segments;
-        std::vector<CFlatParser::GenericTypeParametersContext*> segmentArgs;
-        segments.emplace_back(head->Identifier()->getText(), head);
-        segmentArgs.push_back(head->genericTypeParameters());
+        std::vector<MemberTypeSegment> segments;
+        segments.push_back({ head->Identifier()->getText(), head->genericTypeParameters(), head });
         for (size_t i = 1; i < chain->children.size(); ++i)
         {
             auto* token = dynamic_cast<antlr4::tree::TerminalNode*>(chain->children[i]);
@@ -19674,32 +20062,41 @@ std::string MainListener::TryPostfixAsMemberType(CFlatParser::PostfixExpressionC
                 return {};
             auto* name = dynamic_cast<CFlatParser::MemberNameTokenContext*>(chain->children[i + 1]);
             if (name == nullptr) return {};
-            segments.emplace_back(name->getText(), name);
-            segmentArgs.push_back(nullptr);
+            MemberTypeSegment segment{ name->getText(), nullptr, name };
             i += 1;
             if (i + 1 < chain->children.size())
                 if (auto* args = dynamic_cast<CFlatParser::GenericTypeParametersContext*>(chain->children[i + 1]))
                 {
-                    segmentArgs.back() = args;
+                    segment.TypeArgs = args;
                     i += 1;
                 }
+            segments.push_back(segment);
         }
-        // Exactly one `<...>`, on the owner, followed by at least one member name.
+        // The first template argument list names the owner; later lists belong to nested templates.
         size_t ownerIndex = SIZE_MAX;
-        for (size_t i = 0; i < segmentArgs.size(); ++i)
-            if (segmentArgs[i] != nullptr)
+        for (size_t i = 0; i < segments.size(); ++i)
+            if (segments[i].TypeArgs != nullptr)
             {
-                if (ownerIndex != SIZE_MAX) return {};
                 ownerIndex = i;
+                break;
             }
-        if (ownerIndex == SIZE_MAX || ownerIndex + 1 >= segments.size()) return {};
+        if (ownerIndex == SIZE_MAX)
+        {
+            std::string qualified;
+            for (const auto& segment : segments)
+                qualified += (qualified.empty() ? "" : ".") + segment.Name;
+            if (const auto* closure = Compiler(chain)->FindFunctionTypeAlias(qualified);
+                closure != nullptr)
+                return EncodeClosureFromSig(Compiler(chain), *closure);
+            return {};
+        }
+        if (ownerIndex + 1 >= segments.size()) return {};
         std::string base;
         for (size_t i = 0; i <= ownerIndex; ++i)
-            base += (i == 0 ? "" : ".") + segments[i].first;
-        std::string ownerText = base + segmentArgs[ownerIndex]->getText();
-        std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> members(
-            segments.begin() + ownerIndex + 1, segments.end());
-        return ResolveMemberTypeChain(base, segmentArgs[ownerIndex], ownerText, members, chain,
+            base += (i == 0 ? "" : ".") + segments[i].Name;
+        std::string ownerText = base + segments[ownerIndex].TypeArgs->getText();
+        std::vector<MemberTypeSegment> members(segments.begin() + ownerIndex + 1, segments.end());
+        return ResolveMemberTypeChain(base, segments[ownerIndex].TypeArgs, ownerText, members, chain,
                                       /*report*/ false);
 }
 

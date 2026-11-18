@@ -2218,6 +2218,10 @@ public:
         bool IsCFlatBraceInitTemp = false;
         // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
         bool IsCxxPrvalueTemp = false;
+        // REFDEF: a caller-built `default`/place `?:` temp: the wrapper proves its parameter takes this class.
+        std::string CxxPlaceGuardType;
+        // REFDEF: the caller copy was made because a non-inert sibling writes around it (no proof needed).
+        bool CxxCopyBySibling = false;
         bool IsCxxPrvalueConditional = false;
         // This member expression comes from a C++ class prvalue; the owner name supplies its diagnostic type.
         bool IsCxxPrvalueSubobject = false;
@@ -2232,8 +2236,7 @@ public:
         bool CxxDirectConstructionUsesBraces = false;
         std::string CxxDirectConstructionType;
         std::vector<NamedVariable> CxxDirectConstructionArguments;
-        // T418: a `c ? default : local` argument evaluated inside the C++ wrapper; the shape spells
-        // the conditional over the children (@S = selector, @D = default arm, @<n> = child n).
+        // A deferred C++ call or conditional shape spelled by a generated wrapper.
         std::string CxxDeferredTernaryShape;
         // T518: a snapshot required to preserve this argument before a later write; the flag
         // makes an unavailable by-value dispatch a diagnostic instead of a stale wrapper fallback.
@@ -2435,9 +2438,14 @@ public:
         // name). An outer unique '=' takes that slot as its RHS, as `owner = raw;` does.
         llvm::Value* ChainedAssignSlot = nullptr;
         std::string ChainedAssignName;
+        // Transient: the chain's field destination was reached through `this` (implicit or explicit);
+        // holds that this-field path, empty otherwise. Read by the keyless field-readback gate.
+        std::string ChainedAssignThisPath;
         // Transient: the chain's value came from a '?:' join. A global or field outer refuses it as its
         // two-statement form does, so the store path decides.
         bool ChainedAssignJoinRhs = false;
+        // Transient: the chain's inner store was given an owner (owning join or owning source, read before the consume).
+        bool ChainedAssignJoinOwned = false;
         // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
         // borrowed parameter, so the delete/store diagnostics can name the real owner (Trap B).
         std::string BorrowedUniqueField;
@@ -2975,6 +2983,16 @@ public:
     };
     FragmentDiagnosticAnchor fragmentDiagnosticAnchor_;
     TypeAndValue lastCallReturnType;       // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
+    struct DeferredCxxBraceCall
+    {
+        NamedVariable Callable;
+        std::vector<NamedVariable> Arguments;
+        TypeAndValue ReturnType;
+        const void* CallSite = nullptr;
+    };
+    const void* pendingCxxBraceCallCaptureSite_ = nullptr;
+    std::string pendingCxxBraceCallCaptureType_;
+    std::vector<DeferredCxxBraceCall> cxxBraceCallCaptures_;
     // Result value of the LAST call when it returned an owning `unique` result, else null (see
     // IsUniqueOwningCallResult). Gates compare an RHS value against it, so methods are covered too.
     llvm::Value* lastUniqueOwningCallResult = nullptr;
@@ -3950,6 +3968,15 @@ private:
     std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues_;
     // Value of `p = e = new T()` whose middle cannot own (parameter, alias, other pointee), to its name.
     std::unordered_map<const llvm::Value*, std::string> chainBorrowMiddleValues_;
+    struct StoredPointerJoinOwner
+    {
+        std::string Source;
+        std::vector<llvm::Value*> Slots;
+        llvm::BasicBlock* StoreBlock = nullptr;
+        bool IsFieldOwnerValue = false;
+    };
+    std::unordered_map<std::string, StoredPointerJoinOwner> storedPointerJoinOwners_;
+    std::unordered_map<const llvm::Value*, StoredPointerJoinOwner> storedPointerJoinOwnerValues_;
     // Pointer values produced by ADDRESS-OF (`&x`, `&a[i]`, `&s.f`). Such a value can never own
     // its pointee, so it is positive proof of a borrow. Live compile-time state keyed by
     // llvm::Value identity - never part of the --init cache round-trip.
@@ -5357,6 +5384,9 @@ private:
         std::vector<std::string> ctorSelectedParams;
         // RawSig::selectedCalleeType / selectedCalleeDefaults of a generated wrapper (cached).
         std::string selectedCalleeType;
+        // Selected member-template declaration owner in CFlat record identity form.
+        std::string selectedCalleeOwner;
+        bool selectedCalleeOwnerIsReceiver = false;
         std::string selectedCalleeTemplateArgs;
         std::vector<cflat_cinterop::RawDefaultArg> selectedCalleeDefaults;
         std::string selectedCalleeSymbol;
@@ -5381,6 +5411,9 @@ private:
         // A generated wrapper for an INSTANCE member template: p0 is the receiver, so the
         // symbol is a member call although it is registered like a free function (IsMethod off).
         bool isInstanceTemplateWrapper = false;
+        // Direct by-value callee for a class that cannot be copied or moved: its record parameters are
+        // fed only prvalues the call elides, so the copy/move binding check does not apply.
+        bool prvalueOnlyByValue = false;
         std::string bindRefusal;
         // Refusal reported by clang extraction, before backend type mapping. A cached C++
         // signature remaps its types from the preserved spellings and retains this reason.
@@ -7036,6 +7069,15 @@ private:
     std::string ChainBorrowMiddleArmName(const llvm::Value* joined) const;
     // True when a chain consumer reads this slot as a named `a = slot;` (owner, middle borrowing one, or chain value above).
     bool ChainSlotReadsAsNamed(const NamedVariable& slotVar, const llvm::Value* chainValue) const;
+    // Preserve a proved live owner when a pointer join passes through a raw field or global slot.
+    void SetStoredPointerJoinOwner(const NamedVariable& destination, const std::string& source,
+                                   const std::vector<llvm::Value*>& slots,
+                                   llvm::BasicBlock* storeBlock);
+    bool ApplyStoredPointerJoinOwner(NamedVariable& value) const;
+    void RegisterStoredPointerJoinOwnerValue(const llvm::Value* value,
+                                             const NamedVariable& source);
+    const StoredPointerJoinOwner* FindStoredPointerJoinOwnerValue(const llvm::Value* value) const;
+    std::string StoredPointerJoinOwnerKey(const NamedVariable& value) const;
 
     // True when `value` provably owns nothing because a `move` of a borrow produced it. `originOut`
     // receives the borrow's origin name so the diagnostic can name the real owner.
@@ -8019,6 +8061,9 @@ private:
                                               const std::string& placeType) const;
     bool IsCxxFreeFunctionParameterByValue(const std::string& functionName,
                                            size_t parameterIndex, size_t arity) const;
+    // REFDEF: true when some C++ signature of this name takes the parameter by value (any overload).
+    bool IsCxxFreeFunctionAnyParameterByValue(const std::string& functionName,
+                                              size_t parameterIndex, size_t arity) const;
     bool IsCxxMemberFunctionParameterByValue(const std::string& ownerType,
                                              const std::string& memberName,
                                              size_t parameterIndex, size_t arity) const;
@@ -8113,7 +8158,8 @@ private:
     bool SwitchCxxDirectByValueCall(const std::string& functionName,
                                     std::vector<NamedVariable>& arguments,
                                     std::string& registeredName, std::string& error,
-                                    bool typeDefaultTrailing = false);
+                                    bool typeDefaultTrailing = false,
+                                    const std::vector<size_t>* knownByValueArguments = nullptr);
     // Operator form: the infix wrapper bound under registeredName (free or template).
     bool SwitchCxxOperatorDirectByValueCall(const std::string& functionName,
                                             std::vector<NamedVariable>& arguments,
@@ -8123,6 +8169,7 @@ private:
     std::string lastCxxFreeWrapperLinkage_;
     std::unordered_map<std::string, std::pair<size_t, std::vector<size_t>>> cxxFreeWrapperGroups_;
     std::unordered_map<std::string, std::string> cxxDirectCalleeGetters_;
+    std::unordered_map<std::string, uint64_t> cxxDirectCalleeThisAdjust_;
     // Operator selections called by the selected callee's symbol; the getter stays demanded.
     std::unordered_map<std::string, std::string> cxxDirectCalleeSymbols_;
     std::string CxxConstPointerArgumentError(size_t argumentIndex,
@@ -8186,6 +8233,8 @@ private:
                                           std::vector<size_t>* forwardedElementIndices = nullptr,
                                           const std::vector<std::string>* elementTargetTypes = nullptr,
                                           std::vector<std::vector<NamedVariable>>* deferredArguments = nullptr);
+    bool CxxBraceDeferredParameterSpelling(const TypeAndValue& type,
+                                           std::string& spelling) const;
     bool SpellCxxBraceDeferredConstruction(const NamedVariable& construction, size_t& nextParameter,
                                            std::vector<std::string>& parameterTypes,
                                            std::vector<NamedVariable>* forwarded,
@@ -8409,6 +8458,7 @@ private:
     bool CxxEnumPromotesToElement(const NamedVariable& source, const TypeAndValue& elementType);
     std::string DeclaredPrimitiveIdentityForCxxArgument(const NamedVariable& arg,
                                                         llvm::Type* valueType) const;
+public:
     /*
      * Gate + request in one call, for both ParseDeclarationSpecifiers copies. Returns true when the
      * CFlat name now denotes a registered foreign C++ type. Returns false with `error` EMPTY when
@@ -8419,6 +8469,14 @@ private:
     bool TryRequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
                            const std::string& cflatName, std::string& error,
                            bool deferIncompleteCodegen = false);
+    bool TryRequestCxxMemberTemplateType(const std::string& owner, const std::string& member,
+                                        const std::vector<std::string>& typeArgs,
+                                        const std::string& cflatName, std::string& error);
+    enum class CxxStaticDataValueStatus { NotFound, Inaccessible, NotConstant, IntegerConstant };
+    bool FoldableStaticValue(const cflat_cinterop::RawCxxStaticVar& variable, int64_t value);
+    CxxStaticDataValueStatus LookupCxxStaticDataValue(
+        const std::string& owner, const std::string& member, int64_t& value);
+private:
     // Binds a constant C++ namespace-scope variable (or variable-template specialization)
     // `baseName<typeArgs>` (dotted CFlat path) as the constexpr global `cflatName`; true when bound.
     // `notConstant`: the variable exists but its initializer is not a constant initialization.
@@ -8964,10 +9022,14 @@ private:
     Operation ParseOperation(const std::string& operationText);
 
 public:
+    bool IsImportedCxxTypeRegistered(const std::string& cflatName) const
+    { return IsCxxForeignTypeRegistered(cflatName); }
     // CFlat itself binds the name (local, parameter, implicit-this field, non-macro global).
     bool IsCFlatVariableBinding(const std::string& name);
     // Overload candidates CFlat holds under this (resolved) name, or null when there are none.
     const std::vector<FunctionSymbol>* FindCFlatCallCandidates(const std::string& name) const;
+    bool CxxBraceCallCaptureSignature(const FunctionSymbol& candidate, size_t argumentCount,
+                                     const std::string& targetType, TypeAndValue& signature) const;
     // A parameter a null pointer constant could bind to (pointer-like, class, template or unknown).
     static bool ParameterMayTakeNullConstant(const TypeAndValue& parameter);
     bool IsImportedCxxFunctionMacroName(const std::string& name) const { return IsImportedCxxFunctionMacro(name); }
@@ -15362,7 +15424,9 @@ public:
     // 342: C-variadic function templates are cached with unbounded maxArity.
     // 343: function-template cache entries preserve type parameter names for brace deduction.
     // 345: generated member-template wrappers record the selected member callee type.
-    static constexpr int kCHeaderCacheVersion = 345;
+    // 346: generated member-template wrappers record the selected member's declaring class.
+    // 348: generated member-template wrappers record whether that owner is the receiver record.
+    static constexpr int kCHeaderCacheVersion = 349;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

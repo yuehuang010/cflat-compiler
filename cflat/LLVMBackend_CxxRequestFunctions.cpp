@@ -3206,7 +3206,8 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
             }
             return std::format("__cflat_tpl_{:016x}", HashWrapperKey(hashKey));
         };
-        auto makeWrapperInput = [&](const std::string& name, const std::vector<std::string>& calls) {
+        auto makeWrapperInput = [&](const std::string& name, const std::vector<std::string>& calls,
+                                    const std::string& helperPreamble = std::string()) {
             std::string wrapperSource = wrapperNeedsInitializerList
                 ? "#include <initializer_list>\n" : std::string();
             wrapperSource += "extern \"C\" __attribute__((weak)) decltype(auto) " + name + "(";
@@ -3218,7 +3219,7 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
             wrapperSource += ")";
             if (selected->isNoexcept && !infixForm) wrapperSource += " noexcept";
             wrapperSource += " { " + wrapperBodyPrefix + "return " + makeTargetCall(calls) + "; }\n";
-            return generatedTypeSource + wrapperSource;
+            return generatedTypeSource + helperPreamble + wrapperSource;
         };
         std::string wrapperName = makeWrapperName(callArguments);
         // An infix operator wrapper registers under its own unique name, never under the shared
@@ -3264,6 +3265,94 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
         bool wrapped = RequestGeneratedCxxWrapper(group, makeWrapperInput(wrapperName, callArguments),
                                                   wrapperName, "TPL", bound, wrapperError,
                                                   incompleteTypes.empty(), allowIncremental);
+        bool directByvalProbe = false;
+        size_t directByvalProbeArgument = arguments.size();
+        std::vector<size_t> directByvalProbeArguments;
+        if (!wrapped && (selected->kind == cflat_cinterop::RawFunctionTemplate::Free
+                         || selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember)
+            && infixOperator.empty() && braceArguments.empty() && !hasDirectConstructionArgument)
+        {
+            const std::string originalWrapperError = wrapperError;
+            const std::string originalWrapperCause = lastCxxWrapperCause_;
+            const std::string causeLine = CxxFirstDiagnosticLine(originalWrapperCause);
+            const bool constructorRefusal = causeLine.find("deleted constructor") != std::string::npos
+                || causeLine.find("private constructor") != std::string::npos;
+            if (constructorRefusal)
+            {
+                const size_t argumentOffset =
+                    selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1 : 0;
+                auto leaves = [](auto&& self, const NamedVariable& value) -> size_t {
+                    if (!value.IsCxxDirectConstruction) return 1;
+                    size_t count = 0;
+                    for (const NamedVariable& child : value.CxxDirectConstructionArguments)
+                        count += self(self, child);
+                    return count;
+                };
+                auto sameDiagnosticType = [&](const std::string& spelling) {
+                    if (spelling.empty()) return false;
+                    std::string normalized = spelling;
+                    while (normalized.starts_with("::")) normalized.erase(0, 2);
+                    return causeLine.find("'" + normalized + "'") != std::string::npos;
+                };
+                std::vector<std::pair<size_t, std::string>> probeArguments;
+                std::vector<size_t> probeArgumentIndices;
+                size_t flatArgument = 0;
+                for (size_t i = 0; i < arguments.size(); ++i)
+                {
+                    const NamedVariable& argument = arguments[i];
+                    if (i >= argumentOffset && argument.IsRvalue && argument.IsCxxPrvalueTemp
+                        && (argument.Storage != nullptr || argument.CxxEarlyCopySlot != nullptr)
+                        && !argument.TypeAndValue.Pointer && !argument.TypeAndValue.IsCxxRef()
+                        && IsCxxRecord(argument.TypeAndValue.TypeName)
+                        && IsCxxFunctionTemplateParameterByValue(
+                            functionName, ownerType, i - argumentOffset,
+                            arguments.size() - argumentOffset))
+                    {
+                        std::string spelling;
+                        const std::string sourceType = cflatTypeOf(argument);
+                        if (CxxSpellingForCflatType(sourceType, spelling))
+                        {
+                            if (sameDiagnosticType(spelling))
+                                directByvalProbeArgument = i;
+                            probeArguments.emplace_back(flatArgument, std::move(spelling));
+                            probeArgumentIndices.push_back(i);
+                        }
+                    }
+                    flatArgument += leaves(leaves, argument);
+                }
+                if (directByvalProbeArgument < arguments.size())
+                {
+                    std::vector<std::string> probeCalls = callArguments;
+                    std::string helperPreamble;
+                    for (const auto& [flatIndex, spelling] : probeArguments)
+                    {
+                        if (flatIndex >= probeCalls.size()) continue;
+                        const std::string helper = std::format(
+                            "__cflat_tpl_byval_probe_{:016x}",
+                            HashWrapperKey(wrapperName + "|" + std::to_string(flatIndex)));
+                        helperPreamble += "namespace { " + spelling + " " + helper
+                            + "() { __builtin_unreachable(); } }\n";
+                        probeCalls[flatIndex] = helper + "()";
+                    }
+                    std::string probeError;
+                    if (RequestGeneratedCxxWrapper(
+                            group, makeWrapperInput(wrapperName, probeCalls, helperPreamble),
+                            wrapperName, "TPL", bound, probeError, incompleteTypes.empty(),
+                            allowIncremental))
+                    {
+                        wrapped = true;
+                        directByvalProbe = true;
+                        directByvalProbeArguments = std::move(probeArgumentIndices);
+                        wrapperError.clear();
+                    }
+                    else
+                    {
+                        wrapperError = originalWrapperError;
+                        lastCxxWrapperCause_ = originalWrapperCause;
+                    }
+                }
+            }
+        }
         // T-constst3: clang's selected callee must take each deferred `?:` argument by const reference.
         for (size_t i = 0; wrapped && i < arguments.size(); ++i)
             if (arguments[i].IsCxxDirectConstruction && !arguments[i].CxxDeferredTernaryShape.empty()
@@ -3667,6 +3756,9 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
 
         const bool instanceWrapper = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember;
         const std::string defaultRegisteredName = instanceWrapper ? functionName : lookupName;
+        // A probe wrapper (its by-value prvalue is never built) registers under its unique name, so no
+        // generic name reaches it; the direct route replaces registeredName on success.
+        if (directByvalProbe) registeredName = wrapperName;
         if (registeredName.empty()) registeredName = defaultRegisteredName;
         bound.name = registeredName;
         bound.isInstanceTemplateWrapper = instanceWrapper;
@@ -3724,7 +3816,9 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
          * already has exactly its selected parameter's type; any conversion (narrowing, derived-to-base,
          * a `?:` of a derived class) stays in the wrapper, where C++ performs it.
          */
+        size_t nonExactSelectedArgument = arguments.size();
         const auto exactSelectedParameters = [&]() -> bool {
+            nonExactSelectedArgument = arguments.size();
             std::string fnType = bound.selectedCalleeType;
             if (bound.isInstanceTemplateWrapper)
             {
@@ -3772,19 +3866,65 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 std::string type = cflatTypeOf(argument);
                 std::string spelling;
                 if (type.empty() || !cxxTemplateArgumentSpelling(type, spelling)) return false;
-                if (SqueezeCxxSpelling(spelling) != SqueezeCxxSpelling(params[i])) return false;
+                if (SqueezeCxxSpelling(spelling) != SqueezeCxxSpelling(params[i]))
+                {
+                    nonExactSelectedArgument = i + argumentOffset;
+                    return false;
+                }
             }
             return true;
         };
-        if ((ownerType.empty() || instanceWrapper) && infixOperator.empty() && braceArguments.empty()
+        const bool exactParameters = exactSelectedParameters();
+        const bool directRouteShape = (ownerType.empty() || instanceWrapper)
+            && infixOperator.empty() && braceArguments.empty()
             && scalarBackedParams.empty() && classBackedParams.empty() && !wrapperNeedsInitializerList
             && functionPointerCallerSlots.empty() && !closureArgument && !literalArrayArgument
-            && closureResultKind == FunctionSymbol::CxxClosureResultKind::None
-            && exactSelectedParameters())
+            && closureResultKind == FunctionSymbol::CxxClosureResultKind::None;
+        if (directByvalProbe && !exactParameters)
+        {
+            const std::string className = DisplayCxxClassName(
+                arguments[directByvalProbeArgument].TypeAndValue.TypeName);
+            if (nonExactSelectedArgument < arguments.size())
+            {
+                const size_t argumentOffset = instanceWrapper ? 1 : 0;
+                error = std::format("C++ function template '{}' converts argument {} at the call, which "
+                                    "CFlat cannot do for class '{}' passed by value, and its forwarding "
+                                    "wrapper cannot move or copy that class",
+                                    lookupName, nonExactSelectedArgument - argumentOffset + 1, className);
+            }
+            else
+                error = std::format("C++ function template '{}' cannot pass class '{}' by value with these "
+                                    "arguments: its forwarding wrapper cannot move or copy that class",
+                                    lookupName, className);
+            return false;
+        }
+        if (directRouteShape && exactParameters)
         {
             lastCxxFreeWrapperLinkage_ = wrapperName;
             cxxFreeWrapperGroups_[wrapperName] = { group.primary, group.dependencyGroups };
-            if (!SwitchCxxDirectByValueCall(functionName, arguments, registeredName, error)) return false;
+            const std::string beforeSwitch = registeredName;
+            if (!SwitchCxxDirectByValueCall(functionName, arguments, registeredName, error,
+                                            false, directByvalProbe
+                                                ? &directByvalProbeArguments : nullptr))
+                return false;
+            // A declined probe must not leave the probe wrapper (its prvalue is unreachable) in use.
+            if (directByvalProbe && registeredName == beforeSwitch)
+            {
+                error = std::format("C++ function template '{}' cannot pass class '{}' by value: the direct "
+                                    "by-value call is unavailable and its forwarding wrapper cannot move or "
+                                    "copy that class",
+                                    lookupName, DisplayCxxClassName(
+                                        arguments[directByvalProbeArgument].TypeAndValue.TypeName));
+                return false;
+            }
+        }
+        else if (directByvalProbe)
+        {
+            error = std::format("C++ function template '{}' cannot pass class '{}' by value with these "
+                                "arguments: its forwarding wrapper cannot move or copy that class",
+                                lookupName, DisplayCxxClassName(
+                                    arguments[directByvalProbeArgument].TypeAndValue.TypeName));
+            return false;
         }
         cxxDeductionWrappers_.insert(wrapperName);
         if (auto* sink = GetSymbolSink())
@@ -3943,7 +4083,8 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
 bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                                              std::vector<NamedVariable>& arguments,
                                              std::string& registeredName, std::string& error,
-                                             bool typeDefaultTrailing)
+                                             bool typeDefaultTrailing,
+                                             const std::vector<size_t>* knownByValueArguments)
 {
         if (lastCxxFreeWrapperLinkage_.empty()
             || std::none_of(arguments.begin(), arguments.end(), [&](const NamedVariable& a) {
@@ -3966,6 +4107,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
         if (wrapperSig == nullptr) return true;
         const std::string bindKinds = wrapperSig->paramBindKinds;
         const std::string calleeType = wrapperSig->selectedCalleeType;
+        const std::string calleeOwner = wrapperSig->selectedCalleeOwner;
         const std::string calleeTemplateArgs = wrapperSig->selectedCalleeTemplateArgs;
         const std::vector<cflat_cinterop::RawDefaultArg> calleeDefaults = wrapperSig->selectedCalleeDefaults;
         const bool instanceWrapper = wrapperSig->isInstanceTemplateWrapper;
@@ -3985,7 +4127,11 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             const size_t index = flat;
             flat += leaves(leaves, arguments[i]);
             wrapperBuilt = wrapperBuilt || arguments[i].IsCxxDirectConstruction;
-            if (index < bindKinds.size() && bindKinds[index] == 'v'
+            const bool selectedByValue = (index < bindKinds.size() && bindKinds[index] == 'v')
+                || (knownByValueArguments != nullptr
+                    && std::find(knownByValueArguments->begin(), knownByValueArguments->end(), i)
+                        != knownByValueArguments->end());
+            if (selectedByValue
                 && (arguments[i].CxxEarlyCopySlot != nullptr
                     || (arguments[i].IsCxxPrvalueTemp && arguments[i].Storage != nullptr
                         && !arguments[i].TypeAndValue.Pointer
@@ -4028,6 +4174,16 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
         });
         const size_t first = byValue.front();
         auto refuse = [&](const std::string& reason) {
+            // A probe wrapper's prvalue is never built, so the wrapper must not be used: refuse with an error.
+            if (knownByValueArguments != nullptr)
+            {
+                error = std::format("C++ function template '{}' cannot pass class '{}' by value: {}, and its "
+                                    "forwarding wrapper cannot move or copy that class",
+                                    functionName, DisplayCxxClassName(arguments[first].TypeAndValue.TypeName),
+                                    reason);
+                clearMarkers();
+                return false;
+            }
             if (!hasRequiredNontrivialEarlyCopyByValue)
             {
                 // Trivial snapshots can pass through the wrapper when the selected callee takes
@@ -4090,6 +4246,8 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             cxxBase.replace(pos, 1, "::");
         std::string receiverSpelling;
         std::string ownerSpelling;
+        std::string calleeOwnerSpelling;
+        uint64_t receiverAdjustment = 0;
         if (instanceWrapper)
         {
             if (arguments.empty() || wrapperSig->selectedCalleeSymbol.empty())
@@ -4100,14 +4258,34 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                 receiverType = wrapperSig->params.front().TypeName;
             if (receiverType.empty() || !CxxSpellingForCflatType(receiverType, ownerSpelling))
                 return refuse("the member receiver has no C++ spelling");
+            uint64_t baseOffset = 0;
+            // The selected declaration can be on this exact class-template specialization: it is spelled
+            // as the receiver (its canonical owner name may have no CFlat record) and needs no adjustment.
+            if (wrapperSig->selectedCalleeOwnerIsReceiver)
+                calleeOwnerSpelling = ownerSpelling;
+            else
+            {
+                if (calleeOwner.empty() || !CxxSpellingForCflatType(calleeOwner, calleeOwnerSpelling))
+                    return refuse("the selected member callee has no declaring class");
+                std::string baseOwnerType = calleeOwner;
+                TypeAndValue mappedOwner;
+                if (MapCTypeToTypeAndValue(calleeOwnerSpelling, mappedOwner, true)
+                    && !mappedOwner.TypeName.empty())
+                    baseOwnerType = ResolveTypeAlias(mappedOwner.TypeName);
+                bool inaccessibleBase = false;
+                if (!FindCxxBaseOffset(receiverType, baseOwnerType, baseOffset, inaccessibleBase))
+                    return refuse("the selected member is not in a fixed non-virtual base subobject");
+            }
+            receiverAdjustment = baseOffset;
             receiverSpelling = ownerSpelling;
             if (CxxConstReceiverKind(receiver) != 0) receiverSpelling = "const " + receiverSpelling;
             if (receiver.TypeAndValue.Pointer) receiverSpelling += " *";
             else receiverSpelling += IsCxxObjectRvalue(receiver) ? " &&" : " &";
         }
         const std::string directKey = instanceWrapper
-            ? std::format("{}{}|{}|{}|{}|{}", cxxBase, calleeTemplateArgs, calleeType,
-                          owner->second.first, receiverSpelling, wrapperSig->selectedCalleeSymbol)
+            ? std::format("{}{}|{}|{}|{}|{}|{}", cxxBase, calleeTemplateArgs, calleeType,
+                          owner->second.first, receiverSpelling, calleeOwnerSpelling,
+                          wrapperSig->selectedCalleeSymbol)
             : std::format("{}{}|{}|{}", cxxBase, calleeTemplateArgs, calleeType, owner->second.first);
         const std::string name = std::format("__cflat_byval_{:016x}", HashWrapperKey(directKey));
         const std::string getter = name + "_fp";
@@ -4145,7 +4323,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                 const size_t memberSeparator = cxxBase.rfind("::");
                 const std::string memberName = memberSeparator == std::string::npos
                     ? cxxBase : cxxBase.substr(memberSeparator + 2);
-                const std::string memberTarget = ownerSpelling + "::" + memberName;
+                const std::string memberTarget = calleeOwnerSpelling + "::" + memberName;
                 /*
                  * The getter value-uses a member pointer typed with the selected member's own
                  * (cv/ref-qualified) function type, so clang picks that overload and the demand pass
@@ -4155,7 +4333,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                     + "using " + name + "_m = " + calleeType + ";\n"
                     + "extern \"C\" " + name + "_t " + name + ";\n"
                     + "extern \"C\" __attribute__((weak)) void* " + getter + "() { " + name + "_m "
-                    + ownerSpelling + "::* member = &"
+                    + calleeOwnerSpelling + "::* member = &"
                     + memberTarget + calleeTemplateArgs + "; void* address = nullptr; "
                     + "__builtin_memcpy(&address, &member, sizeof(address)); return address; }\n";
             }
@@ -4188,6 +4366,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             }
             direct.defaultArgs = calleeDefaults;
             direct.name = name;
+            direct.prvalueOnlyByValue = knownByValueArguments != nullptr;
             RegisterCSignatures({ direct }, group.headers.front());
             known = false;
             if (auto fit = functionTable.find(name); fit != functionTable.end())
@@ -4196,6 +4375,8 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             if (!known) return refuse("the selected callee could not be registered");
         }
         cxxDirectCalleeGetters_[name] = getter;
+        if (instanceWrapper && receiverAdjustment != 0)
+            cxxDirectCalleeThisAdjust_[name] = receiverAdjustment;
         if (symbolNamed) cxxDirectCalleeSymbols_[name] = wrapperSig->selectedCalleeSymbol;
         const FunctionSymbol* directSymbol = nullptr;
         if (auto directFunctions = functionTable.find(name); directFunctions != functionTable.end())
@@ -4726,7 +4907,8 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         std::vector<std::pair<size_t, std::string>> literalCallArguments;
         bool hasDeferredMoveLeaf = false;
         // T518: argument `index` must bind a parameter of class `spelling` (by value or reference).
-        struct DeferredPlaceGuard { size_t index; std::string spelling; std::string cflatType; };
+        // fromCopy: the caller made the argument a class prvalue copy (a C++ prvalue, any call form).
+        struct DeferredPlaceGuard { size_t index; std::string spelling; std::string cflatType; bool fromCopy = false; };
         std::vector<DeferredPlaceGuard> deferredPlaceGuards;
         size_t currentArgumentIndex = 0;
         auto appendDirectConstruction = [&](NamedVariable& construction,
@@ -5050,6 +5232,15 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         {
             NamedVariable& arg = arguments[i];
             currentArgumentIndex = i;
+            // REFDEF: a sibling-driven copy is a plain class prvalue (clang's conditional result, one
+            // ordinary conversion away from any parameter), so no place proof can refuse it.
+            if (!arg.CxxPlaceGuardType.empty() && !arg.CxxCopyBySibling)
+            {
+                std::string guardSpelling;
+                if (!CxxSpellingForCflatType(arg.CxxPlaceGuardType, guardSpelling))
+                    return false;
+                deferredPlaceGuards.push_back({ i, guardSpelling, arg.CxxPlaceGuardType, /*fromCopy*/ true });
+            }
             const size_t parameterIndex = parameterSpellings.size();
             TypeAndValue type = argumentType(arg);
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -5216,8 +5407,12 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                     const std::string valueSpelling = constObject && !spelling.starts_with("const ")
                         ? "const " + spelling : spelling;
                     parameterSpellings.push_back(valueSpelling + " &&");
-                    callArguments.push_back("static_cast<" + valueSpelling + " &&>(p"
-                                            + std::to_string(parameterIndex) + ")");
+                    std::string xvalue = "static_cast<" + valueSpelling + " &&>(p"
+                                         + std::to_string(parameterIndex) + ")";
+                    // REFDEF: a `?:` form lets the wrapper's conditional-kind probe see the exact class.
+                    if (!arg.CxxPlaceGuardType.empty() && !arg.CxxCopyBySibling)
+                        xvalue = "(true ? " + xvalue + " : " + xvalue + ")";
+                    callArguments.push_back(std::move(xvalue));
                 }
                 else
                 {
@@ -5452,10 +5647,13 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             if (!explicitArg.starts_with("#")) collectTypeDependencies(explicitArg);
 
         // T518: the place guard re-forms a plain free call only; other call forms refuse.
+        // REFDEF: a caller-made copy is an ordinary prvalue in every call form, so it is exempt.
         std::string placeGuardError;
-        if (!deferredPlaceGuards.empty()
-            && (memberCall || infix || unaryOperator || adlCall
-                || !braceGroups.empty() || !explicitArgs.empty()))
+        const bool nonPlainCallForm = memberCall || infix || unaryOperator || adlCall
+            || !braceGroups.empty() || !explicitArgs.empty();
+        const bool shapeGuard = std::any_of(deferredPlaceGuards.begin(), deferredPlaceGuards.end(),
+            [](const DeferredPlaceGuard& guard) { return !guard.fromCopy; });
+        if (shapeGuard && nonPlainCallForm)
         {
             error = std::format("a '?:' argument of C++ '{}' cannot be checked against its parameter "
                                 "type in this call form", functionName);
@@ -5935,11 +6133,15 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                     if (guard.index >= bound.conditionalArgumentKinds.size()
                         || bound.conditionalArgumentKinds[guard.index] != '=')
                     {
-                        error = std::format("'default' in the '?:' argument {} of C++ '{}' takes the class of "
-                                            "its other arm ('{}'), but the '{}' overload clang selects does not "
-                                            "take that class there; the parameter is not known before the call, "
-                                            "so give 'default' its type explicitly",
-                                            guard.index + 1, functionName, guard.cflatType, functionName);
+                        // REFDEF: a no-sibling copy in a non-plain call form keeps master's call-form text.
+                        error = nonPlainCallForm
+                            ? std::format("a '?:' argument of C++ '{}' cannot be checked against its parameter "
+                                          "type in this call form", functionName)
+                            : std::format("'default' in the '?:' argument {} of C++ '{}' takes the class of "
+                                          "its other arm ('{}'), but the '{}' overload clang selects does not "
+                                          "take that class there; the parameter is not known before the call, "
+                                          "so give 'default' its type explicitly",
+                                          guard.index + 1, functionName, guard.cflatType, functionName);
                         return false;
                     }
                 if (IsCxxClosureReferenceResult(bound.retSpelling)
@@ -6180,7 +6382,11 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         }
         if (!placeGuardError.empty())
         {
-            error = placeGuardError;
+            // REFDEF: a no-sibling copy in a non-plain call form keeps master's call-form refusal text.
+            error = nonPlainCallForm && !deferredPlaceGuards.empty()
+                ? std::format("a '?:' argument of C++ '{}' cannot be checked against its parameter type "
+                              "in this call form", functionName)
+                : placeGuardError;
             return false;
         }
         // clang found the name but could not bind it (a nested ctor or call argument refused):

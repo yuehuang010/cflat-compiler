@@ -2693,6 +2693,8 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         if (!e.selectedCalleeType.empty())
         {
             j["scty"] = e.selectedCalleeType;
+            if (!e.selectedCalleeOwner.empty()) j["scow"] = e.selectedCalleeOwner;
+            if (e.selectedCalleeOwnerIsReceiver) j["scor"] = true;
             if (!e.selectedCalleeTemplateArgs.empty()) j["scta"] = e.selectedCalleeTemplateArgs;
             if (!e.selectedCalleeSymbol.empty()) j["scs"] = e.selectedCalleeSymbol;
             nlohmann::json scd = nlohmann::json::array();
@@ -2764,6 +2766,8 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         e.closureKeptParams = j.value("pckeep", std::string());
         if (j.contains("cpsel")) e.ctorSelectedParams = j["cpsel"].to_string_vector();
         e.selectedCalleeType = j.value("scty", std::string());
+        e.selectedCalleeOwner = j.value("scow", std::string());
+        e.selectedCalleeOwnerIsReceiver = j.value("scor", false);
         e.selectedCalleeTemplateArgs = j.value("scta", std::string());
         e.selectedCalleeSymbol = j.value("scs", std::string());
         if (j.contains("scd"))

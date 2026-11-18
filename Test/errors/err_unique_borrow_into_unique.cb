@@ -222,11 +222,19 @@ expect_error("cannot reset unique<T250BorrowBox> 'owner' from borrowed value 'h'
     }
 }
 
-expect_error("cannot reset unique<T250BorrowBox> 'owner' from a borrowed value") {
+expect_error("call to 'reset': cannot pass the address of a stack or global value to 'move' parameter 'p'") {
     void t250GlobalChainKept()
     {
         unique T250BorrowBox* owner = nullptr;
         owner = t250Global = new T250BorrowBox();
+    }
+}
+
+expect_error("cannot initialize unique<T250BorrowBox> 'owner' from borrowed value 'mid'") {
+    void t250DeclarationNullChainKept()
+    {
+        T250BorrowBox* mid = nullptr;
+        unique T250BorrowBox* owner = mid = nullptr;
     }
 }
 
@@ -645,4 +653,241 @@ expect_error("cannot reset unique<T250BorrowBox> 'owner' from a borrowed value")
             owner = raw = e = new T250BorrowBox();
         }
     };
+}
+
+T250BorrowBox* t251SourceGlobal = nullptr;
+struct T251Owner { unique T250BorrowBox* u = nullptr; };
+
+expect_error("every arm of the join was bound from") {
+    void t251BorrowFieldSplit(bool c)
+    {
+        T251Owner output; T250Holder middle;
+        T250BorrowBox* other = new T250BorrowBox(); T250BorrowBox* bw = other;
+        middle.raw = (c ? bw : nullptr); output.u = middle.raw;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251BorrowFieldChain(bool c)
+    {
+        T251Owner output; T250Holder middle;
+        T250BorrowBox* other = new T250BorrowBox(); T250BorrowBox* bw = other;
+        output.u = middle.raw = (c ? bw : nullptr);
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251FieldFieldSplit(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder middle; T250Holder source;
+        source.raw = sourceArg; middle.raw = (c ? source.raw : nullptr);
+        output.u = middle.raw;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251FieldFieldChain(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder middle; T250Holder source;
+        source.raw = sourceArg;
+        output.u = middle.raw = (c ? source.raw : nullptr);
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251FieldLocalSplit(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder source; T250BorrowBox* middle = nullptr;
+        source.raw = sourceArg; middle = (c ? source.raw : nullptr);
+        output.u = middle;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251FieldLocalChain(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder source; T250BorrowBox* middle = nullptr;
+        source.raw = sourceArg;
+        output.u = middle = (c ? source.raw : nullptr);
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251GlobalFieldSplit(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder middle;
+        t251SourceGlobal = sourceArg; middle.raw = (c ? t251SourceGlobal : nullptr);
+        output.u = middle.raw;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251GlobalFieldChain(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder middle;
+        t251SourceGlobal = sourceArg;
+        output.u = middle.raw = (c ? t251SourceGlobal : nullptr);
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251GlobalLocalSplit(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250BorrowBox* middle = nullptr;
+        t251SourceGlobal = sourceArg; middle = (c ? t251SourceGlobal : nullptr);
+        output.u = middle;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251GlobalLocalChain(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250BorrowBox* middle = nullptr;
+        t251SourceGlobal = sourceArg;
+        output.u = middle = (c ? t251SourceGlobal : nullptr);
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251MixedFieldSplit(bool c)
+    {
+        T251Owner output; T250Holder middle;
+        T250BorrowBox* other = new T250BorrowBox(); T250BorrowBox* bw = other;
+        middle.raw = (c ? other : bw); output.u = middle.raw;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251MixedFieldChain(bool c)
+    {
+        T251Owner output; T250Holder middle;
+        T250BorrowBox* other = new T250BorrowBox(); T250BorrowBox* bw = other;
+        output.u = middle.raw = (c ? other : bw);
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251OwnerFieldSplit(bool c)
+    {
+        T251Owner output; T250Holder middle;
+        T250BorrowBox* other = new T250BorrowBox();
+        middle.raw = (c ? other : nullptr); output.u = middle.raw;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251OwnerFieldChain(bool c)
+    {
+        T251Owner output; T250Holder middle;
+        T250BorrowBox* other = new T250BorrowBox();
+        output.u = middle.raw = (c ? other : nullptr);
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251ParamFieldSplit(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder middle;
+        middle.raw = (c ? sourceArg : nullptr); output.u = middle.raw;
+    }
+}
+
+expect_error("every arm of the join was bound from") {
+    void t251ParamFieldChain(T250BorrowBox* sourceArg, bool c)
+    {
+        T251Owner output; T250Holder middle;
+        output.u = middle.raw = (c ? sourceArg : nullptr);
+    }
+}
+
+// Round 6: a raw field middle read back through the implicit-this receiver is the same double free
+// as the explicit spelling, so the chain is refused as master refuses it and as the split form does.
+struct R6Box { int v = 0; ~R6Box() {} };
+struct R6Holder { R6Box* raw = nullptr; unique R6Box* u = nullptr; };
+
+expect_error("cannot consume owning field 'raw' out of the borrowed receiver 'this'") {
+    struct R6This
+    {
+        R6Box* raw = nullptr;
+        unique R6Box* u = nullptr;
+        void m(bool c)
+        {
+            R6Box* other = new R6Box();
+            R6Box* bw = other;
+            u = raw = (c ? other : bw);
+        }
+    };
+}
+
+expect_error("cannot store 'h.raw' into unique field") {
+    void r6ExplicitChain(bool c)
+    {
+        R6Box* other = new R6Box();
+        R6Box* bw = other;
+        R6Holder h;
+        h.u = h.raw = (c ? other : bw);
+    }
+}
+
+// A BORROWED value stored into a raw field and then moved into a unique field still double frees
+// (master traps at run time), so the owner-proof on the raw field keeps this refused.
+expect_error("cannot store 's.raw' into unique field") {
+    void r6BorrowedRawField()
+    {
+        R6Box* other = new R6Box();
+        R6Box* bw = other;
+        R6Holder s;
+        s.raw = bw;
+        R6Holder h;
+        h.u = s.raw;
+    }
+}
+
+// R7: a chain whose field middle is read through `this` refuses with the split form's consume diagnostic
+// when the outer is unique (a local outer, and a unique field outer).
+struct R7Box { int v = 0; ~R7Box() {} };
+
+expect_error("cannot reset unique<R7Box> 'a' from a borrowed value") {
+    struct R7Local
+    {
+        R7Box* raw = nullptr;
+        void m(bool c)
+        {
+            unique R7Box* a = nullptr;
+            a = raw = (c ? new R7Box() : nullptr);
+        }
+    };
+}
+
+expect_error("cannot consume owning field 'raw' out of the borrowed receiver 'this'") {
+    struct R7Field
+    {
+        R7Box* raw = nullptr;
+        unique R7Box* u = nullptr;
+        void m(bool c)
+        {
+            u = raw = (c ? new R7Box() : nullptr);
+        }
+    };
+}
+
+// R8: a unique FIELD outer over a field reached through a frame pointer or a pointer parameter takes the
+// split form's store guard (the same diagnostic the split statement form reports).
+struct R8Box { int v = 0; ~R8Box() {} };
+struct R8Holder { R8Box* raw = nullptr; unique R8Box* u = nullptr; };
+
+expect_error("cannot store a borrowed value into unique field 'R8Holder.u'") {
+    void r8FramePointerChain(bool c)
+    {
+        R8Holder hl;
+        R8Holder* hp = &hl;
+        hp->u = hp->raw = (c ? new R8Box() : nullptr);
+    }
+}
+
+expect_error("cannot store borrowed parameter 'hp' into unique field 'R8Holder.u'") {
+    void r8PointerParamChain(bool c, R8Holder* hp)
+    {
+        hp->u = hp->raw = (c ? new R8Box() : nullptr);
+    }
 }

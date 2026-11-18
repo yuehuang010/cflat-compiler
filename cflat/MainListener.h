@@ -453,6 +453,19 @@ std::vector<LLVMBackend::AnnotationValue> ExtractAnnotations(CFlatParser::Annota
 
 std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler,
                                                      antlr4::tree::ParseTree* node);
+struct StaticMemberFoldResult
+{
+    bool Found = false;
+    bool Accessible = true;
+    bool IsIntegerConstant = false;
+    int64_t Value = 0;
+};
+StaticMemberFoldResult ResolveCxxStaticMemberPath(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+// The C++ static-member spelling of a type argument (`Owner<T>.name` or `Owner.name`), else null.
+antlr4::ParserRuleContext* CxxStaticMemberArgSpelling(CFlatParser::TypeSpecifierContext* typeSpec);
+// The member name a static-member spelling ends in.
+std::string CxxStaticMemberArgName(antlr4::ParserRuleContext* spelling);
 std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
                                                         CFlatParser::GenericIdentifierContext* gid);
 bool InScannerInt32Range(int64_t v);
@@ -873,6 +886,8 @@ std::string ResolveTypeArgSpelling(const LLVMBackend* compiler, const std::strin
 // case callers fall through to their plain-type path, which reads getText()).
 CFlatParser::GenericTypeParametersContext* GenericSpecOf(
     CFlatParser::TypeSpecifierContext* ts, std::string& base);
+std::string ResolveAliasedNestedGenericBase(
+    LLVMBackend* compiler, CFlatParser::TypeSpecifierContext* typeSpec, const std::string& spelledBase);
 
 bool IsGlobalScopeQualifiedType(CFlatParser::TypeSpecifierContext* typeSpec);
 std::string RootQualifiedTypeSpelling(CFlatParser::TypeSpecifierContext* typeSpec);
@@ -4387,6 +4402,9 @@ public:
     // `using IntFn = Lambda<int(int)>` as a generic arg). BOTH passes call this, so an aliased
     // closure gets one name; produces what BuildEncodedClosureName gives for the direct form.
     static std::string EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig);
+    static std::string ResolveFunctionTypeAliasMember(
+        LLVMBackend* compiler, const std::string& owner, const std::string& member,
+        LLVMBackend::MemberTypeResult* result = nullptr);
 
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);
     // Restores the drain hook the constructor replaced, so no touch reaches a dead listener.
@@ -4583,15 +4601,21 @@ public:
         CFlatParser::GenericTypeParametersContext* genericCtx, bool emitSymbol,
         bool isTypedef = false);
     void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
-    // `Spec<args>.name[.name...]` in type position: instantiates the owner and returns the
-    // member type's spelling; reports a name that is not a member type of the owner.
+    struct MemberTypeSegment
+    {
+        std::string Name;
+        CFlatParser::GenericTypeParametersContext* TypeArgs = nullptr;
+        antlr4::ParserRuleContext* Site = nullptr;
+    };
+    // `Spec<args>.name[<args>][.name...]` in type position: instantiates the owner and each
+    // nested member template, then returns the final member type's spelling.
     std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx,
         uint32_t* constMask = nullptr);
     // The shared walk: instantiate `base<ownerArgs>`, then resolve each member in turn. Returns ""
     // when a member is not a member type (reported only when `report`).
     std::string ResolveMemberTypeChain(
         std::string base, CFlatParser::GenericTypeParametersContext* ownerArgs, const std::string& ownerText,
-        const std::vector<std::pair<std::string, antlr4::ParserRuleContext*>>& members,
+        const std::vector<MemberTypeSegment>& members,
         antlr4::ParserRuleContext* site, bool report, std::string* lastOwner = nullptr);
     // A sizeof/typeof operand the parser read as an expression (`Spec<args>.name`): the member
     // type it names by lookup, or "" when it names none (it then stays a value expression).
@@ -4948,7 +4972,9 @@ public:
     // shape cannot dereference a null insert block at declaration scope. Returns the folded integer,
     // or nullopt when the subtree does not fold to a compile-time constant. Diagnostics are
     // suppressed: a non-constant condition is reported once by the caller, not here.
-    std::optional<int64_t> EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress);
+    // sideEffect (optional) reports a leaf that wrote state (postfix ++ or an assignment): not a constant.
+    std::optional<int64_t> EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress,
+                                                  bool* sideEffect = nullptr);
 
     // Dispatch a leaf `if const` subtree to the matching typed Parse method for emission. The
     // recursive evaluator only ever bottoms out at an inclusiveOrExpression (the level just below
@@ -8096,13 +8122,19 @@ public:
     // T518: the `?:` of a call argument whose every leaf is `default`; nullptr otherwise.
     antlr4::ParserRuleContext* CxxDefaultOnlyTernary(antlr4::ParserRuleContext* ctx);
     bool IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx);
+    // REFDEF: a `?:` whose leaves are exactly one `default` and one bare local place (a C++ prvalue).
+    bool IsCxxMixedDefaultPlaceTernary(antlr4::ParserRuleContext* ctx);
+    // REFDEF: the caller can build `defaultType` (a default ctor resolves, or it needs none) before copying.
+    bool CanMaterializeMixedDefault(const std::string& defaultType);
     // T459: `c ? default : place` into a `const T&` class parameter joins a temporary of that class.
     LLVMBackend::NamedVariable ParseCxxConstRefTernaryTemp(CFlatParser::AssignmentExpressionContext* ctx,
         const LLVMBackend::TypeAndValue& dest);
     // T418: builds the deferred argument (selector + place leaves) for the C++ wrapper to evaluate.
     // T518: `guardPlace` makes the wrapper prove (in clang) that the parameter is `defaultType`.
+    // REFDEF: `materializeMixed` copies a mixed default/place `?:` (a C++ prvalue) at the argument.
     bool BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx, const std::string& defaultType,
-        LLVMBackend::NamedVariable& out, bool guardPlace = false);
+        LLVMBackend::NamedVariable& out, bool guardPlace = false, bool callOnly = false,
+        bool materializeMixed = false);
     // T142: types and owns a `default` call argument for the parameter it binds.
     void MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
         const LLVMBackend::TypeAndValue& dest, bool directLoweredSret = false);

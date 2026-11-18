@@ -43,27 +43,9 @@ int mx(int, rv::C);          // beside template<class T> mx(T)
                               // rv3.mx(1, default); bound result 70/101
 ```
 
-Still open:
-- A `?:` with a `default` arm into a REFERENCE parameter: C++ materializes the selected leaf's
-  copy at the argument, but the wrapper binds the caller's object (CFlat 902, clang 702).
-
-Rebuilt fixture repro (the original `scratch/unbwrap/item3.cb` was lost):
-
-```cflat
-t418.reset();
-int value = 0;
-{ t418.Val x = t418.Val(7); value = t518.lref(false ? default : x, t418.mutate(x)); }
-```
-
-```cpp
-t418::reset();
-int value = 0;
-{ t418::Val x(7); value = t518::lref(false ? t418::Val{} : x, t418::mutate(x)); }
-```
-
-With `Test/library/cpp_interop_lastuse.h`, clang returns `702` with `t418::stats() == 11020`;
-the current compiler returns `902` with `t418.stats() == 10010`. Leg `T518LaterRef` (code 51808) pins 902; flip
-it to clang's 702 in the change that fixes this. UNBDEF round 2 (3 attempts, reverted): marking the default-arm
-conditional for an early copy behind deferredPlaceGuard compiled, but SwitchCxxDirectByValueCall discards early-copy
-slots when the selected parameter is a reference, so the copy is never consumed; an overloaded `T&` / `const T&`
-pair also still selects `T&` (20002/2011, clang 10002/2011). The copy must survive a reference-only selection.
+Bound wrapper divergences (pinned as current behaviour, not clang; cflat value/stats, clang in brackets):
+- bound non-const mixed `nonconst_lref(false ? default : x, ...)`: accepted 12902/10010 [clang refuses]; leg 51901.
+- bound overloaded `refs(false ? default : x, ...)`: 20902/10010 [clang 10702/11020]; leg 51903.
+- bound overloaded `refs(true ? default : x, ...)`: 20002/20020 [clang 10002/20020]; leg 51904.
+- bound overloaded `refs(false ? x : default, ...)`: 20002/20020 [clang 10002/20020]; leg 51905.
+- bound rvalue-ref `rref(c ? default : x / x : default, ...)`: refused "takes ownership" [clang 11702/11020, 11002/20020]; err_cpp_unbound_mixed_conditional_nonconst_lref.cb cases 3-4.

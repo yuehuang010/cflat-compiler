@@ -9,6 +9,15 @@ struct rand_tag {};
 struct fwd_tag {};
 
 template <typename T>
+struct nested_outer {
+    template <typename U>
+    struct inner {
+        using type = U;
+        U value;
+    };
+};
+
+template <typename T>
 class vec {
 public:
     typedef T value_type;
@@ -68,6 +77,12 @@ inline int sum_vec(const vec<int>& v) { int s = 0; for (int i = 0; i < v.count; 
 namespace t37 {
 template <int N> struct fixed { int a[N]; static constexpr int n = N; };
 template <bool B> struct flag { static constexpr bool value = B; };
+struct statmem_plain_owner { static constexpr int kind = 13; };
+template <typename T> struct statmem_unsigned_owner { static constexpr unsigned long long big = ~0ull; };
+struct statmem_unsigned_plain { static constexpr unsigned long long big = ~0ull; };
+template <typename T> struct Outer {
+    template <typename U> struct In { static constexpr int kind = 11; };
+};
 }
 
 namespace t37 {

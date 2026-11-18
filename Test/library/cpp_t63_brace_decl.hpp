@@ -88,6 +88,7 @@ inline int callMoveCount() { return callMoves; }
 inline int callDtorCount() { return callDtors; }
 inline int callSideCount() { return callSide; }
 inline int call_next_side() { return ++callSide; }
+inline int call_fixed_two() { ++callSide; return 2; }
 inline int call_bump_scalar(int* value) { ++*value; ++callSide; return *value; }
 inline int call_bump_choice(int* value) { return ++*value; }
 inline int call_event_pair(CallEvent x, CallEvent y) { return x.value * 1000 + y.value; }
@@ -155,9 +156,56 @@ struct CallHostHolder { CallHost host; };
 struct CallScaleBase {
     int scale;
     template<class T> int scaled(T x, int y) { return x.value * scale + y; }
+    template<class T> int scaled_convert(T x, long long y) { return x.value * scale + (int)y; }
 };
+template<class U> struct CallTemplateOwn {
+    U scale;
+    template<class T> int selected(T x, int y) { return 700000 + x.value * (int)scale + y; }
+};
+template<class U> struct CallTemplateBase {
+    U scale;
+    template<class T> int selected(T x, int y) { return 710000 + x.value * (int)scale + y; }
+};
+using CallTemplateOwnInt = CallTemplateOwn<int>;
+template<bool B> struct CallTemplateOwnBool {
+    template<class T> int selected(T x, int y) { return 720000 + x.value * (B ? 2 : 3) + y; }
+};
+template<class U> struct CallTemplatePrimary : CallTemplateBase<U> {};
+struct CallTemplatePad { long long pad[2]; };
+template<class U> struct CallTemplateNonPrimary : CallTemplatePad, CallTemplateBase<U> {};
+using CallTemplatePrimaryInt = CallTemplatePrimary<int>;
+template<bool B> struct CallTemplateBoolDerived : CallTemplatePad, CallTemplateOwnBool<B> {};
 struct CallScalePad { int pad; };
+struct CallScaleSingle : CallScaleBase {};
+struct CallScaleMiddle : CallScalePad, CallScaleBase {};
+struct CallScaleLeaf : CallScaleMiddle {};
 struct CallScaleDerived : CallScalePad, CallScaleBase {};
+struct CallScaleVirtual : CallScalePad, virtual CallScaleBase {};
+inline CallScaleVirtual* call_scale_virtual() {
+    static CallScaleVirtual value{};
+    value.scale = 10;
+    return &value;
+}
+struct CallScaleHides : CallScaleBase {
+    template<class T> int scaled(T x, int y) { return 60000 + x.value * scale + y; }
+};
+struct CallScaleUsing : CallScaleBase { using CallScaleBase::scaled; };
+inline CallScaleSingle& call_scale_single_ref(CallScaleSingle& value) { return value; }
+struct CallScaleQualBase {
+    int scale;
+    template<class T> int over_scaled(T x, int y) { return 100000 + x.value * 1000 + y; }
+    template<class T> int over_scaled(T x, double y) { return 200000 + x.value * 1000 + (int)y; }
+    template<class T> int const_scaled(T x, int y) const { return 300000 + x.value * 1000 + y; }
+    template<class T> int ref_scaled(T x, int y) & { return 400000 + x.value * 1000 + y; }
+    template<class T> int ref_scaled(T x, int y) && { return 500000 + x.value * 1000 + y; }
+};
+struct CallScaleQualDerived : CallScalePad, CallScaleQualBase {};
+inline CallScaleQualDerived call_scale_qual_value() {
+    CallScaleQualDerived value{};
+    value.scale = 10;
+    return value;
+}
+inline double call_next_side_double() { return (double)call_next_side(); }
 // A class-scope operator new hides the global placement form unless the thunk spells ::new.
 struct ClassNew {
     int count;

@@ -1213,13 +1213,96 @@ std::string LLVMBackend::CxxAggregateFlattenedFieldNameAt(const std::string& typ
  * parameterTypes, its argument to `forwarded`) in flattened order. False when an argument kind
  * cannot cross; the caller then keeps the element on the eager temporary path.
  */
+bool LLVMBackend::CxxBraceDeferredParameterSpelling(const TypeAndValue& type,
+                                                     std::string& spelling) const
+{
+        if (type.TypeName.empty() || type.IsAlias || type.IsRvalueRef || type.IsArrayView
+            || type.IsUnique || type.IsFunctionPointer)
+            return false;
+        if (!type.Pointer && IsCxxRecord(type.TypeName)) return false;
+
+        std::string base;
+        if (!CxxSpellingForCflatType(type.TypeName, base)) return false;
+        if (type.Pointer)
+        {
+            // Const above the pointee level (`T* const*`) is not spelled on every wrapper path: decline.
+            if ((type.PointeeConstMask() & ~1u) != 0) return false;
+            if (type.PointeeConstBit() && !base.starts_with("const "))
+                base = "const " + base;
+            for (int i = 0; i < std::max(type.ValuePointerDepth(), 1); ++i)
+                base += " *";
+        }
+        spelling = std::move(base);
+        return true;
+}
+
 bool LLVMBackend::SpellCxxBraceDeferredConstruction(const NamedVariable& construction,
                                                      size_t& nextParameter,
                                                      std::vector<std::string>& parameterTypes,
                                                      std::vector<NamedVariable>* forwarded,
                                                      std::string& expression, std::string& error)
 {
-        if (!construction.CxxDeferredTernaryShape.empty()) return false;
+        if (!construction.CxxDeferredTernaryShape.empty())
+        {
+            if (construction.CxxDirectConstructionArguments.size() < 2)
+                return false;
+            const auto& children = construction.CxxDirectConstructionArguments;
+            std::vector<std::string> names;
+            names.reserve(children.size());
+            for (size_t i = 0; i < children.size(); ++i)
+            {
+                const NamedVariable& child = children[i];
+                std::string spelling;
+                if (i == 0)
+                    spelling = "int";
+                else if (i == 1 || child.TypeAndValue.IsFunctionPointer
+                    || IsCxxFunctionDesignatorArgument(child))
+                {
+                    if (!CxxThinFunctionPointerSpelling(child.TypeAndValue, spelling))
+                        return false;
+                }
+                else
+                {
+                    const TypeAndValue& type = child.TypeAndValue;
+                    if (!CxxBraceDeferredParameterSpelling(type, spelling)) return false;
+                }
+                names.push_back("p" + std::to_string(nextParameter++));
+                parameterTypes.push_back(std::move(spelling));
+                if (forwarded != nullptr) forwarded->push_back(child);
+            }
+            const std::string& shape = construction.CxxDeferredTernaryShape;
+            if (shape == "@F1")
+            {
+                expression = names[1] + "(";
+                for (size_t i = 2; i < names.size(); ++i)
+                    expression += (i == 2 ? "" : ", ") + names[i];
+                expression += ")";
+                return true;
+            }
+            expression.clear();
+            for (size_t at = 0; at < shape.size(); )
+            {
+                if (shape[at] != '@') { expression += shape[at++]; continue; }
+                ++at;
+                if (at < shape.size() && shape[at] == 'S')
+                {
+                    expression += names.front();
+                    ++at;
+                    continue;
+                }
+                if (at < shape.size() && shape[at] == 'G') { ++at; continue; }
+                const bool call = at < shape.size() && shape[at] == 'F';
+                if (call) ++at;
+                const size_t begin = at;
+                while (at < shape.size() && std::isdigit(static_cast<unsigned char>(shape[at]))) ++at;
+                if (begin == at) return false;
+                const size_t child = static_cast<size_t>(std::stoul(shape.substr(begin, at - begin)));
+                if (child >= names.size()) return false;
+                expression += names[child];
+                if (call) expression += "()";
+            }
+            return true;
+        }
         if (const std::string refusal = CxxConstructorRvalueRefBindRefusal(
                 construction.CxxDirectConstructionType,
                 construction.CxxDirectConstructionArguments);
@@ -3660,6 +3743,8 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             raw.closureKeptParams = stored.closureKeptParams;
             raw.ctorSelectedParams = stored.ctorSelectedParams;
             raw.selectedCalleeType = stored.selectedCalleeType;
+            raw.selectedCalleeOwner = stored.selectedCalleeOwner;
+            raw.selectedCalleeOwnerIsReceiver = stored.selectedCalleeOwnerIsReceiver;
             raw.selectedCalleeTemplateArgs = stored.selectedCalleeTemplateArgs;
             raw.selectedCalleeDefaults = stored.selectedCalleeDefaults;
             raw.selectedCalleeSymbol = stored.selectedCalleeSymbol;

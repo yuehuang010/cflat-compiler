@@ -28,19 +28,20 @@ slot when every return names it. T224 (2026-10-14) landed the single-local cases
 
 ## Still open
 
-1. Brace init of a C++ class from one same-class constructor prvalue (`S x = { S(7) };`) is built in place since
-   BRACEPRV (the brace wrapper spells `S{ S(7) }`, clang elides). BRACECALL fixes same-class CALL prvalues in a
-   single-element local brace init: `S x = { mk(7) };`, `{ (mk(7)) }`, `S x { mk(7) }`, CFlat and method callees,
-   and a call ternary now use the declaration's sret / ternary destination path (1 ctor / 0 move / 1 dtor).
-   Still open: `Outer o = { mk(3), 1 }` into an aggregate member. The aggregate brace wrapper parses the call in
-   CFlat and passes its materialized value as `__cflat_arg_N__`; it has no path to aim that call's sret at the
-   member slot. Fixing this needs the resolved call deferred and spelled in the generated C++ wrapper (or a new
-   member-wise aggregate lowering). Master behavior remains 1 ctor / 1 move / 2 dtors for this shape.
-   Also open (BRACEPRV order rule): a constructor element is deferred only when every LATER element is a literal or a
+1. BRACEPRV order rule: a constructor element is deferred only when every LATER element is a literal or a
    construction from literals, and no earlier element left a CFlat class temp. So `int k = 4; Outer o = { BS(k, 1), k };`
    (braceprv.hpp shapes) still moves: 1 ctor / 1 move / 1 dtor in scope, clang 1/0/0. Lifting it needs a proof that the
    later element cannot observe the constructor (a local read the constructor may write through a pointer).
 2. Paren-aggregate `CM l = CM(S(5), 3);` with `struct CM { S c; int k = 9; };` (see cpp-paren-aggregate-prvalue-member-move.md).
+3. BRACECALL call-element gaps, measured 2026-11-17 (value; ctor/copy/move/dtor; order):
+   - `{ mk(1), side() }`: master and fix are 5; 1/0/1/2; order 19. Clang is 5; 1/0/0/1; order 19.
+     Test leg `Test/test_cpp_interop.cb` 13611 pins this known ordering gap, not clang parity.
+   - A call whose argument is itself a call or temporary, `{ mk(g()), 1 }` and `{ mk(S(2).v), 1 }`,
+     stays on the eager path. `mk(g())`: master and fix are 3; 1/0/1/2; order 73, clang is 3; 1/0/0/1; order 73.
+     `mk(S(2).v)`: master and fix are 2; 2/0/1/3; order 22, clang is 2; 2/0/0/2; order 22.
+   - A callee parameter with const above the pointee level (`S mk(char* const* p)`, `{ mk(&s), 1 }`) declines capture
+     (the direct-brace wrapper's pointer spelling sites only spell pointee const): master and fix 1/0/1/2, clang 1/0/0/1.
+     Leg 13615 pins it. Fix: spell every PointeeConstMask level on all wrapper pointer sites, then drop the decline.
 
 ## Deferred, out of scope
 
@@ -53,7 +54,3 @@ clang parity). (By-value argument temp extra move fixed by T231.)
   `construct_at(bslot, D(3))`: 4/3, clang 3/2 (extra copy before the slice).
   `construct_at(ps, MkP(3))` with ps a CFlat struct pointer is refused "cannot assign a struct value to a pointer
   variable" (master too).
-
-## Open after BRACECALL (2026-11-15)
-- The call-element residue is now only the aggregate-member shape in item 2; local same-class call elements land
-  through the declaration slot path.

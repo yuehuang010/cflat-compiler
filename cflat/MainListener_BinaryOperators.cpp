@@ -3496,7 +3496,21 @@ std::string MainListener::MovedUseMessage(const std::string& subject, bool point
 
 llvm::Value* MainListener::LoadNamedVariable(LLVMBackend::NamedVariable& namedVar) {
         auto* compiler = Compiler();
+        const bool storedPointerJoinOwner = compiler->ApplyStoredPointerJoinOwner(namedVar);
         llvm::Value* result = LoadNamedVariableImpl(namedVar);
+        if (storedPointerJoinOwner && result != nullptr)
+            compiler->RegisterStoredPointerJoinOwnerValue(result, namedVar);
+        else if (result != nullptr && !namedVar.TypeAndValue.IsMove && !namedVar.IsExplicitMove
+            && (namedVar.IsUniqueFieldAlias || !namedVar.BorrowedUniqueField.empty()))
+        {
+            LLVMBackend::NamedVariable fieldOwner = namedVar;
+            fieldOwner.JoinKeepsOwner = true;
+            fieldOwner.JoinKeepsOwnerSource = !namedVar.BorrowedUniqueField.empty()
+                ? namedVar.BorrowedUniqueField
+                : namedVar.OwningStructName + "." + namedVar.FieldName;
+            fieldOwner.JoinKeepsOwnerSlots = { result };
+            compiler->RegisterStoredPointerJoinOwnerValue(result, fieldOwner);
+        }
         // The moved check sees the value the read produced: a cast or comparison operand matches by identity.
         CheckMovedValueRead(namedVar, result);
         if (result != nullptr && namedVar.TypeAndValue.IsFatInterfaceValue()

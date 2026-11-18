@@ -29,19 +29,16 @@ Repro for the free template shape (clang m0 d1, fixed m0 d1 when the arguments a
     template<class T> int free_tmpl(T x, int y) { return x.value * 1000 + y; }
     free_tmpl(Ev(7), next())   // clang: ctor 1 move 0 dtor 1
 
-Still open:
-
-1. A member function template inherited from a base class (`d.scaled(Cls(...), later_call())` with
-   `scaled` declared in a base of `d`'s class): one extra move and one extra dtor (clang 1/0/0/1).
-   The member direct route (fix/mtplelide round 3) only takes a specialization of the receiver's
-   OWN class: a base member needs `this` adjusted, and the route calls the member through its
-   address with the receiver as a plain first argument. Leg 47112/47113 (Test/test_cpp_interop.cb)
-   pins only value and ctor/copy. A member template whose later argument converts keeps the
-   wrapper like the free route (bullet above, legs 47108/47109).
-2. A deleted or private move ctor at a prvalue argument of a function template: CFlat refuses
-   with "call to deleted constructor" where clang++ -std=c++20 accepts (guaranteed elision).
-   Master behaviour; the template wrapper's body must move the argument, so the refusal comes from
-   wrapper generation, not from the call lowering.
+Deleted or private move ctor (DELMOVE round 2, 2026-11-17): a class prvalue whose copy and move are
+deleted or private, passed to a function template (free, explicit or deduced; own or inherited member
+template) beside a later call argument, is built in the callee's parameter as clang does. When the
+wrapper cannot compile (deleted/private ctor), the call is re-requested with a probe wrapper whose
+prvalue is a never-called helper, and the selected callee is called on its by-value ABI with the
+prvalue storage as the parameter. A later argument that converts is refused with a located error.
+Still open: that refusal is a gap, not clang's answer - `free_tmpl(Del(7), longVar)` with an `int`
+parameter (clang converts the later argument and accepts) is refused "converts argument 2 at the call";
+the wrapper is required for the conversion and the wrapper cannot move Del. Fix direction: spell the
+conversion at the CFlat call site (convert the later argument before the direct by-value call).
 
 Member-template route (2026-11-16, fix/mtplelide round 3): an instance member template
 specialization is called on its own ABI (receiver first) through the `_fp` getter, which returns
@@ -51,9 +48,12 @@ link because the getter never value-used the member (an `__asm__` alias, `(void)
 folded `m != nullptr`), so CodeGen never asked for its body; once the address flows into the
 return value, clang's first-reference lookup emits the in-class instantiation. Neither the
 SkippedMember exemption nor the record re-listing turned out necessary (verified by toggling).
-The selected method is recorded only for a non-static, non-virtual, non-operator member template
-of the receiver's own class (its cv/ref qualifiers kept in the recorded type and split off for
-the receiver-first call type); under the MS ABI not when it returns a class (sret after `this`).
+The initial route recorded only a non-static, non-virtual, non-operator member template of the
+receiver's own class. BASEMTPL extends it to fixed non-virtual bases: clang extraction records the
+selected declaration owner, and the call site applies the base adjustment from clang's record
+layout. Virtual-base receivers remain on the wrapper path. The member's cv/ref qualifiers stay in
+the recorded type and are split off for the receiver-first call type; under MS ABI, class returns
+still use the wrapper because sret follows `this`.
 
 Root cause: a call to a function TEMPLATE with a by-value class prvalue argument and a later call
 argument (`f(C(7), next())`) cannot build the prvalue inside the wrapper (the later argument's

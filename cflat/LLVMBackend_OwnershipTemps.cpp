@@ -518,10 +518,17 @@ void LLVMBackend::PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* 
 bool LLVMBackend::IsUniqueFieldReadValue(const llvm::Value* value) const
 {
         if (value == nullptr) return false;
-        for (const auto& entry : uniqueFieldReadValues_)
-            if (entry.first == value) return true;
-        for (const auto& entry : uniqueFieldReadJoins_)
-            if (entry.Joined == value) return true;
+        const llvm::Value* current = value;
+        for (size_t depth = 0; current != nullptr && depth < 8; ++depth)
+        {
+            for (const auto& entry : uniqueFieldReadValues_)
+                if (entry.first == current) return true;
+            for (const auto& entry : uniqueFieldReadJoins_)
+                if (entry.Joined == current) return true;
+            auto source = coreUniqueGetterSource_.find(current);
+            if (source == coreUniqueGetterSource_.end()) return false;
+            current = source->second;
+        }
         return false;
     }
 
@@ -549,8 +556,15 @@ const LLVMBackend::UniqueFieldReadSource* LLVMBackend::FindUniqueFieldReadValueS
         const llvm::Value* value) const
 {
         if (value == nullptr) return nullptr;
-        for (auto it = uniqueFieldReadValues_.rbegin(); it != uniqueFieldReadValues_.rend(); ++it)
-            if (it->first == value) return &it->second;
+        const llvm::Value* current = value;
+        for (size_t depth = 0; current != nullptr && depth < 8; ++depth)
+        {
+            for (auto it = uniqueFieldReadValues_.rbegin(); it != uniqueFieldReadValues_.rend(); ++it)
+                if (it->first == current) return &it->second;
+            auto source = coreUniqueGetterSource_.find(current);
+            if (source == coreUniqueGetterSource_.end()) return nullptr;
+            current = source->second;
+        }
         return nullptr;
 }
 
@@ -2225,6 +2239,85 @@ bool LLVMBackend::ChainSlotReadsAsNamed(const NamedVariable& slotVar, const llvm
 {
         return slotVar.IsOwning || slotVar.BorrowsOwningLocal || slotVar.OwningLocalBorrowAfterRebind
             || chainBorrowMiddleValues_.contains(chainValue);
+}
+
+std::string LLVMBackend::StoredPointerJoinOwnerKey(const NamedVariable& value) const
+{
+        auto* block = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        auto* function = block != nullptr ? block->getParent() : currentFunction;
+        if (function == nullptr) return {};
+        const auto address = [](const llvm::Value* value) {
+            return std::to_string(reinterpret_cast<uintptr_t>(value));
+        };
+        const std::string functionKey = address(function);
+        if (!value.FieldName.empty())
+        {
+            if (value.FieldPathRoot.empty() || value.FieldPathThroughPointer
+                || value.MovePathHasDynamicIndex)
+                return {};
+            auto root = FindVariableStorage(value.FieldPathRoot);
+            if (root.Storage == nullptr)
+                root.Storage = GetGlobalVariableNV(value.FieldPathRoot).Storage;
+            const std::string path = FieldMoveKey(value);
+            if (root.Storage == nullptr || path.empty()) return {};
+            return "field:" + functionKey + ":" + address(root.Storage) + ":" + path;
+        }
+        if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(value.Storage))
+            return "global:" + functionKey + ":" + address(global);
+        return {};
+}
+
+void LLVMBackend::SetStoredPointerJoinOwner(const NamedVariable& destination,
+                                             const std::string& source,
+                                             const std::vector<llvm::Value*>& slots,
+                                             llvm::BasicBlock* storeBlock)
+{
+        const std::string key = StoredPointerJoinOwnerKey(destination);
+        if (key.empty()) return;
+        if (source.empty() || slots.empty() || storeBlock == nullptr)
+        {
+            storedPointerJoinOwners_.erase(key);
+            return;
+        }
+        storedPointerJoinOwners_[key] = { source, slots, storeBlock };
+}
+
+bool LLVMBackend::ApplyStoredPointerJoinOwner(NamedVariable& value) const
+{
+        if (!value.TypeAndValue.Pointer) return false;
+        const std::string key = StoredPointerJoinOwnerKey(value);
+        auto found = storedPointerJoinOwners_.find(key);
+        if (key.empty() || found == storedPointerJoinOwners_.end()) return false;
+        auto* block = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        auto* function = block != nullptr ? block->getParent() : currentFunction;
+        if (function == nullptr || found->second.StoreBlock == nullptr
+            || found->second.StoreBlock->getParent() != function || block == nullptr)
+            return false;
+        if (found->second.StoreBlock != block
+            && found->second.StoreBlock != &function->getEntryBlock())
+            return false;
+        value.JoinKeepsOwner = true;
+        value.JoinKeepsOwnerSource = found->second.Source;
+        value.JoinKeepsOwnerSlots = found->second.Slots;
+        return true;
+}
+
+void LLVMBackend::RegisterStoredPointerJoinOwnerValue(const llvm::Value* value,
+                                                         const NamedVariable& source)
+{
+        if (value == nullptr || !source.JoinKeepsOwner || source.JoinKeepsOwnerSlots.empty()) return;
+        const auto* block = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        storedPointerJoinOwnerValues_[value] = {
+            source.JoinKeepsOwnerSource, source.JoinKeepsOwnerSlots,
+            const_cast<llvm::BasicBlock*>(block), source.IsUniqueFieldAlias
+                || !source.BorrowedUniqueField.empty() };
+}
+
+const LLVMBackend::StoredPointerJoinOwner* LLVMBackend::FindStoredPointerJoinOwnerValue(
+    const llvm::Value* value) const
+{
+        auto found = storedPointerJoinOwnerValues_.find(value);
+        return found == storedPointerJoinOwnerValues_.end() ? nullptr : &found->second;
 }
 
 std::string LLVMBackend::ChainBorrowMiddleArmName(const llvm::Value* joined) const
@@ -4684,6 +4777,8 @@ void LLVMBackend::DropModuleEscapeMemo()
         // helper are module rebuilds OUTSIDE ResetForReanalysis, so clearing here is what covers them.
         uniqueFieldBorrowReturns_.clear();
         uniqueFieldBorrowResults_.clear();
+        storedPointerJoinOwners_.clear();
+        storedPointerJoinOwnerValues_.clear();
         suspendedFunctions_.clear();
     }
 

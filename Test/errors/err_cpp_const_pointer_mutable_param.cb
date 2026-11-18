@@ -40,6 +40,21 @@ expect_error("cannot assign the address of a const C++ object to global 'refused
     cppi.CrPair* refusedInit = &cppi.crConst;
 }
 cppi.CrPair* refusedDerefTarget;
+cppi.CrPair* t324CallGlobal;
+void t324KeepCallGlobal(cppi.CrPair* p) { t324CallGlobal = p; }
+void t324WriteCallLocal(cppi.CrPair* p)
+{
+    cppi.CrPair* q = p;
+    q->v = 5;
+}
+struct T324CallHolder
+{
+    cppi.CrPair* p = nullptr;
+    T324CallHolder(cppi.CrPair* source) { this->p = source; }
+};
+expect_error("cannot return '(const cppi.CrPair)*' as 'cppi.CrPair*'") {
+    cppi.CrPair* t324ReturnMutable() { return &cppi.crConst; }
+}
 
 extern int main()
 {
@@ -89,6 +104,16 @@ extern int main()
     int* primitivePointer = &primitiveValue;
     expect_error("cannot pass C++ const pointer argument 1") {
         cppi.primitive_middle_mutable_only(cppi.primitive_middle_const(&primitivePointer));
+    }
+    // T324 call arguments refuse const CrPair pointers before a function can store or write them.
+    expect_error("cannot pass argument 1") {
+        t324KeepCallGlobal(&cppi.crConst);
+    }
+    expect_error("cannot pass argument 1") {
+        t324WriteCallLocal(&cppi.crConst);
+    }
+    expect_error("cannot pass argument 1") {
+        T324CallHolder holder = T324CallHolder(&cppi.crConst);
     }
     return 0;
 }

@@ -398,8 +398,8 @@ typeSpecifier
     | 'auto'
     | Move                           // soft keyword - ownership modifier on parameters
     | rootQualifiedTypeName          // global:: scope escape in a type position
-    | qualifiedGenericIdentifier     // namespace-qualified type (e.g. MathAdv.MyNumber, Windows.Foundation.IReference<int>)
     | memberTypeSpecifier            // member type of a generic instantiation (e.g. std.vector<int>.value_type)
+    | qualifiedGenericIdentifier     // namespace-qualified type (e.g. MathAdv.MyNumber, Windows.Foundation.IReference<int>)
     | genericIdentifier
     | functionPointerSpecifier
     | simdTypeSpecifier
@@ -1009,16 +1009,19 @@ rootQualifiedTypeName
     : Identifier DoubleColon Identifier ('.' memberNameToken)*
     ;
 
-// `Spec<args>.name` - a member type (C++ member typedef / nested type, CFlat struct `using`) of a
-// generic instantiation. The owner must end in `<...>`, so this never overlaps
-// qualifiedGenericIdentifier; the non-generic `Owner.name` spelling is a qualifiedGenericIdentifier
-// and is resolved by lookup. Type positions only (in an expression, `a<b>.c` is member access).
+// A member type of a generic instantiation; member segments can also be nested templates.
+// Kept ahead of qualifiedGenericIdentifier so nested member templates stay in this type-only rule.
+// Expression parsing remains separate, where `a<b>.c` is member access.
 memberTypeSpecifier
-    : memberTypeOwner ('.' memberNameToken)+
+    : memberTypeOwner ('.' memberTypeMember)+
     ;
 
 memberTypeOwner
     : Identifier ('.' memberNameToken)* genericTypeParameters
+    ;
+
+memberTypeMember
+    : memberNameToken genericTypeParameters?
     ;
 
 memberNameToken

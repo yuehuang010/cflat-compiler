@@ -9,6 +9,7 @@ struct BS_Stats {
     inline static int move = 0;
     inline static int dtor = 0;
     inline static int order = 0;   // decimal digits appended in construction/evaluation order
+    inline static int selected = 0;
     static void reset() { ctor = copy = move = dtor = order = 0; }
     static int code() { return ctor * 1000 + copy * 100 + move * 10 + dtor; }
     static int note(int d) { order = order * 10 + d; return d; }
@@ -46,10 +47,15 @@ struct BSMaker {
     BSMaker() {}
     BS mk(int x) const { return BS(x); }
 };
+struct BSFactory {
+    static BS make(int x) { BS_Stats::selected = 2; return BS(x); }
+    static BS make(long x) { BS_Stats::selected = 8; return BS((int)x + 100); }
+};
 struct Reverse { int head; BS member; };
 inline int callShared = 0;
 inline BS mkWrite(int x) { callShared = x; BS_Stats::note(8); return BS(x); }
 inline int readShared() { BS_Stats::note(9); return callShared; }
+inline int side() { BS_Stats::note(9); return 4; }
 inline BS throwingMk(int x) { BS value(x); throw 7; }
 inline int throwingRead() { throw 8; }
 
@@ -60,6 +66,12 @@ struct BT {
 };
 
 struct Outer { BS r; int x; int y = 9; };
+struct BSMiddle { int x; BS member; int y; };
+struct BSLast { int x; int y; BS member; };
+struct BSPair { BS first; BS second; int x; };
+struct BSInner { BS member; };
+struct BSNested { BSInner inner; int x; };
+struct BCAggregate { BC_S member; int x; };
 // Pointer-argument constructors (string literal, char*, function pointer), counted in BS_Stats.
 struct BL {
     int value;
@@ -80,6 +92,11 @@ struct Wrap { Outer o; int z; };
 struct Ref { const BS& r; int x; };
 
 inline BS mk(int x) { return BS(x); }
+inline BS mkConstString(const char* s) { BS_Stats::selected = 10; return BS(s[0] - '0'); }
+inline BS mkConstInt(const int* p) { BS_Stats::selected = 11; return BS(*p); }
+struct BC_Q { int value; };
+inline BS mkConstRecord(const BC_Q* p) { BS_Stats::selected = 12; return BS(p->value); }
+inline BS mkConstInnerPtr(char* const* p) { BS_Stats::selected = 13; return BS(**p - 48); }
 inline int take(BS b) { return b.value; }
 inline int gslot = 5;
 inline int& slot() { return gslot; }

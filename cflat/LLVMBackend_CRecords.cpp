@@ -419,6 +419,19 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
 {
         error.clear();
         if (!HasCxxImportGroup()) return false;
+        if (!typeArgs.empty())
+            if (const size_t dot = baseName.rfind('.'); dot != std::string::npos && dot > 0
+                && dot + 1 < baseName.size())
+            {
+                const std::string parent = ResolveTypeAlias(
+                    ResolveQualifiedName(baseName.substr(0, dot)));
+                if (IsCxxForeignTypeRegistered(parent))
+                    if (TryRequestCxxMemberTemplateType(
+                            parent, baseName.substr(dot + 1), typeArgs, cflatName, error))
+                        return true;
+                    else if (!error.empty())
+                        return false;
+            }
         if (typeArgs.empty() && GetGlobalVariableNV(cflatName).Storage != nullptr)
             return false;
         if (!typeArgs.empty() && activeCxxRequestGroup_ == nullptr)
@@ -600,6 +613,61 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
                 return skipped("every segment names an imported C++ namespace");
         }
         return RequestCxxType(baseName, typeArgs, cflatName, error, deferIncompleteCodegen);
+}
+
+bool LLVMBackend::TryRequestCxxMemberTemplateType(const std::string& owner, const std::string& member,
+                                                   const std::vector<std::string>& typeArgs,
+                                                   const std::string& cflatName, std::string& error)
+{
+        error.clear();
+        auto ownerSpelling = cxxCflatToCxxSpelling_.find(owner);
+        if (!HasCxxImportGroup() || ownerSpelling == cxxCflatToCxxSpelling_.end()
+            || !IsCxxForeignTypeRegistered(owner))
+            return false;
+        std::string canonicalOwner = CxxRecordCanonicalSpelling(owner);
+        if (canonicalOwner.empty()) canonicalOwner = ownerSpelling->second;
+        for (const char* prefix : { "class ", "struct ", "union " })
+            if (canonicalOwner.rfind(prefix, 0) == 0)
+            {
+                canonicalOwner.erase(0, std::strlen(prefix));
+                break;
+            }
+        std::string spelling = canonicalOwner + "::" + member;
+        if (!typeArgs.empty())
+        {
+            spelling += "<";
+            for (size_t i = 0; i < typeArgs.size(); ++i)
+            {
+                if (i != 0) spelling += ", ";
+                std::string arg;
+                if (!CxxTemplateArgSpellingForCflatType(typeArgs[i], arg))
+                {
+                    error = std::format("'{}' has no C++ spelling, so it cannot be a template "
+                                        "argument of the nested C++ template '{}.{}'",
+                                        typeArgs[i], owner, member);
+                    return false;
+                }
+                spelling += arg;
+            }
+            spelling += ">";
+        }
+
+        if (auto ownerGroup = cxxTypeOwnerGroup_.find(owner); ownerGroup != cxxTypeOwnerGroup_.end())
+        {
+            CxxRequestGroup group = MakeCxxClassRequestGroup(ownerGroup->second, owner);
+            if (!group.headers.empty())
+            {
+                CxxRequestGroupScope scope(*this, &group);
+                return RequestCxxForeignType(cflatName, spelling, error,
+                                             /*needDefinitions*/ true,
+                                             /*explicitInstantiation*/ true);
+            }
+        }
+        if (activeCxxRequestGroup_ != nullptr)
+            return RequestCxxForeignType(cflatName, spelling, error,
+                                         /*needDefinitions*/ true,
+                                         /*explicitInstantiation*/ true);
+        return false;
 }
 
 /*
@@ -7537,6 +7605,55 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             updated->second.instanceMethodNames.push_back(memberName);
         return true;
     }
+
+LLVMBackend::CxxStaticDataValueStatus LLVMBackend::LookupCxxStaticDataValue(
+    const std::string& owner, const std::string& member, int64_t& value)
+{
+        const std::string resolvedOwner = ResolveTypeAlias(owner);
+        auto record = cxxRecordEntries_.find(resolvedOwner);
+        if (record == cxxRecordEntries_.end()) return CxxStaticDataValueStatus::NotFound;
+        auto variable = std::find_if(record->second.staticVars.begin(), record->second.staticVars.end(),
+            [&](const auto& candidate) { return candidate.name == member; });
+        if (variable == record->second.staticVars.end()) return CxxStaticDataValueStatus::NotFound;
+        if (variable->access != cflat_cinterop::AccessPublic)
+            return CxxStaticDataValueStatus::Inaccessible;
+        if (variable->isFloatConstant)
+            return CxxStaticDataValueStatus::NotConstant;
+        if (!variable->isCompileTimeConstant)
+        {
+            std::string ownerSpelling;
+            if (!CxxSpellingForCflatType(resolvedOwner, ownerSpelling))
+                return CxxStaticDataValueStatus::NotConstant;
+            const std::string probeName = "__cflat_static_member_constant_probe." + resolvedOwner
+                + "." + member;
+            if (!TryGetConstGlobalInt(probeName, value))
+            {
+                std::string error;
+                const std::string spelling = "decltype(" + ownerSpelling + "::" + member + ")";
+                if (!RequestCxxTypeInOwningGroup(ownerSpelling, probeName, spelling, {}, error)
+                    || !TryGetConstGlobalInt(probeName, value))
+                    return CxxStaticDataValueStatus::NotConstant;
+            }
+            return FoldableStaticValue(*variable, value)
+                ? CxxStaticDataValueStatus::IntegerConstant : CxxStaticDataValueStatus::NotConstant;
+        }
+        value = variable->constantValue;
+        return FoldableStaticValue(*variable, value)
+            ? CxxStaticDataValueStatus::IntegerConstant : CxxStaticDataValueStatus::NotConstant;
+}
+
+/*
+ * An unsigned 64-bit constant at or above 2^63 has no int64 value: its bits are stored wrapped, so
+ * folding it would read it as a negative. It stays a run-time read of the storage (the bits are
+ * right there) but is refused wherever a constant is needed, as clang refuses it as an int.
+ */
+bool LLVMBackend::FoldableStaticValue(const cflat_cinterop::RawCxxStaticVar& variable, int64_t value)
+{
+        if (value >= 0) return true;
+        TypeAndValue tv;
+        return !(MapCTypeToTypeAndValue(variable.ctype, tv, /*cxxBoundary*/ true)
+                 && tv.IsUnsignedInteger() > 0);
+}
 
 /*
  * M6 - make every method a class INHERITS callable on the derived type.

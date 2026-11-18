@@ -751,6 +751,23 @@ namespace cflat_cinterop
         }
 
         /*
+         * REFDEF: the wrapper parameter a call argument names once casts and temporaries are stripped,
+         * or nullptr. Used by WrapperParameterBindKinds to read through a `(c ? p : p)` argument.
+         */
+        static const ParmVarDecl* ArmParameter(const Expr* e)
+        {
+            for (;;)
+            {
+                e = e->IgnoreParens();
+                if (const auto* cast = llvm::dyn_cast<CastExpr>(e)) { e = cast->getSubExpr(); continue; }
+                if (const auto* temp = llvm::dyn_cast<MaterializeTemporaryExpr>(e)) { e = temp->getSubExpr(); continue; }
+                break;
+            }
+            const auto* ref = llvm::dyn_cast<DeclRefExpr>(e);
+            return ref != nullptr ? llvm::dyn_cast<ParmVarDecl>(ref->getDecl()) : nullptr;
+        }
+
+        /*
          * Per wrapper parameter, how the callee clang selected binds it ('.' if no call argument is
          * that parameter): 'v' by value, 'r' by reference; upper case when the argument is the
          * parameter dereferenced (`*static_cast<T *>(pK)`, a caller slot). A move of a function value
@@ -791,6 +808,11 @@ namespace cflat_cinterop
                         if (const auto* deref = llvm::dyn_cast<UnaryOperator>(e);
                             deref != nullptr && deref->getOpcode() == UO_Deref)
                             { slot = true; e = deref->getSubExpr(); continue; }
+                        // REFDEF: `(true ? p : p)` over one wrapper parameter binds it in both arms.
+                        if (const auto* conditional = llvm::dyn_cast<ConditionalOperator>(e);
+                            conditional != nullptr && ArmParameter(conditional->getTrueExpr()) != nullptr
+                            && ArmParameter(conditional->getTrueExpr()) == ArmParameter(conditional->getFalseExpr()))
+                            { e = conditional->getTrueExpr(); continue; }
                         break;
                     }
                     const auto* ref = llvm::dyn_cast<DeclRefExpr>(e);
@@ -3631,9 +3653,8 @@ namespace cflat_cinterop
                                 && !llvm::isa<UserDefinedLiteral>(outer)
                             ? outer->getDirectCallee() : nullptr;
                         /*
-                         * A method is only a selected callee as an instance member template
-                         * specialization of the receiver's own class called with `.`/`->`, whose ABI
-                         * is a free call with the receiver first; MSVC returns a class after `this`.
+                         * A selected instance member template uses the receiver-first ABI when its
+                         * owner is the receiver or a fixed non-virtual base; MSVC class sret differs.
                          */
                         const auto* memberCall = llvm::dyn_cast_or_null<CXXMemberCallExpr>(outer);
                         // The receiver before any derived-to-base cast: a base member needs `this` adjusted.
@@ -3646,7 +3667,9 @@ namespace cflat_cinterop
                             ? nullptr : objectType->getAsCXXRecordDecl();
                         if (const auto* method = llvm::dyn_cast_or_null<CXXMethodDecl>(callee))
                             if (memberCall == nullptr || objectRecord == nullptr
-                                || objectRecord->getCanonicalDecl() != method->getParent()->getCanonicalDecl()
+                                || (objectRecord->getCanonicalDecl() != method->getParent()->getCanonicalDecl()
+                                    && (!objectRecord->isDerivedFrom(method->getParent())
+                                        || objectRecord->isVirtuallyDerivedFrom(method->getParent())))
                                 || method->isStatic()
                                 || method->isOverloadedOperator() || method->isVirtual()
                                 || method->getPrimaryTemplate() == nullptr
@@ -3669,6 +3692,15 @@ namespace cflat_cinterop
                             // A method keeps its cv/ref qualifiers: the getter's typed member pointer
                             // selects that exact overload.
                             sig.selectedCalleeType = callee->getType().getCanonicalType().getAsString(policy);
+                            if (const auto* method = llvm::dyn_cast<CXXMethodDecl>(callee))
+                            {
+                                const QualType ownerType = ctx.getTypeDeclType(
+                                    llvm::cast<TypeDecl>(method->getParent()));
+                                sig.selectedCalleeOwner = CxxForeignIdentity(
+                                    ownerType.getCanonicalType().getAsString(policy));
+                                sig.selectedCalleeOwnerIsReceiver = objectRecord != nullptr
+                                    && objectRecord->getCanonicalDecl() == method->getParent()->getCanonicalDecl();
+                            }
                             // The selected specialization's own arguments: the getter names exactly it.
                             if (const TemplateArgumentList* targs = callee->getTemplateSpecializationArgs())
                             {
@@ -5791,7 +5823,7 @@ namespace cflat_cinterop
                     return;
                 }
                 auto* vd = ref != nullptr ? llvm::dyn_cast<VarDecl>(const_cast<ValueDecl*>(ref->getDecl())) : nullptr;
-                if (vd == nullptr || !vd->isFileVarDecl()) return;
+                if (vd == nullptr || (!vd->isFileVarDecl() && !vd->isStaticDataMember())) return;
                 const bool mutableClassObject = !vd->getType().isConstQualified()
                     && !vd->isConstexpr() && !vd->getType()->isDependentType()
                     && vd->getType().getCanonicalType()->getAsCXXRecordDecl() != nullptr;
@@ -5810,7 +5842,13 @@ namespace cflat_cinterop
                     st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);
                     definition = vd->getDefinition();
                 }
-                if (vd->isStaticDataMember())
+                // A scalar const/constexpr static member folds like a namespace constant below;
+                // other static members keep their storage-only handling here.
+                const bool foldableStatic = vd->isStaticDataMember()
+                    && !vd->getType()->isDependentType()
+                    && (vd->isConstexpr() || vd->getType().isConstQualified())
+                    && vd->getType().getCanonicalType()->getAsCXXRecordDecl() == nullptr;
+                if (vd->isStaticDataMember() && !foldableStatic)
                 {
                     if (mutableClassObject && definition != nullptr)
                         PublishRequestedClassConstant(vd, definition, marker);
@@ -5843,6 +5881,12 @@ namespace cflat_cinterop
                     return;
                 }
                 if (!vd->getType().isConstQualified() && !vd->isConstexpr()) return;
+                // clang instantiates a class template's static member initializer on demand only.
+                if (foldableStatic && vd->getAnyInitializer() == nullptr
+                    && vd->getTemplateSpecializationKind() == TSK_ImplicitInstantiation
+                    && st.ci != nullptr && st.ci->hasSema())
+                    st.ci->getSema().InstantiateVariableDefinition(
+                        td->getLocation(), vd, /*Recursive=*/false, /*DefinitionRequired=*/true);
                 if (vd->getAnyInitializer() == nullptr && st.ci != nullptr && st.ci->hasSema()
                     && variableTemplateSpecialization != nullptr && definition == nullptr)
                     st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);

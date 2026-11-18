@@ -8292,8 +8292,10 @@ bool MainListener::EmittedSideEffect(const EmissionMark& mark) {
         return false;
     }
 
-std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress) {
+std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress,
+                                                            bool* sideEffect) {
         if (node == nullptr) return std::nullopt;
+        if (sideEffect != nullptr) *sideEffect = false;
         auto* compiler = Compiler();
         auto admitConstGlobal = [&](llvm::Value* value) {
             auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
@@ -8322,7 +8324,11 @@ std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseT
                 v = EmitIfConstLeafValue(node);
                 pendingPostfix = !PlusPlus.empty();
             }
-            if (pendingPostfix || EmittedSideEffect(mark)) return std::nullopt;
+            if (pendingPostfix || EmittedSideEffect(mark))
+            {
+                if (sideEffect != nullptr) *sideEffect = true;
+                return std::nullopt;
+            }
             admitConstGlobal(v);
             uint64_t folded = 0;
             if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_,
@@ -8359,12 +8365,15 @@ std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseT
             }
             admitConstGlobal(v);
             uint64_t folded = 0;
-            if (v && !pendingPostfix && !EmittedSideEffect(EmissionMark{ tmpBB, nullptr, tmpBB, nullptr })
-                && TryFoldConstInt(v, folded, &constFoldableGlobals_,
-                                   &compiler->ImportedEnumeratorGlobals()))
+            if (pendingPostfix || EmittedSideEffect(EmissionMark{ tmpBB, nullptr, tmpBB, nullptr }))
+            {
+                if (sideEffect != nullptr) *sideEffect = true;
+            }
+            else if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_,
+                                          &compiler->ImportedEnumeratorGlobals()))
                 result = (int64_t)folded;
         }
-        catch (const SpeculativeEvalAbort&) {}
+        catch (const SpeculativeEvalAbort&) { if (sideEffect != nullptr) *sideEffect = true; }
         catch (...)
         {
             compiler->suppressErrors_ = savedSuppress;
@@ -8449,12 +8458,19 @@ std::optional<int64_t> MainListener::EvalIfConstConstant(antlr4::tree::ParseTree
                 return EvalIfConstConstant(asn->conditionalExpression(), forceScratch, suppress);
             return std::nullopt;  // an actual assignment is not a constant
         }
-        // Fold nested groups in the syntax tree before emission; their IR joins are not a
-        // constant value and would leave throwaway control-flow blocks in a live function.
+        // Nested groups fold in the scanner folder before emission (their IR joins are not a
+        // constant and would leave throwaway blocks in a live function).
         if (IsGroupedFoldCandidate(node))
             if (auto folded = FoldCompileTimeInt(Compiler(), node)) return folded;
         // Other constant expressions still use codegen folding (sizeof, imported constants, etc.).
-        return EmitAndFoldIfConstLeaf(node, forceScratch, suppress);
+        bool sideEffect = false;
+        if (auto folded = EmitAndFoldIfConstLeaf(node, forceScratch, suppress, &sideEffect))
+            return folded;
+        // A C++ static data member read is a load codegen cannot fold: the scanner folder decides
+        // it, unless the leaf wrote state (a postfix ++ the scanner would fold away) or holds a
+        // typed cast (the int64 folder would lose its signedness).
+        if (sideEffect || !HasNoTypedCast(node)) return std::nullopt;
+        return FoldCompileTimeInt(Compiler(), node);
     }
 
 int MainListener::DecideIfConstCondition(CFlatParser::ExpressionContext* expr) {

@@ -1,6 +1,6 @@
 Bucket: p3 (usable-surface gap) + one silent leak (see item 2)
 
-# Chained `owner = <inner> = new PS()` - remaining gap
+# Chained assignment - remaining parameter ownership gap
 
 Still open:
 
@@ -15,11 +15,25 @@ Still open:
    Same family, parameter middle: `unique PS* a = nullptr; PS* e = nullptr; a = prm = e = new PS();`
    is refused as a chain (`prm` is a borrowed parameter), while `e = new PS(); prm = e; a = prm;` is
    accepted (births 2, dtors 2). The chain stays refused until argument slots carry an owner bit.
-
-3. Owner/borrow ternary arm mismatch (same refusal on master):
-   `unique PS* a = nullptr; PS* other = new PS(); PS* b = nullptr; PS* bw = other;`
-   `a = b = (c ? other : bw);` is refused, while `b = (c ? other : bw); a = b;` is accepted.
-   The same holds with X a parameter, a global or a field. The owner/borrow X-arm family remains
-   outside the nullptr-arm chain fix.
-   Declaration form, same mismatch: `unique PS* a = b = other;` is refused while
-   `b = other; unique PS* a = b;` is accepted.
+   Same family, raw field / global middle (split form leaks on master and the branch): with c true,
+   `PS* outer = nullptr; h.raw = (c ? new PS() : nullptr); outer = h.raw;` (h a local struct with
+   `PS* raw`) and `g = (c ? new PS() : nullptr); outer = g;` (g a global `PS*`) each leave 1 birth,
+   0 dtors. The chain forms `outer = h.raw = (...)` and `outer = g = (...)` are balanced (1 birth,
+   1 dtor): the chain hands the fresh object to the raw outer, the split copy does not. Minimal repro:
+   ```
+   int births = 0; int dtors = 0;
+   struct PS { int value = 7; PS() { births = births + 1; } ~PS() { dtors = dtors + 1; } };
+   struct Holder { PS* raw = nullptr; };
+   PS* g = nullptr;
+   int main(int argc, char** argv)
+   {
+       bool c = argc > 1;
+       { Holder h; PS* outer = nullptr; h.raw = (c ? new PS() : nullptr); outer = h.raw; }
+       printf("field births=%d dtors=%d\n", births, dtors);   // run with an argument: 1 / 0
+       { PS* outer = nullptr; g = (c ? new PS() : nullptr); outer = g; }
+       g = nullptr;
+       printf("global births=%d dtors=%d\n", births, dtors); // 2 / 0 after both blocks
+       return 0;
+   }
+   ```
+   Owner bit on raw field/global slots is the same design call as above; not fixed by the chain work.

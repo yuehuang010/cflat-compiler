@@ -1,0 +1,48 @@
+import cpp "cpp_interop_lastuse.h";
+import cpp "cpp_interop_refdef.hpp";
+
+extern int main()
+{
+    expect_error("C++ free function 't518refdef.nonconst_lref' could not be bound") {
+        t418.Val x = t418.Val(7);
+        t518refdef.nonconst_lref(false ? default : x, t418.mutate(x));
+    }
+
+    expect_error("C++ free function 't518refdef.nonconst_lref' could not be bound") {
+        t418.Val x = t418.Val(7);
+        t518refdef.nonconst_lref(false ? x : default, t418.mutate(x));
+    }
+
+    expect_error("is an rvalue reference; pass 'move <arg>' or a temporary") {
+        t418.Val x = t418.Val(7);
+        t518refdefbound.rref(false ? default : x, t418.mutate(x));
+    }
+
+    expect_error("is an rvalue reference; pass 'move <arg>' or a temporary") {
+        t418.Val x = t418.Val(7);
+        t518refdefbound.rref(false ? x : default, t418.mutate(x));
+    }
+
+    expect_error("C++ class 't518refdef.NoDefault' has no default constructor") {
+        t418.Val x = t418.Val(7);
+        t518refdef.NoDefault n = t518refdef.NoDefault(1);
+        t518refdef.nodef(false ? default : n, t418.mutate(x));
+    }
+
+    expect_error("could not be bound (clang: no matching constructor for initialization of 't518refdef::NoDefault')") {
+        t518refdef.NoDefault n = t518refdef.NoDefault(1);
+        t518refdef.nodef(false ? default : n, 2);
+    }
+
+    // No sibling: the converting copy is not sibling-driven, so master's refusal stands.
+    expect_error("'default' in the '?:' argument 1 of C++ 't518refdef.convf' takes the class of its other arm") {
+        t418.Val x = t418.Val(7);
+        t518refdef.convf(true ? default : x, 2);
+    }
+
+    expect_error("a '?:' argument of C++ 't518refdef.tconv' cannot be checked against its parameter type in this call form") {
+        t418.Val x = t418.Val(7);
+        t518refdef.tconv<int>(false ? default : x, 2);
+    }
+    return 0;
+}

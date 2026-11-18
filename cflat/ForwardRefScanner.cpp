@@ -587,6 +587,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         // Generic type instantiation: Box<MyType> -> Box$MyType
                         // The authoritative resolution runs on the SPELLED name below, once the
                         // argument list exists; this hop is the scanner's copy of the old shape.
+                        baseName = ResolveAliasedNestedGenericBase(compiler, typeSpec, baseName);
                         const std::string spelledBase = baseName;
                         std::vector<std::string> typeArgs;
                         // `T<>` follows the bare-name path: an empty list carries no explicit args.
@@ -3376,6 +3377,13 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         {
             // Same namespace walk as the main pass's ResolveTypeArgEntry (no active substitutions
             // during the scan), so a bare 'Item' inside 'namespace A' names A.Item in both passes.
+            if (auto* staticSpelling = CxxStaticMemberArgSpelling(typeSpec))
+            {
+                const auto staticMember = ResolveCxxStaticMemberPath(Compiler(entry), staticSpelling);
+                if (staticMember.Found)
+                    return staticMember.Accessible && staticMember.IsIntegerConstant
+                        ? std::to_string(staticMember.Value) : "0";
+            }
             resolved = typeSpec != nullptr && typeSpec->memberTypeSpecifier() != nullptr
                 ? ResolveMemberTypeSpecifier(typeSpec->memberTypeSpecifier())
                 : forceRootType ? RootQualifiedTypeSpelling(typeSpec)
@@ -5521,8 +5529,26 @@ std::string ForwardRefScanner::ResolveMemberTypeSpecifier(CFlatParser::MemberTyp
         uint32_t* constMask) {
         auto* compiler = Compiler(ctx);
         auto* ownerCtx = ctx->memberTypeOwner();
-        const std::string ownerText = ownerCtx->getText();
-        std::string base = ownerText.substr(0, ownerText.find('<'));
+        std::vector<std::string> ownerParts{ ownerCtx->Identifier()->getText() };
+        for (auto* part : ownerCtx->memberNameToken()) ownerParts.push_back(part->getText());
+        std::string base;
+        for (const auto& part : ownerParts)
+            base += (base.empty() ? "" : ".") + part;
+        std::string ownerText = base + ownerCtx->genericTypeParameters()->getText();
+        if (ownerParts.size() >= 2)
+        {
+            std::string aliasOwnerSpelling;
+            for (size_t i = 0; i + 1 < ownerParts.size(); ++i)
+                aliasOwnerSpelling += (aliasOwnerSpelling.empty() ? "" : ".") + ownerParts[i];
+            const std::string aliasOwner = compiler->ResolveTypeAlias(
+                compiler->ResolveQualifiedName(aliasOwnerSpelling));
+            if (aliasOwner != compiler->ResolveQualifiedName(aliasOwnerSpelling)
+                || compiler->IsDataStructure(aliasOwner) || compiler->IsCxxForeignTypeRegistered(aliasOwner))
+            {
+                base = aliasOwner + "." + ownerParts.back();
+                ownerText = base + ownerCtx->genericTypeParameters()->getText();
+            }
+        }
         const std::string spelledBase = base;
         std::vector<std::string> args;
         for (auto* entry : ownerCtx->genericTypeParameters()->typeParameterList()->typeParameterEntry())
@@ -5553,15 +5579,108 @@ std::string ForwardRefScanner::ResolveMemberTypeSpecifier(CFlatParser::MemberTyp
         std::string resolvedBase = compiler->AnyGenericTypeTemplateNamed(base)
             ? compiler->ResolveGenericTemplateBase(base) : std::string{};
         std::string lastOwner, lastMember;
-        for (auto* member : ctx->memberNameToken())
+        for (auto* member : ctx->memberTypeMember())
         {
             lastOwner = owner;
-            lastMember = member->getText();
+            lastMember = member->memberNameToken()->getText();
             LLVMBackend::MemberTypeResult result;
-            std::string next = compiler->ResolveMemberType(owner, member->getText(), result);
+            std::string next;
+            if (member->genericTypeParameters() == nullptr)
+                next = compiler->ResolveMemberType(owner, lastMember, result);
+            else
+            {
+                std::vector<std::string> memberArgs;
+                for (auto* entry : member->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                    memberArgs.push_back(ResolveForwardTypeArg(entry));
+                compiler->CompleteCxxTemplateTypeArgs(owner + "." + lastMember, memberArgs);
+                if (compiler->IsCxxForeignTypeRegistered(owner))
+                {
+                    const std::string memberType = MangleGenericInstance(
+                        *compiler, owner + "." + lastMember, memberArgs);
+                    std::string cxxError;
+                    if (compiler->TryRequestCxxMemberTemplateType(
+                            owner, lastMember, memberArgs, memberType, cxxError))
+                        next = compiler->ResolveTypeAlias(memberType);
+                }
+                else
+                {
+                    const std::string memberBase = compiler->ResolveGenericTemplateBase(owner + "." + lastMember);
+                    if (compiler->AnyGenericTypeTemplateNamed(memberBase))
+                        next = MangleGenericInstance(*compiler, memberBase, memberArgs);
+                    else if (!resolvedBase.empty())
+                    {
+                        ScanTemplateAggregateAliases(owner, resolvedBase, args);
+                        antlr4::ParserRuleContext* outerTemplate = nullptr;
+                        if (auto it = scannedGenericAggregates_.find(resolvedBase);
+                            it != scannedGenericAggregates_.end())
+                            outerTemplate = it->second;
+                        else
+                            outerTemplate = compiler->MaterializeGenericStruct(resolvedBase);
+                        auto* outerStruct = dynamic_cast<CFlatParser::StructDefinitionContext*>(outerTemplate);
+                        auto* outerClass = dynamic_cast<CFlatParser::ClassDefinitionContext*>(outerTemplate);
+                        CFlatParser::StructDefinitionContext* nestedStruct = nullptr;
+                        CFlatParser::ClassDefinitionContext* nestedClass = nullptr;
+                        if (outerStruct != nullptr)
+                            for (auto* nested : MemberStructDefinitions(outerStruct))
+                                if (nested->genericTypeParameters() != nullptr
+                                    && nested->directDeclarator()->Identifier() != nullptr
+                                    && nested->directDeclarator()->Identifier()->getText() == lastMember)
+                                    nestedStruct = nested;
+                        if (outerClass != nullptr)
+                            for (auto* nested : MemberClassDefinitions(outerClass))
+                                if (nested->genericTypeParameters() != nullptr
+                                    && nested->directDeclarator()->Identifier() != nullptr
+                                    && nested->directDeclarator()->Identifier()->getText() == lastMember)
+                                    nestedClass = nested;
+                        if (nestedStruct != nullptr || nestedClass != nullptr)
+                        {
+                            const std::string nestedBase = owner + "." + lastMember;
+                            scannedGenericAggregates_[nestedBase] = nestedStruct != nullptr
+                                ? static_cast<antlr4::ParserRuleContext*>(nestedStruct)
+                                : static_cast<antlr4::ParserRuleContext*>(nestedClass);
+                            if (auto ns = scannedGenericAggregateNs_.find(resolvedBase);
+                                ns != scannedGenericAggregateNs_.end())
+                                scannedGenericAggregateNs_[nestedBase] = ns->second;
+                            const auto savedSubstitutions = scanTypeSubstitutions_;
+                            auto* outerParams = outerStruct != nullptr
+                                ? outerStruct->genericTypeParameters() : outerClass->genericTypeParameters();
+                            if (outerParams != nullptr)
+                            {
+                                auto entries = outerParams->typeParameterList()->typeParameterEntry();
+                                for (size_t i = 0; i < entries.size() && i < args.size(); ++i)
+                                {
+                                    auto* generic = entries[i]->typeSpecifier() != nullptr
+                                        ? entries[i]->typeSpecifier()->genericIdentifier() : nullptr;
+                                    if (generic != nullptr && generic->Identifier() != nullptr)
+                                        scanTypeSubstitutions_[generic->Identifier()->getText()] = args[i];
+                                }
+                            }
+                            const std::string nestedType = MangleGenericInstance(
+                                *compiler, nestedBase, memberArgs);
+                            if (ScanTemplateAggregateAliases(
+                                    nestedType, nestedBase, memberArgs, false))
+                            {
+                                next = nestedType;
+                                if (compiler->GetDataStructure(nestedType).StructType == nullptr)
+                                {
+                                    compiler->CreateStructType(nestedType, {});
+                                    LLVMBackend::TypeAndValue returnType{ .TypeName = nestedType };
+                                    compiler->CreateFunctionDeclaration(nestedType, returnType, {});
+                                }
+                            }
+                            scanTypeSubstitutions_ = savedSubstitutions;
+                        }
+                    }
+                }
+                result = next.empty() ? LLVMBackend::MemberTypeResult::NotFound
+                                      : LLVMBackend::MemberTypeResult::Found;
+            }
             if (next.empty() && !resolvedBase.empty()
                 && ScanTemplateAggregateAliases(owner, resolvedBase, args))
-                next = compiler->ResolveMemberType(owner, member->getText(), result);
+                next = compiler->ResolveMemberType(owner, lastMember, result);
+            if (next.empty() && result == LLVMBackend::MemberTypeResult::NotFound)
+                next = MainListener::ResolveFunctionTypeAliasMember(
+                    compiler, owner, lastMember, &result);
             if (next.empty()) return ctx->getText();
             resolvedBase.clear();
             owner = next;

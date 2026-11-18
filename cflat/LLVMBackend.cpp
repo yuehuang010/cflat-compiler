@@ -5870,6 +5870,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxTemplateOwnerGroup_.clear();
     cxxFreeWrapperGroups_.clear();
     cxxDirectCalleeGetters_.clear();
+    cxxDirectCalleeThisAdjust_.clear();
     cxxDirectCalleeSymbols_.clear();
     cxxFunctionTemplates_.clear();
     cxxFunctionTemplateOwnerGroup_.clear();
@@ -6099,6 +6100,9 @@ void LLVMBackend::ResetForReanalysis()
     pendingCxxTernaryDeclFailed_ = false;
     pendingCxxTernaryDeclArmType_.clear();
     pendingCxxTernaryDeclArmCat_ = 0;
+    pendingCxxBraceCallCaptureSite_ = nullptr;
+    pendingCxxBraceCallCaptureType_.clear();
+    cxxBraceCallCaptures_.clear();
     lastCxxRetTemp_ = nullptr;
     lastCxxRetValue_ = nullptr;
     lastLoweredRetTemp_ = nullptr;
@@ -6313,6 +6317,8 @@ void LLVMBackend::ResetForReanalysis()
     movedOutSourceSlots_.clear();
     movedBorrowedPtrValues_.clear();
     chainBorrowMiddleValues_.clear();
+    storedPointerJoinOwners_.clear();
+    storedPointerJoinOwnerValues_.clear();
     borrowedAddressValues_.clear();
     movedBorrowedThroughFieldValues_.clear();
     nonOwningStructJoins_.clear();

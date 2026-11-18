@@ -1,0 +1,16 @@
+// A class prvalue whose copy and move are deleted, passed to a function template beside a later
+// argument that converts at the call. The direct by-value call cannot convert that argument and the
+// forwarding wrapper cannot move the class, so CFlat refuses with a located error (not clang's text).
+import cpp "cpp_prvarg_template.hpp";
+
+extern int main()
+{
+    int narrow = 300;
+    expect_error("converts argument 2 at the call") {
+        int r = prvarg.narrow_short(prvarg.Del(7), narrow);
+    }
+    prvarg.Dt sliced = prvarg.Dt(9);
+    expect_error("converts argument 2 at the call") {
+        int r = prvarg.slice_by_value(prvarg.Del(7), sliced);
+    }
+}

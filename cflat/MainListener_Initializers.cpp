@@ -195,6 +195,14 @@ std::string MainListener::ParseTypeSpecifierName(
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 args.push_back(ResolveTypeArgEntry(entry));
             ResolveEnumTypeArguments(args);
+            const std::string originalBase = base;
+            base = ResolveAliasedNestedGenericBase(Compiler(ctx), ctx, base);
+            const bool aliasedNestedGenericBase = base != originalBase;
+            if (aliasedNestedGenericBase)
+            {
+                LLVMBackend::BuilderStateGuard savedState(Compiler(ctx));
+                ProcessPendingInstantiations();
+            }
             const std::string spelledBase = base;
             const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
                 : EnclosingAggregateScopeFromContext(Compiler(ctx), genParams);
@@ -204,6 +212,13 @@ std::string MainListener::ParseTypeSpecifierName(
             std::string mangledName = MangledGenericName(base, args);
             if (Compiler(ctx)->AnyGenericTypeTemplateNamed(base))
                 QueueAndProcessLocalEnumInstantiation(genParams, base, args, mangledName, ctx);
+            if (aliasedNestedGenericBase && Compiler(ctx)->AnyGenericTypeTemplateNamed(base))
+            {
+                QueueGenericInstantiation(base, args, mangledName, ctx);
+                LLVMBackend::BuilderStateGuard savedState(Compiler(ctx));
+                ProcessPendingInstantiations();
+                return Compiler(ctx)->ResolveTypeAlias(mangledName);
+            }
             return mangledName;
         }
         if (auto* memberType = ctx->memberTypeSpecifier())
@@ -236,6 +251,8 @@ std::string MainListener::ParseTypeSpecifierName(
                 NamespaceNameFromContext(Compiler(ctx), ctx));
             if (!contextual.empty()) resolvedName = contextual;
         }
+        if (const auto* functionAlias = Compiler(ctx)->FindFunctionTypeAlias(resolvedName))
+            return EncodeClosureFromSig(Compiler(ctx), *functionAlias);
         return resolvedName;
     }
 

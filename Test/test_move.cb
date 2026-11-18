@@ -21144,13 +21144,17 @@ extern int main()
     total += 7;
     passed += testChainedAssignItem3();
     total += 2;
+    passed += testChainedAssignFrozenAccepts();
+    total += 5;
+    passed += testChainedAssignFieldMiddle();
+    total += 3;
     passed += testChainedAssignParenthesized();
     total += 3;
     passed += testChainedAssignFreshNonlocal();
     total += 8;
     passed += testChainedRawShapes();
     total += 14;
-    total += 16;
+    total += 30;  // +2 r4 legs; +6 r5 field/global raw-outer legs; +6 r6 explicit-field/owner-raw-field legs
     passed += testChainedRawDeepShapes();
     total += 4;
     passed += chainRawTernaryArmCase(true) + chainRawTernaryArmCase(false);
@@ -22728,6 +22732,21 @@ unique ChainRawBox* t250ReturnAssignedRaw()
 }
 struct ChainRawHolder { unique ChainRawBox* owner = nullptr; };
 unique ChainRawBox* chainRawGlobal = nullptr;
+// Raw outer over a raw field / global middle (round 5): births must equal dtors.
+int chainFieldRawBirths = 0;
+int chainFieldRawDtors = 0;
+struct ChainFieldRawBox
+{
+    int v = 0;
+    ChainFieldRawBox() { chainFieldRawBirths = chainFieldRawBirths + 1; }
+    ~ChainFieldRawBox() { chainFieldRawDtors = chainFieldRawDtors + 1; }
+};
+struct ChainFieldRawHolder { ChainFieldRawBox* raw = nullptr; };
+ChainFieldRawBox* chainFieldRawGlobal = nullptr;
+// Round 6: an explicit-receiver control and an owner read through a raw field (the implicit-this unique
+// field chain is refused in Test/errors/err_unique_borrow_into_unique.cb, R7Field).
+struct ChainFieldBothHolder { ChainFieldRawBox* raw = nullptr; unique ChainFieldRawBox* u = nullptr; };
+struct ChainFieldUniqueHolder { unique ChainFieldRawBox* u = nullptr; };
 
 int testChainedRawIntoUnique()
 {
@@ -25012,6 +25031,63 @@ int testChainedRawDeepShapes()
     }
     passed += Test("chain_return_cast_one_dtor", chainRawDtors, 1);
     chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = chainReturnAssignedCast(false);
+        passed += Test("chain_return_cast_false_null", (int)(owner == nullptr), 1);
+    }
+    passed += Test("chain_return_cast_false_no_dtor", chainRawDtors, 0);
+    chainRawDtors = 0;
+    chainFieldRawBirths = 0;
+    chainFieldRawDtors = 0;
+    {
+        ChainFieldRawHolder middleHolder;
+        ChainFieldRawBox* rawOuter = nullptr;
+        bool useNew = true;
+        rawOuter = middleHolder.raw = (useNew ? new ChainFieldRawBox() : nullptr);
+        rawOuter->v = 18;
+        passed += Test("chain_field_raw_outer_value", rawOuter->v, 18);
+    }
+    passed += Test("chain_field_raw_outer_births", chainFieldRawBirths, 1);
+    passed += Test("chain_field_raw_outer_dtors", chainFieldRawDtors, 1);
+    chainFieldRawBirths = 0;
+    chainFieldRawDtors = 0;
+    {
+        ChainFieldRawBox* rawOuter = nullptr;
+        bool useNew = true;
+        rawOuter = chainFieldRawGlobal = (useNew ? new ChainFieldRawBox() : nullptr);
+        rawOuter->v = 18;
+        passed += Test("chain_global_raw_outer_value", rawOuter->v, 18);
+    }
+    chainFieldRawGlobal = nullptr;
+    passed += Test("chain_global_raw_outer_births", chainFieldRawBirths, 1);
+    passed += Test("chain_global_raw_outer_dtors", chainFieldRawDtors, 1);
+    chainFieldRawBirths = 0;
+    chainFieldRawDtors = 0;
+    chainFieldRawBirths = 0;
+    chainFieldRawDtors = 0;
+    {
+        ChainFieldBothHolder both;
+        bool useNew = true;
+        both.u = both.raw = (useNew ? new ChainFieldRawBox() : nullptr);
+        passed += Test("chain_explicit_field_fresh_value", both.u->v, 0);
+    }
+    passed += Test("chain_explicit_field_fresh_births", chainFieldRawBirths, 1);
+    passed += Test("chain_explicit_field_fresh_dtors", chainFieldRawDtors, 1);
+    chainFieldRawBirths = 0;
+    chainFieldRawDtors = 0;
+    {
+        ChainFieldRawBox* other = new ChainFieldRawBox();
+        ChainFieldRawHolder source;
+        source.raw = other;
+        ChainFieldUniqueHolder target;
+        target.u = source.raw;
+        other->v = 3;
+        passed += Test("chain_owner_raw_field_to_unique_value", target.u->v, 3);
+    }
+    passed += Test("chain_owner_raw_field_to_unique_births", chainFieldRawBirths, 1);
+    passed += Test("chain_owner_raw_field_to_unique_dtors", chainFieldRawDtors, 1);
+    chainFieldRawBirths = 0;
+    chainFieldRawDtors = 0;
     {
         unique ChainRawBox* a = nullptr;
         ChainRawBox* b = nullptr;
@@ -29981,6 +30057,64 @@ int testChainedAssignItem3()
     return passed;
 }
 
+int chainAssignBorrowedMiddle(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        unique ChainAssignPS* a = nullptr;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* borrowed = other;
+        ChainAssignPS* b = nullptr;
+        a = b = (c ? other : borrowed);
+        value = a == nullptr ? -1 : a->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int chainAssignDeclarationDirect()
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* b = nullptr;
+        unique ChainAssignPS* a = b = other;
+        value = a == nullptr ? -1 : a->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int chainAssignBorrowedThreeDeep(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        unique ChainAssignPS* a = nullptr;
+        ChainAssignPS* b = nullptr;
+        ChainAssignPS* e = nullptr;
+        ChainAssignPS* other = new ChainAssignPS();
+        ChainAssignPS* borrowed = other;
+        a = b = e = (c ? other : borrowed);
+        value = a == nullptr ? -1 : a->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int testChainedAssignFrozenAccepts()
+{
+    int passed = 0;
+    passed += Test("chain_borrowed_middle_c0_value_and_dtor", chainAssignBorrowedMiddle(false), 10101);
+    passed += Test("chain_borrowed_middle_c1_value_and_dtor", chainAssignBorrowedMiddle(true), 10101);
+    passed += Test("chain_declaration_direct_value_and_dtor", chainAssignDeclarationDirect(), 10101);
+    passed += Test("chain_borrowed_three_deep_c0_value_and_dtor", chainAssignBorrowedThreeDeep(false), 10101);
+    passed += Test("chain_borrowed_three_deep_c1_value_and_dtor", chainAssignBorrowedThreeDeep(true), 10101);
+    return passed;
+}
+
 int chainAssignParenthesizedAssignment()
 {
     chainAssignBirths = 0;
@@ -30026,7 +30160,47 @@ int testChainedAssignParenthesized()
 // Fresh-or-owned ternary chains into nonlocal unique destinations: the middle owns the join, so
 // the outer takes it as its two-statement form does. Packed result as above; c false is 10101, c true 20202.
 struct ChainAssignHolder { unique ChainAssignPS* u = nullptr; };
+struct ChainAssignRawHolder { ChainAssignPS* raw = nullptr; };
 unique ChainAssignPS* chainAssignGlobalU = nullptr;
+
+int chainAssignFieldMiddleFresh(bool c)
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        ChainAssignHolder outer;
+        ChainAssignRawHolder middle;
+        ChainAssignPS* other = new ChainAssignPS();
+        outer.u = middle.raw = (c ? new ChainAssignPS() : nullptr);
+        value = outer.u == nullptr ? 0 : outer.u->v;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int chainAssignFieldMiddleNull()
+{
+    chainAssignBirths = 0;
+    chainAssignDtors = 0;
+    int value = -1;
+    {
+        ChainAssignHolder outer;
+        ChainAssignRawHolder middle;
+        ChainAssignPS* other = new ChainAssignPS();
+        outer.u = middle.raw = nullptr;
+        value = outer.u == nullptr ? 1 : 0;
+    }
+    return value * 10000 + chainAssignBirths * 100 + chainAssignDtors;
+}
+
+int testChainedAssignFieldMiddle()
+{
+    int passed = 0;
+    passed += Test("chain_field_middle_fresh_c0_value_and_dtor", chainAssignFieldMiddleFresh(false), 101);
+    passed += Test("chain_field_middle_fresh_c1_value_and_dtor", chainAssignFieldMiddleFresh(true), 20202);
+    passed += Test("chain_field_middle_null_value_and_dtor", chainAssignFieldMiddleNull(), 10101);
+    return passed;
+}
 
 int chainAssignArrayFresh(bool c)
 {

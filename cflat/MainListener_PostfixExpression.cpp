@@ -13486,6 +13486,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The type `default` builds when argument `index` defers; empty when it cannot.
                                     // T518: an unbound callee defers on the place type only behind a clang proof.
                                     bool deferredPlaceGuard = false;
+                                    bool deferredByValueSlot = false;
+                                    bool deferredCopyBySibling = false;
                                     auto deferredTypeFor = [&](size_t index, antlr4::ParserRuleContext* expression) {
                                         std::string placeType;
                                         if (!IsCxxDeferrableDefaultTernary(expression, placeType)
@@ -13494,6 +13496,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     /*allowCallArm*/ true)))
                                             return std::string();
                                         std::string parameterType;
+                                        // REFDEF: a by-value C++ parameter keeps the deferred place read (clang copies once).
+                                        if (index == argIdx && cxxFreeWrapper
+                                            && Compiler(ctx)->IsCxxFreeFunctionAnyParameterByValue(
+                                                functionName, index, namedArgCtx.size()))
+                                            deferredByValueSlot = true;
                                         bool parameterAgrees = true;
                                         size_t matchingStaticConstRef = 0;
                                         auto fit = Compiler(ctx)->functionTable.find(functionName);
@@ -13547,15 +13554,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             || funcSym->UniqueName.starts_with("__cflat_free_");
                                         if (funcSym == nullptr)
                                         {
-                                            if (!parameterType.empty()) return std::string();
                                             if (index == argIdx) deferredPlaceGuard = true;
-                                            return placeType;
+                                            return parameterType.empty() ? placeType : parameterType;
                                         }
                                         if (parameterAgrees && !parameterType.empty()
                                             && Compiler(ctx)->IsForeignNontrivialCxxClass(parameterType)
                                             && (wrapperCallee || cxxNonTemplateMemberWrapper
                                                 || cxxStaticMemberWrapper || parameterType != placeType))
+                                        {
+                                            if (index == argIdx && funcSym->UniqueName.starts_with("__cflat_free_"))
+                                                deferredPlaceGuard = true;
                                             return parameterType;
+                                        }
                                         return std::string();
                                     };
                                     std::string deferredDefaultType;
@@ -13575,18 +13585,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         deferredDefaultType = deferredTypeFor(argIdx, argumentExpression);
                                         // Sibling `?:` defer together or not at all (a mixed call pays a copy).
+                                        // REFDEF: a mixed `default`/place `?:` is copied at its own position
+                                        // (caller materialization), so a non-inert sibling cannot change it.
+                                        const bool selfMaterialized = deferredPlaceGuard && !deferredByValueSlot
+                                            && IsCxxMixedDefaultPlaceTernary(argumentExpression)
+                                            && !deferredDefaultType.empty()
+                                            && CanMaterializeMixedDefault(deferredDefaultType);
                                         bool siblingTernary = false;
+                                        bool siblingNonInert = false;
                                         for (size_t other = 0; other < namedArgCtx.size() && !deferredDefaultType.empty(); ++other)
                                         {
                                             if (other == argIdx) continue;
                                             auto* expression = namedArgCtx[other]->assignmentExpression();
-                                            if (!IsCxxInertCallArgument(expression)
+                                            siblingNonInert |= !IsCxxInertCallArgument(expression);
+                                            if ((!IsCxxInertCallArgument(expression) && !selfMaterialized)
                                                 || (IsCxxTernaryArgument(expression) && deferredTypeFor(other, expression).empty()))
                                                 deferredDefaultType.clear();
                                             siblingTernary |= IsCxxTernaryArgument(expression);
                                         }
                                         if (siblingTernary && !IsCxxInertCallArgument(argumentExpression))
                                             deferredDefaultType.clear();
+                                        deferredCopyBySibling = selfMaterialized && siblingNonInert;
                                         if (cxxStaticMemberWrapper && !deferredDefaultType.empty())
                                             cxxStaticDeferredCall = true;
                                     }
@@ -13630,8 +13649,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             LLVMBackend::NamedVariable deferred;
                                             if (!BuildCxxDeferredDefaultTernary(
                                                     argumentExpression, deferredDefaultType, deferred,
-                                                    deferredPlaceGuard))
+                                                    deferredPlaceGuard, /*callOnly*/ false,
+                                                    deferredPlaceGuard && !deferredByValueSlot))
                                                 return LLVMBackend::NamedVariable{};
+                                            deferred.CxxCopyBySibling = deferredCopyBySibling
+                                                && !deferred.CxxPlaceGuardType.empty();
                                             return deferred;
                                         }
                                         if (ctorRefTernary)
@@ -14065,6 +14087,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CxxDirectConstructionArguments =
                                         argNV.CxxDirectConstructionArguments;
                                     argVar.CxxDeferredTernaryShape = argNV.CxxDeferredTernaryShape;
+                                    argVar.CxxPlaceGuardType = argNV.CxxPlaceGuardType;
+                                    argVar.CxxCopyBySibling = argNV.CxxCopyBySibling;
                                     argVar.CxxEarlyCopyDecision = argNV.CxxEarlyCopyDecision;
                                     argVar.CxxEarlyCopySlot = argNV.CxxEarlyCopySlot;
                                     argVar.CxxEarlyCopyJoin = argNV.CxxEarlyCopyJoin;

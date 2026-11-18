@@ -7191,6 +7191,60 @@ bool LLVMBackend::ConvertTupleArgument(NamedVariable& argument, const TypeAndVal
         return true;
 }
 
+bool LLVMBackend::CxxBraceCallCaptureSignature(const FunctionSymbol& candidate,
+        size_t argumentCount, const std::string& targetType, TypeAndValue& signature) const
+{
+        signature = {};
+        if (candidate.Function == nullptr || candidate.Variadic
+            || candidate.Parameters.size() != argumentCount
+            || candidate.ReturnType.Pointer || candidate.ReturnType.IsAlias
+            || ResolveTypeAlias(candidate.ReturnType.TypeName) != ResolveTypeAlias(targetType)
+            || !IsForeignNontrivialCxxClass(candidate.ReturnType.TypeName)
+            || !ReturnsViaInPlaceSret(candidate.ReturnType.TypeName))
+            return false;
+
+        signature = FuncPtrSigOfSymbol(candidate);
+        const bool cflatMethodThis = candidate.IsMethod && !candidate.IsCxx
+            && !candidate.Parameters.empty();
+        if (cflatMethodThis && !signature.FuncPtrParams.empty())
+        {
+            auto& receiver = signature.FuncPtrParams.front();
+            receiver.TypeName = "void";
+            receiver.Pointer = true;
+            receiver.PointerDepth = 1;
+            receiver.IsAlias = false;
+            receiver.IsRvalueRef = false;
+        }
+        std::string functionPointerSpelling;
+        if (!CxxThinFunctionPointerSpelling(signature, functionPointerSpelling))
+            return false;
+        for (size_t i = 0; i < candidate.Parameters.size(); ++i)
+        {
+            const TypeAndValue& parameter = candidate.Parameters[i];
+            const bool implicitThis = cflatMethodThis && i == 0;
+            const bool scalar = !parameter.Pointer && !parameter.IsAlias
+                && !parameter.IsRvalueRef && !parameter.IsFunctionPointer
+                && !IsCxxRecord(parameter.TypeName)
+                && (parameter.IsInteger() != -1 || parameter.IsFloatingPoint() != -1
+                    || parameter.TypeName == "bool");
+            const bool pointer = parameter.Pointer && !parameter.IsAlias
+                && !parameter.IsRvalueRef && !parameter.IsArrayView
+                && !parameter.IsFunctionPointer;
+            if (parameter.IsMove || parameter.IsUnique || parameter.IsOwningSink
+                || parameter.IsConsumeInferredSink
+                || (!implicitThis && (parameter.IsAlias || parameter.IsRvalueRef
+                    || (!scalar && !pointer))))
+                return false;
+            if (!implicitThis)
+            {
+                std::string parameterSpelling;
+                if (!CxxBraceDeferredParameterSpelling(parameter, parameterSpelling))
+                    return false;
+            }
+        }
+        return true;
+}
+
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& inputArguments, bool forceRoot,
         const std::string& displayName, const std::string& cxxMemberReceiver,
         bool postfixMemberCall, const std::string& enclosingFunctionName,
@@ -8996,8 +9050,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (!receiverType.empty() && IsCxxRecord(receiverType)
                 && ReportCxxMemberThroughNonPublicBase(receiverType, bareMemberName))
                 return nullptr;
-            const bool objectlessInstanceCall = resolvedCandidate.empty()
-                && implicitReceiver == nullptr && !lexicalAggregateScopes.empty()
+            const bool implicitReceiverMatchesCandidate = implicitReceiver != nullptr
+                && std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+                    if (!candidate.IsMethod || candidate.Parameters.empty()) return false;
+                    const std::string& ownerType = candidate.Parameters.front().TypeName;
+                    const std::string& receiverType = implicitReceiver->TypeAndValue.TypeName;
+                    return ownerType == receiverType
+                        || (candidate.IsCxx && !receiverType.empty()
+                            && IsCxxBaseOf(ownerType, receiverType));
+                });
+            const bool objectlessInstanceCall = !implicitReceiverMatchesCandidate
+                && !lexicalAggregateScopes.empty()
                 && !candidates.empty()
                 && std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) {
                     return candidate.IsMethod && !candidate.Parameters.empty()
@@ -11527,6 +11590,54 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             transferParamsStorage.front().IsRvalueRef = true;
             transferParams = &transferParamsStorage;
         }
+        TypeAndValue deferredBraceCallSignature;
+        if (pendingCxxBraceCallCaptureSite_ != nullptr
+            && receiverCallSite == pendingCxxBraceCallCaptureSite_
+            && !pendingCxxBraceCallCaptureType_.empty()
+            && CxxBraceCallCaptureSignature(candidate, argList.size(),
+                pendingCxxBraceCallCaptureType_, deferredBraceCallSignature))
+        {
+            TypeAndValue signature = std::move(deferredBraceCallSignature);
+            const bool cflatMethodThis = candidate.IsMethod && !candidate.IsCxx
+                && !candidate.Parameters.empty();
+            DeferredCxxBraceCall deferred;
+            llvm::AllocaInst* callableSlot = AllocaAtEntry(
+                builder->getPtrTy(), nullptr, "cxx.brace.callable");
+            builder->CreateStore(candidate.Function, callableSlot);
+            deferred.Callable.Primary = builder->CreateLoad(
+                builder->getPtrTy(), callableSlot, "cxx.brace.callable.value");
+            deferred.Callable.BaseType = candidate.Function->getType();
+            deferred.Callable.TypeAndValue = signature;
+            deferred.Callable.TypeAndValue.VariableName.clear();
+            deferred.Callable.CallerName.clear();
+            deferred.Callable.IsRvalue = true;
+            deferred.ReturnType = candidate.ReturnType;
+            deferred.CallSite = receiverCallSite;
+            deferred.Arguments.reserve(argList.size());
+            for (size_t i = 0; i < argList.size(); ++i)
+            {
+                NamedVariable argument;
+                argument.TypeAndValue = candidate.Parameters[i];
+                argument.TypeAndValue.VariableName.clear();
+                if (cflatMethodThis && i == 0)
+                {
+                    argument.TypeAndValue.TypeName = "void";
+                    argument.TypeAndValue.Pointer = true;
+                    argument.TypeAndValue.PointerDepth = 1;
+                    argument.TypeAndValue.ElemPointer = false;
+                    argument.TypeAndValue.IsAlias = false;
+                    argument.TypeAndValue.IsRvalueRef = false;
+                }
+                argument.Primary = argList[i];
+                argument.BaseType = argList[i] != nullptr ? argList[i]->getType() : nullptr;
+                argument.IsRvalue = true;
+                deferred.Arguments.push_back(std::move(argument));
+            }
+            cxxBraceCallCaptures_.push_back(std::move(deferred));
+            lastCallReturnType = candidate.ReturnType;
+            lastCallReturnValueCv_ = CxxReturnValueCv(candidate);
+            return llvm::UndefValue::get(GetType(candidate.ReturnType));
+        }
         ApplyMoveParamTransfer(functionName, *transferParams, slotWrapper ? slotBefore : matched,
                                true, candidate.IsMethod, true, candidate.IsCxx);
         std::vector<llvm::Value*> sinkConsumedTemps = std::move(moveTransferConsumedTemps_);
@@ -12067,6 +12178,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
                 else
                     cxxVirtualCallee = builder->CreateCall(getterFn, {}, "cxx.direct.callee");
+                if (auto adjust = cxxDirectCalleeThisAdjust_.find(candidate.UniqueName);
+                    adjust != cxxDirectCalleeThisAdjust_.end() && !argList.empty())
+                    argList[0] = EmitCxxBaseAdjust(argList[0], adjust->second);
             }
 
         const bool calleeMayUnwind = CalleeMayUnwind(candidate);

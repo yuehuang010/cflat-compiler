@@ -9269,6 +9269,56 @@ extern int main(int argc, char** argv)
         if (prvarg.slice_by_value(prvarg.Ev(1), sliceChoose != 0 ? sliceLeft : sliceRight) != 7) return 44635;
         if (prvarg.slice_bare(prvarg.Ev(1), sliceLvalue, prvarg.next_side()) != 442) return 44636;
     }
+    // DELMOVE: a prvalue of a class whose copy and move are deleted or private, beside a later call
+    // argument, is built in the template's by-value parameter (clang: 1 ctor, 0 move, 1 dtor).
+    {
+        prvarg.resetCounts();
+        if (prvarg.free_tmpl(prvarg.Del(7), prvarg.next_side()) != 7001) return 44675;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44676;
+        prvarg.resetCounts();
+        if (prvarg.free_tmpl<prvarg.Del>(prvarg.Del(7), prvarg.next_side()) != 7001) return 44677;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44678;
+        prvarg.resetCounts();
+        if (prvarg.free_tmpl(prvarg.Priv(7), prvarg.next_side()) != 7001) return 44679;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44680;
+        prvarg.resetCounts();
+        if (prvarg.free_tmpl<prvarg.Priv>(prvarg.Priv(7), prvarg.next_side()) != 7001) return 44681;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44682;
+        prvarg.resetCounts();
+        if (prvarg.free_tmpl(prvarg.MoveOnlyPrv(7), prvarg.next_side()) != 7001) return 44683;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44684;
+        prvarg.resetCounts();
+        prvarg.DelOwner owner = prvarg.DelOwner();
+        if (owner.mem(prvarg.Del(7), prvarg.next_side()) != 7001) return 44685;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44686;
+        prvarg.resetCounts();
+        if (owner.mem<prvarg.Priv>(prvarg.Priv(7), prvarg.next_side()) != 7001) return 44687;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44688;
+        prvarg.DelDerived sub = prvarg.DelDerived();
+        prvarg.resetCounts();
+        if (sub.bmem(prvarg.Del(7), prvarg.next_side()) != 7001) return 44689;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44690;
+        prvarg.resetCounts();
+        if (sub.bmem(prvarg.Priv(7), prvarg.next_side()) != 7001) return 44691;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44692;
+        prvarg.resetCounts();
+        if (prvarg.pair_tmpl(prvarg.Del(7), prvarg.Del(8)) != 7008) return 44693;
+        if (prvarg.ctorCount() != 2 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 2) return 44694;
+        prvarg.resetCounts();
+        if (prvarg.one_tmpl(prvarg.Priv(7)) != 7) return 44695;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1) return 44696;
+    }
 
     // BRACEPRV legs: code() = ctor*1000 + copy*100 + move*10 + dtor, read before the scope ends;
     // values pinned to clang++ -std=c++20 on the same shapes (master moved a CFlat temp in).

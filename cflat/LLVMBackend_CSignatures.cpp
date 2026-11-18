@@ -264,7 +264,11 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 // A record by value needs the aggregate ABI arrangement, which is not part of
                 // this prototype - refuse at registration so the LSP sees the same answer.
                 // A refused declaration still proves its namespace exists - seed before the drop.
-                if (RejectCxxRecordByValue(e)) { SeedCxxNamespacesOfDottedName(e.name); continue; }
+                if (!e.prvalueOnlyByValue && RejectCxxRecordByValue(e))
+                {
+                    SeedCxxNamespacesOfDottedName(e.name);
+                    continue;
+                }
                 auto needsProjectedByValueRecord = [&](const TypeAndValue& type) {
                     return !type.TypeName.empty() && !type.Pointer && !type.IsAlias
                         && !type.IsInterface && !type.IsFunctionPointer
@@ -668,6 +672,8 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.closureKeptParams = r.closureKeptParams;
         e.ctorSelectedParams = r.ctorSelectedParams;
         e.selectedCalleeType = r.selectedCalleeType;
+        e.selectedCalleeOwner = r.selectedCalleeOwner;
+        e.selectedCalleeOwnerIsReceiver = r.selectedCalleeOwnerIsReceiver;
         e.selectedCalleeTemplateArgs = r.selectedCalleeTemplateArgs;
         e.selectedCalleeDefaults = r.selectedCalleeDefaults;
         e.selectedCalleeSymbol = r.selectedCalleeSymbol;
@@ -943,6 +949,8 @@ void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
             raw.closureKeptParams = cached.closureKeptParams;
             raw.ctorSelectedParams = cached.ctorSelectedParams;
             raw.selectedCalleeType = cached.selectedCalleeType;
+            raw.selectedCalleeOwner = cached.selectedCalleeOwner;
+            raw.selectedCalleeOwnerIsReceiver = cached.selectedCalleeOwnerIsReceiver;
             raw.selectedCalleeTemplateArgs = cached.selectedCalleeTemplateArgs;
             raw.selectedCalleeDefaults = cached.selectedCalleeDefaults;
             raw.selectedCalleeSymbol = cached.selectedCalleeSymbol;

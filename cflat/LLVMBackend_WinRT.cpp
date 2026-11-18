@@ -1763,6 +1763,33 @@ bool LLVMBackend::JoinArmsStillKeepOwner(const NamedVariable& nv, int depth) con
         {
             if (slot == nullptr || slot == nv.Storage) return false;
             const auto* arm = FindVariableByStorage(slot);
+            NamedVariable externalArm;
+            if (arm == nullptr)
+                if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(slot))
+                {
+                    externalArm = GetGlobalVariableNV(global->getName().str());
+                    arm = &externalArm;
+                }
+            if (arm == nullptr)
+                if (const auto* fieldRead = FindUniqueFieldReadValueSource(slot))
+                    arm = &fieldRead->Variable;
+            if (arm == nullptr)
+                if (const auto* fieldRead = FindUniqueFieldReadSource(slot))
+                    arm = &fieldRead->Variable;
+            if (arm == nullptr)
+                if (const auto* stored = FindStoredPointerJoinOwnerValue(slot);
+                    stored != nullptr && stored->IsFieldOwnerValue)
+                    continue;
+            if (arm == nullptr)
+                if (const auto* stored = FindStoredPointerJoinOwnerValue(slot))
+                {
+                    NamedVariable nested;
+                    nested.JoinKeepsOwner = true;
+                    nested.JoinKeepsOwnerSource = stored->Source;
+                    nested.JoinKeepsOwnerSlots = stored->Slots;
+                    if (!JoinArmsStillKeepOwner(nested, depth + 1)) return false;
+                    continue;
+                }
             // Recheck each arm after binding so a later rebind retires its old proof.
             if (arm == nullptr || arm->PointerRebound) return false;
             if (arm->JoinKeepsOwner)

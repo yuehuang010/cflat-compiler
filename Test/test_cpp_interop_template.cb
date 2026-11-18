@@ -590,7 +590,14 @@ t37.vec<int>.value_type t37Global = 9;
 struct T37Holder { t37.vec<int>.value_type f = default; };
 t37.vec<int>.value_type t37Twice(t37.vec<int>.value_type x) { return x * 2; }
 using T37Vt = t37.vec<int>.value_type;
+using T37VecIntAlias = t37.vec<int>;
+using T37NestedInAlias = t37.Outer<int>.In<long>;
+using T37NestedOuterInt = t37.nested_outer<int>;
+long t37NestedTypeParam(t37.nested_outer<int>.inner<long>.type value) { return value + 1; }
+t37.nested_outer<int>.inner<long>.type t37NestedTypeReturn() { return 17; }
+struct T37NestedTypeHolder { t37.nested_outer<int>.inner<long>.type value = default; };
 struct T37Wrap<T> { T w = default; };
+struct T37FixedByValue<int N> { int get() { return N; } };
 T.value_type t37FirstOf<T>(T v) { T.value_type r = v.at(0); return r; }
 bool t37IsInt<T>() { return t37.same<t37.traits<T>.value_type, int>.value; }
 // A value in parentheses before a binary operator keeps the by-value param's final use a move.
@@ -598,6 +605,8 @@ int t37Take(t37.track x) { return x.v; }
 int t37Forward(t37.track x) { return (t37.vec<int>.kind) + t37Take(x); }
 int t37Apply(function<int(int)> f, int n) { return f(n); }
 int t37ForwardLambda(t37.track x) { return (t37.vec<int>.kind) + t37Apply((int n) => { return n * 2; }, 1) + t37Take(x); }
+int kind = 99;
+int t37KindGlobalShadow() { return kind + t37.vec<int>.kind; }
 
 int t358PassDefault(T358Gate<> value) { return t358.take(value); }
 T358Gate<> t358ReturnDefault(int value) { return t358.make_gate(value); }
@@ -4551,12 +4560,52 @@ extern int main()
         T37Vt va = 12;
         T37Wrap<t37.vec<int>.value_type> w; w.w = 13;
         if (va + w.w != 25) return 2961;
+        // T37 nested template segments work through imported C++ records and outer aliases.
+        t37.nested_outer<int>.inner<long>.type nestedValue = 17;
+        T37NestedOuterInt.inner<long>.type aliasNestedValue = 18;
+        t37.nested_outer<int>.inner<long> nestedRecord = default; nestedRecord.value = 19;
+        T37NestedOuterInt.inner<long> aliasNestedRecord = default; aliasNestedRecord.value = 20;
+        T37NestedTypeHolder nestedHolder; nestedHolder.value = 20;
+        long rawNested = 21;
+        t37.nested_outer<int>.inner<long>.type castNested =
+            (t37.nested_outer<int>.inner<long>.type)rawNested;
+        T37Wrap<t37.nested_outer<int>.inner<long>.type> nestedWrap; nestedWrap.w = 22;
+        long* nestedAllocated = new t37.nested_outer<int>.inner<long>.type;
+        *nestedAllocated = 23;
+        bool nestedNewOk = *nestedAllocated == 23;
+        delete nestedAllocated;
+        if (nestedValue + aliasNestedValue + nestedRecord.value + aliasNestedRecord.value + nestedHolder.value
+            + castNested + nestedWrap.w + t37NestedTypeParam(24) + t37NestedTypeReturn() != 179)
+            return 2974;
+        if (!nestedNewOk || sizeof(t37.nested_outer<int>.inner<long>.type) != sizeof(long))
+            return 2975;
         // A nested scoped enum of a specialization, and enumerator values of a template pattern.
         t37.vec<int>.mode m = t37.vec<int>.mode.mode_b;
         if ((int)m != 2) return 2962;
         if ((int)t37.vec.mode.mode_a != 1 || (int)t37.vec.mode.mode_b != 2) return 2963;
         // Value side unchanged: a static data member and a trait value read as values.
         if (t37.vec<int>.kind != 7 || !t37.same<int, int>.value) return 2964;
+        int kind = 101;
+        if (t37KindGlobalShadow() != 106 || kind + t37.vec<int>.kind != 108) return 2976;
+        T37FixedByValue<t37.vec<int>.kind> cflatValue;
+        if (cflatValue.get() != 7) return 2977;
+        T37FixedByValue<T37VecIntAlias.kind> aliasValue;
+        if (aliasValue.get() != 7) return 2978;
+        T37FixedByValue<t37.Outer<int>.In<long>.kind> nestedValueArg;
+        if (nestedValueArg.get() != 11) return 2979;
+        t37.fixed<t37.vec<int>.kind> cppValue;
+        if (t37.fixed<t37.vec<int>.kind>.n != 7) return 2980;
+        int[t37.vec<int>.kind] staticBound = default;
+        staticBound[6] = 7;
+        if (sizeof(staticBound) != 28 || staticBound[6] != 7) return 2981;
+        int staticIfConst = 0;
+        if const (t37.vec<int>.kind == 7) { staticIfConst = 8; }
+        else { staticIfConst = 9; }
+        if (staticIfConst != 8) return 2982;
+        T37FixedByValue<t37.statmem_plain_owner.kind> plainOwnerValue = default;
+        if (plainOwnerValue.get() != 13) return 2992;
+        T37FixedByValue<T37NestedInAlias.kind> nestedAliasValue = default;
+        if (nestedAliasValue.get() != 11) return 2993;
         if (sizeof(t37.vec<int>.kind) != 4) return 2965;
         // A static value member in parentheses is a parenthesized value, not a cast (C reading).
         int k1 = (t37.vec<int>.kind) + 1;
@@ -5194,4 +5243,19 @@ extern int main()
         }
         if (cppsopd.t711ChainByValueRvalueDtors != 2) return 57134;
     return 0;
+}
+
+expect_error("not a compile-time constant") {
+    T37FixedByValue<cppt.TplStatics<int>.counter> nonConstantStatic;
+}
+
+// An unsigned static above INT64_MAX is refused, never folded to its wrapped negative int64.
+expect_error("'if const' condition must be a compile-time constant expression") {
+    int statmemUnsignedIfConst() { if const (t37.statmem_unsigned_owner<int>.big > 0) { return 1; } return 2; }
+}
+expect_error("is not a compile-time constant integer") {
+    T37FixedByValue<t37.statmem_unsigned_owner<int>.big> unsignedOwnerValue;
+}
+expect_error("is not a compile-time constant integer") {
+    T37FixedByValue<t37.statmem_unsigned_plain.big> unsignedPlainValue;
 }

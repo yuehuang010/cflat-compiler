@@ -33,4 +33,32 @@ struct Tb { int b; Tb(int n) : b(n) {} };
 struct Dt : Tb { Dt() : Tb(33) {} Dt(int n) : Tb(n) {} };
 template<class T> int slice_by_value(T x, Tb b) { return b.b; }
 template<class T> int slice_bare(T x, Tb b, int y) { return b.b * 10 + y; }
+// DELMOVE: a class whose copy and move are deleted, or private, is built in the template's by-value
+// parameter as clang does (guaranteed elision); a move-only class (deleted copy) is the control.
+struct Del {
+    int value;
+    Del(int n) : value(n) { ++ctorCount_; }
+    Del(const Del&) = delete;
+    Del(Del&&) = delete;
+    ~Del() { ++dtorCount_; }
+};
+struct Priv {
+    int value;
+    Priv(int n) : value(n) { ++ctorCount_; }
+    ~Priv() { ++dtorCount_; }
+private:
+    Priv(const Priv&);
+    Priv(Priv&&);
+};
+struct MoveOnlyPrv {
+    int value;
+    MoveOnlyPrv(int n) : value(n) { ++ctorCount_; }
+    MoveOnlyPrv(const MoveOnlyPrv&) = delete;
+    MoveOnlyPrv(MoveOnlyPrv&& other) : value(other.value) { ++moveCount_; }
+    ~MoveOnlyPrv() { ++dtorCount_; }
+};
+template<class T> int one_tmpl(T x) { return x.value; }
+struct DelOwner { template<class T> int mem(T x, int y) { return x.value * 1000 + y; } };
+struct DelBase { template<class T> int bmem(T x, int y) { return x.value * 1000 + y; } };
+struct DelDerived : DelBase { };
 }

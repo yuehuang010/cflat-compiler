@@ -904,10 +904,11 @@ bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* mem
                     }
                 }
                 if (!matches) continue;
-                for (auto* memberName : memberType->memberNameToken())
-                    if (auto alias = aliasFrame.typeAliases.find(memberName->getText());
+                for (auto* member : memberType->memberTypeMember())
+                    if (member->genericTypeParameters() == nullptr)
+                        if (auto alias = aliasFrame.typeAliases.find(member->memberNameToken()->getText());
                         alias != aliasFrame.typeAliases.end())
-                        return isOpaqueName(alias->second);
+                            return isOpaqueName(alias->second);
             }
             return false;
         };

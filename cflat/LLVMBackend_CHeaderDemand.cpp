@@ -3856,6 +3856,21 @@ bool LLVMBackend::IsCxxFreeFunctionParameterByValue(const std::string& functionN
         return sawCandidate;
 }
 
+bool LLVMBackend::IsCxxFreeFunctionAnyParameterByValue(const std::string& functionName,
+                                                       size_t parameterIndex,
+                                                       size_t arity) const
+{
+        auto signatures = cxxFunctionSignatures_.find(functionName);
+        if (signatures == cxxFunctionSignatures_.end()) return false;
+        for (const auto& signature : signatures->second)
+        {
+            if (!signature.isCxx || signature.paramSpellings.size() != arity
+                || parameterIndex >= signature.paramSpellings.size()) continue;
+            if (signature.paramSpellings[parameterIndex].find('&') == std::string::npos) return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::IsCxxMemberFunctionParameterByValue(const std::string& ownerType,
                                                       const std::string& memberName,
                                                       size_t parameterIndex,

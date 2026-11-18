@@ -228,6 +228,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_constrec_accept.hpp";
 import cpp "library/cpp_rangeadl.hpp";
 import cpp "library/cpp_raw_string_base.hpp";
 import cpp "library/cpp_bracefold_base.hpp";
@@ -343,6 +344,7 @@ import cpp "library/cpp_t525_fnwrap_r3.hpp";
 import cpp "library/t84_conversion.hpp";
 import cpp "library/cpp_t27_ptrdiff.hpp";
 import cpp "library/cpp_interop_lastuse.h";
+import cpp "library/cpp_interop_refdef.hpp";
 import cpp "library/cpp_interop_demand_fail.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
@@ -2347,6 +2349,9 @@ int CppuDeclTakesAliasEC(cppu_decl_a.EC e) { return (int)e; }
 cppi.MtConstObj* mtConstPass(cppi.MtConstObj* p) { return p; }
 T mtConstIdent<T>(T value) { return value; }
 int crCallGet(cppi.CrPair* p) { return p->get(); }
+const cppi.CrPair* crT324ConstParam(const cppi.CrPair* p) { return p; }
+const cppi.CrPair* crT324ConstReturn() { return &cppi.crConst; }
+cppi.CrPair* crT324MutableReturn() { return &cppi.crMutable; }
 struct CrConstPointerHolder
 {
     (const cppi.CrReceiverValue)* pc = default;
@@ -3612,6 +3617,13 @@ cppexp.Retelide TNRVOAutoInt(int q)
 // T272: a return of a parenthesized C++ call elides like the bare return (clang: 1 ctor, 1 dtor).
 cppexp.ConvCnt T272Ret() { return (cppexp.conv_mk(7)); }
 struct T272Hold { cppexp.ConvCnt c; };
+braceprv.BS AggCallFlatMake(int n) { braceprv.BS_Stats.selected = 3; return braceprv.BS(n); }
+braceprv.BS AggCallTernaryA() { braceprv.BS_Stats.selected = 5; return braceprv.BS(8); }
+braceprv.BS AggCallTernaryB() { braceprv.BS_Stats.selected = 6; return braceprv.BS(9); }
+struct AggCallFlatMaker
+{
+    braceprv.BS make(int n) { braceprv.BS_Stats.selected = 4; return braceprv.BS(n); }
+};
 // T228: several candidates share the sret slot. A local is elided when every return inside its live
 // range names it; a return naming another local (or any other value) keeps it a normal local.
 // Oracle: clang++ -std=c++20 on the same shapes (scratch/t228_tmp/oracle.cpp, oracle2.cpp, oracle3.cpp).
@@ -7445,6 +7457,165 @@ extern int main()
     if (t146ScaleDerived.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
         return 47112;
     if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0) return 47113;
+    // BASEMTPL: the direct call uses the inherited declaration's receiver type and preserves all counts.
+    t63.resetCallCounts();
+    if (t146ScaleDerived.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47130;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47131;
+    // BASEMTPL: a virtual base has no fixed direct-call adjustment, so its wrapper keeps the move.
+    t63.resetCallCounts();
+    if (t63.call_scale_virtual()->scaled(
+            t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47158;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 1
+        || t63.callDtorCount() != 2) return 47159;
+    t63.resetCallCounts();
+    t63.CallScaleSingle t146ScaleSingle = default;
+    t146ScaleSingle.scale = 10;
+    if (t146ScaleSingle.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47132;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47133;
+    t63.resetCallCounts();
+    t63.CallScaleLeaf t146ScaleLeaf = default;
+    t146ScaleLeaf.scale = 10;
+    if (t146ScaleLeaf.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47134;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47135;
+    t63.resetCallCounts();
+    t63.CallScaleQualDerived t146Qual = default;
+    t146Qual.scale = 10;
+    if (t146Qual.over_scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 101012)
+        return 47136;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47137;
+    t63.resetCallCounts();
+    if (t146Qual.over_scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side_double()) != 201012)
+        return 47138;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47139;
+    t63.resetCallCounts();
+    const t63.CallScaleQualDerived t146ConstQual = t63.call_scale_qual_value();
+    t63.resetCallCounts();
+    if (t146ConstQual.const_scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 301012)
+        return 47140;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47141;
+    t63.resetCallCounts();
+    if (t146Qual.ref_scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 401012)
+        return 47142;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47143;
+    t63.resetCallCounts();
+    if (t63.call_scale_qual_value().ref_scaled(
+            t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 501012)
+        return 47144;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47145;
+    t63.resetCallCounts();
+    t63.CallScaleHides t146Hides = default;
+    t146Hides.scale = 10;
+    if (t146Hides.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 60022)
+        return 47146;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47147;
+    t63.resetCallCounts();
+    t63.CallScaleUsing t146Using = default;
+    t146Using.scale = 10;
+    if (t146Using.scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47148;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47149;
+    t63.resetCallCounts();
+    t63.CallScaleSingle* t146ScalePtr = &t146ScaleSingle;
+    if (t146ScalePtr->scaled(t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47150;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47151;
+    t63.resetCallCounts();
+    if (t63.call_scale_single_ref(t146ScaleSingle).scaled(
+            t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47152;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 47153;
+    t63.resetCallCounts();
+    if (t146Host.template_event_convert(
+            t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 1012)
+        return 47154;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 1
+        || t63.callDtorCount() != 2) return 47155;
+    t63.resetCallCounts();
+    if (t146ScaleSingle.scaled_convert(
+            t63.CallEvent(t63.call_next_side()), t63.call_next_side()) != 22)
+        return 47156;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 1
+        || t63.callDtorCount() != 2) return 47157;
+    // BASEMTPL: class-template receivers keep the own and dependent-base member-template routes.
+    t63.resetCallCounts();
+    t63.CallTemplateOwn<int> t146TemplateOwn = default;
+    t146TemplateOwn.scale = 10;
+    if (t146TemplateOwn.selected(t63.CallEvent(1), t63.call_fixed_two()) != 700012)
+        return 47160;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47161;
+    // The alias keeps the own-record route; the pointer form exercises the same Clang record.
+    t63.resetCallCounts();
+    t63.CallTemplateOwnInt t146TemplateOwnAlias = default;
+    t146TemplateOwnAlias.scale = 10;
+    if (t146TemplateOwnAlias.selected(t63.CallEvent(1), t63.call_fixed_two()) != 700012)
+        return 47166;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47167;
+    t63.resetCallCounts();
+    t63.CallTemplateOwnInt* t146TemplateOwnAliasPtr = &t146TemplateOwnAlias;
+    if (t146TemplateOwnAliasPtr->selected(t63.CallEvent(1), t63.call_fixed_two()) != 700012)
+        return 47168;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47169;
+    // A bool non-type argument has a distinct CFlat spelling for the same receiver record.
+    t63.resetCallCounts();
+    t63.CallTemplateOwnBool<true> t146TemplateOwnBool = default;
+    if (t146TemplateOwnBool.selected(t63.CallEvent(1), t63.call_fixed_two()) != 720004)
+        return 47170;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47171;
+    // <false> is instantiated by no derived control, so only the own-receiver route reaches it.
+    t63.resetCallCounts();
+    t63.CallTemplateOwnBool<false> t146TemplateOwnBoolF = default;
+    if (t146TemplateOwnBoolF.selected(t63.CallEvent(1), t63.call_fixed_two()) != 720005)
+        return 47176;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47177;
+    // Alias and bool-derived receivers retain the base-offset route as controls.
+    t63.resetCallCounts();
+    t63.CallTemplatePrimaryInt t146TemplatePrimaryAlias = default;
+    t146TemplatePrimaryAlias.scale = 10;
+    if (t146TemplatePrimaryAlias.selected(t63.CallEvent(1), t63.call_fixed_two()) != 710012)
+        return 47172;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47173;
+    t63.resetCallCounts();
+    t63.CallTemplateBoolDerived<true> t146TemplateBoolDerived = default;
+    if (t146TemplateBoolDerived.selected(t63.CallEvent(1), t63.call_fixed_two()) != 720004)
+        return 47174;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47175;
+    t63.resetCallCounts();
+    t63.CallTemplatePrimary<int> t146TemplatePrimary = default;
+    t146TemplatePrimary.scale = 10;
+    if (t146TemplatePrimary.selected(t63.CallEvent(1), t63.call_fixed_two()) != 710012)
+        return 47162;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47163;
+    t63.resetCallCounts();
+    t63.CallTemplateNonPrimary<int> t146TemplateNonPrimary = default;
+    t146TemplateNonPrimary.scale = 10;
+    if (t146TemplateNonPrimary.selected(t63.CallEvent(1), t63.call_fixed_two()) != 710012)
+        return 47164;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t63.callSideCount() != 11) return 47165;
     t63.resetCallCounts();
     int t146Member = t146Host.member(t63.CallEvent(3));
     if (t146Member != 203) return 9360;
@@ -24751,6 +24922,14 @@ extern int main()
     if (crConstSlotAddress->get() != 3) return 7998;
     auto crConstArrayAddress = &cppi.crArrayConst.arr[1];
     if (crConstArrayAddress->get() != 3) return 7999;
+    // T324 call and return doors preserve const; the mutable twin still selects mutable get().
+    const cppi.CrPair* crT324ConstArg = crT324ConstParam(&cppi.crConst);
+    if (crT324ConstArg->get() != 3 || crT324ConstReturn()->get() != 3
+        || cppi.cr_take_const_pair(&cppi.crConst) != 3) return 8005;
+    cppi.CrPair* crT324Mutable = crT324MutableReturn();
+    crT324Mutable->v = 8;
+    if (crT324Mutable->get() != 18) return 8006;
+    crT324Mutable->v = 3;
     // CFlat declarations preserve const pointees on parameters and aggregate fields.
     CrConstPointerHolder crConstHolder = default;
     crConstHolder.pc = &cppi.crReceiverGlobal;
@@ -27239,6 +27418,214 @@ int T518DefaultValuePairs(bool c)
 }
 // A reference parameter binds the caller's object, so it sees the later write (no early copy).
 int T518LaterRef() { t418.Val x = t418.Val(7); return t518.lref(x, t418.mutate(x)); }
+int T518RefdefPack(int value, int bias, int stats) { return (value - bias) * 100000 + stats; }
+int T518AcceptRefdefConstDefaultTrue() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.const_lref(true ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518AcceptRefdefConstDefaultReverse() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.const_lref(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518AcceptRefdefConstNoWrite() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.const_lref(false ? default : x, 2); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518AcceptRefdefByval() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.byval(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 30000, t418.stats());
+}
+int T518AcceptRefdefNonconstNamed() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.nonconst_lref(x, t418.mutate(x)); }
+    return T518RefdefPack(value, 12000, t418.stats());
+}
+int T518AcceptRefdefNonconstLvalueConditional() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.nonconst_lref(false ? x : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 12000, t418.stats());
+}
+int T518BoundRefdefConstMixed() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.const_lref(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518BoundRefdefConstDefaultTrue() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.const_lref(true ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518BoundRefdefConstDefaultReverse() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.const_lref(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518BoundRefdefConstNoWrite() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.const_lref(false ? default : x, 2); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518BoundRefdefByval() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.byval(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 30000, t418.stats());
+}
+int T518BoundRefdefNonconstMixed() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.nonconst_lref(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 12000, t418.stats());
+}
+int T518BoundRefdefNonconstReverse() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.nonconst_lref(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 12000, t418.stats());
+}
+int T518BoundRefdefOverMixed() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.refs(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 20000, t418.stats());
+}
+int T518BoundRefdefOverDefaultTrue() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.refs(true ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 20000, t418.stats());
+}
+int T518BoundRefdefOverDefaultReverse() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdefbound.refs(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 20000, t418.stats());
+}
+int T518TernaryConstRef() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518.lref(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 0, t418.stats());
+}
+int T518TernaryRref() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.rref(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 11000, t418.stats());
+}
+int T518TernaryRrefDefaultReverse() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.rref(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 11000, t418.stats());
+}
+int T518TernaryOverRefMixed() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.refs(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518TernaryOverRefDefaultTrue() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.refs(true ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+int T518TernaryOverRefDefaultReverse() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.refs(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 10000, t418.stats());
+}
+// Explicit template call: a mixed `?:` argument with a side-effecting sibling copies at its position.
+int T518TemplateDefaultTrue() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.tmpl<t418.Val>(true ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 40000, t418.stats());
+}
+int T518TemplateDefaultReverse() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.tmpl<t418.Val>(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 40000, t418.stats());
+}
+int T518TemplateDefaultNoSibling() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); value = t518refdef.tmpl<t418.Val>(false ? default : x, 2); }
+    return T518RefdefPack(value, 40000, t418.stats());
+}
+// Converting parameter with a sibling: clang converts the copy of the mixed `?:`, so each cell is clang's value.
+int T518ConvfTdefSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(true ? default : x, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518ConvfTdefSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(true ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518ConvfFdefSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(false ? default : x, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518ConvfFdefSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518ConvfTxdSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(true ? x : default, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518ConvfTxdSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(true ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518ConvfFxdSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(false ? x : default, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518ConvfFxdSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.convf(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvTdefSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(true ? default : x, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvTdefSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(true ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvFdefSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(false ? default : x, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvFdefSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(false ? default : x, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvTxdSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(true ? x : default, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvTxdSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(true ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvFxdSibY() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(false ? x : default, t418.mutate(y)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
+int T518TconvFxdSibX() {
+    t418.reset(); int value;
+    { t418.Val x = t418.Val(7); t418.Val y = t418.Val(5); value = t518refdef.tconv<int>(false ? x : default, t418.mutate(x)); }
+    return T518RefdefPack(value, 69000, t418.stats());
+}
 // The SELECTED overload decides: mixed(const Val&, int) wins for an int, so it sees the write.
 int T518Mixed() { t418.Val x = t418.Val(7); return t518.mixed(x, t418.mutate(x)); }
 // A trivially copyable class is snapshot at its argument; clang's selected callee decides by value.
@@ -29938,6 +30325,113 @@ int LoweredUserDtorAssignLegs(int argc)
         if (pdCallee.v != 7 || cppexp.conv_ctor_count() != 1 || cppexp.conv_dtor_count() != 0) return 13075;
     }
     if (cppexp.conv_dtor_count() != 1) return 13075;
+    // BRACECALL: same-class C++ call results build directly in aggregate member slots.
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.Outer out = { braceprv.mk(3), 1 };
+        if (out.r.value != 3) return 13601;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 3) return 13601;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.Outer out = { braceprv.BSFactory.make(4), 1 };
+        if (out.r.value != 4) return 13602;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 4
+        || braceprv.BS_Stats.selected != 2) return 13602;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.Outer out = { AggCallFlatMake(5), 1 };
+        if (out.r.value != 5) return 13603;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 5
+        || braceprv.BS_Stats.selected != 3) return 13603;
+    braceprv.BS_Stats.reset();
+    {
+        AggCallFlatMaker maker;
+        braceprv.Outer out = { maker.make(6), 1 };
+        if (out.r.value != 6) return 13604;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 6
+        || braceprv.BS_Stats.selected != 4) return 13604;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.BSMiddle out = { 1, braceprv.mk(7), 2 };
+        if (out.member.value != 7) return 13605;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 7) return 13605;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.BSLast out = { 1, 2, braceprv.mk(8) };
+        if (out.member.value != 8) return 13606;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 8) return 13606;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.BSPair out = { braceprv.mk(1), braceprv.mk(2), 3 };
+        if (out.first.value * 10 + out.second.value != 12) return 13607;
+    }
+    if (braceprv.BS_Stats.code() != 2002 || braceprv.BS_Stats.order != 12) return 13607;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.BSNested out = { { braceprv.mk(9) }, 2 };
+        if (out.inner.member.value != 9) return 13608;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 9) return 13608;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.Outer out = { true ? AggCallTernaryA() : AggCallTernaryB(), 1 };
+        if (out.r.value != 8) return 13609;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 8
+        || braceprv.BS_Stats.selected != 5) return 13609;
+    braceprv.BC_Stats.reset();
+    {
+        braceprv.BCAggregate out = { braceprv.bc_mkT(1), 2 };
+        if (out.member.value != 101) return 13610;
+    }
+    if (braceprv.BC_Stats.code() != 1001) return 13610;
+    braceprv.BS_Stats.reset();
+    // Pins a known ordering gap; this is not a clang-parity count.
+    {
+        braceprv.Outer out = { braceprv.mk(1), braceprv.side() };
+        if (out.r.value + out.x != 5) return 13611;
+    }
+    if (braceprv.BS_Stats.code() != 1012 || braceprv.BS_Stats.order != 19) return 13611;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.Outer out = { braceprv.mkConstString("5"), 1 };
+        if (out.r.value != 5) return 13612;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 5
+        || braceprv.BS_Stats.selected != 10) return 13612;
+    braceprv.BS_Stats.reset();
+    {
+        int k = 6;
+        braceprv.Outer out = { braceprv.mkConstInt(&k), 1 };
+        if (out.r.value != 6) return 13613;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 6
+        || braceprv.BS_Stats.selected != 11) return 13613;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.BC_Q q = default;
+        q.value = 8;
+        braceprv.Outer out = { braceprv.mkConstRecord(&q), 1 };
+        if (out.r.value != 8) return 13614;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 8
+        || braceprv.BS_Stats.selected != 12) return 13614;
+    braceprv.BS_Stats.reset();
+    {
+        char[2] buf = default;
+        buf[0] = 55;
+        char* s = &buf[0];
+        braceprv.Outer out = { braceprv.mkConstInnerPtr(&s), 1 };
+        if (out.r.value != 7) return 13615;
+    }
+    // Known gap (not clang parity, clang 1001): const above the pointee level declines capture, eager path.
+    if (braceprv.BS_Stats.code() != 1012 || braceprv.BS_Stats.selected != 13) return 13615;
     // T224: the nested candidate's return moves nothing; the caller's destructor runs once.
     cppunw.reset();
     {
@@ -30571,6 +31065,47 @@ int LoweredUserDtorAssignLegs(int argc)
     expect_error("'default' needs a known target type here") { t518bound.tf(1, default); }
     expect_error("'default' needs a known target type here") { t518.ambiguous(T518RetTw(), default); }
     if (T518LaterRef() != 902) return 51808;
+    if (T518AcceptRefdefConstDefaultTrue() != 220020) return 51890;
+    if (T518AcceptRefdefConstDefaultReverse() != 220020) return 51891;
+    if (T518AcceptRefdefConstNoWrite() != 70211020) return 51892;
+    if (T518AcceptRefdefByval() != 70211020) return 51893;
+    if (T518AcceptRefdefNonconstNamed() != 90210010) return 51894;
+    if (T518AcceptRefdefNonconstLvalueConditional() != 90210010) return 51895;
+    if (T518BoundRefdefConstMixed() != 70211020) return 51896;
+    if (T518BoundRefdefConstDefaultTrue() != 220020) return 51897;
+    if (T518BoundRefdefConstDefaultReverse() != 220020) return 51898;
+    if (T518BoundRefdefConstNoWrite() != 70211020) return 51899;
+    if (T518BoundRefdefByval() != 70211020) return 51900;
+    if (T518BoundRefdefNonconstMixed() != 90210010) return 51901;
+    if (T518BoundRefdefNonconstReverse() != 220020) return 51902;
+    if (T518BoundRefdefOverMixed() != 90210010) return 51903;
+    if (T518BoundRefdefOverDefaultTrue() != 220020) return 51904;
+    if (T518BoundRefdefOverDefaultReverse() != 220020) return 51905;
+    if (T518TernaryConstRef() != 70211020) return 51910;
+    if (T518TernaryRref() != 70211020) return 51911;
+    if (T518TernaryRrefDefaultReverse() != 220020) return 51912;
+    if (T518TernaryOverRefMixed() != 70211020) return 51913;
+    if (T518TernaryOverRefDefaultTrue() != 220020) return 51914;
+    if (T518TernaryOverRefDefaultReverse() != 220020) return 51915;
+    if (T518TemplateDefaultTrue() != 220020) return 51916;
+    if (T518TemplateDefaultReverse() != 220020) return 51917;
+    if (T518TemplateDefaultNoSibling() != 70211020) return 51918;
+    if (T518ConvfTdefSibY() != 230030) return 51919;
+    if (T518ConvfTdefSibX() != 230030) return 51920;
+    if (T518ConvfFdefSibY() != 7221030) return 51921;
+    if (T518ConvfFdefSibX() != 7221030) return 51922;
+    if (T518ConvfTxdSibY() != 7221030) return 51923;
+    if (T518ConvfTxdSibX() != 7221030) return 51924;
+    if (T518ConvfFxdSibY() != 230030) return 51925;
+    if (T518ConvfFxdSibX() != 230030) return 51926;
+    if (T518TconvTdefSibY() != 230030) return 51927;
+    if (T518TconvTdefSibX() != 230030) return 51928;
+    if (T518TconvFdefSibY() != 7221030) return 51929;
+    if (T518TconvFdefSibX() != 7221030) return 51930;
+    if (T518TconvTxdSibY() != 7221030) return 51931;
+    if (T518TconvTxdSibX() != 7221030) return 51932;
+    if (T518TconvFxdSibY() != 230030) return 51933;
+    if (T518TconvFxdSibX() != 230030) return 51934;
     if (T518Mixed() != 2902) return 51809;
     if (T518Pod(false) != 1702) return 51810;
     if (T518Pod(true) != 1002) return 51811;
