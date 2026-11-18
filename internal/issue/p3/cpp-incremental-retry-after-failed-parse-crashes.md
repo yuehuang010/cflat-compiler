@@ -29,3 +29,29 @@ libtorch t14-t16 (first bad 9b825a07): a wrapper naming a protected nested type 
 request, and the retry's rename rebuilt bitcode from clang's per-chunk module, dropping bodies.
 943ea9ab renames inside the harvested bitcode and builds no wrapper that names a non-public nested
 type; guard legs 3637-3639 (cppexp::PrivLoader).
+
+## Repro attempts (2026-11-10, a3retry; no crash, no fix)
+
+Master exe, `CFLAT_CACHE_DIR` isolated, `-B -v`. Headers are in-repo shapes, not system headers.
+None of the three entered DropBlamedDeclarations (0 "dropped declarations" lines), so none
+exercised the trigger.
+
+1. `template <class T> struct Box { T v; int plain(); int get() { return v.missing(); } int
+   twice() { return get() * 2; } };` with `Box<int> b = default; b.twice()`: located error
+   "member 'twice' of C++ class 'Box<int>' cannot be instantiated" (rc 1), no retry.
+2. `template <class T> struct Sm { static const int k = T::nothing; int plain(); };` with
+   `Sm<int> s = default; s.plain()`: "could not be instantiated: clang reported an invalid
+   specialization" (rc 1), no retry.
+3. `template <class T> struct Da { T v; int get(int k = T::missing()); };` with
+   `Da<int> d = default; d.get()`: "clang: type 'int' cannot be used prior to '::'" (rc 1).
+
+Retries on master are reached only from generated-code errors: test_cpp_interop.cb with -v
+logs 71 "dropped declarations" lines (mostly "use of undeclared identifier 'a1'" and "no
+matching constructor").
+
+Lead, unverified: DropBlamedDeclarations (CxxIncrementalGroup.cpp ~622) drops a kept-or-blamed
+segment for a failed member only when its text is `::m)`, `->m(` or `.m(`. The generated
+static-variable use helper (LLVMBackend_CHeaderDemand.cpp ~2330) is `(void)&Marker::var;`, which
+none of those match. A static member that fails, with its error blamed elsewhere in the chunk,
+would then be kept and re-parsed against the poisoned member. Next attempt: force a retry whose
+blamed segment is a sibling helper, not the static-var helper.

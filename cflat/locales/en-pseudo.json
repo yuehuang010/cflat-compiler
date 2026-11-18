@@ -517,6 +517,9 @@
       "c0, c1, c2, c3, c4",
       "2"
     ],
+    "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": [
+      "p0"
+    ],
     "cannotreturnanarrayv...theelementsmustmatch03392cfecad7b037": [
       "AvmIface",
       "int"

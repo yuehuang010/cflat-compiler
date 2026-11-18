@@ -390,6 +390,7 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                                      destTypeName.TypeName);
                 namedVar = ParseCastExpression(castExp, false,
                     destIsVoid ? ResultUse::Discard : ResultUse::Value);
+                NormalizeCxxReferenceNamed(ctx, namedVar);
                 castTernaryConsumed = ternaryDestination.Consumed();
             }
             if (castTernaryConsumed)
@@ -2408,6 +2409,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                                 "the destination as '{}'",
                                 functionName, functionValueTypeName, functionValueTypeName));
                         }
+                        namedVar.IsCxxAddressOfFunction = true;
                         return namedVar;
                     }
                 }

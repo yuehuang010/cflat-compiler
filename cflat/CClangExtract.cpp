@@ -1301,7 +1301,12 @@ namespace cflat_cinterop
                             identity = CalleeIdentity(ctx, callee);
                             continue;
                         }
-                    if (const ParmVarDecl* parm = wrapperParameter(arg->IgnoreParenImpCasts());
+                    // `static_cast<X *&&>(pK)` forwards an `X *&&` parameter as the xvalue it names.
+                    const Expr* forwarded = arg->IgnoreParenImpCasts();
+                    if (const auto* cast = llvm::dyn_cast<CXXStaticCastExpr>(forwarded);
+                        cast != nullptr && cast->getTypeAsWritten()->isRValueReferenceType())
+                        forwarded = cast->getSubExpr()->IgnoreParenImpCasts();
+                    if (const ParmVarDecl* parm = wrapperParameter(forwarded);
                         parm != nullptr && parm->getType()->isReferenceType()
                         && parm->getType().getNonReferenceType()->isPointerType()
                         && identity.empty())
@@ -2138,7 +2143,9 @@ namespace cflat_cinterop
                 fpt = sema.ResolveExceptionSpec(fd->getLocation(), fpt);
             ExceptionSpecificationType est = fpt != nullptr
                 ? fpt->getExceptionSpecType() : fd->getExceptionSpecType();
-            return est == EST_BasicNoexcept || est == EST_NoexceptTrue || est == EST_NoThrow;
+            // `throw()` is noexcept(true) since C++17.
+            return est == EST_BasicNoexcept || est == EST_NoexceptTrue || est == EST_NoThrow
+                || est == EST_DynamicNone;
         }
 
         /*
@@ -3511,7 +3518,8 @@ namespace cflat_cinterop
                 sig.isNoexcept = !st.req.cxxMode
                     || fd->getExceptionSpecType() == EST_BasicNoexcept
                     || fd->getExceptionSpecType() == EST_NoexceptTrue
-                    || fd->getExceptionSpecType() == EST_NoThrow;
+                    || fd->getExceptionSpecType() == EST_NoThrow
+                    || fd->getExceptionSpecType() == EST_DynamicNone;
                 sig.file = file; sig.line = line; sig.col = col;
                 sig.physicalFile = PhysicalFileOf(fd, file);
                 /*

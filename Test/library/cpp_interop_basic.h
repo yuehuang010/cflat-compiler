@@ -964,7 +964,7 @@ namespace cppi
 
     void unsupported_param(_Float16 value) noexcept;
     // A reference over a THREE-level pointer: the mapper folds ONE reference level into
-    // IsCxxRefToPointer, never two, so this stays refused while `T **const &` binds.
+    // IsCxxRefToPointer, so `T ***const &` binds at depth 3 and refuses a depth-2 argument.
     struct PtrDepthOwner { int value; };
     int ptr_depth3_ref_param(PtrDepthOwner ***const &value) noexcept;
     struct MemberPointerOwner { int value; };

@@ -4,13 +4,9 @@
 - (counts differ from clang; no leak on current binaries) `take2T(h2, k ? mkHT() : move h1)` with a later sibling copy throwing (e3.cb): worktree/master construct the `mkHT()` join before copying `h2` (rv.C 4/4, th.T 3/3); clang copies `h2` first, throws, and never evaluates `mkHT()` (rv.C 3/3, th.T 2/2). The join owner is already registered in the resume block. Root cause is delayed by-value argument materialization after later arguments; preserve clang's evaluated order.
 - (pre-existing) `k ? move h1 : h2;` as an expression statement does no move/copy and zeroes h1 (disc.cb).
 - (pre-existing) by-value first-argument unwind leak (e2b.cb, e2c.cb), master the same.
-  Sret CALL result as the first by-value argument with a throwing later sibling: `hv2(mkH(1), rq.thrower(x))`
-  through rq.guarded leaks (dt 0, clang 1), master the same (reviewer repro scratch/rev_t264_opus_repro/T8.cb).
-  The argument-join form (`hv2(k ? mkH(1) : mkH(2), thrower)`) is fixed by T264 round 2 (owner registered in the resume block, disarmed at the adopting call).
 
 ## From T263 review 1 (pre-existing on master; Host = CFlat struct with a C++ field; repros scratch/repro_keep/t263_rev/)
-- (T264 review 2, unwind leak, master the same) a first argument that is a call result, not a bare join, leaks when a later
-  sibling throws: `hv2(gid(mkH(1)), rq.thrower(x))`, `hv2(gid(k ? mkH(1) : mkH(2)), rq.thrower(x))`. `rq.cref(k ? mkC(1) : mkC(2))` does one extra move+destroy vs clang, but the direct sibling `rq.cref(mkC(1))` has the same mismatch; this is CFlat-return materialization, not a ternary-only failure.
+- (T264 review 2) `rq.cref(k ? mkC(1) : mkC(2))` does one extra move+destroy vs clang, but the direct sibling `rq.cref(mkC(1))` has the same mismatch; this is CFlat-return materialization, not a ternary-only failure.
   Repros scratch/repro_keep/t264_rev/.
 
 ## T288 review 1 leftovers (pre-existing on master, not fixed by T288)

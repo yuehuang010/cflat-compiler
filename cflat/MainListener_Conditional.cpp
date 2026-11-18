@@ -1925,6 +1925,39 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                 if (t->isVoidTy()) return "void";
                 return "unknown";
             };
+            // A literal zero or a closure beside a function-slot arm is the slot rule, not a type
+            // clash (rulings 2026-10-20, 2026-10-31). Decided from the arm values, not their text.
+            auto armType = [&](const LLVMBackend::TypedValue& shape) {
+                return shape.hasSourceType ? shape.sourceType : InferTernaryArmType(shape);
+            };
+            const auto trueArm = armType(trueShape);
+            const auto falseArm = armType(falseShape);
+            const auto isFnSlotArm = [](const LLVMBackend::TypeAndValue& t, llvm::Value* v) {
+                return t.IsFunctionPointer || llvm::isa<llvm::Function>(v);
+            };
+            const auto isLiteralZero = [](llvm::Value* v) {
+                auto* c = llvm::dyn_cast_or_null<llvm::ConstantInt>(v);
+                return c != nullptr && c->isZero();
+            };
+            const auto isClosureArm = [](const LLVMBackend::TypeAndValue& t) {
+                return t.TypeName == "__closure_fat_ptr";
+            };
+            if ((isLiteralZero(falseValue) && (isFnSlotArm(trueArm, trueValue) || isClosureArm(trueArm)))
+                || (isLiteralZero(trueValue) && (isFnSlotArm(falseArm, falseValue) || isClosureArm(falseArm))))
+            {
+                LogErrorContext(ctx,
+                    "integer constant zero is not a null spelling for a function slot; use 'nullptr'");
+                return false;
+            }
+            const auto isThinFnArm = [&](const LLVMBackend::TypeAndValue& t, llvm::Value* v) {
+                return isFnSlotArm(t, v) || llvm::isa<llvm::ConstantPointerNull>(v);
+            };
+            if ((isClosureArm(trueArm) && isThinFnArm(falseArm, falseValue))
+                || (isClosureArm(falseArm) && isThinFnArm(trueArm, trueValue)))
+            {
+                LogErrorContext(ctx, compiler->DescribeCapturingClosureToThin({}));
+                return false;
+            }
             // ctx->expression() is the true branch; ctx->conditionalExpression() the false.
             LogErrorContext(ctx, std::format(
                 "ternary branches have incompatible types '{}' and '{}'",
@@ -2074,6 +2107,9 @@ void MainListener::JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
         if (result.value != nullptr && result.value->getType()->isPointerTy()
             && (trueArm.cxxPointeeConst || falseArm.cxxPointeeConst))
             result.cxxPointeeConst = true;
+        if (result.value != nullptr && result.value->getType()->isPointerTy()
+            && (trueArm.cxxSpelledCvrQualifier || falseArm.cxxSpelledCvrQualifier))
+            result.cxxSpelledCvrQualifier = true;
         // Two integer arms naming one non-primitive type (an enum) keep it; the reader resolves it.
         if (result.value != nullptr && result.value->getType()->isIntegerTy()
             && trueArm.pointerDepth == 0 && falseArm.pointerDepth == 0
@@ -2608,7 +2644,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     llvm::cast<llvm::PointerType>(value.value->getType()));
             return value;
         };
-        const bool autoDeclTernary = std::exchange(autoDeclTernaryActive_, false);
+        const bool deferredNewCxxTernarySlot = ctx == newCxxTernaryElisionCandidate_
+            && newCxxTernaryElisionDest_ != nullptr && !newCxxTernaryElisionType_.empty();
+        const bool autoDeclTernary = std::exchange(autoDeclTernaryActive_, false)
+            || deferredNewCxxTernarySlot;
         LLVMBackend::TypeAndValue pointerJoinDest;
         if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
             pointerJoinDest = outerExpected;
@@ -3055,6 +3094,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         llvm::Value* falseValue = nullptr;
         // Each arm's pointer shape (pointee name + depth), joined onto the result when both agree.
         LLVMBackend::TypedValue trueShape, falseShape;
+        llvm::Value* trueStorage = nullptr;
+        llvm::Value* falseStorage = nullptr;
         llvm::UncondBrInst* trueBr  = nullptr;
         llvm::UncondBrInst* falseBr = nullptr;
         llvm::BasicBlock* trueEnd = nullptr;
@@ -3076,6 +3117,54 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         st != nullptr && st->hasName())
                         type.TypeName = st->getName().str();
             return type;
+        };
+        auto consumeNewCxxTernaryElision = [&](LLVMBackend::TypedValue& joined) {
+            if (ctx != newCxxTernaryElisionCandidate_
+                || newCxxTernaryElisionDest_ == nullptr
+                || newCxxTernaryElisionType_.empty() || joined.value == nullptr
+                || !joined.isRvalue || joined.isAlias
+                || trueValue == nullptr || falseValue == nullptr)
+                return false;
+            const std::string targetName = compiler->ResolveTypeAlias(newCxxTernaryElisionType_);
+            if (targetName.empty() || !compiler->IsForeignNontrivialCxxClass(targetName))
+                return false;
+            auto* targetType = compiler->GetType(
+                LLVMBackend::TypeAndValue{ .TypeName = targetName });
+            if (targetType == nullptr || joined.value->getType() != targetType)
+                return false;
+            auto isExactArm = [&](const LLVMBackend::TypedValue& shape, llvm::Value* value,
+                                  llvm::Value* storage) {
+                const auto type = ternaryArmSourceType(shape, value, storage);
+                return value != nullptr && value->getType() == targetType
+                    && !type.Pointer && !type.ElemPointer && !type.IsCxxRef()
+                    && !type.IsArrayView && !type.IsInterface && !type.IsUnique
+                    && !type.TypeName.empty()
+                    && compiler->ResolveTypeAlias(type.TypeName) == targetName;
+            };
+            if (!isExactArm(trueShape, trueValue, trueStorage)
+                || !isExactArm(falseShape, falseValue, falseStorage))
+                return false;
+            auto* resultSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(joined.storage);
+            if (resultSlot == nullptr || resultSlot == newCxxTernaryElisionDest_
+                || resultSlot->getAllocatedType() != targetType
+                || compiler->FindVariableByStorage(resultSlot) != nullptr)
+                return false;
+            const auto ownedResult = std::find_if(compiler->pendingOwnedStructTemps.begin(),
+                compiler->pendingOwnedStructTemps.end(), [&](const auto& temp) {
+                    return temp.Alloca == resultSlot
+                        && compiler->ResolveTypeAlias(temp.TypeName) == targetName;
+                });
+            if (ownedResult == compiler->pendingOwnedStructTemps.end()) return false;
+
+            resultSlot->replaceAllUsesWith(newCxxTernaryElisionDest_);
+            compiler->UnregisterOwnedStructTemp(resultSlot);
+            joined.storage = newCxxTernaryElisionDest_;
+            joined.receiverStorage = newCxxTernaryElisionDest_;
+            compiler->lastCxxRetTemp_ = newCxxTernaryElisionDest_;
+            compiler->lastCxxRetValue_ = joined.value;
+            compiler->pendingCxxTernaryDeclConsumed_ = true;
+            compiler->pendingCxxTernaryDeclFailed_ = false;
+            return true;
         };
         // Emits a deferred lvalue or xvalue derived arm at the end of its own arm, once the other arm
         // is known. Mixed categories of one derived class join as a prvalue (clang): the arm copies
@@ -3118,8 +3207,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         bool falseOwnedString = false;
         bool trueAlias = false;
         bool falseAlias = false;
-        llvm::Value* trueStorage = nullptr;
-        llvm::Value* falseStorage = nullptr;
         bool trueTempField = false;
         bool falseTempField = false;
         bool trueUnsigned = false;
@@ -3894,6 +3981,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     joined.sourceType = LLVMBackend::TypeAndValue{ .TypeName = trueName };
                     joined.sourceTypeName = trueName;
                     joined.hasSourceType = true;
+                    consumeNewCxxTernaryElision(joined);
                     return joined;
                 }
             }
@@ -4368,7 +4456,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         };
         const auto cxxValueJoinResult = lowerMixedCxxValueJoin();
         if (cxxValueJoinResult == CxxValueJoinResult::CallArgumentBuilt)
+        {
+            consumeNewCxxTernaryElision(cxxCallArgumentValue);
             return cxxCallArgumentValue;
+        }
 
         if (cxxTernaryDecl && !cxxTernaryDeclFailed && cxxTernaryDeclArmsMoved == 2)
         {
@@ -5962,6 +6053,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         }
         compiler->lastCallIsBonded = trueBonded || falseBonded;
         compiler->lastCallBondedSources = std::move(ternaryBondedSources);
+        consumeNewCxxTernaryElision(result);
         return result;
     }
 
@@ -7375,8 +7467,7 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                                                            rv.pointerDepth, rv.elemPointer,
                                                            accumulatorStorage, rv.receiverStorage,
                                                            true, true, accumulatorIsRvalue, rv.isRvalue,
-                                                           acc == lv.value ? lv.sourceTypeName
-                                                                           : std::string(),
+                                                           accumulatorSourceTypeName,
                                                            rv.sourceTypeName,
                                                            acc == lv.value ? lv.pointerDepth : 0,
                                                            acc == lv.value && lv.elemPointer, {}, {},
@@ -7493,8 +7584,7 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                                                            rv.pointerDepth, rv.elemPointer,
                                                            accumulatorStorage, rv.receiverStorage,
                                                            true, true, accumulatorIsRvalue, rv.isRvalue,
-                                                           acc == lv.value ? lv.sourceTypeName
-                                                                           : std::string(),
+                                                           accumulatorSourceTypeName,
                                                            rv.sourceTypeName,
                                                            acc == lv.value ? lv.pointerDepth : 0,
                                                            acc == lv.value && lv.elemPointer, {}, {},

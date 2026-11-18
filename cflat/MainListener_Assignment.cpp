@@ -766,6 +766,14 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                     if (joinShape.value == result.Primary && joinShape.hasSourceType
                         && result.TypeAndValue.TypeName.empty())
                         result.TypeAndValue = joinShape.sourceType;
+                    if (std::string enumKey = compilerLLVM->ResolveEnumTypeName(tv.sourceTypeName);
+                        !enumKey.empty() && compilerLLVM->importedEnumTypes_.count(enumKey) != 0)
+                    {
+                        result.TypeAndValue.TypeName = enumKey;
+                        result.TypeAndValue.EnumBacking = compilerLLVM->GetEnumBackingType(enumKey);
+                        result.TypeAndValue.IsScopedEnum = compilerLLVM->IsScopedEnumTypeName(enumKey);
+                        result.TypeAndValue.IsAlias = tv.isAlias;
+                    }
                     if (result.TypeAndValue.TypeName.empty()
                         && result.BaseType->isStructTy()
                         && compilerLLVM->IsCxxRecord(tv.sourceTypeName))
@@ -802,11 +810,13 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                         }
                         // A `?:` whose two arms are one enum type is that enum, as in C++.
                         if (std::string enumKey = compilerLLVM->ResolveEnumTypeName(tv.sourceTypeName);
-                            !enumKey.empty() && (condCtx->Question() != nullptr))
+                            !enumKey.empty() && (condCtx->Question() != nullptr
+                                || compilerLLVM->importedEnumTypes_.count(enumKey) != 0))
                         {
                             result.TypeAndValue.TypeName = enumKey;
                             result.TypeAndValue.EnumBacking = compilerLLVM->GetEnumBackingType(enumKey);
                             result.TypeAndValue.IsScopedEnum = compilerLLVM->IsScopedEnumTypeName(enumKey);
+                            result.TypeAndValue.IsAlias = tv.isAlias;
                         }
                     }
                     // A '?:' join of two interface values yields a phi/select with no NamedVariable
@@ -933,6 +943,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 }
                 result.TypeAndValue.SetPointeeConstBit(joinShape.value == result.Primary
                     && joinShape.cxxPointeeConst && result.TypeAndValue.Pointer);
+                if (joinShape.value == result.Primary && joinShape.cxxSpelledCvrQualifier)
+                    result.TypeAndValue.CxxSpelledCvrQualifier = true;
             }
             if (result.Primary != nullptr && compilerLLVM->IsTempFieldValue(result.Primary))
             {
@@ -1216,6 +1228,8 @@ bool MainListener::JoinArmIsProvablyNull(llvm::Value* arm, int depth) const {
         // An escaping slot can be written through a pointer no store here accounts for, so the
         // store survey below would not be a survey of every reaching definition.
         if (slot == nullptr || !compilerLLVM->AllocaIsLoadStoreOnly(slot)) return false;
+        // The survey sees only the stores emitted so far, not one that follows this join on a back-edge.
+        if (compilerLLVM->LoopMayRebindSlotToBorrow(slot)) return false;
         bool sawStore = false;
         for (llvm::User* u : slot->users())
         {
@@ -7027,6 +7041,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
                 return hasFreshOwner && (hasNamedOwner || arms.size() > 1);
             };
+            // Chained-'=' inputs read BEFORE the store consumes the RHS: finishStore runs after the
+            // consume side effects, which clear the fresh-owner ledger on the join arms.
+            bool rawJoinOwnsArms = false;
+            llvm::Value* rawAliasChainSlot = nullptr;
+            bool middleKeepsBorrow = false;
+            bool chainMiddleAdoptsInArm = false;
+            std::string rawAliasChainName;
             auto finishStore = [&](llvm::Value* v) -> llvm::Value* {
                 llvm::Value* resultValue = v;
                 // A '=' store re-initializes a destination field path AFTER any source consume, so
@@ -7098,14 +7119,29 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         // T203/T250: a local slot fed by `new` (or ?: of new/nullptr) is recorded for an
                         // outer unique '='. Any other RHS keeps the borrow.
                         bool sawNewArm = false;
-                        if (llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
-                            && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                        const bool localRawDest = llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
+                            && namedVar.FieldName.empty() && !namedVar.CallerName.empty();
+                        if (localRawDest
                             && ((OwnedOrNullArms(assignCtx, sawNewArm) && sawNewArm
                                     && RawNewArrayValueOf(assignCtx) == nullptr)
-                                || chainedAssignmentJoinOwns(storedValue)))
+                                || rawJoinOwnsArms))
                         {
                             assignmentResult->ChainedAssignSlot = destination;
                             assignmentResult->ChainedAssignName = namedVar.CallerName;
+                        }
+                        // `a = b = c = new T()`: the middle raw local is an alias of the owning slot
+                        // c, exactly as `b = c;` leaves it (the outer '=' then consumes c).
+                        else if (localRawDest && rawAliasChainSlot != nullptr)
+                        {
+                            assignmentResult->ChainedAssignSlot = rawAliasChainSlot;
+                            assignmentResult->ChainedAssignName = rawAliasChainName;
+                            // The value is a read of the middle, so a '?:' arm consumes it as `c ? b : x` does.
+                            if (!middleKeepsBorrow)
+                            {
+                                assignmentResult->Primary = compiler->builder->CreateLoad(
+                                    resultValue->getType(), rawAliasChainSlot);
+                                resultValue = assignmentResult->Primary;
+                            }
                         }
                     }
                 }
@@ -7210,6 +7246,43 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
+            if (operatorText == "=" && coalesceResume == nullptr && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsUnique && llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
+                && namedVar.FieldName.empty() && !namedVar.CallerName.empty())
+            {
+                // `b = (e = ...)` is `e = ...; b = e;`: read e as that statement does, in every position. A middle
+                // that cannot own what it reads (parameter, alias, other pointee) leaves e the owner.
+                const auto* innerVar = rightNV.ChainedAssignSlot != nullptr
+                    ? compiler->FindVariableByStorage(rightNV.ChainedAssignSlot) : nullptr;
+                const bool middleCanOwn = innerVar != nullptr && !namedVar.TypeAndValue.IsAlias
+                    && !namedVar.IsAliasBorrow && compiler->FindStackArgumentByStorage(destination) == nullptr
+                    && namedVar.TypeAndValue.TypeName == innerVar->TypeAndValue.TypeName;
+                // A void* middle has no borrow to report: it stays the chain slot so `a = v;` refuses by type.
+                if (middleCanOwn || (innerVar != nullptr && namedVar.TypeAndValue.TypeName == "void"))
+                {
+                    rawAliasChainSlot = destination;
+                    rawAliasChainName = namedVar.CallerName;
+                }
+                if (middleCanOwn)
+                {
+                    // In a '?:' or '??' arm this store adopts e's value and takes over from e, so the join
+                    // has one owner, the middle, to consume. Elsewhere it reads e as `b = e;` does.
+                    chainMiddleAdoptsInArm = IsInConditionalArm(assignCtx);
+                    llvm::Value* chainValue = rightNV.Primary;
+                    LLVMBackend::NamedVariable innerRead = *innerVar;
+                    innerRead.CallerName = rightNV.ChainedAssignName;
+                    innerRead.Primary = nullptr;
+                    rightNV = innerRead;
+                    rightNV.Primary = chainMiddleAdoptsInArm ? chainValue : LoadNamedVariable(innerRead);
+                }
+                else if (innerVar != nullptr)
+                {
+                    middleKeepsBorrow = true;
+                    compiler->NoteChainBorrowMiddle(rightNV.Primary, namedVar.CallerName);
+                }
+                else
+                    rawJoinOwnsArms = chainedAssignmentJoinOwns(rightNV.Primary);
+            }
             // A move argument is read without IsMove (ParseIdentifier). A string argument arrives
             // owned (LowerByValueArg), so a global/field/deref store transfers it; a deref always does.
             if (operatorText == "=" && destination != nullptr && isDerefStorage()
@@ -7246,6 +7319,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 rightNV.IsRvalue = true;
             }
             if (RefuseImmovableAssignSource(compiler, ctx, operatorText, rightNV)) return nullptr;
+            // A '?:' or '??' arm that is a chain through such a middle is a borrow of e, as `a = p;` is.
+            if (operatorText == "=" && (namedVar.TypeAndValue.IsUnique
+                    || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)))
+                if (const std::string middle = compiler->ChainBorrowMiddleArmName(rightNV.Primary); !middle.empty())
+                {
+                    std::string uniqueType = SpellType(*compiler, namedVar.TypeAndValue);
+                    while (uniqueType.ends_with("*")) uniqueType.pop_back();
+                    LogErrorContext(assignCtx, std::format(
+                        "cannot reset {} '{}' from borrowed value '{}' - the source still owns it; "
+                        "use 'new', a 'move' expression, or a move-returning call",
+                        uniqueType, namedVar.CallerName, middle));
+                    return finishStore(nullptr);
+                }
             // T203: `owner = raw = new T()` - the inner '=' left its local slot owning the object.
             // A unique destination takes that slot as its RHS, exactly as `owner = raw;` does.
             if (operatorText == "=" && !namedVar.TypeAndValue.Pointer
@@ -7254,12 +7340,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && IsChainedAssignmentShape(assignCtx))
             {
                 const auto* slotVar = compiler->FindVariableByStorage(rightNV.ChainedAssignSlot);
-                if (slotVar != nullptr && slotVar->IsOwning)
+                if (slotVar != nullptr && compiler->ChainSlotReadsAsNamed(*slotVar, rightNV.Primary))
                 {
                     const std::string slotName = rightNV.ChainedAssignName;
+                    const bool readThroughVoidMiddle = !slotVar->IsOwning && !slotVar->BorrowsOwningLocal
+                        && !slotVar->OwningLocalBorrowAfterRebind;
                     rightNV = *slotVar;
-                    rightNV.Primary = nullptr;
                     rightNV.CallerName = slotName;
+                    rightNV.Primary = slotVar->IsOwning ? nullptr : LoadNamedVariable(rightNV);
+                    // `a = v;` refuses by type; the borrow of e recorded on v is not this error.
+                    if (readThroughVoidMiddle) { rightNV.IsBorrowed = false; rightNV.BorrowedOrigin.clear(); }
                 }
             }
             // `t = std.move(x)` of a trivially copyable C++ class: the xvalue's referent is
@@ -7344,8 +7434,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && rightNV.Storage != destination ? nullptr : existingDestination;
             if (operatorText == "=" && namedVar.FieldName.empty()
                 && llvm::isa<llvm::AllocaInst>(destination)
-                && ShouldBorrowPlainPointerBinding(
-                    namedVar.TypeAndValue, rightNV, borrowDestination, false))
+                && ShouldBorrowPlainPointerBinding(namedVar.TypeAndValue, rightNV, borrowDestination,
+                    chainMiddleAdoptsInArm))
             {
                 const auto* sourceBinding = rightNV.Storage != nullptr
                     ? compiler->FindVariableByStorage(rightNV.Storage)
@@ -7591,6 +7681,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         ? rightNV.CallerName : rightNV.BorrowedOrigin;
                     std::string storeBorrowUniqueField = rightNV.BorrowedUniqueField;
                     bool storeSrcIsBorrow = rightNV.IsBorrowed;
+                    // A '??' or '?:' arm read from a raw slot declared outside the loop may be a borrow stored
+                    // on the back-edge; the store records it as a borrow of that slot, as `b = src;` would.
+                    if (!storeSrcIsBorrow && !rightNV.TypeAndValue.IsMove)
+                        if (std::string loopArm = compiler->LoopUnknownJoinArmName(rightNV.Primary);
+                            !loopArm.empty())
+                        {
+                            storeSrcIsBorrow = true;
+                            storeBorrowOrigin = loopArm;
+                        }
                     // Trap B: a plain copy of a `unique` field borrows the field - its synthesized
                     // destructor is still the owner. `move b.p` extracts instead and carries IsMove.
                     if (!storeSrcIsBorrow && !rightNV.TypeAndValue.IsMove
@@ -9273,6 +9372,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         }
                     }
                     if (cxxClassCompoundAttempted)
+                        overload = emitCxxCompound();
+                    // An imported C++ enum left operand: the written compound first, as C++ looks
+                    // it up; no `operator@=` naming the enum leaves the desugared form below.
+                    else if (!binaryOp.empty() && left != nullptr && left->getType()->isIntegerTy()
+                        && !isCxxClassValue(right)
+                        && !LLVMBackend::IsPrimitiveTypeName(namedVar.TypeAndValue.TypeName)
+                        && compiler->importedEnumTypes_.count(
+                            compiler->ResolveEnumTypeName(namedVar.TypeAndValue.TypeName)) != 0)
                         overload = emitCxxCompound();
                     if (!cxxClassCompoundAttempted && !binaryOp.empty() && left != nullptr
                         && left->getType()->isStructTy())

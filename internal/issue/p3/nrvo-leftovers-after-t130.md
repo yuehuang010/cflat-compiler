@@ -31,6 +31,20 @@ slot when every return names it. T224 (2026-10-14) landed the single-local cases
 1. `construct_at(slot, T(f(x)))` with a nested call argument (and the declaration `C c = T(f(x))`)
    still builds a temporary and moves it: clang 1 / 0, we 2 / 1. The single-call arming rule refuses
    any nested call; lifting it needs a proof that the inner call cannot take the armed slot.
+   Same arming rule, declaration form (fix/retelide probe, clang 1 ctor / 0 move / 0 copy for the result):
+       S c2(S p) { S g = move p; return g; }   // now matches clang
+       S x = c2(S(5));                         // caller: x copy-constructed from the result temp (ctor 1, copy 1)
+   The nested prvalue argument `S(5)` disarms the caller's result elision. Same family as item 1.
+2. Brace init of a C++ class from one same-class constructor prvalue (`S x = { S(7) };`) is built in place since
+   BRACEPRV (the brace wrapper spells `S{ S(7) }`, clang elides). Still open: a CALL prvalue element (`S x = { mk(7) };`,
+   `{ (mk(7)) }`, `S x { mk(7) }`, and `Outer o = { mk(3), 1 }` into an aggregate member): clang 1 ctor / 0 move /
+   1 dtor, we 1 / 1 / 2 (the call result is a CFlat temp moved in by the wrapper). Needs the call itself spelled in
+   the wrapper or its sret aimed at the element; not a constructor, so BRACEPRV does not defer it.
+   Also open (BRACEPRV order rule): a constructor element is deferred only when every LATER element is a literal or a
+   construction from literals, and no earlier element left a CFlat class temp. So `int k = 4; Outer o = { BS(k, 1), k };`
+   (braceprv.hpp shapes) still moves: 1 ctor / 1 move / 1 dtor in scope, clang 1/0/0. Lifting it needs a proof that the
+   later element cannot observe the constructor (a local read the constructor may write through a pointer).
+3. Paren-aggregate `CM l = CM(S(5), 3);` with `struct CM { S c; int k = 9; };` (see cpp-paren-aggregate-prvalue-member-move.md).
 
 T224 review 1 notes: clang's rule fits all four multi-candidate oracle shapes - a variable is elided when
 every return inside its scope, after its declaration, names it (no maintainer decision needed; it is
@@ -42,10 +56,18 @@ clang parity). (By-value argument temp extra move fixed by T231.)
   variable" (master too).
 
 ## Open after T272 (2026-10-15)
-- `Cnt x = { (mk(7)) };` and bare `Cnt x = { mk(7) };` / `Cnt x { mk(7) };` (one element of the class's own
-  type) copy: 107-style (v 1007 / 2 ctors / 1 dtor) vs clang 7/1/0. Pre-existing, not paren-specific: the
-  brace-to-same-class element goes through the brace wrapper (RequestCxxDirectBraceConstructor) which copies.
-  Repro scratch/t272_tmp/bare2_cf.cb (master and fix equal).
-- (T272 review 1, PRE-EXISTING, not paren-specific) brace init of a C++ class from a same-class prvalue element:
-  `Cnt x = { mk(7) };` and `Cnt x = { (mk(7)) };` give 100722 on master and after T272 (clang 711) - the brace-to-same-class
-  element path copies instead of eliding.
+- The T272 same-class call-element shapes (`Cnt x = { mk(7) };`, `{ (mk(7)) }`) are item 2's call residue.
+
+## RETELIDE round 2 (2026-11-10)
+- Lambda-body named return of a C++ class: `function<rv.S(int)> k = (int r) => { rv.S a = rv.S(r); return a; }; return k(q);`
+  gives 1/0/1/2 (one move, two dtors) on master and after RETELIDE; clang++ -std=c++20 gives 1/0/0/1. Cause: only
+  ParseFunctionDefinition calls ClassifyNamedLocalReturnCandidates, so lambda bodies never get the NRVO sret path, and
+  the lambda return type is only known from the target function<> type at emission. Repro: scratch/rev_retelide_repro/lam2.cb
+  (clang twin lam2_clang.cpp, rv.hpp shared).
+
+## `auto` locals of an imported C++ class (2026-11-10)
+
+`rv.S f() { auto a = rv.S(1); return a; }`: CFlat 1 ctor / 1 move / 2 dtors, clang 1/0/1 (master the same). Removing the
+`IsForeignNontrivialCxxReturnClass` exclusion at the `ParseDeclaration` wrapper gate elides it but needs (a) the reachable-ctor
+query also applied there, or a class with a private move is accepted, and (b) `TypeName` compared before `GetType`, or
+`auto a = 3` beside a class return type is refused "cannot find the type 'auto'".

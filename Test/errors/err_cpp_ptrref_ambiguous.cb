@@ -1,0 +1,57 @@
+import cpp "cpp_ptrref.hpp";
+
+// PTRREF: ties clang reports ambiguous. A string literal at `const char (&)[4]` is an identity bind
+// and at `const char *const &` an array-to-pointer decay, an lvalue transformation the ranking
+// ignores; a CFlat array decays to a pointer for both `const char *const &` and `const char *`.
+extern int main()
+{
+    expect_error("ambiguous call to 'cpp_ptrref.f3'") {
+        cpp_ptrref.f3("abc");
+    }
+    expect_error("ambiguous call to 'cpp_ptrref.fb'") {
+        cpp_ptrref.fb("abc");
+    }
+    expect_error("ambiguous call to 'cpp_ptrref.f6'") {
+        cpp_ptrref.f6("abc");
+    }
+    expect_error("ambiguous call to 'm3'") {
+        cpp_ptrref.S s = cpp_ptrref.S();
+        s.m3("abc");
+    }
+    expect_error("ambiguous call to 'mb'") {
+        cpp_ptrref.S s = cpp_ptrref.S();
+        s.mb("abc");
+    }
+    expect_error("matches more than one constructor overload") {
+        cpp_ptrref.C3 c = cpp_ptrref.C3("abc");
+    }
+    expect_error("matches more than one constructor overload") {
+        cpp_ptrref.Cb c = cpp_ptrref.Cb("abc");
+    }
+    expect_error("matches more than one constructor overload") {
+        cpp_ptrref.C6 c = cpp_ptrref.C6("abc");
+    }
+    expect_error("ambiguous call to 'cpp_ptrref.f4'") {
+        char[4] a = "abc";
+        cpp_ptrref.f4(a);
+    }
+    expect_error("ambiguous call to 'cpp_ptrref.f9'") {
+        char[4] a = "abc";
+        cpp_ptrref.f9(a, 1);
+    }
+    expect_error("ambiguous call to 'm4'") {
+        char[4] a = "abc";
+        cpp_ptrref.S s = cpp_ptrref.S();
+        s.m4(a);
+    }
+    expect_error("ambiguous call to 'm9'") {
+        char[4] a = "abc";
+        cpp_ptrref.S s = cpp_ptrref.S();
+        s.m9(a, 1);
+    }
+    // nullptr binds `const char *const &` through a temporary and `const char *` by conversion.
+    expect_error("call to constructor of 'cpp_ptrref::C4' is ambiguous") {
+        cpp_ptrref.C4 c = cpp_ptrref.C4(nullptr);
+    }
+    return 0;
+}

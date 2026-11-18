@@ -7,10 +7,11 @@ clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch
 
 1. Positional base/member-aggregate reference members landed REFBASE (ef83ffa02). The array alias residue landed REFRES
    (5344802ed): 1-D and 2-D arrays, fixed-array fields, and globals now preserve aliases in brace-elided and fully braced forms.
-   Remaining pre-existing residue found by the REFBASE reviews (master behaves the same): a C++ class prvalue element
-   (`T(3)`) into an aggregate member inside an elided range makes an extra copy + destroy (CFlat 127458969, clang 1274569);
-   a converting element into a class-type member inside an elided range runs the ctor after later elements
-   (12345769, clang 12374569). Repros in the REFBASE review files (scratch/repro_keep/refbase/).
+   A C++ class prvalue element (`T(3)`) into an aggregate member inside an elided range is built in place since
+   BRACEPRV (aggregates without reference members). Remaining pre-existing residue (master behaves the same): a
+   converting element into a class-type member inside an elided range runs the ctor after later elements
+   (12345769, clang 12374569; not reproduced in the REFMEM2 shapes, original repro lost); the same prvalue element into an aggregate WITH a reference member still makes the
+   extra copy + destroy (BRACEPRV keeps the temp path there, a placement-new wrapper would end a bound temporary early).
 2. Function-reference members landed REFFN (ef83ffa02): a named function or an existing C++ function reference binds, a
    function-pointer value is refused. RULED 2026-10-29 (main session, from precedent; maintainer may veto): `{ &f, 5 }` and `{ (function<int(int)>)f, 5 }` stay ACCEPTED - working
    as intended (T478: `&f` on a named function is the function value; no runtime risk; clang's pointer-prvalue refusal is a

@@ -1,43 +1,72 @@
-# Imported enum free operator resolution
+# Imported enum free operator resolution - leftovers
 
-Remaining T460 item after fixing the original free-operator ambiguity, hidden-friend visibility,
-and global-namespace lookup cases.
+Binary free C++ operators on imported enums now rank against built-in arithmetic as clang does
+(legs 9800-9823 and 9825-9826 in Test/test_cpp_interop.cb, header namespace `cppi_scope::eop` in
+Test/library/cpp_interop_scoped_enum.h). Four cases remain.
 
-## Repro
+## 1. Unary free operators on enums use the built-in
 
-`Test/library/cpp_interop_scoped_enum.h` defines `cppi_scope::PlainN` and free operators on other
-types in the same namespace. The expression below must use the built-in enum arithmetic and fold
-to 3:
+Repro (header already in tree):
+
+```cpp
+// add to cppi_scope::eop in Test/library/cpp_interop_scoped_enum.h
+inline int operator~(SE e) { return 500 + (int)e; }
+inline int operator-(UE e) { return 600 + (int)e; }
+```
 
 ```cflat
 import cpp "library/cpp_interop_scoped_enum.h";
-enum T45Fold : int { Unscoped = cppi_scope.PN_TWO + 1 };
+extern int main()
+{
+    int a = ~cppi_scope.eop.SE.a;   // clang: 505
+    int b = -cppi_scope.eop.ua;     // clang: 605
+    return a == 505 && b == 605 ? 0 : 1;
+}
 ```
 
-The C++ operator probe is `scratch/t460/enum_operator/m.cb` with twin
-`scratch/t460/enum_operator/o.cpp`: an overloaded `operator+(E, int)` should produce 25. On the
-measured master, it compiles but returns 5; clang++ -std=c++20 returns 25. Experimental enum
-support in this run returned 25 but regressed the constant-expression repro above, so it was
-withdrawn after three unsuccessful fixes.
+CFlat runs the built-in for both. Root cause: `TryUnaryFreeOperatorOverload`
+(cflat/MainListener_BinaryOperators.cpp) has the same struct-only gate the binary `tryFreeOperator`
+had. Fix direction: pass the operand's resolved imported-enum identity (`ResolveEnumTypeName`,
+checked against `importedEnumTypes_`) into the unary path at each call site, and send a clang
+request only when a free operator whose parameter resolves to that enum exists; skip while
+`nativeConstantFoldDepth_ > 0`.
 
-## Root cause
+## 2. File-scope int initializer folds the built-in
 
-`cflat/MainListener_Expressions.cpp`, `tryFreeOperator`: enum values have scalar LLVM types and no
-`StructType` name. The current early return excludes them from free-operator lookup. When that gate
-is widened, candidate binding must use the resolved enum identity (`lhsTypeName` / `rhsTypeName`),
-not the empty `leftInfo.second` / `rightInfo.second` values. The empty source name is treated as a
-wildcard by the class-operand binder, so unrelated class overloads are marked viable and produce a
-false no-overload diagnostic instead of letting built-in enum arithmetic fold.
+```cflat
+import cpp "library/cpp_interop_scoped_enum.h";
+int g = cppi_scope.eop.ua + 1;          // clang: 86 (operator+(UE, int)); CFlat: 6
+const int gc = cppi_scope.eop.ua + 1;   // same
+```
 
-## Fix direction
+Master is the same. A file-scope initializer is folded natively before the overload path runs.
+Fix direction: either evaluate a file-scope initializer that names an enum operator through the
+call path (dynamic init), or refuse it like clang refuses it in a constant context.
 
-Add enum operands to free-operator lookup while preserving their resolved enum identity in
-candidate binding. Only send clang a wrapper request when an enum overload candidate can bind; a
-built-in enum expression in a constant-expression context must stay on the native folding path.
+## 3. A clang refusal falls back silently to the built-in
 
-## Opset measurement (2026-11-09)
+When clang rejects the operator request (for example two equally good enum overloads, ambiguous),
+the enum branch in `tryFreeOperator` falls back to built-in arithmetic with no diagnostic. clang
+reports the ambiguity as an error. Fix direction: relay the clang refusal (prefixed "clang: ", per
+the clang-prefix ruling) instead of falling back, once a candidate naming the enum was found.
 
-The cited enum operator repro returns 5 on this worktree and master, while clang++ -std=c++20
-returns 25. Three focused implementation attempts exposed distinct false candidates or lost
-conversions in the related enum arithmetic cases; the fix was withdrawn after the stop rule.
-This item remains active.
+## 4. Enum plus pointer operand overloads
+
+`operator+(E, int*)`, `operator+(E, C*)`, and `operator+(E, in::S*)` are never selected; imported
+enum plus pointer uses master's built-in pointer arithmetic or refusal. For example, clang returns
+1 below while master CFlat returns 0:
+
+```cpp
+#pragma once
+namespace ep { enum E : int { zero = 0 }; inline int* operator+(E, int* p) { return p + 1; } }
+```
+
+```cflat
+import cpp "enum_pointer.h";
+extern int main() { int[2] a = {0, 0}; int* q = ep.zero + &a[0]; return q - &a[0]; }
+```
+
+When a scoped enum pointer is passed through the free-function wrapper, its parameter is spelled
+`T* &` (`RequestCxxFreeFunctionImpl`, pointer lvalue classification near line 4721), so a failed
+probe must fall through silently to GEP. Deleted or ambiguous enum-pointer overloads must error
+like clang instead of silently taking built-in pointer arithmetic.

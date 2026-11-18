@@ -1,0 +1,14 @@
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_interop_assign.h";
+
+// The clang clause of a relayed refusal carries the "clang: " prefix, so the English text is
+// marked as clang's (ruling 2026-09-27). Pre-fix the clause followed the quote bare.
+extern int main()
+{
+    expect_error("clang rejected the call through 'p(cppi::UdcView)' (clang: temporary of type 'UdcResP'") {
+        cppi.UdcParser udcP = default;
+        cppi.UdcStr udcS = default;
+        auto udcR = udcP.p(udcS);
+    }
+    return 0;
+}

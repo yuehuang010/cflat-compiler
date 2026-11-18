@@ -1,5 +1,6 @@
 
 import "library/cinterop.c";
+import "library/c_interop_deepptr.h";
 
 extern short cbf_ext_def_ret(int value) { return (short)value; }
 extern u8 cbf_ext_def_retu(int value) { return (u8)value; }
@@ -1078,6 +1079,39 @@ extern int main(int argc, char** argv)
     int printfFormatBytes = printf("%d-%s|\n", 42, "xy");
     result &= Test("printf_returns_format_len", printfFormatBytes, 7);
     result &= Test("putchar_returns_char", putchar('\n'), 10);
+
+    // C header int*** parameters, returns and fields keep their depth (clang is the oracle).
+    int dpV = 7;
+    int* dpP = &dpV;
+    int** dpPP = &dpP;
+    int*** dpPPP = &dpPP;
+    result &= Test("c_deep_param_bind", dp_load(dpPPP), 7);
+    result &= Test("c_deep_return", ***dp_top(), 5);
+    DpHolder dpH = default;
+    dpH.slot = dpPPP;
+    result &= Test("c_deep_field", ***dpH.slot, 7);
+    result &= Test("c_deep_holder_param", dp_load_holder(dpH), 7);
+    DpDeep dpDeep = {};
+    dpDeep.y = 5;
+    result &= Test("c_deep32_field_unused", dpDeep.y, 5);
+    result &= Test("c_deep32_field_size", (int)sizeof(DpDeep), 24);
+    DpDeepArr dpDeepArr = {};
+    dpDeepArr.y = 6;
+    result &= Test("c_deep32_array_field_unused", dpDeepArr.y, 6);
+    result &= Test("c_deep32_array_field_size", (int)sizeof(DpDeepArr), 32);
+    DpDeepUnion dpDeepUnion = {};
+    dpDeepUnion.x = 4;
+    result &= Test("c_deep32_union_unused", dpDeepUnion.x, 4);
+    result &= Test("c_deep32_union_size", (int)sizeof(DpDeepUnion), 8);
+    result &= Test("c_deep32_field_sizeof", (int)sizeof(dpDeep.w), 8);
+    result &= Test("c_deep32_flexible_size", (int)sizeof(DpDeepFlex), 8);
+    DpCbField dpCb = dp_mkcb();
+    result &= Test("c_deep32_fnptr_param_call", dpCb.cb(nullptr), 8);
+    result &= Test("c_deep32_fnptr_param_pass", dp_runcb(dpCb.cb), 8);
+    DpDeepAnon dpDeepAnon = {};
+    dpDeepAnon.q = 7;
+    result &= Test("c_deep32_anon_unused", dpDeepAnon.q, 7);
+    result &= Test("c_deep32_anon_sizeof", (int)sizeof(dpDeepAnon.w), 8);
 
     if (result)
     {

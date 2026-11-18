@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 namespace cppon {
 struct Cnt
 {
@@ -210,4 +211,82 @@ struct ElideMV
 inline ElideMV mkElideMV(int x) { return ElideMV(x); }
 inline int elideMoveCount() noexcept { return elideMoves; }
 inline void elideMoveReset() noexcept { elideMoves = 0; }
+}
+// Newelide (legs 4007-4013): prvalues that C++17 elides straight into a `new` block. The move
+// constructor of NM is deleted, so a selected move is a compile error in clang.
+namespace cppne {
+inline int live = 0, dtors = 0, copies = 0, ctors = 0, allocs = 0, frees = 0;
+inline void reset() noexcept { live = dtors = copies = ctors = allocs = frees = 0; }
+inline int nCtors() noexcept { return ctors; }
+inline int nCopies() noexcept { return copies; }
+inline int nDtors() noexcept { return dtors; }
+inline int nLive() noexcept { return live; }
+inline int nAllocs() noexcept { return allocs; }
+inline int nFrees() noexcept { return frees; }
+struct NM
+{
+    int v;
+    NM() : v(0) { ++ctors; ++live; }
+    explicit NM(int x) : v(x) { ++ctors; ++live; }
+    NM(NM&&) = delete;
+    ~NM() { --live; ++dtors; }
+};
+inline NM mkNM(int x) { return NM(x); }
+struct ConvU { int v; explicit ConvU(int x) : v(x) {} };
+struct ConvV
+{
+    int v;
+    ConvV(const ConvU& x) : v(x.v + 100) { ++ctors; ++live; }
+    ~ConvV() { --live; ++dtors; }
+};
+inline ConvU mkConvU(int x) { return ConvU(x); }
+struct Sx
+{
+    int v;
+    explicit Sx(int x) : v(x) { ++ctors; ++live; }
+    Sx(const Sx& o) : v(o.v) { ++copies; ++live; }
+    ~Sx() { --live; ++dtors; }
+};
+inline Sx mkSx(int x) { return Sx(x); }
+struct Base
+{
+    int b;
+    explicit Base(int x) : b(x) { ++ctors; ++live; }
+    Base(const Base& o) : b(o.b) { ++copies; ++live; }
+    virtual ~Base() { --live; ++dtors; }
+};
+struct Derived : Base
+{
+    int d;
+    explicit Derived(int x) : Base(x), d(x + 1) {}
+};
+struct Conv
+{
+    int v;
+    explicit Conv(int x) : v(x) { ++ctors; ++live; }
+    ~Conv() { --live; ++dtors; }
+};
+struct Tk
+{
+    int v;
+    Tk(Conv c) : v(c.v + 1) { ++ctors; ++live; }
+    ~Tk() { --live; ++dtors; }
+};
+// Throws before the count and the class new / delete pair are balanced: allocs == frees on any path.
+struct Thr
+{
+    int v;
+    explicit Thr(int x) : v(x) { if (x < 0) throw -x; ++ctors; ++live; }
+    ~Thr() { --live; ++dtors; }
+    static void* operator new(size_t n) { ++allocs; return ::operator new(n); }
+    static void operator delete(void* p) noexcept { ++frees; ::operator delete(p); }
+};
+inline Thr mkThr(int x) { return Thr(x); }
+typedef int (*NeCb)(int);
+inline int neGuarded(NeCb f, int x) { try { return f(x); } catch (int e) { return -e; } }
+inline void neShow(int row, int v)
+{
+    std::printf("row %d v=%d ctors=%d copies=%d dtors=%d live=%d allocs=%d frees=%d\n", row, v,
+        ctors, copies, dtors, live, allocs, frees);
+}
 }

@@ -744,6 +744,7 @@ CFlatParser::NewExpressionContext* RawNewArrayValueOf(antlr4::tree::ParseTree* n
 // T250: true when the RHS IS an assignment, reached only through parentheses and single-child links.
 // A member access, cast or call around it consumes the value differently, so it never takes the slot.
 bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node);
+bool IsInConditionalArm(antlr4::tree::ParseTree* node);
 
 // Fill omitted TRAILING generic arguments from the template's declared defaults. Returns true
 // when every parameter now has an argument. Shared by the struct/class and function
@@ -3893,11 +3894,16 @@ private:
     llvm::Value* cxxTernaryCallResult_ = nullptr;
     LLVMBackend::TypeAndValue cxxTernaryCallResultType_;
     bool cxxTernaryCallConsumed_ = false;
+    CFlatParser::ConditionalExpressionContext* newCxxTernaryElisionCandidate_ = nullptr;
+    llvm::Value* newCxxTernaryElisionDest_ = nullptr;
+    std::string newCxxTernaryElisionType_;
     CFlatParser::AssignmentExpressionContext* cxxDirectConstructionArgument_ = nullptr;
     LLVMBackend::TypeAndValue cxxDirectConstructionTargetType_;
     bool cxxDirectConstructionCanDefer_ = true;
     bool cxxDirectConstructionHasLaterSibling_ = false;
     bool* cxxDirectConstructionCallOrderSafe_ = nullptr;
+    // BRACEPRV: the deferral is armed by a brace element; it must be spellable in the brace wrapper.
+    bool cxxDirectConstructionBraceElement_ = false;
     // The one postfix expression whose flexible-array member stays an array (the direct operand
     // of `sizeof` or unary `&`); every other value context decays it to `T*`, as C does.
     std::vector<antlr4::ParserRuleContext*> flexibleArrayKeep_;
@@ -5711,6 +5717,12 @@ public:
                                                               ResultUse use = ResultUse::Value);
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamedBody(CFlatParser::AssignmentExpressionContext* ctx,
                                                                   ResultUse use);
+    // BRACEPRV: a sole C++ class construction element, and a later element that cannot observe a
+    // deferred element constructor running after it (see TryEmitForeignCxxAggregateBraceInitFields).
+    bool IsCxxBraceDeferrableConstruction(antlr4::tree::ParseTree* node) const;
+    bool IsQuietCxxBraceElement(antlr4::tree::ParseTree* node) const;
+    void RefuseDeferredCxxConstructionNarrowing(const LLVMBackend::NamedVariable& value,
+                                                antlr4::ParserRuleContext* where);
     void PrepareCxxBraceElement(LLVMBackend::NamedVariable& element, llvm::Value* value,
                                 bool deferredDefault, bool targetIsReference,
                                 const std::string& targetSpelling,
@@ -6798,6 +6810,9 @@ public:
     // > 0 while a compound assignment tries CFlat's `a = a op b` desugaring: that fallback keeps
     // the registered-operator / builtin-conversion resolution and never asks clang.
     int cxxAdlSuppressDepth_ = 0;
+    // > 0 while an enum initializer, case label or `if const` condition is folded: built-in
+    // enum arithmetic stays native there and never becomes a C++ operator call.
+    int nativeConstantFoldDepth_ = 0;
     // The operator expression whose clang ADL request was AMBIGUOUS (refused, logged): its
     // registered and rewritten fallbacks stay silent so no overload is picked behind clang's back.
     const antlr4::ParserRuleContext* cxxAdlAmbiguousCtx_ = nullptr;

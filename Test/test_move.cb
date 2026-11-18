@@ -20767,6 +20767,16 @@ extern int main()
     total += 7;
     passed += testChainedRawShapes();
     total += 14;
+    total += 16;
+    passed += testChainedRawDeepShapes();
+    total += 4;
+    passed += chainRawTernaryArmCase(true) + chainRawTernaryArmCase(false);
+    total += 16;
+    passed += chainLoopNoBorrowStoreCase(true) + chainLoopNoBorrowStoreCase(false);
+    total += 8;
+    passed += chainArmConsumesMiddleCase(true) + chainArmConsumesMiddleCase(false);
+    total += 2;
+    passed += testChainMiddleThatCannotOwn();
     passed += testT447ExplicitMoveThisField();
     total++;
     passed += testT376ChainedUniqueField();
@@ -24375,6 +24385,262 @@ int testChainedRawShapes()
         passed += Test("chain_return_assigned_value", owner->v, 8);
     }
     passed += Test("chain_return_assigned_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    return passed;
+}
+
+// Chained `a = b = <inner> = X` where a is unique and the inner forms reach a: three deep, the
+// `??` and `(T*)0` arms, a `?:` with an owning local arm, and `return (raw = ...)`. Each accepted
+// form matches its two-statement form: one destructor per object.
+unique ChainRawBox* chainReturnAssignedCast(bool c)
+{
+    ChainRawBox* raw = nullptr;
+    return (raw = (c ? new ChainRawBox() : (ChainRawBox*)0));
+}
+// Round 2: a chain middle inside a '?:' arm. The arm's new object is owned by the store, so the
+// statement-end cleanup must not free it again (C3 regression).
+int chainRawTernaryArmCase(bool c)
+{
+    int passed = 0;
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* e = nullptr;
+        a = (c ? (b = e = new ChainRawBox()) : nullptr);
+        if (c)
+        {
+            a->v = 5;
+            passed += Test("chain_ternary_arm_value", a->v, 5);
+        }
+        else
+            passed += Test("chain_ternary_arm_null", a == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("chain_ternary_arm_dtors", chainRawDtors, c ? 1 : 0);
+    return passed;
+}
+// Round 3: a loop that stores no borrow into the join's outer slot keeps compiling, and so does a
+// generic first instantiated inside a caller's loop (round 2 refused both: suite gap).
+unique T* chainGenericTernary<T>(bool c)
+{
+    T* n = nullptr;
+    T* m = nullptr;
+    m = (c ? new T() : n);
+    unique T* x = nullptr;
+    x = m;
+    return x;
+}
+unique T* chainGenericCoalesce<T>()
+{
+    T* n = nullptr;
+    T* m = nullptr;
+    m = (n ?? new T());
+    unique T* x = nullptr;
+    x = m;
+    return x;
+}
+int chainLoopNoBorrowStoreCase(bool c)
+{
+    int passed = 0;
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* src = nullptr;
+        for (int i = 0; i < 2; i++) { b = (src ?? new ChainRawBox()); a = b; }
+    }
+    passed += Test("chain_loop_coalesce_two_stmt", chainRawDtors, 2);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* src = nullptr;
+        for (int i = 0; i < 2; i++) { b = (c ? new ChainRawBox() : src); a = b; }
+    }
+    passed += Test("chain_loop_ternary_two_stmt", chainRawDtors, c ? 2 : 0);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (src ?? new ChainRawBox()); }
+    }
+    passed += Test("chain_loop_coalesce_chained", chainRawDtors, 2);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* src = nullptr;
+        int i = 0;
+        while (i < 2) { b = (src ?? new ChainRawBox()); a = b; i++; }
+    }
+    passed += Test("chain_loop_coalesce_while", chainRawDtors, 2);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* src = nullptr;
+        for (int i = 0; i < 2; i++) { b = (c ? new ChainRawBox() : src); a = b; src = nullptr; }
+    }
+    passed += Test("chain_loop_only_null_store", chainRawDtors, c ? 2 : 0);
+    chainRawDtors = 0;
+    for (int i = 0; i < 1; i++) { unique ChainRawBox* d = chainGenericTernary<ChainRawBox>(c); }
+    passed += Test("chain_generic_ternary_in_loop", chainRawDtors, c ? 1 : 0);
+    chainRawDtors = 0;
+    int k = 0;
+    while (k < 1) { k++; unique ChainRawBox* d = chainGenericCoalesce<ChainRawBox>(); }
+    passed += Test("chain_generic_coalesce_in_loop", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        // A same-named local rebound in the caller's loop says nothing about the generic's own n.
+        ChainRawBox* n = nullptr;
+        ChainRawBox* other = new ChainRawBox();
+        for (int i = 0; i < 2; i++) { unique ChainRawBox* d = chainGenericTernary<ChainRawBox>(c); n = other; }
+        delete other;
+    }
+    passed += Test("chain_generic_in_rebinding_loop", chainRawDtors, c ? 3 : 1);
+    return passed;
+}
+
+// Round 3: the arm is `b = e = new T()`, so the join consumes b and a is the sole owner. Round 2 left
+// b owning as well: the reset freed the object and b's scope exit freed it again.
+int chainArmConsumesMiddleCase(bool c)
+{
+    int passed = 0;
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* e = nullptr;
+        a = (c ? (b = e = new ChainRawBox()) : nullptr);
+        a = nullptr;
+        passed += Test("chain_arm_reset_frees", chainRawDtors, c ? 1 : 0);
+    }
+    passed += Test("chain_arm_one_free_only", chainRawDtors, c ? 1 : 0);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* e = nullptr;
+        a = (c ? (b = e = new ChainRawBox()) : nullptr);
+        if (c) passed += Test("chain_arm_owner_value", a != nullptr ? 1 : 0, 1);
+        else passed += Test("chain_arm_owner_null", a == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("chain_arm_owner_dtors", chainRawDtors, c ? 1 : 0);
+    return passed;
+}
+
+// Round 3: a void* or parameter middle cannot own, so e stays the owner (round 2: 1 birth, 0 frees).
+void chainParamMiddle(ChainRawBox* p)
+{
+    ChainRawBox* e = nullptr;
+    p = e = new ChainRawBox();
+}
+int testChainMiddleThatCannotOwn()
+{
+    int passed = 0;
+    chainRawDtors = 0;
+    {
+        void* v = nullptr;
+        ChainRawBox* e = nullptr;
+        v = e = new ChainRawBox();
+    }
+    passed += Test("chain_void_middle_e_owns", chainRawDtors, 1);
+    chainRawDtors = 0;
+    chainParamMiddle(nullptr);
+    passed += Test("chain_param_middle_e_owns", chainRawDtors, 1);
+    return passed;
+}
+
+int testChainedRawDeepShapes()
+{
+    int passed = 0;
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* c = nullptr;
+        a = b = c = new ChainRawBox();
+        a->v = 11;
+        passed += Test("chain_deep_value", a->v, 11);
+    }
+    passed += Test("chain_deep_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* c = nullptr;
+        a = b = c = new ChainRawBox();
+        a = b = c = new ChainRawBox();
+    }
+    passed += Test("chain_deep_reset_two_dtors", chainRawDtors, 2);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* src = nullptr;
+        a = b = (src ?? new ChainRawBox());
+        a->v = 12;
+        passed += Test("chain_coalesce_value", a->v, 12);
+    }
+    passed += Test("chain_coalesce_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        bool useNew = true;
+        a = b = (useNew ? new ChainRawBox() : (ChainRawBox*)0);
+        a->v = 13;
+        passed += Test("chain_cast_null_arm_value", a->v, 13);
+    }
+    passed += Test("chain_cast_null_arm_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        bool useNew = false;
+        a = b = (useNew ? new ChainRawBox() : (ChainRawBox*)0);
+    }
+    passed += Test("chain_cast_null_arm_no_dtor", chainRawDtors, 0);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        bool useNew = true;
+        ChainRawBox* other = new ChainRawBox();
+        a = b = (useNew ? new ChainRawBox() : other);
+        a->v = 15;
+        passed += Test("chain_owned_local_arm_value", a->v, 15);
+    }
+    passed += Test("chain_owned_local_arm_two_dtors", chainRawDtors, 2);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = chainReturnAssignedCast(true);
+        owner->v = 16;
+        passed += Test("chain_return_cast_value", owner->v, 16);
+    }
+    passed += Test("chain_return_cast_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* a = nullptr;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* src = nullptr;
+        bool useNew = true;
+        a = b = (useNew ? new ChainRawBox() : src);
+        a->v = 17;
+        passed += Test("chain_null_local_arm_value", a->v, 17);
+    }
+    passed += Test("chain_null_local_arm_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        ChainRawHolder h;
+        ChainRawBox* b = nullptr;
+        ChainRawBox* c = nullptr;
+        h.owner = b = c = new ChainRawBox();
+        h.owner->v = 18;
+        passed += Test("chain_field_outer_value", h.owner->v, 18);
+    }
+    passed += Test("chain_field_outer_one_dtor", chainRawDtors, 1);
     chainRawDtors = 0;
     return passed;
 }

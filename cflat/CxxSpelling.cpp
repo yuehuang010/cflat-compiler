@@ -173,6 +173,27 @@ bool CxxSpellingIsBareNullptrT(std::string spelled)
         return spelled == "std::nullptr_t" || spelled == "std::__1::nullptr_t"
             || spelled == "nullptr_t" || spelled == "decltype(nullptr)";
 }
+// CVTIE r2: `R (&)(Args)` / `R (&&)(Args)`, the declarator outside any template argument or parameter list.
+bool CxxSpellingIsFunctionReference(const std::string& spelling)
+{
+        int angleDepth = 0;
+        for (size_t i = 0; i < spelling.size(); ++i)
+        {
+            const char c = spelling[i];
+            if (c == '<') ++angleDepth;
+            else if (c == '>' && angleDepth > 0) --angleDepth;
+            if (c != '(' || angleDepth != 0) continue;
+            size_t j = i + 1;
+            if (j >= spelling.size() || spelling[j] != '&') return false;
+            while (j < spelling.size() && spelling[j] == '&') ++j;
+            if (j >= spelling.size() || spelling[j] != ')') return false;
+            ++j;
+            while (j < spelling.size() && spelling[j] == ' ') ++j;
+            return j < spelling.size() && spelling[j] == '(';
+        }
+        return false;
+}
+
 bool CxxSpellingHasTopLevelParen(const std::string& spelling)
 {
         int angleDepth = 0;
@@ -360,11 +381,41 @@ bool CxxSpellingHasConstPointee(const std::string& spelling)
  */
 uint32_t CxxSpellingPointeeConstMask(const std::string& spelling, int depth)
 {
+        // `const T (&)[N]` maps to a `T *` at the first element: its pointee is the element's cv.
+        if (depth == 1 && IsCxxArrayReferenceSpelling(spelling))
+            return CxxSpellingHasTopLevelConst(spelling.substr(0, spelling.find("(&"))) ? 1u : 0u;
         std::string s = spelling;
         while (!s.empty() && (s.back() == ' ' || s.back() == '&')) s.pop_back();
         uint32_t mask = CSpellingPointeeConstMask(s, depth);
         if (depth > 0 && CxxSpellingHasConstPointee(spelling)) mask |= 1u;
         return mask;
+}
+bool CxxSpellingHasCvrQualifier(const std::string& text)
+{
+        // Volatile on the pointer object itself qualifies no pointee level.
+        std::string spelling = text;
+        if (spelling.find('(') == std::string::npos && spelling.find('&') == std::string::npos)
+            if (size_t star = spelling.rfind('*'); star != std::string::npos)
+                spelling.erase(star);
+        int templateDepth = 0;
+        std::string word;
+        auto isQualifier = [](const std::string& w) {
+            return w == "volatile" || w == "__volatile" || w == "__volatile__"
+                || w == "restrict" || w == "__restrict" || w == "__restrict__";
+        };
+        for (char c : spelling)
+        {
+            if (c == '<') ++templateDepth;
+            else if (c == '>') --templateDepth;
+            if (templateDepth == 0 && (std::isalnum((unsigned char)c) || c == '_' || c == ':'))
+            {
+                word += c;
+                continue;
+            }
+            if (isQualifier(word)) return true;
+            word.clear();
+        }
+        return isQualifier(word);
 }
 bool CxxSpellingHasTopLevelConst(const std::string& spelling)
 {

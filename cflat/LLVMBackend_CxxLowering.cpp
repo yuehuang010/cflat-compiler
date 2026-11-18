@@ -1312,6 +1312,18 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 if (argVars != nullptr && i < argVars->size()
                     && IsCxxFixedArrayArgument((*argVars)[i]))
                     got = CxxFixedArrayDecayType((*argVars)[i]);
+                // A loaded multi-level primitive pointer records its pointee only as the source name.
+                if (argVars != nullptr && i < argVars->size() && got.TypeName.empty()
+                    && got.ValuePointerDepth() >= 2 && want.PointeeConstMask() == got.PointeeConstMask())
+                {
+                    FunctionSymbol spelledCtor;
+                    spelledCtor.IsCxx = true;
+                    spelledCtor.UniqueName = c.linkageName;
+                    if (!got.IsCxxPointeeVolatile && !got.CxxSpelledCvrQualifier && !want.IsCxxPointeeVolatile
+                        && !want.CxxSpelledCvrQualifier
+                        && !CxxSpellingHasCvrQualifier(CxxReferenceParameterSpelling(spelledCtor, i + 1)))
+                        got.TypeName = (*argVars)[i].InferSourceTypeName;
+                }
                 if (argVars != nullptr && i < argVars->size())
                 {
                     const NamedVariable& argument = (*argVars)[i];
@@ -1319,6 +1331,24 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     if (argument.IsStringLiteral
                         || (constant != nullptr && IsStringLiteralConstant(constant)))
                         got.SetPointeeConstBit(true);
+                }
+                // A `T (&)[N]` parameter binds only an array: never a null constant or a named
+                // pointer variable (both reach it as a plain pointer).
+                if (argVars != nullptr && i < argVars->size())
+                {
+                    const NamedVariable& argument = (*argVars)[i];
+                    FunctionSymbol spelledCtor;
+                    spelledCtor.IsCxx = true;
+                    spelledCtor.UniqueName = c.linkageName;
+                    const bool namedPointer = argument.TypeAndValue.Pointer && !argument.IsStringLiteral
+                        && !IsCxxFixedArrayArgument(argument) && !argument.TypeAndValue.IsArrayView
+                        && argument.Storage != nullptr && !argument.IsRvalue;
+                    if ((isNullptrArgument(i) || IsNullPointerConstantArgument(argument, true) || namedPointer)
+                        && CxxArrayReferenceSpelling(spelledCtor, i + 1))
+                    {
+                        ok = false;
+                        break;
+                    }
                 }
                 // A bare `nullptr` has no CFlat type: it binds a by-value pointer or function
                 // pointer (a null pointer conversion), or exactly a `std::nullptr_t` by value or
@@ -1655,8 +1685,15 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 if (v->referencePreference < foundReferencePreference) continue;
                 if (v->referencePreference > foundReferencePreference) { take(); continue; }
                 bool sameShape = c.params.size() == found->params.size();
+                FunctionSymbol cSpelled;
+                cSpelled.IsCxx = true;
+                cSpelled.UniqueName = c.linkageName;
+                FunctionSymbol foundSpelled = cSpelled;
+                foundSpelled.UniqueName = found->linkageName;
+                // `const E (&)[N]` and `const E *` map alike; only the spelling separates them.
                 for (size_t i = 0; sameShape && i < c.params.size(); ++i)
-                    sameShape = sameBoundaryType(c.params[i], found->params[i]);
+                    sameShape = sameBoundaryType(c.params[i], found->params[i])
+                        && CxxArrayReferenceSpelling(cSpelled, i) == CxxArrayReferenceSpelling(foundSpelled, i);
                 if (!sameShape)
                 {
                     ambiguous = true;
@@ -1708,7 +1745,8 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                         CxxConversionRank fresh;
                         if (kind == 1 || kind == 2) fresh.rank = 0;
                         else if ((want.Pointer || want.IsFunctionPointer) && !want.IsAlias
-                                 && !want.IsRvalueRef && !want.IsCxxRefToPointer) fresh.rank = 2;
+                                 && !want.IsRvalueRef && !want.IsCxxRefToPointer
+                                 && !self->CxxArrayReferenceSpelling(sym, i + 1)) fresh.rank = 2;
                         else continue;
                         fresh.cxxViable = true;
                         fresh.from = "nullptr";
@@ -1716,6 +1754,12 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     }
                     v.ranks = std::move(ranks);
                     v.ranked = true;
+                }
+                {
+                    std::vector<std::vector<CxxConversionRank>*> rankedCtors;
+                    for (Viable& v : viable)
+                        if (v.ranked) rankedCtors.push_back(&v.ranks);
+                    PreferCxxDeepPointerExact(rankedCtors);
                 }
                 auto fullyRanked = [](const Viable& v) {
                     return v.ranked && std::none_of(v.ranks.begin(), v.ranks.end(),
@@ -1771,8 +1815,15 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     for (const Viable* d : distinct)
                     {
                         bool same = d->ctor->params.size() == v->ctor->params.size();
+                        FunctionSymbol dSpelled;
+                        dSpelled.IsCxx = true;
+                        dSpelled.UniqueName = d->ctor->linkageName;
+                        FunctionSymbol vSpelled = dSpelled;
+                        vSpelled.UniqueName = v->ctor->linkageName;
+                        // `const E (&)[N]` and `const E *` map alike; only the spelling separates them.
                         for (size_t i = 0; same && i < v->ctor->params.size(); ++i)
-                            same = sameBoundaryType(d->ctor->params[i], v->ctor->params[i]);
+                            same = sameBoundaryType(d->ctor->params[i], v->ctor->params[i])
+                                && CxxArrayReferenceSpelling(dSpelled, i) == CxxArrayReferenceSpelling(vSpelled, i);
                         duplicate = duplicate || same;
                     }
                     if (!duplicate) distinct.push_back(v);
@@ -1812,6 +1863,14 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     }
                     return true;
                 };
+                auto ctorSymbol = [](const Viable& v) {
+                    FunctionSymbol sym;
+                    sym.IsCxx = true;
+                    sym.IsMethod = true;
+                    sym.UniqueName = v.ctor->linkageName;
+                    sym.Parameters = v.ctor->params;
+                    return sym;
+                };
                 bool indistinguishable = distinct.size() > 1;
                 for (size_t i = 0; indistinguishable && i < distinct.size(); ++i)
                 {
@@ -1822,7 +1881,9 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                         indistinguishable = CompareCxxConversionRanks(
                                 distinct[i]->ranks, distinct[j]->ranks, crossing) == 0
                             && (!referenceMix(*distinct[i]->ctor, *distinct[j]->ctor)
-                                || exactLvalueMixes(*distinct[i], *distinct[j]));
+                                || exactLvalueMixes(*distinct[i], *distinct[j])
+                                || CxxLiteralArrayReferenceMix(*argVars, ctorSymbol(*distinct[i]),
+                                                               ctorSymbol(*distinct[j]), 1));
                     }
                 }
                 if (indistinguishable)
@@ -1841,9 +1902,20 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             for (const auto* candidate : tied)
             {
                 std::string shape = DisplayCxxClassName(typeName) + "(";
+                FunctionSymbol spelledCtor;
+                spelledCtor.IsCxx = true;
+                spelledCtor.UniqueName = candidate->linkageName;
                 for (size_t i = 1; i < candidate->params.size(); ++i)
                 {
                     if (i > 1) shape += ", ";
+                    // A `T (&)[N]` or `T *const &` shows its C++ spelling: both map to a bare pointer.
+                    if (CxxArrayReferenceSpelling(spelledCtor, i) || candidate->params[i].IsCxxRefToPointer)
+                        if (std::string declared = CxxReferenceParameterSpelling(spelledCtor, i);
+                            !declared.empty())
+                        {
+                            shape += declared;
+                            continue;
+                        }
                     shape += candidate->params[i].TypeName;
                     if (candidate->params[i].Pointer)
                         shape += candidate->params[i].IsAlias ? "&" : "*";
@@ -2453,7 +2525,7 @@ std::string LLVMBackend::CxxRvalueRefBindKey(const NamedVariable& arg, const Typ
             return {};
         if (argType.Pointer)
             parameter = (argType.PointeeConstBit() ? "const " : "") + sourceSpelling
-                + (argType.ElemPointer ? " **" : " *");
+                + " " + std::string(std::max(argType.ValuePointerDepth(), 1), '*');
         else
             parameter = (CxxConstReceiverKind(arg) != 0 ? "const " : "") + sourceSpelling + " &";
         return parameter + "|" + targetSpelling;
@@ -2908,7 +2980,8 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         // A non-const `operator T()` beats `T(const S&)` on an lvalue; copy-initialization
         // in the wrapper lets clang make that pick.
         const bool operatorBindsBetter = !argType.Pointer && !slicesToBase
-            && CxxConversionOperatorBindsBetter(argType.TypeName, param.TypeName);
+            && CxxConversionOperatorBindsBetter(argType.TypeName, param.TypeName,
+                                                   argType.IsConstObject() || argType.CxxConstRef());
         const size_t sourceTemplate = argType.TypeName.find('$');
         const size_t targetTemplate = param.TypeName.find('$');
         const bool bothTemplateSpecializations = sourceTemplate != std::string::npos
@@ -5589,28 +5662,51 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         std::string exactName;
         // (conversion name, result class) of every derived-class pointer result usable here.
         std::vector<std::pair<std::string, std::string>> derivedCandidates;
+        std::vector<int> derivedReceiverRanks;
         bool exactAddsConst = false;
         for (const std::string& name : candidateNames(dest.TypeName))
         {
             bool addsConst = false;
-            if (usable(name, returnTypeName, &exactReceiverRank, &addsConst))
+            int receiverRankOfName = 0;
+            if (usable(name, returnTypeName, &receiverRankOfName, &addsConst))
             {
                 if (classReferenceTarget) return name;
                 if (canonical(returnTypeName) == resolvedDestType)
                 {
-                    exactName = name;
-                    exactAddsConst = addsConst;
-                    break;
+                    if (exactName.empty())
+                    {
+                        exactName = name;
+                        exactAddsConst = addsConst;
+                        exactReceiverRank = receiverRankOfName;
+                    }
+                    continue;
                 }
                 // Only a qualification conversion may follow an explicit operator, never derived-to-base.
                 const size_t opQualifier = name.find(".operator ");
                 const bool explicitOperator = name.find("__cflat_explicit_") != std::string::npos
                     || (info != nullptr && info->explicitConversions.count(
                             opQualifier == std::string::npos ? name : name.substr(opQualifier + 1)) != 0);
-                if (dest.Pointer && !explicitOperator) derivedCandidates.emplace_back(name, returnTypeName);
+                if (dest.Pointer && !explicitOperator)
+                {
+                    derivedCandidates.emplace_back(name, returnTypeName);
+                    derivedReceiverRanks.push_back(receiverRankOfName);
+                }
             }
         }
-        if (!exactName.empty() && (exactReceiverRank == 0 || classReferenceTarget || dest.Pointer))
+        // CVTIE: the implicit object ranks before the result's conversion ([over.match.best] 2.1 then 2.2).
+        int bestDerivedReceiver = std::numeric_limits<int>::max();
+        for (int rank : derivedReceiverRanks) bestDerivedReceiver = std::min(bestDerivedReceiver, rank);
+        const bool exactLosesOnReceiver = !exactName.empty() && bestDerivedReceiver < exactReceiverRank;
+        if (!derivedCandidates.empty())
+        {
+            std::vector<std::pair<std::string, std::string>> bestReceiver;
+            for (size_t i = 0; i < derivedCandidates.size(); ++i)
+                if (derivedReceiverRanks[i] == bestDerivedReceiver)
+                    bestReceiver.push_back(derivedCandidates[i]);
+            derivedCandidates = std::move(bestReceiver);
+        }
+        if (!exactName.empty() && !exactLosesOnReceiver
+            && (exactReceiverRank == 0 || classReferenceTarget || dest.Pointer))
         {
             // `operator T*()` beats `operator const T*()` on a mutable T* parameter (clang
             // ranks the identity second conversion above a qualification adjustment).

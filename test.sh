@@ -897,6 +897,104 @@ if [ "$RUN_MODE" -eq 0 ]; then
         fi
       fi
     fi
+    if [ -z "$cc_fail" ]; then
+      # (13) The prune sentinel (PruneCxxTypeRequestDiskCache): a prune that spares a dead entry in
+      # the grace writes no sentinel; a store whose validity matches a clean sentinel skips the
+      # prune, so a dead entry stays; an hour-old sentinel is rechecked and the dead entry goes.
+      sk="$cc_dir/sentinel"
+      mkdir -p "$sk/cache"
+      [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$sk/cache/"
+      sk_hdr() { # <V1 or V2: the body differs, so the validity does too>
+        printf '%s\n' '#pragma once' 'namespace skn' '{' \
+          "    template <class T> struct P { T v; P(T x) : v(x) {} T get() const { return v + $1; } };" \
+          '}' >"$sk/sn.h"
+      }
+      sk_compile() { # <program>
+        CFLAT_CACHE_DIR="$sk/cache" $TIMEOUT "$CFLAT" "$sk/$1.cb" -B -o "$sk/$1.bin" >"$sk/$1.log" 2>&1
+      }
+      sk_dead() { # <validity kept>: markers of any other validity
+        local n=0 f
+        for f in "$sk"/cache/cheaders/v*/*.rq; do
+          [ -e "$f" ] || continue
+          [ "$(sed -n 2p "$f")" = "$1" ] || n=$((n + 1))
+        done
+        echo "$n"
+      }
+      sk_age() { perl -e 'my $t = time - 1200; utime $t, $t, @ARGV' "$sk"/cache/cheaders/v*/*.rq "$sk"/cache/cheaders/v*/*.json; }
+      sk_sentinels() { ls "$sk"/cache/cheaders/v*/*.prn 2>/dev/null | wc -l | tr -d ' '; }
+      sk_prog() { # <name> <C++ type>: one program per instantiation, all importing sn.h
+        printf '%s\n' 'import cpp "sn.h";' 'int main()' '{' \
+          "    skn.P<$2> p = skn.P<$2>(1);" '    return 0;' '}' >"$sk/$1.cb"
+      }
+      sk_hdr 1
+      sk_prog a int; sk_prog s short; sk_prog b long; sk_prog c char
+      if ! sk_compile a || ! sk_compile s; then
+        cc_fail="(13) seed compiles on V1 failed"
+      else
+        cp -Rp "$sk/cache/cheaders" "$sk/snap"
+        sk_hdr 2
+        # Phase 1: the V1 entries are young (inside the grace), so a's prune spares them and must
+        # write no sentinel.
+        if ! sk_compile a; then
+          cc_fail="(13) compile of a on the edited header failed"
+        elif [ "$(sk_sentinels)" != 0 ]; then
+          cc_fail="(13) a prune that spared dead entries wrote a sentinel"
+        else
+          # Phase 2: aged, the V1 entries go and the prune is clean, so s writes the V2 sentinel.
+          sk_age
+          if ! sk_compile s; then
+            cc_fail="(13) compile of s on the edited header failed"
+          elif [ "$(sk_sentinels)" = 0 ]; then
+            cc_fail="(13) a clean prune wrote no sentinel"
+          elif [ "$(sk_dead "$(sed -n 1p "$sk"/cache/cheaders/v*/*.prn | head -n 1)")" != 0 ]; then
+            cc_fail="(13) a clean prune left dead entries"
+          else
+            # Phase 3: put the aged V1 entries back. A store under the clean V2 sentinel skips the
+            # prune: the dead entries stay and no sentinel is rewritten.
+            cp -Rpn "$sk/snap/." "$sk/cache/cheaders/"
+            sk_age
+            sk_v2=$(sed -n 1p "$sk"/cache/cheaders/v*/*.prn | head -n 1)
+            sk_before=$(sk_dead "$sk_v2")
+            touch "$sk/ref"; sleep 1
+            if [ "$sk_before" -eq 0 ]; then
+              cc_fail="(13) leg is vacuous: no dead entries were restored"
+            elif ! sk_compile b; then
+              cc_fail="(13) compile of b on V2 failed"
+            elif [ "$(sk_dead "$sk_v2")" != "$sk_before" ]; then
+              cc_fail="(13) a store under a clean sentinel pruned (dead $sk_before -> $(sk_dead "$sk_v2"))"
+            elif [ -n "$(find "$sk"/cache/cheaders -name '*.prn' -newer "$sk/ref")" ]; then
+              cc_fail="(13) a skipped store rewrote the sentinel"
+            else
+              # Phase 4: an hour-old sentinel is rechecked, so the same store removes the dead entries.
+              perl -e 'my $t = time - 7200; utime $t, $t, @ARGV' "$sk"/cache/cheaders/v*/*.prn
+              if ! sk_compile c; then
+                cc_fail="(13) compile of c on V2 failed"
+              elif [ "$(sk_dead "$sk_v2")" != 0 ]; then
+                cc_fail="(13) an hour-old sentinel was not rechecked (dead entries left: $(sk_dead "$sk_v2"))"
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+    if [ -z "$cc_fail" ]; then
+      # (14) A standalone (CFLAT_CPP_INCREMENTAL=0) compile must not leave entries the incremental
+      # path reuses: same cache, same stamp, standalone first and then default.
+      nm="$cc_dir/noinc"
+      mkdir -p "$nm/cache"
+      [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$nm/cache/"
+      printf '%s\n' 'namespace rvv { template <int N> struct IntBox { int get() const { return N; } }; }' >"$nm/r.h"
+      printf '%s\n' 'import cpp "r.h";' 'extern int main() { rvv.IntBox<2> b = default; return b.get(); }' >"$nm/r.cb"
+      CFLAT_CPP_INCREMENTAL=0 CFLAT_CACHE_DIR="$nm/cache" $TIMEOUT "$CFLAT" "$nm/r.cb" -B -o "$nm/a.bin" >"$nm/a.log" 2>&1 \
+        || cc_fail="standalone compile failed (leg 14)"
+      if [ -z "$cc_fail" ]; then
+        CFLAT_CACHE_DIR="$nm/cache" $TIMEOUT "$CFLAT" "$nm/r.cb" -B -o "$nm/b.bin" >"$nm/b.log" 2>&1 \
+          || cc_fail="default compile after a standalone one failed on a shared cache (leg 14)"
+      fi
+      if [ -z "$cc_fail" ]; then
+        "$nm/b.bin"; [ $? -eq 2 ] || cc_fail="default compile after a standalone one ran wrong (leg 14)"
+      fi
+    fi
   fi
   cat "$cc_dir"/*.log >"$cc_log" 2>/dev/null
   if [ -z "$cc_fail" ]; then

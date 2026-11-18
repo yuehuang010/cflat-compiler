@@ -312,6 +312,12 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         && PostfixExpressionEndsInCall(argPostfix)
                         && !PostfixCallHasChainedReceiver(argPostfix)
                         && !subscriptHasCall(argPostfix);
+                    // `new T(c ? mk() : mk())`: each '?:' arm builds into the block (decl mechanism).
+                    const bool ternaryElisionArm = hasForeignCxxRecordArgs && ctorArgNodes.size() == 1
+                        && SoleTernaryExpression(armAssign) != nullptr
+                        && TopLevelMoveExpression(armAssign) == nullptr
+                        && !ctorRefTernary
+                        && compiler->IsForeignNontrivialCxxClass(resolvedNewCxxType);
                     bool armConsumed = false;
                     auto nv = [&] {
                         CxxCallArgumentParseStateScope argumentState(compiler);
@@ -320,10 +326,64 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                             compiler->pendingCxxSretDest_ = newBlock;
                             compiler->pendingCxxSretTypeName_ = resolvedNewCxxType;
                         }
+                        // Save the enclosing ternary slot and restore it on every exit.
+                        struct TernarySlotScope
+                        {
+                            LLVMBackend* c;
+                            MainListener* listener;
+                            bool active;
+                            llvm::Value* savedDest;
+                            std::string savedType;
+                            bool savedConsumed;
+                            bool savedFailed;
+                            CFlatParser::ConditionalExpressionContext* savedCandidate;
+                            llvm::Value* savedCandidateDest;
+                            std::string savedCandidateType;
+                            TernarySlotScope(MainListener* listener, LLVMBackend* c, bool active,
+                                             llvm::Value* dest, const std::string& type,
+                                             CFlatParser::ConditionalExpressionContext* candidate)
+                                : c(c), listener(listener), active(active),
+                                  savedDest(c->pendingCxxTernaryDeclDest_),
+                                  savedType(c->pendingCxxTernaryDeclTypeName_),
+                                  savedConsumed(c->pendingCxxTernaryDeclConsumed_),
+                                  savedFailed(c->pendingCxxTernaryDeclFailed_),
+                                  savedCandidate(listener->newCxxTernaryElisionCandidate_),
+                                  savedCandidateDest(listener->newCxxTernaryElisionDest_),
+                                  savedCandidateType(listener->newCxxTernaryElisionType_)
+                            {
+                                if (!active) return;
+                                // Keep this as a candidate until the conditional resolves both arm types.
+                                c->pendingCxxTernaryDeclDest_ = nullptr;
+                                c->pendingCxxTernaryDeclTypeName_.clear();
+                                c->pendingCxxTernaryDeclConsumed_ = false;
+                                c->pendingCxxTernaryDeclFailed_ = false;
+                                listener->newCxxTernaryElisionCandidate_ = candidate;
+                                listener->newCxxTernaryElisionDest_ = dest;
+                                listener->newCxxTernaryElisionType_ = type;
+                            }
+                            bool Consumed() const
+                            {
+                                return active && c->pendingCxxTernaryDeclConsumed_
+                                    && !c->pendingCxxTernaryDeclFailed_;
+                            }
+                            ~TernarySlotScope()
+                            {
+                                c->pendingCxxTernaryDeclDest_ = savedDest;
+                                c->pendingCxxTernaryDeclTypeName_ = std::move(savedType);
+                                c->pendingCxxTernaryDeclConsumed_ = savedConsumed;
+                                c->pendingCxxTernaryDeclFailed_ = savedFailed;
+                                listener->newCxxTernaryElisionCandidate_ = savedCandidate;
+                                listener->newCxxTernaryElisionDest_ = savedCandidateDest;
+                                listener->newCxxTernaryElisionType_ = std::move(savedCandidateType);
+                            }
+                        } ternarySlot(this, compiler, ternaryElisionArm, newBlock,
+                            resolvedNewCxxType, SoleTernaryExpression(armAssign));
                         auto parsed = ctorRefTernary
                             ? ParseCxxConstRefTernaryTemp(argAssign,
                                 LLVMBackend::TypeAndValue{ .TypeName = ctorRefPlaceType })
                             : ParseAssignmentExpressionNamed(argAssign);
+                        if (ternaryElisionArm)
+                            armConsumed = ternarySlot.Consumed();
                         if (selfElisionArm)
                             armConsumed = compiler->pendingCxxSretDest_ == nullptr;
                         llvm::Value* retTemp = compiler->lastCxxRetTemp_;
@@ -337,6 +397,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         }
                         return parsed;
                     }();
+                    if (ternaryElisionArm && armConsumed)
+                        selfElided = true;
                     if (selfElisionArm)
                     {
                         // Unconsumed: a value-returned prvalue (no sret) is stored into the block.
@@ -3763,6 +3825,7 @@ bool MainListener::ResolveTransparentAnonField(
         // bitfieldHit captured by value: GetDataStructure returns a copy, so a pointer into `inner` would dangle.
         std::vector<int> chain;
         bool isBitfieldHit = false;
+        bool isTooDeepHit = false;
         LLVMBackend::BitfieldInfo bitfieldHit{};
         std::function<bool(const LLVMBackend::StructData&)> dfs =
             [&](const LLVMBackend::StructData& sd) -> bool
@@ -3777,6 +3840,7 @@ bool MainListener::ResolveTransparentAnonField(
                 {
                     if (inner.StructFields[k].VariableName == fieldName)
                     {
+                        isTooDeepHit = compiler->IsTooDeepOpaqueField(inner.StructType, fieldName);
                         chain.push_back(i);
                         chain.push_back(k);
                         return true;
@@ -3801,6 +3865,12 @@ bool MainListener::ResolveTransparentAnonField(
         };
         if (!dfs(compiler->GetDataStructure(topStructTy)) || chain.empty())
             return false;
+
+        // Opaque bytes must not decay to the field's address; sizeof and friends stay.
+        if (isTooDeepHit && unevaluatedOperandDepth_ == 0)
+            LogErrorContext(ctx, std::format(
+                "field '{}' has a pointer type deeper than CFlat carries (31 levels), so it cannot be read",
+                fieldName));
 
         // Walk the chain, advancing the base pointer through each anonymous-member hop. A union
         // member sits at offset 0 (pointer unchanged); a struct member needs a StructGEP by index.
@@ -3910,8 +3980,11 @@ void MainListener::CarryCxxOperatorResult(
         llvm::Type*& accRefType, std::string& accSourceTypeName) {
         auto* compiler = Compiler(ctx);
         const auto& returnType = compiler->lastCallReturnType;
+        const std::string enumReturnKey = compiler->ResolveEnumTypeName(returnType.TypeName);
+        const bool importedEnumReturn = !enumReturnKey.empty()
+            && compiler->importedEnumTypes_.count(enumReturnKey) != 0;
         accSourceTypeName = compiler->IsCxxRecord(returnType.TypeName)
-            ? returnType.TypeName : std::string();
+            ? returnType.TypeName : importedEnumReturn ? enumReturnKey : std::string();
         accValue = result;
         accStorage = nullptr;
         accIsRvalue = !returnType.IsAlias;
@@ -3970,12 +4043,14 @@ void MainListener::CarryCxxOperatorResult(
                 accRefType = valueType;
                 return;
             }
+            if (importedEnumReturn) accStorage = result;
             accRefType = valueType;
             return;
         }
         accValue = compiler->CreateLoad(valueType, result);
         accStorage = result;
         accIsRvalue = false;
+        if (importedEnumReturn) accRefType = valueType;
 }
 
 llvm::Type* MainListener::CxxReferenceResultType(

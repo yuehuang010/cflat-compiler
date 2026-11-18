@@ -2459,6 +2459,21 @@ bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node)
         return IsChainedAssignmentShape(ctxRule->children[0]);
     return false;
 }
+// True when node is inside a selected arm of '?:' or '??' in this expression (not its condition or left side).
+bool IsInConditionalArm(antlr4::tree::ParseTree* node)
+{
+    for (antlr4::tree::ParseTree* child = node, *up = node != nullptr ? node->parent : nullptr; up != nullptr;
+         child = up, up = up->parent)
+    {
+        if (dynamic_cast<CFlatParser::CompoundStatementContext*>(up) != nullptr
+            || dynamic_cast<CFlatParser::LambdaExpressionContext*>(up) != nullptr)
+            return false;
+        if (dynamic_cast<CFlatParser::ConditionalExpressionContext*>(up) != nullptr
+            && up->children.size() > 1 && child != up->children[0])
+            return true;
+    }
+    return false;
+}
 bool FillGenericValueDefaults(const LLVMBackend& compiler, const std::string& templateName,
                                      size_t paramCount, std::vector<std::string>& typeArgs)
 {
@@ -3983,8 +3998,10 @@ bool AllParametersDefaulted(CFlatParser::ParameterTypeListContext* paramTypeList
             return false;
     return true;
 }
-std::string BareSourceText(antlr4::tree::ParseTree* node,
-                                  std::vector<std::string>* outWrapperTypes)
+// The node the bare descent stops at (see BareSourceText). Callers that classify by shape
+// (a single identifier token) must look at this node, not at its concatenated text.
+antlr4::tree::ParseTree* BareSourceLeaf(antlr4::tree::ParseTree* node,
+                                        std::vector<std::string>* outWrapperTypes)
 {
     while (node != nullptr)
     {
@@ -4023,7 +4040,13 @@ std::string BareSourceText(antlr4::tree::ParseTree* node,
         }
         break;
     }
-    return node == nullptr ? std::string() : node->getText();
+    return node;
+}
+std::string BareSourceText(antlr4::tree::ParseTree* node,
+                           std::vector<std::string>* outWrapperTypes)
+{
+    antlr4::tree::ParseTree* leaf = BareSourceLeaf(node, outWrapperTypes);
+    return leaf == nullptr ? std::string() : leaf->getText();
 }
 std::vector<std::string> SplitTopLevelTypeArgs(const std::string& args)
 {
@@ -4375,14 +4398,21 @@ void NamedLocalReturnVisit(antlr4::tree::ParseTree* node, NamedLocalReturnScan& 
     if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
     {
         if (jump->Return() == nullptr) { visitChildren(); return; }
-        // Only a bare identifier (no cast or wrapper) names a local; anything else names none.
+        // Only a bare identifier token (no cast, wrapper, or `move`) names a local; the leaf node
+        // is read because `return move a;` concatenates to the text "movea".
         size_t named = NamedLocalReturnScan::kNoCandidate;
         if (jump->expression() != nullptr && jump->compoundStatement() == nullptr)
         {
             std::vector<std::string> wrapperTypes;
-            const std::string returned = BareSourceText(jump->expression(), &wrapperTypes);
-            if (wrapperTypes.empty() && IsBareReturnIdentifier(returned))
-                named = scan.Resolve(returned);
+            auto* leaf = dynamic_cast<antlr4::tree::TerminalNode*>(
+                BareSourceLeaf(jump->expression(), &wrapperTypes));
+            if (wrapperTypes.empty() && leaf != nullptr
+                && leaf->getSymbol()->getType() == CFlatParser::Identifier)
+            {
+                const std::string returned = leaf->getText();
+                if (IsBareReturnIdentifier(returned))
+                    named = scan.Resolve(returned);
+            }
         }
         scan.Return(named);
         return;

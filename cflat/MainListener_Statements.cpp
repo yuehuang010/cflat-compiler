@@ -918,13 +918,70 @@ CFlatParser::NewExpressionContext* LoopDirectNew(antlr4::tree::ParseTree* node)
         return nullptr;
 }
 
-// Names a loop may rebind to a value that is not a bare `new`. Writes through `&v` are not tracked
-// (`S[]*` is refused; the `auto p = &v` slot-address hole is a separate p2), and a lambda body only
-// writes its own params / value captures.
-std::unordered_set<std::string> FindLoopViewRebindTargets(CFlatParser::IterationStatementContext* loop)
+// Bare `nullptr` at the top of an assignment right side, through parentheses and nothing else.
+bool LoopDirectNull(antlr4::tree::ParseTree* node)
+{
+        while (node != nullptr)
+        {
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+            {
+                if (primary->NullPtrConstant() != nullptr) return true;
+                node = primary->expression();
+                continue;
+            }
+            if (node->children.size() != 1) return false;
+            node = node->children[0];
+        }
+        return false;
+}
+
+// A name through parentheses and single-child rules; empty for anything else.
+std::string LoopParenthesizedName(antlr4::tree::ParseTree* node)
+{
+        while (node != nullptr)
+        {
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+            {
+                if (auto* identifier = primary->genericIdentifier())
+                    return identifier->genericTypeParameters() == nullptr && identifier->Identifier() != nullptr
+                        ? identifier->Identifier()->getText() : std::string();
+                node = primary->expression();
+                continue;
+            }
+            if (node->children.size() != 1) return {};
+            node = node->children[0];
+        }
+        return {};
+}
+
+// True when a statement or expression between node and loop may skip node on some iteration.
+bool LoopStoreIsConditional(antlr4::tree::ParseTree* node, CFlatParser::IterationStatementContext* loop)
+{
+        for (antlr4::tree::ParseTree* child = node, *up = node->parent; up != nullptr && up != loop;
+             child = up, up = up->parent)
+        {
+            if (dynamic_cast<CFlatParser::SelectionStatementContext*>(up) != nullptr
+                || dynamic_cast<CFlatParser::IterationStatementContext*>(up) != nullptr)
+                return true;
+            const bool shortCircuit = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(up) != nullptr
+                || dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(up) != nullptr
+                || dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(up) != nullptr;
+            if (shortCircuit && up->children.size() > 1 && child != up->children[0]) return true;
+        }
+        return false;
+}
+
+// Names a loop may rebind to a value that is not a bare `new`; borrowRebinds drops those whose only
+// such stores are a bare `nullptr`, and adds `(v) = x`, any `&v`, `v++` / `v--` and a `new` on one path only.
+// A lambda body only writes its own params / value captures. The view set does not track `&v` (a separate p2).
+std::unordered_set<std::string> FindLoopViewRebindTargets(CFlatParser::IterationStatementContext* loop,
+                                                          std::unordered_set<std::string>& borrowRebinds)
 {
         std::unordered_set<std::string> targets;
         if (loop == nullptr) return targets;
+        const auto noteBorrowRebind = [&](antlr4::ParserRuleContext* site, const std::string& name) {
+            if (!name.empty() && !LoopAssignmentIsShadowed(site, loop, name)) borrowRebinds.insert(name);
+        };
         auto visitAssignments = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
             if (node == nullptr || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr) return;
             if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
@@ -935,8 +992,25 @@ std::unordered_set<std::string> FindLoopViewRebindTargets(CFlatParser::Iteration
                     && loop->Identifier() != nullptr && loop->Identifier()->getText() == name;
                 if (!name.empty() && !rangeVariable && LoopDirectNew(assignment->assignmentExpression()) == nullptr
                     && !LoopAssignmentIsShadowed(assignment, loop, name))
+                {
                     targets.insert(name);
+                    if (!LoopDirectNull(assignment->assignmentExpression())) borrowRebinds.insert(name);
+                }
+                if (name.empty() && LoopDirectNew(assignment->assignmentExpression()) == nullptr
+                    && !LoopDirectNull(assignment->assignmentExpression()))
+                    noteBorrowRebind(assignment, LoopParenthesizedName(assignment->unaryExpression()));
+                if (LoopDirectNew(assignment->assignmentExpression()) != nullptr
+                    && LoopStoreIsConditional(assignment, loop))
+                    noteBorrowRebind(assignment,
+                        name.empty() ? LoopParenthesizedName(assignment->unaryExpression()) : name);
             }
+            if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+                unary != nullptr && unary->unaryOperator() != nullptr && unary->unaryOperator()->getText() == "&")
+                noteBorrowRebind(unary, LoopParenthesizedName(unary->castExpression()));
+            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+                postfix != nullptr && postfix->children.size() == 2
+                && (postfix->children[1]->getText() == "++" || postfix->children[1]->getText() == "--"))
+                noteBorrowRebind(postfix, LoopParenthesizedName(postfix->primaryExpression()));
             for (antlr4::tree::ParseTree* child : node->children) self(self, child);
         };
         visitAssignments(visitAssignments, loop);
@@ -948,7 +1022,9 @@ std::unordered_set<std::string> FindLoopViewRebindTargets(CFlatParser::Iteration
 // Records the loop's view-rebind targets (parse-tree walk) on the innermost loop frame.
 static void NoteLoopBodyViewAssignments(LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop)
 {
-    compiler->NoteLoopViewAssignments(FindLoopViewRebindTargets(loop));
+    std::unordered_set<std::string> borrowRebinds;
+    const auto targets = FindLoopViewRebindTargets(loop, borrowRebinds);
+    compiler->NoteLoopViewAssignments(targets, borrowRebinds);
 }
 
 // A field view target (`h.v`, also `h->v`): its count lives in the field length slot, keyed by the
@@ -1418,6 +1494,7 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                     {
                         // A postfix ++/-- is deferred to the statement's end; isolate it so it is seen.
                         PendingPostfixScope postfixScope(this);
+                        AdlSuppressScope constantFold(nativeConstantFoldDepth_, true);
                         typedVal = ParseConditionalExpression(constExpr->conditionalExpression());
                         pendingPostfix = !PlusPlus.empty();
                     }
@@ -2585,7 +2662,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // the callee then destroys the moved-from parameter after filling the return slot.
             bool namedLocal = false;
             llvm::Value* localStorage = nullptr;
-            std::string returnedLocalName = retText;
+            // `return move a;` concatenates to the text "movea"; it never names a local here.
+            std::string returnedLocalName = TopLevelMoveExpression(assignExpr) != nullptr ? std::string{} : retText;
             while (returnedLocalName.size() >= 2 && returnedLocalName.front() == '('
                    && returnedLocalName.back() == ')')
                 returnedLocalName = returnedLocalName.substr(1, returnedLocalName.size() - 2);
@@ -2762,6 +2840,23 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 return;
             }
 
+            // NRVO (clang): the candidate local was built in the sret slot at its declaration, so
+            // `return s;` has nothing to transfer; only its scope-exit destructor is skipped.
+            {
+                auto& nrvo = namedReturnElision_;
+                if (!defaultValue && nrvo.function == compiler->currentFunction
+                    && nrvo.sretStorage != nullptr && nrvo.sretStorage == cxxSretDest
+                    && returnNV.Storage == nrvo.sretStorage
+                    && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                    && !returnNV.TypeAndValue.Pointer)
+                {
+                    llvm::Value* previousSkip = compiler->returnedStructDtorSkipAlloca;
+                    compiler->returnedStructDtorSkipAlloca = nrvo.sretStorage;
+                    finishCxxSretReturn();
+                    compiler->returnedStructDtorSkipAlloca = previousSkip;
+                    return;
+                }
+            }
             const std::string typeName = compiler->currentFunctionReturnTypeName;
             auto moveExpr = assignExpr != nullptr ? TopLevelMoveExpression(assignExpr) : nullptr;
             const bool explicitMove = moveExpr != nullptr;
@@ -3582,12 +3677,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && IsChainedAssignmentShape(assignExpr))
         {
             if (const auto* slotVar = compiler->FindVariableByStorage(returnNV.ChainedAssignSlot);
-                slotVar != nullptr && slotVar->IsOwning)
+                slotVar != nullptr && compiler->ChainSlotReadsAsNamed(*slotVar, right))
             {
                 llvm::Value* assignmentValue = right;
                 const std::string slotName = returnNV.ChainedAssignName;
                 returnNV = *slotVar;
-                returnNV.Primary = assignmentValue;
+                returnNV.Primary = slotVar->IsOwning ? assignmentValue : LoadNamedVariable(returnNV);
                 returnNV.CallerName = slotName;
             }
         }
@@ -8081,6 +8176,7 @@ llvm::Value* MainListener::EmitIfConstLeafValue(antlr4::tree::ParseTree* node) {
 
 std::optional<int64_t> MainListener::EvalIfConstConstant(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress) {
         if (node == nullptr) return std::nullopt;
+        AdlSuppressScope constantFold(nativeConstantFoldDepth_, true);
 
         if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
         {

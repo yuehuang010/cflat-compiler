@@ -33,3 +33,12 @@ wrapper group from the owners of its parameter and argument types. Then refuse a
 uses a declaration its roots do not reach (the include graph in `CxxIncrementalGroup` already has
 what is needed: `ReachFromRoots` + a RecursiveASTVisitor over the wrapper body).
 Acceptance: the bridge test passes with that guard live; test.sh stays green.
+
+## Repro status (2026-11-10, unchanged master build)
+
+- Reduced probe `import cpp "cpp_interop_sfinae.h"; import cpp "vector";` with `true == bits[0]`
+  compiles and runs (exit 0) cold, warm, and warm after an unrelated `vector` import in one cache.
+- `test_cpp_interop_bridge.cb` (line 8401 today, not 5001) compiles and passes cold and warm with
+  identical request counts (hit 2003 / miss 2048 warm).
+- No cold-vs-warm difference observed. The key-omits-header defect is still true on reading, but
+  no wrong answer or drift was reproduced.

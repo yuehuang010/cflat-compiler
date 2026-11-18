@@ -4,6 +4,31 @@ Status 2026-11-05 (nslookup r4): item 1 (namespace ending in `_`) fixed earlier;
 a field of the generated self) fixed, see Test/test_cpp_interop_template.cb (`CrtpFieldSelf`); fields named
 after imported macros (errno, EOF, stdout) stay opaque (`CrtpMacroFieldMix`). Only this item remains.
 
+Status 2026-11-10 (nslook, box 14), master ee9393ebc: re-verified, NOT fixed. The fix is the identity-keyed
+table change below, out of scope for a contained fix. The reconstructed fixture (fixture.h: `struct GlobalSelf
+{ int value; }`, `counts::Tick` dtor counter, `nslookMakeGlobal`/`nslookGlobalValue`) reproduces the collision,
+but not the exact message quoted in Repro: the closest master text is c21 below.
+
+Pre-fix master cells (x64/Release/cflat, probes under scratch/nslook_tmp/, shown by name):
+- c01/c02 `[cpp] struct GlobalSelf { int value; }`, import before or after: "the C++ class's import group is unavailable"
+- c03/c04/c05 `[cpp] struct GlobalSelf : std.enable_shared_from_this<GlobalSelf>` (+ `counts.Tick tick`), either order:
+  "generated C++ struct 'GlobalSelf' has no bound destructor" (ctor/dtor bind to the import's record)
+- c21 same struct + `std.make_shared<GlobalSelf>()`: "could not be bound (clang: static_cast from
+  '__cflat_user::GlobalSelf *' to 'const GlobalSelf *', which are not related by inheritance...)" (base/spelling hit the import)
+- c08 `global::GlobalSelf` spelling of the [cpp] struct: "import group is unavailable" (same CFlat key, no escape)
+- c06/c07 `namespace nsl { [cpp] struct GlobalSelf ... }` after import: works (41, 41); no collision
+- c11 unique name `[cpp] struct UniqueSelf`: works (41)
+- c16/c17 import only (no CFlat declaration): `auto g = nslookMakeGlobal(41)` and bare `GlobalSelf g = default` work (41)
+- c13/c14/c15 plain `struct GlobalSelf { int value; }` before or after import: works (41); bare name = the CFlat
+  struct, including `GlobalSelf g = nslookMakeGlobal(41)` (layout-compatible, silently accepted: a plain-struct precedent)
+- clang oracle (scratch/nslook_tmp/oracle.cpp): `::GlobalSelf` and `__cflat_user::GlobalSelf` coexist; values 41, 61, 73, 89.
+
+Why it is not contained: every import table is keyed by the bare CFlat string "GlobalSelf": dataStructures,
+cxxClasses_, cxxRecordEntries_, cxxRecords_, cxxTypeOwnerGroup_, cxxCflatToCxxSpelling_ (reverse map), and the
+mangled template arguments (`std.shared_ptr$GlobalSelf` names both identities). Ctor/dtor binding, field
+lookup, and the C++ spelling of the base all resolve through those keys. Giving the import its own key needs an
+identity-keyed table change, not a site fix. Attempts 1-5 below stand.
+
 ## Repro
 
 `scratch/repro_keep/n51_followups/global_collision.cb` (needs `fixture.h`, not in that folder; the
@@ -58,6 +83,7 @@ a `[cpp] struct` of the same name owns the bare CFlat name. Not built in this la
 
 ## Legs
 
-None yet. Expected: a value leg with the collision fixture (`owner->value == 41`, weak_ptr counts and the
+None landed. Candidate legs are the failing master cells above (c03 "no bound destructor", c21 clang static_cast);
+they would stay red on any branch until the identity-keyed table change lands, so none is added to Test/ now. Expected: a value leg with the collision fixture (`owner->value == 41`, weak_ptr counts and the
 Tick destructor count), plus a unique-name twin as accept-set. The plain-struct precedent (gs_plain.cb) is the
 accept-set for the bare-name behaviour.

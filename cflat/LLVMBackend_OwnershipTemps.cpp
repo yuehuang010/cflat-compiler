@@ -1753,6 +1753,8 @@ void LLVMBackend::EnterOwnershipControlRegion(uint8_t frameKind)
             frame.isDoWhile = (frameKind & OwnFlagDoWhileFrame) != 0;
             frame.hasIncrement = (frameKind & OwnFlagLoopIncrementFrame) != 0;
             frame.scopeDepth = stackNamedVariable.size();
+            frame.function = builder->GetInsertBlock() != nullptr
+                ? builder->GetInsertBlock()->getParent() : nullptr;
             ownFlagLoopReownSnapshots_.push_back(std::move(frame));
         }
 }
@@ -2173,6 +2175,62 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::NormalizeOwnFlagJoinState(
         return MergeOwnFlagJoinStates(state, state, keepMayBeFalse);
 }
 
+bool LLVMBackend::LoopMayRebindSlotToBorrow(const llvm::Value* slot) const
+{
+        if (slot == nullptr || ownFlagLoopReownSnapshots_.empty() || builder->GetInsertBlock() == nullptr)
+            return false;
+        const llvm::Function* current = builder->GetInsertBlock()->getParent();
+        for (size_t i = 0; i < stackNamedVariable.size(); ++i)
+        {
+            const auto& frame = stackNamedVariable[i];
+            const std::string* name = nullptr;
+            for (const auto& [varName, nv] : frame.namedVariable)
+                if (nv.Storage == slot) name = &varName;
+            for (const auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == slot) name = &varName;
+            if (name == nullptr) continue;
+            return std::ranges::any_of(ownFlagLoopReownSnapshots_, [&](const OwnFlagLoopReownFrame& loop) {
+                return loop.function == current && i < loop.scopeDepth && loop.borrowRebindNames.contains(*name);
+            });
+        }
+        return false;
+}
+
+void LLVMBackend::NoteChainBorrowMiddle(const llvm::Value* value, const std::string& middle)
+{
+        if (value != nullptr) chainBorrowMiddleValues_[value] = middle;
+}
+
+bool LLVMBackend::ChainSlotReadsAsNamed(const NamedVariable& slotVar, const llvm::Value* chainValue) const
+{
+        return slotVar.IsOwning || slotVar.BorrowsOwningLocal || slotVar.OwningLocalBorrowAfterRebind
+            || chainBorrowMiddleValues_.contains(chainValue);
+}
+
+std::string LLVMBackend::ChainBorrowMiddleArmName(const llvm::Value* joined) const
+{
+        for (const llvm::Value* arm : JoinArmValues(joined))
+            if (auto found = chainBorrowMiddleValues_.find(arm); found != chainBorrowMiddleValues_.end())
+                return found->second;
+        return {};
+}
+
+std::string LLVMBackend::LoopUnknownJoinArmName(const llvm::Value* joined)
+{
+        // A join arm reading a raw slot declared outside the loop may hold a borrow stored on the back-edge
+        // (`src = p;` after the join), which no store emitted so far shows. Returns that slot's name.
+        if (joined == nullptr || !joined->getType()->isPointerTy()) return {};
+        for (llvm::Value* arm : JoinArmValues(joined))
+        {
+            auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arm);
+            if (load == nullptr || !llvm::isa<llvm::AllocaInst>(load->getPointerOperand())) continue;
+            if (!LoopMayRebindSlotToBorrow(load->getPointerOperand())) continue;
+            if (TernaryArmJoinsOwning(arm, true)) continue;
+            return FindVariableNameByStorage(load->getPointerOperand());
+        }
+        return {};
+}
+
 bool LLVMBackend::IsInsideOwnershipControlFrame(uint8_t frameKinds) const
 {
         for (uint8_t kind : ownFlagControlKind_)
@@ -2192,10 +2250,12 @@ bool LLVMBackend::HasOwnershipControlFrameBetween(const std::vector<uint64_t>& o
         return false;
 }
 
-void LLVMBackend::NoteLoopViewAssignments(const std::unordered_set<std::string>& names)
+void LLVMBackend::NoteLoopViewAssignments(const std::unordered_set<std::string>& names,
+                                          const std::unordered_set<std::string>& borrowRebindNames)
 {
         if (ownFlagLoopReownSnapshots_.empty()) return;
         ownFlagLoopReownSnapshots_.back().nonNewViewAssigns = names;
+        ownFlagLoopReownSnapshots_.back().borrowRebindNames = borrowRebindNames;
 }
 
 void LLVMBackend::RecordUniqueOwnerLoopSink(const NamedVariable& source,
@@ -8699,6 +8759,14 @@ void LLVMBackend::RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, l
         // The alias-by-pointer arg path already spilled the rvalue into `slot`; registering that
         // very slot (instead of a second copy) is what keeps the temp destructed exactly once.
         if (slot == nullptr || !BorrowedOwningStructTempQualifies(arg, fromTernaryArm)) return;
+        // A lowered sret source the ledger already owns (a direct argument the parser registered for
+        // unwind cover) stays the one owner; the borrowed copy must not destroy the same object again.
+        if (auto* produced = llvm::dyn_cast<llvm::LoadInst>(arg.Primary);
+            produced != nullptr && IsLoweredCFlatOnlyStruct(arg.TypeAndValue.TypeName)
+            && HasForeignNontrivialCxxField(arg.TypeAndValue.TypeName)
+            && std::any_of(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                [&](const PendingOwnedStructTemp& e) { return e.Alloca == produced->getPointerOperand(); }))
+            return;
         RegisterOwnedStructTemp(slot, arg.TypeAndValue.TypeName);
     }
 

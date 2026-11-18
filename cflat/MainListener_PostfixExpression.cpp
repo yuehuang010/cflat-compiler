@@ -1949,6 +1949,36 @@ static bool IsSoleCxxClassConstruction(const LLVMBackend& compiler,
         && compiler.IsForeignCxxClassWithConstructors(text.substr(0, open));
 }
 
+static bool IsLiteralOnlyTree(antlr4::tree::ParseTree* node)
+{
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        return primary->Constant() != nullptr || primary->NullPtrConstant() != nullptr
+            || !primary->StringLiteral().empty();
+    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    return rule != nullptr && rule->children.size() == 1 && IsLiteralOnlyTree(rule->children.front());
+}
+
+bool MainListener::IsCxxBraceDeferrableConstruction(antlr4::tree::ParseTree* node) const
+{
+    return compilerLLVM != nullptr && IsSoleCxxClassConstruction(*compilerLLVM, node);
+}
+
+// BRACEPRV: a later brace element whose evaluation has no side effect a deferred constructor
+// could observe out of order: a literal, or a C++ class construction from such elements only.
+bool MainListener::IsQuietCxxBraceElement(antlr4::tree::ParseTree* node) const
+{
+    if (node == nullptr) return false;
+    if (IsLiteralOnlyTree(node)) return true;
+    if (!IsCxxBraceDeferrableConstruction(node)) return false;
+    auto* postfix = SoleCxxConstructionPostfix(node);
+    for (auto* list : postfix->argumentExpressionList())
+        for (auto* argument : list->argumentNamedExpression())
+            if (argument->assignmentExpression() == nullptr
+                || !IsQuietCxxBraceElement(argument->assignmentExpression()))
+                return false;
+    return true;
+}
+
 static uint32_t DecodeLiteralScalar(std::string::const_iterator& it,
                                     const std::string::const_iterator& end)
 {
@@ -2640,6 +2670,28 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             DiagnoseAssignmentArguments(argumentList);
         const size_t arrowTempMark = arrowOwnedTemps_.size();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        // Direct sret call argument: unowned until its callee adopts it, so register it for a
+        // throwing later sibling (as the join does). `move <call>`: the move wrapper is the site.
+        antlr4::ParserRuleContext* argumentSite = ctx;
+        if (ctx->parent != nullptr && ctx->parent->children.size() == 1
+            && ctx->parent->parent != nullptr
+            && dynamic_cast<CFlatParser::MoveExpressionContext*>(ctx->parent->parent) != nullptr)
+            argumentSite = static_cast<antlr4::ParserRuleContext*>(ctx->parent->parent);
+        if (namedVar.Primary != nullptr && namedVar.Primary == Compiler(ctx)->lastLoweredRetValue_
+            && !namedVar.TypeAndValue.Pointer && namedVar.TypeAndValue.PointerDepth == 0
+            && !namedVar.TypeAndValue.IsAlias && !namedVar.TypeAndValue.IsRvalueRef
+            && (IsDirectCallArgument(argumentSite) || IsCallArgumentThroughParens(argumentSite)))
+        {
+            auto* slot = Compiler(ctx)->lastLoweredRetTemp_;
+            const std::string& typeName = namedVar.TypeAndValue.TypeName;
+            if (slot != nullptr && Compiler(ctx)->IsLoweredCFlatOnlyStruct(typeName)
+                && Compiler(ctx)->HasForeignNontrivialCxxField(typeName)
+                && Compiler(ctx)->LoweredSretTempOf(namedVar.Primary, namedVar.Primary->getType()) == slot
+                && std::none_of(Compiler(ctx)->pendingOwnedStructTemps.begin(),
+                    Compiler(ctx)->pendingOwnedStructTemps.end(),
+                    [&](const LLVMBackend::PendingOwnedStructTemp& t) { return t.Alloca == slot; }))
+                Compiler(ctx)->RegisterOwnedStructTemp(slot, typeName);
+        }
         if (ctx->argumentExpressionList().size() == 1)
             CarryStringViewConstructionBorrow(ctx, namedVar);
         if (namedVar.Primary != nullptr
@@ -5349,6 +5401,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     structVar = {};
                                     break;
                                 }
+                            }
+
+                            // Opaque bytes must not decay to the field's address; sizeof and friends stay.
+                            if (fieldIndex < dataStructure.StructFields.size()
+                                && Compiler(ctx)->IsTooDeepOpaqueField(dataStructure.StructType,
+                                    dataStructure.StructFields[fieldIndex].VariableName))
+                            {
+                                if (unevaluatedOperandDepth_ == 0)
+                                    LogErrorContext(ctx, std::format(
+                                        "field '{}' has a pointer type deeper than CFlat carries (31 levels), so it cannot be read",
+                                        dataStructure.StructFields[fieldIndex].VariableName));
                             }
 
                             // [PFX-2-std] A by-value std specialization field of an imported C++
@@ -11482,6 +11545,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.IsCxxAddressOfPointerValue = argNV.IsCxxAddressOfPointerValue;
+                                    argVar.IsCxxAddressOfFunction = argNV.IsCxxAddressOfFunction;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
                                     argVar.CxxDirectConstructionUsesBraces =
@@ -11520,6 +11584,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The POSITIVE depth is the argument-side proof the depth gates
                                     // read; dropped here every argument looks depth-unrecorded.
                                     argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
+                                    argVar.TypeAndValue.CxxSpelledCvrQualifier =
+                                        argNV.TypeAndValue.CxxSpelledCvrQualifier;
                                     const std::string sourceEnum = argNV.InferSourceTypeName.empty()
                                         ? std::string()
                                         : Compiler(ctx)->ResolveEnumTypeName(argNV.InferSourceTypeName);
@@ -13058,6 +13124,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             cxxDirectConstructionArgument_,
                                             cxxDirectConstructionSink || directConstructionParent
                                                 ? namedArgument->assignmentExpression() : nullptr);
+                                    // Only a constructor argument of a brace element stays in the brace wrapper.
+                                    llvm::SaveAndRestore<bool> directConstructionBraceElement(
+                                        cxxDirectConstructionBraceElement_,
+                                        cxxDirectConstructionBraceElement_ && directConstructionParent);
                                     const bool directClassConstructionArgument =
                                         (cxxDirectConstructionSink || directConstructionParent)
                                         && IsSoleCxxClassConstruction(
@@ -13812,6 +13882,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.IsCxxAddressOfPointerValue = argNV.IsCxxAddressOfPointerValue;
+                                    argVar.IsCxxAddressOfFunction = argNV.IsCxxAddressOfFunction;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
@@ -13844,6 +13915,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The POSITIVE depth is the argument-side proof the depth gates
                                     // read; dropped here every argument looks depth-unrecorded.
                                     argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
+                                    argVar.TypeAndValue.CxxSpelledCvrQualifier =
+                                        argNV.TypeAndValue.CxxSpelledCvrQualifier;
                                     if (argNV.IsCxxAddressOfPointerValue)
                                     {
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
@@ -14363,7 +14436,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         && (!parameter.Pointer || valueReceiver
                                                             || !compiler->IsCxxRecord(parameter.TypeName)
                                                             || parameter.PointeeConstBit()
-                                                                   == argument.TypeAndValue.PointeeConstBit());
+                                                                   == argument.TypeAndValue.PointeeConstBit())
+                                                        // Nor is `char *` into `const char *` (a
+                                                        // qualification): `const T&` deduces `T = char *`.
+                                                        && (!parameter.Pointer || valueReceiver
+                                                            || compiler->IsCxxRecord(parameter.TypeName)
+                                                            || !parameter.PointeeConstBit()
+                                                            || argument.IsStringLiteral
+                                                            || argument.TypeAndValue.PointeeConstBit()
+                                                            || compiler->CxxArgumentPointeeConst(argument));
                                                 }
                                                 hasExactNonWrapper = hasExactNonWrapper || exact;
                                             }
@@ -14709,7 +14790,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (isTemplate && !registeredName.empty()
                                     && (!cxxExplicitTemplateArgs.empty()
                                         || registeredName.starts_with("__cflat_tpl_")
-                                        || registeredName.starts_with("__cflat_free_")))
+                                        || registeredName.starts_with("__cflat_free_")
+                                        || registeredName.starts_with("__cflat_byval_")))
                                 {
                                     resolvedName = registeredName;
                                     if (callDisplayName.empty()) callDisplayName = functionName;
@@ -14745,10 +14827,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 auto* objectType = compiler->GetType(
                                     LLVMBackend::TypeAndValue{ .TypeName = functionName });
+                                LLVMBackend::NamedVariable deferred;
                                 if (canDeferCxxConstruction(objectType))
                                 {
-                                    callArgumentPostfix.Flush();
-                                    LLVMBackend::NamedVariable deferred;
                                     deferred.Primary = llvm::UndefValue::get(objectType);
                                     deferred.BaseType = objectType;
                                     deferred.TypeAndValue.TypeName = functionName;
@@ -14758,6 +14839,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     deferred.CxxDirectConstructionType = functionName;
                                     deferred.CxxDirectConstructionArguments =
                                         cxxBraceArguments.front().elements;
+                                }
+                                // A brace element whose arguments cannot cross keeps the eager temp.
+                                if (deferred.IsCxxDirectConstruction
+                                    && (!cxxDirectConstructionBraceElement_
+                                        || compiler->CanSpellCxxBraceDeferredConstruction(deferred)))
+                                {
+                                    callArgumentPostfix.Flush();
+                                    RefuseDeferredCxxConstructionNarrowing(deferred, ctx);
                                     namedVar = std::move(deferred);
                                     structVar = {};
                                     interfaceVar = {};
@@ -14771,10 +14860,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 auto* objectType = compiler->GetType(
                                     LLVMBackend::TypeAndValue{ .TypeName = functionName });
+                                LLVMBackend::NamedVariable deferred;
                                 if (canDeferCxxConstruction(objectType))
                                 {
-                                    callArgumentPostfix.Flush();
-                                    LLVMBackend::NamedVariable deferred;
                                     deferred.Primary = llvm::UndefValue::get(objectType);
                                     deferred.BaseType = objectType;
                                     deferred.TypeAndValue.TypeName = functionName;
@@ -14782,6 +14870,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     deferred.IsCxxDirectConstruction = true;
                                     deferred.CxxDirectConstructionType = functionName;
                                     deferred.CxxDirectConstructionArguments = arguments;
+                                }
+                                // A brace element whose arguments cannot cross keeps the eager temp.
+                                if (deferred.IsCxxDirectConstruction
+                                    && (!cxxDirectConstructionBraceElement_
+                                        || compiler->CanSpellCxxBraceDeferredConstruction(deferred)))
+                                {
+                                    callArgumentPostfix.Flush();
+                                    RefuseDeferredCxxConstructionNarrowing(deferred, ctx);
                                     namedVar = std::move(deferred);
                                     structVar = {};
                                     interfaceVar = {};
@@ -20269,8 +20365,9 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 && call->primaryExpression() != nullptr && call->primaryExpression()->getStart() == node->getSymbol())
                 return {};
         }
-        // A hidden friend is found by ADL from its call alone; the postfix call path requests it.
-        if (compiler->IsCxxFriendName(name))
+        // A hidden friend is found by ADL from its call alone; the postfix call path requests it. CVTIE: so
+        // is a global-namespace function template, which has no declaration in the function table.
+        if (compiler->IsCxxFriendName(name) || compiler->HasCxxFunctionTemplate(name))
         {
             antlr4::tree::ParseTree* up = node->parent;
             while (up != nullptr && dynamic_cast<CFlatParser::PostfixExpressionContext*>(up) == nullptr)

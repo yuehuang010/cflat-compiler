@@ -197,8 +197,8 @@ extern int main()
     return 0;
 }
 
-// T250: the chained inner forms that stay refused keep their messages. A borrowed source (a global,
-// a ternary arm, a raw local) is refused even when the inner slot owned an older object.
+// T250: the chained inner forms that stay refused keep their messages. A borrowed source (a global)
+// is refused even when the inner slot owned an older object.
 struct T250BorrowBox { int v = 0; ~T250BorrowBox() {} };
 struct T250Holder { T250BorrowBox* raw = nullptr; };
 T250BorrowBox* t250Global = nullptr;
@@ -210,16 +210,6 @@ expect_error("cannot reset unique<T250BorrowBox> 'owner' from borrowed value 'ra
         T250BorrowBox* raw = nullptr;
         raw = new T250BorrowBox();
         owner = raw = t250Global;
-    }
-}
-
-expect_error("cannot reset unique<T250BorrowBox> 'owner' from borrowed value 'raw'") {
-    void t250ChainTernaryBorrowArm(bool c)
-    {
-        unique T250BorrowBox* owner = nullptr;
-        T250BorrowBox* raw = nullptr;
-        T250BorrowBox* src = nullptr;
-        owner = raw = (c ? new T250BorrowBox() : src);
     }
 }
 
@@ -240,12 +230,344 @@ expect_error("cannot reset unique<T250BorrowBox> 'owner' from a borrowed value")
     }
 }
 
+// Three-deep `a = b = c = new T()` is accepted (test_move.cb). A borrow-returning call and a '?:'
+// mixing a new arm with a borrowed parameter stay refused, in assignment and in return.
+T250BorrowBox* t250PickBorrowed() { return t250Global; }
+
 expect_error("cannot reset unique<T250BorrowBox> 'a' from borrowed value 'b'") {
-    void t250ThreeDeepKept()
+    void t250ChainCallKept()
     {
         unique T250BorrowBox* a = nullptr;
         T250BorrowBox* b = nullptr;
-        T250BorrowBox* c = nullptr;
-        a = b = c = new T250BorrowBox();
+        a = b = t250PickBorrowed();
+    }
+}
+
+expect_error("'?:' arms differ in ownership") {
+    void t250ChainTernaryParamKept(T250BorrowBox* src, bool c)
+    {
+        unique T250BorrowBox* a = nullptr;
+        T250BorrowBox* b = nullptr;
+        a = b = (c ? new T250BorrowBox() : src);
+    }
+}
+
+expect_error("'?:' arms differ in ownership") {
+    unique T250BorrowBox* t250ReturnChainParamKept(T250BorrowBox* src, bool c)
+    {
+        T250BorrowBox* raw = nullptr;
+        return (raw = (c ? new T250BorrowBox() : src));
+    }
+}
+
+// Round 2: a chain middle is the same slot `b = e;` leaves, so the outer '=' refuses every use the
+// two-statement form refuses. Each leg is one reviewer repro (scratch/rev_chainasg_opus_repro/).
+void t250Sink(move T250Link* x) { }
+struct T250Link { int v = 0; T250Link* next = nullptr; ~T250Link() { v = 1; } };
+struct T250Owner { unique T250Link* u = nullptr; };
+
+expect_error("use of moved variable 'b'") {
+    void t250MidSinkLive()
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* e = nullptr;
+        a = b = e = new T250Link();
+        t250Sink(b);
+    }
+}
+
+expect_error("use of moved variable 'b'") {
+    void t250MidReadAfterReset()
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* e = nullptr;
+        a = b = e = new T250Link();
+        a = nullptr;
+        int x = b->v;
+    }
+}
+
+expect_error("use of moved variable 'x'") {
+    void t250MidFourDeep()
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* x = nullptr;
+        T250Link* e = nullptr;
+        a = b = x = e = new T250Link();
+        x->v = 4660;
+        b->v = 4660;
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'p'") {
+    void t250MidParam(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* e = nullptr;
+        a = p = e = new T250Link();
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'r'") {
+    void t250MidAlias()
+    {
+        unique T250Link* a = nullptr;
+        T250Link* x = nullptr;
+        alias T250Link* r = x;
+        T250Link* e = nullptr;
+        a = r = e = new T250Link();
+    }
+}
+
+expect_error("no overload of 'reset' matches the given arguments") {
+    void t250MidVoid()
+    {
+        unique T250Link* a = nullptr;
+        void* v = nullptr;
+        T250Link* e = nullptr;
+        a = v = e = new T250Link();
+    }
+}
+
+expect_error("cannot return borrowed value 'p'") {
+    unique T250Link* t250RetParamMid(T250Link* p)
+    {
+        T250Link* e = nullptr;
+        return (p = e = new T250Link());
+    }
+}
+
+expect_error("cannot initialize unique<T250Link> 'd' from borrowed value 'p'") {
+    void t250DeclParamMid(T250Link* p)
+    {
+        T250Link* e = nullptr;
+        unique T250Link* d = p = e = new T250Link();
+    }
+}
+
+expect_error("cannot store borrowed parameter 'p' into unique field") {
+    void t250FieldOuterParam(T250Link* p)
+    {
+        T250Owner h;
+        T250Link* e = nullptr;
+        h.u = p = e = new T250Link();
+    }
+}
+
+// Loop back-edge: `src` is null on the first trip only, and `src = p;` runs after the join.
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
+    void t250LoopChainCoal(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (src ?? new T250Link()); src = p; }
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
+    void t250LoopChainTernary(T250Link* p, bool c)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (c ? new T250Link() : src); src = p; }
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'src'") {
+    void t250LoopTwoStmtCoal(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { b = (src ?? new T250Link()); a = b; src = p; }
+    }
+}
+
+// Round 3. A chain middle in a '?:' arm is consumed by the join as a named arm is.
+
+expect_error("use of moved variable 'b'") {
+    void t250ArmMiddleSink(bool c)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* e = nullptr;
+        a = (c ? (b = e = new T250Link()) : nullptr);
+        t250Sink(b);
+    }
+}
+
+expect_error("use of moved variable 'b'") {
+    void t250ArmMiddleRead(bool c)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* e = nullptr;
+        a = (c ? (b = e = new T250Link()) : nullptr);
+        a = nullptr;
+        b->v = 2;
+    }
+}
+
+// A middle that cannot own what it reads refuses on every arm spelling, as `a = p;` does.
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'p'") {
+    void t250ArmParamMiddle(T250Link* p, bool c)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* e = nullptr;
+        a = (c ? (p = e = new T250Link()) : nullptr);
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'p'") {
+    void t250ArmParamMiddleNested(T250Link* p, bool c)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* e = nullptr;
+        a = (c ? (c ? (p = e = new T250Link()) : nullptr) : nullptr);
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'p'") {
+    void t250CoalesceParamMiddle(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* s = nullptr;
+        T250Link* e = nullptr;
+        a = (s ?? (p = e = new T250Link()));
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'r'") {
+    void t250ArmAliasMiddle(bool c)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* x = nullptr;
+        alias T250Link* r = x;
+        T250Link* e = nullptr;
+        a = (c ? (r = e = new T250Link()) : nullptr);
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'v'") {
+    void t250ArmVoidMiddle(bool c)
+    {
+        unique T250Link* a = nullptr;
+        void* v = nullptr;
+        T250Link* e = nullptr;
+        a = (c ? (v = e = new T250Link()) : nullptr);
+    }
+}
+
+// The chain consumes e exactly as `b = e;` does (accepted before round 2, refused since, by the oracle).
+
+expect_error("use of moved variable 'e'") {
+    void t250ChainMovedInner()
+    {
+        T250Link* b = nullptr;
+        T250Link* e = nullptr;
+        b = e = new T250Link();
+        e->v = 1;
+    }
+}
+
+// Must stay refused after the round 3 narrowing: a store the pre-scan can see on some back-edge.
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'src'") {
+    void t250LoopOuterStore(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int j = 0; j < 2; j++)
+        {
+            for (int i = 0; i < 1; i++) { b = (src ?? new T250Link()); a = b; }
+            src = p;
+        }
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'src'") {
+    void t250LoopTernaryNullStore(T250Link* p, bool c)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { b = (src ?? new T250Link()); a = b; src = (c ? nullptr : p); }
+    }
+}
+
+unique T* t250GenLoop<T>(T* p)
+{
+    T* n = nullptr;
+    T* m = nullptr;
+    unique T* x = nullptr;
+    for (int i = 0; i < 2; i++) { m = (n ?? new T()); x = m; n = p; }
+    return x;
+}
+
+expect_error("cannot reset unique<T250Link> 'x' from borrowed value 'n'") {
+    void t250GenericOwnLoopInstantiator(T250Link* p)
+    {
+        unique T250Link* d = t250GenLoop<T250Link>(p);
+    }
+}
+
+// Round 4. The loop pre-scan counts every rebind spelling of the join's outer slot, not only `src = ...`.
+void t250SetSlot(T250Link** q, T250Link* v) { *q = v; }
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
+    void t250LoopParenTarget(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (src ?? new T250Link()); (src) = p; }
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
+    void t250LoopSlotPointer(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (src ?? new T250Link()); T250Link** pp = &src; *pp = p; }
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
+    void t250LoopSlotAddressCall(T250Link* p)
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (src ?? new T250Link()); t250SetSlot(&src, p); }
+    }
+}
+
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
+    void t250LoopPostfixIncrement()
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (src ?? new T250Link()); src++; }
+    }
+}
+
+// A bare `new` on one path only leaves the slot holding the last iteration's pointer on the next one.
+expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'b'") {
+    void t250LoopConditionalNew()
+    {
+        unique T250Link* a = nullptr;
+        T250Link* b = nullptr;
+        T250Link* src = nullptr;
+        for (int i = 0; i < 2; i++) { a = b = (src ?? new T250Link()); if (i == 0) src = new T250Link(); }
     }
 }

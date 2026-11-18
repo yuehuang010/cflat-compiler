@@ -10,10 +10,10 @@ extern int main()
         std.vector<std.pair<int, double>> nested = default;
         nested = 7;
     }
-    // Pointer elements retain their declarator spelling when a C++ member refusal names the owner.
-    expect_error("member 'data' of C++ class 'std.vector<nest.Cell**>' returns unsupported type") {
+    // Pointer elements retain their declarator spelling when a C++ assignment refusal names the owner.
+    expect_error("cannot assign to C++ class 'std.vector<nest.Cell**>' from this expression") {
         std.vector<nest.Cell**> pointers = default;
-        pointers.data();
+        pointers = 7;
     }
     // DisplayCxxClassName leaves an ordinary namespace-qualified class unchanged.
     expect_error("cannot copy-assign C++ class 'cppas.MoveOnly': it has no copy assignment operator") {

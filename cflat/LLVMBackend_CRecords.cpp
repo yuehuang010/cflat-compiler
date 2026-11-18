@@ -3695,6 +3695,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             }
             std::vector<DeclTypeAndValue> fields;
             bool anyOpaqueBlob = false;   // candidate for BindLazyCxxStdField
+            std::set<std::string> tooDeepFields;
             bool ok = true;
             std::string badFieldName;
             std::string badFieldType;
@@ -3736,11 +3737,13 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         // field address comes from the clang offset map, with no record storage.
                         if (f.isZeroSize && !arrDims.empty() && arrDims.front() == 0)
                             arrDims.front() = 1;
+                        cTypeMapExceededPointerDepth_ = false;
                         if (!MapCTypeToTypeAndValue(elemSpelling, tv, r.isCxx))
                         {
                             if (r.isCxx && !f.isBitfield && arrDims.empty()
                                 && MakeOpaqueFieldBlob(f, d))
                             {
+                                if (cTypeMapExceededPointerDepth_) tooDeepFields.insert(f.name);
                                 d.VariableName = f.name;
                                 d.IsAnonymousMember = f.isAnonymousMember;
                                 out.push_back(std::move(d));
@@ -3892,16 +3895,32 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     ok = false;
                     break;
                 }
+                cTypeMapExceededPointerDepth_ = false;
                 if (!MapCTypeToTypeAndValue(elemSpelling, tv, r.isCxx))
                 {
                     // A C++ field whose TYPE has no CFlat mapping yet (a class-template
                     // specialization such as `ImVector<T>`) still has a size and alignment
                     // from Clang: embed it as an opaque blob so the record and its other
                     // fields stay usable. Typed access to the blob goes through the request
-                    // layer.
+                    // layer. A C field too deep to carry keeps the same bytes.
                     DeclTypeAndValue blob;
-                    if (r.isCxx && !f.isBitfield && arrDims.empty() && MakeOpaqueFieldBlob(f, blob))
+                    // A flexible array of such pointers has no storage of its own.
+                    if (cTypeMapExceededPointerDepth_ && f.isZeroSize && f.sizeBytes == 0)
                     {
+                        CRecordFieldEntry storage = f;
+                        storage.sizeBytes = storage.alignBytes = 8;
+                        if (MakeOpaqueFieldBlob(storage, blob))
+                        {
+                            blob.IsFlexibleArrayMember = true;
+                            tooDeepFields.insert(f.name);
+                            fields.push_back(std::move(blob));
+                            continue;
+                        }
+                    }
+                    if (!f.isBitfield && (r.isCxx ? arrDims.empty() : cTypeMapExceededPointerDepth_)
+                        && MakeOpaqueFieldBlob(f, blob))
+                    {
+                        if (cTypeMapExceededPointerDepth_) tooDeepFields.insert(f.name);
                         if (verbose) std::cout << std::format("[verbose]   C++ struct '{}': field '{}' of type '{}' embedded as {} opaque bytes\n",
                             r.name, f.name, f.ctype, f.sizeBytes);
                         fields.push_back(std::move(blob));
@@ -4221,6 +4240,9 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     if (auto it = dataStructures.find(r.name); it != dataStructures.end())
                         cxxOpaqueFieldOwners_[it->second.StructType] = r.name;
             }
+            if (!tooDeepFields.empty())
+                if (auto it = dataStructures.find(r.name); it != dataStructures.end())
+                    tooDeepOpaqueFields_[it->second.StructType] = tooDeepFields;
             if (r.isCxx)
             {
                 cxxRecords_.insert(r.name);
@@ -5924,7 +5946,10 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
             if (isReturn && !tv.Pointer && !tv.IsAlias && !tv.IsFunctionPointer
                 && IsCxxRecord(tv.TypeName) && CxxSpellingHasTopLevelConst(spelling))
+            {
                 tv.IsCxxConstValueReturn = true;
+                tv.ConstMask |= TypeAndValue::ConstBitAt(0);
+            }
             return true;
         };
 
@@ -8681,8 +8706,8 @@ bool LLVMBackend::TranslateMacroBody(const CFunctionMacroEntry& m, std::string& 
                 && !MapCTypeToTypeAndValue(spelling, mapped, /*cxxBoundary*/ true))
                 return false;
             flatType = mapped.TypeName;
-            if (mapped.Pointer) flatType += "*";
-            if (mapped.ElemPointer) flatType += "*";
+            if (mapped.Pointer) flatType.append(mapped.ValuePointerDepth(), '*');
+            else if (mapped.ElemPointer) flatType += "*";
             translatedCastTypes.insert(flatType);
             return !flatType.empty();
         };

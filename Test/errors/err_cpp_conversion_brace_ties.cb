@@ -1,0 +1,82 @@
+// CVTIE: calls clang reports as ambiguous: a tie across two conversion operators, and sets where no
+// candidate beats every other one, on the braced and the plain route.
+import cpp "cpp_cvtie.hpp";
+
+extern int main()
+{
+    CvtBoth both = CvtBoth();
+    expect_error("ambiguous call to 'cvt_tie': no candidate ranks better than the others") {
+        int r = cvt_tie(both, 1);
+    }
+    short s = 1;
+    expect_error("ambiguous call to 'cvt_cross': no candidate ranks better than the others") {
+        int r = cvt_cross(s, {s, s});
+    }
+    CvtC c = CvtC();
+    expect_error("no candidate ranks better than the others") {
+        int r = c.f(s, {s, s});
+    }
+    CvtOne one = CvtOne();
+    int i = 1;
+    expect_error("ambiguous call to 'cvt_nb': no candidate ranks better than the others") {
+        int r = cvt_nb(one, s, i);
+    }
+    // CVTIE r2 (suite gap, master refused these): a non-const operator is no conversion for a const object.
+    expect_error("no overload of 'cvr_c'") {
+        int r = cvr_c(cvr_getnc());
+    }
+    // CVTIE r2 (suite gap, master refused these): on a const source only the const operator ties `T(const S&)`.
+    expect_error("is ambiguous") {
+        int r = cvr_t(cvr_gets());
+    }
+    expect_error("is ambiguous") {
+        int r = cvr_t(*cvr_getsp());
+    }
+    expect_error("is ambiguous") {
+        int r = cvr_tr(cvr_gets());
+    }
+    // CVTIE r3: a const class prvalue ties its const operator and `T(const S&)` (clang: ambiguous).
+    expect_error("is ambiguous") {
+        int r = cvs_ct(cvs_cmks());
+    }
+    expect_error("is ambiguous") {
+        int r = cvs_ctr(cvs_cmks());
+    }
+    // CVTIE r3: a local function pointer has no clang spelling to compare; refused beside bool.
+    expect_error("ambiguous call to 'cvs_u'") {
+        CvsFp v = cvs_getcb();
+        int r = cvs_u(v, {1, 2});
+    }
+    // CVTIE r4: unequal spellings prove nothing, so differences the mapping erases are refused (r3 legs 69837-38).
+    expect_error("ambiguous call to 'cvs_d1'") {
+        int r = cvs_d1(cvs_getcb(), {1, 2});
+    }
+    expect_error("ambiguous call to 'cvs_d2'") {
+        int r = cvs_d2(cvs_getl(), {1, 2});
+    }
+    // CVTIE r6: a template among the overloads leaves the set unknown; refused as on master.
+    expect_error("ambiguous call to 'cvw_b'") {
+        int r = cvw_b(cvw_g, {1, 2});
+    }
+    // CVTIE r6: a function-typed parameter of the value maps unreliably; refused as on master.
+    expect_error("ambiguous call to 'cvw_c'") {
+        int r = cvw_c(cvw_k, {1, 2});
+    }
+    // CVTIE r5: a function returning a function pointer cannot be judged; refused as on master.
+    expect_error("ambiguous call to 'cvu_e'") {
+        int r = cvu_e(cvu_r, {1, 2});
+    }
+    expect_error("ambiguous call to 'cvu_f'") {
+        int r = cvu_f(cvu_r, {1, 2});
+    }
+    // CVTIE r4: the mapping erases `const`, so a local function pointer is refused on the plain route too.
+    expect_error("ambiguous call to 'cvq_d'") {
+        CvsFp v = cvs_getcb();
+        int r = cvq_d(v, 1);
+    }
+    // CVTIE r3: a pointer shape the wrapper cannot bind ends in an error, never a verifier failure.
+    expect_error("may store captured state") {
+        int r = cvs_n(cvs_getv(), {1, 2});
+    }
+    return 0;
+}

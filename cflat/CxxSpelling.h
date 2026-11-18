@@ -27,6 +27,7 @@ uint64_t HashWrapperKey(std::string_view key);
 void EraseDeclaratorToken(std::string& s, const char* word);
 bool CxxSpellingIsBareNullptrT(std::string spelled);
 bool CxxSpellingHasTopLevelParen(const std::string& spelling);
+bool CxxSpellingIsFunctionReference(const std::string& spelling);
 bool IsCxxClosureReferenceResult(std::string spelling);
 std::string CxxClosureReferenceResultRefusal(const std::string& callee);
 bool CxxParamIsConstLvalueReference(const std::string& spelling);
@@ -36,6 +37,8 @@ bool CxxParamIsConstRefToPointer(const std::string& spelling);
 uint32_t CSpellingPointeeConstMask(const std::string& spelling, int depth);
 bool CxxSpellingHasConstPointee(const std::string& spelling);
 uint32_t CxxSpellingPointeeConstMask(const std::string& spelling, int depth);
+// True when the spelling names volatile or restrict at any declarator level (not in template arguments).
+bool CxxSpellingHasCvrQualifier(const std::string& spelling);
 bool CxxSpellingHasTopLevelConst(const std::string& spelling);
 bool CxxSpellingHasTopLevelObjectConst(const std::string& spelling);
 std::string CxxMemberValueSpelling(const std::string& spelling);

@@ -1,0 +1,18 @@
+import cpp "cpp_braceprv.hpp";
+
+// BRACEPRV: a C++ class element built in place inside a brace list keeps the call-site narrowing
+// refusal of its constructor (ruling 2026-09-04), as `T(args)` outside a brace list does.
+extern int main()
+{
+    expect_error("narrows argument 1 from 'double' to 'int' (no implicit narrowing at a call)") {
+        braceprv.Outer member = { braceprv.BS(2.5), 1 };
+    }
+    expect_error("narrows argument 1 from 'double' to 'int' (no implicit narrowing at a call)") {
+        braceprv.BS sole = { braceprv.BS(2.5) };
+    }
+    // The same deferral into a by-value C++ call parameter (accepted silently before BRACEPRV).
+    expect_error("narrows argument 1 from 'double' to 'int' (no implicit narrowing at a call)") {
+        int taken = braceprv.take(braceprv.BS(2.5));
+    }
+    return 0;
+}

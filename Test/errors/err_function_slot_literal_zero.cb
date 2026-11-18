@@ -159,3 +159,60 @@ expect_error("integer constant zero is not a null spelling for a function slot")
         return value.value;
     }
 }
+
+// Ternary joins: a literal zero beside a function-slot arm is the null-spelling rule, not a type clash.
+int t185TernInc(int x) { return x + 1; }
+int t185TernTake(function<int(int)> f) { return f == nullptr ? 0 : 1; }
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroTernaryDeclaration() {
+        int k = 1;
+        function<int(int)> f = k ? t185TernInc : 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    function<int(int)> t185ZeroTernaryReturn(int k) { return k ? t185TernInc : 0; }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroTernaryArgument() {
+        int k = 1;
+        return t185TernTake(k ? t185TernInc : 0);
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroTernaryAssignment() {
+        int k = 1;
+        function<int(int)> f = nullptr;
+        f = k ? t185TernInc : 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroTernaryTrueArm() {
+        int k = 0;
+        function<int(int)> f = k ? 0 : t185TernInc;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroTernaryLongZero() {
+        int k = 1;
+        function<int(int)> f = k ? t185TernInc : 0L;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroTernaryLambdaSlot() {
+        int k = 1;
+        Lambda<int(int)> f = k ? t185TernInc : 0;
+        return 0;
+    }
+}
+expect_error("integer constant zero is not a null spelling for a function slot") {
+    int t185ZeroTernaryToFunction() {
+        int k = 1;
+        Lambda<int(int)> l = (int a) => a + 2;
+        function<int(int)> f = k ? l.toFunction() : 0;
+        return 0;
+    }
+}

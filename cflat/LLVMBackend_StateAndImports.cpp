@@ -2431,6 +2431,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxRefToPointer) j["crp"] = true;
         if (s.CxxRefLevel >= 0) j["cxr"] = static_cast<int>(s.CxxRefLevel);
         if (s.IsCxxPointeeVolatile) j["cpv"] = true;
+        if (s.CxxSpelledCvrQualifier) j["cscq"] = true;
         if (s.ConstMask) j["cm"] = static_cast<int64_t>(s.ConstMask);
         if (s.IsCxxNullptrT) j["cnt"] = true;
         if (s.IsCxxMutableField) j["cmf"] = true;
@@ -2517,6 +2518,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxRefToPointer = j.value("crp", false);
         s.CxxRefLevel = static_cast<int8_t>(j.value("cxr", -1));
         s.IsCxxPointeeVolatile = j.value("cpv", false);
+        s.CxxSpelledCvrQualifier = j.value("cscq", false);
         s.ConstMask = static_cast<uint32_t>(j.value("cm", 0));
         s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxMutableField = j.value("cmf", false);
@@ -4198,8 +4200,8 @@ std::shared_ptr<LLVMBackend::CSigBaseline> LLVMBackend::AcquireSigBaseline(
     }
 
 // Request markers (.rq) read once per process and cache directory: owner -> marker file name ->
-// validity and scope. Built by the first store under the directory, before the publish mutex is
-// taken; after that it is only touched under gCHeaderDiskCachePublishMutex.
+// validity and scope. Built on the first prune that needs it, and only touched under
+// gCHeaderDiskCachePublishMutex.
 struct CxxRequestMarkerInfo
 {
         std::string validity;
@@ -4208,7 +4210,7 @@ struct CxxRequestMarkerInfo
 
 struct CxxRequestPruneIndex
 {
-        std::once_flag built;
+        bool built = false;
         std::map<std::string, std::map<std::string, CxxRequestMarkerInfo>> byOwner;
         std::map<std::string, std::string> ownerOfFile;
 };
@@ -4264,7 +4266,7 @@ static void BuildCxxRequestPruneIndex(CxxRequestPruneIndex& index,
         }
 }
 
-// The index for cacheDir; the first caller scans the directory, the rest wait for that scan.
+// The index for cacheDir, scanned on first use. Callers hold gCHeaderDiskCachePublishMutex.
 static CxxRequestPruneIndex& CxxRequestPruneIndexFor(const std::filesystem::path& cacheDir)
 {
         std::shared_ptr<CxxRequestPruneIndex> index;
@@ -4274,8 +4276,22 @@ static CxxRequestPruneIndex& CxxRequestPruneIndexFor(const std::filesystem::path
             if (!slot) slot = std::make_shared<CxxRequestPruneIndex>();
             index = slot;
         }
-        std::call_once(index->built, [&] { BuildCxxRequestPruneIndex(*index, cacheDir); });
+        if (!index->built)
+        {
+            BuildCxxRequestPruneIndex(*index, cacheDir);
+            index->built = true;
+        }
         return *index;
+}
+
+// The index for cacheDir if this process has already scanned it; never scans. Callers hold
+// gCHeaderDiskCachePublishMutex.
+static CxxRequestPruneIndex* CxxRequestPruneIndexIfBuilt(const std::filesystem::path& cacheDir)
+{
+        std::lock_guard<std::mutex> lock(gCxxRequestPruneIndexesMutex);
+        const auto slot = gCxxRequestPruneIndexes.find(cacheDir.string());
+        if (slot == gCxxRequestPruneIndexes.end() || !slot->second->built) return nullptr;
+        return slot->second.get();
 }
 
 // A marker no compile can hit any more. Another scope is never judged; an empty scope is a
@@ -4633,11 +4649,12 @@ void LLVMBackend::WriteCHeaderDiskCache(
                 }
                 else { fs::remove(markerTmpPath, ec); ec.clear(); }
             }
-            // The index scan runs outside the publish mutex (once per process and directory).
-            CxxRequestPruneIndex& index = CxxRequestPruneIndexFor(cacheDir);
+            // No scan here: the prune scans only when this owner's validity is not clean on disk.
+            // An index already scanned in this process must still see the marker.
             std::lock_guard<std::mutex> publishLock(gCHeaderDiskCachePublishMutex);
             if (markerWritten)
-                NoteCxxRequestMarker(index, markerPath.filename().string(), owner, info);
+                if (CxxRequestPruneIndex* index = CxxRequestPruneIndexIfBuilt(cacheDir))
+                    NoteCxxRequestMarker(*index, markerPath.filename().string(), owner, info);
             PruneCxxTypeRequestDiskCache(cacheDir, *requestGroup, mtime, contentHash);
         }
     }
@@ -4665,12 +4682,59 @@ static std::string CxxRequestEntryValidity(std::filesystem::file_time_type mtime
 
 // Hashed CxxRequestGroup::pruneScope: entries written under another composition or config
 // (other template-argument groups, -I dirs, defines) have their own validity.
-static std::string CxxRequestPruneScope(const std::string& pruneScope)
+static uint64_t CxxRequestHash(const std::string& text)
 {
         uint64_t h = 14695981039346656037ULL;
-        for (unsigned char byte : pruneScope) { h ^= byte; h *= 1099511628211ULL; }
-        return std::format("P{:016x}", h);
-    }
+        for (unsigned char byte : text) { h ^= byte; h *= 1099511628211ULL; }
+        return h;
+}
+
+static std::string CxxRequestPruneScope(const std::string& pruneScope)
+{
+        return std::format("P{:016x}", CxxRequestHash(pruneScope));
+}
+
+// The prune's sentinel for one owner and scope: the validity its last prune left nothing dead
+// for. It is written only when that prune spared no dead entry (the grace), so a store whose
+// validity matches skips the directory scan, and a stamp flip (no validity change) skips too. An
+// hour-old sentinel is rechecked, which bounds what a racing writer can leave behind. The name
+// does not end in .rq, so the marker scan never reads it.
+static std::filesystem::path CxxRequestPrunedSentinel(const std::filesystem::path& cacheDir,
+                                                      const std::string& owner,
+                                                      const std::string& scope)
+{
+        return cacheDir / std::format("{:016x}_{}.prn", CxxRequestHash(owner), scope);
+}
+
+static bool CxxRequestPrunedAt(const std::filesystem::path& sentinel, const std::string& current)
+{
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const auto written = fs::last_write_time(sentinel, ec);
+        if (ec || fs::file_time_type::clock::now() - written >= std::chrono::hours(1)) return false;
+        std::ifstream input(sentinel);
+        std::string pruned;
+        return std::getline(input, pruned) && pruned == current;
+}
+
+static void SetCxxRequestPruned(const std::filesystem::path& sentinel, const std::string& current,
+                                bool clean)
+{
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (!clean) { fs::remove(sentinel, ec); return; }
+        // Written beside the sentinel and renamed over it, so a reader sees the old or the new.
+        const auto tmp = fs::path(sentinel.string() + "." + std::to_string(_getpid()) + ".tmp");
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out << current;
+            const bool ok = static_cast<bool>(out);
+            out.close();
+            if (!ok) { fs::remove(tmp, ec); return; }
+        }
+        fs::rename(tmp, sentinel, ec);
+        if (ec) fs::remove(tmp, ec);
+}
 
 /*
  * Removes the owner group's request entries that no compile can hit any more: written in the
@@ -4682,6 +4746,10 @@ static std::string CxxRequestPruneScope(const std::string& pruneScope)
  * stale-build entry is rewritten in place by its own key on load. Hits do not refresh a marker, so age alone is no
  * evidence: deleting by age emptied a group's cache under its siblings on the first store after
  * ten idle minutes. The grace still spares a racing writer's fresh file.
+ *
+ * The sentinel (CxxRequestPrunedSentinel) lets a store skip this scan when its validity is the
+ * one the last clean prune left; a prune that spared a dead entry leaves no sentinel, so the
+ * next store prunes again.
  */
 void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cacheDir,
                                                 const CxxRequestGroup& group,
@@ -4694,14 +4762,17 @@ void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cach
         const std::string owner = CxxRequestGroupMarker(group.ownerHeaders, group.ownerDefines);
         const std::string current = CxxRequestEntryValidity(mtime, contentHash);
         const std::string scope = CxxRequestPruneScope(group.pruneScope);
+        const auto sentinel = CxxRequestPrunedSentinel(cacheDir, owner, scope);
+        if (CxxRequestPrunedAt(sentinel, current)) return;
         // The index holds every marker of the directory, so a prune reads no directory and only
         // re-reads the dead entries it is about to delete. Callers hold gCHeaderDiskCachePublishMutex.
         CxxRequestPruneIndex& index = CxxRequestPruneIndexFor(cacheDir);
-        const auto ownerEntries = index.byOwner.find(owner);
-        if (ownerEntries == index.byOwner.end()) return;
+        bool clean = true;
         std::vector<std::string> dead;
-        for (const auto& [file, info] : ownerEntries->second)
-            if (CxxRequestMarkerIsDead(info, current, scope)) dead.push_back(file);
+        const auto ownerEntries = index.byOwner.find(owner);
+        if (ownerEntries != index.byOwner.end())
+            for (const auto& [file, info] : ownerEntries->second)
+                if (CxxRequestMarkerIsDead(info, current, scope)) dead.push_back(file);
         const auto now = fs::file_time_type::clock::now();
         constexpr auto grace = std::chrono::minutes(10);
         for (const auto& file : dead)
@@ -4709,14 +4780,15 @@ void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cach
             const auto path = cacheDir / file;
             const auto age = now - fs::last_write_time(path, ec);
             if (ec) { ec.clear(); ForgetCxxRequestMarker(index, file); continue; }
-            // A racing writer's fresh file is spared by the grace.
-            if (age < grace) continue;
+            // A racing writer's fresh file is spared by the grace; the next store prunes again.
+            if (age < grace) { clean = false; continue; }
             // Re-read: another process may have rewritten the entry since the index saw it.
             std::string freshOwner;
             CxxRequestMarkerInfo fresh;
             if (!ReadCxxRequestMarker(path, freshOwner, fresh))
             {
                 ForgetCxxRequestMarker(index, file);
+                clean = false;
                 continue;
             }
             if (freshOwner != owner || !CxxRequestMarkerIsDead(fresh, current, scope))
@@ -4729,8 +4801,10 @@ void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cach
             fs::remove(jsonPath, ec); ec.clear();
             fs::remove(path, ec); ec.clear();
             if (!fs::exists(path, ec)) ForgetCxxRequestMarker(index, file);
+            else clean = false;
             ec.clear();
         }
+        SetCxxRequestPruned(sentinel, current, clean);
     }
 
 bool LLVMBackend::CompileVcpkgImport(const std::string& importingFilePath,

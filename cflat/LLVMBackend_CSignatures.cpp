@@ -786,7 +786,10 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             e.ret.SetCxxConstRef(true);
         if (r.isCxx && !e.ret.Pointer && !e.ret.IsAlias && !e.ret.IsFunctionPointer
             && IsCxxRecord(e.ret.TypeName) && CxxSpellingHasTopLevelConst(r.retType))
+        {
             e.ret.IsCxxConstValueReturn = true;
+            e.ret.ConstMask |= TypeAndValue::ConstBitAt(0);   // a const prvalue: conversions and receivers see const
+        }
         if (r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer)
             e.ret.ConstMask |= CxxSpellingPointeeConstMask(r.retType, e.ret.ValuePointerDepth());
         // A C result keeps its spelled pointee levels like a C parameter (`const char *` -> 1).
@@ -2156,7 +2159,9 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                             cxxTopLevelConstTypeAliases_.insert(a.qualifiedName);
                         qualifiedTarget = mappedTarget.TypeName;
                         if (mappedTarget.Pointer) qualifiedTarget += "*";
-                        if (mappedTarget.ElemPointer) qualifiedTarget += "*";
+                        if (mappedTarget.ValuePointerDepth() >= 3)
+                            qualifiedTarget.append(mappedTarget.ValuePointerDepth() - 1, '*');
+                        else if (mappedTarget.ElemPointer) qualifiedTarget += "*";
                     }
                     cTypedefMap_.emplace(a.qualifiedName, qualifiedTarget);
                     // A function-pointer typedef carries its signature: bind it like `using F = function<...>`.
@@ -2273,7 +2278,9 @@ bool LLVMBackend::MaterializeCxxGlobalTypedef(const std::string& name)
         }
         std::string spelled = mapped.TypeName;
         if (mapped.Pointer) spelled += "*";
-        if (mapped.ElemPointer) spelled += "*";
+        if (mapped.ValuePointerDepth() >= 3)
+            spelled.append(mapped.ValuePointerDepth() - 1, '*');
+        else if (mapped.ElemPointer) spelled += "*";
         if (spelled == name) return false;
         typeAliases[name] = spelled;
         if (mapped.Pointer && !mapped.ElemPointer && CxxSpellingHasConstPointee(target))

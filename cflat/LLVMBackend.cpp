@@ -5811,6 +5811,7 @@ void LLVMBackend::ResetForReanalysis()
     registeringCxxProjection_ = false;
     registeringCxxProjectionMembers_ = true;
     cxxOpaqueFieldOwners_.clear();
+    tooDeepOpaqueFields_.clear();
     cxxRecordSpellingIndex_.clear();
     cxxRecordSpellingIndexDirty_ = true;
     cxxRefusedMemberRebindInFlight_.clear();
@@ -6047,6 +6048,7 @@ void LLVMBackend::ResetForReanalysis()
     movedOutPtrValues_.clear();
     movedOutSourceSlots_.clear();
     movedBorrowedPtrValues_.clear();
+    chainBorrowMiddleValues_.clear();
     borrowedAddressValues_.clear();
     movedBorrowedThroughFieldValues_.clear();
     nonOwningStructJoins_.clear();
@@ -7953,6 +7955,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.CxxRefLevel >= 0)       o["cxr"] = static_cast<int64_t>(s.CxxRefLevel);
     if (s.IsCxxConstValueReturn)  o["ccv"] = true;
     if (s.IsCxxPointeeVolatile)   o["cpv"] = true;
+    if (s.CxxSpelledCvrQualifier) o["cscq"] = true;
     if (s.IsCxxNullptrT)          o["cnt"] = true;
     if (s.IsCxxMutableField)      o["cmf"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
@@ -8068,6 +8071,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getInteger("cxr")) s.CxxRefLevel = static_cast<int8_t>(*v);
     if (auto v = o.getBoolean("ccv")) s.IsCxxConstValueReturn = *v;
     if (auto v = o.getBoolean("cpv")) s.IsCxxPointeeVolatile = *v;
+    if (auto v = o.getBoolean("cscq")) s.CxxSpelledCvrQualifier = *v;
     if (auto v = o.getBoolean("cnt")) s.IsCxxNullptrT = *v;
     if (auto v = o.getBoolean("cmf")) s.IsCxxMutableField = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;

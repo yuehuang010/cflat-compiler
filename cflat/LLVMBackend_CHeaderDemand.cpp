@@ -1556,16 +1556,31 @@ LLVMBackend::CxxVerdictFile* LLVMBackend::GetCxxVerdictFile(const CxxRequestGrou
             return memo->second;
         CxxRequestGroup cohort;
         std::string cohortSource = generatedSource;
+        std::string cohortGroupKeys;
         if (cohortFile)
             for (size_t index = 0; index < cxxImportGroups_.size(); ++index)
             {
                 const auto group = MakeCxxRequestGroup(index, {});
-                cohortSource += CxxIncrementalGroupKey(group);
+                const std::string groupKey = CxxIncrementalGroupKey(group);
+                cohortSource += groupKey;
+                cohortGroupKeys += "|" + groupKey;
                 cohort.dependencyGroups.push_back(index);
                 for (const auto& header : group.headers)
                     if (std::find(cohort.headers.begin(), cohort.headers.end(), header) == cohort.headers.end())
                         cohort.headers.push_back(header);
+                for (const auto& define : group.defines)
+                    if (std::find(cohort.ownerDefines.begin(), cohort.ownerDefines.end(), define)
+                        == cohort.ownerDefines.end())
+                        cohort.ownerDefines.push_back(define);
             }
+        // The cohort is its own request owner and prune scope. Its validity folds every import
+        // group, so the scope names the groups: a regular group's scope would prune it as dead.
+        if (cohortFile)
+        {
+            cohort.ownerHeaders = cohort.headers;
+            cohort.pruneScope = CxxRequestPruneScopeFor(cohort.headers, cohort.ownerDefines)
+                + "|COHORT" + cohortGroupKeys;
+        }
         const CxxRequestGroup& group = cohortFile ? cohort : requested;
         CxxVerdictFile* result = nullptr;
         std::filesystem::file_time_type stamp;
@@ -3010,6 +3025,9 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
             key += "|T" + std::to_string((long long)stamp.time_since_epoch().count());
         key += std::format("|C{:016x}", CxxGroupClosureHash(group));
         key += emitDefinitions ? "|EDEF" : "|EDECL";
+        // A standalone request records no bodies for the incremental path, so the modes do not share.
+        if (!UseCxxIncrementalRequests())
+            key += "|NOINC";
         // Imported records pack bitfields by the MSVC rule on a Windows target and the Itanium
         // rule elsewhere, so a cached layout from the other target is not reusable.
         key += targetWindows_ ? "|BFMS" : "|BFIT";
@@ -3528,17 +3546,25 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxRequestGroup(size_t primary,
         out.diskCache = primaryHasHeaders || hasDependencyGroup
             || std::any_of(cxxImportGroups_.begin(), cxxImportGroups_.end(),
                            [](const CxxImportGroup& g) { return !g.headers.empty(); });
-        out.pruneScope = "STD" + cppStandard_ + (targetWindows_ ? "|W" : "|N");
-        out.pruneScope += "|T" + CInteropTargetTriple();
-        for (const auto& h : out.headers)     out.pruneScope += "|H" + h;
-        for (const auto& def : out.defines)   out.pruneScope += "|d" + def;
-        for (const auto& inc : cIncludeDirs_) out.pruneScope += "|I" + inc;
-        for (const auto& def : cDefines_)     out.pruneScope += "|D" + def;
+        out.pruneScope = CxxRequestPruneScopeFor(out.headers, out.defines);
         out.label = out.headers.empty()
             ? std::string("<no header>")
             : std::filesystem::path(out.headers.front()).filename().string();
         return out;
     }
+
+// The prune scope of a request over these headers and defines (CxxRequestGroup::pruneScope).
+std::string LLVMBackend::CxxRequestPruneScopeFor(const std::vector<std::string>& headers,
+                                                 const std::vector<std::string>& defines) const
+{
+        std::string scope = "STD" + cppStandard_ + (targetWindows_ ? "|W" : "|N");
+        scope += "|T" + CInteropTargetTriple();
+        for (const auto& h : headers)         scope += "|H" + h;
+        for (const auto& def : defines)       scope += "|d" + def;
+        for (const auto& inc : cIncludeDirs_) scope += "|I" + inc;
+        for (const auto& def : cDefines_)     scope += "|D" + def;
+        return scope;
+}
 
 // Qualified C++ names an import group brought in, so a later CFlat spelling resolves without a probe.
 void LLVMBackend::PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records)
@@ -4372,7 +4398,9 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
             if (pointer)
             {
                 type += "*";
-                if (arg.TypeAndValue.ElemPointer) type += "*";
+                if (arg.TypeAndValue.ValuePointerDepth() >= 3)
+                    type.append(arg.TypeAndValue.ValuePointerDepth() - 1, '*');
+                else if (arg.TypeAndValue.ElemPointer) type += "*";
             }
             return type;
         };

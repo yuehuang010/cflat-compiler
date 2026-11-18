@@ -82,8 +82,31 @@ built outside the publish mutex). Dead/live rule unchanged. Dead-entry removal e
 (same test: 3427 stale entries removed, 3203 written). Single-process flip, test_cpp_interop_template:
 sys 16.5 s (master) -> 5.3 s, control 2.8 s; wall 27.8 s -> 26.9 s, control 21.1-21.5 s.
 
+## Status 2026-11-10 (branch fix/prune2, uncommitted) - stays OPEN, narrowed again
+
+Done: the prune no longer scans the cache directory on an ordinary store. Each owner and scope
+keeps a sentinel file (`<owner hash>_<scope>.prn`, cache version 336) that holds the validity its
+last prune left nothing dead for. A store whose validity matches the sentinel skips the prune and
+the scan; a stamp flip changes no validity, so it skips too. A prune that spared a dead entry
+(inside the 10-minute grace) leaves no sentinel, and an hour-old sentinel is rechecked. Dead/live
+rule unchanged; the publish mutex and atomic renames are unchanged. Cost of the old scan measured
+with open+read of 37.5k markers: about 1.1 s sys per process.
+
+Round 2 (2026-11-10): the demand-verdict (cohort) entries had an empty owner and scope, so
+every program shared one sentinel and each flip scanned. The cohort now takes its owner headers
+and prune scope from the same helper as MakeCxxRequestGroup (CxxRequestPruneScopeFor). Three
+programs, two stamps, then a third: no empty-owner (H0) marker remains, each program has its own
+sentinel, and a flip rewrites no sentinel (no scan); the marker count stays constant. This also
+stops a store past the grace from deleting other programs' live verdict entries. Test: test.sh
+cxx_request_cache_consistency leg (13) checks the spared-prune, skip and 1 h recheck paths.
+
+Measured (Mac, test_cpp_interop_template, machine under load 15-25, so only user+sys is
+meaningful; before round 2 the flip still cost ~3 s sys over control, plausibly the empty-owner
+scans, not re-measured for one compile).
+
 Still open:
-- One 35k-file scan per storing process remains: flip wall is still ~25% over cold per compile.
+- Flip wall over a cleared cache on a quiet machine is not yet shown to be within ~10% for one
+  compile; the test.sh-level flip needs a quiet box to re-measure.
 - Real flip (touch the exe; .rq aged past the grace) over a full cache, test.sh on the Mac, same
   build, 2026-11-07: test_cpp_interop / _bridge / _template 269 / 26 / 27 s vs cleared-cache
   279 / 25 / 25 s (master flip: 759 / 106 / 172). The request-cache part is fixed.

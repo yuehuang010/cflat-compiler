@@ -516,6 +516,7 @@ import cpp "library/cpp_mix18_overloads.hpp";
 import cpp "library/cpp_mix11_ctor.hpp";
 import cpp "library/cpp_cvamb_conv.hpp";
 import cpp "library/cpp_cvamb_brace.hpp";
+import cpp "library/cpp_cvtie.hpp";
 
 int mix7FnTwice(int x) { return x * 2; }
 int mix14Twice(int x) { return x * 2; }
@@ -657,6 +658,8 @@ import cpp "library/t12_msvc_shapes.hpp";
 import cpp "library/cpp_interop_nested_free.hpp";
 import cpp "library/cpp_interop_outline_proxy.hpp";
 import cpp "library/t15_friendptr.hpp";
+import cpp "library/cpp_interop_deepptr.hpp";
+import cpp "library/cpp_ptrref.hpp";
 import cpp "library/cpp_namespace_class_constants.hpp";
 import cpp "library/cpp_var_template_views.hpp";
 import cpp "library/cpp_t61_var_template_cpo.hpp";
@@ -952,6 +955,20 @@ int UnwMoveSink(int x)
     UnwOwn* p = new UnwOwn();
     return UnwSink(move p, x);
 }
+// A CFlat struct with a C++ field returned by sret and passed as the FIRST by-value argument, with a
+// throwing later sibling: the statement owns the sret result until the callee adopts it, so the
+// throw unwinds it (direct, wrapped in a call, wrapped around a ternary join, and `move`).
+struct UnwSretHost { cppunw.Tr f = default; int v = 0; };
+UnwSretHost UnwSretMk(int v) { UnwSretHost h = default; h.v = v; return h; }
+UnwSretHost UnwSretGid(UnwSretHost h) { return h; }
+int UnwSretTake(UnwSretHost h, int x) { return h.v + x; }
+int UnwSretDirect(int x) { return UnwSretTake(UnwSretMk(1), cppunw.thrower(x)); }
+int UnwSretWrapped(int x) { return UnwSretTake(UnwSretGid(UnwSretMk(1)), cppunw.thrower(x)); }
+int UnwSretJoinWrapped(int x) { return UnwSretTake(UnwSretGid(x > 100 ? UnwSretMk(1) : UnwSretMk(2)), cppunw.thrower(x)); }
+int UnwSretMoved(int x) { return UnwSretTake(move UnwSretMk(1), cppunw.thrower(x)); }
+// The same sret result bound to an `alias` (borrowed) parameter: one owner, destroyed once on unwind.
+int UnwSretRead(alias (const UnwSretHost) h, int x) { return h.v + x; }
+int UnwSretAliasSibling(int x) { return UnwSretRead(UnwSretMk(1), cppunw.thrower(x)); }
 
 // Throwing C++ constructors / assignments / operator new, and statement temporaries, in a frame an
 // exception unwinds through (legs 3178-3198). cppunw.Tx throws from the special member setArm(n)
@@ -2369,6 +2386,48 @@ int T45IntCase(int v)
 {
     switch (v) { case cppi_scope.PN_TWO: return 5; case (int)cppi_scope.Hue.Green + 1: return 6; }
     return 0;
+}
+// An imported enum with a free operator: constant contexts still fold built-in arithmetic.
+enum EopFold : int { Over = cppi_scope.eop.ua + 1, Fixed = cppi_scope.eop.p2 * 4 };
+int EopCase(int v)
+{
+    switch (v) { case cppi_scope.eop.ua + 1: return 1; }
+    return 0;
+}
+int EopCompound()
+{
+    cppi_scope.eop.SE c = cppi_scope.eop.SE.a;
+    c += 2;
+    return (int)c;
+}
+cppi_scope.eop.SE EopPick() { return cppi_scope.eop.SE.b; }
+int EopRefIdentity()
+{
+    cppi_scope.eop.SE x = cppi_scope.eop.SE.a;
+    cppi_scope.eop.SE y = x ^ 0;
+    return (int)y;
+}
+int EopRefValue()
+{
+    cppi_scope.eop.SE x = cppi_scope.eop.SE.a;
+    return (int)(x ^ 2);
+}
+int EopRefReturn()
+{
+    cppi_scope.eop.SE x = cppi_scope.eop.SE.a;
+    cppi_scope.eop.SE y = x ^ 2;
+    return (int)y + (int)x;
+}
+int EopChain()
+{
+    cppi_scope.eop.Chain x = cppi_scope.eop.Chain.first;
+    return (x | 0) + 1;
+}
+int EopFloatCompound()
+{
+    cppi_scope.eop.SE x = cppi_scope.eop.SE.a;
+    x += 2.0;
+    return (int)x;
 }
 // A `static` local initialized from a T&& result is move-constructed on first entry, like clang.
 int T45StaticXvalue(int seed)
@@ -4838,6 +4897,23 @@ int arithldG<T>(T x) { return arithldId(x); }
 struct ArithldSv { double v = default; };
 double operator+(ArithldSv a, ArithldSv b) { return a.v + b.v; }
 longdouble operator*(ArithldSv a, ArithldSv b) { return (longdouble)a.v * (longdouble)b.v; }
+
+// Newelide (legs 4012-4013): a constructor that throws inside a `new` argument. The class new
+// frees the block once each (allocs == frees), and the guard returns the thrown value negated.
+int NeThrNew(int x)
+{
+    cppne.Thr* p = new cppne.Thr(cppne.mkThr(x));
+    int r = p->v;
+    delete p;
+    return r;
+}
+int NeThrDirect(int x)
+{
+    cppne.Thr* p = new cppne.Thr(cppne.Thr(x));
+    int r = p->v;
+    delete p;
+    return r;
+}
 
 extern int main()
 {
@@ -13097,6 +13173,51 @@ extern int main()
     if (senumOp + (senumPickFirst ? cppi_scope.A.x : cppi_scope.A.x) != 15507) return 7214;
     if (cppi_scope.A.x - senumOp != 16007) return 7215;
     if (cppi_scope.U2.w * senumOp != 16507) return 7216;
+    // Free operators on imported enums, ranked by clang against the built-in candidate (pre-fix:
+    // two scalar operands never reached free-operator lookup, so the built-in always ran).
+    cppi_scope.eop.SE eopA = cppi_scope.eop.SE.a;
+    cppi_scope.eop.SE eopB = cppi_scope.eop.SE.b;
+    cppi_scope.eop.UE eopUa = cppi_scope.eop.ua;
+    cppi_scope.eop.UE eopUb = cppi_scope.eop.ub;
+    cppi_scope.eop.E[4] eopPointerArray = {
+        cppi_scope.eop.e0, cppi_scope.eop.e1, cppi_scope.eop.e2, cppi_scope.eop.e3
+    };
+    cppi_scope.eop.Mem eopMem = default;
+    cppi_scope.eop.Unrel eopUn = default;
+    if (eopA + 0 != 25) return 9800;
+    if (1 + eopA != 46) return 9801;
+    if (eopA * eopB != 95) return 9802;
+    // The written operator+= runs, never the desugared `c = c + 2` (27).
+    if (EopCompound() != 25) return 9803;
+    if (eopA < eopB) return 9804;
+    if (eopUa + 1 != 86) return 9805;
+    if (10 - eopUa != 105) return 9806;
+    if (!(eopUa == eopUb)) return 9807;
+    if (eopUa + eopUb != 92) return 9808;
+    if (cppi_scope.eop.SE.b + 0 != 27) return 9809;
+    if (EopPick() + 1 != 28) return 9810;
+    if (eopA % 1 != 706) return 9811;
+    const int eopLocal = eopUa + 1;
+    if (eopLocal != 86) return 9812;
+    // No operator names these operand types: the built-in candidate stays.
+    if (eopUa * eopUb != 35 || eopUa - 1 != 4 || !(eopUa < eopUb) || 2 + eopUb != 9) return 9813;
+    if (cppi_scope.eop.p2 + 1 != 3 || 4 * cppi_scope.eop.p3 != 12 || eopA == eopB) return 9814;
+    if (eopMem + eopA != 308 || eopMem + eopUa != 408) return 9815;
+    if (eopUn + 4 != 904 || 4 - eopUn != 954) return 9816;
+    // Constant contexts fold natively even where an operator names the enum.
+    if (EopFold.Over != 6 || EopFold.Fixed != 8 || EopCase(6) != 1) return 9817;
+    if const (cppi_scope.eop.ua + 1 == 6) {} else { return 9818; }
+    if (EopRefIdentity() != 5) return 9819;
+    if (EopRefValue() != 45 || EopRefReturn() != 90) return 9820;
+    if (EopChain() != 116) return 9821;
+    double eopDouble = 2.0;
+    if (eopA + eopDouble != 307 || eopDouble + eopA != 407) return 9822;
+    if (EopFloatCompound() != 65) return 9823;
+    cppi_scope.eop.E* eopPointerFromEnum = cppi_scope.eop.e0 + &eopPointerArray[0];
+    if ((int)*eopPointerFromEnum != (int)cppi_scope.eop.e2) return 9825;
+    cppi_scope.eop.N eopPointerOffset = cppi_scope.eop.n0;
+    cppi_scope.eop.E* eopPointerFromOtherEnum = eopPointerOffset + &eopPointerArray[0];
+    if ((int)*eopPointerFromOtherEnum != (int)cppi_scope.eop.e2) return 9826;
     if (cppi_scope.onlyDev(senumDev) != 3107) return 1629;
     if (cppi_scope.devA(senumDevA) != 6207) return 1630;
     std.vector<cppi_scope.A> senumEnumVector = default;
@@ -17946,6 +18067,30 @@ extern int main()
         cppunw.reset();
         r = cppunw.guarded(UnwMoveAssign, 5);
         if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3181;
+        // An sret call result as the first by-value argument, unwound by a throwing sibling (clang:
+        // live 0, dtors 1 / 2 / 2 / 1). Master leaks the C++ field (live 1). The same calls with a
+        // non-throwing sibling (x = -3) balance too (clang: -2 / -2 / -1, dtors 1 / 2 / 2).
+        cppunw.reset();
+        r = cppunw.guarded(UnwSretDirect, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 99327;
+        cppunw.reset();
+        r = cppunw.guarded(UnwSretDirect, -3);
+        if (r != -2 || cppunw.live() != 0 || cppunw.dtors() != 1) return 99328;
+        cppunw.reset();
+        r = cppunw.guarded(UnwSretWrapped, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 99329;
+        cppunw.reset();
+        r = cppunw.guarded(UnwSretWrapped, -3);
+        if (r != -2 || cppunw.live() != 0 || cppunw.dtors() != 2) return 99330;
+        cppunw.reset();
+        r = cppunw.guarded(UnwSretJoinWrapped, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 99331;
+        cppunw.reset();
+        r = cppunw.guarded(UnwSretMoved, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 99332;
+        cppunw.reset();
+        r = cppunw.guarded(UnwSretAliasSibling, 5);
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 99333;
         // A throwing destination field dtor must leave the fresh movable C++ RHS alive for unwind.
         cppunw.resetFreshReplace();
         r = cppunw.guarded(UnwFreshCxxTemporary, 0);
@@ -18901,6 +19046,67 @@ extern int main()
         int parenV = parenP->v;
         if (parenV != 2 || cppon.elideMoveCount() != parenMoves) return 4006;
         delete parenP;
+
+        // Newelide (legs 4007-4008): a '?:' of two same-class prvalues builds into the new block,
+        // one constructor and no move (the move constructor is deleted, as in clang).
+        cppne.reset();
+        bool neC = true;
+        cppne.NM* neT = new cppne.NM(neC ? cppne.mkNM(1) : cppne.mkNM(2));
+        int neV = neT->v;
+        int neCt = cppne.nCtors();
+        int neLv = cppne.nLive();
+        delete neT;
+        if (neV != 1 || neCt != 1 || neLv != 1 || cppne.nLive() != 0 || cppne.nDtors() != 1
+            || cppne.nCopies() != 0) return 4007;
+        cppne.reset();
+        neC = false;
+        cppne.NM* neF = new cppne.NM(neC ? cppne.mkNM(1) : cppne.mkNM(2));
+        int neF2 = neF->v;
+        delete neF;
+        if (neF2 != 2 || cppne.nCtors() != 1 || cppne.nLive() != 0 || cppne.nDtors() != 1) return 4008;
+        // Keep (4009-4011): an lvalue '?:' copies its chosen arm, a derived prvalue slices with one
+        // copy, and `new T[2]` runs the default constructor per element. Clang's counts are the same.
+        cppne.Sx neA = cppne.mkSx(1);
+        cppne.Sx neB = cppne.mkSx(2);
+        cppne.reset();
+        bool neL = true;
+        cppne.Sx* neP = new cppne.Sx(neL ? neA : neB);
+        int neP2 = neP->v;
+        delete neP;
+        if (neP2 != 1 || cppne.nCopies() != 1 || cppne.nCtors() != 0 || cppne.nDtors() != 1) return 4009;
+        cppne.reset();
+        cppne.Base* neBs = new cppne.Base(cppne.Derived(4));
+        int neBv = neBs->b;
+        delete neBs;
+        if (neBv != 4 || cppne.nCopies() != 1 || cppne.nCtors() != 1 || cppne.nLive() != 0) return 4010;
+        cppne.reset();
+        cppne.NM* neArr = new cppne.NM[2];
+        int neAv = neArr[1].v;
+        delete neArr;
+        if (neAv != 0 || cppne.nCtors() != 2 || cppne.nLive() != 0 || cppne.nDtors() != 2) return 4011;
+        // A throwing constructor in the argument leaves no block behind (allocs == frees).
+        cppne.reset();
+        if (cppne.neGuarded(NeThrNew, -3) != -3 || cppne.nAllocs() != 1 || cppne.nFrees() != 1
+            || cppne.nLive() != 0) return 4012;
+        if (cppne.neGuarded(NeThrDirect, -4) != -4 || cppne.nAllocs() != 2 || cppne.nFrees() != 2
+            || cppne.nLive() != 0) return 4013;
+        // A U/U conditional remains a U prvalue so V(const U&) is selected normally.
+        cppne.reset();
+        bool neConvert = true;
+        cppne.ConvV* neCv = new cppne.ConvV(neConvert ? cppne.mkConvU(1) : cppne.mkConvU(2));
+        int neCvv = neCv->v;
+        int neCvl = cppne.nLive();
+        delete neCv;
+        if (neCvv != 101 || neCvl != 1 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4014;
+        cppne.reset();
+        neConvert = false;
+        cppne.ConvV* neCw = new cppne.ConvV(neConvert ? cppne.mkConvU(1) : cppne.mkConvU(2));
+        int neCwv = neCw->v;
+        int neCwl = cppne.nLive();
+        delete neCw;
+        if (neCwv != 102 || neCwl != 1 || cppne.nCtors() != 1 || cppne.nCopies() != 0
+            || cppne.nDtors() != 1 || cppne.nLive() != 0) return 4015;
 
         // A runtime delete count destroys every polymorphic element before one array free.
         cppunw.reset();
@@ -28049,6 +28255,9 @@ int LoweredUserDtorAssignLegs(int argc)
     // SRCTYPE round 4: identity-only sources reach free operators and C++ templates (clang oracle).
     int srctypeR4 = srctypeRound4Legs();
     if (srctypeR4 != 0) return srctypeR4;
+    // Pointer depth 3 in C++ signatures: exact-depth binding, returns, typedefs, templates, fields.
+    int deepPtrR = deepPtrLegs();
+    if (deepPtrR != 0) return deepPtrR;
     return 0;
 }
 
@@ -29200,6 +29409,90 @@ int srctypeRound4Legs()
     short cvcS = 1;
     if (cvc_pick(cvcMU, cvcS) != 3) return 69122;
     if (cvb_pref(cvbP, {1, 2}) != 1) return 69123;
+    // CVTIE: one usable conversion operator is picked; the implicit-conversion wrappers no longer tie.
+    CvtOne cvtOne = CvtOne();
+    CvtEx cvtEx = CvtEx();
+    CvtBoth cvtBoth = CvtBoth();
+    CvtM cvtM = CvtM();
+    if (cvt_bv(cvtOne) != 1 || cvt_bv(cvtEx) != 1) return 69801;
+    if (cvt_one(cvtBoth) != 1 || cvt_sec(1, cvtEx) != 1) return 69802;
+    if (cvtM.m(cvtOne) != 1 || CvtM.s(cvtEx) != 1) return 69803;
+    // CVTIE review: a by-value function pointer is no reference; `const` on a pointee or in a name is no const reference.
+    if (cvt_fp(cvt_getcb(), {1, 2}) != 1 || cvt_fps(cvt_getcb(), {1, 2}) != 1) return 69804;
+    int cvtX = 1;
+    int* cvtPx = &cvtX;
+    if (cvt_cp(&cvtX, {1, 2}) != 2 || cvt_cp(cvtPx, {1, 2}) != 2) return 69805;
+    if (cvt_en(CVT_KA, {1, 2}) != 2) return 69806;
+    // CVTIE review: a candidate a temporary cannot bind leaves the set in either declaration order.
+    CvtN cvtN = CvtN();
+    if (cvt_nv(1, {1, 2}) != 2 || cvt_nvs(1, {1, 2}) != 2 || cvtN.f(1, {1, 2}) != 2) return 69807;
+    short cvtS = 1;
+    if (cvt_best(cvtS, {cvtS, cvtS}) != 3) return 69808;
+    int cvtI = 1;
+    if (cvt_nbok(cvtOne, cvtS, cvtI) != 2) return 69809;
+    // CVTIE review: the implicit object ranks before the result's conversion.
+    CvtS1 cvtS1 = CvtS1();
+    CvtS2 cvtS2 = CvtS2();
+    CvtS3 cvtS3 = CvtS3();
+    if (cvt_p(cvtS1) != 8 || cvt_p(cvtS2) != 8 || cvt_p(cvtS3) != 7) return 69810;
+    // CVTIE review: a non-const conversion operator beats its const twin whatever the declaration order.
+    CvtTgtS cvtTs = CvtTgtS();
+    if (cvt_t(cvtTs) != 2 || cvt_tr(cvtTs) != 2) return 69811;
+    // CVTIE: a global-namespace function template, by value and from a braced list.
+    if (cvt_gt(1) != 3 || cvt_gl({1, 2}) != 42) return 69812;
+    // CVTIE r2: the wrapper made for an lvalue does not serve a prvalue, in any order (clang 12, 121, 12).
+    CvrQ cvrU = CvrQ();
+    if (cvr_a(cvrU) * 10 + cvr_a(cvr_mk()) != 12) return 69813;
+    if (cvr_b(cvrU) * 100 + cvr_b(cvr_mk()) * 10 + cvr_b(cvrU) != 121) return 69814;
+    CvrM cvrM = CvrM();
+    if (cvrM.m(cvrU) * 10 + cvrM.m(cvr_mk()) != 12) return 69815;
+    // CVTIE r2: a const source sees only its const operators (clang 1).
+    if (cvr_d(cvr_getmix()) != 1) return 69816;
+    // CVTIE r2: from a pointer only bool is viable (suite gap: master 2, first round refused).
+    int cvrX = 1;
+    if (cvr_bi(&cvrX, {1, 2}) != 2) return 69817;
+    if (cvr_db(&cvrX, {1, 2}) != 2) return 69818;
+    // CVTIE r2: a function-pointer value reaches bool or its own type (suite gap: master 1, first round refused).
+    if (cvr_fv(cvt_getcb(), {1, 2}) != 1) return 69819;
+    if (cvr_fc(cvt_getcb(), {1, 2}) != 1) return 69820;
+    if (cvr_fo(cvt_getcb(), {1, 2}) != 1) return 69821;
+    if (cvr_fown(cvt_getcb(), {1, 2}) != 1) return 69822;
+    // CVTIE r2: a pointer value cannot bind a function reference (suite gap: master 2, first round refused).
+    if (cvr_r1(cvt_getcb(), {1, 2}) != 2) return 69823;
+    if (cvr_r2(cvt_getcb(), {1, 2}) != 2) return 69824;
+    if (cvr_r3(cvt_getcb(), {1, 2}) != 2) return 69825;
+    if (cvr_r4(cvt_getcb(), {1, 2}) != 2) return 69826;
+    // CVTIE r2: a const source counts only const operators; `T(S&)` cannot take it (clang 1, 1).
+    if (cvr_t2(cvr_gets2()) != 1) return 69827;
+    if (cvr_t3(cvr_gets3()) != 1) return 69828;
+    // CVTIE r3: a pointer is no integer and no enum, a reference by its referent; both orders (clang 1).
+    int cvsX = 1;
+    CvsM cvsM = CvsM();
+    if (cvs_a1(&cvsX, {1, 2}) != 1) return 69829;
+    if (cvs_a2(&cvsX, {1, 2}) != 1) return 69830;
+    if (cvsM.f(&cvsX, {1, 2}) != 1) return 69831;
+    if (cvs_b1(&cvsX, {1, 2}) != 1) return 69832;
+    if (cvs_b2(&cvsX, {1, 2}) != 1) return 69833;
+    if (cvs_b3(&cvsX, {1, 2}) != 1) return 69834;
+    // CVTIE r3: `&cb` is a pointer value, not the function lvalue; `cb` converts to no object pointer.
+    if (cvs_c1(&cvs_cb, {1, 2}) != 2) return 69835;
+    if (cvs_c2(cvs_cb, {1, 2}) != 1) return 69836;
+    // CVTIE r3: a function name in a brace-list constructor call, a const pointer.
+    if (CvsC(cvs_cb, {1, 2}).k != 1) return 69839;
+    if (cvs_e2(cvs_getcp(), {1, 2}) != 1) return 69840;
+    // CVTIE r4: spellings differ for one type: top-level const, overloaded name, nested declarator (clang 2).
+    if (cvq_a(cvq_k, 1) != 2) return 69841;
+    if (cvq_b(cvq_o, 1) != 2) return 69842;
+    if (cvq_c(cvq_getg(), 1) != 2) return 69843;
+    // CVTIE r5: every overload counts, static members included; top-level const and noexcept (clang 2).
+    if (cvu_a(CvuN.g, 1) != 2) return 69844;
+    if (cvu_b(cvu_t, 1) != 2) return 69845;
+    if (cvu_c(cvu_o, 1) != 2) return 69846;
+    if (cvu_d(cvu_n, 1) != 2) return 69847;
+    if (cvu_f(cvu_getr(), {1, 2}) != 2) return 69848;  // a pointer value binds no function reference
+    // CVTIE r6: `throw()` is noexcept (clang 2).
+    if (cvw_a(cvw_t, 1) != 2) return 69849;
+    if (cvw_d(cvw_g, {1, 2}) != 2) return 69850;  // the exact non-template wins over the template
     // Fixed-array brace sinks select the same constructors as std::move in C++20.
     cppi.xv_reset();
     {
@@ -29264,5 +29557,138 @@ int srctypeRound4Legs()
         for (int value in nested) rangeadlGlobalNestedSum += value;
     }
     if (rangeadlGlobalNestedSum != 3) return 71205;
+    return 0;
+}
+
+// Depth-3 pointers (int***) bind at exactly their depth; values are clang++ -std=c++20 results.
+int deepPtrLegs()
+{
+    int v = 7;
+    int* p = &v;
+    int** pp = &p;
+    int*** ppp = &pp;
+    if (dpt.load3(ppp) != 7) return 91001;
+    if (dpt.over(ppp) != 3 || dpt.over(pp) != 2) return 91002;
+    int*** top = dpt.top3();
+    if (***top != 5) return 91003;
+    if (dpt.load_td(ppp) != 7) return 91004;
+    int*** tp = dpt.tptr(ppp);
+    if (***tp != 7) return 91005;
+    dpt.Holder h{};
+    h.slot = ppp;
+    if (***h.slot != 7 || dpt.load_holder(h) != 7) return 91006;
+    dpt.ref_slot() = ppp;
+    if (***dpt.ref_slot() != 7 || dpt.load3_ref(dpt.ref_slot()) != 7) return 91007;
+    if (***dpt.cref_slot() != 7 || dpt.load3_cref(ppp) != 7) return 91008;
+    if (dpt.cl_all(ppp) != 7) return 91009;
+    if (dpt.load3(&pp) != 7 || dpt.over(&pp) != 3) return 91010;
+    std.vector<int***> depthVec;
+    depthVec.push_back(ppp);
+    if (***depthVec[0] != 7) return 91011;
+    dpt.Cell cell = dpt.Cell(1, 2);
+    dpt.Cell* cellP = &cell;
+    dpt.Cell** cellPP = &cellP;
+    std.vector<dpt.Cell**> cellVec;
+    cellVec.push_back(cellPP);
+    dpt.Cell*** cellData = cellVec.data();
+    if ((**cellData)->b != 2) return 91012;
+    dpt.TD3b aliasP = ppp;
+    if (***aliasP != 7 || dpt.over(aliasP) != 3) return 91013;
+    dpt.T3 aliasL = ppp;
+    if (dpt.load_alias(aliasL) != 7 || dpt.load3(aliasL) != 7) return 91014;
+    if (dpt.over2(ppp) != 3 || dpt.over2d(pp) != 2) return 91015;
+    int***[] view = new int***[2];
+    view[0] = ppp;
+    if (dpt.over4(dpt.tptr(view)) != 4) return 91016;
+    // void* and const void* at depth >= 2: the cv tie-break, either declaration order.
+    if (dpt.vcv(pp) != 1 || dpt.vcv(ppp) != 1 || dpt.vcv(cellPP) != 1) return 91017;
+    // void* drops the const of the pointee the pointer points at, so only const void* binds.
+    auto constMid3 = dpt.mid3(ppp);
+    if (dpt.vcv(constMid3) != 2) return 91019;
+    // int** to const int** is no conversion, so void* is the only viable arm.
+    if (dpt.cl2(pp) != 1 || dpt.cl3(ppp) != 1 || dpt.ccell2(cellPP) != 1) return 91020;
+    // A `Cell* const*` argument cannot drop to `Cell**`.
+    if (dpt.mcell2(dpt.cmid2(cellPP)) != 1) return 91022;
+    // void* const& binds a converted temporary: Conversion rank, below the exact int***.
+    if (dpt.vref(ppp) != 3) return 91023;
+    // A depth-2 argument at a temporary's constructor is ranked like every other call site.
+    if (dpt.Ctor2(pp).v != 2) return 91025;
+    // The exact arm beats void* and a same-depth pointer to another type.
+    if (dpt.tg(pp) != 1) return 91026;
+    // No exact arm: the call keeps its declared-order pick.
+    if (dpt.vol(pp) != 1 || dpt.crefcl(pp) != 1) return 91027;
+    if (dpt.mkdeep32().y != 3 || sizeof(dpt.Deep32Field) != 24) return 91028;
+    auto dptQual3 = dpt.qual3src(dpt.qv3);
+    if (dpt.qual3(dptQual3) != 2) return 91029;
+    // volatile follows [conv.qual] like const: an invalid arm loses to void*, a valid one wins.
+    if (dpt.volv(pp) != 1 || dpt.tvolv(pp) != 1) return 91030;
+    if (dpt.CtorVol(pp).v != 1) return 91031;
+    // A valid volatile arm keeps master's pick: volatile levels are not modelled (open in the issue).
+    if (dpt.volok(pp) != 1) return 91032;
+    dpt.CbDeep cbDeep = dpt.mkcbdeep();
+    if (cbDeep.cb != nullptr || cbDeep.y != 3) return 91033;
+    dpt.DeepUnion deepUnion = dpt.mkdeepunion();
+    if (deepUnion.u != 4 || sizeof(dpt.DeepUnion) != 8) return 91034;
+    // A too-deep signature component keeps a pointer carrier: the field is still callable.
+    dpt.CbLive cbLive = dpt.mkcblive();
+    if (cbLive.cb(nullptr) != 8) return 91035;
+    if (dpt.runcb(cbLive.cb) != 8) return 91036;
+    // Volatile or restrict at any level takes master's path.
+    if (dpt.dropv(dpt.dropvsrc(pp)) != 1) return 91037;
+    auto dptVolatile3 = dpt.vsrc3();
+    if (dpt.exactv3(dptVolatile3) != 2) return 91038;
+    if (dpt.restr3(ppp) != 1) return 91039;
+    if (dpt.d3v(dpt.vsrc3()) != 1) return 91040;
+    if (dpt.rfv(dpt.vsrc3g) != 2 || dpt.crfv(dpt.vsrc3g) != 2) return 91041;
+    if (dpt.m3v(dpt.vsrc3()) != 1) return 91042;
+    dpt.VolF volF;
+    if (dpt.dropv(pp != nullptr ? volF.f2 : volF.f2) != 1) return 91043;
+    auto volJoin = pp != nullptr ? volF.f2 : volF.f2;
+    if (dpt.dropv(volJoin) != 1) return 91044;
+    // The direct result of a too-deep function-pointer return keeps master's pick.
+    if (dpt.pkv(dpt.RbDeep().rb(1)) != 1) return 91045;
+    // Volatile on the pointer object itself qualifies no pointee level.
+    if (dpt.tvq3(dpt.volTop.f3) != 2) return 91046;
+    // PTRREF: a C++ `T (&)[N]` maps to a bare pointer but binds only an array, so a pointer or
+    // nullptr takes the `const char *const &` / `const char *` sibling (clang values).
+    char[4] prArr = "abc";
+    char* prMut = &prArr[0];
+    const char* prConst = "abc";
+    cpp_ptrref.S prS = cpp_ptrref.S();
+    // A literal is const: it never binds `char (&)[4]` (master 100).
+    if (cpp_ptrref.f7("abc") != 203) return 96001;
+    // Member array references (master 200, 200, and a refused const pointer).
+    if (prS.m3(prMut) != 103 || prS.m3(nullptr) != 109 || prS.m3(prConst) != 103) return 96002;
+    if (prS.mb(prMut) != 103 || prS.mb(nullptr) != 109 || prS.mb(prConst) != 103) return 96003;
+    // A member `const char (&)[4]` keeps its const (master refused prConst, picked 100 for prMut).
+    if (prS.ma(prConst) != 200 || prS.ma(prMut) != 200) return 96004;
+    if (prS.m6(prConst) != 200 || prS.m6(prMut) != 200 || prS.m6(prArr) != 100) return 96005;
+    if (prS.m7(prMut) != 203) return 96006;
+    // Constructors (master 100, 100, 200, 200, 200, 100, 100).
+    if (cpp_ptrref.C7(prMut).r != 203 || cpp_ptrref.C7(nullptr).r != 209) return 96007;
+    if (cpp_ptrref.C3(nullptr).r != 109 || cpp_ptrref.Cb(nullptr).r != 109
+        || cpp_ptrref.C9(nullptr, 1).r != 109) return 96008;
+    if (cpp_ptrref.C6(prMut).r != 200 || cpp_ptrref.C6(nullptr).r != 200) return 96009;
+    // Master refused "abc" and prConst (lost const), and picked 100 for prMut / nullptr.
+    if (cpp_ptrref.Ca("abc").r != 100 || cpp_ptrref.Ca(prConst).r != 200
+        || cpp_ptrref.Ca(prMut).r != 200 || cpp_ptrref.Ca(nullptr).r != 200) return 96010;
+    // `char *` into `const char *const &` is a qualification: `const T&` deduces T = char* (master 103).
+    if (cpp_ptrref.f5(prMut) != 200 || cpp_ptrref.f8(prMut) != 300) return 96011;
+    // A literal at a template `const char *&&` keeps the caller's slot (master refused).
+    if (cpp_ptrref.consume(cpp_ptrref.rr("abc", 1), cpp_ptrref.scribble()) != 3) return 96012;
+    // Accept-set: master matched clang here, through the new literal array lvalue in the ctor wrapper.
+    if (cpp_ptrref.consume(cpp_ptrref.Keep("abc").q, cpp_ptrref.scribble()) != 3) return 96013;
+    if (cpp_ptrref.C9("abc", 1).r != 103 || cpp_ptrref.f9("abc", 1) != 103
+        || prS.m9("abc", 1) != 103) return 96014;
+    if (cpp_ptrref.f3(prArr) != 200 || prS.m3(prArr) != 200 || cpp_ptrref.Ca(prArr).r != 100
+        || cpp_ptrref.f6(prArr) != 100 || cpp_ptrref.f7(prArr) != 100 || prS.ma("abc") != 100) return 96015;
+    if (cpp_ptrref.f5("abc") != 103 || cpp_ptrref.f5(prConst) != 103 || cpp_ptrref.f5(prArr) != 200
+        || cpp_ptrref.f8(prConst) != 103) return 96016;
+    int[3] cvArray = {1, 2, 3};
+    const int[3] cvConstArray = {1, 2, 3};
+    cpp_ptrref.CvArrayMember cvArrayMember = cpp_ptrref.CvArrayMember();
+    if (cpp_ptrref.cv_array_pick(cvArray) != 1 || cpp_ptrref.cv_array_pick(cvConstArray) != 2
+        || cvArrayMember.pick(cvArray) != 1 || cpp_ptrref.CvArrayCtor(cvArray).r != 1)
+        return 96017;
     return 0;
 }

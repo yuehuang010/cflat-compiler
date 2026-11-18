@@ -1,0 +1,11 @@
+import cpp "../library/cpp_retelide.h";
+
+expect_error("its move or copy constructor is not accessible") {
+    retelide.PV retelide_private_local() { retelide.PV a = retelide.PV(1); return a; }
+}
+
+expect_error("its move or copy constructor is deleted") {
+    retelide.PM retelide_deleted_local() { retelide.PM a = retelide.PM(1); return a; }
+}
+
+extern int main() { return 0; }

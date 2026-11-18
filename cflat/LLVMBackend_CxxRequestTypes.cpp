@@ -449,6 +449,15 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                             + std::to_string(stringLiteralLenByPtr.at(constant) + 1) + "]>()";
                     else if (one.empty() && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary))
                         one = "nullptr";
+                    if (one.empty() && CxxFunctionValueSpelling(arg, spelling))
+                    {
+                        // A function name stays the function lvalue it is; `&f` and a call result are pointers.
+                        size_t at = spelling.find("(*)");
+                        if (llvm::isa<llvm::Function>(arg.Primary) && !arg.IsCxxAddressOfFunction
+                            && at != std::string::npos)
+                            spelling.replace(at, 3, "(&)");
+                        one = "declval<" + spelling + ">()";
+                    }
                     if (one.empty() && !arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
                         && CxxSpellingForCflatType(arg.TypeAndValue.TypeName, spelling))
                     {
@@ -465,7 +474,9 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                     {
                         std::string pointee = arg.TypeAndValue.TypeName.empty()
                             ? arg.InferSourceTypeName : arg.TypeAndValue.TypeName;
-                        if (arg.TypeAndValue.ElemPointer) pointee += "*";
+                        if (arg.TypeAndValue.ValuePointerDepth() >= 3)
+                            pointee.append(arg.TypeAndValue.ValuePointerDepth() - 1, '*');
+                        else if (arg.TypeAndValue.ElemPointer) pointee += "*";
                         if (!pointee.empty() && CxxSpellingForCflatType(pointee, spelling))
                             one = "declval<" + spelling + " *>()";
                     }
@@ -1195,12 +1206,190 @@ std::string LLVMBackend::CxxAggregateFlattenedFieldNameAt(const std::string& typ
         return record->second.fields[index].name;
 }
 
+/*
+ * BRACEPRV: a class prvalue element `T(args)` deferred into a brace list is spelled as that
+ * construction inside the wrapper, so clang builds it in place (no temporary moved in). Each
+ * constructor argument it does not spell inline becomes a wrapper parameter (appended to
+ * parameterTypes, its argument to `forwarded`) in flattened order. False when an argument kind
+ * cannot cross; the caller then keeps the element on the eager temporary path.
+ */
+bool LLVMBackend::SpellCxxBraceDeferredConstruction(const NamedVariable& construction,
+                                                     size_t& nextParameter,
+                                                     std::vector<std::string>& parameterTypes,
+                                                     std::vector<NamedVariable>* forwarded,
+                                                     std::string& expression, std::string& error)
+{
+        if (!construction.CxxDeferredTernaryShape.empty()) return false;
+        if (const std::string refusal = CxxConstructorRvalueRefBindRefusal(
+                construction.CxxDirectConstructionType,
+                construction.CxxDirectConstructionArguments);
+            !refusal.empty())
+        {
+            error = refusal;
+            return false;
+        }
+        std::string typeSpelling;
+        if (!CxxSpellingForCflatType(construction.CxxDirectConstructionType, typeSpelling))
+            return false;
+        std::string arguments;
+        for (const auto& argument : construction.CxxDirectConstructionArguments)
+        {
+            std::string child;
+            const auto& argType = argument.TypeAndValue;
+            if (argument.IsCxxDirectConstruction)
+            {
+                if (!SpellCxxBraceDeferredConstruction(argument, nextParameter, parameterTypes,
+                        forwarded, child, error))
+                    return false;
+            }
+            else if (argument.IsDefaultArgument || !argument.CxxClosureSignature.empty()
+                || argType.ElemPointer)
+                return false;
+            else if (IsCxxFunctionDesignatorArgument(argument) || argType.IsFunctionPointer)
+            {
+                // A named function crosses as its pointer and is re-spelled as the function
+                // lvalue; a function pointer value crosses by value.
+                TypeAndValue functionType = argType;
+                const bool designator = IsCxxFunctionDesignatorArgument(argument);
+                if (designator && argument.Primary != nullptr)
+                    if (auto* fn = llvm::dyn_cast<llvm::Function>(argument.Primary->stripPointerCasts()))
+                        if (const FunctionSymbol* symbol = FindSymbolForFunction(fn))
+                            functionType = FuncPtrSigOfSymbol(*symbol);
+                std::string spelling;
+                if (!CxxThinFunctionPointerSpelling(functionType, spelling)) return false;
+                const std::string parameter = "p" + std::to_string(nextParameter++);
+                parameterTypes.push_back(std::move(spelling));
+                if (forwarded != nullptr) forwarded->push_back(argument);
+                child = designator ? "(*" + parameter + ")" : parameter;
+            }
+            else if (std::string literal = argType.Pointer || argument.IsStringLiteral
+                    ? CxxStringLiteralArrayLvalue(argument, nextParameter) : std::string();
+                     !literal.empty())
+            {
+                // A string literal is its own `const char[N]` lvalue, as at a C++ call.
+                ++nextParameter;
+                parameterTypes.push_back(argType.TypeName == "c8" ? "const char8_t *" : "const char *");
+                if (forwarded != nullptr) forwarded->push_back(argument);
+                child = std::move(literal);
+            }
+            else if (IsCxxNullTypedArgument(argument) || IsBareNullptrBraceLiteral(argument))
+                child = "nullptr";
+            else if (const std::string* unnamedEnum = CxxUnnamedEnumExpression(argument.Storage);
+                     unnamedEnum != nullptr)
+                child = *unnamedEnum;
+            else
+            {
+                std::string spelling;
+                // The call-argument builder may blank a primitive TypeName; recover its identity.
+                std::string typeName = argType.TypeName;
+                llvm::Type* valueType = argument.Primary != nullptr
+                    ? argument.Primary->getType() : argument.BaseType;
+                if (typeName.empty() && argType.Pointer)
+                    typeName = !argument.InferSourceTypeName.empty() ? argument.InferSourceTypeName
+                        : DeclaredPrimitiveIdentityForCxxArgument(argument, valueType);
+                if (typeName.empty() && !argType.Pointer)
+                {
+                    typeName = !argument.LiteralIdentity.empty() ? argument.LiteralIdentity
+                        : DeclaredPrimitiveIdentityForCxxArgument(argument, valueType);
+                    if (typeName.empty()) typeName = argument.InferSourceTypeName;
+                    if (typeName.empty() && valueType != nullptr)
+                    {
+                        if (valueType->isFloatTy()) typeName = "float";
+                        else if (valueType->isDoubleTy()) typeName = "double";
+                        else if (valueType->isIntegerTy())
+                        {
+                            const unsigned bits = valueType->getIntegerBitWidth();
+                            typeName = bits == 1 ? "bool" : bits <= 8 ? "i8"
+                                : bits <= 16 ? "short" : bits <= 32 ? "int" : "i64";
+                        }
+                    }
+                }
+                if (typeName.empty()
+                    || (!(!argType.Pointer
+                            && CxxImportedEnumElementSpelling(typeName, spelling))
+                        && !CxxSpellingForCflatType(typeName, spelling)))
+                    return false;
+                const std::string parameter = "p" + std::to_string(nextParameter);
+                bool usesParameter = true;
+                if (argType.Pointer)
+                {
+                    if (spelling.find('*') == std::string::npos) spelling += " *";
+                    if ((argType.PointeeConstBit() || (argType.PointeeConstMask() & 1u) != 0)
+                        && !spelling.starts_with("const "))
+                        spelling = "const " + spelling;
+                    if (argType.IsCxxPointeeVolatile) PrependCv(spelling, "volatile ");
+                    child = parameter;
+                }
+                else if (IsCxxRecord(argType.TypeName))
+                {
+                    // A class argument binds by reference: clang copies an lvalue, moves an rvalue.
+                    const bool xvalue = argType.IsRvalueRef || argument.IsExplicitMove
+                        || IsCxxRvalueReferenceArgument(argument)
+                        || (argument.IsRvalue && !argType.IsAlias);
+                    const bool isConst = CxxConstReceiverKind(argument) != 0;
+                    spelling += xvalue ? " &&" : isConst ? " const &" : " &";
+                    child = xvalue ? "std::move(" + parameter + ")" : parameter;
+                }
+                else if (argType.IsAlias || argType.IsRvalueRef)
+                {
+                    // A scalar reference result (`T& f()`) stays bound to its referent.
+                    spelling += argType.IsRvalueRef ? " &&" : " &";
+                    child = argType.IsRvalueRef ? "std::move(" + parameter + ")" : parameter;
+                }
+                else
+                {
+                    std::string constant = argument.CxxImportedLiteral;
+                    if (constant.empty())
+                        constant = DirectBraceConstantText(argument, spelling,
+                            IsNullPointerConstantArgument(argument, true));
+                    usesParameter = constant.empty();
+                    // A scalar lvalue stays an lvalue so a `T&` constructor binds the source.
+                    if (usesParameter && argument.Storage != nullptr && !argument.IsRvalue
+                        && IsProvenCxxScalarLvalue(argument))
+                        spelling += " &";
+                    child = usesParameter ? parameter : constant;
+                }
+                if (usesParameter)
+                {
+                    ++nextParameter;
+                    parameterTypes.push_back(std::move(spelling));
+                    if (forwarded != nullptr) forwarded->push_back(argument);
+                }
+            }
+            arguments += (arguments.empty() ? "" : ", ") + child;
+        }
+        expression = construction.CxxDirectConstructionUsesBraces
+            ? typeSpelling + "{" + arguments + "}" : typeSpelling + "(" + arguments + ")";
+        return true;
+}
+
+bool LLVMBackend::CanSpellCxxBraceDeferredConstruction(const NamedVariable& construction)
+{
+        size_t nextParameter = 1;
+        std::vector<std::string> parameterTypes{ std::string() };
+        std::string expression;
+        std::string error;
+        return SpellCxxBraceDeferredConstruction(construction, nextParameter, parameterTypes,
+                                                 nullptr, expression, error)
+            && error.empty();
+}
+
+bool LLVMBackend::IsBareNullptrBraceLiteral(const NamedVariable& element)
+{
+        const auto& type = element.TypeAndValue;
+        return type.TypeName.empty() && !type.Pointer && !type.IsCxxNullptrT
+            && !type.IsFunctionPointer && element.LiteralIdentity.empty()
+            && element.Storage == nullptr
+            && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(element.Primary);
+}
+
 bool LLVMBackend::RequestCxxDirectBraceConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& elements,
         const std::string& initializerList, bool copyListInit, std::string& wrapperName,
         std::string& error, bool allowIncremental,
         std::vector<size_t>* forwardedElementIndices,
-        const std::vector<std::string>* elementTargetTypes)
+        const std::vector<std::string>* elementTargetTypes,
+        std::vector<std::vector<NamedVariable>>* deferredArguments)
 {
         error.clear();
         wrapperName.clear();
@@ -1293,6 +1482,18 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 && element.Storage == nullptr
                 && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(element.Primary);
         };
+        /*
+         * BRACEPRV: a class prvalue element `T(args)` deferred by the caller is spelled as that
+         * construction inside the brace list, so clang builds it in place (no temporary moved in).
+         * Each constructor argument becomes a wrapper parameter in flattened order; the caller
+         * passes CxxDirectConstructionArguments flattened the same way.
+         */
+        std::vector<std::string> deferredInit(elements.size());
+        if (deferredArguments != nullptr)
+        {
+            deferredArguments->clear();
+            deferredArguments->resize(elements.size());
+        }
         for (size_t i = 0; i < elements.size(); ++i)
         {
             std::string spelling;
@@ -1303,6 +1504,20 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             const std::string targetType = !(scalarReferenceSet && scalarElement)
                 && elementTargetTypes != nullptr
                 && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
+            if (elements[i].IsCxxDirectConstruction)
+            {
+                if (forwardedElementIndices == nullptr || deferredArguments == nullptr
+                    || CxxBraceFieldIsReference(targetType)
+                    || !SpellCxxBraceDeferredConstruction(elements[i], nextParameter, parameterTypes,
+                           &(*deferredArguments)[i], deferredInit[i], error))
+                {
+                    if (error.empty())
+                        error = "a deferred C++ class element cannot be built in the brace list";
+                    return false;
+                }
+                forwardedElementIndices->push_back(i);
+                continue;
+            }
             if (elements[i].IsDefaultArgument)
             {
                 if (type.TypeName.empty() || !CxxSpellingForCflatType(type.TypeName, spelling))
@@ -1409,6 +1624,17 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         }
         for (size_t i = 0; i < elements.size(); ++i)
         {
+            if (elements[i].IsCxxDirectConstruction)
+            {
+                const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
+                size_t at = 0;
+                while ((at = init.find(marker, at)) != std::string::npos)
+                {
+                    init.replace(at, marker.size(), deferredInit[i]);
+                    at += deferredInit[i].size();
+                }
+                continue;
+            }
             if (elements[i].IsDefaultArgument || isBareNullptrLiteral(elements[i])) continue;
             const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
             const std::string& param = elementParameters[i];
@@ -1504,7 +1730,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             }
             if (pointerXvalue)
             {
-                std::string castType = parameterTypes[i + 1];
+                std::string castType = parameterTypes[elementParameterTypes[i]];
                 castType.resize(castType.size() - 3);
                 replacement = "static_cast<" + castType + " &&>(" + param + ")";
             }
@@ -1878,6 +2104,19 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
             }))
             return true;
         if (HasDefaultedCxxConstructorTie(typeName, argTypes, allowExplicit)) return true;
+        // `nullptr` binds a `X *const &` constructor through a temporary, which the listed set does
+        // not admit: beside the listed pick, only clang ranks the two (a by-value `X *` ties).
+        if (selected != nullptr && argVars != nullptr)
+            if (auto raw = cxxRecordEntries_.find(typeName); raw != cxxRecordEntries_.end())
+                for (size_t i = 0; i < argVars->size(); ++i)
+                {
+                    if (!IsCxxNullTypedArgument((*argVars)[i])) continue;
+                    for (const auto& member : raw->second.members)
+                        if (member.kind == cflat_cinterop::RawCxxMember::Constructor
+                            && !member.isDeleted && member.paramTypes.size() == argVars->size() + 1
+                            && IsCxxConstRefToPointerSpelling(member.paramTypes[i + 1]))
+                            return true;
+                }
         const bool addressValue = argVars != nullptr
             && std::any_of(argVars->begin(), argVars->end(), [](const NamedVariable& arg) {
                 return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr;
@@ -2523,7 +2762,9 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             {
                 type += "*";
                 // `&p` over a `T*` is a `T**` prvalue: its recorded depth is the second star.
-                if (arg.TypeAndValue.ElemPointer
+                if (arg.TypeAndValue.ValuePointerDepth() >= 3)
+                    type.append(arg.TypeAndValue.ValuePointerDepth() - 1, '*');
+                else if (arg.TypeAndValue.ElemPointer
                     || (arg.IsCxxAddressOfPointerValue && arg.TypeAndValue.PointerDepth >= 2))
                     type += "*";
             }
@@ -2569,6 +2810,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
 
         std::vector<std::string> parameterSpellings;
         std::vector<std::string> callArguments;
+        std::vector<size_t> literalArrayParams;   // wrapper parameters holding a string literal
         parameterSpellings.push_back(ownerSpelling + " *");
         // The C++ spelling of a null pointer constant: the integer literal 0 in the suffix of its
         // type (a zero macro folds to a constant, so its declared type is the key), else empty.
@@ -2615,6 +2857,17 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 // A CFlat closure: the class is constructed from the owning __cflat_closure<>.
                 parameterSpellings.push_back("void *");
                 callArguments.push_back(CxxClosureCallArgument(arg, "p" + std::to_string(i + 1)));
+                continue;
+            }
+            // A literal is its own `const char[N]` lvalue, as on the free path, so clang ranks an
+            // array-reference constructor against a pointer one exactly as at the source site.
+            if (std::string literalArray = stringLiteral
+                    ? CxxStringLiteralArrayLvalue(arg, i + 1) : std::string();
+                !literalArray.empty())
+            {
+                literalArrayParams.push_back(i + 1);
+                parameterSpellings.push_back("const char *");
+                callArguments.push_back(std::move(literalArray));
                 continue;
             }
             if (IsCxxNullTypedArgument(arg))
@@ -3101,6 +3354,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         bool requested = RequestGeneratedCxxWrapper(group, generatedTypeSource + mirror + wrapperSource,
                                                     wrapperName, "VARIADIC_CTOR", bound, wrapperError,
                                                     incompleteTypes.empty(), allowIncremental);
+        bool requestedWithMirror = requested;
+        std::vector<std::string> exactSpellingsCopy = exactParameterSpellings;
         if (!requested && !mirror.empty())
         {
             // A mirror clang cannot compile (a spelling that does not round-trip) must not
@@ -3131,6 +3386,40 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 error = std::format("C++ variadic constructor call '{}' does not match (clang: {})",
                                     typeName, FirstCxxErrorLine(wrapperError));
             return false;
+        }
+        // The selected constructor binds `X *const &` to a literal's decayed pointer: that
+        // temporary dies with the wrapper frame, so the caller's slot is passed instead.
+        if (!literalArrayParams.empty())
+        {
+            // The spellings and calls of the request that succeeded (the mirror's, else the exact retry).
+            const std::string usedMirror = requestedWithMirror ? mirror : std::string();
+            std::vector<std::string>& spellings = requestedWithMirror
+                ? parameterSpellings : exactSpellingsCopy;
+            // Calls indexed like the spellings (the receiver `p0` first), as the retarget expects.
+            std::vector<std::string> calls{ "p0" };
+            for (const std::string& call : requestedWithMirror ? callArguments : exactCallArguments)
+                calls.push_back(call);
+            auto makeInput = [&](const std::vector<std::string>& retargetCalls, std::string& name) {
+                compose(spellings, std::vector<std::string>(retargetCalls.begin() + 1, retargetCalls.end()),
+                        usedMirror);
+                name = wrapperName;
+                return generatedTypeSource + usedMirror + wrapperSource;
+            };
+            auto request = [&](const std::string& name, const std::string& input, CSigEntry& out,
+                               std::string& requestError) {
+                return RequestGeneratedCxxWrapper(group, input, name, "VARIADIC_CTOR", out,
+                                                  requestError, incompleteTypes.empty(),
+                                                  allowIncremental);
+            };
+            std::string retargetError;
+            if (!RetargetCxxLiteralPointerTemporaries(bound, literalArrayParams, spellings, calls,
+                                                      makeInput, request,
+                                                      DisplayCxxClassName(typeName), wrapperName,
+                                                      retargetError))
+            {
+                error = retargetError;
+                return false;
+            }
         }
         bound.name = wrapperName;
         RegisterCSignatures({ bound }, group.headers.front());
@@ -3857,7 +4146,8 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
             std::string spelled = mapped.TypeName;
             if (mapped.Pointer) spelled += "*";
-            if (mapped.ElemPointer) spelled += "*";
+            if (mapped.ValuePointerDepth() >= 3) spelled.append(mapped.ValuePointerDepth() - 1, '*');
+            else if (mapped.ElemPointer) spelled += "*";
             typeAliases[cflatName] = spelled;
             // `using Name = const char*` keeps its pointee const (a `(const char)*` alias).
             if (mapped.Pointer && !mapped.ElemPointer && CxxSpellingHasConstPointee(spelling))

@@ -1,0 +1,106 @@
+import cpp "cpp_interop_deepptr.hpp";
+import "c_interop_deepptr.h";
+
+extern int main()
+{
+    // An exact-depth parameter refuses a depth-2 argument: int** into int*** is a refusal, not a
+    // silent accept (master accepted it and read through the wrong depth).
+    expect_error("no overload of 'dpt.load3' matches the given arguments") {
+        int v = 7;
+        int* p = &v;
+        int** pp = &p;
+        dpt.load3(pp);
+    }
+    expect_error("no overload of 'dpt.load3' matches the given arguments") {
+        int v = 7;
+        int* p = &v;
+        dpt.load3(p);
+    }
+    expect_error("no overload of 'dpt.load3_cref' matches the given arguments") {
+        int v = 7;
+        int* p = &v;
+        int** pp = &p;
+        dpt.load3_cref(pp);
+    }
+    // The C header's int*** parameter refuses a depth-2 argument the same way.
+    expect_error("no overload of 'dp_load' matches the given arguments") {
+        int v = 7;
+        int* p = &v;
+        int** pp = &p;
+        dp_load(pp);
+    }
+    // Depth 32 declared in the header compiles unused (test_cpp_interop.cb); a use refuses.
+    expect_error("was not bound: parameter 'p' has unsupported C++ type") {
+        dpt.f32(nullptr);
+    }
+    // A field past the carrier limit keeps its record complete; opaque bytes never decay to
+    // the field's address, in any read of it.
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeep deep = {};
+        int x = deep.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeep deep = {};
+        void* v = deep.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeep deep = {};
+        dp_takevp(deep.w);
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeep deep = {};
+        void* v = (void*)deep.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeep deep = {};
+        auto q = deep.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        dpt.Deep32Field deep = dpt.mkdeep32();
+        void* v = deep.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        dpt.Deep32Field deep = dpt.mkdeep32();
+        dpt.takevp(deep.w);
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        dpt.Deep32Field deep = dpt.mkdeep32();
+        auto q = deep.w;
+    }
+    // A function-pointer field with a too-deep parameter is a function pointer, not a void*.
+    expect_error("cannot assign a 'int*' value to 'function<>' destination") {
+        dpt.CbLive h = dpt.mkcblive();
+        int v = 1;
+        h.cb = &v;
+    }
+    expect_error("no overload of 'dpt.cbpick' matches the given arguments") {
+        dpt.CbLive h = dpt.mkcblive();
+        dpt.cbpick(h.cb);
+    }
+    // A union and a C anonymous member read the same way.
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeepUnion deepUnion = {};
+        void* v = deepUnion.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeepUnion deepUnion = {};
+        dp_takevp(deepUnion.w);
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        dpt.DeepUnion deepUnion = dpt.mkdeepunion();
+        void* v = deepUnion.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeepAnon deepAnon = {};
+        void* v = deepAnon.w;
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeepAnon deepAnon = {};
+        dp_takevp(deepAnon.w);
+    }
+    expect_error("field 'w' has a pointer type deeper than CFlat carries") {
+        DpDeepAnonU deepAnonU = {};
+        void* v = deepAnonU.w;
+    }
+    return 0;
+}

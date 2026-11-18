@@ -1144,6 +1144,8 @@ public:
         bool IsCxxConstValueReturn = false;
         // C++ receiver whose innermost pointee or referent is volatile.
         bool IsCxxPointeeVolatile = false;
+        // The imported spelling names volatile or restrict at some declarator level.
+        bool CxxSpelledCvrQualifier = false;
         // Declared std::nullptr_t (CFlat spells it void*): only such a value, a nullptr literal
         // or 0 binds a C++ nullptr_t parameter. Internal only: overload viability.
         bool IsCxxNullptrT = false;
@@ -1736,6 +1738,7 @@ public:
         int8_t CxxRefLevel = -1;
         bool IsCxxConstValueReturn = false;
         bool IsCxxPointeeVolatile = false;
+        bool CxxSpelledCvrQualifier = false;
         bool IsCxxNullptrT = false;
         bool IsCxxMutableField = false;
         bool IsOwningSink = false;
@@ -1826,6 +1829,7 @@ public:
             s.CxxRefLevel = t.CxxRefLevel;
             s.IsCxxConstValueReturn = t.IsCxxConstValueReturn;
             s.IsCxxPointeeVolatile = t.IsCxxPointeeVolatile;
+            s.CxxSpelledCvrQualifier = t.CxxSpelledCvrQualifier;
             s.IsCxxNullptrT = t.IsCxxNullptrT;
             s.IsCxxMutableField = t.IsCxxMutableField;
             s.IsOwningSink = t.IsOwningSink;
@@ -1919,6 +1923,7 @@ public:
             t.CxxRefLevel = CxxRefLevel;
             t.IsCxxConstValueReturn = IsCxxConstValueReturn;
             t.IsCxxPointeeVolatile = IsCxxPointeeVolatile;
+            t.CxxSpelledCvrQualifier = CxxSpelledCvrQualifier;
             t.IsCxxNullptrT = IsCxxNullptrT;
             t.IsCxxMutableField = IsCxxMutableField;
             t.IsOwningSink = IsOwningSink;
@@ -2201,6 +2206,8 @@ public:
         bool HasOwnedStructTempRange = false;
         // Address-of a proven pointer lvalue yields a C++ pointer prvalue (`&p`). Transient.
         bool IsCxxAddressOfPointerValue = false;
+        // Address-of a function name: a pointer value, where the bare name is a function lvalue. Transient.
+        bool IsCxxAddressOfFunction = false;
         // CFlat brace arguments load from their construction slot instead of a call instruction.
         bool IsCFlatBraceInitTemp = false;
         // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
@@ -2652,6 +2659,7 @@ public:
         bool hasSourceType = false;
         // TypeAndValue::PointeeConstBit() of a pointer operand, so a `?:` join keeps it.
         bool         cxxPointeeConst = false;
+        bool         cxxSpelledCvrQualifier = false;
         // CxxReceiverCv of a C++ object operand (a const prvalue or xvalue included), kept for
         // operator ranking once the NamedVariable is gone.
         int          cxxObjectCv = 0;
@@ -3921,6 +3929,8 @@ private:
     // paths). Carried through a '?:' join whose arms are all borrowed moves or null, so the
     // laundered spelling is rejected exactly like the direct one. Retired with ownedNewTemps_.
     std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues_;
+    // Value of `p = e = new T()` whose middle cannot own (parameter, alias, other pointee), to its name.
+    std::unordered_map<const llvm::Value*, std::string> chainBorrowMiddleValues_;
     // Pointer values produced by ADDRESS-OF (`&x`, `&a[i]`, `&s.f`). Such a value can never own
     // its pointee, so it is positive proof of a borrow. Live compile-time state keyed by
     // llvm::Value identity - never part of the --init cache round-trip.
@@ -5125,7 +5135,8 @@ public:
     static constexpr uint8_t OwnFlagDoWhileFrame = 4;
     static constexpr uint8_t OwnFlagLoopIncrementFrame = 8;
     // Records the innermost loop's view-rebind names on its frame (see FindLoopViewRebindTargets).
-    void NoteLoopViewAssignments(const std::unordered_set<std::string>& names);
+    void NoteLoopViewAssignments(const std::unordered_set<std::string>& names,
+                                 const std::unordered_set<std::string>& borrowRebindNames);
     void RecordUniqueOwnerLoopSink(const NamedVariable& source, const std::string& uniqueType,
                                    const std::string& destination, bool isReset, bool isUnique = true);
     void RecordMoveOwnerLoopSink(const NamedVariable& source, const std::string& function,
@@ -5204,6 +5215,10 @@ private:
         size_t scopeDepth = 0;
         // Names the loop body rebinds by anything other than a bare `new` (may carry a borrow).
         std::unordered_set<std::string> nonNewViewAssigns;
+        // The subset also rebound by something other than a bare `nullptr`.
+        std::unordered_set<std::string> borrowRebindNames;
+        // A generic instantiated inside this loop swaps the scope stack, so scopeDepth means nothing there.
+        const llvm::Function* function = nullptr;
         std::vector<MoveSinkView> moveSinkViews;
         std::vector<UniqueOwnerSink> uniqueOwnerSinks;
         std::vector<MoveOwnerSink> moveOwnerSinks;
@@ -6980,6 +6995,11 @@ private:
     // must not prescribe `move <origin>` (see NamedVariable::BorrowedThroughField).
     void RegisterMovedBorrowedThroughField(llvm::Value* value);
     bool IsMovedBorrowedThroughField(llvm::Value* value) const;
+    void NoteChainBorrowMiddle(const llvm::Value* value, const std::string& middle);
+    // Name of the first join arm of `joined` that is such a chain value; empty when none is.
+    std::string ChainBorrowMiddleArmName(const llvm::Value* joined) const;
+    // True when a chain consumer reads this slot as a named `a = slot;` (owner, middle borrowing one, or chain value above).
+    bool ChainSlotReadsAsNamed(const NamedVariable& slotVar, const llvm::Value* chainValue) const;
 
     // True when `value` provably owns nothing because a `move` of a borrow produced it. `originOut`
     // receives the borrow's origin name so the diagnostic can name the real owner.
@@ -7936,6 +7956,8 @@ private:
     size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
                                    const std::vector<std::string>& defines);
     CxxRequestGroup MakeCxxRequestGroup(size_t primary, const std::vector<size_t>& deps) const;
+    std::string CxxRequestPruneScopeFor(const std::vector<std::string>& headers,
+                                        const std::vector<std::string>& defines) const;
     CxxRequestGroup MakeCxxClassRequestGroup(size_t owner, const std::string& typeName,
                                             const std::vector<size_t>& deps = {}) const;
     void PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records);
@@ -8120,7 +8142,15 @@ private:
                                           std::string& error,
                                           bool allowIncremental = true,
                                           std::vector<size_t>* forwardedElementIndices = nullptr,
-                                          const std::vector<std::string>* elementTargetTypes = nullptr);
+                                          const std::vector<std::string>* elementTargetTypes = nullptr,
+                                          std::vector<std::vector<NamedVariable>>* deferredArguments = nullptr);
+    bool SpellCxxBraceDeferredConstruction(const NamedVariable& construction, size_t& nextParameter,
+                                           std::vector<std::string>& parameterTypes,
+                                           std::vector<NamedVariable>* forwarded,
+                                           std::string& expression, std::string& error);
+    // A dry run of SpellCxxBraceDeferredConstruction: may the element be deferred into the wrapper?
+    bool CanSpellCxxBraceDeferredConstruction(const NamedVariable& construction);
+    static bool IsBareNullptrBraceLiteral(const NamedVariable& element);
     bool CxxRecordFieldTypeSpelling(const std::string& typeName,
                                     const std::string& fieldName,
                                     std::string& spelling,
@@ -8604,6 +8634,10 @@ private:
     static std::string CxxRecordPointeeTag(const std::string& spelling, int& outPtr);
     static std::string AggregatePointeeTag(const std::string& spelling, int& outPtr);
 
+    // The last MapCTypeToTypeAndValue failed on a pointer deeper than the carrier holds.
+    bool cTypeMapExceededPointerDepth_ = false;
+    // > 0 while mapping a function signature's return or parameter.
+    int cTypeMapSignatureNesting_ = 0;
     bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
                                     std::unordered_set<std::string>& visited,
                                     bool cxxBoundary);
@@ -12332,6 +12366,13 @@ public:
     void RegisterPendingSyntheticCRecord(const std::string& ctype);
     // C++ records laid out with an opaque-bytes field, keyed by LLVM type (BindLazyCxxStdField).
     std::unordered_map<llvm::StructType*, std::string> cxxOpaqueFieldOwners_;
+    // Fields of imported records too deep to carry (opaque bytes): a read is refused, layout stays.
+    std::unordered_map<llvm::StructType*, std::set<std::string>> tooDeepOpaqueFields_;
+    bool IsTooDeepOpaqueField(llvm::StructType* owner, const std::string& field) const
+    {
+        auto it = tooDeepOpaqueFields_.find(owner);
+        return it != tooDeepOpaqueFields_.end() && it->second.count(field) != 0;
+    }
     // Register the callable surface of one imported C++ class: instance methods, static methods,
     // static data members, and the constructor/destructor table used by lifetime codegen.
     void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
@@ -12978,6 +13019,8 @@ public:
     // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10).
     // `suffixedInteger` (optional) is set when the identity comes from an integer suffix (1UL, 2LL).
     bool CxxArrayReferenceSpelling(const FunctionSymbol& candidate, size_t index) const;
+    bool CxxLiteralArrayReferenceMix(const std::vector<NamedVariable>& arguments, const FunctionSymbol& x,
+                                     const FunctionSymbol& y, size_t offset) const;
     bool IsNullPointerConstantArgument(const NamedVariable& arg, bool cxx = false) const;
     static bool LiteralTextHasSign(std::string_view text);
     static std::string LiteralIdentityForOverload(std::string_view text, bool* suffixedInteger = nullptr);
@@ -13007,6 +13050,10 @@ public:
         int second = 0;
         bool cxxViable = false;
         bool implicitObjectCvNonViable = false;
+        // An unjudged function value against a parameter holding what the CFlat mapping erases.
+        bool functionValueUnproven = false;
+        bool functionValueUnranked = false;   // any Unranked verdict: the parameter is function-typed
+        bool functionValueExact = false;   // this argument's clang spelling equals the parameter's
         std::vector<std::string> ambiguousOperators;
         std::string from;   // the argument's type as ranked, for diagnostics
         // RULING: a C++ `const T&` scalar bound to a materialized temporary (argument type differs from
@@ -13017,6 +13064,9 @@ public:
         // to `void*`) conversion from `from` to `toClass`; an implicit object's ref-qualifier.
         std::string cvBase;
         int cv = 0;
+        // Element cv for a direct array-reference binding; kept separate from `cv` so it ranks
+        // against another array reference without changing its existing comparison to decay paths.
+        int arrayReferenceCv = -1;
         std::string toClass;
         int objectRef = 0;
         bool objectIsRvalue = false;
@@ -13027,7 +13077,15 @@ public:
         // [over.ics.rank] 3.2.3 for a derived-to-base binding: `Base&&` to an rvalue (1) beats
         // `Base&` / `const Base&` (2); a by-value base has no binding kind (0).
         int derivedRefBind = 0;
+        // Depth >= 2 pointer argument: the parameter matches it exactly in depth, pointee and cv /
+        // the parameter is `void*` or another pointee at that depth (PreferCxxDeepPointerExact).
+        bool deepPointerExact = false;
+        bool deepPointerOther = false;
     };
+    bool IsCxxDeepPointerNonExactParam(const FunctionSymbol& candidate, size_t index,
+                                       const NamedVariable& arg, const TypeAndValue& param) const;
+    // An exact-match arm at a depth >= 2 argument outranks `void*`; everything else stays as ranked.
+    static void PreferCxxDeepPointerExact(const std::vector<std::vector<CxxConversionRank>*>& candidates);
     // The candidate C++ would call when CFlat's call rules refuse it (see ComputeOverloadFunction).
     struct CxxPreferredOverload
     {
@@ -13050,7 +13108,8 @@ public:
     std::optional<int> TupleLiteralElementCost(const NamedVariable& argument,
                                                const TypeAndValue& parameter, bool cxx);
     std::vector<std::string> CxxClassConversionTies(const std::string& source,
-                                                    const std::string& target) const;
+                                                    const std::string& target,
+                                                    bool sourceConst = false) const;
     struct CxxClassConversionPair
     {
         int operatorConst = 0;
@@ -13059,8 +13118,23 @@ public:
         std::string ctorParam;
     };
     bool FindCxxClassConversionPair(const std::string& source, const std::string& target,
-                                    CxxClassConversionPair& out) const;
-    bool CxxConversionOperatorBindsBetter(const std::string& source, const std::string& target) const;
+                                    CxxClassConversionPair& out, bool sourceConst = false) const;
+    bool CxxConversionOperatorBindsBetter(const std::string& source, const std::string& target,
+                                          bool sourceConst = false) const;
+    // Viability and rank of a pointer-shaped argument against one parameter spelling; see the definition.
+    struct CxxPointerArgumentFit
+    {
+        enum class Kind { NotApplicable, NotViable, Viable, Unranked } kind = Kind::NotApplicable;
+        int rank = 0;                   // 0 exact, 2 conversion, 3 boolean conversion
+        bool boolConversion = false;
+        bool erasedSignature = false;   // Unranked, and the parameter holds what the CFlat mapping erases
+    };
+    CxxPointerArgumentFit ClassifyCxxPointerArgument(const NamedVariable& arg, const std::string& spelling);
+    bool CxxFunctionValueSpelling(const NamedVariable& arg, std::string& spelling) const;
+    bool CxxFunctionNameOverloads(const NamedVariable& arg, std::vector<const FunctionSymbol*>& overloads,
+        bool& hasTemplate);
+    bool CxxFunctionSymbolSpellings(const FunctionSymbol& symbol, std::string& result,
+        std::vector<std::string>& parameters, bool& isNoexcept) const;
     std::vector<CxxConversionRank> RankCxxConversionSequences(
         const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate,
         bool allowTemplateClassConversion = false);
@@ -13777,6 +13851,10 @@ public:
     OwnFlagJoinSnapshot NormalizeOwnFlagJoinState(const OwnFlagJoinSnapshot& state,
                                                    bool keepMayBeFalse) const;
     bool IsInsideOwnershipControlFrame(uint8_t frameKinds) const;
+    // True when a loop of the current function, entered after this named slot was declared, may
+    // rebind it to a value that can be a borrow. Stores emitted so far do not show that back-edge store.
+    bool LoopMayRebindSlotToBorrow(const llvm::Value* slot) const;
+    std::string LoopUnknownJoinArmName(const llvm::Value* joined);
     bool HasOwnershipControlFrameBetween(const std::vector<uint64_t>& originPath,
                                          uint8_t frameKinds) const;
 
@@ -15202,7 +15280,9 @@ public:
     // 325: constant macro entries record an unnamed-enum natural type ("ue", MACROLEFT).
     // 328: conversion-function template metadata and requests are cached separately from ctor templates.
     // 330: function-type parameters record pointee const (callback overload ranking).
-    static constexpr int kCHeaderCacheVersion = 335;
+    // 336: C and C++ pointer depth 3+ is recorded ("pd") instead of collapsing to void**.
+    // 341: a C++ throw() declaration is recorded as noexcept.
+    static constexpr int kCHeaderCacheVersion = 341;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

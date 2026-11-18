@@ -804,7 +804,8 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
             if (type.Pointer)
             {
                 cflatType += "*";
-                if (type.ElemPointer) cflatType += "*";
+                if (type.ValuePointerDepth() >= 3) cflatType.append(type.ValuePointerDepth() - 1, '*');
+                else if (type.ElemPointer) cflatType += "*";
             }
             std::string spelling;
             if (!CxxSpellingForCflatType(cflatType, spelling)) return std::nullopt;
@@ -815,9 +816,16 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
 
             const bool rvalue = IsCxxRvalueReferenceArgument(arg);
             if (rvalue)
-                return ActualArgument{ spelling + " &&",
-                    "static_cast<" + spelling + " &&>(p" + std::to_string(parameterIndex) + ")" };
-            return ActualArgument{ spelling + " &",
+            {
+                const std::string cvRvalue = arg.TypeAndValue.IsConstObject() || arg.TypeAndValue.CxxConstRef()
+                    ? "const " : "";
+                return ActualArgument{ cvRvalue + spelling + " &&",
+                    "static_cast<" + cvRvalue + spelling + " &&>(p" + std::to_string(parameterIndex) + ")" };
+            }
+            // CVTIE r2: a known-const object is spelled so clang sees only its const operators.
+            const std::string cv = arg.TypeAndValue.IsConstObject() || arg.TypeAndValue.CxxConstRef()
+                ? "const " : "";
+            return ActualArgument{ cv + spelling + " &",
                 "p" + std::to_string(parameterIndex) };
         };
 
@@ -879,7 +887,8 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
             hashKey += candidate.lookupName;
             hashKey += candidate.ownerSpelling;
             hashKey += target;
-            for (const auto& param : candidate.parameterTypes) hashKey += param;
+            // CVTIE: the body is one C++ call clang resolves itself, so sibling overloads that spell the
+            // same call share one wrapper; a wrapper per candidate tied with itself in overload ranking.
             for (const auto& actual : candidateActuals) hashKey += actual.spelling;
             const uint64_t hash = HashWrapperKey(hashKey);
             const std::string wrapperName = std::format("__cflat_udc_{:016x}", hash);
@@ -897,7 +906,10 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
                 wrapperSource += candidateActuals[i].spelling + " p" + std::to_string(i);
             }
             wrapperSource += ")";
-            if (candidate.isNoexcept) wrapperSource += " noexcept";
+            // CVTIE: the shared wrapper may call any sibling; noexcept only when every one is.
+            if (std::all_of(candidates.begin(), candidates.end(),
+                            [](const CxxImplicitArgumentCandidate& c) { return c.isNoexcept; }))
+                wrapperSource += " noexcept";
             wrapperSource += " { return " + target + "; }\n";
 
             size_t groupIndex = static_cast<size_t>(-1);
@@ -939,7 +951,7 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
                             wrapperName, wrapperError);
                     if (std::string cause = CxxFirstDiagnosticLine(wrapperError); !cause.empty())
                         cxxImplicitConversionRefusal_ = std::format(
-                            "clang rejected the call through '{}': {}",
+                            "clang rejected the call through '{}' (clang: {})",
                             candidateDescription(candidate), cause);
                 }
                 continue;
@@ -1513,19 +1525,29 @@ bool LLVMBackend::RetargetCxxLiteralPointerTemporaries(
                 plan.emplace_back(k, bound.paramTemporarySpellings[k]);
         if (plan.empty()) return true;
         const std::vector<std::string> sourceSpellings = parameterSpellings;
-        std::vector<std::string> retargetCalls = calls;
-        for (const auto& [k, type] : plan)
-        {
-            parameterSpellings[k] = type + "const &";
-            retargetCalls[k] = "p" + std::to_string(k);
-        }
+        std::vector<std::string> retargetCalls;
         std::string name;
-        const std::string input = makeInput(retargetCalls, name);
-        parameterSpellings = sourceSpellings;
         CSigEntry retargeted;
-        std::string requestError;
-        if (!request(name, input, retargeted, requestError)
-            || bound.calleeIdentity.empty() || retargeted.calleeIdentity != bound.calleeIdentity)
+        bool sameCallee = false;
+        // The caller's slot as `X *const &`; an `X *&&` callee takes it as an xvalue `X *&&` instead.
+        for (const bool xvalue : { false, true })
+        {
+            retargetCalls = calls;
+            for (const auto& [k, type] : plan)
+            {
+                const std::string slot = "p" + std::to_string(k);
+                parameterSpellings[k] = type + (xvalue ? "&&" : "const &");
+                retargetCalls[k] = xvalue ? "static_cast<" + type + "&&>(" + slot + ")" : slot;
+            }
+            const std::string input = makeInput(retargetCalls, name);
+            parameterSpellings = sourceSpellings;
+            std::string requestError;
+            retargeted = CSigEntry{};
+            sameCallee = request(name, input, retargeted, requestError)
+                && !bound.calleeIdentity.empty() && retargeted.calleeIdentity == bound.calleeIdentity;
+            if (sameCallee) break;
+        }
+        if (!sameCallee)
         {
             error = std::format("C++ '{}' called with a string literal selects an overload that "
                                 "binds a reference to the literal's decayed pointer, and CFlat "
@@ -1854,7 +1876,10 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
             if (pointer)
             {
                 type += "*";
-                if (arg.TypeAndValue.ElemPointer
+                // A recorded depth of 3+ spells every level; depth 1-2 keep the shape bits.
+                if (arg.TypeAndValue.ValuePointerDepth() >= 3)
+                    type.append(arg.TypeAndValue.ValuePointerDepth() - 1, '*');
+                else if (arg.TypeAndValue.ElemPointer
                     || (arg.IsCxxAddressOfPointerValue
                         && arg.TypeAndValue.PointerDepth >= 2))
                     type += "*";
@@ -3557,6 +3582,67 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 if (symbol.External && symbol.UniqueName == wrapperName)
                 { registered = true; break; }
         if (!registered) return noMatch("the generated wrapper could not be registered");
+        /*
+         * A by-value class prvalue argument reaches the wrapper, which moves it into a local before the
+         * call. C++ builds it in the callee's parameter; the selected instantiation is called through
+         * its address on the by-value ABI instead, as SwitchCxxDirectByValueCall does for free functions.
+         * The direct call passes every argument unconverted, so it is taken only when each argument
+         * already has exactly its selected parameter's type; any conversion (narrowing, derived-to-base,
+         * a `?:` of a derived class) stays in the wrapper, where C++ performs it.
+         */
+        const auto exactSelectedParameters = [&]() -> bool {
+            const std::string& fnType = bound.selectedCalleeType;
+            if (fnType.empty() || fnType.back() != ')') return false;
+            size_t open = std::string::npos;
+            for (int depth = 0, i = static_cast<int>(fnType.size()) - 1; i >= 0; --i)
+            {
+                if (fnType[i] == ')') ++depth;
+                else if (fnType[i] == '(' && --depth == 0) { open = static_cast<size_t>(i); break; }
+            }
+            if (open == std::string::npos) return false;
+            const std::string list = fnType.substr(open + 1, fnType.size() - open - 2);
+            std::vector<std::string> params;
+            if (list != "void" && !list.empty())
+            {
+                int depth = 0;
+                std::string current;
+                for (char c : list)
+                {
+                    if (c == '(' || c == '<' || c == '[') ++depth;
+                    else if (c == ')' || c == '>' || c == ']') --depth;
+                    if (c == ',' && depth == 0)
+                    {
+                        params.push_back(current);
+                        current.clear();
+                        continue;
+                    }
+                    current.push_back(c);
+                }
+                params.push_back(current);
+            }
+            if (arguments.size() > params.size()) return false;
+            for (const std::string& param : params)
+                if (param.find("...") != std::string::npos) return false;
+            for (size_t i = 0; i < arguments.size(); ++i)
+            {
+                if (arguments[i].IsCxxDirectConstruction) return false;
+                std::string type = cflatTypeOf(arguments[i]);
+                std::string spelling;
+                if (type.empty() || !cxxTemplateArgumentSpelling(type, spelling)) return false;
+                if (SqueezeCxxSpelling(spelling) != SqueezeCxxSpelling(params[i])) return false;
+            }
+            return true;
+        };
+        if (ownerType.empty() && infixOperator.empty() && !instanceWrapper && braceArguments.empty()
+            && scalarBackedParams.empty() && classBackedParams.empty() && !wrapperNeedsInitializerList
+            && functionPointerCallerSlots.empty() && !closureArgument && !literalArrayArgument
+            && closureResultKind == FunctionSymbol::CxxClosureResultKind::None
+            && exactSelectedParameters())
+        {
+            lastCxxFreeWrapperLinkage_ = wrapperName;
+            cxxFreeWrapperGroups_[wrapperName] = { group.primary, group.dependencyGroups };
+            if (!SwitchCxxDirectByValueCall(functionName, arguments, registeredName, error)) return false;
+        }
         cxxDeductionWrappers_.insert(wrapperName);
         if (auto* sink = GetSymbolSink())
             sink->Register(SymbolKind::Function, selected->name,
@@ -5531,6 +5617,283 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         return false;
 }
 
+// ONE place that decides a pointer-shaped argument (object pointer, nullptr, function designator,
+// `&fn`, function pointer value) against a parameter, from the parameter's resolved type.
+bool LLVMBackend::CxxFunctionValueSpelling(const NamedVariable& arg, std::string& spelling) const
+{
+    const llvm::Function* function = llvm::dyn_cast_or_null<llvm::Function>(arg.Primary);
+    if (function == nullptr)
+    {
+        // A C++ function pointer result reaches CFlat wrapped in its thunk pair; the call is inside.
+        const llvm::Value* origin = arg.Primary;
+        while (auto* insert = llvm::dyn_cast_or_null<llvm::InsertValueInst>(origin))
+            origin = insert->getInsertedValueOperand();
+        if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(origin))
+            function = call->getCalledFunction();
+    }
+    if (function == nullptr) return false;
+    const FunctionSymbol* symbol = FindSymbolForFunction(function);
+    if (symbol == nullptr || !symbol->IsCxx) return false;
+    auto found = cxxFunctionSignatures_.find(symbol->SourceName);
+    if (found == cxxFunctionSignatures_.end()) return false;
+    for (const auto& raw : found->second)
+    {
+        if (raw.linkageName != symbol->UniqueName || symbol->Variadic) continue;
+        if (llvm::isa<llvm::Function>(arg.Primary))
+        {
+            spelling = raw.retSpelling + " (*)(";
+            for (size_t i = 0; i < raw.paramSpellings.size(); ++i)
+                spelling += (i == 0 ? "" : ", ") + raw.paramSpellings[i];
+            spelling += ")";
+        }
+        else
+            spelling = raw.retSpelling;
+        return !spelling.empty();
+    }
+    return false;
+}
+
+// The C++ overload set a function-name argument names. False when the compiler cannot say.
+bool LLVMBackend::CxxFunctionNameOverloads(const NamedVariable& arg,
+    std::vector<const FunctionSymbol*>& overloads, bool& hasTemplate)
+{
+    overloads.clear();
+    hasTemplate = false;
+    if (arg.Storage != nullptr) return false;
+    auto found = functionTable.end();
+    if (!arg.CallerName.empty()) found = functionTable.find(ResolveQualifiedName(arg.CallerName));
+    if (found == functionTable.end())
+        if (auto* function = llvm::dyn_cast_or_null<llvm::Function>(arg.Primary))
+            if (const auto* symbol = FindSymbolForFunction(function))
+                found = functionTable.find(symbol->SourceName);
+    if (found == functionTable.end() || found->second.empty()) return false;
+    // functionTable holds no templates: such a set is complete only for an exact non-template match.
+    hasTemplate = cxxFunctionTemplates_.contains(found->first);
+    for (const FunctionSymbol& symbol : found->second)
+    {
+        if (!symbol.IsCxx) { overloads.clear(); return false; }
+        overloads.push_back(&symbol);
+    }
+    return true;
+}
+
+// The clang spellings of one overload; a static member lives in its record, not the function table.
+bool LLVMBackend::CxxFunctionSymbolSpellings(const FunctionSymbol& symbol, std::string& result,
+    std::vector<std::string>& parameters, bool& isNoexcept) const
+{
+    if (auto found = cxxFunctionSignatures_.find(symbol.SourceName); found != cxxFunctionSignatures_.end())
+        for (const auto& raw : found->second)
+            if (raw.linkageName == symbol.UniqueName)
+            {
+                result = raw.retSpelling;
+                parameters = raw.paramSpellings;
+                isNoexcept = raw.isNoexcept;
+                return !result.empty();
+            }
+    const size_t dot = symbol.SourceName.rfind('.');
+    if (dot == std::string::npos) return false;
+    auto record = cxxRecordEntries_.find(symbol.SourceName.substr(0, dot));
+    if (record == cxxRecordEntries_.end()) return false;
+    for (const auto& member : record->second.members)
+        if (member.linkageName == symbol.UniqueName
+            && member.kind == cflat_cinterop::RawCxxMember::StaticMethod)
+        {
+            result = member.retType;
+            parameters = member.paramTypes;
+            isNoexcept = member.isNoexcept;
+            return !result.empty();
+        }
+    return false;
+}
+
+LLVMBackend::CxxPointerArgumentFit LLVMBackend::ClassifyCxxPointerArgument(const NamedVariable& arg,
+    const std::string& spelling)
+{
+    using Kind = CxxPointerArgumentFit::Kind;
+    const CxxPointerArgumentFit notApplicable{ Kind::NotApplicable, 0, false };
+    const CxxPointerArgumentFit notViable{ Kind::NotViable, 0, false };
+    const CxxPointerArgumentFit unranked{ Kind::Unranked, 0, false };
+    if (spelling.empty() || IsCxxFixedArrayArgument(arg)) return notApplicable;
+    const TypeAndValue& tv = arg.TypeAndValue;
+    auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+    if (tv.IsArrayView || IsImportedEnumeratorStorage(arg.Storage)
+        || (constant != nullptr && IsStringLiteralConstant(constant)))
+        return notApplicable;
+    const bool functionObject = llvm::isa_and_nonnull<llvm::Function>(arg.Primary);
+    std::vector<const FunctionSymbol*> overloads;
+    bool overloadTemplate = false;
+    const bool namedSet = (functionObject || arg.Primary == nullptr)
+        && CxxFunctionNameOverloads(arg, overloads, overloadTemplate);
+    const bool functionName = functionObject || namedSet;
+    const bool designator = functionName && !arg.IsCxxAddressOfFunction;
+    std::vector<FuncPtrComponent> valueSignature;
+    TypeAndValue functionValueType = tv;
+    if (functionObject)
+    {
+        // A CFlat function or lambda binds by its own rules; only a C++ function is judged here.
+        const auto* symbol = FindSymbolForFunction(llvm::cast<llvm::Function>(arg.Primary));
+        if (symbol == nullptr || !symbol->IsCxx) return notApplicable;
+        functionValueType = FuncPtrSigOfSymbol(*symbol);
+    }
+    const bool functionValue = functionName || FuncPtrSignatureOf(tv, valueSignature);
+    const bool nullLiteral = !functionValue && IsCxxNullTypedArgument(arg);
+    const bool objectPointer = !functionValue && !nullLiteral && tv.Pointer && !tv.IsFunctionPointer;
+    if (!functionValue && !nullLiteral && !objectPointer) return notApplicable;
+
+    const bool functionReference = CxxSpellingIsFunctionReference(spelling);
+    TypeAndValue parameter;
+    // A name against a declarator returning a function pointer or reference: nothing judges it.
+    size_t firstDeclarator = spelling.find("(*");
+    firstDeclarator = std::min(firstDeclarator, spelling.find("(&"));
+    const bool nestedReturn = functionName && firstDeclarator != std::string::npos
+        && firstDeclarator + 2 < spelling.size() && spelling[firstDeclarator + 2] == '(';
+    if (!functionReference && !nestedReturn)
+    {
+        if (!MapCTypeToTypeAndValue(spelling, parameter, true)) return notApplicable;
+        MarkCxxReferenceField(spelling, parameter, true);
+    }
+    const bool reference = parameter.IsAlias || parameter.IsRvalueRef;
+    const bool rvalueReference = parameter.IsRvalueRef;
+    const bool constReference = reference && parameter.CxxConstRef();
+    const bool mutableLvalueReference = reference && !rvalueReference && !constReference;
+    // A function value against one function-typed slot: the clang spellings when both are known.
+    auto functionSignatureFit = [&]() -> CxxPointerArgumentFit {
+        // The declarator holds any `const` and `&` of a reference to a function pointer or function.
+        std::string parameterSpelling = spelling;
+        std::string signatureText = spelling;
+        size_t open = parameterSpelling.find("(*");
+        if (open == std::string::npos) open = parameterSpelling.find("(&");
+        if (open != std::string::npos)
+            if (size_t close = parameterSpelling.find(')', open); close != std::string::npos)
+            {
+                parameterSpelling.replace(open, close - open + 1, "(*)");
+                signatureText.erase(open, close - open + 1);
+            }
+        const std::string wanted = SqueezeCxxSpelling(parameterSpelling);
+        bool judgeable = true;
+        if (functionName)
+        {
+            // Any overload of the set with this exact type settles it. A parameter's top-level
+            // const is not part of a function's type; noexcept is, and a noexcept function
+            // converts to the plain function pointer.
+            judgeable = !overloads.empty() && !overloadTemplate;
+            for (const FunctionSymbol* symbol : overloads)
+            {
+                std::string result;
+                std::vector<std::string> parameters;
+                bool isNoexcept = false;
+                if (symbol->Variadic || !CxxFunctionSymbolSpellings(*symbol, result, parameters, isNoexcept)
+                    || result.find("(*") != std::string::npos || result.find("(&") != std::string::npos)
+                {
+                    judgeable = false;
+                    continue;
+                }
+                std::string value = result + " (*)(";
+                for (size_t i = 0; i < parameters.size(); ++i)
+                {
+                    std::string one = parameters[i];
+                    // A const function-typed parameter maps through CFlat unreliably (`void (*const)(int)`).
+                    if (one.find('(') != std::string::npos)
+                        judgeable = judgeable && one.find("const") == std::string::npos;
+                    else
+                    {
+                        if (one.find('*') != std::string::npos && one.ends_with("const"))
+                        {
+                            one.resize(one.size() - 5);
+                            while (!one.empty() && one.back() == ' ') one.pop_back();
+                        }
+                        else if (one.starts_with("const ") && one.find_first_of("*&") == std::string::npos)
+                            one.erase(0, 6);
+                    }
+                    value += (i == 0 ? "" : ", ") + one;
+                }
+                value += ")";
+                const std::string plain = SqueezeCxxSpelling(value);
+                if (plain == wanted || (isNoexcept && plain + "noexcept" == wanted))
+                    return { Kind::Viable, 0, false };
+            }
+            judgeable = judgeable && overloads.size() <= 1;
+        }
+        else
+        {
+            std::string valueSpelling;
+            if (CxxFunctionValueSpelling(arg, valueSpelling))
+            {
+                const std::string value = SqueezeCxxSpelling(valueSpelling);
+                if (value == wanted || value == SqueezeCxxSpelling(spelling))
+                    return { Kind::Viable, 0, false };
+            }
+        }
+        // Unequal text proves nothing (nested declarators, adjusted parameters); only the mapped
+        // signature of a value known to be this one function can.
+        if (judgeable && !nestedReturn && !functionReference
+            && FuncPtrSignaturesProvablyDiffer(parameter, functionValueType))
+            return notViable;
+        // `const`, `&&` and `long long` do not survive the CFlat mapping, so equal signatures may be
+        // different C++ types. A plain `&` is left out: it is how `FP v` beside `f(FP, ...)` binds.
+        auto isIdentifierChar = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+        bool holdsConst = false;
+        for (size_t at = signatureText.find("const"); at != std::string::npos && !holdsConst;
+             at = signatureText.find("const", at + 1))
+            holdsConst = (at == 0 || !isIdentifierChar(signatureText[at - 1]))
+                && (at + 5 >= signatureText.size() || !isIdentifierChar(signatureText[at + 5]));
+        CxxPointerArgumentFit result = unranked;
+        result.erasedSignature = holdsConst || signatureText.find("&&") != std::string::npos
+            || signatureText.find("long long") != std::string::npos;
+        return result;
+    };
+    if (functionReference)
+    {
+        if (!designator) return notViable;
+        return functionSignatureFit();
+    }
+    if (nestedReturn) return functionSignatureFit();
+    if (parameter.IsFunctionPointer && !parameter.FuncPtrReturnTypeName.empty())
+    {
+        if (objectPointer) return notViable;
+        if (nullLiteral) return mutableLvalueReference ? notViable : CxxPointerArgumentFit{ Kind::Viable, 2, false };
+        const bool lvalueValue = !functionName && !arg.IsRvalue && arg.CxxLvalueKind != 0
+            && arg.CxxLvalueKind != 3;
+        if ((mutableLvalueReference && !lvalueValue) || (rvalueReference && lvalueValue)) return notViable;
+        return functionSignatureFit();
+    }
+    // A mapped `T&` carries Pointer for its ABI; only a reference to a pointer has a pointer referent.
+    if (parameter.Pointer && (!reference || parameter.IsCxxRefToPointer))
+    {
+        if (functionValue) return notViable;
+        if (reference) return notApplicable;     // a reference to a pointer is judged by its own rules
+        if (nullLiteral) return { Kind::Viable, 2, false };
+        const int fromDepth = tv.ValuePointerDepth();
+        const int toDepth = parameter.ValuePointerDepth();
+        const bool dropsPointeeConst = fromDepth == 1 && toDepth == 1 && tv.PointeeConstBit()
+            && (CxxSpellingPointeeConstMask(spelling, 1) & 1u) == 0;
+        if (parameter.TypeName == "void" && toDepth == 1)
+            return dropsPointeeConst ? notViable : CxxPointerArgumentFit{ Kind::Viable, 2, false };
+        const std::string fromName = ResolveTypeAlias(tv.TypeName.empty() ? arg.InferSourceTypeName : tv.TypeName);
+        const std::string toName = ResolveTypeAlias(parameter.TypeName);
+        if (fromName.empty() || IsCxxRecord(fromName) || IsCxxRecord(toName)
+            || fromName == "void" || toName == "void")
+            return notApplicable;
+        if (fromDepth != toDepth) return notViable;
+        if (fromName != toName) return notViable;
+        if (dropsPointeeConst) return notViable;
+        return { Kind::Viable, 0, false };
+    }
+    // Referent is not a pointer: bool takes the boolean conversion, a known scalar takes nothing.
+    TypeAndValue referent = parameter;
+    referent.DropCxxRef();
+    if (referent.TypeName == "bool")
+    {
+        if (nullLiteral || mutableLvalueReference) return notViable;
+        return { Kind::Viable, 3, true };
+    }
+    const bool scalar = referent.IsInteger() > 0 || referent.TypeName == "float"
+        || referent.TypeName == "double" || referent.TypeName == "longdouble"
+        || referent.IsScopedEnum || IsScopedEnumTypeName(referent.TypeName)
+        || !ResolveEnumTypeName(referent.TypeName).empty();
+    return scalar ? notViable : notApplicable;
+}
+
 bool LLVMBackend::RequestCxxFreeBraceCall(const std::string& functionName,
                                           const std::vector<std::string>& explicitArgs,
                                           std::vector<NamedVariable>& arguments,
@@ -5887,7 +6250,9 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         // CVAMB: per-argument ranks from argument index `first` on ([over.best.ics]): a braced slot by its
         // worst element, a plain scalar by identity or promotion. Other plain arguments are uncertain.
         constexpr size_t kPlainArgumentNotViable = 1000;
+        bool unranked = false;   // set per candidate by argumentRanks
         auto argumentRanks = [&](const std::vector<std::string>& params, bool& certain, size_t first) {
+            unranked = false;
             std::vector<size_t> ranks;
             for (size_t k = first; k < arguments.size() && k < params.size(); ++k)
             {
@@ -5903,22 +6268,43 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 // reference binds only an lvalue of its own referent (anything else is not viable); every
                 // other reference binding is uncertain, so a tie on it is never refused.
                 const std::string& spelling = params[k];
-                if (spelling.find('&') != std::string::npos)
+                const CxxPointerArgumentFit pointerFit = ClassifyCxxPointerArgument(arguments[k], spelling);
+                if (pointerFit.kind != CxxPointerArgumentFit::Kind::NotApplicable)
                 {
-                    const bool rvalueRef = spelling.find("&&") != std::string::npos;
-                    const bool constRef = spelling.find("const") != std::string::npos;
+                    // The function-pointer and object-pointer ranks tie among themselves on cv only.
+                    if (pointerFit.kind != CxxPointerArgumentFit::Kind::Viable || !pointerFit.boolConversion)
+                        certain = false;
+                    unranked |= pointerFit.kind == CxxPointerArgumentFit::Kind::Unranked;
+                    ranks.push_back(pointerFit.kind == CxxPointerArgumentFit::Kind::NotViable
+                        ? kPlainArgumentNotViable : pointerFit.rank);
+                    continue;
+                }
+                TypeAndValue mappedParameter;
+                bool mappedReference = MapCTypeToTypeAndValue(spelling, mappedParameter, true);
+                if (mappedReference) MarkCxxReferenceField(spelling, mappedParameter, true);
+                if (mappedReference && (mappedParameter.IsAlias || mappedParameter.IsRvalueRef))
+                {
+                    const bool rvalueRef = mappedParameter.IsRvalueRef;
+                    const bool constRef = mappedParameter.CxxConstRef();
                     const bool lvalueArg = !arguments[k].IsRvalue && arguments[k].CxxLvalueKind != 0
-                        && arguments[k].CxxLvalueKind != 3;
+                        && arguments[k].CxxLvalueKind != 3
+                        && !IsImportedEnumeratorStorage(arguments[k].Storage);
                     bool referentCertain = true;
                     const size_t referentRank = elementRank(arguments[k], spelling, referentCertain);
                     certain = false;
+                    // CVTIE: `const T *&` does not bind an lvalue `T *` (a qualification conversion needs a temporary).
+                    const bool pointeeConstMismatch = !constRef && !rvalueRef && mappedParameter.IsCxxRefToPointer
+                        && arguments[k].TypeAndValue.Pointer
+                        && (CxxSpellingPointeeConstMask(spelling, 1) & 1u) != 0
+                        && arguments[k].TypeAndValue.PointeeConstMask() == 0;
                     if ((!constRef && !rvalueRef && (!lvalueArg || (referentCertain && referentRank != 0)))
-                        || (rvalueRef && lvalueArg))
+                        || (rvalueRef && lvalueArg) || pointeeConstMismatch)
                         ranks.push_back(kPlainArgumentNotViable);
                     else
                         ranks.push_back(referentCertain ? referentRank : 0);
                     continue;
                 }
+                // Everything else ranks by identity or promotion (pointer arguments were judged above).
                 bool argumentCertain = true;
                 size_t rank = elementRank(arguments[k], params[k], argumentCertain);
                 if (!argumentCertain)
@@ -5947,8 +6333,55 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         auto displayCandidate = [&](const std::string& name, const std::vector<std::string>& params) {
             std::string shown = name + "(";
             for (size_t p = 0; p < params.size(); ++p)
-                shown += (p == 0 ? "" : ", ") + DisplayCxxClassName(params[p]);
+            {
+                // CVTIE: the CFlat spelling of a C++ scope (std.initializer_list<int>).
+                std::string one = DisplayCxxClassName(params[p]);
+                for (size_t at; (at = one.find("::")) != std::string::npos;) one.replace(at, 2, ".");
+                shown += (p == 0 ? "" : ", ") + one;
+            }
             return shown + ")";
+        };
+        // CVTIE: a candidate seen by the scan; the running best is compared to one rival at a time, so
+        // the pick is checked against every viable candidate afterwards ([over.match.best]).
+        struct SeenBraceCandidate
+        {
+            int priority = 0;
+            std::vector<size_t> ranks;
+            bool certain = false;
+            std::vector<std::string> shownParams;
+            bool unranked = false;   // holds a function pointer that may not fit (see ClassifyCxxPointerArgument)
+        };
+        auto isNotViable = [&](const std::vector<size_t>& ranks) {
+            return std::find(ranks.begin(), ranks.end(), kPlainArgumentNotViable) != ranks.end();
+        };
+        auto noteRivalsOfPick = [&](const std::vector<SeenBraceCandidate>& seen, int priority,
+                                    const std::vector<size_t>& pickRanks, bool pickCertain,
+                                    const std::vector<std::string>& pickParams, const std::string& name,
+                                    bool& tied, std::vector<std::string>& tiedList) {
+            bool pickUnranked = false;
+            for (const auto& entry : seen)
+                pickUnranked |= entry.priority == priority && entry.shownParams == pickParams && entry.unranked;
+            for (const auto& rival : seen)
+            {
+                if (rival.priority != priority || rival.shownParams == pickParams
+                    || (!pickUnranked && !rival.unranked) || isNotViable(rival.ranks))
+                    continue;
+                tied = true;
+                std::string shown = displayCandidate(name, rival.shownParams);
+                if (std::find(tiedList.begin(), tiedList.end(), shown) == tiedList.end())
+                    tiedList.push_back(std::move(shown));
+            }
+            if (!pickCertain) return;
+            for (const auto& rival : seen)
+            {
+                if (rival.priority != priority || !rival.certain || rival.shownParams == pickParams
+                    || compareRanks(pickRanks, rival.ranks) == -1)
+                    continue;
+                tied = true;
+                std::string shown = displayCandidate(name, rival.shownParams);
+                if (std::find(tiedList.begin(), tiedList.end(), shown) == tiedList.end())
+                    tiedList.push_back(std::move(shown));
+            }
         };
         if (ownerType.empty())
         {
@@ -5960,6 +6393,10 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             bool selectedCertain = false;
             bool bracesTied = false;
             std::vector<std::string> tiedCandidates;
+            std::vector<SeenBraceCandidate> seenCandidates;
+            std::vector<std::string> selectedShownParams;
+            // CVTIE: a known non-viable candidate leaves the set; pass 1 keeps clang's refusal when none is viable.
+            for (int pass = 0; pass < 2 && !selected.found; ++pass)
             for (const auto& sig : it->second)
             {
                 // A brace wrapper registered by an earlier call is not a C++ overload: its
@@ -5974,6 +6411,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 // arguments alone); braced and plain arguments rank per argument.
                 bool certain = true;
                 const std::vector<size_t> ranks = argumentRanks(sig.paramSpellings, certain, 0);
+                if (pass == 0 && isNotViable(ranks)) continue;
+                seenCandidates.push_back({ *bracePriority, ranks, certain, sig.paramSpellings, unranked });
                 const size_t extraParameters = sig.paramSpellings.size() - arguments.size();
                 int order = selected.found ? compareRanks(ranks, selectedRanks) : -1;
                 // CVAMB r1: an uncertain tie keeps master's fewer-defaulted-parameters preference.
@@ -6009,8 +6448,12 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 selectedExtraParameters = extraParameters;
                 selectedCertain = certain;
                 selected.found = true;
+                selectedShownParams = sig.paramSpellings;
                 tiedCandidates = {displayCandidate(functionName, sig.paramSpellings)};
             }
+            if (selected.found)
+                noteRivalsOfPick(seenCandidates, selectedBracePriority, selectedRanks, selectedCertain,
+                                 selectedShownParams, functionName, bracesTied, tiedCandidates);
             if (bracesTied)
             {
                 std::string candidateList;
@@ -6064,6 +6507,10 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             };
             bool bracesTied = false;
             std::vector<std::string> tiedCandidates;
+            std::vector<SeenBraceCandidate> seenCandidates;
+            std::vector<std::string> fallbackShownParams;
+            // CVTIE: as in the free scan, pass 1 runs only when no candidate is viable.
+            for (int pass = 0; pass < 2 && fallback == nullptr; ++pass)
             for (const auto& member : record->second.members)
             {
                 if (member.name != memberName
@@ -6088,6 +6535,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 const std::vector<size_t> argumentRanksOf = argumentRanks(member.paramTypes, certain,
                                                                           instance ? 1 : 0);
                 ranks.insert(ranks.end(), argumentRanksOf.begin(), argumentRanksOf.end());
+                if (pass == 0 && isNotViable(ranks)) continue;
+                seenCandidates.push_back({ *bracePriority, ranks, certain, memberShownParams(member), unranked });
                 const size_t extraParameters = member.paramTypes.size() - arguments.size();
                 int order = fallback != nullptr ? compareRanks(ranks, fallbackRanks) : -1;
                 // CVAMB r1: an uncertain tie keeps master's fewer-defaulted-parameters preference.
@@ -6110,12 +6559,16 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 }
                 bracesTied = false;
                 tiedCandidates = {displayCandidate(memberName, memberShownParams(member))};
+                fallbackShownParams = memberShownParams(member);
                 fallback = &member;
                 fallbackBracePriority = *bracePriority;
                 fallbackRanks = ranks;
                 fallbackExtraParameters = extraParameters;
                 fallbackCertain = certain;
             }
+            if (fallback != nullptr)
+                noteRivalsOfPick(seenCandidates, fallbackBracePriority, fallbackRanks, fallbackCertain,
+                                 fallbackShownParams, memberName, bracesTied, tiedCandidates);
             if (bracesTied)
             {
                 std::string candidateList;
@@ -6197,7 +6650,9 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             {
                 type += "*";
                 // `&p` over a `T*` is a `T**` prvalue: its recorded depth is the second star.
-                if (arg.TypeAndValue.ElemPointer
+                if (arg.TypeAndValue.ValuePointerDepth() >= 3)
+                    type.append(arg.TypeAndValue.ValuePointerDepth() - 1, '*');
+                else if (arg.TypeAndValue.ElemPointer
                     || (arg.IsCxxAddressOfPointerValue && arg.TypeAndValue.PointerDepth >= 2))
                     type += "*";
             }
@@ -6486,7 +6941,13 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                     error = "the C++ declaration has too few parameters for this call";
                     return false;
                 }
-                parameterSpellings.push_back(selected.paramTypes[i]);
+                // CVTIE: a function-pointer spelling has no room for a trailing parameter name.
+                TypeAndValue mappedSlot;
+                parameterSpellings.push_back(
+                    CxxSpellingIsFunctionReference(selected.paramTypes[i])
+                        || (MapCTypeToTypeAndValue(selected.paramTypes[i], mappedSlot, true)
+                            && mappedSlot.IsFunctionPointer && !mappedSlot.IsAlias)
+                        ? "__typeof__(" + selected.paramTypes[i] + ")" : selected.paramTypes[i]);
                 callArguments.push_back("p" + std::to_string(flatParameterIndex++));
             }
         }

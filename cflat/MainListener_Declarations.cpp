@@ -6101,10 +6101,10 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             && !returnType.Pointer && !returnType.IsAlias && !returnType.IsMove
             && compiler->currentFunctionAbiRecipe.hasLowering
             && compiler->currentFunctionAbiRecipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
-            && !compiler->IsCxxRecord(returnType.TypeName)
+            && (!compiler->IsCxxRecord(returnType.TypeName)
+                || compiler->IsForeignNontrivialCxxClass(returnType.TypeName))
             && compiler->IsDataStructure(returnType.TypeName)
             && compiler->HasForeignNontrivialCxxField(returnType.TypeName)
-            && !compiler->IsForeignNontrivialCxxReturnClass(returnType.TypeName)
             && compiler->ReturnsViaCxxSret(returnType.TypeName))
         {
             const unsigned sretIndex = compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe);
@@ -7627,6 +7627,7 @@ void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, co
                     {
                         // A postfix ++/-- is deferred to the statement's end; isolate it so it is seen.
                         PendingPostfixScope postfixScope(this);
+                        AdlSuppressScope constantFold(nativeConstantFoldDepth_, true);
                         v = ParseConditionalExpression(cond);
                         pendingPostfix = !PlusPlus.empty();
                     }
@@ -7975,6 +7976,51 @@ void MainListener::PrepareCxxBraceElement(LLVMBackend::NamedVariable& element,
     targetTypes.push_back(targetSpelling);
 }
 
+// A deferred `T(args)` skips the paren-construction path, so its call-site narrowing refusal
+// (ruling 2026-09-04: no implicit narrowing at a call) is applied where it is deferred.
+void MainListener::RefuseDeferredCxxConstructionNarrowing(const LLVMBackend::NamedVariable& value,
+                                                          antlr4::ParserRuleContext* where)
+{
+        auto* compiler = Compiler(where);
+        if (!value.IsCxxDirectConstruction || !value.CxxDeferredTernaryShape.empty()) return;
+        const std::string& type = value.CxxDirectConstructionType;
+        const auto& arguments = value.CxxDirectConstructionArguments;
+        std::vector<LLVMBackend::TypeAndValue> types;
+        for (const auto& argument : arguments)
+        {
+            // Typed as the paren-construction path types them (its refusal names these).
+            types.push_back(argument.TypeAndValue);
+            if (types.back().TypeName.empty() && types.back().Pointer
+                && !types.back().IsProvenDoublePointer()
+                && !types.back().IsProvenDecayedDoublePointer()
+                && !argument.InferSourceTypeName.empty())
+                types.back().TypeName = argument.InferSourceTypeName;
+            LLVMBackend::TypeAndValue sourceType = argument.TypeAndValue;
+            TypeUntypedCtorArg(types.back(), argument.Primary,
+                argument.LiteralIdentitySuffixed ? argument.LiteralIdentity : std::string(),
+                &sourceType);
+        }
+        const std::string name = compiler->DisplayCxxClassName(type);
+        if (compiler->CxxCtorSetRequiresNarrowing(type, &arguments))
+        {
+            std::string floatNarrowing;
+            if (compiler->CxxCtorSetRequiresFloatToInteger(type, types))
+            {
+                floatNarrowing = compiler->CxxCtorSelectedNarrowingError(type, arguments, true);
+                if (floatNarrowing.empty())
+                    floatNarrowing = "all viable constructors require a floating-to-integer conversion "
+                        "(no implicit narrowing at a call); cast it explicitly";
+            }
+            LogErrorContext(where, floatNarrowing.empty()
+                ? std::format("C++ class '{}' {}", name, compiler->CxxCtorNoMatchReason(types))
+                : std::format("C++ class '{}' {}; {}", name,
+                    compiler->CxxCtorNoMatchReason(types), floatNarrowing));
+        }
+        else if (std::string narrowing = compiler->CxxCtorSelectedNarrowingError(type, arguments);
+                 !narrowing.empty())
+            LogErrorContext(where, std::format("C++ class '{}' {}", name, narrowing));
+}
+
 bool MainListener::TryEmitForeignCxxAggregateBraceInit(
         const std::string& typeName,
         CFlatParser::InitializerListContext* list,
@@ -8014,6 +8060,79 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                 prefetchedBraceElements;
             std::string braceExpression = "{";
             bool valid = true;
+            /*
+             * BRACEPRV: a leaf `T(args)` element is deferred into the wrapper (built in place, as
+             * clang does) when every later leaf is quiet, so no later evaluation can observe its
+             * constructor running after it. Aggregates with reference members keep the temp path; a
+             * non-aggregate class defers only a sole element (`S x = { S(7) }`), so an
+             * initializer_list expansion (`vector<T> v{T(1), T(2)}`) keeps its pinned counts.
+             */
+            std::unordered_set<CFlatParser::FieldInitContext*> deferrableBraceLeaves;
+            const bool soleElement = fields.size() == 1 && fields.front()->initializerList() == nullptr;
+            if (!HasForeignCxxAggregateReferenceMember(typeName, errorContext)
+                && (compiler->IsForeignCxxAggregateClass(typeName) || soleElement))
+            {
+                std::vector<CFlatParser::FieldInitContext*> leaves;
+                auto collectLeaves = [&](auto&& self,
+                    const std::vector<CFlatParser::FieldInitContext*>& list) -> void {
+                    for (auto* element : list)
+                    {
+                        if (element->initializerList() != nullptr)
+                            self(self, element->initializerList()->fieldInit());
+                        else if (element->LeftBrace() == nullptr) leaves.push_back(element);
+                    }
+                };
+                collectLeaves(collectLeaves, fields);
+                bool laterQuiet = true;
+                for (size_t i = leaves.size(); i-- > 0;)
+                {
+                    auto* leaf = leaves[i];
+                    auto* expression = leaf->Colon() == nullptr
+                        && leaf->assignmentExpression().size() == 1
+                        ? leaf->assignmentExpression(0) : nullptr;
+                    if (laterQuiet && expression != nullptr
+                        && IsCxxBraceDeferrableConstruction(expression))
+                        deferrableBraceLeaves.insert(leaf);
+                    laterQuiet = laterQuiet && expression != nullptr
+                        && (IsQuietCxxBraceElement(expression) || IsDefaultOnlyExpression(expression));
+                }
+            }
+            // A class prvalue already built in a CFlat temp keeps later elements eager: a deferred
+            // constructor that throws would otherwise destroy the moved-in copy and the temp.
+            bool eagerClassPrvalueSeen = false;
+            auto noteParsedBraceLeaf = [&](const LLVMBackend::NamedVariable& parsed) {
+                if (!parsed.IsCxxDirectConstruction && !parsed.TypeAndValue.Pointer
+                    && (parsed.IsRvalue || parsed.IsCxxPrvalueTemp)
+                    && compiler->IsCxxRecord(compiler->ResolveTypeAlias(parsed.TypeAndValue.TypeName)))
+                    eagerClassPrvalueSeen = true;
+            };
+            auto armBraceDeferral = [&](CFlatParser::FieldInitContext* element) {
+                return !eagerClassPrvalueSeen && deferrableBraceLeaves.count(element) != 0;
+            };
+            struct BraceDeferralScope
+            {
+                llvm::SaveAndRestore<CFlatParser::AssignmentExpressionContext*> argument;
+                llvm::SaveAndRestore<bool> canDefer;
+                llvm::SaveAndRestore<bool> laterSibling;
+                llvm::SaveAndRestore<bool*> orderSafe;
+                llvm::SaveAndRestore<LLVMBackend::TypeAndValue> target;
+                llvm::SaveAndRestore<bool> braceElement;
+                BraceDeferralScope(MainListener& self, CFlatParser::AssignmentExpressionContext* expression,
+                                   bool armed)
+                    : argument(self.cxxDirectConstructionArgument_,
+                          armed ? expression : self.cxxDirectConstructionArgument_),
+                      canDefer(self.cxxDirectConstructionCanDefer_,
+                          armed || self.cxxDirectConstructionCanDefer_),
+                      laterSibling(self.cxxDirectConstructionHasLaterSibling_,
+                          !armed && self.cxxDirectConstructionHasLaterSibling_),
+                      orderSafe(self.cxxDirectConstructionCallOrderSafe_,
+                          armed ? nullptr : self.cxxDirectConstructionCallOrderSafe_),
+                      target(self.cxxDirectConstructionTargetType_,
+                          armed ? LLVMBackend::TypeAndValue{} : self.cxxDirectConstructionTargetType_),
+                      braceElement(self.cxxDirectConstructionBraceElement_,
+                          armed || self.cxxDirectConstructionBraceElement_)
+                {}
+            };
             auto prefetchBraceElement = [&](CFlatParser::FieldInitContext* element)
                 -> LLVMBackend::NamedVariable* {
                 auto prefetched = prefetchedBraceElements.find(element);
@@ -8031,6 +8150,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     CxxCallArgumentExpectedTypeScope cxxArgumentExpected(
                         cxxCallArgumentExpectedType_, LLVMBackend::TypeAndValue{});
                     CxxCallArgumentParseStateScope argumentState(compiler);
+                    BraceDeferralScope deferral(*this, expression, armBraceDeferral(element));
                     candidate = ParseAssignmentExpressionNamed(expression);
                     llvm::Value* retTemp = compiler->lastCxxRetTemp_;
                     llvm::Value* retValue = compiler->lastCxxRetValue_;
@@ -8041,6 +8161,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                         candidate.IsRvalue = true;
                         candidate.IsCxxPrvalueTemp = !candidate.IsExplicitMove;
                     }
+                    noteParsedBraceLeaf(candidate);
                 }
                 return &prefetchedBraceElements.emplace(element, std::move(candidate)).first->second;
             };
@@ -8463,6 +8584,8 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                         {
                             elementNV = [&] {
                                 CxxCallArgumentParseStateScope argumentState(compiler);
+                                BraceDeferralScope deferral(*this, expression,
+                                    !constRefTernary && armBraceDeferral(element));
                                 auto parsed = constRefTernary
                                     ? ParseCxxConstRefTernaryTemp(expression,
                                         LLVMBackend::TypeAndValue{ .TypeName = constRefPlaceType })
@@ -8476,6 +8599,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                                     parsed.IsRvalue = true;
                                     parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
                                 }
+                                noteParsedBraceLeaf(parsed);
                                 return parsed;
                             }();
                         }
@@ -8619,11 +8743,12 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
             compiler->RejectLiteralZeroCxxConstructorFunctionSlotArgs(
                 typeName, braceElements, braceValues);
             std::vector<size_t> forwardedBraceElements;
+            std::vector<std::vector<LLVMBackend::NamedVariable>> deferredBraceArguments;
             if (!compiler->RequestCxxDirectBraceConstructor(
                     typeName, braceElements, braceExpression,
                     copyListInit,
                     wrapperName, constructorError, true, &forwardedBraceElements,
-                    &braceElementTargetTypes))
+                    &braceElementTargetTypes, &deferredBraceArguments))
             {
                 if (constructorError.empty())
                     constructorError = std::format(
@@ -8642,7 +8767,14 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
             wrapperArguments.reserve(forwardedBraceElements.size() + 1);
             wrapperArguments.push_back(self);
             for (size_t index : forwardedBraceElements)
-                wrapperArguments.push_back(braceElements[index]);
+            {
+                // A deferred element passes the constructor arguments the wrapper took as parameters.
+                if (braceElements[index].IsCxxDirectConstruction)
+                    wrapperArguments.insert(wrapperArguments.end(),
+                        deferredBraceArguments[index].begin(), deferredBraceArguments[index].end());
+                else
+                    wrapperArguments.push_back(braceElements[index]);
+            }
             // Settle before wrapper-call flushing so the reference-bound prvalue uses the
             // same scope cleanup as a reference local.
             compiler->SettleAliasDeclTemps(braceReferenceTempMark, true);
@@ -8707,8 +8839,32 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
                 [](auto* field) { return field->Colon() != nullptr; });
         const bool hasCxxReferenceMember = hasCxxFieldDesignators
             && HasForeignCxxAggregateReferenceMember(typeName, direct);
+        // BRACEPRV: `{ r = T(3), x = 1 }` - every element named, in declaration order, with a
+        // C++ class construction element - takes the wrapper so the element is built in place.
+        auto designatedInPlace = [&]() {
+            if (!hasCxxFieldDesignators || compiler->CxxAggregateBaseCount(typeName) != 0
+                || !compiler->IsForeignCxxAggregateClass(typeName))
+                return false;
+            const auto record = compiler->GetDataStructure(typeName);
+            size_t cursor = 0;
+            bool constructionElement = false;
+            for (auto* field : declarationBraceFields)
+            {
+                if (field->Identifier() == nullptr || field->assignmentExpression().size() != 1)
+                    return false;
+                const std::string fieldName = field->Identifier()->getText();
+                while (cursor < record.StructFields.size()
+                       && record.StructFields[cursor].VariableName != fieldName)
+                    ++cursor;
+                if (cursor == record.StructFields.size()) return false;
+                ++cursor;
+                constructionElement = constructionElement
+                    || IsCxxBraceDeferrableConstruction(field->assignmentExpression(0));
+            }
+            return constructionElement;
+        };
         if (hasKeyedInitializers || (hasCxxFieldDesignators
-            && !hasCxxReferenceMember))
+            && !hasCxxReferenceMember && !designatedInPlace()))
             return false;
         // Depending on the initializer alternative selected by ANTLR, `default` may be exposed
         // as the rule token or as a single assignment-expression child.
@@ -8793,10 +8949,42 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             LogErrorContext(direct, std::format(
                 "redeclaration of '{}' in the same scope; use a different name or assign to the "
                 "existing variable", name));
+        // NRVO (clang): a local every return names is built in the caller's sret slot, not an alloca.
+        auto& nrvo = namedReturnElision_;
+        const auto nrvoCandidate = std::find(nrvo.declarators.begin(), nrvo.declarators.end(), direct);
+        llvm::Value* nrvoStorage = nullptr;
+        if (nrvo.function == compiler->currentFunction && nrvoCandidate != nrvo.declarators.end())
+        {
+            auto* localType = compiler->GetType(declType);
+            const auto& recipe = compiler->currentFunctionAbiRecipe;
+            const uint64_t abiAlign = localType != nullptr && localType->isSized()
+                ? compiler->module->getDataLayout().getABITypeAlign(localType).value() : 0;
+            // Elision still needs a reachable move (else copy) constructor; otherwise drop the
+            // candidate so the normal return path reports the refusal.
+            auto returnCtorReachable = [&]() {
+                return compiler->FindCxxMoveCtor(declType.TypeName) != nullptr
+                    || compiler->FindCxxCopyCtor(declType.TypeName, true, false) != nullptr
+                    || compiler->FindCxxCopyCtor(declType.TypeName, false, false) != nullptr
+                    || compiler->TryBindCxxGeneratedMoveCtor(declType.TypeName) != nullptr;
+            };
+            if (!declType.Pointer && !declType.IsAlias && !declType.IsMove && !declType.staticStorage
+                && declType.ConstArraySize == 0 && declType.ConstInnerDimensions.empty()
+                && declType.TypeName == compiler->currentFunctionReturnTypeName
+                && compiler->IsForeignNontrivialCxxClass(declType.TypeName)
+                && returnCtorReachable()
+                && recipe.hasLowering
+                && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
+                && recipe.retSlot.structTy == localType
+                && nrvo.sretStorage != nullptr
+                && (declType.UserAlignValue == 0 || declType.UserAlignValue <= abiAlign))
+                nrvoStorage = nrvo.sretStorage;
+            else
+                nrvo.declarators.erase(nrvoCandidate);
+        }
         llvm::Value* slotValue = compiler->CreateLocalVariable(slotType, nullptr, nullptr, line,
-                                                               slotType.UserAlignValue);
-        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
-        allocList.push_back(std::pair(name, slot));
+                                                               slotType.UserAlignValue, nrvoStorage);
+        llvm::Value* slot = slotValue;
+        allocList.push_back(std::pair(name, llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue)));
         if (slotValue == nullptr) return true;
         // The slot is under construction: a const local is still writable by its constructor.
         LLVMBackend::ConstructingScope constructingSlot(compiler, slotValue);
@@ -8818,7 +9006,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
             }
             std::string refusal;
             compiler->SetCurrentDebugLocation(line);
-            switch (compiler->ConvertThroughCxxConvertingCtor(source, typeName, slot, refusal,
+            switch (compiler->ConvertThroughCxxConvertingCtor(source, typeName, slotValue, refusal,
                                                               /*directInit*/ false,
                                                               /*allowScalarNarrowing*/ true))
             {
@@ -8862,7 +9050,7 @@ cxx_dtor_ready:
             if (!compiler->IsRawPointerForCxxUniquePtr(typeName, nv)) return false;
             compiler->SetCurrentDebugLocation(line);
             return compiler->TryAdoptRawPointerIntoCxxUniquePtr(
-                typeName, slot, nv, std::format("local '{}'", name), &declType);
+                typeName, slotValue, nv, std::format("local '{}'", name), &declType);
         };
 
         // ---- `= default`, or no initializer at all: the default constructor ----------------
@@ -8886,8 +9074,8 @@ cxx_dtor_ready:
                             wrapperName, constructorError))
                     {
                         LLVMBackend::NamedVariable self;
-                        self.Primary = slot;
-                        self.BaseType = slot->getType();
+                        self.Primary = slotValue;
+                        self.BaseType = slotValue->getType();
                         self.TypeAndValue.TypeName = typeName;
                         self.TypeAndValue.Pointer = true;
                         self.IsRvalue = true;
@@ -8921,7 +9109,7 @@ cxx_dtor_ready:
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
-            compiler->EmitCxxStructorCall(typeName, *ctor, slot, {});
+            compiler->EmitCxxStructorCall(typeName, *ctor, slotValue, {});
             return true;
         }
 
@@ -9171,7 +9359,7 @@ cxx_dtor_ready:
                     }
                     std::string conversionRefusal;
                     if (compiler->ConvertThroughCxxConvertingCtor(nv, typeName,
-                                                                  soleArgument ? slot : nullptr,
+                                                                  soleArgument ? slotValue : nullptr,
                                                                   conversionRefusal)
                         != LLVMBackend::CxxConvertingCtorResult::Converted)
                     {
@@ -9256,8 +9444,8 @@ cxx_dtor_ready:
                     LogErrorContext(direct, constructorError);
                 }
                 LLVMBackend::NamedVariable self;
-                self.Primary = slot;
-                self.BaseType = slot->getType();
+                self.Primary = slotValue;
+                self.BaseType = slotValue->getType();
                 self.TypeAndValue.TypeName = typeName;
                 self.TypeAndValue.Pointer = true;
                 self.IsRvalue = true;
@@ -9392,8 +9580,8 @@ cxx_dtor_ready:
                         typeName, thunkArguments, wrapperName, wrapperError))
                 {
                     LLVMBackend::NamedVariable self;
-                    self.Primary = slot;
-                    self.BaseType = slot->getType();
+                    self.Primary = slotValue;
+                    self.BaseType = slotValue->getType();
                     self.TypeAndValue.TypeName = typeName;
                     self.TypeAndValue.Pointer = true;
                     self.IsRvalue = true;
@@ -9453,7 +9641,7 @@ cxx_dtor_ready:
             }
             compiler->SetCurrentDebugLocation(line);
             ctorArgumentPostfix.Flush();
-            compiler->EmitCxxStructorCall(typeName, *ctor, slot, argValues,
+            compiler->EmitCxxStructorCall(typeName, *ctor, slotValue, argValues,
                                           &ctorArgumentAddresses);
             return true;
         }
@@ -9477,13 +9665,13 @@ cxx_dtor_ready:
                     std::string refusal;
                     if (compiler->CxxExplicitMoveNeedsTransfer(typeName, constSource, false))
                     {
-                        if (!compiler->EmitCxxExplicitMoveTransfer(typeName, slot,
+                        if (!compiler->EmitCxxExplicitMoveTransfer(typeName, slotValue,
                                 sourceNV.Storage, constSource, false, srcName, refusal))
                             LogErrorContext(moveExpr, refusal);
                         return true;
                     }
                     compiler->EmitCxxCopyOrMoveConstruct(
-                        typeName, slot, sourceNV.Storage, /*useMove*/ true,
+                        typeName, slotValue, sourceNV.Storage, /*useMove*/ true,
                         std::format("into local '{}'", name).c_str(), declType.DiagnosticTypeName);
                     return true;
                 }
@@ -9491,9 +9679,9 @@ cxx_dtor_ready:
                     && compiler->IsCxxTriviallyCopyableRecord(typeName)
                     && !sourceNV.TypeAndValue.Pointer
                     && sourceNV.TypeAndValue.TypeName == typeName
-                    && sourceNV.Primary->getType() == slot->getAllocatedType())
+                    && sourceNV.Primary->getType() == (llvm::isa_and_nonnull<llvm::AllocaInst>(slot) ? llvm::cast<llvm::AllocaInst>(slot)->getAllocatedType() : compiler->GetType(declType)))
                 {
-                    compiler->builder->CreateStore(sourceNV.Primary, slot);
+                    compiler->builder->CreateStore(sourceNV.Primary, slotValue);
                     return true;
                 }
                 if (sourceNV.Storage != nullptr && !sourceNV.TypeAndValue.Pointer
@@ -9961,7 +10149,8 @@ cxx_dtor_ready:
             }
             const bool sameCflatValue = rightNV.TypeAndValue.TypeName == typeName
                 && !rightNV.TypeAndValue.Pointer && rightNV.Primary != nullptr
-                && rightNV.Primary->getType() == slot->getAllocatedType();
+                && llvm::isa_and_nonnull<llvm::AllocaInst>(slot)
+                && rightNV.Primary->getType() == llvm::cast<llvm::AllocaInst>(slot)->getAllocatedType();
             if (sameCflatValue)
             {
                 // A CFlat function returning this value type already returned the complete
@@ -10109,7 +10298,7 @@ cxx_dtor_ready:
         // so the slot's LLVM type is the identity check for the outermost call's temporary.
         const bool outermostCxxTemp = compiler->lastCxxRetTemp_ != nullptr
             && rightNV.Primary != nullptr && rightNV.Primary == compiler->lastCxxRetValue_
-            && slot != nullptr && rightNV.Primary->getType() == slot->getAllocatedType();
+            && llvm::isa_and_nonnull<llvm::AllocaInst>(slot) && rightNV.Primary->getType() == llvm::cast<llvm::AllocaInst>(slot)->getAllocatedType();
         if (outermostCxxTemp
             || (rightNV.TypeAndValue.TypeName == typeName && !rightNV.TypeAndValue.Pointer
                 && rightNV.Primary != nullptr && compiler->lastCxxRetTemp_ == nullptr))
@@ -11461,6 +11650,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcInferredElemPointer = false;
                 int srcInferredPointerDepth = 0;
                 uint32_t srcInferredConstMask = 0;
+                bool srcInferredCvrQualifier = false;
                 // Thin function-pointer initializer (`auto p = signal(...)`): its signature.
                 std::optional<LLVMBackend::TypeAndValue> srcThinFnPtr;
                 // Closure initializer (`auto f = lam;`): its Lambda<> signature. The fat value
@@ -13044,6 +13234,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
                                 srcInferredPointerDepth = rightNV.TypeAndValue.ValuePointerDepth();
                                 srcInferredConstMask = rightNV.TypeAndValue.ConstMask;
+                                srcInferredCvrQualifier = rightNV.TypeAndValue.CxxSpelledCvrQualifier;
                                 if (rightNV.TypeAndValue.IsFunctionPointer
                                     && rightNV.TypeAndValue.TypeName != "__closure_fat_ptr"
                                     && !rightNV.TypeAndValue.FuncPtrReturnTypeName.empty())
@@ -13580,13 +13771,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     const auto* slotVar = compiler->FindVariableByStorage(
                                         initializerSourceNV.ChainedAssignSlot);
-                                    if (slotVar != nullptr && slotVar->IsOwning)
+                                    if (slotVar != nullptr && compiler->ChainSlotReadsAsNamed(
+                                            *slotVar, initializerSourceNV.Primary))
                                     {
                                         const auto chainPrimary = initializerSourceNV.Primary;
                                         const std::string slotName = initializerSourceNV.ChainedAssignName;
                                         initializerSourceNV = *slotVar;
-                                        initializerSourceNV.Primary = chainPrimary;
                                         initializerSourceNV.CallerName = slotName;
+                                        initializerSourceNV.Primary = slotVar->IsOwning
+                                            ? chainPrimary : LoadNamedVariable(initializerSourceNV);
                                     }
                                 }
                                 bool initializerIsBorrowed = initializerSourceNV.IsBorrowed
@@ -14157,6 +14350,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.IsCxxNullptrT = srcCxxNullptrT;
                         // C++ deduction: the initializer's top-level const is dropped, pointee const is kept.
                         const bool declaredConst = typeAndValue.IsConstObject();
+                        typeAndValue.CxxSpelledCvrQualifier = srcInferredCvrQualifier;
                         typeAndValue.ConstMask = srcInferredConstMask
                             & LLVMBackend::TypeAndValue::ConstBitsBelow(typeAndValue.ValuePointerDepth());
                         if (declaredConst) typeAndValue.ApplyWholeWordConst();
@@ -14586,7 +14780,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (nrvo.function == compiler->currentFunction
                         && nrvoCandidate != nrvo.declarators.end())
                     {
-                        auto* localType = compiler->GetType(typeAndValue);
+                        // The name test comes first: GetType reports an error on an `auto` local.
+                        auto* localType = typeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                            ? compiler->GetType(typeAndValue) : nullptr;
                         const auto& recipe = compiler->currentFunctionAbiRecipe;
                         const uint64_t abiAlign = localType != nullptr && localType->isSized()
                             ? compiler->module->getDataLayout().getABITypeAlign(localType).value() : 0;

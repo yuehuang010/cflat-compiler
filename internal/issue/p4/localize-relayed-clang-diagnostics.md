@@ -74,3 +74,9 @@ drives) carries a `clang: ` prefix so the user can tell it did not come from cfl
 coverage: find every relay site that forwards clang/tool text without the prefix (the clang-cl
 compile/link stderr relays in LLVMBackend_CInterop.cpp and LLVMBackend.cpp are the known ones) and
 prefix it. The cflat sentence around a quoted clause stays localized as today.
+
+## Status 2026-11-10
+
+Clang's own clauses are now marked: the C compiler / clang-cl relays and "clang rejected the call through ..." carry `(clang: ...)`
+(leg Test/errors/err_cpp_relayed_clang_clause_prefix.cb). Linker and dsymutil stderr stay unprefixed because that text is not clang's.
+Still open: the text itself stays English in every locale, and the list of unprefixed clang sinks has not been audited in full.

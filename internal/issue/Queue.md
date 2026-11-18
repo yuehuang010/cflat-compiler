@@ -117,7 +117,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | - | p3/cpp-free-operator-conversion-vs-builtin-ambiguity + p3/template-member-operators-not-ranked + p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in; compound and rewritten member templates not ranked, protected member template; public member templates and both-class free ranking landed 62b0d331 (RULED 2026-10-31) |
 | - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left; tie diagnostic landed 9356d941 |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | Itanium landed CONSTTWIN (72073fc6); clang-cl residue only |
-| B5j | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | `const char *const &` overloads: constructor wrapper path and direct non-template ranking; literal at a `const char *&&` template refused | NEW 2026-10-05 (T28 round 5 matrix, pre-existing on master) |
 | B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), siblings | FLEXLEFT cface31e landed `*&` / paren sizeof and implicit-this `move data`; FLEXSZ 31d380ba landed 2-D row sizeof / arithmetic, 1-D double subscript refusal, `sizeof(&a)` |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | by-design B9 rulings (arr elem init landed ASSIGN 72073fc6) | OPEN (P2 landed 1955bd95) |
 | W13b | p3/cpp-overload-variadic-and-conversion-gaps | conversion operators at C++ callees landed 723b0440; residue CFlat callee with a derived-pointer result | inline variadic link landed VARLINK (1a702805) |
@@ -137,7 +136,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 |-----|----------|------|------|
 | - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | C++ class ternary + static init leftovers | array element of a temp as an arm, global move init; static-init temp destruction and throwing temp dtor landed 62b0d331; moved-arm + nested temp field landed 2026-11-04, mixed-class lvalue join landed 2026-11-06 (af28ab81); derived local return implicit move landed STATLEFT cface31e (explicit `return move d` residue) |
 | - | p3/function-slot-null-zero-spellings | null-constant classifier | function-like zero macros landed NULLMACFN (cface31e); residue: function-slot ternary join (RULED 2026-10-20) |
-| D1b | p3/cpp-unguarded-header-class-template-lookup-fails-cold (cold-cache only) | free-function selection; incremental request units | NEW 2026-09-28 (D1 leftovers) |
 | - | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused | converting-ctor path | absorbed by P1 (converting constructors); land there |
 | - | p3/cpp-class-pointer-converting-ctor-leftovers | converting-ctor path | T305 residue; with P1 |
 | - | p3/cpp-inherited-operator-diamond-and-protected-access | virtual inheritance in imported classes | with P4 virtual-base layout |
@@ -152,7 +150,7 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | E5 | p3/cflat-default-param-temporaries-leftovers | default-argument temporaries: wrapper-lifetime timing, refused class/pointer/string/nested brace elements, native default leaks (DEFPARAM 9356d941 landed ternary + scalar brace defaults; CONDDEF 31d380ba landed by-value ctor `?: default`; CONSTREF 31d380ba landed const T& brace / new; CONSTST 31d380ba landed static overload sets + omitted defaults; CONSTARM 1a702805 landed derived / converting arms; CONSTST3 1a702805 landed the static member template, issue file deleted) |
 | E6 | p3/cflat-move-cpp-class-sink-shapes-leftovers + p3/discard-ternary-move-join-and-cxx-field-move | `move` of a C++ class: element, field, brace and container sinks landed 723b0440; residue ternary arms, [cpp] whole-object move, prvalue through the foreign brace wrapper, discard join |
 | E7 | p3/cpp-ternary-move-join-leftovers | ternary move joins over C++ classes: same-class and derived-to-base joins landed; residue extra copy of a one-const-arm join as a ctor argument inside an outer arm |
-| E8 | p3/cpp-return-named-local-implicit-move-and-byvalue-elision + p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; `return move param` landed 723b0440 |
+| E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; `return move param` landed 723b0440; named locals built in the caller landed RETELIDE 03da49d3c |
 | E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue after UNBWRAP (9356d941; DIRCTOR 31d380ba landed direct construction): refusing-callee global writes, implicit-this method / returned-pointer writes, native-callee global order, ref-param `?: default` |
 | E11 | p3/lowered-cxx-field-structs-leftovers-after-t528 | with P2 (cflat-struct-nontrivial-cxx-fields) |
 
@@ -251,7 +249,6 @@ None. Parked branches (worktrees removed 2026-11-03, branch kept, not landing as
 | Issue | DISABLED case | Summary |
 |---|---|---|
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
-| p3/cpp-pointer-depth-and-array-pointer-param-gaps | (C++ interop) | non-null int** accepted into C++ int*** (depth >= 3 maps to void**); member/static array-pointer params landed 31d380ba |
 | p3/generic-overload-not-joining-concrete-overload-set | (none) | refused cells landed GENOVL (ef83ffa02); ruled picks landed GENOVLR (5344802ed); leftovers: CFlat expression typing (1 << 2L, 1.5 + x, char arithmetic), strlit vs char*, named-arg inference, generic-only const pointee return, UFCS free generic |
 | p3/member-type-path-remaining-gaps | (none) | `Outer<int>.Inner<long>.type`, closure-alias members, CFlat static data members, C++ statics as value template args (T37 follow-up) |
 
@@ -275,11 +272,9 @@ this table.
 | 1 | DIAG-TEXT | M/L | p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | shared KIND only (relayed clang / refusal text) (u) | F1 | yes |
 | 3 | NULLCTOR | L/M | p3/cpp-null-constant-ctor-leftovers-after-t132 | scalar-ref + nullptr_t&& + tdp<int>(0) landed 72073fc6; function-like zero macros landed cface31e | CTOR-VIABILITY, PTRRANK | no |
 | 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | CRTP field item landed 72073fc6; residue: [cpp] struct vs same-named imported global class (identity table, direction coexist) | - | yes, careful on identity |
-| 8 | PTRRANK | M/H | p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg, TryBinaryOperatorOverload | NULLCTOR, CTOR-VIABILITY | no |
 | 10 | CLIBNAME | M/M | p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | - | RULED 2026-10-21: nobuiltin on CFlat bodies |
 | 15 | ASSIGN | L/M | p3/cpp-assignment-result-leftovers-after-b9 | route + c6 landed 72073fc6 (route-leftovers deleted); residue: by-design B9 rulings only | - | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | CTOR-VIABILITY | no |
-| 18 | CTOR-VIABILITY | L/H | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM, PTRRANK | no |
 | 20 | FNWRAP-RES | L/H | p3/cpp-forwarded-closure-refusals-after-t525, p3/cpp-capturing-closure-to-std-function | residue after FNWRAP af28ab81 (see issue files) | ELIDE (P2 plan) | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, A3 | no |
 | 25 | CONSTTWIN | L/H | p3/cpp-constrained-twin-default-argument-ranking | Itanium + const twins landed 72073fc6; residue: MSVC shared-symbol body choice (Windows host) | CONSTPOINTEE | no |

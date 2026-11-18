@@ -122,4 +122,45 @@ namespace cppi_scope
     inline int operator-(A a, const OpFoo&) { return 16000 + (int)a; }
     inline int operator*(U2 u, const OpFoo&) { return 16500 + (int)u; }
     constexpr A kA = A::x;
+
+    // Free operators declared on an enum: an exact enum match beats built-in arithmetic, as in
+    // clang. Each body returns a distinct value so the leg names the overload that ran.
+    namespace eop
+    {
+        enum class SE : int { a = 5, b = 7 };
+        enum UE : int { ua = 5, ub = 7 };
+        enum Plain : int { p2 = 2, p3 = 3 };      // no overloads: built-in arithmetic only
+        enum class PlainS : int { s2 = 2 };       // no overloads
+        struct Unrel { int v = 1; };
+        inline int operator+(const Unrel&, int i) { return 900 + i; }
+        inline int operator-(int i, const Unrel&) { return 950 + i; }
+        inline int operator+(SE e, int i) { return 20 + (int)e + i; }
+        inline int operator+(int i, SE e) { return 40 + i + (int)e; }
+        inline int operator+(SE e, double d) { return 300 + (int)e + (int)d; }
+        inline int operator+(double d, SE e) { return 400 + (int)d + (int)e; }
+        inline int operator*(SE x, SE y) { return 60 + (int)x * (int)y; }
+        inline SE& operator+=(SE& e, int i) { e = (SE)((int)e + i * 10); return e; }
+        inline SE& operator+=(SE& e, double d) { e = (SE)((int)e + (int)d * 30); return e; }
+        inline SE& operator^(SE& e, int i) { e = (SE)((int)e + i * 20); return e; }
+        inline bool operator<(SE x, SE y) { return (int)x > (int)y; }
+        inline int operator+(UE e, int i) { return 80 + (int)e + i; }
+        inline int operator-(int i, UE e) { return 100 + i - (int)e; }
+        inline bool operator==(UE x, UE y) { return (int)x != (int)y; }
+        struct Mem
+        {
+            int v = 3;
+            int operator+(SE e) const { return 300 + v + (int)e; }
+        };
+        inline int operator+(const Mem& m, UE e) { return 400 + m.v + (int)e; }
+        enum class Chain : int { first = 5 };
+        inline Chain operator|(Chain e, int) { return (Chain)((int)e + 10); }
+        inline int operator+(Chain e, int i) { return 100 + (int)e + i; }
+        enum E : int { e0 = 2, e1 = 3, e2 = 5, e3 = 7 };
+        enum N : int { n0 = 2 };
+        inline int operator+(E e, int i) { return 800 + (int)e + i; }
+        inline int operator+(N n, int i) { return 1000 + (int)n + i; }
+    }
 }
+
+// A global-namespace operator on a namespaced enum: found by ordinary lookup, not ADL.
+inline int operator%(cppi_scope::eop::SE e, int i) { return 700 + (int)e + i; }

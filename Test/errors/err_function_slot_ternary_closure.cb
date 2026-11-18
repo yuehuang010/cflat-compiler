@@ -1,0 +1,31 @@
+// A closure joined to a thin function slot is refused with the closure rule, not a type clash.
+// The spelling that works is `k ? l.toFunction() : nullptr` (ruling 2026-10-20).
+int t185ClosureTernInc(int x) { return x + 1; }
+expect_error("a closure that may carry captured state cannot become a C function pointer") {
+    int t185ClosureTernaryNullDecl() {
+        int k = 1;
+        Lambda<int(int)> l = (int a) => a + 2;
+        function<int(int)> f = k ? l : nullptr;
+        return 0;
+    }
+}
+expect_error("a closure that may carry captured state cannot become a C function pointer") {
+    int t185ClosureTernaryNamedArm() {
+        int k = 1;
+        Lambda<int(int)> l = (int a) => a + 2;
+        function<int(int)> f = k ? l : t185ClosureTernInc;
+        return 0;
+    }
+}
+expect_error("a closure that may carry captured state cannot become a C function pointer") {
+    int t185ClosureTernaryAssignment() {
+        int k = 1;
+        Lambda<int(int)> l = (int a) => a + 2;
+        function<int(int)> f = nullptr;
+        f = k ? l : nullptr;
+        return 0;
+    }
+}
+expect_error("a closure that may carry captured state cannot become a C function pointer") {
+    function<int(int)> t185ClosureTernaryReturn(int k, Lambda<int(int)> l) { return k ? l : nullptr; }
+}

@@ -94,6 +94,7 @@ import cpp "library/cpp_interop_override_abi.h";
 // The CFlat-defined [cpp] structs below derive from C++ class-template specializations, and
 // the make_shared checks register them through std::shared_ptr.
 import cpp "library/cpp_interop_tpl.h";
+import cpp "library/cpp_retelide.h";
 import cpp "library/cpp_interop_inline.h";
 import cpp "vector";
 import cpp "string";
@@ -307,6 +308,8 @@ import cpp "library/cpp_interop_twin.h";
 import cpp "library/cpp_interop_t417.h";
 import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_arrayelem.h";
+import cpp "library/cpp_prvarg_template.hpp";
+import cpp "library/cpp_braceprv.hpp";
 import "library/cpp_interop_gfield_a.cb";
 import "library/cpp_interop_gfield_b.cb";
 import "test_helper.cb";
@@ -4664,6 +4667,43 @@ t162.ReturnSrc t446_same_type_local()
     t162.ReturnSrc source = t162.ReturnSrc(5);
     return source;
 }
+// RETELIDE: a C++ class local every return names is built in the sret slot (clang: NRVO). Fixture:
+// Test/library/cpp_retelide.h. Counts pinned to clang++ -std=c++20 on the same shapes.
+retelide.RS retelide_same_local() { retelide.RS s = retelide.RS(5); return s; }
+retelide.RS retelide_branch(int c)
+{
+    retelide.RS a = retelide.RS(1);
+    if (c != 0) return a;
+    retelide.RS b = retelide.RS(2);
+    return b;
+}
+retelide.RS retelide_param_move(retelide.RS f) { retelide.RS g = move f; return g; }
+retelide.RS retelide_throw(int t)
+{
+    retelide.RS a = retelide.RS(3);
+    retelide.boom(t);
+    return a;
+}
+int retelide_throw_wrap(int t)
+{
+    retelide.RS r = retelide_throw(t);
+    return r.value;
+}
+struct RetelideWrap { retelide.RS s = default; };
+RetelideWrap retelide_wrap_movea()
+{
+    RetelideWrap movea = default;
+    movea.s.value = 1;
+    RetelideWrap a = default;
+    a.s.value = 2;
+    return move a;
+}
+retelide.RS retelide_movea()
+{
+    retelide.RS movea = retelide.RS(1);
+    retelide.RS a = retelide.RS(2);
+    return move a;
+}
 std.pair<i64, int> t177_pair_return() { return std.pair<int, int>(3, 4); }
 std.tuple<i64, int> t177_tuple_return() { return std.tuple<int, int>(3, 4); }
 std.complex<double> t177_complex_return() { return std.complex<float>(3.0f, 4.0f); }
@@ -4676,6 +4716,10 @@ std.unique_ptr<cppinl.Base> t177_unique_move_return()
     return move value;
 }
 
+// BRACEPRV: a C++ class prvalue element of a braced aggregate is built in place (clang 0 moves).
+int braceprv_twice(int v) { return v * 2; }
+int braceprv_throw1(int t) { braceprv.Thrower th = { braceprv.BS(1), braceprv.BT(1), 2 }; return th.a.value; }
+int braceprv_throw0(int t) { braceprv.Thrower th = { braceprv.BS(1), braceprv.BT(0), 2 }; return th.a.value; }
 extern int main(int argc, char** argv)
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -4794,7 +4838,47 @@ extern int main(int argc, char** argv)
         t446Value = value.value;
     }
     if (t446Value != 5 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
-        || t162.ReturnStats.srcMove != 1 || t162.ReturnStats.srcDtor != 2) return 44606;
+        || t162.ReturnStats.srcMove != 0 || t162.ReturnStats.srcDtor != 1) return 44606;
+
+    // RETELIDE legs (clang++ -std=c++20 counts: ctor/copy/move/dtor).
+    retelide.RS_Stats.reset();
+    { retelide.RS rtlX = retelide_same_local(); }
+    if (retelide.RS_Stats.ctor != 1 || retelide.RS_Stats.copy != 0
+        || retelide.RS_Stats.move != 0 || retelide.RS_Stats.dtor != 1) return 44617;
+    retelide.RS_Stats.reset();
+    { retelide.RS rtlX = retelide_branch(1); }
+    if (retelide.RS_Stats.ctor != 1 || retelide.RS_Stats.copy != 0
+        || retelide.RS_Stats.move != 1 || retelide.RS_Stats.dtor != 2) return 44618;
+    retelide.RS_Stats.reset();
+    { retelide.RS rtlX = retelide_branch(0); }
+    if (retelide.RS_Stats.ctor != 2 || retelide.RS_Stats.copy != 0
+        || retelide.RS_Stats.move != 0 || retelide.RS_Stats.dtor != 2) return 44611;
+    retelide.RS_Stats.reset();
+    {
+        retelide.RS rtlA = retelide.RS(5);
+        retelide.RS rtlX = retelide_param_move(move rtlA);
+    }
+    if (retelide.RS_Stats.ctor != 1 || retelide.RS_Stats.copy != 0
+        || retelide.RS_Stats.move != 2 || retelide.RS_Stats.dtor != 3) return 44612;
+    retelide.RS_Stats.reset();
+    if (retelide.guarded(retelide_throw_wrap, 1) != -1) return 44613;
+    if (retelide.RS_Stats.ctor != 1 || retelide.RS_Stats.move != 0
+        || retelide.RS_Stats.dtor != 1) return 44614;
+    retelide.RS_Stats.reset();
+    if (retelide.guarded(retelide_throw_wrap, 0) != 3) return 44615;
+    if (retelide.RS_Stats.ctor != 1 || retelide.RS_Stats.move != 0
+        || retelide.RS_Stats.dtor != 1) return 44616;
+    retelide.RS_Stats.reset();
+    int rtlWrapValue = 0;
+    { RetelideWrap rtlW = retelide_wrap_movea(); rtlWrapValue = rtlW.s.value; }
+    if (rtlWrapValue != 2 || retelide.RS_Stats.bad != 0) return 44619;
+    retelide.RS_Stats.reset();
+    int rtlMoveaValue = 0;
+    { retelide.RS rtlM = retelide_movea(); rtlMoveaValue = rtlM.value; }
+    if (rtlMoveaValue != 2 || retelide.RS_Stats.ctor != 2 || retelide.RS_Stats.copy != 0
+        || retelide.RS_Stats.move != 1 || retelide.RS_Stats.dtor != 3
+        || retelide.RS_Stats.bad != 0) return 44620;
+    retelide.RS_Stats.reset();
 
     // Clang: a prvalue argument is built in the parameter, moved once into the result, no copy.
     t162.ReturnStats.reset();
@@ -7261,8 +7345,8 @@ extern int main(int argc, char** argv)
     }
     bridge_check("bridge return local C++ ctor", cpptw.ctor_count(), 1);
     bridge_check("bridge return local C++ copy", cpptw.copy_count(), 0);
-    bridge_check("bridge return local C++ move", cpptw.move_count(), 1);
-    bridge_check("bridge return local C++ dtor", cpptw.dtor_count(), 2);
+    bridge_check("bridge return local C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge return local C++ dtor", cpptw.dtor_count(), 1);
     bridge_check("bridge return local C++ live", cpptw.live_allocations(), 0);
 
     bridge_reset_cf();
@@ -9129,6 +9213,94 @@ extern int main(int argc, char** argv)
         if (mixT.v != 11 || mixF.v != 10) return 4758;
     }
     if (cppfc.rt_live() != 0) return 4759;
+
+    // PRVARG: a prvalue class argument beside a later call argument is elided into a function
+    // template's by-value parameter, as clang does: no move, one destructor per temporary.
+    {
+        prvarg.resetCounts();
+        int prvFree = prvarg.free_tmpl(prvarg.Ev(7), prvarg.next_side());
+        if (prvFree != 7001) return 44621;
+        if (prvarg.ctorCount() != 1 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 1 || prvarg.sideCount() != 1) return 44622;
+        prvarg.resetCounts();
+        int prvPair = prvarg.pair_tmpl(prvarg.Ev(prvarg.next_side()), prvarg.Ev(prvarg.next_side()));
+        if (prvPair != 1002) return 44623;
+        if (prvarg.ctorCount() != 2 || prvarg.copyCount() != 0 || prvarg.moveCount() != 0
+            || prvarg.dtorCount() != 2 || prvarg.sideCount() != 2) return 44624;
+    }
+    // PRVARG round 2: a later argument that converts at the call keeps the wrapper, so C++ converts it.
+    {
+        prvarg.resetCounts();
+        long narrowLong = 4;
+        if (prvarg.narrow_long(prvarg.Ev(1), narrowLong) != 4) return 44625;
+        double narrowDouble = 2.5;
+        if (prvarg.narrow_double(prvarg.Ev(1), narrowDouble) != 2) return 44627;
+        int narrowInt = 300;
+        if (prvarg.narrow_short(prvarg.Ev(1), narrowInt) != 300) return 44628;
+        int narrowChar = 65;
+        if (prvarg.narrow_char(prvarg.Ev(1), narrowChar) != 65) return 44629;
+        double narrowFloat = 1.5;
+        if (prvarg.narrow_float(prvarg.Ev(1), narrowFloat) != 3) return 44630;
+        prvarg.resetCounts();
+        if (prvarg.narrow_long(prvarg.Ev(prvarg.next_side()), narrowLong) != 4) return 44631;
+        if (prvarg.sideCount() != 1) return 44632;
+    }
+    // PRVARG round 2: a derived-to-base by-value argument beside a class prvalue links and binds the
+    // base subobject, as clang does; the direct call is not taken for it.
+    {
+        prvarg.Dt sliceLvalue = prvarg.Dt(44);
+        if (prvarg.slice_by_value(prvarg.Ev(1), sliceLvalue) != 44) return 44633;
+        if (prvarg.slice_by_value(prvarg.Ev(1), prvarg.Dt(55)) != 55) return 44634;
+        prvarg.Dt sliceLeft = prvarg.Dt(7);
+        prvarg.Dt sliceRight = prvarg.Dt(8);
+        int sliceChoose = 1;
+        if (prvarg.slice_by_value(prvarg.Ev(1), sliceChoose != 0 ? sliceLeft : sliceRight) != 7) return 44635;
+        if (prvarg.slice_bare(prvarg.Ev(1), sliceLvalue, prvarg.next_side()) != 442) return 44636;
+    }
+
+    // BRACEPRV legs: code() = ctor*1000 + copy*100 + move*10 + dtor, read before the scope ends;
+    // values pinned to clang++ -std=c++20 on the same shapes (master moved a CFlat temp in).
+    braceprv.BS_Stats.reset();
+    { braceprv.Outer bpo = { braceprv.BS(3), 1, 9 }; if (braceprv.code() != 1000 || bpo.r.value + bpo.x + bpo.y != 13) return 44640; }
+    braceprv.BS_Stats.reset();
+    { braceprv.Multi bpm = { braceprv.BS(3), 1, braceprv.BS(4), 2, 7 }; if (braceprv.code() != 2000 || bpm.b.value != 4) return 44641; }
+    braceprv.BS_Stats.reset();
+    { braceprv.Outer bpd = { r = braceprv.BS(3), x = 1 }; if (braceprv.code() != 1000 || bpd.r.value + bpd.y != 12) return 44642; }
+    braceprv.BS_Stats.reset();
+    { braceprv.Outer bpt = { braceprv.BS(5, 6), 1 }; if (braceprv.code() != 1000 || bpt.r.value != 56) return 44643; }
+    braceprv.BS_Stats.reset();
+    { braceprv.BS bps = { braceprv.BS(7) }; if (braceprv.code() != 1000 || bps.value != 7) return 44644; }
+    braceprv.BS_Stats.reset();
+    { braceprv.Wrap bpw = { braceprv.BS(3), 1, 9, 5 }; if (braceprv.code() != 1000 || bpw.o.r.value + bpw.o.y + bpw.z != 17) return 44645; }
+    braceprv.BS_Stats.reset();
+    { braceprv.Wrap bpn = { { braceprv.BS(3), 1 }, 5 }; if (braceprv.code() != 1000 || bpn.o.y != 9) return 44646; }
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(braceprv_throw0, 0) != 1 || braceprv.code() != 1001) return 44647;
+    // Guard (master equal): the in-place element is destroyed once when a later element throws.
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(braceprv_throw1, 1) != -1 || braceprv.code() != 1001) return 44648;
+    cppi.xv_reset();
+    { cppi.XvTrivialTemplateHolder bph = { cppi.XvTrivialTemplate(7) }; if (bph.item.v != 7 || cppi.xv_move_count() != 0) return 44649; }
+    // Private copy and move: accepted only because the element is built in place (master refused).
+    { braceprv.PAgg bpp = { braceprv.BP(3), 1 }; if (bpp.p.value + bpp.x != 4) return 44650; }
+    braceprv.BS_Stats.reset();
+    { braceprv.Outer bpe = { braceprv.BS(braceprv.BS(6)), 1 }; if (braceprv.code() != 1000 || bpe.r.value != 6) return 44652; }
+    braceprv.BS_Stats.reset();
+    { braceprv.BS bpb = braceprv.BS(4); braceprv.Outer bpv = { braceprv.BS(move bpb), 1 }; if (braceprv.code() != 1010 || bpv.r.value != 4) return 44653; }
+    // Guard (master equal): a `T&` constructor argument still binds the caller's variable in place.
+    { int bpk = 3; braceprv.WAgg bpr = { braceprv.BW(bpk), 1 }; if (bpr.w.value != 3 || bpk != 77) return 44654; }
+    // Round 2: a string-literal, a `char*` and a function-pointer constructor argument (built in place).
+    braceprv.BS_Stats.reset();
+    { braceprv.LAgg bpl = { braceprv.BL("a\"b"), 1 }; if (braceprv.code() != 1000 || bpl.l.value != 3) return 44655; }
+    braceprv.BS_Stats.reset();
+    { char* bpc = (char*)"abcd"; braceprv.LAgg bpp2 = { braceprv.BL(bpc), 1 }; if (braceprv.code() != 1000 || bpp2.l.value != 4) return 44656; }
+    braceprv.BS_Stats.reset();
+    { braceprv.LAgg bpf = { braceprv.BL(braceprv_twice), 1 }; if (braceprv.code() != 1000 || bpf.l.value != 6) return 44657; }
+    braceprv.BS_Stats.reset();
+    { braceprv.LAgg bpu = { braceprv.BL(u8"abc"), 1 }; if (braceprv.code() != 1000 || bpu.l.value != 53) return 44658; }
+    // Guard (master equal): an element constructor still runs before a later element with side effects.
+    braceprv.BS_Stats.reset();
+    { braceprv.Outer bpq = { braceprv.BS(braceprv.BS_Stats.note(3)), braceprv.BS_Stats.note(4) }; if (braceprv.BS_Stats.order != 334) return 44651; }
 
     return 0;
 }

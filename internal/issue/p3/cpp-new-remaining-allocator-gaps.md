@@ -28,8 +28,17 @@ inaccessible; (5) run test_cpp_interop on Windows.
 - `new CVA(4)` through a `using` alias of a class with a converting ctor fails "has no imported constructors"; clang 8, cv_alias.
 - `new DM(vref())` from a `volatile DM&` source is accepted by a stack declaration too (`DM q = vref();`), so the
   gap is general volatile-copy acceptance, not new-specific; CFlat drops volatile by design. Needs a ruling.
-- Open shapes after the 2026-11-09 elision of `new T(f())` (f returns T by value; ternary arms excluded):
-  `new NM(NM())` (direct construction, deleted move) is still refused; `new Sx(Sx(4))` builds a temp and
-  copies (148 vs clang 80, dtors 2 vs 1); `new NM(c ? mk() : mk())` is refused. Fix direction: the
-  functional-cast in-place path (MainListener_UnaryCast.cpp, cast-init slot) for a new-argument.
+- Open shapes after the 2026-11-09 elision of `new T(f())` (f returns T by value). Ternary arms of two
+  same-class prvalues are fixed (legs 4007-4008). Still open, clang twin in brackets:
+  `new NM(NM())` refused, "has no constructor whose parameter types match these arguments";
+  `new NM{NM(4)}` refused the same way; `new Sx(Sx(4))` copies once (copies=1, clang 0, dtors 1 at
+  first show, clang 0); `new Sx(Sx(Sx(4)))` copies twice (copies=2, clang 0).
+  Repro: `struct NM { NM() {} explicit NM(int); NM(NM&&) = delete; }; new NM(NM());` and
+  `struct Sx { explicit Sx(int); Sx(const Sx&) {++copies;} }; Sx* p = new Sx(Sx(4));`.
+  Cause (2026-11-10): a functional-cast `T(args)` is a constructor call that builds an alloca temp; a
+  `new` block cannot adopt that temp (a declaration does), and the armed block is not consumed by the
+  constructor call (no sret consumer fires for it, LLVMBackend_Overloads.cpp ~11192/11214). Fix
+  direction: build the constructor call directly into a given object address for a new-argument.
+  Same copy in a declaration (outside this bullet's scope, not fixed): `Sx s = Sx(Sx(4));` copies
+  once on master (clang 0).
 - Not reproduced 2026-11-09: `new CVA(4)` through a `using` alias (master and fix both run 8, clang 8).

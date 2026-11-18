@@ -1070,8 +1070,8 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         {
             (void)llvm::sys::fs::remove(objPath);
             (void)llvm::sys::fs::remove(depPath);
-            LogRawError(std::format("C compiler failed to compile C source '{}' (exit {}){}{}",
-                cSourcePath, rc, compileErr.empty() ? "" : ": ", compileErr));
+            LogRawError(std::format("C compiler failed to compile C source '{}' (exit {}){}",
+                cSourcePath, rc, compileErr.empty() ? std::string() : std::format(" (clang: {})", compileErr)));
             return false;
         }
 
@@ -1190,8 +1190,8 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         {
             (void)llvm::sys::fs::remove(objPath);
             (void)llvm::sys::fs::remove(depPath);
-            LogRawError(std::format("clang-cl failed to compile C source '{}' (exit {}){}{}",
-                cSourcePath, rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
+            LogRawError(std::format("clang-cl failed to compile C source '{}' (exit {}){}",
+                cSourcePath, rc, clangCompileErr.empty() ? std::string() : std::format(" (clang: {})", clangCompileErr)));
             return false;
         }
 
@@ -1262,8 +1262,8 @@ bool LLVMBackend::CompileCrashHandlerObject(const std::string& arch)
         if (rc != 0)
         {
             (void)llvm::sys::fs::remove(objPath);
-            LogRawError(std::format("clang-cl failed to compile crash handler (exit {}){}{}",
-                rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
+            LogRawError(std::format("clang-cl failed to compile crash handler (exit {}){}",
+                rc, clangCompileErr.empty() ? std::string() : std::format(" (clang: {})", clangCompileErr)));
             return false;
         }
 
@@ -1334,8 +1334,8 @@ bool LLVMBackend::CompileBuiltinsObject(const std::string& arch)
         if (rc != 0)
         {
             (void)llvm::sys::fs::remove(objPath);
-            LogRawError(std::format("clang-cl failed to compile cflat_builtins.c (exit {}){}{}",
-                rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
+            LogRawError(std::format("clang-cl failed to compile cflat_builtins.c (exit {}){}",
+                rc, clangCompileErr.empty() ? std::string() : std::format(" (clang: {})", clangCompileErr)));
             return false;
         }
 
@@ -1360,7 +1360,10 @@ bool LLVMBackend::MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out,
                                          bool cxxBoundary)
 {
         std::unordered_set<std::string> visited;
-        return MapCTypeToTypeAndValueImpl(std::move(ctype), out, visited, cxxBoundary);
+        const bool namesCvr = CxxSpellingHasCvrQualifier(ctype);
+        const bool mapped = MapCTypeToTypeAndValueImpl(std::move(ctype), out, visited, cxxBoundary);
+        if (mapped && namesCvr) out.CxxSpelledCvrQualifier = true;
+        return mapped;
 }
 
 void LLVMBackend::SetCInteropTargetFacts(const cflat_cinterop::ExtractResult& raw)
@@ -1587,7 +1590,10 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             ? static_cast<size_t>(std::count(retSpelling.begin(), retSpelling.end(), '[')) : 0;
         const std::string retMapSpelling = cxxArrayReferenceReturn
             ? StripFixedArrayDims(retSpelling, returnArrayDims) : retSpelling;
-        if (!MapCTypeToTypeAndValueImpl(retMapSpelling, retTV, visited, cxxBoundary)) return false;
+        ++cTypeMapSignatureNesting_;
+        const bool returnMapped = MapCTypeToTypeAndValueImpl(retMapSpelling, retTV, visited, cxxBoundary);
+        --cTypeMapSignatureNesting_;
+        if (!returnMapped) return false;
         // Function pointers returning function pointers are not supported here.
         if (retTV.IsFunctionPointer) return false;
         const bool cxxReferenceReturn = cxxBoundary
@@ -1673,7 +1679,10 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         {
             TypeAndValue ptv;
             const std::string parameterSpelling = trim(p);
-            if (!MapCTypeToTypeAndValueImpl(parameterSpelling, ptv, visited, cxxBoundary)) return false;
+            ++cTypeMapSignatureNesting_;
+            const bool parameterMapped = MapCTypeToTypeAndValueImpl(parameterSpelling, ptv, visited, cxxBoundary);
+            --cTypeMapSignatureNesting_;
+            if (!parameterMapped) return false;
             if (ptv.IsFunctionPointer) return false; // nested fn-ptr arg not supported
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = ptv.TypeName;
@@ -1849,6 +1858,8 @@ bool LLVMBackend::IsCxxNullTypedArgument(const NamedVariable& arg)
 
 // std::nullptr_t by value (outer cv ignored): a builtin, never a class worth a type request.
 
+static constexpr int kMaxCarrierPointerDepth = 31;
+
 bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValue& out,
                                            bool& mapped) const
 {
@@ -1950,18 +1961,18 @@ bool LLVMBackend::TryMapCxxForeignSpelling(const std::string& ctype, TypeAndValu
             out.IsScopedEnum = scopedEnumTypes_.count(foreignName) != 0;
         }
         out.IsRvalueRef = ptr > 0 && ctype.find("&&") != std::string::npos;
+        // A REFERENCE to a T** (or deeper) is one declarator level more than its pointee: the
+        // reference is the ABI's extra pointer, which IsCxxRefToPointer already encodes.
+        if (refs == 1 && stars >= 2 && ptr == stars + 1)
+        {
+            ptr = stars;
+            out.IsCxxRefToPointer = true;
+        }
         if (ptr > 0) out.Pointer = true;
         if (ptr > 1) out.ElemPointer = true;
-        mapped = ptr <= 2;
-        // A REFERENCE to a T** is three declarator levels but only two CFlat ones: the reference
-        // is the ABI's extra pointer, which IsCxxRefToPointer already encodes. Store T** and let
-        // the caller keep the flag instead of peeling a level it cannot represent.
-        if (!mapped && refs == 1 && stars == 2)
-        {
-            out.ElemPointer = true;
-            out.IsCxxRefToPointer = true;
-            mapped = true;
-        }
+        if (ptr > 2) out.PointerDepth = ptr;
+        // Past the 31-level carrier the spelling is not bound (a use reports the located refusal).
+        mapped = ptr <= kMaxCarrierPointerDepth;
         return true;
     }
 
@@ -2035,6 +2046,41 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             isReference = true;
         }
 
+        // A function declarator the parser above could not read: its stars are not this type's
+        // depth, so it keeps the pointer carrier.
+        if (ptr > 2)
+        {
+            int angleDepth = 0;
+            for (char c : ctype)
+            {
+                if (c == '<') ++angleDepth;
+                else if (c == '>') --angleDepth;
+                else if (c == '(' && angleDepth == 0)
+                {
+                    out.TypeName = "void";
+                    out.Pointer = true;
+                    out.ElemPointer = true;
+                    return true;
+                }
+            }
+        }
+
+        // CFlat carries at most 31 declarator levels (MaxDeclaratorPointerDepth): deeper
+        // spellings are not bound, so an unused declaration still compiles.
+        if (ptr > kMaxCarrierPointerDepth)
+        {
+            // In a function signature a too-deep component keeps a pointer carrier: same ABI.
+            if (cTypeMapSignatureNesting_ > 0)
+            {
+                out.TypeName = "void";
+                out.Pointer = true;
+                out.ElemPointer = true;
+                return true;
+            }
+            cTypeMapExceededPointerDepth_ = true;
+            return false;
+        }
+
         // Collapse runs of whitespace and trim - so "unsigned   long  long" normalizes.
         std::string base;
         bool prevSpace = true; // leading -> skip
@@ -2061,21 +2107,12 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
             }
         for (size_t pos; (pos = base.find("::")) != std::string::npos; ) base.replace(pos, 2, ".");
 
-        // A REFERENCE to a T** keeps the pointee: the reference is the ABI's extra level and
-        // IsCxxRefToPointer already encodes it, so T** fits the two CFlat levels.
-        if (ptr == 3 && isReference && starLevels == 2)
+        // A REFERENCE to a T** (or deeper) keeps the pointee: the reference is the ABI's extra
+        // level and IsCxxRefToPointer already encodes it, so T**& carries depth 2 and T***& depth 3.
+        if (isReference && starLevels >= 2 && ptr == starLevels + 1)
         {
-            ptr = 2;
+            ptr = starLevels;
             out.IsCxxRefToPointer = true;
-        }
-        // 3+ levels of indirection collapse to void** - CFlat TypeAndValue has at most two pointer
-        // levels. Pointers are the same ABI size on x64/x86, so calls still link correctly.
-        if (ptr > 2)
-        {
-            out.TypeName = "void";
-            out.Pointer = true;
-            out.ElemPointer = true;
-            return true;
         }
 
         /*
@@ -2108,7 +2145,8 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
                 out.EnumBacking = it->second;
                 out.IsScopedEnum = scopedEnumTypes_.count(base) != 0;
                 out.Pointer = ptr >= 1;
-                out.ElemPointer = ptr == 2;
+                out.ElemPointer = ptr >= 2;
+                if (ptr >= 3) out.PointerDepth = ptr;
                 return true;
             }
             mapped = "int";
@@ -2207,7 +2245,9 @@ bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& ou
 
         out.TypeName = mapped;
         out.Pointer = ptr >= 1;
-        out.ElemPointer = ptr == 2;
+        out.ElemPointer = ptr >= 2;
+        // Depth 3+ is positively recorded here: C and C++ spell the exact '*' count.
+        if (ptr >= 3) out.PointerDepth = ptr;
         out.IsCxxNullptrT = nullptrT;
         return true;
     }

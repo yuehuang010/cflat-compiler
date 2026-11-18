@@ -229,8 +229,7 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                                                            rv.pointerDepth, rv.elemPointer,
                                                            accumulatorStorage, rv.receiverStorage,
                                                            true, true, accumulatorIsRvalue, rv.isRvalue,
-                                                           acc == lv.value ? lv.sourceTypeName
-                                                                           : std::string(),
+                                                           accumulatorSourceTypeName,
                                                            rv.sourceTypeName,
                                                            acc == lv.value ? lv.pointerDepth : 0,
                                                            acc == lv.value && lv.elemPointer, {}, {},
@@ -677,6 +676,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.cxxClosureLenders = namedVar.CxxClosureLenders;
         result.cxxPointeeConst = namedVar.TypeAndValue.PointeeConstBit()
             && namedVar.TypeAndValue.Pointer;
+        result.cxxSpelledCvrQualifier = namedVar.TypeAndValue.CxxSpelledCvrQualifier;
         result.cxxObjectCv = Compiler(ctx)->CxxOperandObjectCv(namedVar);
         result.joinClassPointee = namedVar.JoinClassPointee;
         result.joinClassPointeeDepth = namedVar.JoinClassPointeeDepth;
@@ -5206,6 +5206,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             auto leftInfo = structInfo(lvalue);
             auto rightInfo = structInfo(rvalue);
             auto operands = collectOperatorOperandRules();
+            bool enumOperandRequest = false;
             auto setLiteralIdentity = [&](LLVMBackend::NamedVariable& arg, size_t side) {
                 arg.CxxArithIdentity = side == 0 ? lhsArithIdentity : rhsArithIdentity;
                 if (arg.CxxArithIdentity.empty())
@@ -5221,6 +5222,14 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         operands[side]->getText(), &arg.LiteralIdentitySuffixed);
                     arg.LiteralSigned = LLVMBackend::LiteralTextHasSign(operands[side]->getText());
                 }
+                // Enum-only request: the operand keeps its enum type (clang promotes it itself);
+                // an `operator+(E, int)` must see `E`, never the promoted `int`.
+                if (enumOperandRequest
+                    && !compiler->ResolveEnumTypeName(arg.TypeAndValue.TypeName).empty())
+                {
+                    arg.CxxArithIdentity.clear();
+                    return;
+                }
                 if (arg.LiteralIdentity.empty() && !arg.CxxArithIdentity.empty()
                     && arg.BaseType != nullptr
                     && (arg.BaseType->isIntegerTy() || arg.BaseType->isFloatingPointTy()))
@@ -5229,7 +5238,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             auto isFat = [](const std::string& typeName) {
                 return typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr";
             };
-            if (leftInfo.second.empty() && rightInfo.second.empty()) return nullptr;
+            // Two scalars: only the imported-enum branch below can bind (no class wildcard).
+            if (leftInfo.second.empty() && rightInfo.second.empty()
+                && (adlOnly || (lhsTypeName.empty() && rhsTypeName.empty())))
+                return nullptr;
             if (isFat(leftInfo.second) || isFat(rightInfo.second)) return nullptr;
 
             std::vector<std::string> namespaces;
@@ -5443,6 +5455,93 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (result != nullptr) TrackOwnedStringOperatorResult(compiler, result);
                 return result;
             };
+
+            /*
+             * No class operand: an imported C++ enum can name a free operator on scalar operands.
+             * Bind by the RESOLVED enum identity (an empty class name is a wildcard to the class
+             * binders below), and ask clang - which ranks the built-in candidate too - only when
+             * the enum's associated namespace or the global one declares an operator naming that
+             * enum. Other operands may be arithmetic values. Constant folds stay native.
+             */
+            if (leftInfo.second.empty() && rightInfo.second.empty())
+            {
+                auto supportedEnumOperatorOperand = [](llvm::Value* value) {
+                    if (value == nullptr) return false;
+                    auto* type = value->getType();
+                    return type->isIntegerTy() || type->isFloatingPointTy();
+                };
+                if (adlOnly || cxxOperatorRewriteDepth_ > 0 || cxxAdlSuppressDepth_ > 0
+                    || nativeConstantFoldDepth_ > 0 || lvalue == nullptr || rvalue == nullptr
+                    || !supportedEnumOperatorOperand(lvalue)
+                    || !supportedEnumOperatorOperand(rvalue))
+                    return nullptr;
+                static const std::set<std::string> enumOperators = {
+                    "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "==", "!=", "<", "<=",
+                    ">", ">=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="
+                };
+                if (enumOperators.count(op) == 0) return nullptr;
+                auto cxxEnumKey = [&](const std::string& name, int pointerDepth,
+                                      llvm::Value* value) {
+                    if (name.empty() || LLVMBackend::IsPrimitiveTypeName(name)
+                        || pointerDepth > 0 || (value != nullptr && value->getType()->isPointerTy()))
+                        return std::string();
+                    std::string key = compiler->ResolveEnumTypeName(name);
+                    return compiler->importedEnumTypes_.count(key) != 0 ? key : std::string();
+                };
+                const std::string leftEnum = cxxEnumKey(lhsTypeName, lhsPointerDepth, lvalue);
+                const std::string rightEnum = cxxEnumKey(rhsTypeName, rhsPointerDepth, rvalue);
+                if (leftEnum.empty() && rightEnum.empty()) return nullptr;
+                auto enumNamespace = [](const std::string& key) {
+                    const size_t dot = key.rfind('.');
+                    return dot == std::string::npos ? std::string() : key.substr(0, dot);
+                };
+                std::vector<std::string> enumNamespaces;
+                for (const std::string& key : { leftEnum, rightEnum })
+                    if (!key.empty()
+                        && std::find(enumNamespaces.begin(), enumNamespaces.end(),
+                                     enumNamespace(key)) == enumNamespaces.end())
+                        enumNamespaces.push_back(enumNamespace(key));
+                if (std::find(enumNamespaces.begin(), enumNamespaces.end(), std::string())
+                    == enumNamespaces.end())
+                    enumNamespaces.push_back(std::string());
+                auto namesOperandEnum = [&](const LLVMBackend::FunctionSymbol& candidate) {
+                    if (!isFreeCxxCandidate(candidate) || candidate.Parameters.size() != 2)
+                        return false;
+                    for (size_t side = 0; side < 2; ++side)
+                    {
+                        const std::string& key = side == 0 ? leftEnum : rightEnum;
+                        if (!key.empty()
+                            && compiler->ResolveEnumTypeName(
+                                candidate.Parameters[side].TypeName) == key)
+                            return true;
+                    }
+                    return false;
+                };
+                bool found = false;
+                for (const std::string& ns : enumNamespaces)
+                {
+                    const std::string sourceName = ns.empty() ? opName : ns + "." + opName;
+                    compiler->TryBindCxxFunction(sourceName);
+                    auto fit = compiler->functionTable.find(
+                        ns.empty() ? "__cxx_free." + opName : sourceName);
+                    if (fit == compiler->functionTable.end()) continue;
+                    if (std::any_of(fit->second.begin(), fit->second.end(),
+                                    [&](const auto& candidate) {
+                                        return candidate.SourceName == sourceName
+                                            && namesOperandEnum(candidate);
+                                    }))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return nullptr;
+                // Unqualified `p0 OP p1` from the first enum's namespace: clang's own lookup.
+                enumOperandRequest = true;
+                const std::string& requestNamespace = enumNamespaces.front();
+                return callOperatorTemplate((requestNamespace.empty()
+                    ? std::string("__cxx_free") : requestNamespace) + "." + opName, true);
+            }
 
             /*
              * Argument-dependent lookup the way C++ does it: with a C++ class operand, `p0 OP p1`
