@@ -13,6 +13,34 @@ expect_error("cannot consume owning value 'gU.p' out of storage that outlives th
     void badGlobalFieldChain() { unique PS* o = gU.p = new PS(18); }
 }
 
+// A plain `unique` global stored into a field implicitly consumes it, as the joined and
+// this-> spellings below do. `move` on the source is the sanctioned form (tests in test_move.cb).
+unique PS* t382PlainGlobal = nullptr;
+struct U382Recv { unique PS* p = nullptr; };
+
+expect_error("cannot consume owning value 't382PlainGlobal' out of storage that outlives this function") {
+    void plainGlobalIntoField() { U382Recv u = default; u.p = t382PlainGlobal; }
+}
+
+expect_error("cannot consume owning value 't382PlainGlobal' out of storage that outlives this function") {
+    void joinGlobalIntoField(bool f) { U382Recv u = default; u.p = f ? t382PlainGlobal : nullptr; }
+}
+
+expect_error("cannot consume owning value 't382PlainGlobal' out of storage that outlives this function") {
+    void coalesceGlobalIntoField() { U382Recv u = default; u.p = t382PlainGlobal ?? nullptr; }
+}
+
+struct U382This
+{
+    unique PS* p = nullptr;
+    void takeGlobal()
+    {
+        expect_error("cannot consume owning value 't382PlainGlobal' out of storage that outlives this function") {
+            this->p = t382PlainGlobal;
+        }
+    }
+};
+
 expect_error("out of storage that outlives this function") {
     void t382BadStaticDeclChain()
     {

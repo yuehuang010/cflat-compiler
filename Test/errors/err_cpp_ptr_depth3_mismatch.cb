@@ -102,5 +102,146 @@ extern int main()
         DpDeepAnonU deepAnonU = {};
         void* v = deepAnonU.w;
     }
+    expect_error("pointer depths differ") {
+        int v = 1;
+        int* p = &v;
+        int** pp = &p;
+        int* bad = pp;
+    }
+    expect_error("pointer depths differ") {
+        int v = 1;
+        int* p = &v;
+        int** bad = p;
+    }
+    expect_error("pointer depths differ") {
+        int v = 1;
+        int* p = &v;
+        int** pp = &p;
+        int*** ppp = &pp;
+        int** bad = ppp;
+    }
+    expect_error("pointer depths differ") {
+        int v = 1;
+        int* p = &v;
+        int** pp = &p;
+        int* target = nullptr;
+        target = pp;
+    }
+    expect_error("pointee types differ") {
+        int** pp = nullptr;
+        void** vpp = (void**)&pp;
+        int** bad = vpp;
+    }
     return 0;
+}
+
+expect_error("pointer depths differ") {
+    int* pdepthBadReturn(int** pp) { return pp; }
+}
+
+expect_error("pointer depths differ") {
+    int** pdepthBadReturnReverse(int* p) { return p; }
+}
+
+expect_error("cannot pass an array view of 'int*' as parameter 'values'") {
+    int pdepthTakeTwo(int**[] values) { return 2; }
+    int pdepthViewCallOneToTwo() {
+        int x = 1; int* p = &x; int*[1] slots; slots[0] = p;
+        int*[] values = slots;
+        return pdepthTakeTwo(values);
+    }
+}
+
+expect_error("cannot pass an array view of 'int**' as parameter 'values'") {
+    int pdepthTakeOne(int*[] values) { return 1; }
+    int pdepthViewCallTwoToOne() {
+        int x = 1; int* p = &x; int** pp = &p; int**[1] slots; slots[0] = pp;
+        int**[] values = slots;
+        return pdepthTakeOne(values);
+    }
+}
+
+expect_error("pointer depths differ") {
+    int pdepthFixedArrayToShallowPointer() {
+        int*[3] arr;
+        int* e = arr;
+        return 0;
+    }
+}
+
+expect_error("pointer depths differ") {
+    int pdepthIntArrayToDeepPointer() {
+        int[3] arr;
+        int** e = arr;
+        return 0;
+    }
+}
+
+expect_error("pointer depths differ") {
+    int pdepthUniquePointerToDeepPointer() {
+        unique int* u = new int;
+        int** q = u;
+        return 0;
+    }
+}
+
+expect_error("cannot convert 'function<int()>*' to 'function<int()>**' implicitly: the pointer depths differ") {
+    int pdepthFunctionTarget() { return 1; }
+    int pdepthFunctionPointerToDeepPointer() {
+        function<int()> f = pdepthFunctionTarget;
+        function<int()>* fp = &f;
+        function<int()>** fpp = fp;
+        return 0;
+    }
+}
+
+struct PdepthUniqueRecord { int value = default; };
+
+expect_error("cannot convert 'unique<int>[2]' to 'int*' implicitly: the pointer depths differ") {
+    int pdepthUniqueArrayToShallowPointer() {
+        unique int*[2] ua;
+        int* bad = ua;
+        return 0;
+    }
+}
+
+expect_error("cannot convert 'unique<PdepthUniqueRecord>[2]' to 'PdepthUniqueRecord*' implicitly: the pointer depths differ") {
+    int pdepthUniqueRecordArrayToShallowPointer() {
+        unique PdepthUniqueRecord*[2] ua;
+        PdepthUniqueRecord* bad = ua;
+        return 0;
+    }
+}
+
+expect_error("cannot convert 'function<int()>*[2]' to 'function<int()>*' implicitly: the pointer depths differ") {
+    int pdepthFunctionPointerArrayToShallowPointer() {
+        function<int()>*[2] fpa;
+        function<int()>* bad = fpa;
+        return 0;
+    }
+}
+
+expect_error("cannot convert 'function<int()>*' to 'function<int()>' implicitly: the pointer depths differ") {
+    int pdepthFunctionPointerToValue() {
+        function<int()>* fp = nullptr;
+        function<int()> bad = fp;
+        return 0;
+    }
+}
+
+expect_error("cannot convert 'int*[3]' to 'int*' implicitly: the pointer depths differ") {
+    int pdepthPlainPointerArrayToShallowPointer() {
+        int*[3] arr;
+        int* bad = arr;
+        return 0;
+    }
+}
+
+int pdepthFunctionValueTarget() { return 1; }
+expect_error("cannot convert 'function<int()>' to 'function<int()>*' implicitly: the pointer depths differ") {
+    int pdepthFunctionValueToPointer() {
+        function<int()> g = pdepthFunctionValueTarget;
+        function<int()>* bad = g;
+        return 0;
+    }
 }

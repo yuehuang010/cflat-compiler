@@ -534,6 +534,26 @@ const LLVMBackend::UniqueFieldReadJoin* LLVMBackend::FindUniqueFieldReadJoin(
         return nullptr;
     }
 
+const LLVMBackend::UniqueFieldReadSource* LLVMBackend::FindUniqueFieldReadSource(
+        const llvm::Value* storage, const llvm::BasicBlock* block) const
+{
+        if (storage == nullptr) return nullptr;
+        for (auto it = uniqueFieldReadValues_.rbegin(); it != uniqueFieldReadValues_.rend(); ++it)
+            if (it->second.Storage == storage
+                && (block == nullptr || it->second.Block == block))
+                return &it->second;
+        return nullptr;
+    }
+
+const LLVMBackend::UniqueFieldReadSource* LLVMBackend::FindUniqueFieldReadValueSource(
+        const llvm::Value* value) const
+{
+        if (value == nullptr) return nullptr;
+        for (auto it = uniqueFieldReadValues_.rbegin(); it != uniqueFieldReadValues_.rend(); ++it)
+            if (it->first == value) return &it->second;
+        return nullptr;
+}
+
 void LLVMBackend::RegisterJoinArmCastOccurrence(const llvm::Value* joined, unsigned index, size_t occurrence)
 {
         if (joined == nullptr) return;

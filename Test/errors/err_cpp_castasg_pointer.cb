@@ -1,0 +1,10 @@
+expect_error("found '=' but expected ';'");
+int CastAsgPointerCastRejected()
+{
+    int* value = nullptr;
+    int* source = nullptr;
+    (int*)value = source;
+    return 0;
+}
+
+extern int main() { return 0; }

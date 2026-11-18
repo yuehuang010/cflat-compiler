@@ -182,6 +182,29 @@ bool MainListener::ReparseFragmentAsCast(LLVMBackend* compiler, const std::strin
         return true;
 }
 
+LLVMBackend::NamedVariable MainListener::ParseCastAssignmentTarget(
+    CFlatParser::CastAssignmentTargetContext* ctx, ResultUse use)
+{
+        if (ctx == nullptr || ctx->castExpression() == nullptr
+            || ctx->castExpression()->stop == nullptr || ctx->start == nullptr)
+            return {};
+        antlr4::CharStream* chars = ctx->start->getInputStream();
+        if (chars == nullptr) return {};
+        std::string fragment(ctx->start->getLine() - 1, '\n');
+        fragment.append(ctx->start->getCharPositionInLine(), ' ');
+        fragment += chars->getText(antlr4::misc::Interval(ctx->start->getStartIndex(),
+            ctx->castExpression()->stop->getStopIndex()));
+        auto* parse = NewCallFragment(Compiler(ctx), fragment);
+        auto* cast = parse->parser.castExpression();
+        if (!CallFragmentIsWhole(parse->parser))
+        {
+            LogErrorContext(ctx, "could not parse C++ class cast assignment target");
+            return {};
+        }
+        NormalizeForInitTree(parse->parser, cast);
+        return ParseCastExpression(cast, false, use);
+}
+
 LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue,
                                                    ResultUse use) {
         LLVMBackend::NamedVariable rerouted;

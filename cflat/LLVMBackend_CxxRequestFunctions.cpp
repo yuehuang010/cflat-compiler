@@ -1288,6 +1288,13 @@ std::string LLVMBackend::CxxXvalueRefusal(const std::string& typeName, bool cons
  * constructor (copy-initialization skips it), a deleted move constructor, a const-qualified
  * assignment (a non-const competitor can win).
  */
+bool LLVMBackend::CxxCopyAssignImplicitlyDeleted(const std::string& typeName) const
+{
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
+        return info != nullptr && info->hasDeletedMoveCtor && !info->hasMoveAssign
+            && !info->hasCopyAssign;
+}
+
 bool LLVMBackend::CxxTrivialMoveNeedsTransfer(const std::string& typeName, bool constSource,
                                               bool assignment)
 {
@@ -1297,6 +1304,7 @@ bool LLVMBackend::CxxTrivialMoveNeedsTransfer(const std::string& typeName, bool 
         if (assignment)
         {
             if (info->hasAssignTemplate) return true;
+            if (CxxCopyAssignImplicitlyDeleted(typeName)) return true;
             for (const auto* list : { &info->moveAssignOverloads, &info->copyAssignOverloads })
                 for (const auto& m : *list)
                     if (m.isConstReceiver) return true;

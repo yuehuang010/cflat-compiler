@@ -13,17 +13,13 @@
 - Source reads stay allowed after a ternary move join (onearm_read.cb, bare.cb), while a direct move refuses them (direct.cb).
 - `flat_host.cb` does one extra move/dtor versus clang; its Host aggregate/native unique-field path is owned by another run.
 - `derived.cb`'s D/C xvalue join is accepted (derived/base reference join, C&& move-assignment).
-- OPEN: `convert.cb` (X/C via `X::operator C() const`) stays refused with master's incompatible-types diagnostic; clang accepts it (true 121,21,22; false 22,21,-1). A conversion join must neither mark the X source moved nor zero it before the conversion runs.
 - Declaration `T z2 = k ? move a : move b;` with const arms now copy-constructs the selected source, which remains unchanged, matching clang++ -std=c++20.
 - `nested_outer.cb` now joins directly without the extra move/dtor and matches clang++ -std=c++20.
 - Const by-value parameter (`void f(const rv.C a)`): CFlat keeps no const on by-value params, so `z = k ? move a : move b` with `a` such a parameter moves on T288 (master copied); master's explicit `z = move a` already moves it. Needs const carried on parameter signatures.
-- Mutable field join `z = k ? move s.a : move s.b` (s a mutable local): clang move-assigns (one source reads -1 after the join); master copy-assigns and keeps both sources. T288 r3 leaves it on master's path (legs 99017/99018 pin master). Pre-existing, not fixed by T288.
 - Const-host field join `z = k ? move s.a : move s.b` (s const): clang and master copy-assign and keep both sources; T288 r3 falls back to master's path (leg 99015/99016).
 
 ## Ternary move-join open items after the ternmv round 3-4 review (fix/ternmv)
 - OPEN: `b4_r_c1_rev` (`C h(bool k) { const C a; C b; C c = k ? move b : move a; return c; }`, then `z = h(k)`): the const-arm value matches clang (z=22), but the return of local `c` moves once more and dtor +1 (clang: copy, no move; move-assign into z). Master differs too (r=-1). Return-of-local count only; not in the decl path.
-- OPEN: const FIELD leaf in a move join (`const N* p; z = k ? move p->f : b;`, `C z = k ? move p->f : move b;`). `joinMoveConst` sees only bare const names of the declared class, so a const field leaf moves its source as master does (b2_cfield_one: master's value r=-1). Clang copies the const leaf (const C&& composite). Needs the const of field and deref leaves from the arm expression.
-- OPEN: `b3_x_field_decl` (`C z = k ? move s.x : move b;`, X has `operator C`): z=100, clang 121, master the same. X/C field join in a declaration takes the converting path without a refusal.
 
 OPEN (2026-11-09): a one-const-arm move join as a constructor argument inside an outer ternary arm,
 `z = k ? C(k ? move a : move b) : move c`, makes one extra copy (cp2 dt5; master and clang cp1 dt4). Value and sources are

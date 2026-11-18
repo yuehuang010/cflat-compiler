@@ -3765,6 +3765,49 @@ bool LLVMBackend::IsCxxFunctionTemplateParameterByValue(const std::string& funct
         return sawCandidate;
 }
 
+bool LLVMBackend::IsCxxFunctionTemplateParameterDirectType(const std::string& functionName,
+                                                           const std::string& ownerType,
+                                                           size_t parameterIndex,
+                                                           size_t arity) const
+{
+        const std::string resolved = ownerType.empty()
+            ? functionName
+            : ResolveCxxFunctionTemplateName(ownerType, functionName);
+        auto templates = cxxFunctionTemplates_.find(resolved);
+        if (templates == cxxFunctionTemplates_.end()) return false;
+        bool sawCandidate = false;
+        for (const auto& candidate : templates->second)
+        {
+            const bool kindMatches = ownerType.empty()
+                ? candidate.kind == cflat_cinterop::RawFunctionTemplate::Free
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember
+                : candidate.kind == cflat_cinterop::RawFunctionTemplate::InstanceMember
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember;
+            if (!kindMatches || arity < candidate.minArity || arity > candidate.maxArity)
+                continue;
+            sawCandidate = true;
+            size_t index = parameterIndex;
+            if (candidate.hasParameterPack && !candidate.parameterTypes.empty()
+                && index >= candidate.parameterTypes.size() - 1)
+                index = candidate.parameterTypes.size() - 1;
+            if (index >= candidate.parameterTypes.size()) return false;
+            std::string parameterType = candidate.parameterTypes[index];
+            parameterType.erase(std::remove_if(parameterType.begin(), parameterType.end(),
+                [](unsigned char ch) { return std::isspace(ch); }), parameterType.end());
+            const bool directTypeParameter = std::any_of(
+                candidate.typeParameterNames.begin(), candidate.typeParameterNames.end(),
+                [&](const std::string& typeParameter) {
+                    return parameterType == typeParameter
+                        || parameterType == "const" + typeParameter
+                        || parameterType == "volatile" + typeParameter
+                        || parameterType == "constvolatile" + typeParameter
+                        || parameterType == "volatileconst" + typeParameter;
+                });
+            if (!directTypeParameter) return false;
+        }
+        return sawCandidate;
+}
+
 bool LLVMBackend::IsCxxStaticTemplateConstRefParameter(const std::string& qualifiedName,
                                                        size_t parameterIndex, size_t arity,
                                                        const std::string& placeType) const

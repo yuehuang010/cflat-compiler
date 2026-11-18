@@ -1,0 +1,54 @@
+import cpp "cpp_interop_assign.h";
+import cpp "cpp_interop_deleted.h";
+
+struct CastAsgNative { int value = default; };
+using CastAsgNativeAlias = CastAsgNative;
+using CastAsgPrimitiveAlias = int;
+using CastAsgCppAlias = CastAssignBox;
+void takeCastAssignBox(CastAssignBox value) {}
+
+extern int main()
+{
+    int primitive = 1;
+    int primitiveSource = 2;
+    expect_error("found '=' but expected ';'") {
+        (CastAsgPrimitiveAlias)primitive = primitiveSource;
+    }
+    if (primitive != 1) return 11822;
+
+    CastAsgNative native = default;
+    CastAsgNative nativeSource = default;
+    expect_error("found '=' but expected ';'") {
+        (CastAsgNative)native = nativeSource;
+    }
+    if (native.value != 0) return 11823;
+    expect_error("found '=' but expected ';'") {
+        (CastAsgNativeAlias)native = nativeSource;
+    }
+    if (native.value != 0) return 11824;
+
+    CastAssignBox cppBox = CastAssignBox(1);
+    CastAssignBox cppSource = CastAssignBox(2);
+    expect_error("found '=' but expected ';'") {
+        (CastAsgCppAlias)cppBox = cppSource;
+    }
+    if (cppBox.value != 1) return 11825;
+    expect_error("assign first, then pass 'cppBox'") {
+        takeCastAssignBox((CastAssignBox)cppBox = cppSource);
+    }
+
+    int T = 1;
+    int local = 2;
+    expect_error("found '=' but expected ';'") {
+        (T)local = 3;
+    }
+
+    cppdel.Assignment deleted = cppdel.Assignment();
+    cppdel.Assignment deletedSource = cppdel.Assignment();
+
+    // Keep this refusal beyond line 20 to pin the original source location.
+    expect_error("selected deleted operator '='") {
+        (cppdel.Assignment)deleted = deletedSource;
+    }
+    return 0;
+}

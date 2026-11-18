@@ -662,6 +662,8 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.sourceMovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
         result.sourceIsElementAccess = namedVar.IsElementAccess;
         result.sourceIsPointeeMove = namedVar.IsExplicitMove && namedVar.PointeeMove;
+        result.sourceRootIsAliasBorrowLocal = namedVar.RootIsAliasBorrowLocal;
+        result.sourceBorrowedOrigin = namedVar.IsBorrowed ? namedVar.BorrowedOrigin : std::string();
         result.sourceRootIsBorrowedThisField = namedVar.RootIsBorrowedThisField;
         result.sourceThisFieldPath = namedVar.ThisFieldPath;
         result.conditionalMoveSources = namedVar.ConditionalMoveSources;
@@ -2054,7 +2056,7 @@ int8_t MainListener::CxxArgumentLvalueKind(antlr4::tree::ParseTree* tree)
         {
             if (auto* a = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(tree))
             {
-                if (a->assignmentOperator() != nullptr) return 3;
+                if (HasAssignmentOperator(a)) return 3;
                 if (a->conditionalExpression() == nullptr) return 0;
                 tree = a->conditionalExpression();
                 continue;
@@ -2702,6 +2704,11 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             auto lv = ParseCxxFoldOperand(Compiler(ctx), [&] {
                 return ParseMultiplicativeExpression(nextCtxs[0], ResultUse::Value);
             });
+            if (IsNullptrTypedExpressionTree(nextCtxs[0]))
+            {
+                lv.hasSourceType = true;
+                lv.sourceType.IsCxxNullptrT = true;
+            }
             NormalizeCxxReferenceOperand(ctx, lv);
             llvm::Value* lvalue = lv.value;
             LLVMBackend::TypedValue arithRunning = lv;
@@ -2739,6 +2746,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             LLVMBackend::TypeAndValue pointerArithmeticSourceType = lv.sourceType;
             int pointerArithmeticDepth = lv.pointerDepth;
             bool hasPointerArithmeticResultType = false;
+            bool hasPointerOperatorResultType = false;
             TrackOwnedStringOperatorResult(Compiler(ctx), lvalue);
             // String concat (+) only borrows its operands: a plain (non-move) string-returning
             // call leaves lastCallReturnsOwned false, so TrackOwnedStringOperatorResult skips it.
@@ -2782,6 +2790,11 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     }
                     else
                         parsed = parseRightOperand();
+                    if (IsNullptrTypedExpressionTree(nextCtxs[i]))
+                    {
+                        parsed.hasSourceType = true;
+                        parsed.sourceType.IsCxxNullptrT = true;
+                    }
                     return parsed;
                 }();
                 NormalizeCxxReferenceOperand(ctx, rv);
@@ -2845,7 +2858,9 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 }
                 else if (elemType && lvalue->getType()->isPointerTy()
                     && rvalue && rvalue->getType()->isIntegerTy()
-                    && (op == "+" || op == "-"))
+                    && (op == "+" || op == "-")
+                    && CxxImportedEnumKey(Compiler(ctx), rv.sourceTypeName,
+                                          rv.pointerDepth, rvalue).empty())
                 {
                     if (lv.isArrayView || rv.isArrayView)
                         LogErrorContext(ctx, "pointer arithmetic is not allowed on an array-view 'T[]' - index it with 'a[i]' instead "
@@ -2873,7 +2888,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     lhsNativeArithmeticTypeName.clear();
                     // A chained `1 + p + n` keeps the type the earlier step produced; only the
                     // first step on the original left operand reads lv.
-                    const bool firstStepOnLeft = !hasPointerArithmeticResultType;
+                    const bool firstStepOnLeft = !hasPointerArithmeticResultType
+                        && !hasPointerOperatorResultType;
                     hasPointerArithmeticResultType = true;
                     if (firstStepOnLeft)
                     {
@@ -2892,7 +2908,9 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     // elemType stays the same - result is still a pointer to the same element type
                 }
                 else if (op == "+" && rv.elemType != nullptr && rvalue->getType()->isPointerTy()
-                    && lvalue->getType()->isIntegerTy())
+                    && lvalue->getType()->isIntegerTy()
+                    && CxxImportedEnumKey(Compiler(ctx), lv.sourceTypeName,
+                                          lv.pointerDepth, lvalue).empty())
                 {
                     if (rv.elemType->isVoidTy())
                     {
@@ -2937,11 +2955,11 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                                                lhsStorage, rv.receiverStorage,
                                                                true, true, lhsIsRvalue, rv.isRvalue,
                                                                lvalue == lv.value
-                                                                   ? lv.sourceTypeName
-                                                                   : std::string(),
+                                                                   ? lv.sourceTypeName : lhsSourceTypeName,
                                                                rv.sourceTypeName,
-                                                               lvalue == lv.value ? lv.pointerDepth : 0,
-                                                               lvalue == lv.value && lv.elemPointer,
+                                                               lvalue == lv.value ? lv.pointerDepth : pointerArithmeticDepth,
+                                                               lvalue == lv.value ? lv.elemPointer
+                                                                   : pointerArithmeticSourceType.ElemPointer,
                                                                lvalue == lv.value ? lv.sourceCallerName : std::string(),
                                                                lvalue == lv.value ? lv.sourceFieldName : std::string(),
                                                                lvalue == lv.value && lv.sourceIsElementAccess,
@@ -2961,6 +2979,105 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                                                lhsIsAlias, false, nullptr, nextCtxs[i],
                                                                rv.bitfieldStorage);
 
+                    std::string enumPointerKey;
+                    llvm::Value* enumPointerValue = nullptr;
+                    bool enumIsPointerLeft = false;
+                    if (lvalue->getType()->isPointerTy() && rvalue->getType()->isIntegerTy())
+                    {
+                        enumPointerKey = CxxImportedEnumKey(Compiler(ctx), rv.sourceTypeName,
+                                                            rv.pointerDepth, rvalue);
+                        enumPointerValue = lvalue;
+                        enumIsPointerLeft = true;
+                    }
+                    else if (lvalue->getType()->isIntegerTy() && rvalue->getType()->isPointerTy())
+                    {
+                        const bool originalLeft = lvalue == lv.value;
+                        enumPointerKey = CxxImportedEnumKey(Compiler(ctx),
+                            originalLeft ? lv.sourceTypeName : lhsSourceTypeName,
+                            originalLeft ? lv.pointerDepth : pointerArithmeticDepth, lvalue);
+                        enumPointerValue = rvalue;
+                    }
+                    bool enumPointerBuiltin = false;
+                    if (overload == nullptr && !enumPointerKey.empty())
+                    {
+                        const bool scopedEnum = Compiler(ctx)->IsScopedEnumTypeName(enumPointerKey);
+                        const bool nullPointerLiteral = enumIsPointerLeft
+                            ? lvalue == lv.value && lv.hasSourceType && lv.sourceType.IsCxxNullptrT
+                            : rv.hasSourceType && rv.sourceType.IsCxxNullptrT;
+                        const bool builtinPointerArithmetic = !scopedEnum && !nullPointerLiteral
+                            && (op == "+" || (op == "-" && enumIsPointerLeft));
+                        if (!builtinPointerArithmetic)
+                            LogErrorContext(ctx, std::format(
+                                "no viable C++ operator '{}' for imported enum and pointer operands",
+                                "operator" + op));
+                        if (enumIsPointerLeft)
+                        {
+                            if (lv.isArrayView || rv.isArrayView)
+                                LogErrorContext(ctx, "pointer arithmetic is not allowed on an array-view 'T[]' - index it with 'a[i]' instead "
+                                    "(the view spans a whole allocation; arithmetic would create an aliasing pointer the noalias contract forbids)");
+                            llvm::Type* pointerElement = elemType != nullptr ? elemType : lv.elemType;
+                            if (pointerElement == nullptr || pointerElement->isVoidTy())
+                                LogVoidPointerArithmetic(ctx);
+                            llvm::Value* index = rvalue;
+                            if (index->getType()->isIntegerTy(1))
+                                index = Compiler(ctx)->builder->CreateZExt(
+                                    index, Compiler(ctx)->builder->getInt64Ty(), "bool_index");
+                            if (op == "-")
+                                index = Compiler(ctx)->builder->CreateNeg(index, "neg");
+                            pointerToArrayArithmetic = IsPointerToRow(lv);
+                            if (pointerToArrayArithmetic)
+                                pointerElement = PointerRowType(lv);
+                            lvalue = Compiler(ctx)->CreateGEP(pointerElement, lvalue, index, "ptrarith");
+                            lhsStorage = nullptr;
+                            lhsIsRvalue = true;
+                            lhsIsAlias = false;
+                            lhsAliasType = {};
+                            lhsRefType = nullptr;
+                            lhsNativeArithmeticTypeName.clear();
+                            const bool firstStepOnLeft = !hasPointerArithmeticResultType
+                                && !hasPointerOperatorResultType;
+                            hasPointerArithmeticResultType = true;
+                            if (firstStepOnLeft)
+                            {
+                                pointerArithmeticSourceType = lv.sourceType;
+                                pointerArithmeticDepth = lv.pointerDepth;
+                            }
+                            if (firstStepOnLeft && !fixedArrayPointerArithmetic && lv.hasSourceType
+                                && !pointerToArrayArithmetic
+                                && (lv.sourceType.ConstArraySize != 0
+                                    || !lv.sourceType.ConstInnerDimensions.empty())
+                                && !lv.sourceType.IsArrayView)
+                            {
+                                fixedArrayPointerArithmetic = true;
+                                pointerArithmeticSourceType = lv.sourceType;
+                            }
+                        }
+                        else
+                        {
+                            llvm::Type* pointerElement = IsPointerToRow(rv)
+                                ? PointerRowType(rv) : rv.elemType;
+                            if (pointerElement == nullptr || pointerElement->isVoidTy())
+                                LogVoidPointerArithmetic(ctx);
+                            lvalue = Compiler(ctx)->CreateGEP(pointerElement, rvalue, lvalue, "ptrarith");
+                            lhsStorage = nullptr;
+                            lhsIsRvalue = true;
+                            lhsIsAlias = false;
+                            lhsAliasType = {};
+                            lhsRefType = nullptr;
+                            lhsNativeArithmeticTypeName.clear();
+                            lhsSourceTypeName.clear();
+                            elemType = pointerElement;
+                            hasPointerArithmeticResultType = true;
+                            pointerArithmeticSourceType = rv.sourceType;
+                            pointerArithmeticDepth = rv.pointerDepth;
+                            fixedArrayPointerArithmetic = rv.hasSourceType && !IsPointerToRow(rv)
+                                && (rv.sourceType.ConstArraySize != 0
+                                    || !rv.sourceType.ConstInnerDimensions.empty())
+                                && !rv.sourceType.IsArrayView;
+                        }
+                        enumPointerBuiltin = true;
+                    }
+
                 // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
                     auto isCStr = [&](llvm::Value* v, llvm::Type* et) -> bool {
@@ -2969,7 +3086,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                             return Compiler(ctx)->stringLiteralLenByPtr.count(c) > 0;
                         return false;
                     };
-                    if (overload == nullptr && op == "+"
+                    if (overload == nullptr && !enumPointerBuiltin && op == "+"
                         && lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy()
                         && isCStr(lvalue, elemType) && isCStr(rvalue, rv.elemType))
                     {
@@ -2998,6 +3115,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         resultNV.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                         DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                     }
+                    bool pointerOperatorResult = false;
                     if (overload != nullptr)
                     {
                         lhsNativeArithmeticTypeName.clear();
@@ -3005,6 +3123,24 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                                lhsStorage, lhsIsRvalue, lhsRefType,
                                                lhsSourceTypeName);
                         const auto& returnType = Compiler(ctx)->lastCallReturnType;
+                        const int returnPointerDepth = returnType.PointerDepth > 0
+                            ? returnType.PointerDepth : returnType.ElemPointer ? 2 : 1;
+                        pointerOperatorResult = returnType.Pointer
+                            && !returnType.IsAlias && lvalue != nullptr
+                            && lvalue->getType()->isPointerTy();
+                        if (pointerOperatorResult)
+                        {
+                            lhsSourceTypeName = returnType.TypeName;
+                            auto pointerElementType = returnType;
+                            pointerElementType.Pointer = returnPointerDepth > 1;
+                            pointerElementType.ElemPointer = false;
+                            pointerElementType.PointerDepth = std::max(returnPointerDepth - 1, 0);
+                            elemType = Compiler(ctx)->GetType(pointerElementType);
+                            pointerArithmeticSourceType = returnType;
+                            pointerArithmeticDepth = returnPointerDepth;
+                            fixedArrayPointerArithmetic = false;
+                            hasPointerOperatorResultType = true;
+                        }
                         lhsNativeArithmeticTypeName = FloatingOperatorReturnName(returnType);
                         if (lhsNativeArithmeticTypeName == "longdouble") lhsArithIdentity = "longdouble";
                         lhsIsAlias = returnType.IsAlias && !returnType.Pointer
@@ -3026,7 +3162,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         else
                             lhsAliasType = {};
                     }
-                    else
+                    else if (!enumPointerBuiltin)
                     {
                         const LLVMBackend::TypedValue arithLhs = ArithRunningOperand(arithRunning, lvalue);
                         lvalue = Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
@@ -3052,13 +3188,17 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                 rightIdentity, lvalue->getType());
                         }
                     }
-                    unsignedStorage = !overload && lvalue != nullptr && lvalue->getType()->isIntegerTy()
-                        && lvalue->getType()->getIntegerBitWidth() < 32 && (lu || ru);
-                    // An overload's signedness is its RETURN type, not the operands' flags.
-                    lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1
-                                  : BinaryJoinIsUnsigned(lu, leftBits, ru, rightBits);
-                    elemType = nullptr;  // arithmetic result is no longer a pointer
-                    hasPointerArithmeticResultType = false;
+                    if (!enumPointerBuiltin && !pointerOperatorResult)
+                    {
+                        unsignedStorage = !overload && lvalue != nullptr && lvalue->getType()->isIntegerTy()
+                            && lvalue->getType()->getIntegerBitWidth() < 32 && (lu || ru);
+                        // An overload's signedness is its RETURN type, not the operands' flags.
+                        lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1
+                                      : BinaryJoinIsUnsigned(lu, leftBits, ru, rightBits);
+                        elemType = nullptr;
+                        hasPointerArithmeticResultType = false;
+                        hasPointerOperatorResultType = false;
+                    }
                 }
 
                 // Pointer arithmetic can precede the real difference in a flat left-associative chain.
@@ -3144,7 +3284,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 result.sourceType.TypeName = lhsNativeArithmeticTypeName;
                 result.hasSourceType = true;
             }
-            if (hasPointerArithmeticResultType
+            if ((hasPointerArithmeticResultType || hasPointerOperatorResultType)
                 && (pointerArithmeticSourceType.Pointer || fixedArrayPointerArithmetic
                     || !pointerArithmeticSourceType.TypeName.empty()
                     || !lhsSourceTypeName.empty() || elemType != nullptr))
@@ -5566,10 +5706,15 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     return arg;
                 };
                 std::vector<LLVMBackend::NamedVariable> templateArgs;
+                const bool lhsPointerHasEnumPartner = lvalue->getType()->isPointerTy()
+                    && rvalue != nullptr
+                    && !CxxImportedEnumKey(compiler, rhsTypeName, rhsPointerDepth, rvalue).empty();
                 templateArgs.push_back(templateArgument(lvalue, freeLhsStorage, lhsStorage,
                                                        leftInfo.first, leftInfo.second, lhsTypeName,
                                                        lhsPointerDepth, lhsElemPointer,
-                                                       lhsCxxNullptrT, false, true));
+                                                       lhsCxxNullptrT,
+                                                       lhsCxxPointeeConst && lhsPointerHasEnumPartner,
+                                                       true));
                 templateArgs.push_back(templateArgument(rvalue, freeRhsStorage, rhsStorage,
                                                         rightInfo.first, rightInfo.second, rhsTypeName,
                                                         rhsPointerDepth, rhsElemPointer,
@@ -5673,15 +5818,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 auto supportedEnumOperatorOperand = [](llvm::Value* value) {
                     if (value == nullptr) return false;
                     auto* type = value->getType();
-                    return type->isIntegerTy() || type->isFloatingPointTy();
+                    return type->isIntegerTy() || type->isFloatingPointTy() || type->isPointerTy();
                 };
-                if (adlOnly || cxxOperatorRewriteDepth_ > 0 || cxxAdlSuppressDepth_ > 0
+                if (adlOnly || (cxxOperatorRewriteDepth_ > 0 && op != "==" && op != "<=>")
+                    || cxxAdlSuppressDepth_ > 0
                     || nativeConstantFoldDepth_ > 0 || lvalue == nullptr || rvalue == nullptr
                     || !supportedEnumOperatorOperand(lvalue)
                     || !supportedEnumOperatorOperand(rvalue))
                     return nullptr;
                 static const std::set<std::string> enumOperators = {
-                    "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "==", "!=", "<", "<=",
+                    "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "<=>", "==", "!=", "<", "<=",
                     ">", ">=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="
                 };
                 if (enumOperators.count(op) == 0) return nullptr;
@@ -5718,6 +5864,47 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     }
                     return false;
                 };
+                auto pointerOperandCouldBind = [&](const LLVMBackend::FunctionSymbol& candidate) {
+                    if (candidate.Parameters.size() != 2) return false;
+                    for (size_t enumSide = 0; enumSide < 2; ++enumSide)
+                    {
+                        const std::string& key = enumSide == 0 ? leftEnum : rightEnum;
+                        if (key.empty() || compiler->ResolveEnumTypeName(
+                                candidate.Parameters[enumSide].TypeName) != key)
+                            continue;
+                        const size_t pointerSide = 1 - enumSide;
+                        llvm::Value* pointerValue = pointerSide == 0 ? lvalue : rvalue;
+                        if (pointerValue == nullptr || !pointerValue->getType()->isPointerTy())
+                            return true;
+                        const auto& parameter = candidate.Parameters[pointerSide];
+                        const bool isNullptr = pointerSide == 0 ? lhsCxxNullptrT : rhsCxxNullptrT;
+                        const std::string& sourceName = pointerSide == 0
+                            ? lhsTypeName : rhsTypeName;
+                        const int pointerDepth = pointerSide == 0
+                            ? lhsPointerDepth : rhsPointerDepth;
+                        if (!parameter.Pointer)
+                        {
+                            const std::string targetName = compiler->ResolveTypeAlias(parameter.TypeName);
+                            if (targetName == "bool") return true;
+                            if (targetName == "std.nullptr_t") return isNullptr;
+                            if (compiler->IsCxxRecord(targetName)) return true;
+                            return false;
+                        }
+                        if (isNullptr) return true;
+                        if (pointerDepth <= 0 || sourceName.empty()) return true;
+                        if (parameter.ValuePointerDepth() != pointerDepth) return false;
+                        const bool sourceConst = pointerSide == 0
+                            ? lhsCxxPointeeConst : rhsCxxPointeeConst;
+                        if (sourceConst && !parameter.PointeeConstBit()) return false;
+                        const std::string sourceType = compiler->ResolveTypeAlias(sourceName);
+                        const std::string targetType = compiler->ResolveTypeAlias(parameter.TypeName);
+                        if (sourceType == targetType) return true;
+                        if (targetType == "void" && pointerDepth == 1) return true;
+                        return compiler->IsCxxRecord(sourceType) && compiler->IsCxxRecord(targetType)
+                            && compiler->IsCxxBaseOf(targetType, sourceType);
+                    }
+                    return true;
+                };
                 bool found = false;
                 for (const std::string& ns : enumNamespaces)
                 {
@@ -5729,7 +5916,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     if (std::any_of(fit->second.begin(), fit->second.end(),
                                     [&](const auto& candidate) {
                                         return candidate.SourceName == sourceName
-                                            && namesOperandEnum(candidate);
+                                            && namesOperandEnum(candidate)
+                                            && pointerOperandCouldBind(candidate);
                                     }))
                     {
                         found = true;
@@ -6481,14 +6669,27 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 auto* st = llvm::cast<llvm::StructType>(value->getType());
                 return !st->isLiteral() && st->hasName();
             };
-            if (!isStructOperand(lvalue) && !isStructOperand(rvalue)) return nullptr;
+            auto isImportedEnumOperand = [&](llvm::Value* value, const std::string& name,
+                                             int pointerDepth) {
+                return !CxxImportedEnumKey(compiler, name, pointerDepth, value).empty();
+            };
+            if (!isStructOperand(lvalue) && !isStructOperand(rvalue)
+                && !((op == "==" || op == "<=>")
+                    && (isImportedEnumOperand(lvalue, lhsTypeName, lhsPointerDepth)
+                        || isImportedEnumOperand(rvalue, rhsTypeName, rhsPointerDepth))))
+                return nullptr;
             if (op == "==")
             {
-                auto isCxxOperand = [&](llvm::Value* value) {
-                    return isStructOperand(value)
-                        && compiler->IsCxxRecord(llvm::cast<llvm::StructType>(value->getType())->getName().str());
+                auto isCxxOperand = [&](llvm::Value* value, const std::string& name,
+                                        int pointerDepth) {
+                    const bool cxxRecord = isStructOperand(value)
+                        && compiler->IsCxxRecord(
+                            llvm::cast<llvm::StructType>(value->getType())->getName().str());
+                    return cxxRecord || isImportedEnumOperand(value, name, pointerDepth);
                 };
-                if (!isCxxOperand(lvalue) && !isCxxOperand(rvalue)) return nullptr;
+                if (!isCxxOperand(lvalue, lhsTypeName, lhsPointerDepth)
+                    && !isCxxOperand(rvalue, rhsTypeName, rhsPointerDepth))
+                    return nullptr;
             }
             RewriteDepthScope rewriteScope(cxxOperatorRewriteDepth_);
             llvm::Value* reversed = TryBinaryOperatorOverload(
@@ -6941,6 +7142,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         if (ty->isPointerTy())
         {
+            if (rvalue != nullptr && rvalue->getType()->isIntegerTy()
+                && !CxxImportedEnumKey(compiler, rhsTypeName, rhsPointerDepth, rvalue).empty())
+                if (llvm::Value* freeResult = tryFreeOperator()) return freeResult;
             // An unwrapped left literal against a C++ right operand: its only candidates are the
             // free operators of that operand's namespace, which the struct paths below never see.
             // Nothing bound there -> wrap after all and re-enter, so an operator that stays
@@ -6980,6 +7184,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 return bound;
             if (!triedCxxComparisonRewrites)
                 if (llvm::Value* rewritten = tryRewrites()) return rewritten;
+            if (cxxOperatorRewriteDepth_ == 0 && IsComparisonOperatorText(op) && rvalue != nullptr
+                && rvalue->getType()->isIntegerTy()
+                && !CxxImportedEnumKey(compiler, rhsTypeName, rhsPointerDepth, rvalue).empty())
+                LogErrorContext(ctx, std::format(
+                    "no viable C++ operator '{}' for imported enum and pointer operands",
+                    "operator" + op));
             return nullptr;
         }
 
@@ -7000,6 +7210,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             // A scalar left operand still reaches a class operator through the C++20 reversed
             // candidate: `5 == ops` selects the member `operator==(int)` with swapped operands.
             if (llvm::Value* rewritten = tryRewrites()) return rewritten;
+            if (cxxOperatorRewriteDepth_ == 0 && IsComparisonOperatorText(op) && rvalue != nullptr
+                && rvalue->getType()->isPointerTy()
+                && !CxxImportedEnumKey(compiler, lhsTypeName, lhsPointerDepth, lvalue).empty())
+                LogErrorContext(ctx, std::format(
+                    "no viable C++ operator '{}' for imported enum and pointer operands",
+                    "operator" + op));
             if (rvalue != nullptr && rvalue->getType()->isStructTy())
             {
                 auto* rhsStruct = llvm::cast<llvm::StructType>(rvalue->getType());

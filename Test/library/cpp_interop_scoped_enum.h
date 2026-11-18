@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <compare>
 #include <vector>
 
 namespace cppi_scope
@@ -171,8 +172,46 @@ namespace cppi_scope
         inline int operator+(Chain e, int i) { return 100 + (int)e + i; }
         enum E : int { e0 = 2, e1 = 3, e2 = 5, e3 = 7 };
         enum N : int { n0 = 2 };
+        struct PointerClass { int value; };
+        namespace in { struct S { int value; }; }
         inline int operator+(E e, int i) { return 800 + (int)e + i; }
         inline int operator+(N n, int i) { return 1000 + (int)n + i; }
+        inline int* operator+(E, int* p) { return p + 1; }
+        inline const int* operator+(E, const int* p) { return p + 1; }
+        inline PointerClass* operator+(E, PointerClass* p) { return p + 1; }
+        inline in::S* operator+(E, in::S* p) { return p + 1; }
+        inline int* operator+(int* p, E) { return p + 1; }
+        inline int operator-(E, int*) { return 61; }
+        inline int operator-(int*, E) { return 62; }
+        inline bool operator==(E, int*) { return true; }
+        inline bool operator==(int*, E) { return true; }
+        inline bool operator<(E, int*) { return false; }
+        inline bool operator<(int*, E) { return true; }
+        enum EPtrR2 : int { epr2 = 0 };
+        inline int* operator+(int* p, EPtrR2) { return p + 5; }
+        inline int* operator+(EPtrR2, int* p) { return p + 5; }
+        inline bool operator==(EPtrR2, int*) { return true; }
+        enum EPtrSpaceshipR2 : int { epr2_spaceship = 1 };
+        inline int epr2_spaceship_calls = 0;
+        inline void epr2_reset_spaceship_calls() { epr2_spaceship_calls = 0; }
+        inline int epr2_get_spaceship_calls() { return epr2_spaceship_calls; }
+        inline std::strong_ordering operator<=>(EPtrSpaceshipR2, int*)
+        {
+            ++epr2_spaceship_calls;
+            return std::strong_ordering::less;
+        }
+        enum ENoPtrR2 : int { enpr2 = 0 };
+        inline E& operator+=(E& e, int*) { e = e3; return e; }
+        inline int*& operator+=(int*& p, E) { p = p + 1; return p; }
+        inline int* operator+(SE, int* p) { return p + 1; }
+        inline int* operator+(int* p, SE) { return p + 1; }
+        enum class PtrDeleted : int { value = 0 };
+        inline int* operator+(PtrDeleted, int*) = delete;
+        enum class PtrAmbiguous : int { value = 0 };
+        inline int* operator+(PtrAmbiguous, const int* p) { return const_cast<int*>(p) + 1; }
+        inline int* operator+(PtrAmbiguous, volatile int* p) { return const_cast<int*>(p) + 2; }
+        inline int* operator+(const int* p, PtrAmbiguous) { return const_cast<int*>(p) + 1; }
+        inline int* operator+(volatile int* p, PtrAmbiguous) { return const_cast<int*>(p) + 2; }
         // Unary overload markers differ from the integral built-ins for both enum kinds.
         inline constexpr int operator~(SE e) { return 1500 + (int)e; }
         inline constexpr int operator-(SE e) { return 1600 + (int)e; }

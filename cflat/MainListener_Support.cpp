@@ -2450,7 +2450,7 @@ bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node)
     if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
         assign != nullptr)
     {
-        if (assign->assignmentOperator() != nullptr) return true;
+        if (HasAssignmentOperator(assign)) return true;
         if (assign->assignmentExpression() != nullptr)
             return IsChainedAssignmentShape(assign->assignmentExpression());
     }
@@ -4438,6 +4438,25 @@ std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandi
             if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr)
                 scan.Bind(getDirectDeclName(param->declarator()->directDeclarator()), nullptr);
     NamedLocalReturnVisit(func->compoundStatement(), scan);
+    for (const auto& candidate : scan.candidates)
+        if (candidate.named && !candidate.killed) out.push_back(candidate.declarator);
+    return out;
+}
+std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandidates(
+    CFlatParser::LambdaExpressionContext* lambda)
+{
+    std::vector<CFlatParser::DirectDeclaratorContext*> out;
+    if (lambda == nullptr || lambda->lambdaBody() == nullptr
+        || lambda->lambdaBody()->compoundStatement() == nullptr)
+        return out;
+
+    NamedLocalReturnScan scan;
+    scan.scopes.emplace_back();
+    if (lambda->lambdaParamList() != nullptr)
+        for (auto* param : lambda->lambdaParamList()->lambdaParam())
+            if (param->Identifier() != nullptr)
+                scan.Bind(param->Identifier()->getText(), nullptr);
+    NamedLocalReturnVisit(lambda->lambdaBody()->compoundStatement(), scan);
     for (const auto& candidate : scan.candidates)
         if (candidate.named && !candidate.killed) out.push_back(candidate.declarator);
     return out;

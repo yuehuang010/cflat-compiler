@@ -1212,6 +1212,95 @@ int t259LocalArm(bool f)
     return t.item != nullptr ? t.item->id : -1;
 }
 
+unique Resource* msink13GlobalOwner = nullptr;
+
+int msink13MoveGlobalIntoField()
+{
+    dtorCount = 0;
+    msink13GlobalOwner = new Resource();
+    msink13GlobalOwner->id = 131;
+    int valueOk = 0;
+    int sourceOk = 0;
+    int noEarlyFree = 0;
+    {
+        UniqueBox t = default;
+        t.item = move msink13GlobalOwner;
+        valueOk = t.item != nullptr && t.item->id == 131 ? 1 : 0;
+        sourceOk = msink13GlobalOwner == nullptr ? 1 : 0;
+        noEarlyFree = dtorCount == 0 ? 1 : 0;
+    }
+    return valueOk * 1000 + sourceOk * 100 + noEarlyFree * 10
+        + (dtorCount == 1 ? 1 : 0);
+}
+
+int msink13MoveLocalJoinIntoField(bool f)
+{
+    dtorCount = 0;
+    int valueOk = 0;
+    int sourceOk = 0;
+    int noEarlyFree = 0;
+    {
+        unique Resource* a = new Resource();
+        a->id = 132;
+        UniqueBox t = default;
+        t.item = f ? move a : nullptr;
+        valueOk = f ? (t.item != nullptr && t.item->id == 132 ? 1 : 0)
+                    : (t.item == nullptr ? 1 : 0);
+        sourceOk = f ? (a == nullptr ? 1 : 0) : (a != nullptr ? 1 : 0);
+        noEarlyFree = dtorCount == 0 ? 1 : 0;
+    }
+    return valueOk * 1000 + sourceOk * 100 + noEarlyFree * 10
+        + (dtorCount == 1 ? 1 : 0);
+}
+
+int msink13NewIntoField()
+{
+    dtorCount = 0;
+    int valueOk = 0;
+    int noEarlyFree = 0;
+    {
+        UniqueBox t = default;
+        t.item = new Resource();
+        t.item->id = 133;
+        valueOk = t.item != nullptr && t.item->id == 133 ? 1 : 0;
+        noEarlyFree = dtorCount == 0 ? 1 : 0;
+    }
+    return valueOk * 100 + noEarlyFree * 10 + (dtorCount == 1 ? 1 : 0);
+}
+
+int msink13TernaryNewIntoField(bool f)
+{
+    dtorCount = 0;
+    int valueOk = 0;
+    int noEarlyFree = 0;
+    {
+        UniqueBox t = default;
+        t.item = f ? new Resource() : nullptr;
+        if (f) t.item->id = 134;
+        valueOk = f ? (t.item != nullptr && t.item->id == 134 ? 1 : 0)
+                    : (t.item == nullptr ? 1 : 0);
+        noEarlyFree = dtorCount == 0 ? 1 : 0;
+    }
+    return valueOk * 100 + noEarlyFree * 10
+        + (dtorCount == (f ? 1 : 0) ? 1 : 0);
+}
+
+int msink13CoalesceNewIntoField()
+{
+    dtorCount = 0;
+    int valueOk = 0;
+    int noEarlyFree = 0;
+    {
+        unique Resource* empty = nullptr;
+        UniqueBox t = default;
+        t.item = empty ?? new Resource();
+        t.item->id = 135;
+        valueOk = t.item != nullptr && t.item->id == 135 ? 1 : 0;
+        noEarlyFree = dtorCount == 0 ? 1 : 0;
+    }
+    return valueOk * 100 + noEarlyFree * 10 + (dtorCount == 1 ? 1 : 0);
+}
+
 // '??' with an owning unique LOCAL lhs joins like a '?:' arm: a unique destination consumes the
 // taken local on its path. The fallback `new` is owned by the destination once, never leaked.
 int coalLocalField(bool f)
@@ -1565,7 +1654,87 @@ struct T466FieldPair
     unique Resource* p = nullptr;
     unique Resource* r = nullptr;
     void sinkJoin() { sinkResourceMove(this.p ?? this.r); }
+    int borrowLocal() { Resource* b = this.p ?? this.r; return readResourceId(b); }
+    int borrowArg() { return readResourceId(this.p ?? this.r); }
+    int sinkJoinValue() { return t466SinkResourceMoveValue(this.p ?? this.r); }
+    void moveJoinTo(T466FieldPair* target) { target->p = move (this.p ?? this.r); }
 };
+
+struct T466IfaceFieldPair
+{
+    unique CoalIface p = default;
+    unique CoalIface r = default;
+    int borrowLocal() { CoalIface b = this.p ?? this.r; return b.val(); }
+    int borrowArg() { return coalSeeIface(this.p ?? this.r); }
+    int sinkJoin() { return t466SinkCoalIfaceValue(this.p ?? this.r); }
+    void moveJoinTo(T466IfaceFieldPair* target) { target->p = move (this.p ?? this.r); }
+};
+
+int coalfldNestedAllocCount = 0;
+int coalfldNestedDtorCount = 0;
+struct CoalFldNestedResource
+{
+    int id = 0;
+    CoalFldNestedResource() { coalfldNestedAllocCount = coalfldNestedAllocCount + 1; }
+    ~CoalFldNestedResource() { coalfldNestedDtorCount = coalfldNestedDtorCount + 1; }
+};
+interface CoalFldNestedIface { int val(); };
+class CoalFldNestedImpl : CoalFldNestedIface
+{
+    CoalFldNestedImpl() { coalfldNestedAllocCount = coalfldNestedAllocCount + 1; }
+    ~CoalFldNestedImpl() { coalfldNestedDtorCount = coalfldNestedDtorCount + 1; }
+    int val() { return 56; }
+};
+struct CoalFldNestedTarget { unique CoalFldNestedResource* p = nullptr; };
+struct CoalFldNestedFields
+{
+    unique CoalFldNestedResource* p = nullptr;
+    unique CoalFldNestedResource* q = nullptr;
+    unique CoalFldNestedResource* r = nullptr;
+    int moveNestedLocal() { unique CoalFldNestedResource* u = move ((this.p ?? this.q) ?? this.r); return u->id; }
+    void moveNestedTo(CoalFldNestedTarget* target) { target->p = move ((this.p ?? this.q) ?? this.r); }
+    int moveNestedRhs() { unique CoalFldNestedResource* u = move (this.q ?? (this.p ?? this.r)); return u->id; }
+    int moveNestedTernary(bool f) { unique CoalFldNestedResource* u = move (f ? (this.p ?? this.r) : nullptr); return u->id; }
+    int moveNestedRaw() { CoalFldNestedResource* b = move ((this.p ?? this.q) ?? this.r); int id = b->id; delete b; return id; }
+};
+struct CoalFldNestedIfaceFields
+{
+    unique CoalFldNestedIface ip = default;
+    unique CoalFldNestedIface ir = default;
+    int moveNestedIface() { unique CoalFldNestedIface u = move ((this.ip ?? this.ir) ?? this.ir); return u.val(); }
+};
+
+struct T466ByValSource { unique Resource* p = nullptr; };
+struct T466ByValTarget { unique Resource* p = nullptr; };
+int t466BorrowByValPlain(T466ByValSource s) { return readResourceId(s.p); }
+int t466BorrowByValCoalesce(T466ByValSource s)
+{
+    Resource* p = s.p ?? nullptr;
+    return readResourceId(p);
+}
+int t466BorrowByValTernary(T466ByValSource s)
+{
+    Resource* p = true ? s.p : nullptr;
+    return readResourceId(p);
+}
+int t466OwnByValSinkCoalesce(move T466ByValSource s)
+{
+    return t466SinkResourceMoveValue(s.p ?? nullptr);
+}
+int t466OwnByValSinkTernary(move T466ByValSource s, bool f)
+{
+    return t466SinkResourceMoveValue(f ? s.p : nullptr);
+}
+int t466OwnByValFieldCoalesce(move T466ByValSource s, T466ByValTarget* t)
+{
+    t->p = s.p ?? nullptr;
+    return t->p->id;
+}
+int t466OwnByValFieldTernary(move T466ByValSource s, T466ByValTarget* t, bool f)
+{
+    t->p = f ? s.p : nullptr;
+    return t->p->id;
+}
 
 int testUniqueField()
 {
@@ -1727,6 +1896,200 @@ int testUniqueField()
     }
     passed += Test("t466_coalesce_call_this_fields_freed_once", dtorCount, 1);
 
+    // COALFLD: borrows preserve the selected field; the move destinations still consume it.
+    int coalValue = 0;
+    dtorCount = 0;
+    {
+        T466FieldPair fp = default;
+        fp.p = new Resource(); fp.p->id = 31;
+        coalValue = fp.borrowLocal();
+    }
+    passed += Test("coalfld_this_borrow_local_value_and_dtor", coalValue * 100 + dtorCount, 3101);
+    dtorCount = 0;
+    {
+        T466FieldPair fp = default;
+        fp.p = new Resource(); fp.p->id = 32;
+        coalValue = fp.borrowArg();
+    }
+    passed += Test("coalfld_this_borrow_arg_value_and_dtor", coalValue * 100 + dtorCount, 3201);
+    dtorCount = 0;
+    {
+        T466FieldPair fp = default;
+        fp.p = new Resource(); fp.p->id = 33;
+        coalValue = fp.sinkJoinValue();
+    }
+    passed += Test("coalfld_this_move_arg_value_and_dtor", coalValue * 100 + dtorCount, 3301);
+    dtorCount = 0;
+    {
+        T466FieldPair fp = default;
+        T466FieldPair target = default;
+        fp.p = new Resource(); fp.p->id = 34;
+        fp.moveJoinTo(&target);
+        coalValue = target.p->id;
+    }
+    passed += Test("coalfld_this_unique_field_value_and_dtor", coalValue * 100 + dtorCount, 3401);
+
+    dtorCount = 0;
+    {
+        T466IfaceFieldPair fp = default;
+        fp.p = new CoalImpl();
+        coalValue = fp.borrowLocal();
+    }
+    passed += Test("coalfld_iface_borrow_local_value_and_dtor", coalValue * 100 + dtorCount, 3101);
+    dtorCount = 0;
+    {
+        T466IfaceFieldPair fp = default;
+        fp.p = new CoalImpl();
+        coalValue = fp.borrowArg();
+    }
+    passed += Test("coalfld_iface_borrow_arg_value_and_dtor", coalValue * 100 + dtorCount, 3101);
+    dtorCount = 0;
+    {
+        T466IfaceFieldPair fp = default;
+        fp.p = new CoalImpl();
+        coalValue = fp.sinkJoin();
+    }
+    passed += Test("coalfld_iface_move_arg_value_and_dtor", coalValue * 100 + dtorCount, 3101);
+    dtorCount = 0;
+    {
+        T466IfaceFieldPair fp = default;
+        T466IfaceFieldPair target = default;
+        fp.p = new CoalImpl();
+        fp.moveJoinTo(&target);
+        coalValue = target.p.get().val();
+    }
+    passed += Test("coalfld_iface_unique_field_value_and_dtor", coalValue * 100 + dtorCount, 3101);
+
+    dtorCount = 0;
+    {
+        unique Resource* u = new Resource(); u->id = 39;
+        unique Resource* v = nullptr;
+        Resource* b = u ?? v;
+        coalValue = readResourceId(b);
+    }
+    passed += Test("coalfld_local_borrow_local_value_and_dtor", coalValue * 100 + dtorCount, 3901);
+    dtorCount = 0;
+    {
+        unique Resource* u = new Resource(); u->id = 40;
+        unique Resource* v = nullptr;
+        coalValue = readResourceId(u ?? v);
+    }
+    passed += Test("coalfld_local_borrow_arg_value_and_dtor", coalValue * 100 + dtorCount, 4001);
+    dtorCount = 0;
+    {
+        unique Resource* u = new Resource(); u->id = 41;
+        unique Resource* v = nullptr;
+        coalValue = t466SinkResourceMoveValue(u ?? v);
+    }
+    passed += Test("coalfld_local_move_arg_value_and_dtor", coalValue * 100 + dtorCount, 4101);
+    dtorCount = 0;
+    {
+        unique Resource* u = new Resource(); u->id = 42;
+        unique Resource* v = nullptr;
+        T466ByValTarget target = default;
+        target.p = u ?? v;
+        coalValue = target.p->id;
+    }
+    passed += Test("coalfld_local_unique_field_value_and_dtor", coalValue * 100 + dtorCount, 4201);
+
+    // Frozen accept set: borrowed by-value reads and owning move-parameter joins remain valid.
+    dtorCount = 0;
+    {
+        T466ByValSource s = default; s.p = new Resource(); s.p->id = 43;
+        coalValue = t466BorrowByValPlain(s);
+    }
+    passed += Test("coalfld_byval_borrow_plain_value_and_dtor", coalValue * 100 + dtorCount, 4301);
+    dtorCount = 0;
+    {
+        T466ByValSource s = default; s.p = new Resource(); s.p->id = 44;
+        coalValue = t466BorrowByValCoalesce(s);
+    }
+    passed += Test("coalfld_byval_borrow_coalesce_value_and_dtor", coalValue * 100 + dtorCount, 4401);
+    dtorCount = 0;
+    {
+        T466ByValSource s = default; s.p = new Resource(); s.p->id = 45;
+        coalValue = t466BorrowByValTernary(s);
+    }
+    passed += Test("coalfld_byval_borrow_ternary_value_and_dtor", coalValue * 100 + dtorCount, 4501);
+    dtorCount = 0;
+    {
+        T466ByValSource s = default; s.p = new Resource(); s.p->id = 46;
+        coalValue = t466OwnByValSinkCoalesce(move s);
+    }
+    passed += Test("coalfld_byval_move_sink_coalesce_value_and_dtor", coalValue * 100 + dtorCount, 4601);
+    dtorCount = 0;
+    {
+        T466ByValSource s = default; s.p = new Resource(); s.p->id = 47;
+        coalValue = t466OwnByValSinkTernary(move s, true);
+    }
+    passed += Test("coalfld_byval_move_sink_ternary_value_and_dtor", coalValue * 100 + dtorCount, 4701);
+    dtorCount = 0;
+    {
+        T466ByValSource s = default; T466ByValTarget t = default;
+        s.p = new Resource(); s.p->id = 48;
+        coalValue = t466OwnByValFieldCoalesce(move s, &t);
+    }
+    passed += Test("coalfld_byval_move_field_coalesce_value_and_dtor", coalValue * 100 + dtorCount, 4801);
+    dtorCount = 0;
+    {
+        T466ByValSource s = default; T466ByValTarget t = default;
+        s.p = new Resource(); s.p->id = 49;
+        coalValue = t466OwnByValFieldTernary(move s, &t, true);
+    }
+    passed += Test("coalfld_byval_move_field_ternary_value_and_dtor", coalValue * 100 + dtorCount, 4901);
+
+    // COALFLD review r1: moving an outer join must clear nested field reads on either result arm.
+    coalfldNestedAllocCount = 0; coalfldNestedDtorCount = 0;
+    {
+        CoalFldNestedFields fields = default;
+        fields.p = new CoalFldNestedResource(); fields.p->id = 51;
+        coalValue = fields.moveNestedLocal();
+    }
+    passed += Test("coalfld_nested_move_local_value", coalValue, 51);
+    passed += Test("coalfld_nested_move_local_alloc_dtor", coalfldNestedAllocCount * 10 + coalfldNestedDtorCount, 11);
+    coalfldNestedAllocCount = 0; coalfldNestedDtorCount = 0;
+    {
+        CoalFldNestedFields fields = default;
+        CoalFldNestedTarget target = default;
+        fields.p = new CoalFldNestedResource(); fields.p->id = 52;
+        fields.moveNestedTo(&target);
+        coalValue = target.p->id;
+    }
+    passed += Test("coalfld_nested_move_field_value", coalValue, 52);
+    passed += Test("coalfld_nested_move_field_alloc_dtor", coalfldNestedAllocCount * 10 + coalfldNestedDtorCount, 11);
+    coalfldNestedAllocCount = 0; coalfldNestedDtorCount = 0;
+    {
+        CoalFldNestedFields fields = default;
+        fields.p = new CoalFldNestedResource(); fields.p->id = 53;
+        coalValue = fields.moveNestedRhs();
+    }
+    passed += Test("coalfld_nested_move_rhs_value", coalValue, 53);
+    passed += Test("coalfld_nested_move_rhs_alloc_dtor", coalfldNestedAllocCount * 10 + coalfldNestedDtorCount, 11);
+    coalfldNestedAllocCount = 0; coalfldNestedDtorCount = 0;
+    {
+        CoalFldNestedFields fields = default;
+        fields.p = new CoalFldNestedResource(); fields.p->id = 54;
+        coalValue = fields.moveNestedTernary(true);
+    }
+    passed += Test("coalfld_nested_move_ternary_value", coalValue, 54);
+    passed += Test("coalfld_nested_move_ternary_alloc_dtor", coalfldNestedAllocCount * 10 + coalfldNestedDtorCount, 11);
+    coalfldNestedAllocCount = 0; coalfldNestedDtorCount = 0;
+    {
+        CoalFldNestedIfaceFields fields = default;
+        fields.ip = new CoalFldNestedImpl();
+        coalValue = fields.moveNestedIface();
+    }
+    passed += Test("coalfld_nested_move_interface_value", coalValue, 56);
+    passed += Test("coalfld_nested_move_interface_alloc_dtor", coalfldNestedAllocCount * 10 + coalfldNestedDtorCount, 11);
+    coalfldNestedAllocCount = 0; coalfldNestedDtorCount = 0;
+    {
+        CoalFldNestedFields fields = default;
+        fields.p = new CoalFldNestedResource(); fields.p->id = 55;
+        coalValue = fields.moveNestedRaw();
+    }
+    passed += Test("coalfld_nested_move_raw_value", coalValue, 55);
+    passed += Test("coalfld_nested_move_raw_alloc_dtor", coalfldNestedAllocCount * 10 + coalfldNestedDtorCount, 11);
+
     // T466 accept-set: consuming one possible `??` field keeps an unrelated field live.
     dtorCount = 0;
     {
@@ -1869,6 +2232,15 @@ int testUniqueField()
     t259v = t259NewArm(false);
     passed += Test("t259_new_arm_untaken_value", t259v, 0);
     passed += Test("t259_new_arm_untaken_both_freed_once", dtorCount, 2);
+
+    // MSINK13 accept-set: explicit global move and owned local/new join forms stay legal.
+    passed += Test("msink13_explicit_global_move_into_field", msink13MoveGlobalIntoField(), 1111);
+    passed += Test("msink13_owned_local_move_join_taken", msink13MoveLocalJoinIntoField(true), 1111);
+    passed += Test("msink13_owned_local_move_join_untaken", msink13MoveLocalJoinIntoField(false), 1111);
+    passed += Test("msink13_new_into_field", msink13NewIntoField(), 111);
+    passed += Test("msink13_ternary_new_taken", msink13TernaryNewIntoField(true), 111);
+    passed += Test("msink13_ternary_new_untaken", msink13TernaryNewIntoField(false), 111);
+    passed += Test("msink13_coalesce_new_fallback", msink13CoalesceNewIntoField(), 111);
 
     // T259 - a unique LOCAL arm is consumed on the taken path, as the plain '=' consumes it.
     dtorCount = 0;
@@ -14354,6 +14726,8 @@ int readResourceId(Resource* r) { return r->id; }
 move Resource* makeArmOwnedResource() { Resource* r = new Resource(); r->id = 52; return r; }
 void sinkResourceUnique(unique Resource* r) { }
 void sinkResourceMove(move Resource* r) { delete r; }
+int t466SinkResourceMoveValue(move Resource* r) { int id = r->id; delete r; return id; }
+int t466SinkCoalIfaceValue(move CoalIface r) { int id = r.val(); delete r; return id; }
 
 // Callee shapes the PLAIN-`T*` guard must NOT reject. ParameterProvablyRetainsArgument answers
 // "no proof" for every one of them, which is the unknown-accepts polarity the guard is built on:
@@ -20277,7 +20651,10 @@ extern int main()
     total += 19;  // T230 r3 legs in testUniqueField
     total += 22;  // T259 legs in testUniqueField
     total += 15;  // T466 legs in testUniqueField
+    total += 19;  // COALFLD borrowing, consuming, and frozen accept-set legs
+    total += 12;  // COALFLD r2 nested join regression legs
     total += 10;  // mfcond join guards and correlated explicit-move control
+    total += 7;   // MSINK13 accept-set legs
 
     passed += testUniqueAssignmentOwnership();
     total += 23;

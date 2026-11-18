@@ -815,6 +815,63 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxMoveCtor(const st
         return nullptr;
     }
 
+bool LLVMBackend::TryGetCxxNamedReturnCtorReachability(const std::string& typeName,
+                                                        bool& reachable) const
+{
+        const auto record = cxxRecordEntries_.find(typeName);
+        if (record == cxxRecordEntries_.end() || !record->second.isCxx) return false;
+
+        bool hasMoveCtor = false;
+        bool hasCopyCtor = false;
+        bool moveReachable = false;
+        bool copyReachable = false;
+        bool uncertain = false;
+        unsigned moveCount = 0;
+        unsigned copyCount = 0;
+        for (const auto& member : record->second.members)
+        {
+            if (member.kind != cflat_cinterop::RawCxxMember::Constructor) continue;
+            if (!member.isMoveCtor && !member.isCopyCtor) continue;
+            if (member.isMoveCtor) { hasMoveCtor = true; ++moveCount; }
+            if (member.isCopyCtor) { hasCopyCtor = true; ++copyCount; }
+            if (member.requiresConstructorWrapper || member.needsLocalDefinition
+                || !member.bindRefusal.empty())
+            {
+                uncertain = true;
+                continue;
+            }
+            if (member.isDeleted || member.access != cflat_cinterop::AccessPublic) continue;
+            if (member.isMoveCtor) moveReachable = true;
+            if (member.isCopyCtor) copyReachable = true;
+        }
+        if (moveCount > 1 || copyCount > 1) uncertain = true;
+
+        // A declared move constructor wins for an xvalue, including when it is private or deleted.
+        if (hasMoveCtor && !uncertain)
+        {
+            reachable = moveReachable;
+            return true;
+        }
+        if (hasMoveCtor || uncertain) return false;
+
+        // With no declared move constructor, a public copy constructor accepts the named local.
+        if (hasCopyCtor)
+        {
+            if (!uncertain)
+            {
+                reachable = copyReachable;
+                return true;
+            }
+            return false;
+        }
+        if (record->second.hasCopyCtor && !record->second.hasDeletedCopyCtor)
+        {
+            reachable = true;
+            return true;
+        }
+        return false;
+}
+
 /*
  * Constructor overload selection for `T(args)`. Arity first, then a per-argument compatibility
  * test that is deliberately narrow: a scalar matches a scalar of the same CFlat family, a

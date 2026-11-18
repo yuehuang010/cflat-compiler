@@ -57,17 +57,3 @@ clang parity). (By-value argument temp extra move fixed by T231.)
 
 ## Open after T272 (2026-10-15)
 - The T272 same-class call-element shapes (`Cnt x = { mk(7) };`, `{ (mk(7)) }`) are item 2's call residue.
-
-## RETELIDE round 2 (2026-11-10)
-- Lambda-body named return of a C++ class: `function<rv.S(int)> k = (int r) => { rv.S a = rv.S(r); return a; }; return k(q);`
-  gives 1/0/1/2 (one move, two dtors) on master and after RETELIDE; clang++ -std=c++20 gives 1/0/0/1. Cause: only
-  ParseFunctionDefinition calls ClassifyNamedLocalReturnCandidates, so lambda bodies never get the NRVO sret path, and
-  the lambda return type is only known from the target function<> type at emission. Repro: scratch/rev_retelide_repro/lam2.cb
-  (clang twin lam2_clang.cpp, rv.hpp shared).
-
-## `auto` locals of an imported C++ class (2026-11-10)
-
-`rv.S f() { auto a = rv.S(1); return a; }`: CFlat 1 ctor / 1 move / 2 dtors, clang 1/0/1 (master the same). Removing the
-`IsForeignNontrivialCxxReturnClass` exclusion at the `ParseDeclaration` wrapper gate elides it but needs (a) the reachable-ctor
-query also applied there, or a class with a private move is accepted, and (b) `TypeName` compared before `GetType`, or
-`auto a = 3` beside a class return type is refused "cannot find the type 'auto'".

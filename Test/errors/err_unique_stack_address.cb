@@ -28,6 +28,27 @@ expect_error("cannot store the address of a stack or global value into unique fi
     void storeField() { Item i; Holder h = default; h.slot = &i; }
 }
 
+// A stack address joined through '?:' or '??' into a unique field is the same store: same message.
+expect_error("cannot store the address of a stack or global value into unique field 'Holder.slot'") {
+    void storeFieldJoinTernary(bool f) { Item i; Holder h = default; h.slot = f ? &i : nullptr; }
+}
+
+expect_error("cannot store the address of a stack or global value into unique field 'Holder.slot'") {
+    void storeFieldJoinCoalesce() { Item i; Holder h = default; h.slot = &i ?? nullptr; }
+}
+
+struct HolderThis
+{
+    unique Item* slot = nullptr;
+    void storeThis(bool f)
+    {
+        expect_error("cannot store the address of a stack or global value into unique field 'HolderThis.slot'") {
+            Item i;
+            this->slot = f ? &i : nullptr;
+        }
+    }
+};
+
 expect_error("cannot store the address of a stack or global value into unique field 'Holder.slot'") {
     void storeFieldGlobal() { Holder h = default; h.slot = &gItem; }
 }

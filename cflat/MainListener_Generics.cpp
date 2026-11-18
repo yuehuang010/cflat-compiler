@@ -831,6 +831,26 @@ static std::string GenericLiteralBinaryIdentity(const std::string& leftName,
 static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node,
                                                     const std::string& typedFallback = {});
 
+static std::string GenericArgumentSubstitutionSpelling(const LLVMBackend& compiler,
+                                                       const TypeSpelling& type)
+{
+        TypeSpelling base = type;
+        const int pointerDepth = std::max(base.pointerDepth, 0);
+        const bool arrayView = base.view;
+        const bool alias = base.alias;
+        const int constDepth = base.constDepth;
+        base.pointerDepth = 0;
+        base.view = false;
+        base.alias = false;
+        base.constDepth = 0;
+
+        std::string result = MangleType(compiler, base);
+        if (alias) result = "alias " + result;
+        result.append(pointerDepth, '*');
+        if (arrayView) result += "[]";
+        return JoinConstTypeArgument(result, constDepth);
+}
+
 enum class GenericBinaryIdentityKind { Arithmetic, Shift, Bitwise };
 
 static std::string GenericLiteralBinaryExpressionIdentity(
@@ -1125,10 +1145,9 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                     {
                         const std::string declaringNamespace = DeclaringNamespaceOf(
                             compilerLLVM, funcName);
-                        const std::string qualifiedPattern = declaringNamespace.empty()
-                            ? nestedGenericBase : declaringNamespace + "." + nestedGenericBase;
-                        if (compilerLLVM->IsGenericTemplateKey(qualifiedPattern))
-                            resolvedPatternBase = qualifiedPattern;
+                        resolvedPatternBase = ResolveGenericTemplateBaseAtScope(
+                            compilerLLVM, nestedGenericBase, declaringNamespace, funcCtx,
+                            nestedGenericBase);
                     }
                     if (resolvedPatternBase.empty())
                         resolvedPatternBase = compilerLLVM->ResolveGenericTemplateBase(nestedGenericBase);
@@ -1136,12 +1155,8 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                         || MangledBase(base) != resolvedPatternBase
                         || argumentSpelling.args.size() != 1)
                         break;
-                    const std::string encodedArgument =
-                        MangleType(*compilerLLVM, argumentSpelling.args.front());
-                    argType = encodedArgument.starts_with(".p$")
-                        ? SpellType(*compilerLLVM,
-                            LLVMBackend::TypeAndValue{ .TypeName = encodedArgument })
-                        : encodedArgument;
+                    argType = GenericArgumentSubstitutionSpelling(
+                        *compilerLLVM, argumentSpelling.args.front());
                     declared = true;
                 }
                 else if (paramStars == 0 && !paramView && !sourceTV.Pointer
@@ -1172,6 +1187,15 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 {
                     argType = literalIdentity;
                     fromLiteral = true;
+                }
+                // Preserve the string-literal pointer type across ?: / ?? joins instead of
+                // rebuilding it from LLVM's opaque i8 pointer carrier.
+                if (argType.empty() && paramStars == 0 && !paramView
+                    && compilerLLVM->JoinIsAllStringLiterals(argument.Primary)
+                    && compilerLLVM->JoinIsCharPointer(argument.Primary, true))
+                {
+                    argType = JoinConstTypeArgument("char*", 1);
+                    declared = true;
                 }
                 if (argType.empty() && !base.empty())
                 {

@@ -6397,6 +6397,81 @@ int testT323ImplicitCoreGlobal()
     return passed;
 }
 
+using PDepthAcceptAlias = int**;
+class PDepthAcceptClass { int value = 9; };
+int* pdepthReturnOne(int* p) { return p; }
+int** pdepthReturnTwo(int** p) { return p; }
+int*** pdepthReturnThree(int*** p) { return p; }
+int pdepthTakeViewOne(int*[] values) { return values == nullptr ? 0 : 11; }
+int pdepthTakeViewTwo(int**[] values) { return values == nullptr ? 0 : 22; }
+int pdepthTakeViewThree(int***[] values) { return values == nullptr ? 0 : 33; }
+
+int testPointerDepthAcceptSet()
+{
+    int passed = 0;
+    int value = 7;
+    int* p = &value;
+    int** pp = &p;
+    int*** ppp = &pp;
+    int* p1 = p;
+    int** p2 = pp;
+    int*** p3 = ppp;
+    p1 = pdepthReturnOne(p1);
+    p2 = pdepthReturnTwo(p2);
+    p3 = pdepthReturnThree(p3);
+    passed += Test("pdepth exact init, assignment and return depths",
+        p1 == p && p2 == pp && p3 == ppp, true);
+
+    int*[2] f2;
+    f2[0] = p;
+    int** elementAddress = &f2[0];
+    passed += Test("pdepth address of int pointer array element is depth two",
+        elementAddress != nullptr && *elementAddress == p, true);
+
+    void* carrier = pp;
+    int** restored = carrier;
+    passed += Test("pdepth void pointer carries a depth two object pointer",
+        restored == pp, true);
+
+    int* null1 = 0;
+    int** null2 = nullptr;
+    int*** null3 = 0;
+    passed += Test("pdepth null constants initialize all pointer depths",
+        null1 == nullptr && null2 == nullptr && null3 == nullptr, true);
+
+    int* cast1 = (int*)pp;
+    int*** cast3 = (int***)p;
+    passed += Test("pdepth explicit casts retain depth conversions",
+        cast1 != nullptr && cast3 != nullptr, true);
+
+    PDepthAcceptAlias alias = pp;
+    passed += Test("pdepth same-depth alias pointer remains exact", alias == pp, true);
+
+    int*[1] slots1;
+    int**[1] slots2;
+    int***[1] slots3;
+    slots1[0] = p;
+    slots2[0] = pp;
+    slots3[0] = ppp;
+    int*[] view1 = slots1;
+    int**[] view2 = slots2;
+    int***[] view3 = slots3;
+    passed += Test("pdepth exact view element depths bind", pdepthTakeViewOne(view1)
+        + pdepthTakeViewTwo(view2) + pdepthTakeViewThree(view3), 66);
+
+    PDepthAcceptClass object;
+    PDepthAcceptClass* classPointer = &object;
+    PDepthAcceptClass* sameClassPointer = classPointer;
+    passed += Test("pdepth exact class pointer remains accepted",
+        sameClassPointer == classPointer, true);
+
+    unique int* owner = new int(8);
+    int* borrowed = owner;
+    passed += Test("pdepth same-depth unique pointer borrow remains accepted",
+        *borrowed, 8);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -6454,6 +6529,7 @@ extern int main()
     r = testT513BareTernaryAcceptSet(); passed += r; total += 7;
     r = testT513DiscardedVoidArms(); passed += r; total += 5;
     r = testT323ImplicitCoreGlobal(); passed += r; total += 1;
+    r = testPointerDepthAcceptSet(); passed += r; total += 9;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

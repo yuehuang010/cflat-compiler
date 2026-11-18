@@ -727,7 +727,7 @@ bool LoopValueMayPointToConstCxxObject(CFlatParser::AssignmentExpressionContext*
                                        LLVMBackend* compiler, const LoopConstKind& constKind)
 {
         if (expression == nullptr) return false;
-        if (expression->assignmentOperator() != nullptr)
+        if (HasAssignmentOperator(expression))
             return LoopValueMayPointToConstCxxObject(expression->assignmentExpression(), compiler, constKind);
         return LoopConditionalValueMayPointToConstCxxObject(expression->conditionalExpression(), compiler, constKind);
 }
@@ -2395,16 +2395,31 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
             // `return std.move(x)` of a trivially copyable C++ class returned in registers: the
             // referent's bytes (the trivial pick), or a temporary built by clang's pick.
+            const bool ternaryTrivialXvalue = SoleTernaryExpression(assignExpr) != nullptr
+                && returnNV.IsExplicitMove && returnNV.Storage != nullptr
+                && compiler->IsCxxTriviallyCopyableRecord(returnNV.TypeAndValue.TypeName);
             if (!cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer
-                && compiler->IsCxxRvalueRefClassResult(returnNV)
+                && (compiler->IsCxxRvalueRefClassResult(returnNV) || ternaryTrivialXvalue)
                 && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
                 && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName))
             {
                 const std::string tn = returnNV.TypeAndValue.TypeName;
                 const bool constSource = returnNV.TypeAndValue.CxxConstRef();
                 llvm::Type* recordType = compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = tn });
-                llvm::Value* source = returnNV.Primary;
-                if (recordType != nullptr && compiler->CxxTrivialMoveNeedsTransfer(tn, constSource, false))
+                llvm::Value* source = ternaryTrivialXvalue ? returnNV.Storage : returnNV.Primary;
+                if (recordType != nullptr && ternaryTrivialXvalue
+                    && compiler->CxxExplicitMoveNeedsTransfer(tn, constSource, false))
+                {
+                    auto* temp = compiler->AllocaAtEntry(recordType, nullptr, "cxx.xvalue.ret",
+                        compiler->module->getDataLayout().getABITypeAlign(recordType).value());
+                    std::string refusal;
+                    if (!compiler->EmitCxxExplicitMoveTransfer(tn, temp, source, constSource,
+                            false, assignExpr->getText(), refusal))
+                        LogErrorContext(assignExpr, refusal);
+                    source = temp;
+                }
+                else if (recordType != nullptr
+                    && compiler->CxxTrivialMoveNeedsTransfer(tn, constSource, false))
                 {
                     auto* temp = compiler->AllocaAtEntry(recordType, nullptr, "cxx.xvalue.ret",
                         compiler->module->getDataLayout().getABITypeAlign(recordType).value());
@@ -3347,7 +3362,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                                   retDestElement, retSrcElement))
                 LogErrorContext(errCtx, compiler->LocalizeMessage(
                     "cannot return an array view of '{}' from a function whose return element is "
-                    "'{}' - a view indexes by its own element, so the elements must match",
+                    "'{}' - the view's element type and pointer depth must match the return type",
                     { retSrcElement, retDestElement }));
         }
         // Return leg of the code-value store gate: `return w;` from a `Rec*`
@@ -5288,7 +5303,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // end-of-full-expression destruction (FlushOwnedTemps at the block-item boundary).
                 if (auto* assign = express->assignmentExpression())
                 {
-                    bool bareExpr = assign->assignmentOperator() == nullptr;
+                    bool bareExpr = !HasAssignmentOperator(assign);
                     auto resultNV = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
                     if (bareExpr) DiagnoseDiscardedOwningReturn(assign, resultNV);
                     ProcessPlusPlus();
@@ -5505,7 +5520,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     {
                         // Evaluate the initializer with the same discarded-expression semantics as a statement.
                         auto* initAssign = expressionCtx->assignmentExpression();
-                        bool bareExpr = initAssign->assignmentOperator() == nullptr;
+                        bool bareExpr = !HasAssignmentOperator(initAssign);
                         auto nv = ParseAssignmentExpressionNamed(initAssign, ResultUse::Discard);
                         if (bareExpr) DiagnoseDiscardedOwningReturn(initAssign, nv);
                         ProcessPlusPlus();
@@ -5556,7 +5571,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                         for (auto assign : assignments)
                         {
                             // A for-update is a discard position too (its value is unused).
-                            bool bareExpr = assign->assignmentOperator() == nullptr;
+                            bool bareExpr = !HasAssignmentOperator(assign);
                             auto nv = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
                             if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
                             ProcessPlusPlus();

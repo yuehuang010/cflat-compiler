@@ -23,6 +23,54 @@ void stashBraceInit(list<Token> toks)
     Holder h = { tok = toks.get(0) };
 }
 
+// The same borrow reached through a '?:' or '??' join of a `unique` field arm. The join must
+// refuse exactly as the plain store does, for a local, a struct field and a this-> receiver.
+struct P9 { int value = 1; };
+struct S9 { unique P9* p = nullptr; };
+S9 gS9 = default;
+struct T9 { unique P9* p = nullptr; };
+struct O9 { T9 item = default; };
+
+void joinAliasGlobalLocal(bool f)
+{
+    expect_error("cannot store an 'alias' value") {
+        alias S9 a = gS9;
+        T9 t = default;
+        t.p = f ? a.p : nullptr;
+    }
+}
+
+void joinAliasGlobalCoalesceLocal()
+{
+    expect_error("cannot store an 'alias' value") {
+        alias S9 a = gS9;
+        T9 t = default;
+        t.p = a.p ?? nullptr;
+    }
+}
+
+void joinAliasOwnerFieldRecv(bool f)
+{
+    expect_error("cannot store an 'alias' value") {
+        S9 owner = default;
+        alias S9 a = owner;
+        O9 o = default;
+        o.item.p = f ? a.p : nullptr;
+    }
+}
+
+struct T9This
+{
+    unique P9* p = nullptr;
+    void joinAlias(bool f)
+    {
+        expect_error("cannot store an 'alias' value") {
+            alias S9 a = gS9;
+            this->p = f ? a.p : nullptr;
+        }
+    }
+};
+
 extern int main()
 {
     return 0;

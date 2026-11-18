@@ -2,6 +2,7 @@
 // member, so a deleted move constructor / move assignment is refused with clang's reason instead
 // of silently copying, and a const source selects the copy members. clang++ rejects every leg.
 import cpp "cpp_interop_basic.h";
+import cpp "../library/cpp_t239_ternary_byvalue.hpp";
 
 expect_error("cannot move-construct C++ class 'cppi.XvNoMove' from 'move a' (std::move of a 'cppi.XvNoMove'): clang: call to deleted constructor of 'cppi::XvNoMove'") {
     cppi.XvNoMove mv_return_deleted() { cppi.XvNoMove a = cppi.XvNoMove(1); return move a; }
@@ -11,6 +12,47 @@ expect_error("cannot move-construct C++ class 'cppi.XvNoMove' from 'move a' (std
 // spelling (pre-fix `auto`, return and argument byte-copied it).
 expect_error("cannot move-construct C++ class 'cppi.XvTrivialNoMove' from 'move a' (std::move of a 'cppi.XvTrivialNoMove'): clang: call to deleted constructor of 'cppi::XvTrivialNoMove'") {
     cppi.XvTrivialNoMove mv_return_trivial_deleted() { cppi.XvTrivialNoMove a = cppi.XvTrivialNoMove(1); return move a; }
+}
+
+expect_error("cannot move-construct C++ class 'e6mv.NoMove' from 'move k?movea:moveb' (std::move of a 'e6mv.NoMove'): clang: call to deleted constructor of 'e6mv::NoMove'") {
+    int e6mvNoMoveTernaryAuto(int k) {
+        e6mv.NoMove a = e6mv.NoMove(7); e6mv.NoMove b = e6mv.NoMove(8);
+        auto c = k ? move a : move b;
+        return c.v;
+    }
+}
+
+expect_error("cannot move-assign C++ class 'e6mv.NoMove'") {
+    int e6mvNoMoveTernaryAssign(int k) {
+        e6mv.NoMove a = e6mv.NoMove(7); e6mv.NoMove b = e6mv.NoMove(8);
+        e6mv.NoMove c = e6mv.NoMove(9);
+        c = k ? move a : move b;
+        return c.v;
+    }
+}
+
+expect_error("clang: call to deleted constructor of 'e6mv::NoMove'") {
+    e6mv.NoMove e6mvNoMoveTernaryReturn(int k) {
+        e6mv.NoMove a = e6mv.NoMove(7); e6mv.NoMove b = e6mv.NoMove(8);
+        return k ? move a : move b;
+    }
+}
+
+expect_error("clang: call to deleted constructor of 'e6mv::NoMove'") {
+    int e6mvNoMoveTernaryElement(int k) {
+        e6mv.NoMove[2] arr = {e6mv.NoMove(7), e6mv.NoMove(8)};
+        auto c = k ? move arr[0] : move arr[1];
+        return c.v;
+    }
+}
+
+expect_error("clang: call to deleted constructor of 'e6mv::NoMove'") {
+    int e6mvNoMoveTernaryField(int k) {
+        e6mv.NoMoveHolder h0 = default; e6mv.NoMoveHolder h1 = default;
+        h0.t.v = 7; h1.t.v = 8;
+        auto c = k ? move h0.t : move h1.t;
+        return c.v;
+    }
 }
 
 extern int main()
@@ -64,6 +106,19 @@ extern int main()
     // A constructed prvalue moved into a bound by-value callee is an xvalue: deleted move refused.
     expect_error("clang: call to deleted constructor of 'cppi::XvNoMove'") {
         int r = cppi.xv_take_nomove(move cppi.XvNoMove(7));
+    }
+    // Trivially copyable NoMove: its copy assignment is implicitly deleted, so `move` refuses.
+    expect_error("cannot move-assign C++ class 'e6mv.NoMove' from 'move a'") {
+        e6mv.NoMove a = e6mv.NoMove(7);
+        e6mv.NoMove c = e6mv.NoMove(9);
+        c = move a;
+    }
+    // A nested xvalue join takes the same pick: clang refuses the deleted copy assignment.
+    expect_error("cannot move-assign C++ class 'e6mv.NoMove' from 'move k?(j?movea:moveb):moved'") {
+        int k = 1; int j = 0;
+        e6mv.NoMove a = e6mv.NoMove(7); e6mv.NoMove b = e6mv.NoMove(8);
+        e6mv.NoMove d = e6mv.NoMove(9); e6mv.NoMove c = e6mv.NoMove(10);
+        c = k ? (j ? move a : move b) : move d;
     }
     // Controls: a move-only class moves; XvNoMove copies from a const source.
     cppi.XvMoveOnly m = cppi.XvMoveOnly(10);

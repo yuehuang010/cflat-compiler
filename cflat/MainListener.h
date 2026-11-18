@@ -43,6 +43,29 @@
 #include "TypeMangling.h"
 #include "LspSymbolIndex.h"
 
+inline bool HasAssignmentOperator(CFlatParser::AssignmentExpressionContext* expression)
+{
+    return expression != nullptr
+        && (expression->assignmentOperator() != nullptr
+            || expression->castAssignmentTarget() != nullptr);
+}
+
+inline bool IsSimpleAssignmentExpression(CFlatParser::AssignmentExpressionContext* expression)
+{
+    if (expression == nullptr) return false;
+    if (expression->castAssignmentTarget() != nullptr) return true;
+    auto* op = expression->assignmentOperator();
+    return op != nullptr && op->Assign() != nullptr;
+}
+
+inline std::string AssignmentOperatorText(CFlatParser::AssignmentExpressionContext* expression)
+{
+    if (expression == nullptr) return {};
+    if (expression->castAssignmentTarget() != nullptr) return "=";
+    auto* op = expression->assignmentOperator();
+    return op == nullptr ? std::string() : op->getText();
+}
+
 // Preserve the written star as an element pointer before Pointer becomes the view pointer.
 LLVM_ATTRIBUTE_NOINLINE static void SetFunctionPointerArrayViewShape(
     LLVMBackend::TypeAndValue& type)
@@ -1500,6 +1523,8 @@ void NamedLocalReturnVisit(antlr4::tree::ParseTree* node, NamedLocalReturnScan& 
 // since a return inside both would have to name both. Returns in declaration order.
 std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandidates(
     CFlatParser::FunctionDefinitionContext* func);
+std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandidates(
+    CFlatParser::LambdaExpressionContext* lambda);
 
 // Locals whose initializer and every whole-variable assignment resolve to this or another such local.
 std::unordered_set<CFlatParser::DirectDeclaratorContext*> ClassifyThisReceiverAliasLocals(
@@ -4956,6 +4981,11 @@ public:
     // (`return (f ? x : y);`), or null. Shape probe only.
     static CFlatParser::ConditionalExpressionContext* SoleTernaryExpression(
         antlr4::tree::ParseTree* node);
+    // True when a move leaf of the join (ctx, climbed to its outermost ternary) is const: a
+    // const field, deref or bare name root. clang's composite is then const and never moves.
+    bool JoinMoveLeafConst(CFlatParser::ConditionalExpressionContext* ctx);
+    // Const-ness of the object a move operand moves, from its unevaluated resolved type.
+    bool MoveOperandConst(CFlatParser::MoveExpressionContext* mv);
     // Signature of one arm of a bare `function f = c ? a : b;`: a plain local/argument name (its
     // declared function type) or a plain function name with exactly one overload. False otherwise.
     bool ResolveBareFunctionArmSignature(antlr4::ParserRuleContext* arm,
@@ -5283,6 +5313,7 @@ public:
      */
     void RejectNonHeapAddressIntoUnique(const std::string& destDesc,
                                         antlr4::ParserRuleContext* ctx);
+    bool IsProvableNonHeapAddressJoin(LLVMBackend* compiler, llvm::Value* value) const;
 
     /*
      * The LOCAL counterpart of RejectBorrowIntoUniqueField: a BORROW stored into a `unique` local.
@@ -6904,6 +6935,8 @@ public:
     // caller that would read the cast name as a type asks this first.
     bool CastIsCallSpelling(CFlatParser::CastExpressionContext* ctx);
     std::string CastCallFragment(CFlatParser::CastExpressionContext* ctx);
+    LLVMBackend::NamedVariable ParseCastAssignmentTarget(
+        CFlatParser::CastAssignmentTargetContext* ctx, ResultUse use = ResultUse::Value);
     CFlatParser::AssignmentExpressionContext* CastCallInitializer(CFlatParser::AssignmentExpressionContext* assign);
     CallFragmentParse* NewCallFragment(LLVMBackend* compiler, const std::string& text);
     bool TryReparseCastAsCall(CFlatParser::CastExpressionContext* ctx, bool lvalue, ResultUse use,
@@ -7657,9 +7690,10 @@ public:
     }
     // Each source arm of a '?:' / '??' join that feeds a unique field store gets the same refusal
     // its plain form gets (a field of a borrowed by-value parameter). True when refused.
+    // aliasArmsOnly: only the alias-arm refusal (the plain store's diagnostic), no consume checks.
     bool RejectJoinedSourceIntoUniqueField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& rightNV,
-        antlr4::ParserRuleContext* ctx);
+        antlr4::ParserRuleContext* ctx, bool aliasArmsOnly = false);
 
     // Reject an owning-field overwrite when the field path roots at a borrowed by-value
     // parameter or an alias-borrow local. The drop-old destructor would free the real owner's
@@ -7942,6 +7976,7 @@ public:
     bool ResolveCxxDeferredCallArm(antlr4::tree::ParseTree* node, LLVMBackend::NamedVariable& callable,
                                    LLVMBackend::TypeAndValue& returnType);
     bool IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool condition = false);
+    bool IsCxxSideEffectFreeScalarExpression(antlr4::tree::ParseTree* node);
     // T518: whether `ctx` names a local or parameter whose storage is one of `storage`'s roots.
     bool ArgumentNamesStorageRoot(antlr4::ParserRuleContext* ctx, llvm::Value* storage,
                                  const std::string& thisFieldPath, bool* mayWrite = nullptr,

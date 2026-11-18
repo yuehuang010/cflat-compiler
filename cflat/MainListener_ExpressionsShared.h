@@ -395,7 +395,7 @@ inline bool TernaryIsBinaryOperand(CFlatParser::ConditionalExpressionContext* ct
             if (postfix->children.size() > 1) return false;
         if (IsBinaryExpressionRuleWithOperator(parent)) return true;
         if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent))
-            if (assignment->assignmentOperator() != nullptr) return true;
+            if (HasAssignmentOperator(assignment)) return true;
     }
     return false;
 }

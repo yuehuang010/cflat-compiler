@@ -1358,9 +1358,9 @@ public:
             if (PointerDepthRefuses(other))
                 return false;
 
-            // View-to-view: the ELEMENT star is part of the type, so 'int*[]' is not 'int[]'.
-            // Both sides record it (a view spells depth about its element), so this is proven.
-            if (IsArrayView && other.IsArrayView && ElemPointer != other.ElemPointer)
+            // A view spells pointer depth about its element; the legacy bit collapses 2+ to true.
+            if (IsArrayView && other.IsArrayView
+                && ElementPointerDepth() != other.ElementPointerDepth())
                 return false;
 
             if (TypeName == other.TypeName)
@@ -2677,6 +2677,9 @@ public:
         bool         sourceMovePathHasDynamicIndex = false;
         bool         sourceIsElementAccess = false;
         bool         sourceIsPointeeMove = false;
+        bool         sourceRootIsAliasBorrowLocal = false;
+        // Borrowed-parameter origin of the source field read; empty when the read owns its root.
+        std::string  sourceBorrowedOrigin;
         bool         sourceRootIsBorrowedThisField = false;
         std::string  sourceThisFieldPath;
         std::vector<ConditionalMoveSource> conditionalMoveSources;
@@ -3310,6 +3313,10 @@ public:
                                   llvm::Value* joined);
     bool IsUniqueFieldReadValue(const llvm::Value* value) const;
     const UniqueFieldReadJoin* FindUniqueFieldReadJoin(const llvm::Value* value) const;
+    const UniqueFieldReadSource* FindUniqueFieldReadSource(
+        const llvm::Value* storage, const llvm::BasicBlock* block = nullptr) const;
+    const UniqueFieldReadSource* FindUniqueFieldReadValueSource(
+        const llvm::Value* value) const;
 
     void RegisterAliasValue(llvm::Value* value);
     bool IsAliasValue(const llvm::Value* value) const;
@@ -5062,6 +5069,9 @@ private:
     // alias name -> the C++ spelling, requested under the alias's own name on first use.
     std::unordered_map<std::string, std::string> cxxLazyAliasSpecializations_;
     std::unordered_set<std::string> cxxTopLevelConstTypeAliases_;
+    // Preserve C++ import provenance after a lazy typedef is materialized. Cast-assignment
+    // syntax accepts imported record aliases, while CFlat `using` aliases remain refused.
+    std::unordered_set<std::string> cxxImportedTypeAliases_;
     // A global-scope C++-import typedef of a non-record type (DWORD, a function pointer): name ->
     // clang's canonical spelling, mapped and bound as an alias on first lookup of the name.
     std::unordered_map<std::string, std::string> cxxLazyGlobalTypedefs_;
@@ -7978,6 +7988,9 @@ private:
     bool IsCxxFunctionTemplateParameterByValue(const std::string& functionName,
                                                const std::string& ownerType,
                                                size_t parameterIndex, size_t arity) const;
+    bool IsCxxFunctionTemplateParameterDirectType(const std::string& functionName,
+                                                  const std::string& ownerType,
+                                                  size_t parameterIndex, size_t arity) const;
     // T-constst3: every static member template that fits the arity takes the slot by `const place &`.
     bool IsCxxStaticTemplateConstRefParameter(const std::string& qualifiedName,
                                               size_t parameterIndex, size_t arity,
@@ -9158,7 +9171,8 @@ public:
     // value member still reads "not a type" rather than "no member type".
     std::unordered_map<std::string, std::unordered_set<std::string>> aggregateValueMembers_;
     bool IsImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
-                                                    const TypeAndValue& to) const;
+                                                    const TypeAndValue& to,
+                                                    bool includeDepthMismatch = true) const;
     void RejectImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
                                                         const TypeAndValue& to);
     std::string ImplicitIntegerPointeeConversionText(const TypeAndValue& from,
@@ -10184,8 +10198,8 @@ public:
      * them. An unknown arm does not erase the proof supplied by a literal arm.
      */
     bool JoinIsAllStringLiterals(const llvm::Value* value, int depth = 0) const;
-    // True when every non-null leaf of a pointer ternary is a literal or resolved `char*`.
-    bool JoinIsCharPointer(const llvm::Value* value) const;
+    // True when every non-null leaf of a pointer join is a literal or resolved `char*`.
+    bool JoinIsCharPointer(const llvm::Value* value, bool includeNullCoalesce = false) const;
     std::string DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
                                                        const std::string& destDesc) const;
 
@@ -11405,6 +11419,12 @@ public:
                                                 const std::string& methodName,
                                                 const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    bool IsCxxImportedTypeAlias(const std::string& name) const
+    {
+        for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
+            if (frame.typeAliases.count(name) != 0) return false;
+        return cxxImportedTypeAliases_.count(name) != 0;
+    }
     bool IsCxxFriendName(const std::string& simpleName) const
     {
         return cxxFriendNames_.count(simpleName) != 0;
@@ -12111,6 +12131,8 @@ public:
                                                    bool constSource = false,
                                                    bool allowExplicit = false) const;
     const CxxClassInfo::Structor* FindCxxMoveCtor(const std::string& typeName) const;
+    bool TryGetCxxNamedReturnCtorReachability(const std::string& typeName,
+                                               bool& reachable) const;
     const CxxClassInfo::Structor* TryBindCxxGeneratedMoveCtor(const std::string& typeName);
     /*
      * Pick the constructor overload for `T(args)` from the argument types alone. Reports and
@@ -12596,6 +12618,9 @@ public:
     // move, const-qualified assignment).
     bool CxxTrivialMoveNeedsTransfer(const std::string& typeName, bool constSource,
                                      bool assignment);
+    // A user-declared deleted move constructor and no assignment of its own: the implicit copy
+    // assignment is deleted, so clang refuses `dst = xvalue` (a byte copy would silently pass).
+    bool CxxCopyAssignImplicitlyDeleted(const std::string& typeName) const;
     // Constructs that pick into a temporary `nv` then names; false when it does not apply or
     // with `refusal` set when clang refuses.
     bool MaterializeTrivialCxxExplicitMove(NamedVariable& nv, const std::string& sourceName,

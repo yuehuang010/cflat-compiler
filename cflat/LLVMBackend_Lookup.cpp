@@ -153,6 +153,15 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
                                            const LLVMBackend::TypeAndValue& rawSrc,
                                            std::string& destElement, std::string& srcElement) const
 {
+        auto elementDepth = [](const LLVMBackend::TypeAndValue& type) {
+            if (type.IsArrayView) return type.ElementPointerDepth();
+            if (type.Pointer) return std::max(type.ValuePointerDepth() - 1, 0);
+            return type.ElementPointerDepth();
+        };
+        auto spellElement = [&](const LLVMBackend::TypeAndValue& type) {
+            const std::string base = type.TypeName.empty() ? "T" : type.TypeName;
+            return base + std::string(elementDepth(type), '*');
+        };
         // A FIXED array binds to a VIEW destination by decaying to its own view, so it indexes by
         // its own element too. Scoped to a view destination: the one-way 'T[] -> T*' decay keeps
         // its own byte/scalar reinterpret rules, and a simd value is not an element source.
@@ -169,9 +178,9 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
             // No rebox is emitted per view element, so every element must ALREADY carry this
             // interface's fat pointer. Unproven (unnamed) elements are accepted, not rejected.
             if (dest.TypeName.empty() || src.TypeName.empty()) return false;
-            if (dest.ElemPointer == src.ElemPointer && dest.TypeName == src.TypeName) return false;
-            destElement = dest.TypeName + (dest.ElemPointer ? "*" : "");
-            srcElement = src.TypeName + (src.ElemPointer ? "*" : "");
+            if (elementDepth(dest) == elementDepth(src) && dest.TypeName == src.TypeName) return false;
+            destElement = spellElement(dest);
+            srcElement = spellElement(src);
             return true;
         }
         // A function-value view indexes by its element star alone; its signature is ranked elsewhere.
@@ -190,7 +199,7 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
 
         // The DEPTH axis needs no name: an unnamed loaded view value still records its element
         // star, and a pointer element against a value element is proven either way.
-        bool depthDiffers = dest.ElemPointer != src.ElemPointer;
+        bool depthDiffers = elementDepth(dest) != elementDepth(src);
         bool nameDiffers = false;
         if (dest.IsArrayView && !depthDiffers
             && !dest.TypeName.empty() && !src.TypeName.empty() && dest.TypeName != src.TypeName)
@@ -212,10 +221,8 @@ bool LLVMBackend::ArrayViewElementMismatch(const LLVMBackend::TypeAndValue& dest
         if (!depthDiffers && !nameDiffers) return false;
 
         // 'T' stands in when a loaded value carries no declared name; the star half is always known.
-        destElement = (dest.TypeName.empty() ? std::string("T") : dest.TypeName)
-            + (dest.ElemPointer ? "*" : "");
-        srcElement = (src.TypeName.empty() ? std::string("T") : src.TypeName)
-            + (src.ElemPointer ? "*" : "");
+        destElement = spellElement(dest);
+        srcElement = spellElement(src);
         return true;
     }
 

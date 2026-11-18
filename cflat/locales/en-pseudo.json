@@ -298,11 +298,19 @@
       "int[]",
       "int"
     ],
+    "cannotbindanarrayvie...chthepointerspointeefb2dc13d38787044": [
+      "int",
+      "int*"
+    ],
     "cannotbindanarrayvie...eemaydecaytoapointer2a051f8345ba8873": [
       "int",
       "int*"
     ],
     "cannotbindanarrayvie...lementtypesmustmatch3c93d43fe1f8dd3a": [
+      "AvmIface",
+      "int"
+    ],
+    "cannotbindanarrayvie...tmatchthedestinationfdce27c470891950": [
       "AvmIface",
       "int"
     ],
@@ -519,6 +527,10 @@
     ],
     "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": [
       "p0"
+    ],
+    "cannotreturnanarrayv...stmatchthereturntype7359e3ee7919a245": [
+      "AvmIface",
+      "int"
     ],
     "cannotreturnanarrayv...theelementsmustmatch03392cfecad7b037": [
       "AvmIface",
@@ -2117,8 +2129,10 @@
     "cannotassignarg0toar...thanexplicitcastarg4fac024c4cf80f689": "cannot assign {0} to '{1}' destination {2}: only a named function, a '{3}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{4}'.",
     "cannotassignarg0tocl...thanexplicitcastarg3b001825100666242": "cannot assign {0} to closure destination {1}: only a named function, a '{2}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotbindaarg0value...llonenotasinglevalue0596274fbb0f0913": "cannot bind a '{0}' value to array view '{1}' - a view indexes whole '{2}' elements, so its source must be an array view (or a null one), not a single value",
+    "cannotbindanarrayvie...chthepointerspointeefb2dc13d38787044": "cannot bind an array view of '{0}' to a plain pointer whose pointee is '{1}' - the view's element type and pointer depth must match the pointer's pointee",
     "cannotbindanarrayvie...eemaydecaytoapointer2a051f8345ba8873": "cannot bind an array view of '{0}' to a plain pointer whose pointee is '{1}' - only a view whose element matches the pointee may decay to a pointer",
     "cannotbindanarrayvie...lementtypesmustmatch3c93d43fe1f8dd3a": "cannot bind an array view of '{0}' to a destination of '{1}' - a view indexes by its own element, so the element types must match",
+    "cannotbindanarrayvie...tmatchthedestinationfdce27c470891950": "cannot bind an array view of '{0}' to a destination of '{1}' - the view's element type and pointer depth must match the destination",
     "cannotbindanowningca...rawpointerexplicitly97184b875fcd0fe7": "cannot bind an owning call result to raw pointer '{0}' - nothing frees it. Bind it to a 'unique' local, or call '.release()' to take the raw pointer explicitly",
     "cannotbraceinitializ...lonenotasingleobjectec2caca65ac1fee1": "cannot brace-initialize array-view field '{0}.{1}' ('{2}') from '{3}' - a view indexes whole '{4}' elements, so its source must be an array view of '{5}' (or a null one), not a single object",
     "cannotconvertarg0tob...implicitoperatorbool61d893b2ebf00f2d": "cannot convert '{0}' to 'bool': it is not a scalar and declares no implicit 'operator bool'",
@@ -2167,6 +2181,7 @@
     "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}, ... (and {4} more)]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": "cannot pass to C function-pointer parameter '{0}': this 'function<>' value may store captured state. A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",
     "cannotrepairtheexter...arationisalreadyused97e1fff5ca82f8ac": "cannot repair the extern '{0}' declaration after ABI lowering was selected: the old declaration is already used",
+    "cannotreturnanarrayv...stmatchthereturntype7359e3ee7919a245": "cannot return an array view of '{0}' from a function whose return element is '{1}' - the view's element type and pointer depth must match the return type",
     "cannotreturnanarrayv...theelementsmustmatch03392cfecad7b037": "cannot return an array view of '{0}' from a function whose return element is '{1}' - a view indexes by its own element, so the elements must match",
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": "cannot return {0} as a '{1}' value: only a named function, a '{2}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": "cannot return {0} as a closure: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",

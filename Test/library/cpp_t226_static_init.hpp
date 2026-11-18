@@ -83,5 +83,16 @@ struct HA {
 };
 inline H2 mkH2(int x) { return H2(x); }
 inline HA mkHA(int x) { return HA(x); }
+// STATELEM r3: a const member of a class temporary, and a mutable member under a const root.
+struct HC {
+    const B cd;
+    HC(int x) : cd(x) {}
+};
+inline HC mkHC(int x) { return HC(x); }
+struct HM {
+    B m;
+    HM(int x) : m(x) {}
+};
+inline const HM mkHM(int x) { return HM(x); }
 inline void reset() { made = copies = moves = dead = conv = 0; }
 }

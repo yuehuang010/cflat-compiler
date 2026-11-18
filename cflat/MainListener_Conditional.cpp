@@ -159,10 +159,10 @@ LLVM_ATTRIBUTE_NOINLINE LLVMBackend::TypedValue MainListener::ParseTernaryArmExp
         CFlatParser::ExpressionContext* ctx) {
         auto* assignCtx = ctx->assignmentExpression();
         auto* bareIdentifier = BareIdentifierInExpression(ctx);
-        if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr)
+        if (assignCtx != nullptr && !HasAssignmentOperator(assignCtx))
             if (auto* move = TopLevelMoveExpression(ctx))
                 return ParseTernaryMoveArm(move, ctx);
-        if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr
+        if (assignCtx != nullptr && !HasAssignmentOperator(assignCtx)
             && assignCtx->conditionalExpression() != nullptr
             && bareIdentifier == nullptr)
         {
@@ -171,7 +171,7 @@ LLVM_ATTRIBUTE_NOINLINE LLVMBackend::TypedValue MainListener::ParseTernaryArmExp
             CarryNestedTernaryBorrow(Compiler(ctx), tv);
             return tv;
         }
-        if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr
+        if (assignCtx != nullptr && !HasAssignmentOperator(assignCtx)
             && bareIdentifier != nullptr)
         {
             auto named = ParseAssignmentExpressionNamed(assignCtx);
@@ -331,7 +331,7 @@ static CFlatParser::ConditionalExpressionContext* DeferrableTernaryNode(antlr4::
                 conditional != nullptr && conditional->Question() != nullptr)
                 return conditional;
             if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
-                assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                HasAssignmentOperator(assignment))
                 return nullptr;
             auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
             if (rule == nullptr) return nullptr;
@@ -829,6 +829,154 @@ bool MainListener::IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool c
         if (local == nullptr || local->Storage == nullptr) return false;
         // A condition must be a builtin read; overloaded operator bool may mutate an earlier leaf.
         return CxxInertLocalReadType(Compiler(), local->TypeAndValue, condition);
+}
+
+bool MainListener::IsCxxSideEffectFreeScalarExpression(antlr4::tree::ParseTree* node)
+{
+        auto* compiler = Compiler();
+        auto resolveNameType = [&](antlr4::tree::TerminalNode* identifier,
+                                   LLVMBackend::TypeAndValue& type) {
+            if (identifier == nullptr) return false;
+            const std::string name = identifier->getText();
+            auto local = compiler->GetScopedLocalOrArgument(name);
+            if (local.Storage != nullptr || local.Primary != nullptr || local.BitfieldStorage != nullptr)
+            {
+                type = local.TypeAndValue;
+                return true;
+            }
+            const LLVMBackend::StructData* thisStruct = nullptr;
+            const LLVMBackend::BitfieldInfo* bitfield = nullptr;
+            int fieldIndex = -1;
+            if (compiler->FindImplicitThisField(name, &thisStruct, &fieldIndex, &bitfield))
+            {
+                if (bitfield != nullptr)
+                {
+                    type.TypeName = bitfield->TypeName;
+                    return true;
+                }
+                if (thisStruct != nullptr && fieldIndex >= 0
+                    && static_cast<size_t>(fieldIndex) < thisStruct->StructFields.size())
+                {
+                    type = static_cast<const LLVMBackend::TypeAndValue&>(
+                        thisStruct->StructFields[static_cast<size_t>(fieldIndex)]);
+                    return true;
+                }
+            }
+            auto globalType = compiler->globalVariableTypes.find(name);
+            if (globalType != compiler->globalVariableTypes.end())
+            {
+                type = globalType->second;
+                return true;
+            }
+            return false;
+        };
+        auto isScalarType = [](const LLVMBackend::TypeAndValue& type) {
+            return type.IsPrimitive() || type.Pointer || type.PointerDepth != 0;
+        };
+        auto isScalar = [&](auto&& self, antlr4::tree::ParseTree* expression) -> bool {
+            if (auto* expr = dynamic_cast<CFlatParser::ExpressionContext*>(expression))
+                return expr->assignmentExpression() != nullptr
+                    && self(self, expr->assignmentExpression());
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(expression))
+            {
+                if (assignment->assignmentOperator() != nullptr) return false;
+                if (assignment->conditionalExpression() != nullptr)
+                    return self(self, assignment->conditionalExpression());
+                return assignment->DigitSequence() != nullptr;
+            }
+            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(expression))
+            {
+                if (conditional->expression() != nullptr || conditional->QuestionQuestion() != nullptr)
+                    return false;
+                return conditional->logicalOrExpression() != nullptr
+                    && self(self, conditional->logicalOrExpression());
+            }
+            if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(expression))
+            {
+                if (unary->postfixExpression() != nullptr)
+                    return self(self, unary->postfixExpression());
+                auto* op = unary->unaryOperator();
+                return op != nullptr && unary->castExpression() != nullptr
+                    && (op->Plus() != nullptr || op->Minus() != nullptr
+                        || op->Tilde() != nullptr || op->Not() != nullptr)
+                    && self(self, unary->castExpression());
+            }
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(expression))
+            {
+                if (cast->castTypeName() != nullptr) return false;
+                return cast->unaryExpression() != nullptr && self(self, cast->unaryExpression());
+            }
+            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(expression))
+            {
+                if (!postfix->LeftParen().empty() || !postfix->LeftBracket().empty()
+                    || !postfix->Arrow().empty() || !postfix->QuestionDot().empty()
+                    || !postfix->PlusPlus().empty() || !postfix->MinusMinus().empty())
+                    return false;
+                auto* primary = postfix->primaryExpression();
+                if (primary == nullptr) return false;
+                if (primary->expression() != nullptr)
+                    return postfix->children.size() == 1 && self(self, primary->expression());
+                if (primary->Constant() != nullptr || primary->NullPtrConstant() != nullptr
+                    || !primary->StringLiteral().empty())
+                    return postfix->Dot().empty();
+                auto* generic = primary->genericIdentifier();
+                auto* baseIdentifier = generic != nullptr ? generic->Identifier() : nullptr;
+                if (baseIdentifier == nullptr || generic->genericTypeParameters() != nullptr
+                    || postfix->Dot().size() != postfix->memberNameToken().size())
+                    return false;
+                LLVMBackend::TypeAndValue valueType;
+                if (!resolveNameType(baseIdentifier, valueType)) return false;
+                for (auto* member : postfix->memberNameToken())
+                {
+                    auto* memberIdentifier = member->Identifier();
+                    if (memberIdentifier == nullptr) return false;
+                    auto structure = compiler->GetDataStructure(valueType.TypeName);
+                    if (structure.StructType == nullptr)
+                        structure = compiler->GetDataStructure(compiler->ResolveTypeAlias(valueType.TypeName));
+                    auto field = std::find_if(structure.StructFields.begin(), structure.StructFields.end(),
+                        [&](const auto& candidate) {
+                            return candidate.VariableName == memberIdentifier->getText();
+                        });
+                    if (field == structure.StructFields.end()) return false;
+                    valueType = static_cast<const LLVMBackend::TypeAndValue&>(*field);
+                }
+                return isScalarType(valueType);
+            }
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(expression))
+            {
+                if (primary->Constant() != nullptr || primary->NullPtrConstant() != nullptr
+                    || !primary->StringLiteral().empty()) return true;
+                if (primary->expression() != nullptr) return self(self, primary->expression());
+                return false;
+            }
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(expression);
+            if (rule == nullptr) return false;
+            const bool builtinBinary =
+                dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::AndExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::EqualityExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::RelationalExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::ShiftExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::AdditiveExpressionContext*>(rule) != nullptr
+                || dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(rule) != nullptr;
+            if (builtinBinary)
+            {
+                bool hasOperand = false;
+                for (auto* child : rule->children)
+                {
+                    auto* childRule = dynamic_cast<antlr4::ParserRuleContext*>(child);
+                    if (childRule == nullptr) continue;
+                    hasOperand = true;
+                    if (!self(self, childRule)) return false;
+                }
+                return hasOperand;
+            }
+            return rule->children.size() == 1 && self(self, rule->children.front());
+        };
+        return isScalar(isScalar, node);
 }
 
 bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx,
@@ -2540,6 +2688,53 @@ static void JoinElementBorrow(LLVMBackend* compiler, LLVMBackend::TypedValue& re
         : elem.sourceCallerName;
 }
 
+// Const-ness of the object a move leaf moves (clang's cv of the final operand). Typed unevaluated,
+// so the operand's own resolved type decides: a `->` takes the pointee, a `.` inherits the object's
+// const and adds the member's, so a mutable pointer to a const N stays mutable, a const member
+// under a mutable root is const, and implicit-this and global roots resolve the same way.
+bool MainListener::MoveOperandConst(CFlatParser::MoveExpressionContext* mv) {
+    if (mv == nullptr || mv->unaryExpression() == nullptr) return false;
+    auto operand = EvaluateOperandTypeOnly([&]() {
+        return ParseUnaryExpression(mv->unaryExpression(), ResultUse::Value);
+    });
+    if (!operand.HasValue) return false;
+    const auto& type = operand.Type;
+    return type.Pointer ? type.PointeeConst() : CxxTernaryArmConst(type);
+}
+
+// clang's composite of a move join is const when a move leaf is const (MoveOperandConst). The
+// composite then binds no move ctor / move-assign.
+bool MainListener::JoinMoveLeafConst(CFlatParser::ConditionalExpressionContext* ctx) {
+    // Climb through parentheses and single-child rules only; a condition operand is no join.
+    auto* top = ctx;
+    antlr4::tree::ParseTree* from = ctx;
+    for (antlr4::tree::ParseTree* p = ctx->parent; p != nullptr; from = p, p = p->parent)
+    {
+        auto* up = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(p);
+        if (up != nullptr && up->expression() != nullptr && up->conditionalExpression() != nullptr)
+        {
+            if (from == up->logicalOrExpression()) break;
+            top = up;
+            continue;
+        }
+        const bool parens = p->children.size() == 3 && p->children[0]->getText() == "(";
+        if (p->children.size() != 1 && !parens) break;
+    }
+    std::function<bool(antlr4::tree::ParseTree*)> leafConst =
+        [&](antlr4::tree::ParseTree* arm) -> bool {
+        if (auto* nested = SoleTernaryExpression(arm); nested != nullptr)
+            return nested->expression() != nullptr && nested->conditionalExpression() != nullptr
+                && (leafConst(nested->expression()->assignmentExpression())
+                    || leafConst(nested->conditionalExpression()));
+        auto* mv = TopLevelMoveExpression(arm);
+        if (mv == nullptr || mv->unaryExpression() == nullptr) return false;
+        return MoveOperandConst(mv);
+    };
+    return top->expression() != nullptr && top->conditionalExpression() != nullptr
+        && (leafConst(top->expression()->assignmentExpression())
+            || leafConst(top->conditionalExpression()));
+}
+
 // The `?:` an arm is, looking through parentheses: `a ? X : (b ? Y : Z)` nests a claim on the
 // declaration slot, which a plain operand (not a `?:`) must pass on rather than consume.
 
@@ -2579,6 +2774,23 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 && !outerExpected.Pointer && !outerExpected.IsArrayView
                 && !compiler->IsInterfaceType(MangledGenericArgument(
                     *compiler, outerExpected.TypeName)));
+        auto trackGlobalUniquePointerArm = [&](llvm::Value* value, llvm::Value* storage,
+                                                const LLVMBackend::TypedValue& shape) {
+            if (!uniquePointerDestination || value == nullptr || storage == nullptr
+                || !shape.hasSourceType || !shape.sourceType.IsUnique
+                || !shape.sourceType.Pointer || shape.isExplicitMove
+                || !llvm::isa<llvm::GlobalVariable>(storage))
+                return;
+            LLVMBackend::NamedVariable source;
+            source.Primary = value;
+            source.Storage = storage;
+            source.BaseType = value->getType();
+            source.CallerName = compiler->FindVariableNameByStorage(storage);
+            source.TypeAndValue = shape.sourceType;
+            source.TypeAndValue.IsMove = false;
+            source.IsOwning = true;
+            compiler->RegisterUniqueFieldRead(value, storage, {}, source);
+        };
         auto isFunctionValueDestination = [&](const LLVMBackend::TypeAndValue& destination) {
             if (!destination.FuncPtrReturnTypeName.empty()) return true;
             if (destination.Pointer) return false;
@@ -2746,40 +2958,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             return true;
         };
-        // clang's composite of the move arms is const when a move leaf of the outermost ternary is
-        // const. Only bare const leaves of the declared class count (field leaves stay master's).
-        auto joinMoveConst = [&]() {
-            // Climb through parentheses and single-child rules only; a condition operand is no join.
-            auto* top = ctx;
-            antlr4::tree::ParseTree* from = ctx;
-            for (antlr4::tree::ParseTree* p = ctx->parent; p != nullptr; from = p, p = p->parent)
-            {
-                auto* up = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(p);
-                if (up != nullptr && up->expression() != nullptr && up->conditionalExpression() != nullptr)
-                {
-                    if (from == up->logicalOrExpression()) break;
-                    top = up;
-                    continue;
-                }
-                const bool parens = p->children.size() == 3 && p->children[0]->getText() == "(";
-                if (p->children.size() != 1 && !parens) break;
-            }
-            std::function<bool(antlr4::tree::ParseTree*)> leafConst =
-                [&](antlr4::tree::ParseTree* arm) -> bool {
-                if (auto* nested = SoleTernaryExpression(arm); nested != nullptr)
-                    return nested->expression() != nullptr && nested->conditionalExpression() != nullptr
-                        && (leafConst(nested->expression()->assignmentExpression())
-                            || leafConst(nested->conditionalExpression()));
-                auto* mv = TopLevelMoveExpression(arm);
-                if (mv == nullptr || mv->unaryExpression() == nullptr) return false;
-                auto* nv = compiler->FindLiveNamedVariable(mv->unaryExpression()->getText());
-                return nv != nullptr && CxxTernaryArmConst(nv->TypeAndValue)
-                    && compiler->ResolveTypeAlias(nv->TypeAndValue.TypeName) == compiler->ResolveTypeAlias(cxxTernaryDeclType);
-            };
-            return top->expression() != nullptr && top->conditionalExpression() != nullptr
-                && (leafConst(top->expression()->assignmentExpression())
-                    || leafConst(top->conditionalExpression()));
-        };
         auto moveCxxTernaryArmIntoDecl = [&](llvm::Value* armValue, llvm::Value* armStorage,
                                               const LLVMBackend::OwnedTempMark& armMark,
                                               bool explicitMove,
@@ -2797,6 +2975,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 ++cxxTernaryDeclScalarArms;
                 return;
             }
+            const bool fieldOfTemp = !explicitMove && armValue != nullptr && armStorage != nullptr
+                && compiler->IsFieldOfOwnedStructTemp(armStorage, armValue);
             // A derived class arm (`D(1)`, or a D lvalue or xvalue) slices into the declared base.
             // A prvalue slices now; an lvalue or xvalue waits for the other arm's category.
             if (armValue != nullptr && armStorage != nullptr)
@@ -2810,10 +2990,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     slice.BaseType = armValue->getType();
                     slice.TypeAndValue.TypeName = armStruct->getName().str();
                     LLVMBackend::NamedVariable ownedProbe = slice;
-                    const bool derivedMove = explicitMove && !CxxTernaryArmConst(armType) && !joinMoveConst();
+                    const bool derivedMove = explicitMove && !CxxTernaryArmConst(armType)
+                        && !JoinMoveLeafConst(ctx);
                     // A field of an owned temp (`mkH(1).d`) is an xvalue, not a place (clang).
-                    const bool fieldOfTemp = !explicitMove
-                        && compiler->IsFieldOfOwnedStructTemp(armStorage, armValue);
                     slice.IsRvalue = derivedMove || fieldOfTemp || compiler->IsOwnedTempValue(ownedProbe);
                     if (compiler->IsCxxDerivedToBaseValue(slice.TypeAndValue,
                             LLVMBackend::TypeAndValue{ .TypeName = cxxTernaryDeclType }, &slice))
@@ -2851,7 +3030,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         return;
                     }
                 }
-            llvm::Value* temp = compiler->lastCxxRetTemp_;
+            // A field or element of an owned temp is a place inside that temp, not the call's
+            // return temporary the arm last published (`mkHA(1).a[0]` keeps `mkHA`'s sret).
+            llvm::Value* temp = fieldOfTemp ? nullptr : compiler->lastCxxRetTemp_;
             if (temp == nullptr && armStorage != nullptr)
             {
                 LLVMBackend::NamedVariable tempNV;
@@ -2877,7 +3058,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 // An explicit move zeroed its source: restore the loaded bytes, then move the C++
                 // fields (the source stays a live moved-from object, as in a plain `T x = move y;`).
                 const bool lowered = compiler->IsLoweredCFlatOnlyStruct(cxxTernaryDeclType);
-                const bool useMove = explicitMove && !joinMoveConst();
+                const bool useMove = (explicitMove && !JoinMoveLeafConst(ctx))
+                    || (fieldOfTemp && !CxxTernaryArmConst(armType));
                 bool copied = false;
                 if (lowered && useMove)
                 {
@@ -3552,23 +3734,32 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
          * other sinks keep the mixed-ownership rejection.
          */
         // A reference-returning C++ call is an alias arm with real storage, so it copies too.
+        // A const field of a temp is copied, not moved (clang): only a mutable one is an xvalue.
+        auto isOwnedTempField = [&](llvm::Value* value, llvm::Value* storage,
+                                    const LLVMBackend::TypeAndValue& armType) {
+            return value != nullptr && storage != nullptr && !CxxTernaryArmConst(armType)
+                && compiler->IsFieldOfOwnedStructTemp(storage, value);
+        };
         auto isCopyableCxxLvalueArm = [&](llvm::Value* value, llvm::Value* storage,
-                                          llvm::Type* joinType, bool explicitMove) {
+                                          llvm::Type* joinType, bool explicitMove,
+                                          const LLVMBackend::TypeAndValue& armType) {
             return !cxxTernaryDecl && use != ResultUse::Discard && !trueDefault
                 && autoDeclTernary && !outerExpected.IsAlias && !compiler->currentFunctionReturnTV.IsAlias
                 && value != nullptr && value->getType() == joinType
                 && isAddressableLvalue(value, storage)
-                && (explicitMove || !compiler->IsTempFieldValue(value));
+                && (explicitMove || !compiler->IsTempFieldValue(value)
+                    || isOwnedTempField(value, storage, armType));
         };
         auto materializeCxxLvalueArm = [&]() {
             if (sharedCxxRetTemp != nullptr || trueValue == nullptr || falseValue == nullptr)
                 return;
             if (trueCxxRetTemp != nullptr
                 && isCopyableCxxLvalueArm(falseValue, falseStorage, trueValue->getType(),
-                                           falseExplicitMove))
+                                           falseExplicitMove, falseShape.sourceType))
             {
                 if (!compiler->EmitCxxCopyOrMoveConstruct(sharedCxxRetType, trueCxxRetTemp,
-                        falseStorage, /*useMove*/ falseExplicitMove,
+                        falseStorage, /*useMove*/ falseExplicitMove
+                            || isOwnedTempField(falseValue, falseStorage, falseShape.sourceType),
                         "into a conditional expression"))
                     return;
                 sharedCxxRetTemp = trueCxxRetTemp;
@@ -3584,7 +3775,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (trueCxxRetTemp != nullptr || falseTemp == nullptr
                 || falseStorage != compiler->lastCxxRetTemp_ || st == nullptr || !st->hasName()
                 || !compiler->IsForeignNontrivialCxxReturnClass(st->getName().str())
-                || !isCopyableCxxLvalueArm(trueValue, trueStorage, st, trueExplicitMove)
+                || !isCopyableCxxLvalueArm(trueValue, trueStorage, st, trueExplicitMove,
+                                           trueShape.sourceType)
                 || trueEnd == nullptr || cflat_llvm::GetTerminatorOrNull(trueEnd) != nullptr)
                 return;
             const std::string typeName = st->getName().str();
@@ -3592,7 +3784,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             compiler->builder->SetInsertPoint(trueEnd);
             const auto mark = compiler->MarkOwnedTemps();
             if (compiler->EmitCxxCopyOrMoveConstruct(typeName, falseTemp, trueStorage,
-                    /*useMove*/ trueExplicitMove, "into a conditional expression"))
+                    /*useMove*/ trueExplicitMove
+                        || isOwnedTempField(trueValue, trueStorage, trueShape.sourceType),
+                    "into a conditional expression"))
             {
                 sharedCxxRetTemp = falseTemp;
                 compiler->RegisterOwnedStructTemp(falseTemp, typeName);
@@ -4700,10 +4894,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 };
                 const bool trueRvalueRef = rvalueRefClassArm(trueClassType, trueShape, trueValue);
                 const bool falseRvalueRef = rvalueRefClassArm(falseClassType, falseShape, falseValue);
-                const bool mismatchedCxxClasses = (!trueClassType.Pointer || trueRvalueRef)
+                const bool cxxClassConditional = (!trueClassType.Pointer || trueRvalueRef)
                     && (!falseClassType.Pointer || falseRvalueRef)
                     && !trueClassName.empty() && !falseClassName.empty()
-                    && trueClassName != falseClassName
+                    && (trueClassName != falseClassName
+                        || (trueCategory == CxxArmCategory::Xvalue
+                            && falseCategory == CxxArmCategory::Xvalue))
                     && compiler->IsCxxRecord(trueClassName) && compiler->IsCxxRecord(falseClassName);
                 auto bindRvalueRefArm = [&](LLVMBackend::TypeAndValue& type, llvm::Value*& value,
                                             llvm::Value*& storage, llvm::BasicBlock* endBlock) {
@@ -4716,7 +4912,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     value = compiler->CreateLoad(compiler->GetType(type), storage);
                     compiler->builder->restoreIP(savedIP);
                 };
-                if (mismatchedCxxClasses)
+                if (cxxClassConditional)
                 {
                     if (trueRvalueRef) bindRvalueRefArm(trueClassType, trueValue, trueStorage, trueEnd);
                     if (falseRvalueRef)
@@ -4776,7 +4972,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                             shape.sourceType = resultType;
                             shape.sourceTypeName = resultType.TypeName;
                             shape.hasSourceType = true;
-                            shape.isRvalue = cxxVerdict.kind == CxxKind::Prvalue;
+                            shape.isRvalue = cxxVerdict.kind != CxxKind::LvalueRef;
+                            shape.isExplicitMove = cxxVerdict.kind == CxxKind::XvalueRef;
                             shape.isAlias = false;
                             alias = false;
                             endBlock = compiler->builder->GetInsertBlock();
@@ -4934,7 +5131,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         // A conditional of owned unique sources (a desugared field, an owning local) must remain a
         // raw pointer join so the selected slot can be nulled by the implicit move at the destination.
         auto lowerCoreUniqueField = [&](llvm::Value*& value, llvm::Value* storage,
-                                        llvm::BasicBlock* block, const std::string& nullKey) {
+                                        llvm::BasicBlock* block, const std::string& nullKey,
+                                        const LLVMBackend::TypedValue& shape) {
             auto* structTy = llvm::dyn_cast<llvm::StructType>(value->getType());
             if (structTy == nullptr || !structTy->hasName()
                 || !compiler->IsCoreUniqueType(structTy->getName().str()) || storage == nullptr)
@@ -4951,7 +5149,32 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             rawType.Pointer = true;
             value = compiler->CreateCoreUniqueRawPointerCall(receiver, rawType);
             if (value != nullptr)
-                compiler->RegisterUniqueFieldRead(value, storage, nullKey);
+            {
+                LLVMBackend::NamedVariable source;
+                source.Primary = value;
+                source.Storage = storage;
+                source.BaseType = value->getType();
+                source.CallerName = shape.sourceCallerName;
+                source.FieldName = shape.sourceFieldName;
+                source.RootIsAliasBorrowLocal = shape.sourceRootIsAliasBorrowLocal;
+                source.IsAliasBorrow = shape.isAlias;
+                source.TypeAndValue = shape.sourceType;
+                // The owning struct of a field arm, as the field-read ledger records it (consume checks need it).
+                if (auto* fieldGep = llvm::dyn_cast<llvm::GetElementPtrInst>(storage);
+                    fieldGep != nullptr && fieldGep->getNumIndices() == 2
+                    && fieldGep->getSourceElementType()->isStructTy())
+                    source.OwningStructName = fieldGep->getSourceElementType()->getStructName().str();
+                source.IsBorrowed = !shape.sourceBorrowedOrigin.empty();
+                source.BorrowedOrigin = shape.sourceBorrowedOrigin;
+                if (uniquePointerDestination
+                    && llvm::isa_and_nonnull<llvm::GlobalVariable>(storage))
+                {
+                    source.TypeAndValue.TypeName = rawType.TypeName;
+                    source.TypeAndValue.Pointer = true;
+                    source.TypeAndValue.IsUnique = true;
+                }
+                compiler->RegisterUniqueFieldRead(value, storage, nullKey, source);
+            }
             return value != nullptr;
         };
         auto isCoreUniqueStructValue = [&](llvm::Value* value) {
@@ -5073,7 +5296,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 const std::string uniqueName = llvm::cast<llvm::StructType>(value->getType())->getName().str();
                 if (compiler->IsInterfaceType(MangledGenericArgument(*compiler, uniqueName))) return false;
                 return compiler->IsUniqueFieldReadValue(value)
-                    || llvm::isa_and_nonnull<llvm::AllocaInst>(storage);
+                    || llvm::isa_and_nonnull<llvm::AllocaInst>(storage)
+                    || (uniquePointerDestination
+                        && llvm::isa_and_nonnull<llvm::GlobalVariable>(storage));
             }
             return value->getType()->isPointerTy()
                 && llvm::isa_and_nonnull<llvm::GlobalVariable>(storage);
@@ -5092,7 +5317,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             && (!structJoin || anyFieldArm);
         if (lowerUniqueFieldJoin)
         {
-            auto joinOwnedArm = [&](llvm::Value*& value, llvm::Value* storage, llvm::BasicBlock*& block) {
+            auto joinOwnedArm = [&](llvm::Value*& value, llvm::Value* storage,
+                                    llvm::BasicBlock*& block,
+                                    const LLVMBackend::TypedValue& shape) {
                 const std::string nullKey = compiler->UniqueFieldReadNullKey(value);
                 if (!isCoreUniqueStructValue(value))
                 {
@@ -5100,12 +5327,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     compiler->RegisterUniqueFieldRead(value, storage, nullKey);
                     return;
                 }
-                lowerCoreUniqueField(value, storage, block, nullKey);
+                lowerCoreUniqueField(value, storage, block, nullKey, shape);
                 // The get() call may be an invoke that splits the arm: track its new end.
                 block = compiler->builder->GetInsertBlock();
             };
-            if (trueOwnedArm) joinOwnedArm(trueValue, trueStorage, trueEnd);
-            if (falseOwnedArm) joinOwnedArm(falseValue, falseStorage, falseEnd);
+            if (trueOwnedArm) joinOwnedArm(trueValue, trueStorage, trueEnd, trueShape);
+            if (falseOwnedArm) joinOwnedArm(falseValue, falseStorage, falseEnd, falseShape);
             compiler->SwitchToBlock(resumeBlock);
             if (trueValue == nullptr || falseValue == nullptr) return {};
         }
@@ -5685,6 +5912,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             compiler->MarkUniqueFieldReadExplicitMove(trueValue, nullptr, nullptr);
         if (ArmIsExplicitMove(expressionFalseCtx))
             compiler->MarkUniqueFieldReadExplicitMove(falseValue, nullptr, nullptr);
+        trackGlobalUniquePointerArm(trueValue, trueStorage, trueShape);
+        trackGlobalUniquePointerArm(falseValue, falseStorage, falseShape);
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
         PropagateTernaryViewElement(ctx, trueValue, trueStorage, falseValue, falseStorage, phi);
@@ -5729,12 +5958,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         result.arithNarrowWidth = LLVMBackend::ArithResultNarrowWidth(trueShape, falseShape);
         JoinTernaryPointerShape(result, trueShape, falseShape);
         JoinTernaryClassPointee(result, trueShape, falseShape);
-        // Same-class C++ arms: the joined object is const when either arm's object is (clang: a
-        // const arm makes the conditional a const lvalue), so a later conversion reads that const.
+        auto moveArmIsConst = [&](const LLVMBackend::TypedValue& shape,
+                                  antlr4::tree::ParseTree* arm) {
+            if (shape.hasSourceType && CxxTernaryArmConst(shape.sourceType)) return true;
+            return MoveOperandConst(TopLevelMoveExpression(arm));
+        };
+        // Same-class C++ arms: the joined object is const when either arm's object is const.
         if (cxxRecordJoin && trueShape.hasSourceType && falseShape.hasSourceType
             && !trueShape.sourceType.Pointer && !falseShape.sourceType.Pointer
             && trueShape.sourceType.TypeName == falseShape.sourceType.TypeName
-            && (CxxTernaryArmConst(trueShape.sourceType) || CxxTernaryArmConst(falseShape.sourceType)))
+            && (moveArmIsConst(trueShape, expressionTrueCtx)
+                || moveArmIsConst(falseShape, expressionFalseCtx)))
         {
             result.sourceType = LLVMBackend::TypeAndValue{ .TypeName = trueShape.sourceType.TypeName };
             result.sourceType.ConstMask = 1u;
@@ -6109,6 +6343,24 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 && !outerExpected.Pointer && !outerExpected.IsArrayView
                 && !compiler->IsInterfaceType(MangledGenericArgument(
                     *compiler, outerExpected.TypeName)));
+        const bool uniqueInterfaceDestination = IsOwningUniqueInterfaceField(outerExpected);
+        auto trackGlobalUniquePointerArm = [&](llvm::Value* value, llvm::Value* storage,
+                                                const LLVMBackend::TypedValue& shape) {
+            if (!uniquePointerDestination || value == nullptr || storage == nullptr
+                || !shape.hasSourceType || !shape.sourceType.IsUnique
+                || !shape.sourceType.Pointer || shape.isExplicitMove
+                || !llvm::isa<llvm::GlobalVariable>(storage))
+                return;
+            LLVMBackend::NamedVariable source;
+            source.Primary = value;
+            source.Storage = storage;
+            source.BaseType = value->getType();
+            source.CallerName = compiler->FindVariableNameByStorage(storage);
+            source.TypeAndValue = shape.sourceType;
+            source.TypeAndValue.IsMove = false;
+            source.IsOwning = true;
+            compiler->RegisterUniqueFieldRead(value, storage, {}, source);
+        };
         auto isFunctionValueDestination = [&](const LLVMBackend::TypeAndValue& destination) {
             if (!destination.FuncPtrReturnTypeName.empty()) return true;
             if (destination.Pointer) return false;
@@ -6281,7 +6533,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             }
             if (!crossedCallArgument)
                 if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
-                    assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                    HasAssignmentOperator(assignment))
                 {
                     collapseLvalueSink = true;
                     break;
@@ -6291,6 +6543,39 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
         if (ctx->QuestionQuestion())
         {
+            auto isWholeJoinMove = [&]() {
+                auto* node = static_cast<antlr4::tree::ParseTree*>(ctx);
+                while (node != nullptr && node->parent != nullptr)
+                {
+                    auto* parent = node->parent;
+                    if (dynamic_cast<CFlatParser::MoveExpressionContext*>(parent) != nullptr)
+                        return true;
+                    if (parent->children.size() == 1
+                        || (dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parent) != nullptr
+                            && static_cast<CFlatParser::PrimaryExpressionContext*>(parent)->expression() == node))
+                    {
+                        node = parent;
+                        continue;
+                    }
+                    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent))
+                    {
+                        const bool coalesceOperand = conditional->QuestionQuestion() != nullptr
+                            && (conditional->logicalOrExpression() == node
+                                || conditional->conditionalExpression() == node);
+                        const bool ternaryResultArm = conditional->Question() != nullptr
+                            && (conditional->expression() == node
+                                || conditional->conditionalExpression() == node);
+                        if (coalesceOperand || ternaryResultArm)
+                        {
+                            node = parent;
+                            continue;
+                        }
+                    }
+                    return false;
+                }
+                return false;
+            };
+            const bool wholeJoinIsMoved = isWholeJoinMove();
             // Null-coalescing: lhs ?? rhs  ->  (lhs != null) ? lhs : rhs
             // Per-arm cast occurrence, exactly as ParseTernaryBranches scopes its two arms.
             llvm::Value* lhs = nullptr;
@@ -6387,7 +6672,10 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 && !lhsTv.sourceRootIsBorrowedThisField && ownedUniqueShape(lhs, lhsStorage, lhsTv);
             const bool localUniqueJoin = !moveUniquePointerJoin && !lhsUniqueFieldRead
                 && owningUniqueLocal(lhs, lhsStorage, lhsTv);
-            const bool rawUniqueJoin = uniqueFieldJoin || localUniqueJoin;
+            const bool globalUniqueJoin = uniquePointerDestination && !lhsUniqueFieldRead
+                && ownedUniqueShape(lhs, lhsStorage, lhsTv)
+                && llvm::isa_and_nonnull<llvm::GlobalVariable>(lhsStorage);
+            const bool rawUniqueJoin = uniqueFieldJoin || localUniqueJoin || globalUniqueJoin;
             llvm::Type* resultType = lhs->getType();
             if (moveUniquePointerJoin || rawUniqueJoin)
             {
@@ -6455,14 +6743,28 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 rawType.TypeName = MangledGenericArgument(*compiler, receiver.TypeAndValue.TypeName);
                 rawType.Pointer = true;
                 lhs = compiler->CreateCoreUniqueRawPointerCall(receiver, rawType);
-                compiler->RegisterUniqueFieldRead(lhs, lhsStorage, lhsNullKey);
+                if (globalUniqueJoin)
+                {
+                    LLVMBackend::NamedVariable source;
+                    source.Primary = lhs;
+                    source.Storage = lhsStorage;
+                    source.BaseType = lhs->getType();
+                    source.CallerName = compiler->FindVariableNameByStorage(lhsStorage);
+                    source.TypeAndValue.TypeName = rawType.TypeName;
+                    source.TypeAndValue.Pointer = true;
+                    source.TypeAndValue.IsUnique = true;
+                    compiler->RegisterUniqueFieldRead(lhs, lhsStorage, lhsNullKey, source);
+                }
+                else
+                    compiler->RegisterUniqueFieldRead(lhs, lhsStorage, lhsNullKey);
             }
             // A named-function LHS becomes its thin pointer before the join store (thin result only).
             if (resultAlloca->getAllocatedType()->isPointerTy())
                 lhs = compiler->BareFunctionToThinValue(lhs, nullptr);
             compiler->CreateAssignment(lhs, resultAlloca);
-            // A struct-join field lhs (an interface field, an explicit move) is still cleared here.
-            if (lhsUniqueFieldRead && !rawUniqueJoin)
+            // Clear here only for an owning destination; borrowed results retain the field's owner.
+            if (lhsUniqueFieldRead && !rawUniqueJoin
+                && (uniquePointerDestination || uniqueInterfaceDestination || wholeJoinIsMoved))
                 clearUniqueFieldRead(lhs, lhsStorage);
             lhsCount = GetTernaryArrayCountState(lhs, lhsStorage, lhsTv);
             compiler->builder->CreateStore(
@@ -6599,6 +6901,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // An owning unique LOCAL rhs joins like the lhs local: its slot is a join source.
                 const bool rhsOwnedLocal = !moveUniquePointerJoin && !rhsUniqueFieldRead
                     && owningUniqueLocal(rhs, rhsStorage, rhsShape);
+                const bool rhsOwnedGlobal = uniquePointerDestination && !rhsUniqueFieldRead
+                    && ownedUniqueShape(rhs, rhsStorage, rhsShape)
+                    && llvm::isa_and_nonnull<llvm::GlobalVariable>(rhsStorage);
                 // A raw-pointer coalesce result observes a desugared unique field on its RHS.
                 if (rhs != nullptr && resultAlloca->getAllocatedType()->isPointerTy())
                 {
@@ -6625,12 +6930,28 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                             compiler->RegisterOwningTempUniqueField(rhs);
                         // The raw read keeps the field slot as its source, so the join records it and
                         // the destination's implicit move (not this join) nulls it when it is consumed.
-                        if (rhsUniqueFieldRead || rhsOwnedLocal)
-                            compiler->RegisterUniqueFieldRead(rhs, rhsStorage, rhsNullKey);
+                        if (rhsUniqueFieldRead || rhsOwnedLocal || rhsOwnedGlobal)
+                        {
+                            if (rhsOwnedGlobal)
+                            {
+                                LLVMBackend::NamedVariable source;
+                                source.Primary = rhs;
+                                source.Storage = rhsStorage;
+                                source.BaseType = rhs->getType();
+                                source.CallerName = compiler->FindVariableNameByStorage(rhsStorage);
+                                source.TypeAndValue.TypeName = rawType.TypeName;
+                                source.TypeAndValue.Pointer = true;
+                                source.TypeAndValue.IsUnique = true;
+                                compiler->RegisterUniqueFieldRead(
+                                    rhs, rhsStorage, rhsNullKey, source);
+                            }
+                            else
+                                compiler->RegisterUniqueFieldRead(rhs, rhsStorage, rhsNullKey);
+                        }
                     }
                 }
                 // A struct join (a unique field lhs) keeps the struct rhs: its slot is still the source.
-                else if (rhsOwnedLocal)
+                else if (rhsOwnedLocal || rhsOwnedGlobal)
                     compiler->RegisterUniqueFieldRead(rhs, rhsStorage);
                 // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
                 // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
@@ -6738,6 +7059,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 compiler->PropagateBondedValue(lhs, rhs, joined);
                 compiler->RegisterJoinArmCastOccurrence(joined, 0, lhsOcc);
                 compiler->RegisterJoinArmCastOccurrence(joined, 1, rhsOcc);
+                trackGlobalUniquePointerArm(lhs, lhsStorage, lhsTv);
+                trackGlobalUniquePointerArm(rhs, rhsStorage, rhsShape);
                 compiler->PropagateUniqueFieldRead(lhs, rhs, joined);
                 bool rawJoin = (compiler->IsRawArrayResult(lhs)
                         || compiler->IsRawArrayResult(rhs))

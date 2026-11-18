@@ -12,7 +12,6 @@ argument names its element in the array-view diagnostic.
 
 Pre-existing separate issues:
 
-- Pointer-depth mismatches at initialization, assignment, and return can be accepted (also a view passed to a param of a different element depth, `int** e = &f2[0]`), and overloads on `int*[]` / `int**[]` / `int***[]` are not told apart - every call picks the first (NEWDEPTH2 review 2, repros scratch/repro_keep/newdepth2/).
 - `new const int*(&cx)` fails to parse.
 - Overload ranking does not model volatile or restrict at pointer depth >= 2: a pointer naming either keeps the legacy pick, so a valid arm can lose. Repro: `int f(void*) {return 1;} int f(int* volatile*) {return 2;}` called with an `int**` picks 1, clang picks 2. Same family: `volatile int* const*`, `const volatile int* const*`, `int* restrict*`.
 - A depth >= 3 parameter naming volatile or restrict accepts a source that does not name it, where clang and pre-carrier CFlat refused. Repro: `int s3(volatile int***p) {return p?4:5;}` called with an `int***` compiles and returns 4; clang: no matching function. Same for `int* volatile**` and `int* __restrict__* __restrict__*`.

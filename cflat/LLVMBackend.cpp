@@ -5869,6 +5869,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionSignatures_.clear();
     cxxFunctionParameterSpellingsByLinkage_.clear();
     cxxTopLevelConstTypeAliases_.clear();
+    cxxImportedTypeAliases_.clear();
     cxxDefaultWrapperRequests_.clear();
     cxxDefaultInitHelpers_.clear();
     cxxVariadicCtorRequestsInProgress_.clear();
@@ -6167,6 +6168,7 @@ void LLVMBackend::ResetForReanalysis()
     typeAliases.clear();
     typeAliasConstMasks.clear();
     cxxNullptrTAliases_.clear();
+    cxxImportedTypeAliases_.clear();
     cxxDeductionWrappers_.clear();
     aliasScopeStack_.clear();
     aggregateAliasScopes_.clear();
@@ -9488,6 +9490,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     namespaceTable.clear();
     typeAliases.clear();
     cxxNullptrTAliases_.clear();
+    cxxImportedTypeAliases_.clear();
     manglingAliases_.clear();
     manglingPointerAliases_.clear();
     enumBackingTypes.clear();

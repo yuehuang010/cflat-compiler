@@ -2267,11 +2267,26 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
 
 bool MainListener::RejectJoinedSourceIntoUniqueField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& rightNV,
-        antlr4::ParserRuleContext* ctx) {
-        const auto* join = compiler->FindUniqueFieldReadJoin(rightNV.Primary);
-        if (join == nullptr) return false;
-        for (const auto& source : join->Sources)
+        antlr4::ParserRuleContext* ctx, bool aliasArmsOnly) {
+        // A ternary may carry an alias value in its result PHI while keeping selected field
+        // storage in a separate lvalue PHI. Reuse the ordinary alias-field rejection at the sink.
+        if (!rightNV.IsExplicitMove
+            && llvm::dyn_cast_or_null<llvm::PHINode>(rightNV.Primary) != nullptr
+            && compiler->IsAliasValue(rightNV.Primary))
         {
+            auto aliasSource = rightNV;
+            aliasSource.TypeAndValue.IsAlias = true;
+            if (RejectAliasStoreIntoField(aliasSource, rightNV.Primary, ctx)) return true;
+        }
+        auto rejectSource = [&](const LLVMBackend::UniqueFieldReadSource& source) {
+            // An alias arm (`a.p` through an `alias` root) borrows: refused as the plain store is,
+            // even when the root is an owning local of this frame.
+            if (!rightNV.IsExplicitMove && !source.IsExplicitMove
+                && !source.Variable.FieldName.empty()
+                && (source.Variable.RootIsAliasBorrowLocal || source.Variable.IsAliasBorrow)
+                && RejectAliasStoreIntoField(source.Variable, rightNV.Primary, ctx))
+                return true;
+            if (aliasArmsOnly) return false;
             // Pointer-parameter arms: an unmoved arm of a plain join is refused by name. A
             // `move` arm, or a `move` spelled over the whole join, is the caller's consent.
             if (!rightNV.IsExplicitMove && !source.IsExplicitMove
@@ -2281,7 +2296,38 @@ bool MainListener::RejectJoinedSourceIntoUniqueField(
                 if (RejectConsumeOfBorrowedByValueParamField(compiler, sourceVariable, ctx))
                     return true;
             }
-            if (source.Storage == nullptr) continue;
+            if (!rightNV.IsExplicitMove && !source.IsExplicitMove
+                && source.Variable.TypeAndValue.IsUnique
+                && RejectImplicitConsumeOfOutlivingOwner(
+                    compiler, source.Variable, false, ctx))
+                return true;
+            return false;
+        };
+        if (const auto* join = compiler->FindUniqueFieldReadJoin(rightNV.Primary))
+            for (const auto& source : join->Sources)
+                if (rejectSource(source)) return true;
+
+        // Some alias ternaries materialize a raw-pointer PHI without a unique-read join. Its
+        // branch values still retain the direct field-read ledger entries.
+        if (auto* valuePhi = llvm::dyn_cast_or_null<llvm::PHINode>(rightNV.Primary))
+            for (unsigned i = 0; i < valuePhi->getNumIncomingValues(); ++i)
+                if (const auto* source = compiler->FindUniqueFieldReadValueSource(
+                        valuePhi->getIncomingValue(i));
+                    source != nullptr && rejectSource(*source))
+                    return true;
+
+        // An alias-source ternary carries selected FIELD ADDRESSES in its storage PHI rather
+        // than the raw-value join ledger. Recover each address's registered read provenance.
+        if (auto* storagePhi = llvm::dyn_cast_or_null<llvm::PHINode>(rightNV.Storage))
+            for (unsigned i = 0; i < storagePhi->getNumIncomingValues(); ++i)
+                if (const auto* source = compiler->FindUniqueFieldReadSource(
+                        storagePhi->getIncomingValue(i), storagePhi->getIncomingBlock(i));
+                    source != nullptr && rejectSource(*source))
+                    return true;
+
+        if (const auto* join = compiler->FindUniqueFieldReadJoin(rightNV.Primary))
+            for (const auto& source : join->Sources)
+            {
             // A (possibly nested) field of a BORROWED by-value parameter: the caller keeps the pointee.
             // Owner/field come from the leaf GEP; struct-field GEP bases lead back to the parameter.
             auto isStructFieldGep = [](const llvm::Value* value) {
@@ -2309,8 +2355,29 @@ bool MainListener::RejectJoinedSourceIntoUniqueField(
             srcNV.FieldPathRoot = param->TypeAndValue.VariableName;
             if (RejectConsumeOfBorrowedByValueParamField(compiler, srcNV, ctx))
                 return true;
-        }
+            }
         return false;
+    }
+
+bool MainListener::IsProvableNonHeapAddressJoin(
+        LLVMBackend* compiler, llvm::Value* value) const {
+        std::unordered_set<const llvm::Value*> visited;
+        std::function<bool(const llvm::Value*, int)> check = [&](const llvm::Value* current, int depth) {
+            if (current == nullptr || depth > 32 || !visited.insert(current).second) return false;
+            if (LLVMBackend::IsProvableNonHeapAddress(const_cast<llvm::Value*>(current)))
+                return true;
+            if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(current))
+                for (const auto& incoming : phi->incoming_values())
+                    if (check(incoming, depth + 1)) return true;
+            if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(current))
+                return check(select->getTrueValue(), depth + 1)
+                    || check(select->getFalseValue(), depth + 1);
+            if (const auto* join = compiler->FindNullCoalesceJoin(current))
+                for (const auto& arm : join->Arms)
+                    if (check(arm.Value, depth + 1)) return true;
+            return false;
+        };
+        return check(value, 0);
     }
 
 bool MainListener::RejectImplicitConsumeOfOutlivingOwner(
@@ -2672,12 +2739,13 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(
         // source like any other C++ object: the sink runs that pick, nothing zeroes the slot first.
         if (!argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
             && !argNV.IsTempSpillStorage && ctx != trivialCxxMoveSite_ && ctx != discardMoveSite_
-            && !IsDirectConditionalArm(ctx)
             && !(IsDirectCallArgument(ctx) && !argNV.IsElementAccess)
             && compiler->IsCxxRecord(argNV.TypeAndValue.TypeName)
             && !compiler->IsCppStructName(argNV.TypeAndValue.TypeName)
             && compiler->IsCxxTriviallyCopyableRecord(argNV.TypeAndValue.TypeName)
-            && compiler->CxxTrivialMoveNeedsTransfer(argNV.TypeAndValue.TypeName, false, false))
+            && (IsDirectConditionalArm(ctx)
+                || compiler->CxxTrivialMoveNeedsTransfer(
+                    argNV.TypeAndValue.TypeName, false, false)))
         {
             argNV.IsExplicitMove = true;
             argNV.IsRvalue = true;

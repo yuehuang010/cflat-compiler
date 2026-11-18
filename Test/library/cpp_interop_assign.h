@@ -1,7 +1,40 @@
 #pragma once
 // Fixture for assignment INTO a live nontrivial C++ object from a temporary (codes 3320-3339).
+// Fixture for assignment into a C++ cast temporary (run legs 11801-11812).
 // Header-only; every special member bumps an inline static counter, so a leg asserts the EXACT
 // number of constructions, copies, moves, assignments and destructions an assignment performs.
+
+namespace castasg_test
+{
+inline int events[32] = {};
+inline int eventCount = 0;
+inline int copies = 0;
+inline int copyAssigns = 0;
+inline int intAssigns = 0;
+inline int constructors = 0;
+inline int destructors = 0;
+inline void Record(int event)
+{
+    events[eventCount++] = event;
+    if (event == 10) ++constructors;
+    if (event == 20) ++copies;
+    if (event == 40) ++copyAssigns;
+    if (event == 50) ++intAssigns;
+    if (event == 60) ++destructors;
+}
+inline void reset()
+{
+    eventCount = 0; copies = 0; copyAssigns = 0; intAssigns = 0;
+    constructors = 0; destructors = 0;
+}
+inline int event_size() { return eventCount; }
+inline int event_at(int index) { return events[index]; }
+inline int copy_count() { return copies; }
+inline int copy_assign_count() { return copyAssigns; }
+inline int int_assign_count() { return intAssigns; }
+inline int ctor_count() { return constructors; }
+inline int dtor_count() { return destructors; }
+}
 
 namespace cppas {
 
@@ -587,4 +620,35 @@ inline ObRank obRankGlobal;
 inline ObRank obRankMake() { return ObRank(); }
 inline const ObRank& obRankRef(const ObRank& value) { return value; }
 
+class CastAssignBox
+{
+public:
+    int value = 0;
+    CastAssignBox(int v = 0) : value(v) { castasg_test::Record(10); }
+    CastAssignBox(const CastAssignBox& other) : value(other.value) { castasg_test::Record(20); }
+    CastAssignBox& operator=(const CastAssignBox& other)
+    { value = other.value; castasg_test::Record(40); return *this; }
+    CastAssignBox& operator=(int v)
+    { value = v; castasg_test::Record(50); return *this; }
+    ~CastAssignBox() { castasg_test::Record(60); }
+};
+inline CastAssignBox make_cast_assign_box()
+{ castasg_test::Record(1); return CastAssignBox(42); }
+
 } // namespace cppas
+
+class CastAssignBox
+{
+public:
+    int value = 0;
+    CastAssignBox(int v = 0) : value(v) { castasg_test::Record(10); }
+    CastAssignBox(const CastAssignBox& other) : value(other.value) { castasg_test::Record(20); }
+    CastAssignBox& operator=(const CastAssignBox& other)
+    { value = other.value; castasg_test::Record(40); return *this; }
+    CastAssignBox& operator=(int v)
+    { value = v; castasg_test::Record(50); return *this; }
+    ~CastAssignBox() { castasg_test::Record(60); }
+};
+using CastAssignBoxAlias = CastAssignBox;
+inline CastAssignBox make_cast_assign_box()
+{ castasg_test::Record(1); return CastAssignBox(42); }

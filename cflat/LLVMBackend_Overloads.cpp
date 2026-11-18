@@ -85,14 +85,16 @@ static antlr4::tree::TerminalNode* PreviousTerminal(antlr4::tree::ParseTree* nod
 }
 
 bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
-    const TypeAndValue& from, const TypeAndValue& to) const
+    const TypeAndValue& from, const TypeAndValue& to, bool includeDepthMismatch) const
 {
     // Array-view destinations use their own element-compatibility diagnostic. A view or fixed
     // array source decays only when the destination is an ordinary pointer.
     if (to.IsArrayView) return false;
     auto decayed = [](const TypeAndValue& value) {
         TypeAndValue result = value;
-        if (result.IsArrayView || result.ConstArraySize > 0)
+        const bool fixedArrayObject = result.ConstArraySize > 0 && !result.IsArrayView
+            && (!result.Pointer || result.PointerDepth > 0 || result.ElemPointer);
+        if (result.IsArrayView || fixedArrayObject)
         {
             result.Pointer = true;
             result.IsArrayView = false;
@@ -103,12 +105,18 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
     };
     const TypeAndValue fromPointer = decayed(from);
     const TypeAndValue& toPointer = to;
-    if (!fromPointer.Pointer || !toPointer.Pointer
+    const bool functionPointerPair = fromPointer.IsFunctionPointer && toPointer.IsFunctionPointer;
+    if ((!fromPointer.Pointer && !functionPointerPair) || (!toPointer.Pointer && !functionPointerPair)
         || fromPointer.CxxConstRef() || toPointer.CxxConstRef()
         || fromPointer.IsRvalueRef || toPointer.IsRvalueRef
         || fromPointer.IsCxxRefToPointer || toPointer.IsCxxRefToPointer)
         return false;
 
+    const bool fromFixedArraySource = from.ConstArraySize > 0 && !from.IsArrayView
+        && (!from.Pointer || from.PointerDepth > 0 || from.ElemPointer);
+    int fromDepth = fromFixedArraySource
+        ? from.ElementPointerDepth() + 1 : fromPointer.ValuePointerDepth();
+    const int toDepth = toPointer.ValuePointerDepth();
     auto resolvedPointee = [&](const TypeAndValue& value) {
         std::string resolved = ResolveTypeAlias(value.TypeName);
         std::string manglingAlias = ResolveManglingPointerAlias(resolved);
@@ -116,8 +124,64 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
         std::string backing = GetEnumBackingType(resolved);
         return backing.empty() ? resolved : ResolveTypeAlias(backing);
     };
-    const std::string fromBase = resolvedPointee(fromPointer);
+    std::string fromBase = resolvedPointee(fromPointer);
     const std::string toBase = resolvedPointee(toPointer);
+    // A unique<T> element adds a raw T* level only when the destination is T*, not unique<T>*.
+    if (fromFixedArraySource && IsCoreUniqueType(fromBase))
+    {
+        const std::string pointee = MangledGenericArgument(*this, fromBase);
+        if (!pointee.empty())
+        {
+            TypeAndValue pointeeType;
+            pointeeType.TypeName = pointee;
+            const std::string pointeeBase = resolvedPointee(pointeeType);
+            if (pointeeBase == toBase)
+            {
+                fromBase = pointeeBase;
+                ++fromDepth;
+            }
+        }
+    }
+    const bool functionPointerDepthComparable = functionPointerPair
+        && !from.IsArrayView && !to.IsArrayView && !from.IsSimd && !to.IsSimd
+        && !from.IsInterface && !to.IsInterface && !from.IsInterfacePointer && !to.IsInterfacePointer
+        && (from.ConstArraySize == 0 || fromFixedArraySource) && to.ConstArraySize == 0
+        && to.ConstInnerDimensions.empty();
+    const bool fromDepthRecorded = fromFixedArraySource
+        ? fromDepth > 0 : from.PointerDepth > 0 || from.ElemPointer || functionPointerDepthComparable;
+    const bool toDepthRecorded = to.PointerDepth > 0 || to.ElemPointer || functionPointerDepthComparable;
+    const bool depthComparable = !from.IsArrayView && !to.IsArrayView
+        && !from.IsSimd && !to.IsSimd && !from.IsInterface && !to.IsInterface
+        && !from.IsInterfacePointer && !to.IsInterfacePointer
+        && !from.IsFunctionPointer && !to.IsFunctionPointer
+        && (from.ConstArraySize == 0 || fromFixedArraySource)
+        && to.ConstArraySize == 0 && to.ConstInnerDimensions.empty();
+    // A generic pointer alias can share its spelling with a concrete struct registered later.
+    // In that shadowed case the scan-only alias table cannot prove either TypeAndValue's base.
+    const bool fromShadowedPointerAlias = !ResolveManglingPointerAlias(from.TypeName).empty()
+        && dataStructures.contains(from.TypeName);
+    const bool toShadowedPointerAlias = !ResolveManglingPointerAlias(to.TypeName).empty()
+        && dataStructures.contains(to.TypeName);
+    if ((depthComparable || functionPointerDepthComparable)
+        && !fromShadowedPointerAlias && !toShadowedPointerAlias
+        && fromDepthRecorded && toDepthRecorded
+        && !fromBase.empty() && !toBase.empty())
+    {
+        // C's void* carrier converts to and from any object pointer, including T**. A void**
+        // is instead a pointer to a void* object and cannot convert to T**.
+        const bool voidCarrier = (fromBase == "void" && fromDepth == 1)
+            || (toBase == "void" && toDepth == 1);
+        if (voidCarrier && !from.IsFunctionPointer && !to.IsFunctionPointer) return false;
+        if (fromBase == "void" || toBase == "void")
+            return fromBase != toBase || (includeDepthMismatch && fromDepth != toDepth);
+        // Taking the address of unique<T>'s owner slot produces the raw T** carrier expected by
+        // C++ out-parameters, even though the source TypeAndValue still names unique<T>.
+        if (IsCoreUniqueType(fromBase)
+            && MangledGenericArgument(*this, fromBase) == toBase
+            && fromDepth + 1 == toDepth)
+            return false;
+        if (fromDepth != toDepth) return includeDepthMismatch;
+    }
     // `long` is the target's C long: C headers bind it as the same-width iN, so the two match.
     if (fromBase.empty() || toBase.empty() || fromBase == "void" || toBase == "void"
         || CanonicalPointeeTypeName(fromBase) == CanonicalPointeeTypeName(toBase))
@@ -154,10 +218,11 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
 std::string LLVMBackend::ImplicitIntegerPointeeConversionText(
     const TypeAndValue& from, const TypeAndValue& to) const
 {
-
     auto decayed = [](const TypeAndValue& value) {
         TypeAndValue result = value;
-        if (result.IsArrayView || result.ConstArraySize > 0)
+        const bool fixedArrayObject = result.ConstArraySize > 0 && !result.IsArrayView
+            && (!result.Pointer || result.PointerDepth > 0 || result.ElemPointer);
+        if (result.IsArrayView || fixedArrayObject)
         {
             result.Pointer = true;
             result.IsArrayView = false;
@@ -167,19 +232,46 @@ std::string LLVMBackend::ImplicitIntegerPointeeConversionText(
         return result;
     };
     const TypeAndValue fromPointer = decayed(from);
-    const TypeAndValue& toPointer = to;
-
-    auto resolvedPointee = [&](const TypeAndValue& value) {
-        std::string resolved = ResolveTypeAlias(value.TypeName);
-        std::string manglingAlias = ResolveManglingPointerAlias(resolved);
-        if (!manglingAlias.empty()) resolved = std::move(manglingAlias);
-        std::string backing = GetEnumBackingType(resolved);
-        return backing.empty() ? resolved : ResolveTypeAlias(backing);
+    const bool fromFixedArraySource = from.ConstArraySize > 0 && !from.IsArrayView
+        && (!from.Pointer || from.PointerDepth > 0 || from.ElemPointer);
+    int fromDepth = fromFixedArraySource
+        ? from.ElementPointerDepth() + 1 : fromPointer.ValuePointerDepth();
+    if (fromFixedArraySource && IsCoreUniqueType(ResolveTypeAlias(from.TypeName)))
+    {
+        auto resolvedPointee = [&](const TypeAndValue& value) {
+            std::string resolved = ResolveTypeAlias(value.TypeName);
+            std::string manglingAlias = ResolveManglingPointerAlias(resolved);
+            if (!manglingAlias.empty()) resolved = std::move(manglingAlias);
+            std::string backing = GetEnumBackingType(resolved);
+            return backing.empty() ? resolved : ResolveTypeAlias(backing);
+        };
+        TypeAndValue pointeeType;
+        pointeeType.TypeName = MangledGenericArgument(*this, ResolveTypeAlias(from.TypeName));
+        if (!pointeeType.TypeName.empty()
+            && resolvedPointee(pointeeType) == resolvedPointee(to))
+            ++fromDepth;
+    }
+    const int toDepth = to.ValuePointerDepth();
+    auto spell = [&](const TypeAndValue& value) {
+        std::string result = value.IsFunctionPointer
+            ? SpellTypeForSymbolDump(*this, value) : SpellDiagnosticType(*this, value);
+        if (value.ConstArraySize > 0)
+        {
+            result += std::format("[{}]", value.ConstArraySize);
+            for (const uint64_t dimension : value.ConstInnerDimensions)
+                result += std::format("[{}]", dimension);
+        }
+        return result;
     };
-    const std::string fromBase = resolvedPointee(fromPointer);
-    const std::string toBase = resolvedPointee(toPointer);
-    const std::string fromType = fromBase + std::string(fromPointer.ValuePointerDepth(), '*');
-    const std::string toType = toBase + std::string(toPointer.ValuePointerDepth(), '*');
+    const std::string toType = spell(to);
+    if (fromDepth != toDepth)
+    {
+        const std::string fromType = spell(fromFixedArraySource ? from : fromPointer);
+        return std::format("cannot convert '{}' to '{}' implicitly: the pointer depths differ; "
+                           "use an explicit cast '({})p'", fromType, toType, toType);
+    }
+    // A pointee mismatch keeps the decayed spelling; only the source pointer type matters there.
+    const std::string fromType = spell(fromPointer);
     return std::format("cannot convert '{}' to '{}' implicitly: the pointee types differ; "
                        "use an explicit cast '({})p'", fromType, toType, toType);
 }
@@ -840,7 +932,7 @@ bool LLVMBackend::UnrelatedPointeePair(const NamedVariable& arg, const FunctionS
         to.IsRvalueRef = false;
         to.IsCxxRefToPointer = false;
     }
-    return IsImplicitIntegerPointeePointerConversion(from, to);
+    return IsImplicitIntegerPointeePointerConversion(from, to, /*includeDepthMismatch*/ false);
 }
 
 // T85: some C++ candidate of an operator set is not viable for `arg` at `index` by its pointee, so
@@ -4543,13 +4635,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && !arg.IsStringLiteral && !isStringLiteralValue(arg.Primary))
                         result = -1;
 
-                    // Opaque pointers make every view look alike to CompareUpconvert; both sides
-                    // record the ELEMENT star, so refusing 'int*[]' against 'int[]' is proven.
-                    // With a lone candidate there is nothing to disambiguate, so let the pair
-                    // through and let the element gate at the call site speak the real reason.
+                    // Opaque pointers erase array element depth in CompareUpconvert. Reject only
+                    // a recorded mismatch so exact-depth view overloads can win.
                     if (result >= 0 && candidates.size() > 1
-                        && arg.TypeAndValue.IsArrayView && candidateParamItr->IsArrayView
-                        && arg.TypeAndValue.ElemPointer != candidateParamItr->ElemPointer)
+                        && (arg.TypeAndValue.IsArrayView || arg.TypeAndValue.ConstArraySize > 0)
+                        && candidateParamItr->IsArrayView
+                        && arg.TypeAndValue.ElementPointerDepth()
+                            != candidateParamItr->ElementPointerDepth())
                         result = -1;
 
                     // Same blindness for the ELEMENT identity: an 'int[4]' argument scored perfect
@@ -7709,6 +7801,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (!MapCTypeToTypeAndValue(spelling, arrayPointer, true)
                         || !arrayPointer.Pointer)
                         continue;
+                    const uint64_t arrayBound = CxxPointerToArrayBound(spelling);
+                    if (arrayBound > 0)
+                        arrayPointer.ConstInnerDimensions.push_back(arrayBound);
                     const size_t declaratorOpen = spelling.rfind('(', close);
                     const bool constElement = declaratorOpen != std::string::npos
                         && spelling.substr(0, declaratorOpen).find("const") != std::string::npos;
@@ -7746,7 +7841,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 const auto& arg = callArgs[i];
                 const auto& from = arg.HasOriginalArgumentType
                     ? arg.OriginalArgumentType : arg.TypeAndValue;
-                if (IsImplicitIntegerPointeePointerConversion(from, candidate.Parameters[i]))
+                if (IsImplicitIntegerPointeePointerConversion(
+                        from, candidate.Parameters[i], /*includeDepthMismatch*/ false))
                     return true;
             }
             return false;
@@ -8722,7 +8818,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     const auto& from = arg.HasOriginalArgumentType
                         ? arg.OriginalArgumentType : arg.TypeAndValue;
                     if (IsImplicitIntegerPointeePointerConversion(
-                            from, resolvedSym.Parameters[i]))
+                            from, resolvedSym.Parameters[i], /*includeDepthMismatch*/ false))
                         RejectImplicitIntegerPointeePointerConversion(
                             from, resolvedSym.Parameters[i]);
                 }
@@ -11284,6 +11380,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 const bool cxxObject = IsForeignNontrivialCxxClass(pn);
                 const bool cflatHolder = !cxxObject && HasForeignNontrivialCxxField(pn);
                 if (!cxxObject && !cflatHolder) continue;
+                if (cxxObject && i < matched.size() && matched[i].CxxEarlyCopySlot != nullptr)
+                {
+                    llvm::AllocaInst* slot = matched[i].CxxEarlyCopySlot;
+                    if (matched[i].CxxEarlyCopyDecision != nullptr)
+                        matched[i].CxxEarlyCopyDecision->setOperand(0, builder->getInt1(true));
+                    if (IsCxxParamDestroyedInCallee(pn)) UnregisterOwnedStructTemp(slot);
+                    cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                    cxxIndirectArgAddrs[i] = slot;
+                    continue;
+                }
                 if (cxxObject && i < matched.size() && matched[i].CxxDefaultInitIndex >= 0)
                 {
                     // An omitted class default: constructed now, after the explicit arguments.

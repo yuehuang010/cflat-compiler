@@ -1,0 +1,10 @@
+expect_error("found '=' but expected ';'");
+int CastAsgPrimitiveCastRejected()
+{
+    int value = 1;
+    int source = 2;
+    (int)value = source;
+    return value;
+}
+
+extern int main() { return 0; }

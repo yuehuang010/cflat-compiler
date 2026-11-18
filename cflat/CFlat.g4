@@ -257,8 +257,17 @@ conditionalExpression
 
 assignmentExpression
     : unaryExpression assignmentOperator assignmentExpression
+    | castAssignmentTarget assignmentExpression
     | conditionalExpression
     | DigitSequence // for
+    ;
+
+castAssignmentTarget
+    : '(' castAssignmentTypeName ')' castExpression '='
+    ;
+
+castAssignmentTypeName
+    : Identifier ('.' memberNameToken)*
     ;
 
 structOrUnionSpecifier

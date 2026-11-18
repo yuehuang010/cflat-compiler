@@ -2065,7 +2065,12 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
 {
         if (cxxBoundary)
             for (const auto& alias : aliases)
+            {
+                if (!alias.name.empty()) cxxImportedTypeAliases_.insert(alias.name);
+                if (!alias.qualifiedName.empty())
+                    cxxImportedTypeAliases_.insert(alias.qualifiedName);
                 RememberCxxAnonymousEnumAlias(alias.name, alias.qualifiedName, alias.target);
+            }
         auto cxxIdentity = [&](const CTypeAliasEntry& a, std::string& baseOut,
                                std::vector<std::string>& argsOut, std::string& out) -> bool {
             const std::string s = CanonicalizeCxxUniquePtrSpelling(a.cxxSpecialization);

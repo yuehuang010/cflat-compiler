@@ -3538,10 +3538,23 @@ T litListFirst<T>(list<T> values) { return values.get(0); }
 int lgenListElementSize<T>(list<T> values) { return (int)sizeof(T); }
 int lgenGenericArgSize<T>(T value) { return (int)sizeof(T); }
 struct LgenGenericElem<T> { T value = default; };
+namespace LgenGenericNs { struct Elem<T> { T value = default; }; }
 namespace LgenListNs
 {
     struct list<T> { T value = default; };
     T get<T>(list<T> value) { return value.value; }
+}
+namespace GenlitEnclosing
+{
+    struct W<T> { T value = 6; };
+    int outer<T>(W<T> value) { return value.value; }
+    namespace C
+    {
+        int f<T>(W<T> value) { return value.value; }
+        int fp<T>(W<T>* value) { return value.value; }
+        int g(W<int> value) { return value.value; }
+    }
+    namespace B { namespace C { int f<T>(W<T> value) { return value.value; } } }
 }
 
 struct GenOvlA { int value = default; };
@@ -4099,6 +4112,31 @@ bool testGenericArgInference()
     pointerList.add(&pointerElement);
     result &= Test("generic_list_pointer_element_deduction",
         lgenListElementSize(pointerList), 8);
+    list<LgenGenericElem<int>*> genericPointerList = default;
+    result &= Test("generic_list_generic_pointer_element", lgenListElementSize(genericPointerList), 8);
+    list<LgenGenericElem<int>**> genericPointer2List = default;
+    result &= Test("generic_list_generic_pointer2_element", lgenListElementSize(genericPointer2List), 8);
+    list<LgenGenericElem<int>***> genericPointer3List = default;
+    result &= Test("generic_list_generic_pointer3_element", lgenListElementSize(genericPointer3List), 8);
+    list<LgenGenericElem<int*>*> genericPointerBaseList = default;
+    result &= Test("generic_list_generic_pointer_base_element",
+        lgenListElementSize(genericPointerBaseList), 8);
+    list<LgenGenericNs.Elem<int>*> genericNamespacedPointerList = default;
+    result &= Test("generic_list_namespaced_generic_pointer_element",
+        lgenListElementSize(genericNamespacedPointerList), 8);
+    list<LgenGenericElem<list<int>>*> nestedGenericPointerList = default;
+    result &= Test("generic_list_nested_generic_pointer_element",
+        lgenListElementSize(nestedGenericPointerList), 8);
+    list<list<int>*> genericListPointerList = default;
+    result &= Test("generic_list_compound_pointer_element",
+        lgenListElementSize(genericListPointerList), 8);
+    list<function<int(int)>*> genericFunctionPointerList = default;
+    result &= Test("generic_list_function_pointer_element",
+        lgenListElementSize(genericFunctionPointerList), 8);
+    list<(const int)*> constPointerList = default;
+    result &= Test("generic_list_const_pointer_element", lgenListElementSize(constPointerList), 8);
+    list<(const int)**> constPointer2List = default;
+    result &= Test("generic_list_const_pointer2_element", lgenListElementSize(constPointer2List), 8);
     LgenGenericElem<int> genericElement = default;
     list<LgenGenericElem<int>> genericElementList = default;
     genericElementList.add(genericElement);
@@ -4108,6 +4146,18 @@ bool testGenericArgInference()
     namespacedList.value = 9;
     result &= Test("generic_list_namespace_pattern_deduction",
         LgenListNs.get(namespacedList), 9);
+    GenlitEnclosing.W<int> enclosingW = default;
+    // This value distinguishes enclosing-namespace template lookup from the no-overload path.
+    result &= Test("genlit_enclosing_namespace_struct_pattern",
+        GenlitEnclosing.C.f(enclosingW), 6);
+    result &= Test("genlit_enclosing_namespace_pointer_pattern",
+        GenlitEnclosing.C.fp(&enclosingW), 6);
+    result &= Test("genlit_two_level_enclosing_namespace_pattern",
+        GenlitEnclosing.B.C.f(enclosingW), 6);
+    result &= Test("genlit_non_generic_nested_scope_control",
+        GenlitEnclosing.C.g(enclosingW), 6);
+    result &= Test("genlit_enclosing_generic_function_control",
+        GenlitEnclosing.outer(enclosingW), 6);
     // int default: value and width (pre-fix: refused / 1 byte).
     result &= Test("lit_val_300",       litFirst(300, 2),        300);
     result &= Test("lit_second_val_300", litSecond(2, 300),      300);
@@ -4126,6 +4176,18 @@ bool testGenericArgInference()
     result &= Test("lit_sz_ternary_i8_promotion",
         (int)sizeof(litFirst(litCondition ? litNarrow : 2, 3)) * 100
             + litFirst(litCondition ? litNarrow : 2, 3), 401);
+    char* genericLiteralPointer = (char*)"b";
+    bool genericLiteralInnerCondition = false;
+    char* genericLiteralNullPointer = nullptr;
+    result &= Test("genlit_direct_string_pointer_control", lgenGenericArgSize("a"), 8);
+    result &= Test("genlit_string_literal_ternary", lgenGenericArgSize(
+        litCondition ? "a" : "b"), 8);
+    result &= Test("genlit_string_literal_char_pointer_ternary", lgenGenericArgSize(
+        litCondition ? "a" : genericLiteralPointer), 8);
+    result &= Test("genlit_nested_string_pointer_ternary", lgenGenericArgSize(
+        litCondition ? (genericLiteralInnerCondition ? "a" : "b") : genericLiteralPointer), 8);
+    result &= Test("genlit_string_pointer_null_coalesce", lgenGenericArgSize(
+        genericLiteralNullPointer ?? "a"), 8);
     result &= Test("lit_sz_unary_neg_paren", (int)sizeof(litUnary(-(7))) * 100
         + litUnary(-(7)), 393);
     result &= Test("lit_sz_unary_pos_paren", (int)sizeof(litUnary(+(7))) * 100

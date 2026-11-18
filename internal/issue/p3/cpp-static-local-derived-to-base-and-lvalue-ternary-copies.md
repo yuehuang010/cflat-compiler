@@ -6,7 +6,8 @@ cflat vs clang). T226 fixed the lvalue copy and the non-ternary derived slice. T
 T233 round 2 fixed the xvalue (`move d`) derived arms, mixed lvalue/xvalue/prvalue arms of one derived
 class, `static T g = move *p`, and the moved-source refusal for a second static `move a` (legs
 93025-93035). T231 fixed the call-argument double slice `takeb(D(3))`. TERNBASE (af28ab81) fixed the
-derived/base lvalue join. TERNMOVE fixed the nested-field arm `rv.mkH2(1).h.d`.
+derived/base lvalue join. TERNMOVE fixed the nested-field arm `rv.mkH2(1).h.d`. STATELEM fixed the
+array element of a class temporary as a ternary arm in typed and `auto` locals (legs 93085-93100).
 
 Still open:
 
@@ -24,29 +25,19 @@ copy-init overload resolution on the xvalue) and falls back to the lvalue wrappe
 `B(D&&)` still calls `B(B&&)` (clang `B(D&&)`; master too): the `!explicitMove` guard skips the wrapper. Matrix in scratch/statleft_matrix.md. Parenthesized returns and
 reference returns already matched clang and are guarded by legs.
 
-## Still open: array element of a class temporary as a ternary arm
+## Not fixed here: refusals and notes (STATELEM scope left out)
 
-`c ? rv.mkHA(1).a[0] : rv.D(2)` into a plain local base, `B g` (C++ class `B`, element type `D`) gives
-`1 2 0 1 3` (clang `1 2 0 2 4`): one move straight from the element, where clang moves the element into a
-D temporary and then slices that temporary into B. Reversed arms, `a[1]`, `c ? mkHA(1).a[0] : (c ? ...)`
-and `auto` / same-class `D` destinations are the same family. A static local destination already matches
-clang (`B1S`, `B2S`). Field-of-temp arms (`mkH(1).d`, `mkH2(1).h.d`) match clang.
+Refused on master and still refused, clang accepts (not counts; out of this item, do not fix here):
+`takeB(c ? mkHA(1).a[0] : sl.D(2))` (by-value arm ownership error; master words it "'?:' arms differ in
+ownership", the STATELEM build words it "'?:' arms handle ownership differently").
 
-Traced (STATLEFT, IR and probes, `scratch/statleft_probe/`):
-- The element arm reaches the derived-arm path with `fieldOfTemp=1`: the element's storage is a zero-offset
-  GEP into the HA sret temp, so `IsOwnedTempValue` (exact alloca match) is false and
-  `IsFieldOfOwnedStructTemp` (GEP walk) is true. The arm is Xvalue and deferred.
-- The deferred arm reaches `resolveDerivedArm` with a Prvalue sibling of the same class, and the temp
-  branch runs (`EmitCxxCopyOrMoveConstruct` returns success), yet the final IR has no temp move. The
-  decl join ends in the generic `cxx_lvalue_storage_join` PHI, and the slice from the PHI moves once.
-  Why the temp move is discarded is NOT yet known. Next step: lldb on the decl-join path, not a guess edit.
-- Two tried and reverted: (1) recording a built-in-place prvalue sibling as the derived arm state
-  (`NoteBuiltInPlaceDerivedArm`): no change in any cell. (2) (not tried) allowing Xvalue/Lvalue x Prvalue
-  of one class in `lowerMixedCxxValueJoin` (its same-name gate only admits Lvalue x Xvalue).
+Accepted since STATELEM, matching clang's counts, not legged: `sl.D g = c ? sl.D(2) : mkHA(1).a[0]` (refused
+on master; element-selected `1 2 0 1 3`) and `sl.D g = c ? mkH(1).d : sl.D(2)` (refused on master;
+`1 1 0 1 2` / `2 1 0 0 1`).
 
-Refused on master, clang accepts (not counts; out of this item, do not fix here): `sl.D g = c ? sl.D(2) :
-mkHA(1).a[0]` ("cannot initialize C++ class"), `sl.D g = c ? mkH(1).d : sl.D(2)`, and `takeB(c ? mkHA(1).a[0]
-: sl.D(2))` (by-value arm ownership error "'?:' arms handle ownership differently").
+Pre-existing, differs from clang on master too (not in STATELEM r3): `B g = c ? mkDCF(1).cd : D(2)` where
+`cd` is a `const D` field of a temporary moves from the const field (2 moves, clang copies twice on
+c=true; `1 1 2 0 3` vs cflat `1 1 0 2 3`). The derived block uses the field xvalue without the const check.
 
 Same-class NRVO (not a derived-to-base item; master kept): `B b = B(6); return b;` and `D d = D(6);
 return d;` move on master, clang elides (0 moves). Same for `DC d; return d;` with a copy-only class.

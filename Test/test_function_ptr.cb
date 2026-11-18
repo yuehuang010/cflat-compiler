@@ -8109,6 +8109,11 @@ int fnvsValueView(function<int(int)>[] values) { return values[0](1); }
 int fnvsPointerView(function<int(int)>*[] values) { return (*values[0])(2); }
 int fnvsPick(function<int(int)>[] values) { return 10 + values[0](1); }
 int fnvsPick(function<int(int)>*[] values) { return 20 + (*values[0])(1); }
+int pdepthViewPick(int*[] values) { return values == nullptr ? 0 : 11; }
+int pdepthViewPick(int**[] values) { return values == nullptr ? 0 : 22; }
+int pdepthViewPick(int***[] values) { return values == nullptr ? 0 : 33; }
+int pdepthFixedPickTwo(int*[] values) { return values == nullptr ? 0 : 11; }
+int pdepthFixedPickTwo(int**[] values) { return values == nullptr ? 0 : 22; }
 
 bool testFnviewstarPointerViewElement()
 {
@@ -8121,6 +8126,28 @@ bool testFnviewstarPointerViewElement()
     result &= Test("fnviewstar pointer view call", fnvsPointerView(pointers), 5);
     result &= Test("fnviewstar overload value view picks [] arm", fnvsPick(values), 14);
     result &= Test("fnviewstar overload pointer view picks *[] arm", fnvsPick(pointers), 24);
+    function<int(int)>* fnSlot = &fn;
+    function<int(int)>* fnSlotCopy = fnSlot;
+    result &= Test("pdepth exact function-pointer slot depth stays accepted",
+        fnSlotCopy == fnSlot, true);
+    int*[1] pdepthSlotsOne;
+    int**[1] pdepthSlotsTwo;
+    int***[1] pdepthSlotsThree;
+    int*[] pdepthViewOne = pdepthSlotsOne;
+    int**[] pdepthViewTwo = pdepthSlotsTwo;
+    int***[] pdepthViewThree = pdepthSlotsThree;
+    result &= Test("pdepth view overload selects element depth one",
+        pdepthViewPick(pdepthViewOne), 11);
+    result &= Test("pdepth view overload selects element depth two",
+        pdepthViewPick(pdepthViewTwo), 22);
+    result &= Test("pdepth view overload selects element depth three",
+        pdepthViewPick(pdepthViewThree), 33);
+    result &= Test("pdepth fixed array two-overload selects element depth two",
+        pdepthFixedPickTwo(pdepthSlotsTwo), 22);
+    result &= Test("pdepth fixed array three-overload selects element depth two",
+        pdepthViewPick(pdepthSlotsTwo), 22);
+    result &= Test("pdepth fixed array three-overload selects element depth three",
+        pdepthViewPick(pdepthSlotsThree), 33);
     return result;
 }
 

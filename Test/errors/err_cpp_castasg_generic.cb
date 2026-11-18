@@ -1,0 +1,12 @@
+struct CastAsgGeneric<T> { T value = default; };
+
+expect_error("found '=' but expected ';'");
+int CastAsgGenericCastRejected()
+{
+    CastAsgGeneric<int> value = {};
+    CastAsgGeneric<int> source = {};
+    (CastAsgGeneric<int>)value = source;
+    return 0;
+}
+
+extern int main() { return 0; }

@@ -1640,7 +1640,10 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
             tv.TypeName = p.TypeName;
         tv.Pointer  = p.Pointer || p.IsArrayView;
         tv.IsArrayView = p.IsArrayView;
-        tv.PointerDepth = p.PointerDepth;
+        // FuncPtrParam stores a view's thin pointer in PointerDepth too; TypeAndValue stores
+        // the element depth, so remove that representation level when reconstructing the param.
+        tv.PointerDepth = p.IsArrayView && p.PointerDepth > 0
+            ? p.PointerDepth - 1 : p.PointerDepth;
         tv.ElemPointer = tv.Pointer && p.PointerDepth >= 2;
         if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint32_t>(p.ConstMask);
         tv.IsInterface = IsInterfaceType(p.TypeName);
@@ -4131,6 +4134,35 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 || (!params[i].Pointer && !params[i].IsAlias
                         && IsCoreUniqueType(params[i].TypeName))
                 || sinkConsumes || forcedOperatorConsume);
+            // The core unique<T> wrapper is a compiler-generated bridge; the outer store owns its diagnostic.
+            const bool coreUniqueWrapperCall = IsCoreUniqueType(functionName);
+            if (paramConsumesOwningValue && !coreUniqueWrapperCall)
+                if (const auto* join = FindUniqueFieldReadJoin(args[i].Primary))
+                    for (const auto& source : join->Sources)
+                    {
+                        const auto& field = source.Variable;
+                        if (!field.RootIsBorrowedByValueParam || field.FieldName.empty()) continue;
+                        const std::string borrowedSource = field.FieldPathRoot.empty()
+                            ? field.TypeAndValue.VariableName : field.FieldPathRoot;
+                        LogError(std::format(
+                            "call to '{}': parameter '{}' takes over the value and frees it later, but "
+                            "this function only uses it ('{}' is a parameter that takes a copy, so the "
+                            "calling code keeps ownership). Accept the parameter as a parameter that "
+                            "takes over the value (move it in the body), or pass a copy with 'copy()'.",
+                            SpellFunctionSymbol(*this, functionName), params[i].VariableName,
+                            borrowedSource));
+                    }
+            if (paramConsumesOwningValue && !coreUniqueWrapperCall)
+                for (const auto& source : args[i].ConditionalMoveSources)
+                    if (!source.FieldName.empty()
+                        && IsVariableBorrowedOwningValue(source.CallerName))
+                        LogError(std::format(
+                            "call to '{}': parameter '{}' takes over the value and frees it later, but "
+                            "this function only uses it ('{}' is a parameter that takes a copy, so the "
+                            "calling code keeps ownership). Accept the parameter as a parameter that "
+                            "takes over the value (move it in the body), or pass a copy with 'copy()'.",
+                            SpellFunctionSymbol(*this, functionName), params[i].VariableName,
+                            source.CallerName));
             if (paramConsumesOwningValue && args[i].IsTupleLiteral)
             {
                 auto findBorrowedTupleParam = [&](auto&& self, const NamedVariable& value) -> std::string {

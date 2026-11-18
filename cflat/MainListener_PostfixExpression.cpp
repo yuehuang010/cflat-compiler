@@ -2950,10 +2950,13 @@ void MainListener::DiagnoseAssignmentArguments(CFlatParser::ArgumentExpressionLi
             pending.pop_back();
             if (dynamic_cast<CFlatParser::LambdaBodyContext*>(node) != nullptr) continue;
             if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
-                assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                HasAssignmentOperator(assignment))
             {
+                auto* castTarget = assignment->castAssignmentTarget();
                 const std::string target = assignment->unaryExpression() != nullptr
-                    ? assignment->unaryExpression()->getText() : std::string("the variable");
+                    ? assignment->unaryExpression()->getText()
+                    : castTarget != nullptr && castTarget->castExpression() != nullptr
+                        ? castTarget->castExpression()->getText() : std::string("the variable");
                 LogErrorContext(assignment, std::format(
                     "an assignment cannot be used as a call argument; assign first, then pass '{}'",
                     target));
@@ -3133,7 +3136,7 @@ bool SameVarResolve(antlr4::tree::ParseTree* node, SameVarLoc& loc, const SameVa
             return SameVarDeref(loc, "0");
         }
         if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
-            assignment != nullptr && assignment->assignmentOperator() != nullptr)
+            HasAssignmentOperator(assignment))
             return false;
         auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
         if (rule == nullptr || rule->children.size() != 1) return false;
@@ -3196,7 +3199,7 @@ void CollectSameVarMods(antlr4::tree::ParseTree* root, std::vector<SameVarMod>& 
             }
         }
         else if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
-                 assignment != nullptr && assignment->assignmentOperator() != nullptr
+                 HasAssignmentOperator(assignment)
                  && assignment->unaryExpression() != nullptr)
         {
             SameVarLoc loc;
@@ -10770,7 +10773,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 || argNV.TypeAndValue.IsTypeMatch(argExpectedDest);
                                             const bool integerPointeeMismatch =
                                                 backend->IsImplicitIntegerPointeePointerConversion(
-                                                    sourcePointerType, argExpectedDest);
+                                                    sourcePointerType, argExpectedDest,
+                                                    /*includeDepthMismatch*/ false);
                                             const bool derivedToBase = backend->IsCxxDerivedToBasePointer(
                                                 sourcePointerType, argExpectedDest);
                                             // `&t` reports depth 0 with Pointer set; compare normalized depths.
@@ -12822,7 +12826,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                      */
                                     auto sameClassLocalOtherArm = [&]() {
                                         auto* conditional = argumentExpression != nullptr
-                                            && argumentExpression->assignmentOperator() == nullptr
+                                            && !HasAssignmentOperator(argumentExpression)
                                             ? argumentExpression->conditionalExpression() : nullptr;
                                         if (conditional == nullptr || conditional->Question() == nullptr
                                             || conditional->expression() == nullptr
@@ -12905,7 +12909,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         ternaryCallSinkReturnType = funcSym->ReturnType;
                                     }
                                     auto* conditionalArgument = argumentExpression != nullptr
-                                        && argumentExpression->assignmentOperator() == nullptr
+                                        && !HasAssignmentOperator(argumentExpression)
                                         ? argumentExpression->conditionalExpression() : nullptr;
                                     const bool isConditionalArgument = conditionalArgument != nullptr
                                         && conditionalArgument->Question() != nullptr;
@@ -12929,7 +12933,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     priorArgument, priorParameter)
                                                     == LLVMBackend::ScalarArgConversion::Narrow
                                                 || Compiler(ctx)->IsImplicitIntegerPointeePointerConversion(
-                                                    priorArgument.TypeAndValue, priorParameter))
+                                                    priorArgument.TypeAndValue, priorParameter,
+                                                    /*includeDepthMismatch*/ false))
                                                 priorArgsHaveValidConversions = false;
                                         }
                                     if (ternaryCallSink == nullptr && isConditionalArgument
@@ -13212,6 +13217,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         (cxxDirectConstructionSink || directConstructionParent)
                                         && IsSoleCxxClassConstruction(
                                             *Compiler(ctx), namedArgument->assignmentExpression());
+                                    const bool cxxTemplateDirectTypeParameter = cxxTemplateWrapper
+                                        && structVar.BaseType == nullptr
+                                        && cxxDirectConstructionSink
+                                        && Compiler(ctx)->IsCxxFunctionTemplateParameterDirectType(
+                                            structVar.BaseType != nullptr
+                                                ? primaryIdentifier : functionName,
+                                            structVar.BaseType != nullptr
+                                                ? structVar.TypeAndValue.TypeName : std::string(),
+                                            argIdx, namedArgCtx.size());
                                     auto isLiteralArgumentTree = [&](auto&& self,
                                                                      antlr4::tree::ParseTree* node) -> bool {
                                         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
@@ -13267,9 +13281,111 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (hasLaterConstructionSibling
                                         && cxxDirectConstructionCallOrderSafe_ != nullptr)
                                         *cxxDirectConstructionCallOrderSafe_ = false;
+                                    std::string directConstructionTypeName;
+                                    if (directClassConstructionArgument)
+                                    {
+                                        auto* construction = SoleCxxConstructionPostfix(
+                                            namedArgument->assignmentExpression());
+                                        auto* primary = construction != nullptr
+                                            ? construction->primaryExpression() : nullptr;
+                                        auto* generic = primary != nullptr
+                                            ? primary->genericIdentifier() : nullptr;
+                                        auto* identifier = generic != nullptr
+                                            ? generic->Identifier() : nullptr;
+                                        if (identifier != nullptr)
+                                        {
+                                            directConstructionTypeName = identifier->getText();
+                                            if (generic->genericTypeParameters() != nullptr)
+                                                directConstructionTypeName +=
+                                                    generic->genericTypeParameters()->getText();
+                                            for (auto* member : construction->memberNameToken())
+                                            {
+                                                auto* memberIdentifier = member->Identifier();
+                                                if (memberIdentifier == nullptr)
+                                                {
+                                                    directConstructionTypeName.clear();
+                                                    break;
+                                                }
+                                                directConstructionTypeName += "." + memberIdentifier->getText();
+                                            }
+                                        }
+                                    }
+                                    bool directConstructionHasMutableRefParameter = false;
+                                    bool directConstructionHasNonSimpleArgument = false;
+                                    const bool directConstructionIsImmovableTemplateArgument =
+                                        cxxTemplateWrapper && directClassConstructionArgument
+                                        && ((!argExpectedDest.TypeName.empty()
+                                                && Compiler(ctx)->IsImmovableType(argExpectedDest.TypeName))
+                                            || (!directConstructionTypeName.empty()
+                                                && Compiler(ctx)->IsImmovableType(
+                                                    directConstructionTypeName)));
+                                    if (directClassConstructionArgument && cxxDirectConstructionSink
+                                        && !argExpectedDest.TypeName.empty())
+                                    {
+                                        auto* construction = SoleCxxConstructionPostfix(
+                                            namedArgument->assignmentExpression());
+                                        auto* info = Compiler(ctx)->GetCxxClassInfoWithConstructors(
+                                            argExpectedDest.TypeName);
+                                        if (info == nullptr && !directConstructionTypeName.empty())
+                                            info = Compiler(ctx)->GetCxxClassInfoWithConstructors(
+                                                directConstructionTypeName);
+                                        if (construction != nullptr && info != nullptr)
+                                        {
+                                            auto constructorLists = construction->argumentExpressionList();
+                                            if (!constructorLists.empty())
+                                            {
+                                                auto constructorArgs = constructorLists.back()->argumentNamedExpression();
+                                                for (const auto& constructorArg : constructorArgs)
+                                                {
+                                                    auto* expression = constructorArg->assignmentExpression();
+                                                    if (IsCxxInertCallArgument(expression)
+                                                        || IsCxxSideEffectFreeScalarExpression(expression))
+                                                        continue;
+                                                    if (isLiteralArgumentTree(isLiteralArgumentTree, expression))
+                                                        continue;
+                                                    auto* identifier = BareIdentifierInExpression(expression);
+                                                    const bool isVariable = identifier != nullptr
+                                                        && (Compiler(ctx)->GetScopedLocalOrArgument(
+                                                                identifier->getText()).Storage != nullptr
+                                                            || Compiler(ctx)->GetScopedLocalOrArgument(
+                                                                identifier->getText()).Primary != nullptr
+                                                            || Compiler(ctx)->HasMemberVariable(
+                                                                identifier->getText())
+                                                            || Compiler(ctx)->globalNamedVariable.contains(
+                                                                identifier->getText()));
+                                                    if (!isVariable)
+                                                    {
+                                                        directConstructionHasNonSimpleArgument = true;
+                                                        break;
+                                                    }
+                                                }
+                                                for (const auto& ctor : info->constructors)
+                                                {
+                                                    if (ctor.params.size() != constructorArgs.size() + 1) continue;
+                                                    for (size_t i = 0; i < constructorArgs.size(); ++i)
+                                                    {
+                                                        const auto& param = ctor.params[i + 1];
+                                                        if (!param.IsCxxRef() || param.CxxConstRef()
+                                                            || param.IsRvalueRef)
+                                                            continue;
+                                                        directConstructionHasMutableRefParameter = true;
+                                                        break;
+                                                    }
+                                                    if (directConstructionHasMutableRefParameter) break;
+                                                }
+                                            }
+                                        }
+                                    }
                                     llvm::SaveAndRestore<bool> directConstructionPosition(
                                         cxxDirectConstructionCanDefer_,
                                         cxxDirectConstructionCanDefer_
+                                            && (!((cxxFreeWrapper || cxxNonTemplateMemberWrapper
+                                            || cxxTemplateDirectTypeParameter)
+                                                    && !cxxConstructorCall
+                                                    && cxxDirectConstructionSink)
+                                                || directConstructionHasMutableRefParameter
+                                                || directConstructionHasNonSimpleArgument
+                                                || directConstructionIsImmovableTemplateArgument)
                                             && !hasLaterConstructionSibling
                                             && (cxxDirectConstructionCallOrderSafe_ == nullptr
                                                 || *cxxDirectConstructionCallOrderSafe_));
@@ -13562,12 +13678,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
                                     /*
-                                     * T518: an unbound C++ free wrapper copies a class lvalue argument only
-                                     * inside the wrapper, after every later argument ran; a later non-inert
-                                     * argument naming the same object is handled below.
+                                     * T518: an unbound C++ wrapper or constructor copies a class lvalue
+                                     * argument only after later arguments ran; materialize it before them.
                                      */
-                                    if (cxxFreeWrapper && !cxxTemplateWrapper && !cxxConstructorCall
-                                        && (funcSym == nullptr || funcSym->UniqueName.starts_with("__cflat_free_"))
+                                    const bool cxxByValueCall = cxxFreeWrapper || cxxNonTemplateMemberWrapper
+                                        || cxxConstructorCall || (funcSym != nullptr && funcSym->IsCxx);
+                                    if (cxxByValueCall && !cxxTemplateWrapper
+                                        && (cxxConstructorCall || funcSym == nullptr || funcSym->IsCxx
+                                            || funcSym->UniqueName.starts_with("__cflat_free_"))
                                         && !argNV.IsRvalue && !argNV.IsExplicitMove
                                         && argNV.Storage != nullptr
                                         && !argNV.IsCxxDirectConstruction && argNV.CxxClosureSignature.empty()
@@ -13602,7 +13720,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 namedArgCtx[later]->assignmentExpression(),
                                                 argNV.Storage, argNV.ThisFieldPath, &laterMayWrite,
                                                 namedArgCtx[argIdx]->assignmentExpression());
-                                            if (globalStorage || namedLaterWrite || laterMayWrite)
+                                            if (globalStorage || namedLaterWrite || laterMayWrite
+                                                || !IsCxxInertCallArgument(
+                                                    namedArgCtx[later]->assignmentExpression()))
                                                 laterIndex = later + 1;
                                         }
                                         const bool laterMayWrite = laterIndex != 0;
@@ -17673,6 +17793,30 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         if (ctorClosure != nullptr) ctorClosure->Family.insert(fn);
         compiler->InitializeBlock(&fn->front(), false);
+        NamedReturnElisionContext nrvoContext;
+        nrvoContext.function = fn;
+        if (compiler->currentFunction == fn
+            && !returnType.Pointer && !returnType.IsAlias && !returnType.IsMove
+            && compiler->currentFunctionAbiRecipe.hasLowering
+            && compiler->currentFunctionAbiRecipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
+            && (!compiler->IsCxxRecord(returnType.TypeName)
+                || compiler->IsForeignNontrivialCxxClass(returnType.TypeName))
+            && compiler->IsDataStructure(returnType.TypeName)
+            && compiler->HasForeignNontrivialCxxField(returnType.TypeName)
+            && compiler->ReturnsViaCxxSret(returnType.TypeName))
+        {
+            auto nrvoDeclarators = ClassifyNamedLocalReturnCandidates(ctx);
+            if (!nrvoDeclarators.empty())
+            {
+                const unsigned sretIndex = compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe);
+                if (compiler->currentFunction->arg_size() > sretIndex)
+                {
+                    nrvoContext.declarators = std::move(nrvoDeclarators);
+                    nrvoContext.sretStorage = compiler->currentFunction->getArg(sretIndex);
+                }
+            }
+        }
+        NamedReturnElisionScope nrvoScope(*this, std::move(nrvoContext));
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         struct LambdaDeferredCheckGuard
         {
@@ -17869,7 +18013,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                         // below then emits the CreateRetVoid. FlushOwnedTemps stands in for the
                         // block-item boundary flush an expression body never reaches. `void*`
                         // returns a real value and stays on the return lowering.
-                        bool bareExpr = !forcedDiscard && expr->assignmentOperator() == nullptr;
+                        bool bareExpr = !forcedDiscard && !HasAssignmentOperator(expr);
                         auto resultNV = ParseAssignmentExpressionNamed(discardExpr, ResultUse::Discard);
                         // No context declared the return type, so "void" here is a fallback. A body
                         // that yields a VALUE would be silently dropped and the caller would read
@@ -18152,7 +18296,7 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             {
                 auto* assignment = entries[i]->assignmentExpression();
                 const bool discarded = i + 1 != entries.size();
-                const bool bareExpr = assignment->assignmentOperator() == nullptr;
+                const bool bareExpr = !HasAssignmentOperator(assignment);
                 auto operand = ParseAssignmentExpressionNamed(assignment,
                     discarded ? ResultUse::Discard : ResultUse::Value);
                 llvm::Value* value = operand.Primary != nullptr
@@ -20195,9 +20339,9 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                         continue;
                     }
                     if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
-                        assignment != nullptr && assignment->assignmentOperator() != nullptr
+                        HasAssignmentOperator(assignment)
                         && assignment->assignmentExpression() == inner)
-                        return assignment->assignmentOperator()->Assign() == nullptr
+                        return !IsSimpleAssignmentExpression(assignment)
                             || IsGenericFunctionScalarDestination(compiler, functionDestination);
                     if (auto* selection = dynamic_cast<CFlatParser::SelectionStatementContext*>(parent);
                         selection != nullptr && selection->expression() == inner)
@@ -20283,10 +20427,10 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                     break;
                 }
                 if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
-                    assignment != nullptr && assignment->assignmentOperator() != nullptr
+                    HasAssignmentOperator(assignment)
                     && assignment->assignmentExpression() == child)
                 {
-                    scalarOperand = assignment->assignmentOperator()->Assign() == nullptr
+                    scalarOperand = !IsSimpleAssignmentExpression(assignment)
                         || IsGenericFunctionScalarDestination(compiler, functionDestination);
                     valueConsumer = !scalarOperand;
                     break;

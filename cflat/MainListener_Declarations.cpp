@@ -93,7 +93,7 @@ static bool IsTernaryArmOfBinaryOperand(antlr4::ParserRuleContext* arm)
             if (auto* p = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(parent);
                 p != nullptr && p->logicalAndExpression().size() > 1) return true;
             if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
-                assignment != nullptr && assignment->assignmentOperator() != nullptr) return true;
+                HasAssignmentOperator(assignment)) return true;
         }
         return false;
     }
@@ -509,7 +509,7 @@ static bool ClosureLocalStoresAreProvablyEnvFree(CFlatParser::InitDeclaratorCont
 static bool IsSoleUnaryExpression(antlr4::tree::ParseTree* node)
 {
         if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
-            return assign->assignmentOperator() == nullptr && assign->conditionalExpression() != nullptr
+            return !HasAssignmentOperator(assign) && assign->conditionalExpression() != nullptr
                 && IsSoleUnaryExpression(assign->conditionalExpression());
         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
             primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
@@ -526,7 +526,7 @@ static bool IsSoleOperatorExpression(antlr4::tree::ParseTree* node)
 {
         if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
         {
-            if (assign->assignmentOperator() != nullptr) return false;
+            if (HasAssignmentOperator(assign)) return false;
             return assign->conditionalExpression() != nullptr
                 && IsSoleOperatorExpression(assign->conditionalExpression());
         }
@@ -10011,10 +10011,11 @@ cxx_dtor_ready:
                 parsedArrayRetValue = compiler->lastCxxRetValue_;
                 hasParsedArrayInitializer = true;
             }
-            // A sole unary operator is armed at the operator slot below; pre-parsing it here
-            // would build its result before the slot exists.
+            // A sole unary operator or ternary is armed at its slot below; pre-parsing it here
+            // would build its arms before the destination exists (a ternary joins into the slot).
             else if (!directCxxSubscript && !IsBareIdentifierText(srcText)
                 && srcText.find('[') != std::string::npos
+                && SoleTernaryExpression(assign) == nullptr
                 && !IsSoleUnaryExpression(assign)
                 && !IsSoleOperatorExpression(assign))
             {
@@ -10438,13 +10439,19 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
         const std::string typeName = sourceNV.TypeAndValue.TypeName;
         // A `T&&` / `const T&&` class result: clang selects the constructor into the slot.
         const bool xvalue = compiler->IsCxxRvalueRefClassResult(sourceNV);
+        const bool ternaryTrivialXvalue = SoleTernaryExpression(assign) != nullptr
+            && (sourceNV.TypeAndValue.IsMove || sourceNV.IsExplicitMove)
+            && !sourceNV.TypeAndValue.Pointer && sourceNV.Storage != nullptr
+            && compiler->IsCxxRecord(typeName)
+            && compiler->IsCxxTriviallyCopyableRecord(typeName);
         // `alias auto` keeps its borrow; a prvalue (sret temp) keeps the elision path.
         if (autoType.IsAlias || autoType.Pointer || autoType.staticStorage
-            || (!xvalue && (sourceNV.TypeAndValue.Pointer || sourceNV.Storage == nullptr))
+            || (!xvalue && !ternaryTrivialXvalue
+                && (sourceNV.TypeAndValue.Pointer || sourceNV.Storage == nullptr))
             || sourceCxxRetTemp != nullptr
             || (compiler->lastCxxRetTemp_ != nullptr && sourceNV.Storage == compiler->lastCxxRetTemp_)
             || !compiler->IsForeignCxxClassWithConstructors(typeName)
-            || !compiler->IsForeignNontrivialCxxClass(typeName))
+            || (!compiler->IsForeignNontrivialCxxClass(typeName) && !ternaryTrivialXvalue))
             return false;
 
         LLVMBackend::DeclTypeAndValue slotType = autoType;
@@ -10456,6 +10463,34 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
             LogErrorContext(direct, std::format(
                 "redeclaration of '{}' in the same scope; use a different name or assign to the "
                 "existing variable", name));
+        llvm::Value* nrvoStorage = nullptr;
+        auto& nrvo = namedReturnElision_;
+        const auto nrvoCandidate = std::find(nrvo.declarators.begin(), nrvo.declarators.end(), direct);
+        if (nrvo.function == compiler->currentFunction && nrvoCandidate != nrvo.declarators.end())
+        {
+            auto* localType = compiler->GetType(slotType);
+            const auto& recipe = compiler->currentFunctionAbiRecipe;
+            const uint64_t abiAlign = localType != nullptr && localType->isSized()
+                ? compiler->module->getDataLayout().getABITypeAlign(localType).value() : 0;
+            const bool returnCtorReachable =
+                compiler->FindCxxMoveCtor(typeName) != nullptr
+                || compiler->FindCxxCopyCtor(typeName, true, false) != nullptr
+                || compiler->FindCxxCopyCtor(typeName, false, false) != nullptr
+                || compiler->TryBindCxxGeneratedMoveCtor(typeName) != nullptr;
+            const bool nrvoEligible = !autoType.Pointer && !autoType.IsAlias
+                && !autoType.IsMove && !autoType.staticStorage
+                && autoType.ConstArraySize == 0 && autoType.ConstInnerDimensions.empty()
+                && typeName == compiler->currentFunctionReturnTypeName
+                && compiler->IsForeignNontrivialCxxClass(typeName)
+                && returnCtorReachable && recipe.hasLowering
+                && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
+                && recipe.retSlot.structTy == localType && nrvo.sretStorage != nullptr
+                && (autoType.UserAlignValue == 0 || autoType.UserAlignValue <= abiAlign);
+            if (nrvoEligible)
+                nrvoStorage = nrvo.sretStorage;
+            else
+                nrvo.declarators.erase(nrvoCandidate);
+        }
         if (!compiler->HasTrivialCxxDtor(typeName)
             && compiler->GetOrCreateCxxClassDestructor(typeName) == nullptr)
         {
@@ -10469,10 +10504,9 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
                 return true;
             }
         }
-        llvm::Value* slotValue = compiler->CreateLocalVariable(slotType, nullptr, nullptr, line,
-                                                               slotType.UserAlignValue);
-        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
-        allocList.push_back(std::pair(name, slot));
+        llvm::Value* slot = compiler->CreateLocalVariable(slotType, nullptr, nullptr, line,
+                                                          slotType.UserAlignValue, nrvoStorage);
+        allocList.push_back(std::pair(name, llvm::dyn_cast_or_null<llvm::AllocaInst>(slot)));
         if (slot == nullptr) return true;
 
         if (xvalue)
@@ -10483,6 +10517,25 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
                     sourceNV.TypeAndValue.CxxConstRef(), false, refusal))
                 LogErrorContext(assign != nullptr ? static_cast<antlr4::ParserRuleContext*>(assign)
                                                   : direct, refusal);
+            return true;
+        }
+        if (ternaryTrivialXvalue)
+        {
+            compiler->SetCurrentDebugLocation(line);
+            const bool constSource = compiler->CxxConstReceiverKind(sourceNV) != 0;
+            const std::string srcName = !sourceNV.CallerName.empty() ? sourceNV.CallerName
+                : assign != nullptr ? assign->getText() : std::string();
+            std::string refusal;
+            if (compiler->CxxExplicitMoveNeedsTransfer(typeName, constSource, false))
+            {
+                if (!compiler->EmitCxxExplicitMoveTransfer(typeName, slot, sourceNV.Storage,
+                        constSource, false, srcName, refusal))
+                    LogErrorContext(assign != nullptr ? static_cast<antlr4::ParserRuleContext*>(assign)
+                                                      : direct, refusal);
+            }
+            else
+                compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, sourceNV.Storage,
+                    /*useMove*/ true, std::format("into local '{}'", name).c_str(), {}, constSource);
             return true;
         }
         const std::string srcText = assign != nullptr ? assign->getText() : std::string();
@@ -13056,6 +13109,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         *compiler, rightNV.TypeAndValue.TypeName);
                                     rightNV.TypeAndValue.TypeName = pointeeName;
                                     rightNV.TypeAndValue.Pointer = true;
+                                    rightNV.TypeAndValue.ElemPointer = false;
+                                    rightNV.TypeAndValue.PointerDepth =
+                                        compiler->IsInterfaceType(pointeeName) ? 0 : 1;
                                     rightNV.TypeAndValue.IsMove = movingUnique;
                                     rightNV.IsOwning = movingUnique;
                                     rightNV.IsBorrowed = !movingUnique;
@@ -14886,24 +14942,39 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && nrvoCandidate != nrvo.declarators.end())
                     {
                         // The name test comes first: GetType reports an error on an `auto` local.
-                        auto* localType = typeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                        const bool typeMatchesReturn =
+                            typeAndValue.TypeName == compiler->currentFunctionReturnTypeName;
+                        auto* localType = typeMatchesReturn
                             ? compiler->GetType(typeAndValue) : nullptr;
                         const auto& recipe = compiler->currentFunctionAbiRecipe;
                         const uint64_t abiAlign = localType != nullptr && localType->isSized()
                             ? compiler->module->getDataLayout().getABITypeAlign(localType).value() : 0;
-                        nrvoLocal = !global_scope && !isStaticLocal
+                        const bool nrvoEligible = !global_scope && !isStaticLocal
                             && !typeAndValue.Pointer && !typeAndValue.IsAlias && !typeAndValue.IsMove
                             && typeAndValue.ConstArraySize == 0
-                            && typeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                            && typeMatchesReturn
                             && compiler->IsDataStructure(typeAndValue.TypeName)
                             && compiler->HasForeignNontrivialCxxField(typeAndValue.TypeName)
-                            && !compiler->IsForeignNontrivialCxxReturnClass(typeAndValue.TypeName)
                             && recipe.hasLowering
                             && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
                             && recipe.retSlot.structTy == localType
                             && nrvo.sretStorage != nullptr
                             && (typeAndValue.UserAlignValue == 0
                                 || typeAndValue.UserAlignValue <= abiAlign);
+                        nrvoLocal = nrvoEligible;
+                        if (nrvoLocal
+                            && compiler->IsForeignNontrivialCxxReturnClass(typeAndValue.TypeName))
+                        {
+                            bool reachable = false;
+                            if (compiler->TryGetCxxNamedReturnCtorReachability(
+                                    typeAndValue.TypeName, reachable))
+                                nrvoLocal = reachable;
+                            else
+                                nrvoLocal = compiler->FindCxxMoveCtor(typeAndValue.TypeName) != nullptr
+                                    || compiler->FindCxxCopyCtor(typeAndValue.TypeName, true, false) != nullptr
+                                    || compiler->FindCxxCopyCtor(typeAndValue.TypeName, false, false) != nullptr
+                                    || compiler->TryBindCxxGeneratedMoveCtor(typeAndValue.TypeName) != nullptr;
+                        }
                         if (nrvoLocal)
                             nrvoStorage = nrvo.sretStorage;
                         else

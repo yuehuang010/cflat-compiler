@@ -1760,10 +1760,11 @@ bool LLVMBackend::JoinIsAllStringLiterals(const llvm::Value* value, int depth) c
     return false;
 }
 
-bool LLVMBackend::JoinIsCharPointer(const llvm::Value* value) const
+bool LLVMBackend::JoinIsCharPointer(const llvm::Value* value, bool includeNullCoalesce) const
 {
         if (value == nullptr || (!llvm::isa<llvm::SelectInst>(value)
-            && !llvm::isa<llvm::PHINode>(value)))
+            && !llvm::isa<llvm::PHINode>(value)
+            && !(includeNullCoalesce && FindNullCoalesceJoin(value) != nullptr)))
             return false;
         const auto arms = JoinArmValues(value);
         if (arms.empty()) return false;

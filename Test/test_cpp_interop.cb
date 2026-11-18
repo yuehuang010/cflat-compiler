@@ -1961,6 +1961,13 @@ int DtorOrdAliasEarlyReturn()
     cppdtorord.mark(8);
     return r.v;
 }
+struct DtorOrdImplicitThis {
+    int k = 0;
+    int run() {
+        return cppdtorord.take_value(cppdtorord.C(k))
+            + cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+    }
+};
 int CppDtorOrderCases()
 {
     cppdtorord.reset();
@@ -2020,6 +2027,53 @@ int CppDtorOrderCases()
     cppdtorord.mark(8);
     if (lvalueByValue != 24 || cppdtorord.order() != 3218
         || cppdtorord.routes() != 30113) return 3622;
+
+    cppdtorord.reset();
+    int prvalueByValue = cppdtorord.take_value(cppdtorord.C(1))
+        + cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+    if (prvalueByValue != 24 || cppdtorord.order() != 321
+        || cppdtorord.routes() != 20113) return 3635;
+
+    cppdtorord.reset();
+    cppdtorord.require_ctor_count_before_dtor(3);
+    int arithmeticBase = 0;
+    int arithmeticCtorArg = cppdtorord.take_value(cppdtorord.C(arithmeticBase + 1))
+        + cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+    if (arithmeticCtorArg != 24 || cppdtorord.order() != 321
+        || cppdtorord.routes() != 20113 || cppdtorord.destroyed_too_early() != 0) return 3636;
+
+    cppdtorord.reset();
+    cppdtorord.require_ctor_count_before_dtor(3);
+    DtorOrdImplicitThis dtorOrdHolder = default;
+    dtorOrdHolder.k = 1;
+    int fieldCtorArg = cppdtorord.take_value(cppdtorord.C(dtorOrdHolder.k))
+        + cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+    if (fieldCtorArg != 24 || cppdtorord.order() != 321
+        || cppdtorord.routes() != 20113 || cppdtorord.destroyed_too_early() != 0) return 3637;
+
+    cppdtorord.reset();
+    cppdtorord.require_ctor_count_before_dtor(3);
+    DtorOrdImplicitThis implicitThis = default;
+    implicitThis.k = 2;
+    int implicitThisCtorArg = implicitThis.run();
+    if (implicitThisCtorArg != 25 || cppdtorord.order() != 322
+        || cppdtorord.routes() != 20113 || cppdtorord.destroyed_too_early() != 0) return 3638;
+
+    cppdtorord.reset();
+    cppdtorord.require_ctor_count_before_dtor(3);
+    int unarySource = 2;
+    int unaryCtorArg = cppdtorord.take_value(cppdtorord.C(-unarySource))
+        + cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+    if (unaryCtorArg != 21 || cppdtorord.order() != 318
+        || cppdtorord.routes() != 20113 || cppdtorord.destroyed_too_early() != 0) return 3639;
+
+    cppdtorord.reset();
+    cppdtorord.require_ctor_count_before_dtor(3);
+    int templateCtorArg = cppdtorord.tone(cppdtorord.C(1))
+        + cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3));
+    if (templateCtorArg != 24 || cppdtorord.order() != 321
+        || cppdtorord.routes() != 30113 || cppdtorord.destroyed_too_early() != 0) return 3640;
+    cppdtorord.require_ctor_count_before_dtor(0);
 
     cppdtorord.reset();
     int lvalueLast = cppdtorord.pick(cppdtorord.C(2), cppdtorord.C(3))
@@ -2679,6 +2733,22 @@ int T243FieldBothTern(bool c) { t226s.B g = c ? t226s.mkH(1).d : t226s.mkH(2).d;
 int T243FieldMoveTern(bool c) { t226s.D d2 = t226s.D(2); t226s.B g = c ? t226s.mkH(1).d : move d2; return g.get(); }
 int T243FieldTemp(bool c) { t226s.B g = t226s.mkH(1).d; return g.get(); }
 int T243NamedFieldTern(bool c) { t226s.H h = t226s.mkH(1); t226s.B g = c ? h.d : t226s.D(2); return g.get(); }
+// STATELEM: array elements of a class temporary are xvalue arms and must first join as D prvalues.
+int TStatelemBDirect(bool c) { t226s.B g = c ? t226s.mkHA(1).a[0] : t226s.D(2); return g.get(); }
+int TStatelemBReversed(bool c) { t226s.B g = c ? t226s.D(2) : t226s.mkHA(1).a[0]; return g.get(); }
+int TStatelemBSecond(bool c) { t226s.B g = c ? t226s.mkHA(1).a[1] : t226s.D(2); return g.get(); }
+int TStatelemBNested(bool c, bool d) { t226s.B g = c ? t226s.mkHA(1).a[0] : (d ? t226s.mkHA(3).a[1] : t226s.D(5)); return g.get(); }
+int TStatelemAuto(bool c) { auto g = c ? t226s.mkHA(1).a[0] : t226s.D(2); return g.get(); }
+int TStatelemD(bool c) { t226s.D g = c ? t226s.mkHA(1).a[0] : t226s.D(2); return g.get(); }
+int TStatelemB1S(bool c) { static t226s.B g = c ? t226s.mkHA(1).a[0] : t226s.D(2); return g.get(); }
+int TStatelemB2S(bool c) { static t226s.B g = c ? t226s.D(2) : t226s.mkHA(1).a[0]; return g.get(); }
+int TStatelemFieldH(bool c) { t226s.B g = c ? t226s.mkH(1).d : t226s.D(2); return g.get(); }
+int TStatelemFieldH2(bool c) { t226s.B g = c ? t226s.mkH2(1).h.d : t226s.D(2); return g.get(); }
+// STATELEM r3: a const field of a temporary, and a mutable member under a const root, copy (clang).
+int TConstFieldAuto(bool c) { auto g = c ? t226s.mkHC(1).cd : t226s.B(2); return g.get(); }
+int TConstFieldTyped(bool c) { t226s.B g = c ? t226s.mkHC(1).cd : t226s.B(2); return g.get(); }
+int TConstRootAuto(bool c) { auto g = c ? t226s.mkHM(1).m : t226s.B(2); return g.get(); }
+int TConstRootTyped(bool c) { t226s.B g = c ? t226s.mkHM(1).m : t226s.B(2); return g.get(); }
 int T226CallLvalueMove(bool c)
 {
     t226s.T a = t226s.T(1);
@@ -3346,6 +3416,141 @@ int T224ThrowWrapper(int x)
     return s.t.get();
 }
 cppexp.ConvCnt T224Mk(int x) { return x; }
+struct TNRVOHolder { cppexp.Retelide c; int k = 1; };
+TNRVOHolder TNRVOMakeHolder(int q)
+{
+    TNRVOHolder a = { c = cppexp.Retelide(q), k = 2 };
+    return a;
+}
+cppexp.Retelide TNRVOLamSingle(int q)
+{
+    function<cppexp.Retelide(int)> k = (int r) => {
+        cppexp.Retelide a = cppexp.Retelide(r);
+        return a;
+    };
+    return k(q);
+}
+cppexp.Retelide TNRVOLamTwo(int q)
+{
+    function<cppexp.Retelide(int)> k = (int r) => {
+        cppexp.Retelide a = cppexp.Retelide(r);
+        if (r) return a;
+        return a;
+    };
+    return k(q);
+}
+cppexp.Retelide TNRVOLamOther(int q)
+{
+    function<cppexp.Retelide(int)> k = (int r) => {
+        cppexp.Retelide a = cppexp.Retelide(r);
+        if (r) return a;
+        return cppexp.Retelide(r + 10);
+    };
+    return k(q);
+}
+cppexp.Retelide TNRVOLamNested(int q)
+{
+    function<cppexp.Retelide(int)> k = (int r) => {
+        { cppexp.Retelide a = cppexp.Retelide(r); return a; }
+    };
+    return k(q);
+}
+cppexp.Retelide TNRVOLamCapture(int q)
+{
+    int bias = 3;
+    Lambda<cppexp.Retelide(int)> k = (int r) => {
+        cppexp.Retelide a = cppexp.Retelide(r + bias);
+        return a;
+    };
+    return k(q);
+}
+TNRVOHolder TNRVOLamHolder(int q)
+{
+    function<TNRVOHolder(int)> k = (int r) => {
+        TNRVOHolder a = { c = cppexp.Retelide(r), k = 2 };
+        return a;
+    };
+    return k(q);
+}
+cppexp.Retelide TNRVOAutoSingle(int q) { auto a = cppexp.Retelide(q); return a; }
+cppexp.Retelide TNRVOAutoTwo(int q)
+{
+    auto a = cppexp.Retelide(q);
+    if (q) return a;
+    return a;
+}
+cppexp.Retelide TNRVOAutoOther(int q)
+{
+    auto a = cppexp.Retelide(q);
+    if (q) return a;
+    return cppexp.Retelide(q + 10);
+}
+cppexp.Retelide TNRVOAutoNested(int q)
+{
+    { auto a = cppexp.Retelide(q); return a; }
+}
+cppexp.Retelide TNRVOAutoCapture(int q)
+{
+    int bias = 3;
+    Lambda<cppexp.Retelide(int)> k = (int r) => {
+        auto a = cppexp.Retelide(r + bias);
+        return a;
+    };
+    return k(q);
+}
+TNRVOHolder TNRVOAutoHolderLambda(int q)
+{
+    function<TNRVOHolder(int)> k = (int r) => {
+        auto a = TNRVOMakeHolder(r);
+        return a;
+    };
+    return k(q);
+}
+cppexp.Retelide TNRVOAutoCopyLocal(int q)
+{
+    cppexp.Retelide b = cppexp.Retelide(q);
+    auto a = b;
+    int t = b.v;
+    return a;
+}
+cppexp.Retelide TNRVOAutoCopyParam(alias cppexp.Retelide b)
+{
+    auto a = b;
+    int t = b.v;
+    return a;
+}
+cppexp.Retelide TNRVOAutoCopyField(alias TNRVOHolder h)
+{
+    auto a = h.c;
+    int t = h.c.v;
+    return a;
+}
+cppexp.Retelide TNRVOAutoCopyDeref(cppexp.Retelide* p)
+{
+    auto a = *p;
+    int t = p->v;
+    return a;
+}
+cppexp.Retelide TNRVOAutoCopyLambda(int q)
+{
+    function<cppexp.Retelide(int)> k = (int r) => {
+        cppexp.Retelide b = cppexp.Retelide(r);
+        auto a = b;
+        int t = b.v;
+        return a;
+    };
+    return k(q);
+}
+TNRVOHolder TNRVOAutoHolderFunction(int q)
+{
+    auto a = TNRVOMakeHolder(q);
+    return a;
+}
+cppexp.Retelide TNRVOAutoInt(int q)
+{
+    auto a = 3;
+    return a;
+}
 // T272: a return of a parenthesized C++ call elides like the bare return (clang: 1 ctor, 1 dtor).
 cppexp.ConvCnt T272Ret() { return (cppexp.conv_mk(7)); }
 struct T272Hold { cppexp.ConvCnt c; };
@@ -5010,6 +5215,182 @@ class W13BPlainValueImpl : W13BPlainValueIface
     int write(immt90.Plain* p) { p->v = 99; return p->v; }
 };
 int w13b_plain_value_direct(immt90.Plain* p) { p->v = 99; return p->v; }
+
+e6mv.Tc TernSinkReturnTc(int k)
+{
+    e6mv.Tc a = e6mv.Tc(7); e6mv.Tc b = e6mv.Tc(8);
+    e6mv.reset();
+    return k ? move a : move b;
+}
+e6mv.Plain TernSinkReturnPlain(int k)
+{
+    e6mv.Plain a = e6mv.Plain(7); e6mv.Plain b = e6mv.Plain(8);
+    e6mv.reset();
+    return k ? move a : move b;
+}
+e6mv.UserMove TernSinkReturnUserMove(int k)
+{
+    e6mv.UserMove a = e6mv.UserMove(7); e6mv.UserMove b = e6mv.UserMove(8);
+    e6mv.reset();
+    return k ? move a : move b;
+}
+
+int TernSinkTcCheck(int k)
+{
+    int expected = k ? 107 : 108;
+    {
+        e6mv.Tc a = e6mv.Tc(7); e6mv.Tc b = e6mv.Tc(8); e6mv.reset();
+        auto c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 1) return 8151;
+    }
+    {
+        e6mv.Tc a = e6mv.Tc(7); e6mv.Tc b = e6mv.Tc(8); e6mv.reset();
+        e6mv.Tc c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 1) return 8152;
+    }
+    {
+        e6mv.Tc a = e6mv.Tc(7); e6mv.Tc b = e6mv.Tc(8);
+        e6mv.Tc c = e6mv.Tc(9); e6mv.reset();
+        c = k ? move a : move b;
+        if (c.v != (k ? 7 : 8) || e6mv.moves != 0) return 8153;
+    }
+    {
+        e6mv.Tc a = e6mv.Tc(7); e6mv.Tc b = e6mv.Tc(8); e6mv.reset();
+        int value = e6mv.take(k ? move a : move b);
+        if (value != expected || e6mv.moves != 1) return 8154;
+    }
+    {
+        e6mv.reset(); auto c = TernSinkReturnTc(k);
+        if (c.v != expected || e6mv.moves != 1) return 8155;
+    }
+    {
+        e6mv.Tc[2] arr = {e6mv.Tc(7), e6mv.Tc(8)}; e6mv.reset();
+        auto c = k ? move arr[0] : move arr[1];
+        if (c.v != expected || e6mv.moves != 1) return 8156;
+    }
+    {
+        e6mv.TcHolder h0 = default; e6mv.TcHolder h1 = default;
+        h0.t.v = 7; h1.t.v = 8; e6mv.reset();
+        auto c = k ? move h0.t : move h1.t;
+        if (c.v != expected || e6mv.moves != 1) return 8157;
+    }
+    return 0;
+}
+
+int TernSinkPlainCheck(int k)
+{
+    int expected = k ? 7 : 8;
+    {
+        e6mv.Plain a = e6mv.Plain(7); e6mv.Plain b = e6mv.Plain(8); e6mv.reset();
+        auto c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 0) return 8161;
+    }
+    {
+        e6mv.Plain a = e6mv.Plain(7); e6mv.Plain b = e6mv.Plain(8); e6mv.reset();
+        e6mv.Plain c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 0) return 8162;
+    }
+    {
+        e6mv.Plain a = e6mv.Plain(7); e6mv.Plain b = e6mv.Plain(8);
+        e6mv.Plain c = e6mv.Plain(9); e6mv.reset();
+        c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 0) return 8163;
+    }
+    {
+        e6mv.Plain a = e6mv.Plain(7); e6mv.Plain b = e6mv.Plain(8); e6mv.reset();
+        int value = e6mv.take(k ? move a : move b);
+        if (value != expected || e6mv.moves != 0) return 8164;
+    }
+    {
+        e6mv.reset(); auto c = TernSinkReturnPlain(k);
+        if (c.v != expected || e6mv.moves != 0) return 8165;
+    }
+    {
+        e6mv.Plain[2] arr = {e6mv.Plain(7), e6mv.Plain(8)}; e6mv.reset();
+        auto c = k ? move arr[0] : move arr[1];
+        if (c.v != expected || e6mv.moves != 0) return 8166;
+    }
+    {
+        e6mv.PlainHolder h0 = default; e6mv.PlainHolder h1 = default;
+        h0.t.v = 7; h1.t.v = 8; e6mv.reset();
+        auto c = k ? move h0.t : move h1.t;
+        if (c.v != expected || e6mv.moves != 0) return 8167;
+    }
+    return 0;
+}
+
+int TernSinkUserMoveCheck(int k)
+{
+    int expected = k ? 107 : 108;
+    {
+        e6mv.UserMove a = e6mv.UserMove(7); e6mv.UserMove b = e6mv.UserMove(8); e6mv.reset();
+        auto c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 1) return 8171;
+    }
+    {
+        e6mv.UserMove a = e6mv.UserMove(7); e6mv.UserMove b = e6mv.UserMove(8); e6mv.reset();
+        e6mv.UserMove c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 1) return 8172;
+    }
+    {
+        e6mv.UserMove a = e6mv.UserMove(7); e6mv.UserMove b = e6mv.UserMove(8);
+        e6mv.UserMove c = e6mv.UserMove(9); e6mv.reset();
+        c = k ? move a : move b;
+        if (c.v != expected || e6mv.moves != 1) return 8173;
+    }
+    {
+        e6mv.UserMove a = e6mv.UserMove(7); e6mv.UserMove b = e6mv.UserMove(8); e6mv.reset();
+        int value = e6mv.take(k ? move a : move b);
+        if (value != expected || e6mv.moves != 1) return 8174;
+    }
+    {
+        e6mv.reset(); auto c = TernSinkReturnUserMove(k);
+        if (c.v != expected || e6mv.moves != 1) return 8175;
+    }
+    {
+        e6mv.UserMove[2] arr = {e6mv.UserMove(7), e6mv.UserMove(8)}; e6mv.reset();
+        auto c = k ? move arr[0] : move arr[1];
+        if (c.v != expected || e6mv.moves != 1) return 8176;
+    }
+    {
+        e6mv.UserMoveHolder h0 = default; e6mv.UserMoveHolder h1 = default;
+        h0.t.v = 7; h1.t.v = 8; e6mv.reset();
+        auto c = k ? move h0.t : move h1.t;
+        if (c.v != expected || e6mv.moves != 1) return 8177;
+    }
+    return 0;
+}
+
+// TERNSINK r4: an assignment-template class assigns an xvalue join (nested, element, field arms
+// too) through clang's pick: the template, never the byte copy (clang 20x/1).
+int TernSinkAssignTCheck(int k)
+{
+    {
+        e6mv.AssignT a = e6mv.AssignT(7); e6mv.AssignT b = e6mv.AssignT(8);
+        e6mv.AssignT c = e6mv.AssignT(10); e6mv.reset();
+        c = k ? move a : move b;
+        if (c.v != (k ? 207 : 208) || e6mv.moves != 1) return 8191;
+    }
+    {
+        e6mv.AssignT a = e6mv.AssignT(7); e6mv.AssignT b = e6mv.AssignT(8);
+        e6mv.AssignT d = e6mv.AssignT(9); e6mv.AssignT c = e6mv.AssignT(10); e6mv.reset();
+        c = k ? (k ? move a : move b) : move d;
+        if (c.v != (k ? 207 : 209) || e6mv.moves != 1) return 8195;
+    }
+    {
+        e6mv.AssignT[2] arr = {e6mv.AssignT(7), e6mv.AssignT(8)};
+        e6mv.AssignT c = e6mv.AssignT(10); e6mv.reset();
+        c = k ? move arr[0] : move arr[1];
+        if (c.v != (k ? 207 : 208) || e6mv.moves != 1) return 8193;
+    }
+    {
+        e6mv.AssignTHolder h0 = default; e6mv.AssignTHolder h1 = default;
+        h0.t.v = 7; h1.t.v = 8; e6mv.AssignT c = e6mv.AssignT(10); e6mv.reset();
+        c = k ? move h0.t : move h1.t;
+        if (c.v != (k ? 207 : 208) || e6mv.moves != 1) return 8194;
+    }
+    return 0;
+}
 
 extern int main()
 {
@@ -7821,6 +8202,55 @@ extern int main()
     if (StatLeftConvBUse(6) != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.conv != 10 || t226s.dead != 2) return 93062;
     t226s.reset();
     if (StatLeftExplUse(6) != 6 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.conv != 0 || t226s.dead != 2) return 93063;
+    // STATELEM: compare derived array-element xvalue arms, joined class destinations and controls to clang++.
+    t226s.reset();
+    if (TStatelemBDirect(true) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93085;
+    t226s.reset();
+    if (TStatelemBDirect(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93086;
+    t226s.reset();
+    if (TStatelemBReversed(false) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93087;
+    t226s.reset();
+    if (TStatelemBReversed(true) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93088;
+    t226s.reset();
+    if (TStatelemBSecond(true) != 2 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93089;
+    t226s.reset();
+    if (TStatelemBNested(true, false) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93090;
+    t226s.reset();
+    if (TStatelemBNested(false, true) != 4 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93091;
+    t226s.reset();
+    if (TStatelemBNested(false, false) != 5 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93092;
+    t226s.reset();
+    if (TStatelemAuto(true) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93093;
+    t226s.reset();
+    if (TStatelemAuto(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93094;
+    t226s.reset();
+    if (TStatelemD(true) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93095;
+    t226s.reset();
+    if (TStatelemD(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93096;
+    t226s.reset();
+    if (TStatelemB1S(true) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93097;
+    t226s.reset();
+    if (TStatelemB2S(false) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93098;
+    t226s.reset();
+    if (TStatelemFieldH(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93099;
+    t226s.reset();
+    if (TStatelemFieldH2(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93100;
+    t226s.reset();
+    if (TConstFieldAuto(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93101;
+    t226s.reset();
+    if (TConstFieldAuto(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93102;
+    t226s.reset();
+    if (TConstFieldTyped(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93103;
+    t226s.reset();
+    if (TConstFieldTyped(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93104;
+    t226s.reset();
+    if (TConstRootAuto(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93105;
+    t226s.reset();
+    if (TConstRootAuto(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93106;
+    t226s.reset();
+    if (TConstRootTyped(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93107;
+    t226s.reset();
+    if (TConstRootTyped(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93108;
     if (T62StaticAutoGlobalCopy() != 1) return 62010;
     cpp_t62.set_global_string("changed");
     if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
@@ -13374,6 +13804,68 @@ extern int main()
     cppi_scope.eop.N eopPointerOffset = cppi_scope.eop.n0;
     cppi_scope.eop.E* eopPointerFromOtherEnum = eopPointerOffset + &eopPointerArray[0];
     if ((int)*eopPointerFromOtherEnum != (int)cppi_scope.eop.e2) return 9826;
+    int[8] eopRawPointerArray = default;
+    int* eopRawPointer = &eopRawPointerArray[0];
+    cppi_scope.eop.E eopPointerEnum = cppi_scope.eop.e0;
+    int* eopForwardEnumPointer = eopPointerEnum + eopRawPointer;
+    if ((int)(eopForwardEnumPointer - eopRawPointer) != 1) return 9827;
+    int* eopReverseEnumPointer = eopRawPointer + eopPointerEnum;
+    if ((int)(eopReverseEnumPointer - eopRawPointer) != 1) return 9828;
+    (const int)* eopConstEnumPointer = eopPointerEnum + eopRawPointer;
+    if ((int)(eopConstEnumPointer - eopRawPointer) != 1) return 9829;
+    cppi_scope.eop.PointerClass[3] eopPointerClassArray = default;
+    cppi_scope.eop.PointerClass* eopClassEnumPointer = eopPointerEnum + &eopPointerClassArray[0];
+    if ((int)(eopClassEnumPointer - &eopPointerClassArray[0]) != 1) return 9860;
+    cppi_scope.eop.in.S[3] eopNestedPointerArray = default;
+    cppi_scope.eop.in.S* eopNestedEnumPointer = eopPointerEnum + &eopNestedPointerArray[0];
+    if ((int)(eopNestedEnumPointer - &eopNestedPointerArray[0]) != 1) return 9861;
+    if (eopPointerEnum - eopRawPointer != 61
+        || eopRawPointer - eopPointerEnum != 62) return 9862;
+    if (!(eopPointerEnum == eopRawPointer) || !(eopRawPointer == eopPointerEnum)) return 9863;
+    if (eopPointerEnum < eopRawPointer || !(eopRawPointer < eopPointerEnum)) return 9864;
+    cppi_scope.eop.E eopCompoundPointerEnum = eopPointerEnum;
+    eopCompoundPointerEnum += eopRawPointer;
+    if ((int)eopCompoundPointerEnum != 7) return 9865;
+    int* eopCompoundEnumPointer = eopRawPointer;
+    eopCompoundEnumPointer += eopPointerEnum;
+    if ((int)(eopCompoundEnumPointer - eopRawPointer) != 1) return 9866;
+    cppi_scope.eop.SE eopScopedPointerEnum = cppi_scope.eop.SE.a;
+    int* eopScopedForwardPointer = eopScopedPointerEnum + eopRawPointer;
+    int* eopScopedReversePointer = eopRawPointer + eopScopedPointerEnum;
+    if ((int)(eopScopedForwardPointer - eopRawPointer) != 1
+        || (int)(eopScopedReversePointer - eopRawPointer) != 1) return 9867;
+    int[16] eopPointerChainArray = default;
+    int* eopPointerChainBase = &eopPointerChainArray[0];
+    cppi_scope.eop.EPtrR2 eopPointerChainEnum = cppi_scope.eop.epr2;
+    int* eopChain1 = eopPointerChainBase + eopPointerChainEnum + eopPointerChainEnum;
+    if ((int)(eopChain1 - eopPointerChainBase) != 10) return 9868;
+    int* eopChain2 = eopPointerChainBase + 0 + eopPointerChainEnum;
+    if ((int)(eopChain2 - eopPointerChainBase) != 5) return 9869;
+    int* eopChain3 = eopPointerChainEnum + eopPointerChainBase + 1;
+    if ((int)(eopChain3 - eopPointerChainBase) != 6) return 9870;
+    int* eopChain4 = (eopPointerChainBase + eopPointerChainEnum) + eopPointerChainEnum;
+    if ((int)(eopChain4 - eopPointerChainBase) != 10) return 9871;
+    int* eopChain5 = eopPointerChainEnum + (eopPointerChainEnum + eopPointerChainBase);
+    if ((int)(eopChain5 - eopPointerChainBase) != 10) return 9872;
+    if (!(eopPointerChainBase == eopPointerChainEnum)) return 9873;
+    if (eopPointerChainBase != eopPointerChainEnum) return 9874;
+    if (eopPointerChainEnum != eopPointerChainBase) return 9875;
+    cppi_scope.eop.EPtrSpaceshipR2 eopSpaceshipEnum = cppi_scope.eop.epr2_spaceship;
+    cppi_scope.eop.epr2_reset_spaceship_calls();
+    if (eopPointerChainBase < eopSpaceshipEnum
+        || cppi_scope.eop.epr2_get_spaceship_calls() != 1) return 9877;
+    cppi_scope.eop.epr2_reset_spaceship_calls();
+    if (!(eopSpaceshipEnum < eopPointerChainBase)
+        || cppi_scope.eop.epr2_get_spaceship_calls() != 1) return 9878;
+    cppi_scope.eop.epr2_reset_spaceship_calls();
+    if (!(eopPointerChainBase >= eopSpaceshipEnum)
+        || cppi_scope.eop.epr2_get_spaceship_calls() != 1) return 9879;
+    cppi_scope.eop.ENoPtrR2 eopNoPointerOperatorEnum = cppi_scope.eop.enpr2;
+    int* eopTypedNullPointer = eopNoPointerOperatorEnum + (int*)nullptr;
+    if (eopTypedNullPointer != nullptr) return 9876;
+    expect_error("no viable C++ operator 'operator+' for imported enum and pointer operands") {
+        int* eopNullLiteralPointer = eopNoPointerOperatorEnum + nullptr;
+    }
     // Unary free operators must beat the integral built-ins for imported enum identities.
     if (~eopA != 1505) return 9830;
     if (-eopA != 1605) return 9831;
@@ -22094,12 +22586,76 @@ extern int main()
         if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99015;
         T288ConstHostField(false, q);
         if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99016;
-        // T288 r3: a mutable field join (`move s.a : move s.b`) stays on master's copy path. clang
-        // move-assigns here (pre-existing, not fixed by T288; see the p3 issue file).
+        // TERNFLD r1: a mutable field join (`move s.a : move s.b`) move-assigns the selected source
+        // (clang): the source reads -1 after the join, the other source is kept.
         T288FieldJoin(true, q);
-        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99017;
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99017;
         T288FieldJoin(false, q);
-        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99018;
+        if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99018;
+        // TERNFLD r2: a const deref leaf (`const N* p; z = k ? move p->f : b;`) is a const xvalue join:
+        // one copy into the temp, copy-assign, sources kept (clang). Clang's declaration copies too.
+        int[9] r13 = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        T13ConstDerefAssign(true, r13);
+        if (r13[0] != 21 || r13[1] != 21 || r13[2] != 22 || r13[3] != 0 || r13[4] != 1 || r13[5] != 0 || r13[6] != 1 || r13[7] != 0) return 99034;
+        T13ConstDerefAssign(false, r13);
+        if (r13[0] != 22 || r13[1] != 21 || r13[2] != 22 || r13[3] != 0 || r13[4] != 1 || r13[5] != 0 || r13[6] != 1 || r13[7] != 0) return 99035;
+        T13ConstDerefDecl(true, r13);
+        if (r13[0] != 21 || r13[1] != 21 || r13[2] != 22 || r13[3] != 0 || r13[4] != 1 || r13[5] != 0 || r13[6] != 0 || r13[7] != 0) return 99036;
+        T13ConstDerefDecl(false, r13);
+        if (r13[0] != 22 || r13[1] != 21 || r13[2] != 22 || r13[3] != 0 || r13[4] != 1 || r13[5] != 0 || r13[6] != 0 || r13[7] != 0) return 99037;
+        // TERNFLD r2: a converting field join (`MvCnt z = k ? move s.x : move b;`, s.x an MvX): the
+        // selected source converts once, the unselected one is not moved or zeroed (clang 121 / 22).
+        T13ConvFieldDecl(true, r13);
+        if (r13[0] != 121 || r13[1] != 21 || r13[2] != 22 || r13[3] != 1 || r13[4] != 0 || r13[5] != 0 || r13[6] != 0 || r13[7] != 0 || r13[8] != 1) return 99038;
+        T13ConvFieldDecl(false, r13);
+        if (r13[0] != 22 || r13[1] != 21 || r13[2] != -1 || r13[3] != 0 || r13[4] != 0 || r13[5] != 1 || r13[6] != 0 || r13[7] != 0 || r13[8] != 0) return 99039;
+        // TERNFLD r3: field-leaf shapes. The const of a move leaf is the cv of its final `.`/`->`
+        // operand (a mutable pointer to a const N moves; a const member or a const pointee copies).
+        T13DeepMutableDecl(true, r13);
+        if (!T13Match(r13, 21, -1, 22, 0, 1, 0, 0)) return 99040;
+        T13DeepMutableDecl(false, r13);
+        if (!T13Match(r13, 22, 21, -1, 0, 1, 0, 0)) return 99041;
+        T13DeepMutableMixed(true, r13);
+        if (!T13Match(r13, 21, -1, 22, 0, 1, 0, 1)) return 99042;
+        T13DeepMutableMixed(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 0, 1)) return 99043;
+        T13DeepConstDecl(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 0, 0)) return 99044;
+        T13DeepConstDecl(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 0, 0)) return 99045;
+        T13DeepConstMixed(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 1, 0)) return 99046;
+        T13DeepConstMixed(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 1, 0)) return 99047;
+        T13ConstMemberDecl(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 0, 0)) return 99048;
+        T13ConstMemberDecl(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 0, 0)) return 99049;
+        T13ConstMemberMixed(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 1, 0)) return 99050;
+        T13ConstMemberMixed(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 1, 0)) return 99051;
+        T13ConstMemberPtrDecl(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 0, 0)) return 99052;
+        T13ConstMemberPtrDecl(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 0, 0)) return 99053;
+        T13ConstMemberPtrMixed(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 1, 0)) return 99054;
+        T13ConstMemberPtrMixed(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 1, 0)) return 99055;
+        T13ConstArrayMixed(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 1, 0)) return 99056;
+        T13ConstArrayMixed(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 1, 0)) return 99057;
+        T13NameGlobal(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 0, 0)) return 99058;
+        T13NameGlobal(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 0, 0)) return 99059;
+        T13Runner rn = default;
+        rn.run(true, r13);
+        if (!T13Match(r13, 21, 21, 22, 1, 0, 0, 0)) return 99060;
+        rn.run(false, r13);
+        if (!T13Match(r13, 22, 21, 22, 1, 0, 0, 0)) return 99061;
     }
     // T264: a by-value argument joined from two fresh call arms (bare, parenthesized, const, two
     // arguments, loop body) is owned once by the callee, as clang++'s prvalue join: 1 ctor, 1 dtor.
@@ -23004,6 +23560,18 @@ extern int main()
         cppi.XvTrivialAssign taD = xv_return_ta(&taC);
         if (taB.v != 107 || taP->v != 7 || taC.v != 207 || taD.v != 207
             || cppi.xv_move_count() != 2) return 7052;
+    }
+    // TERNSINK: same-class C++ xvalue joins match clang at every sink and arm shape.
+    for (int pick = 0; pick < 2; pick = pick + 1)
+    {
+        int result = TernSinkTcCheck(pick);
+        if (result != 0) return result;
+        result = TernSinkPlainCheck(pick);
+        if (result != 0) return result;
+        result = TernSinkUserMoveCheck(pick);
+        if (result != 0) return result;
+        result = TernSinkAssignTCheck(pick);
+        if (result != 0) return result;
     }
     // T70 argument doors: a non-const C++ T&& call result is `move *p` at local/new
     // construction, by-value and template parameters, nested results, and vector emplace.
@@ -28237,6 +28805,178 @@ int LoweredUserDtorAssignLegs(int argc)
     cppunw.reset();
     if (cppunw.guarded(T228ThrowWrapper, 5) != -5) return 13059;
     if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13059;
+    // RETELIDE: lambda and `auto` named returns follow clang's live-range rule.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOLamSingle(5);
+        if (value.v != 5 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13066;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13066;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOLamTwo(5);
+        if (value.v != 5 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13067;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13067;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOLamOther(5);
+        if (value.v != 1005 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+            || cppexp.retelide_dtor_count() != 1) return 13068;
+    }
+    if (cppexp.retelide_dtor_count() != 2) return 13068;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOLamNested(5);
+        if (value.v != 5 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13069;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13069;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOLamCapture(5);
+        if (value.v != 8 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13070;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13070;
+    cppexp.retelide_reset();
+    {
+        TNRVOHolder value = TNRVOLamHolder(5);
+        if (value.c.v != 5 || value.k != 2 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13071;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13071;
+
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoSingle(5);
+        if (value.v != 5 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13072;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13072;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoTwo(5);
+        if (value.v != 5 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13073;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13073;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoOther(5);
+        if (value.v != 1005 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 1
+            || cppexp.retelide_dtor_count() != 1) return 13074;
+    }
+    if (cppexp.retelide_dtor_count() != 2) return 13074;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoNested(5);
+        if (value.v != 5 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13075;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13075;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoCapture(5);
+        if (value.v != 8 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13076;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13076;
+    cppexp.retelide_reset();
+    {
+        TNRVOHolder value = TNRVOAutoHolderLambda(5);
+        if (value.c.v != 5 || value.k != 2 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13077;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13077;
+
+    // Accept-set controls: ordinary CFlat-struct NRVO and nonmatching `auto` types stay intact.
+    cppexp.retelide_reset();
+    {
+        TNRVOHolder value = TNRVOAutoHolderFunction(5);
+        if (value.c.v != 5 || value.k != 2 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13078;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13078;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoInt(5);
+        if (value.v != 3 || cppexp.retelide_ctor_count() != 1
+            || cppexp.retelide_copy_count() != 0 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 0) return 13079;
+    }
+    if (cppexp.retelide_dtor_count() != 1) return 13079;
+    // RETELIDE r2: an auto copy from a named C++ lvalue constructs in the return slot.
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoCopyLocal(5);
+        if (value.v != 105 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 1 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 1) return 13080;
+    }
+    if (cppexp.retelide_dtor_count() != 2) return 13080;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide source = cppexp.Retelide(5);
+        cppexp.retelide_reset();
+        {
+            cppexp.Retelide value = TNRVOAutoCopyParam(source);
+            if (value.v != 105 || cppexp.retelide_ctor_count() != 1
+                || cppexp.retelide_copy_count() != 1 || cppexp.retelide_move_count() != 0
+                || cppexp.retelide_dtor_count() != 0) return 13081;
+        }
+        if (cppexp.retelide_dtor_count() != 1) return 13081;
+    }
+    if (cppexp.retelide_dtor_count() != 2) return 13081;
+    cppexp.retelide_reset();
+    {
+        TNRVOHolder holder = { c = cppexp.Retelide(5), k = 2 };
+        cppexp.retelide_reset();
+        {
+            cppexp.Retelide value = TNRVOAutoCopyField(holder);
+            if (value.v != 105 || cppexp.retelide_ctor_count() != 1
+                || cppexp.retelide_copy_count() != 1 || cppexp.retelide_move_count() != 0
+                || cppexp.retelide_dtor_count() != 0) return 13082;
+        }
+        if (cppexp.retelide_dtor_count() != 1) return 13082;
+    }
+    if (cppexp.retelide_dtor_count() != 2) return 13082;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide source = cppexp.Retelide(5);
+        cppexp.retelide_reset();
+        {
+            cppexp.Retelide value = TNRVOAutoCopyDeref(&source);
+            if (value.v != 105 || cppexp.retelide_ctor_count() != 1
+                || cppexp.retelide_copy_count() != 1 || cppexp.retelide_move_count() != 0
+                || cppexp.retelide_dtor_count() != 0) return 13083;
+        }
+        if (cppexp.retelide_dtor_count() != 1) return 13083;
+    }
+    if (cppexp.retelide_dtor_count() != 2) return 13083;
+    cppexp.retelide_reset();
+    {
+        cppexp.Retelide value = TNRVOAutoCopyLambda(5);
+        if (value.v != 105 || cppexp.retelide_ctor_count() != 2
+            || cppexp.retelide_copy_count() != 1 || cppexp.retelide_move_count() != 0
+            || cppexp.retelide_dtor_count() != 1) return 13084;
+    }
+    if (cppexp.retelide_dtor_count() != 2) return 13084;
     // T97: a C++ field named by a brace default keeps its value when the CFlat struct has no user ctor.
     // Probe scratch/repro_keep/v20/rv20/d/p.cb (master gave d.v=0 here; the user-ctor form was already right).
     cpp_t97.reset();
@@ -29510,6 +30250,174 @@ void T288FieldJoin(bool k, int* o)
     o[0] = z.v; o[1] = s.a.v; o[2] = s.b.v;
     T249ReadCounts(o);
 }
+// TERNFLD r2 helpers (legs 99034-99039). o[3..7] = ctors, copies, moves, copy-assign, move-assign.
+struct T13Node { e6mv.MvCnt f = e6mv.MvCnt(21); };
+struct T13XHost { e6mv.MvX x = e6mv.MvX(21); };
+void T13ReadCounts(int* o)
+{
+    o[3] = e6mv.MvCnt.ctors;
+    o[4] = e6mv.MvCnt.copies;
+    o[5] = e6mv.MvCnt.moves;
+    o[6] = e6mv.MvCnt.copyAssigns;
+    o[7] = e6mv.MvCnt.moveAssigns;
+}
+void T13ConstDerefAssign(bool k, int* o)
+{
+    T13Node n = default;
+    const T13Node* p = &n;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt z = e6mv.MvCnt(0);
+    e6mv.MvCnt.reset();
+    z = k ? move p->f : b;
+    o[0] = z.v; o[1] = p->f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13ConstDerefDecl(bool k, int* o)
+{
+    T13Node n = default;
+    const T13Node* p = &n;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt.reset();
+    e6mv.MvCnt z = k ? move p->f : move b;
+    o[0] = z.v; o[1] = p->f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13ConvFieldDecl(bool k, int* o)
+{
+    T13XHost s = default;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt.reset();
+    e6mv.MvX.reset();
+    e6mv.MvCnt z = k ? move s.x : move b;
+    o[0] = z.v; o[1] = s.x.v; o[2] = b.v;
+    T13ReadCounts(o);
+    o[8] = e6mv.MvX.conversions;
+}
+// TERNFLD r3: field-leaf shapes (Sol review repros). Layout as above: o[0] value, o[1] and o[2] the
+// two sources after the join, o[3..7] counts. Clang twins: scratch/rev_ternfld_sol_tmp/*.cpp.
+bool T13Match(int* o, int z, int a, int b, int copies, int moves, int ca, int ma)
+{
+    return o[0] == z && o[1] == a && o[2] == b && o[3] == 0 && o[4] == copies && o[5] == moves
+        && o[6] == ca && o[7] == ma;
+}
+void T13DeepMutableDecl(bool k, int* o)
+{
+    e6mv.MvNode n;
+    e6mv.MvRPtr s = e6mv.MvRPtr(&n);
+    const e6mv.MvRPtr* p = &s;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt.reset();
+    { e6mv.MvCnt z = k ? move p->q->f : move b; o[0] = z.v; }
+    o[1] = n.f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13DeepMutableMixed(bool k, int* o)
+{
+    e6mv.MvNode n;
+    e6mv.MvRPtr s = e6mv.MvRPtr(&n);
+    const e6mv.MvRPtr* p = &s;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt z = e6mv.MvCnt(0);
+    e6mv.MvCnt.reset();
+    z = k ? move p->q->f : b;
+    o[0] = z.v; o[1] = n.f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13DeepConstDecl(bool k, int* o)
+{
+    e6mv.MvNode n;
+    e6mv.MvQPtr s = e6mv.MvQPtr(&n);
+    e6mv.MvQPtr* p = &s;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt.reset();
+    { e6mv.MvCnt z = k ? move p->q->f : move b; o[0] = z.v; }
+    o[1] = n.f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13DeepConstMixed(bool k, int* o)
+{
+    e6mv.MvNode n;
+    e6mv.MvQPtr s = e6mv.MvQPtr(&n);
+    e6mv.MvQPtr* p = &s;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt z = e6mv.MvCnt(0);
+    e6mv.MvCnt.reset();
+    z = k ? move p->q->f : b;
+    o[0] = z.v; o[1] = n.f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13ConstMemberDecl(bool k, int* o)
+{
+    e6mv.MvCF s = e6mv.MvCF();
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt.reset();
+    { e6mv.MvCnt z = k ? move s.f : move b; o[0] = z.v; }
+    o[1] = s.f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13ConstMemberMixed(bool k, int* o)
+{
+    e6mv.MvCF s = e6mv.MvCF();
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt z = e6mv.MvCnt(0);
+    e6mv.MvCnt.reset();
+    z = k ? move s.f : b;
+    o[0] = z.v; o[1] = s.f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13ConstMemberPtrDecl(bool k, int* o)
+{
+    e6mv.MvCF s = e6mv.MvCF();
+    e6mv.MvCF* p = &s;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt.reset();
+    { e6mv.MvCnt z = k ? move p->f : move b; o[0] = z.v; }
+    o[1] = p->f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13ConstMemberPtrMixed(bool k, int* o)
+{
+    e6mv.MvCF s = e6mv.MvCF();
+    e6mv.MvCF* p = &s;
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt z = e6mv.MvCnt(0);
+    e6mv.MvCnt.reset();
+    z = k ? move p->f : b;
+    o[0] = z.v; o[1] = p->f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+void T13ConstArrayMixed(bool k, int* o)
+{
+    e6mv.MvAF s = e6mv.MvAF();
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt z = e6mv.MvCnt(0);
+    e6mv.MvCnt.reset();
+    z = k ? move s.f[0] : b;
+    o[0] = z.v; o[1] = s.f[0].v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+e6mv.MvNode t13Gn = default;
+const e6mv.MvNode* t13Gp = &t13Gn;
+void T13NameGlobal(bool k, int* o)
+{
+    e6mv.MvCnt b = e6mv.MvCnt(22);
+    e6mv.MvCnt.reset();
+    { e6mv.MvCnt z = k ? move t13Gp->f : move b; o[0] = z.v; }
+    o[1] = t13Gp->f.v; o[2] = b.v;
+    T13ReadCounts(o);
+}
+struct T13Runner
+{
+    e6mv.MvCF s = default;
+    void run(bool k, int* o)
+    {
+        e6mv.MvCnt b = e6mv.MvCnt(22);
+        e6mv.MvCnt.reset();
+        { e6mv.MvCnt z = k ? move s.f : move b; o[0] = z.v; }
+        o[1] = s.f.v; o[2] = b.v;
+        T13ReadCounts(o);
+    }
+};
 void T249PlainMove(int* o)
 {
     T249Host h1; h1.c.v = 21;
@@ -29907,9 +30815,64 @@ int srctypeRound4Legs()
     return 0;
 }
 
+struct PdepthFixedArrayItem { int value = default; };
+int pdepthFnTarget() { return 73; }
+
 // Depth-3 pointers (int***) bind at exactly their depth; values are clang++ -std=c++20 results.
 int deepPtrLegs()
 {
+    int pdepthValue = 41;
+    int*[3] pdepthArray;
+    pdepthArray[0] = &pdepthValue;
+    int** pdepthDecay = pdepthArray;
+    int** pdepthFirst = &pdepthArray[0];
+    if (*pdepthDecay != &pdepthValue || *pdepthFirst != &pdepthValue) return 91050;
+    char pdepthFirstChar = 'a';
+    char pdepthSecondChar = 'b';
+    char*[2] pdepthNames;
+    pdepthNames[0] = &pdepthFirstChar;
+    pdepthNames[1] = &pdepthSecondChar;
+    char** pdepthCharDecay = pdepthNames;
+    if (pdepthCharDecay[0][0] != 'a' || pdepthCharDecay[1][0] != 'b') return 91051;
+    PdepthFixedArrayItem pdepthItem;
+    pdepthItem.value = 5;
+    PdepthFixedArrayItem*[2] pdepthItems;
+    pdepthItems[0] = &pdepthItem;
+    PdepthFixedArrayItem** pdepthStructDecay = pdepthItems;
+    if ((*pdepthStructDecay)->value != 5) return 91052;
+    unique int* pdepthOwner = new int;
+    *pdepthOwner = 61;
+    int** pdepthOwnerSlot = &pdepthOwner;
+    if (**pdepthOwnerSlot != 61) return 91053;
+    // Frozen PDEPTH r3 accept-set: unique array decay retains the owner pointer element depth.
+    unique int*[2] pdepthUniqueArray;
+    pdepthUniqueArray[0] = new int;
+    *pdepthUniqueArray[0] = 67;
+    int** pdepthUniqueDecay = pdepthUniqueArray;
+    int* pdepthUniqueElement = pdepthUniqueArray[0];
+    if (**pdepthUniqueDecay != 67 || *pdepthUniqueElement != 67) return 91054;
+    unique PdepthFixedArrayItem*[2] pdepthUniqueItems;
+    pdepthUniqueItems[0] = new PdepthFixedArrayItem();
+    pdepthUniqueItems[0]->value = 9;
+    PdepthFixedArrayItem** pdepthUniqueStructDecay = pdepthUniqueItems;
+    PdepthFixedArrayItem* pdepthUniqueStructElement = pdepthUniqueItems[0];
+    if ((*pdepthUniqueStructDecay)->value != 9 || pdepthUniqueStructElement->value != 9)
+        return 91055;
+    // Function pointer arrays keep their exact depth; function-value arrays decay once.
+    function<int()> pdepthFn = pdepthFnTarget;
+    function<int()>*[2] pdepthFnSlots;
+    pdepthFnSlots[0] = &pdepthFn;
+    function<int()>** pdepthFnDeep = pdepthFnSlots;
+    function<int()>[2] pdepthFnValues;
+    pdepthFnValues[0] = pdepthFnTarget;
+    function<int()>* pdepthFnShallow = pdepthFnValues;
+    function<int()>* pdepthFnSlot = &pdepthFn;
+    void* pdepthFnErased = pdepthFnSlot;
+    function<int()>* pdepthFnRestored = pdepthFnErased;
+    function<int()>** pdepthFnNull = nullptr;
+    if ((**pdepthFnDeep)() != 73 || (*pdepthFnShallow)() != 73
+        || (*pdepthFnRestored)() != 73 || pdepthFnNull != nullptr) return 91056;
+
     int v = 7;
     int* p = &v;
     int** pp = &p;
@@ -30312,5 +31275,67 @@ int deepPtrLegs()
         || w13bMember.pick(1, 9, 10) != 9) return 87114;
     if (w13bMember.pick((long)1) != 10 || w13bMember.pick((long)1, 9) != 10
         || w13bMember.pick((long)1, 9, 10) != 10) return 87115;
+
+    // CASTASG P1: a plain imported C++ class cast copy-assigns its temporary, not the source.
+    CastAssignBox castasgBox = CastAssignBox(1);
+    CastAssignBox castasgSource = CastAssignBox(9);
+    castasg_test.reset();
+    (CastAssignBox)castasgBox = castasgSource;
+    if (castasgBox.value != 1 || castasg_test.copy_count() != 1
+        || castasg_test.copy_assign_count() != 1 || castasg_test.dtor_count() != 1) return 11801;
+    if (castasg_test.event_size() != 3 || castasg_test.event_at(0) != 20
+        || castasg_test.event_at(1) != 40 || castasg_test.event_at(2) != 60) return 11802;
+
+    // CASTASG P2: the C++ conversion assignment overload runs on the cast temporary.
+    castasg_test.reset();
+    (CastAssignBox)castasgBox = 5;
+    if (castasgBox.value != 1 || castasg_test.copy_count() != 1
+        || castasg_test.int_assign_count() != 1 || castasg_test.dtor_count() != 1) return 11803;
+    if (castasg_test.event_size() != 3 || castasg_test.event_at(0) != 20
+        || castasg_test.event_at(1) != 50 || castasg_test.event_at(2) != 60) return 11804;
+
+    // CASTASG P3: the RHS prvalue finishes before the cast copy; both full-expression temps die.
+    castasg_test.reset();
+    (CastAssignBox)castasgBox = make_cast_assign_box();
+    if (castasgBox.value != 1 || castasg_test.copy_count() != 1
+        || castasg_test.copy_assign_count() != 1 || castasg_test.ctor_count() != 1
+        || castasg_test.dtor_count() != 2) return 11805;
+    if (castasg_test.event_size() != 6 || castasg_test.event_at(0) != 1
+        || castasg_test.event_at(1) != 10 || castasg_test.event_at(2) != 20
+        || castasg_test.event_at(3) != 40 || castasg_test.event_at(4) != 60
+        || castasg_test.event_at(5) != 60) return 11806;
+
+    // CASTASG P7: a header `using` alias resolves to the imported C++ record.
+    castasg_test.reset();
+    (CastAssignBoxAlias)castasgBox = castasgSource;
+    if (castasgBox.value != 1 || castasg_test.copy_count() != 1
+        || castasg_test.copy_assign_count() != 1 || castasg_test.dtor_count() != 1) return 11813;
+    if (castasg_test.event_size() != 3 || castasg_test.event_at(0) != 20
+        || castasg_test.event_at(1) != 40 || castasg_test.event_at(2) != 60) return 11814;
+
+    // CASTASG P4-P6: namespace-qualified casts select the same overloads and lifetimes.
+    cppas.CastAssignBox castasgNamespaced = cppas.CastAssignBox(1);
+    cppas.CastAssignBox castasgNamespacedSource = cppas.CastAssignBox(9);
+    castasg_test.reset();
+    (cppas.CastAssignBox)castasgNamespaced = castasgNamespacedSource;
+    if (castasgNamespaced.value != 1 || castasg_test.copy_count() != 1
+        || castasg_test.copy_assign_count() != 1 || castasg_test.dtor_count() != 1) return 11807;
+    if (castasg_test.event_size() != 3 || castasg_test.event_at(0) != 20
+        || castasg_test.event_at(1) != 40 || castasg_test.event_at(2) != 60) return 11808;
+    castasg_test.reset();
+    (cppas.CastAssignBox)castasgNamespaced = 5;
+    if (castasgNamespaced.value != 1 || castasg_test.copy_count() != 1
+        || castasg_test.int_assign_count() != 1 || castasg_test.dtor_count() != 1) return 11809;
+    if (castasg_test.event_size() != 3 || castasg_test.event_at(0) != 20
+        || castasg_test.event_at(1) != 50 || castasg_test.event_at(2) != 60) return 11810;
+    castasg_test.reset();
+    (cppas.CastAssignBox)castasgNamespaced = cppas.make_cast_assign_box();
+    if (castasgNamespaced.value != 1 || castasg_test.copy_count() != 1
+        || castasg_test.copy_assign_count() != 1 || castasg_test.ctor_count() != 1
+        || castasg_test.dtor_count() != 2) return 11811;
+    if (castasg_test.event_size() != 6 || castasg_test.event_at(0) != 1
+        || castasg_test.event_at(1) != 10 || castasg_test.event_at(2) != 20
+        || castasg_test.event_at(3) != 40 || castasg_test.event_at(4) != 60
+        || castasg_test.event_at(5) != 60) return 11812;
     return 0;
 }

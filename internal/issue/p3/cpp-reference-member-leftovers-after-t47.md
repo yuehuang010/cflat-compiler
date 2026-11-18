@@ -37,9 +37,23 @@ clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch
      when the callee carries it; never inspect inline bodies. `alias r = pickref(C(2), 0)` (clang 7) stays refused. Pre-existing: `alias r = *C(6).ptr();` (raw-pointer provenance) dangles.
      Repros scratch/repro_keep/aliastmp/.
    - A by-value copy of an lvalue is never destroyed when a later constructor in the same call throws (thrlv: 3210,
-     clang 13210).
-   - A conditional prvalue into a by-value param makes an extra moved copy clang elides (condbv 131, clang 31).
-   - A by-value param that goes through the generated C++ wrapper (`bv1(C(1)) + ref2(C(2), C(3))`) is destroyed inside
-     the call (132, clang 321).
+     clang 13210). BVPARAM did not resolve the direct C++ constructor-argument path after three targeted attempts:
+     matrix row 10 (a / constructor / direct / throw) still copies the lvalue after the later `D` constructor; the
+     worktree records `1/0/0/1`, while clang records `2/1/0/2` (`corder=12`, `dorder=21`). Repro shape:
+     `T t = T(s, C(2))` with `s` a C++ class lvalue and `C(2)`'s constructor throwing; the fix prints `c1 d1`, clang
+     `c1 k1 d1 d1` (the copy of `s` is ordered after the throwing constructor and never made).
+   - The same direct constructor path also has a no-throw order mismatch: `T t = T(s, C(2))` (BVPARAM p.cb f13)
+     records `c1 c2 k1 d1 d2 d1`; clang++ -std=c++20 records `c1 k1 c2 d2 d1 d1`. This remained after three
+     targeted BVPARAM attempts and is documented residue for this round.
+   - The reviewed `tone<T>(T)` free-function template path now uses the direct-construction guard. The guard stays
+     off member-template wrappers: broadening it changed `PvHost::byVal(PvCount<T,F>)` from the existing no-move
+     prvalue route to an extra move (`Test/test_cpp_interop_template.cb`, leg 2856). That member path matches both
+     master and clang when kept on its prior route.
+   - By-value param through the C++ wrapper is still destroyed inside the call when a constructor argument has side
+     effects or is not a plain scalar (master the same, values right, order differs): `C(g())`, `C(i++)` / `--`,
+     `C(GA[i])`, `C(*p)`, `C(a + b)` with an overloaded C++ `operator+`, and member-template callees. Repro:
+     `one(C(g())) + cref2(C(G2), C(3))` (one takes C by value, cref2 two const C&, C prints c<v>/d<v>) prints
+     `c2 d2 c2 c3 d3 d2`; clang++ -std=c++20 prints `c2 c2 c3 d3 d2 d2`. BVPARAM's deferral gate admits only
+     side-effect-free scalar arguments (IsCxxSideEffectFreeScalarExpression, MainListener_Conditional.cpp).
    - A conditional mixing a prvalue and an lvalue arm (`c ? D(1) : y`) is refused; clang accepts.
 

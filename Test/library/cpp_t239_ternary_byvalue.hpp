@@ -147,3 +147,98 @@ inline int memberPointer(const B& value)
 inline int takeD(const D& value) { which = 7; return value.v + 200; }
 inline int takeB(const B& value) { which = 8; return value.v + 300; }
 }
+
+namespace e6mv {
+inline int moves = 0;
+
+struct Tc {
+    int v;
+    Tc() : v(0) {}
+    Tc(int x) : v(x) {}
+    Tc(const Tc&) = default;
+    template <class U> Tc(U&& u) : v(u.v + 100) { ++moves; }
+};
+
+struct NoMove {
+    int v;
+    NoMove() : v(0) {}
+    NoMove(int x) : v(x) {}
+    NoMove(const NoMove&) = default;
+    NoMove(NoMove&&) = delete;
+};
+
+struct Plain {
+    int v;
+    Plain() : v(0) {}
+    Plain(int x) : v(x) {}
+    Plain(const Plain&) = default;
+};
+
+struct UserMove {
+    int v;
+    UserMove() : v(0) {}
+    UserMove(int x) : v(x) {}
+    UserMove(const UserMove&) = default;
+    UserMove(UserMove&& other) noexcept : v(other.v + 100) {
+        other.v = -1;
+        ++moves;
+    }
+    UserMove& operator=(const UserMove&) = default;
+    UserMove& operator=(UserMove&& other) noexcept {
+        v = other.v + 100;
+        other.v = -1;
+        ++moves;
+        return *this;
+    }
+};
+
+struct TcHolder { Tc t; };
+struct NoMoveHolder { NoMove t; };
+struct PlainHolder { Plain t; };
+struct UserMoveHolder { UserMove t; };
+
+// Deleted move ctor + assignment template: an xvalue join assigns through the template (clang 207/1).
+struct AssignT {
+    int v;
+    AssignT(int x) : v(x) {}
+    AssignT(const AssignT&) = default;
+    AssignT(AssignT&&) = delete;
+    template <class U> AssignT& operator=(U&& u) { v = u.v + 200; ++moves; return *this; }
+};
+struct AssignTHolder { AssignT t; AssignTHolder() : t(0) {} };
+
+inline int take(Tc value) { return value.v; }
+inline int take(NoMove value) { return value.v; }
+inline int take(Plain value) { return value.v; }
+inline int take(UserMove value) { return value.v; }
+inline void reset() { moves = 0; }
+
+// TERNFLD r2: counting class whose copy- and move-assignments are visible (clang: copy-assign
+// binds the const join, move-assign the mutable one).
+struct MvCnt {
+    inline static int ctors = 0, copies = 0, moves = 0, copyAssigns = 0, moveAssigns = 0, dtors = 0;
+    inline static void reset() noexcept { ctors = copies = moves = copyAssigns = moveAssigns = dtors = 0; }
+    int v;
+    MvCnt() noexcept : v(0) { ++ctors; }
+    explicit MvCnt(int x) noexcept : v(x) { ++ctors; }
+    MvCnt(const MvCnt& o) noexcept : v(o.v) { ++copies; }
+    MvCnt(MvCnt&& o) noexcept : v(o.v) { o.v = -1; ++moves; }
+    MvCnt& operator=(const MvCnt& o) noexcept { v = o.v; ++copyAssigns; return *this; }
+    MvCnt& operator=(MvCnt&& o) noexcept { v = o.v; o.v = -1; ++moveAssigns; return *this; }
+    ~MvCnt() noexcept { ++dtors; }
+};
+// TERNFLD r3: field-leaf shapes for the operand-typed const check (clang: cv of the last operand).
+struct MvNode { MvCnt f = MvCnt(21); };
+struct MvRPtr { MvNode* q; explicit MvRPtr(MvNode* n) noexcept : q(n) {} };
+struct MvQPtr { const MvNode* q; explicit MvQPtr(const MvNode* n) noexcept : q(n) {} };
+struct MvCF { const MvCnt f{21}; };
+struct MvAF { const MvCnt f[2] = {MvCnt(21), MvCnt(23)}; };
+// Converting source for a field join: `MvCnt z = k ? move s.x : move b;` (one conversion).
+struct MvX {
+    inline static int conversions = 0;
+    inline static void reset() noexcept { conversions = 0; }
+    int v;
+    explicit MvX(int x) noexcept : v(x) {}
+    operator MvCnt() const { ++conversions; return MvCnt(v + 100); }
+};
+}

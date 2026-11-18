@@ -360,6 +360,25 @@ struct ConvCnt {
     ConvCnt& operator=(ConvCnt&& o) { v = o.v + 20000; return *this; }
     ~ConvCnt() { ++conv_dtors; }
 };
+inline int retelide_ctors = 0;
+inline int retelide_copies = 0;
+inline int retelide_moves = 0;
+inline int retelide_dtors = 0;
+inline void retelide_reset() { retelide_ctors = retelide_copies = retelide_moves = retelide_dtors = 0; }
+inline int retelide_ctor_count() { return retelide_ctors; }
+inline int retelide_copy_count() { return retelide_copies; }
+inline int retelide_move_count() { return retelide_moves; }
+inline int retelide_dtor_count() { return retelide_dtors; }
+struct Retelide {
+    int v = 0;
+    Retelide() { ++retelide_ctors; }
+    Retelide(int x) : v(x) { ++retelide_ctors; }
+    Retelide(const Retelide& other) : v(other.v + 100) { ++retelide_ctors; ++retelide_copies; }
+    Retelide(Retelide&& other) noexcept : v(other.v + 1000) { ++retelide_ctors; ++retelide_moves; }
+    Retelide& operator=(const Retelide& other) { v = other.v + 10000; return *this; }
+    Retelide& operator=(Retelide&& other) noexcept { v = other.v + 20000; return *this; }
+    ~Retelide() { ++retelide_dtors; }
+};
 // T272: a maker and a taker for ConvCnt (parenthesized-initializer legs). ConvNoDefault has no
 // default constructor, so a CFlat struct holding it has no implicit no-arg construction.
 inline ConvCnt conv_mk(int x) { return ConvCnt(x); }
