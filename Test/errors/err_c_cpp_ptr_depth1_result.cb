@@ -1,0 +1,84 @@
+import cpp "cpp_interop_deepptr.hpp";
+import "c_interop_deepptr.h";
+
+// A C or C++ declaration spelled with one '*' carries depth 1 like a native `T*`: its result,
+// global, field or static member refuses a destination of another depth (clang refuses each).
+// Master left that level unrecorded and accepted every one of these.
+expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+    int** d1ReturnC(int* p) { return dp_r1(p); }
+}
+expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+    int** d1ReturnCxx(int* p) { return dpt.r1(p); }
+}
+int d1TakeDeep(int** q) { return 1; }
+
+extern int main()
+{
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        int v = 7;
+        int** bad = dp_r1(&v);
+    }
+    expect_error("cannot convert 'int*' to 'int****' implicitly: the pointer depths differ") {
+        int v = 7;
+        int**** bad = dp_r1(&v);
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        int** bad = dp_g1;
+    }
+    expect_error("cannot convert 'int**' to 'int*' implicitly: the pointer depths differ") {
+        int v = 7;
+        int* p = &v;
+        dp_g1 = &p;
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        DpH4 h = default;
+        int** bad = h.one;
+    }
+    expect_error("cannot convert 'int**' to 'int*' implicitly: the pointer depths differ") {
+        int v = 7;
+        int* p = &v;
+        DpH4 h = default;
+        h.one = &p;
+    }
+    expect_error("no overload of 'd1TakeDeep' matches the given arguments") {
+        int v = 7;
+        d1TakeDeep(dp_r1(&v));
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        int v = 7;
+        int** bad = dpt.r1(&v);
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        int v = 7;
+        int** bad = dpt.tr1(&v);
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        int** bad = dpt.g4a;
+    }
+    expect_error("cannot convert 'int**' to 'int*' implicitly: the pointer depths differ") {
+        int v = 7;
+        int* p = &v;
+        dpt.g4a = &p;
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        dpt.M3 m = dpt.M3();
+        int** bad = m.ptr1();
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        int** bad = dpt.M3.s1;
+    }
+    expect_error("cannot convert 'int**' to 'int*' implicitly: the pointer depths differ") {
+        int v = 7;
+        int* p = &v;
+        dpt.M3.s1 = &p;
+    }
+    expect_error("no overload of 'd1TakeDeep' matches the given arguments") {
+        int v = 7;
+        d1TakeDeep(dpt.r1(&v));
+    }
+    expect_error("cannot convert 'int*' to 'int**' implicitly: the pointer depths differ") {
+        int v = 7;
+        int* p = &v;
+        int** bad = v > 0 ? dpt.r1(p) : &p;
+    }
+}

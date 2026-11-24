@@ -242,6 +242,9 @@ import cpp "library/cpp_interop_global_scope.h";
 import cpp "library/cpp_interop_global_collision.h";
 // T23: assert from an NDEBUG group (this file has no other assert definition).
 import cpp "cassert" define "NDEBUG";
+import cpp "library/cpp_cachekey_box.hpp";
+import cpp "library/cpp_cachekey_leaf_int.hpp";
+import cpp "library/cpp_cachekey_macro_refuse.hpp";
 struct T383CppAliasOuter
 {
     struct GCellAlias<T> { int tag = default; };
@@ -5242,6 +5245,19 @@ extern int main()
                 || cppsopd.t711ChainByValueRvalueDtors != 1) return 57133;
         }
         if (cppsopd.t711ChainByValueRvalueDtors != 2) return 57134;
+    // CACHE-KEY: `b * 4` is a free-operator wrapper over ckeyb.Box<ckeyl.Leaf>. Its key must name the
+    // Leaf header too: test_cpp_interop_bridge.cb pairs the same box header with a double-val() Leaf,
+    // and a key of cpp_cachekey_box.hpp alone let one file replay the other's wrapper (garbage value).
+    {
+        ckeyb.Box<ckeyl.Leaf> ckeyBox = ckeyb.Box<ckeyl.Leaf>(ckeyl.Leaf(5));
+        double ckeyProduct = ckeyBox * 4;
+        if (ckeyProduct != 20.0) return 57150;
+    }
+    // CACHE-KEY: the only CKEYM_LIMIT here is refused, and the refusal is remembered. It must end
+    // this file's lookup only: test_cpp_interop_bridge.cb binds it from an earlier group.
+    expect_error("Undefined variable CKEYM_LIMIT.") {
+        int ckeyRefused = CKEYM_LIMIT;
+    }
     return 0;
 }
 

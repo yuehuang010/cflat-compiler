@@ -1,0 +1,39 @@
+// A class whose only class-scope operator delete is not a usual deallocation function (the second
+// parameter is not size_t) has no suitable delete: `delete p` and unique<T> / unique T* of it are
+// located errors, as clang (the unique_ptr instantiation fails). The member still hides the base's
+// delete; the unwind path of a throwing constructor calls nothing (value legs in test_cpp_interop.cb).
+import "malloc_allocator.cb";
+import cpp "cpp_interop_basic.h";
+
+[cpp] struct UnusableDel { int z = 0;
+    static void* operator new(ulong n) { return malloc(n); }
+    static void operator delete(void* p, i64 n) { free(p); }
+    UnusableDel(int x) { z = x; }
+};
+
+expect_error("no suitable 'operator delete'") {
+    int viaDelete(int x) { UnusableDel* p = new UnusableDel(x); int z = p->z; delete p; return z; }
+}
+
+expect_error("no suitable 'operator delete'") {
+    int viaUnique(int x) { unique<UnusableDel> p = new UnusableDel(x); return p->z; }
+}
+
+expect_error("which has no suitable 'operator delete'") {
+    int viaUniquePtr(int x) { unique UnusableDel* p = new UnusableDel(x); return p->z; }
+}
+
+// Same refusal for a derived [cpp] struct over a C++ base whose only class delete is (void*, i64).
+import cpp "cpp_interop_opnew.h";
+
+[cpp] struct UnusableSub : cppon.Cls {
+    static void operator delete(void* p, i64 n) { free(p); }
+};
+
+expect_error("no suitable 'operator delete'") {
+    int viaSubDelete() { UnusableSub* p = new UnusableSub(); int z = p->get(); delete p; return z; }
+}
+
+expect_error("no suitable 'operator delete'") {
+    int viaSubUnique() { unique<UnusableSub> p = new UnusableSub(); return p->get(); }
+}

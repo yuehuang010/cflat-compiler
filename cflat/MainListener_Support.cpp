@@ -3300,6 +3300,13 @@ std::string ResolveGenericTemplateSpellingAtScope(
     const std::string& lookupName, bool report, NonGenericRefusal* nonGenericRefusal)
 {
     if (compiler == nullptr || spelledBase.empty()) return spelledBase;
+    // A unique<X> over a C++ class with no suitable delete is refused at the spelling, located.
+    if (report)
+        if (std::string msg = compiler->UnusableUniqueSpellingError(spelledBase, args); !msg.empty())
+            // The declaration's own rule context (a use site is always inside one).
+            for (auto* node = useSite; node != nullptr; node = node->parent)
+                if (auto* site = dynamic_cast<antlr4::ParserRuleContext*>(node))
+                { MainListener::LogErrorContext(compiler, site, msg); break; }
     std::string base = ResolveGenericTemplateBaseAtScope(
         compiler, spelledBase, enclosingScopes, useSite, lookupName, nonGenericRefusal);
     if (base.empty() || base == spelledBase)

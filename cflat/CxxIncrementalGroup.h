@@ -2,6 +2,7 @@
 
 #include "CClangExtract.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -30,6 +31,12 @@ public:
     void SetDynamicInitializerOwners(
         cflat_cinterop::DynamicInitializerOwnerMap* owners,
         const cflat_cinterop::CxxImportOrder& importOrder);
+    // The include roots (CxxRequestIncludeRoots) of the group's own import line. Macros and
+    // strong definitions from files they do not reach came in through a dependency include.
+    void SetOwnIncludeRoots(const std::vector<std::string>& roots);
+    // Every import line's #include lines (one string each, BuildCxxRequestIncludes form). A
+    // prelude header sees the hidden macros of the earlier headers of its own import line.
+    void SetImportLineIncludes(std::function<std::vector<std::string>()> lines);
     bool HarvestHeader(const cflat_cinterop::ExtractRequest& req,
                        cflat_cinterop::ExtractResult& out,
                        std::string& error);

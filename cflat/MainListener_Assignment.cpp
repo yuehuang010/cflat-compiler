@@ -755,6 +755,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 result.ThisFieldPath = tv.sourceThisFieldPath;
                 result.IsExplicitMove = tv.isExplicitMove;
                 result.TernaryOwnedCallArms = tv.ownedCallArms;
+                result.IsDataNullCast = tv.isDataNullCast;
                 // A `?:` over two addressable C++ objects joins their storage too; keep it so a
                 // parenthesized ternary operand still names the SELECTED object.
                 if (result.Storage == nullptr && tv.receiverStorage != nullptr
@@ -8055,7 +8056,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         && !namedVar.TypeAndValue.IsUnique
                         && !namedVar.TypeAndValue.IsArrayView
                         && !namedVar.TypeAndValue.IsInterface
-                        && compiler->FindStackArgumentByStorage(namedVar.Storage) == nullptr
+                        && (compiler->FindStackArgumentByStorage(namedVar.Storage) == nullptr
+                            || compiler->FindAdoptingPointerParam(namedVar.Storage) != nullptr)
                         && chainedAssignmentJoinOwns(rightNV.Primary, nullptr);
                     bool reboundToOwnedStore = coalesceResume == nullptr
                         && !assignmentBorrowsOwningLocal
@@ -9869,8 +9871,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         // A member template operator (`template<class U> T& operator&=(U&&)`) is
                         // instantiated for this receiver and operand (each operand category is its own
                         // instance), as the assignment path does.
+                        // Beside a free candidate the operator lookup lets clang rank the joint set; an
+                        // eager failed instantiation here would hide the member template from it.
                         if (!compoundTemplateExists
-                            && compiler->HasCxxFunctionTemplateMember(leftType, "operator" + operatorText))
+                            && compiler->HasCxxFunctionTemplateMember(leftType, "operator" + operatorText)
+                            && !HasCxxFreeOperatorForLeftClass(leftType, "operator" + operatorText))
                         {
                             LLVMBackend::NamedVariable receiver;
                             receiver.Primary = namedVar.Storage;
@@ -12029,6 +12034,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         if (viewLocal != nullptr && viewLocal->IsOwning
                             && !viewLocal->OwnFlagActive)
                             compiler->ActivateParamOwnFlag(*viewLocal);
+                        else if (auto* param = compiler->FindAdoptingPointerParam(namedVar.Storage))
+                            compiler->EnsureAdoptingParamOwnFlag(*param,
+                                assignmentAdoptsOwnedSource || srcIsOwnedPtrRhs || rightNV.IsOwning);
                     }
                     if (viewLocal != nullptr)
                         compiler->EmitOwnedPtrRelease(
@@ -12320,7 +12328,20 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 compiler->RecordUniqueOwnerLoopSink(rightNV,
                     SpellType(*compiler, namedVar.TypeAndValue), sinkName, true, false);
             }
-            if (operatorText == "="
+            // A plain pointer parameter is a local that began as a borrow (as `T* a = &x; a = new T();`):
+            // it adopts the owned store and scope exit releases it.
+            auto* adoptingParam = operatorText == "=" && namedVar.FieldName.empty()
+                && !namedVar.CallerName.empty() && !namedVar.TypeAndValue.IsUnique
+                && !assignmentMovesArrayViewWithOwnState
+                && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty()))
+                ? compiler->FindAdoptingPointerParam(destination) : nullptr;
+            if (adoptingParam != nullptr)
+            {
+                compiler->AdoptOwnedStoreIntoParam(*adoptingParam);
+                compiler->ConsumeOwnedNewTemp(rightNV.Primary);
+                compiler->GateOwnFlagAdoption(*adoptingParam, right);
+            }
+            else if (operatorText == "="
                 && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty()))
                 && (!destinationHadBorrowProvenance || adoptsOwningPointerJoin
                     || (storeRetiredBorrow && existingDestination != nullptr

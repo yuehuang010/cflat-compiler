@@ -61,6 +61,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
@@ -3075,7 +3076,10 @@ namespace cflat_cinterop
                 // drops it; libc++ declares every basic_string operator that way.
                 const bool isFreeBinaryOperatorTemplate = IsBindableFreeOperatorTemplate(fd);
                 const auto* md = llvm::dyn_cast<CXXMethodDecl>(fd);
-                if (md != nullptr && md->getAccess() != AS_public) return true;
+                // A non-public member operator template is published only so the operator candidate
+                // set knows it exists; registration keeps it out of the callable template registry.
+                if (md != nullptr && md->getAccess() != AS_public
+                    && md->getOverloadedOperator() == OO_None) return true;
                 if (md == nullptr && fd->getStorageClass() == SC_Static) return true;
                 const bool isMemberAssignmentOperatorTemplate = md != nullptr
                     && md->getOverloadedOperator() == OO_Equal
@@ -4586,6 +4590,25 @@ namespace cflat_cinterop
                      * so no new registration surface is needed. Anything else without an
                      * identifier (conversion functions, operator new, ...) stays out.
                      */
+                    // Usual deallocation (void*) or (void*, size_t) - the one predicate for the switch
+                    // binding and for the record's no-suitable-delete flags.
+                    const bool usualDelete = md->getNumParams() >= 1
+                        && md->getParamDecl(0)->getType()->isVoidPointerType()
+                        && (md->getNumParams() == 1
+                            || (md->getNumParams() == 2
+                                && ctx.hasSameType(md->getParamDecl(1)->getType(), ctx.getSizeType())));
+                    if (md->getOverloadedOperator() == OO_Delete)
+                    {
+                        // Clang also deletes through an aligned class-scope (void*, align_val_t[, size_t]);
+                        // an enum second parameter is std::align_val_t. A destroying delete is chosen first
+                        // and is suitable ([expr.delete]/10), so it counts as usable too.
+                        const unsigned np = md->getNumParams();
+                        const bool alignedDelete = np >= 2 && md->getParamDecl(0)->getType()->isVoidPointerType()
+                            && md->getParamDecl(np - 1)->getType()->isEnumeralType();
+                        rec.hasClassDelete = true;
+                        if (usualDelete || alignedDelete || md->isDestroyingOperatorDelete())
+                            rec.hasUsualClassDelete = true;
+                    }
                     bool isBindableOperator = false;
                     switch (md->getOverloadedOperator())
                     {
@@ -4636,12 +4659,7 @@ namespace cflat_cinterop
                                                    ctx.getSizeType());
                             break;
                         case OO_Delete: case OO_Array_Delete:
-                            isBindableOperator = !md->isDestroyingOperatorDelete()
-                                && md->getParamDecl(0)->getType()->isVoidPointerType()
-                                && (md->getNumParams() == 1
-                                    || (md->getNumParams() == 2
-                                        && ctx.hasSameType(md->getParamDecl(1)->getType(),
-                                                           ctx.getSizeType())));
+                            isBindableOperator = !md->isDestroyingOperatorDelete() && usualDelete;
                             break;
                         default: break;
                     }
@@ -9500,7 +9518,7 @@ namespace cflat_cinterop
                                const std::vector<clang::TranslationUnitDecl*>& extraRoots,
                                llvm::Module* module,
                                ExtractResult& out, std::string& err, bool checkHeader,
-                               clang::TranslationUnitDecl* preludeRoot,
+                               const std::vector<clang::TranslationUnitDecl*>* preludeRoots,
                                const std::vector<clang::Decl*>* announcedDecls)
     {
         if (root == nullptr)
@@ -9533,12 +9551,11 @@ namespace cflat_cinterop
             }
         // Includes committed in a separate chunk are shared roots too. Keep their declarations
         // available to CodeGen for helper references, but do not harvest them per request.
-        if (req.RecordsDefinitionDemand() && preludeRoot != nullptr
-            && preludeRoot != headerRoot)
-            for (clang::Decl* decl : preludeRoot->decls())
-            {
-                st.sharedDecls.push_back(decl);
-            }
+        if (req.RecordsDefinitionDemand() && preludeRoots != nullptr)
+            for (clang::TranslationUnitDecl* preludeRoot : *preludeRoots)
+                if (preludeRoot != nullptr && preludeRoot != headerRoot)
+                    for (clang::Decl* decl : preludeRoot->decls())
+                        st.sharedDecls.push_back(decl);
         // What Sema announced while parsing this chunk: implicit instantiations and the members
         // an explicit instantiation defines, none of which are children of the chunk's root.
         if (req.RecordsDefinitionDemand() && announcedDecls != nullptr)
@@ -9550,8 +9567,10 @@ namespace cflat_cinterop
         }
         // Chunk 0 (root == headerRoot) harvests the group and committed-prelude surfaces. A
         // request only harvests its own root and the request's earlier stage-1 root, if present.
-        if (root == headerRoot && preludeRoot != nullptr && preludeRoot != headerRoot)
-            HarvestTranslationUnit(st, ci.getASTContext(), preludeRoot, false, false);
+        if (root == headerRoot && preludeRoots != nullptr)
+            for (clang::TranslationUnitDecl* preludeRoot : *preludeRoots)
+                if (preludeRoot != nullptr && preludeRoot != headerRoot)
+                    HarvestTranslationUnit(st, ci.getASTContext(), preludeRoot, false, false);
         for (clang::TranslationUnitDecl* extra : extraRoots)
             if (extra != nullptr && extra != root && extra != headerRoot)
                 HarvestTranslationUnit(st, ci.getASTContext(), extra, false, false);
@@ -10004,12 +10023,31 @@ namespace cflat_cinterop
                 llvm::TimeTraceScope handScope("CxxDemandHand", std::to_string(lazy.size()));
                 for (Decl* d : lazy) cg->HandleTopLevelDecl(DeclGroupRef(d));
             }
+            // Each variable's dynamic initializer, by the decl CodeGen emitted it for: a strong
+            // variable is emitted eagerly, so its __cxx_global_var_init appears during its hand.
+            std::vector<std::pair<llvm::WeakTrackingVH, llvm::WeakTrackingVH>> initializerOf;
             for (const std::string& name : wantOrder)
             {
                 if (auto it = held.find(name); it != held.end())
                 {
+                    llvm::Module* handMod = cg->GetModule();
+                    const bool variable = llvm::isa<VarDecl>(it->second.getDecl()) && handMod != nullptr;
+                    const bool wasEmpty = !variable || handMod->empty();
+                    llvm::WeakVH last(variable && !wasEmpty ? &*std::prev(handMod->end()) : nullptr);
                     cg->HandleTopLevelDecl(DeclGroupRef(const_cast<Decl*>(it->second.getDecl())));
-                    cg->GetAddrOfGlobal(it->second, /*isForDefinition*/ false);
+                    llvm::Constant* address = cg->GetAddrOfGlobal(it->second, /*isForDefinition*/ false);
+                    auto* gv = address != nullptr
+                        ? llvm::dyn_cast<llvm::GlobalVariable>(address->stripPointerCasts()) : nullptr;
+                    // CodeGen may erase the old last function (a retyped declaration): leave the
+                    // initializer untagged then; the store-set rule handles untagged functions.
+                    if (variable && gv != nullptr && (wasEmpty || last))
+                        for (auto fn = wasEmpty ? handMod->begin()
+                                                : std::next(llvm::cast<llvm::Function>(last)->getIterator());
+                             fn != handMod->end(); ++fn)
+                            if (fn->hasLocalLinkage() && !fn->isDeclaration()
+                                && (fn->getName().starts_with("__cxx_global_var_init")
+                                    || fn->getName().starts_with("??__E")))
+                                initializerOf.emplace_back(&*fn, gv);
                 }
                 if (auto it = plan.bound.find(name); it != plan.bound.end())
                     cg->GetAddrOfGlobal(GlobalDecl::getFromOpaquePtr(it->second),
@@ -10125,6 +10163,19 @@ namespace cflat_cinterop
             if (grew) continue;
 
             RewriteNonOwnerInternalAliases(*mod, plan.nonOwnerInternalAliases);
+            if (plan.dependencyDefinition)
+                for (llvm::GlobalObject& object : mod->global_objects())
+                    if (!object.isDeclaration() && object.hasExternalLinkage() && object.hasName()
+                        && (llvm::isa<llvm::Function>(object)
+                            || llvm::isa<llvm::GlobalVariable>(object))
+                        && plan.dependencyDefinition(cg->GetDeclForMangledName(object.getName())))
+                    {
+                        if (auto* fn = llvm::dyn_cast<llvm::Function>(&object))
+                            fn->addFnAttr(kCxxDependencyDefinitionAttr);
+                        else
+                            llvm::cast<llvm::GlobalVariable>(object).addAttribute(
+                                kCxxDependencyDefinitionAttr);
+                    }
 
             for (const std::string& sym : plan.weakPromoteSymbols)
             {
@@ -10164,6 +10215,11 @@ namespace cflat_cinterop
                     else
                         gv->setName(programName);
                 }
+            for (const auto& [fn, variable] : initializerOf)
+                if (auto* initializer = llvm::dyn_cast_or_null<llvm::Function>(fn))
+                    if (auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(variable);
+                        gv != nullptr && gv->hasName() && !initializer->isDeclaration())
+                        initializer->addFnAttr(kCxxVariableInitializerAttr, gv->getName());
             {
                 llvm::TimeTraceScope serializeScope("CxxDemandSerialize");
                 llvm::raw_string_ostream os(bitcode);

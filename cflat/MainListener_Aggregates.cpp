@@ -3603,7 +3603,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             }
             // Scalar operator new / delete the CFlat struct declares. C++ frees a D (unique<D>, delete)
             // through them, so the twin forwards to CFlat's own members (extern "C" thunks below).
-            bool fwdNew = false, fwdDel = false, fwdDelSized = false;
+            bool fwdNew = false, fwdDel = false, fwdDelSized = false, fwdDelUnusable = false;
             for (auto* func : functionList)
             {
                 // Class operator new / delete are implicitly static ([class.free]), spelled or not.
@@ -3618,8 +3618,15 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     fwdNew |= opParams.size() == 1 && isSize(opParams[0]);
                 else if (opParams.size() == 1 && isPtr(opParams[0]))
                     fwdDel = true;
-                else if (opParams.size() == 2 && isPtr(opParams[0]) && isSize(opParams[1]))
-                    fwdDelSized = true;
+                else if (opParams.size() == 2 && isPtr(opParams[0]))
+                {
+                    // Only the usual (void*, size_t) form forwards; any other sized delete becomes an
+                    // inert non-usual twin so clang refuses unique<T> as it does for its own classes.
+                    if (!isPtr(opParams[1]) && opParams[1].TypeName == compiler->SizeTypeSpelling())
+                        fwdDelSized = true;
+                    else
+                        fwdDelUnusable = true;
+                }
             }
             if (fwdNew) source += "void* __cflat_opnew_" + shortName + "(decltype(sizeof(0)) n);\n";
             if (fwdDel) source += "void __cflat_opdel_" + shortName + "(void* p);\n";
@@ -3637,6 +3644,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             if (fwdDelSized)
                 source += "    static void operator delete(void* p, decltype(sizeof(0)) n) { __cflat_opdels_"
                     + shortName + "(p, n); }\n";
+            if (fwdDelUnusable)
+                source += "    static void operator delete(void* p, int n) {}\n";
             std::set<std::pair<std::string, std::string>> inheritedUsing;
             for (const auto& method : cppMethods)
                 for (const auto& candidate : compiler->FindCxxBaseMethods(cppBaseName, method.Name))
@@ -7839,7 +7848,21 @@ void MainListener::EmitCppStructMoveThunk(antlr4::ParserRuleContext* ctx,
             uint64_t fieldStart = 0;
             uint64_t fieldBytes = 0;
             const bool memberwise = compiler->NeedsCxxLoweringType(structName);
-            if (memberwise
+            llvm::Function* recordMove = nullptr;
+            if (compiler->GetGeneratedCxxFieldBlock(structName, fieldStart, fieldBytes)
+                && compiler->CppStructFieldsNeedClangMove(structName))
+                recordMove = compiler->RequestCppStructRecordMove(structName);
+            if (recordMove != nullptr)
+            {
+                // Clang's implicit move of the same fields (RULED 2026-11-18), source left as
+                // clang leaves it.
+                auto* i8 = compiler->builder->getInt8Ty();
+                auto* offset = compiler->builder->getInt64(fieldStart);
+                compiler->builder->CreateCall(recordMove->getFunctionType(), recordMove,
+                    { compiler->builder->CreateInBoundsGEP(i8, dst, offset, "cflat_move_dst"),
+                      compiler->builder->CreateInBoundsGEP(i8, src, offset, "cflat_move_src") });
+            }
+            else if (memberwise
                 && compiler->GetGeneratedCxxFieldBlock(structName, fieldStart, fieldBytes))
             {
                 // A C++ field that is not trivially relocatable is move-constructed, never

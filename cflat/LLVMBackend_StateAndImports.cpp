@@ -3168,6 +3168,8 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         // a clang session, so a dropped triviality bit or member list silently unbinds the class.
         if (r.isPolymorphic)         j["po"] = true;
         if (!r.vtableDeleteVerdict.empty()) j["vdv"] = r.vtableDeleteVerdict;
+        if (r.hasClassDelete)        j["cd"] = true;
+        if (r.hasUsualClassDelete)   j["ucd"] = true;
         if (r.hasBases)              j["hb"] = true;
         if (r.hasTrivialDefaultCtor) j["tdc"] = true;
         if (r.hasTrivialCopyCtor)    j["tcc"] = true;
@@ -3300,6 +3302,8 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.alignBytes = j.value("al", (uint64_t)0);
         r.isPolymorphic         = j.value("po", false);
         r.vtableDeleteVerdict   = j.value("vdv", std::string());
+        r.hasClassDelete        = j.value("cd", false);
+        r.hasUsualClassDelete   = j.value("ucd", false);
         r.hasBases              = j.value("hb", false);
         r.hasTrivialDefaultCtor = j.value("tdc", false);
         r.hasTrivialCopyCtor    = j.value("tcc", false);

@@ -1,0 +1,44 @@
+// A protected or private member operator template beside a free candidate joins the C++
+// candidate set: when clang selects it, the access error is the answer (no free fallback).
+import cpp "cpp_mix7_operator_rank.hpp";
+
+extern int main()
+{
+    expect_error("'operator+' is a private member of 'oprank::PrivateBinary'") {
+        oprank.PrivateBinary value = default;
+        int result = value + 2;
+    }
+    expect_error("'operator+' is a protected member of 'oprank::ProtectedBase'") {
+        oprank.ProtectedDerived value = default;
+        int result = value + 2;
+    }
+    expect_error("'operator+' is a protected member of 'oprank::ProtectedClassTemplate<int>'") {
+        oprank.ProtectedClassTemplateInt value = default;
+        int result = value + 2;
+    }
+    expect_error("'operator+=' is a protected member of 'oprank::ProtectedCompound'") {
+        oprank.ProtectedCompound value = default;
+        value += 2;
+    }
+    expect_error("'operator<=>' is a protected member of 'oprank::ProtectedSpaceship'") {
+        oprank.ProtectedSpaceship value = default;
+        bool less = value < 1;
+    }
+    expect_error("'operator==' is a protected member of 'oprank::ProtectedEq'") {
+        oprank.ProtectedEq value = default;
+        bool same = value == 1;
+    }
+    expect_error("'operator==' is a protected member of 'oprank::ProtectedEq'") {
+        oprank.ProtectedEq value = default;
+        bool differ = value != 1;
+    }
+    expect_error("'operator==' is a protected member of 'oprank::ProtectedEq'") {
+        oprank.ProtectedEq value = default;
+        bool reversed = 1 == value;
+    }
+    expect_error("'operator-' is a protected member of 'oprank::UnaryDerivedProtected'") {
+        oprank.UnaryDerivedProtected value = default;
+        int negated = -value;
+    }
+    return 0;
+}

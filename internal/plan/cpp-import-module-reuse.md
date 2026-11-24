@@ -44,6 +44,59 @@ the free / infix function loop (LLVMBackend_CxxRequestFunctions.cpp) and the typ
    moves (measured with the fix/memfan prototype).
 4. Post-parse plateau: memory after parsing returns to the warm level.
 
+## Phase 1 spike results (2026-11-18, Mac, clang 23.1.0, memory only - host not perf-stable)
+
+Harness: scratch/modspike/ (run.sh, run2.sh, repl.sh, delta.sh, stdmod.sh, lsv.sh). Footprint is
+`/usr/bin/time -l` "peak memory footprint" of one clang / clang-repl process; a host header stands for group
+k, `cpp_interop_basic.h` (4,258 lines, 15 includes) is the dependency B, the probe is
+`s + v` on cppi::ConstPointerRankShift. clang-repl runs the same clang::Interpreter the groups use, and
+it accepts `-fmodules -fmodule-map-file= -fmodule-file=`: a header module imported by `#include` executes
+correctly (probe=5).
+
+Measured (clang-repl, codegen + run):
+
+| host k | k textual | k + B textual | k modular-std | k + B modular-std |
+|---|---|---|---|---|
+| cpp_t48_nullptr.hpp | 13 MB | 90 MB | 81 MB | 89 MB |
+| cpp_interop_stream.h | 90 MB | 109 MB | 81 MB | 91 MB |
+| cpp_t43_ref_ops.hpp, cpp_namespace_class_constants.hpp | 13 MB | 90 MB | 81 MB | 89 MB |
+
+So B through a module costs +8-10 MB per group instead of +19-77 MB textual (basic.pcm is 2.5 MB with a
+modular std, 19.8 MB with libc++ inside it). Most of the 81 MB floor is the 42 MB std.pcm, which clang reads
+into a heap buffer per CompilerInstance; one in-process module cache shared by all groups would hold it once
+(not measured - needs an in-process harness, not clang-repl).
+
+What fails - every variant that keeps libc++ textual (no shared std module):
+- k textual + B as a header module (libc++ inside B): `-fsyntax-only` passes, codegen fails - 17 errors
+  "'std::basic_string_view<char>::basic_string_view' from module 'cppi_basic' is not present in definition
+  of 'std::string_view' provided earlier". `-fmodules-local-submodule-visibility` does not fix it.
+- k and B both header modules, libc++ textual inside each (the "each import is its own module" reading):
+  driver `-fsyntax-only` passes (20 MB), codegen fails - 17 errors; with local submodule visibility 2 errors
+  remain (std::logic_error / std::length_error ctors taking `const string&`), either import order;
+  clang-repl segfaults on the same input.
+- Conclusion: clang 23 does not reliably merge two textual copies of libc++ that live in different modules
+  (or one module + the TU). It works only when libc++ itself is a module (SDK module map, 0 errors).
+
+Consequences:
+1. The only working mechanism is a modular standard library shared by every group's modules - the shared
+   system closure the 2026-11-08 ruling excludes. It also has no Windows counterpart: the MSVC STL ships no
+   clang header-module map, and Windows is the host that pages (27 GB).
+2. Pick parity, if a modular std were allowed: a header module is built in isolation, so B no longer sees
+   k's macros or k's namespace-scope declarations, and every group's libc++ becomes an import (config
+   macros a user header defines before `#include <vector>` stop applying). B-in-isolation equals textual
+   B-after-k only when no k-only macro or k-only namespace-scope name occurs among B's closure identifier
+   tokens (and no k-only operator declaration meets an operator token in B); both sets come from the
+   groups' own parses. When the check fails the request must keep today's textual path, which cannot be
+   mixed with module imports in the same interpreter (the merge failure above), so it needs a separate
+   fully textual group.
+3. A non-module reading (ExternalASTSource / ASTImporter pulling B's decls from B's live interpreter, the
+   lldb approach) keeps k textual, but merges libc++ by structural equivalence instead of ODR - expected to
+   be weaker than the module merge that already fails; not prototyped.
+
+Status: per the phase 1 rule, no mechanism that keeps include order and avoids a shared system closure was
+found - back to the maintainer. Decision needed: allow a modular std (macOS/Linux libc++ only, Windows keeps
+the ~27 GB path), or try the ASTImporter reading, or keep accepting the cold peak.
+
 ## Acceptance
 
 Cold test_cpp_interop peak under ~8 GB (`/usr/bin/time -l` "peak memory footprint", not max RSS), program

@@ -1,7 +1,11 @@
 import cpp "cpp_interop_basic.h";
+import cpp "cpp_arrbound.hpp";
 
 extern int main()
 {
+    expect_error("must be a compile-time constant (runtime-sized arrays are not supported yet)") {
+        int[arrb.Mut.n] a = default;
+    }
     expect_error("arg=std.array<int, 3>  param=std.array<int, 4>") {
         std.array<int, 3> bad = default;
         cppi.array_total(bad);

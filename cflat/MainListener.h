@@ -4018,7 +4018,7 @@ private:
                                          const LLVMBackend::DeclTypeAndValue& field)
     {
         return !field.Pointer && !field.ElemPointer && !field.IsAlias && !field.IsArrayView
-            && field.ConstArraySize == 0 && compiler->IsLoweredCFlatOnlyStruct(field.TypeName);
+            && field.ConstArraySize == 0 && compiler->NeedsCxxLoweringType(field.TypeName);
     }
     // Builds the deferred `move` source (see LoweredBraceMoveScope) into a field slot member-wise.
     // False when rightNV is not that move; the caller then runs its normal store path.
@@ -6759,6 +6759,7 @@ public:
     // typeName. Used to decide whether a shift operator should dispatch to an overload
     // (member or free) instead of a primitive bit-shift.
     bool HasOperatorOverloadForFirstParam(const std::string& opName, const std::string& typeName);
+    bool HasCxxFreeOperatorForLeftClass(const std::string& typeName, const std::string& opName);
 
     struct ShiftOperand
     {

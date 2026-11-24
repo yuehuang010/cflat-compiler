@@ -5844,7 +5844,6 @@ void LLVMBackend::ResetForReanalysis()
     cxxImportGroups_.clear();
     cHeaderMacroGroups_.clear();
     currentCxxImportOrderPath_.clear();
-    cxxHeaderGuardCache_.clear();
     tuParseCounts_.clear();
     cInlineBodyRequests_.clear();
     cxxIncrementalGroups_.clear();
@@ -5874,6 +5873,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxDirectCalleeSymbols_.clear();
     cxxFunctionTemplates_.clear();
     cxxFunctionTemplateOwnerGroup_.clear();
+    cxxNonPublicMemberOperatorTemplates_.clear();
     cxxFunctionSignatures_.clear();
     cxxFunctionParameterSpellingsByLinkage_.clear();
     cxxTopLevelConstTypeAliases_.clear();
@@ -5889,6 +5889,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionOwnerGroup_.clear();
     cxxBoundSignatureKeys_.clear();
     cxxTypeOwnerGroup_.clear();
+    cxxTypeOwnerDependencyGroups_.clear();
     cxxSpecialMemberOwner_.clear();
     cxxEarlyClosureDeps_.clear();
     completingCxxSpecialMembers_ = false;
@@ -5921,6 +5922,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxArgumentFreeMacros_.clear();
     cxxNamespaceObjectProbed_.clear();
     generatedCxxRecords_.clear();
+    cppStructRecordMoves_.clear();
     cxxBraceSelectorSources_.clear();
     cppStructNames_.clear();
     cppStructBases_.clear();

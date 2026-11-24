@@ -10,31 +10,28 @@ Earlier wrapper sites (T110): default/move ctor, xvalue transfer, brace ctors, v
 operator->, type-definition upgrades, special-member completion, base conversion, refused member
 retry, xvalue pointer conversion all use MakeCxxClassRequestGroup (kCHeaderCacheVersion 240).
 
-## Still open: CFLAT_CPP_INCREMENTAL=0 implicit std.unique_ptr<cppon.Cls> destructor
+## Still open: CFLAT_CPP_INCREMENTAL=0 calloc overload (blocks the noinc dtor check)
 
-Not reproduced in the WRAPGRP run (2026-11-06). The repro scratch/wrapgrp_repro/t70_unique_repro.cb
-stops earlier, in both master and fix, at a separate noinc defect:
+Re-measured 2026-11-18 (CACHE-KEY, master 496b9392e and fix identical):
+- `import cpp "memory"; import cpp "cpp_interop_opnew.h";` +
+  `std.unique_ptr<cppon.Cls> p = std.unique_ptr<cppon.Cls>(new cppon.Cls(7));` compiles and runs
+  under CFLAT_CPP_INCREMENTAL=0 (exit 0); so does `list<int>` with only `import cpp "memory"`.
+- Adding `import cpp "vector"; import cpp "cpp_interop_basic.h";` plus `import "list.cb"` and a
+  `struct Holder { std.unique_ptr<cppon.Cls> p = default; }` still stops at core/list.cb:48
+  "cannot choose which 'calloc' to call: calloc(u64, u64), calloc(unsigned long, unsigned long)"
+  (noinc only; default mode exit 0). This is not a request-group defect.
 
-- core/list.cb:48 `calloc((i64)newCap, (i64)sizeof(T))`: "cannot choose which 'calloc' to call:
-  calloc(u64, u64), calloc(unsigned long, unsigned long)". The first is cruntime.cb's wrapper, the
-  second the C header's declaration. Any `list<T>` with CFLAT_CPP_INCREMENTAL=0 and a C++ import
-  of memory/vector/basic.h hits it (`list<int>` too), so the no-dtor diagnostic is never reached.
-- Noinc-only, master identical: `struct Holder { std.unique_ptr<cppon.Cls> p; };` then
-  `h.p = std.unique_ptr<cppon.Cls>(new cppon.Cls(7));` -> "overload resolution selected deleted
-  operator '='" (default mode passes).
-
-Next step: fix the calloc overload first (or log the set of calloc candidates per import group),
-then rerun t70 noinc. Only then root-cause the dtor with lldb or a GetOrCreateCxxClassDestructor
-log (MainListener_Declarations.cpp, "it has no destructor cflat can call"). A candidate to test
-first is LLVMBackend_EmitAndLink.cpp (upgrade of layout-only assumed bodies) builds its request
-with the owner-only group, MakeCxxRequestGroup(groupIt->second, {}). Unverified.
+Next step: fix the noinc calloc overload, then re-check the noinc Holder assignment and the
+implicit unique_ptr destructor.
 
 ## Owner-only sites (audit)
 
-Not converted: no repro reached them in this run. The issue's old line numbers moved; current sites
-are MakeCxxRequestGroup(..., {}) in LLVMBackend_Overloads.cpp:2878 (class pointer -> void*),
-LLVMBackend_EmitAndLink.cpp:2921 (assumed-body owners), LLVMBackend_CHeaderDemand.cpp:1376
-(assumed-body field binding), plus the CRecords/CSignatures/CxxRequest sites without a repro.
+CACHE-KEY converted every type-owner site to MakeCxxClassRequestGroup / CollectCxxTypeOwnerGroups
+(class pointer -> void* in LLVMBackend_Overloads.cpp, assumed-body owners in
+LLVMBackend_EmitAndLink.cpp, assumed-body field binding in LLVMBackend_CHeaderDemand.cpp, the
+CRecords field/base/member-typedef sites, the CSignatures member sites), and those groups now carry
+the owner request's dependency groups. Function-owner and per-import-group sites stay owner-only:
+an import harvest has no dependency groups.
 
 ## Open: pointer typedef over an unpublished class-template specialization
 

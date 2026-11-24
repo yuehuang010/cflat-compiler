@@ -1,0 +1,80 @@
+// A fixed-array bound that is not a compile-time constant is refused at the declaration.
+int arrBoundCallN() { return 3; }
+int arrBoundStructN = 3;
+
+expect_error("must be a compile-time constant (runtime-sized arrays are not supported yet)") {
+    int arrBoundParam(int n) { int[n] a = default; return (int)sizeof(a); }
+}
+
+expect_error("must be a compile-time constant (runtime-sized arrays are not supported yet)") {
+    int arrBoundCallResult() { int[arrBoundCallN()] a = default; return (int)sizeof(a); }
+}
+
+expect_error("array size must be a compile-time constant") {
+    struct ArrBoundField { int[arrBoundStructN] d; };
+}
+
+expect_error("must be a compile-time constant (runtime-sized arrays are not supported yet)") {
+    int arrBoundPtrCStyle(int n) { int* arr[n]; return (int)sizeof(arr); }
+}
+
+const int ArrBoundShadowN = 9;
+int arrBoundMoveSink(move int* p) { return 3; }
+
+expect_error("array size 'ArrBoundShadowN' must be a compile-time constant") {
+    int arrBoundShadowCall(int ArrBoundShadowN) { int[ArrBoundShadowN] v = default; return (int)sizeof(v); }
+}
+
+// The shadows below hide a file-scope const double that WOULD fold (bound 2); a broken shadow folds it instead.
+const double ArrBoundD = 1.0;
+expect_error("array size '(ArrBoundD>0.0)?2:1' must be a compile-time constant") {
+    int arrBoundShadowParamD(double ArrBoundD) { int[(ArrBoundD > 0.0) ? 2 : 1] v = default; return (int)sizeof(v); }
+}
+
+expect_error("array size '(ArrBoundD>0.0)?2:1' must be a compile-time constant") {
+    int arrBoundShadowLocal() { double ArrBoundD = 0.0; int[(ArrBoundD > 0.0) ? 2 : 1] v = default; return (int)sizeof(v); }
+}
+
+expect_error("array size '(ArrBoundD>0.0)?2:1' must be a compile-time constant") {
+    struct ArrBoundShadowField { double ArrBoundD = 0.0; int Dim() { int[(ArrBoundD > 0.0) ? 2 : 1] v = default; return (int)sizeof(v); } };
+}
+
+expect_error("array size '(ArrBoundMutF>0.0f)?2:1' must be a compile-time constant") {
+    float ArrBoundMutF = 1.0f;
+    int arrBoundMutFloat() { int[(ArrBoundMutF > 0.0f) ? 2 : 1] v = default; return (int)sizeof(v); }
+}
+
+const int ArrBoundFileK = 2;
+expect_error("array size 'ArrBoundFileK' must be a compile-time constant") {
+    namespace ArrBoundVla { int ArrBoundFileK = 7; int local() { int[ArrBoundFileK] a = default; return (int)sizeof(a); } }
+}
+
+expect_error("array size '(ArrBoundMutD>0.0)?2:1' must be a compile-time constant") {
+    double ArrBoundMutD = 1.0;
+    int arrBoundMutDouble() { int[(ArrBoundMutD > 0.0) ? 2 : 1] v = default; return (int)sizeof(v); }
+}
+
+extern int main()
+{
+    expect_error("must be a compile-time constant (runtime-sized arrays are not supported yet)") {
+        int* p = nullptr;
+        int[arrBoundMoveSink(move p)] a = default;
+    }
+    expect_error("must be a compile-time constant (runtime-sized arrays are not supported yet)") {
+        int n = 3;
+        int[n] a = default;
+    }
+    expect_error("must be a compile-time constant (runtime-sized arrays are not supported yet)") {
+        int n = 3;
+        int[n][4] a = default;
+    }
+    expect_error("a 'static' local array must have a compile-time constant length") {
+        int n = 3;
+        static int* arr[n];
+    }
+    expect_error("array dimension must be a compile-time constant") {
+        int n = 3;
+        int[4][n] a = default;
+    }
+    return 0;
+}

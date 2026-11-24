@@ -236,7 +236,7 @@ is generated.
   `hasErrorOccurred()` after Parse, before any CodeGen, in cflat's wrapper) because the demand chunk
   runs after many earlier chunks.
 - **Request order dependence.** Batching changes the order Sema sees spellings. Known symptoms:
-  cpp-noinc-mode-std-map-lookup-fails, cpp-candidate-tier-differs-cold-vs-warm. Mitigate with
+  cpp-noinc-mode-std-map-lookup-fails; candidate tiers seeded by request history (fixed 2df193301). Mitigate with
   canonical (sorted) batch order, and a cold-vs-warm equality check on the fixtures (the bound
   surface from the snapshot must match a fresh cold run byte for byte).
 - **Lazy member typing changes answers.** A member bound later may resolve overloads differently

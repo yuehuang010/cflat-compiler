@@ -114,8 +114,10 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
          * register thousands of implementation details and emit a whole standard library's inline
          * bodies. Nothing is bound at import time; the concrete types the program names are
          * requested one at a time (RequestCxxForeignType), which re-parses this same header set.
+         * A group skips the walk only when EVERY header is a catalog: a user header listed after
+         * a system one is still a bound surface (the in-scope filter below drops the catalog).
          */
-        if (cxxMode && IsSystemCxxHeaderPath(headerPath))
+        if (cxxMode && std::all_of(headerPaths.begin(), headerPaths.end(), IsSystemCxxHeaderPath))
         {
             cppInteropUsed_ = true;
             return true;
@@ -1381,8 +1383,9 @@ std::string LLVMBackend::CxxIncrementalGroupKey(const CxxRequestGroup& group) co
         };
         append('T', CInteropTargetTriple());
         // One TU per import line: {a.h, b.h} and {a.h, c.h} share a first header but not a TU, so
-        // key on the line's whole header set. Dependency-group headers appended after it do not split it.
-        if (!group.ownerHeaders.empty())
+        // key on the line's whole header set. Dependency-group headers appended after it do not split it,
+        // not even for a header-free line (a generated struct): its TU is keyed by no header at all.
+        if (!group.ownerHeaders.empty() || group.primary < cxxImportGroups_.size())
             for (const auto& header : group.ownerHeaders) append('H', header);
         else if (!group.headers.empty())
             append('H', group.headers.front());
@@ -1406,7 +1409,7 @@ std::string LLVMBackend::CheckCxxDemand(const std::string& symbol)
                 && !cxxForeignDefinitions_.count(owner))
             {
                 const std::string cxxSpelling = spelling->second;
-                CxxRequestGroup group = MakeCxxRequestGroup(owningGroup->second, {});
+                CxxRequestGroup group = MakeCxxClassRequestGroup(owningGroup->second, owner);
                 CxxRequestGroupScope groupScope(*this, &group);
                 std::string error;
                 if (!RequestCxxForeignType(owner, cxxSpelling, error, true, true))
@@ -2200,6 +2203,19 @@ CxxIncrementalGroup* LLVMBackend::GetCxxIncrementalGroup(const CxxRequestGroup& 
             cxxDemandGroups_.contains(key) && cxxDemandGroups_[key].forceEagerBodies);
         if (!created) return nullptr;
         CxxIncrementalGroup* result = created.get();
+        result->SetOwnIncludeRoots(CxxRequestIncludeRoots(
+            group.ownerHeaders.empty() && group.primary >= cxxImportGroups_.size()
+                ? group.headers : group.ownerHeaders));
+        result->SetImportLineIncludes([this] {
+            std::vector<std::string> lines;
+            for (const CxxImportGroup& line : cxxImportGroups_)
+            {
+                CxxRequestGroup headersOnly;
+                headersOnly.headers = line.headers;
+                lines.push_back(BuildCxxRequestIncludes(headersOnly));
+            }
+            return lines;
+        });
         result->SetDynamicInitializerOwners(&cxxDynamicInitializerOwners_,
             importOrder);
         result->RememberPrefixSource(BuildCxxRequestIncludes(group));
@@ -2857,10 +2873,15 @@ bool LLVMBackend::RequestCxxVariadicCallAbi(
             return false;
 
         size_t primary = static_cast<size_t>(-1);
+        std::string primaryType;
         if (candidate.IsMethod && !candidate.Parameters.empty())
         {
             auto owner = cxxTypeOwnerGroup_.find(candidate.Parameters.front().TypeName);
-            if (owner != cxxTypeOwnerGroup_.end()) primary = owner->second;
+            if (owner != cxxTypeOwnerGroup_.end())
+            {
+                primary = owner->second;
+                primaryType = owner->first;
+            }
         }
         else
         {
@@ -2871,7 +2892,10 @@ bool LLVMBackend::RequestCxxVariadicCallAbi(
             else if (const size_t dot = name.rfind('.'); dot != std::string::npos)
                 if (auto memberOwner = cxxTypeOwnerGroup_.find(name.substr(0, dot));
                     memberOwner != cxxTypeOwnerGroup_.end())
+                {
                     primary = memberOwner->second;
+                    primaryType = memberOwner->first;
+                }
         }
         if (primary >= cxxImportGroups_.size()) return false;
 
@@ -2882,6 +2906,8 @@ bool LLVMBackend::RequestCxxVariadicCallAbi(
 
         std::vector<size_t> dependencies;
         std::unordered_set<std::string> visited;
+        // The receiver's owner request compiled against more than its primary group.
+        if (!primaryType.empty()) CollectCxxTypeOwnerGroups(primaryType, dependencies, visited);
         std::vector<std::string> tailSpellings;
         tailSpellings.reserve(arguments.size() - candidate.Parameters.size());
         uint64_t requestHash = 14695981039346656037ULL;
@@ -3188,6 +3214,8 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.scopeNames = cached.scopeNames;
         raw.isPolymorphic = cached.isPolymorphic;
         raw.vtableDeleteVerdict = cached.vtableDeleteVerdict;
+        raw.hasClassDelete = cached.hasClassDelete;
+        raw.hasUsualClassDelete = cached.hasUsualClassDelete;
         raw.hasBases = cached.hasBases;
         raw.hasVirtualBases = cached.hasVirtualBases;
         raw.isFinal = cached.isFinal;
@@ -3501,6 +3529,27 @@ LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxClassRequestGroup(
         return MakeCxxRequestGroup(owner, groups);
 }
 
+void LLVMBackend::NoteCxxTypeOwner(const std::string& cflatName, size_t group, bool overwrite)
+{
+        auto [owner, inserted] = cxxTypeOwnerGroup_.try_emplace(cflatName, group);
+        if (!inserted && !overwrite) return;
+        owner->second = group;
+        // Only the request that owns `group` knows what else it compiled against.
+        if (activeCxxRequestGroup_ != nullptr && activeCxxRequestGroup_->primary == group
+            && !activeCxxRequestGroup_->dependencyGroups.empty())
+            cxxTypeOwnerDependencyGroups_[cflatName] = activeCxxRequestGroup_->dependencyGroups;
+        else
+            cxxTypeOwnerDependencyGroups_.erase(cflatName);
+}
+
+std::vector<size_t> LLVMBackend::CxxTypeOwnerGroupsOf(const std::vector<std::string>& cflatTypes) const
+{
+        std::vector<size_t> groups;
+        std::unordered_set<std::string> visited;
+        for (const std::string& type : cflatTypes) CollectCxxTypeOwnerGroups(type, groups, visited);
+        return groups;
+}
+
 /*
  * The primary group's headers first, then the headers of the groups that own the requested
  * spelling's template arguments, appended in a canonical (sorted) order so the prologue and the
@@ -3582,7 +3631,7 @@ void LLVMBackend::PublishCxxGroupNames(size_t group, const std::vector<CRecordEn
             while ((pos = cxxName.find('.', pos)) != std::string::npos)
             { cxxName.replace(pos, 1, "::"); pos += 2; }
             g.publishedNames.insert(cxxName);
-            cxxTypeOwnerGroup_.emplace(record.name, group);
+            NoteCxxTypeOwner(record.name, group);
     }
 }
 
@@ -3593,6 +3642,12 @@ void LLVMBackend::RegisterCxxFunctionTemplates(
         for (const auto& t : templates)
         {
             if (t.name.empty() || t.cxxSpelling.empty()) continue;
+            if (t.kind != cflat_cinterop::RawFunctionTemplate::Free
+                && t.access != static_cast<int>(cflat_cinterop::AccessPublic))
+            {
+                cxxNonPublicMemberOperatorTemplates_.insert(t.name);
+                continue;
+            }
             auto& entries = cxxFunctionTemplates_[t.name];
             const bool duplicate = std::any_of(entries.begin(), entries.end(), [&](const auto& old) {
                 return old.kind == t.kind && old.cxxSpelling == t.cxxSpelling
@@ -4099,6 +4154,41 @@ bool LLVMBackend::HasCxxFunctionTemplateMember(const std::string& owner,
                                                const std::string& memberName) const
 {
         return !ResolveCxxFunctionTemplateName(owner, memberName).empty();
+}
+
+bool LLVMBackend::HasCxxMemberOperatorTemplateAnyAccess(const std::string& owner,
+                                                        const std::string& memberName) const
+{
+        if (HasCxxFunctionTemplateMember(owner, memberName)) return true;
+        if (cxxNonPublicMemberOperatorTemplates_.empty()) return false;
+        // Name lookup finds a member template through any base; access is clang's to check.
+        std::set<std::string> seen;
+        std::function<bool(const std::string&)> find = [&](const std::string& candidate) {
+            if (!seen.insert(candidate).second) return false;
+            // A specialization or alias owner records its member templates under the template's name.
+            std::string spelled;
+            if (CxxSpellingForCflatType(candidate, spelled))
+            {
+                spelled.resize(std::min(spelled.size(), spelled.find('<')));
+                while (spelled.starts_with("::")) spelled.erase(0, 2);
+                for (size_t pos = 0; (pos = spelled.find("::", pos)) != std::string::npos; ++pos)
+                    spelled.replace(pos, 2, ".");
+            }
+            const std::string base = candidate.substr(0, candidate.find('$'));
+            for (const std::string& name : { candidate, base, spelled })
+                if (!name.empty()
+                    && cxxNonPublicMemberOperatorTemplates_.count(name + "." + memberName) != 0)
+                    return true;
+            auto record = cxxRecordEntries_.find(candidate);
+            if (record == cxxRecordEntries_.end()) return false;
+            for (const auto& recordBase : record->second.bases)
+            {
+                const std::string baseName = ResolveCxxBaseIdentity(recordBase);
+                if (!baseName.empty() && find(baseName)) return true;
+            }
+            return false;
+        };
+        return find(owner);
 }
 
 bool LLVMBackend::HasCxxFunctionTemplateMemberName(const std::string& memberName) const

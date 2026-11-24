@@ -3244,7 +3244,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 }
                 // An explicit move zeroed its source: restore the loaded bytes, then move the C++
                 // fields (the source stays a live moved-from object, as in a plain `T x = move y;`).
-                const bool lowered = compiler->IsLoweredCFlatOnlyStruct(cxxTernaryDeclType);
+                const bool lowered = compiler->NeedsCxxLoweringType(cxxTernaryDeclType);
                 const bool useMove = (explicitMove && !JoinMoveLeafConst(ctx))
                     || (fieldOfTemp && !CxxTernaryArmConst(armType));
                 bool copied = false;
@@ -3835,6 +3835,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 trueShape.isRvalue = trueNV.IsRvalue || (trueNV.IsExplicitMove
                     && compiler->IsCxxRecord(trueNV.TypeAndValue.TypeName));
                 trueShape.isExplicitMove = trueNV.IsExplicitMove;
+                trueShape.isDataNullCast = trueNV.IsDataNullCast;
                 OperandPointerDepth(trueNV, trueValue, trueShape.pointerDepth, trueShape.elemPointer);
                 if (trueShape.hasSourceType && trueShape.sourceType.Pointer
                     && trueShape.pointerDepth > 0)
@@ -3894,7 +3895,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (trueValue != nullptr && trueValue == compiler->lastLoweredRetValue_)
                 if (auto* st = llvm::dyn_cast<llvm::StructType>(trueValue->getType());
                     st != nullptr && st->hasName()
-                    && compiler->IsLoweredCFlatOnlyStruct(st->getName().str()))
+                    && compiler->NeedsCxxLoweringType(st->getName().str()))
                     trueLoweredRetTemp =
                         llvm::dyn_cast_or_null<llvm::AllocaInst>(compiler->lastLoweredRetTemp_);
             trueJoinSlot = loweredJoinSlotOf(trueValue);
@@ -4097,7 +4098,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (falseValue != nullptr && falseValue == compiler->lastLoweredRetValue_)
                 if (auto* st = llvm::dyn_cast<llvm::StructType>(falseValue->getType());
                     st != nullptr && st->hasName()
-                    && compiler->IsLoweredCFlatOnlyStruct(st->getName().str()))
+                    && compiler->NeedsCxxLoweringType(st->getName().str()))
                     falseLoweredRetTemp =
                         llvm::dyn_cast_or_null<llvm::AllocaInst>(compiler->lastLoweredRetTemp_);
             falseJoinSlot = loweredJoinSlotOf(falseValue);
@@ -5884,7 +5885,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             && (trueExplicitMove || falseExplicitMove || trueJoinSlot != nullptr
                 || falseJoinSlot != nullptr || trueLoweredRetTemp != nullptr
                 || falseLoweredRetTemp != nullptr) && !loweredJoinName.empty()
-            && compiler->IsLoweredCFlatOnlyStruct(loweredJoinName)
+            && compiler->NeedsCxxLoweringType(loweredJoinName)
             && (trueExplicitMove ? trueStorage != nullptr
                 : trueJoinSlot != nullptr || trueLoweredRetTemp != nullptr || trueStorage != nullptr)
             && (falseExplicitMove ? falseStorage != nullptr
@@ -6267,6 +6268,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         result.isAlias = (trueAlias || falseAlias) && !cxxRefBorrowJoin;
         // A join is an explicit move only when every arm is one: `cond ? move a : b` stays a borrow.
         result.isExplicitMove = trueShape.isExplicitMove && falseShape.isExplicitMove;
+        // Either arm a data-pointer null cast makes the join one (refused at a function slot).
+        result.isDataNullCast = trueShape.isDataNullCast || falseShape.isDataNullCast;
         result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
         result.receiverStorage = cxxLvalueStorageJoin;
         result.isCxxPrvalueConditional = mixedCxxRecordCategories;

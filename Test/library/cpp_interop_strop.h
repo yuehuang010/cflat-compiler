@@ -414,6 +414,19 @@ struct T456PublicTemplateFree
     int useSelf() const { return *this + 2; }
 };
 inline int operator+(const T456PublicTemplateFree&, double) { return 61; }
+// OPRANK (grouped import): compound and rewritten member templates rank with the free set.
+struct T456CompoundTemplateFree
+{
+    int value = 0;
+    template<class T> T456CompoundTemplateFree& operator+=(T) { value = 71; return *this; }
+};
+inline T456CompoundTemplateFree& operator+=(T456CompoundTemplateFree& x, double) { x.value = 61; return x; }
+inline int t456SpaceshipChoice = 0;
+struct T456SpaceshipTemplateFree
+{
+    template<class T> int operator<=>(T x) const { t456SpaceshipChoice = 71; return 0 - (int)x; }
+};
+inline int operator<=>(const T456SpaceshipTemplateFree&, int) { t456SpaceshipChoice = 61; return -1; }
 inline int operator+(const T456ProtectedFreeUnary&) { return 63; }
 }
 

@@ -7119,6 +7119,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             lastParenExprCallerName.clear();
                             auto parenInnerNamed = lastParenExprNamed;
                             lastParenExprNamed = {};
+                            // Identity parentheses keep the null-cast provenance (`k ? f : ((void*)0)`).
+                            if (prevPrimary->expression() != nullptr && childLimit == 1)
+                                namedVar.IsDataNullCast = parenInnerNamed.IsDataNullCast;
                             // Identity parentheses keep a tuple literal's provenance; a suffix drops it.
                             if (prevPrimary->expression() != nullptr && childLimit == 1 && parenInnerNamed.IsTupleLiteral)
                             {
@@ -11643,6 +11646,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
                                     argVar.IsCxxNullIntegerMacro = argNV.IsCxxNullIntegerMacro;
                                     argVar.IsCxxMacroJoin = argNV.IsCxxMacroJoin;
+                                    argVar.IsDataNullCast = argNV.IsDataNullCast;
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.Storage = argNV.Storage;
@@ -14108,6 +14112,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
                                     argVar.IsCxxNullIntegerMacro = argNV.IsCxxNullIntegerMacro;
                                     argVar.IsCxxMacroJoin = argNV.IsCxxMacroJoin;
+                                    argVar.IsDataNullCast = argNV.IsDataNullCast;
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.RootIsBorrowedThisField = argNV.RootIsBorrowedThisField;
@@ -17714,6 +17719,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         for (auto& cap : captures)
         {
             if (cap.ByReference || cap.IsThis || !cap.TV.Pointer) continue;
+            compiler->ReleaseParamAdoptionForCapture(cap.Name);
             const auto outer = compiler->GetScopedLocalOrArgument(cap.Name);
             // Storage identity, not the name: a same-named local of an enclosing lambda is no parameter.
             const bool paramBorrow = compiler->IsFunctionParameterStorage(outer.Storage)

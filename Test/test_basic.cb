@@ -88,73 +88,6 @@ const double T118ConstCastDouble = 2.0;
 float T118MutableFloat = 1.0f;
 double T118MutableDouble = 1.0;
 namespace T118DimNS { const double D = 1.0; }
-int t114MoveSinkDtors = 0;
-struct T114MoveSink
-{
-    int value = default;
-    ~T114MoveSink() { t114MoveSinkDtors++; }
-};
-T114MoveSink* t114MoveSinkKeep = nullptr;
-int t114TakeMoveSink(move T114MoveSink* p)
-{
-    int value = p->value;
-    t114MoveSinkKeep = move p;
-    return value;
-}
-bool testT114MoveDimension()
-{
-    int size = 0;
-    t114MoveSinkDtors = 0;
-    {
-        T114MoveSink* p = new T114MoveSink();
-        p->value = 3;
-        int[t114TakeMoveSink(move p)] values = default;
-        size = (int)sizeof(values);
-    }
-    delete t114MoveSinkKeep;
-    t114MoveSinkKeep = nullptr;
-    return Test("array_dim_move_value", size, 4)
-        && Test("array_dim_move_dtor_once", t114MoveSinkDtors, 1);
-}
-int t114ShadowParam(int T114ShadowBound)
-{
-    int[T114ShadowBound] values = default;
-    return (int)sizeof(values);
-}
-bool testT114ShadowDimension()
-{
-    return Test("array_dim_parameter_shadows_global", t114ShadowParam(3), 4) != 0;
-}
-int t118ShadowLocalDim()
-{
-    double T118ConstDouble = 0.0;
-    int[(T118ConstDouble > 0.0) ? 2 : 1] values = default;
-    return (int)sizeof(values);
-}
-int t118ShadowParameterDim(double T118ConstDouble)
-{
-    int[(T118ConstDouble > 0.0) ? 2 : 1] values = default;
-    return (int)sizeof(values);
-}
-struct T118ShadowField
-{
-    double T118ConstDouble = 0.0;
-    int Dim()
-    {
-        int[(T118ConstDouble > 0.0) ? 2 : 1] values = default;
-        return (int)sizeof(values);
-    }
-};
-int t118MutableFloatDim()
-{
-    int[(T118MutableFloat > 0.0f) ? 2 : 1] values = default;
-    return (int)sizeof(values);
-}
-int t118MutableDoubleDim()
-{
-    int[(T118MutableDouble > 0.0) ? 2 : 1] values = default;
-    return (int)sizeof(values);
-}
 using T114LogicalDimAlias = int[(1 && 1) ? 2 : 1];
 using T118FloatDimAlias = int[(T118ConstFloat > 0.0f) ? 2 : 1];
 using T118DoubleDimAlias = int[(T118ConstDouble > 0.0) ? 2 : 1];
@@ -225,13 +158,7 @@ bool testT118ConstFloatingDims()
 
     int[(T118DimNS.D > 0.0) ? 2 : 1] qualified = default;
     result &= Test("t118_qualified_global_size", (int)sizeof(qualified), 8);
-    result &= Test("t118_shadow_local_size", t118ShadowLocalDim(), 4);
-    result &= Test("t118_shadow_parameter_size", t118ShadowParameterDim(0.0), 4);
-    T118ShadowField shadow = default;
-    result &= Test("t118_shadow_this_field_size", shadow.Dim(), 4);
 
-    result &= Test("t118_mutable_float_stays_vla", t118MutableFloatDim(), 4);
-    result &= Test("t118_mutable_double_stays_vla", t118MutableDoubleDim(), 4);
     return result;
 }
 
@@ -321,7 +248,7 @@ void writeUnionStructViaPtr(UnionWithStructs* s, int x, int y)
 
 int testArray()
 {
-    int arraySize = 30;
+    const int arraySize = 30;
     int[arraySize] array;
 
     int i = 0;
@@ -2048,14 +1975,7 @@ namespace T193Dim
     struct T193Buf<T, int CAP> { T[CAP] items; int cap() { return CAP; } };
     int gen() { T193Buf<int, T193K> b = default; return b.cap(); }
 }
-// T206 guard: a NON-const namespace int sizes a local array at run time (a VLA, sizeof 4 as in the
-// t118_* legs), never the file-scope const of the same name (2 would give sizeof 8).
 const int T206FileK = 2;
-namespace T206Vla
-{
-    int T206FileK = 7;
-    int local() { int[T206FileK] a = default; return (int)sizeof(a); }
-}
 
 namespace Qo2Use
 {
@@ -2523,7 +2443,6 @@ bool testNamespace()
     result &= Test("t193_ns_const_field", sizeof(t193b.f) / sizeof(int), 3);
     result &= Test("t193_ns_const_global", sizeof(T193Dim.garr) / sizeof(int), 3);
     result &= Test("t193_ns_const_generic", T193Dim.gen(), 3);
-    result &= Test("t206_ns_nonconst_vla_not_file_const", T206Vla.local(), 4);
     result &= Test("namespace_add", MathUtils.add(3, 4), 7);            // 3+4=7
     result &= Test("namespace_multiply", MathUtils.multiply(3, 4), 12); // 3*4=12
     result &= Test("global_add", add(3, 4), 107);                       // 3+4+100=107
@@ -9505,6 +9424,44 @@ bool testStringNullCharPtr()
     return result;
 }
 
+// Constant fixed-array bounds that must keep folding (ARRBOUND accept-set).
+const int ArrAcceptGlobal = 4;
+const int ArrAcceptK = 1;
+enum ArrAcceptEnum : int { ArrAcceptTwo = 5 };
+if const (ArrAcceptK == 1) { const int ArrAcceptSel = 3; } else { const int ArrAcceptSel = 2; }
+struct ArrAcceptFields { int[ArrAcceptGlobal] d; };
+struct ArrAcceptBuf<int N> { int[N] d; };
+int arrAcceptLiteral() { int[3] a = default; a[2] = 7; return (int)sizeof(a) * 10 + a[2]; }
+int arrAcceptConstLocal() { const int n = 3; int[n] a = default; a[2] = 7; return (int)sizeof(a) * 10 + a[2]; }
+int arrAcceptConstGlobal() { int[ArrAcceptGlobal] a = default; a[3] = 7; return (int)sizeof(a) * 10 + a[3]; }
+int arrAcceptEnum() { int[ArrAcceptEnum.ArrAcceptTwo] a = default; a[4] = 7; return (int)sizeof(a) * 10 + a[4]; }
+int arrAcceptArith() { int[sizeof(int) + 2 * 3 + 1] a = default; a[10] = 7; return (int)sizeof(a) * 10 + a[10]; }
+int arrAcceptTernaryAnd() { int[(ArrAcceptK && 1) ? 3 : 4] a = default; a[2] = 7; return (int)sizeof(a) * 10 + a[2]; }
+int arrAcceptSizeofPtr() { int* p = nullptr; int[sizeof(p) > 0 ? 3 : 1] a = default; a[2] = 7; return (int)sizeof(a) * 10 + a[2]; }
+int arrAcceptTwoDim() { int[2][3] a = default; a[1][2] = 7; return (int)sizeof(a) * 10 + a[1][2]; }
+int arrAcceptStaticLocal() { static int[ArrAcceptGlobal] a; a[3] = 7; return (int)sizeof(a) * 10 + a[3]; }
+int arrAcceptIfConstSel() { int[ArrAcceptSel] a = default; a[2] = 7; return (int)sizeof(a) * 10 + a[2]; }
+int arrAcceptField() { ArrAcceptFields s = default; s.d[3] = 7; return (int)sizeof(s) * 10 + s.d[3]; }
+int arrAcceptGenericValue() { ArrAcceptBuf<2> b = default; b.d[1] = 7; return (int)sizeof(b.d) * 10 + b.d[1]; }
+
+bool testArrBoundAccept()
+{
+    bool result = true;
+    result &= Test("arr_bound_accept_literal", arrAcceptLiteral(), 127);
+    result &= Test("arr_bound_accept_const_local", arrAcceptConstLocal(), 127);
+    result &= Test("arr_bound_accept_const_global", arrAcceptConstGlobal(), 167);
+    result &= Test("arr_bound_accept_enum", arrAcceptEnum(), 207);
+    result &= Test("arr_bound_accept_arith", arrAcceptArith(), 447);
+    result &= Test("arr_bound_accept_ternary_and", arrAcceptTernaryAnd(), 127);
+    result &= Test("arr_bound_accept_sizeof_ptr", arrAcceptSizeofPtr(), 127);
+    result &= Test("arr_bound_accept_two_dim", arrAcceptTwoDim(), 247);
+    result &= Test("arr_bound_accept_static_local", arrAcceptStaticLocal(), 167);
+    result &= Test("arr_bound_accept_if_const", arrAcceptIfConstSel(), 127);
+    result &= Test("arr_bound_accept_struct_field", arrAcceptField(), 167);
+    result &= Test("arr_bound_accept_generic_value", arrAcceptGenericValue(), 87);
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -9513,9 +9470,8 @@ extern int main()
 
     int passed = 0;
     int total  = 0;
-    total++; passed += testT114MoveDimension() ? 1 : 0;
-    total++; passed += testT114ShadowDimension() ? 1 : 0;
     total++; passed += testT118ConstFloatingDims() ? 1 : 0;
+    total++; passed += testArrBoundAccept() ? 1 : 0;
     total++; passed += testPointerToIntegerAccepts() ? 1 : 0;
     total++; passed += testUnaryDerefDecay() ? 1 : 0;
     total++; passed += testNdPointerArrayDerefWrite() ? 1 : 0;

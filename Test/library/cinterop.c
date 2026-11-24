@@ -326,3 +326,9 @@ C14RevFn c14RevTd = c14Rev;
 int (*c14TakeFp)(const char* s) = c14Take;
 struct C14Ops c14Ops = { c14Rev, c14Take };
 int c14CallTake(int (*f)(const char*), const char* s) { return f(s) + 1; }
+/* A depth-3 global declared extern in c_interop_deepptr.h. */
+int dp_g3_value = 11;
+static int *dp_g3_p = &dp_g3_value;
+static int **dp_g3_pp = &dp_g3_p;
+int ***dp_g3 = &dp_g3_pp;
+int *dp_g1 = &dp_g3_value;

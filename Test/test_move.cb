@@ -70,6 +70,30 @@ void chainJoinParameterDestination(CS* raw, bool c)
     raw = c ? new CS(68) : other;
     raw->v;
 }
+// A plain pointer parameter is a local that began as a borrow: an owned store is adopted.
+void paramAdoptFresh(CS* raw) { raw = new CS(80); }
+void paramAdoptDelete(CS* raw) { raw = new CS(81); delete raw; }
+void paramAdoptConditional(CS* raw, bool c) { if (c) { raw = new CS(82); } }
+void paramAdoptTwice(CS* raw) { raw = new CS(83); raw = new CS(84); }
+void paramAdoptLoop(CS* raw, int n) { for (int i = 0; i < n; i++) { raw = new CS(85); } }
+CS* paramAdoptReturn(CS* raw) { raw = new CS(86); return raw; }
+void paramAdoptBackToBorrow(CS* raw, CS* other) { raw = new CS(87); raw = other; }
+void paramAdoptFromLocal(CS* raw) { CS* a = new CS(88); raw = a; }
+void paramAdoptChainMiddle(CS* p)
+{
+    unique CS* a = nullptr;
+    CS* e = nullptr;
+    a = p = e = new CS(89);
+}
+void paramAdoptSplitMiddle(CS* p)
+{
+    unique CS* a = nullptr;
+    CS* e = nullptr;
+    e = new CS(90);
+    p = e;
+    a = p;
+}
+void paramAdoptMoveParam(move CS* raw) { raw = new CS(91); }
 int chainJoinDeclaration(bool c)
 {
     CS* other = new CS(69);
@@ -16129,8 +16153,8 @@ int testTernaryArmsShortCircuit()
     passed += Test("chainleak swapped arms true balance",
         conditionalNewCount * 10 + conditionalDtorCount, 22);
 
-    // Function parameters cannot own the joined value; preserve the master's behavior. The selected
-    // fresh arm remains the existing raw-parameter leak and is not adopted by this change.
+    // A plain pointer parameter adopts the owning join as a local does: the selected fresh arm is
+    // released at function exit (was the raw-parameter leak, 3 births / 2 dtors).
     conditionalNewCount = 0;
     conditionalDtorCount = 0;
     CS* paramKeepFalse = new CS(71);
@@ -16143,8 +16167,86 @@ int testTernaryArmsShortCircuit()
     CS* paramKeepTrue = new CS(72);
     chainJoinParameterDestination(paramKeepTrue, true);
     delete paramKeepTrue;
-    passed += Test("chainleak parameter true master counts",
-        conditionalNewCount * 10 + conditionalDtorCount, 32);
+    passed += Test("chainleak parameter true balance",
+        conditionalNewCount * 10 + conditionalDtorCount, 33);
+
+    // Parameter adoption legs: births * 10 + dtors, the caller's own block included.
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    {
+        CS* keep = new CS(1);
+        paramAdoptFresh(keep);
+        passed += Test("param adopt fresh keeps caller", keep->v, 1);
+        delete keep;
+    }
+    passed += Test("param adopt fresh balance", conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptDelete(keep); delete keep; }
+    passed += Test("param adopt delete no double free", conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptConditional(keep, true); delete keep; }
+    passed += Test("param adopt conditional true", conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    {
+        CS* keep = new CS(1);
+        paramAdoptConditional(keep, false);
+        passed += Test("param adopt conditional false keeps caller", keep->v, 1);
+        delete keep;
+    }
+    passed += Test("param adopt conditional false", conditionalNewCount * 10 + conditionalDtorCount, 11);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptTwice(keep); delete keep; }
+    passed += Test("param adopt twice", conditionalNewCount * 10 + conditionalDtorCount, 33);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptLoop(keep, 3); delete keep; }
+    passed += Test("param adopt loop", conditionalNewCount * 10 + conditionalDtorCount, 44);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptLoop(keep, 0); delete keep; }
+    passed += Test("param adopt loop zero trips", conditionalNewCount * 10 + conditionalDtorCount, 11);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    {
+        CS* keep = new CS(1);
+        CS* got = paramAdoptReturn(keep);
+        passed += Test("param adopt return value", got->v, 86);
+        passed += Test("param adopt return not freed", conditionalDtorCount, 0);
+        delete got;
+        delete keep;
+    }
+    passed += Test("param adopt return balance", conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    {
+        CS* keep = new CS(1);
+        CS* other = new CS(2);
+        paramAdoptBackToBorrow(keep, other);
+        passed += Test("param adopt back to borrow keeps other", other->v, 2);
+        delete other;
+        delete keep;
+    }
+    passed += Test("param adopt back to borrow", conditionalNewCount * 10 + conditionalDtorCount, 33);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptFromLocal(keep); delete keep; }
+    passed += Test("param adopt from owning local", conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptChainMiddle(keep); delete keep; }
+    passed += Test("param adopt chain middle", conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    { CS* keep = new CS(1); paramAdoptSplitMiddle(keep); delete keep; }
+    passed += Test("param adopt split middle", conditionalNewCount * 10 + conditionalDtorCount, 22);
+    conditionalNewCount = 0;
+    conditionalDtorCount = 0;
+    paramAdoptMoveParam(new CS(1));
+    passed += Test("param adopt move param unchanged", conditionalNewCount * 10 + conditionalDtorCount, 22);
 
     // Declarations use the same all-arms-owning predicate as assignments.
     conditionalNewCount = 0;
@@ -21642,6 +21744,7 @@ extern int main()
     total += 26;
     total += 6;
     total += 22;
+    total += 18; // parameter adoption legs
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

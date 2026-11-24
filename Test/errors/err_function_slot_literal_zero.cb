@@ -316,3 +316,124 @@ expect_error("no method of 'FnZeroWordMisPairIface.run' matches the given argume
         return iface.run(0, "x");
     }
 }
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastVoidDeclaration() {
+        function<int(int)> fn = (void*)0;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastVoidAssignment() {
+        function<int(int)> fn = nullptr;
+        fn = (void*)0;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastVoidJoin(int k) {
+        function<int(int)> fn = k ? (void*)0 : nullptr;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastIntZeroDeclaration() {
+        function<int(int)> fn = (int*)0;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastIntZeroAssignment() {
+        function<int(int)> fn = nullptr;
+        fn = (int*)0;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastIntZeroJoin(int k) {
+        function<int(int)> fn = k ? (int*)0 : nullptr;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastIntNullptrDeclaration() {
+        function<int(int)> fn = (int*)nullptr;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastIntNullptrAssignment() {
+        function<int(int)> fn = nullptr;
+        fn = (int*)nullptr;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCastIntNullptrJoin(int k) {
+        function<int(int)> fn = k ? (int*)nullptr : nullptr;
+        return 0;
+    }
+}
+
+int fnslotR2Inc(int x) { return x; }
+int fnslotR2Tf(function<int(int)> f) { return f == nullptr ? 7 : 1; }
+long fnslotR2Gl = 3;
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotParenArmVoid(int k) {
+        function<int(int)> fn = k ? fnslotR2Inc : ((void*)0);
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotParenArmNested(int k, int k2) {
+        function<int(int)> fn = k ? (k2 ? (void*)0 : nullptr) : fnslotR2Inc;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCMacroIntCast() {
+        function<int(int)> fn = (int*)T311_NULL;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCMacroVoidCast() {
+        function<int(int)> fn = (void*)T311_NULL;
+        return 0;
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotCMacroIntCastArg() {
+        return fnslotR2Tf((int*)T311_NULL);
+    }
+}
+
+expect_error("a data-pointer null is not a null spelling for a function slot") {
+    int fnslotVoidCastArg() {
+        return fnslotR2Tf((void*)0);
+    }
+}
+
+expect_error("cannot initialize parameter 'f'") {
+    int fnslotDefaultInt(function<int(int)> f = 5) { return 0; }
+}
+
+expect_error("cannot initialize parameter 'f'") {
+    int fnslotDefaultLong(function<int(int)> f = fnslotR2Gl) { return 0; }
+}
+
+expect_error("cannot initialize parameter 'f'") {
+    int fnslotDefaultLambdaInt(Lambda<int(int)> f = 5) { return 0; }
+}

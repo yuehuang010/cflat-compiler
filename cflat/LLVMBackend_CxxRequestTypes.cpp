@@ -1080,74 +1080,6 @@ std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element
         return "static_cast<" + spelled + ">(" + (negative ? "(-" + digits + suffix + ")" : digits + suffix) + ")";
 }
 
-static bool CxxHeaderHasIncludeGuard(const std::string& contents)
-{
-        if (contents.find("#pragma once") != std::string::npos) return true;
-        std::vector<std::string> directives;
-        bool inBlockComment = false;
-        size_t offset = 0;
-        while (offset <= contents.size() && directives.size() < 2)
-        {
-            const size_t end = contents.find('\n', offset);
-            const std::string_view line(contents.data() + offset,
-                (end == std::string::npos ? contents.size() : end) - offset);
-            offset = end == std::string::npos ? contents.size() + 1 : end + 1;
-            std::string visible;
-            for (size_t i = 0; i < line.size(); ++i)
-            {
-                if (inBlockComment)
-                {
-                    const size_t close = line.find("*/", i);
-                    if (close == std::string_view::npos) break;
-                    i = close + 1;
-                    inBlockComment = false;
-                    continue;
-                }
-                if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '/') break;
-                if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '*')
-                {
-                    inBlockComment = true;
-                    ++i;
-                    continue;
-                }
-                visible += line[i];
-            }
-            const size_t first = visible.find_first_not_of(" \t\r");
-            if (first == std::string::npos) continue;
-            visible.erase(0, first);
-            if (visible.front() != '#') return false;
-            directives.push_back(std::move(visible));
-        }
-        if (directives.size() != 2) return false;
-        auto parseDirective = [](const std::string& line) {
-            std::pair<std::string, std::string> parsed;
-            size_t i = 1;
-            auto skipSpace = [&] {
-                while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-            };
-            auto readToken = [&] {
-                const size_t start = i;
-                while (i < line.size()
-                    && (std::isalnum(static_cast<unsigned char>(line[i])) || line[i] == '_'))
-                    ++i;
-                return line.substr(start, i - start);
-            };
-            skipSpace();
-            parsed.first = readToken();
-            skipSpace();
-            parsed.second = readToken();
-            return parsed;
-        };
-        const auto first = parseDirective(directives[0]);
-        const auto second = parseDirective(directives[1]);
-        return first.first == "ifndef" && second.first == "define"
-            && !first.second.empty() && first.second == second.second;
-}
-
-
-
-
-
 bool LLVMBackend::CxxRecordFieldTypeSpelling(const std::string& typeName,
                                               const std::string& fieldName,
                                               std::string& spelling,
@@ -1509,26 +1441,8 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             error = "the C++ class's import group is unavailable";
             return false;
         }
-        // Incremental requests include the group's headers into one live clang TU. Guardless
-        // user headers must use standalone requests or a later empty-brace spelling redefines them.
-        const bool headersGuarded = std::all_of(group.ownerHeaders.begin(), group.ownerHeaders.end(),
-            [this](const std::string& header) {
-                if (IsSystemCxxHeaderPath(header)) return true;
-                const std::string cacheKey = std::filesystem::path(header).lexically_normal().string();
-                auto cached = cxxHeaderGuardCache_.find(cacheKey);
-                if (cached != cxxHeaderGuardCache_.end()) return cached->second;
-                std::ifstream in(header, std::ios::binary);
-                bool guarded = false;
-                if (in)
-                {
-                    const std::string contents((std::istreambuf_iterator<char>(in)),
-                                               std::istreambuf_iterator<char>());
-                    guarded = CxxHeaderHasIncludeGuard(contents);
-                }
-                cxxHeaderGuardCache_.emplace(cacheKey, guarded);
-                return guarded;
-            });
-        allowIncremental = allowIncremental && headersGuarded;
+        // Guardless headers stay incremental too: a request prelude never re-includes a file the
+        // live TU already included (UnseenIncludeLines), so a standalone TU would only reparse.
         std::vector<std::string> parameterTypes{ ownerSpelling + " *" };
         std::vector<std::string> elementParameters(elements.size());
         std::vector<size_t> elementParameterTypes(elements.size(), 0);
@@ -1831,7 +1745,9 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             + (copyListInit ? "copy|" : "direct|") + init + "|" + narrowingChecks
             + [&] { std::string k; for (const auto& p : parameterTypes) k += "|" + p; return k; }();
         wrapperName = std::format("__cflat_dbrace_{:016x}", HashWrapperKey(key));
+        // push/pop: a group's live TU parses every later request after this one.
         std::string source = "#include <new>\n#include <utility>\n"
+            "#pragma clang diagnostic push\n"
             "#pragma clang diagnostic error \"-Wc++11-narrowing\"\n"
             "extern \"C\" void "
             + wrapperName + "(";
@@ -1842,7 +1758,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         }
         // `::new`: a class-scope operator new would hide the global placement form.
         source += ") { " + narrowingChecks + copyCheck + "::new ((void*)p0) " + ownerSpelling + init
-            + "; }\n";
+            + "; }\n#pragma clang diagnostic pop\n";
         CxxRequestGroupScope groupScope(*this, &group);
         CSigEntry bound;
         std::string wrapperError;
@@ -4944,7 +4860,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 cxxCflatToCxxSpelling_[cflatName] = cxxSpelling;
                 cxxForeignRequests_[cflatName] = "";
                 if (group.primary != static_cast<size_t>(-1))
-                    cxxTypeOwnerGroup_[cflatName] = group.primary;
+                    NoteCxxTypeOwner(cflatName, group.primary, /*overwrite*/ true);
                 if (incompleteTentative)
                     cxxTentativeTypes_.insert(cflatName);
                 else
@@ -5017,7 +4933,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
         cxxCflatToCxxSpelling_[cflatName] = cxxSpelling;
         cxxForeignRequests_[cflatName] = "";
         if (group.primary != static_cast<size_t>(-1))
-            cxxTypeOwnerGroup_[cflatName] = group.primary;
+            NoteCxxTypeOwner(cflatName, group.primary, /*overwrite*/ true);
         if (incompleteTentative)
             cxxTentativeTypes_.insert(cflatName);
         else

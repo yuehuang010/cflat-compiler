@@ -430,6 +430,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 namedVar.IsRvalue = true;
                 return namedVar;
             }
+            // Captured before the macro flags are cleared below: a C NULL macro operand (T311_NULL) is a null source.
+            const bool cNullMacroOperand = namedVar.IsCxxNullIntegerMacro;
             // A cast result is a new value: `(long)ZERO` is not the macro's literal (clang refuses it).
             namedVar.IsCxxMacroGlobal = false;
             namedVar.IsCxxNullIntegerMacro = false;
@@ -980,9 +982,18 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
             if (castPending != nullptr)
             { castConds = castPending->Conds; castCallee = castPending->CalleeName;
               castAccess = castPending->Access; }
+            // A null constant cast to a DATA pointer is not a null spelling for a function slot
+            // (ruling 2026-11-18); the NULL macro and nullptr are, and stay unflagged.
+            const bool dataNullSource = namedVar.IsCxxNullIntegerMacro || cNullMacroOperand
+                || namedVar.TypeAndValue.IsCxxNullptrT || namedVar.TypeAndValue.TypeName == "nullptr"
+                || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(namedVar.Primary)
+                || compiler->IsLiteralZeroIntegerToPointer(namedVar.Primary, namedVar);
+            const bool dataNullCast = dataNullSource && destTypeName.Pointer
+                && !destTypeName.IsFunctionPointer && !destTypeName.IsArrayView;
             namedVar.Primary = compiler->CreateCast(namedVar.Primary, type, srcIsSigned,
                 destTypeName.IsUnsignedInteger() != -1);
             namedVar.TypeAndValue = destTypeName;
+            namedVar.IsDataNullCast = dataNullCast;
             if (castOfTempUniqueField)
                 compiler->RegisterOwningTempUniqueField(namedVar.Primary);
             else if (!castConds.empty())
@@ -1025,6 +1036,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 namedVar.TypeAndValue.ParentVariableName = operandParentName;
                 namedVar.TypeAndValue.IsMove = operandIsMove;
                 namedVar.TypeAndValue.IsAlias = operandIsAlias;
+                // The restored operand binding dropped the null-cast provenance set below.
+                namedVar.IsDataNullCast = dataNullCast;
             }
             if (!destTypeName.Pointer && namedVar.Primary != nullptr
                 && (namedVar.Primary->getType()->isIntegerTy()

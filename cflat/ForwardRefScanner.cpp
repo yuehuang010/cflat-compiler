@@ -282,6 +282,12 @@ std::string ForwardRefScanner::ResolveGenericTemplateSpellingAtUse(
     NonGenericRefusal* refusal)
 {
         if (compiler == nullptr || spelledBase.empty()) return spelledBase;
+        if (report)
+            if (std::string msg = compiler->UnusableUniqueSpellingError(spelledBase, args); !msg.empty())
+                // The declaration's own rule context (a use site is always inside one).
+                for (auto* node = useSite; node != nullptr; node = node->parent)
+                    if (auto* site = dynamic_cast<antlr4::ParserRuleContext*>(node))
+                    { MainListener::LogErrorContext(compiler, site, msg); break; }
         std::string base = ResolveGenericTemplateBaseAtUse(compiler, spelledBase, useSite, lookupName, refusal);
         if (base.empty() || base == spelledBase)
         {

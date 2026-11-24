@@ -1478,6 +1478,15 @@ public:
             return ElemPointer ? 1 : 0;
         }
 
+        // A C or C++ result or global spelled with one '*' records depth 1, like a native `T*`;
+        // the shared type mapper leaves that level unrecorded (depth 2 is ElemPointer, 3+ PointerDepth).
+        void RecordSpelledSinglePointerDepth()
+        {
+            if (Pointer && !ElemPointer && PointerDepth == 0 && !IsFunctionPointer && !IsArrayView
+                && !IsAlias && !IsCxxRef() && ConstArraySize == 0 && ConstInnerDimensions.empty())
+                PointerDepth = 1;
+        }
+
         void ApplyWholeWordConst()
         {
             const int depth = ValuePointerDepth();
@@ -2178,6 +2187,8 @@ public:
         bool IsCxxNullIntegerMacro = false;
         // A `?:` whose two arms are both imported macro constants: a C++ prvalue. Transient.
         bool IsCxxMacroJoin = false;
+        // Transient: a data-pointer-typed null cast `(void*)0`, `(int*)nullptr`. Refused at function slots.
+        bool IsDataNullCast = false;
         // Transient: TypedValue::joinClassPointee of a conditional join, so a nested arm keeps it.
         std::string JoinClassPointee;
         int JoinClassPointeeDepth = 0;
@@ -2433,6 +2444,8 @@ public:
         // runtime OwnFlag keeps the truth; IsOwnedAtScopeExit reads it, so a later owning store in
         // another block still frees its object at scope exit.
         bool BorrowSuppressedOwner = false;
+        // A plain (non-move) pointer parameter that adopted an owned store (AdoptOwnedStoreIntoParam).
+        bool AdoptedParamOwner = false;
         std::string BorrowedOrigin;     // name of the borrowed parameter this value transitively aliases (for diagnostics)
         // Transient: on an assignment RESULT, the local slot a direct `new` '=' stored into (and its
         // name). An outer unique '=' takes that slot as its RHS, as `owner = raw;` does.
@@ -2646,6 +2659,7 @@ public:
         bool         isCxxSameTypeCastCopy = false; // transient provenance for a C++ conditional join
         bool         isCxxPrvalueConditional = false; // mixed C++ class glvalue/prvalue conditional
         bool         isExplicitMove = false; // written 'move x' operand; transient, read by operator calls
+        bool         isDataNullCast = false; // transient: NamedVariable::IsDataNullCast of this arm or join
         // ?: only: bit 0 = true arm, bit 1 = false arm is an owning unique call result (ruling 2026-10-31).
         int          ownedCallArms = 0;
         // ?: only, transient: an arm reads a container-owned element (list<unique X*>.get); the join
@@ -4902,8 +4916,6 @@ private:
     };
     std::vector<CHeaderMacroGroup> cHeaderMacroGroups_;
     cflat_cinterop::CxxImportOrder currentCxxImportOrderPath_;
-    // Header guard verdicts are reused across constructor requests within one analysis.
-    std::unordered_map<std::string, bool> cxxHeaderGuardCache_;
     /*
      * The header/define set ONE request compiles against: the owning import group, plus the groups
      * that own the template arguments of the requested spelling (`std::vector<std::string>` from
@@ -4990,6 +5002,8 @@ private:
     std::unordered_map<std::string, std::vector<cflat_cinterop::RawFunctionTemplate>>
         cxxFunctionTemplates_;
     std::unordered_map<std::string, size_t> cxxFunctionTemplateOwnerGroup_;
+    // Dotted names of protected / private member operator templates (never callable from CFlat).
+    std::unordered_set<std::string> cxxNonPublicMemberOperatorTemplates_;
     std::unordered_map<std::string, size_t> cxxFunctionOwnerGroup_;
     std::unordered_set<std::string> importedCxxFunctionMacros_;
     std::unordered_map<std::string, std::pair<bool, std::string>> cxxMacroExpansionZeroCache_;
@@ -4998,6 +5012,8 @@ private:
     std::unordered_set<std::string> cxxBoundSignatureKeys_;
     // CFlat foreign type name -> the import group index whose request registered it.
     std::unordered_map<std::string, size_t> cxxTypeOwnerGroup_;
+    // The dependency groups of that registering request: a request derived from the type needs them too.
+    std::unordered_map<std::string, std::vector<size_t>> cxxTypeOwnerDependencyGroups_;
     /*
      * Leading namespace segments a C++ import group actually brought in ("std" for a standard
      * header, plus every namespace a walked C++ header declared a class in). A dotted type name
@@ -5145,6 +5161,8 @@ private:
     // Temporary layout recipe used while RegisterCRecords replaces __cflat_fields with the
     // original CFlat fields. It is populated before the generated class request is harvested.
     std::unordered_map<std::string, GeneratedCxxRecord> generatedCxxRecords_;
+    // [cpp] struct -> its clang record-move wrapper ("" = unavailable, today's move stands).
+    std::unordered_map<std::string, std::string> cppStructRecordMoves_;
     // Brace-constructor overload selector namespaces, deduplicated in an incremental TU by text.
     std::unordered_set<std::string> cxxBraceSelectorSources_;
     std::unordered_set<std::string> cppStructNames_;
@@ -5605,6 +5623,9 @@ private:
         bool isAbstract = false;
         // Clang's deleting-destructor verdict ("" = usable); see RawRecord::vtableDeleteVerdict.
         std::string vtableDeleteVerdict;
+        // See RawRecord::hasClassDelete / hasUsualClassDelete.
+        bool hasClassDelete = false;
+        bool hasUsualClassDelete = false;
         bool hasFriendOperators = false;   // a friend operator: ADL may find what was not registered
         std::vector<std::string> friendNames;   // see RawRecord::friendNames
         std::vector<std::string> ambiguousFieldNames; // see RawRecord::ambiguousFieldNames
@@ -6328,6 +6349,16 @@ private:
     bool IsOwnedAtScopeExit(const NamedVariable& nv) const;
     // Gives a move parameter a runtime OwnFlag (true from entry) at its first borrowing store.
     void ActivateParamOwnFlag(NamedVariable& nv);
+    // A plain (non-move) pointer parameter is a local that starts as a borrow: returns its
+    // argument binding when `storage` is that slot and no local shadows it, else nullptr.
+    NamedVariable* FindAdoptingPointerParam(const llvm::Value* storage);
+    // An owned value stored into such a parameter is adopted exactly as a local adopts it: the
+    // entry borrow retires, the owner bit is set and a runtime OwnFlag (false at entry) arms.
+    void AdoptOwnedStoreIntoParam(NamedVariable& nv);
+    // Gives such a parameter its runtime OwnFlag (false at entry, active) before a store reads it.
+    void EnsureAdoptingParamOwnFlag(NamedVariable& nv, bool ownedStore);
+    // A by-value lambda capture of an adopted parameter gives the adoption up (it stays a borrow).
+    void ReleaseParamAdoptionForCapture(const std::string& name);
     // Arms the runtime flag of a borrow-suppressed owner by name (no compile-time owner bit).
     void ArmSuppressedOwnFlag(const std::string& name);
     // Re-owns a move parameter at an owning store (SetVariableOwning reads locals only): the owner
@@ -8038,6 +8069,14 @@ private:
                                         const std::vector<std::string>& defines) const;
     CxxRequestGroup MakeCxxClassRequestGroup(size_t owner, const std::string& typeName,
                                             const std::vector<size_t>& deps = {}) const;
+    /*
+     * Records `group` as the owner of a C++ type registered under the active request, with that
+     * request's dependency groups (CollectCxxTypeOwnerGroups adds them back to every request
+     * built from the type). `overwrite` replaces an existing owner instead of keeping the first.
+     */
+    void NoteCxxTypeOwner(const std::string& cflatName, size_t group, bool overwrite = false);
+    // CollectCxxTypeOwnerGroups over several types: the dependency list of a request naming all of them.
+    std::vector<size_t> CxxTypeOwnerGroupsOf(const std::vector<std::string>& cflatTypes) const;
     void PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records);
     void RegisterCxxFunctionTemplates(
         const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
@@ -8081,6 +8120,9 @@ private:
     bool HasCxxFunctionTemplateMember(const std::string& owner,
                                       const std::string& memberName) const;
     bool HasCxxFunctionTemplateMemberName(const std::string& memberName) const;
+    // A member operator template of any access (or of a base) beside the public registry.
+    bool HasCxxMemberOperatorTemplateAnyAccess(const std::string& owner,
+                                               const std::string& memberName) const;
     bool IsCxxStaticOnlyFunctionTemplateMember(const std::string& owner,
                                                const std::string& memberName) const;
     // A bound C++ symbol that is a recorded specialization of a function template.
@@ -11305,6 +11347,9 @@ public:
         bool isAbstract = false;
         // Clang's deleting-destructor verdict ("" = usable); see RawRecord::vtableDeleteVerdict.
         std::string vtableDeleteVerdict;
+        // See RawRecord::hasClassDelete / hasUsualClassDelete.
+        bool hasClassDelete = false;
+        bool hasUsualClassDelete = false;
         // Non-empty when the C++ layout could not be flattened (virtual inheritance, or a
         // bitfield / anonymous member inside a hierarchy). The type stays an opaque shell.
         std::string layoutRefusal;
@@ -11851,6 +11896,7 @@ public:
                 complete = false;
                 return false;
             }
+            if (CppStructNeedsClangRecordMove(name)) return true;
             for (const auto& field : nested->second.StructFields)
             {
                 if (field.Pointer || field.ElemPointer || field.IsUnique
@@ -12176,6 +12222,15 @@ public:
     void EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr);
     // Unwind release of a user T.operator new block through T's usual operator delete (see .cpp).
     bool EmitUserNewHeapFree(const std::string& typeName, llvm::Value* ptr, llvm::Value* allocSize);
+    // Clang's usual deallocation takes exactly size_t: "ulong" on LP64, "u64" on Win64.
+    const char* SizeTypeSpelling() const;
+    bool IsUsualSizedDeleteParam(const TypeAndValue& p) const;
+    // The class (or the nearest scope declaring operator delete) has only non-usual deletes: no
+    // suitable delete for `delete p` or a unique release (the unwind path still calls nothing).
+    bool ClassDeleteUnusable(const std::string& typeName) const;
+    std::string UnusableUniqueDeleteMessage(const std::string& pointee) const;
+    // The refusal for a spelled `unique<X>` whose X is a C++ class with no suitable delete; "" otherwise.
+    std::string UnusableUniqueSpellingError(const std::string& base, const std::vector<std::string>& args) const;
     // ::operator new[] / ::operator delete[] (unsized), declared on demand like the pair above.
     llvm::Function* GetCxxOperatorNewArray(bool overAligned);
     llvm::Function* GetCxxOperatorDeleteArray(bool overAligned);
@@ -12361,6 +12416,18 @@ public:
     bool EmitLoweredMemberwiseMove(const std::string& typeName, llvm::Type* valueType,
                                    llvm::Value* dest, llvm::Value* src, const char* context,
                                    uint64_t skipBefore = 0, uint64_t skipAfter = UINT64_MAX);
+    // RULED 2026-11-18: a [cpp] struct holding a C++ field whose move cflat cannot rank
+    // (CxxTrivialMoveNeedsTransfer) moves as clang's implicit move of the same aggregate.
+    bool CppStructNeedsClangRecordMove(const std::string& typeName) const;
+    bool CppStructFieldsNeedClangMove(const std::string& typeName) const;
+    llvm::Function* RequestCppStructRecordMove(const std::string& typeName);
+    // How the record-move mirror spells one CFlat field (ordered by strength): by its C++ type;
+    // as trivially copyable bytes (POD, or holding a raw pointer, which a union may not); bytes
+    // behind a user move (CFlat owners, like std::unique_ptr); or not at all. The source of every
+    // non-C++ field is zero-filled after the move.
+    enum class CppMirrorField { Spelled, Bytes, NulledBytes, OwnedBytes, Refused };
+    CppMirrorField ClassifyCppMirrorField(const DeclTypeAndValue& field, int depth = 0) const;
+    CppMirrorField ClassifyCppMirrorStruct(const std::string& typeName, int depth) const;
     bool EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::Type* valueType,
                                    llvm::Value* dest, llvm::Value* src, const char* context);
     llvm::AllocaInst* LoweredSretTempOf(llvm::Value* value, llvm::Type* type) const;
@@ -15426,7 +15493,13 @@ public:
     // 345: generated member-template wrappers record the selected member callee type.
     // 346: generated member-template wrappers record the selected member's declaring class.
     // 348: generated member-template wrappers record whether that owner is the receiver record.
-    static constexpr int kCHeaderCacheVersion = 349;
+    // 350: a group whose first header is a libc++ header still walks its user headers (GRPSYS).
+    // 351: C and C++ results, globals and C fields spelled with one '*' record depth 1 ("pd").
+    // 353: request chunks no longer see a dependency include's macros or a committed pragma;
+    //      companions tag dependency-only strong definitions and per-variable initializers.
+    // 354: C++ records carry hasClassDelete / hasUsualClassDelete (unusable class delete refusal).
+    // 355: wrapper keys name their types' dependency groups; system-macro lookup-level refusal.
+    static constexpr int kCHeaderCacheVersion = 355;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

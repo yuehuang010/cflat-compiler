@@ -56,3 +56,19 @@ format-string expansions; the hole is a `{}` absorbing anything.) Test consequen
 clang text ('invokes a deleted function', 'failed to instantiate ...') are re-pinned onto the cflat half of
 their message; the value-only rule (substring occurs in its own fixture or a direct Test/ import) from the
 2026-11-07 attempt stays. Acceptance as above: 4/4 nonsense probes refused, 0 false refusals, mutation-proven.
+
+## Attempt 2026-11-18 (box 16, Claude Haiku; not landed - the ruling's scope needs a second look)
+
+Implemented the ruling literally (a match starts and ends on a literal token of the format string; patch kept at
+scratch/repro_keep/lint/anchored_attempt.patch in the main checkout) plus the value-only rule. Measured over the live
+corpus: 386 distinct legitimate substrings (183 fixtures) refused, not 3. Of them, 156 end in a runtime value after a
+literal head (`expected 2 argument(s), got 1` vs `expected {} argument(s), got {}`), 8 start in a value, 209 have a
+value at both ends, 11 fail only the value-only rule, 2 match no format string. Relayed clang text is a small share.
+Probes: 3/4 refused; `expected ';' at 'string'` still matches `OS returned '{}', expected '{}'` (a MIDDLE
+placeholder absorbs `';' at 'string`). One-word `zzqq` mutations of 265 accepted prose substrings: head 100%,
+middle 61%, tail 100% refused. Static phase 11.4 -> 15.7 s (loaded machine).
+
+NEEDS RULING (maintainer): (1) keep the literal reading and re-pin ~370 legs so they end on literal text, or (2) let
+an end placeholder absorb one value atom (number, identifier, quoted name, type spelling; no free prose) while the
+substring must still contain a literal run with letters - refuses the `{} {}` / `{}, {}` / `{}.{}` probes, keeps
+`got 1`. Either way probe 4 needs a middle rule too (a placeholder may not absorb a quoted span with spaces).

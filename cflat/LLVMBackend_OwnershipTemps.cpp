@@ -2799,6 +2799,75 @@ void LLVMBackend::RearmParamOwner(const std::string& name)
             builder->CreateStore(builder->getInt1(true), nv->OwnFlag);
     }
 
+LLVMBackend::NamedVariable* LLVMBackend::FindAdoptingPointerParam(const llvm::Value* storage)
+{
+        auto* nv = FindStackArgumentByStorage(storage);
+        if (nv == nullptr || FindStackVariableByStorage(storage) != nullptr) return nullptr;
+        const auto& tv = nv->TypeAndValue;
+        if (!tv.Pointer || tv.IsMove || tv.IsUnique || tv.IsArrayView || tv.IsInterface
+            || tv.IsInterfacePointer || tv.IsFunctionPointer || tv.IsAlias || tv.ElemPointer || tv.TypeName == "void"
+            || (nv->IsOwning && !nv->AdoptedParamOwner) || nv->IsOwningStruct || nv->IsOwningString
+            || !llvm::isa<llvm::AllocaInst>(nv->Storage))
+            return nullptr;
+        return nv;
+    }
+
+void LLVMBackend::EnsureAdoptingParamOwnFlag(NamedVariable& nv, bool ownedStore)
+{
+        if (nv.OwnFlag != nullptr || !IsInsertBlockLive()) return;
+        // A loop store may run after an adopting store parsed later in the body, so it needs the
+        // flag now to release that block; outside loops only an owned store creates it.
+        auto* fn = builder->GetInsertBlock()->getParent();
+        const bool inLoop = !ownFlagLoopReownSnapshots_.empty()
+            && ownFlagLoopReownSnapshots_.back().function == fn;
+        if (!ownedStore && !inLoop) return;
+        // False at entry: paths that never reach an adopting store keep the caller's borrow.
+        nv.OwnFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr,
+                                   nv.TypeAndValue.VariableName + ".owns");
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(nv.OwnFlag->getParent(), std::next(nv.OwnFlag->getIterator()));
+            builder->CreateStore(builder->getInt1(false), nv.OwnFlag);
+        }
+        nv.OwnFlagActive = true;
+    }
+
+void LLVMBackend::AdoptOwnedStoreIntoParam(NamedVariable& nv)
+{
+        EnsureAdoptingParamOwnFlag(nv, true);
+        if (nv.OwnFlag == nullptr) return;
+        nv.IsOwning = true;
+        nv.AdoptedParamOwner = true;
+        nv.BorrowSuppressedOwner = false;
+        nv.IsBorrowed = false;
+        nv.BorrowedOrigin.clear();
+        if (IsInsertBlockLive() && nv.OwnFlag->getFunction() == builder->GetInsertBlock()->getParent())
+            builder->CreateStore(builder->getInt1(true), nv.OwnFlag);
+    }
+
+void LLVMBackend::ReleaseParamAdoptionForCapture(const std::string& name)
+{
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (frame.namedVariable.find(name) != frame.namedVariable.end()) return;
+            auto it = frame.functionArgument.find(name);
+            if (it == frame.functionArgument.end()) continue;
+            auto& nv = it->second;
+            if (!nv.AdoptedParamOwner) return;
+            // A by-value lambda capture cannot carry the adoption into the env (closure captures of an
+            // owning raw local are not transferred either), so the parameter reverts to its borrow.
+            nv.AdoptedParamOwner = false;
+            nv.IsOwning = false;
+            nv.IsBorrowed = true;
+            nv.BorrowedOrigin = name;
+            if (nv.OwnFlag != nullptr && IsInsertBlockLive()
+                && nv.OwnFlag->getFunction() == builder->GetInsertBlock()->getParent())
+                builder->CreateStore(builder->getInt1(false), nv.OwnFlag);
+            return;
+        }
+    }
+
 void LLVMBackend::ArmSuppressedOwnFlag(const std::string& name)
 {
         if (name.empty() || stackNamedVariable.empty()) return;
@@ -3581,6 +3650,12 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
             if (t != nullptr && t->isSized())
                 effAlign = std::max(effAlign, GetEffectiveAlignmentForType(tv.TypeName, t));
         }
+        // A unique owner of a class whose only operator delete is not usual has no suitable delete.
+        if (namedVar.TypeAndValue.IsUnique && !namedVar.TypeAndValue.IsArrayView
+            && ClassDeleteUnusable(ownTypeName))
+            LogError(std::format("cannot release unique '{}': no suitable 'operator delete' - its only "
+                "class-scope 'operator delete' is not a usual deallocation function (the second "
+                "parameter must be size_t)", SpellType(*this, TypeAndValue{ .TypeName = ownTypeName })));
         // A foreign nontrivial C++ pointee was allocated by the C++ global operator new, so its
         // release must use the matching C++ operator delete - this is the `unique T* p = new T(..)`
         // scope-exit leg, and it has to agree with the explicit `delete p` leg.
@@ -10039,11 +10114,8 @@ bool LLVMBackend::EmitUserNewHeapFree(const std::string& typeName, llvm::Value* 
             if (ownCflat && sym.IsCxx) continue;
             if (sym.Variadic || sym.Parameters.empty() || !sym.Parameters[0].Pointer) continue;
             if (sym.Parameters.size() == 1 && oneArg == nullptr) oneArg = &sym;
-            else if (sym.Parameters.size() == 2 && sized == nullptr && !sym.Parameters[1].Pointer)
-            {
-                TypeAndValue p1 = sym.Parameters[1];
-                if (llvm::Type* t = GetType(p1); t != nullptr && t->isIntegerTy(64)) sized = &sym;
-            }
+            else if (sym.Parameters.size() == 2 && sized == nullptr && IsUsualSizedDeleteParam(sym.Parameters[1]))
+                sized = &sym;
         }
         const FunctionSymbol* pick = oneArg != nullptr ? oneArg : (allocSize != nullptr ? sized : nullptr);
         if (pick == nullptr) return true;

@@ -1,44 +1,26 @@
-# A generated C++ wrapper's request key can omit the header its body needs
+# Refuse a C++ wrapper whose body uses a declaration its request group does not reach (remaining)
 
-## Summary
+## Fixed (CACHE-KEY)
 
-Generated wrapper requests (`RequestGeneratedCxxWrapperUncached`, cflat/LLVMBackend_CInterop.cpp)
-are keyed on `MakeCxxRequestGroup(primary, deps)`, and the incremental executor compiles them in the
-primary group's shared clang TU. Most wrapper sites pass no dependency groups, and the ones that do
-(`collectTypeDependencies`) look the argument types up in `cxxTypeOwnerGroup_`, which records only a
-type request's PRIMARY group - the dependency groups that request needed are lost. So a wrapper can
-compile only because an earlier request left another group's header in the TU, and its cache key
-names fewer headers than its body uses. Type requests do not have this problem: their harvest is
-filtered to the request's own include graph (`DropCxxDeclarationsOutsideRequestGroup`).
+The key defect is closed. Every request group built from a type owner now carries the dependency
+groups of the request that registered that type (`cxxTypeOwnerDependencyGroups_`, written by
+`NoteCxxTypeOwner`, read by `CollectCxxTypeOwnerGroups`), and the free-call wrapper
+(`__cflat_free_*`) collects owners recursively. Measured on master 496b9392e: `b * 4` on
+`ckab.Box<ckal.Leaf>` (free operator template in one header, Leaf in another import line) was
+keyed on the box header alone; two files pairing that header with two different `ckal::Leaf`
+headers shared the key and the second printed garbage (clang 22.00). Legs: "CACHE-KEY" in
+Test/test_cpp_interop_template.cb (int Leaf, 57150) and Test/test_cpp_interop_bridge.cb (double
+Leaf, 44750). The originally filed `true == bits[0]` wrapper was already keyed sfinae + vector on
+496b9392e.
 
-## Repro
+## Still open: the refusal guard
 
-Test/test_cpp_interop_bridge.cb line 5001, `true == bits[0]` on a `std.vector<bool>`: the
-`__cflat_tpl_` wrapper is keyed on `cpp_interop_sfinae.h` alone, yet its body calls
-`std::__bit_reference<std::vector<bool>, true>::operator bool` from `<vector>`. A clang TU of
-`<new>` + `cpp_interop_sfinae.h` alone would reject it. Walking the wrapper body and refusing such a
-wrapper (tried in the fix for cpp-request-cache-entry-carries-foreign-tu-signatures) breaks this
-compile ("cannot bind its right operand ... non-const reference"), so it was not landed.
+A wrapper can still compile against more than its key names when the incremental TU of its
+primary group holds headers an earlier request (or a served replay chunk) added. Nothing refuses
+such a wrapper yet. Direction: walk the wrapper body (RecursiveASTVisitor) and refuse a use whose
+declaring file `ReachFromRoots` of the request group does not reach (CxxIncrementalGroup has the
+include graph). Acceptance: test.sh green with the guard live.
 
-## Impact
-
-Low: the replayed wrapper bitcode is self-contained and a compile only asks for it after resolving
-the argument types, which needs an import group that declares them. The key is still wrong, and a
-refusal-based guard cannot be added until the groups are right.
-
-## Fix direction
-
-Record the full request group (primary + dependency groups) with each type owner, and build every
-wrapper group from the owners of its parameter and argument types. Then refuse a wrapper whose body
-uses a declaration its roots do not reach (the include graph in `CxxIncrementalGroup` already has
-what is needed: `ReachFromRoots` + a RecursiveASTVisitor over the wrapper body).
-Acceptance: the bridge test passes with that guard live; test.sh stays green.
-
-## Repro status (2026-11-10, unchanged master build)
-
-- Reduced probe `import cpp "cpp_interop_sfinae.h"; import cpp "vector";` with `true == bits[0]`
-  compiles and runs (exit 0) cold, warm, and warm after an unrelated `vector` import in one cache.
-- `test_cpp_interop_bridge.cb` (line 8401 today, not 5001) compiles and passes cold and warm with
-  identical request counts (hit 2003 / miss 2048 warm).
-- No cold-vs-warm difference observed. The key-omits-header defect is still true on reading, but
-  no wrong answer or drift was reproduced.
+Also unrecorded: `cxxFunctionOwnerGroup_` keeps only the primary group of the request that
+registered a free function. Import harvests (no dependency groups) register nearly all of them;
+no repro of a function registered under a request with dependency groups.

@@ -1968,6 +1968,16 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             compiler->DeferOwnedElementDelete(operandNamedVar, static_cast<int>(ctx->getStart()->getLine()),
                 static_cast<int>(ctx->getStart()->getCharPositionInLine()));
 
+        // A class whose only class-scope operator delete is not usual has no suitable delete: refused, as clang.
+        if (!isArray && !typeName.empty() && !elemIsPtr && compiler->ClassDeleteUnusable(typeName))
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot 'delete' '{}': no suitable 'operator delete' - its only class-scope 'operator delete' "
+                "is not a usual deallocation function (the second parameter must be size_t)",
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
+            return {};
+        }
+
         // 1. Call the full destructor (user dtor + member fields) if needed (non-array only).
         // Guard on null: 'delete nullptr' must be a no-op (operator delete below already
         // null-checks). Without this, the destructor would dereference a null pointer - a
@@ -3099,7 +3109,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(
             && !argNV.TypeAndValue.Pointer
             && compiler->ResolveTypeAlias(argNV.TypeAndValue.TypeName)
                 == compiler->ResolveTypeAlias(loweredBraceMoveTypeName_)
-            && compiler->IsLoweredCFlatOnlyStruct(argNV.TypeAndValue.TypeName);
+            && compiler->NeedsCxxLoweringType(argNV.TypeAndValue.TypeName);
 
         // move on a named struct value type: capture the value, then zero the source storage
         // to leave it in a "moved-from" (default) state - enables safe delete[n] on the source.

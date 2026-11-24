@@ -3,6 +3,7 @@ import "list.cb";
 import "string.cb";
 import "dictionary.cb";
 import "library/c_variadic_fnptr.h";
+import "library/fnslot_nullmacro.h";
 import "library/c_variadic_aggregate.c";
 import "library/cinterop.c";
 import "thread.cb";
@@ -6328,6 +6329,33 @@ int t311TakeCFn(T311Bin f) { return f == nullptr ? 1 : 0; }
 struct T311Hold { function<int(int)> fn = T311_NULL; };
 int t311DefaultArg(function<int(int)> f = T311_NULL) { return f == nullptr ? 1 : 0; }
 
+// Null spellings that stay accepted at function slots after the data-pointer cast rule (2026-11-18).
+int fnslotAcceptInc(int x) { return x + 1; }
+bool testFunctionSlotDataNullAccept()
+{
+    bool result = true;
+    bool pick = true;
+    function<int(int)> lit = nullptr;
+    result &= Test("nullptr into a function<> local", lit == nullptr, true);
+    function<int(int)> joinNullptr = pick ? fnslotAcceptInc : nullptr;
+    result &= Test("nullptr arm of a function<> join keeps the function", joinNullptr(5), 6);
+    pick = false;
+    function<int(int)> joinNull = pick ? fnslotAcceptInc : nullptr;
+    result &= Test("nullptr arm of a function<> join selects null", joinNull == nullptr, true);
+    function<int(int)> joinMacro = pick ? fnslotAcceptInc : T311_NULL;
+    result &= Test("C NULL macro arm of a function<> join selects null", joinMacro == nullptr, true);
+    function<int(int)> macroDecl = FNSLOT_MACRO_NULL;
+    result &= Test("null macro into a function<> local", macroDecl == nullptr, true);
+    Lambda<int(int)> lam = nullptr;
+    result &= Test("nullptr into a Lambda<> local", lam == nullptr, true);
+    T311Bin cb = nullptr;
+    result &= Test("nullptr into a C function pointer", cb == nullptr, true);
+    function<int(int)> fa = fnslotAcceptInc;
+    fa = nullptr;
+    result &= Test("nullptr assigned to a function<>", fa == nullptr, true);
+    return result;
+}
+
 // T311: the C NULL macro is a null pointer constant, so it enters a function<> slot, a C
 // function-pointer slot and a C struct fn-pointer field exactly where nullptr does.
 bool testFunctionSlotNullMacro()
@@ -8380,6 +8408,7 @@ extern int main(int argc, char** argv)
     total++; passed += testTernaryArmKinds()               ? 1 : 0;
     total++; passed += testFunctionSlotAccepts()           ? 1 : 0;
     total++; passed += testFunctionSlotNullMacro()         ? 1 : 0;
+    total++; passed += testFunctionSlotDataNullAccept()    ? 1 : 0;
     total++; passed += testLambdaSlotNullMacro()           ? 1 : 0;
     total++; passed += testTernaryClosureNamedJoin()       ? 1 : 0;
     total++; passed += testTernaryGenericFunctionArm()     ? 1 : 0;

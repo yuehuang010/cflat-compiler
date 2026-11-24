@@ -128,4 +128,59 @@ union DeepUnion { int ********************************w; int u; };
 inline DeepUnion mkdeepunion() { DeepUnion d{}; d.u = 4; return d; }
 // Depth 32 is the carrier limit: declaring it is fine, using it refuses with a located error.
 inline int f32(int******************************** p) { return 1; }
+// Depth 3 and 4: nullptr, references, class pointees, templates, function pointers, members.
+inline int load4(int**** p) { return ****p; }
+inline int g4v = 9; inline int* g4a = &g4v; inline int** g4b = &g4a; inline int*** g4c = &g4b;
+inline int**** g4 = &g4c;
+inline int**** top4() { return &g4c; }
+using T4 = int****;
+inline int t4(T4 p) { return ****p; }
+inline int null3(int*** p) { return p ? 2 : 1; }
+inline int null4(int**** p) { return p ? 2 : 1; }
+inline int ref2(int**& r) { return **r; }
+inline int setref3(int***& r, int*** v) { r = v; return 0; }
+inline int rr3(int***&& p) { return ***p; }
+inline int cls3(Cell*** p) { return (**p)->b; }
+inline int ccls3(const Cell* const* const* p) { return (**p)->a; }
+template <class T> T tf3(T*** p) { return ***p; }
+template <class T> int tdepth(T*) { return 1; }
+template <class T> int tdepth(T**) { return 2; }
+template <class T> int tdepth(T***) { return 3; }
+template <class T> int tsz(T***) { return (int)sizeof(T); }
+typedef int (*Fp3)(int***);
+inline int fpImpl(int*** p) { return ***p + 1; }
+inline Fp3 getfp() { return fpImpl; }
+inline int runfp(Fp3 f, int*** p) { return f(p); }
+inline int fp4(int (*f)(int****), int**** p) { return f(p); }
+inline int cvsel(int***) { return 1; }
+inline int cvsel(const int***) { return 2; }
+inline int over23(int**) { return 2; }
+inline int over23(int***) { return 3; }
+inline int pc3(int* const** p) { return ***p; }
+inline int dflt3(int*** p = nullptr) { return p ? 2 : 1; }
+inline int fw3(int*** a, int**** b) { return ***a + ****b; }
+template <class... A> int fwd3(A... a) { return fw3(a...); }
+inline int arr4(int**** a, int n) { int s = 0; for (int i = 0; i < n; i++) s += ***a[i]; return s; }
+struct M3 {
+    int*** m3 = nullptr;
+    int v1 = 4;
+    int* ptr1() { return &v1; }
+    static inline int* s1 = nullptr;
+    int over(int**) const { return 2; }
+    int over(int***) const { return 3; }
+    int take3(int*** p) const { return ***p + 100; }
+};
+template <class T> struct B3 { int m(T*** p) { return ***p + 1; } };
+// One '*' is a recorded depth too: results, globals and static members refuse a deeper destination.
+inline int* r1(int* p) { return p; }
+inline void* vr1(void* p) { return p; }
+template <class T> T* tr1(T* p) { return p; }
+inline int take2(int** p) { return **p + 2; }
+inline int ov1(int*) { return 1; }
+inline int ov1(int**) { return 2; }
+inline int ov1(void*) { return 3; }
+struct Base1 { int b = 4; };
+struct Der1 : Base1 { int d = 6; };
+inline Der1 gder1;
+inline Der1* mkder1() { return &gder1; }
 }

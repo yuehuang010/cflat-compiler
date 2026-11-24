@@ -3138,6 +3138,11 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                 && owner->second < cxxImportGroups_.size()
                 && !cxxImportGroups_[owner->second].headers.empty())
                 addDependencyGroup(owner->second);
+            if (auto deps = cxxTypeOwnerDependencyGroups_.find(base);
+                deps != cxxTypeOwnerDependencyGroups_.end())
+                for (size_t dep : deps->second)
+                    if (dep < cxxImportGroups_.size() && !cxxImportGroups_[dep].headers.empty())
+                        addDependencyGroup(dep);
             TypeSpelling parsed;
             if (!DemangleType(*this, base, parsed)) return;
             for (const auto& arg : parsed.args)
@@ -5613,20 +5618,22 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             return target;
         };
 
+        // operandOwnerGroups: the direct owners, tried first as an infix request's primary.
+        // dependencyGroups adds what those owners' requests compiled against (template arguments).
+        std::vector<size_t> operandOwnerGroups;
         std::vector<size_t> dependencyGroups;
-        auto addDependencyGroup = [&](size_t group) {
-            if (std::find(dependencyGroups.begin(), dependencyGroups.end(), group)
-                == dependencyGroups.end())
-                dependencyGroups.push_back(group);
-        };
+        std::unordered_set<std::string> visitedDependencyTypes;
         auto collectTypeDependencies = [&](const std::string& type) {
             std::string base = type;
             while (!base.empty() && base.back() == '*') base.pop_back();
             if (auto owner = cxxTypeOwnerGroup_.find(base);
                 owner != cxxTypeOwnerGroup_.end()
                 && owner->second < cxxImportGroups_.size()
-                && !cxxImportGroups_[owner->second].headers.empty())
-                addDependencyGroup(owner->second);
+                && !cxxImportGroups_[owner->second].headers.empty()
+                && std::find(operandOwnerGroups.begin(), operandOwnerGroups.end(), owner->second)
+                       == operandOwnerGroups.end())
+                operandOwnerGroups.push_back(owner->second);
+            CollectCxxTypeOwnerGroups(base, dependencyGroups, visitedDependencyTypes);
         };
         auto collectConstructionDependencies = [&](auto&& self,
                                                     const NamedVariable& construction) -> void {
@@ -6038,7 +6045,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         // per-name owner memo is neither read nor written - one pair must not steer another.
         if (infix || unaryOperator || adlCall)
         {
-            candidateGroups = dependencyGroups;
+            candidateGroups = operandOwnerGroups;
             const std::string lead = unaryOperator && !arguments.empty()
                 ? arguments[0].TypeAndValue.TypeName
                 : !infixLhsName.empty() ? infixLhsName

@@ -978,6 +978,11 @@ void LLVMBackend::ResolveGenericAliasSpelling(std::string& base, std::vector<std
         if (base == "unique" && args.size() == 1 && gts.coreGenericTemplates.count("unique") != 0
             && IsCxxUniquePtrPointee(args[0]))
         {
+            if (ClassDeleteUnusable(ResolveTypeAlias(args[0])))
+            {
+                if (report) LogError(UnusableUniqueDeleteMessage(ResolveTypeAlias(args[0])));
+                return;
+            }
             base = "std.unique_ptr";
             args[0] = ResolveTypeAlias(args[0]);
         }

@@ -80,3 +80,11 @@ extern int main()
     }
     return 0;
 }
+// A protected member operator template beside a free operator: clang selects the template.
+expect_error("'operator+' is a protected member of 'cppsopd::T456ProtectedTemplateFree'") {
+    int t456ProtectedTemplateFreeUse()
+    {
+        cppsopd.T456ProtectedTemplateFree value = default;
+        return value + 2;
+    }
+}

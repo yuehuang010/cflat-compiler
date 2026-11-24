@@ -64,10 +64,10 @@ concurrent runs on the same function). Line numbers in old rows predate the 2026
 
 ## Ship gate (p1 + p2)
 
-p1 = 0. p2 = 3 open, none blocks on a ruling:
+p1 = 0. p2 = 3 open, one (LINT) blocks on a ruling:
 
-- p2/expect-error-substring-source-check-loose - READY (run LINT, see Ready to start).
-- p2/cold-cpp-interop-compile-peaks-23-27-gb - 20.33 GB cold / 1.47 GB warm; accepted until plan P10 lands (RULED 2026-11-18).
+- p2/expect-error-substring-source-check-loose - NEEDS RULING (2026-11-18 box 16: literal anchoring refuses 386 legit substrings; two options in the file).
+- p2/cold-cpp-interop-compile-peaks-23-27-gb - 9.51 GB cold since the regroup (80a853e9a; was 20.33 GB); accepted until plan P10 lands (RULED 2026-11-18).
 - p2/test-suite-over-time-budget - run G7: phase timing first; a fixture split needs the maintainer's OK.
 
 Run the Windows gate on the master tip once per box.
@@ -82,16 +82,10 @@ Each ruling is in the issue file, which is the brief's source. One run = one wor
 
 | Run | Issue | Mode | Work | Not concurrent with |
 |-----|-------|------|------|---------------------|
-| ARRBOUND | p3/non-constant-array-bound-silently-one-element | full (type C) | `int[n] a` with a non-constant `n` is silently one element; refuse it (RULED 2026-11-18) until p4/runtime-sized-arrays-vla is built; accept-set of constant bounds first; new err_array_bound_not_constant.cb | READY - see Ready to start |
-| FNSLOT | p3/function-slot-null-zero-spellings | full (type C) | refuse `(void*)0`, `(int*)0`, `(int*)nullptr` at function slots (RULED 2026-11-18, C++ wins); `nullptr` and `NULL` stay accepted; function-slot ternary join RULED 2026-10-20 | NULLCTOR |
-| UNWDEL | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries item 2 | full (type C/E) | a class whose only member operator delete is not a usual deallocation function is refused as clang, `[cpp]` struct included (CONFIRMED 2026-11-18); sanctioned leg flips are listed in the file; the old patch is gone | E runs |
-| CPPMOVE | p3/cflat-move-cpp-class-sink-shapes-leftovers item 2 | full (type E, opus-tier) | `Box b = move a` of a `[cpp]` struct: ask clang for the whole-record move (RULED 2026-11-18); two regressions of the dropped E6SINK attempt are in the file | E runs |
 | LINKPFX | p4/localize-relayed-clang-diagnostics | batch (type F) | linker / dsymutil stderr gets the `linker: ` prefix (RULED 2026-11-18, amends 2026-09-27); 3 relayed-clang legs re-pinned | DIAG-TEXT |
-| LINT | p2/expect-error-substring-source-check-loose | test-infra | leg lint check 2 anchors both substring ends on cflat literal text, no vendoring (RULED 2026-11-18) | - |
-| CLIBNAME | p3/core-defines-externally-visible-libc-functions | full | RULED 2026-10-21: `nobuiltin` on CFlat bodies of libc names | - |
-| DEPTH2B | p3/new-pointer-depth-carrier | full | RULED 2026-11-04: step 2b, C / C++ interop pointer depth > 2 | - |
+| CLIBNAME | p3/core-defines-externally-visible-libc-functions | needs ruling | the RULED part (nobuiltin) landed as T444; what remains (a C object / C++ inline calling printf resolves to the core body) is outside that ruling | - |
 | - | p4/three-way-comparison-operator | plan-sized | `<=>` in the CFlat language RULED 2026-10-02; `= default` member-wise `<=>` still needs a ruling | operator runs |
-| P10 phase 1 | plan cpp-import-module-reuse | read-only spike | design spike for "dependency reached through its own module"; nothing lands | - |
+| P10 phase 1 | plan cpp-import-module-reuse | read-only spike | DONE 2026-11-18: only a modular std works (ruled out); back to the maintainer, see the plan | - |
 
 Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the plan), P8 runtime-sized arrays (zero bound and owning elements not ruled; optional).
 
@@ -129,7 +123,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | float and native-call residue |
 | - | p3/cpp-wrapper-request-misses-template-argument-headers | `std.unique_ptr<cppon.Cls>` wrappers | open: noinc implicit dtor, unpublished-specialization pointer binding |
 | - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | residue: forwarding template ctor pick, CFlat-callee return elision, leftovers file |
-| - | p3/template-member-operators-not-ranked + p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in; compound and rewritten member templates not ranked, protected member template |
+| - | p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in (member templates vs free operators landed d6eeafe54) |
 | - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | clang-cl residue only |
 | B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), siblings | residue in the issue file |
@@ -141,7 +135,6 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| ARRBOUND | p3/non-constant-array-bound-silently-one-element | local array dimension fold (MainListener_Initializers.cpp, both passes) | READY. RULED 2026-11-18: `int[n] a` with a non-constant `n` (silently one element, overrun) is a compiler error until p4/runtime-sized-arrays-vla is built; accept-set of constant bounds first; new err_array_bound_not_constant.cb |
 | - | p3/cpp-brace-overload-ambiguity-leftovers-after-t314 | C++ call / brace-arg ranking | open: template candidate with a braced list, a tie across two conversion operators by value, cosmetic candidate-list spelling |
 
 ### D - wrongly refused (acceptance gaps)
@@ -149,7 +142,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | Run | Issue(s) | Site | Mode |
 |-----|----------|------|------|
 | - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | C++ class ternary + static init leftovers | residue: global move init; explicit `return move d` |
-| - | p3/function-slot-null-zero-spellings | null-constant classifier | READY (run FNSLOT) - see Ready to start |
+| - | p3/function-slot-null-zero-spellings | grammar | OPEN residue: `rv.G{0}` expression form does not parse (data-pointer null casts landed 63cdc54c2) |
 | - | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused | converting-ctor path | absorbed by P1 (converting constructors); land there |
 | - | p3/cpp-class-pointer-converting-ctor-leftovers | converting-ctor path | T305 residue; with P1 |
 | - | p3/cpp-inherited-operator-diamond-and-protected-access | virtual inheritance in imported classes | with P4 virtual-base layout |
@@ -158,10 +151,10 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 
 | Run | Issue | Notes |
 |-----|-------|-------|
-| E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | item 2 READY (run UNWDEL) - see Ready to start; item 3 Windows funclet cleanup not exercised |
+| E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | item 2 landed a2111ce54; item 3 Windows funclet cleanup not exercised |
 | E4 | p3/cpp-new-remaining-allocator-gaps | by-design / out-of-scope residue only (bare `Sx(...)` in a reopened namespace beside a global function), Windows MS-ABI array new / delete names; volatile copy closed by ruling 2026-11-18 |
 | E5 | p3/cflat-default-param-temporaries-leftovers | default-argument temporaries: refused class / pointer / string / nested brace elements, native default leaks |
-| E6 | p3/cflat-move-cpp-class-sink-shapes-leftovers + p3/discard-ternary-move-join-and-cxx-field-move | item 2 READY (run CPPMOVE) - see Ready to start; residue: item 3 brace-element prvalue deferral, discard join |
+| E6 | p3/discard-ternary-move-join-and-cxx-field-move | [cpp] struct whole-record move landed 517833bb1 (item 3 no longer reproduces); residue: discard join |
 | E7 | p3/cpp-ternary-move-join-leftovers | ternary move joins over C++ classes; residue: lowered-struct shapes, b4_r_c1_rev return-of-local |
 | E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; residue: later non-literal aggregate element, call-argument calls, const above pointee |
 | E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue: same-arity overload sets, later C++ default param, mixed template arity (bound-wrapper divergences recorded) |
@@ -177,7 +170,6 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 
 | Run | Issue(s) | Mode | Notes |
 |-----|----------|------|-------|
-| G2 | p3/cpp-wrapper-request-group-omits-type-dependencies + p3/cpp-candidate-tier-differs-cold-vs-warm | batch | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; scheduled as CACHE-KEY below |
 | G3 | p3/cpp-check-mode-cannot-repopulate-type-request-cache | full | design: --check writing the cache |
 | G4 | p3/cpp-noinc-mode-divergences | full | CFLAT_CPP_INCREMENTAL=0 kept (RULED 2026-10-31); fallback must bind what incremental binds; two crashes fixed |
 
@@ -193,7 +185,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | N-COPY | p3/pointer-subscript-owning-element-copy-leftovers-after-r21 + p3/raw-delete-string-array-skips-element-dtors | R21 residue (element store needs the destructor first); `delete[]` of string* skips element dtors |
 | N-BORROW | p3/consolidate-named-variable-borrow-provenance + p3/iface-return-call-borrow-precision + p3/deref-of-moved-pointer-guard-inside-callee | borrow provenance of named variables; interface return precision; false positive behind a terminating callee |
 | N-UNIQUE | p3/unique-array-dynamic-index-move-untracked | dynamic-index field moves untracked |
-| N-RULED | p3/chained-assign-raw-inner-into-unique-refused | NEEDS RULING: who frees a fresh object stored into a raw field, global or borrowed parameter (discussion open 2026-11-18) |
+| N-RULED | p3/chained-assign-raw-inner-into-unique-refused | parameter half landed 2026-11-18 (a pointer parameter adopts like a local); NEEDS RULING: may a raw field or global own implicitly, or must an owning field be spelled unique (spike numbers in the file) |
 | N-TEMP | p3/statement-temp-gep-leaks | two conservative retention cases, no free |
 | N-CONST | p3/native-auto-copy-drops-transitive-const + p3/const-gaps-c-depth-auto-copy-and-named-alias-signatures + p3/trailing-const-leftovers-after-c08 | no branch (deleted 2026-11-18, redo from the issue files); C global exact levels; const plan phase 8 residue |
 | - | p3/uninitialized-new-array-reads | ruled 2026-09-03; no detection today |
@@ -279,7 +271,7 @@ this table.
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, A3 | no |
 | 25 | CONSTTWIN | L/H | p3/cpp-constrained-twin-default-argument-ranking | residue: MSVC shared-symbol body choice (Windows host) | CONSTPOINTEE | no |
 | 26 | SRCTYPE | L/H | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | residue: floating auto local (float/double) at C++ calls | - | no |
-| 27 | CACHE-KEY | L/H | p3/cpp-wrapper-request-group-omits-type-dependencies, p3/cpp-wrapper-request-misses-template-argument-headers, p3/cpp-candidate-tier-differs-cold-vs-warm | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; partial patch scratch/repro_keep/t70_groupfix.patch | CHUNK, G3 | no |
+| 27 | CACHE-KEY | L/H | p3/cpp-wrapper-request-group-omits-type-dependencies, p3/cpp-wrapper-request-misses-template-argument-headers | residue after 2df193301 (key + cold/warm tiers fixed): wrapper-body refusal guard; CFLAT_CPP_INCREMENTAL=0 calloc overload | CHUNK, G3 | no |
 | 28 | BORROW-PROV | L/H | p3/consolidate-named-variable-borrow-provenance | borrow provenance of named variables through helpers; design first (N-BORROW) | N runs | no |
 
 Cheap singletons (S, risk L): p3/os-abstraction-process-cb-not-converted, p3/view-element-gate-diagnostic-gaps.
@@ -289,7 +281,7 @@ Overload/ctor selection family (never two at once): NULLCTOR, PTRRANK, CTOR-VIAB
 
 | Issue | Question |
 |-------|----------|
-| p3/chained-assign-raw-inner-into-unique-refused | item 2: owner bit on argument / raw field / global slots - runtime owned flag, compile-time owning field (= unique), or C manual delete; discussion open 2026-11-18 |
+| p3/chained-assign-raw-inner-into-unique-refused | item 2, raw field / global slots only (parameters landed 2026-11-18): may a raw field own implicitly or must it be spelled unique; spike numbers in the file |
 
 ### Conflict map (never concurrent)
 

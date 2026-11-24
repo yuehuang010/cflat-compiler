@@ -674,6 +674,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.isCxxSameTypeCastCopy = namedVar.IsCxxSameTypeCastCopy;
         result.cxxRefValueType = namedVar.CxxRefValueType;
         result.isExplicitMove = namedVar.IsExplicitMove;
+        result.isDataNullCast = namedVar.IsDataNullCast;
         result.storage = result.isAlias ? namedVar.Storage : nullptr;
         result.receiverStorage = namedVar.Storage;
         if (result.isAlias) Compiler(ctx)->RegisterAliasValue(result.value);
@@ -4260,6 +4261,59 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
             return temp;
         };
 
+        // A member operator template (any access) beside a free unary candidate taking this class
+        // or a base: clang ranks the joint set, and an access or selected-body error is final.
+        if (compiler->HasCxxMemberOperatorTemplateAnyAccess(typeName, opName))
+        {
+            if (!ns.empty()) compiler->TryBindCxxFunction(opName);
+            auto hasFreeUnary = [&](const std::string& tableName, const std::string& source) {
+                auto found = compiler->functionTable.find(tableName);
+                if (found == compiler->functionTable.end()) return false;
+                return std::any_of(found->second.begin(), found->second.end(), [&](const auto& candidate) {
+                    return candidate.IsCxx && !candidate.IsMethod
+                        && candidate.SourceName == source && candidate.Parameters.size() == 1
+                        && (candidate.Parameters[0].TypeName == typeName
+                            || compiler->IsCxxBaseOf(candidate.Parameters[0].TypeName, typeName));
+                });
+            };
+            if (hasFreeUnary(lookupName, sourceName)
+                || (!ns.empty() && hasFreeUnary("__cxx_free." + opName, opName)))
+            {
+                LLVMBackend::NamedVariable argument;
+                argument.Primary = operand;
+                argument.Storage = operandStorage;
+                argument.BaseType = operand->getType();
+                argument.TypeAndValue.TypeName = typeName;
+                argument.TypeAndValue.SetCxxConstRef(operandIsConst);
+                argument.TypeAndValue.IsCxxPointeeVolatile = operandIsVolatile;
+                argument.IsRvalue = operandIsRvalue;
+                argument.IsExplicitMove = operandExplicitMove;
+                if (auto* unaryCtx = dynamic_cast<CFlatParser::UnaryExpressionContext*>(ctx);
+                    unaryCtx != nullptr && unaryCtx->castExpression() != nullptr)
+                    argument.CxxLvalueKind = CxxArgumentLvalueKind(unaryCtx->castExpression());
+                std::vector<LLVMBackend::NamedVariable> arguments{ argument };
+                std::string registeredName;
+                std::string requestError;
+                if (compiler->RequestCxxFreeFunction(sourceName, {}, arguments,
+                        registeredName, requestError, op) && !registeredName.empty())
+                {
+                    FlushCallPostfix();
+                    if (llvm::Value* selected = CallOperatorWithoutExcluded(
+                            compiler->functionTable, compiler, lookupName,
+                            registeredName, arguments, {}))
+                        return selected;
+                }
+                else if (compiler->LastCxxRequestClangRejected()
+                    && !compiler->LastCxxRequestNoViableAtRequest()
+                    && !requestError.empty())
+                {
+                    LogErrorContext(ctx, requestError.starts_with("clang: ")
+                        ? requestError : "clang: " + requestError);
+                    return nullptr;
+                }
+            }
+        }
+
         if (!ns.empty())
         {
             compiler->TryBindCxxFunction(opName);
@@ -4885,6 +4939,40 @@ llvm::Value* MainListener::TryPointerLhsOperatorOverload(
 
         return nullptr;
     }
+
+/*
+ * A free C++ operator (template, or bound overload whose first parameter is this class or a base)
+ * in the class's operator sources: with a member template beside it, clang ranks the joint set.
+ */
+bool MainListener::HasCxxFreeOperatorForLeftClass(const std::string& typeName,
+                                                  const std::string& opName)
+{
+        auto* compiler = Compiler();
+        for (const std::string& source : CxxFreeOperatorSources(typeName, opName))
+        {
+            if (compiler->HasCxxFunctionTemplate(source)) return true;
+            if (compiler->cxxFunctionSignatures_.count(source) == 0) continue;
+            compiler->TryBindCxxFunction(source);
+            const std::string lookup = source == opName ? "__cxx_free." + opName : source;
+            auto it = compiler->functionTable.find(lookup);
+            if (it == compiler->functionTable.end()) continue;
+            auto rawIt = compiler->cxxFunctionSignatures_.find(source);
+            for (const auto& candidate : it->second)
+            {
+                if (!candidate.IsCxx || candidate.IsMethod || candidate.SourceName != source
+                    || candidate.Parameters.size() != 2
+                    || (candidate.Parameters[0].TypeName != typeName
+                        && !compiler->IsCxxBaseOf(candidate.Parameters[0].TypeName, typeName)))
+                    continue;
+                const bool instanceWrapper = rawIt != compiler->cxxFunctionSignatures_.end()
+                    && std::any_of(rawIt->second.begin(), rawIt->second.end(), [&](const auto& raw) {
+                        return raw.isInstanceTemplateWrapper && raw.linkageName == candidate.UniqueName;
+                    });
+                if (!instanceWrapper) return true;
+            }
+        }
+        return false;
+}
 
 llvm::Value* MainListener::TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
@@ -6782,6 +6870,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             LogErrorContext(ctx, diagnostic);
             return nullptr;
         };
+        // Clang's refusal of a compound set holding a public member template; the member request
+        // below reports a selected member body in its own words, this text otherwise.
+        std::string deferredCompoundTemplateRefusal;
         auto tryClangForCxx20CandidateSet = [&]() -> llvm::Value* {
             if (cxxOperatorRewriteDepth_ != 0 || cxxAdlSuppressDepth_ != 0) return nullptr;
             // Scalar-left operators can use right-class ADL; clang ranks namespace and global
@@ -6814,7 +6905,18 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             }
             // A scalar-left equality needs C++20's reversed candidates in the same set.
             if (op == "==" && !isCxxRecordValue(lvalue) && isCxxRecordValue(rvalue))
-                return tryFreeOperator(true, true);
+            {
+                // A reversed member template clang selects (an access error) is the final answer.
+                const std::string rightName =
+                    llvm::cast<llvm::StructType>(rvalue->getType())->getName().str();
+                if (!compiler->HasCxxMemberOperatorTemplateAnyAccess(rightName, "operator=="))
+                    return tryFreeOperator(true, true);
+                adlClangRefusal.clear();
+                if (llvm::Value* resolved = tryFreeOperator(true, true)) return resolved;
+                if (!adlClangAmbiguous && !adlClangRefusal.empty())
+                    LogErrorContext(ctx, adlClangRefusal);
+                return nullptr;
+            }
             auto hasMemberCandidate = [&](const std::string& className,
                                           const std::string& operatorName) {
                 compiler->EnsureCxxMemberProjected(className, operatorName);
@@ -6827,9 +6929,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                             return true;
                 return false;
             };
+            // Any access: a protected member template still joins the set and clang refuses it.
             auto hasMemberTemplateCandidate = [&](const std::string& className,
                                                   const std::string& operatorName) {
-                return compiler->HasCxxFunctionTemplateMember(className, operatorName);
+                return compiler->HasCxxMemberOperatorTemplateAnyAccess(className, operatorName);
             };
             auto hasFreeTemplateCandidate = [&](const std::string& className,
                                                 const std::string& operatorName) {
@@ -6932,7 +7035,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 const bool hasUnregisteredMember = classInfo != nullptr
                     && classInfo->memberAccess.count(operatorName) != 0
                     && !hasRegisteredMember;
-                if ((hasMemberTemplate && hasFree)
+                if ((hasMemberTemplate
+                        && (hasFree || HasCxxFreeOperatorForLeftClass(leftName, operatorName)))
                     || (hasRegisteredMember && hasFreeTemplate)
                     || (hasUnregisteredMember && hasFree && [&]() {
                             size_t freeCount = 0;
@@ -6978,6 +7082,26 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     && (hasFreeCandidate(leftName, opName)
                         || hasFreeTemplateCandidate(leftName, opName)))
                     if (llvm::Value* resolved = tryFreeOperator(true, true, true)) return resolved;
+                // A member template beside a free compound operator: clang ranks the joint set,
+                // so a non-viable template drops out and an access or selected-body error is final.
+                if (hasMemberTemplateCandidate(leftName, opName)
+                    && HasCxxFreeOperatorForLeftClass(leftName, opName))
+                {
+                    adlClangRefusal.clear();
+                    if (llvm::Value* resolved = tryFreeOperator(true, true, true)) return resolved;
+                    if (adlClangAmbiguous) return nullptr;
+                    if (!adlClangRefusal.empty())
+                    {
+                        if (compiler->HasCxxFunctionTemplateMember(leftName, opName))
+                        {
+                            deferredCompoundTemplateRefusal = adlClangRefusal;
+                            adlClangRefusal.clear();
+                            return nullptr;
+                        }
+                        LogErrorContext(ctx, adlClangRefusal);
+                        return nullptr;
+                    }
+                }
                 bool inheritedMember = false;
                 if (auto it = compiler->functionTable.find(opName);
                     it != compiler->functionTable.end())
@@ -7024,6 +7148,27 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             };
             const bool splitFreeSpaceshipSet = hasSplitFreeSpaceshipSet(leftName)
                 || (rightName != leftName && hasSplitFreeSpaceshipSet(rightName));
+            auto hasAnyFreeCandidate = [&](const std::string& className,
+                                           const std::string& operatorName) {
+                for (const std::string& source : CxxFreeOperatorSources(className, operatorName))
+                    if (sourceHasFreeCandidate(className, source, operatorName)) return true;
+                return HasCxxFreeOperatorForLeftClass(className, operatorName);
+            };
+            // A `<=>` member template beside a free `<` or `<=>`: only clang ranks the rewritten set.
+            auto spaceshipTemplateBesideFree = [&](const std::string& className) {
+                return !className.empty() && hasMemberTemplateCandidate(className, "operator<=>")
+                    && (hasAnyFreeCandidate(className, "operator" + op)
+                        || hasAnyFreeCandidate(className, "operator<=>"));
+            };
+            if (spaceshipTemplateBesideFree(leftName)
+                || (rightName != leftName && spaceshipTemplateBesideFree(rightName)))
+            {
+                adlClangRefusal.clear();
+                if (llvm::Value* resolved = tryFreeOperator(true, true, true)) return resolved;
+                if (!adlClangAmbiguous && !adlClangRefusal.empty())
+                    LogErrorContext(ctx, adlClangRefusal);
+                return nullptr;
+            }
             if (hasCxxMemberOperator(leftName, "operator<=>")
                 || hasCxxMemberOperator(rightName, "operator<=>")
                 || splitFreeSpaceshipSet)
@@ -7293,31 +7438,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             }
             std::vector<LLVMBackend::NamedVariable> templateArguments = { receiver, operand };
             std::string registeredName, templateError;
-            bool hasFreeCandidate = false;
-            for (const std::string& source : CxxFreeOperatorSources(typeName, opName))
-            {
-                if (compiler->HasCxxFunctionTemplate(source))
-                {
-                    hasFreeCandidate = true;
-                    break;
-                }
-                if (compiler->cxxFunctionSignatures_.count(source) == 0) continue;
-                compiler->TryBindCxxFunction(source);
-                const std::string lookup = source == opName
-                    ? "__cxx_free." + opName : source;
-                if (auto it = compiler->functionTable.find(lookup);
-                    it != compiler->functionTable.end()
-                    && std::any_of(it->second.begin(), it->second.end(), [&](const auto& candidate) {
-                        return isFreeCxxCandidate(candidate) && candidate.SourceName == source
-                            && candidate.Parameters.size() == 2
-                            && candidate.Parameters[0].TypeName == typeName;
-                    }))
-                {
-                    hasFreeCandidate = true;
-                    break;
-                }
-            }
-            if (hasFreeCandidate)
+            if (HasCxxFreeOperatorForLeftClass(typeName, opName))
             {
                 triedCandidateSetBeforeMemberTemplate = true;
                 adlClangRefusal.clear();
@@ -7338,6 +7459,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             {
                 LogErrorContext(ctx, templateError.starts_with("clang: ")
                     ? templateError : "clang: " + templateError);
+                return nullptr;
+            }
+            if (!deferredCompoundTemplateRefusal.empty())
+            {
+                LogErrorContext(ctx, deferredCompoundTemplateRefusal);
                 return nullptr;
             }
         }

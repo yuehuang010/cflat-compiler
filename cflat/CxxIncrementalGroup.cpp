@@ -513,6 +513,194 @@ namespace
         uint64_t version = 0;   // bumped per recorded #include; keys reachability memos
     };
 
+    // Every file `roots` reach in `graph`; false when a root is not a header of the TU.
+    bool ReachFromRoots(const IncludeGraph& graph, clang::FileManager& fm,
+                        const std::vector<std::string>& roots,
+                        std::unordered_set<const clang::FileEntry*>& reached)
+    {
+        std::vector<const clang::FileEntry*> work;
+        for (const std::string& root : roots)
+        {
+            const clang::FileEntry* entry = nullptr;
+            if (root.starts_with("<"))
+            {
+                auto found = graph.angled.find(root);
+                if (found != graph.angled.end()) entry = found->second;
+            }
+            else if (auto ref = fm.getOptionalFileRef(root))
+                entry = &ref->getFileEntry();
+            if (entry == nullptr || graph.targets.count(entry) == 0) return false;
+            if (reached.insert(entry).second) work.push_back(entry);
+        }
+        while (!work.empty())
+        {
+            const clang::FileEntry* current = work.back();
+            work.pop_back();
+            auto found = graph.edges.find(current);
+            if (found == graph.edges.end()) continue;
+            for (const clang::FileEntry* child : found->second)
+                if (reached.insert(child).second) work.push_back(child);
+        }
+        return true;
+    }
+
+    /*
+     * Macros a dependency include brought into this TU. A request whose types come from another
+     * import group includes that group's headers here for good (ParseRequest), but each import
+     * keeps its own macros: a dependency's `#define M1 (1-1)` must not rewrite `cppsfx::M1` in
+     * the group's own chunks, nor in another dependency's header parsed here later. Each macro
+     * a parse touched is set to its newest directive from a VISIBLE file: the group's own headers,
+     * chunk text, and the files shown during the current Parse - those it entered, and those an
+     * include reaches again (an include guard skip included), so a header lexes with what it
+     * includes. Between parses only own files are visible. Header guards are never hidden.
+     */
+    struct DependencyMacroLayer
+    {
+        clang::Preprocessor* pp = nullptr;
+        const IncludeGraph* graph = nullptr;
+        std::vector<std::string> ownRoots;
+        bool rootsKnown = false;
+        uint64_t reachVersion = 0;
+        bool reachOk = false;
+        std::unordered_set<const clang::FileEntry*> own;
+        llvm::SmallPtrSet<clang::IdentifierInfo*, 32> touchedSet;   // since the last Hide
+        std::vector<clang::IdentifierInfo*> touched;
+        // Every macro a file has a directive for, and the directives this layer appended.
+        std::unordered_map<const clang::FileEntry*, llvm::SmallPtrSet<clang::IdentifierInfo*, 4>>
+            macrosByFile;
+        llvm::SmallPtrSet<const clang::MacroDirective*, 32> synthetic;
+        bool anyHidden = false;   // false: clang's own macro state is already the right one
+        std::unordered_set<const clang::FileEntry*> shownThisParse;
+        std::unordered_set<const clang::FileEntry*> entered;
+
+        void Touch(clang::IdentifierInfo* name)
+        {
+            if (name != nullptr && touchedSet.insert(name).second) touched.push_back(name);
+        }
+
+        // A #define / #undef clang just ran: index it by its file, recompute it after the Parse.
+        void Note(clang::IdentifierInfo* name, clang::SourceLocation loc)
+        {
+            if (name == nullptr) return;
+            Touch(name);
+            if (const clang::FileEntry* file = FileOf(loc)) macrosByFile[file].insert(name);
+        }
+
+        const clang::FileEntry* FileOf(clang::SourceLocation loc) const
+        {
+            if (loc.isInvalid()) return nullptr;
+            clang::SourceManager& sm = pp->getSourceManager();
+            auto file = sm.getFileEntryRefForID(sm.getFileID(sm.getExpansionLoc(loc)));
+            return file ? &file->getFileEntry() : nullptr;
+        }
+
+        // A header file this group's own headers do not reach; predefines and chunk text are own.
+        bool InDependencyFile(clang::SourceLocation loc) const
+        {
+            const clang::FileEntry* file = FileOf(loc);
+            return file != nullptr && !own.contains(file);
+        }
+
+        bool Visible(clang::SourceLocation loc) const
+        {
+            const clang::FileEntry* file = FileOf(loc);
+            return file == nullptr || own.contains(file) || shownThisParse.contains(file);
+        }
+
+        bool RefreshOwn()
+        {
+            if (!rootsKnown) return false;
+            if (reachVersion != graph->version || reachVersion == 0)
+            {
+                own.clear();
+                reachOk = ReachFromRoots(*graph, pp->getFileManager(), ownRoots, own);
+                reachVersion = graph->version;
+            }
+            return reachOk;
+        }
+
+        // True when `decl` is defined in a file only a dependency include brought in.
+        bool DependencyDeclaration(const clang::Decl* decl)
+        {
+            return decl != nullptr && RefreshOwn() && InDependencyFile(decl->getLocation());
+        }
+
+        // Set `name` to its newest directive from a visible file (undefined when there is none).
+        void Recompute(clang::IdentifierInfo* name)
+        {
+            clang::MacroDirective* latest = pp->getLocalMacroDirectiveHistory(name);
+            clang::MacroDirective* real = latest;
+            while (real != nullptr && synthetic.contains(real)) real = real->getPrevious();
+            if (real == nullptr) return;
+            if (auto* guard = llvm::dyn_cast<clang::DefMacroDirective>(real);
+                guard != nullptr && guard->getInfo()->isUsedForHeaderGuard())
+                return;
+            clang::MacroDirective* want = real;
+            while (want != nullptr && (synthetic.contains(want) || !Visible(want->getLocation())))
+                want = want->getPrevious();
+            auto* wantDefinition = llvm::dyn_cast_or_null<clang::DefMacroDirective>(want);
+            clang::MacroInfo* wantInfo = wantDefinition != nullptr ? wantDefinition->getInfo() : nullptr;
+            auto* nowDefinition = llvm::dyn_cast<clang::DefMacroDirective>(latest);
+            if (wantInfo == (nowDefinition != nullptr ? nowDefinition->getInfo() : nullptr)) return;
+            anyHidden = true;
+            if (wantInfo != nullptr)
+                synthetic.insert(pp->appendDefMacroDirective(name, wantInfo,
+                                                             wantInfo->getDefinitionLoc()));
+            else
+            {
+                auto* undef = new (pp->getPreprocessorAllocator())
+                    clang::UndefMacroDirective(real->getLocation());
+                pp->appendMacroDirective(name, undef);
+                synthetic.insert(undef);
+            }
+        }
+
+        // A header entered for the first time this Parse: its own directives are visible.
+        void Entered(const clang::FileEntry* file)
+        {
+            if (file != nullptr) shownThisParse.insert(file);
+        }
+
+        // Show the macros of `file` and of every file it includes.
+        void ShowReached(const clang::FileEntry* file)
+        {
+            // `own` is refreshed by Hide: a file this Parse newly reached is entered, so visible.
+            if (file == nullptr || !anyHidden || !reachOk) return;
+            std::vector<const clang::FileEntry*> work{ file };
+            std::vector<clang::IdentifierInfo*> names;
+            while (!work.empty())
+            {
+                const clang::FileEntry* current = work.back();
+                work.pop_back();
+                if (!shownThisParse.insert(current).second) continue;
+                if (auto found = macrosByFile.find(current); found != macrosByFile.end())
+                    names.insert(names.end(), found->second.begin(), found->second.end());
+                if (auto edges = graph->edges.find(current); edges != graph->edges.end())
+                    for (const clang::FileEntry* child : edges->second) work.push_back(child);
+            }
+            for (clang::IdentifierInfo* name : names)
+            {
+                Recompute(name);
+                Touch(name);
+            }
+        }
+
+        void Hide()
+        {
+            shownThisParse.clear();
+            if (touched.empty()) return;
+            if (!RefreshOwn())
+            {
+                // Own headers unknown or not in this TU: leave every macro as clang left it.
+                if (rootsKnown) { touched.clear(); touchedSet.clear(); }
+                return;
+            }
+            for (clang::IdentifierInfo* name : touched) Recompute(name);
+            touched.clear();
+            touchedSet.clear();
+        }
+    };
+
     // True when loc lies in a file entered through #include (a header). The Interpreter's own
     // input buffers (input_line_N, CFlat's chunk text) also carry an include location, but it
     // is the start of the empty main file; a real header's is an #include in another buffer.
@@ -536,11 +724,31 @@ namespace
         clang::LangOptions& langOptions;
         const bool incrementalExtensions;
 
+        DependencyMacroLayer& macroLayer;
+
         IncludeCollector(clang::Preprocessor& p, std::vector<std::string>& f,
                          std::vector<clang::FileID>& ids, IncludeGraph& g,
-                         clang::LangOptions& opts)
+                         clang::LangOptions& opts, DependencyMacroLayer& layer)
             : pp(p), files(f), fileIds(ids), graph(g), langOptions(opts),
-              incrementalExtensions(opts.IncrementalExtensions) {}
+              incrementalExtensions(opts.IncrementalExtensions), macroLayer(layer) {}
+
+        // An include guard skip still makes the header's macros visible, as a parse would.
+        void FileSkipped(const clang::FileEntryRef& file, const clang::Token&,
+                         clang::SrcMgr::CharacteristicKind) override
+        {
+            macroLayer.ShowReached(&file.getFileEntry());
+        }
+
+        void MacroDefined(const clang::Token& name, const clang::MacroDirective*) override
+        {
+            macroLayer.Note(name.getIdentifierInfo(), name.getLocation());
+        }
+
+        void MacroUndefined(const clang::Token& name, const clang::MacroDefinition&,
+                            const clang::MacroDirective*) override
+        {
+            macroLayer.Note(name.getIdentifierInfo(), name.getLocation());
+        }
 
         void FileChanged(clang::SourceLocation loc, FileChangeReason reason,
                          clang::SrcMgr::CharacteristicKind, clang::FileID) override
@@ -556,6 +764,15 @@ namespace
                 langOptions.IncrementalExtensions
                     = LocInHeaderFile(sources, loc) ? false : incrementalExtensions;
             if (reason != EnterFile) return;
+            // A header entered again lexes with the macros it defined (DependencyMacroLayer).
+            if (LocInHeaderFile(sources, loc))
+                if (auto entry = sources.getFileEntryRefForID(sources.getFileID(loc)))
+                {
+                    if (!macroLayer.entered.insert(&entry->getFileEntry()).second)
+                        macroLayer.ShowReached(&entry->getFileEntry());
+                    else
+                        macroLayer.Entered(&entry->getFileEntry());
+                }
             clang::SourceManager& sm = sources;
             llvm::StringRef file = sm.getFilename(loc);
             if (file.empty()) return;
@@ -1944,6 +2161,7 @@ struct CxxIncrementalGroup::Impl
     std::vector<std::string> includedFiles;
     std::vector<clang::FileID> includedFileIds;   // parallel to includedFiles
     IncludeGraph includeGraph;
+    DependencyMacroLayer macroLayer;
     // Files reached from a request's include roots, per roots; valid while the graph's version holds.
     struct Reach
     {
@@ -1958,7 +2176,8 @@ struct CxxIncrementalGroup::Impl
     std::unordered_map<std::string, cflat_cinterop::ExtractResult> typeResults;
     std::unordered_map<std::string, clang::TranslationUnitDecl*> typeRoots;
     // Include preludes already committed as their own chunk, with the root they produced.
-    std::unordered_map<std::string, clang::TranslationUnitDecl*> preludeRoots;
+    std::unordered_map<std::string, std::vector<clang::TranslationUnitDecl*>> preludeRoots;
+    std::function<std::vector<std::string>()> importLineIncludes;
     ChunkConsumer* announcer = nullptr;   // owned by the Interpreter's consumer chain
     unsigned wrapperRenames = 0;
     // Specializations whose bodies were emptied after a failed instantiation, with the reason.
@@ -2123,7 +2342,9 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             std::make_unique<IncludeCollector>(
                 impl->interpreter->getCompilerInstance()->getPreprocessor(),
                 impl->includedFiles, impl->includedFileIds, impl->includeGraph,
-                impl->interpreter->getCompilerInstance()->getLangOpts()));
+                impl->interpreter->getCompilerInstance()->getLangOpts(), impl->macroLayer));
+        impl->macroLayer.pp = &impl->interpreter->getCompilerInstance()->getPreprocessor();
+        impl->macroLayer.graph = &impl->includeGraph;
         /*
          * Skip the bodies of inline non-template functions, keeping their tokens: the demand
          * pass parses only the ones the program reaches (LazyBodies). Request chunks parse all.
@@ -2423,6 +2644,19 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         new CxxIncrementalGroup(std::move(impl)));
 }
 
+void CxxIncrementalGroup::SetOwnIncludeRoots(const std::vector<std::string>& roots)
+{
+    impl_->macroLayer.ownRoots = roots;
+    impl_->macroLayer.rootsKnown = true;
+    impl_->macroLayer.reachVersion = 0;
+    impl_->macroLayer.Hide();
+}
+
+void CxxIncrementalGroup::SetImportLineIncludes(std::function<std::vector<std::string>()> lines)
+{
+    impl_->importLineIncludes = std::move(lines);
+}
+
 bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& req,
                                          cflat_cinterop::ExtractResult& out,
                                          std::string& error)
@@ -2505,6 +2739,7 @@ bool CxxIncrementalGroup::PrecheckSpelling(const std::string& spelling, std::str
     DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
     auto ptu = impl_->interpreter->Parse(
         "typedef " + spelling + " " + typedefName + ";\n");
+    impl_->macroLayer.Hide();
     if (!ptu)
     {
         // Consume the Expected either way; an unchecked one aborts under LLVM assertions.
@@ -2683,7 +2918,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         if (!context.getTranslationUnitDecl()->lookup(
                 clang::DeclarationName(&context.Idents.get(name))).empty())
             renameWrapper(name);
-    clang::TranslationUnitDecl* preludeRoot = nullptr;
+    const std::vector<clang::TranslationUnitDecl*>* preludeRoots = nullptr;
     {
         /*
          * Commit the leading #include lines first, in their own chunk. A failed chunk that is the
@@ -2691,7 +2926,10 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
          * set, so every later chunk would see the header as empty ("undeclared identifier 'std'").
          */
         size_t bodyStart = 0;
-        while (bodyStart < chunk.size() && (chunk[bodyStart] == '#' || chunk[bodyStart] == '\n'))
+        // Only includes: any other directive (a request's `#pragma clang diagnostic`) belongs
+        // to its own chunk, never to the TU every later request parses in.
+        while (bodyStart < chunk.size()
+               && (chunk.compare(bodyStart, 8, "#include") == 0 || chunk[bodyStart] == '\n'))
         {
             const size_t end = chunk.find('\n', bodyStart);
             bodyStart = end == std::string::npos ? chunk.size() : end + 1;
@@ -2704,25 +2942,72 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             {
                 const std::string unseen = UnseenIncludeLines(
                     impl_->interpreter->getCompilerInstance()->getPreprocessor(), prelude);
-                clang::TranslationUnitDecl* root = nullptr;
+                std::vector<clang::TranslationUnitDecl*> roots;
                 if (!unseen.empty())
                 {
-                    DiagnosticScope diagnostics(
-                        impl_->interpreter->getCompilerInstance()->getDiagnostics());
-                    auto ptu = impl_->interpreter->Parse(unseen);
-                    recordErrorLocations(diagnostics.consumer, unseen);
-                    if (!ptu)
+                    /*
+                     * One Parse per import line, in prelude order: an unseen header sees the macros
+                     * of its own line's earlier headers (a grouped import's header may rely on one),
+                     * never another dependency line's - clang++ on that line alone would not.
+                     */
+                    clang::Preprocessor& pp = impl_->interpreter->getCompilerInstance()->getPreprocessor();
+                    const auto linesOf = [](std::string_view text) {
+                        std::vector<std::string_view> lines;
+                        for (size_t at = 0; at < text.size();)
+                        {
+                            size_t end = text.find('\n', at);
+                            if (end == std::string_view::npos) end = text.size();
+                            if (end > at) lines.push_back(text.substr(at, end - at));
+                            at = end + 1;
+                        }
+                        return lines;
+                    };
+                    const auto contains = [](const std::vector<std::string_view>& lines, std::string_view line) {
+                        return std::find(lines.begin(), lines.end(), line) != lines.end();
+                    };
+                    const std::vector<std::string> importLines = impl_->importLineIncludes
+                        ? impl_->importLineIncludes() : std::vector<std::string>{};
+                    std::vector<std::vector<std::string_view>> importLineLines;
+                    for (const std::string& importLine : importLines)
+                        importLineLines.push_back(linesOf(importLine));
+                    std::vector<std::pair<size_t, std::string>> slices;   // import line, its lines
+                    for (std::string_view line : linesOf(unseen))
                     {
-                        const std::string parseError = ErrorText(ptu.takeError());
-                        error = diagnostics.consumer.firstError;
-                        if (error.empty()) error = parseError;
-                        return false;
+                        size_t owner = std::string::npos;
+                        for (size_t i = 0; i < importLineLines.size() && owner == std::string::npos; ++i)
+                            if (contains(importLineLines[i], line)) owner = i;
+                        if (slices.empty() || slices.back().first != owner) slices.push_back({ owner, {} });
+                        slices.back().second.append(line);
+                        slices.back().second += '\n';
                     }
-                    root = (*ptu).TUPart;
+                    for (const auto& [owner, slice] : slices)
+                    {
+                        if (owner != std::string::npos)
+                        {
+                            const auto sliceLines = linesOf(slice);
+                            for (std::string_view line : importLineLines[owner])
+                                if (!contains(sliceLines, line))
+                                    if (auto file = ResolveIncludeLine(pp, line); file && pp.alreadyIncluded(*file))
+                                        impl_->macroLayer.ShowReached(&file->getFileEntry());
+                        }
+                        DiagnosticScope diagnostics(
+                            impl_->interpreter->getCompilerInstance()->getDiagnostics());
+                        auto ptu = impl_->interpreter->Parse(slice);
+                        impl_->macroLayer.Hide();
+                        recordErrorLocations(diagnostics.consumer, slice);
+                        if (!ptu)
+                        {
+                            const std::string parseError = ErrorText(ptu.takeError());
+                            error = diagnostics.consumer.firstError;
+                            if (error.empty()) error = parseError;
+                            return false;
+                        }
+                        roots.push_back((*ptu).TUPart);
+                    }
                 }
-                known = impl_->preludeRoots.emplace(prelude, root).first;
+                known = impl_->preludeRoots.emplace(prelude, std::move(roots)).first;
             }
-            preludeRoot = known->second;
+            preludeRoots = &known->second;
             chunk.erase(0, bodyStart);
         }
     }
@@ -2748,6 +3033,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             namespaces = VisibleTopLevelNamespaces(astContext);
         if (impl_->announcer != nullptr) impl_->announcer->sink = &announced;
         auto ptu = impl_->interpreter->Parse(chunk);
+        impl_->macroLayer.Hide();
         recordErrorLocations(diagnostics.consumer, chunk);
         if (!ptu && !namespaces.empty()) RestoreTopLevelNamespaces(astContext, namespaces);
         // No longer invalid, so it must be poisoned for a body that already reaches it.
@@ -2927,7 +3213,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
         effective, *impl_->interpreter->getCompilerInstance(), parsed->TUPart,
         wrapperBatch ? nullptr : impl_->headerRoot, extraRoots,
-        parsed->TheModule.get(), out, error, false, wrapperBatch ? nullptr : preludeRoot,
+        parsed->TheModule.get(), out, error, false, wrapperBatch ? nullptr : preludeRoots,
         &announced);
     if (harvested && effective.emitDefinitions && effective.demandPlan != nullptr)
         out.demandRecorded = true;
@@ -3285,6 +3571,9 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
                     break;
                 }
     };
+    impl_->plan.dependencyDefinition = [this](const clang::Decl* decl) {
+        return impl_->macroLayer.DependencyDeclaration(decl);
+    };
     lazy.MarkPending(/*forCodeGen*/ true);
     const auto companionStart = std::chrono::steady_clock::now();
     const auto previousResolver = impl_->plan.resolveVTableDelete;
@@ -3298,6 +3587,7 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
     lazy.MarkPending(/*forCodeGen*/ false);
     impl_->plan.materializeBody = nullptr;
     impl_->plan.materializeReachable = nullptr;
+    impl_->plan.dependencyDefinition = nullptr;
     // The caller takes the keys (TakeLookupTaintedBodyKeys) and re-parses the group.
     if (!lazy.lookupTaintedBodyKeys.empty())
     {
@@ -3321,39 +3611,6 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
     return ok;
 }
 
-namespace
-{
-    // Every file `roots` reach in `graph`; false when a root is not a header of the TU.
-    bool ReachFromRoots(const IncludeGraph& graph, clang::FileManager& fm,
-                        const std::vector<std::string>& roots,
-                        std::unordered_set<const clang::FileEntry*>& reached)
-    {
-        std::vector<const clang::FileEntry*> work;
-        for (const std::string& root : roots)
-        {
-            const clang::FileEntry* entry = nullptr;
-            if (root.starts_with("<"))
-            {
-                auto found = graph.angled.find(root);
-                if (found != graph.angled.end()) entry = found->second;
-            }
-            else if (auto ref = fm.getOptionalFileRef(root))
-                entry = &ref->getFileEntry();
-            if (entry == nullptr || graph.targets.count(entry) == 0) return false;
-            if (reached.insert(entry).second) work.push_back(entry);
-        }
-        while (!work.empty())
-        {
-            const clang::FileEntry* current = work.back();
-            work.pop_back();
-            auto found = graph.edges.find(current);
-            if (found == graph.edges.end()) continue;
-            for (const clang::FileEntry* child : found->second)
-                if (reached.insert(child).second) work.push_back(child);
-        }
-        return true;
-    }
-}
 
 std::unordered_set<std::string> CxxIncrementalGroup::UnreachableFiles(
     const std::vector<std::string>& roots, const std::vector<std::string>& files) const

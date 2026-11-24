@@ -224,3 +224,99 @@ skip can change a pick. The 12 GB fan-out is lowered only by the 2026-11-08 dire
 reached through its own module instead of being included into ~207 groups - which needs a plan. Until that
 lands the ~20 GB cold peak is accepted (warm ~1.5 GB). Rejected: skip + negative memo + pick-parity run (the
 box 15 recommendation). No test consequence; the next step is the plan `internal/plan/cpp-import-module-reuse.md` (phase 1 = design spike), not a fix run.
+
+## 2026-11-18 - not cold-only: one new question on a warm cache re-pays the peak
+
+The cache stores CFlat extraction results (json / rq / bc), never a clang AST, so a question it has not seen
+re-creates every group the question reaches - each one a full parse of its header + libc++ closure - plus the
+dependency prelude includes. An edit that adds one fan-out question costs about a cold compile.
+
+Measured (Mac Release, master b88de94cf, local x64/Release/.cflat warm for test_cpp_interop, `-o -v`, peak
+memory footprint; wall not recorded, host not perf-stable):
+
+| program | footprint | "clang parse" lines |
+|---|---|---|
+| copy of Test/test_cpp_interop.cb, unchanged | 1.51 GB | 8 (3 header groups) |
+| + one new question that compiles (`OpHideUnary + OpLeaf`) | 2.06 GB | 17 (12 header groups) |
+| + one new question no group answers (below) | 20.03 GB | 267 |
+| same program again | 1.55 GB | 8 |
+
+Appended to the copy (compile with `-i Test -i Test/library`):
+
+```cflat
+expect_error("operator") {
+    int warm_miss_probe2()
+    {
+        cppi_inh.OpHideBinary a = cppi_inh.OpHideBinary(1);
+        cppi_inh.OpHideBinary b = cppi_inh.OpHideBinary(2);
+        cppi_inh.OpBase s = a * b;
+        return s.value;
+    }
+}
+```
+
+The failed answer is cached (the rerun drops to 1.55 GB), so the cost is once per new question - but it is
+paid in the edit loop, not only on a fresh cache. Not measured: the LSP pool (4 backends) re-analysing such
+an edit.
+
+## 2026-11-18 - one TU for all imports: 166 MB in one Interpreter (spike, no code)
+
+test_cpp_interop.cb has 230 `import cpp` lines (2 grouped), 234 header names, 229 distinct (27 system, 202
+test headers); a cold compile creates ~216-226 groups, one per import line.
+
+Spike (clang 23.1.0, Mac, peak memory footprint): every distinct header, import order, `#include <new>` first,
+as `#include` lines of one TU (system names as `<x>`, others quoted, `-I Test -I Test/library`, -std=c++20,
+-isysroot SDK, -Wno-everything).
+
+| setup | footprint |
+|---|---|
+| one clang-repl Interpreter, 225 headers (4 clashing ones dropped) + the `s + v` probe, executed (probe=5) | 166 MB |
+| one TU, clang driver -fsyntax-only, all 229 headers | 152 MB, 13 errors |
+| one TU per header (`<new>` + header), -fsyntax-only, footprints summed | 5.1 GB (avg 22 MB) |
+| real cold compile today | ~20 GB |
+
+The header content itself is ~150 MB of AST; the 20 GB is ~216 overlapping libc++ closures plus the dependency
+prelude copies. The 166 MB is clang's share only (no harvest, wrappers, codegen).
+
+What one TU breaks - per-import isolation is documented (doc/LANGUAGE.md: "The C-header entries of a group
+share one translation unit"), and 4 headers clash when merged:
+- cpp_inline_static_b.hpp (9 redefinitions) and cpp_hdrglob_r3_b.hpp (`S`): deliberate same-name isolation
+  tests.
+- cpp_late_lookup.hpp:23 "unexpected namespace name 'q'": an earlier header's namespace changes its parse -
+  the lookup-order effect behind the pick-parity rule.
+- cpp_interop_demand_fail.h: deliberately bad bodies, an error only under eager body parsing.
+- The probe's own variable `r` collided with a test header's namespace `r` (same hazard for generated code).
+
+Open (maintainer): should one .cb file's C++ imports behave as one C++ TU (as a .cpp including them would),
+always / by default with opt-in isolation / split only on a clash? Every form changes picks vs master.
+
+## 2026-11-18 - fixed cost of one group: ~7.6 MB for an empty header
+
+Cold `-o` compiles of `extern int main() { return 0; }` with N distinct empty-header imports
+(`import cpp "inc/empty_<i>.h";`), fresh CFLAT_CACHE_DIR + `--init` per run, Mac Release, peak footprint:
+
+| N | footprint | header groups parsed |
+|---|---|---|
+| 0 | 25 MB | 0 |
+| 1 | 32 MB | 1 |
+| 50 | 403 MB | 50 |
+| 200 | 1,541 MB | 200 |
+
+Slope ~7.6 MB per group, linear, all live at once. Plain clang for comparison: an empty header TU 4 MB (the
+process floor), the `#include <new>` every group prepends +6 MB; clang-repl empty 7 MB, `<new>` + empty
+header 12 MB. So a group's fixed cost is ~1-2 MB of Interpreter / CompilerInstance plus ~6 MB for `<new>`;
+for test_cpp_interop's ~216 groups that is ~1.6 GB before any real header content. The rest of the 20 GB is
+header content (each group ~22 MB of its own libc++ closure, ~4-5 GB total) and the dependency prelude
+copies (~12-13 GB).
+
+## 2026-11-18 - grouped test_cpp_interop.cb: 11.9 GB cold
+
+After the grouping pass (95 import lines, 23 grouped runs; runs 4, 8, 14, 19 kept single, blocked by
+two grouping bugs, both fixed 2026-11-18: system-header-first groups 27a5911f1, dependency prelude 80a853e9a):
+cold `-o` compile with a fresh CFLAT_CACHE_DIR, Mac Release, rc 0, peak footprint 11.9 GB, 121 header groups
+parsed (was ~20 GB cold on the one-import-per-line layout). The remaining cost is the dependency prelude copies
+and the four single-line runs; the full grouping waited on those two fixes.
+
+Reverted 2026-11-18: the grouped layout failed the cold header-parse budget (the dependency prelude
+re-parse, since fixed). Regrouped with that fix in 80a853e9a: 85 import lines (32 grouped), cold `-o` with a fresh
+CFLAT_CACHE_DIR peaks at 9.51 GB, 88 header groups, budget cold 1 / warm 0 met.

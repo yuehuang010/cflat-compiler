@@ -805,6 +805,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                 e.ret.ConstMask = mask;
         if (r.isCxx && CxxSpellingHasVolatileTarget(r.retType))
             e.ret.IsCxxPointeeVolatile = true;
+        e.ret.RecordSpelledSinglePointerDepth();
         for (size_t i = 0; i < r.paramTypes.size(); ++i)
         {
             if (r.isCxx && r.paramTypes[i].find("::*") != std::string::npos)
@@ -1218,7 +1219,8 @@ void LLVMBackend::RememberCxxDefaultWrapper(const std::string& owner,
                      found != cxxFunctionOwnerGroup_.end())
                 primary = found->second;
             if (primary < cxxImportGroups_.size())
-                request.group = MakeCxxRequestGroup(primary, {});
+                request.group = member ? MakeCxxClassRequestGroup(primary, owner)
+                                       : MakeCxxRequestGroup(primary, {});
         }
         cxxDefaultWrapperRequests_.emplace(name, std::move(request));
 }
@@ -1500,7 +1502,7 @@ bool LLVMBackend::CxxCtorDefaultsDirect(const std::string& typeName, const CxxCl
             if (member.kind == cflat_cinterop::RawCxxMember::Constructor
                 && member.linkageName == st.linkageName)
             {
-                const CxxRequestGroup group = MakeCxxRequestGroup(primary, {});
+                const CxxRequestGroup group = MakeCxxClassRequestGroup(primary, typeName);
                 return EnsureCxxDefaultInitHelper(st.linkageName, st.defaultArgs, member.paramTypes,
                                                   /*member*/ true, owner, group);
             }
@@ -1875,6 +1877,7 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         if (r.isConst && !e.type.IsArrayView)
             e.type.ConstMask |= LLVMBackend::TypeAndValue::ConstBitAt(
                 isArray ? 0 : e.type.ValuePointerDepth());
+        e.type.RecordSpelledSinglePointerDepth();
         e.type.VariableName = r.name;
         if (auto it = cxxBindingRefusals_.find(e.name);
             it != cxxBindingRefusals_.end() && it->second.starts_with("global array '"))
@@ -2142,9 +2145,9 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                     cxxLazyAliasSpecializations_.emplace(a.name, a.cxxSpecialization);
                 if (activeCxxRequestGroup_ != nullptr)
                 {
-                    cxxTypeOwnerGroup_.emplace(a.qualifiedName, activeCxxRequestGroup_->primary);
+                    NoteCxxTypeOwner(a.qualifiedName, activeCxxRequestGroup_->primary);
                     if (a.name != a.qualifiedName)
-                        cxxTypeOwnerGroup_.emplace(a.name, activeCxxRequestGroup_->primary);
+                        NoteCxxTypeOwner(a.name, activeCxxRequestGroup_->primary);
                 }
                 RegisterTypeAliasSymbol(a.qualifiedName, a.cxxSpecialization, a.file, a.line, a.col);
                 if (a.name != a.qualifiedName)
@@ -2476,6 +2479,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.inScope = r.inScope;
             rec.isPolymorphic = r.isPolymorphic; rec.hasBases = r.hasBases;
             rec.vtableDeleteVerdict = r.vtableDeleteVerdict;
+            rec.hasClassDelete = r.hasClassDelete; rec.hasUsualClassDelete = r.hasUsualClassDelete;
             rec.hasVirtualBases = r.hasVirtualBases; rec.isAbstract = r.isAbstract;
             rec.isFinal = r.isFinal;
             rec.hasFriendOperators = r.hasFriendOperators;

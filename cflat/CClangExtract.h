@@ -116,6 +116,13 @@ namespace cflat_cinterop
 
     inline constexpr std::string_view kCxxVbaseCtorThunkPrefix = "__cflat_vctor_";
 
+    // String attribute on a companion's strong definition from a dependency-only header: at the
+    // companion merge it yields to another strong copy of the name (stripped after the link).
+    inline constexpr char kCxxDependencyDefinitionAttr[] = "cflat-dependency-definition";
+    // String attribute on a companion's __cxx_global_var_init function: the mangled name of the
+    // variable clang emitted it for (its own decl, whatever else the initializer stores).
+    inline constexpr char kCxxVariableInitializerAttr[] = "cflat-variable-initializer";
+
     // Declared after the header in every stub; it lands outside file scope iff the header
     // leaves a namespace or brace scope open.
     inline constexpr char kHeaderScopeSentinel[] = "__cflat_header_scope_sentinel";
@@ -521,6 +528,10 @@ namespace cflat_cinterop
         // with the record: the text of why it is unusable ("" = usable or no class-scope delete).
         // Read at each object demand so a warm compile needs no live group to refuse it.
         std::string vtableDeleteVerdict;
+        // Class-scope operator delete declarations (not destroying): any, and any usual one. A class
+        // with only non-usual deletes has no suitable delete (no `delete p`, no unique release).
+        bool hasClassDelete = false;
+        bool hasUsualClassDelete = false;
         bool hasBases = false;              // any base class
         bool hasVirtualBases = false;       // virtual inheritance: rejected, the VTT is not modelled
         bool isFinal = false;               // final class: a reference to it names a complete object
@@ -743,6 +754,9 @@ namespace cflat_cinterop
             materializeReachable;
         // Validate a newly demanded polymorphic record before it reaches demand CodeGen.
         std::function<std::string(const clang::CXXRecordDecl*)> resolveVTableDelete;
+        // Set by the group for its demand pass: true for a declaration from a header only a
+        // dependency include brought into this TU (its strong definition is tagged).
+        std::function<bool(const clang::Decl*)> dependencyDefinition;
 
         void Add(clang::Decl* decl)
         {
@@ -1023,7 +1037,7 @@ namespace cflat_cinterop
                                llvm::Module* module,
                                ExtractResult& out, std::string& err,
                                bool checkHeader = false,
-                               clang::TranslationUnitDecl* preludeRoot = nullptr,
+                               const std::vector<clang::TranslationUnitDecl*>* preludeRoots = nullptr,
                                const std::vector<clang::Decl*>* announcedDecls = nullptr);
 
     /*

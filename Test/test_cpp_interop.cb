@@ -227,18 +227,9 @@
 //   C++ class pointers keep pointer semantics through generic storage (3602-3605): borrowed
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
-import cpp "library/cpp_interop_basic.h";
-import cpp "library/cpp_constrec_accept.hpp";
-import cpp "library/cpp_rangeadl.hpp";
-import cpp "library/cpp_raw_string_base.hpp";
-import cpp "library/cpp_bracefold_base.hpp";
+import cpp {"library/cpp_interop_basic.h", "library/cpp_constrec_accept.hpp", "library/cpp_rangeadl.hpp", "library/cpp_raw_string_base.hpp", "library/cpp_arrbound.hpp", "library/cpp_bracefold_base.hpp"};
 import "application.cb";
-import cpp "library/cpp_defarg_trace.hpp";
-import cpp "library/cpp_cdefarg.hpp";
-import cpp "library/cpp_mixs2.hpp";
-import cpp "library/cpp_defcls.hpp";
-import cpp "library/cpp_braceprv.hpp";
-import cpp "library/cpp_interop_mixcond3.h";
+import cpp {"library/cpp_defarg_trace.hpp", "library/cpp_cdefarg.hpp", "library/cpp_mixs2.hpp", "library/cpp_defcls.hpp", "library/cpp_braceprv.hpp", "library/cpp_interop_mixcond3.h"};
 import cpp {"library/cpp_hdrglob_a.hpp", "library/cpp_hdrglob_b.hpp"};
 import cpp "library/cpp_hdrglob_r3_a.hpp";
 import cpp "library/cpp_hdrglob_r3_b.hpp";
@@ -266,41 +257,11 @@ if const (__MACOS__) {
 import cpp "library/cpp_hdrglob_r5_order_y.hpp";
 import cpp "library/cpp_hdrglob_r3_order_y.hpp";
 import cpp "library/cpp_hdrglob_r3_order_x.hpp";
-import cpp "library/cpp_t497_compound.hpp";
-import cpp "library/t414_fnmove.hpp";
-import cpp "library/cpp_t322_constretcv.hpp";
-import cpp "library/cpp_t337_constretcv_umbrella.hpp";
-import cpp "library/cpp_t217_mutable.hpp";
-import cpp "library/cpp_t450_round2.hpp";
+import cpp {"library/cpp_t497_compound.hpp", "library/t414_fnmove.hpp", "library/cpp_t322_constretcv.hpp", "library/cpp_t337_constretcv_umbrella.hpp", "library/cpp_t217_mutable.hpp", "library/cpp_t450_round2.hpp"};
 import "library/cpp_t103_nullctor_c.h";
-import cpp "library/cpp_t103_nullctor.hpp";
-import cpp "library/cpp_t110_varlink.hpp";
-import cpp "library/cpp_interop_t74.h";
-import cpp "library/cpp_dtorord.hpp";
-import cpp "library/t70_xvalue_overloads.h";
-import cpp "library/cpp_t105_conversion_operators.hpp";
-import cpp "library/cpp_ucv_user_conversions.hpp";
-import cpp "library/cpp_t97_fieldctor.h";
-import cpp "library/cpp_t68_intptr.hpp";
-import cpp "library/cpp_t62_static_auto.hpp";
-import cpp "library/cpp_t93_static_init.hpp";
-import cpp "library/cpp_t226_static_init.hpp";
-import cpp "library/cpp_u8_literal.hpp";
-import cpp "library/cpp_t43_char_types.hpp";
-import cpp "library/cpp_immovable.hpp";
-import cpp "library/cpp_t89_char_pointer.hpp";
-import cpp "library/cpp_t102_assign_routes.hpp";
-import cpp "library/cpp_t43_ref_ops.hpp";
-import cpp "library/cpp_mix15_ref_result.hpp";
-import cpp "library/cpp_t85_pointee.hpp";
-import cpp "library/cpp_t94_anon_typedef.hpp";
-import cpp "library/cpp_t95_deref.hpp";
-import cpp "library/t38_offsetof.hpp";
+import cpp {"library/cpp_t103_nullctor.hpp", "library/cpp_t110_varlink.hpp", "library/cpp_interop_t74.h", "library/cpp_dtorord.hpp", "library/t70_xvalue_overloads.h", "library/cpp_t105_conversion_operators.hpp", "library/cpp_ucv_user_conversions.hpp", "library/cpp_t97_fieldctor.h", "library/cpp_t68_intptr.hpp", "library/cpp_t62_static_auto.hpp", "library/cpp_t93_static_init.hpp", "library/cpp_t226_static_init.hpp", "library/cpp_u8_literal.hpp", "library/cpp_t43_char_types.hpp", "library/cpp_immovable.hpp", "library/cpp_t89_char_pointer.hpp", "library/cpp_t102_assign_routes.hpp", "library/cpp_t43_ref_ops.hpp", "library/cpp_mix15_ref_result.hpp", "library/cpp_t85_pointee.hpp", "library/cpp_t94_anon_typedef.hpp", "library/cpp_t95_deref.hpp", "library/t38_offsetof.hpp"};
 import cpp "library/cpp_interop_scoped_enum_collide.h";
-import cpp "library/t20_abi_records.hpp";
-import cpp "library/cpp_interop_cwrapper_macros.hpp";
-import cpp "functional";
-import cpp "compare";
+import cpp {"library/t20_abi_records.hpp", "library/cpp_interop_cwrapper_macros.hpp", "functional", "compare"};
 
 struct TSpaceshipWeakOuter
 {
@@ -317,34 +278,11 @@ int t74StaticLocalArray()
     static T74Wrap[2] values;
     return values[1].track.value * 10 + values[1].z;
 }
-import cpp "library/t25_csurface.hpp";
-import cpp "library/cpp_t14_template_functor.hpp";
-import cpp "library/cpp_t22_constrained_members.hpp";
+import cpp {"library/t25_csurface.hpp", "library/cpp_t14_template_functor.hpp", "library/cpp_t22_constrained_members.hpp"};
 import cpp "library/cpp_interop_demand_fail.h";
-import cpp "library/cpp_interop_anon.h";
-import cpp "library/cpp_interop_explicit.h";
-import cpp "library/cpp_t496_ctorf2i.hpp";
-import cpp "library/cpp_t253_brace_move.hpp";
-import cpp "library/cpp_t261_named_unwind.hpp";
-import cpp "library/cpp_t470_braceunwind.hpp";
-import cpp "library/cpp_interop_refgate.h";
+import cpp {"library/cpp_interop_anon.h", "library/cpp_interop_explicit.h", "library/cpp_t496_ctorf2i.hpp", "library/cpp_t253_brace_move.hpp", "library/cpp_t261_named_unwind.hpp", "library/cpp_t470_braceunwind.hpp", "library/cpp_interop_refgate.h"};
 import cpp "library/cpp_interop_basic.cpp";
-import cpp "library/cpp_interop_member_shadow.h";
-import cpp "library/cpp_interop_twin.h";
-import cpp "library/cpp_t24_argconv.hpp";
-import cpp "library/cpp_t35_ownerexpr.hpp";
-import cpp "library/cpp_t42_convref.hpp";
-import cpp "library/cpp_t48_nullptr.hpp";
-import cpp "library/cpp_t52_refnull.hpp";
-import cpp "library/cpp_t111_nullptr_t.hpp";
-import cpp "library/cpp_t98_macro_constant.hpp";
-import cpp "library/cpp_t98_macro_ref.hpp";
-import cpp "library/cpp_t28_fwdref.hpp";
-import cpp "library/cpp_t525_fnwrap_r3.hpp";
-import cpp "library/t84_conversion.hpp";
-import cpp "library/cpp_t27_ptrdiff.hpp";
-import cpp "library/cpp_interop_lastuse.h";
-import cpp "library/cpp_interop_refdef.hpp";
+import cpp {"library/cpp_interop_member_shadow.h", "library/cpp_interop_twin.h", "library/cpp_t24_argconv.hpp", "library/cpp_t35_ownerexpr.hpp", "library/cpp_t42_convref.hpp", "library/cpp_t48_nullptr.hpp", "library/cpp_t52_refnull.hpp", "library/cpp_t111_nullptr_t.hpp", "library/cpp_t98_macro_constant.hpp", "library/cpp_t98_macro_ref.hpp", "library/cpp_t28_fwdref.hpp", "library/cpp_t525_fnwrap_r3.hpp", "library/t84_conversion.hpp", "library/cpp_t27_ptrdiff.hpp", "library/cpp_interop_lastuse.h", "library/cpp_interop_refdef.hpp"};
 import cpp "library/cpp_interop_demand_fail.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
 // virtual function needs a real symbol and the vtable needs a key function.
@@ -357,23 +295,14 @@ import cpp "library/cpp_interop_poly.cpp";
 import cpp "library/cpp_interop_inline.h";
 import cpp "library/cpp_interop_inline_again.h";
 
-import cpp "library/cpp_interop_vdtor_unused_accept.h";
-import cpp "library/cpp_vdtor_opdelete_template.h";
+import cpp {"library/cpp_interop_vdtor_unused_accept.h", "library/cpp_vdtor_opdelete_template.h"};
 import cpp "library/cpp_inline_static_a.hpp";
 import cpp "library/cpp_inline_static_b.hpp";
-import cpp "library/cpp_derefcopy.hpp";
-import cpp "coroutine";
-import cpp "library/t7_coroutine_generator.hpp";
+import cpp {"library/cpp_derefcopy.hpp", "coroutine", "library/t7_coroutine_generator.hpp"};
 // The `T&` constructor-parameter checks lock a CFlat-owned std.mutex through std.lock_guard / std.unique_lock.
-import cpp "mutex";
-import cpp "library/cpp_interop_throw.h";
+import cpp {"mutex", "library/cpp_interop_throw.h"};
 import cpp "library/cpp_interop_scoped_enum.h";
-import cpp "library/cpp_interop_errc.h";
-import cpp "library/cpp_t49_enum_args.hpp";
-import cpp "library/cpp_ctortpl.hpp";
-import cpp "library/cpp_t86_literals.hpp";
-import cpp "library/cpp_t100_long_double.hpp";
-import cpp "library/cpp_arithld_longdouble.hpp";
+import cpp {"library/cpp_interop_errc.h", "library/cpp_t49_enum_args.hpp", "library/cpp_ctortpl.hpp", "library/cpp_t86_literals.hpp", "library/cpp_t100_long_double.hpp", "library/cpp_arithld_longdouble.hpp"};
 enum T49Own : int { T49V = 6 };
 enum T64U8 : u8 { T64U8Hi = 200 };
 enum T64U16 : u16 { T64U16Hi = 40000 };
@@ -392,18 +321,12 @@ u64 doubleFoldInteropBits(double value) { return *(u64*)&value; }
 t300.DoubleCtor t300MakeDouble(double value) { return value; }
 t300.DoubleCtor t300MakeDoubleCtor(double value) { return value; }
 extern int abs(int value);
-import cpp "future";
-import cpp "system_error";
+import cpp {"future", "system_error"};
 struct CxxDerefLocalHolder { cpp_derefcopy.Cursor16 cursor; };
 void CxxDerefParam(cpp_derefcopy.Cursor16 value, int x) { *value = x; *value = x + 1; }
 void CxxDerefPointer(cpp_derefcopy.Cursor16* value, int x) { **value = x; **value = x + 1; }
 // C++ REFERENCE data members - an alias of the referent (M97/M98), never reseatable.
-import cpp "library/cpp_interop_ref_member.h";
-import cpp "library/cpp_interop_ref_alias.h";
-import cpp "library/cpp_interop_refctx_overload.h";
-import cpp "library/cpp_interop_refres_array.hpp";
-import cpp "library/cpp_t495_amppick.hpp";
-import cpp "library/cpp_interop_field.h";
+import cpp {"library/cpp_interop_ref_member.h", "library/cpp_interop_ref_alias.h", "library/cpp_interop_refctx_overload.h", "library/cpp_interop_refres_array.hpp", "library/cpp_t495_amppick.hpp", "library/cpp_interop_field.h"};
 int RefFnCflat(int x) { return x + 3000; }
 // Array elements of a C++ class.
 import cpp "library/cpp_interop_arrayelem.h";
@@ -440,8 +363,7 @@ import cpp "library/cpp_cppfix_spec.hpp";
 import cpp "library/cpp_interop_c2_repeat.h";
 import cpp "library/cpp_interop_c2_repeat.h";
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
-import cpp "library/cpp_interop_ctorref.h";
-import cpp "library/cpp_interop_tpl.h";
+import cpp {"library/cpp_interop_ctorref.h", "library/cpp_interop_tpl.h"};
 using T469Gate = cppt.dflt.Gate;
 using T469GateExplicit = cppt.dflt.Gate<cppt.dflt.CountDone>;
 using T469GA = cppt.dflt.GA;
@@ -508,53 +430,24 @@ namespace T469AliasShadowNS
     using T469Gate = cppt.dflt.Plain;
     int size() { return (int)sizeof(T469Gate); }
 }
-import cpp "library/cpp_interop_varctor.h";
-import cpp "library/cpp_interop_freeoptpl.h";
-import cpp "library/cpp_interop_deleted.h";
-import cpp "library/cpp_t460_operator_lookup.hpp";
-import cpp "library/cpp_mix7_operator_rank.hpp";
-import cpp "library/cpp_mix7_fnptr_bool.hpp";
-import cpp "library/cpp_mix14_scalar_ctor.hpp";
-import cpp "library/cpp_mix18_overloads.hpp";
-import cpp "library/cpp_mix11_ctor.hpp";
-import cpp "library/cpp_cvamb_conv.hpp";
-import cpp "library/cpp_cvamb_brace.hpp";
-import cpp "library/cpp_cvtie.hpp";
+import cpp {"library/cpp_interop_varctor.h", "library/cpp_interop_freeoptpl.h", "library/cpp_interop_deleted.h", "library/cpp_t460_operator_lookup.hpp", "library/cpp_mix7_operator_rank.hpp", "library/cpp_mix7_fnptr_bool.hpp", "library/cpp_mix14_scalar_ctor.hpp", "library/cpp_mix18_overloads.hpp", "library/cpp_mix11_ctor.hpp", "library/cpp_cvamb_conv.hpp", "library/cpp_cvamb_brace.hpp", "library/cpp_cvtie.hpp"};
 
 int mix7FnTwice(int x) { return x * 2; }
 int mix14Twice(int x) { return x * 2; }
 int ctorConvIndexCalls = 0;
 int CtorConvNextIndex() { ctorConvIndexCalls++; return ctorConvIndexCalls; }
-import cpp "library/cpp_mix4_conv_builtin.hpp";
-import cpp "library/cpp_interop_fixedarray.hpp";
-import cpp "library/cpp_interop_arraybool.hpp";
+import cpp {"library/cpp_mix4_conv_builtin.hpp", "library/cpp_interop_fixedarray.hpp", "library/cpp_interop_arraybool.hpp"};
 // `explicit` constructors are not implicit conversions at a call argument; the non-explicit
 // converting constructor in the same header is the accept set. Rejections: err_cpp_explicit_ctor.cb.
-import cpp "library/cpp_interop_explicit.h";
-import cpp "string";
-import cpp "optional";
-import cpp "numbers";
-import cpp "utility";
-import cpp "library/cpp_rvref_return.hpp";
-import cpp "library/cpp_t45_global_xvalue.hpp";
-import cpp "array";
-import cpp "deque";
-import cpp "iterator";
-import cpp "valarray";
-import cpp "complex";
-import cpp "library/cpp_t10_refexpr.hpp";
-import cpp "vector";
-import cpp "library/cpp_t67_postinc.hpp";
-import cpp "library/cpp_charptrref.hpp";
-import cpp "library/cpp_interop_iterdiff.hpp";
-import cpp "functional";
-import cpp "unordered_map";
-import cpp "set";
+import cpp {"library/cpp_interop_explicit.h", "string", "optional", "numbers", "utility", "library/cpp_rvref_return.hpp", "library/cpp_t45_global_xvalue.hpp", "array", "deque", "iterator", "valarray", "complex", "library/cpp_t10_refexpr.hpp", "vector", "library/cpp_t67_postinc.hpp", "library/cpp_charptrref.hpp", "library/cpp_interop_iterdiff.hpp", "functional", "unordered_map", "set"};
 import cpp "library/cpp_late_lookup.hpp";
 import cpp "cwchar";
 // std.format bodies reach libc++ inline variables and ctor-initializer callees (legs 7400-7403).
-import cpp "format";
-import cpp "library/cpp_interop_strop.h";
+import cpp {"format", "library/cpp_interop_strop.h"};
+// A group listing standard-library headers BEFORE a user header still binds the user header's
+// free operators, globals and the rest (grpsys legs 45620-45636); the second one is not in Test/library.
+import cpp {"cstddef", "climits", "library/cpp_grpsys.hpp"};
+import cpp {"cstddef", "library/grpsys/cpp_grpsys_sub.hpp"};
 import "list.cb";
 import "dictionary.cb";
 import "thread.cb";
@@ -565,28 +458,15 @@ import "unique.cb";
 import cpp "library/cpp_interop_unwind.h";
 import cpp "library/cpp_interop_unwind.cpp";
 // Class-scope operator new / delete / new[] / delete[] (legs 3350-3368).
-import cpp "library/cpp_interop_opnew.h";
-import cpp "library/cpp_t242_join.h";
+import cpp {"library/cpp_interop_opnew.h", "library/cpp_t242_join.h"};
+// UNWDEL r2b: destroying delete (std::destroying_delete_t) over a sized (void*, long long) delete.
+import cpp "library/cpp_unwdel_destroy.hpp";
 import "diagnostic/heap_audit.cb";
 // Standard streams: one grouped std import (stringstream is not visible through a user header alone).
 import cpp {"sstream", "fstream", "iostream", "iomanip"};
-import cpp "library/cpp_interop_stream.h";
-import cpp "library/cpp_interop_list.h";
+import cpp {"library/cpp_interop_stream.h", "library/cpp_interop_list.h"};
 // Assignment into a live object from a temporary: instrumented, header-only.
-import cpp "library/cpp_interop_assign.h";
-import cpp "library/cpp_t231_byvalue.hpp";
-import cpp "library/cpp_t239_ternary_byvalue.hpp";
-import cpp "library/cpp_t331_override.hpp";
-import cpp "library/cpp_interop_proxy_assign.h";
-import cpp "library/t29_valarray_subscript.hpp";
-import cpp "library/cpp_interop_refbinding.h";
-import cpp "library/cpp_interop_opaque_return.hpp";
-import cpp "library/cpp_t34_traits_static.hpp";
-import cpp "library/t17_empty_return.hpp";
-import cpp "memory";
-import cpp "library/cpp_t46_smartdot.hpp";
-import cpp "library/cpp_interop_uniqueptr.h";
-import cpp "library/cpp_t492_fieldmove.hpp";
+import cpp {"library/cpp_interop_assign.h", "library/cpp_t231_byvalue.hpp", "library/cpp_t239_ternary_byvalue.hpp", "library/cpp_t331_override.hpp", "library/cpp_interop_proxy_assign.h", "library/t29_valarray_subscript.hpp", "library/cpp_interop_refbinding.h", "library/cpp_interop_opaque_return.hpp", "library/cpp_t34_traits_static.hpp", "library/t17_empty_return.hpp", "memory", "library/cpp_t46_smartdot.hpp", "library/cpp_interop_uniqueptr.h", "library/cpp_t492_fieldmove.hpp"};
 
 using NestCastSxAlias = cppne.Sx;
 namespace NestCastAliasNs { using SA = cppne.Sx; }
@@ -657,26 +537,9 @@ cppas.AssignRouteRegister cppAssignRegisterReturn()
 {
     return (cppAssignRegisterGlobal = 7);
 }
-import cpp "library/cpp_interop_fnptr.h";
-import cpp "library/cpp_interop_cglobals.h";
-import cpp "library/c_macro_helpers.h";
-import cpp "cstdint";
-import cpp "library/t8_declorder.hpp";
-import cpp "library/t12_msvc_shapes.hpp";
-import cpp "library/cpp_interop_nested_free.hpp";
-import cpp "library/cpp_interop_outline_proxy.hpp";
-import cpp "library/t15_friendptr.hpp";
-import cpp "library/cpp_interop_deepptr.hpp";
-import cpp "library/cpp_ptrref.hpp";
-import cpp "library/cpp_namespace_class_constants.hpp";
-import cpp "library/cpp_var_template_views.hpp";
-import cpp "library/cpp_t61_var_template_cpo.hpp";
-import cpp "library/t32_msvc_std_shapes.hpp";
-import cpp "library/cpp_t26_ios_shapes.hpp";
+import cpp {"library/cpp_interop_fnptr.h", "library/cpp_interop_cglobals.h", "library/c_macro_helpers.h", "cstdint", "library/t8_declorder.hpp", "library/t12_msvc_shapes.hpp", "library/cpp_interop_nested_free.hpp", "library/cpp_interop_outline_proxy.hpp", "library/t15_friendptr.hpp", "library/cpp_interop_deepptr.hpp", "library/cpp_ptrref.hpp", "library/cpp_namespace_class_constants.hpp", "library/cpp_var_template_views.hpp", "library/cpp_t61_var_template_cpo.hpp", "library/t32_msvc_std_shapes.hpp", "library/cpp_t26_ios_shapes.hpp"};
 import cpp "library/cpp_t26_ios_shapes.cpp";
-import cpp "library/cpp_t138_tplglobal.hpp";
-import cpp "library/cpp_t138_tplglobal_r2.hpp";
-import cpp "library/cpp_unbdef_r4.hpp";
+import cpp {"library/cpp_t138_tplglobal.hpp", "library/cpp_t138_tplglobal_r2.hpp", "library/cpp_unbdef_r4.hpp"};
 
 int[3] arrcv2Global = {7, 8, 9};
 int arrcv2Drops = 0;
@@ -707,26 +570,35 @@ int t26AliasHeldRead(alias t26v.left left)
     t26v.sink sink = default;
     return sink.read(left);
 }
-import cpp "library/cpp_t50_vbase.hpp";
-import cpp "library/cpp_t50_vbase_sys.hpp";
+import cpp {"library/cpp_t50_vbase.hpp", "library/cpp_t50_vbase_sys.hpp"};
 // T50: a derived-to-virtual-base pointer converts at a return and at a CFlat parameter too.
 t50v.V* t50Up(t50v.L* p) { return p; }
 int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
-import cpp "library/t31_minmax_brace.hpp";
-import cpp "library/cpp_t63_brace_decl.hpp";
+import cpp {"library/t31_minmax_brace.hpp", "library/cpp_t63_brace_decl.hpp"};
 enum T276Cf : u8 { T276C0, T276C1 };
-import cpp "library/cpp_t135_field_brace.hpp";
-import cpp "library/cpp_t78_scalar_table.h";
-import cpp "library/cpp_interop_t104_refparam.hpp";
-import cpp "library/cpp_t87_null_zero.h";
-import cpp "library/cpp_t132_s7_byval.hpp";
-import cpp "library/cpp_t310_fldinit.hpp";
-import cpp "library/cpp_private_base_shadow.h";
-import cpp "library/cpp_mixed_access.hpp";
-import cpp "library/cpp_private_overloads.hpp";
-import cpp "library/cpp_move_operand_ops.hpp";
-import cpp "library/cpp_copy_parity.hpp";
-import cpp "library/cpp_copy_ctor_pick.hpp";
+import cpp {"library/cpp_t135_field_brace.hpp", "library/cpp_t78_scalar_table.h", "library/cpp_interop_t104_refparam.hpp", "library/cpp_t87_null_zero.h", "library/cpp_t132_s7_byval.hpp", "library/cpp_t310_fldinit.hpp", "library/cpp_private_base_shadow.h", "library/cpp_mixed_access.hpp", "library/cpp_private_overloads.hpp", "library/cpp_move_operand_ops.hpp", "library/cpp_copy_parity.hpp", "library/cpp_copy_ctor_pick.hpp"};
+// GRPLEAK: three separate lines on purpose - a request on the host line includes the other two.
+import cpp "library/cpp_grpleak_dep.hpp";
+// (a separate line: its header must not see the line above's macros)
+import cpp "library/cpp_grpleak_dep2.hpp";
+// (separate lines: one host request includes pa and pb into the host's TU together)
+import cpp "library/cpp_grpleak_pa.hpp";
+// (a separate line)
+import cpp "library/cpp_grpleak_pb.hpp";
+// (c1 and c2 share cpp_grpleak_cfg.hpp; c1 redefines its macro)
+import cpp "library/cpp_grpleak_c1.hpp";
+// (a separate line)
+import cpp "library/cpp_grpleak_c2.hpp";
+// (a dynamically initialized global the host also reaches)
+import cpp "library/cpp_grpleak_dyn.hpp";
+// (a reference-extended temporary beside the global's initializer)
+import cpp "library/cpp_grpleak_ref.hpp";
+// (an initializer that also stores another global)
+import cpp "library/cpp_grpleak_side.hpp";
+// (a separate line: the host's own text must not see the dependency lines' macros)
+import cpp "library/cpp_grpleak_host.hpp";
+import cpp {"library/cpp_grpleak_brace_ref.hpp", "library/cpp_grpleak_brace_overload.hpp"};
+grpleak_bra.In GrpleakMakeIn(int a, alias int p) { return { r = p, v = a }; }
 // Return of a parameter and a move fallback: clang's implicit move picks the const copy constructor.
 cpcpick.CV ctorPickReturnParam(cpcpick.CV x) { return x; }
 cpcpick.CV ctorPickMoveParam(cpcpick.CV a) { return move a; }
@@ -1487,6 +1359,8 @@ struct MviCflatHolder { cppi.Tracked item = cppi.Tracked(17); };
 // A C++ class with VIRTUAL BASES held as a CFlat struct FIELD. Pre-fix this
 // compiled and crashed on the first member call; the field was never constructed.
 struct ThunkHolder { cpppoly.VBaseArgs<int> a = default; };
+int d2bTriple(int*** p) { return ***p * 2; }
+int d2bQuad(int**** p) { return ****p + 1; }
 int cpp_throw_deep2(int value)
 {
     return cppthrow.throw_if(value);
@@ -1662,7 +1536,7 @@ int T320EThrow(int x) { T320E* p = new T320E(x); delete p; return 0; }
 int t320uNew = 0;
 int t320uDel = 0;
 int t320uNNew = 0;
-int t320uSDel = 0;
+int t320uULDel = 0;
 [cpp] struct T320UD : cppon.Cls { int z = 0;
     static void* operator new(i64 n) { t320uNew = t320uNew + 1; return malloc(n); }
     static void operator delete(void* p) { t320uDel = t320uDel + 1; free(p); }
@@ -1672,13 +1546,13 @@ int t320uSDel = 0;
     static void* operator new(i64 n) { t320uNNew = t320uNNew + 1; return malloc(n); }
     T320UN(int x) { z = x; }
 };
-[cpp] struct T320US : cppon.Cls { int z = 0;
-    void operator delete(void* p, i64 n) { t320uSDel = t320uSDel + 1; free(p); }   // implicitly static
-    T320US(int x) { z = x; }
+[cpp] struct T320UL : cppon.Cls { int z = 0;
+    void operator delete(void* p, ulong n) { t320uULDel = t320uULDel + 1; free(p); }   // implicitly static
+    T320UL(int x) { z = x; }
 };
 int T320UniqD(int x) { unique<T320UD> p = new T320UD(x); return p->z; }
 int T320UniqN(int x) { unique<T320UN> p = new T320UN(x); return p->z; }
-int T320UniqS(int x) { unique<T320US> p = new T320US(x); return p->z; }
+int T320UniqUL(int x) { unique<T320UL> p = new T320UL(x); return p->z; }
 // list<T*>.add invoke regressions (legs 3600-3601).
 int tempListBdtors = 0;
 struct TempListB
@@ -3310,7 +3184,7 @@ struct T313UC { t261.Counted a; int z = 0;
     T313UC(int x) { z = t261.bval(x); }
 };
 int t313CtorThrow(int x) { T313UC* p = new T313UC(x); int z = p->z; delete p; return z; }
-// T313 r2: a class whose only operator delete is sized (void*, i64) frees the block through it on unwind.
+// T313 r2: a class whose only operator delete is sized (void*, i64) is not usual: the unwind frees nothing.
 int t313SdNew = 0;
 int t313SdDel = 0;
 struct T313SD { t261.Counted a; int z = 0;
@@ -3322,6 +3196,8 @@ int t313SdTag(int x) { t261.Counted h0 = default; T313SD* p = <T313SD a={h0} z={
 int t313SdBrace(int x) { t261.Counted h0 = default; T313SD* p = new T313SD{ a = h0, z = t261.bval(x) }; int z = p->z; return z; }
 // T313 r2: `new T[3]` with a user operator new: a throwing element frees the block through the user delete.
 int t313ArN = 0;
+// UNWDEL r2b: CFlat new/delete of a C++ class with a destroying delete (leg 25348).
+int UnwdelDdUse(int x) { UnwdelDestroy* p = new UnwdelDestroy(x); int z = p->z; delete p; return z; }
 int t313ArD = 0;
 int t313ArX = 0;
 struct T313AR { t261.Counted a; int z = 0;
@@ -5586,8 +5462,145 @@ int TernSinkAssignTCheck(int k)
     return 0;
 }
 
+// CPPMOVE (RULED 2026-11-18): moving a [cpp] struct is clang's implicit move of the WHOLE record.
+// e6mv.Tc is trivially copyable but its move picks the constructor template (+100, ++moves); clang
+// merges a run of two or more such fields into one memcpy. A plain struct keeps its byte copy.
+[cpp] struct CmLone { e6mv.Tc item; };
+[cpp] struct CmIntTc { int tag = 5; e6mv.Tc item; };
+[cpp] struct CmTcInt { e6mv.Tc item; int tag = 5; };
+[cpp] struct CmTwo { e6mv.Tc a; e6mv.Tc b; };
+[cpp] struct CmArr { e6mv.Tc[2] items; };
+[cpp] struct CmNest { CmLone inner; };
+[cpp] struct CmBase : e6mv.Tc { };
+[cpp] struct CmUser { e6mv.UserMove item; };
+[cpp] struct CmGen<T> { T item; };
+int cm_dtors = 0;
+[cpp] struct CmDtor { int x = 0; e6mv.Tc item; ~CmDtor() { cm_dtors++; } };
+struct CmPlain { e6mv.Tc item; };
+CmLone CmLoneReturnMove() { CmLone l; l.item.v = 7; e6mv.reset(); return move l; }
+CmLone CmLoneReturnNamed() { CmLone l; l.item.v = 7; e6mv.reset(); return l; }
+CmLone CmLoneReturnTernary(int k)
+{
+    CmLone a; a.item.v = 7; CmLone b; b.item.v = 8; e6mv.reset();
+    return k ? move a : move b;
+}
+CmPlain CmPlainReturnNamed() { CmPlain l; l.item.v = 7; e6mv.reset(); return l; }
+CmDtor CmDtorReturnMove() { CmDtor a; a.x = 7; return move a; }
+int CmLoneTake(CmLone p) { return p.item.v; }
+T CmGenericPass<T>(T x) { T y = move x; return y; }
+struct CmLoneHolder { CmLone b; };
+struct CmUserHolder { CmUser b; };
+// Non-C++ fields beside UserMove + Tc: the UserMove field ends the memcpy run, so Tc stays lone.
+enum CmEnum : int { CmEnumA, CmEnumB = 3 };
+struct CmPod { int q; CmEnum e; };
+int cm_live = 0;
+[cpp] struct CmPtrUT { int* p = nullptr; e6mv.UserMove u; e6mv.Tc item; };
+[cpp] struct CmEnUT { CmEnum e = CmEnum.CmEnumB; e6mv.UserMove u; e6mv.Tc item; };
+[cpp] struct CmPodUT { CmPod s; e6mv.UserMove u; e6mv.Tc item; };
+[cpp] struct CmBfUT { int k : 3; e6mv.UserMove u; e6mv.Tc item; };
+[cpp] struct CmPtrDtor { int* p = nullptr; e6mv.UserMove u; e6mv.Tc item; ~CmPtrDtor() { if (p != nullptr) cm_live++; } };
+// An owner (unique) moves like std::unique_ptr: never part of a memcpy run.
+[cpp] struct CmUqT { unique int* p = nullptr; e6mv.Tc item; };
+[cpp] struct CmPtrT { int* p = nullptr; e6mv.Tc item; };
+// The moved-from source's non-C++ fields are zero-filled (ruling 2026-10-31): one close per handle.
+int cm_closes = 0;
+int cm_zero = 0;
+int cm_full = 0;
+[cpp] struct CmFh { int fd = 0; e6mv.UserMove u; e6mv.Tc item; ~CmFh() { if (fd != 0) cm_closes++; } };
+[cpp] struct CmFh2 { int fd = 0; e6mv.Tc item; ~CmFh2() { if (fd != 0) cm_closes++; } };
+[cpp] struct CmSrc
+{
+    int k = 0; CmEnum e = CmEnum.CmEnumB; CmPod s; int* p = nullptr; e6mv.UserMove u; e6mv.Tc item;
+    ~CmSrc()
+    {
+        if (k == 0 && (int)e == 0 && s.q == 0 && p == nullptr) cm_zero++;
+        else if (k == 4 && (int)e == 3 && s.q == 9 && p != nullptr) cm_full++;
+    }
+};
+CmSrc CmSrcReturnMove(int* p) { CmSrc l; l.k = 4; l.s.q = 9; l.p = p; return move l; }
+int CmSrcTake(CmSrc x) { return x.k; }
+
+int CppMoveRecordCheck()
+{
+    { CmLone a; a.item.v = 7; e6mv.reset(); CmLone b = move a; if (b.item.v * 10 + e6mv.moves != 1071) return 8201; }
+    { CmLone a; a.item.v = 7; e6mv.reset(); auto b = move a; if (b.item.v * 10 + e6mv.moves != 1071) return 8202; }
+    { CmLone b = CmLoneReturnMove(); if (b.item.v * 10 + e6mv.moves != 1071) return 8203; }
+    { CmLone b = CmLoneReturnNamed(); if (b.item.v * 10 + e6mv.moves != 70) return 8204; }
+    { CmLone a; a.item.v = 7; e6mv.reset(); int v = CmLoneTake(move a); if (v * 10 + e6mv.moves != 1071) return 8205; }
+    { CmLone a; a.item.v = 7; e6mv.reset(); CmLoneHolder h = { b = move a }; if (h.b.item.v * 10 + e6mv.moves != 1071) return 8206; }
+    { CmLone a; a.item.v = 7; e6mv.reset(); CmLone b = CmGenericPass(move a); if (b.item.v * 10 + e6mv.moves != 2072) return 8207; }
+    { CmLone b = CmLoneReturnTernary(1); if (b.item.v * 10 + e6mv.moves != 1071) return 8208; }
+    { CmLone a; a.item.v = 7; CmLone c; c.item.v = 8; e6mv.reset(); int k = 0; CmLone b = k ? move a : move c; if (b.item.v * 10 + e6mv.moves != 1081) return 8209; }
+    // Runs of two or more trivially copyable fields: clang's memcpy, no constructor template.
+    { CmIntTc a; a.item.v = 7; e6mv.reset(); CmIntTc b = move a; if (b.tag * 1000 + b.item.v + e6mv.moves * 100000 != 5007) return 8210; }
+    { CmIntTc a; a.item.v = 7; e6mv.reset(); auto b = move a; if (b.tag * 1000 + b.item.v + e6mv.moves * 100000 != 5007) return 8211; }
+    { CmTcInt a; a.item.v = 7; e6mv.reset(); CmTcInt b = move a; if (b.tag * 1000 + b.item.v + e6mv.moves * 100000 != 5007) return 8212; }
+    { CmTwo a; a.a.v = 7; a.b.v = 1; e6mv.reset(); CmTwo b = move a; if (b.a.v + b.b.v * 1000 + e6mv.moves * 1000000 != 1007) return 8213; }
+    // A fixed array is moved element-wise, a nested [cpp] struct and a C++ base by their own pick.
+    { CmArr a; a.items[0].v = 7; a.items[1].v = 1; e6mv.reset(); CmArr b = move a; if (b.items[0].v + b.items[1].v * 1000 + e6mv.moves * 1000000 != 2101107) return 8214; }
+    { CmNest a; a.inner.item.v = 7; e6mv.reset(); auto b = move a; if (b.inner.item.v * 10 + e6mv.moves != 1071) return 8215; }
+    { CmBase a; a.v = 7; e6mv.reset(); auto b = move a; if (b.v * 10 + e6mv.moves != 1071) return 8216; }
+    { CmGen<e6mv.Tc> a; a.item.v = 7; e6mv.reset(); auto b = move a; if (b.item.v * 10 + e6mv.moves != 1071) return 8217; }
+    { CmUser a; a.item.v = 7; e6mv.reset(); auto b = move a; if (b.item.v * 10 + e6mv.moves != 1071) return 8218; }
+    { CmUser a; a.item.v = 7; e6mv.reset(); CmUserHolder h = { b = move a }; if (h.b.item.v * 10 + e6mv.moves != 1071) return 8219; }
+    // The moved-from source is still destroyed, as in C++.
+    cm_dtors = 0;
+    { CmDtor a; a.x = 7; auto b = move a; if (b.x != 7) return 8220; }
+    if (cm_dtors != 2) return 8221;
+    cm_dtors = 0;
+    { CmDtor b = CmDtorReturnMove(); if (b.x != 7) return 8222; }
+    if (cm_dtors != 2) return 8223;
+    // Plain struct: byte copy and NRVO, unchanged.
+    { CmPlain b = CmPlainReturnNamed(); if (b.item.v * 10 + e6mv.moves != 70) return 8224; }
+    { CmPlain a; a.item.v = 7; e6mv.reset(); CmPlain b = move a; if (b.item.v * 10 + e6mv.moves != 70) return 8225; }
+    int cmZ = 5;
+    { CmPtrUT a; a.p = &cmZ; a.item.v = 7; e6mv.reset(); CmPtrUT b = move a; if (b.item.v * 10 + e6mv.moves != 1072 || *b.p != 5) return 8226; }
+    { CmEnUT a; a.item.v = 7; e6mv.reset(); auto b = move a; if (b.item.v * 10 + e6mv.moves != 1072 || (int)b.e != 3) return 8227; }
+    { CmPodUT a; a.s.q = 9; a.item.v = 7; e6mv.reset(); CmPodUT b = move a; if (b.item.v * 10 + e6mv.moves != 1072 || b.s.q != 9) return 8228; }
+    { CmBfUT a; a.u.v = 3; a.item.v = 7; e6mv.reset(); CmBfUT b = move a; if (b.u.v * 10000 + b.item.v * 10 + e6mv.moves != 1031072) return 8229; }
+    // The raw pointer is still nulled in the source (CFlat move), so only one dtor sees it.
+    cm_live = 0;
+    { CmPtrDtor a; a.p = &cmZ; a.item.v = 7; e6mv.reset(); { CmPtrDtor b = move a; if (b.item.v * 10 + e6mv.moves != 1072) return 8230; } }
+    if (cm_live != 1) return 8231;
+    { CmUqT a; a.p = new int(4); a.item.v = 7; e6mv.reset(); CmUqT b = move a; if (b.item.v * 10 + e6mv.moves != 1071 || *b.p != 4) return 8232; }
+    { CmPtrT a; a.p = &cmZ; a.item.v = 7; e6mv.reset(); CmPtrT b = move a; if (b.item.v * 10 + e6mv.moves != 70) return 8233; }
+    cm_closes = 0;
+    { CmFh a; a.fd = 3; CmFh b = move a; if (b.fd != 3) return 8234; }
+    if (cm_closes != 1) return 8235;
+    cm_closes = 0;
+    { CmFh2 a; a.fd = 3; CmFh2 b = move a; if (b.fd != 3) return 8236; }
+    if (cm_closes != 1) return 8237;
+    // Source state, field by field, seen by its destructor: init, `return move l`, by-value arg.
+    cm_zero = 0; cm_full = 0;
+    { CmSrc a; a.k = 4; a.s.q = 9; a.p = &cmZ; CmSrc b = move a; }
+    if (cm_zero * 10 + cm_full != 11) return 8238;
+    cm_zero = 0; cm_full = 0;
+    { CmSrc b = CmSrcReturnMove(&cmZ); }
+    if (cm_zero * 10 + cm_full != 11) return 8239;
+    cm_zero = 0; cm_full = 0;
+    { CmSrc a; a.k = 4; a.s.q = 9; a.p = &cmZ; if (CmSrcTake(move a) != 4) return 8240; }
+    if (cm_zero * 10 + cm_full != 11) return 8241;
+    return 0;
+}
+
+// ARRBOUND accept-set: C++ constant statics and enumerators still fold as fixed-array bounds.
+int arrBoundCppAccept()
+{
+    int[arrb.K.n] a = default; a[2] = 7;
+    if ((int)sizeof(a) * 10 + a[2] != 127) return 86901;
+    int[arrb.K.m] b = default; b[3] = 7;
+    if ((int)sizeof(b) * 10 + b[3] != 167) return 86902;
+    int[arrb.gk] c = default; c[4] = 7;
+    if ((int)sizeof(c) * 10 + c[4] != 207) return 86903;
+    int[(int)arrb.Col.R] d = default; d[1] = 7;
+    if ((int)sizeof(d) * 10 + d[1] != 87) return 86904;
+    return 0;
+}
+
 extern int main()
 {
+    int arrBoundCppRc = arrBoundCppAccept();
+    if (arrBoundCppRc != 0) return arrBoundCppRc;
     int nullmacfnValue = 7;
     int* nullmacfnPointer = &nullmacfnValue;
     if (cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(0)) != 5) return 86201;
@@ -13754,6 +13767,83 @@ extern int main()
     if (!(opgridRewrittenViableTemplate < 1)
         || mix7op.rewrittenViableTemplateChoice != 1) return 9465;
 
+    // OPRANK accept-set (clang++ -std=c++20 values): a member operator template beside a free
+    // candidate keeps clang's pick. 11 = member template, 22 = free, 33 = free template, 44 = member.
+    oprank.BinExact oprBinExact = default;
+    if (oprBinExact + 2 != 22)                                    return 94701;
+    oprank.BinSfinae oprBinSfinae = default;
+    if (oprBinSfinae + 2 != 22)                                   return 94702;
+    oprank.BinBody oprBinBody = default;
+    if (oprBinBody + 2 != 22)                                     return 94703;
+    oprank.BinReversed oprBinReversed = default;
+    if (2 + oprBinReversed != 22)                                 return 94704;
+    oprank.BinLong oprBinLong = default;
+    if (oprBinLong + 2 != 11)                                     return 94705;
+    oprank.BinClassTemplateInt oprBinClassTemplate = default;
+    if (oprBinClassTemplate + 2 != 11)                            return 94706;
+    oprank.UnaryTemplate oprUnaryTemplate = default;
+    if (-oprUnaryTemplate != 22)                                  return 94707;
+    oprank.CompoundExact oprCompoundExact = default;
+    oprCompoundExact += 2;
+    if (oprCompoundExact.v != 22)                                 return 94708;
+    oprank.CompoundAlone oprCompoundAlone = default;
+    oprCompoundAlone += 2;
+    if (oprCompoundAlone.v != 11)                                 return 94709;
+    oprank.CompoundFreeTemplate oprCompoundFreeTemplate = default;
+    oprCompoundFreeTemplate += 2;
+    if (oprCompoundFreeTemplate.v != 33)                          return 94710;
+    oprank.CompoundMinus oprCompoundMinus = default;
+    oprCompoundMinus -= 2;
+    if (oprCompoundMinus.v != 11)                                 return 94711;
+    oprank.LessExact oprLessExact = default;
+    if (!(oprLessExact < 1) || oprank.who != 22)                  return 94712;
+    oprank.LessSfinae oprLessSfinae = default;
+    if (!(oprLessSfinae < 1) || oprank.who != 22)                 return 94713;
+    oprank.LessBody oprLessBody = default;
+    if (!(oprLessBody < 1) || oprank.who != 22)                   return 94714;
+    oprank.EqExact oprEqExact = default;
+    if (!(oprEqExact == 1) || oprank.who != 22)                   return 94715;
+    oprank.EqReversed oprEqReversed = default;
+    if (!(1 == oprEqReversed) || oprank.who != 22)                return 94716;
+    oprank.who = 0;
+    if (oprEqExact != 1 || oprank.who != 22)                      return 94717;
+    // OPRANK fixed cells: compound and rewritten sets now rank the member template with the free
+    // candidates (master: 22, refused, refused, refused, 22, 11, 11, 22 respectively).
+    oprank.CompoundViable oprCompoundViable = default;
+    oprCompoundViable += 2;
+    if (oprCompoundViable.v != 11)                                return 94720;
+    oprank.CompoundSfinae oprCompoundSfinae = default;
+    oprCompoundSfinae += 2;
+    if (oprCompoundSfinae.v != 22)                                return 94721;
+    oprank.CompoundRequires oprCompoundRequires = default;
+    oprCompoundRequires += 2;
+    if (oprCompoundRequires.v != 22)                              return 94722;
+    oprank.CompoundUnselectedBody oprCompoundUnselectedBody = default;
+    oprCompoundUnselectedBody += 2;
+    if (oprCompoundUnselectedBody.v != 22)                        return 94723;
+    oprank.LessViable oprLessViable = default;
+    bool oprLessViableResult = oprLessViable < 1;
+    if (!oprLessViableResult || oprank.who != 11)                 return 94724;
+    oprank.SpaceshipFree oprSpaceshipFree = default;
+    bool oprSpaceshipFreeResult = oprSpaceshipFree < 1;
+    if (!oprSpaceshipFreeResult || oprank.who != 22)              return 94725;
+    oprank.who = 0;
+    bool oprSpaceshipReversed = 1 < oprSpaceshipFree;
+    if (oprSpaceshipReversed || oprank.who != 22)                 return 94726;
+    oprank.GreaterEqualViable oprGreaterEqualViable = default;
+    bool oprGreaterEqualResult = oprGreaterEqualViable >= 1;
+    if (oprGreaterEqualResult || oprank.who != 11)                return 94727;
+    // Inherited member templates beside free operators taking the base (master 22, 22, 11).
+    oprank.TemplateDerived oprTemplateDerived = default;
+    if (oprTemplateDerived + 2 != 11)                             return 94728;
+    oprTemplateDerived += 2;
+    if (oprTemplateDerived.v != 11)                               return 94729;
+    bool oprTemplateDerivedLess = oprTemplateDerived < 1;
+    if (!oprTemplateDerivedLess || oprank.who != 22)              return 94730;
+    // A unary member template beats the free operator taking the base (clang 11, master 22).
+    oprank.UnaryDerivedTemplate oprUnaryDerivedTemplate = default;
+    if (-oprUnaryDerivedTemplate != 11)                           return 94731;
+
     // Reversed MEMBER ==: only cppi.Rev declares one, against cppi.RevOther.
     cppi.Rev opgridRev = default;
     cppi.RevOther opgridOther = default;
@@ -18265,6 +18355,48 @@ extern int main()
     // clang++ -std=c++20 selects the int member template over the double free overload (72); no lifetime hooks run.
     cppsopd.T456PublicTemplateFree t456TemplateFree = default;
     if (t456TemplateFree + 2 != 72 || t456TemplateFree.useSelf() != 72) return 45612;
+    // OPRANK, grouped import: the member template ranks with the free set (master 61 and 71).
+    cppsopd.T456CompoundTemplateFree t456CompoundTemplateFree = default;
+    t456CompoundTemplateFree += 2;
+    if (t456CompoundTemplateFree.value != 71)                                return 45613;
+    cppsopd.T456SpaceshipTemplateFree t456SpaceshipTemplateFree = default;
+    bool t456SpaceshipLess = t456SpaceshipTemplateFree < 1;
+    if (!t456SpaceshipLess || cppsopd.t456SpaceshipChoice != 61)            return 45614;
+    // System-header-first groups (clang++ -std=c++20 oracle values): free operators beat the members.
+    grpsys.Bin grpsysBin = default;
+    grpsysBin.v = 5;
+    if (grpsysBin + 2 != 107)                                                 return 45620;
+    if (-grpsysBin != -1005)                                                  return 45621;
+    grpsysBin += 3;
+    if (grpsysBin.v != 11)                                                    return 45622;
+    grpsys.Bin grpsysBinEq = default;
+    grpsysBinEq.v = 12;
+    if (!(grpsysBinEq == grpsysBin))                                          return 45623;
+    // The free <=> is reversed, so `5 < 3` holds only through the rewritten candidate.
+    grpsys.Cmp grpsysCmpA = default;
+    grpsysCmpA.v = 5;
+    grpsys.Cmp grpsysCmpB = default;
+    grpsysCmpB.v = 3;
+    if (!(grpsysCmpA < grpsysCmpB) || grpsysCmpB < grpsysCmpA)                return 45624;
+    grpsys.Prot grpsysProt = default;
+    if (grpsysProt + 2.5 != 61)                                               return 45625;
+    grpsys.Mem grpsysMem = default;
+    grpsysMem.v = 4;
+    if (grpsysMem * 3 != 19)                                                  return 45626;
+    if (grpsys.grpsysFree(4) != 12)                                           return 45627;
+    if (grpsys.grpsysTwice(5) != 11)                                          return 45628;
+    grpsys.Color grpsysColor = grpsys.Color.Green;
+    if ((int)grpsysColor != 9)                                                return 45629;
+    if (grpsys.GrpsysPlainA != 11)                                            return 45630;
+    if (grpsys.grpsysGlobal != 23)                                            return 45631;
+    grpsys.grpsysGlobal = 24;
+    if (grpsys.grpsysGlobal != 24)                                            return 45632;
+    if (GRPSYS_MACRO != 47)                                                   return 45633;
+    if (grpsys.inner.deep() != 31)                                            return 45634;
+    grpsub.Sub grpsubSub = default;
+    grpsubSub.v = 2;
+    if (grpsubSub + 3 != 23)                                                  return 45635;
+    if (grpsub.subFree() != 77)                                               return 45636;
     // A class template specialization target; copy-assign from the temporary adds 10 to tag.
     cppexp.ConvBox<int> convBox = 3;
     if (convBox.v != 3 || convBox.tag != 1)                                    return 2247;
@@ -20727,11 +20859,12 @@ extern int main()
         cppon.reset();
         if (T320UniqN(3) != 3 || t320uNNew != 1 || cppon.clsNew() != 0 || cppon.clsDel() != 1)
             return 3421;
-        // T320 r2: own sized delete only: it hides the base's delete and takes the block.
-        t320uSDel = 0;
+        // T320 r2: own usual (void*, ulong) delete only: it hides the base's delete and takes the block
+        // on unique<T> scope exit (the sized-delete ruling: ulong is size_t on LP64).
+        t320uULDel = 0;
         cppon.reset();
-        if (T320UniqS(3) != 3 || t320uSDel != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0)
-            return 3422;
+        if (T320UniqUL(3) != 3 || t320uULDel != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0)
+            return 3423;
 
     }
 
@@ -24447,6 +24580,11 @@ extern int main()
         result = TernSinkUserMoveCheck(pick);
         if (result != 0) return result;
         result = TernSinkAssignTCheck(pick);
+        if (result != 0) return result;
+    }
+    // CPPMOVE: [cpp] struct moves are clang's whole-record move.
+    {
+        int result = CppMoveRecordCheck();
         if (result != 0) return result;
     }
     // T70 argument doors: a non-const C++ T&& call result is `move *p` at local/new
@@ -29770,7 +29908,7 @@ int LoweredUserDtorAssignLegs(int argc)
     t313UnDel = 0;
     t258A = t261.guarded(t313CtorThrow, 1);
     if (t258A != -7 || t313UnNew != 1 || t313UnDel != 1) return 25340;
-    // T313 r2: sized-only operator delete: the no-throw path is correct, a throw frees once through it.
+    // T313 r2: sized-only (non-usual) operator delete: the no-throw path is correct, a throw frees nothing.
     t313SdNew = 0;
     t313SdDel = 0;
     t258A = t313SdOk(3);
@@ -29778,11 +29916,11 @@ int LoweredUserDtorAssignLegs(int argc)
     t313SdNew = 0;
     t313SdDel = 0;
     t258A = t261.guarded(t313SdTag, 1);
-    if (t258A != -7 || t313SdNew != 1 || t313SdDel != 1) return 25342;
+    if (t258A != -7 || t313SdNew != 1 || t313SdDel != 0) return 25342;
     t313SdNew = 0;
     t313SdDel = 0;
     t258A = t261.guarded(t313SdBrace, 1);
-    if (t258A != -7 || t313SdNew != 1 || t313SdDel != 1) return 25343;
+    if (t258A != -7 || t313SdNew != 1 || t313SdDel != 0) return 25343;
     // T313 r2: `new T[3]` with a user operator new: a throwing element frees the block once.
     t313ArN = 0;
     t313ArD = 0;
@@ -29799,6 +29937,12 @@ int LoweredUserDtorAssignLegs(int argc)
     if (t258A != -7 || t313NuNew != 2 || t313NuDel != 0) return 25346;
     t258A = t261.guarded(t313NiiArgs, 1);
     if (t258A != -7 || t313NuNew != 3 || t313NuDel != 0) return 25347;
+    // UNWDEL r2b: a class with a destroying delete + (void*, long long) delete builds and deletes.
+    // The sized form is never chosen (clang++ -std=c++20 oracle: value 9, sized 0). CFlat does not
+    // bind the destroying form yet (clang: destroy 1), so its count is not asserted here.
+    unwdelDdReset();
+    t258A = UnwdelDdUse(9);
+    if (t258A != 9 || unwdelDdSizedCount() != 0) return 25348;
     // No-throw controls: the same initializers build and destroy each object exactly once.
     t261.reset();
     t258A = t261.guarded(t261Pair, 0);
@@ -33049,6 +33193,80 @@ int deepPtrLegs()
     if (dpt.pkv(dpt.RbDeep().rb(1)) != 1) return 91045;
     // Volatile on the pointer object itself qualifies no pointee level.
     if (dpt.tvq3(dpt.volTop.f3) != 2) return 91046;
+    // Depth 3 and 4 against clang++ -std=c++20: nullptr, references, class pointees, templates,
+    // function pointers, members and globals keep the spelled depth (values are clang's).
+    int**** pppp = &ppp;
+    if (dpt.load4(pppp) != 7 || dpt.load4(&ppp) != 7 || ****dpt.top4() != 9) return 91060;
+    if (dpt.t4(dpt.g4) != 9 || dpt.t4(pppp) != 7) return 91061;
+    dpt.g4v = 10;
+    if (****dpt.g4 != 10) return 91062;
+    if (dpt.null3(nullptr) != 1 || dpt.null4(nullptr) != 1 || dpt.null3(ppp) != 2) return 91063;
+    int d2bW = 8;
+    int* d2bWp = &d2bW;
+    int** d2bQ = pp;
+    if (dpt.ref2(d2bQ) != 7) return 91064;
+    int*** d2bR3 = nullptr;
+    dpt.setref3(d2bR3, ppp);
+    if (***d2bR3 != 7 || dpt.rr3(&pp) != 7) return 91065;
+    dpt.Cell** d2bCellPP = cellPP;
+    dpt.Cell*** d2bCellPPP = &d2bCellPP;
+    if (dpt.cls3(d2bCellPPP) != 2 || dpt.ccls3(d2bCellPPP) != 1) return 91066;
+    // T*** deduces T at every depth; partial ordering picks the deepest pattern (T = int*, not int).
+    if (dpt.tf3(ppp) != 7 || dpt.tf3<int>(ppp) != 7 || dpt.tf3(d2bCellPPP).b != 2) return 91067;
+    if (dpt.tdepth(p) != 1 || dpt.tdepth(pp) != 2 || dpt.tdepth(ppp) != 3 || dpt.tdepth(pppp) != 3)
+        return 91068;
+    if (dpt.tsz(d2bCellPPP) != 8 || dpt.tsz(ppp) != 4) return 91069;
+    if (dpt.getfp()(ppp) != 8 || dpt.runfp(dpt.fpImpl, ppp) != 8 || dpt.runfp(d2bTriple, ppp) != 14)
+        return 91070;
+    if (dpt.fp4(d2bQuad, pppp) != 8) return 91071;
+    function<int(int***)> d2bFn = dpt.fpImpl;
+    if (d2bFn(ppp) != 8) return 91072;
+    const int d2bCv = 3;
+    (const int)* d2bCp = &d2bCv;
+    (const int)** d2bCpp = &d2bCp;
+    (const int)*** d2bCppp = &d2bCpp;
+    if (dpt.cvsel(ppp) != 1 || dpt.cvsel(d2bCppp) != 2) return 91073;
+    if (dpt.over23(pp) != 2 || dpt.over23(ppp) != 3 || dpt.over23(&pp) != 3) return 91074;
+    if (dpt.dflt3() != 1 || dpt.dflt3(ppp) != 2 || dpt.fwd3(ppp, pppp) != 14) return 91075;
+    int** d2bWpp = &d2bWp;
+    int***[2] d2bArr = {ppp, &d2bWpp};
+    if (dpt.arr4(d2bArr, 2) != 15) return 91076;
+    dpt.M3 d2bM = dpt.M3();
+    d2bM.m3 = ppp;
+    if (***d2bM.m3 != 7 || d2bM.over(pp) != 2 || d2bM.over(ppp) != 3 || d2bM.take3(ppp) != 107)
+        return 91077;
+    dpt.B3<int> d2bB = dpt.B3<int>();
+    if (d2bB.m(ppp) != 8) return 91078;
+    std.vector<int****> d2bVec4;
+    d2bVec4.push_back(pppp);
+    if (****d2bVec4[0] != 7) return 91079;
+    // One-level C++ results, globals and members record depth 1: every legal use stays accepted.
+    void* d2bOneVoid = dpt.r1(p);
+    int** d2bOneFromVoid = (int**)dpt.vr1(&p);
+    auto d2bOneAuto = dpt.r1(p);
+    int** d2bOneAutoAddr = &d2bOneAuto;
+    int* d2bOneTmp = dpt.r1(p);
+    if (*(int*)d2bOneVoid + **d2bOneFromVoid + **d2bOneAutoAddr + dpt.take2(&d2bOneTmp) != 30)
+        return 91080;
+    if (dpt.ov1(dpt.r1(p)) != 1 || dpt.ov1(&d2bOneTmp) != 2 || dpt.ov1(dpt.vr1(p)) != 3) return 91081;
+    int** d2bOneGlobalAddr = &dpt.g4a;
+    void* d2bOneGlobalVoid = dpt.g4a;
+    if (**d2bOneGlobalAddr != 10 || *(int*)d2bOneGlobalVoid != 10) return 91082;
+    dpt.M3 d2bOneM = dpt.M3();
+    int** d2bOneStaticAddr = &dpt.M3.s1;
+    dpt.M3.s1 = d2bOneM.ptr1();
+    if (**d2bOneStaticAddr != 4 || *dpt.M3.s1 != 4) return 91083;
+    dpt.Base1* d2bOneBase = dpt.mkder1();
+    if (d2bOneBase->b != 4 || dpt.mkder1()->d != 6) return 91084;
+    int** d2bOneTemplate = dpt.tr1(&p);
+    if (**d2bOneTemplate != 7 || *dpt.tr1(p) != 7) return 91085;
+    // Refusals clang makes: ambiguity by depth, depth mismatch, and an invalid qualification.
+    expect_error("ambiguous call to 'dpt.over23': no candidate ranks better than the others") { dpt.over23(nullptr); }
+    expect_error("no overload of 'dpt.null4' matches the given arguments") { dpt.null4(ppp); }
+    expect_error("no overload of 'dpt.null3' matches the given arguments") { dpt.null3(pppp); }
+    expect_error("the pointer depths differ") { int**** d2bBad = dpt.tf3<int*>(pppp); }
+    expect_error("no overload of 'dpt.runfp' matches the given arguments") { dpt.runfp(d2bQuad, ppp); }
+    expect_error("its pointer const qualifications are incompatible") { dpt.pc3(ppp); }
     // PTRREF: a C++ `T (&)[N]` maps to a bare pointer but binds only an array, so a pointer or
     // nullptr takes the `const char *const &` / `const char *` sibling (clang values).
     char[4] prArr = "abc";
@@ -33427,6 +33645,39 @@ int deepPtrLegs()
         || castasg_test.event_at(1) != 10 || castasg_test.event_at(2) != 20
         || castasg_test.event_at(3) != 40 || castasg_test.event_at(4) != 60
         || castasg_test.event_at(5) != 60) return 11812;
+    // GRPLEAK: the Box request includes the dependency line into the host line's TU first.
+    grpleak_host.Box<grpleak_dep.Rec> grpleakBox = grpleak_host.Box<grpleak_dep.Rec>();
+    if (grpleakBox.size() != 4) return 11901;
+    // Symptom 1: the dependency's `GrpleakHostMember` macro never lexes the host's member text.
+    grpleak_host.GrpleakHostMember grpleakMember = grpleak_host.GrpleakHostMember();
+    if (grpleakMember.p(0) != 3) return 11902;
+    // Symptom 2: the host's TU saw this strong definition too; one copy links, cold and warm.
+    if (grpleak_variadic((char*)"x", (i8*)"x") != 55) return 11903;
+    // Symptom 4: dep2's header text, newly included next to dep's, never sees dep's macros.
+    grpleak_host.Pair<grpleak_dep.Rec, grpleak_dep2.GrpleakDep2Rec> grpleakPair =
+        grpleak_host.Pair<grpleak_dep.Rec, grpleak_dep2.GrpleakDep2Rec>();
+    if (grpleakPair.size() != 16) return 11904;
+    if (GRPLEAK_DEPC != 11) return 11905;
+    // Symptom 3: the first brace request's narrowing pragma never reaches the later `{ 5 }`.
+    int grpleakK = 4;
+    grpleak_bra.In grpleakIn = GrpleakMakeIn(3, grpleakK);
+    if (grpleak_bra.take(grpleakIn) != 7) return 11906;
+    if (grpleak_brb.ov({ 5 }) != 1) return 11907;
+    // Two dependency lines new to the host in ONE request: pb never lexes through pa's macro.
+    grpleak_host.Pair<grpleak_pa.X, grpleak_pb.GrpleakPairY> grpleakPairAB =
+        grpleak_host.Pair<grpleak_pa.X, grpleak_pb.GrpleakPairY>();
+    if (grpleakPairAB.size() != 16) return 11908;
+    // c2 sees the shared cfg's GRPLEAK_GLM 1 after c1 (redefined to 2) is in the host's TU.
+    grpleak_host.Box<grpleak_c1.X> grpleakBoxC1 = grpleak_host.Box<grpleak_c1.X>();
+    if (grpleakBoxC1.size() != 8) return 11909;
+    grpleak_host.Pair<grpleak_c1.X, grpleak_c2.Y> grpleakPairC = grpleak_host.Pair<grpleak_c1.X, grpleak_c2.Y>();
+    if (grpleakPairC.size() != 12) return 11910;
+    // The dependency global's dynamic initializer runs once although the host emitted it too.
+    grpleak_host.Calls<grpleak_dyn.X> grpleakCalls = grpleak_host.Calls<grpleak_dyn.X>();
+    if (grpleakCalls.sf() != 7 || grpleakCalls.g() != 11 || grpleakCalls.bump() != 1) return 11911;
+    // Each runs once too: the temporary and the other global's store belong to the variable's own initializer.
+    if (grpleak_host.Calls<grpleak_ref.X>().g() != 11) return 11912;
+    if (grpleak_host.Calls<grpleak_side.X>().g() != 1417) return 11913;
     return 0;
 }
 

@@ -1235,6 +1235,10 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
                                    antlr4::ParserRuleContext* site,
                                    bool pointerOnly) {
         auto* compiler = site != nullptr ? Compiler(site) : Compiler();
+        // A unique<X> over a C++ class with no suitable delete is refused at the spelling, located.
+        if (site != nullptr && typeArgs.size() == 1 && baseName == "unique")
+            if (std::string msg = compiler->UnusableUniqueSpellingError(baseName, typeArgs); !msg.empty())
+            { LogErrorContext(site, msg); return; }
         const std::string scope = !structScopeStack.empty() ? structScopeStack.back()
             : EnclosingAggregateScopeFromContext(compiler, site);
         const std::string resolvedBase = compiler->IsGenericTemplateKey(baseName) ? baseName
@@ -12014,6 +12018,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 {
                     arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
                     arraySize = FoldArrayDimValue(typeAndValue.ArraySize, arraySize);
+                    // A runtime size would leave the array one element wide; refuse it.
+                    if (arraySize != nullptr && !llvm::isa<llvm::ConstantInt>(arraySize))
+                        LogErrorContext(typeAndValue.ArraySize, compiler->LocalizeMessage(
+                            "array size '{}' must be a compile-time constant (runtime-sized arrays are not supported yet)",
+                            { typeAndValue.ArraySize->getText() }));
                 }
             }
         }
@@ -12312,8 +12321,17 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     {
                         sizeVal = ParseAssignmentExpression(direct->assignmentExpression());
                         sizeVal = FoldArrayDimValue(direct->assignmentExpression(), sizeVal);
+                        // Non-pointer C-style arrays were refused above; pointer arrays reach here.
+                        if (typeAndValue.Pointer && sizeVal != nullptr && !llvm::isa<llvm::ConstantInt>(sizeVal))
+                            LogErrorContext(direct->assignmentExpression(), compiler->LocalizeMessage(
+                                "array size '{}' must be a compile-time constant (runtime-sized arrays are not supported yet)",
+                                { direct->assignmentExpression()->getText() }));
                     }
-                    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
+                    // A static declaration is never re-parsed above: an unfolded bound is refused here.
+                    if (sizeVal == nullptr && typeAndValue.staticStorage)
+                        LogErrorContext(direct->assignmentExpression(),
+                            "a 'static' local array must have a compile-time constant length");
+                    if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(sizeVal))
                         typeAndValue.ConstArraySize = ci->getZExtValue();
                 }
                 else if (arraySize != nullptr)
@@ -12419,6 +12437,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool haveInterfaceSourceNV = false;
                 LLVMBackend::NamedVariable initializerSourceNV;
                 bool haveInitializerSourceNV = false;
+                // The initializer expression's null-cast provenance (NamedVariable::IsDataNullCast).
+                bool initializerDataNullCast = false;
                 // True when an `auto` local took the native initializer type (not the C++ identity).
                 bool autoNativeInitType = false;
                 bool closureInitKnownFree = false;
@@ -13194,6 +13214,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         compiler->pendingCxxSretTypeName_ = typeAndValue.TypeName;
                                     }
                                     rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                    initializerDataNullCast = rightNV.IsDataNullCast;
                                     if (typeAndValue.TypeName == "auto" && global_scope)
                                         LogErrorContext(assignmentExpression,
                                             "auto is not supported for file-scope variables");
@@ -14539,6 +14560,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 rhsProvenance.TypeAndValue.IsFunctionPointer = rhsIsFuncPtr;
                                 rhsProvenance.TypeAndValue.Pointer = rhsIsPointer;
                                 rhsProvenance.TypeAndValue.TypeName = srcInferredTypeName;
+                                rhsProvenance.IsDataNullCast = initializerDataNullCast;
                                 compiler->RejectLiteralZeroFunctionSlot(right, rhsProvenance);
                             }
                             // Decl-init spelling of the thin gate ('function<T> f = vp;'); rightNV
@@ -16146,7 +16168,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && srcStorage == nullptr && srcUnionFieldType == nullptr
                             && right != nullptr && right->getType()->isStructTy()
                             && srcInferredTypeName == typeAndValue.TypeName && !srcInferredPointer
-                            && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName))
+                            && compiler->NeedsCxxLoweringType(typeAndValue.TypeName))
                         {
                             if (auto* loaded = llvm::dyn_cast<llvm::LoadInst>(right))
                             {

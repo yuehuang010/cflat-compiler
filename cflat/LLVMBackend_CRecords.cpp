@@ -120,7 +120,7 @@ bool LLVMBackend::BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValu
                                 { field->name, DisplayCxxClassName(ownerName), spelling });
                 return false;
             }
-            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+            CxxRequestGroup group = MakeCxxClassRequestGroup(ownerIt->second, ownerName);
             if (group.headers.empty())
             {
                 LogErrorMessage("cannot bind C++ field '{}' of '{}' with type '{}': "
@@ -154,7 +154,7 @@ bool LLVMBackend::BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValu
         {
             auto ownerIt = cxxTypeOwnerGroup_.find(ownerName);
             if (ownerIt == cxxTypeOwnerGroup_.end()) return false;
-            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+            CxxRequestGroup group = MakeCxxClassRequestGroup(ownerIt->second, ownerName);
             if (group.headers.empty()) return false;
             CxxRequestGroupScope groupScope(*this, &group);
             std::string error;
@@ -926,6 +926,8 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
         };
         std::vector<Candidate> pending;
         std::optional<Candidate> hit;
+        std::vector<Candidate> refusedHere;
+        uint64_t lookupHash = 14695981039346656037ULL;
         CMacroEntry hitEntry;
         std::vector<CFunctionMacroEntry> hitFunctionMacros;
         /*
@@ -942,6 +944,11 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
                                            BuildCxxRequestIncludes(c.group),
                                            BuildCxxRequestClangArgs(c.group), false)
                 + "|MACRO";
+            for (unsigned char byte : c.key + "\n")
+            {
+                lookupHash ^= byte;
+                lookupHash *= 1099511628211ULL;
+            }
             CFileSigCacheEntry entry;
             std::string miss;
             if (TryLoadCxxTypeRequestCache(c.group, c.key, /*emitDefinitions*/ false, entry, miss,
@@ -954,10 +961,32 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
                     hitFunctionMacros = entry.funcMacros;
                     hit = std::move(c);
                 }
-                continue;   // a hit, or a remembered absence
+                // value 1: found there but not bindable; terminal only for the lookup that stopped.
+                if (entry.macros.front().name == kNegativeCxxRequestMarker
+                    && entry.macros.front().value == 1)
+                    refusedHere.push_back(c);
+                continue;   // a hit, or a remembered absence or refusal
             }
             c.live = cxxIncrementalGroups_.count(CxxIncrementalGroupKey(c.group)) != 0;
             pending.push_back(std::move(c));
+        }
+        /*
+         * A refusal ends the lookup only for the import set whose cold lookup stopped there (its
+         * ordered group keys name the verdict), ahead of a hit another set stored later. Any other
+         * set reads the refusing group as an absence.
+         */
+        auto lookupKey = [&](const Candidate& c) {
+            return c.key + std::format("|LOOKUP{:016x}", lookupHash);
+        };
+        for (const Candidate& c : refusedHere)
+        {
+            CFileSigCacheEntry entry;
+            std::string miss;
+            if (TryLoadCxxTypeRequestCache(c.group, lookupKey(c), /*emitDefinitions*/ false, entry,
+                                           miss, /*allowDisk*/ true)
+                && entry.macros.size() == 1
+                && entry.macros.front().name == kNegativeCxxRequestMarker)
+                return false;
         }
         if (hit.has_value())
         {
@@ -1008,9 +1037,10 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
                 StoreCxxTypeRequestCache(c.group, c.key, /*emitDefinitions*/ false,
                                          std::move(stored), /*allowDisk*/ true, nullptr);
             };
-            auto rememberAbsent = [&] {
+            auto rememberAbsent = [&](bool refused = false) {
                 CMacroEntry marker;
                 marker.name = kNegativeCxxRequestMarker;
+                marker.value = refused ? 1 : 0;
                 remember(std::move(marker));
             };
             std::string error;
@@ -1142,7 +1172,15 @@ bool LLVMBackend::TryBindCxxSystemMacro(const std::string& name)
                     remember(std::move(marker));
                     return true;
                 }
-                rememberAbsent();
+                // Found but not bindable: the lookup ends here, so a warm compile must end here too.
+                rememberAbsent(/*refused*/ true);
+                CMacroEntry verdict;
+                verdict.name = kNegativeCxxRequestMarker;
+                verdict.value = 1;
+                CFileSigCacheEntry stored;
+                stored.macros.push_back(std::move(verdict));
+                StoreCxxTypeRequestCache(c.group, lookupKey(c), /*emitDefinitions*/ false,
+                                         std::move(stored), /*allowDisk*/ true, nullptr);
                 return false;
             }
             entry.name = name;
@@ -1246,6 +1284,7 @@ bool LLVMBackend::TryBindCxxNamespaceConstant(const std::string& cflatName,
             std::cout << std::format("[verbose]   C++ namespace constant '{}' not bound: {}\n",
                                      cxxVariable, error);
         cxxTypeOwnerGroup_.erase(cflatName);
+        cxxTypeOwnerDependencyGroups_.erase(cflatName);
         if (notConstant != nullptr) *notConstant = cxxNotConstantVariables_.count(cflatName) != 0;
         return bound && GetGlobalVariableNV(cflatName).Storage != nullptr;
 }
@@ -1434,12 +1473,19 @@ void LLVMBackend::CollectCxxTypeOwnerGroups(const std::string& cflatTypeName,
         std::string type = cflatTypeName;
         while (!type.empty() && (type.back() == '*' || type.back() == ' ')) type.pop_back();
         if (type.empty() || !visited.insert(type).second) return;
-        if (auto owner = cxxTypeOwnerGroup_.find(type);
-            owner != cxxTypeOwnerGroup_.end()
-            && owner->second < cxxImportGroups_.size()
-            && !cxxImportGroups_[owner->second].headers.empty()
-            && std::find(groups.begin(), groups.end(), owner->second) == groups.end())
-            groups.push_back(owner->second);
+        auto addGroup = [&](size_t group) {
+            if (group < cxxImportGroups_.size() && !cxxImportGroups_[group].headers.empty()
+                && std::find(groups.begin(), groups.end(), group) == groups.end())
+                groups.push_back(group);
+        };
+        if (auto owner = cxxTypeOwnerGroup_.find(type); owner != cxxTypeOwnerGroup_.end())
+        {
+            addGroup(owner->second);
+            // The groups the owning request compiled against: its body may name their declarations.
+            if (auto deps = cxxTypeOwnerDependencyGroups_.find(type);
+                deps != cxxTypeOwnerDependencyGroups_.end())
+                for (size_t dep : deps->second) addGroup(dep);
+        }
         TypeSpelling parsed;
         if (!DemangleType(*this, type, parsed)) return;
         // A POINTER or VIEW argument mangles as a PREFIX ('.p$nest.Cell'), and no group owns that
@@ -1715,7 +1761,7 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                                       /*deferIncompleteCodegen*/ deferIncompleteCodegen))
             {
                 cxxTemplateOwnerGroup_[cxxBase] = order[k];
-                cxxTypeOwnerGroup_[cflatName] = order[k];
+                NoteCxxTypeOwner(cflatName, order[k], /*overwrite*/ true);
                 return true;
             }
             tried.push_back(group.label);
@@ -2037,7 +2083,7 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
                 if (e.isScoped && !e.enumType.empty()) RegisterScopedEnumType(e.enumType);
                 if (!e.enumType.empty()) importedEnumTypes_.insert(e.enumType);
                 if (cxxBoundary && activeCxxRequestGroup_ != nullptr && !e.enumType.empty())
-                    cxxTypeOwnerGroup_.emplace(e.enumType, activeCxxRequestGroup_->primary);
+                    NoteCxxTypeOwner(e.enumType, activeCxxRequestGroup_->primary);
                 if (!e.enumType.empty() && !e.underlyingType.empty())
                 {
                     const std::string* backingName = mappedTypeName(e.underlyingType);
@@ -2830,7 +2876,7 @@ void LLVMBackend::RegisterCxxRecordShell(const CRecordEntry& r, const std::strin
         if (r.name.empty()) return;
         NoteCxxForeignNamespace(r.name);
         if (activeCxxRequestGroup_ != nullptr)
-            cxxTypeOwnerGroup_.emplace(r.name, activeCxxRequestGroup_->primary);
+            NoteCxxTypeOwner(r.name, activeCxxRequestGroup_->primary);
         if (r.specialMembersPending && activeCxxRequestGroup_ != nullptr)
         {
             cxxSpecialMemberOwner_[r.name] = activeCxxRequestGroup_->primary;
@@ -2981,7 +3027,7 @@ void LLVMBackend::EnsureCxxRecordLayoutsForMemberSignatures(const CRecordEntry& 
                 if (valueSpelling.find('<') != std::string::npos && !identity.empty()
                     && owner != cxxTypeOwnerGroup_.end())
                 {
-                    CxxRequestGroup group = MakeCxxRequestGroup(owner->second, {});
+                    CxxRequestGroup group = MakeCxxClassRequestGroup(owner->second, record.name);
                     if (!group.headers.empty())
                     {
                         CxxRequestGroupScope groupScope(*this, &group);
@@ -3673,7 +3719,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         cxxForeignTypeSpellings_.emplace(bare, r.name);
                 }
                 if (activeCxxRequestGroup_ != nullptr)
-                    cxxTypeOwnerGroup_.emplace(r.name, activeCxxRequestGroup_->primary);
+                    NoteCxxTypeOwner(r.name, activeCxxRequestGroup_->primary);
                 for (size_t pos = 0; (pos = r.name.find('.', pos)) != std::string::npos; ++pos)
                     RegisterNamespace(r.name.substr(0, pos));
             }
@@ -3832,9 +3878,9 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         tv.IsZeroLengthArrayMember = tv.IsFlexibleArrayMember && zeroLengthArray;
                         tv.IsCxxMutableField = f.isMutable;
                         MarkCxxReferenceField(f.ctype, tv, r.isCxx);
-                        // C++ field pointers have a known one-level shape even though the shared
-                        // type mapper leaves their ordinary value depth unrecorded.
-                        if (r.isCxx && tv.Pointer && !tv.ElemPointer
+                        // C and C++ field pointers have a known one-level shape even though the
+                        // shared type mapper leaves their ordinary value depth unrecorded.
+                        if (tv.Pointer && !tv.ElemPointer
                             && !tv.IsFunctionPointer && !tv.IsCxxRef())
                             tv.PointerDepth = 1;
                         MarkCxxDeclaredConstField(tv, r.isCxx && f.isConst && !f.isMutable);
@@ -4005,7 +4051,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 tv.IsCxxMutableField = f.isMutable;
                 MarkCxxReferenceField(f.ctype, tv, r.isCxx);
                 // Keep a pointer field's known one-level shape when taking its address.
-                if (r.isCxx && tv.Pointer && !tv.ElemPointer
+                if (tv.Pointer && !tv.ElemPointer
                     && !tv.IsFunctionPointer && !tv.IsCxxRef())
                     tv.PointerDepth = 1;
                 // `const char* p`: the pointee stays const for C++ overload choice; a class-typed
@@ -5158,6 +5204,12 @@ std::string LLVMBackend::CxxUniquePtrForUniqueKeyword(const std::string& pointee
         error.clear();
         if (!IsCxxUniquePtrPointee(pointee)) return {};
         const std::string resolved = ResolveTypeAlias(pointee);
+        // Refused here, not at the clang instantiation: its unique_ptr failure surfaces at link time.
+        if (ClassDeleteUnusable(resolved))
+        {
+            error = UnusableUniqueDeleteMessage(resolved);
+            return {};
+        }
         std::string name = MangleGenericInstance(*this, "std.unique_ptr", { resolved });
         if (dataStructures.count(name) != 0 && CxxUniquePtrPointee(name) == resolved) return name;
         if (TryRequestCxxType("std.unique_ptr", { resolved }, name, error))
@@ -5927,6 +5979,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         {
             info.isPolymorphic         = r.isPolymorphic;
             info.vtableDeleteVerdict   = r.vtableDeleteVerdict;
+            info.hasClassDelete        = r.hasClassDelete;
+            info.hasUsualClassDelete   = r.hasUsualClassDelete;
             info.hasBases              = r.hasBases;
             info.hasVirtualBases       = r.hasVirtualBases;
             info.isFinal               = r.isFinal;
@@ -6555,6 +6609,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 ret.ConstMask |= CxxSpellingPointeeConstMask(m.retType, ret.ValuePointerDepth());
             if (CxxSpellingHasVolatileTarget(m.retType))
                 ret.IsCxxPointeeVolatile = true;
+            if (aliasRefs) ret.RecordSpelledSinglePointerDepth();
             std::vector<TypeAndValue> params;
             bool paramsOk = true;
             size_t unmappableParam = m.paramTypes.size();
@@ -6927,6 +6982,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     : "clang: " + sv.initializerFailure;
             TypeAndValue tv;
             if (!mapType(sv.ctype, tv)) continue;
+            tv.RecordSpelledSinglePointerDepth();
             tv.ConstMask |= CxxSpellingPointeeConstMask(sv.ctype, tv.ValuePointerDepth());
             MarkCxxDeclaredConstField(tv, CxxSpellingHasTopLevelObjectConst(sv.ctype));
             const std::string regName = r.name + "." + sv.name;
@@ -8167,7 +8223,7 @@ void LLVMBackend::RequestCxxSpecializationBase(const std::string& derivedName,
         if (cxxClasses_.count(identity) != 0 || cxxForeignRequests_.count(identity) != 0) return;
         auto ownerIt = cxxTypeOwnerGroup_.find(derivedName);
         if (ownerIt == cxxTypeOwnerGroup_.end()) return;
-        CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(ownerIt->second, derivedName);
         if (group.headers.empty()) return;
         CxxRequestGroupScope groupScope(*this, &group);
         std::string error;

@@ -4601,12 +4601,16 @@ bool LLVMBackend::IsLiteralZeroIntegerToPointer(llvm::Value* value, const NamedV
 void LLVMBackend::RejectLiteralZeroFunctionSlot(llvm::Value* value, const NamedVariable& arg,
         antlr4::ParserRuleContext* context) const
 {
-        if (IsLiteralZeroIntegerToPointer(value, arg))
+        const bool literalZero = IsLiteralZeroIntegerToPointer(value, arg);
+        // A data-pointer null cast (ruling 2026-11-18): only the cast and `?:` joins carry the flag.
+        const bool dataNull = arg.IsDataNullCast && value != nullptr && value->getType()->isPointerTy();
+        if (literalZero || dataNull)
         {
             const std::string destination = arg.TypeAndValue.VariableName.empty()
                 ? "a function slot" : std::format("a function slot '{}'", arg.TypeAndValue.VariableName);
-            const std::string message = std::format(
-                "integer constant zero is not a null spelling for {}; use 'nullptr'", destination);
+            const std::string message = literalZero
+                ? std::format("integer constant zero is not a null spelling for {}; use 'nullptr'", destination)
+                : std::format("a data-pointer null is not a null spelling for {}; use 'nullptr'", destination);
             if (context != nullptr)
                 MainListener::LogErrorContext(const_cast<LLVMBackend*>(this), context, message);
             else

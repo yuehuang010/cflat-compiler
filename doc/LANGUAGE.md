@@ -2533,6 +2533,26 @@ package-only `from` / `pri` clauses are not valid. A grouped import is one C++ t
 its headers share one header set and one cache key. Every import is disk-cached, so a warm
 compile does not reparse the headers.
 
+**Prefer one grouped `import cpp` over many single lines.** Each `import cpp` line is its own clang
+translation unit, and each one parses its own copy of every system header it reaches (`<vector>`,
+`<string>`, ...). Ten single-line imports of headers that all include `<string>` parse `<string>` ten
+times and keep ten copies in memory, and a C++ question the cache has not answered yet (a new call or
+operator in edited code) can be tried in every one of them. One group parses the shared headers once:
+
+```c
+// Preferred: one translation unit for headers used together.
+import cpp { "geo/point.h", "geo/shape.h", "geo/render.h", "vector", "string" };
+
+// Avoid: three translation units, three copies of <vector> / <string>.
+import cpp "geo/point.h";
+import cpp "geo/shape.h";
+import cpp "geo/render.h";
+```
+
+Within a group the headers see each other in listed order, as `#include` lines in one C++ file do. Keep
+a header on its own line only when it must not see the others: it redefines a name another header also
+defines, its macros would change another header, or its meaning depends on not seeing an earlier header.
+
 Raw-pointer parameters of imported C++ functions borrow by default. To transfer a CFlat owner to
 a C++ callee that takes ownership, write `move p`; this consumes `p`, and later use is rejected.
 

@@ -310,12 +310,15 @@ expect_error("use of moved variable 'x'") {
     }
 }
 
-expect_error("cannot reset unique<T250Link> 'a' from borrowed value 'p'") {
+// A plain pointer parameter middle adopts like a local middle (it began as a borrow), so the
+// chain is its split form: accepted, and the parameter is moved-from after the unique reset.
+expect_error("use of moved variable 'p'") {
     void t250MidParam(T250Link* p)
     {
         unique T250Link* a = nullptr;
         T250Link* e = nullptr;
         a = p = e = new T250Link();
+        int x = p->v;
     }
 }
 
@@ -348,11 +351,13 @@ expect_error("cannot return borrowed value 'p'") {
     }
 }
 
-expect_error("cannot initialize unique<T250Link> 'd' from borrowed value 'p'") {
+// Declaration form of the same parameter middle: the parameter adopted, so `d` takes it.
+expect_error("use of moved variable 'p'") {
     void t250DeclParamMid(T250Link* p)
     {
         T250Link* e = nullptr;
         unique T250Link* d = p = e = new T250Link();
+        int x = p->v;
     }
 }
 

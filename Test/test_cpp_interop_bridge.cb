@@ -310,6 +310,10 @@ import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_arrayelem.h";
 import cpp "library/cpp_prvarg_template.hpp";
 import cpp "library/cpp_braceprv.hpp";
+import cpp "library/cpp_cachekey_box.hpp";
+import cpp "library/cpp_cachekey_leaf_dbl.hpp";
+import cpp "library/cpp_cachekey_macro_bind.hpp" define "CKEYM_LIMIT=41";
+import cpp "library/cpp_cachekey_macro_refuse.hpp";
 import "library/cpp_interop_gfield_a.cb";
 import "library/cpp_interop_gfield_b.cb";
 import "test_helper.cb";
@@ -9394,5 +9398,18 @@ extern int main(int argc, char** argv)
     braceprv.BS_Stats.reset();
     { braceprv.Outer bpq = { braceprv.BS(braceprv.BS_Stats.note(3)), braceprv.BS_Stats.note(4) }; if (braceprv.BS_Stats.order != 334) return 44651; }
 
+    // CACHE-KEY twin of test_cpp_interop_template.cb's leg: same box header and wrapper source, but
+    // this Leaf's val() returns double (clang: 22.00). The wrapper key must name the Leaf header.
+    {
+        ckeyb.Box<ckeyl.Leaf> ckeyBox = ckeyb.Box<ckeyl.Leaf>(ckeyl.Leaf(5));
+        double ckeyProduct = ckeyBox * 4;
+        if (ckeyProduct != 22.0) return 44750;
+    }
+    // CACHE-KEY twin of test_cpp_interop_template.cb's CKEYM_LIMIT refusal: the earlier group binds
+    // it, so that file's remembered refusal (one cache, template first) must not end this lookup.
+    {
+        ckeym.Probe ckeyProbe = { 1 };
+        if (CKEYM_LIMIT + ckeyProbe.a != 42) return 44751;
+    }
     return 0;
 }

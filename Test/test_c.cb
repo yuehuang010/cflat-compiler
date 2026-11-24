@@ -1112,6 +1112,57 @@ extern int main(int argc, char** argv)
     dpDeepAnon.q = 7;
     result &= Test("c_deep32_anon_unused", dpDeepAnon.q, 7);
     result &= Test("c_deep32_anon_sizeof", (int)sizeof(dpDeepAnon.w), 8);
+    // Depth 3 and 4 through C typedefs, function pointers, out-parameters, arrays and a global
+    // (clang -std=c17 values; a collapsed carrier reads through the wrong level).
+    int**** dpPPPP = &dpPPP;
+    result &= Test("c_deep4_param", dp_load4(dpPPPP), 7);
+    result &= Test("c_deep4_addr_of_deep3", dp_load4(&dpPPP), 7);
+    result &= Test("c_deep3_typedef_chain", dp_td(dpPPP), 7);
+    result &= Test("c_deep3_nullptr", dp_null3(nullptr) * 10 + dp_null3(dpPPP), 12);
+    result &= Test("c_deep3_const_levels", dp_cpc(dpPPP), 7);
+    result &= Test("c_deep3_fnptr_result", dp_getfp()(dpPPP), 8);
+    result &= Test("c_deep3_fnptr_param", dp_runfp(dp_fpimpl, dpPPP), 18);
+    int*** dpOut = nullptr;
+    dp_out3(&dpOut, dp_g3);
+    result &= Test("c_deep3_out_param_global", ***dpOut, 11);
+    dp_g3_value = 12;
+    result &= Test("c_deep3_global_write", ***dp_g3, 12);
+    int dpW = 4;
+    int* dpWP = &dpW;
+    int** dpWPP = &dpWP;
+    DpH4 dpH4 = default;
+    dpH4.f = dpPPPP;
+    dpH4.t = dpPPP;
+    dpH4.arr[0] = dpPPP;
+    dpH4.arr[1] = &dpWPP;
+    dpH4.cb = dp_fpimpl;
+    result &= Test("c_deep4_struct_fields", dp_h4(&dpH4), 7 + 7 + 4 + 8);
+    result &= Test("c_deep3_array_field", ***dpH4.arr[1] + dpH4.cb(dpH4.arr[1]), 9);
+    int dpArgc = 0;
+    char** dpArgv = nullptr;
+    dp_args(&dpArgc, &dpArgv);
+    result &= Test("c_deep3_char_out_param", dpArgc * 100 + (int)dpArgv[1][2], 301);
+    // One-level C results, globals and fields record depth 1: every legal use stays accepted.
+    int dpOneV = 7;
+    int* dpOneP = &dpOneV;
+    void* dpOneVoid = dp_r1(dpOneP);
+    int** dpOneFromVoid = dp_vr1(&dpOneP);
+    auto dpOneAuto = dp_r1(dpOneP);
+    int** dpOneAutoAddr = &dpOneAuto;
+    int* dpOneTmp = dp_r1(dpOneP);
+    (const int)* dpOneConst = dp_r1(dpOneP);
+    int* dpOneJoin = dpOneV > 0 ? dp_r1(dpOneP) : nullptr;
+    result &= Test("c_one_result_uses", *(int*)dpOneVoid + **dpOneFromVoid + **dpOneAutoAddr
+        + dp_take2(&dpOneTmp) + *dpOneConst + *dpOneJoin, 7 * 6 + 2);
+    dp_g1 = &dpOneV;
+    int** dpOneGlobalAddr = &dp_g1;
+    void* dpOneGlobalVoid = dp_g1;
+    result &= Test("c_one_global_uses", **dpOneGlobalAddr + *(int*)dpOneGlobalVoid + *dp_g1, 7 * 3);
+    dpH4.one = &dpOneV;
+    dpH4.vp = &dpW;
+    int** dpOneFieldAddr = &dpH4.one;
+    int* dpOneFieldVoid = dpH4.vp;
+    result &= Test("c_one_field_uses", **dpOneFieldAddr * 10 + *dpOneFieldVoid, 74);
 
     if (result)
     {

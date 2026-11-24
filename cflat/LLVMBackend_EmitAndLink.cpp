@@ -8,6 +8,8 @@
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/StructuralHash.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/ADT/SetVector.h>
@@ -2881,6 +2883,143 @@ static void DeclareDuplicateDefinitions(llvm::Module& destination, llvm::Module&
     }
 }
 
+/*
+ * A strong definition a group emitted only because a dependency include brought its header into
+ * the group's TU (kCxxDependencyDefinitionAttr) is the same header text the owning group emits:
+ * it yields to any other strong copy of the name. A sole tagged copy stays as emitted, strong.
+ */
+static bool IsCxxDependencyDefinition(const llvm::GlobalValue& value)
+{
+    if (const auto* function = llvm::dyn_cast<llvm::Function>(&value))
+        return function->hasFnAttribute(cflat_cinterop::kCxxDependencyDefinitionAttr);
+    if (const auto* variable = llvm::dyn_cast<llvm::GlobalVariable>(&value))
+        return variable->hasAttribute(cflat_cinterop::kCxxDependencyDefinitionAttr);
+    return false;
+}
+
+// The module's dynamic initializers of `variable`: functions llvm.global_ctors reaches (one call
+// deep, clang's _GLOBAL__sub_I fan-out). One the companion tagged with its decl's variable
+// (kCxxVariableInitializerAttr) counts by that tag alone; an untagged one only when its stores and
+// constructed objects are `variable` alone. A merged body over several variables is never one.
+static std::vector<llvm::Function*> CxxDynamicInitializersOf(llvm::Module& module,
+                                                             const llvm::GlobalVariable& variable)
+{
+    std::vector<llvm::Function*> candidates;
+    const llvm::GlobalVariable* ctors = module.getNamedGlobal("llvm.global_ctors");
+    if (ctors == nullptr || !ctors->hasInitializer()) return {};
+    if (const auto* array = llvm::dyn_cast<llvm::ConstantArray>(ctors->getInitializer()))
+        for (const llvm::Use& entry : array->operands())
+            if (const auto* record = llvm::dyn_cast<llvm::ConstantStruct>(entry.get());
+                record != nullptr && record->getNumOperands() >= 2)
+                if (auto* root = llvm::dyn_cast<llvm::Function>(record->getOperand(1)->stripPointerCasts()))
+                    candidates.push_back(root);
+    const size_t roots = candidates.size();
+    for (size_t i = 0; i < roots; ++i)
+        for (llvm::Instruction& inst : llvm::instructions(*candidates[i]))
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(&inst))
+                if (llvm::Function* callee = call->getCalledFunction();
+                    callee != nullptr && callee->hasLocalLinkage() && !callee->isDeclaration())
+                    candidates.push_back(callee);
+    std::vector<llvm::Function*> result;
+    for (llvm::Function* candidate : candidates)
+    {
+        if (candidate->isDeclaration() || !candidate->hasLocalLinkage()
+            || std::find(result.begin(), result.end(), candidate) != result.end())
+            continue;
+        if (llvm::Attribute tag = candidate->getFnAttribute(cflat_cinterop::kCxxVariableInitializerAttr);
+            tag.isStringAttribute())
+        {
+            if (tag.getValueAsString() == variable.getName()) result.push_back(candidate);
+            continue;
+        }
+        bool mine = false, other = false;
+        auto note = [&](const llvm::Value* pointer) {
+            const auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(pointer));
+            if (global == &variable) mine = true;
+            else if (global != nullptr) other = true;
+        };
+        for (llvm::Instruction& inst : llvm::instructions(*candidate))
+        {
+            if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&inst)) note(store->getPointerOperand());
+            else if (auto* call = llvm::dyn_cast<llvm::CallBase>(&inst); call != nullptr && call->arg_size() > 0
+                     && call->getArgOperand(0)->getType()->isPointerTy())
+                note(call->getArgOperand(0));
+        }
+        if (mine && !other) result.push_back(candidate);
+    }
+    return result;
+}
+
+static void YieldCxxDependencyDefinitions(llvm::Module& destination, llvm::Module& source,
+                                          llvm::StringSet<>* functionDefinitions,
+                                          llvm::StringSet<>* globalDefinitions)
+{
+    auto strong = [](const llvm::GlobalValue& value) {
+        return !value.isDeclaration() && value.hasExternalLinkage()
+            && (llvm::isa<llvm::Function>(value) || llvm::isa<llvm::GlobalVariable>(value));
+    };
+    auto demote = [](llvm::GlobalValue& value) {
+        if (auto* function = llvm::dyn_cast<llvm::Function>(&value)) function->deleteBody();
+        else llvm::cast<llvm::GlobalVariable>(value).setInitializer(nullptr);
+        llvm::cast<llvm::GlobalObject>(value).setComdat(nullptr);
+    };
+    // A demoted variable's own dynamic initializer would run a second time on the surviving
+    // copy; it becomes empty when the survivor brings one.
+    auto dropInitializer = [](llvm::Module& demoted, llvm::GlobalValue& value, llvm::Module& kept,
+                              llvm::GlobalValue& survivor) {
+        auto* variable = llvm::dyn_cast<llvm::GlobalVariable>(&value);
+        auto* keptVariable = llvm::dyn_cast<llvm::GlobalVariable>(&survivor);
+        if (variable == nullptr || keptVariable == nullptr
+            || CxxDynamicInitializersOf(kept, *keptVariable).empty())
+            return;
+        for (llvm::Function* initializer : CxxDynamicInitializersOf(demoted, *variable))
+        {
+            initializer->deleteBody();
+            llvm::ReturnInst::Create(initializer->getContext(),
+                                     llvm::BasicBlock::Create(initializer->getContext(), "", initializer));
+            initializer->setLinkage(llvm::GlobalValue::InternalLinkage);
+        }
+    };
+    // The other copy may be weak: a dynamically initialized global its owner promoted.
+    auto defined = [](const llvm::GlobalValue& value) {
+        return !value.isDeclaration() && !value.hasLocalLinkage()
+            && !value.hasAvailableExternallyLinkage()
+            && (llvm::isa<llvm::Function>(value) || llvm::isa<llvm::GlobalVariable>(value));
+    };
+    for (llvm::GlobalValue& value : source.global_values())
+    {
+        if (!value.hasName() || !defined(value)) continue;
+        llvm::GlobalValue* existing = destination.getNamedValue(value.getName());
+        if (existing == nullptr || !defined(*existing)) continue;
+        if (!strong(value) && !strong(*existing)) continue;
+        if (strong(value) && IsCxxDependencyDefinition(value))
+        {
+            dropInitializer(source, value, destination, *existing);
+            demote(value);
+        }
+        else if (strong(*existing) && IsCxxDependencyDefinition(*existing))
+        {
+            dropInitializer(destination, *existing, source, value);
+            demote(*existing);
+            if (functionDefinitions != nullptr) functionDefinitions->erase(value.getName());
+            if (globalDefinitions != nullptr) globalDefinitions->erase(value.getName());
+        }
+    }
+}
+
+static void StripCxxDependencyDefinitionTags(llvm::Module& module)
+{
+    for (llvm::Function& function : module.functions())
+    {
+        function.removeFnAttr(cflat_cinterop::kCxxDependencyDefinitionAttr);
+        function.removeFnAttr(cflat_cinterop::kCxxVariableInitializerAttr);
+    }
+    for (llvm::GlobalVariable& variable : module.globals())
+        if (variable.hasAttribute(cflat_cinterop::kCxxDependencyDefinitionAttr))
+            variable.setAttributes(variable.getAttributes().removeAttribute(
+                module.getContext(), cflat_cinterop::kCxxDependencyDefinitionAttr));
+}
+
 static size_t CountDefinitions(const llvm::Module& m)
 {
     size_t count = 0;
@@ -2918,7 +3057,7 @@ bool LLVMBackend::UpgradeCxxAssumedBodyOwners(const llvm::Module& companions)
         auto groupIt = cxxTypeOwnerGroup_.find(target);
         if (spellingIt == cxxCflatToCxxSpelling_.end() || groupIt == cxxTypeOwnerGroup_.end())
             continue;
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, target);
         if (group.headers.empty()) continue;
         CxxRequestGroupScope groupScope(*this, &group);
         std::string error;
@@ -3438,6 +3577,9 @@ bool LLVMBackend::LinkCxxCompanionModules()
                 rememberDefinitions(*companions);
                 companionDefinitionsIndexed = true;
             }
+            YieldCxxDependencyDefinitions(*companions, *companion,
+                companionDefinitionsIndexed ? &companionFunctionDefinitions : nullptr,
+                companionDefinitionsIndexed ? &companionGlobalDefinitions : nullptr);
             DeclareDuplicateDefinitions(*companions, *companion, cachedCompanion,
                                         companionDefinitionsIndexed ? &companionFunctionDefinitions : nullptr,
                                         companionDefinitionsIndexed ? &companionGlobalDefinitions : nullptr);
@@ -3486,6 +3628,7 @@ bool LLVMBackend::LinkCxxCompanionModules()
                         { "import cpp" });
         return false;
     }
+    StripCxxDependencyDefinitionTags(*module);
     for (const llvm::Function& function : module->functions())
         if (!function.isDeclaration() && !programOrigin.contains(function.getName().str()))
             companionFunctionNames_.insert(function.getName().str());

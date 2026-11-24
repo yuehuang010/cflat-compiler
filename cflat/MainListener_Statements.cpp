@@ -7904,6 +7904,15 @@ void MainListener::GenerateDefaultParamOverloads(
                         auto destination = defNV;
                         destination.TypeAndValue.VariableName = params[i].VariableName;
                         compiler->RejectLiteralZeroFunctionSlot(defaultVal, destination);
+                        // A non-pointer default (`function<int(int)> f = 5`) is refused like a
+                        // declaration initializer; the slot takes its null default instead of the store.
+                        if (RejectImplicitPrimitiveToPointer(ae, params[i], defNV, defaultVal, "initialize",
+                                std::format("parameter '{}'", params[i].VariableName)))
+                        {
+                            defaultVal = GenerateDefaultValue(params[i]);
+                            defaultArg = {};
+                            defNV = {};
+                        }
                     }
                     RejectCodeValueIntoDataSlot(ae, defNV, params[i], "default-initialize",
                         std::format("parameter '{}' of", params[i].VariableName));

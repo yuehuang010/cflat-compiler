@@ -2874,10 +2874,10 @@ bool LLVMBackend::IsCxxConvertingTemporaryForRvalueRef(const NamedVariable& arg,
             std::unordered_set<std::string> incompleteTypes;
             GeneratedCxxDefinitionsFor({ param.TypeName, argType.TypeName }, generatedTypeSource,
                                        dependencySet, incompleteTypes);
-            if (auto owner = cxxTypeOwnerGroup_.find(argType.TypeName);
-                owner != cxxTypeOwnerGroup_.end() && owner->second != groupIt->second)
-                dependencySet.insert(owner->second);
-            const std::vector<size_t> dependencies(dependencySet.begin(), dependencySet.end());
+            std::vector<size_t> dependencies(dependencySet.begin(), dependencySet.end());
+            std::unordered_set<std::string> visitedTypes;
+            CollectCxxTypeOwnerGroups(param.TypeName, dependencies, visitedTypes);
+            CollectCxxTypeOwnerGroups(argType.TypeName, dependencies, visitedTypes);
             CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, dependencies);
             if (!group.headers.empty())
             {
@@ -2942,10 +2942,10 @@ std::string LLVMBackend::CxxCopyInitRefusal(const NamedVariable& arg, const std:
         std::unordered_set<std::string> incompleteTypes;
         GeneratedCxxDefinitionsFor({ targetType, argType.TypeName }, generatedTypeSource,
                                    dependencySet, incompleteTypes);
-        if (auto owner = cxxTypeOwnerGroup_.find(argType.TypeName);
-            owner != cxxTypeOwnerGroup_.end() && owner->second != groupIt->second)
-            dependencySet.insert(owner->second);
-        const std::vector<size_t> dependencies(dependencySet.begin(), dependencySet.end());
+        std::vector<size_t> dependencies(dependencySet.begin(), dependencySet.end());
+        std::unordered_set<std::string> visitedTypes;
+        CollectCxxTypeOwnerGroups(targetType, dependencies, visitedTypes);
+        CollectCxxTypeOwnerGroups(argType.TypeName, dependencies, visitedTypes);
         CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, dependencies);
         if (group.headers.empty()) return {};
         const std::string wrapperName = std::format("__cflat_copyinit_{:016x}",
@@ -3693,7 +3693,7 @@ LLVMBackend::CxxTernaryVerdict LLVMBackend::ClassifyCxxTernary(const TypeAndValu
             || trueOwner == cxxTypeOwnerGroup_.end() || falseOwner == cxxTypeOwnerGroup_.end())
             return verdict;
         CxxRequestGroup group = MakeCxxClassRequestGroup(trueOwner->second, trueName,
-                                                         { falseOwner->second });
+                                                         CxxTypeOwnerGroupsOf({ falseName }));
         if (group.headers.empty()) return verdict;
         const std::string trueCv = (trueConst ? "const " : "") + trueSpelling;
         const std::string falseCv = (falseConst ? "const " : "") + falseSpelling;
@@ -4089,7 +4089,7 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
                 + armParams + ") { ::new (static_cast<void *>(self)) " + resultSpelling + "("
                 + conditional + "); }\n";
         CxxRequestGroup group = MakeCxxClassRequestGroup(resultOwner->second, resultName,
-            { armOwner->second, otherOwner->second });
+            CxxTypeOwnerGroupsOf({ armName, otherName }));
         if (group.headers.empty()) return false;
         CxxRequestGroupScope groupScope(*this, &group);
         CSigEntry signature;
@@ -4800,6 +4800,220 @@ bool LLVMBackend::EmitLoweredMemberwiseMove(const std::string& typeName, llvm::T
         builder->CreateStore(llvm::Constant::getNullValue(valueType), src);
         movedFields.Release();
         return true;
+}
+
+/*
+ * RULED 2026-11-18: `Box b = move a` of a [cpp] struct is the implicit move of the WHOLE record as
+ * clang defines it. The generated C++ class keeps its fields as an opaque byte block, so clang is
+ * asked through a mirror aggregate of the same fields. Only a struct holding a C++ field whose move
+ * cflat cannot rank triggers it; every other [cpp] struct's per-field move already is clang's pick.
+ */
+/*
+ * A CFlat move is a byte move that zero-fills the source, so each non-C++ field is modelled by
+ * bytes with its C++ analog's triviality and zeroed in the source afterwards: owners (unique,
+ * unique<T>, a struct with a dtor or [unique]) get a user move and break clang's memcpy runs, as
+ * std::unique_ptr does; raw pointers and dtor-free plain structs stay trivially copyable.
+ * Refs, aliases, interfaces, unions with pointers or owners and odd layouts are Refused:
+ * today's move stands.
+ */
+LLVMBackend::CppMirrorField LLVMBackend::ClassifyCppMirrorField(const DeclTypeAndValue& field,
+                                                                int depth) const
+{
+        if (field.IsRvalueRef || field.IsCxxRef() || field.IsAlias || field.IsFlexibleArrayMember
+            || field.IsZeroLengthArrayMember || field.IsAnonymousMember
+            || field.IsInlineAggregateField)
+            return CppMirrorField::Refused;
+        if (field.IsUnique || MangledBase(field.TypeName) == "unique")
+            return CppMirrorField::OwnedBytes;
+        if (field.Pointer || field.ElemPointer || field.IsArrayView) return CppMirrorField::NulledBytes;
+        if (field.IsBitfield || field.IsBitfieldStorage || field.IsSimd) return CppMirrorField::Bytes;
+        const std::string element = ResolveTypeAlias(field.TypeName);
+        if (IsCppStructName(element)
+            || (cxxRecords_.count(element) != 0 && generatedCxxRecords_.count(element) == 0))
+            return depth == 0 && field.ConstInnerDimensions.empty() ? CppMirrorField::Spelled
+                                                                    : CppMirrorField::Refused;
+        if ((IsPrimitiveTypeName(element) && element != "void")
+            || !ResolveEnumTypeName(element).empty())
+            return CppMirrorField::Bytes;
+        return ClassifyCppMirrorStruct(element, depth + 1);
+}
+
+LLVMBackend::CppMirrorField LLVMBackend::ClassifyCppMirrorStruct(const std::string& typeName,
+                                                                 int depth) const
+{
+        auto found = dataStructures.find(typeName);
+        if (depth > 16 || found == dataStructures.end() || found->second.StructType == nullptr
+            || found->second.StructType->isOpaque()
+            || !found->second.Interfaces.empty() || IsCppStructName(typeName)
+            || cxxRecords_.count(typeName) != 0)
+            return CppMirrorField::Refused;
+        CppMirrorField kind = found->second.Destructor != nullptr
+            || HasTypeAnnotation(typeName, "unique") ? CppMirrorField::OwnedBytes
+                                                     : CppMirrorField::Bytes;
+        for (const auto& field : found->second.StructFields)
+        {
+            if (field.IsPadding) continue;
+            kind = std::max(kind, ClassifyCppMirrorField(field, depth));
+            if (kind == CppMirrorField::Refused) break;
+        }
+        // A union is bytes only when no member needs its source nulled.
+        if (found->second.IsUnion && kind != CppMirrorField::Bytes) return CppMirrorField::Refused;
+        return kind;
+}
+
+bool LLVMBackend::CppStructNeedsClangRecordMove(const std::string& typeName) const
+{
+        if (CppStructFieldsNeedClangMove(typeName)) return true;
+        // The generated move constructor moves the C++ base through clang's pick.
+        std::string base;
+        return IsCppStructName(typeName) && GetCppStructBase(typeName, base)
+            && cxxRecords_.count(base) != 0 && generatedCxxRecords_.count(base) == 0
+            && const_cast<LLVMBackend*>(this)->CxxTrivialMoveNeedsTransfer(base, false, false);
+}
+
+bool LLVMBackend::CppStructFieldsNeedClangMove(const std::string& typeName) const
+{
+        if (!IsCppStructName(typeName)) return false;
+        auto found = dataStructures.find(typeName);
+        if (found == dataStructures.end() || found->second.StructType == nullptr
+            || found->second.StructType->isOpaque())
+            return false;
+        const bool generated = generatedCxxRecords_.count(typeName) != 0;
+        bool trigger = false;
+        for (const auto& field : found->second.StructFields)
+        {
+            if ((generated && !field.IsCflatOwned) || field.IsPadding) continue;
+            const CppMirrorField kind = ClassifyCppMirrorField(field);
+            if (kind == CppMirrorField::Refused) return false;
+            if (kind != CppMirrorField::Spelled) continue;
+            const std::string element = ResolveTypeAlias(field.TypeName);
+            if (IsCppStructName(element))
+            {
+                if (element != typeName && CppStructNeedsClangRecordMove(element)) trigger = true;
+                continue;
+            }
+            if (cxxRecords_.count(element) != 0 && generatedCxxRecords_.count(element) == 0)
+            {
+                if (const_cast<LLVMBackend*>(this)->CxxTrivialMoveNeedsTransfer(element, false,
+                                                                                 false))
+                    trigger = true;
+                continue;
+            }
+        }
+        return trigger;
+}
+
+llvm::Function* LLVMBackend::RequestCppStructRecordMove(const std::string& typeName)
+{
+        if (auto known = cppStructRecordMoves_.find(typeName); known != cppStructRecordMoves_.end())
+            return known->second.empty() ? nullptr : GetFunction(known->second);
+        cppStructRecordMoves_[typeName].clear();
+        auto generated = generatedCxxRecords_.find(typeName);
+        if (generated == generatedCxxRecords_.end() || generated->second.literalType == nullptr
+            || !CppStructFieldsNeedClangMove(typeName))
+            return nullptr;
+        auto* literal = generated->second.literalType;
+        const auto& fields = generated->second.fields;
+        if (fields.size() != literal->getNumElements()) return nullptr;
+        const auto& dl = module->getDataLayout();
+        const auto* layout = dl.getStructLayout(literal);
+        std::string body;
+        std::string nulls;
+        std::vector<std::pair<size_t, uint64_t>> offsets;
+        std::vector<std::string> fieldTypes;
+        size_t owner = static_cast<size_t>(-1);
+        std::vector<size_t> deps;
+        for (size_t i = 0; i < fields.size(); ++i)
+        {
+            const auto& field = fields[i];
+            const std::string member = "f" + std::to_string(i);
+            auto* elementType = literal->getElementType((unsigned)i);
+            const uint64_t size = dl.getTypeAllocSize(elementType).getFixedValue();
+            // Padding stays implicit, as in the C++ equivalent: a byte member would join a run.
+            if (field.IsPadding) continue;
+            const CppMirrorField kind = ClassifyCppMirrorField(field);
+            if (kind == CppMirrorField::Refused) return nullptr;
+            if (kind != CppMirrorField::Spelled)
+            {
+                if (size == 0) continue;
+                const uint64_t fieldAlign = dl.getABITypeAlign(elementType).value();
+                if (kind == CppMirrorField::OwnedBytes)
+                    body += std::format("    @OWNED@<{}, {}> {};\n", size, fieldAlign, member);
+                else
+                    body += std::format("    alignas({}) unsigned char {}[{}];\n", fieldAlign,
+                                        member, size);
+                // Every non-C++ source field is zero-filled after the move, as a CFlat move does
+                // (ruling 2026-10-31); an owner zeroes itself. Runs are chosen before this.
+                if (kind != CppMirrorField::OwnedBytes)
+                    nulls += std::format(" __builtin_memset(s->{0}, 0, sizeof(s->{0}));", member);
+            }
+            else
+            {
+                std::string spelling;
+                if (!CxxSpellingForCflatType(ResolveTypeAlias(field.TypeName), spelling))
+                    return nullptr;
+                body += "    " + spelling + " " + member
+                     + (field.ConstArraySize > 0 ? std::format("[{}]", field.ConstArraySize) : "")
+                     + ";\n";
+                fieldTypes.push_back(ResolveTypeAlias(field.TypeName));
+                size_t group = 0;
+                if (generatedCxxRecords_.count(fieldTypes.back()) == 0
+                    && GetCxxTypeOwnerGroup(fieldTypes.back(), group))
+                {
+                    if (owner == static_cast<size_t>(-1)) owner = group;
+                    else deps.push_back(group);
+                }
+            }
+            offsets.emplace_back(i, layout->getElementOffset((unsigned)i));
+        }
+        std::string generatedSource;
+        std::set<size_t> generatedGroups;
+        std::unordered_set<std::string> incomplete;
+        GeneratedCxxDefinitionsFor(fieldTypes, generatedSource, generatedGroups, incomplete);
+        if (!incomplete.empty()) return nullptr;
+        deps.insert(deps.end(), generatedGroups.begin(), generatedGroups.end());
+        if (owner == static_cast<size_t>(-1)) owner = FindOrAddCxxImportGroup({}, {});
+        CxxRequestGroup group = MakeCxxRequestGroup(owner, deps);
+        if (group.headers.empty()) group.label = "<generated C++ struct>";
+        const uint64_t hash = HashWrapperKey(typeName + "|record-move|" + body + "|" + nulls);
+        const std::string mirror = std::format("__cflat_rmirror_{:016x}", hash);
+        const std::string wrapperName = std::format("__cflat_rmove_{:016x}", hash);
+        // A CFlat owner moves as bytes and nulls its source; the user move breaks memcpy runs.
+        const std::string owned = std::format("__cflat_rowned_{:016x}", hash);
+        std::string ownedSource;
+        if (body.find("@OWNED@") != std::string::npos)
+        {
+            ownedSource = std::format("template <unsigned long N, unsigned long A> struct alignas(A) {0} {{\n"
+                "    unsigned char b[N];\n"
+                "    {0}({0}&& o) noexcept {{ __builtin_memcpy(b, o.b, N); __builtin_memset(o.b, 0, N); }}\n"
+                "}};\n", owned);
+            for (size_t at = body.find("@OWNED@"); at != std::string::npos; at = body.find("@OWNED@"))
+                body.replace(at, 7, owned);
+        }
+        // The mirror must reproduce the CFlat layout exactly; a mismatch fails the request.
+        std::string checks;
+        for (const auto& [index, offset] : offsets)
+            checks += std::format("static_assert(__builtin_offsetof({}, f{}) == {});\n", mirror,
+                                  index, offset);
+        const uint64_t align = layout->getAlignment().value();
+        const std::string source = "#include <new>\n" + generatedSource + ownedSource
+            + std::format("struct alignas({}) {}", align, mirror) + " {\n" + body + "};\n" + checks
+            + std::format("static_assert(sizeof({0}) == {1} && alignof({0}) == {2});\n", mirror,
+                          dl.getTypeAllocSize(literal).getFixedValue(), align)
+            + "extern \"C\" __attribute__((weak)) void " + wrapperName + "(void* p0, void* p1) noexcept"
+            + " { " + mirror + "* s = static_cast<" + mirror + "*>(p1); ::new (p0) " + mirror
+            + "(static_cast<" + mirror + "&&>(*s));" + nulls + " }\n";
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry signature;
+        std::string error;
+        if (!RequestGeneratedCxxWrapper(group, source, wrapperName, "RECORD_MOVE", signature, error)
+            || signature.params.size() != 2)
+            return nullptr;
+        signature.name = wrapperName;
+        RegisterCSignatures({ signature }, group.headers.empty() ? group.label : group.headers.front());
+        auto* fn = GetFunction(wrapperName);
+        if (fn != nullptr) cppStructRecordMoves_[typeName] = wrapperName;
+        return fn;
 }
 
 bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::Type* valueType,
@@ -5571,6 +5785,65 @@ llvm::Function* LLVMBackend::GetCxxOperatorDeleteArray(bool overAligned)
         return llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, name, module.get());
     }
 
+const char* LLVMBackend::SizeTypeSpelling() const
+{
+        return targetWindows_ ? "u64" : "ulong";
+}
+
+std::string LLVMBackend::UnusableUniqueDeleteMessage(const std::string& pointee) const
+{
+        return std::format("'unique' on C++ class '{}' names std::unique_ptr<{}>, which has no suitable "
+                           "'operator delete' - its only class-scope 'operator delete' is not a usual "
+                           "deallocation function (the second parameter must be size_t)",
+                           SpellType(*this, TypeAndValue{ .TypeName = pointee }),
+                           SpellType(*this, TypeAndValue{ .TypeName = pointee }));
+}
+
+std::string LLVMBackend::UnusableUniqueSpellingError(const std::string& base,
+                                                    const std::vector<std::string>& args) const
+{
+        if (base != "unique" || args.size() != 1 || !IsCxxUniquePtrPointee(args[0])) return {};
+        const std::string pointee = ResolveTypeAlias(args[0]);
+        return ClassDeleteUnusable(pointee) ? UnusableUniqueDeleteMessage(pointee) : std::string();
+}
+
+bool LLVMBackend::IsUsualSizedDeleteParam(const TypeAndValue& p) const
+{
+        return !p.Pointer && p.ValuePointerDepth() == 0 && p.TypeName == SizeTypeSpelling();
+}
+
+bool LLVMBackend::ClassDeleteUnusable(const std::string& typeName) const
+{
+        // The first scope declaring operator delete decides (its non-usual deletes hide the base's).
+        std::vector<std::string> work{ typeName };
+        std::set<std::string> seen;
+        for (size_t i = 0; i < work.size(); ++i)
+        {
+            const std::string cls = work[i];
+            if (!seen.insert(cls).second) continue;
+            const CxxClassInfo* info = GetCxxClassInfo(cls);
+            // A C++ class's own deletes: non-usual ones are never projected, so the record decides.
+            if (info != nullptr && info->hasClassDelete) return !info->hasUsualClassDelete;
+            auto it = functionTable.find(cls + ".operator delete");
+            bool declared = false, usual = false;
+            if (it != functionTable.end())
+                for (const FunctionSymbol& sym : it->second)
+                {
+                    if (sym.IsCxx) continue;   // projected base member, not declared by this class
+                    declared = true;
+                    if (sym.Variadic || sym.Parameters.empty() || !sym.Parameters[0].Pointer) continue;
+                    if (sym.Parameters.size() == 1
+                        || (sym.Parameters.size() == 2 && IsUsualSizedDeleteParam(sym.Parameters[1])))
+                        usual = true;
+                }
+            if (declared) return !usual;
+            if (info != nullptr)
+                for (const CxxClassInfo::BaseRef& b : info->bases)
+                    if (!b.isVirtual) work.push_back(b.name);
+        }
+        return false;
+}
+
 const LLVMBackend::FunctionSymbol* LLVMBackend::FindCxxClassAllocFunction(
     const std::string& typeName, const std::string& opName, bool& sized)
 {
@@ -5581,6 +5854,7 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::FindCxxClassAllocFunction(
          * delete(void*) / (void*, size_t), where a class-scope delete prefers the unsized one.
          */
         sized = false;
+        const bool isDelete = opName == "operator delete" || opName == "operator delete[]";
         std::vector<std::string> work{ typeName };
         std::set<std::string> seen;
         for (size_t i = 0; i < work.size(); ++i)
@@ -5597,7 +5871,9 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::FindCxxClassAllocFunction(
                 {
                     if (!sym.IsCxx || sym.IsMethod || sym.Function == nullptr) continue;
                     if (sym.Parameters.size() == 1 && unsized == nullptr) unsized = &sym;
-                    else if (sym.Parameters.size() == 2 && withSize == nullptr) withSize = &sym;
+                    else if (sym.Parameters.size() == 2 && withSize == nullptr
+                             && (!isDelete || IsUsualSizedDeleteParam(sym.Parameters[1])))
+                        withSize = &sym;
                 }
                 if (unsized != nullptr) return unsized;
                 sized = withSize != nullptr;
@@ -5675,6 +5951,8 @@ void LLVMBackend::EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr)
 {
         uint64_t size = 0, align = 0;
         if (ptr == nullptr || !CxxObjectSizeAndAlign(typeName, size, align)) return;
+        // Only non-usual deletes: no deallocator is suitable, and the release calls nothing (as clang).
+        if (ClassDeleteUnusable(typeName)) return;
         auto* voidPtr = builder->CreateBitCast(ptr, cflat_llvm::PointerTo(builder->getInt8Ty()));
         // A CFlat-declared operator delete on the class itself hides the base's C++ ones.
         if (HasCflatClassAllocFunction(typeName, "operator delete"))

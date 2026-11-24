@@ -3527,7 +3527,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     std::string sourceSpelling;
                     if (CxxSpellingForCflatType(sourceType, sourceSpelling))
                     {
-                        CxxRequestGroup group = MakeCxxRequestGroup(owner->second, {});
+                        CxxRequestGroup group = MakeCxxClassRequestGroup(owner->second, sourceType);
                         if (!group.headers.empty())
                         {
                             for (size_t pos = 0; (pos = sourceName.find('.', pos)) != std::string::npos;
@@ -9791,7 +9791,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
         {
             const auto& param = candidate.Parameters[i];
-            if (candidate.IsCxx && matched[i].Primary != nullptr
+            // A data-pointer null cast is refused at a native function slot too (ruling 2026-11-18).
+            if ((candidate.IsCxx || matched[i].IsDataNullCast) && matched[i].Primary != nullptr
                 && (param.IsFunctionPointer
                     || (!param.Pointer && (IsStdFunctionTypeName(param.TypeName)
                                            || IsStdFunctionSpecialization(param.TypeName)))))

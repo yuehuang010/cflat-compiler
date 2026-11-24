@@ -30,4 +30,33 @@ static inline int ***dp_top(void)
     return &pp;
 }
 
+/* Depth 3 and 4 through typedefs, function pointers, out-parameters, arrays and a global. */
+typedef int **DpIPP;
+typedef DpIPP *DpIPPP;
+typedef int (*DpFp3)(int ***);
+typedef struct DpH4 { int ****f; DpIPPP t; int ***arr[2]; DpFp3 cb; int *one; void *vp; } DpH4;
+extern int dp_g3_value;
+extern int ***dp_g3;
+/* One '*' is a recorded depth too: results, globals and fields refuse a deeper destination. */
+extern int *dp_g1;
+static inline int *dp_r1(int *p) { return p; }
+static inline void *dp_vr1(void *p) { return p; }
+static inline int dp_take2(int **p) { return **p + 2; }
+static inline int dp_load4(int ****p) { return ****p; }
+static inline int dp_td(DpIPPP p) { return ***p; }
+static inline int dp_null3(int ***p) { return p == 0 ? 1 : 2; }
+static inline int dp_cpc(int *const *const *p) { return ***p; }
+static inline int dp_fpimpl(int ***p) { return ***p + 1; }
+static inline DpFp3 dp_getfp(void) { return dp_fpimpl; }
+static inline int dp_runfp(DpFp3 f, int ***p) { return f(p) + 10; }
+static inline int dp_out3(int ****out, int ***v) { *out = v; return 0; }
+static inline int dp_h4(DpH4 *h) { return ****h->f + ***h->t + ***h->arr[1] + h->cb(h->arr[0]); }
+static inline int dp_args(int *argc, char ***argv)
+{
+    static char *v[2] = {"ab", "cde"};
+    *argc = 2;
+    *argv = v;
+    return 0;
+}
+
 #endif
