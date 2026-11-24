@@ -8183,6 +8183,72 @@ bool testFnviewstarPointerViewElement()
     return result;
 }
 
+// IFACETMP neighbour: a native by-value temporary passed through a function value is destroyed
+// once, as on the direct call. Pre-fix only a brace temp was; a ctor or call temp leaked (dead 0).
+int gFpTmpDead = 0;
+
+struct FpTmpN
+{
+    int v = 0;
+    FpTmpN(int x) { v = x; }
+    ~FpTmpN() { gFpTmpDead++; }
+};
+
+FpTmpN fpTmpMake(int x) { return FpTmpN(x); }
+int fpTmpGet(FpTmpN d) { return d.v; }
+int fpTmpTake(move FpTmpN d) { return d.v; }
+struct FpTmpHolder { function<int(FpTmpN)> f = default; };
+
+int fpTmpDeadSince()
+{
+    int d = gFpTmpDead;
+    gFpTmpDead = 0;
+    return d;
+}
+
+bool testFunctionValueByValueTempDestroyedOnce()
+{
+    bool result = true;
+    int v = 0;
+    fpTmpDeadSince();
+    { v = fpTmpGet(FpTmpN(7)); }
+    result &= Test("fptmp_direct_value", v, 7);
+    result &= Test("fptmp_direct_dead", fpTmpDeadSince(), 1);
+    function<int(FpTmpN)> f = fpTmpGet;
+    { v = f(FpTmpN(7)); }
+    result &= Test("fptmp_ctor_value", v, 7);
+    result &= Test("fptmp_ctor_dead", fpTmpDeadSince(), 1);
+    { v = f(fpTmpMake(8)); }
+    result &= Test("fptmp_factory_value", v, 8);
+    result &= Test("fptmp_factory_dead", fpTmpDeadSince(), 1);
+    { function<int(FpTmpN)> l = (FpTmpN d) => d.v; v = l(FpTmpN(9)); }
+    result &= Test("fptmp_lambda_value", v, 9);
+    result &= Test("fptmp_lambda_dead", fpTmpDeadSince(), 1);
+    { int bias = 1; Lambda<int(FpTmpN)> c = (FpTmpN d) => d.v + bias; v = c(FpTmpN(9)); }
+    result &= Test("fptmp_closure_value", v, 10);
+    result &= Test("fptmp_closure_dead", fpTmpDeadSince(), 1);
+    { FpTmpHolder h = FpTmpHolder(); h.f = fpTmpGet; v = h.f(FpTmpN(4)); }
+    result &= Test("fptmp_field_value", v, 4);
+    result &= Test("fptmp_field_dead", fpTmpDeadSince(), 1);
+    { int s = 0; for (int j = 0; j < 3; j++) s = s + f(FpTmpN(j)); v = s; }
+    result &= Test("fptmp_loop_value", v, 3);
+    result &= Test("fptmp_loop_dead", fpTmpDeadSince(), 3);
+    // Accept-set: destroyed once on master already.
+    { v = f({.v = 5}); }
+    result &= Test("fptmp_brace_value", v, 5);
+    result &= Test("fptmp_brace_dead", fpTmpDeadSince(), 1);
+    { FpTmpN x = FpTmpN(6); v = f(x); }
+    result &= Test("fptmp_lvalue_value", v, 6);
+    result &= Test("fptmp_lvalue_dead", fpTmpDeadSince(), 1);
+    { bool c = v > 0; v = f(c ? FpTmpN(2) : FpTmpN(3)); }
+    result &= Test("fptmp_ternary_value", v, 2);
+    result &= Test("fptmp_ternary_dead", fpTmpDeadSince(), 1);
+    { function<int(move FpTmpN)> m = fpTmpTake; v = m(FpTmpN(3)); }
+    result &= Test("fptmp_move_value", v, 3);
+    result &= Test("fptmp_move_dead", fpTmpDeadSince(), 1);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -8448,6 +8514,7 @@ extern int main(int argc, char** argv)
     total++; passed += testFntype2FunctionAliases() ? 1 : 0;
     total++; passed += testFntype2ExactOverloadBinding() ? 1 : 0;
     total++; passed += testFnviewstarPointerViewElement() ? 1 : 0;
+    total++; passed += testFunctionValueByValueTempDestroyedOnce() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

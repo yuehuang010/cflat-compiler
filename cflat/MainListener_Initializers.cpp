@@ -324,6 +324,63 @@ std::string MainListener::ResolveInitializerArgType(
         return resolved;
     }
 
+bool MainListener::ParseInterfaceBraceArgument(
+        CFlatParser::ArgumentNamedExpressionContext* argument,
+        const LLVMBackend::TypeAndValue* param,
+        const std::string& ifaceName,
+        const std::string& methodName,
+        size_t position,
+        LLVMBackend::NamedVariable& out,
+        std::vector<std::pair<llvm::Value*, std::string>>* retainedUnwindSlots) {
+        auto* compiler = Compiler(argument);
+        const std::string structType = param != nullptr
+            ? compiler->ResolveTypeAlias(param->TypeName) : std::string();
+        const bool cflatStruct = param != nullptr && !argument->Ellipsis()
+            && (!param->Pointer || param->PointerDepth <= 1) && !param->ElemPointer
+            && !param->IsArrayView
+            && !param->IsInterface && !param->IsFunctionPointer
+            && param->ConstArraySize == 0 && param->ConstInnerDimensions.empty()
+            && !structType.empty() && compiler->IsDataStructure(structType)
+            && !compiler->IsCxxRecord(structType);
+        if (!cflatStruct)
+        {
+            LogErrorContext(argument, std::format(
+                "argument {} to interface method '{}.{}' cannot be passed here: a brace list or "
+                "'...' binds only a CFlat struct or struct-pointer parameter",
+                position, ifaceName, methodName));
+            return false;
+        }
+        LLVMBackend::DeclTypeAndValue paramType;
+        paramType.TypeName = structType;
+        auto* initList = argument->initializerList();
+        llvm::Value* slot = nullptr;
+        if (initList != nullptr && CanFreshBraceInitializeAggregate(structType, initList))
+        {
+            slot = compiler->CreateAlloca(compiler->GetType(paramType));
+            if (!EmitFreshBraceInitializeAggregate(slot, structType, initList))
+                return false;
+        }
+        else
+        {
+            llvm::Value* defaultVal = GenerateDefaultValue(paramType);
+            if (defaultVal == nullptr) return false;
+            slot = compiler->CreateAlloca(defaultVal->getType());
+            compiler->CreateAssignment(defaultVal, slot);
+            // An empty brace has no initializerList() child: the default-initialized value.
+            if (initList != nullptr)
+                EmitConstructedFieldOverrides(slot, structType, initList, true, retainedUnwindSlots);
+        }
+        llvm::Value* loaded = compiler->CreateLoad(slot);
+        out = {};
+        out.Primary = loaded;
+        out.BaseType = loaded->getType();
+        out.TypeAndValue.TypeName = structType;
+        out.TypeAndValue.VariableName = argument->Identifier() ? argument->Identifier()->getText()
+                                                               : std::string();
+        out.IsCFlatBraceInitTemp = true;
+        return true;
+    }
+
 llvm::Value* MainListener::CoerceInitValueToInterface(
         LLVMBackend::NamedVariable& rightNV,
         llvm::Value* val,

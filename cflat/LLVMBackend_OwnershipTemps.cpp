@@ -4070,11 +4070,49 @@ void LLVMBackend::RegisterCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin)
             cxxDefaultTernaryStorageJoins_.push_back(storageJoin);
 }
 
+void LLVMBackend::MarkZeroedMoveStorageJoin(llvm::PHINode* storageJoin)
+{
+        if (storageJoin != nullptr)
+            storageJoin->setMetadata("cflat.zeroed.move.join", llvm::MDNode::get(*context, {}));
+}
+
+bool LLVMBackend::RestoreZeroedMoveStorageJoin(llvm::Value* storageJoin, llvm::Value* joinedValue)
+{
+        auto* storagePhi = llvm::dyn_cast_or_null<llvm::PHINode>(storageJoin);
+        auto* valuePhi = llvm::dyn_cast_or_null<llvm::PHINode>(joinedValue);
+        if (storagePhi == nullptr || valuePhi == nullptr || builder == nullptr
+            || storagePhi->getMetadata("cflat.zeroed.move.join") == nullptr
+            || valuePhi->getParent() != storagePhi->getParent()
+            || !valuePhi->getType()->isStructTy())
+            return false;
+        builder->CreateStore(valuePhi, storagePhi);
+        storagePhi->setMetadata("cflat.zeroed.move.join", nullptr);
+        return true;
+}
+
 bool LLVMBackend::IsCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin) const
 {
         return storageJoin != nullptr
             && std::find(cxxDefaultTernaryStorageJoins_.begin(), cxxDefaultTernaryStorageJoins_.end(),
                          storageJoin) != cxxDefaultTernaryStorageJoins_.end();
+}
+
+void LLVMBackend::HandOverJoinedOwnedTemps(llvm::Value* valueJoin)
+{
+    llvm::SmallVector<llvm::PHINode*, 4> joins;
+    llvm::SmallPtrSet<llvm::PHINode*, 4> seen;
+    if (auto* join = llvm::dyn_cast_or_null<llvm::PHINode>(valueJoin))
+        if (join->getType()->isStructTy()) joins.push_back(join);
+    while (!joins.empty())
+    {
+        llvm::PHINode* join = joins.pop_back_val();
+        if (!seen.insert(join).second) continue;
+        for (llvm::Value* incoming : join->incoming_values())
+            if (auto* nested = llvm::dyn_cast<llvm::PHINode>(incoming))
+                joins.push_back(nested);
+            else if (auto* bytes = llvm::dyn_cast<llvm::LoadInst>(incoming))
+                UnregisterOwnedStructTemp(bytes->getPointerOperand());
+    }
 }
 
 bool LLVMBackend::IsProducedTempValue(llvm::Value* value) const
@@ -8900,6 +8938,19 @@ void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg, boo
         auto* tempAlloca = AllocaAtEntry(arg.BaseType, nullptr, "argtemp");
         builder->CreateStore(arg.Primary, tempAlloca);
         RegisterOwnedStructTemp(tempAlloca, arg.TypeAndValue.TypeName);
+    }
+
+void LLVMBackend::RegisterBorrowedByValueArgTemp(const NamedVariable& arg, const TypeAndValue& param)
+{
+        bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
+            && llvm::isa<llvm::PHINode>(arg.Primary)
+            && !arg.TernaryTempAlreadyRegistered;
+        const bool loweredSretPassedByValue = IsLoweredCFlatOnlyStruct(param.TypeName)
+            && arg.TypeAndValue.TypeName == param.TypeName
+            && LoweredSretTempOf(arg.Primary,
+                                 arg.Primary != nullptr ? arg.Primary->getType() : nullptr) != nullptr;
+        if (!loweredSretPassedByValue)
+            RegisterBorrowedOwningStructTemp(arg, ternaryJoinNeedsRegistration);
     }
 
 bool LLVMBackend::AdoptTernaryArmStructTemps(llvm::PHINode* join)

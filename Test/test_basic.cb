@@ -1072,6 +1072,226 @@ bool testDefaultExpression()
     return result;
 }
 
+// DEFTMP: a native default temporary built by the default-param wrapper is destroyed exactly once
+// (master forgot it - the destructor never ran). DefTmpSeen packs value*1000 + live*100 + dup*10
+// + zero-state destructions; a leak shows as live=1, a double destroy as dup=1.
+int defTmpNextId = 0;
+int defTmpLive = 0;
+int defTmpZero = 0;
+int defTmpDup = 0;
+int[64] defTmpDestroyed;
+struct DefTmpN
+{
+    int id = default;
+    int v = default;
+    DefTmpN(int x) { v = x; defTmpNextId++; id = defTmpNextId; defTmpLive++; }
+    DefTmpN copy() { return DefTmpN(v); }
+    ~DefTmpN()
+    {
+        if (id == 0) { defTmpZero++; return; }
+        if (defTmpDestroyed[id] != 0) defTmpDup++;
+        defTmpDestroyed[id]++;
+        defTmpLive--;
+    }
+};
+int DefTmpSeen(int value)
+{
+    int seen = value * 1000 + defTmpLive * 100 + defTmpDup * 10 + defTmpZero;
+    defTmpNextId = 0; defTmpLive = 0; defTmpZero = 0; defTmpDup = 0;
+    for (int i = 0; i < 64; i++) defTmpDestroyed[i] = 0;
+    return seen;
+}
+DefTmpN defTmpMk(int x) { return DefTmpN(x); }
+DefTmpN defTmpMkD(DefTmpN x = DefTmpN(3)) { return x; }
+int defTmpF(DefTmpN a, DefTmpN d = DefTmpN(5)) { return a.v * 10 + d.v; }
+int defTmpFac(DefTmpN a, DefTmpN d = defTmpMk(5)) { return a.v * 10 + d.v; }
+int defTmpBrace(DefTmpN a, DefTmpN d = {.v = 5}) { return a.v * 10 + d.v; }
+int defTmpDef(DefTmpN a, DefTmpN d = default) { return a.v * 10 + d.v; }
+int defTmpNest(DefTmpN d = defTmpMkD()) { return d.v; }
+int defTmpInner(DefTmpN d = DefTmpN(defTmpMk(2).v + 1)) { return d.v; }
+int defTmpThree(DefTmpN a, DefTmpN b = DefTmpN(2), DefTmpN c = DefTmpN(3))
+{
+    return a.v * 100 + b.v * 10 + c.v;
+}
+DefTmpN defTmpRd(DefTmpN a, DefTmpN d = DefTmpN(5)) { return d; }
+int defTmpVoidSum = 0;
+void defTmpVoid(DefTmpN d = DefTmpN(5)) { defTmpVoidSum += d.v; }
+int defTmpAlias(alias DefTmpN d = defTmpMk(6)) { return d.v; }
+int defTmpGen<T>(T a, DefTmpN d = DefTmpN(5)) { return a * 10 + d.v; }
+class DefTmpHost { int k = 1; int m(DefTmpN d = DefTmpN(5)) { return k * 100 + d.v; } };
+class DefTmpGenHost<T> { T k = default; int m(DefTmpN d = DefTmpN(5)) { return d.v + 1; } };
+interface IDefTmp { int get(DefTmpN d = DefTmpN(5)); };
+class DefTmpImpl : IDefTmp { int b = 100; int get(DefTmpN d) { return b + d.v; } };
+struct DefTmpCtor { int v = default; DefTmpCtor(DefTmpN d = DefTmpN(6)) { v = d.v; } };
+// unique<T> defaults: a raw `new` / nullptr default failed module verification on master.
+int defTmpUnique(unique<DefTmpN> u = new DefTmpN(5)) { return u->v; }
+int defTmpUniqueNull(unique<DefTmpN> u = nullptr) { return u == nullptr ? 4 : u->v; }
+int defTmpUniqueInt(unique<int> u = new int(7)) { return *u; }
+int DefTmpEarlyCaller() { return defTmpLate(); }
+int defTmpLate(DefTmpN d = DefTmpN(9)) { return d.v; }
+
+// DEFTMP r2: a result that borrows from an omitted default (alias, pointer, data()) is read after
+// the call; the default lives to the end of the CALLER's statement like an explicit argument. The
+// destructor poisons v, so a default destroyed inside the wrapper reads -999.
+int defTmpPLive = 0;
+struct DefTmpP
+{
+    int v = default;
+    DefTmpP(int x) { v = x; defTmpPLive++; }
+    ~DefTmpP() { if (v != -999) defTmpPLive--; v = -999; }
+};
+DefTmpP defTmpMkP(int x) { return DefTmpP(x); }
+alias DefTmpP defTmpPick(alias DefTmpP d = defTmpMkP(6)) { return d; }
+int* defTmpPv(alias DefTmpP d = defTmpMkP(6)) { return &d.v; }
+int defTmpUse(alias DefTmpP a, int k) { return a.v + k; }
+(const char)* defTmpSd(string s = string("ab") + "cd") { return s.data(); }
+struct DefTmpPRef { int* p = default; };
+DefTmpPRef defTmpPr(alias DefTmpP d = defTmpMkP(7)) { DefTmpPRef r = default; r.p = &d.v; return r; }
+int* defTmpPvEarlier(DefTmpP first, alias DefTmpP d = defTmpMkP(first.v + 2)) { return &d.v; }
+DefTmpN defTmpGlobal = default;
+int defTmpBumpGlobal(alias DefTmpN d = defTmpGlobal) { d.v = d.v + 1; return d.v; }
+int defTmpByvPick(DefTmpP d = defTmpPick()) { return d.v; }
+int defTmpByaPick(alias DefTmpP d = defTmpPick()) { return d.v; }
+alias DefTmpP defTmpPick2(alias DefTmpP d = defTmpPick()) { return d; }
+alias DefTmpP defTmpGenPick<T>(T x, alias DefTmpP d = defTmpPick()) { return d; }
+interface IDefTmpPut { int put(move DefTmpP p = DefTmpP(1)); int putf(move DefTmpP p = defTmpMkP(1)); int get(DefTmpP d = DefTmpP(2)); };
+class DefTmpPut : IDefTmpPut
+{
+    int put(move DefTmpP p) { return p.v; }
+    int putf(move DefTmpP p) { return p.v; }
+    int get(DefTmpP d) { return d.v; }
+};
+int DefTmpPSeen(int value)
+{
+    int seen = value * 10 + defTmpPLive;
+    defTmpPLive = 0;
+    return seen;
+}
+
+bool testDefaultParamNativeTemporaries()
+{
+    bool result = true;
+    DefTmpSeen(0);
+    int r = defTmpF(DefTmpN(1));
+    result &= Test("deftmp_ctor_omit", DefTmpSeen(r), 15000);
+    r = defTmpFac(DefTmpN(1));
+    result &= Test("deftmp_factory_omit", DefTmpSeen(r), 15000);
+    r = defTmpBrace(DefTmpN(1));
+    result &= Test("deftmp_brace_omit_zero_dtor", DefTmpSeen(r), 15001);
+    r = defTmpDef(DefTmpN(1));
+    result &= Test("deftmp_default_omit_zero_dtor", DefTmpSeen(r), 10001);
+    r = defTmpNest();
+    result &= Test("deftmp_nested_default", DefTmpSeen(r), 3000);
+    r = defTmpInner();
+    result &= Test("deftmp_temp_inside_default", DefTmpSeen(r), 3000);
+    r = defTmpThree(DefTmpN(1), DefTmpN(7));
+    result &= Test("deftmp_some_omitted", DefTmpSeen(r), 173000);
+    r = defTmpThree(DefTmpN(1));
+    result &= Test("deftmp_two_omitted", DefTmpSeen(r), 123000);
+    r = defTmpF(DefTmpN(1), DefTmpN(6));
+    result &= Test("deftmp_explicit_temps_kept", DefTmpSeen(r), 16000);
+    {
+        DefTmpN lv = DefTmpN(1);
+        r = defTmpF(lv);
+    }
+    result &= Test("deftmp_lvalue_then_omit", DefTmpSeen(r), 15000);
+    r = defTmpF(DefTmpN(1)) + defTmpF(DefTmpN(2));
+    result &= Test("deftmp_in_expression", DefTmpSeen(r), 40000);
+    r = 0;
+    for (int i = 1; i < 4; i++) r += defTmpF(DefTmpN(i));
+    result &= Test("deftmp_in_loop", DefTmpSeen(r), 75000);
+    {
+        DefTmpN z = defTmpRd(defTmpMk(1));
+        r = z.v;
+    }
+    result &= Test("deftmp_returned_default", DefTmpSeen(r), 5000);
+    {
+        DefTmpN z = defTmpRd(defTmpMk(1), DefTmpN(5));
+        r = z.v;
+    }
+    result &= Test("deftmp_returned_explicit_once", DefTmpSeen(r), 5000);
+    defTmpVoidSum = 0;
+    defTmpVoid();
+    result &= Test("deftmp_void_omit", DefTmpSeen(defTmpVoidSum), 5000);
+    r = defTmpAlias();
+    result &= Test("deftmp_alias_default", DefTmpSeen(r), 6000);
+    r = defTmpGen(3);
+    result &= Test("deftmp_generic_fn", DefTmpSeen(r), 35000);
+    {
+        DefTmpHost h = default;
+        r = h.m();
+    }
+    result &= Test("deftmp_method", DefTmpSeen(r), 105000);
+    {
+        DefTmpGenHost<int> g = default;
+        r = g.m();
+    }
+    result &= Test("deftmp_generic_method", DefTmpSeen(r), 6000);
+    {
+        DefTmpImpl k = default;
+        IDefTmp i = k;
+        r = i.get();
+    }
+    result &= Test("deftmp_interface_omit", DefTmpSeen(r), 105000);
+    {
+        DefTmpCtor c = DefTmpCtor();
+        r = c.v;
+    }
+    result &= Test("deftmp_ctor_param_default", DefTmpSeen(r), 6000);
+    r = defTmpUnique();
+    result &= Test("deftmp_unique_new_default", DefTmpSeen(r), 5000);
+    r = 0;
+    for (int i = 0; i < 3; i++) r += defTmpUnique();
+    result &= Test("deftmp_unique_new_loop", DefTmpSeen(r), 15000);
+    r = defTmpUniqueNull();
+    result &= Test("deftmp_unique_null_default", DefTmpSeen(r), 4000);
+    r = defTmpUniqueInt();
+    result &= Test("deftmp_unique_int_default", DefTmpSeen(r), 7000);
+    r = DefTmpEarlyCaller();
+    result &= Test("deftmp_caller_above_callee", DefTmpSeen(r), 9000);
+    // r2: borrows from an omitted default stay valid through the caller's statement, then die once.
+    r = defTmpPick().v;
+    result &= Test("deftmp_alias_return_borrow", DefTmpPSeen(r), 60);
+    r = *defTmpPv();
+    result &= Test("deftmp_pointer_return_borrow", DefTmpPSeen(r), 60);
+    r = defTmpUse(defTmpPick(), 1);
+    result &= Test("deftmp_alias_return_nested", DefTmpPSeen(r), 70);
+    r = *defTmpPr().p;
+    result &= Test("deftmp_struct_field_borrow", DefTmpPSeen(r), 70);
+    r = (int)strlen(defTmpSd());
+    result &= Test("deftmp_string_data_borrow", r, 4);
+    r = 0;
+    for (int i = 0; i < 3; i++) r += *defTmpPv();
+    result &= Test("deftmp_pointer_borrow_loop", DefTmpPSeen(r), 180);
+    // An earlier-parameter default stays in the wrapper; a borrowing result keeps it alive (leak).
+    r = *defTmpPvEarlier(DefTmpP(2));
+    result &= Test("deftmp_earlier_param_borrow_value", DefTmpPSeen(r) / 10, 4);
+    // An alias default naming a global binds the global itself, as C++ `N& d = g` does.
+    defTmpGlobal.v = 40;
+    r = defTmpBumpGlobal();
+    result &= Test("deftmp_alias_default_global", r * 100 + defTmpGlobal.v, 4141);
+    // A default that is itself an alias-returning call stays in the wrapper.
+    r = defTmpByvPick();
+    result &= Test("deftmp_alias_call_default_byvalue", DefTmpPSeen(r), 60);
+    r = defTmpByaPick();
+    result &= Test("deftmp_alias_call_default_alias", DefTmpPSeen(r), 60);
+    r = defTmpPick2().v;
+    result &= Test("deftmp_alias_call_default_alias_return", DefTmpPSeen(r) / 10, 6);
+    r = defTmpGenPick(1).v;
+    result &= Test("deftmp_alias_call_default_generic", DefTmpPSeen(r) / 10, 6);
+    // Interface defaults: the helper forwards a move param without destroying its shell.
+    DefTmpPut putImpl = default;
+    IDefTmpPut putIface = putImpl;
+    r = putIface.put();
+    result &= Test("deftmp_iface_move_default_ctor", DefTmpPSeen(r), 10);
+    r = putIface.putf();
+    result &= Test("deftmp_iface_move_default_call", DefTmpPSeen(r), 10);
+    r = putIface.get();
+    result &= Test("deftmp_iface_byvalue_default", DefTmpPSeen(r), 20);
+    DefTmpSeen(0);
+    return result;
+}
+
 // Regression: a method default parameter whose bare name collides with a
 // same-named method on an UNRELATED type used to abort the compile with
 // "named argument '<Type>__' does not match any parameter". The default-param
@@ -9488,6 +9708,7 @@ extern int main()
     total++; passed += testIntToBoolCallArgument()       ? 1 : 0;
     total++; passed += testDefaultExpression()           ? 1 : 0;
     total++; passed += testDefaultParamNameCollision()   ? 1 : 0;
+    total++; passed += testDefaultParamNativeTemporaries() ? 1 : 0;
     total++; passed += testParameterizedConstructorPrelude() ? 1 : 0;
     total++; passed += testAllDefaultedConstructor()     ? 1 : 0;
     total++; passed += testNoArgCtorFieldSeeding()       ? 1 : 0;

@@ -70,7 +70,7 @@ class spsc_queue<T>
     bool try_pop(T* out) {
         int tail = __atomic_i32_load(&_tail);
         if (tail == __atomic_i32_load(&_head)) return false;   // empty
-        if const (is_assignable(T)) *out = _buf[tail]; else compile_error("spsc_queue<T>: the element type has a const field and cannot be reassigned");
+        if const (is_assignable(T)) *out = move _buf[tail]; else compile_error("spsc_queue<T>: the element type has a const field and cannot be reassigned");
         __atomic_i32_store(&_tail, (tail + 1) % _cap);
         return true;
     }
@@ -103,7 +103,7 @@ class spsc_queue<T>
             pause();
             tail = __atomic_i32_load(&_tail);
         }
-        T out = _buf[tail];
+        T out = move _buf[tail];
         __atomic_i32_store(&_tail, (tail + 1) % _cap);
         return out;
     }

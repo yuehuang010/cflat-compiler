@@ -10,19 +10,15 @@ Earlier wrapper sites (T110): default/move ctor, xvalue transfer, brace ctors, v
 operator->, type-definition upgrades, special-member completion, base conversion, refused member
 retry, xvalue pointer conversion all use MakeCxxClassRequestGroup (kCHeaderCacheVersion 240).
 
-## Still open: CFLAT_CPP_INCREMENTAL=0 calloc overload (blocks the noinc dtor check)
+## CFLAT_CPP_INCREMENTAL=0 calloc overload: fixed (NOINC, fix box 16)
 
-Re-measured 2026-11-18 (CACHE-KEY, master 496b9392e and fix identical):
-- `import cpp "memory"; import cpp "cpp_interop_opnew.h";` +
-  `std.unique_ptr<cppon.Cls> p = std.unique_ptr<cppon.Cls>(new cppon.Cls(7));` compiles and runs
-  under CFLAT_CPP_INCREMENTAL=0 (exit 0); so does `list<int>` with only `import cpp "memory"`.
-- Adding `import cpp "vector"; import cpp "cpp_interop_basic.h";` plus `import "list.cb"` and a
-  `struct Holder { std.unique_ptr<cppon.Cls> p = default; }` still stops at core/list.cb:48
-  "cannot choose which 'calloc' to call: calloc(u64, u64), calloc(unsigned long, unsigned long)"
-  (noinc only; default mode exit 0). This is not a request-group defect.
-
-Next step: fix the noinc calloc overload, then re-check the noinc Holder assignment and the
-implicit unique_ptr destructor.
+The calloc ambiguity was the fallback request TU re-harvesting libc's `::calloc`; see
+internal/issue/p3/cpp-noinc-mode-divergences.md. Re-checked 2026-11-19 under CFLAT_CPP_INCREMENTAL=0
+with `import cpp "memory"; import cpp "vector"; import cpp "cpp_interop_opnew.h";
+import cpp "cpp_interop_basic.h"; import "list.cb";` and
+`struct Holder { std.unique_ptr<cppon.Cls> p = default; };`: list<int> growth, the Holder
+assignment `h.p = std.unique_ptr<cppon.Cls>(new cppon.Cls(7));` and the implicit unique_ptr
+destructor compile and run (exit 0; master: calloc refusal, then "selected deleted operator '='").
 
 ## Owner-only sites (audit)
 

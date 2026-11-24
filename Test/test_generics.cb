@@ -8653,6 +8653,192 @@ bool testTupleLambdaParamsAndDtors()
     return result;
 }
 
+// GENCTAD: native generic constructor deduction, C++20 CTAD over the constructors (`GctBox(3)`
+// is `GctBox<int>(3)`). Literals take the generic-deduction default type; names keep precedence.
+struct GctBox<T> { T value = default; GctBox(T v) { value = v; } };
+struct GctBox2<T> { T value = default; GctBox2(T v) { value = v; } GctBox2(T a, T b) { value = a + b; } };
+struct GctScaled<T> { T value = default; GctScaled(T v, int k = 2) { value = v * k; } };
+struct GctPair<A, B> { A a = default; B b = default; GctPair(A x, B y) { a = x; b = y; } };
+struct GctRef<T> { T* p = default; GctRef(T* q) { p = q; } };
+struct GctSpan<T> { T last = default; T first = default; GctSpan(T[] a) { last = a[2]; first = a[0]; } };
+struct GctWrap<T> { T inner = default; GctWrap(GctBox<T> b) { inner = b.value; } };
+struct GctNamed<T> { T value = default; int k = 0; GctNamed(T v, int scale = 1) { value = v; k = scale; } };
+struct GctTwo<T> { T value = default; GctTwo(T a, T b) { value = a + b; } };
+struct GctPo<T> { int tag = 0; GctPo(T v) { tag = 1; } GctPo(T* p) { tag = 2; } };
+class GctCls<T> { T value = default; GctCls(T v) { value = v + 1; } };
+interface IGctScore { int Score(); };
+class GctRobot : IGctScore { int power = 0; int Score() { return power * 2; } };
+struct GctBest<T> where T : IGctScore { T item = default; GctBest(T x) { item = x; } int get() { return item.Score(); } };
+struct GctPlain { int a = 5; };
+enum GctColor : int { GctRed, GctGreen };
+namespace GctNs
+{
+    struct GctNsBox<T> { T value = default; GctNsBox(T v) { value = v + 100; } };
+    int bare() { auto b = GctNsBox(3); return b.value; }
+    namespace Inner { int enclosing() { auto b = GctNsBox(4); return b.value; } }
+    // Collision twin: a same-named template in a namespace and at file scope.
+    struct GctBox<T> { T value = default; GctBox(T v) { value = v * 10; } };
+    int collide() { auto b = GctBox(5); return b.value; }
+    struct GctNsFn<T> { T value = default; GctNsFn(T v) { value = v; } };
+    int GctNsFn(int v) { return v * 2; }
+}
+int gctCtors = 0;
+int gctDtors = 0;
+struct GctProbe { int id = 0; GctProbe(int i) { id = i; gctCtors++; } ~GctProbe() { gctDtors++; } };
+int gctDeducedLifetime() { GctProbe p = GctProbe(1); auto b = GctBox(p); return b.value.id; }
+int gctSpelledLifetime() { GctProbe p = GctProbe(1); auto b = GctBox<GctProbe>(p); return b.value.id; }
+int gctBumps = 0;
+int gctBump() { gctBumps++; return gctBumps * 10; }
+i64 gctWide() { return 6; }
+int gctTakesBox(GctBox<int> b) { return b.value + 1; }
+GctBox<int> gctReturnsBox() { return GctBox(3); }
+GctBox<i64> gctMakeWide() { return GctBox<i64>(9); }
+T gctTwice<T>(T v) { auto b = GctBox(v); return b.value * 2; }
+T gctPass<T>(T x) { return x; }
+struct GctMethod { int k = 3; int run() { auto b = GctBox(k); return b.value; } };
+// Name gate (accept set, master result kept): each same-named value outranks the template.
+struct GctLoc<T> { T value = default; GctLoc(T v) { value = v; } };
+struct GctPrm<T> { T value = default; GctPrm(T v) { value = v; } };
+struct GctFld<T> { T value = default; GctFld(T v) { value = v; } };
+struct GctGlb<T> { T value = default; GctGlb(T v) { value = v; } };
+struct GctFun<T> { T value = default; GctFun(T v) { value = v; } };
+int gctDouble(int v) { return v * 2; }
+int gctUsesParam(function<int(int)> GctPrm) { return GctPrm(3); }
+struct GctFieldGate { function<int(int)> GctFld = default; int run() { return GctFld(3); } };
+function<int(int)> GctGlb = gctDouble;
+int GctFun(int v) { return v * 3; }
+// Inside its own members the bare name is the current instance (C++ injected class name).
+struct GctSelf<T> { T value = default; GctSelf(T v) { value = v; }
+    int lit() { auto b = GctSelf(3); return (int)sizeof(b.value); }
+    int dbl() { auto b = GctSelf(value * 2); return (int)sizeof(b.value) * 100 + (int)b.value; }
+    int bare() { GctSelf b = GctSelf(value); return (int)sizeof(b.value); }
+    int heap() { auto p = new GctSelf(3); int r = (int)sizeof(p->value); delete p; return r; }
+    int gen<U>(U u) { auto b = GctSelf(u); return (int)sizeof(b.value) * 10 + (int)sizeof(u); }
+    int lam() { function<int(int)> f = (int a) => { auto b = GctSelf(3); return (int)sizeof(b.value) + a; }; return f(0); }
+    static int stat() { auto b = GctSelf(3); return (int)sizeof(b.value); } };
+struct GctOther<T> { T w = default; int m() { auto b = GctBox(3); auto c = GctBox(w); return (int)sizeof(b.value) * 10 + (int)sizeof(c.value); } };
+// A constructor inside an `if const` arm is a guide only where the deduced arguments take that arm.
+struct GctArm<T> { T value = default; int k = 0;
+    if const (sizeof(T) > 4) { GctArm(T v) { value = v; k = 1; } } else { GctArm(T v, int x) { value = v; k = x; } } };
+
+bool testGenericConstructorDeduction()
+{
+    bool result = true;
+    auto one = GctBox(3);
+    result &= Test("gct_one_ctor", one.value * 10 + (int)sizeof(one.value), 34);
+    result &= Test("gct_overloaded", GctBox2(4, 5).value * 10 + GctBox2(3).value, 93);
+    result &= Test("gct_default_param", GctScaled(3).value * 100 + GctScaled(3, 5).value, 615);
+    auto pair = GctPair(1, 2.5);
+    result &= Test("gct_two_params", pair.a * 100 + (int)(pair.b * 10) + (int)sizeof(pair.b) * 1000, 8125);
+    int pointee = 7;
+    result &= Test("gct_tptr", *GctRef(&pointee).p, 7);
+    int[3] arr = { 4, 5, 6 };
+    auto span = GctSpan(arr);
+    result &= Test("gct_tview", span.last * 10 + span.first, 64);
+    auto wrap = GctWrap(GctBox<short>(9));
+    result &= Test("gct_nested_param", wrap.inner * 10 + (int)sizeof(wrap.inner), 92);
+    auto named = GctNamed(v: 3, scale: 4);
+    auto reordered = GctNamed(scale: 5, v: 6);
+    result &= Test("gct_named_args", named.value * 1000 + named.k * 100 + reordered.value * 10 + reordered.k, 3465);
+    result &= Test("gct_class", GctCls(3).value, 4);
+    GctRobot robot;
+    robot.power = 4;
+    result &= Test("gct_interface_constraint", GctBest(robot).get(), 8);
+    // Literal kinds: the C++ default type (int, long past int, double, float for 'f', char, bool).
+    result &= Test("gct_lit_int", (int)sizeof(GctBox(3).value), 4);
+    result &= Test("gct_lit_long", (int)sizeof(GctBox(5000000000).value), 8);
+    result &= Test("gct_lit_long_value", GctBox(5000000000).value, (i64)5000000000);
+    result &= Test("gct_lit_double", (int)sizeof(GctBox(3.5).value), 8);
+    result &= Test("gct_lit_float", (int)sizeof(GctBox(2.5f).value), 4);
+    result &= Test("gct_lit_char", (int)sizeof(GctBox('c').value) * 1000 + (int)GctBox('c').value, 1099);
+    result &= Test("gct_lit_bool", GctBox(true).value, true);
+    result &= Test("gct_lit_unsigned", (int)sizeof(GctBox(7u).value), 4);
+    // Non-literal arguments are typed through the expression path.
+    short s = 4;
+    result &= Test("gct_arg_local", (int)sizeof(GctBox(s).value) * 10 + GctBox(s).value, 24);
+    GctMethod method;
+    result &= Test("gct_arg_implicit_field", method.run(), 3);
+    result &= Test("gct_arg_call", (int)sizeof(GctBox(gctWide()).value), 8);
+    result &= Test("gct_arg_cast", (int)sizeof(GctBox((i8)7).value), 1);
+    i64 wide = 4;
+    result &= Test("gct_arg_binary", (int)sizeof(GctBox(s + wide).value), 8);
+    result &= Test("gct_arg_unary", (int)sizeof(GctBox(-s).value), 4);
+    result &= Test("gct_arg_string", GctBox("hi").value, "hi");
+    result &= Test("gct_arg_pointer", *GctBox(&pointee).value, 7);
+    i16[2] halves = { 1, 9 };
+    result &= Test("gct_arg_index", (int)sizeof(GctBox(halves[1]).value) * 10 + GctBox(halves[1]).value, 29);
+    bool pickWide = true;
+    result &= Test("gct_arg_ternary", (int)sizeof(GctBox(pickWide ? wide : 2).value), 8);
+    result &= Test("gct_arg_enum", (int)GctBox(GctColor.GctGreen).value, 1);
+    GctPlain plain;
+    result &= Test("gct_arg_struct", GctBox(plain).value.a, 5);
+    auto once = GctBox(gctBump());
+    result &= Test("gct_arg_evaluated_once", once.value * 10 + gctBumps, 101);
+    // Spellings: declared, bare destination, argument, member, return, new, namespaces.
+    GctBox<int> declared = GctBox(3);
+    result &= Test("gct_explicit_destination", declared.value, 3);
+    GctBox bare = GctBox(4);
+    result &= Test("gct_bare_destination", bare.value, 4);
+    GctBox bareFromCall = gctMakeWide();
+    result &= Test("gct_bare_destination_call", (int)sizeof(bareFromCall.value) * 10 + (int)bareFromCall.value, 89);
+    result &= Test("gct_call_argument", gctTakesBox(GctBox(3)), 4);
+    result &= Test("gct_member_access", GctBox(5).value, 5);
+    result &= Test("gct_return", gctReturnsBox().value, 3);
+    GctBox<int>* heap = new GctBox(6);
+    auto heapAuto = new GctBox(7);
+    result &= Test("gct_new", heap->value * 10 + heapAuto->value, 67);
+    delete heap;
+    delete heapAuto;
+    result &= Test("gct_ns_qualified", GctNs.GctNsBox(2).value, 102);
+    result &= Test("gct_ns_bare_inside", GctNs.bare(), 103);
+    result &= Test("gct_ns_enclosing", GctNs.Inner.enclosing(), 104);
+    result &= Test("gct_ns_collision", GctNs.collide() * 1000 + GctBox(6).value * 10 + GctNs.GctBox(7).value, 50130);
+    result &= Test("gct_inside_generic", gctTwice(4), 8);
+    result &= Test("gct_nested_generic_call", gctPass(GctBox(5000000000)).value, (i64)5000000000);
+    // Ranking: partial ordering, literal widening, a literal adapting to a declared binding.
+    result &= Test("gct_partial_order", GctPo(&pointee).tag * 10 + GctPo(pointee).tag, 21);
+    auto widened = GctTwo(5000000000, 2);
+    result &= Test("gct_literals_widen", widened.value, (i64)5000000002);
+    result &= Test("gct_literal_adapts", (int)sizeof(GctTwo(wide, 3).value) * 10 + (int)sizeof(GctTwo(4, wide).value), 88);
+    // Lifetime: the deduced form runs the same constructors and destructors as the spelled one.
+    gctCtors = 0;
+    gctDtors = 0;
+    int deducedId = gctDeducedLifetime();
+    int deducedCounts = gctCtors * 10 + gctDtors;
+    gctCtors = 0;
+    gctDtors = 0;
+    int spelledId = gctSpelledLifetime();
+    result &= Test("gct_lifetime_same_as_spelled", deducedId * 100 + deducedCounts, spelledId * 100 + gctCtors * 10 + gctDtors);
+    result &= Test("gct_lifetime_counts", deducedCounts, 13);
+    // Name gate: local, parameter, implicit-this field, global and function keep precedence.
+    function<int(int)> GctLoc = gctDouble;
+    result &= Test("gct_gate_local", GctLoc(3), 6);
+    result &= Test("gct_gate_param", gctUsesParam(gctDouble), 6);
+    GctFieldGate gate;
+    gate.GctFld = gctDouble;
+    result &= Test("gct_gate_field", gate.run(), 6);
+    result &= Test("gct_gate_global", GctGlb(3), 6);
+    result &= Test("gct_gate_function", GctFun(3), 9);
+    result &= Test("gct_gate_ns_function", GctNs.GctNsFn(3), 6);
+    GctSelf<i64> self64 = GctSelf<i64>(5);
+    GctSelf<i8> self8 = GctSelf<i8>(3);
+    i8 small = 2;
+    result &= Test("gct_injected_literal", self64.lit(), 8);
+    result &= Test("gct_injected_expression", self8.dbl(), 106);
+    result &= Test("gct_injected_bare_destination", self64.bare(), 8);
+    result &= Test("gct_injected_new", self64.heap(), 8);
+    result &= Test("gct_injected_generic_method", self64.gen(small), 81);
+    result &= Test("gct_injected_lambda", self64.lam(), 8);
+    result &= Test("gct_injected_static", GctSelf<i64>.stat(), 8);
+    GctOther<i64> other;
+    result &= Test("gct_other_generic_deduces", other.m(), 48);
+    auto armWide = GctArm(5000000000);
+    auto armNarrow = GctArm(3, 7);
+    result &= Test("gct_if_const_arm_taken", (int)sizeof(armWide.value) * 10 + armWide.k, 81);
+    result &= Test("gct_if_const_else_arm", (int)sizeof(armNarrow.value) * 10 + armNarrow.k, 47);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -8853,6 +9039,7 @@ extern int main()
     total++; passed += testGenns2NamespaceValueParam()                ? 1 : 0;
     total++; passed += testGenns2NestedValueBindingDoesNotLeak()       ? 1 : 0;
     total++; passed += testGenns2NestedSizeofUsesType()                ? 1 : 0;
+    total++; passed += testGenericConstructorDeduction()        ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

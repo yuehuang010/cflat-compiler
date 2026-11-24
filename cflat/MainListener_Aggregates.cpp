@@ -647,11 +647,23 @@ bool MainListener::CanFreshBraceInitializeAggregate(
     auto* compiler = Compiler(list);
     auto data = compiler->GetDataStructure(typeName);
     if (data.StructType == nullptr || data.IsUnion) return false;
-    auto isDirectMoveValue = [](antlr4::tree::ParseTree* node) {
+    auto isDirectMoveValue = [](auto&& self, antlr4::tree::ParseTree* node) -> bool {
         while (node != nullptr)
         {
             if (dynamic_cast<CFlatParser::MoveExpressionContext*>(node) != nullptr)
                 return true;
+            // `c ? move a : move b` moves whichever source it selects, like a direct move.
+            if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+                cond != nullptr && cond->expression() != nullptr
+                && cond->conditionalExpression() != nullptr)
+                return self(self, cond->expression()) && self(self, cond->conditionalExpression());
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                primary != nullptr && primary->expression() != nullptr
+                && primary->children.size() == 3)
+            {
+                node = primary->expression();
+                continue;
+            }
             auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
             if (rule == nullptr || rule->children.size() != 1) return false;
             node = rule->children[0];
@@ -664,7 +676,7 @@ bool MainListener::CanFreshBraceInitializeAggregate(
                 || fi->assignmentExpression().empty())
                 return false;
             auto* initExpr = fi->assignmentExpression()[0];
-            if (!isDirectMoveValue(initExpr))
+            if (!isDirectMoveValue(isDirectMoveValue, initExpr))
                 return false;
             const std::string fieldName = fi->Identifier()->getText();
             auto field = std::find_if(data.StructFields.begin(), data.StructFields.end(),
@@ -3534,9 +3546,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     return false;
                 return compiler->GetCxxClassInfo(param.TypeName) != nullptr;
             };
+            // The wrapper passes its own parameter by reference unless the body needs a copy it
+            // destroys itself (callee-destroyed ABI); then it forwards, or borrows if it cannot.
             auto isBorrowedCxxOverrideParam = [&](const LLVMBackend::DeclTypeAndValue& param) {
                 return isByValueCxxRecord(param)
-                    && compiler->CxxClassOverrideParamIsBorrowed(param.TypeName);
+                    && (!compiler->CxxOverrideParamForwardsByValue(param.TypeName)
+                        || compiler->CxxClassOverrideParamIsBorrowed(param.TypeName));
             };
             const bool hasByValueCxxRecordOverrideParam = std::any_of(
                 overrides.begin(), overrides.end(), [&](const auto& overrideInfo) {

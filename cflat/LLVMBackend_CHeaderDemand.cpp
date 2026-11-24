@@ -2263,11 +2263,17 @@ std::string LLVMBackend::BuildCxxRequestOdrUses(const cflat_cinterop::RawRecord&
         std::string src;
         // The one-shot fallback ODR-uses every nontrivial destructor; the default path (and its cache key) is master's.
         const bool oneShotFallback = !UseCxxIncrementalRequests();
-        if (!rec.hasTrivialDtor && (evaluated || oneShotFallback))
+        // A protected destructor (enable_shared_from_this) is not this probe's to name: the
+        // one-shot TU has no blamed-declaration retry, so its access error fails the request.
+        const bool fallbackHiddenDtor = oneShotFallback
+            && std::any_of(rec.members.begin(), rec.members.end(), [](const Member& m) {
+                   return m.kind == Member::Destructor && m.access != cflat_cinterop::AccessPublic;
+               });
+        if (!fallbackHiddenDtor && !rec.hasTrivialDtor && (evaluated || oneShotFallback))
             src = std::string(incrementalSource || oneShotFallback ? "__attribute__((used, noinline)) " : "")
                 + "static void __cflat_use_dtor" + tagPrefix + "(" + marker
                 + "* p) { p->~" + marker + "(); }\n";
-        else if (!rec.hasTrivialDtor)
+        else if (!fallbackHiddenDtor && !rec.hasTrivialDtor)
             src = "using __cflat_use_dtor" + tagPrefix + " = decltype(((" + marker
                 + "*)0)->~" + marker + "());\n";
         unsigned n = 0;
@@ -2811,6 +2817,7 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             }))
             req.source = cflat_cinterop::AliasCxxNestedSpecializationNames(req.source);
         specialMemberRecords.clear();
+        req.tagRequestHeaderFunctions = !incrementalRequests;
         bool ok = cflat_cinterop::ExtractCInterop(req, raw, error);
         // The PCH must only ever change the speed, never the answer. A stale or truncated one can
         // fail the frontend outright, but it can also be error-recovered into an AST where the
@@ -2852,6 +2859,15 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
             if (CxxIncrementalGroup* scope = GetCxxIncrementalGroup(group, scopeError);
                 scope != nullptr)
                 DropCxxDeclarationsOutsideRequestGroup(group, items, *scope, raw);
+        }
+        else
+        {
+            /*
+             * An incremental request chunk never re-harvests its group's headers. A header's
+             * plain free function was the import's to bind (or to leave out of scope, like libc's
+             * ::calloc), never a request's: drop it after the PCH retry judged the harvest.
+             */
+            std::erase_if(raw.sigs, [](const auto& sig) { return sig.declaredByRequestHeader; });
         }
         if (req.completeCxxSpecialMembers)
         {

@@ -4569,14 +4569,33 @@ public:
                                                CFlatParser::ArgumentExpressionListContext* argList = nullptr,
                                                std::vector<std::string>* deducedParameterTypes = nullptr,
                                                bool instantiate = true,
-                                               std::string* refusal = nullptr);
+                                               std::string* refusal = nullptr,
+                                               std::vector<std::string>* selectedTypeArgs = nullptr,
+                                               bool* ambiguous = nullptr);
+    /*
+     * GENCTAD: class template argument deduction for a native generic struct/class called with
+     * no type arguments (`Box(3)`). Each constructor is an implicit guide over the template's type
+     * parameters; arguments are typed through the normal expression path without being emitted.
+     * Returns the instance name (e.g. Box$int), queued and drained; empty after a logged refusal.
+     */
+    std::string DeduceNativeConstructorTemplate(const std::string& base,
+                                                CFlatParser::ArgumentExpressionListContext* argList,
+                                                antlr4::ParserRuleContext* site);
+    // A bare name that reached the `Undefined variable` point as a direct callee of a native
+    // generic template; the call's argument list consumes it and deduces the type arguments.
+    antlr4::tree::TerminalNode* ctadCalleeNode_ = nullptr;
+    // Owner instance of the generic method body being instantiated (no structScopeStack entry).
+    std::string genericMethodOwner_;
+    std::string NativeConstructorDeductionTemplate(antlr4::tree::TerminalNode* node);
+    std::string NativeConstructorDeductionBase(const std::string& base);
+    std::string InjectedClassInstance(const std::string& base, antlr4::tree::ParseTree* site);
     std::string TryInferAndInstantiateFromArgsCandidate(const std::string& funcName,
         size_t candidateIndex, const std::vector<LLVMBackend::NamedVariable>& args,
         CFlatParser::ArgumentExpressionListContext* argList,
         std::vector<std::string>* deducedParameterTypes,
         std::vector<std::string>* deducedTypeArgs, bool instantiate,
         std::vector<LLVMBackend::TypeAndValue>* deducedParameterValues = nullptr,
-        bool rejectDeductionConflicts = false);
+        bool rejectDeductionConflicts = false, bool literalsAdapt = false);
     std::string TryInferAndInstantiateFromFuncPtrCandidate(const std::string& funcName,
         size_t candidateIndex, const LLVMBackend::TypeAndValue& destSig,
         std::string& refusal);
@@ -6347,9 +6366,11 @@ public:
 
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx,
                                            LLVMBackend::NamedVariable* assignmentResult = nullptr);
+    // R21 / N-COPY: an element read through a `T*` subscript whose slot provenance is unproven
+    // copies. `anyOwningStruct` widens the value check from `string` to any struct value.
     bool IsDeclaredPointerSubscriptString(
         CFlatParser::AssignmentExpressionContext* expression,
-        llvm::Value* value, llvm::Value* storage);
+        llvm::Value* value, llvm::Value* storage, bool anyOwningStruct = false);
 
     // Box a THIN '?:' arm (`new T()` / `nullptr` / a borrowed pointer) into the interface fat
     // struct, matching a sibling arm already fat (e.g. `move` of an interface-typed local).
@@ -7169,6 +7190,18 @@ public:
         const std::string& functionName,
         int effectiveParamIdx,
         const std::string& namedParam);
+    static void ReleaseRetainedBraceArgumentUnwinds(LLVMBackend& compiler,
+        std::vector<std::pair<llvm::Value*, std::string>>& retained);
+    // A brace argument `{...}` / `name: {...}` to an INTERFACE method: builds the CFlat struct the
+    // declared parameter names, the direct call's lowering. False after a logged refusal.
+    bool ParseInterfaceBraceArgument(
+        CFlatParser::ArgumentNamedExpressionContext* argument,
+        const LLVMBackend::TypeAndValue* param,
+        const std::string& ifaceName,
+        const std::string& methodName,
+        size_t position,
+        LLVMBackend::NamedVariable& out,
+        std::vector<std::pair<llvm::Value*, std::string>>* retainedUnwindSlots);
 
     // Store a pre-parsed value into one named (non-bitfield) struct field, with the
     // same coercions and ownership behavior as brace-init: a char* string literal is

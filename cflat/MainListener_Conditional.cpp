@@ -3113,6 +3113,95 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             && armIsMove(expressionFalseCtx);
         const bool bothArmsMoved = expressionTrueCtx != nullptr && expressionFalseCtx != nullptr
             && trueExplicitMove && falseExplicitMove;
+        /*
+         * A moved arm whose bytes nothing consumes keeps them in its source: the operand of
+         * `(c ? move a : move b).x` (read in place through the storage join) and a discarded
+         * `c ? move a : move b;`. A discarded mixed join is a prvalue, so its moved bytes are
+         * destroyed like the C++ temporary. The source is re-armed either way.
+         */
+        auto isParenMemberReceiver = [](antlr4::tree::ParseTree* node) {
+            bool parens = false;
+            for (; node != nullptr; node = node->parent)
+            {
+                auto* parent = dynamic_cast<antlr4::ParserRuleContext*>(node->parent);
+                if (parent == nullptr) return false;
+                if (dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent) != nullptr
+                    && parent->children.size() > 1)
+                    return parens && parent->children[0] == node
+                        && parent->children[1]->getText() == ".";
+                const bool paren = parent->children.size() == 3
+                    && parent->children[0]->getText() == "(" && parent->children[2]->getText() == ")";
+                if (!paren && parent->children.size() != 1) return false;
+                parens = parens || paren;
+            }
+            return false;
+        };
+        // A (parenthesised) `?:` whose arms all move counts as a moved arm here, recursively.
+        std::function<bool(antlr4::tree::ParseTree*)> armAllMoves =
+            [&](antlr4::tree::ParseTree* node) -> bool {
+            while (node != nullptr)
+            {
+                if (dynamic_cast<CFlatParser::MoveExpressionContext*>(node) != nullptr) return true;
+                if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+                    cond != nullptr && cond->expression() != nullptr
+                    && cond->conditionalExpression() != nullptr)
+                    return armAllMoves(cond->expression())
+                        && armAllMoves(cond->conditionalExpression());
+                auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                if (primary != nullptr && primary->expression() != nullptr
+                    && primary->children.size() == 3)
+                {
+                    node = primary->expression();
+                    continue;
+                }
+                if (node->children.size() != 1) return false;
+                node = node->children[0];
+            }
+            return false;
+        };
+        const bool trueKeepMove = trueExplicitMove
+            || (expressionTrueCtx != nullptr && armAllMoves(expressionTrueCtx));
+        const bool falseKeepMove = falseExplicitMove
+            || (expressionFalseCtx != nullptr && armAllMoves(expressionFalseCtx));
+        const bool keepBothMoved = trueKeepMove && falseKeepMove;
+        const bool movedReceiverArms = keepBothMoved && isParenMemberReceiver(ctx);
+        // Re-arms the source behind `storage`; a nested join's sources in their own arm blocks.
+        std::function<void(llvm::Value*)> rearmMovedSource = [&](llvm::Value* storage) {
+            auto* join = llvm::dyn_cast<llvm::PHINode>(storage);
+            if (join == nullptr)
+            {
+                compiler->MarkStorageNotExplicitlyMovedNull(storage);
+                return;
+            }
+            const auto savedIP = compiler->builder->saveIP();
+            for (unsigned i = 0; i < join->getNumIncomingValues(); ++i)
+                if (auto* term = cflat_llvm::GetTerminatorOrNull(join->getIncomingBlock(i)))
+                {
+                    compiler->builder->SetInsertPoint(term);
+                    rearmMovedSource(join->getIncomingValue(i));
+                }
+            compiler->builder->restoreIP(savedIP);
+        };
+        auto keepUnconsumedMovedArm = [&](bool explicitMove, llvm::Value* value, llvm::Value* storage) {
+            const bool discard = use == ResultUse::Discard;
+            if (!explicitMove || (!discard && !movedReceiverArms) || value == nullptr
+                || storage == nullptr || !storage->getType()->isPointerTy())
+                return;
+            auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
+            if (st == nullptr || !st->hasName()
+                || st == llvm::StructType::getTypeByName(*compiler->context, "string")
+                || !compiler->IsDataStructure(st->getName().str()))
+                return;
+            if (discard && !keepBothMoved)
+            {
+                auto* movedTemp = compiler->AllocaAtEntry(st, nullptr, "discardtemp");
+                compiler->builder->CreateStore(value, movedTemp);
+                compiler->RegisterOwnedStructTemp(movedTemp, st->getName().str());
+            }
+            else
+                compiler->builder->CreateStore(value, storage);
+            rearmMovedSource(storage);
+        };
         // clang's composite is const when a leaf is const (`c ? mkDCF(1).cd : D(2)`): a derived
         // arm of such a join copies, never moves. Read once, from the source shape.
         std::optional<bool> derivedJoinConstMemo;
@@ -3247,10 +3336,14 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 const bool lowered = compiler->NeedsCxxLoweringType(cxxTernaryDeclType);
                 const bool useMove = (explicitMove && !JoinMoveLeafConst(ctx))
                     || (fieldOfTemp && !CxxTernaryArmConst(armType));
+                // Only a CFlat-declared struct's move zeroes the source; an imported class is intact.
+                const bool zeroedSource = explicitMove
+                    && compiler->IsDataStructure(cxxTernaryDeclType);
+                if (zeroedSource || (lowered && useMove))
+                    compiler->builder->CreateStore(armValue, armStorage);
                 bool copied = false;
                 if (lowered && useMove)
                 {
-                    compiler->builder->CreateStore(armValue, armStorage);
                     copied = compiler->EmitLoweredMemberwiseMove(cxxTernaryDeclType, declType,
                         cxxTernaryDeclDest, armStorage, "into a ternary declaration");
                 }
@@ -3267,6 +3360,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     cxxTernaryDeclFailed = true;
                     return;
                 }
+                // The source is left a live moved-from object, so its scope exit destroys it.
+                if (zeroedSource) compiler->MarkStorageNotExplicitlyMovedNull(armStorage);
                 built = true;
                 ++cxxTernaryDeclArmsMoved;
                 return;
@@ -3940,8 +4035,26 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 armNV.TypeAndValue.IsAlias = false;
                 armNV.TypeAndValue.IsMove = false;
                 normalizeOwningArmType(armNV);
-                compiler->RegisterBorrowedOwningStructTemp(armNV, true);
+                // A moved plain-struct arm passed by value: its bytes left the zeroed source, so a
+                // per-arm temp owns them until the call returns, as for a produced arm.
+                const std::string& armTypeName = armNV.TypeAndValue.TypeName;
+                if (trueExplicitMove && inCallArgument_ && !movedReceiverArms
+                    && trueValue->getType()->isStructTy()
+                    && trueValue->getType()
+                        != llvm::StructType::getTypeByName(*compiler->context, "string")
+                    && compiler->IsDataStructure(armTypeName)
+                    && !compiler->IsForeignNontrivialCxxClass(armTypeName)
+                    && compiler->IsOwningValueType(armTypeName)
+                    && compiler->GetType(armNV.TypeAndValue) == trueValue->getType())
+                {
+                    auto* movedTemp = compiler->AllocaAtEntry(trueValue->getType(), nullptr, "argtemp");
+                    compiler->builder->CreateStore(trueValue, movedTemp);
+                    compiler->RegisterOwnedStructTemp(movedTemp, armTypeName);
+                }
+                else
+                    compiler->RegisterBorrowedOwningStructTemp(armNV, true);
             }
+            keepUnconsumedMovedArm(trueKeepMove, trueValue, trueStorage);
             if (use == ResultUse::Discard)
             {
                 const auto type = ternaryArmSourceType(trueShape, trueValue, trueStorage);
@@ -4163,8 +4276,26 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 armNV.TypeAndValue.IsAlias = false;
                 armNV.TypeAndValue.IsMove = false;
                 normalizeOwningArmType(armNV);
-                compiler->RegisterBorrowedOwningStructTemp(armNV, true);
+                // A moved plain-struct arm passed by value: its bytes left the zeroed source, so a
+                // per-arm temp owns them until the call returns, as for a produced arm.
+                const std::string& armTypeName = armNV.TypeAndValue.TypeName;
+                if (falseExplicitMove && inCallArgument_ && !movedReceiverArms
+                    && falseValue->getType()->isStructTy()
+                    && falseValue->getType()
+                        != llvm::StructType::getTypeByName(*compiler->context, "string")
+                    && compiler->IsDataStructure(armTypeName)
+                    && !compiler->IsForeignNontrivialCxxClass(armTypeName)
+                    && compiler->IsOwningValueType(armTypeName)
+                    && compiler->GetType(armNV.TypeAndValue) == falseValue->getType())
+                {
+                    auto* movedTemp = compiler->AllocaAtEntry(falseValue->getType(), nullptr, "argtemp");
+                    compiler->builder->CreateStore(falseValue, movedTemp);
+                    compiler->RegisterOwnedStructTemp(movedTemp, armTypeName);
+                }
+                else
+                    compiler->RegisterBorrowedOwningStructTemp(armNV, true);
             }
+            keepUnconsumedMovedArm(falseKeepMove, falseValue, falseStorage);
             if (use == ResultUse::Discard)
             {
                 const auto type = ternaryArmSourceType(falseShape, falseValue, falseStorage);
@@ -4683,6 +4814,18 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 {
                     llvm::BasicBlock* endBlock = trueArm ? trueEnd : falseEnd;
                     compiler->builder->SetInsertPoint(endBlock);
+                    // `move a` of a CFlat-declared class zeroed `a`: the callee binds the object
+                    // itself, so restore it; it stays a live moved-from object (destroyed later).
+                    llvm::Value* armSource = trueArm ? trueStorage : falseStorage;
+                    llvm::Value* armBytes = trueArm ? trueValue : falseValue;
+                    if (xvalueReferenceJoin && (trueArm ? trueExplicitMove : falseExplicitMove)
+                        && armSource != nullptr && armBytes != nullptr
+                        && armBytes->getType()->isStructTy()
+                        && compiler->IsDataStructure((trueArm ? trueType : falseType).TypeName))
+                    {
+                        compiler->builder->CreateStore(armBytes, armSource);
+                        compiler->MarkStorageNotExplicitlyMovedNull(armSource);
+                    }
                     llvm::Value* address = lowerReferenceAddress(trueArm);
                     if (address == nullptr) return CxxValueJoinResult::NotApplicable;
                     const size_t index = trueArm ? 0 : 1;
@@ -6023,6 +6166,27 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             && !trueSlotRewritten && !falseSlotRewritten
             && truePointerArmType.TypeName == falsePointerArmType.TypeName
             && truePointerArmType.PointerDepth == falsePointerArmType.PointerDepth;
+        // A moved arm of a CFlat-declared class leaves a live moved-from source; a consumer
+        // constructing from the storage join restores the selected source's bytes first.
+        const bool zeroedMoveArms = cxxRecordJoin && !cxxTernaryDecl && loweredJoinTemp == nullptr
+            && (trueExplicitMove || falseExplicitMove) && trueBr != nullptr && falseBr != nullptr
+            && compiler->IsDataStructure(
+                llvm::cast<llvm::StructType>(trueValue->getType())->getName().str());
+        if (zeroedMoveArms)
+        {
+            const auto savedIP = compiler->builder->saveIP();
+            if (trueExplicitMove && trueStorage != nullptr)
+            {
+                compiler->builder->SetInsertPoint(trueBr);
+                compiler->MarkStorageNotExplicitlyMovedNull(trueStorage);
+            }
+            if (falseExplicitMove && falseStorage != nullptr)
+            {
+                compiler->builder->SetInsertPoint(falseBr);
+                compiler->MarkStorageNotExplicitlyMovedNull(falseStorage);
+            }
+            compiler->builder->restoreIP(savedIP);
+        }
         if (sharedCxxRetTemp != nullptr && trueStorage == sharedCxxRetTemp
             && falseStorage == sharedCxxRetTemp)
             cxxLvalueStorageJoin = sharedCxxRetTemp;
@@ -6037,6 +6201,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             cxxStoragePhi->addIncoming(trueStorage, trueEnd);
             cxxStoragePhi->addIncoming(falseStorage, falseEnd);
             cxxLvalueStorageJoin = cxxStoragePhi;
+            if (zeroedMoveArms) compiler->MarkZeroedMoveStorageJoin(cxxStoragePhi);
         }
         if (cxxRecordJoin && HasDefaultOnlyTernaryArm(ctx)
             && llvm::isa_and_nonnull<llvm::PHINode>(cxxLvalueStorageJoin))

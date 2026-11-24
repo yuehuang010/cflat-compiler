@@ -55,6 +55,8 @@
 //     const-ref lvalue, insert by move and temporary, map emplace, and emplace_back(move) bind.
 //   C++ override helper ABI returns (2100-2109): void, scalar, pointer, reference, 8/16-byte
 //     aggregates, and sret, with the adjacent scalar forms kept as value-checking neighbours.
+//   [cpp] override by-value class parameters (3660-3669): the wrapper binds its own parameter, so
+//     C++ dispatch, CFlat base dispatch and direct calls construct the argument once like clang.
 //   C++ contiguous container -> CFlat T[] call-site decay (3510-3519): vectors, references,
 //     temporaries, array, string, span, nested calls, fields, mutation, exact elements and rank.
 //   C++ proxy prvalue assignment and binary operators (2100-2129): assignment and conversion cases
@@ -91,6 +93,7 @@ import cpp "library/cpp_interop_t520_callable.h";
 import cpp "library/cpp_interop_poly.h";
 import cpp "library/cpp_interop_poly.cpp";
 import cpp "library/cpp_interop_override_abi.h";
+import cpp "library/cpp_ovrmove.hpp";
 // The CFlat-defined [cpp] structs below derive from C++ class-template specializations, and
 // the make_shared checks register them through std::shared_ptr.
 import cpp "library/cpp_interop_tpl.h";
@@ -389,6 +392,45 @@ import "list.cb";
         return result;
     }
 };
+
+[cpp] struct OvrMoveRead : ovm.Base
+{
+    override int takeMv(ovm.Mv r) { return r.v + 1; }
+    override int takeBox(ovm.Box r) { return r.m.v + r.k; }
+    override int takeMvD(ovm.MvD r) { return r.v + r.e; }
+    override int takeTc(ovm.Tc r) { return r.v + 1; }
+    override int takePod(ovm.Pod r) { return r.a + r.b; }
+    override int writePod(ovm.Pod r) { r.a = 99; return r.a + r.b; }
+    override int takeInt(int x) { return x + 1; }
+    override int takePtr(int* p) { return *p + 1; }
+    override ovm.Mv giveMv(ovm.Mv r) { return r; }
+};
+
+[cpp] struct OvrMoveField : ovm.Base
+{
+    ovm.Mv held = default;
+    override int takeMv(ovm.Mv r) { held = move r; return held.v; }
+};
+
+[cpp] struct OvrMoveIgnore : ovm.Base
+{
+    override int takeMv(ovm.Mv r) { return 5; }
+};
+
+[cpp] struct OvrMoveGen<T> : ovm.GBase<T>
+{
+    override T take(ovm.Mv r) { T result = r.v + 1; return result; }
+};
+
+// One value plus the Mv move / copy / destructor counts since the last reset (clang oracle).
+void ovrmove_check(const char* name, int actual, int value, int moves, int copies, int dtors)
+{
+    bridge_check(name, actual, value);
+    bridge_check(name, ovm.get_moves(), moves);
+    bridge_check(name, ovm.get_copies(), copies);
+    bridge_check(name, ovm.get_dtors(), dtors);
+    ovm.reset();
+}
 
 int bridge_cf_ctor = 0;
 int bridge_cf_copy = 0;
@@ -8258,7 +8300,7 @@ extern int main(int argc, char** argv)
         bridge_check("override ABI large24", cppoa.call_large24(base), 1002003);
         cppoa.reset_dtor_count();
         bridge_check("override ABI nontrivial byvalue", cppoa.call_byvalue(base), 24);
-        bridge_check("override ABI nontrivial byvalue dtors", cppoa.dtor_count(), 3);
+        bridge_check("override ABI nontrivial byvalue dtors", cppoa.dtor_count(), 2);
         BridgeGenericOverrideAbi<cppoa.Small8> generic = default;
         cppoa.GenericBase<cppoa.Small8>* genericBase = &generic;
         cppoa.Small8 genericValue = cppoa.call_generic_value(genericBase, cppoa.Dtor(11));
@@ -8266,6 +8308,75 @@ extern int main(int argc, char** argv)
     }
     if (bridge_passed - bridgeOaStartPassed != bridge_checks - bridgeOaStartChecks)
         return 2109;
+
+    // ---- [cpp] override by-value class parameters (3660-3669) --------------------------------
+    // Pre-fix the wrapper moved its parameter into a second by-value copy: one extra move and
+    // destructor per class argument (C++ dispatch and CFlat base dispatch), while a trivially
+    // copyable class bound by alias, so a direct call skipped the copy (Tc) or wrote through (Pod).
+    int bridgeOmStartChecks = bridge_checks;
+    int bridgeOmStartPassed = bridge_passed;
+    {
+        OvrMoveRead derived = default;
+        ovm.Base* base = &derived;
+        ovm.reset();
+        ovrmove_check("OM cpp xvalue", ovm.call_mv_xvalue(base, 7), 108, 1, 0, 2);
+        ovrmove_check("OM cpp prvalue", ovm.call_mv_prvalue(base, 7), 8, 0, 0, 1);
+        ovrmove_check("OM cpp lvalue copy", ovm.call_mv_lvalue(base, 7), 1008, 0, 1, 2);
+        ovrmove_check("OM cpp aggregate", ovm.call_box_xvalue(base, 7), 109, 1, 0, 2);
+        ovrmove_check("OM cpp derived class", ovm.call_mvd_xvalue(base, 7), 108, 1, 0, 2);
+        ovrmove_check("OM cpp return param", ovm.call_give(base, 7), 107, 1, 0, 2);
+        ovrmove_check("OM cpp trivial", ovm.call_tc_xvalue(base, 7), 108, 1, 0, 0);
+        ovrmove_check("OM cpp pod", ovm.call_pod(base, 7), 9, 0, 0, 0);
+        ovrmove_check("OM cpp pod write", ovm.call_write_pod(base, 7), 10107, 0, 0, 0);
+        ovrmove_check("OM cpp int", ovm.call_int(base, 7), 8, 0, 0, 0);
+        ovrmove_check("OM cpp pointer", ovm.call_ptr(base, 7), 8, 0, 0, 0);
+        {
+            ovm.Mv x = ovm.Mv(7);
+            ovm.reset();
+            int r = base->takeMv(move x);
+            ovrmove_check("OM base dispatch", r, 108, 1, 0, 1);
+        }
+        {
+            ovm.Mv x = ovm.Mv(7);
+            ovm.reset();
+            int r = derived.takeMv(move x);
+            ovrmove_check("OM direct", r, 108, 1, 0, 1);
+        }
+        {
+            ovm.Mv x = ovm.Mv(7);
+            ovm.reset();
+            ovm.Mv r = base->giveMv(move x);
+            ovrmove_check("OM base return param", r.v, 207, 2, 0, 1);
+        }
+        {
+            ovm.Tc x = ovm.Tc(7);
+            ovm.reset();
+            int r = derived.takeTc(move x);
+            ovrmove_check("OM direct trivial", r, 108, 1, 0, 0);
+        }
+        {
+            ovm.Pod p = default;
+            p.a = 7;
+            p.b = 2;
+            ovm.reset();
+            int r = derived.writePod(p);
+            ovrmove_check("OM direct pod write", r * 100 + p.a, 10107, 0, 0, 0);
+        }
+    }
+    {
+        OvrMoveField derived = default;
+        ovm.Base* base = &derived;
+        ovm.reset();
+        ovrmove_check("OM cpp move into field", ovm.call_mv_xvalue(base, 7), 207, 2, 0, 2);
+        OvrMoveIgnore ignore = default;
+        ovm.reset();
+        ovrmove_check("OM cpp ignored", ovm.call_mv_xvalue(&ignore, 7), 5, 1, 0, 2);
+        OvrMoveGen<int> generic = default;
+        ovm.reset();
+        ovrmove_check("OM cpp generic", ovm.call_generic(&generic, 7), 108, 1, 0, 2);
+    }
+    if (bridge_passed - bridgeOmStartPassed != bridge_checks - bridgeOmStartChecks)
+        return 3660;
 
     // ---- C++ contiguous-container -> T[] call-site decay (3510-3519) -------------------
     int bridgeViewStartChecks = bridge_checks;

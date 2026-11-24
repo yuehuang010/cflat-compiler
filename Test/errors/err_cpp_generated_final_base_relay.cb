@@ -4,4 +4,22 @@ expect_error("clang: base 'FinalBase' is marked 'final'") {
     [cpp] struct T340FinalBaseFailure : cppt331.FinalBase {};
 }
 
-extern int main() { return 0; }
+// OVRMOVE: a direct call passing an [immovable] lvalue to a [cpp] override's by-value parameter
+// is refused like clang (deleted copy constructor); it used to bind the caller's object by alias.
+[cpp] struct OvrMoveImmovableDirect : cppt331.ImmovableBase
+{
+    override int use(cppt331.Immovable value) { return value.value; }
+};
+
+extern int main()
+{
+    OvrMoveImmovableDirect d = default;
+    cppt331.Immovable x = cppt331.Immovable(5);
+    // MS ABI: the callee-destroyed Immovable stays a borrowed alias (p3 callee-destroyed residue).
+    if const (!__WINDOWS__) {
+        expect_error("the type is [immovable], so its value may not be transferred") {
+            int r = d.use(x);
+        }
+    }
+    return 0;
+}

@@ -497,6 +497,8 @@ void take<T>(list<T>* values, int expectedCount)
 struct CppListBox<T> { list<T> values; };
 struct NewTempBox<T> { T value; };
 struct CppListHolder { cpplist.Plain item = default; int tag = 0; };
+// A struct field holding a std::unique_ptr: move-assigned from a prvalue, destroyed implicitly.
+struct UniquePtrFieldHolder { std.unique_ptr<cppon.Cls> p = default; };
 struct T304NativeFoo { int value = 3; };
 int t255CppDtor = 0;
 struct T255CppLeaf { int value = 0; };
@@ -4556,6 +4558,30 @@ int DefArgRoundNativeMove(move DefArgRoundNative v, int e = 3)
     return v.value + e;
 }
 
+// DEFTMP: native and unique<T> temporaries built inside a C++ class default are destroyed once.
+// Master leaked them in the earlier-parameter forwarding wrapper and in the brace-default factory.
+int defTmpCxxLive = 0;
+struct DefTmpCxxN
+{
+    int value = 0;
+    DefTmpCxxN(int x) { value = x; defTmpCxxLive++; }
+    ~DefTmpCxxN() { if (value != 0) defTmpCxxLive--; }
+};
+DefTmpCxxN DefTmpCxxMk(int x) { return DefTmpCxxN(x); }
+unique<DefTmpCxxN> DefTmpCxxMkU(int x) { unique<DefTmpCxxN> u = new DefTmpCxxN(x); return move u; }
+int DefTmpCxxEarlier(cppdefcls.Trace first,
+                     cppdefcls.Trace d = cppdefcls.Trace(DefTmpCxxMk(first.value + 1).value))
+{
+    return first.value * 10 + d.value;
+}
+int DefTmpCxxEarlierUnique(cppdefcls.Trace first,
+                           cppdefcls.Trace d = cppdefcls.Trace(DefTmpCxxMkU(first.value + 2)->value))
+{
+    return first.value * 10 + d.value;
+}
+int DefTmpCxxBrace(cppdefcls.Implicit d = {DefTmpCxxMk(7).value}) { return d.value; }
+int DefTmpCxxCallsite(cppdefcls.Trace d = cppdefcls.Trace(DefTmpCxxMk(6).value)) { return d.value; }
+
 interface IOvlRound1DerivedPointer
 {
     int f(cppi.ConstPointerRankValue* value);
@@ -5580,6 +5606,151 @@ int CppMoveRecordCheck()
     cm_zero = 0; cm_full = 0;
     { CmSrc a; a.k = 4; a.s.q = 9; a.p = &cmZ; if (CmSrcTake(move a) != 4) return 8240; }
     if (cm_zero * 10 + cm_full != 11) return 8241;
+    return 0;
+}
+
+// CPPTERN: a `?:` arm `move a` of a [cpp] struct that is not lowered zeroes its source before the
+// join; typed, auto and field sinks construct from the restored bytes, and the moved-from source
+// is still destroyed (clang: 7 or 8, three destructor runs). k picks the arm at run time.
+int ct_d = 0;
+int ct_live = 0;
+[cpp] struct CtNl { int x = 0; };
+[cpp] struct CtNd { int x = 0; ~CtNd() { ct_d++; } };
+[cpp] struct CtNb { int x = 0; i64[8] pad; ~CtNb() { ct_d++; } };
+[cpp] struct CtNu { unique int* p = nullptr; int x = 0; ~CtNu() { if (p != nullptr) ct_live++; } };
+struct CtNlHolder { CtNl f; };
+struct CtNuHolder { CtNu f; CtNu g; };
+CtNd CtNdReturn(int k) { CtNd a; a.x = 7; CtNd b; b.x = 8; return k ? move a : move b; }
+CtNb CtNbReturn(int k) { CtNb a; a.x = 7; CtNb b; b.x = 8; return k ? move a : move b; }
+CtNd CtNdMake() { CtNd t; t.x = 9; return t; }
+int CtNuRead(CtNu* u) { return u->p == nullptr ? -1 : u->x * 100 + *u->p; }
+int CtNuParams(int k, CtNu p, CtNu q) { CtNu c = k ? move p : move q; return CtNuRead(&c); }
+// A returned ctor-temp arm is handed to the caller, not destroyed too (was a double free).
+[cpp] struct CtNr { unique int* p = nullptr; int x = 0; CtNr() { } CtNr(int v) { p = new int(v); x = v; } ~CtNr() { ct_d++; if (p != nullptr) ct_live++; } };
+CtNr CtNrPick(int k) { return k ? CtNr(4) : CtNr(5); }
+CtNd CtNdMixed(int k) { CtNd a; a.x = 7; return k ? move a : CtNd(); }
+// A moved plain-struct arm passed by value is owned by the call's temp, so it is freed once.
+struct CtSu { int* p = nullptr; ~CtSu() { ct_d++; if (p != nullptr) { ct_live++; delete p; p = nullptr; } } };
+CtSu CtSuMake() { CtSu t; t.p = new int(90); return t; }
+int CtSuTake(CtSu s) { return s.p == nullptr ? -1 : *s.p; }
+struct CtSuHolder { CtSu f; };
+CtNr CtNrMk(int v) { return CtNr(v); }
+CtNr CtNrPickCall(int k) { return k ? CtNrMk(4) : CtNr(5); }
+CtNr CtNrPickNested(int k) { return k != 0 ? CtNr(4) : (k == 0 ? CtNr(5) : CtNr(6)); }
+int CtTakeInt(int v) { return v; }
+int CppTernZeroedCheck(int k)
+{
+    const int want = k ? 7 : 8;
+    { CtNl a; a.x = 7; CtNl b; b.x = 8; CtNl c = k ? move a : move b; if (c.x != want) return 8242; }
+    { CtNl a; a.x = 7; CtNl b; b.x = 8; auto c = k ? move a : move b; if (c.x != want) return 8243; }
+    { CtNl a; a.x = 7; CtNl b; b.x = 8; CtNlHolder h = { f = k ? move a : move b }; if (h.f.x != want) return 8244; }
+    { CtNl a; a.x = 7; CtNl b; CtNl c = k ? move a : CtNl(); if (c.x != (k ? 7 : 0)) return 8245; }
+    ct_d = 0;
+    { CtNd a; a.x = 7; CtNd b; b.x = 8; CtNd c = k ? move a : move b; if (c.x != want) return 8246; }
+    if (ct_d != 3) return 8247;
+    ct_d = 0;
+    { CtNd a; a.x = 7; CtNd b; b.x = 8; auto c = k ? move a : move b; if (c.x != want) return 8248; }
+    if (ct_d != 3) return 8249;
+    ct_d = 0;
+    { CtNd c = CtNdReturn(k); if (c.x != want) return 8250; }
+    if (ct_d != 3) return 8251;
+    ct_d = 0;
+    { CtNd b; b.x = 8; auto c = k ? CtNdMake() : move b; if (c.x != (k ? 9 : 8)) return 8252; }
+    if (ct_d != 2) return 8253;
+    ct_d = 0;
+    { CtNb a; a.x = 7; CtNb b; b.x = 8; auto c = k ? move a : move b; if (c.x != want) return 8254; }
+    { CtNb c = CtNbReturn(k); if (c.x != want) return 8255; }
+    if (ct_d != 6) return 8256;
+    // An owner field: the selected pointer reaches the destination, each pointer is freed once.
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); CtNu c = k ? move a : move b; if (CtNuRead(&c) != want * 110) return 8257; }
+    if (ct_live != 2) return 8258;
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); auto c = k ? move a : move b; if (CtNuRead(&c) != want * 110) return 8259; }
+    if (ct_live != 2) return 8260;
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); if (CtNuParams(k, move a, move b) != want * 110) return 8261; }
+    if (ct_live != 2) return 8262;
+    ct_live = 0;
+    { CtNuHolder h; h.f.x = 7; h.f.p = new int(70); h.g.x = 8; h.g.p = new int(80); auto c = k ? move h.f : move h.g; if (CtNuRead(&c) != want * 110) return 8263; }
+    if (ct_live != 2) return 8264;
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); CtNu* h = new CtNu(k ? move a : move b); int r = CtNuRead(h); delete h; if (r != want * 110) return 8267; }
+    if (ct_live != 2) return 8268;
+    ct_d = 0; ct_live = 0;
+    { CtNr c = CtNrPick(k); if (c.x * 10 + *c.p != (k ? 44 : 55)) return 8269; }
+    if (ct_d * 10 + ct_live != 11) return 8270;
+    ct_d = 0;
+    { CtNd c = CtNdMixed(k); if (c.x != (k ? 7 : 0)) return 8271; }
+    if (ct_d != 2) return 8272;
+    ct_live = 0;
+    { CtSu a; a.p = new int(70); if (CtSuTake(k ? move a : CtSu()) != (k ? 70 : -1)) return 8273; }
+    if (ct_live != 1) return 8274;
+    ct_live = 0;
+    { CtSu b; b.p = new int(80); if (CtSuTake(k ? CtSuMake() : move b) != (k ? 90 : 80)) return 8275; }
+    if (ct_live != (k ? 2 : 1)) return 8276;
+    // Returned temp arms with no storage join, and nested joins: each temp destroyed once.
+    ct_d = 0; ct_live = 0;
+    { CtNr c = CtNrPickCall(k); if (c.x * 10 + *c.p != (k ? 44 : 55)) return 8277; }
+    if (ct_d * 10 + ct_live != 11) return 8278;
+    ct_d = 0; ct_live = 0;
+    { CtNr c = CtNrPickNested(k); if (c.x * 10 + *c.p != (k ? 44 : 55)) return 8279; }
+    if (ct_d * 10 + ct_live != 11) return 8280;
+    // Member read and discard of a moved join: the selected source keeps its bytes.
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); if ((k ? move a : move b).x != want) return 8281; }
+    if (ct_live != 2) return 8282;
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); if (CtTakeInt((k ? move a : move b).x) != want) return 8283; }
+    if (ct_live != 2) return 8284;
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); k ? move a : move b; }
+    if (ct_live != 2) return 8285;
+    // A discarded mixed join is a prvalue: the moved bytes die as the temporary (clang d=2).
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); k ? move a : CtNu(); }
+    if (ct_live != 1) return 8286;
+    ct_d = 0;
+    { CtNd a; a.x = 7; k ? move a : CtNd(); }
+    if (ct_d != 2) return 8287;
+    // `auto` from a join of temps relocates the selected one (C++17 elision, one destructor).
+    ct_d = 0; ct_live = 0;
+    { auto c = k ? CtNr(4) : CtNr(5); if (c.x * 10 + *c.p != (k ? 44 : 55)) return 8288; }
+    if (ct_d * 10 + ct_live != 11) return 8289;
+    // Plain struct: member read of a moved join, and a brace field built from one.
+    ct_d = 0; ct_live = 0;
+    { CtSu a; a.p = new int(70); CtSu b; b.p = new int(80); if (*(k ? move a : move b).p != (k ? 70 : 80)) return 8290; }
+    if (ct_d * 10 + ct_live != 22) return 8291;
+    ct_d = 0; ct_live = 0;
+    { CtSu a; a.p = new int(70); CtSu b; b.p = new int(80); CtSuHolder h = { f = k ? move a : move b }; if (*h.f.p != (k ? 70 : 80)) return 8292; }
+    if (ct_d * 10 + ct_live != 32) return 8293;
+    // `auto` from a join of a call result and a ctor temp: the temp is handed over, not destroyed.
+    ct_d = 0; ct_live = 0;
+    { auto c = k ? CtNrMk(4) : CtNr(5); if (c.x * 10 + *c.p != (k ? 44 : 55)) return 8294; }
+    if (ct_d * 10 + ct_live != 11) return 8295;
+    ct_d = 0; ct_live = 0;
+    { auto c = k ? CtNr(4) : CtNrMk(5); if (c.x * 10 + *c.p != (k ? 44 : 55)) return 8296; }
+    if (ct_d * 10 + ct_live != 11) return 8297;
+    // Double parentheses and nested moved joins keep the selected source in place.
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); if (((k ? move a : move b)).x != want) return 8298; }
+    if (ct_live != 2) return 8299;
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); CtNu e; e.x = 9; e.p = new int(90); if ((k != 0 ? move a : (k == 0 ? move b : move e)).x != want) return 8300; }
+    if (ct_live != 3) return 8301;
+    ct_live = 0;
+    { CtNu a; a.x = 7; a.p = new int(70); CtNu b; b.x = 8; b.p = new int(80); CtNu e; e.x = 9; e.p = new int(90); k != 0 ? move a : (k == 0 ? move b : move e); }
+    if (ct_live != 3) return 8302;
+    ct_d = 0;
+    { CtNd a; a.x = 7; CtNd b; b.x = 8; CtNd e; e.x = 9; k != 0 ? move a : (k == 0 ? move b : move e); }
+    if (ct_d != 3) return 8303;
+    ct_d = 0; ct_live = 0;
+    { CtSu a; a.p = new int(70); CtSu b; b.p = new int(80); CtSu e; e.p = new int(90); CtSuHolder h = { f = k != 0 ? move a : (k == 0 ? move b : move e) }; if (*h.f.p != (k ? 70 : 80)) return 8304; }
+    if (ct_d * 10 + ct_live != 43) return 8305;
+    // A lowered [cpp] struct keeps its value and now destroys the moved-from source too.
+    cm_dtors = 0;
+    { CmDtor a; a.x = 7; CmDtor b; b.x = 8; CmDtor c = k ? move a : move b; if (c.x != want) return 8265; }
+    if (cm_dtors != 3) return 8266;
     return 0;
 }
 
@@ -11682,6 +11853,28 @@ extern int main()
         defArgValue = DefArgRoundNativeTwo(defArgLocal, 9);
     }
     if (defArgValue != 33 || defArgRoundNativeDtors - defArgNativeBase != 1) return 86113;
+
+    // DEFTMP: native temps inside C++ class defaults (value, native live delta, C++ live delta).
+    int defTmpCxxBase = cppdefcls.live_count();
+    defTmpCxxLive = 0;
+    // Each call is its own statement: its explicit Trace argument lives to the statement end.
+    int defTmpCxxValue = DefTmpCxxEarlier(cppdefcls.Trace(4));
+    if (defTmpCxxValue != 45 || defTmpCxxLive != 0
+        || cppdefcls.live_count() != defTmpCxxBase) return 86190;
+    defTmpCxxValue = DefTmpCxxEarlierUnique(cppdefcls.Trace(4));
+    if (defTmpCxxValue != 46 || defTmpCxxLive != 0
+        || cppdefcls.live_count() != defTmpCxxBase) return 86191;
+    defTmpCxxValue = DefTmpCxxBrace();
+    if (defTmpCxxValue != 7 || defTmpCxxLive != 0
+        || cppdefcls.live_count() != defTmpCxxBase) return 86192;
+    defTmpCxxValue = 0;
+    for (int i = 0; i < 3; i++) defTmpCxxValue += DefTmpCxxBrace() + DefTmpCxxEarlier(cppdefcls.Trace(i));
+    if (defTmpCxxValue != 7 * 3 + 1 + 12 + 23 || defTmpCxxLive != 0
+        || cppdefcls.live_count() != defTmpCxxBase) return 86193;
+    // Accept-set: the call-site path already destroyed this one on master.
+    defTmpCxxValue = DefTmpCxxCallsite();
+    if (defTmpCxxValue != 6 || defTmpCxxLive != 0
+        || cppdefcls.live_count() != defTmpCxxBase) return 86194;
 
     // CDEFARG: an omitted by-value C++ class default is built in its parameter slot after the
     // explicit arguments (prvalue elided, lvalue copied, move moved) and lives to the end of the
@@ -23875,6 +24068,14 @@ extern int main()
         }
         if (cppon.clsNew() != 1 || cppon.clsDel() != 1 || cppon.dtors() != 1
             || cppon.live() != 0) return 3661;
+        // unique_ptr field: operator=(unique_ptr&&) frees the old object, the holder frees the last.
+        {
+            UniquePtrFieldHolder holder;
+            holder.p = std.unique_ptr<cppon.Cls>(new cppon.Cls(53));
+            holder.p = std.unique_ptr<cppon.Cls>(new cppon.Cls(54));
+            if (holder.p.get()->get() != 54 || cppon.dtors() != 2) return 3667;
+        }
+        if (cppon.clsNew() != 3 || cppon.clsDel() != 3 || cppon.live() != 0) return 39901;
         // A pointer typedef over a class template specialization binds the specialization.
         {
             cppon.Later<cppon.Cls> seen = default;
@@ -24585,6 +24786,12 @@ extern int main()
     // CPPMOVE: [cpp] struct moves are clang's whole-record move.
     {
         int result = CppMoveRecordCheck();
+        if (result != 0) return result;
+    }
+    // CPPTERN: `?:` moves of a non-lowered [cpp] struct read the restored source.
+    for (int ctPick = 1; ctPick >= 0; ctPick--)
+    {
+        int result = CppTernZeroedCheck(ctPick);
         if (result != 0) return result;
     }
     // T70 argument doors: a non-const C++ T&& call result is `move *p` at local/new
@@ -31006,22 +31213,26 @@ int LoweredUserDtorAssignLegs(int argc)
         int readBack = cppon.escReadIntArg(&(new cppon.Esc(10))->v);
         if (readBack != 10 || cppon.dtors() != 1 || cppon.live() != 0) return 17317;
     }
-    // T331: an override moves its by-value C++ parameter into the CFlat body (clang counts).
+    // T331: an override receives its by-value C++ parameter (clang counts). OVRMOVE: the wrapper
+    // binds its own parameter (no move, one dtor); MS ABI still forwards (p3 callee-destroyed).
     {
+        int t331Moves = 0;
+        int t331Dtors = 1;
+        if const (__WINDOWS__) { t331Moves = 1; t331Dtors = 2; }
         T331Override object = default;
         t331OverrideCalls = 0;
         cppt331.Counted.reset();
         int normal = cppt331.call(&object, 0);
         if (normal != 0 || t331OverrideCalls != 1 || cppt331.Counted.ctors != 1
-            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
-            || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 33101;
+            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != t331Moves
+            || cppt331.Counted.dtors != t331Dtors || cppt331.Counted.live != 0) return 33101;
 
         t331OverrideCalls = 0;
         cppt331.Counted.reset();
         int thrown = cppt331.catch_call(&object, 13);
         if (thrown != -13 || t331OverrideCalls != 1 || cppt331.Counted.ctors != 1
-            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
-            || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 33102;
+            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != t331Moves
+            || cppt331.Counted.dtors != t331Dtors || cppt331.Counted.live != 0) return 33102;
     }
     // T488 control: an imported C++ class field keeps its value and destructor count.
     {
@@ -31058,7 +31269,12 @@ int LoweredUserDtorAssignLegs(int argc)
             || cppt331.Immovable.live != 0) return 34002;
     }
     // T340: immovable and movable by-value parameters keep independent construction paths.
+    // OVRMOVE: the wrapper binds its own Counted parameter (clang: no move, one dtor); the MS ABI
+    // still forwards a callee-destroyed copy (p3 cpp-override-callee-destroyed-byvalue-param).
     {
+        int t340CountedMoves = 0;
+        int t340CountedDtors = 1;
+        if const (__WINDOWS__) { t340CountedMoves = 1; t340CountedDtors = 2; }
         T340MixedOverride object = default;
         cppt331.Immovable.reset();
         cppt331.MixedBase.reset();
@@ -31068,8 +31284,8 @@ int LoweredUserDtorAssignLegs(int argc)
         if (value != 12 || t340MixedCalls != 1 || cppt331.MixedBase.intCalls != 0
             || cppt331.Immovable.ctors != 1 || cppt331.Immovable.dtors != 1
             || cppt331.Immovable.live != 0 || cppt331.Counted.ctors != 1
-            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
-            || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 34003;
+            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != t340CountedMoves
+            || cppt331.Counted.dtors != t340CountedDtors || cppt331.Counted.live != 0) return 34003;
     }
     // T340: a trivial-destructor immovable parameter also stays borrowed by the body.
     {

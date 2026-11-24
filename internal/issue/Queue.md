@@ -153,12 +153,13 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 |-----|-------|-------|
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | item 2 landed a2111ce54; item 3 Windows funclet cleanup not exercised |
 | E4 | p3/cpp-new-remaining-allocator-gaps | by-design / out-of-scope residue only (bare `Sx(...)` in a reopened namespace beside a global function), Windows MS-ABI array new / delete names; volatile copy closed by ruling 2026-11-18 |
-| E5 | p3/cflat-default-param-temporaries-leftovers | default-argument temporaries: refused class / pointer / string / nested brace elements, native default leaks |
+| E5 | p3/cflat-default-param-temporaries-leftovers | residue after DEFTMP 9d70b56d0 (call-site native defaults die once): forwarding-wrapper defaults (earlier-param, caller above callee, unique/closure/fn-ptr/C++ holder) leak under a borrow-returning wrapper |
 | E6 | p3/discard-ternary-move-join-and-cxx-field-move | [cpp] struct whole-record move landed 517833bb1 (item 3 no longer reproduces); residue: discard join |
 | E7 | p3/cpp-ternary-move-join-leftovers | ternary move joins over C++ classes; residue: lowered-struct shapes, b4_r_c1_rev return-of-local |
 | E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; residue: later non-literal aggregate element, call-argument calls, const above pointee |
 | E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue: same-arity overload sets, later C++ default param, mixed template arity (bound-wrapper divergences recorded) |
 | E11 | p3/lowered-cxx-field-structs-leftovers-after-t528 | with P2 (cflat-struct-nontrivial-cxx-fields) |
+| E12 | p3/cpp-override-callee-destroyed-byvalue-param-double-move | trivial_abi param through C++ dispatch moves twice (needs a per-function caller-destroyed convention); MS ABI: OVRMOVE 82c23505a is a no-op (inferred) |
 
 ### F - diagnostics only
 
@@ -171,7 +172,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | Run | Issue(s) | Mode | Notes |
 |-----|----------|------|-------|
 | G3 | p3/cpp-check-mode-cannot-repopulate-type-request-cache | full | design: --check writing the cache |
-| G4 | p3/cpp-noinc-mode-divergences | full | CFLAT_CPP_INCREMENTAL=0 kept (RULED 2026-10-31); fallback must bind what incremental binds; two crashes fixed |
+| G4 | p3/cpp-noinc-mode-divergences | full | calloc / operator= / esfts base landed 5f56a7576; residue: noinc first stops interop 282 (eager broken inline bodies), template 431 (CRTP over incomplete [cpp] struct), bridge 3504 (__cflat_user undeclared) |
 
 ### N - native ownership, move, borrow (opus-tier area)
 
@@ -182,7 +183,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | N-RAWOWN | p3/raw-local-owner-bit-leftovers + p3/owning-pointer-release-withheld-when-alias-may-reach + p3/runtime-null-coalesce-new-into-local-leaks | raw owner bit: counter-dependent first-iteration sink, alias-withheld release (leak only), `g ?? new T` leak |
 | N-JOIN | p3/owned-borrowed-ternary-join-rejects-and-misclassifies + p3/moved-raw-heap-array-ternary-destroys-one-element | owned/borrowed `?:` joins; moved raw heap array ternary |
 | N-VIEW | p3/borrowed-view-fields-passed-through-retaining-calls + p3/move-borrowed-view-field-refused | view fields through retaining calls; `move` of a borrowed view field refused |
-| N-COPY | p3/pointer-subscript-owning-element-copy-leftovers-after-r21 + p3/raw-delete-string-array-skips-element-dtors | R21 residue (element store needs the destructor first); `delete[]` of string* skips element dtors |
+| N-COPY | p3/raw-delete-string-array-skips-element-dtors | residue after 56aecbae4 (pointer-subscript reads copy, stores drop old): `delete[_]` element dtors NEEDS RULING (LANGUAGE.md + test_cpp_interop:20498 say frees only; options in the file) |
 | N-BORROW | p3/consolidate-named-variable-borrow-provenance + p3/iface-return-call-borrow-precision + p3/deref-of-moved-pointer-guard-inside-callee | borrow provenance of named variables; interface return precision; false positive behind a terminating callee |
 | N-UNIQUE | p3/unique-array-dynamic-index-move-untracked | dynamic-index field moves untracked |
 | N-RULED | p3/chained-assign-raw-inner-into-unique-refused | parameter half landed 2026-11-18 (a pointer parameter adopts like a local); NEEDS RULING: may a raw field or global own implicitly, or must an owning field be spelled unique (spike numbers in the file) |
@@ -196,7 +197,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
 | L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; residue: owned unique-element refusals, R133/R134 |
-| L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | C++ template instance as value; ctor deduction (ruled 2026-10-13) |
+| L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | C++ template instance as value; ctor deduction `Box(3)` landed 8d05c9344; brace `Box b{3}` NEEDS RULING (aggregate deduction vs designated brace init) |
 
 ### P - plans and staged work
 

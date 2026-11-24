@@ -4498,23 +4498,65 @@ static bool LoopUsesKeepRawNewProvenance(antlr4::tree::ParseTree* loop, const st
 
 bool MainListener::IsDeclaredPointerSubscriptString(
         CFlatParser::AssignmentExpressionContext* expression,
-        llvm::Value* value, llvm::Value* storage)
+        llvm::Value* value, llvm::Value* storage, bool anyOwningStruct)
 {
         if (expression == nullptr || value == nullptr) return false;
         auto* stringType = llvm::StructType::getTypeByName(*compilerLLVM->context, "string");
         if (stringType == nullptr) return false;
-        if (value->getType() != stringType)
+        if (anyOwningStruct ? !value->getType()->isStructTy() : value->getType() != stringType)
             return false;
 
         auto* postfix = tryGetPostfixExpression(expression);
-        // R21: `Ns.g[i]` - a `.` member path ahead of the subscript; only a global slot decides it.
+        // N-COPY: `f()[i]`, `g.get()[i]` - a call-result base pointer carries no slot provenance.
+        if (postfix != nullptr && postfix->LeftBracket().size() == 1 && postfix->children.size() >= 4
+            && postfix->children.back() == postfix->RightBracket().back()
+            && postfix->children[postfix->children.size() - 3] == postfix->LeftBracket(0)
+            && !postfix->RightParen().empty()
+            && postfix->children[postfix->children.size() - 4] == postfix->RightParen().back()
+            && llvm::isa_and_nonnull<llvm::GEPOperator>(storage))
+        {
+            auto* callBase = llvm::cast<llvm::GEPOperator>(storage)->getPointerOperand();
+            if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callBase);
+                call != nullptr && compilerLLVM->FindRawArrayResult(call) == nullptr)
+                return true;
+        }
+        // N-COPY: `geth()->q[i]`, `g.get().q[i]` - an owning struct read through a field-loaded pointer
+        // behind a call has no syntactic slot to consult; the field load decides.
+        if (anyOwningStruct && postfix != nullptr && postfix->LeftBracket().size() == 1
+            && postfix->children.size() >= 4
+            && postfix->children.back() == postfix->RightBracket().back()
+            && postfix->children[postfix->children.size() - 3] == postfix->LeftBracket(0)
+            && !postfix->RightParen().empty()
+            && llvm::isa_and_nonnull<llvm::GEPOperator>(storage)
+            && llvm::cast<llvm::GEPOperator>(storage)->getNumIndices() == 1)
+        {
+            // The pointer is a field loaded through a GEP, or extracted from a by-value struct result.
+            auto* fieldPtr = llvm::cast<llvm::GEPOperator>(storage)->getPointerOperand();
+            auto* fieldLoad = llvm::dyn_cast<llvm::LoadInst>(fieldPtr);
+            auto* fieldGep = fieldLoad != nullptr
+                ? llvm::dyn_cast<llvm::GEPOperator>(fieldLoad->getPointerOperand()) : nullptr;
+            auto* fieldExtract = llvm::dyn_cast<llvm::ExtractValueInst>(fieldPtr);
+            if (fieldPtr->getType()->isPointerTy()
+                && ((fieldGep != nullptr && fieldGep->getSourceElementType()->isStructTy())
+                    || (fieldExtract != nullptr && fieldExtract->getNumIndices() == 1
+                        && fieldExtract->getAggregateOperand()->getType()->isStructTy())))
+            {
+                const auto* target = compilerLLVM->FindRawArrayResult(fieldPtr);
+                if (target == nullptr || !target->IsArrayView) return true;
+            }
+        }
+        // R21: `Ns.g[i]` / `hp->q[i]` - a member path ahead of the subscript; the base slot decides.
         const size_t memberPathChildren = postfix != nullptr && postfix->children.size() > 4
             ? postfix->children.size() - 4 : 0;
         bool memberPathOnly = memberPathChildren > 0 && memberPathChildren % 2 == 0
             && postfix->memberNameToken().size() == memberPathChildren / 2
             && postfix->genericTypeParameters().empty();
         for (size_t i = 1; memberPathOnly && i <= memberPathChildren; i += 2)
-            memberPathOnly = postfix->children[i]->getText() == ".";
+        {
+            auto* op = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+            memberPathOnly = op != nullptr && (op->getSymbol()->getType() == CFlatParser::Dot
+                || op->getSymbol()->getType() == CFlatParser::Arrow);
+        }
         if (postfix == nullptr || postfix->LeftBracket().size() != 1
             || postfix->RightBracket().size() != 1
             || postfix->expression().size() != 1
@@ -4785,16 +4827,13 @@ bool MainListener::IsDeclaredPointerSubscriptString(
         const bool globalSlot = slotGlobal != nullptr && slotGlobal->getValueType()->isPointerTy();
         const bool fieldSlot = slotGep != nullptr && slotGep->getSourceElementType()->isStructTy();
         if (pointerLoad != nullptr && pointerBinding == nullptr && !parenthesizedPointerDeref
-            && pointerLoad->getType()->isPointerTy() && (globalSlot || (fieldSlot && !memberPathOnly))
+            && pointerLoad->getType()->isPointerTy()
+            && (globalSlot || (fieldSlot && (!memberPathOnly || anyOwningStruct)))
             && (rawArrayTarget == nullptr || !rawArrayTarget->IsArrayView))
         {
-            // A container's `_data[i]` in a generic instance over string keeps its bit-move: the
-            // container consumes the read (swap, return), so a copy would leak the element.
-            bool genericOverString = false;
-            for (const auto& [param, argument] : activeTypeSubstitutions)
-                genericOverString = genericOverString || argument == "string";
-            // A struct element read through a field is a container slot (list sort shuffles borrow it).
-            if (globalSlot || !genericOverString) return true;
+            // N-COPY: a generic instance's field slot copies too; core containers relocate their
+            // elements with an explicit `move _data[i]` instead of a bare read.
+            return true;
         }
         if (memberPathOnly) return false;
         // An unproven `(*pp)[i]` can be borrowed; its copy sites apply owned-array exceptions.
@@ -5696,7 +5735,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         && namedVar.ConditionalDropFlag == nullptr;
                     const bool destinationConditional = namedVar.ConditionalDropFlag != nullptr;
                     const bool destinationGlobalConditional = destinationGlobalLiveFlag != nullptr;
-                    compiler->EnsureCxxMemberProjected(tn, "operator=");
+                    compiler->EnsureCxxAssignmentProjected(tn);
                     const auto* info = compiler->GetCxxClassInfo(tn);
                     // wantConstRhs: -1 = no preference; 0/1 = the lvalue source is non-const/const.
                     // clang binds a const source only to a const reference and prefers the
@@ -10196,6 +10235,27 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && !namedVar.IsInterfaceField && !namedVar.BitfieldStorage
                 && !namedVar.UnionFieldType)
                 || destIsViewElem;
+            // N-COPY: a `T*` owning element is LIVE: copy/move in, drop the old (a zeroed slot drops a zero
+            // shell). Raw `new string[n]` locals, closures, interfaces and C++ classes keep their arms.
+            const bool destIsPointerElem = !destIsFixedArrayElem && destGep
+                && destGep->getNumIndices() == 1
+                && namedVar.IsElementAccess && !destIsStructField
+                && !namedVar.IsInterfaceField && !namedVar.BitfieldStorage
+                && !namedVar.UnionFieldType
+                && !namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsArrayView
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsFatInterfaceValue()
+                && namedVar.TypeAndValue.TypeName != "__closure_fat_ptr"
+                && (NamedVarIsString(namedVar)
+                    || (compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
+                        && !compiler->IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
+                        && !compiler->NeedsCxxLoweringType(namedVar.TypeAndValue.TypeName)))
+                && !(NamedVarIsString(namedVar)
+                    && llvm::isa<llvm::LoadInst>(destGep->getPointerOperand())
+                    && llvm::isa<llvm::AllocaInst>(
+                        llvm::cast<llvm::LoadInst>(destGep->getPointerOperand())->getPointerOperand())
+                    && RawHeapBaseIsNewArrayLocal(destGep->getPointerOperand()));
+            destIsFixedArrayElem = destIsFixedArrayElem || destIsPointerElem;
             // A desugared unique field reached through an array element is still a field even
             // though its GEP source type is the containing array, not the holder struct.
             bool destIsUniqueFieldSlot = !namedVar.FieldName.empty()

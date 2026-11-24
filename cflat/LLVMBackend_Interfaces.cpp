@@ -1694,7 +1694,16 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
                 static_cast<unsigned>(naturalParamIndex))->isPointerTy();
             llvm::Value* value = nullptr;
             if (slot.kind == AbiSlot::Direct)
+            {
                 value = thunk->getArg(loweredIndex++);
+                // A [cpp] override wrapper binds a trivially copyable by-value class by reference;
+                // the body takes it as a value, so read the wrapper's own parameter.
+                auto* naturalParamTy = original->getFunctionType()->getParamType(
+                    static_cast<unsigned>(naturalParamIndex));
+                if (value->getType()->isPointerTy() && !naturalParamIsPointer
+                    && naturalParamTy->isStructTy())
+                    value = b.CreateLoad(naturalParamTy, value, "callback.byref");
+            }
             else if (slot.kind == AbiSlot::ByVal)
             {
                 auto* incoming = thunk->getArg(loweredIndex++);

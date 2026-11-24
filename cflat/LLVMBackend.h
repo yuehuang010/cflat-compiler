@@ -6428,6 +6428,13 @@ private:
     bool IsOwnedCxxPrvalueArgument(const NamedVariable& arg, llvm::Type* structTy) const;
     void RegisterCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin);
     bool IsCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin) const;
+    // A `?:` storage join whose moved arms zeroed a CFlat-declared C++ class source is tagged;
+    // a consumer constructing from it stores the joined pre-move value back first (once).
+    void MarkZeroedMoveStorageJoin(llvm::PHINode* storageJoin);
+    bool RestoreZeroedMoveStorageJoin(llvm::Value* storageJoin, llvm::Value* joinedValue);
+    // A sink took the bytes of a `?:` value join (nested joins too): every incoming that loads an
+    // owned struct temp is handed to that sink, so the temp is not destroyed as well.
+    void HandOverJoinedOwnedTemps(llvm::Value* valueJoin);
 
     // Carry produced-temp identity through a value join, including nested ternaries.
     void PropagateProducedTempValue(llvm::Value* from, llvm::Value* to);
@@ -7249,6 +7256,10 @@ private:
     // fields of an already-registered owning temp (FromOwningTempField) run their own paths.
     void RegisterBorrowedOwningStructTemp(const NamedVariable& arg, bool fromTernaryArm = false);
 
+    // The by-value BORROW argument site shared by the direct call and virtual dispatch
+    // (CallInterfaceMethod): registers an owning rvalue temp unless a lowered sret source owns it.
+    void RegisterBorrowedByValueArgTemp(const NamedVariable& arg, const TypeAndValue& param);
+
     // When a `?:` value moves into an owning slot, drop its arm entries so the destination is the
     // one owner. True only when every incoming value of the join had its own entry.
     bool AdoptTernaryArmStructTemps(llvm::PHINode* join);
@@ -7318,7 +7329,7 @@ private:
                               llvm::BasicBlock* hoistTo = nullptr,
                               bool preserveReturnedPtrTemps = false);
     // Forget (never destroy) every owned temp registered since `mark` except C++-holder structs:
-    // a native default's temps keep the leak they had instead of gaining a wrapper-return destroy.
+    // a wrapper whose result can borrow from its native default temps leaves them alive (leak).
     void DropNonCxxOwnedTempsSince(const OwnedTempMark& mark);
     std::vector<PendingOwnedStructTemp> HoistBraceListTempsSince(const OwnedTempMark& mark,
                                                                  llvm::BasicBlock* hoistTo);
@@ -9890,6 +9901,11 @@ public:
 
     bool IsCoreUniqueTemplate(const std::string& templateName) const;
     bool IsCoreUniqueType(const std::string& typeName) const;
+    // A CFlat default of this parameter is evaluated at the call site, so its temporaries live to the
+    // end of the caller's statement like an explicit argument (not scalars, function values, unique<T>, C++ types).
+    bool IsNativeCallSiteDefaultParam(const TypeAndValue& param) const;
+    // True when a value of this type can hold a pointer, alias or view into another object.
+    bool TypeCanCarryBorrow(const TypeAndValue& type, int depth = 0) const;
     // True for a mangled instantiation of the core `array<T>` (array$<T>).
     bool IsCoreArrayType(const std::string& typeName) const;
     // Answers whether this parameter/return consumes ownership: explicit move, or a by-value core unique<T>.
@@ -11538,6 +11554,12 @@ public:
         const std::string& baseType) const;
     bool CxxBaseHasAccessibleMoveOrCopy(const std::string& baseType) const;
     bool CxxClassOverrideParamIsBorrowed(const std::string& typeName) const;
+    // The [cpp] override wrapper hands the body a copy only for a callee-destroyed C++ class;
+    // any other by-value class parameter is bound to the wrapper's own parameter slot.
+    bool CxxOverrideParamForwardsByValue(const std::string& typeName) const
+    {
+        return GetCxxClassInfo(typeName) != nullptr && IsCxxParamDestroyedInCallee(typeName);
+    }
     void RecordCppStructBase(const std::string& structName, const std::string& baseName);
     void RegisterCppStructName(const std::string& structName);
     bool IsCppStructName(const std::string& structName) const;
@@ -12519,6 +12541,8 @@ public:
                                  bool gateSpecialMembersOnly = false);
     bool RegisterCxxMembersForProjectedRecord(const std::string& typeName);
     bool EnsureCxxMemberProjected(const std::string& typeName, const std::string& memberName);
+    // Projects operator=; the non-incremental fallback also requests a refused body on use.
+    void EnsureCxxAssignmentProjected(const std::string& typeName);
     bool EnsureCxxMemberProjectedImpl(const std::string& typeName, const std::string& memberName);
     /*
      * A member refused because a by-value member class of a class template specialization was
@@ -15499,7 +15523,8 @@ public:
     //      companions tag dependency-only strong definitions and per-variable initializers.
     // 354: C++ records carry hasClassDelete / hasUsualClassDelete (unusable class delete refusal).
     // 355: wrapper keys name their types' dependency groups; system-macro lookup-level refusal.
-    static constexpr int kCHeaderCacheVersion = 355;
+    // 356: a fallback request TU publishes no plain free function of the group's headers.
+    static constexpr int kCHeaderCacheVersion = 356;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

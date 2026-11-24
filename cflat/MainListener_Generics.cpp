@@ -646,6 +646,13 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             if (!ownerStruct.empty())
             {
                 LLVMBackend::AliasScopeGuard aggregateAliasScope(instCompiler, ownerStruct);
+                // The injected class name inside a generic method body names this owner instance.
+                struct OwnerScope
+                {
+                    std::string& slot;
+                    std::string saved;
+                    ~OwnerScope() { slot = std::move(saved); }
+                } ownerScope{ genericMethodOwner_, std::exchange(genericMethodOwner_, ownerStruct) };
                 ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, candidateKey));
             }
             else
@@ -1016,7 +1023,7 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                                                std::vector<std::string>* deducedTypeArgs,
                                                bool instantiate,
                                                std::vector<LLVMBackend::TypeAndValue>* deducedParameterValues,
-                                               bool rejectDeductionConflicts) {
+                                               bool rejectDeductionConflicts, bool literalsAdapt) {
         auto templateIt = genericFunctionTemplates.find(funcName);
         if (templateIt == genericFunctionTemplates.end()
             || candidateIndex >= templateIt->second.size()) return {};
@@ -1312,7 +1319,7 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 else if (declared && !declaredBinding[tp]
                     && literalBinding[tp] && prev->second != argType)
                 {
-                    if (rejectDeductionConflicts)
+                    if (rejectDeductionConflicts && !literalsAdapt)
                     {
                         deductionConflict = true;
                         break;
@@ -1338,7 +1345,8 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 {
                     if (prev->second != argType)
                     {
-                        if (rejectDeductionConflicts)
+                        if (rejectDeductionConflicts
+                            && !(literalsAdapt && fromLiteral && literalBinding[tp]))
                         {
                             deductionConflict = true;
                             break;
@@ -1355,7 +1363,7 @@ std::string MainListener::TryInferAndInstantiateFromArgsCandidate(const std::str
                 }
                 else if (prev->second != argType)
                 {
-                    if (rejectDeductionConflicts)
+                    if (rejectDeductionConflicts && !(literalsAdapt && fromLiteral))
                     {
                         deductionConflict = true;
                         break;
@@ -1421,10 +1429,18 @@ struct GenericTemplateTypePattern
         std::vector<GenericTemplateTypePattern> arguments;
 };
 
+// GENCTAD: while constructor guides are ranked, each guide's type parameters are its template's.
+static thread_local const std::unordered_map<const CFlatParser::FunctionDefinitionContext*,
+    std::vector<std::string>>* constructorGuideTypeParams = nullptr;
+
 static std::vector<std::string> GenericFunctionTypeParameterNames(
         CFlatParser::FunctionDefinitionContext* context)
 {
         std::vector<std::string> names;
+        if (constructorGuideTypeParams != nullptr && context != nullptr)
+            if (auto guide = constructorGuideTypeParams->find(context);
+                guide != constructorGuideTypeParams->end())
+                return guide->second;
         if (context == nullptr || context->genericTypeParameters() == nullptr) return names;
         for (auto* entry : context->genericTypeParameters()->typeParameterList()->typeParameterEntry())
         {
@@ -1631,12 +1647,15 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         const std::vector<LLVMBackend::NamedVariable>& args,
         CFlatParser::ArgumentExpressionListContext* argList,
         std::vector<std::string>* deducedParameterTypes, bool instantiate,
-        std::string* refusal)
+        std::string* refusal, std::vector<std::string>* selectedTypeArgs, bool* ambiguous)
 {
         if (refusal != nullptr) refusal->clear();
+        if (ambiguous != nullptr) *ambiguous = false;
         auto templates = genericFunctionTemplates.find(funcName);
         if (templates == genericFunctionTemplates.end()) return {};
-        if (templates->second.size() == 1)
+        // A deduction-guide query (selectedTypeArgs) always ranks, so a lone guide is still
+        // checked for viability against every argument.
+        if (templates->second.size() == 1 && selectedTypeArgs == nullptr)
         {
             std::vector<std::string> typeArgs;
             std::string mangled = TryInferAndInstantiateFromArgsCandidate(funcName, 0, args,
@@ -1677,9 +1696,11 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             if (!defaultsCoverMissing) continue;
 
             Candidate candidate{ index, {}, {}, {}, {}, context };
+            // A constructor guide follows the single-template literal rule: two literals widen
+            // and a literal adapts to a declared binding; two declared bindings still conflict.
             TryInferAndInstantiateFromArgsCandidate(funcName, index, args, argList,
                 &candidate.parameterTypes, &candidate.typeArgs, false,
-                &candidate.parameterValues, true);
+                &candidate.parameterValues, true, selectedTypeArgs != nullptr);
             if (candidate.typeArgs.empty()) continue;
             const auto argumentMap = GenericParameterArgumentMap(
                 declarations, args, argList, variadic);
@@ -1722,6 +1743,12 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             const size_t fixedArguments = std::min(args.size(), candidate.parameterValues.size());
             rankCandidate.Parameters.assign(candidate.parameterValues.begin(),
                 candidate.parameterValues.begin() + fixedArguments);
+            // A constructor guide binds named arguments (`Box(v: 3)`) by its parameter names.
+            if (selectedTypeArgs != nullptr)
+                for (size_t i = 0; i < rankCandidate.Parameters.size() && i < declarations.size(); ++i)
+                    if (auto* declarator = declarations[i]->declarator())
+                        rankCandidate.Parameters[i].VariableName =
+                            getDirectDeclName(declarator->directDeclarator());
             auto matched = compilerLLVM->MatchFunction(args, rankCandidate.Parameters,
                 rankCandidate.Variadic, true);
             if (matched.size() != args.size()) continue;
@@ -1801,6 +1828,7 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         }
         if (best.size() != 1)
         {
+            if (ambiguous != nullptr) *ambiguous = best.size() > 1;
             if (refusal != nullptr)
             {
                 std::vector<std::string> bestNames;
@@ -1816,8 +1844,212 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         const Candidate& selected = viable[best.front()];
         if (deducedParameterTypes != nullptr)
             *deducedParameterTypes = selected.parameterTypes;
+        if (selectedTypeArgs != nullptr) *selectedTypeArgs = selected.typeArgs;
         if (!instantiate) return {};
         return InstantiateGenericFunction(funcName, selected.typeArgs, selected.index);
+}
+
+std::string MainListener::DeduceNativeConstructorTemplate(const std::string& base,
+        CFlatParser::ArgumentExpressionListContext* argList, antlr4::ParserRuleContext* site)
+{
+        auto* compiler = compilerLLVM;
+        auto typeParamsIt = genericStructTypeParams.find(base);
+        if (argList == nullptr || typeParamsIt == genericStructTypeParams.end()
+            || typeParamsIt->second.empty())
+            return {};
+        const std::vector<std::string> typeParams = typeParamsIt->second;
+        std::string example;
+        for (size_t i = 0; i < typeParams.size(); ++i)
+            example += (i == 0 ? "" : ", ") + std::string("int");
+        example = base + "<" + example + ">";
+
+        std::vector<CFlatParser::AggregateMemberContext*> members;
+        if (genericStructTemplates.count(base) != 0)
+        {
+            if (auto* definition = compiler->MaterializeGenericStruct(base))
+                members = definition->aggregateMember();
+        }
+        else if (auto* definition = compiler->MaterializeGenericClass(base))
+            members = definition->aggregateMember();
+        const size_t dot = base.rfind('.');
+        const std::string simpleName = dot == std::string::npos ? base : base.substr(dot + 1);
+        // Constructors are the guides; one inside an `if const` member block carries its arm
+        // conditions, checked against the type arguments it deduces (a false arm is not viable).
+        struct Guide
+        {
+            CFlatParser::FunctionDefinitionContext* function;
+            std::vector<std::pair<CFlatParser::ExpressionContext*, bool>> conditions;
+        };
+        std::vector<Guide> guides;
+        std::function<void(const std::vector<CFlatParser::AggregateMemberContext*>&,
+            const std::vector<std::pair<CFlatParser::ExpressionContext*, bool>>&)> collectGuides;
+        std::function<void(CFlatParser::IfConstMemberContext*,
+            std::vector<std::pair<CFlatParser::ExpressionContext*, bool>>)> collectIfConst;
+        collectGuides = [&](const auto& list, const auto& conditions) {
+            for (auto* member : list)
+            {
+                if (auto* ifConst = member->ifConstMember()) collectIfConst(ifConst, conditions);
+                else if (auto* function = member->functionDefinition();
+                    function != nullptr && function->declarationSpecifiers() == nullptr
+                    && function->genericTypeParameters() == nullptr
+                    && getFunctionName(function) == simpleName)
+                    guides.push_back({ function, conditions });
+            }
+        };
+        collectIfConst = [&](CFlatParser::IfConstMemberContext* ifConst, auto conditions) {
+            const auto blocks = ifConst->ifConstMemberBlock();
+            if (blocks.empty() || ifConst->expression() == nullptr) return;
+            auto taken = conditions;
+            taken.emplace_back(ifConst->expression(), true);
+            collectGuides(blocks[0]->aggregateMember(), taken);
+            conditions.emplace_back(ifConst->expression(), false);
+            if (auto* elseIf = ifConst->ifConstMember()) collectIfConst(elseIf, conditions);
+            else if (blocks.size() > 1) collectGuides(blocks[1]->aggregateMember(), conditions);
+        };
+        collectGuides(members, {});
+
+        // Type every argument through the normal expression path; nothing it emits survives.
+        std::vector<LLVMBackend::NamedVariable> args;
+        for (auto* named : argList->argumentNamedExpression())
+        {
+            if (named->assignmentExpression() == nullptr)
+            {
+                LogErrorContext(site, std::format(
+                    "cannot deduce the type arguments of generic type '{}' from a brace-list "
+                    "argument; write them explicitly, for example {}", base, example));
+                return {};
+            }
+            LLVMBackend::NamedVariable arg;
+            const auto operand = EvaluateOperandTypeOnly([&]() {
+                auto value = ParseAssignmentExpressionNamed(named->assignmentExpression());
+                // A constant (literal, null, string global) outlives the erased region.
+                if (llvm::isa_and_nonnull<llvm::Constant>(value.Primary))
+                    arg.Primary = value.Primary;
+                arg.IsStringLiteral = value.IsStringLiteral;
+                arg.IsRvalue = value.IsRvalue;
+                arg.IsTopLevelConst = value.IsTopLevelConst;
+                return value;
+            });
+            arg.TypeAndValue = operand.Type;
+            arg.OriginalArgumentType = operand.Type;
+            arg.HasOriginalArgumentType = true;
+            arg.InferSourceTypeName = operand.Type.TypeName.empty()
+                ? operand.SourceTypeName : operand.Type.TypeName;
+            arg.BaseType = operand.ValueType != nullptr ? operand.ValueType : operand.BaseType;
+            arg.IsStringLiteral = arg.IsStringLiteral || operand.IsStringLiteral;
+            // VariableName is the named-argument label at a call, never the argument's own name.
+            arg.TypeAndValue.VariableName = named->Identifier() != nullptr
+                ? named->Identifier()->getText() : std::string();
+            args.push_back(std::move(arg));
+        }
+
+        std::vector<std::string> typeArgs;
+        std::string mangled;
+        // The copy deduction candidate: one argument that already is an instance of the template.
+        if (args.size() == 1 && !args.front().TypeAndValue.Pointer
+            && !args.front().TypeAndValue.IsArrayView
+            && MangledBase(args.front().TypeAndValue.TypeName) == base)
+            mangled = args.front().TypeAndValue.TypeName;
+        else if (guides.empty())
+        {
+            LogErrorContext(site, std::format(
+                "cannot deduce the type arguments of generic type '{}': it declares no constructor "
+                "to deduce them from; write them explicitly, for example {}", base, example));
+            return {};
+        }
+        else
+        {
+            // Register a set of constructors as a transient generic-function overload set so the
+            // generic call resolver ranks them: deduction, conversion ranks, partial ordering.
+            const std::string key = base + ".<constructor deduction>";
+            // Removed on every exit: a diagnostic inside the ranking unwinds through here.
+            struct GuideRegistration
+            {
+                MainListener* self;
+                const std::string& key;
+                const std::vector<std::string>& candidateKeys;
+                decltype(constructorGuideTypeParams) savedGuides = constructorGuideTypeParams;
+                ~GuideRegistration()
+                {
+                    constructorGuideTypeParams = savedGuides;
+                    self->genericFunctionTemplates.erase(key);
+                    for (const auto& candidateKey : candidateKeys)
+                    {
+                        self->genericFunctionTypeParams.erase(candidateKey);
+                        self->compilerLLVM->gts.genericTemplateNamespace.erase(candidateKey);
+                    }
+                }
+            };
+            const std::string declaringNamespace = DeclaringNamespaceOf(compiler, base);
+            auto rankGuides = [&](const std::vector<CFlatParser::FunctionDefinitionContext*>& set,
+                                  std::vector<std::string>& selected, bool& isAmbiguous) {
+                std::unordered_map<const CFlatParser::FunctionDefinitionContext*,
+                    std::vector<std::string>> guideParams;
+                std::vector<std::string> candidateKeys{ key };
+                for (size_t i = 0; i < set.size(); ++i)
+                {
+                    guideParams[set[i]] = typeParams;
+                    candidateKeys.push_back(GenericTemplateState::GenericFunctionCandidateKey(key, i));
+                }
+                GuideRegistration registration{ this, key, candidateKeys };
+                genericFunctionTemplates[key] = set;
+                for (const auto& candidateKey : candidateKeys)
+                {
+                    genericFunctionTypeParams[candidateKey] = typeParams;
+                    compiler->gts.genericTemplateNamespace[candidateKey] = declaringNamespace;
+                }
+                constructorGuideTypeParams = &guideParams;
+                TryInferAndInstantiateFromArgs(key, args, argList, nullptr, false, nullptr,
+                    &selected, &isAmbiguous);
+            };
+            // An `if const` arm holds when its condition, with the deduced arguments bound, matches.
+            auto conditionsHold = [&](const Guide& guide, const std::vector<std::string>& bound) {
+                struct RestoreSubstitutions
+                {
+                    TypeSubstitutionMap& target;
+                    TypeSubstitutionMap saved;
+                    ~RestoreSubstitutions() { target = std::move(saved); }
+                } restore{ activeTypeSubstitutions, activeTypeSubstitutions };
+                for (size_t i = 0; i < typeParams.size() && i < bound.size(); ++i)
+                    activeTypeSubstitutions.Bind(typeParams[i], bound[i]);
+                for (const auto& [condition, expected] : guide.conditions)
+                {
+                    const int decision = DecideIfConstCondition(condition);
+                    if (decision < 0 || (decision != 0) != expected) return false;
+                }
+                return true;
+            };
+            std::vector<CFlatParser::FunctionDefinitionContext*> viable;
+            for (const auto& guide : guides)
+            {
+                if (!guide.conditions.empty())
+                {
+                    std::vector<std::string> own;
+                    bool ownAmbiguous = false;
+                    rankGuides({ guide.function }, own, ownAmbiguous);
+                    if (own.size() != typeParams.size() || !conditionsHold(guide, own)) continue;
+                }
+                viable.push_back(guide.function);
+            }
+            bool ambiguous = false;
+            if (!viable.empty()) rankGuides(viable, typeArgs, ambiguous);
+            if (typeArgs.size() != typeParams.size())
+            {
+                LogErrorContext(site, ambiguous
+                    ? std::format("ambiguous type argument deduction for generic type '{}': more "
+                        "than one constructor matches these arguments equally well; write the type "
+                        "arguments explicitly, for example {}", base, example)
+                    : std::format("cannot deduce the type arguments of generic type '{}' from these "
+                        "arguments: no constructor deduces every type parameter from them; write "
+                        "them explicitly, for example {}", base, example));
+                return {};
+            }
+            mangled = MangleGenericInstance(*compiler, base, typeArgs);
+            QueueGenericInstantiation(base, typeArgs, mangled, site);
+            LLVMBackend::BuilderStateGuard savedState(compiler);
+            ProcessPendingInstantiations();
+        }
+        return mangled;
 }
 
 std::string MainListener::TryInferAndInstantiateFromFuncPtrCandidate(

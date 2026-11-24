@@ -4639,6 +4639,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             compiler->UnregisterOwnedStructTemp(returnNV.Storage);
             if (returnNV.Primary == compiler->lastCxxRetValue_)
                 compiler->UnregisterOwnedStructTemp(compiler->lastCxxRetTemp_);
+            // `return c ? T(1) : (d ? mk() : x)`: the returned arm's temp goes to the caller.
+            compiler->HandOverJoinedOwnedTemps(returnNV.Primary);
         }
         compiler->FlushOwnedStructTemps();
         // Borrow returns: hand the caller a non-owning copy (see the classification
@@ -7626,13 +7628,13 @@ void MainListener::GenerateDefaultParamOverloads(
                 callArgs.push_back(arg);
             }
 
-            bool wrapperHasCxxDefault = false;
             for (int i = cutoff; i < (int)params.size(); i++)
             {
                 auto* initCtx = params[i].DefaultValue;
                 llvm::Value* defaultVal = nullptr;
                 LLVMBackend::NamedVariable defaultArg;
                 bool defaultIsUnsigned = false;
+                bool nativeBraceTemp = false;   // a CFlat brace default, owned like a brace argument
                 // By-value C++ class or CFlat holder default: its owned temps are wrapper-flushed.
                 const bool cxxHolderDefault = !params[i].Pointer && !params[i].IsAlias
                     && !params[i].IsRvalueRef && compiler->HasCxxClassMember(params[i].TypeName);
@@ -7898,6 +7900,12 @@ void MainListener::GenerateDefaultParamOverloads(
                     defaultArg = defNV;
                     defaultVal = LoadNamedVariable(defNV);
                     defaultIsUnsigned = defNV.TypeAndValue.IsUnsignedInteger() != -1;
+                    // A default that yields a borrow (an alias-returning call, a computed pointer)
+                    // stays in the wrapper: a call-site factory would return it past its referent.
+                    if (cutoff == i && defaultVal != nullptr && !llvm::isa<llvm::Constant>(defaultVal)
+                        && (defNV.TypeAndValue.Pointer || defNV.TypeAndValue.IsAlias
+                            || defNV.TypeAndValue.IsArrayView || defNV.TypeAndValue.IsRvalueRef))
+                        defaultParamNeedsWrapper[i] = true;
                     if (params[i].IsFunctionPointer
                         || compiler->GetEncodedClosureType(params[i].TypeName) != nullptr)
                     {
@@ -7995,8 +8003,25 @@ void MainListener::GenerateDefaultParamOverloads(
                     {
                         auto* alloca = compiler->CreateAlloca(defaultVal->getType());
                         compiler->CreateAssignment(defaultVal, alloca);
-                        EmitConstructedFieldOverrides(alloca, params[i].TypeName, initList);
+                        {
+                            // A brace element naming an earlier parameter keeps this default in the
+                            // wrapper, exactly as an expression default does.
+                            struct RestoreBraceObserver
+                            {
+                                std::function<void(const LLVMBackend::NamedVariable&, bool)>& Slot;
+                                std::function<void(const LLVMBackend::NamedVariable&, bool)> Saved;
+                                ~RestoreBraceObserver() { Slot = std::move(Saved); }
+                            } restore{ defaultParamResolutionObserver_, defaultParamResolutionObserver_ };
+                            if (cutoff == i)
+                                defaultParamResolutionObserver_ =
+                                    [&](const LLVMBackend::NamedVariable&, bool callerContextBinding) {
+                                        if (callerContextBinding)
+                                            defaultParamNeedsWrapper[i] = true;
+                                    };
+                            EmitConstructedFieldOverrides(alloca, params[i].TypeName, initList);
+                        }
                         defaultVal = compiler->CreateLoad(alloca);
+                        nativeBraceTemp = true;
                     }
                 }
                 // An unsupported default-initializer spelling (notably an empty '= {}') leaves
@@ -8027,12 +8052,26 @@ void MainListener::GenerateDefaultParamOverloads(
                     }
                 }
 
-                wrapperHasCxxDefault = wrapperHasCxxDefault || cxxHolderDefault;
                 LLVMBackend::NamedVariable namedVar = cxxHolderDefault ? defaultArg : LLVMBackend::NamedVariable{};
                 namedVar.Primary = defaultVal;
                 namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
                 namedVar.TypeAndValue = params[i];
                 namedVar.TypeAndValue.VariableName.clear();
+                namedVar.IsCFlatBraceInitTemp = nativeBraceTemp;
+                // The default is a value bound to the alias parameter, not an alias itself: the
+                // call materializes and owns its slot as for an explicit `fa(N(5))`.
+                if (params[i].IsAlias && !params[i].Pointer) namedVar.TypeAndValue.IsAlias = false;
+                // A raw pointer default of a unique<T> parameter binds like a raw pointer argument:
+                // the call constructs the owner, so it must keep the pointer's own type.
+                if (!params[i].Pointer && compiler->IsCoreUniqueType(params[i].TypeName)
+                    && defaultVal != nullptr && defaultVal->getType()->isPointerTy()
+                    && (defaultArg.TypeAndValue.Pointer || llvm::isa<llvm::ConstantPointerNull>(defaultVal)))
+                {
+                    namedVar = defaultArg;
+                    namedVar.Primary = defaultVal;
+                    namedVar.BaseType = defaultVal->getType();
+                    namedVar.TypeAndValue.VariableName.clear();
+                }
                 // Naming the PARAMETER type would sign-extend an unsigned default into a wider
                 // slot; carry the default expression's own unsigned width instead.
                 if (defaultIsUnsigned && defaultVal != nullptr && defaultVal->getType()->isIntegerTy()
@@ -8068,12 +8107,8 @@ void MainListener::GenerateDefaultParamOverloads(
             if (returnType.TypeName == "void")
             {
                 compiler->CreateOverloadedFunctionCall(name, callArgs);
-                if (wrapperHasCxxDefault)
-                {
-                    // Native temps (defaults and call-made argtemps) keep master's leak.
-                    compiler->DropNonCxxOwnedTempsSince(wrapperTempMark);
-                    compiler->FlushOwnedTempsSince(wrapperTempMark, nullptr);
-                }
+                // The wrapper is the caller of the full overload: it destroys the default temps.
+                compiler->FlushOwnedTempsSince(wrapperTempMark, nullptr);
                 compiler->CreateReturnCall(nullptr);
             }
             else
@@ -8102,12 +8137,12 @@ void MainListener::GenerateDefaultParamOverloads(
                     compiler->pendingCxxSretReturn_ = false;
                     compiler->pendingCxxSretForFixedArray_ = false;
                 }
-                if (wrapperHasCxxDefault)
-                {
+                // A result that can borrow from a default (alias, pointer, view) must not outlive it:
+                // those native temps leak rather than dangle. Call-site evaluable defaults never get here.
+                if (compiler->TypeCanCarryBorrow(returnType))
                     compiler->DropNonCxxOwnedTempsSince(wrapperTempMark);
-                    compiler->FlushOwnedTempsSince(wrapperTempMark,
-                        builtInPlace ? nullptr : result, nullptr, true);
-                }
+                compiler->FlushOwnedTempsSince(wrapperTempMark,
+                    builtInPlace ? nullptr : result, nullptr, true);
                 compiler->CreateReturnCall(builtInPlace ? nullptr : result);
             }
 
@@ -8115,12 +8150,16 @@ void MainListener::GenerateDefaultParamOverloads(
             compiler->ClearCurrentSubprogram();
         }
 
-        const bool hasDirectCxxClassDefault = std::any_of(params.begin(), params.end(), [&](const auto& param) {
-            return param.DefaultValue != nullptr && !param.Pointer && !param.IsAlias
-                && !param.IsRvalueRef && compiler->HasCxxClassMember(param.TypeName)
-                && compiler->IsCxxRecord(param.TypeName);
-        });
-        if (!hasDirectCxxClassDefault)
+        bool hasCallSiteDefault = false;
+        for (size_t i = 0; i < params.size() && !hasCallSiteDefault; ++i)
+        {
+            const auto& param = params[i];
+            if (param.DefaultValue == nullptr) continue;
+            hasCallSiteDefault = (!param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                    && compiler->HasCxxClassMember(param.TypeName) && compiler->IsCxxRecord(param.TypeName))
+                || (!defaultParamNeedsWrapper[i] && compiler->IsNativeCallSiteDefaultParam(param));
+        }
+        if (!hasCallSiteDefault)
             return;
 
         std::vector<std::string> factoryNames(params.size());
@@ -8132,6 +8171,7 @@ void MainListener::GenerateDefaultParamOverloads(
                 && !params[i].IsRvalueRef && compiler->HasCxxClassMember(params[i].TypeName);
             const bool cxxClassDefault = cxxHolderDefault && compiler->IsCxxRecord(params[i].TypeName);
             if (cxxHolderDefault && !cxxClassDefault) continue;
+            if (!params[i].Pointer && compiler->IsCoreUniqueType(params[i].TypeName)) continue;
             const bool hasExpression = initCtx->assignmentExpression() != nullptr;
             const bool isDefault = initCtx->Default() != nullptr;
             const bool emptyBrace = initCtx->LeftBrace() != nullptr
@@ -8141,8 +8181,11 @@ void MainListener::GenerateDefaultParamOverloads(
             const bool cxxBraceDefault = cxxClassDefault && initCtx->LeftBrace() != nullptr
                 && initCtx->initializerList() != nullptr
                 && compiler->ReturnsViaInPlaceSret(params[i].TypeName);
+            // A CFlat brace default `N d = {.v = 5}` is rebuilt in the factory and returned by value.
+            const bool nativeBraceDefault = !cxxHolderDefault && !params[i].Pointer
+                && initCtx->LeftBrace() != nullptr && initCtx->initializerList() != nullptr;
             if (!hasExpression && !isDefault
-                && !cxxBraceDefault
+                && !cxxBraceDefault && !nativeBraceDefault
                 && !(emptyBrace && (!cxxClassDefault || cxxEmptyBrace)))
                 continue;
 
@@ -8160,6 +8203,9 @@ void MainListener::GenerateDefaultParamOverloads(
 
             LLVMBackend::TypeAndValue helperReturn = params[i];
             helperReturn.VariableName.clear();
+            // The factory hands the caller a value; the call binds an alias or move parameter to it.
+            if (!helperReturn.Pointer) helperReturn.IsAlias = false;
+            helperReturn.IsMove = false;
             auto* helperFn = compiler->CreateFunctionDefinition(
                 helperName, helperReturn, {}, false, false, initCtx->getStart()->getLine());
             compiler->InitializeBlock(&helperFn->front(), false);
@@ -8182,6 +8228,20 @@ void MainListener::GenerateDefaultParamOverloads(
                 else
                     LogErrorContext(initCtx, "cannot build the C++ class default in its caller slot");
             }
+            else if (nativeBraceDefault)
+            {
+                llvm::Value* braceValue = GenerateDefaultValue(params[i]);
+                if (braceValue == nullptr)
+                    LogErrorContext(initCtx, "cannot build the default value in its caller slot");
+                else
+                {
+                    auto* braceSlot = compiler->CreateAlloca(braceValue->getType());
+                    compiler->CreateAssignment(braceValue, braceSlot);
+                    EmitConstructedFieldOverrides(braceSlot, params[i].TypeName,
+                        initCtx->initializerList());
+                    compiler->CreateReturnCall(compiler->CreateLoad(braceSlot));
+                }
+            }
             else if (cxxBraceDefault)
             {
                 const auto& recipe = compiler->currentFunctionAbiRecipe;
@@ -8189,9 +8249,12 @@ void MainListener::GenerateDefaultParamOverloads(
                 {
                     auto* destination = compiler->currentFunction->getArg(
                         compiler->SRetArgIndex(recipe));
+                    const auto elementTempMark = compiler->MarkOwnedTemps();
                     if (!TryEmitForeignCxxAggregateBraceInit(params[i].TypeName,
                             initCtx->initializerList(), initCtx, destination, true))
                         LogErrorContext(initCtx, "cannot build the C++ class default in its caller slot");
+                    // Scalar elements only, so element temps (`{mkN(7).v}`) die with the factory.
+                    compiler->FlushOwnedTempsSince(elementTempMark, nullptr);
                     compiler->CreateReturnCall(nullptr);
                 }
                 else

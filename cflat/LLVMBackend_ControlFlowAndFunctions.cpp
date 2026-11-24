@@ -734,15 +734,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                     || IsCoreUniqueType(fp.TypeName)
                     || (OwningSinkConsumesConcrete(param)
                         && (fp.TypeName == "string" || IsOwningValueType(fp.TypeName)));
+                // A borrowing slot: no target destroys an rvalue temp, so it ends with the full
+                // expression - brace and call-produced temps alike, as on the direct path.
                 if (!paramTakesOwnership)
-                {
-                    const auto& arg = (*argNVs)[i];
-                    if (!arg.IsCFlatBraceInitTemp) continue;
-                    bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
-                        && llvm::isa<llvm::PHINode>(arg.Primary)
-                        && !arg.TernaryTempAlreadyRegistered;
-                    RegisterBorrowedOwningStructTemp(arg, ternaryJoinNeedsRegistration);
-                }
+                    RegisterBorrowedByValueArgTemp((*argNVs)[i], param);
             }
         }
         // Pointer references were checked at their referent depth by FuncPtrArgDepthMismatch.

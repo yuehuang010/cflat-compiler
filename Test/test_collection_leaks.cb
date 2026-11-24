@@ -646,6 +646,111 @@ bool r22Clean(function<int()> body, int expectedValue, u64 allocations)
         && t392AuditAllocations == allocations && t392AuditFrees == allocations;
 }
 
+// N-COPY: a `T*` subscript element of an owning type is a LIVE object, as in C++. A read whose
+// slot provenance is unproven copies (R21 widened to every owning struct, generic instances and
+// call-result bases); a store copies or moves its source and destroys the old element.
+struct NcOwner { string name = default; };
+int ncDtorRuns = 0;
+struct NcDtor { int v = 0; ~NcDtor() { ncDtorRuns++; } };
+NcOwner* ncG = nullptr;
+string* ncSG = nullptr;
+NcOwner ncMakeOwner(int pick)
+{
+    NcOwner o = default;
+    if (pick == 0) o.name = t413MakeString();
+    else o.name = "0123456789abcdefghijklmnopqrstuvwxyz".copy();
+    return o;
+}
+struct NcBox<T> { T* gq = default; int read() { T t = gq[0]; return t.length(); } };
+int ncReadGenericBox() { string s = t413MakeString(); NcBox<string> b = default; b.gq = &s; return b.read(); }
+int ncReadGlobalStruct() { NcOwner s = ncMakeOwner(0); ncG = &s; NcOwner t = ncG[0]; return t.name.length(); }
+int ncReadGlobalStructAuto() { NcOwner s = ncMakeOwner(0); ncG = &s; auto t = ncG[0]; return t.name.length(); }
+struct NcHolder { NcOwner* q = default; int read() { NcOwner t = q[0]; return t.name.length(); } };
+int ncReadFieldStruct() { NcOwner s = ncMakeOwner(0); NcHolder h = default; h.q = &s; NcOwner t = h.q[0]; return t.name.length(); }
+int ncReadImplicitThisStruct() { NcOwner s = ncMakeOwner(0); NcHolder h = default; h.q = &s; return h.read(); }
+string* ncGetSG() { return ncSG; }
+int ncReadCallBase() { string s = t413MakeString(); ncSG = &s; string t = ncGetSG()[0]; return t.length(); }
+// An arrow member path (`hp->q[0]`, `this->q[0]`) and a method-call base (`g.get()[0]`) copy too.
+struct NcArrow { NcOwner* q = default; string* sq = default; int readThis() { NcOwner t = this->q[0]; return t.name.length(); }
+    string* get() { return sq; } NcOwner* getp() { return q; } };
+int ncArrowRead(NcArrow* hp) { NcOwner t = hp->q[0]; return t.name.length(); }
+int ncArrowReadAuto(NcArrow* hp) { auto t = hp->q[0]; return t.name.length(); }
+int ncArrowReadString(NcArrow* hp) { string t = hp->sq[0]; return t.length(); }
+int ncReadArrowStruct() { NcOwner s = ncMakeOwner(0); NcArrow h = default; h.q = &s; return ncArrowRead(&h); }
+int ncReadArrowStructAuto() { NcOwner s = ncMakeOwner(0); NcArrow h = default; h.q = &s; return ncArrowReadAuto(&h); }
+int ncReadArrowString() { string s = t413MakeString(); NcArrow h = default; h.sq = &s; return ncArrowReadString(&h); }
+int ncReadThisArrowStruct() { NcOwner s = ncMakeOwner(0); NcArrow h = default; h.q = &s; return h.readThis(); }
+int ncReadMethodBaseString() { string s = t413MakeString(); NcArrow g = default; g.sq = &s; string a = g.get()[0]; return a.length(); }
+int ncAssignMethodBaseString()
+{
+    string s = t413MakeString(); NcArrow g = default; g.sq = &s;
+    string a = default;
+    a = g.get()[0];
+    return a.length();
+}
+int ncReadMethodBaseStruct() { NcOwner s = ncMakeOwner(0); NcArrow g = default; g.q = &s; NcOwner b = g.getp()[0]; return b.name.length(); }
+// A call ahead of the member path (`geth()->q[0]`, `g.h()->q[0]`, `g.get().q[0]`) copies too.
+NcArrow ncGA = default;
+NcArrow* ncGetA() { return &ncGA; }
+struct NcArrowG { NcArrow* hh = default; NcArrow hv = default; NcArrow* h() { return hh; } NcArrow get() { return hv; } };
+int ncReadCallArrowStruct() { NcOwner s = ncMakeOwner(0); ncGA.q = &s; NcOwner t = ncGetA()->q[0]; return t.name.length(); }
+int ncReadMethodArrowStruct()
+{
+    NcOwner s = ncMakeOwner(0); NcArrow h = default; h.q = &s; NcArrowG g = default; g.hh = &h;
+    NcOwner t = g.h()->q[0];
+    return t.name.length();
+}
+int ncReadMethodArrowStructAuto()
+{
+    NcOwner s = ncMakeOwner(0); NcArrow h = default; h.q = &s; NcArrowG g = default; g.hh = &h;
+    auto t = g.h()->q[0];
+    return t.name.length();
+}
+int ncReadMethodValueStruct()
+{
+    NcOwner s = ncMakeOwner(0); NcArrowG g = default; g.hv.q = &s;
+    NcOwner t = g.get().q[0];
+    return t.name.length();
+}
+// Swap through a temporary: three copies, every old element destroyed (was a double free).
+int ncSwapGlobalStruct()
+{
+    NcOwner[2] arr = default;
+    arr[0] = ncMakeOwner(0);
+    arr[1] = ncMakeOwner(1);
+    ncG = &arr[0];
+    NcOwner tmp = ncG[0];
+    ncG[0] = ncG[1];
+    ncG[1] = tmp;
+    return arr[1].name.length();
+}
+// Element stores: a temp, a `move`, an element and a loop each destroy the old element.
+int ncStoreTempString() { string[2] arr = default; arr[0] = t413MakeString(); string* p = &arr[0]; p[0] = t413MakeString(); return p[0].length(); }
+int ncStoreMoveString() { string[2] arr = default; arr[0] = t413MakeString(); string* p = &arr[0]; string v = t413MakeString(); p[0] = move v; return p[0].length(); }
+int ncStoreElemString() { string[2] arr = default; arr[0] = t413MakeString(); arr[1] = t413MakeString(); string* p = &arr[0]; p[0] = p[1]; return p[0].length(); }
+int ncStoreLoopStruct()
+{
+    NcOwner[2] arr = default;
+    arr[0] = ncMakeOwner(1);
+    arr[1] = ncMakeOwner(1);
+    NcOwner* p = &arr[0];
+    for (int i = 0; i < 2; i++) p[i] = ncMakeOwner(0);
+    return p[1].name.length();
+}
+// A destructor-bearing element: overwriting through the pointer runs ~NcDtor on the old value.
+int ncStoreDtorElement()
+{
+    ncDtorRuns = 0;
+    NcDtor* p = new NcDtor[2];
+    NcDtor d = default;
+    d.v = 46;
+    p[0] = d;
+    p[0] = d;
+    int value = p[0].v;
+    delete[2] p;
+    return ncDtorRuns == 4 ? value : -ncDtorRuns;
+}
+
 void* t359SelfAssignBuffer = nullptr;
 u64 t359SelfAssignAllocations = 0;
 u64 t359SelfAssignFrees = 0;
@@ -2364,6 +2469,30 @@ extern int main()
     total++; passed += Test("r22_value_receiver_copy", r22Clean(r22ValueReceiverCase, 92, 2u), true);
     total++; passed += Test("r22_pointer_receiver_copy", r22Clean(r22PointerReceiverCase, 92, 2u), true);
     total++; passed += Test("r22_generic_string_field_copy", r22Clean(r22GenericCase, 92, 2u), true);
+    // N-COPY: pre-fix the reads double-freed (rc 133) and the stores leaked the old element.
+    total++; passed += Test("ncopy_generic_box_copy", r22Clean(ncReadGenericBox, 46, 2u), true);
+    total++; passed += Test("ncopy_global_struct_copy", r22Clean(ncReadGlobalStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_global_struct_auto_copy", r22Clean(ncReadGlobalStructAuto, 46, 2u), true);
+    total++; passed += Test("ncopy_field_struct_copy", r22Clean(ncReadFieldStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_implicit_this_struct_copy", r22Clean(ncReadImplicitThisStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_call_base_copy", r22Clean(ncReadCallBase, 46, 2u), true);
+    total++; passed += Test("ncopy_arrow_struct_copy", r22Clean(ncReadArrowStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_arrow_struct_auto_copy", r22Clean(ncReadArrowStructAuto, 46, 2u), true);
+    total++; passed += Test("ncopy_arrow_string_copy", r22Clean(ncReadArrowString, 46, 2u), true);
+    total++; passed += Test("ncopy_this_arrow_struct_copy", r22Clean(ncReadThisArrowStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_method_base_string_copy", r22Clean(ncReadMethodBaseString, 46, 2u), true);
+    total++; passed += Test("ncopy_method_base_string_assign", r22Clean(ncAssignMethodBaseString, 46, 2u), true);
+    total++; passed += Test("ncopy_method_base_struct_copy", r22Clean(ncReadMethodBaseStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_call_arrow_struct_copy", r22Clean(ncReadCallArrowStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_method_arrow_struct_copy", r22Clean(ncReadMethodArrowStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_method_arrow_struct_auto_copy", r22Clean(ncReadMethodArrowStructAuto, 46, 2u), true);
+    total++; passed += Test("ncopy_method_value_struct_copy", r22Clean(ncReadMethodValueStruct, 46, 2u), true);
+    total++; passed += Test("ncopy_swap_global_struct", r22Clean(ncSwapGlobalStruct, 46, 5u), true);
+    total++; passed += Test("ncopy_store_temp_drops_old", r22Clean(ncStoreTempString, 46, 2u), true);
+    total++; passed += Test("ncopy_store_move_drops_old", r22Clean(ncStoreMoveString, 46, 2u), true);
+    total++; passed += Test("ncopy_store_elem_copy", r22Clean(ncStoreElemString, 46, 3u), true);
+    total++; passed += Test("ncopy_store_loop_struct", r22Clean(ncStoreLoopStruct, 46, 4u), true);
+    total++; passed += Test("ncopy_store_dtor_element", r22Clean(ncStoreDtorElement, 46, 1u), true);
     total++; passed += Test("r22_lambda_implicit_this_copy", r22Clean(r22LambdaCase, 92, 3u), true);
     // Accept-set: existing spellings and adjacent consumers keep their independently measured values/counts.
     total++; passed += Test("r22_explicit_this_accept", r22Clean(r22ExplicitCase, 92, 2u), true);

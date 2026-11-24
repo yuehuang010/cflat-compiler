@@ -5194,7 +5194,7 @@ bool LLVMBackend::EmitLoweredMemberwiseAssign(const std::string& typeName, llvm:
         if (dest == nullptr || src == nullptr || valueType == nullptr) return false;
         auto cxxAssign = [&](const std::string& cxxType, llvm::Value* dst, llvm::Value* from,
                              const std::string& fieldName) -> bool {
-            EnsureCxxMemberProjected(cxxType, "operator=");
+            EnsureCxxAssignmentProjected(cxxType);
             const CxxClassInfo* info = GetCxxClassInfo(cxxType);
             const CxxClassInfo::Structor* op = nullptr;
             if (info != nullptr)

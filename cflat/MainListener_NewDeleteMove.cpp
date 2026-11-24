@@ -33,7 +33,42 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         DeclExpectedTypeScope newExpectedScope(&declExpectedType, {});
         DiagnoseAssignmentArguments(ctx->argumentExpressionList());
         uint32_t elementConstMask = 0;
-        std::string typeName = NewExpressionElementTypeName(ctx, &elementConstMask);
+        // GENCTAD: `new Box(args)` with no type arguments deduces them like `Box(args)` does.
+        std::string deducedNewType;
+        if (auto* typeSpec = ctx->typeSpecifier(); typeSpec != nullptr
+            && ctx->argumentExpressionList() != nullptr && ctx->multiWordTypeSuffix() == nullptr
+            && ctx->pointer() == nullptr)
+        {
+            std::string spelled;
+            bool bareSpelling = false;
+            if (auto* generic = typeSpec->genericIdentifier();
+                generic != nullptr && generic->Identifier() != nullptr
+                && generic->genericTypeParameters() == nullptr)
+            {
+                spelled = generic->Identifier()->getText();
+                bareSpelling = true;
+            }
+            else if (auto* qualified = typeSpec->qualifiedGenericIdentifier();
+                     qualified != nullptr && qualified->genericTypeParameters() == nullptr)
+                spelled = qualified->getText();
+            const std::string base = spelled.empty() ? std::string()
+                : NativeConstructorDeductionBase(ResolveGenericTemplateBaseAtScope(
+                    compiler, spelled,
+                    !structScopeStack.empty() ? structScopeStack.back()
+                        : EnclosingAggregateScopeFromContext(compiler, ctx),
+                    ctx, spelled));
+            if (!base.empty() && !compiler->IsDataStructure(compiler->ResolveTypeAlias(
+                    compiler->ResolveQualifiedName(spelled))))
+            {
+                // A bare `new Box(args)` inside Box's own members is the current instance.
+                if (bareSpelling) deducedNewType = InjectedClassInstance(base, ctx);
+                if (deducedNewType.empty())
+                    deducedNewType = DeduceNativeConstructorTemplate(base, ctx->argumentExpressionList(), ctx);
+                if (deducedNewType.empty()) return {};
+            }
+        }
+        std::string typeName = deducedNewType.empty()
+            ? NewExpressionElementTypeName(ctx, &elementConstMask) : deducedNewType;
         const bool forceRootType = IsGlobalScopeQualifiedType(ctx->typeSpecifier());
         bool isArray = ctx->assignmentExpression() != nullptr;
 

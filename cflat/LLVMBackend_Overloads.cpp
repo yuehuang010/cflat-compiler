@@ -8010,8 +8010,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         break;
                     }
                     const TypeAndValue& param = declaration.Parameters[i];
-                    if (!param.Pointer && !param.IsAlias && !param.IsRvalueRef
-                        && HasCxxClassMember(param.TypeName))
+                    if ((!param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                            && HasCxxClassMember(param.TypeName))
+                        || IsNativeCallSiteDefaultParam(param))
                         hasOmittedClassDefault = true;
                 }
                 if (!allOmittedHaveFactories || !hasOmittedClassDefault) continue;
@@ -9724,6 +9725,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             value.Primary = generated;
                             value.BaseType = generated->getType();
                             value.IsRvalue = true;
+                            // The factory returned a value: an alias parameter binds to (and the
+                            // call owns) it, as for an explicit `f(mk())`.
+                            if (!value.TypeAndValue.Pointer) value.TypeAndValue.IsAlias = false;
                             if (lastCxxRetValue_ == generated && lastCxxRetTemp_ != nullptr)
                                 value.Storage = lastCxxRetTemp_;
                             else if (lastLoweredRetValue_ == generated && lastLoweredRetTemp_ != nullptr)
@@ -11012,19 +11016,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         value = slot;
                     }
                     else if (!paramTakesOwnership)
-                    {
-                        bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
-                            && llvm::isa<llvm::PHINode>(arg.Primary)
-                            && !arg.TernaryTempAlreadyRegistered;
-                        const bool loweredSretPassedByValue =
-                            IsLoweredCFlatOnlyStruct(candParamItr->TypeName)
-                            && arg.TypeAndValue.TypeName == candParamItr->TypeName
-                            && LoweredSretTempOf(arg.Primary,
-                                                 arg.Primary != nullptr ? arg.Primary->getType()
-                                                                        : nullptr) != nullptr;
-                        if (!loweredSretPassedByValue)
-                            RegisterBorrowedOwningStructTemp(arg, ternaryJoinNeedsRegistration);
-                    }
+                        RegisterBorrowedByValueArgTemp(arg, *candParamItr);
                 }
                 else if (value->getType()->isIntegerTy(1))
                 {
@@ -13267,6 +13259,35 @@ bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
         // The parser and generic-instantiation queue ask this before the wrapper struct is
         // materialized. The reserved mangling plus the imported core template is sufficient.
         return IsCoreUniqueTemplate(std::string(base));
+}
+
+bool LLVMBackend::IsNativeCallSiteDefaultParam(const TypeAndValue& param) const
+{
+        if (param.IsRvalueRef || param.IsFunctionPointer || param.TypeName.empty()) return false;
+        if (GetEncodedClosureType(param.TypeName) != nullptr) return false;
+        if (!param.Pointer && !param.IsAlias && param.IsPrimitive()) return false;
+        // unique<T> is a sink the callee owns; its raw `new` / nullptr default stays in the wrapper.
+        if (!param.Pointer && IsCoreUniqueType(param.TypeName)) return false;
+        return !HasCxxClassMember(param.TypeName) && !IsCxxRecord(param.TypeName);
+}
+
+bool LLVMBackend::TypeCanCarryBorrow(const TypeAndValue& type, int depth) const
+{
+        if (type.Pointer || type.IsAlias || type.IsArrayView || type.IsRvalueRef || type.IsInterface)
+            return true;
+        if (type.IsPrimitive() || type.TypeName == "string" || IsCoreUniqueType(type.TypeName))
+            return false;
+        auto found = dataStructures.find(type.TypeName);
+        if (found == dataStructures.end())
+        {
+            // An enum or other scalar-lowered name carries nothing; anything unknown is assumed to.
+            auto* lowered = GetType(type);
+            return lowered == nullptr || !(lowered->isIntegerTy() || lowered->isFloatingPointTy());
+        }
+        if (depth > 8) return true;
+        for (const auto& field : found->second.StructFields)
+            if (TypeCanCarryBorrow(field, depth + 1)) return true;
+        return false;
 }
 
 bool LLVMBackend::IsCoreArrayType(const std::string& typeName) const

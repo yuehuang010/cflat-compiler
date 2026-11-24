@@ -1,0 +1,43 @@
+// GENCTAD refusals: constructor deduction for a native generic type (`Box(3)`) refuses what C++20
+// CTAD refuses, and never lets the destination stand in for the deduction.
+struct GcdBox<T> { T value = default; GcdBox(T v) { value = v; } };
+struct GcdTwo<T> { T value = default; GcdTwo(T a, T b) { value = a + b; } };
+struct GcdSides<T> { T value = default; GcdSides(T a, int b) { value = a; } GcdSides(int a, T b) { value = b; } };
+struct GcdFixed<T> { T value = default; GcdFixed(int v) { } };
+struct GcdAgg<T> { T value = default; };
+// Its only constructor sits in an `if const` arm that int (the deduced T) does not take.
+struct GcdWide<T> { T value = default; if const (sizeof(T) > 4) { GcdWide(T v) { value = v; } } };
+
+extern int main()
+{
+    expect_error("cannot deduce the type arguments of generic type 'GcdAgg': it declares no constructor") {
+        auto a = GcdAgg(3);
+    }
+    expect_error("cannot deduce the type arguments of generic type 'GcdBox' from these arguments") {
+        auto b = GcdBox(1, 2);
+    }
+    expect_error("cannot deduce the type arguments of generic type 'GcdFixed' from these arguments") {
+        auto f = GcdFixed(3);
+    }
+    expect_error("ambiguous type argument deduction for generic type 'GcdSides'") {
+        auto s = GcdSides(1, 2);
+    }
+    expect_error("cannot deduce the type arguments of generic type 'GcdTwo' from these arguments") {
+        short narrow = 1;
+        i64 wide = 2;
+        auto t = GcdTwo(narrow, wide);
+    }
+    expect_error("cannot deduce the type arguments of generic type 'GcdBox' from a brace-list argument") {
+        auto l = GcdBox({ value = 1 });
+    }
+    expect_error("cannot initialize or assign 'GcdBox<i64>' from unrelated struct type 'GcdBox<int>'") {
+        GcdBox<i64> d = GcdBox(3);
+    }
+    expect_error("cannot deduce the type arguments of 'GcdBox' from this initializer: it is not a 'GcdBox' instance") {
+        GcdBox n = 3;
+    }
+    expect_error("cannot deduce the type arguments of generic type 'GcdWide' from these arguments") {
+        auto w = GcdWide(3);
+    }
+    return 0;
+}

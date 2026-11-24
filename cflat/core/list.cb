@@ -323,6 +323,24 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // Sorting swaps live elements by assignment; a const-field T cannot be reassigned.
     if const (is_assignable(T))
     {
+        // Exchange two live elements. A native owner relocates by move into the vacated slot
+        // (construct_at: no copy, no drop); plain values and C++ classes swap by assignment.
+        void _swap(int a, int b)
+        {
+            if const (is_primitive(T) || is_pointer(T) || is_interface(T) || is_cpp_class(T))
+            {
+                T tmp = _data[a];
+                _data[a] = _data[b];
+                _data[b] = tmp;
+            }
+            else
+            {
+                T tmp = move _data[a];
+                construct_at(&_data[a], move _data[b]);
+                construct_at(&_data[b], move tmp);
+            }
+        }
+
         // Lomuto partition: pivot at _data[hi], returns final pivot index.
         int _partition(int lo, int hi, Lambda<bool(T, T)> compare)
         {
@@ -333,28 +351,22 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
                 if (compare(_data[j], _data[hi]))
                 {
                     i++;
-                    T tmp = _data[i];
-                    _data[i] = _data[j];
-                    _data[j] = tmp;
+                    _swap(i, j);
                 }
                 j++;
             }
             i++;
-            T tmp = _data[i];
-            _data[i] = _data[hi];
-            _data[hi] = tmp;
+            _swap(i, hi);
             return i;
         }
 
         // Place the median of _data[lo], _data[mid], _data[hi] at position hi.
         void _medianPivot(int lo, int mid, int hi, Lambda<bool(T, T)> compare)
         {
-            if (compare(_data[hi], _data[lo])) { T t = _data[lo]; _data[lo] = _data[hi]; _data[hi] = t; }
-            if (compare(_data[mid], _data[lo])) { T t = _data[lo]; _data[lo] = _data[mid]; _data[mid] = t; }
-            if (compare(_data[hi], _data[mid])) { T t = _data[mid]; _data[mid] = _data[hi]; _data[hi] = t; }
-            T tmp = _data[mid];
-            _data[mid] = _data[hi];
-            _data[hi] = tmp;
+            if (compare(_data[hi], _data[lo])) _swap(lo, hi);
+            if (compare(_data[mid], _data[lo])) _swap(lo, mid);
+            if (compare(_data[hi], _data[mid])) _swap(mid, hi);
+            _swap(mid, hi);
         }
 
         // Recursive quicksort over [lo, hi] using median-of-three pivot selection.

@@ -6243,6 +6243,171 @@ bool testInterfaceValuePointerArguments()
     return result;
 }
 
+// IFACETMP: a native by-value temporary passed to an INTERFACE method is destroyed exactly once,
+// as on the direct call. Pre-fix every borrowing-slot temp leaked (destroyed 0 times) and a brace
+// argument crashed the compiler. gIfaceTmpDead counts destructor runs; a brace runs no ctor.
+int gIfaceTmpMade = 0;
+int gIfaceTmpDead = 0;
+
+struct IfaceTmpN
+{
+    int v = 0;
+    IfaceTmpN(int x) { v = x; gIfaceTmpMade++; }
+    ~IfaceTmpN() { gIfaceTmpDead++; }
+};
+
+IfaceTmpN ifaceTmpMake(int x) { return IfaceTmpN(x); }
+
+interface IIfaceTmp
+{
+    int get(IfaceTmpN d);
+    IfaceTmpN echo(IfaceTmpN d);
+    void touch(IfaceTmpN d);
+    int mv(move IfaceTmpN p);
+    int al(alias IfaceTmpN p);
+    int bp(IfaceTmpN* p);
+    int two(int a, IfaceTmpN d);
+};
+
+class IfaceTmpImpl : IIfaceTmp
+{
+    int base = 0;
+    int get(IfaceTmpN d) { return d.v + base; }
+    IfaceTmpN echo(IfaceTmpN d) { return IfaceTmpN(d.v + 100); }
+    void touch(IfaceTmpN d) { base = base + d.v; }
+    int mv(move IfaceTmpN p) { return p.v; }
+    int al(alias IfaceTmpN p) { return p.v; }
+    int bp(IfaceTmpN* p) { return p->v; }
+    int two(int a, IfaceTmpN d) { return a * 10 + d.v; }
+};
+
+struct IfaceTmpHolder { IIfaceTmp g = default; };
+
+IIfaceTmp ifaceTmpPass(IIfaceTmp a) { return a; }
+int ifaceTmpViaParam(IIfaceTmp g) { return g.get(IfaceTmpN(7)); }
+int ifaceTmpAddOne(int x) { return x + 1; }
+
+// Destructor runs since the last call; resets the counters.
+int ifaceTmpDeadSince()
+{
+    int d = gIfaceTmpDead;
+    gIfaceTmpDead = 0;
+    gIfaceTmpMade = 0;
+    return d;
+}
+
+bool testInterfaceByValueTempDestroyedOnce()
+{
+    bool result = true;
+    IfaceTmpImpl k = IfaceTmpImpl();
+    IIfaceTmp i = k;
+    int v = 0;
+    ifaceTmpDeadSince();
+
+    // Direct twin: the oracle every interface leg below must match.
+    { v = k.get(IfaceTmpN(7)); }
+    result &= Test("ifacetmp_direct_value", v, 7);
+    result &= Test("ifacetmp_direct_dead", ifaceTmpDeadSince(), 1);
+
+    // Pre-fix each of these left the temp alive (dead 0).
+    { v = i.get(IfaceTmpN(7)); }
+    result &= Test("ifacetmp_ctor_value", v, 7);
+    result &= Test("ifacetmp_ctor_dead", ifaceTmpDeadSince(), 1);
+    { v = i.get(ifaceTmpMake(8)); }
+    result &= Test("ifacetmp_factory_value", v, 8);
+    result &= Test("ifacetmp_factory_dead", ifaceTmpDeadSince(), 1);
+    { v = ifaceTmpPass(i).get(IfaceTmpN(9)); }
+    result &= Test("ifacetmp_returned_receiver_value", v, 9);
+    result &= Test("ifacetmp_returned_receiver_dead", ifaceTmpDeadSince(), 1);
+    { IfaceTmpHolder h = IfaceTmpHolder(); h.g = k; v = h.g.get(IfaceTmpN(10)); }
+    result &= Test("ifacetmp_field_receiver_value", v, 10);
+    result &= Test("ifacetmp_field_receiver_dead", ifaceTmpDeadSince(), 1);
+    { v = ifaceTmpViaParam(i); }
+    result &= Test("ifacetmp_param_receiver_value", v, 7);
+    result &= Test("ifacetmp_param_receiver_dead", ifaceTmpDeadSince(), 1);
+    { unique IIfaceTmp u = new IfaceTmpImpl(); v = u.get(IfaceTmpN(11)); }
+    result &= Test("ifacetmp_unique_receiver_value", v, 11);
+    result &= Test("ifacetmp_unique_receiver_dead", ifaceTmpDeadSince(), 1);
+    { IIfaceTmp[2] arr; arr[0] = k; arr[1] = k; v = arr[1].get(IfaceTmpN(12)); }
+    result &= Test("ifacetmp_array_receiver_value", v, 12);
+    result &= Test("ifacetmp_array_receiver_dead", ifaceTmpDeadSince(), 1);
+    { v = i?.get(IfaceTmpN(13)); }
+    result &= Test("ifacetmp_null_conditional_value", v, 13);
+    result &= Test("ifacetmp_null_conditional_dead", ifaceTmpDeadSince(), 1);
+    { IfaceTmpN r = i.echo(IfaceTmpN(1)); v = r.v; }
+    result &= Test("ifacetmp_return_value", v, 101);
+    result &= Test("ifacetmp_return_dead", ifaceTmpDeadSince(), 2);
+    { v = i.echo(IfaceTmpN(2)).v; }
+    result &= Test("ifacetmp_return_chain_value", v, 102);
+    result &= Test("ifacetmp_return_chain_dead", ifaceTmpDeadSince(), 2);
+    { i.touch(IfaceTmpN(5)); v = k.base; }
+    result &= Test("ifacetmp_void_value", v, 5);
+    result &= Test("ifacetmp_void_dead", ifaceTmpDeadSince(), 1);
+    k.base = 0;
+    { v = i.get(IfaceTmpN(3)) + i.get(IfaceTmpN(4)); }
+    result &= Test("ifacetmp_expression_value", v, 7);
+    result &= Test("ifacetmp_expression_dead", ifaceTmpDeadSince(), 2);
+    { int s = 0; for (int j = 0; j < 3; j++) s = s + i.get(IfaceTmpN(j)); v = s; }
+    result &= Test("ifacetmp_loop_value", v, 3);
+    result &= Test("ifacetmp_loop_dead", ifaceTmpDeadSince(), 3);
+    { bool c = v > 0; v = c ? i.get(IfaceTmpN(5)) : 0; }
+    result &= Test("ifacetmp_ternary_arm_value", v, 5);
+    result &= Test("ifacetmp_ternary_arm_dead", ifaceTmpDeadSince(), 1);
+    { v = ifaceTmpAddOne(i.get(IfaceTmpN(5))); }
+    result &= Test("ifacetmp_nested_value", v, 6);
+    result &= Test("ifacetmp_nested_dead", ifaceTmpDeadSince(), 1);
+    { v = i.get(IfaceTmpN(i.get(IfaceTmpN(2)))); }
+    result &= Test("ifacetmp_nested_iface_value", v, 2);
+    result &= Test("ifacetmp_nested_iface_dead", ifaceTmpDeadSince(), 2);
+
+    // Accept-set: already destroyed once on master; must stay so.
+    { IfaceTmpN x = IfaceTmpN(6); v = i.get(x); }
+    result &= Test("ifacetmp_lvalue_value", v, 6);
+    result &= Test("ifacetmp_lvalue_dead", ifaceTmpDeadSince(), 1);
+    { bool c = v > 0; v = i.get(c ? IfaceTmpN(5) : IfaceTmpN(6)); }
+    result &= Test("ifacetmp_ternary_argument_value", v, 5);
+    result &= Test("ifacetmp_ternary_argument_dead", ifaceTmpDeadSince(), 1);
+    { v = i.mv(IfaceTmpN(4)); }
+    result &= Test("ifacetmp_move_param_value", v, 4);
+    result &= Test("ifacetmp_move_param_dead", ifaceTmpDeadSince(), 1);
+    { v = i.mv(ifaceTmpMake(4)); }
+    result &= Test("ifacetmp_move_param_factory_value", v, 4);
+    result &= Test("ifacetmp_move_param_factory_dead", ifaceTmpDeadSince(), 1);
+    { v = i.al(IfaceTmpN(3)); }
+    result &= Test("ifacetmp_alias_param_value", v, 3);
+    result &= Test("ifacetmp_alias_param_dead", ifaceTmpDeadSince(), 1);
+    { IfaceTmpN x = IfaceTmpN(2); v = i.bp(&x); }
+    result &= Test("ifacetmp_pointer_param_value", v, 2);
+    result &= Test("ifacetmp_pointer_param_dead", ifaceTmpDeadSince(), 1);
+    { IIfaceTmp n = nullptr; v = n?.get(IfaceTmpN(13)); }
+    result &= Test("ifacetmp_null_receiver_value", v, 0);
+    result &= Test("ifacetmp_null_receiver_dead", ifaceTmpDeadSince(), 0);
+
+    // Brace arguments: pre-fix a SIGSEGV in the argument parser. Values and counts match the
+    // direct twin (a brace builds the fields, runs no ctor, and is destroyed once).
+    { v = k.get({.v = 7}); }
+    result &= Test("ifacetmp_brace_direct_value", v, 7);
+    result &= Test("ifacetmp_brace_direct_dead", ifaceTmpDeadSince(), 1);
+    { v = i.get({.v = 7}); }
+    result &= Test("ifacetmp_brace_value", v, 7);
+    result &= Test("ifacetmp_brace_dead", ifaceTmpDeadSince(), 1);
+    { v = i.get({}); }
+    result &= Test("ifacetmp_brace_empty_value", v, 0);
+    result &= Test("ifacetmp_brace_empty_dead", ifaceTmpDeadSince(), 1);
+    { v = i.two(d: {.v = 3}, a: 2); }
+    result &= Test("ifacetmp_brace_named_value", v, 23);
+    result &= Test("ifacetmp_brace_named_dead", ifaceTmpDeadSince(), 1);
+    { v = i.mv({.v = 5}); }
+    result &= Test("ifacetmp_brace_move_value", v, 5);
+    result &= Test("ifacetmp_brace_move_dead", ifaceTmpDeadSince(), 1);
+    { v = i.al({.v = 6}); }
+    result &= Test("ifacetmp_brace_alias_value", v, 6);
+    result &= Test("ifacetmp_brace_alias_dead", ifaceTmpDeadSince(), 1);
+    { v = i.bp({.v = 8}); }
+    result &= Test("ifacetmp_brace_pointer_value", v, 8);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -6361,6 +6526,7 @@ extern int main()
 
     total++; passed += testAutoCopyInterface()                          ? 1 : 0;
     total++; passed += testInterfaceValuePointerArguments()              ? 1 : 0;
+    total++; passed += testInterfaceByValueTempDestroyedOnce()           ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

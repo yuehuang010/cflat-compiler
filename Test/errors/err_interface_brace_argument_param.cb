@@ -1,0 +1,14 @@
+// A brace argument to an INTERFACE method binds only a CFlat struct or struct-pointer parameter.
+// Pre-fix any brace argument there crashed the compiler (null assignmentExpression).
+struct IfaceBraceN { int v = 0; };
+interface IIfaceBrace { int pp(IfaceBraceN** q); };
+class IfaceBraceImpl : IIfaceBrace { int pp(IfaceBraceN** q) { return 0; } };
+
+extern int main()
+{
+    IfaceBraceImpl k = IfaceBraceImpl();
+    IIfaceBrace i = k;
+    expect_error("argument 1 to interface method 'IIfaceBrace.pp' cannot be passed here: a brace list or '...' binds only a CFlat struct or struct-pointer parameter");
+    int r = i.pp({.v = 1});
+    return r;
+}

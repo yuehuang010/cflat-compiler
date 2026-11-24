@@ -6473,6 +6473,10 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 // than a bare ptr. See LowerByValueArg (canonical path: CreateOverloadedFunctionCall).
                 auto val = nv.Primary != nullptr ? nv.Primary : CreateLoad(nv.Storage);
                 val = LowerByValueArg(val, param, nv);
+                // An owning rvalue temp into a BORROWING slot: no implementation destroys it, so
+                // it ends with the full expression, as on the direct path. Sinks take the temp.
+                if (!transferParams[i].IsInterfaceSink)
+                    RegisterBorrowedByValueArgTemp(nv, param);
                 callArgs.push_back(val);
             }
             if (ParameterCarriesRawArrayCount(param))

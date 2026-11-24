@@ -267,6 +267,8 @@ namespace cflat_cinterop
         bool isStaticInline = false;
         bool isDeleted = false;
         bool isTemplateSpecialization = false;
+        // Request TU only: a plain free function some header of the TU declares (not this TU).
+        bool declaredByRequestHeader = false;
         bool isNoexcept = false;
         std::string bindRefusal;
         // The clang diagnostic lines behind a refusal, when one is known (never displayed).
@@ -788,6 +790,9 @@ namespace cflat_cinterop
         bool wantMacros = false;            // header-bind path harvests macros; .c path does not
         std::vector<CxxMacroProbe> cxxMacroProbes;
         bool requireInScope = false;        // keep only decls whose file is under inScopeDirs
+        // Request TU of the non-incremental fallback: tag the plain free functions its headers
+        // declare (RawSig::declaredByRequestHeader) so the caller can drop them.
+        bool tagRequestHeaderFunctions = false;
         std::vector<std::string> inScopeDirs;
         bool checkHeaderScope = false;      // reject a stub sentinel left inside a header scope
         std::string scopeHeaderPath;        // fallback path for a missing sentinel

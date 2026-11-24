@@ -2857,6 +2857,9 @@ namespace cflat_cinterop
             LookupResult found(sema, ctx.DeclarationNames.getCXXOperatorName(OO_Equal),
                                loc, Sema::LookupOrdinaryName);
             sema.LookupQualifiedName(found, record);
+            // An extractor probe, not a use: a protected operator= (enable_shared_from_this) must
+            // not leave an access error behind as the request TU's first clang error.
+            found.suppressDiagnostics();
             QualType objectType = ctx.getCanonicalTagType(record);
             QualType argType = constSource ? objectType.withConst() : objectType;
             OpaqueValueExpr arg(loc, argType, VK_XValue);
@@ -3567,6 +3570,9 @@ namespace cflat_cinterop
                 if (!LocOf(fd, file, line, col)) return true;
 
                 RawSig sig;
+                sig.declaredByRequestHeader = st.req.tagRequestHeaderFunctions
+                    && fd->getPrimaryTemplate() == nullptr && !fd->isTemplateInstantiation()
+                    && !sm.isInMainFile(sm.getExpansionLoc(fd->getLocation()));
                 sig.name = st.req.cxxMode ? CxxQualifiedName(fd) : fd->getNameAsString();
                 if (st.req.cxxMode && (fd->isInAnonymousNamespace()
                     || (fd->getOverloadedOperator() == OO_None && !IsValidDottedName(sig.name))))

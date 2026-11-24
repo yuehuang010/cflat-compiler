@@ -159,7 +159,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    if const (is_assignable(T)) *out = _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
+                    if const (is_assignable(T)) *out = move _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
@@ -184,7 +184,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    if const (is_assignable(T)) *out = _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
+                    if const (is_assignable(T)) *out = move _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
@@ -235,7 +235,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    T value = _buf[slot];
+                    T value = move _buf[slot];
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return value;
                 }
@@ -270,7 +270,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    if const (is_assignable(T)) *out = _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
+                    if const (is_assignable(T)) *out = move _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
@@ -324,7 +324,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    T value = _buf[slot];
+                    T value = move _buf[slot];
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return value;
                 }

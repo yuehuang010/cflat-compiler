@@ -3155,6 +3155,20 @@ bool LLVMBackend::EnsureCxxMemberProjected(const std::string& typeName,
         return projected;
 }
 
+/*
+ * The fallback binds no member body clang did not emit yet, so an inline template operator=
+ * (unique_ptr, list) stays refused "no definition" until a use requests it, as a member call
+ * does. The incremental executor's demand pass needs no retry.
+ */
+void LLVMBackend::EnsureCxxAssignmentProjected(const std::string& typeName)
+{
+        EnsureCxxMemberProjected(typeName, "operator=");
+        if (UseCxxIncrementalRequests()) return;
+        if (const auto* info = GetCxxClassInfo(typeName);
+            info != nullptr && info->refusedMembers.count("operator=") != 0)
+            TryBindRefusedCxxMember(typeName, "operator=");
+}
+
 void LLVMBackend::RetryLazyNestedCxxMemberRefusal(const std::string& typeName,
                                                   const std::string& memberName)
 {
@@ -7858,8 +7872,15 @@ bool LLVMBackend::CxxBaseHasAccessibleMoveOrCopy(const std::string& baseType) co
         return info->hasCopyCtor && !info->hasDeletedCopyCtor;
 }
 
+/*
+ * A by-value C++ class parameter of a [cpp] override is borrowed (an alias in the CFlat body)
+ * only when the wrapper can neither bind the twin's own parameter nor forward a copy into the
+ * body. A caller-destroyed parameter is always bound in place (the body's by-value ABI is a
+ * pointer to caller-owned storage); only a callee-destroyed one (MS ABI, trivial_abi) forwards.
+ */
 bool LLVMBackend::CxxClassOverrideParamIsBorrowed(const std::string& typeName) const
 {
+        if (!CxxOverrideParamForwardsByValue(typeName)) return false;
         const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__ctor");
         const auto* info = GetCxxClassInfo(typeName);
         if (info == nullptr) return false;

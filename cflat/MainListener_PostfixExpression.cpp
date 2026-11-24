@@ -336,6 +336,22 @@ struct BraceArgumentUnwindScope
     }
 };
 
+// Drop the unwind entries a brace argument retained until its call was emitted (newest first).
+void MainListener::ReleaseRetainedBraceArgumentUnwinds(LLVMBackend& compiler,
+    std::vector<std::pair<llvm::Value*, std::string>>& retained)
+{
+    auto& entries = compiler.unwindPartial_;
+    for (auto slot = retained.rbegin(); slot != retained.rend(); ++slot)
+        for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
+            if (entry->K == LLVMBackend::UnwindPartialEntry::Kind::Slot
+                && entry->V == slot->first && entry->TypeName == slot->second)
+            {
+                entries.erase(std::next(entry).base());
+                break;
+            }
+    retained.clear();
+}
+
 static bool IsParenthesizedExpression(antlr4::tree::ParseTree* node)
 {
     auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
@@ -8251,6 +8267,66 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CallPostfixScope callArgumentPostfix(this);
                         const bool callWasQualified = qualifiedCallPending;
                         qualifiedCallPending = false;
+                        // GENCTAD: `Box(args)` / `ns.Box(args)` naming a native generic template with no
+                        // type arguments deduces them from the constructors, then calls `Box<...>(args)`.
+                        if (auto* ctadArguments = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(parseTree))
+                        {
+                            const size_t argumentChild = childIndex - 1;
+                            std::string ctadBase;
+                            bool ctadQualified = false;
+                            if (ctadCalleeNode_ != nullptr && argumentChild == 2
+                                && ctx->primaryExpression() != nullptr
+                                && ctx->primaryExpression()->genericIdentifier() != nullptr
+                                && ctx->primaryExpression()->genericIdentifier()->Identifier() == ctadCalleeNode_)
+                            {
+                                ctadBase = NativeConstructorDeductionTemplate(ctadCalleeNode_);
+                                ctadCalleeNode_ = nullptr;
+                            }
+                            else if (argumentChild >= 4 && namespaceContext.empty()
+                                && namedVar.Storage == nullptr && namedVar.Primary == nullptr
+                                && structVar.BaseType == nullptr && interfaceVar.BaseType == nullptr)
+                            {
+                                auto* open = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[argumentChild - 1]);
+                                auto* dot = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[argumentChild - 3]);
+                                antlr4::tree::ParseTree* memberNode = ctx->children[argumentChild - 2];
+                                if (auto* rule = dynamic_cast<antlr4::RuleContext*>(memberNode);
+                                    rule != nullptr && rule->getRuleIndex() == CFlatParser::RuleMemberNameToken
+                                    && !rule->children.empty())
+                                    memberNode = rule->children.front();
+                                auto* member = dynamic_cast<antlr4::tree::TerminalNode*>(memberNode);
+                                auto* compiler = Compiler(ctx);
+                                // The member link left the resolved qualified name (`ns.Box`) here.
+                                const std::string& qualified = primaryIdentifier;
+                                if (open != nullptr && open->getSymbol()->getType() == CFlatParser::LeftParen
+                                    && dot != nullptr && dot->getSymbol()->getType() == CFlatParser::Dot
+                                    && member != nullptr
+                                    && qualified.ends_with("." + member->getText())
+                                    && compiler->GetFunction(qualified) == nullptr
+                                    && compiler->GetReturnBlock(qualified) == nullptr
+                                    && genericFunctionTemplates.count(
+                                        compiler->ResolveGenericFunctionBase(qualified)) == 0
+                                    && compiler->GetGlobalVariableNV(qualified).Storage == nullptr
+                                    && !compiler->IsDataStructure(qualified))
+                                {
+                                    ctadBase = NativeConstructorDeductionBase(qualified);
+                                    ctadQualified = !ctadBase.empty();
+                                }
+                            }
+                            if (!ctadBase.empty())
+                            {
+                                // Bare `Box(args)` inside Box's own members is the current instance.
+                                std::string instance = ctadQualified ? std::string()
+                                    : InjectedClassInstance(ctadBase, ctx);
+                                if (instance.empty())
+                                    instance = DeduceNativeConstructorTemplate(ctadBase, ctadArguments, ctx);
+                                if (instance.empty()) return {};
+                                if (ctadQualified) namespaceContext = instance;
+                                primaryIdentifier = instance;
+                                namedVar = {};
+                                structVar = {};
+                                interfaceVar = {};
+                            }
+                        }
                         // Create Function Call
                         std::string functionName = primaryIdentifier;
                         // Parenthesized `(*namedFunction)` keeps the resolved function value, while
@@ -11484,6 +11560,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // Collect extra call arguments
                             std::vector<LLVMBackend::NamedVariable> extraArgs;
                             std::vector<antlr4::ParserRuleContext*> extraArgContexts;
+                            std::vector<std::pair<llvm::Value*, std::string>> ifaceBraceArgumentUnwinds;
+                            BraceArgumentUnwindScope ifaceBraceArgumentUnwind{ [&]() {
+                                ReleaseRetainedBraceArgumentUnwinds(*Compiler(ctx), ifaceBraceArgumentUnwinds);
+                            } };
                             if (argumentList.size() > 0)
                             {
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
@@ -11547,6 +11627,23 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (p.IsFunctionPointer) lambdaExpectedType = p;
                                         else if (const auto* enc = Compiler(ctx)->GetEncodedClosureType(p.TypeName))
                                             lambdaExpectedType = *enc;
+                                    }
+                                    // A brace (or '...') argument has no assignmentExpression: lower it
+                                    // from the declared parameter, as the direct call does.
+                                    if (namedArgument->assignmentExpression() == nullptr)
+                                    {
+                                        lambdaExpectedType = {};
+                                        const LLVMBackend::TypeAndValue* braceParam = ifaceParams != nullptr
+                                            && declaredIdx[argIdx] >= 0
+                                            && declaredIdx[argIdx] < (int64_t)ifaceParams->size()
+                                            ? &(*ifaceParams)[declaredIdx[argIdx]] : nullptr;
+                                        LLVMBackend::NamedVariable braceArg;
+                                        if (!ParseInterfaceBraceArgument(namedArgument, braceParam,
+                                                interfaceVar.TypeAndValue.TypeName, primaryIdentifier,
+                                                argIdx + 1, braceArg, &ifaceBraceArgumentUnwinds))
+                                            break;
+                                        extraArgs.emplace_back(std::move(braceArg));
+                                        continue;
                                     }
                                     // Occurrence-scope this argument (see codeValueDataCasts_): a
                                     // cast here must not launder a sibling argument's join arm.
@@ -11933,6 +12030,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
 
                                 callArgumentPostfix.Flush();
+                                ifaceBraceArgumentUnwind.Release();
                                 namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
                                     ifacePtr,
                                     interfaceVar.TypeAndValue.TypeName,
@@ -12136,18 +12234,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             std::vector<LLVMBackend::NamedVariable> arguments;
                             std::vector<std::pair<llvm::Value*, std::string>> retainedBraceArgumentUnwinds;
                             auto releaseBraceArgumentUnwinds = [&]() {
-                                auto& entries = Compiler(ctx)->unwindPartial_;
-                                for (auto slot = retainedBraceArgumentUnwinds.rbegin();
-                                     slot != retainedBraceArgumentUnwinds.rend(); ++slot)
-                                    for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
-                                        if (entry->K == LLVMBackend::UnwindPartialEntry::Kind::Slot
-                                            && entry->V == slot->first
-                                            && entry->TypeName == slot->second)
-                                        {
-                                            entries.erase(std::next(entry).base());
-                                            break;
-                                        }
-                                retainedBraceArgumentUnwinds.clear();
+                                ReleaseRetainedBraceArgumentUnwinds(*Compiler(ctx), retainedBraceArgumentUnwinds);
                             };
                             BraceArgumentUnwindScope braceArgumentUnwind{ releaseBraceArgumentUnwinds };
                             LLVMBackend::NamedVariable implicitCallReceiver;
@@ -19958,6 +20045,78 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
         return nullptr;
     }
 
+// GENCTAD: the native generic struct/class template a bare direct callee `Name(args)` names, or
+// empty. Only the shape `Name(args...)` qualifies: no type arguments, no parentheses around Name.
+std::string MainListener::NativeConstructorDeductionTemplate(antlr4::tree::TerminalNode* node) {
+        if (node == nullptr) return {};
+        CFlatParser::PostfixExpressionContext* postfix = nullptr;
+        for (antlr4::tree::ParseTree* up = node->parent; up != nullptr && postfix == nullptr; up = up->parent)
+            postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(up);
+        if (postfix == nullptr || postfix->children.size() < 4) return {};
+        auto* primary = postfix->primaryExpression();
+        if (primary == nullptr || postfix->children[0] != primary
+            || primary->genericIdentifier() == nullptr
+            || primary->genericIdentifier()->Identifier() != node
+            || primary->genericIdentifier()->genericTypeParameters() != nullptr)
+            return {};
+        auto* open = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[1]);
+        if (open == nullptr || open->getSymbol()->getType() != CFlatParser::LeftParen
+            || dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(postfix->children[2]) == nullptr)
+            return {};
+        auto* compiler = Compiler(primary);
+        const std::string name = node->getText();
+        const std::string enclosingScope = !structScopeStack.empty()
+            ? structScopeStack.back() : EnclosingAggregateScopeFromContext(compiler, primary);
+        const std::string base = ResolveGenericTemplateBaseAtScope(
+            compiler, name, enclosingScope, primary, name);
+        return NativeConstructorDeductionBase(base);
+    }
+
+// GENCTAD: inside the members of `base`'s own instance (nested aggregates included) the bare
+// template name is the injected class name, the active instance (C++); empty elsewhere.
+std::string MainListener::InjectedClassInstance(const std::string& base, antlr4::tree::ParseTree* site) {
+        auto* compiler = Compiler();
+        const auto contextScopes = EnclosingAggregateTypeScopesFromContext(compiler, site);
+        if (base.empty() || contextScopes.empty()) return {};
+        std::unordered_map<antlr4::ParserRuleContext*, std::string> activeByDefinition;
+        std::unordered_set<std::string> visited;
+        std::vector<std::string> activeScopes(structScopeStack.rbegin(), structScopeStack.rend());
+        if (!genericMethodOwner_.empty()) activeScopes.push_back(genericMethodOwner_);
+        for (const auto& activeScope : activeScopes)
+            for (std::string scope = activeScope; !scope.empty() && visited.insert(scope).second; )
+            {
+                auto definition = aggregateDefinitionContexts_.find(scope);
+                if (definition != aggregateDefinitionContexts_.end() && definition->second != nullptr)
+                    activeByDefinition.try_emplace(definition->second, scope);
+                auto parent = aggregateParentScopes_.find(scope);
+                if (parent == aggregateParentScopes_.end()) break;
+                scope = parent->second;
+            }
+        for (const auto& contextScope : contextScopes)
+        {
+            auto active = activeByDefinition.find(contextScope.Definition);
+            if (active == activeByDefinition.end()) continue;
+            auto instance = compiler->gts.genericAggregateInstances.find(active->second);
+            if (instance != compiler->gts.genericAggregateInstances.end()
+                && instance->second.templateName == base)
+                return active->second;
+        }
+        return {};
+    }
+
+// The template key when `base` is a native generic struct/class with type parameters only.
+std::string MainListener::NativeConstructorDeductionBase(const std::string& base) {
+        if (genericStructTemplates.count(base) == 0 && genericClassTemplates.count(base) == 0)
+            return {};
+        auto params = genericStructTypeParams.find(base);
+        if (params == genericStructTypeParams.end() || params->second.empty()) return {};
+        // A value parameter (`int N`) has no constructor guide to deduce it from.
+        if (auto values = genericStructValueParams.find(base); values != genericStructValueParams.end())
+            for (const auto& valueType : values->second)
+                if (!valueType.empty()) return {};
+        return base;
+    }
+
 LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalNode* node) {
         auto* compiler = Compiler();
         if (!node)
@@ -21033,6 +21192,12 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             && compiler->IsForeignCxxClassWithConstructors(
                 compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(name))))
             return {};
+        else if (!NativeConstructorDeductionTemplate(node).empty())
+        {
+            // GENCTAD: the call's argument list deduces the type arguments (C++ CTAD).
+            ctadCalleeNode_ = node;
+            return {};
+        }
         else
             LogErrorContext(node, std::format("Undefined variable {}.", name));
         return {};

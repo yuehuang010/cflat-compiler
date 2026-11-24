@@ -4538,6 +4538,15 @@ void MainListener::GenerateInterfaceDefaultParamOverloads(
         }
         auto* result = compiler->CallInterfaceMethod(ifaceStorage, interfaceName, methodName,
                                                      callArgs, nullptr, &ifaceArg);
+        // A forwarded move param now belongs to the implementation; the helper must not
+        // run a second destructor on the zero-filled slot it moved from.
+        if (!compiler->stackNamedVariable.empty())
+            for (const auto& param : methodParams)
+                if (param.IsMove && !param.Pointer)
+                    if (auto it = compiler->stackNamedVariable.back().functionArgument.find(
+                            param.VariableName);
+                        it != compiler->stackNamedVariable.back().functionArgument.end())
+                        it->second.IsOwningStruct = false;
         compiler->CreateReturnCall(result);
         compiler->CreateBlockBreak(nullptr, true);
         compiler->ClearCurrentSubprogram();
@@ -11091,6 +11100,13 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
             && !sourceNV.TypeAndValue.Pointer && sourceNV.Storage != nullptr
             && compiler->IsCxxRecord(typeName)
             && compiler->IsCxxTriviallyCopyableRecord(typeName);
+        // `auto x = c ? mk() : T(5)` (no storage join) byte-stores the joined value on the
+        // generic path: the arm temps it loads are handed to x.
+        if (!autoType.IsAlias && !autoType.Pointer && !autoType.staticStorage
+            && sourceNV.Storage == nullptr && !sourceNV.TypeAndValue.Pointer
+            && compiler->IsDataStructure(typeName) && !compiler->NeedsCxxLoweringType(typeName)
+            && compiler->IsForeignNontrivialCxxClass(typeName))
+            compiler->HandOverJoinedOwnedTemps(sourceNV.Primary);
         // `alias auto` keeps its borrow; a prvalue (sret temp) keeps the elision path.
         if (autoType.IsAlias || autoType.Pointer || autoType.staticStorage
             || (!xvalue && !ternaryTrivialXvalue
@@ -11155,6 +11171,8 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
                                                           slotType.UserAlignValue, nrvoStorage);
         allocList.push_back(std::pair(name, llvm::dyn_cast_or_null<llvm::AllocaInst>(slot)));
         if (slot == nullptr) return true;
+        // `auto x = c ? move a : move b;` on a CFlat-declared class: un-zero the selected source.
+        compiler->RestoreZeroedMoveStorageJoin(sourceNV.Storage, sourceNV.Primary);
 
         if (xvalue)
         {
@@ -11195,6 +11213,21 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
             && compiler->FindCxxCopyCtor(typeName) == nullptr
             && compiler->FindCxxMoveCtor(typeName) != nullptr;
         compiler->SetCurrentDebugLocation(line);
+        /*
+         * `auto x = c ? T(1) : (d ? T(2) : mk())` on a CFlat-declared class: the joined rvalue
+         * relocates into the slot and its arm temps are handed over (the C++17 elision a typed
+         * declaration gets by constructing in place), so no temp is destroyed.
+         */
+        auto* slotAlloca = llvm::dyn_cast<llvm::AllocaInst>(slot);
+        if (rvalueJoin && compiler->IsDataStructure(typeName)
+            && !compiler->NeedsCxxLoweringType(typeName) && slotAlloca != nullptr
+            && sourceNV.Primary != nullptr
+            && sourceNV.Primary->getType() == slotAlloca->getAllocatedType())
+        {
+            compiler->builder->CreateStore(sourceNV.Primary, slot);
+            compiler->HandOverJoinedOwnedTemps(sourceNV.Primary);
+            return true;
+        }
         // A named source is consumed (still destroyed at its own scope exit, as for the typed
         // `T x = move u;`). An indirect source stays with its owner, as in C++.
         const std::string srcName = !sourceNV.CallerName.empty() ? sourceNV.CallerName
@@ -12083,6 +12116,46 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 ~AliasDeclTempScope() { backend->DiscardAliasDeclTemps(mark); }
             } aliasTemps{ compiler, compiler->MarkAliasDeclTemps() };
             typeAndValue = parsedTypeAndValue;
+            // GENCTAD: `Box b = init;` names only the template (a C++ deduced class type); the
+            // initializer must be an instance of it, and that instance is the declared type.
+            if (!global_scope && !typeAndValue.Pointer && !typeAndValue.IsArrayView
+                && typeAndValue.ConstArraySize == 0 && typeAndValue.ArraySize == nullptr
+                && !compiler->IsDataStructure(typeAndValue.TypeName))
+            {
+                const std::string base = NativeConstructorDeductionBase(ResolveGenericTemplateBaseAtScope(
+                    compiler, typeAndValue.TypeName,
+                    !structScopeStack.empty() ? structScopeStack.back()
+                        : EnclosingAggregateScopeFromContext(compiler, declSpec),
+                    declSpec, typeAndValue.TypeName));
+                // A bare `Box` inside Box's own members is the current instance (injected class name).
+                bool bareSpelling = false;
+                for (auto* spec : declSpec->declarationSpecifier())
+                    if (auto* typeSpec = spec->typeSpecifier();
+                        typeSpec != nullptr && typeSpec->genericIdentifier() != nullptr)
+                        bareSpelling = true;
+                const std::string injected = !base.empty() && bareSpelling
+                    ? InjectedClassInstance(base, declSpec) : std::string();
+                if (!injected.empty())
+                    typeAndValue.TypeName = injected;
+                else if (!base.empty() && initDecl->initializer() != nullptr
+                    && initDecl->initializer()->assignmentExpression() != nullptr)
+                {
+                    auto* initExpression = initDecl->initializer()->assignmentExpression();
+                    const auto operand = EvaluateOperandTypeOnly([&]() {
+                        return ParseAssignmentExpressionNamed(initExpression);
+                    });
+                    if (operand.Type.Pointer || operand.Type.IsArrayView
+                        || MangledBase(operand.Type.TypeName) != base)
+                    {
+                        LogErrorContext(initExpression, std::format(
+                            "cannot deduce the type arguments of '{}' from this initializer: it is not "
+                            "a '{}' instance; write the type arguments, for example {}<int>",
+                            base, base, base));
+                        continue;
+                    }
+                    typeAndValue.TypeName = operand.Type.TypeName;
+                }
+            }
             const LLVMBackend::TypeAndValue declaredTypeAndValue = typeAndValue;
             // Each init-declarator is a full expression: land its postfix ++/-- before the next
             // declarator or statement reads the operand (every `continue`/return path included).
@@ -16224,7 +16297,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // admitted on the same alloca-backed-local provenance the string
                                 // arms use - never on the GEP shape, which container internals share.
                                 || (srcInitGep->getNumIndices() == 1
-                                    && RawHeapBaseIsNewArrayLocal(srcInitGep->getPointerOperand())));
+                                    && RawHeapBaseIsNewArrayLocal(srcInitGep->getPointerOperand()))
+                                // N-COPY: a `T*` subscript element whose slot provenance is unproven
+                                // is a LIVE object (R21's rule, for every owning struct).
+                                || (srcInitGep->getNumIndices() == 1 && right != nullptr
+                                    && initializer != nullptr
+                                    && initializer->assignmentExpression() != nullptr
+                                    && IsDeclaredPointerSubscriptString(
+                                        initializer->assignmentExpression(), right, srcStorage, true)));
                         if (right->getType()->isStructTy()
                             && (srcIsNamedSlot || srcIsIndirectOwningLvalue)
                             && !srcIsMove
